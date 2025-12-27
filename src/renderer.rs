@@ -47,31 +47,31 @@ const QUAD_VERTICES: &[Vertex] = &[
     Vertex { position: [-1.0, 1.0], tex_coords: [0.0, 0.0] },
 ];
 
-/// Uniform data passed to shaders
+/// Uniform data passed to shaders.
+///
+/// Note: this avoids 4x4 matrix layout pitfalls between Rust and WGSL.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 struct Uniforms {
-    /// Transform matrix (scale, rotation, translation)
-    transform: [[f32; 4]; 4],
-    /// Image opacity (for fade animations)
-    opacity: f32,
+    /// Final scale in NDC (includes fit-to-window + zoom + startup scale)
+    scale: [f32; 2],
+    /// Translation in NDC
+    translate: [f32; 2],
     /// Rotation in radians
     rotation: f32,
-    /// Padding for alignment
+    /// Image opacity (for fade animations)
+    opacity: f32,
+    /// Padding for 16-byte alignment
     _padding: [f32; 2],
 }
 
 impl Default for Uniforms {
     fn default() -> Self {
         Self {
-            transform: [
-                [1.0, 0.0, 0.0, 0.0],
-                [0.0, 1.0, 0.0, 0.0],
-                [0.0, 0.0, 1.0, 0.0],
-                [0.0, 0.0, 0.0, 1.0],
-            ],
-            opacity: 1.0,
+            scale: [1.0, 1.0],
+            translate: [0.0, 0.0],
             rotation: 0.0,
+            opacity: 1.0,
             _padding: [0.0; 2],
         }
     }
@@ -442,6 +442,29 @@ impl Renderer {
             view_formats: &[],
         });
         
+        // IMPORTANT:
+        // wgpu requires bytes_per_row to be a multiple of COPY_BYTES_PER_ROW_ALIGNMENT (256).
+        // Without padding, many image widths will render as black (or fail validation).
+        let bytes_per_pixel = 4u32;
+        let unpadded_bpr = bytes_per_pixel * frame.width;
+        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let padded_bpr = ((unpadded_bpr + (align - 1)) / align) * align;
+
+        let upload_bytes: std::borrow::Cow<'_, [u8]> = if padded_bpr == unpadded_bpr {
+            std::borrow::Cow::Borrowed(&frame.data)
+        } else {
+            let mut padded = vec![0u8; (padded_bpr * frame.height) as usize];
+            let src_row_bytes = unpadded_bpr as usize;
+            let dst_row_bytes = padded_bpr as usize;
+            for row in 0..(frame.height as usize) {
+                let src_start = row * src_row_bytes;
+                let dst_start = row * dst_row_bytes;
+                padded[dst_start..dst_start + src_row_bytes]
+                    .copy_from_slice(&frame.data[src_start..src_start + src_row_bytes]);
+            }
+            std::borrow::Cow::Owned(padded)
+        };
+
         self.queue.write_texture(
             wgpu::ImageCopyTexture {
                 texture: &texture,
@@ -449,10 +472,10 @@ impl Renderer {
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            &frame.data,
+            &upload_bytes,
             wgpu::ImageDataLayout {
                 offset: 0,
-                bytes_per_row: Some(4 * frame.width),
+                bytes_per_row: Some(padded_bpr),
                 rows_per_image: Some(frame.height),
             },
             texture_size,
@@ -491,53 +514,26 @@ impl Renderer {
         image_aspect: f32,
     ) {
         let rotation_rad = (rotation_degrees as f32).to_radians();
-        let cos_r = rotation_rad.cos();
-        let sin_r = rotation_rad.sin();
-        
-        // Calculate aspect ratio correction
+
+        // Fit-to-window scale (preserve aspect ratio). The render pass clears to black,
+        // so this naturally produces black bars in fullscreen when needed.
         let window_aspect = self.size.width as f32 / self.size.height as f32;
-        let aspect_correction = if rotation_degrees == 90 || rotation_degrees == 270 {
-            // Swap aspect for 90/270 degree rotations
-            (1.0 / image_aspect) / window_aspect
+        let (fit_x, fit_y) = if image_aspect >= window_aspect {
+            // Image is wider than window
+            (1.0, window_aspect / image_aspect)
         } else {
-            image_aspect / window_aspect
+            // Image is taller than window
+            (image_aspect / window_aspect, 1.0)
         };
-        
-        // Build transform matrix: Scale -> Rotate -> Translate
-        let sx = scale * aspect_correction.min(1.0);
-        let sy = scale * (1.0 / aspect_correction).min(1.0);
-        
-        // Rotation matrix
-        let rot = [
-            [cos_r, -sin_r, 0.0, 0.0],
-            [sin_r, cos_r, 0.0, 0.0],
-            [0.0, 0.0, 1.0, 0.0],
-            [0.0, 0.0, 0.0, 1.0],
-        ];
-        
-        // Scale matrix
-        let scl = [
-            [sx, 0.0, 0.0, 0.0],
-            [0.0, sy, 0.0, 0.0],
-            [0.0, 0.0, 1.0, 0.0],
-            [0.0, 0.0, 0.0, 1.0],
-        ];
-        
-        // Translation
-        let trans = [
-            [1.0, 0.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0, 0.0],
-            [0.0, 0.0, 1.0, 0.0],
-            [offset_x * 2.0, offset_y * 2.0, 0.0, 1.0],
-        ];
-        
-        // Combine: T * R * S
-        let transform = mat4_multiply(&trans, &mat4_multiply(&rot, &scl));
-        
+
+        let sx = fit_x * scale;
+        let sy = fit_y * scale;
+
         self.uniforms = Uniforms {
-            transform,
-            opacity,
+            scale: [sx, sy],
+            translate: [offset_x, offset_y],
             rotation: rotation_rad,
+            opacity,
             _padding: [0.0; 2],
         };
         
@@ -545,7 +541,12 @@ impl Renderer {
     }
     
     /// Render the current frame
-    pub fn render(&mut self, show_controls: bool, button_states: &[bool; 3]) -> Result<(), wgpu::SurfaceError> {
+    pub fn render(
+        &mut self,
+        show_controls: bool,
+        button_states: &[bool; 3],
+        controls_opacity: f32,
+    ) -> Result<(), wgpu::SurfaceError> {
         let output = self.surface.get_current_texture()?;
         let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
         
@@ -581,7 +582,7 @@ impl Renderer {
         
         // Render UI buttons if controls are visible
         if show_controls {
-            self.render_buttons(&mut encoder, &view, button_states);
+            self.render_buttons(&mut encoder, &view, button_states, controls_opacity);
         }
         
         self.queue.submit(std::iter::once(encoder.finish()));
@@ -596,36 +597,53 @@ impl Renderer {
         encoder: &mut wgpu::CommandEncoder,
         view: &wgpu::TextureView,
         button_states: &[bool; 3],
+        controls_opacity: f32,
     ) {
         // Buttons: [minimize, maximize, close]
         let button_width = 46.0 / self.size.width as f32;
         let button_height = 32.0 / self.size.height as f32;
-        let padding = 2.0 / self.size.width as f32;
+        let padding_x = 2.0 / self.size.width as f32;
+        let padding_y = 2.0 / self.size.height as f32;
+
+        let controls_opacity = controls_opacity.clamp(0.0, 1.0);
         
         let buttons = [
             // Minimize button
             ButtonUniform {
-                position: [1.0 - (button_width + padding) * 3.0, 1.0 - button_height - padding],
+                // Normalized coordinates in [0..1] with origin at top-left.
+                position: [1.0 - (button_width + padding_x) * 3.0, padding_y],
                 size: [button_width, button_height],
-                color: if button_states[0] { [0.4, 0.4, 0.4, 0.9] } else { [0.2, 0.2, 0.2, 0.85] },
+                color: if button_states[0] {
+                    [0.4, 0.4, 0.4, 0.9 * controls_opacity]
+                } else {
+                    [0.2, 0.2, 0.2, 0.85 * controls_opacity]
+                },
                 hover: if button_states[0] { 1.0 } else { 0.0 },
                 button_type: 0.0,
                 _padding: [0.0; 2],
             },
             // Maximize button
             ButtonUniform {
-                position: [1.0 - (button_width + padding) * 2.0, 1.0 - button_height - padding],
+                position: [1.0 - (button_width + padding_x) * 2.0, padding_y],
                 size: [button_width, button_height],
-                color: if button_states[1] { [0.4, 0.4, 0.4, 0.9] } else { [0.2, 0.2, 0.2, 0.85] },
+                color: if button_states[1] {
+                    [0.4, 0.4, 0.4, 0.9 * controls_opacity]
+                } else {
+                    [0.2, 0.2, 0.2, 0.85 * controls_opacity]
+                },
                 hover: if button_states[1] { 1.0 } else { 0.0 },
                 button_type: 1.0,
                 _padding: [0.0; 2],
             },
             // Close button
             ButtonUniform {
-                position: [1.0 - button_width - padding, 1.0 - button_height - padding],
+                position: [1.0 - button_width - padding_x, padding_y],
                 size: [button_width, button_height],
-                color: if button_states[2] { [0.9, 0.2, 0.2, 0.9] } else { [0.7, 0.1, 0.1, 0.85] },
+                color: if button_states[2] {
+                    [0.9, 0.2, 0.2, 0.9 * controls_opacity]
+                } else {
+                    [0.7, 0.1, 0.1, 0.85 * controls_opacity]
+                },
                 hover: if button_states[2] { 1.0 } else { 0.0 },
                 button_type: 2.0,
                 _padding: [0.0; 2],
@@ -663,15 +681,4 @@ impl Renderer {
     }
 }
 
-/// Matrix multiplication for 4x4 matrices
-fn mat4_multiply(a: &[[f32; 4]; 4], b: &[[f32; 4]; 4]) -> [[f32; 4]; 4] {
-    let mut result = [[0.0f32; 4]; 4];
-    for i in 0..4 {
-        for j in 0..4 {
-            for k in 0..4 {
-                result[i][j] += a[i][k] * b[k][j];
-            }
-        }
-    }
-    result
-}
+

@@ -32,9 +32,11 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     let normalized_pos = (in.position + 1.0) * 0.5; // [0, 1]
     let button_pos = button.position + normalized_pos * button.size;
     
-    // Convert to clip space (already in [0, 1] for position, need [-1, 1])
-    out.clip_position = vec4<f32>(button_pos * 2.0 - 1.0, 0.0, 1.0);
-    out.clip_position.y = -out.clip_position.y; // Flip Y for correct orientation
+    // Convert to clip space.
+    // button_pos is normalized [0..1] with origin at top-left.
+    let x_clip = button_pos.x * 2.0 - 1.0;
+    let y_clip = 1.0 - button_pos.y * 2.0;
+    out.clip_position = vec4<f32>(x_clip, y_clip, 0.0, 1.0);
     out.local_pos = in.position;
     
     return out;

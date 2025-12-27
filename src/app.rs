@@ -199,10 +199,9 @@ impl App {
                 // In floating mode, move the window
                 self.window_manager.move_window_by(window, dx as i32, dy as i32);
             } else {
-                // In fullscreen mode, pan the image
-                let zoom = self.animations.get_zoom();
-                let pan_dx = dx as f32 / size.width as f32 / zoom;
-                let pan_dy = dy as f32 / size.height as f32 / zoom;
+                // In fullscreen mode, pan the image in NDC units (independent of zoom)
+                let pan_dx = (dx as f32 * 2.0) / size.width as f32;
+                let pan_dy = (dy as f32 * 2.0) / size.height as f32;
                 self.animations.add_pan(pan_dx, -pan_dy);
             }
             
@@ -285,25 +284,27 @@ impl App {
         if let Some(action) = self.input.handle_scroll(delta, &self.config) {
             match action {
                 Action::ZoomIn | Action::ZoomOut => {
-                    // Handle zoom with cursor following
+                    // Handle zoom with cursor-follow in NDC
                     let size = window.inner_size();
                     let current_zoom = self.animations.get_zoom();
                     let scroll_amount = self.input.get_scroll_amount(delta);
                     let new_zoom = (current_zoom * (1.0 + scroll_amount)).clamp(0.1, 10.0);
-                    
-                    // Calculate offset to zoom toward cursor
-                    let current_offset = (self.animations.get_pan_x(), self.animations.get_pan_y());
-                    let new_offset = self.input.calculate_zoom_offset(
-                        size.width,
-                        size.height,
-                        current_zoom,
-                        new_zoom,
-                        current_offset,
-                    );
-                    
+
+                    let mouse = self.input.mouse_position();
+                    let cursor_ndc_x = (mouse.x as f32 / size.width as f32) * 2.0 - 1.0;
+                    let cursor_ndc_y = 1.0 - (mouse.y as f32 / size.height as f32) * 2.0;
+
+                    let ratio = if current_zoom.abs() < 1e-6 { 1.0 } else { new_zoom / current_zoom };
+                    let pan_x = self.animations.get_pan_x();
+                    let pan_y = self.animations.get_pan_y();
+
+                    // Keep the point under the cursor stable as zoom changes.
+                    let new_pan_x = ratio * pan_x + (1.0 - ratio) * cursor_ndc_x;
+                    let new_pan_y = ratio * pan_y + (1.0 - ratio) * cursor_ndc_y;
+
                     self.animations.set_zoom(new_zoom);
-                    self.animations.set_pan(new_offset.0, new_offset.1);
-                    
+                    self.animations.set_pan(new_pan_x, new_pan_y);
+
                     window.request_redraw();
                 }
                 _ => {
@@ -350,6 +351,9 @@ impl App {
             Action::RotateClockwise => {
                 if let Some(ref mut image) = self.current_image {
                     image.rotate_clockwise();
+                    if self.window_manager.mode() == ViewMode::Floating {
+                        self.window_manager.update_window_size(&window, image.dimensions());
+                    }
                     window.request_redraw();
                 }
             }
@@ -357,6 +361,9 @@ impl App {
             Action::RotateCounterClockwise => {
                 if let Some(ref mut image) = self.current_image {
                     image.rotate_counter_clockwise();
+                    if self.window_manager.mode() == ViewMode::Floating {
+                        self.window_manager.update_window_size(&window, image.dimensions());
+                    }
                     window.request_redraw();
                 }
             }
@@ -468,7 +475,7 @@ impl App {
         let show_controls = self.ui.is_visible() && self.ui.opacity() > 0.01;
         let button_states = self.ui.get_button_states();
         
-        match renderer.render(show_controls, &button_states) {
+        match renderer.render(show_controls, &button_states, self.ui.opacity()) {
             Ok(_) => {}
             Err(wgpu::SurfaceError::Lost) => {
                 let size = renderer.size();

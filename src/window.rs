@@ -10,7 +10,7 @@ use log::{info, warn};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event_loop::ActiveEventLoop;
-use winit::window::{Window, WindowAttributes, WindowLevel, Fullscreen, CursorIcon};
+use winit::window::{Window, WindowAttributes, WindowLevel, CursorIcon};
 
 #[cfg(windows)]
 use windows::{
@@ -255,9 +255,19 @@ impl WindowManager {
         // Store current position and size
         self.last_position = window.outer_position().ok();
         self.last_size = Some(window.inner_size());
-        
-        // Enter fullscreen
-        window.set_fullscreen(Some(Fullscreen::Borderless(None)));
+
+        // "Windowed fullscreen": do NOT use winit fullscreen APIs.
+        // This avoids being treated as fullscreen exclusive/borderless fullscreen by drivers.
+        window.set_fullscreen(None);
+
+        let (target_pos, target_size) = if let Some(monitor) = window.current_monitor() {
+            (monitor.position(), monitor.size())
+        } else {
+            (PhysicalPosition::new(0, 0), self.screen_size)
+        };
+
+        let _ = window.request_inner_size(target_size);
+        window.set_outer_position(target_pos);
         window.set_window_level(WindowLevel::Normal);
         
         self.mode = ViewMode::Fullscreen;

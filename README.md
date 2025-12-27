@@ -9,17 +9,20 @@ A high-performance, beautiful, fully animated image viewer for Windows 11, writt
 ## Features
 
 ### 🎨 Beautiful UI
+
 - **Borderless floating window** - Clean, modern design without Windows title bar
 - **Picasa-style startup animation** - Smooth scale animation from 10% to 100%
 - **Glass-effect control buttons** - Transparent minimize, maximize, and close buttons
 - **Automatic image fitting** - Large images fit to screen, small images stay at 100%
 
 ### 🚀 High Performance
+
 - **GPU-accelerated rendering** via wgpu (Vulkan/DX12/Metal backend)
 - **Smooth 60 FPS animations** for zooming, panning, and transitions
 - **Efficient memory usage** with optimized image loading
 
 ### 🖼️ Image Support
+
 - JPEG (.jpg, .jpeg)
 - PNG (.png)
 - WebP (.webp)
@@ -30,12 +33,14 @@ A high-performance, beautiful, fully animated image viewer for Windows 11, writt
 ### 🎯 View Modes
 
 #### Floating Mode (Default)
+
 - Move window freely by dragging anywhere on the image
 - Window stays always-on-top
 - Glass-effect blur background (Windows 11)
 - Invisible navigation zones on left/right edges
 
 #### Fullscreen Mode
+
 - Black bars for images that don't fill the screen
 - Same navigation and control functionality
 - Press F, F12, or middle-click to toggle
@@ -43,22 +48,24 @@ A high-performance, beautiful, fully animated image viewer for Windows 11, writt
 ### 🔧 Controls
 
 #### Mouse
-| Action | Effect |
-|--------|--------|
-| Left Click + Drag | Pan image / Move window (floating mode) |
-| Double Click | Reset zoom to 100% |
-| Scroll Wheel | Zoom in/out (follows cursor) |
-| Middle Click | Toggle fullscreen |
-| Right Click (left edge) | Previous image |
-| Right Click (right edge) | Next image |
+
+| Action                   | Effect                                  |
+| ------------------------ | --------------------------------------- |
+| Left Click + Drag        | Pan image / Move window (floating mode) |
+| Double Click             | Reset zoom to 100%                      |
+| Scroll Wheel             | Zoom in/out (follows cursor)            |
+| Middle Click             | Toggle fullscreen                       |
+| Right Click (left edge)  | Previous image                          |
+| Right Click (right edge) | Next image                              |
 
 #### Keyboard
-| Key | Action |
-|-----|--------|
-| `F` / `F12` | Toggle fullscreen |
-| `Ctrl+W` / `Esc` | Exit application |
-| `←` / `→` | Previous / Next image |
-| `↑` / `↓` | Rotate image 90° clockwise / counter-clockwise |
+
+| Key              | Action                                         |
+| ---------------- | ---------------------------------------------- |
+| `F` / `F12`      | Toggle fullscreen                              |
+| `Ctrl+W` / `Esc` | Exit application                               |
+| `←` / `→`        | Previous / Next image                          |
+| `↑` / `↓`        | Rotate image 90° clockwise / counter-clockwise |
 
 ### ⚙️ Configuration
 
@@ -86,16 +93,19 @@ ControlButtonOpacity = 0.85
 ```
 
 #### Available Mouse Buttons for Shortcuts
+
 - `LeftClick`, `MiddleClick`, `RightClick`
 - `ScrollUp`, `ScrollDown`
 - `Mouse4` (Back), `Mouse5` (Forward)
 
 #### Keyboard Modifiers
+
 - `Ctrl+`, `Alt+`, `Shift+` (e.g., `Ctrl+W`, `Alt+Enter`)
 
 ## Building from Source
 
 ### Prerequisites
+
 - Rust 1.75 or later
 - Windows 11 (Windows 10 may work but is not tested)
 
@@ -115,6 +125,7 @@ cargo run --release -- "path/to/image.jpg"
 ### Installation
 
 1. Build the release version:
+
    ```bash
    cargo build --release
    ```
@@ -150,17 +161,20 @@ rust-image-viewer/
 ## Technical Details
 
 ### Rendering Pipeline
+
 1. **wgpu** for cross-platform GPU abstraction (uses Vulkan on Windows)
 2. **Custom WGSL shaders** for image and UI rendering
 3. **Transform matrix** for zoom, pan, and rotation
 4. **Alpha blending** for UI overlay and fade animations
 
 ### Animation System
+
 - **Easing functions**: Linear, EaseOut, EaseInOut, EaseOutBack, EaseOutElastic
 - **Smooth interpolation** for all visual transitions
 - **Frame-rate independent** animation timing
 
 ### Windows Integration
+
 - **DWM (Desktop Window Manager)** blur/acrylic effects
 - **Borderless window** with custom hit testing
 - **DPI-aware** rendering
@@ -177,4 +191,3 @@ Contributions are welcome! Please feel free to submit issues and pull requests.
 
 - Inspired by Google Picasa Photo Viewer
 - Built with [wgpu](https://wgpu.rs/) and [winit](https://github.com/rust-windowing/winit)
-
