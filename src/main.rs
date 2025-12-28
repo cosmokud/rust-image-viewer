@@ -29,12 +29,6 @@ enum ResizeDirection {
     BottomRight,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ResizeCornerAxis {
-    Horizontal,
-    Vertical,
-}
-
 /// Application state
 struct ImageViewer {
     /// Current loaded image
@@ -133,8 +127,8 @@ struct ImageViewer {
     resize_start_inner_size: Option<egui::Vec2>,
     /// Accumulated mouse delta since resize started (using pointer.delta() each frame)
     resize_accumulated_delta: egui::Vec2,
-    /// Axis lock for corner resizing to avoid jitter near diagonal
-    resize_corner_axis_lock: Option<ResizeCornerAxis>,
+    /// Last commanded window size during resize (to compute stable content center)
+    resize_last_size: Option<egui::Vec2>,
 }
 
 impl Default for ImageViewer {
@@ -188,7 +182,7 @@ impl Default for ImageViewer {
             resize_start_outer_pos: None,
             resize_start_inner_size: None,
             resize_accumulated_delta: egui::Vec2::ZERO,
-            resize_corner_axis_lock: None,
+            resize_last_size: None,
         }
     }
 }
@@ -745,8 +739,8 @@ impl ImageViewer {
                 self.video_texture_dims = Some((frame.width, frame.height));
             }
 
-            // Always request repaint for video playback
-            if player.is_playing() {
+            // Always request repaint for video playback or when seeking (to show new frames when paused)
+            if player.is_playing() || self.is_seeking {
                 ctx.request_repaint();
             }
         }
@@ -1250,27 +1244,42 @@ impl ImageViewer {
 
                         // Handle seeking
                         if seek_response.dragged() || seek_response.clicked() {
-                            self.is_seeking = true;
                             if let Some(pos) = seek_response.interact_pointer_pos() {
                                 let seek_fraction = ((pos.x - bar_inner.min.x) / bar_inner.width()).clamp(0.0, 1.0);
+                                
+                                // Check if the fraction actually changed (avoid jitter when mouse is still)
+                                let fraction_changed = self.seek_preview_fraction
+                                    .map_or(true, |prev| (prev - seek_fraction).abs() > 0.001);
+                                
+                                self.is_seeking = true;
                                 self.seek_preview_fraction = Some(seek_fraction);
 
-                                // Rate-limit seeks while dragging to prevent pipeline thrash + UI flicker.
-                                let should_send = seek_response.clicked()
-                                    || self.last_seek_sent_at.elapsed() >= Duration::from_millis(50);
-                                if should_send {
-                                    let _ = player.seek(seek_fraction as f64);
-                                    self.last_seek_sent_at = Instant::now();
+                                // Only send seek if fraction changed and rate-limit allows
+                                if fraction_changed {
+                                    let should_send = seek_response.clicked()
+                                        || self.last_seek_sent_at.elapsed() >= Duration::from_millis(50);
+                                    if should_send {
+                                        let _ = player.seek(seek_fraction as f64);
+                                        self.last_seek_sent_at = Instant::now();
+                                    }
                                 }
                             }
+                            // Always request repaint to update seek preview (especially when paused)
                             ctx.request_repaint();
                         }
-                        if seek_response.drag_stopped() {
+                        
+                        // Only clear seeking state when drag stops (not on click release)
+                        // For clicks, we want to keep the preview visible briefly
+                        if seek_response.drag_stopped() && !seek_response.clicked() {
                             if let Some(final_fraction) = self.seek_preview_fraction.take() {
                                 let _ = player.seek(final_fraction as f64);
                             }
                             self.is_seeking = false;
                             self.last_seek_sent_at = Instant::now();
+                        } else if seek_response.clicked() {
+                            // For single clicks, immediately apply and clear seeking state
+                            // The seek was already sent above, just clear the state
+                            self.is_seeking = false;
                         }
 
                         ui.add_space(4.0);
@@ -1459,153 +1468,96 @@ impl ImageViewer {
         self.resize_accumulated_delta += frame_delta;
         let mouse_delta = self.resize_accumulated_delta;
 
-        if mouse_delta.length() < 0.5 {
-            return; // No significant movement
+        // Skip if delta is too small
+        if mouse_delta.length() < 1.0 {
+            return;
         }
 
         let clamp_min_w: f32 = 200.0;
         let clamp_min_h: f32 = 150.0;
-
-        // Get max size constraint
         let max_size = self.floating_max_inner_size.unwrap_or(egui::Vec2::new(4000.0, 3000.0));
 
-        // Calculate new size based on direction, using absolute positions
-        // The key insight: we compute the new window rect based on which edges move
-        let corner_axis = if matches!(
-            direction,
-            ResizeDirection::TopLeft
-                | ResizeDirection::TopRight
-                | ResizeDirection::BottomLeft
-                | ResizeDirection::BottomRight
-        ) {
-            if self.resize_corner_axis_lock.is_none() && mouse_delta.length() >= 2.0 {
-                self.resize_corner_axis_lock = Some(if mouse_delta.x.abs() >= mouse_delta.y.abs() {
-                    ResizeCornerAxis::Horizontal
-                } else {
-                    ResizeCornerAxis::Vertical
-                });
-            }
-            self.resize_corner_axis_lock
-        } else {
-            None
+        // Compute anchored edges based on resize direction
+        let right_edge = start_outer_pos.x + start_inner_size.x;
+        let bottom_edge = start_outer_pos.y + start_inner_size.y;
+
+        // Helper to compute new size from width, maintaining aspect ratio
+        let size_from_width = |w: f32| -> (f32, f32) {
+            let w = w.clamp(clamp_min_w, max_size.x);
+            let h = (w / aspect).clamp(clamp_min_h, max_size.y);
+            let w = h * aspect; // Recalculate to respect height constraint
+            (w.round(), h.round())
+        };
+
+        // Helper to compute new size from height, maintaining aspect ratio
+        let size_from_height = |h: f32| -> (f32, f32) {
+            let h = h.clamp(clamp_min_h, max_size.y);
+            let w = (h * aspect).clamp(clamp_min_w, max_size.x);
+            let h = w / aspect; // Recalculate to respect width constraint
+            (w.round(), h.round())
         };
 
         let (new_w, new_h, new_x, new_y) = match direction {
             ResizeDirection::Right => {
                 // Right edge moves, left edge anchored
-                let w = (start_inner_size.x + mouse_delta.x).max(clamp_min_w).min(max_size.x);
-                let h = (w / aspect).max(clamp_min_h).min(max_size.y);
-                let w = h * aspect; // Recalculate width to match constrained height
+                let (w, h) = size_from_width(start_inner_size.x + mouse_delta.x);
                 (w, h, start_outer_pos.x, start_outer_pos.y)
             }
             ResizeDirection::Left => {
                 // Left edge moves, right edge anchored
-                let w = (start_inner_size.x - mouse_delta.x).max(clamp_min_w).min(max_size.x);
-                let h = (w / aspect).max(clamp_min_h).min(max_size.y);
-                let w = h * aspect;
-                // Right edge stays at: start_outer_pos.x + start_inner_size.x
-                // New left = right_edge - new_width
-                let right_edge = start_outer_pos.x + start_inner_size.x;
-                let new_x = right_edge - w;
-                (w, h, new_x, start_outer_pos.y)
+                let (w, h) = size_from_width(start_inner_size.x - mouse_delta.x);
+                (w, h, right_edge - w, start_outer_pos.y)
             }
             ResizeDirection::Bottom => {
                 // Bottom edge moves, top edge anchored
-                let h = (start_inner_size.y + mouse_delta.y).max(clamp_min_h).min(max_size.y);
-                let w = (h * aspect).max(clamp_min_w).min(max_size.x);
-                let h = w / aspect;
+                let (w, h) = size_from_height(start_inner_size.y + mouse_delta.y);
                 (w, h, start_outer_pos.x, start_outer_pos.y)
             }
             ResizeDirection::Top => {
                 // Top edge moves, bottom edge anchored
-                let h = (start_inner_size.y - mouse_delta.y).max(clamp_min_h).min(max_size.y);
-                let w = (h * aspect).max(clamp_min_w).min(max_size.x);
-                let h = w / aspect;
-                let bottom_edge = start_outer_pos.y + start_inner_size.y;
-                let new_y = bottom_edge - h;
-                (w, h, start_outer_pos.x, new_y)
+                let (w, h) = size_from_height(start_inner_size.y - mouse_delta.y);
+                (w, h, start_outer_pos.x, bottom_edge - h)
             }
             ResizeDirection::BottomRight => {
-                // Bottom-right corner moves, top-left anchored
-                let axis = corner_axis.unwrap_or(ResizeCornerAxis::Horizontal);
-                let (w, h) = match axis {
-                    ResizeCornerAxis::Horizontal => {
-                        let w = (start_inner_size.x + mouse_delta.x).max(clamp_min_w).min(max_size.x);
-                        let h = (w / aspect).max(clamp_min_h).min(max_size.y);
-                        (h * aspect, h)
-                    }
-                    ResizeCornerAxis::Vertical => {
-                        let h = (start_inner_size.y + mouse_delta.y).max(clamp_min_h).min(max_size.y);
-                        let w = (h * aspect).max(clamp_min_w).min(max_size.x);
-                        (w, w / aspect)
-                    }
+                // Bottom-right corner moves, top-left anchored - use larger delta
+                let (w, h) = if mouse_delta.x.abs() >= mouse_delta.y.abs() {
+                    size_from_width(start_inner_size.x + mouse_delta.x)
+                } else {
+                    size_from_height(start_inner_size.y + mouse_delta.y)
                 };
                 (w, h, start_outer_pos.x, start_outer_pos.y)
             }
             ResizeDirection::BottomLeft => {
                 // Bottom-left corner moves, top-right anchored
-                let axis = corner_axis.unwrap_or(ResizeCornerAxis::Horizontal);
-                let (w, h) = match axis {
-                    ResizeCornerAxis::Horizontal => {
-                        let w = (start_inner_size.x - mouse_delta.x).max(clamp_min_w).min(max_size.x);
-                        let h = (w / aspect).max(clamp_min_h).min(max_size.y);
-                        (h * aspect, h)
-                    }
-                    ResizeCornerAxis::Vertical => {
-                        let h = (start_inner_size.y + mouse_delta.y).max(clamp_min_h).min(max_size.y);
-                        let w = (h * aspect).max(clamp_min_w).min(max_size.x);
-                        (w, w / aspect)
-                    }
+                let (w, h) = if mouse_delta.x.abs() >= mouse_delta.y.abs() {
+                    size_from_width(start_inner_size.x - mouse_delta.x)
+                } else {
+                    size_from_height(start_inner_size.y + mouse_delta.y)
                 };
-                let right_edge = start_outer_pos.x + start_inner_size.x;
-                let new_x = right_edge - w;
-                (w, h, new_x, start_outer_pos.y)
+                (w, h, right_edge - w, start_outer_pos.y)
             }
             ResizeDirection::TopRight => {
                 // Top-right corner moves, bottom-left anchored
-                let axis = corner_axis.unwrap_or(ResizeCornerAxis::Horizontal);
-                let (w, h) = match axis {
-                    ResizeCornerAxis::Horizontal => {
-                        let w = (start_inner_size.x + mouse_delta.x).max(clamp_min_w).min(max_size.x);
-                        let h = (w / aspect).max(clamp_min_h).min(max_size.y);
-                        (h * aspect, h)
-                    }
-                    ResizeCornerAxis::Vertical => {
-                        let h = (start_inner_size.y - mouse_delta.y).max(clamp_min_h).min(max_size.y);
-                        let w = (h * aspect).max(clamp_min_w).min(max_size.x);
-                        (w, w / aspect)
-                    }
+                let (w, h) = if mouse_delta.x.abs() >= mouse_delta.y.abs() {
+                    size_from_width(start_inner_size.x + mouse_delta.x)
+                } else {
+                    size_from_height(start_inner_size.y - mouse_delta.y)
                 };
-                let bottom_edge = start_outer_pos.y + start_inner_size.y;
-                let new_y = bottom_edge - h;
-                (w, h, start_outer_pos.x, new_y)
+                (w, h, start_outer_pos.x, bottom_edge - h)
             }
             ResizeDirection::TopLeft => {
                 // Top-left corner moves, bottom-right anchored
-                let axis = corner_axis.unwrap_or(ResizeCornerAxis::Horizontal);
-                let (w, h) = match axis {
-                    ResizeCornerAxis::Horizontal => {
-                        let w = (start_inner_size.x - mouse_delta.x).max(clamp_min_w).min(max_size.x);
-                        let h = (w / aspect).max(clamp_min_h).min(max_size.y);
-                        (h * aspect, h)
-                    }
-                    ResizeCornerAxis::Vertical => {
-                        let h = (start_inner_size.y - mouse_delta.y).max(clamp_min_h).min(max_size.y);
-                        let w = (h * aspect).max(clamp_min_w).min(max_size.x);
-                        (w, w / aspect)
-                    }
+                let (w, h) = if mouse_delta.x.abs() >= mouse_delta.y.abs() {
+                    size_from_width(start_inner_size.x - mouse_delta.x)
+                } else {
+                    size_from_height(start_inner_size.y - mouse_delta.y)
                 };
-                let right_edge = start_outer_pos.x + start_inner_size.x;
-                let bottom_edge = start_outer_pos.y + start_inner_size.y;
-                let new_x = right_edge - w;
-                let new_y = bottom_edge - h;
-                (w, h, new_x, new_y)
+                (w, h, right_edge - w, bottom_edge - h)
             }
             ResizeDirection::None => return,
         };
 
-        // Round to reduce tiny oscillations from fractional point/pixel conversions.
-        let new_size = egui::Vec2::new(new_w.round(), new_h.round());
+        let new_size = egui::Vec2::new(new_w, new_h);
         let new_pos = egui::pos2(new_x.round(), new_y.round());
 
         // Update zoom based on new window size
@@ -1615,12 +1567,14 @@ impl ImageViewer {
         self.zoom_velocity = 0.0;
         self.offset = egui::Vec2::ZERO;
 
-        // Apply position first, then size - this order matters for smooth resizing
-        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(new_pos));
-        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(new_size));
-        self.last_requested_inner_size = Some(new_size);
+        // Store the commanded size for stable content rendering
+        self.resize_last_size = Some(new_size);
 
-        ctx.request_repaint();
+        // Apply size first for directions where position depends on size
+        // This ordering can help reduce flicker
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(new_size));
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(new_pos));
+        self.last_requested_inner_size = Some(new_size);
     }
 
     /// Draw the main image
@@ -1631,8 +1585,8 @@ impl ImageViewer {
         self.tick_floating_zoom_animation(ctx);
 
         // Floating mode: when zooming out to <= 100%, ease any residual offset back to center.
-        // (No bounce, no fade; just a smooth settle.)
-        if !self.is_fullscreen && !self.is_panning && self.zoom <= 1.0 && self.offset.length() > 0.1 {
+        // (No bounce, no fade; just a smooth settle.) Skip during resize/seeking to avoid fighting.
+        if !self.is_fullscreen && !self.is_panning && !self.is_resizing && !self.is_seeking && self.zoom <= 1.0 && self.offset.length() > 0.1 {
             let dt = ctx.input(|i| i.stable_dt).min(0.033);
             let k = (1.0 - dt * 12.0).clamp(0.0, 1.0);
             self.offset *= k;
@@ -1674,9 +1628,6 @@ impl ImageViewer {
             }
         }
 
-        // Floating mode: autosize the window to match the image (up to a cap).
-        self.request_floating_autosize(ctx);
-
         // Get pointer state
         let pointer_pos = ctx.input(|i| i.pointer.hover_pos());
         let primary_down = ctx.input(|i| i.pointer.button_down(egui::PointerButton::Primary));
@@ -1717,7 +1668,7 @@ impl ImageViewer {
             self.resize_start_outer_pos = None;
             self.resize_start_inner_size = None;
             self.resize_accumulated_delta = egui::Vec2::ZERO;
-            self.resize_corner_axis_lock = None;
+            self.resize_last_size = None;
         }
 
         // Handle resizing
@@ -1732,10 +1683,10 @@ impl ImageViewer {
             self.resize_start_outer_pos = None;
             self.resize_start_inner_size = None;
             self.resize_accumulated_delta = egui::Vec2::ZERO;
-            self.resize_corner_axis_lock = None;
+            self.resize_last_size = None;
         } else if !self.is_resizing {
-            // Handle panning/window dragging (only if not resizing and not over video controls)
-            if primary_down && hover_resize_direction == ResizeDirection::None && !over_video_controls {
+            // Handle panning/window dragging (only if not resizing, not seeking, and not over video controls)
+            if primary_down && hover_resize_direction == ResizeDirection::None && !over_video_controls && !self.is_seeking && !self.is_volume_dragging {
                 if let Some(pos) = pointer_pos {
                     // Check if drag started from title bar area (top 50px) for window dragging
                     let in_title_bar = self.last_mouse_pos.map_or(pos.y < 50.0, |lp| lp.y < 50.0);
@@ -1779,6 +1730,10 @@ impl ImageViewer {
                 }
             }
         }
+
+        // Floating mode: autosize the window to match the image (up to a cap).
+        // Called after resize handling to avoid fighting with resize on first click frame.
+        self.request_floating_autosize(ctx);
 
         // Handle double-click to fit media to screen (fullscreen) or reset zoom (floating)
         if ctx.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary)) {
@@ -1874,7 +1829,18 @@ impl ImageViewer {
                         img_h as f32 * self.zoom,
                     );
                     
-                    let center = available.center() + self.offset;
+                    // During resize, use the commanded size to compute center to avoid jitter
+                    // from frame timing mismatches when window position changes.
+                    let center = if self.is_resizing {
+                        if let Some(commanded_size) = self.resize_last_size {
+                            // Use the commanded size as the stable reference for centering
+                            egui::pos2(commanded_size.x / 2.0, commanded_size.y / 2.0)
+                        } else {
+                            available.center()
+                        }
+                    } else {
+                        available.center() + self.offset
+                    };
                     let image_rect = egui::Rect::from_center_size(center, display_size);
 
                     // Fullscreen transition:
