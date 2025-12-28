@@ -98,6 +98,14 @@ struct ImageViewer {
     image_rotated: bool,
     /// Pending window resize to apply after a frame delay (to prevent flash on fullscreen exit)
     pending_window_resize: Option<(egui::Vec2, egui::Pos2, u8)>,
+
+    /// Last observed window outer position (top-left in screen coordinates).
+    /// Used to keep the window location stable in floating mode after the user moves it.
+    last_known_outer_pos: Option<egui::Pos2>,
+    /// Once the user has manually moved/resized the floating window, stop auto-centering on media changes.
+    floating_user_moved_window: bool,
+    /// Suppress position-change tracking for a few frames after programmatic moves.
+    suppress_outer_pos_tracking_frames: u8,
     // ============ VIDEO-SPECIFIC FIELDS ============
     /// Current video player (None if viewing an image)
     video_player: Option<VideoPlayer>,
@@ -170,6 +178,9 @@ impl Default for ImageViewer {
             fullscreen_transition_target: 0.0,
             image_rotated: false,
             pending_window_resize: None,
+            last_known_outer_pos: None,
+            floating_user_moved_window: false,
+            suppress_outer_pos_tracking_frames: 0,
             // Video-specific fields
             video_player: None,
             video_texture: None,
@@ -193,6 +204,43 @@ impl Default for ImageViewer {
 }
 
 impl ImageViewer {
+    fn track_floating_window_position(&mut self, ctx: &egui::Context) {
+        let Some(pos) = ctx
+            .input(|i| i.raw.viewport().outer_rect)
+            .map(|r| r.min)
+        else {
+            return;
+        };
+
+        // Always keep this updated so we have a good fallback.
+        if self.is_fullscreen {
+            self.last_known_outer_pos = Some(pos);
+            return;
+        }
+
+        if self.suppress_outer_pos_tracking_frames > 0 {
+            self.suppress_outer_pos_tracking_frames = self.suppress_outer_pos_tracking_frames.saturating_sub(1);
+            self.last_known_outer_pos = Some(pos);
+            return;
+        }
+
+        if let Some(prev) = self.last_known_outer_pos {
+            let delta = pos - prev;
+            if delta.length() > 0.5 {
+                self.floating_user_moved_window = true;
+            }
+        }
+
+        self.last_known_outer_pos = Some(pos);
+    }
+
+    fn send_outer_position(&mut self, ctx: &egui::Context, pos: egui::Pos2) {
+        // Programmatic move: ignore any resulting outer-pos deltas for a couple frames.
+        self.suppress_outer_pos_tracking_frames = self.suppress_outer_pos_tracking_frames.max(2);
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+        self.last_known_outer_pos = Some(pos);
+    }
+
     #[allow(dead_code)]
     fn apply_floating_layout_exit_fullscreen_current_image(&mut self, ctx: &egui::Context) {
         self.offset = egui::Vec2::ZERO;
@@ -230,7 +278,16 @@ impl ImageViewer {
         self.floating_max_inner_size = Some(size);
         self.last_requested_inner_size = Some(size);
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
-        self.center_window_on_monitor(ctx, size);
+
+        if self.floating_user_moved_window {
+            if let Some(pos) = self.last_known_outer_pos {
+                self.send_outer_position(ctx, pos);
+            } else {
+                self.center_window_on_monitor(ctx, size);
+            }
+        } else {
+            self.center_window_on_monitor(ctx, size);
+        }
     }
 
     fn run_action(&mut self, action: Action) {
@@ -466,11 +523,13 @@ impl ImageViewer {
         }
     }
 
-    fn center_window_on_monitor(&self, ctx: &egui::Context, inner_size: egui::Vec2) {
+    fn center_window_on_monitor(&mut self, ctx: &egui::Context, inner_size: egui::Vec2) {
         let monitor = self.monitor_size_points(ctx);
         let x = (monitor.x - inner_size.x) * 0.5;
         let y = (monitor.y - inner_size.y) * 0.5;
-        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(x.max(0.0), y.max(0.0))));
+        // Centering is a programmatic placement, so it resets the "user moved" latch.
+        self.floating_user_moved_window = false;
+        self.send_outer_position(ctx, egui::pos2(x.max(0.0), y.max(0.0)));
     }
 
     fn apply_floating_layout_for_current_image(&mut self, ctx: &egui::Context) {
@@ -519,7 +578,18 @@ impl ImageViewer {
             self.floating_max_inner_size = Some(size);
             self.last_requested_inner_size = Some(size);
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
-            self.center_window_on_monitor(ctx, size);
+
+            // In floating mode, keep the user's window placement once they've moved/resized it.
+            // Otherwise, keep the existing behavior: center on the monitor.
+            if self.floating_user_moved_window {
+                if let Some(pos) = self.last_known_outer_pos {
+                    self.send_outer_position(ctx, pos);
+                } else {
+                    self.center_window_on_monitor(ctx, size);
+                }
+            } else {
+                self.center_window_on_monitor(ctx, size);
+            }
         }
     }
 
@@ -1625,7 +1695,7 @@ impl ImageViewer {
             }
             _ => {
                 // For edges/corners that require position change, send position first.
-                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(new_pos));
+                self.send_outer_position(ctx, new_pos);
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(new_size));
             }
         }
@@ -1741,6 +1811,11 @@ impl ImageViewer {
                 };
                 self.floating_max_inner_size = Some(updated);
             }
+
+            // Manual resize counts as the user "placing" the window.
+            // After this, keep the window location stable on next/prev and file drops.
+            self.floating_user_moved_window = true;
+
             self.is_resizing = false;
             self.resize_direction = ResizeDirection::None;
             self.last_mouse_pos = None;
@@ -1970,6 +2045,9 @@ impl ImageViewer {
 
 impl eframe::App for ImageViewer {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Track current floating window position so we can preserve it across media changes.
+        self.track_floating_window_position(ctx);
+
         // Handle file drops
         ctx.input(|i| {
             if !i.raw.dropped_files.is_empty() {
@@ -2052,6 +2130,7 @@ impl eframe::App for ImageViewer {
                 // Use borderless "pseudo-fullscreen" instead of OS fullscreen.
                 // This avoids a brief desktop flash on Windows caused by toggling window styles/swapchain.
                 let monitor = self.monitor_size_points(ctx);
+                self.suppress_outer_pos_tracking_frames = self.suppress_outer_pos_tracking_frames.max(2);
                 ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::Pos2::ZERO));
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(monitor));
                 self.last_requested_inner_size = Some(monitor);
@@ -2183,7 +2262,9 @@ impl eframe::App for ImageViewer {
             if frames_remaining <= 1 {
                 // Apply the resize now
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+                self.suppress_outer_pos_tracking_frames = self.suppress_outer_pos_tracking_frames.max(2);
                 ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+                self.last_known_outer_pos = Some(pos);
             } else {
                 // Wait another frame
                 self.pending_window_resize = Some((size, pos, frames_remaining - 1));
