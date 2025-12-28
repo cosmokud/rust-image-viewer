@@ -81,6 +81,12 @@ struct ImageViewer {
     last_requested_inner_size: Option<egui::Vec2>,
     /// Saved floating state before entering fullscreen (zoom, zoom_target, offset, window_size, window_pos)
     saved_floating_state: Option<(f32, f32, egui::Vec2, egui::Vec2, egui::Pos2)>,
+    /// Fullscreen transition animation progress (0.0 = floating, 1.0 = fullscreen)
+    fullscreen_transition: f32,
+    /// Fullscreen transition target (0.0 or 1.0)
+    fullscreen_transition_target: f32,
+    /// Bounce animation for zoom-out-past-100% in floating mode
+    zoom_bounce: f32,
 }
 
 impl Default for ImageViewer {
@@ -112,6 +118,9 @@ impl Default for ImageViewer {
             floating_max_inner_size: None,
             last_requested_inner_size: None,
             saved_floating_state: None,
+            fullscreen_transition: 0.0,
+            fullscreen_transition_target: 0.0,
+            zoom_bounce: 0.0,
         }
     }
 }
@@ -907,17 +916,21 @@ impl ImageViewer {
                     self.zoom_target = (self.zoom_target * factor).clamp(0.1, 50.0);
                     self.zoom = (self.zoom * factor).clamp(0.1, 50.0);
 
-                    // Follow cursor if we have any offset (user panned) or zoom > 100%
+                    // Follow cursor if we have any offset (user panned) AND still above 100%
                     let has_offset = self.offset.length() > 0.1;
-                    if self.zoom > 1.0 || old_zoom > 1.0 || has_offset {
-                        // When zoomed past 100% or user has panned, follow cursor like fullscreen mode
+                    if self.zoom > 1.0 && (old_zoom > 1.0 || has_offset) {
+                        // When zoomed past 100%, follow cursor like fullscreen mode
                         let rect_center = screen_rect.center();
                         let cursor_offset = pos - rect_center;
                         let zoom_ratio = self.zoom / old_zoom;
                         self.offset = self.offset * zoom_ratio - cursor_offset * (zoom_ratio - 1.0);
                     } else {
-                        // At or below 100% with no offset, keep centered
+                        // At or below 100%, reset offset and let window follow image size
                         self.offset = egui::Vec2::ZERO;
+                        // Trigger bounce animation when crossing 100% threshold
+                        if old_zoom > 1.0 && self.zoom <= 1.0 {
+                            self.zoom_bounce = 1.0;
+                        }
                     }
                     // Reset velocity on new scroll input for immediate response
                     self.zoom_velocity = 0.0;
@@ -1062,15 +1075,16 @@ impl ImageViewer {
             }
         }
 
-        // Handle right-click for prev/next image
-        if ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Secondary)) {
+        // Handle right-click for prev/next image (consume event to prevent context menu)
+        let right_clicked = ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Secondary));
+        if right_clicked {
+            // Consume the event by requesting a repaint (prevents default behavior)
+            ctx.request_repaint();
             if let Some(pos) = pointer_pos {
                 let third = screen_rect.width() / 3.0;
                 if pos.x < third {
-                    self.texture = None; // Clear texture immediately to prevent flash
                     self.prev_image();
                 } else if pos.x > screen_rect.width() - third {
-                    self.texture = None; // Clear texture immediately to prevent flash
                     self.next_image();
                 }
             }
@@ -1093,9 +1107,44 @@ impl ImageViewer {
                         let center = available.center() + self.offset;
                         let image_rect = egui::Rect::from_center_size(center, display_size);
                         
+                        // Calculate combined bounce effect
+                        let mut scale_factor = 1.0f32;
+                        
+                        // Fullscreen transition bounce animation (no fade)
+                        let t = self.fullscreen_transition;
+                        let in_fs_transition = t > 0.001 && t < 0.999;
+                        if in_fs_transition {
+                            // Elastic bounce effect: starts big, settles to normal
+                            // Use sine wave for smooth bounce
+                            let bounce_intensity = 0.08; // 8% max scale
+                            let bounce_freq = std::f32::consts::PI * 2.0;
+                            let decay = 1.0 - t; // Decay as transition completes
+                            let bounce = (t * bounce_freq).sin() * decay * bounce_intensity;
+                            scale_factor *= 1.0 + bounce;
+                        }
+                        
+                        // Zoom-out-past-100% bounce animation
+                        if self.zoom_bounce > 0.01 {
+                            let bounce_intensity = 0.05; // 5% max scale
+                            let bounce = (self.zoom_bounce * std::f32::consts::PI).sin() * self.zoom_bounce * bounce_intensity;
+                            scale_factor *= 1.0 + bounce;
+                            // Decay the bounce
+                            let dt = ctx.input(|i| i.stable_dt).min(0.033);
+                            self.zoom_bounce = (self.zoom_bounce - dt * 4.0).max(0.0);
+                            ctx.request_repaint();
+                        }
+                        
+                        // Apply scale if there's any animation
+                        let final_rect = if (scale_factor - 1.0).abs() > 0.001 {
+                            let scaled_size = display_size * scale_factor;
+                            egui::Rect::from_center_size(center, scaled_size)
+                        } else {
+                            image_rect
+                        };
+                        
                         ui.painter().image(
                             texture.id(),
-                            image_rect,
+                            final_rect,
                             egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                             egui::Color32::WHITE,
                         );
@@ -1164,10 +1213,16 @@ impl eframe::App for ImageViewer {
                     .unwrap_or(egui::Pos2::ZERO);
                 self.saved_floating_state = Some((self.zoom, self.zoom_target, self.offset, inner_size, outer_pos));
 
+                // Start transition animation
+                self.fullscreen_transition_target = 1.0;
+
                 // Requirement: when moving from floating -> fullscreen, always fit vertically and center.
                 self.apply_fullscreen_layout_for_current_image(ctx);
                 ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
             } else {
+                // Start transition animation
+                self.fullscreen_transition_target = 0.0;
+
                 ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
 
                 // Restore previous floating state if available
@@ -1203,6 +1258,22 @@ impl eframe::App for ImageViewer {
                 }
             }
             self.toggle_fullscreen = false;
+        }
+
+        // Animate fullscreen transition
+        {
+            let target = self.fullscreen_transition_target;
+            let current = self.fullscreen_transition;
+            if (current - target).abs() > 0.001 {
+                // Smooth easing animation (ease-out cubic)
+                let speed = 8.0;
+                let dt = ctx.input(|i| i.stable_dt).min(0.033);
+                self.fullscreen_transition += (target - current) * speed * dt;
+                self.fullscreen_transition = self.fullscreen_transition.clamp(0.0, 1.0);
+                ctx.request_repaint();
+            } else {
+                self.fullscreen_transition = target;
+            }
         }
 
         if self.request_minimize {
