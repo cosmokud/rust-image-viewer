@@ -41,6 +41,8 @@ struct ImageViewer {
     current_index: usize,
     /// Current zoom level (1.0 = 100%)
     zoom: f32,
+    /// Target zoom for smooth animation in floating mode
+    zoom_target: f32,
     /// Image offset for panning
     offset: egui::Vec2,
     /// Whether we're currently panning/dragging window
@@ -57,8 +59,8 @@ struct ImageViewer {
     controls_show_time: Instant,
     /// Error message to display
     error_message: Option<String>,
-    /// Whether initial setup is complete
-    initial_setup_done: bool,
+    /// Whether we should apply post-load layout logic next frame
+    image_changed: bool,
     /// Screen size
     screen_size: egui::Vec2,
     /// Request to exit
@@ -86,6 +88,7 @@ impl Default for ImageViewer {
             image_list: Vec::new(),
             current_index: 0,
             zoom: 1.0,
+            zoom_target: 1.0,
             offset: egui::Vec2::ZERO,
             is_panning: false,
             last_mouse_pos: None,
@@ -94,7 +97,7 @@ impl Default for ImageViewer {
             show_controls: false,
             controls_show_time: Instant::now(),
             error_message: None,
-            initial_setup_done: false,
+            image_changed: false,
             screen_size: egui::Vec2::new(1920.0, 1080.0),
             should_exit: false,
             toggle_fullscreen: false,
@@ -144,10 +147,7 @@ impl ImageViewer {
                 // Don't clear texture here - keep showing old image until new one loads
                 // The texture will be updated in update_texture()
                 self.texture_frame = usize::MAX;
-                self.reset_view();
-                self.initial_setup_done = false;
-                self.floating_max_inner_size = Some(self.get_initial_window_size());
-                self.last_requested_inner_size = None;
+                self.image_changed = true;
                 self.error_message = None;
             }
             Err(e) => {
@@ -180,10 +180,101 @@ impl ImageViewer {
         self.load_image(&path);
     }
 
-    /// Reset view to initial state
-    fn reset_view(&mut self) {
-        self.zoom = 1.0;
+
+    fn monitor_size_points(&self, ctx: &egui::Context) -> egui::Vec2 {
+        ctx.input(|i| i.raw.viewport().monitor_size).unwrap_or(self.screen_size)
+    }
+
+    fn floating_available_size(&self, ctx: &egui::Context) -> egui::Vec2 {
+        // Keep a small margin so borderless floating mode doesn't look like "true fullscreen".
+        let monitor = self.monitor_size_points(ctx);
+        egui::Vec2::new((monitor.x - 40.0).max(200.0), (monitor.y - 80.0).max(150.0))
+    }
+
+    fn initial_window_size_for_available(&self, available: egui::Vec2) -> egui::Vec2 {
+        if let Some(ref img) = self.image {
+            let (img_w, img_h) = img.display_dimensions();
+            let img_w = img_w as f32;
+            let img_h = img_h as f32;
+
+            if img_w <= 0.0 || img_h <= 0.0 {
+                return egui::Vec2::new(800.0, 600.0);
+            }
+
+            if img_w > available.x || img_h > available.y {
+                let scale = (available.x / img_w).min(available.y / img_h).min(1.0);
+                egui::Vec2::new(img_w * scale, img_h * scale)
+            } else {
+                egui::Vec2::new(img_w, img_h)
+            }
+        } else {
+            egui::Vec2::new(800.0, 600.0)
+        }
+    }
+
+    fn center_window_on_monitor(&self, ctx: &egui::Context, inner_size: egui::Vec2) {
+        let monitor = self.monitor_size_points(ctx);
+        let x = (monitor.x - inner_size.x) * 0.5;
+        let y = (monitor.y - inner_size.y) * 0.5;
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(x.max(0.0), y.max(0.0))));
+    }
+
+    fn apply_floating_layout_for_current_image(&mut self, ctx: &egui::Context) {
         self.offset = egui::Vec2::ZERO;
+
+        let available = self.floating_available_size(ctx);
+        let size = self.initial_window_size_for_available(available);
+
+        // Derive zoom from the window size so the image fits exactly (no black bars).
+        if let Some(ref img) = self.image {
+            let (_, img_h) = img.display_dimensions();
+            if img_h > 0 {
+                let z = (size.y / img_h as f32).clamp(0.1, 50.0);
+                self.zoom = z;
+                self.zoom_target = z;
+            }
+        }
+
+        self.floating_max_inner_size = Some(size);
+        self.last_requested_inner_size = Some(size);
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+        self.center_window_on_monitor(ctx, size);
+    }
+
+    fn apply_fullscreen_layout_for_current_image(&mut self, ctx: &egui::Context) {
+        self.offset = egui::Vec2::ZERO;
+        if let Some(ref img) = self.image {
+            let (_, img_h) = img.display_dimensions();
+            if img_h > 0 {
+                let z = (ctx.screen_rect().height() / img_h as f32).clamp(0.1, 50.0);
+                self.zoom = z;
+                self.zoom_target = z;
+            }
+        }
+    }
+
+    fn tick_floating_zoom_animation(&mut self, ctx: &egui::Context) {
+        if self.is_fullscreen {
+            self.zoom_target = self.zoom;
+            return;
+        }
+
+        // While resizing, treat window size as the source of truth.
+        if self.is_resizing {
+            self.zoom_target = self.zoom;
+            return;
+        }
+
+        let dt = ctx.input(|i| i.stable_dt).min(0.1);
+        let t = 1.0 - (-dt * 18.0).exp(); // ~fast but smooth
+        let new_zoom = self.zoom + (self.zoom_target - self.zoom) * t;
+
+        if (new_zoom - self.zoom).abs() > 0.0001 {
+            self.zoom = new_zoom;
+            ctx.request_repaint();
+        } else {
+            self.zoom = self.zoom_target;
+        }
     }
 
     fn background_color32(&self) -> egui::Color32 {
@@ -196,27 +287,6 @@ impl ImageViewer {
         [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0]
     }
 
-    /// Calculate initial zoom to fit image in screen if larger
-    fn calculate_fit_zoom(&self) -> f32 {
-        if let Some(ref img) = self.image {
-            let (img_w, img_h) = img.display_dimensions();
-            let img_w = img_w as f32;
-            let img_h = img_h as f32;
-
-            let screen_w = self.screen_size.x - 40.0;
-            let screen_h = self.screen_size.y - 80.0;
-
-            if img_w > screen_w || img_h > screen_h {
-                let scale_x = screen_w / img_w;
-                let scale_y = screen_h / img_h;
-                scale_x.min(scale_y)
-            } else {
-                1.0
-            }
-        } else {
-            1.0
-        }
-    }
 
     fn calculate_fit_zoom_for_available(&self, available_size: egui::Vec2) -> f32 {
         if let Some(ref img) = self.image {
@@ -240,26 +310,6 @@ impl ImageViewer {
         }
     }
 
-    /// Get window size for initial display
-    fn get_initial_window_size(&self) -> egui::Vec2 {
-        if let Some(ref img) = self.image {
-            let (img_w, img_h) = img.display_dimensions();
-            let img_w = img_w as f32;
-            let img_h = img_h as f32;
-
-            let screen_w = self.screen_size.x - 40.0;
-            let screen_h = self.screen_size.y - 80.0;
-
-            if img_w > screen_w || img_h > screen_h {
-                let scale = (screen_w / img_w).min(screen_h / img_h);
-                egui::Vec2::new(img_w * scale, img_h * scale)
-            } else {
-                egui::Vec2::new(img_w, img_h)
-            }
-        } else {
-            egui::Vec2::new(800.0, 600.0)
-        }
-    }
 
     /// Zoom at a specific point
     fn zoom_at(&mut self, center: egui::Pos2, factor: f32, available_rect: egui::Rect) {
@@ -286,7 +336,7 @@ impl ImageViewer {
     }
 
     fn request_floating_autosize(&mut self, ctx: &egui::Context) {
-        if self.is_fullscreen {
+        if self.is_fullscreen || self.is_resizing {
             return;
         }
 
@@ -389,9 +439,29 @@ impl ImageViewer {
                                     self.texture = None;
                                 }
                             }
-                            Action::ResetZoom => self.reset_view(),
-                            Action::ZoomIn => self.zoom = (self.zoom * 1.1).min(50.0),
-                            Action::ZoomOut => self.zoom = (self.zoom / 1.1).max(0.1),
+                            Action::ResetZoom => {
+                                self.offset = egui::Vec2::ZERO;
+                                self.zoom_target = 1.0;
+                                if self.is_fullscreen {
+                                    self.zoom = 1.0;
+                                }
+                            }
+                            Action::ZoomIn => {
+                                if self.is_fullscreen {
+                                    self.zoom = (self.zoom * 1.1).min(50.0);
+                                    self.zoom_target = self.zoom;
+                                } else {
+                                    self.zoom_target = (self.zoom_target * 1.1).min(50.0);
+                                }
+                            }
+                            Action::ZoomOut => {
+                                if self.is_fullscreen {
+                                    self.zoom = (self.zoom / 1.1).max(0.1);
+                                    self.zoom_target = self.zoom;
+                                } else {
+                                    self.zoom_target = (self.zoom_target / 1.1).max(0.1);
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -454,7 +524,9 @@ impl ImageViewer {
                 );
 
                 ui.allocate_new_ui(egui::UiBuilder::new().max_rect(bar_rect), |ui| {
-                    ui.horizontal(|ui| {
+                    ui.set_min_height(bar_height);
+
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                         ui.add_space(10.0);
                         
                         // Show filename
@@ -602,16 +674,171 @@ impl ImageViewer {
         }
     }
 
+    fn resize_floating_keep_aspect(&mut self, ctx: &egui::Context, direction: ResizeDirection) {
+        if self.is_fullscreen {
+            return;
+        }
+        let Some(ref img) = self.image else {
+            return;
+        };
+        let (img_w_u, img_h_u) = img.display_dimensions();
+        if img_w_u == 0 || img_h_u == 0 {
+            return;
+        }
+        let img_w = img_w_u as f32;
+        let img_h = img_h_u as f32;
+        let aspect = img_w / img_h;
+
+        let delta = ctx.input(|i| i.pointer.delta());
+        if delta == egui::Vec2::ZERO {
+            return;
+        }
+
+        let inner_size = ctx
+            .input(|i| i.raw.viewport().inner_rect)
+            .map(|r| r.size())
+            .unwrap_or_else(|| ctx.screen_rect().size());
+        let outer_rect = ctx.input(|i| i.raw.viewport().outer_rect);
+
+        let mut new_w = inner_size.x;
+        let mut new_h = inner_size.y;
+        let mut move_left = false;
+        let mut move_up = false;
+
+        let clamp_min_w = 200.0;
+        let clamp_min_h = 150.0;
+
+        let apply_width = |w: &mut f32, h: &mut f32| {
+            *w = w.max(clamp_min_w);
+            *h = (*w / aspect).max(clamp_min_h);
+        };
+        let apply_height = |w: &mut f32, h: &mut f32| {
+            *h = h.max(clamp_min_h);
+            *w = (*h * aspect).max(clamp_min_w);
+        };
+
+        match direction {
+            ResizeDirection::Left => {
+                new_w -= delta.x;
+                apply_width(&mut new_w, &mut new_h);
+                move_left = true;
+            }
+            ResizeDirection::Right => {
+                new_w += delta.x;
+                apply_width(&mut new_w, &mut new_h);
+            }
+            ResizeDirection::Top => {
+                new_h -= delta.y;
+                apply_height(&mut new_w, &mut new_h);
+                move_up = true;
+            }
+            ResizeDirection::Bottom => {
+                new_h += delta.y;
+                apply_height(&mut new_w, &mut new_h);
+            }
+            ResizeDirection::TopLeft => {
+                // Drive by the dominant axis for intuitive feel.
+                if delta.x.abs() >= delta.y.abs() {
+                    new_w -= delta.x;
+                    apply_width(&mut new_w, &mut new_h);
+                } else {
+                    new_h -= delta.y;
+                    apply_height(&mut new_w, &mut new_h);
+                }
+                move_left = true;
+                move_up = true;
+            }
+            ResizeDirection::TopRight => {
+                if delta.x.abs() >= delta.y.abs() {
+                    new_w += delta.x;
+                    apply_width(&mut new_w, &mut new_h);
+                } else {
+                    new_h -= delta.y;
+                    apply_height(&mut new_w, &mut new_h);
+                }
+                move_up = true;
+            }
+            ResizeDirection::BottomLeft => {
+                if delta.x.abs() >= delta.y.abs() {
+                    new_w -= delta.x;
+                    apply_width(&mut new_w, &mut new_h);
+                } else {
+                    new_h += delta.y;
+                    apply_height(&mut new_w, &mut new_h);
+                }
+                move_left = true;
+            }
+            ResizeDirection::BottomRight => {
+                if delta.x.abs() >= delta.y.abs() {
+                    new_w += delta.x;
+                    apply_width(&mut new_w, &mut new_h);
+                } else {
+                    new_h += delta.y;
+                    apply_height(&mut new_w, &mut new_h);
+                }
+            }
+            ResizeDirection::None => {
+                return;
+            }
+        }
+
+        // Enforce fit-to-screen cap (captured on image load) to avoid huge windows.
+        if let Some(max) = self.floating_max_inner_size {
+            let max_w = max.x.min(max.y * aspect);
+            if new_w > max_w {
+                new_w = max_w;
+                new_h = new_w / aspect;
+            }
+            if new_h > max.y {
+                new_h = max.y;
+                new_w = new_h * aspect;
+            }
+        }
+
+        let new_size = egui::Vec2::new(new_w, new_h);
+
+        // Window size defines zoom in floating mode (no bars).
+        let new_zoom = (new_h / img_h).clamp(0.1, 50.0);
+        self.zoom = new_zoom;
+        self.zoom_target = new_zoom;
+        self.offset = egui::Vec2::ZERO;
+
+        // Keep the opposite edge anchored by moving the window when resizing from left/top.
+        if let Some(outer) = outer_rect {
+            let mut pos = outer.min;
+            if move_left {
+                pos.x += outer.width() - new_w;
+            }
+            if move_up {
+                pos.y += outer.height() - new_h;
+            }
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+        }
+
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(new_size));
+        self.last_requested_inner_size = Some(new_size);
+        ctx.request_repaint();
+    }
+
     /// Draw the main image
     fn draw_image(&mut self, ctx: &egui::Context) {
         let screen_rect = ctx.screen_rect();
 
+        // Smooth zoom animation (floating mode)
+        self.tick_floating_zoom_animation(ctx);
+
         // Handle scroll wheel zoom
-        let scroll_delta = ctx.input(|i| i.raw_scroll_delta.y);
+        let scroll_delta = ctx.input(|i| i.smooth_scroll_delta.y);
         if scroll_delta != 0.0 {
             if let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) {
                 let factor = if scroll_delta > 0.0 { 1.1 } else { 1.0 / 1.1 };
-                self.zoom_at(pos, factor, screen_rect);
+                if self.is_fullscreen {
+                    self.zoom_at(pos, factor, screen_rect);
+                    self.zoom_target = self.zoom;
+                } else {
+                    self.zoom_target = (self.zoom_target * factor).clamp(0.1, 50.0);
+                    self.offset = egui::Vec2::ZERO;
+                }
             }
         }
 
@@ -644,28 +871,7 @@ impl ImageViewer {
 
         // Handle resizing
         if self.is_resizing && primary_down {
-            if let (Some(_pos), Some(_last_pos)) = (pointer_pos, self.last_mouse_pos) {
-                // We need screen-space delta, so use raw pointer delta
-                let screen_delta = ctx.input(|i| i.pointer.delta());
-                
-                if screen_delta != egui::Vec2::ZERO {
-                    // Request resize via viewport command
-                    ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(
-                        match self.resize_direction {
-                            ResizeDirection::Left => egui::ResizeDirection::West,
-                            ResizeDirection::Right => egui::ResizeDirection::East,
-                            ResizeDirection::Top => egui::ResizeDirection::North,
-                            ResizeDirection::Bottom => egui::ResizeDirection::South,
-                            ResizeDirection::TopLeft => egui::ResizeDirection::NorthWest,
-                            ResizeDirection::TopRight => egui::ResizeDirection::NorthEast,
-                            ResizeDirection::BottomLeft => egui::ResizeDirection::SouthWest,
-                            ResizeDirection::BottomRight => egui::ResizeDirection::SouthEast,
-                            ResizeDirection::None => egui::ResizeDirection::East,
-                        }
-                    ));
-                }
-            }
-            self.last_mouse_pos = pointer_pos;
+            self.resize_floating_keep_aspect(ctx, self.resize_direction);
             ctx.set_cursor_icon(self.get_resize_cursor(self.resize_direction));
         } else if self.is_resizing && primary_released {
             self.is_resizing = false;
@@ -710,7 +916,13 @@ impl ImageViewer {
 
         // Handle double-click to reset zoom
         if ctx.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary)) {
-            self.reset_view();
+            self.offset = egui::Vec2::ZERO;
+            if self.is_fullscreen {
+                self.zoom = 1.0;
+                self.zoom_target = 1.0;
+            } else {
+                self.zoom_target = 1.0;
+            }
         }
 
         // Handle right-click for prev/next image
@@ -766,27 +978,11 @@ impl ImageViewer {
 
 impl eframe::App for ImageViewer {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Initial window setup
-        if !self.initial_setup_done && self.image.is_some() {
-            let size = self.get_initial_window_size();
-            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
-            self.last_requested_inner_size = Some(size);
-            
-            let fit_zoom = self.calculate_fit_zoom();
-            if fit_zoom < 1.0 {
-                self.zoom = fit_zoom;
-            }
-            
-            self.initial_setup_done = true;
-        }
-
-        // Update texture for current frame
-        self.update_texture(ctx);
-
         // Handle file drops
         ctx.input(|i| {
             if !i.raw.dropped_files.is_empty() {
                 if let Some(path) = i.raw.dropped_files[0].path.clone() {
+                    // Layout will be applied via `image_changed`.
                     self.load_image(&path);
                 }
             }
@@ -794,6 +990,21 @@ impl eframe::App for ImageViewer {
 
         // Handle input
         self.handle_input(ctx);
+
+        // Apply layout changes after image changes.
+        if self.image_changed {
+            if self.is_fullscreen {
+                // Fullscreen: keep fullscreen and fit vertically, centered.
+                self.apply_fullscreen_layout_for_current_image(ctx);
+            } else {
+                // Floating: size exactly to image (fit-to-screen if needed) and center window.
+                self.apply_floating_layout_for_current_image(ctx);
+            }
+            self.image_changed = false;
+        }
+
+        // Update texture for current frame (after any image loads)
+        self.update_texture(ctx);
 
         // Process viewport commands
         if self.should_exit {
@@ -808,26 +1019,30 @@ impl eframe::App for ImageViewer {
                 if self.config.fullscreen_reset_fit_on_enter {
                     self.offset = egui::Vec2::ZERO;
                     self.zoom = self.calculate_fit_zoom_for_available(ctx.screen_rect().size());
+                    self.zoom_target = self.zoom;
                 }
                 ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
             } else {
                 // Restore down: reset to centered at 100% and resize to 100% image size (capped by fit-to-screen)
                 self.offset = egui::Vec2::ZERO;
                 self.zoom = 1.0;
+                self.zoom_target = 1.0;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
 
                 if let Some(img) = self.image.as_ref() {
                     let (w, h) = img.display_dimensions();
                     let mut desired = egui::Vec2::new(w as f32, h as f32);
-                    if let Some(max_size) = self.floating_max_inner_size {
-                        if desired.x > max_size.x || desired.y > max_size.y {
-                            desired = max_size;
-                        }
+                    let available = self.floating_available_size(ctx);
+                    let cap = self.initial_window_size_for_available(available);
+                    self.floating_max_inner_size = Some(cap);
+                    if desired.x > cap.x || desired.y > cap.y {
+                        desired = cap;
                     }
                     desired.x = desired.x.max(200.0);
                     desired.y = desired.y.max(150.0);
                     ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(desired));
                     self.last_requested_inner_size = Some(desired);
+                    self.center_window_on_monitor(ctx, desired);
                 }
             }
             self.toggle_fullscreen = false;
