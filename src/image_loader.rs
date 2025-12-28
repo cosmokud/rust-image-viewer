@@ -57,7 +57,6 @@ pub struct LoadedImage {
     pub last_frame_time: Instant,
     pub original_width: u32,
     pub original_height: u32,
-    pub rotation: i32, // 0, 90, 180, 270
 }
 
 impl LoadedImage {
@@ -96,7 +95,6 @@ impl LoadedImage {
             last_frame_time: Instant::now(),
             original_width: width,
             original_height: height,
-            rotation: 0,
         })
     }
 
@@ -165,7 +163,6 @@ impl LoadedImage {
             last_frame_time: Instant::now(),
             original_width: width,
             original_height: height,
-            rotation: 0,
         })
     }
 
@@ -196,23 +193,21 @@ impl LoadedImage {
     }
 
     /// Get display dimensions after rotation
+    /// Since we physically rotate the pixel data, the dimensions are simply
+    /// the current original_width and original_height (which get swapped during rotation)
     pub fn display_dimensions(&self) -> (u32, u32) {
-        if self.rotation == 90 || self.rotation == 270 {
-            (self.original_height, self.original_width)
-        } else {
-            (self.original_width, self.original_height)
-        }
+        // The original_width/height are already updated when we rotate,
+        // so just return them directly
+        (self.original_width, self.original_height)
     }
 
     /// Rotate the image clockwise by 90 degrees
     pub fn rotate_clockwise(&mut self) {
-        self.rotation = (self.rotation + 90) % 360;
         self.apply_rotation();
     }
 
     /// Rotate the image counter-clockwise by 90 degrees
     pub fn rotate_counter_clockwise(&mut self) {
-        self.rotation = (self.rotation + 270) % 360;
         self.apply_rotation_ccw();
     }
 

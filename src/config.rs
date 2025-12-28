@@ -61,7 +61,7 @@ impl Action {
         }
     }
 
-    pub fn to_str(&self) -> &'static str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             Action::ToggleFullscreen => "toggle_fullscreen",
             Action::NextImage => "next_image",
@@ -84,16 +84,13 @@ pub fn parse_input_binding(s: &str) -> Option<InputBinding> {
     let s = s.trim().to_lowercase();
     
     // Check for modifiers
-    if s.starts_with("ctrl+") {
-        let key_str = &s[5..];
+    if let Some(key_str) = s.strip_prefix("ctrl+") {
         return parse_key(key_str).map(InputBinding::KeyWithCtrl);
     }
-    if s.starts_with("shift+") {
-        let key_str = &s[6..];
+    if let Some(key_str) = s.strip_prefix("shift+") {
         return parse_key(key_str).map(InputBinding::KeyWithShift);
     }
-    if s.starts_with("alt+") {
-        let key_str = &s[4..];
+    if let Some(key_str) = s.strip_prefix("alt+") {
         return parse_key(key_str).map(InputBinding::KeyWithAlt);
     }
 
@@ -263,7 +260,7 @@ impl Config {
         self.bindings.insert(input.clone(), action);
         self.action_bindings
             .entry(action)
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(input);
     }
 
@@ -438,9 +435,9 @@ impl Config {
         
         // Write settings section
         content.push_str("[Settings]\n");
-        content.push_str(&format!("; How long the title bar stays visible (in seconds)\n"));
+        content.push_str("; How long the title bar stays visible (in seconds)\n");
         content.push_str(&format!("controls_hide_delay = {}\n", self.controls_hide_delay));
-        content.push_str(&format!("; Size of the window resize border in pixels\n"));
+        content.push_str("; Size of the window resize border in pixels\n");
         content.push_str(&format!("resize_border_size = {}\n\n", self.resize_border_size));
 
         content.push_str("; Background color (RGB 0-255). You can either set background_rgb or background_r/g/b\n");
@@ -472,13 +469,13 @@ impl Config {
             let binding_str = binding_to_string(binding);
             action_strings
                 .entry(*action)
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(binding_str);
         }
 
         // Write shortcuts
         for (action, bindings) in &action_strings {
-            content.push_str(&format!("{} = {}\n", action.to_str(), bindings.join(", ")));
+            content.push_str(&format!("{} = {}\n", action.as_str(), bindings.join(", ")));
         }
 
         let _ = fs::write(Self::config_path(), content);

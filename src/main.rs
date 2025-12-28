@@ -183,6 +183,7 @@ impl ImageViewer {
                     img.rotate_clockwise();
                     self.texture = None;
                     self.image_rotated = true;
+                    self.zoom_velocity = 0.0;
                 }
             }
             Action::RotateCounterClockwise => {
@@ -190,6 +191,7 @@ impl ImageViewer {
                     img.rotate_counter_clockwise();
                     self.texture = None;
                     self.image_rotated = true;
+                    self.zoom_velocity = 0.0;
                 }
             }
             Action::ResetZoom => {
@@ -1002,16 +1004,14 @@ impl ImageViewer {
 
         // Floating mode: when zooming out to <= 100%, ease any residual offset back to center.
         // (No bounce, no fade; just a smooth settle.)
-        if !self.is_fullscreen && !self.is_panning && self.zoom <= 1.0 {
-            if self.offset.length() > 0.1 {
-                let dt = ctx.input(|i| i.stable_dt).min(0.033);
-                let k = (1.0 - dt * 12.0).clamp(0.0, 1.0);
-                self.offset *= k;
-                if self.offset.length() < 0.1 {
-                    self.offset = egui::Vec2::ZERO;
-                }
-                ctx.request_repaint();
+        if !self.is_fullscreen && !self.is_panning && self.zoom <= 1.0 && self.offset.length() > 0.1 {
+            let dt = ctx.input(|i| i.stable_dt).min(0.033);
+            let k = (1.0 - dt * 12.0).clamp(0.0, 1.0);
+            self.offset *= k;
+            if self.offset.length() < 0.1 {
+                self.offset = egui::Vec2::ZERO;
             }
+            ctx.request_repaint();
         }
 
         // Handle scroll wheel zoom
@@ -1534,6 +1534,7 @@ fn build_app_icon() -> egui::IconData {
     build_fallback_icon()
 }
 
+#[allow(clippy::nonminimal_bool)]
 fn build_fallback_icon() -> egui::IconData {
     let w: usize = 64;
     let h: usize = 64;
