@@ -246,7 +246,8 @@ impl ImageViewer {
         if let Some(ref img) = self.image {
             let (_, img_h) = img.display_dimensions();
             if img_h > 0 {
-                let z = (ctx.screen_rect().height() / img_h as f32).clamp(0.1, 50.0);
+                let target_h = self.monitor_size_points(ctx).y.max(ctx.screen_rect().height());
+                let z = (target_h / img_h as f32).clamp(0.1, 50.0);
                 self.zoom = z;
                 self.zoom_target = z;
             }
@@ -265,8 +266,16 @@ impl ImageViewer {
             return;
         }
 
+        // Exponential smoothing towards zoom_target.
+        // speed = 0 -> snap, otherwise higher = faster.
+        let speed = self.config.zoom_animation_speed.max(0.0);
+        if speed <= 0.0 {
+            self.zoom = self.zoom_target;
+            return;
+        }
+
         let dt = ctx.input(|i| i.stable_dt).min(0.1);
-        let t = 1.0 - (-dt * 18.0).exp(); // ~fast but smooth
+        let t = 1.0 - (-dt * speed).exp();
         let new_zoom = self.zoom + (self.zoom_target - self.zoom) * t;
 
         if (new_zoom - self.zoom).abs() > 0.0001 {
@@ -287,28 +296,6 @@ impl ImageViewer {
         [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0]
     }
 
-
-    fn calculate_fit_zoom_for_available(&self, available_size: egui::Vec2) -> f32 {
-        if let Some(ref img) = self.image {
-            let (img_w, img_h) = img.display_dimensions();
-            let img_w = img_w as f32;
-            let img_h = img_h as f32;
-
-            if img_w <= 0.0 || img_h <= 0.0 {
-                return 1.0;
-            }
-
-            if img_w > available_size.x || img_h > available_size.y {
-                let scale_x = available_size.x / img_w;
-                let scale_y = available_size.y / img_h;
-                scale_x.min(scale_y).min(1.0)
-            } else {
-                1.0
-            }
-        } else {
-            1.0
-        }
-    }
 
 
     /// Zoom at a specific point
@@ -1016,11 +1003,8 @@ impl eframe::App for ImageViewer {
             self.is_fullscreen = entering_fullscreen;
 
             if entering_fullscreen {
-                if self.config.fullscreen_reset_fit_on_enter {
-                    self.offset = egui::Vec2::ZERO;
-                    self.zoom = self.calculate_fit_zoom_for_available(ctx.screen_rect().size());
-                    self.zoom_target = self.zoom;
-                }
+                // Requirement: when moving from floating -> fullscreen, always fit vertically and center.
+                self.apply_fullscreen_layout_for_current_image(ctx);
                 ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
             } else {
                 // Restore down: reset to centered at 100% and resize to 100% image size (capped by fit-to-screen)

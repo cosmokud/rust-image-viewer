@@ -205,6 +205,8 @@ pub struct Config {
     pub background_rgb: [u8; 3],
     /// When entering fullscreen, reset image to center and fit-to-screen.
     pub fullscreen_reset_fit_on_enter: bool,
+    /// Floating-mode zoom animation speed. Higher = faster.
+    pub zoom_animation_speed: f32,
 }
 
 impl Default for Config {
@@ -216,6 +218,7 @@ impl Default for Config {
             resize_border_size: 6.0,
             background_rgb: [0, 0, 0],
             fullscreen_reset_fit_on_enter: true,
+            zoom_animation_speed: 6.0,
         };
         config.set_defaults();
         config
@@ -306,6 +309,7 @@ impl Config {
             resize_border_size: 6.0,
             background_rgb: [0, 0, 0],
             fullscreen_reset_fit_on_enter: true,
+            zoom_animation_speed: 6.0,
         };
 
         let mut in_shortcuts_section = false;
@@ -386,6 +390,12 @@ impl Config {
                                 config.fullscreen_reset_fit_on_enter = v;
                             }
                         }
+                        "zoom_animation_speed" => {
+                            if let Ok(v) = value.parse::<f32>() {
+                                // 0 disables animation (snap), otherwise speed is an exponential smoothing constant.
+                                config.zoom_animation_speed = v.clamp(0.0, 60.0);
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -433,6 +443,9 @@ impl Config {
             "fullscreen_reset_fit_on_enter = {}\n\n",
             if self.fullscreen_reset_fit_on_enter { "true" } else { "false" }
         ));
+
+        content.push_str("; Floating-mode zoom animation speed. Higher = faster, 0 = snap instantly\n");
+        content.push_str(&format!("zoom_animation_speed = {}\n\n", self.zoom_animation_speed));
         
         content.push_str("[Shortcuts]\n");
 
