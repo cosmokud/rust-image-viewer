@@ -973,7 +973,34 @@ impl ImageViewer {
                     }
                 }
             } else {
+                // Floating mode: reset to exactly 100% and resize the window to match.
+                // If the image is larger than the monitor, consume full monitor height.
+                self.zoom = 1.0;
                 self.zoom_target = 1.0;
+
+                if let Some(ref img) = self.image {
+                    let (img_w, img_h) = img.display_dimensions();
+
+                    let monitor = self.monitor_size_points(ctx);
+                    let mut desired = egui::Vec2::new(img_w as f32, img_h as f32);
+
+                    if desired.x > monitor.x || desired.y > monitor.y {
+                        // Oversized image: maximize window vertically.
+                        desired.y = monitor.y;
+                        // Keep window on-screen horizontally as well.
+                        desired.x = desired.x.min(monitor.x);
+                    }
+
+                    // Respect the viewport minimum size.
+                    desired.x = desired.x.max(200.0);
+                    desired.y = desired.y.max(150.0);
+
+                    // Update cap so autosize doesn't fight this request.
+                    self.floating_max_inner_size = Some(desired);
+                    self.last_requested_inner_size = Some(desired);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(desired));
+                    self.center_window_on_monitor(ctx, desired);
+                }
             }
         }
 

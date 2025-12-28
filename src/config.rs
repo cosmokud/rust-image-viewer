@@ -220,8 +220,8 @@ impl Default for Config {
             resize_border_size: 6.0,
             background_rgb: [0, 0, 0],
             fullscreen_reset_fit_on_enter: true,
-            zoom_animation_speed: 8.0,
-            zoom_step: 1.08,
+            zoom_animation_speed: 20.0,
+            zoom_step: 1.02,
         };
         config.set_defaults();
         config
