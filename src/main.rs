@@ -43,6 +43,8 @@ struct ImageViewer {
     zoom: f32,
     /// Target zoom for smooth animation in floating mode
     zoom_target: f32,
+    /// Zoom velocity for critically-damped spring animation
+    zoom_velocity: f32,
     /// Image offset for panning
     offset: egui::Vec2,
     /// Whether we're currently panning/dragging window
@@ -89,6 +91,7 @@ impl Default for ImageViewer {
             current_index: 0,
             zoom: 1.0,
             zoom_target: 1.0,
+            zoom_velocity: 0.0,
             offset: egui::Vec2::ZERO,
             is_panning: false,
             last_mouse_pos: None,
@@ -257,32 +260,63 @@ impl ImageViewer {
     fn tick_floating_zoom_animation(&mut self, ctx: &egui::Context) {
         if self.is_fullscreen {
             self.zoom_target = self.zoom;
+            self.zoom_velocity = 0.0;
             return;
         }
 
         // While resizing, treat window size as the source of truth.
         if self.is_resizing {
             self.zoom_target = self.zoom;
+            self.zoom_velocity = 0.0;
             return;
         }
 
-        // Exponential smoothing towards zoom_target.
-        // speed = 0 -> snap, otherwise higher = faster.
-        let speed = self.config.zoom_animation_speed.max(0.0);
-        if speed <= 0.0 {
+        let error = self.zoom_target - self.zoom;
+
+        // Snap threshold - if we're very close, just snap to target
+        const SNAP_THRESHOLD: f32 = 0.0005;
+        const VELOCITY_THRESHOLD: f32 = 0.001;
+
+        if error.abs() < SNAP_THRESHOLD && self.zoom_velocity.abs() < VELOCITY_THRESHOLD {
             self.zoom = self.zoom_target;
+            self.zoom_velocity = 0.0;
             return;
         }
 
-        let dt = ctx.input(|i| i.stable_dt).min(0.1);
-        let t = 1.0 - (-dt * speed).exp();
-        let new_zoom = self.zoom + (self.zoom_target - self.zoom) * t;
+        // Critically-damped spring system for snappy, responsive animation
+        // This eliminates overshoot while providing immediate response
+        //
+        // Physics: critically damped when damping_ratio = 1.0
+        // x'' = -omega^2 * (x - target) - 2 * omega * x'
+        //
+        // Higher omega = faster response (snappier)
+        // We use omega based on user's speed setting, scaled for snappiness
 
-        if (new_zoom - self.zoom).abs() > 0.0001 {
-            self.zoom = new_zoom;
+        let speed = self.config.zoom_animation_speed.max(0.1);
+        // Scale omega for snappy feel: speed=2 gives omega~25 (very fast)
+        let omega = speed * 12.0;
+        let omega_sq = omega * omega;
+
+        let dt = ctx.input(|i| i.stable_dt).min(0.033); // Cap at ~30fps minimum for stability
+
+        // Semi-implicit Euler integration for stability:
+        // 1. Update velocity with spring force and damping
+        // 2. Update position with new velocity
+        let spring_force = omega_sq * error;
+        let damping_force = 2.0 * omega * self.zoom_velocity;
+
+        // Acceleration = spring force - damping (critically damped: damping = 2*omega)
+        let acceleration = spring_force - damping_force;
+
+        self.zoom_velocity += acceleration * dt;
+        self.zoom += self.zoom_velocity * dt;
+
+        // Clamp zoom to valid range
+        self.zoom = self.zoom.clamp(0.1, 50.0);
+
+        // Request repaint for continuous animation
+        if error.abs() > SNAP_THRESHOLD || self.zoom_velocity.abs() > VELOCITY_THRESHOLD {
             ctx.request_repaint();
-        } else {
-            self.zoom = self.zoom_target;
         }
     }
 
@@ -429,6 +463,7 @@ impl ImageViewer {
                             Action::ResetZoom => {
                                 self.offset = egui::Vec2::ZERO;
                                 self.zoom_target = 1.0;
+                                self.zoom_velocity = 0.0;
                                 if self.is_fullscreen {
                                     self.zoom = 1.0;
                                 }
@@ -437,16 +472,22 @@ impl ImageViewer {
                                 if self.is_fullscreen {
                                     self.zoom = (self.zoom * 1.1).min(50.0);
                                     self.zoom_target = self.zoom;
+                                    self.zoom_velocity = 0.0;
                                 } else {
                                     self.zoom_target = (self.zoom_target * 1.1).min(50.0);
+                                    // Reset velocity for immediate response to new input
+                                    self.zoom_velocity = 0.0;
                                 }
                             }
                             Action::ZoomOut => {
                                 if self.is_fullscreen {
                                     self.zoom = (self.zoom / 1.1).max(0.1);
                                     self.zoom_target = self.zoom;
+                                    self.zoom_velocity = 0.0;
                                 } else {
                                     self.zoom_target = (self.zoom_target / 1.1).max(0.1);
+                                    // Reset velocity for immediate response to new input
+                                    self.zoom_velocity = 0.0;
                                 }
                             }
                             _ => {}
@@ -788,6 +829,7 @@ impl ImageViewer {
         let new_zoom = (new_h / img_h).clamp(0.1, 50.0);
         self.zoom = new_zoom;
         self.zoom_target = new_zoom;
+        self.zoom_velocity = 0.0;
         self.offset = egui::Vec2::ZERO;
 
         // Keep the opposite edge anchored by moving the window when resizing from left/top.
@@ -822,9 +864,12 @@ impl ImageViewer {
                 if self.is_fullscreen {
                     self.zoom_at(pos, factor, screen_rect);
                     self.zoom_target = self.zoom;
+                    self.zoom_velocity = 0.0;
                 } else {
                     self.zoom_target = (self.zoom_target * factor).clamp(0.1, 50.0);
                     self.offset = egui::Vec2::ZERO;
+                    // Reset velocity on new scroll input for immediate response
+                    self.zoom_velocity = 0.0;
                 }
             }
         }
@@ -904,6 +949,7 @@ impl ImageViewer {
         // Handle double-click to reset zoom
         if ctx.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary)) {
             self.offset = egui::Vec2::ZERO;
+            self.zoom_velocity = 0.0;
             if self.is_fullscreen {
                 self.zoom = 1.0;
                 self.zoom_target = 1.0;
@@ -1099,12 +1145,46 @@ fn main() -> eframe::Result<()> {
 }
 
 fn build_app_icon() -> egui::IconData {
+    // Try to load the icon from assets folder next to executable
+    let exe_path = std::env::current_exe().unwrap_or_default();
+    let exe_dir = exe_path.parent().unwrap_or(std::path::Path::new("."));
+
+    // Try PNG first (better quality), then ICO
+    let icon_paths = [
+        exe_dir.join("assets").join("icon.png"),
+        exe_dir.join("assets").join("icon.ico"),
+        // Also check if assets is in current working directory
+        std::path::PathBuf::from("assets").join("icon.png"),
+        std::path::PathBuf::from("assets").join("icon.ico"),
+    ];
+
+    for icon_path in &icon_paths {
+        if icon_path.exists() {
+            if let Ok(icon_data) = std::fs::read(icon_path) {
+                // Decode the image
+                if let Ok(img) = image::load_from_memory(&icon_data) {
+                    let rgba_img = img.to_rgba8();
+                    let (width, height) = rgba_img.dimensions();
+                    return egui::IconData {
+                        rgba: rgba_img.into_raw(),
+                        width,
+                        height,
+                    };
+                }
+            }
+        }
+    }
+
+    // Fallback: generate a simple procedural icon if files not found
+    build_fallback_icon()
+}
+
+fn build_fallback_icon() -> egui::IconData {
     let w: usize = 64;
     let h: usize = 64;
     let mut rgba = vec![0u8; w * h * 4];
 
     // Simple "photo frame" glyph: crisp white lines on transparent background.
-    // (Let the OS decide icon background depending on theme.)
     let set_px = |rgba: &mut [u8], x: usize, y: usize, r: u8, g: u8, b: u8, a: u8| {
         let idx = (y * w + x) * 4;
         rgba[idx] = r;

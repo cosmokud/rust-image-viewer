@@ -218,7 +218,7 @@ impl Default for Config {
             resize_border_size: 6.0,
             background_rgb: [0, 0, 0],
             fullscreen_reset_fit_on_enter: true,
-            zoom_animation_speed: 6.0,
+            zoom_animation_speed: 2.0,
         };
         config.set_defaults();
         config
@@ -264,24 +264,26 @@ impl Config {
 
     /// Get settings file path.
     ///
-    /// Prefers `setting.ini` (as requested), but migrates from legacy `config.ini` if present.
+    /// Uses `config.ini` next to the executable.
+    ///
+    /// If a legacy `setting.ini` exists (from a prior build), we migrate it back to `config.ini`.
     pub fn config_path() -> PathBuf {
         let exe_path = std::env::current_exe().unwrap_or_default();
         let exe_dir = exe_path.parent().unwrap_or(std::path::Path::new("."));
 
-        let preferred = exe_dir.join("setting.ini");
-        if preferred.exists() {
-            return preferred;
+        let config = exe_dir.join("config.ini");
+
+        // Best-effort migration back from `setting.ini` -> `config.ini`.
+        // We only do this if `config.ini` is missing so we don't overwrite user edits.
+        if !config.exists() {
+            let legacy_setting = exe_dir.join("setting.ini");
+            if legacy_setting.exists() {
+                let _ = fs::copy(&legacy_setting, &config);
+                let _ = fs::remove_file(&legacy_setting);
+            }
         }
 
-        let legacy = exe_dir.join("config.ini");
-        if legacy.exists() {
-            // Best-effort migration so users can edit `setting.ini` going forward.
-            let _ = fs::copy(&legacy, &preferred);
-            return preferred;
-        }
-
-        preferred
+        config
     }
 
     /// Load configuration from INI file
@@ -309,7 +311,7 @@ impl Config {
             resize_border_size: 6.0,
             background_rgb: [0, 0, 0],
             fullscreen_reset_fit_on_enter: true,
-            zoom_animation_speed: 6.0,
+            zoom_animation_speed: 2.0,
         };
 
         let mut in_shortcuts_section = false;
@@ -420,7 +422,7 @@ impl Config {
         let mut content = String::new();
         
         content.push_str("; Image Viewer Configuration\n");
-        content.push_str("; See setting.ini in the application directory for examples\n\n");
+        content.push_str("; See config.ini in the application directory for examples\n\n");
         
         // Write settings section
         content.push_str("[Settings]\n");
