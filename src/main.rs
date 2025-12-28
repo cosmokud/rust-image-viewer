@@ -85,8 +85,6 @@ struct ImageViewer {
     fullscreen_transition: f32,
     /// Fullscreen transition target (0.0 or 1.0)
     fullscreen_transition_target: f32,
-    /// Bounce animation for zoom-out-past-100% in floating mode
-    zoom_bounce: f32,
 }
 
 impl Default for ImageViewer {
@@ -120,12 +118,63 @@ impl Default for ImageViewer {
             saved_floating_state: None,
             fullscreen_transition: 0.0,
             fullscreen_transition_target: 0.0,
-            zoom_bounce: 0.0,
         }
     }
 }
 
 impl ImageViewer {
+    fn run_action(&mut self, action: Action) {
+        match action {
+            Action::Exit => self.should_exit = true,
+            Action::ToggleFullscreen => self.toggle_fullscreen = true,
+            Action::NextImage => self.next_image(),
+            Action::PreviousImage => self.prev_image(),
+            Action::RotateClockwise => {
+                if let Some(ref mut img) = self.image {
+                    img.rotate_clockwise();
+                    self.texture = None;
+                }
+            }
+            Action::RotateCounterClockwise => {
+                if let Some(ref mut img) = self.image {
+                    img.rotate_counter_clockwise();
+                    self.texture = None;
+                }
+            }
+            Action::ResetZoom => {
+                self.offset = egui::Vec2::ZERO;
+                self.zoom_target = 1.0;
+                self.zoom_velocity = 0.0;
+                if self.is_fullscreen {
+                    self.zoom = 1.0;
+                }
+            }
+            Action::ZoomIn => {
+                let step = self.config.zoom_step;
+                if self.is_fullscreen {
+                    self.zoom = (self.zoom * step).min(50.0);
+                    self.zoom_target = self.zoom;
+                    self.zoom_velocity = 0.0;
+                } else {
+                    self.zoom_target = (self.zoom_target * step).min(50.0);
+                    self.zoom_velocity = 0.0;
+                }
+            }
+            Action::ZoomOut => {
+                let step = self.config.zoom_step;
+                if self.is_fullscreen {
+                    self.zoom = (self.zoom / step).max(0.1);
+                    self.zoom_target = self.zoom;
+                    self.zoom_velocity = 0.0;
+                } else {
+                    self.zoom_target = (self.zoom_target / step).max(0.1);
+                    self.zoom_velocity = 0.0;
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Create new viewer with an image path
     fn new(cc: &eframe::CreationContext<'_>, path: Option<PathBuf>) -> Self {
         let mut viewer = Self::default();
@@ -458,6 +507,7 @@ impl ImageViewer {
 
     /// Handle keyboard and mouse input
     fn handle_input(&mut self, ctx: &egui::Context) {
+        let screen_width = ctx.screen_rect().width();
         ctx.input(|input| {
             let ctrl = input.modifiers.ctrl;
             let shift = input.modifiers.shift;
@@ -486,55 +536,7 @@ impl ImageViewer {
                     };
 
                     if let Some(action) = self.config.bindings.get(&binding) {
-                        match action {
-                            Action::Exit => self.should_exit = true,
-                            Action::ToggleFullscreen => self.toggle_fullscreen = true,
-                            Action::NextImage => self.next_image(),
-                            Action::PreviousImage => self.prev_image(),
-                            Action::RotateClockwise => {
-                                if let Some(ref mut img) = self.image {
-                                    img.rotate_clockwise();
-                                    self.texture = None;
-                                }
-                            }
-                            Action::RotateCounterClockwise => {
-                                if let Some(ref mut img) = self.image {
-                                    img.rotate_counter_clockwise();
-                                    self.texture = None;
-                                }
-                            }
-                            Action::ResetZoom => {
-                                self.offset = egui::Vec2::ZERO;
-                                self.zoom_target = 1.0;
-                                self.zoom_velocity = 0.0;
-                                if self.is_fullscreen {
-                                    self.zoom = 1.0;
-                                }
-                            }
-                            Action::ZoomIn => {
-                                let step = self.config.zoom_step;
-                                if self.is_fullscreen {
-                                    self.zoom = (self.zoom * step).min(50.0);
-                                    self.zoom_target = self.zoom;
-                                    self.zoom_velocity = 0.0;
-                                } else {
-                                    self.zoom_target = (self.zoom_target * step).min(50.0);
-                                    self.zoom_velocity = 0.0;
-                                }
-                            }
-                            Action::ZoomOut => {
-                                let step = self.config.zoom_step;
-                                if self.is_fullscreen {
-                                    self.zoom = (self.zoom / step).max(0.1);
-                                    self.zoom_target = self.zoom;
-                                    self.zoom_velocity = 0.0;
-                                } else {
-                                    self.zoom_target = (self.zoom_target / step).max(0.1);
-                                    self.zoom_velocity = 0.0;
-                                }
-                            }
-                            _ => {}
-                        }
+                        self.run_action(*action);
                     }
                 }
             }
@@ -543,6 +545,30 @@ impl ImageViewer {
             if input.pointer.button_pressed(egui::PointerButton::Middle) {
                 if self.config.is_action(&InputBinding::MouseMiddle, Action::ToggleFullscreen) {
                     self.toggle_fullscreen = true;
+                }
+            }
+
+            // Mouse4 / Mouse5 bindings (Extra buttons)
+            if input.pointer.button_pressed(egui::PointerButton::Extra1) {
+                if let Some(action) = self.config.bindings.get(&InputBinding::Mouse4) {
+                    self.run_action(*action);
+                }
+            }
+            if input.pointer.button_pressed(egui::PointerButton::Extra2) {
+                if let Some(action) = self.config.bindings.get(&InputBinding::Mouse5) {
+                    self.run_action(*action);
+                }
+            }
+
+            // Right-click navigation processed here (pre-draw) to avoid a one-frame flash.
+            if input.pointer.button_clicked(egui::PointerButton::Secondary) {
+                if let Some(pos) = input.pointer.hover_pos() {
+                    let third = screen_width / 3.0;
+                    if pos.x < third {
+                        self.prev_image();
+                    } else if pos.x > screen_width - third {
+                        self.next_image();
+                    }
                 }
             }
         });
@@ -899,6 +925,20 @@ impl ImageViewer {
         // Smooth zoom animation (floating mode)
         self.tick_floating_zoom_animation(ctx);
 
+        // Floating mode: when zooming out to <= 100%, ease any residual offset back to center.
+        // (No bounce, no fade; just a smooth settle.)
+        if !self.is_fullscreen && !self.is_panning && self.zoom <= 1.0 {
+            if self.offset.length() > 0.1 {
+                let dt = ctx.input(|i| i.stable_dt).min(0.033);
+                let k = (1.0 - dt * 12.0).clamp(0.0, 1.0);
+                self.offset *= k;
+                if self.offset.length() < 0.1 {
+                    self.offset = egui::Vec2::ZERO;
+                }
+                ctx.request_repaint();
+            }
+        }
+
         // Handle scroll wheel zoom
         let scroll_delta = ctx.input(|i| i.smooth_scroll_delta.y);
         if scroll_delta != 0.0 {
@@ -916,21 +956,14 @@ impl ImageViewer {
                     self.zoom_target = (self.zoom_target * factor).clamp(0.1, 50.0);
                     self.zoom = (self.zoom * factor).clamp(0.1, 50.0);
 
-                    // Follow cursor if we have any offset (user panned) AND still above 100%
+                    // Keep cursor-follow behavior when zooming and/or after panning.
+                    // When we cross <= 100%, we don't snap to center; the offset eases back via the settle block above.
                     let has_offset = self.offset.length() > 0.1;
-                    if self.zoom > 1.0 && (old_zoom > 1.0 || has_offset) {
-                        // When zoomed past 100%, follow cursor like fullscreen mode
+                    if old_zoom > 1.0 || self.zoom > 1.0 || has_offset {
                         let rect_center = screen_rect.center();
                         let cursor_offset = pos - rect_center;
                         let zoom_ratio = self.zoom / old_zoom;
                         self.offset = self.offset * zoom_ratio - cursor_offset * (zoom_ratio - 1.0);
-                    } else {
-                        // At or below 100%, reset offset and let window follow image size
-                        self.offset = egui::Vec2::ZERO;
-                        // Trigger bounce animation when crossing 100% threshold
-                        if old_zoom > 1.0 && self.zoom <= 1.0 {
-                            self.zoom_bounce = 1.0;
-                        }
                     }
                     // Reset velocity on new scroll input for immediate response
                     self.zoom_velocity = 0.0;
@@ -1075,21 +1108,6 @@ impl ImageViewer {
             }
         }
 
-        // Handle right-click for prev/next image (consume event to prevent context menu)
-        let right_clicked = ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Secondary));
-        if right_clicked {
-            // Consume the event by requesting a repaint (prevents default behavior)
-            ctx.request_repaint();
-            if let Some(pos) = pointer_pos {
-                let third = screen_rect.width() / 3.0;
-                if pos.x < third {
-                    self.prev_image();
-                } else if pos.x > screen_rect.width() - third {
-                    self.next_image();
-                }
-            }
-        }
-
         // Draw the image
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(self.background_color32()))
@@ -1106,37 +1124,15 @@ impl ImageViewer {
                         
                         let center = available.center() + self.offset;
                         let image_rect = egui::Rect::from_center_size(center, display_size);
-                        
-                        // Calculate combined bounce effect
-                        let mut scale_factor = 1.0f32;
-                        
-                        // Fullscreen transition bounce animation (no fade)
+
+                        // Smooth fullscreen transition (no fade, no bounce): subtle ease scale.
                         let t = self.fullscreen_transition;
-                        let in_fs_transition = t > 0.001 && t < 0.999;
-                        if in_fs_transition {
-                            // Elastic bounce effect: starts big, settles to normal
-                            // Use sine wave for smooth bounce
-                            let bounce_intensity = 0.08; // 8% max scale
-                            let bounce_freq = std::f32::consts::PI * 2.0;
-                            let decay = 1.0 - t; // Decay as transition completes
-                            let bounce = (t * bounce_freq).sin() * decay * bounce_intensity;
-                            scale_factor *= 1.0 + bounce;
-                        }
-                        
-                        // Zoom-out-past-100% bounce animation
-                        if self.zoom_bounce > 0.01 {
-                            let bounce_intensity = 0.05; // 5% max scale
-                            let bounce = (self.zoom_bounce * std::f32::consts::PI).sin() * self.zoom_bounce * bounce_intensity;
-                            scale_factor *= 1.0 + bounce;
-                            // Decay the bounce
-                            let dt = ctx.input(|i| i.stable_dt).min(0.033);
-                            self.zoom_bounce = (self.zoom_bounce - dt * 4.0).max(0.0);
-                            ctx.request_repaint();
-                        }
-                        
-                        // Apply scale if there's any animation
-                        let final_rect = if (scale_factor - 1.0).abs() > 0.001 {
-                            let scaled_size = display_size * scale_factor;
+                        let in_transition = t > 0.001 && t < 0.999;
+                        let final_rect = if in_transition {
+                            // smoothstep
+                            let ease = t * t * (3.0 - 2.0 * t);
+                            let scale = 0.985 + 0.015 * ease;
+                            let scaled_size = display_size * scale;
                             egui::Rect::from_center_size(center, scaled_size)
                         } else {
                             image_rect

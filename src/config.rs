@@ -239,6 +239,8 @@ impl Config {
         // Navigation
         self.add_binding(InputBinding::Key(egui::Key::ArrowRight), Action::NextImage);
         self.add_binding(InputBinding::Key(egui::Key::ArrowLeft), Action::PreviousImage);
+        self.add_binding(InputBinding::Mouse5, Action::NextImage);
+        self.add_binding(InputBinding::Mouse4, Action::PreviousImage);
 
         // Rotation
         self.add_binding(InputBinding::Key(egui::Key::ArrowUp), Action::RotateClockwise);
