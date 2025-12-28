@@ -930,8 +930,12 @@ impl ImageViewer {
                                 // In fullscreen, pan the image
                                 let delta = ctx.input(|i| i.pointer.delta());
                                 self.offset += delta;
+                            } else if self.zoom > 1.0 {
+                                // In floating mode when zoomed past 100%, pan image inside window
+                                let delta = ctx.input(|i| i.pointer.delta());
+                                self.offset += delta;
                             } else {
-                                // In floating mode, drag the window
+                                // In floating mode at/below 100%, drag the window
                                 ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
                             }
                         }
@@ -973,23 +977,31 @@ impl ImageViewer {
                     }
                 }
             } else {
-                // Floating mode: reset to exactly 100% and resize the window to match.
-                // If the image is larger than the monitor, consume full monitor height.
-                self.zoom = 1.0;
-                self.zoom_target = 1.0;
-
+                // Floating mode: fit image to screen while keeping aspect ratio.
+                // For images taller than screen, scale down to fit 100% of screen height.
                 if let Some(ref img) = self.image {
                     let (img_w, img_h) = img.display_dimensions();
+                    let img_w = img_w as f32;
+                    let img_h = img_h as f32;
 
                     let monitor = self.monitor_size_points(ctx);
-                    let mut desired = egui::Vec2::new(img_w as f32, img_h as f32);
 
-                    if desired.x > monitor.x || desired.y > monitor.y {
-                        // Oversized image: maximize window vertically.
-                        desired.y = monitor.y;
-                        // Keep window on-screen horizontally as well.
-                        desired.x = desired.x.min(monitor.x);
-                    }
+                    // Determine if image needs to be scaled down to fit the screen.
+                    // If image is taller than screen, fit vertically (100% screen height).
+                    // If image is wider than screen, fit horizontally.
+                    // Otherwise, use 100% zoom.
+                    let fit_zoom = if img_h > monitor.y || img_w > monitor.x {
+                        // Scale to fit: use the smaller scale factor to ensure it fits.
+                        (monitor.y / img_h).min(monitor.x / img_w).min(1.0)
+                    } else {
+                        1.0
+                    };
+
+                    self.zoom = fit_zoom;
+                    self.zoom_target = fit_zoom;
+
+                    // Compute window size based on zoom.
+                    let mut desired = egui::Vec2::new(img_w * fit_zoom, img_h * fit_zoom);
 
                     // Respect the viewport minimum size.
                     desired.x = desired.x.max(200.0);
