@@ -197,6 +197,10 @@ pub struct Config {
     pub bindings: HashMap<InputBinding, Action>,
     /// Reverse map for looking up bindings for an action
     pub action_bindings: HashMap<Action, Vec<InputBinding>>,
+    /// How long the controls bar stays visible (in seconds)
+    pub controls_hide_delay: f32,
+    /// Size of the resize border in pixels
+    pub resize_border_size: f32,
 }
 
 impl Default for Config {
@@ -204,6 +208,8 @@ impl Default for Config {
         let mut config = Config {
             bindings: HashMap::new(),
             action_bindings: HashMap::new(),
+            controls_hide_delay: 0.5,
+            resize_border_size: 6.0,
         };
         config.set_defaults();
         config
@@ -275,9 +281,12 @@ impl Config {
         let mut config = Config {
             bindings: HashMap::new(),
             action_bindings: HashMap::new(),
+            controls_hide_delay: 0.5,
+            resize_border_size: 6.0,
         };
 
         let mut in_shortcuts_section = false;
+        let mut in_settings_section = false;
 
         for line in content.lines() {
             let line = line.trim();
@@ -291,6 +300,7 @@ impl Config {
             if line.starts_with('[') && line.ends_with(']') {
                 let section = &line[1..line.len() - 1];
                 in_shortcuts_section = section.eq_ignore_ascii_case("shortcuts");
+                in_settings_section = section.eq_ignore_ascii_case("settings");
                 continue;
             }
 
@@ -307,6 +317,28 @@ impl Config {
                                 config.add_binding(binding, action);
                             }
                         }
+                    }
+                }
+            }
+
+            // Parse key=value pairs in settings section
+            if in_settings_section {
+                if let Some((key, value)) = line.split_once('=') {
+                    let key = key.trim().to_lowercase();
+                    let value = value.trim();
+                    
+                    match key.as_str() {
+                        "controls_hide_delay" => {
+                            if let Ok(v) = value.parse::<f32>() {
+                                config.controls_hide_delay = v.max(0.1);
+                            }
+                        }
+                        "resize_border_size" => {
+                            if let Ok(v) = value.parse::<f32>() {
+                                config.resize_border_size = v.clamp(2.0, 20.0);
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -331,6 +363,14 @@ impl Config {
         
         content.push_str("; Image Viewer Configuration\n");
         content.push_str("; See config.ini in the application directory for examples\n\n");
+        
+        // Write settings section
+        content.push_str("[Settings]\n");
+        content.push_str(&format!("; How long the title bar stays visible (in seconds)\n"));
+        content.push_str(&format!("controls_hide_delay = {}\n", self.controls_hide_delay));
+        content.push_str(&format!("; Size of the window resize border in pixels\n"));
+        content.push_str(&format!("resize_border_size = {}\n\n", self.resize_border_size));
+        
         content.push_str("[Shortcuts]\n");
 
         // Group bindings by action

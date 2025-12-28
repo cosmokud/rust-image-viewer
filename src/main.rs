@@ -13,6 +13,20 @@ use eframe::egui;
 use std::path::PathBuf;
 use std::time::Instant;
 
+/// Resize direction for window edge dragging
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResizeDirection {
+    None,
+    Left,
+    Right,
+    Top,
+    Bottom,
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
 /// Application state
 struct ImageViewer {
     /// Current loaded image
@@ -29,7 +43,7 @@ struct ImageViewer {
     zoom: f32,
     /// Image offset for panning
     offset: egui::Vec2,
-    /// Whether we're currently panning
+    /// Whether we're currently panning/dragging window
     is_panning: bool,
     /// Last mouse position for panning
     last_mouse_pos: Option<egui::Pos2>,
@@ -53,6 +67,10 @@ struct ImageViewer {
     toggle_fullscreen: bool,
     /// Request minimize
     request_minimize: bool,
+    /// Current resize direction
+    resize_direction: ResizeDirection,
+    /// Whether we're currently resizing
+    is_resizing: bool,
 }
 
 impl Default for ImageViewer {
@@ -77,6 +95,8 @@ impl Default for ImageViewer {
             should_exit: false,
             toggle_fullscreen: false,
             request_minimize: false,
+            resize_direction: ResizeDirection::None,
+            is_resizing: false,
         }
     }
 }
@@ -114,7 +134,8 @@ impl ImageViewer {
                 self.current_index = self.image_list.iter().position(|p| p == path).unwrap_or(0);
                 
                 self.image = Some(img);
-                self.texture = None;
+                // Don't clear texture here - keep showing old image until new one loads
+                // The texture will be updated in update_texture()
                 self.texture_frame = usize::MAX;
                 self.reset_view();
                 self.error_message = None;
@@ -314,8 +335,8 @@ impl ImageViewer {
             }
         }
 
-        // Auto-hide controls after 2 seconds
-        if self.controls_show_time.elapsed().as_secs_f32() > 2.0 {
+        // Auto-hide controls after configured delay
+        if self.controls_show_time.elapsed().as_secs_f32() > self.config.controls_hide_delay {
             if let Some(pos) = mouse_pos {
                 if pos.y >= 50.0 {
                     self.show_controls = false;
@@ -397,6 +418,38 @@ impl ImageViewer {
             });
     }
 
+    /// Determine resize direction based on mouse position
+    fn get_resize_direction(&self, pos: egui::Pos2, rect: egui::Rect) -> ResizeDirection {
+        let border = self.config.resize_border_size;
+        let at_left = pos.x < rect.min.x + border;
+        let at_right = pos.x > rect.max.x - border;
+        let at_top = pos.y < rect.min.y + border;
+        let at_bottom = pos.y > rect.max.y - border;
+
+        match (at_left, at_right, at_top, at_bottom) {
+            (true, false, true, false) => ResizeDirection::TopLeft,
+            (false, true, true, false) => ResizeDirection::TopRight,
+            (true, false, false, true) => ResizeDirection::BottomLeft,
+            (false, true, false, true) => ResizeDirection::BottomRight,
+            (true, false, false, false) => ResizeDirection::Left,
+            (false, true, false, false) => ResizeDirection::Right,
+            (false, false, true, false) => ResizeDirection::Top,
+            (false, false, false, true) => ResizeDirection::Bottom,
+            _ => ResizeDirection::None,
+        }
+    }
+
+    /// Get cursor icon for resize direction
+    fn get_resize_cursor(&self, direction: ResizeDirection) -> egui::CursorIcon {
+        match direction {
+            ResizeDirection::Left | ResizeDirection::Right => egui::CursorIcon::ResizeHorizontal,
+            ResizeDirection::Top | ResizeDirection::Bottom => egui::CursorIcon::ResizeVertical,
+            ResizeDirection::TopLeft | ResizeDirection::BottomRight => egui::CursorIcon::ResizeNwSe,
+            ResizeDirection::TopRight | ResizeDirection::BottomLeft => egui::CursorIcon::ResizeNeSw,
+            ResizeDirection::None => egui::CursorIcon::Default,
+        }
+    }
+
     /// Draw the main image
     fn draw_image(&mut self, ctx: &egui::Context) {
         let screen_rect = ctx.screen_rect();
@@ -410,27 +463,94 @@ impl ImageViewer {
             }
         }
 
-        // Handle panning
+        // Get pointer state
         let pointer_pos = ctx.input(|i| i.pointer.hover_pos());
         let primary_down = ctx.input(|i| i.pointer.button_down(egui::PointerButton::Primary));
-        
-        if primary_down {
+        let primary_pressed = ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary));
+        let primary_released = ctx.input(|i| i.pointer.button_released(egui::PointerButton::Primary));
+
+        // Determine if we're over a resize edge (only in floating mode)
+        let hover_resize_direction = if !self.is_fullscreen {
             if let Some(pos) = pointer_pos {
-                if let Some(last_pos) = self.last_mouse_pos {
-                    if self.is_panning {
-                        let delta = pos - last_pos;
-                        self.offset += delta;
-                    }
-                }
-                self.is_panning = true;
-                self.last_mouse_pos = Some(pos);
-                ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+                self.get_resize_direction(pos, screen_rect)
+            } else {
+                ResizeDirection::None
             }
         } else {
-            if self.is_panning {
-                self.is_panning = false;
+            ResizeDirection::None
+        };
+
+        // Handle resize start
+        if primary_pressed && hover_resize_direction != ResizeDirection::None && !self.is_resizing && !self.is_panning {
+            self.is_resizing = true;
+            self.resize_direction = hover_resize_direction;
+            self.last_mouse_pos = pointer_pos;
+        }
+
+        // Handle resizing
+        if self.is_resizing && primary_down {
+            if let (Some(_pos), Some(_last_pos)) = (pointer_pos, self.last_mouse_pos) {
+                // We need screen-space delta, so use raw pointer delta
+                let screen_delta = ctx.input(|i| i.pointer.delta());
+                
+                if screen_delta != egui::Vec2::ZERO {
+                    // Request resize via viewport command
+                    ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(
+                        match self.resize_direction {
+                            ResizeDirection::Left => egui::ResizeDirection::West,
+                            ResizeDirection::Right => egui::ResizeDirection::East,
+                            ResizeDirection::Top => egui::ResizeDirection::North,
+                            ResizeDirection::Bottom => egui::ResizeDirection::South,
+                            ResizeDirection::TopLeft => egui::ResizeDirection::NorthWest,
+                            ResizeDirection::TopRight => egui::ResizeDirection::NorthEast,
+                            ResizeDirection::BottomLeft => egui::ResizeDirection::SouthWest,
+                            ResizeDirection::BottomRight => egui::ResizeDirection::SouthEast,
+                            ResizeDirection::None => egui::ResizeDirection::East,
+                        }
+                    ));
+                }
             }
+            self.last_mouse_pos = pointer_pos;
+            ctx.set_cursor_icon(self.get_resize_cursor(self.resize_direction));
+        } else if self.is_resizing && primary_released {
+            self.is_resizing = false;
+            self.resize_direction = ResizeDirection::None;
             self.last_mouse_pos = None;
+        } else if !self.is_resizing {
+            // Handle panning/window dragging (only if not resizing)
+            if primary_down && hover_resize_direction == ResizeDirection::None {
+                if let Some(pos) = pointer_pos {
+                    if let Some(_last_pos) = self.last_mouse_pos {
+                        if self.is_panning {
+                            if self.is_fullscreen {
+                                // In fullscreen, pan the image
+                                let delta = ctx.input(|i| i.pointer.delta());
+                                self.offset += delta;
+                            } else {
+                                // In floating mode, drag the window
+                                ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                            }
+                        }
+                    }
+                    if !self.is_panning {
+                        self.is_panning = true;
+                    }
+                    self.last_mouse_pos = Some(pos);
+                    ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+                }
+            } else {
+                if self.is_panning {
+                    self.is_panning = false;
+                }
+                self.last_mouse_pos = None;
+                
+                // Set cursor based on hover state
+                if hover_resize_direction != ResizeDirection::None {
+                    ctx.set_cursor_icon(self.get_resize_cursor(hover_resize_direction));
+                } else {
+                    ctx.set_cursor_icon(egui::CursorIcon::Default);
+                }
+            }
         }
 
         // Handle double-click to reset zoom
@@ -486,11 +606,6 @@ impl ImageViewer {
                     });
                 }
             });
-
-        // Set cursor based on state
-        if !self.is_panning {
-            ctx.set_cursor_icon(egui::CursorIcon::Grab);
-        }
     }
 }
 
