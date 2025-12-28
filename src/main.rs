@@ -127,21 +127,12 @@ struct ImageViewer {
     /// Whether user is dragging the volume slider
     is_volume_dragging: bool,
     // ============ RESIZE STATE FIELDS ============
-    /// Initial mouse position when resize started (in screen/global coordinates)
-    resize_start_mouse_pos: Option<egui::Pos2>,
     /// Initial window outer position when resize started
     resize_start_outer_pos: Option<egui::Pos2>,
     /// Initial window inner size when resize started
     resize_start_inner_size: Option<egui::Vec2>,
-    /// Estimated mouse position in global/screen coordinates (points) while resizing.
-    /// Computed by integrating local pointer delta plus the commanded window movement.
-    resize_mouse_global_est: Option<egui::Pos2>,
-    /// Previous frame's local mouse position (window coordinates) while resizing.
-    resize_prev_local_mouse_pos: Option<egui::Pos2>,
-    /// Window movement we commanded last frame (consumed once).
-    resize_pending_outer_delta: egui::Vec2,
-    /// Last commanded window outer position.
-    resize_last_commanded_outer_pos: Option<egui::Pos2>,
+    /// Accumulated mouse delta since resize started (using pointer.delta() each frame)
+    resize_accumulated_delta: egui::Vec2,
     /// Axis lock for corner resizing to avoid jitter near diagonal
     resize_corner_axis_lock: Option<ResizeCornerAxis>,
 }
@@ -194,13 +185,9 @@ impl Default for ImageViewer {
             last_seek_sent_at: Instant::now(),
             is_volume_dragging: false,
             // Resize state fields
-            resize_start_mouse_pos: None,
             resize_start_outer_pos: None,
             resize_start_inner_size: None,
-            resize_mouse_global_est: None,
-            resize_prev_local_mouse_pos: None,
-            resize_pending_outer_delta: egui::Vec2::ZERO,
-            resize_last_commanded_outer_pos: None,
+            resize_accumulated_delta: egui::Vec2::ZERO,
             resize_corner_axis_lock: None,
         }
     }
@@ -1439,23 +1426,17 @@ impl ImageViewer {
         let media_h = media_h_u as f32;
         let aspect = media_w / media_h;
 
-        // Compute an estimated global/screen mouse position in points.
-        // Key idea: when resizing from left/top edges we also move the window.
-        // That movement cancels out in window-local coordinates, making resizing feel "slow".
-        // We avoid relying on viewport outer_rect (which can lag a frame) by integrating:
-        //   global_delta = local_delta + window_delta_commanded
-        let current_local_mouse = match ctx.input(|i| i.pointer.hover_pos()).or(self.last_mouse_pos) {
-            Some(p) => p,
-            None => return,
-        };
+        // Use pointer.delta() which gives the actual mouse movement in screen coordinates.
+        // This is independent of window position changes, so it works correctly for all
+        // resize directions including left/top edges where the window moves.
+        let frame_delta = ctx.input(|i| i.pointer.delta());
 
         // On first call (resize just started), capture initial state
-        let (start_mouse, start_outer_pos, start_inner_size) = match (
-            self.resize_start_mouse_pos,
+        let (start_outer_pos, start_inner_size) = match (
             self.resize_start_outer_pos,
             self.resize_start_inner_size,
         ) {
-            (Some(m), Some(p), Some(s)) => (m, p, s),
+            (Some(p), Some(s)) => (p, s),
             _ => {
                 // Capture initial state now
                 let outer_pos = ctx
@@ -1467,33 +1448,17 @@ impl ImageViewer {
                     .map(|r| r.size())
                     .unwrap_or_else(|| ctx.screen_rect().size());
 
-                // Initialize global mouse estimate from the best available outer position.
-                let global_mouse = egui::pos2(outer_pos.x + current_local_mouse.x, outer_pos.y + current_local_mouse.y);
-                self.resize_mouse_global_est = Some(global_mouse);
-                self.resize_prev_local_mouse_pos = Some(current_local_mouse);
-                self.resize_pending_outer_delta = egui::Vec2::ZERO;
-                self.resize_last_commanded_outer_pos = Some(outer_pos);
-                
-                self.resize_start_mouse_pos = Some(global_mouse);
                 self.resize_start_outer_pos = Some(outer_pos);
                 self.resize_start_inner_size = Some(inner_size);
+                self.resize_accumulated_delta = egui::Vec2::ZERO;
                 return; // Skip this frame; next frame we'll have valid start state
             }
         };
 
-        // Update global mouse estimate.
-        let mut global_mouse = self.resize_mouse_global_est.unwrap_or(start_mouse);
-        let prev_local = self.resize_prev_local_mouse_pos.unwrap_or(current_local_mouse);
-        let local_delta = current_local_mouse - prev_local;
-        let window_delta = self.resize_pending_outer_delta;
-        self.resize_pending_outer_delta = egui::Vec2::ZERO; // consume once
-        global_mouse += local_delta + window_delta;
-        self.resize_mouse_global_est = Some(global_mouse);
-        self.resize_prev_local_mouse_pos = Some(current_local_mouse);
+        // Accumulate mouse delta from start of resize
+        self.resize_accumulated_delta += frame_delta;
+        let mouse_delta = self.resize_accumulated_delta;
 
-        // Calculate mouse delta from start position
-        let mouse_delta = global_mouse - start_mouse;
-        
         if mouse_delta.length() < 0.5 {
             return; // No significant movement
         }
@@ -1538,7 +1503,7 @@ impl ImageViewer {
                 let w = (start_inner_size.x - mouse_delta.x).max(clamp_min_w).min(max_size.x);
                 let h = (w / aspect).max(clamp_min_h).min(max_size.y);
                 let w = h * aspect;
-                // Right edge stays at: start_outer_pos.x + start_inner_size.x (approximately)
+                // Right edge stays at: start_outer_pos.x + start_inner_size.x
                 // New left = right_edge - new_width
                 let right_edge = start_outer_pos.x + start_inner_size.x;
                 let new_x = right_edge - w;
@@ -1655,11 +1620,6 @@ impl ImageViewer {
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(new_size));
         self.last_requested_inner_size = Some(new_size);
 
-        // Record the commanded window movement so next frame can reconstruct global mouse movement.
-        let last_pos = self.resize_last_commanded_outer_pos.unwrap_or(start_outer_pos);
-        self.resize_pending_outer_delta = new_pos - last_pos;
-        self.resize_last_commanded_outer_pos = Some(new_pos);
-
         ctx.request_repaint();
     }
 
@@ -1754,13 +1714,9 @@ impl ImageViewer {
             self.resize_direction = hover_resize_direction;
             self.last_mouse_pos = pointer_pos;
             // Clear any stale resize state - it will be captured fresh on first resize call
-            self.resize_start_mouse_pos = None;
             self.resize_start_outer_pos = None;
             self.resize_start_inner_size = None;
-            self.resize_mouse_global_est = None;
-            self.resize_prev_local_mouse_pos = None;
-            self.resize_pending_outer_delta = egui::Vec2::ZERO;
-            self.resize_last_commanded_outer_pos = None;
+            self.resize_accumulated_delta = egui::Vec2::ZERO;
             self.resize_corner_axis_lock = None;
         }
 
@@ -1773,13 +1729,9 @@ impl ImageViewer {
             self.resize_direction = ResizeDirection::None;
             self.last_mouse_pos = None;
             // Clear resize start state
-            self.resize_start_mouse_pos = None;
             self.resize_start_outer_pos = None;
             self.resize_start_inner_size = None;
-            self.resize_mouse_global_est = None;
-            self.resize_prev_local_mouse_pos = None;
-            self.resize_pending_outer_delta = egui::Vec2::ZERO;
-            self.resize_last_commanded_outer_pos = None;
+            self.resize_accumulated_delta = egui::Vec2::ZERO;
             self.resize_corner_axis_lock = None;
         } else if !self.is_resizing {
             // Handle panning/window dragging (only if not resizing and not over video controls)
