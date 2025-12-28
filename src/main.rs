@@ -1,13 +1,15 @@
-//! High-performance Image Viewer for Windows 11
+//! High-performance Image and Video Viewer for Windows 11
 //! Built with Rust + egui (eframe)
 
 #![windows_subsystem = "windows"]
 
 mod config;
 mod image_loader;
+mod video_player;
 
 use config::{Action, Config, InputBinding};
-use image_loader::{get_images_in_directory, LoadedImage};
+use image_loader::{get_media_in_directory, LoadedImage};
+use video_player::{format_time, is_supported_video, VideoPlayer};
 
 use eframe::egui;
 use std::path::PathBuf;
@@ -91,6 +93,19 @@ struct ImageViewer {
     image_rotated: bool,
     /// Pending window resize to apply after a frame delay (to prevent flash on fullscreen exit)
     pending_window_resize: Option<(egui::Vec2, egui::Pos2, u8)>,
+    // --- Video-specific fields ---
+    /// Current loaded video player
+    video: Option<VideoPlayer>,
+    /// Video texture handle (updated each frame)
+    video_texture: Option<egui::TextureHandle>,
+    /// Whether to show video controls bar
+    show_video_controls: bool,
+    /// Time when video controls were last shown
+    video_controls_show_time: Instant,
+    /// Whether a video control is being interacted with (e.g., dragging seekbar)
+    video_control_active: bool,
+    /// Last mouse position (for video controls visibility)
+    last_mouse_move_time: Instant,
 }
 
 impl Default for ImageViewer {
@@ -127,6 +142,13 @@ impl Default for ImageViewer {
             fullscreen_transition_target: 0.0,
             image_rotated: false,
             pending_window_resize: None,
+            // Video fields
+            video: None,
+            video_texture: None,
+            show_video_controls: false,
+            video_controls_show_time: Instant::now(),
+            video_control_active: false,
+            last_mouse_move_time: Instant::now(),
         }
     }
 }
@@ -230,6 +252,9 @@ impl ImageViewer {
 
     /// Create new viewer with an image path
     fn new(cc: &eframe::CreationContext<'_>, path: Option<PathBuf>) -> Self {
+        // Initialize FFmpeg
+        VideoPlayer::init_ffmpeg();
+
         let mut viewer = Self::default();
 
         // Configure visuals (background driven by config)
@@ -246,7 +271,7 @@ impl ImageViewer {
         }
 
         if let Some(path) = path {
-            viewer.load_image(&path);
+            viewer.load_media(&path);
         }
 
         viewer
@@ -254,10 +279,14 @@ impl ImageViewer {
 
     /// Load an image from path
     fn load_image(&mut self, path: &PathBuf) {
+        // Clear any existing video
+        self.video = None;
+        self.video_texture = None;
+
         match LoadedImage::load(path) {
             Ok(img) => {
                 // Get images in directory
-                self.image_list = get_images_in_directory(path);
+                self.image_list = get_media_in_directory(path);
                 self.current_index = self.image_list.iter().position(|p| p == path).unwrap_or(0);
                 
                 self.image = Some(img);
@@ -273,6 +302,59 @@ impl ImageViewer {
         }
     }
 
+    /// Load a video from path
+    fn load_video(&mut self, path: &PathBuf) {
+        // Clear any existing image
+        self.image = None;
+        self.texture = None;
+
+        match VideoPlayer::open(path, self.config.video_mute_by_default) {
+            Ok(player) => {
+                // Set default volume
+                player.set_volume(self.config.video_default_volume);
+                
+                // Get media in directory
+                self.image_list = get_media_in_directory(path);
+                self.current_index = self.image_list.iter().position(|p| p == path).unwrap_or(0);
+                
+                self.video = Some(player);
+                self.video_texture = None;
+                self.image_changed = true;
+                self.error_message = None;
+                self.show_video_controls = true;
+                self.video_controls_show_time = Instant::now();
+            }
+            Err(e) => {
+                self.error_message = Some(e);
+            }
+        }
+    }
+
+    /// Load media (image or video) based on file extension
+    fn load_media(&mut self, path: &PathBuf) {
+        if is_supported_video(path) {
+            self.load_video(path);
+        } else {
+            self.load_image(path);
+        }
+    }
+
+    /// Check if currently viewing a video
+    fn is_video(&self) -> bool {
+        self.video.is_some()
+    }
+
+    /// Get current media dimensions
+    fn current_media_dimensions(&self) -> Option<(u32, u32)> {
+        if let Some(ref video) = self.video {
+            Some(video.display_dimensions())
+        } else if let Some(ref img) = self.image {
+            Some(img.display_dimensions())
+        } else {
+            None
+        }
+    }
+
     /// Load next image
     fn next_image(&mut self) {
         if self.image_list.is_empty() {
@@ -280,7 +362,7 @@ impl ImageViewer {
         }
         self.current_index = (self.current_index + 1) % self.image_list.len();
         let path = self.image_list[self.current_index].clone();
-        self.load_image(&path);
+        self.load_media(&path);
     }
 
     /// Load previous image
@@ -294,7 +376,7 @@ impl ImageViewer {
             self.current_index - 1
         };
         let path = self.image_list[self.current_index].clone();
-        self.load_image(&path);
+        self.load_media(&path);
     }
 
 
@@ -339,26 +421,22 @@ impl ImageViewer {
     fn apply_floating_layout_for_current_image(&mut self, ctx: &egui::Context) {
         self.offset = egui::Vec2::ZERO;
 
-        // For images larger than the screen, fit to screen while keeping aspect ratio.
+        // For media larger than the screen, fit to screen while keeping aspect ratio.
         // This matches the double-click behavior.
-        if let Some(ref img) = self.image {
-            let (img_w, img_h) = img.display_dimensions();
-            let img_w = img_w as f32;
-            let img_h = img_h as f32;
+        let dims = self.current_media_dimensions();
+        if let Some((media_w, media_h)) = dims {
+            let media_w = media_w as f32;
+            let media_h = media_h as f32;
 
-            if img_w <= 0.0 || img_h <= 0.0 {
+            if media_w <= 0.0 || media_h <= 0.0 {
                 return;
             }
 
             let monitor = self.monitor_size_points(ctx);
 
-            // Determine if image needs to be scaled down to fit the screen.
-            // If image is taller than screen, fit vertically (100% screen height).
-            // If image is wider than screen, fit horizontally.
-            // Otherwise, use 100% zoom.
-            let fit_zoom = if img_h > monitor.y || img_w > monitor.x {
-                // Scale to fit: use the smaller scale factor to ensure it fits.
-                (monitor.y / img_h).min(monitor.x / img_w).min(1.0)
+            // Determine if media needs to be scaled down to fit the screen.
+            let fit_zoom = if media_h > monitor.y || media_w > monitor.x {
+                (monitor.y / media_h).min(monitor.x / media_w).min(1.0)
             } else {
                 1.0
             };
@@ -367,7 +445,7 @@ impl ImageViewer {
             self.zoom_target = fit_zoom;
 
             // Compute window size based on zoom.
-            let mut size = egui::Vec2::new(img_w * fit_zoom, img_h * fit_zoom);
+            let mut size = egui::Vec2::new(media_w * fit_zoom, media_h * fit_zoom);
 
             // Respect the viewport minimum size.
             size.x = size.x.max(200.0);
@@ -382,11 +460,10 @@ impl ImageViewer {
 
     fn apply_fullscreen_layout_for_current_image(&mut self, ctx: &egui::Context) {
         self.offset = egui::Vec2::ZERO;
-        if let Some(ref img) = self.image {
-            let (_, img_h) = img.display_dimensions();
-            if img_h > 0 {
+        if let Some((_, media_h)) = self.current_media_dimensions() {
+            if media_h > 0 {
                 let target_h = self.monitor_size_points(ctx).y.max(ctx.screen_rect().height());
-                let z = (target_h / img_h as f32).clamp(0.1, 50.0);
+                let z = (target_h / media_h as f32).clamp(0.1, 50.0);
                 self.zoom = z;
                 self.zoom_target = z;
             }
@@ -496,8 +573,7 @@ impl ImageViewer {
     }
 
     fn image_display_size_at_zoom(&self) -> Option<egui::Vec2> {
-        let img = self.image.as_ref()?;
-        let (img_w, img_h) = img.display_dimensions();
+        let (img_w, img_h) = self.current_media_dimensions()?;
         Some(egui::Vec2::new(img_w as f32 * self.zoom, img_h as f32 * self.zoom))
     }
 
@@ -553,6 +629,27 @@ impl ImageViewer {
             }
 
             if img.is_animated() {
+                ctx.request_repaint();
+            }
+        }
+
+        // Update video texture
+        if let Some(ref mut video) = self.video {
+            if let Some(frame) = video.get_current_frame() {
+                let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                    [frame.width as usize, frame.height as usize],
+                    &frame.pixels,
+                );
+                
+                self.video_texture = Some(ctx.load_texture(
+                    "video_frame",
+                    color_image,
+                    egui::TextureOptions::LINEAR,
+                ));
+            }
+            
+            // Request repaint for continuous video playback
+            if video.is_playing() {
                 ctx.request_repaint();
             }
         }
@@ -633,6 +730,7 @@ impl ImageViewer {
             }
 
             // Right-click navigation processed here (pre-draw) to avoid a one-frame flash.
+            // For videos, center right-click toggles play/pause instead of navigation.
             if input.pointer.button_clicked(egui::PointerButton::Secondary) {
                 if let Some(pos) = input.pointer.hover_pos() {
                     let third = screen_width / 3.0;
@@ -641,9 +739,30 @@ impl ImageViewer {
                     } else if pos.x > screen_width - third {
                         actions_to_run.push(Action::NextImage);
                     }
+                    // Center third: video pause/unpause will be handled after actions_to_run
                 }
             }
         });
+        
+        // Handle center right-click for video play/pause
+        let center_right_clicked = ctx.input(|input| {
+            if input.pointer.button_clicked(egui::PointerButton::Secondary) {
+                if let Some(pos) = input.pointer.hover_pos() {
+                    let third = screen_width / 3.0;
+                    pos.x >= third && pos.x <= screen_width - third
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        });
+        
+        if center_right_clicked && self.is_video() {
+            if let Some(ref video) = self.video {
+                video.toggle_playback();
+            }
+        }
         
         // Run all collected actions
         for action in actions_to_run {
@@ -816,6 +935,341 @@ impl ImageViewer {
             });
     }
 
+    /// Draw video controls bar at the bottom of the screen
+    fn draw_video_controls(&mut self, ctx: &egui::Context) {
+        // Only show for videos
+        if !self.is_video() {
+            return;
+        }
+
+        let screen_rect = ctx.screen_rect();
+        let bar_height = 48.0;
+        let bar_margin = 20.0;
+        let bar_width = (screen_rect.width() - bar_margin * 2.0).min(800.0);
+
+        // Check if mouse moved recently or is near bottom
+        let mouse_pos = ctx.input(|i| i.pointer.hover_pos());
+        let mouse_delta = ctx.input(|i| i.pointer.delta());
+        
+        if mouse_delta.length() > 0.5 {
+            self.last_mouse_move_time = Instant::now();
+        }
+
+        if let Some(pos) = mouse_pos {
+            if pos.y > screen_rect.height() - 100.0 {
+                self.show_video_controls = true;
+                self.video_controls_show_time = Instant::now();
+            }
+        }
+
+        // Keep controls visible if mouse moved recently or control is being interacted with
+        let mouse_active = self.last_mouse_move_time.elapsed().as_secs_f32() < self.config.video_controls_hide_delay;
+        let should_show = self.video_control_active 
+            || mouse_active 
+            || self.video_controls_show_time.elapsed().as_secs_f32() < self.config.video_controls_hide_delay;
+
+        if !should_show {
+            self.show_video_controls = false;
+        }
+
+        // Also show controls when video is paused
+        let is_paused = self.video.as_ref().map(|v| v.is_paused()).unwrap_or(false);
+        if is_paused {
+            self.show_video_controls = true;
+        }
+
+        if !self.show_video_controls {
+            return;
+        }
+
+        // Extract video state before entering UI code to avoid borrow issues
+        let (is_playing, position, duration, is_muted, volume, has_audio) = {
+            if let Some(ref video) = self.video {
+                (video.is_playing(), video.position(), video.duration, video.is_muted(), video.volume(), video.has_audio)
+            } else {
+                return;
+            }
+        };
+
+        let bar_rect = egui::Rect::from_center_size(
+            egui::pos2(screen_rect.center().x, screen_rect.max.y - bar_margin - bar_height / 2.0),
+            egui::Vec2::new(bar_width, bar_height),
+        );
+
+        // Track actions to apply after UI
+        let mut toggle_playback = false;
+        let mut seek_to: Option<f64> = None;
+        let mut toggle_mute = false;
+        let mut new_volume: Option<f32> = None;
+
+        egui::Area::new(egui::Id::new("video_control_bar"))
+            .fixed_pos(bar_rect.min)
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                // Draw background first
+                ui.painter().rect_filled(
+                    bar_rect,
+                    12.0,
+                    egui::Color32::from_rgba_unmultiplied(30, 30, 30, 220),
+                );
+
+                let content_rect = bar_rect.shrink(8.0);
+                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(content_rect), |ui| {
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = 12.0;
+
+                        // Play/Pause button
+                        let play_btn_size = egui::Vec2::splat(28.0);
+                        let (play_rect, play_response) = ui.allocate_exact_size(play_btn_size, egui::Sense::click());
+
+                        if ui.is_rect_visible(play_rect) {
+                            let bg = if play_response.hovered() {
+                                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 30)
+                            } else {
+                                egui::Color32::TRANSPARENT
+                            };
+                            ui.painter().rect_filled(play_rect, 4.0, bg);
+
+                            let icon_center = play_rect.center();
+                            if is_playing {
+                                // Pause icon (two vertical bars)
+                                let bar_w = 3.0;
+                                let bar_h = 12.0;
+                                let gap = 3.0;
+                                ui.painter().rect_filled(
+                                    egui::Rect::from_center_size(
+                                        icon_center - egui::vec2(gap, 0.0),
+                                        egui::Vec2::new(bar_w, bar_h),
+                                    ),
+                                    1.0,
+                                    egui::Color32::WHITE,
+                                );
+                                ui.painter().rect_filled(
+                                    egui::Rect::from_center_size(
+                                        icon_center + egui::vec2(gap, 0.0),
+                                        egui::Vec2::new(bar_w, bar_h),
+                                    ),
+                                    1.0,
+                                    egui::Color32::WHITE,
+                                );
+                            } else {
+                                // Play icon (triangle)
+                                let size = 10.0;
+                                let points = vec![
+                                    egui::pos2(icon_center.x - size * 0.4, icon_center.y - size),
+                                    egui::pos2(icon_center.x - size * 0.4, icon_center.y + size),
+                                    egui::pos2(icon_center.x + size * 0.8, icon_center.y),
+                                ];
+                                ui.painter().add(egui::Shape::convex_polygon(
+                                    points,
+                                    egui::Color32::WHITE,
+                                    egui::Stroke::NONE,
+                                ));
+                            }
+                        }
+
+                        if play_response.clicked() {
+                            toggle_playback = true;
+                        }
+
+                        // Current time
+                        ui.label(
+                            egui::RichText::new(format_time(position))
+                                .color(egui::Color32::WHITE)
+                                .size(12.0),
+                        );
+
+                        // Seekbar
+                        let seekbar_width = ui.available_width() - 180.0;
+                        let seekbar_height = 6.0;
+                        let (seekbar_rect, seekbar_response) = ui.allocate_exact_size(
+                            egui::Vec2::new(seekbar_width.max(50.0), 20.0),
+                            egui::Sense::click_and_drag(),
+                        );
+
+                        let track_rect = egui::Rect::from_center_size(
+                            seekbar_rect.center(),
+                            egui::Vec2::new(seekbar_rect.width(), seekbar_height),
+                        );
+
+                        // Track background
+                        ui.painter().rect_filled(track_rect, 3.0, egui::Color32::from_gray(60));
+
+                        // Progress
+                        let progress = if duration > 0.0 { (position / duration).clamp(0.0, 1.0) } else { 0.0 };
+                        let progress_width = track_rect.width() * progress as f32;
+                        let progress_rect = egui::Rect::from_min_size(
+                            track_rect.min,
+                            egui::Vec2::new(progress_width, seekbar_height),
+                        );
+                        ui.painter().rect_filled(progress_rect, 3.0, egui::Color32::from_rgb(100, 180, 255));
+
+                        // Seek handle
+                        let handle_x = track_rect.min.x + progress_width;
+                        let handle_radius = if seekbar_response.hovered() || seekbar_response.dragged() { 8.0 } else { 6.0 };
+                        ui.painter().circle_filled(
+                            egui::pos2(handle_x, track_rect.center().y),
+                            handle_radius,
+                            egui::Color32::WHITE,
+                        );
+
+                        // Handle seeking
+                        if seekbar_response.dragged() || seekbar_response.clicked() {
+                            self.video_control_active = true;
+                            if let Some(pointer_pos) = ui.input(|i| i.pointer.hover_pos()) {
+                                let relative_x = (pointer_pos.x - track_rect.min.x) / track_rect.width();
+                                let seek_pos = (relative_x.clamp(0.0, 1.0) as f64) * duration;
+                                seek_to = Some(seek_pos);
+                            }
+                        }
+                        if seekbar_response.drag_stopped() {
+                            self.video_control_active = false;
+                        }
+
+                        // Duration
+                        ui.label(
+                            egui::RichText::new(format_time(duration))
+                                .color(egui::Color32::GRAY)
+                                .size(12.0),
+                        );
+
+                        // Volume control (only if video has audio)
+                        if has_audio {
+                            // Mute button
+                            let mute_btn_size = egui::Vec2::splat(24.0);
+                            let (mute_rect, mute_response) = ui.allocate_exact_size(mute_btn_size, egui::Sense::click());
+
+                            if ui.is_rect_visible(mute_rect) {
+                                let bg = if mute_response.hovered() {
+                                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 30)
+                                } else {
+                                    egui::Color32::TRANSPARENT
+                                };
+                                ui.painter().rect_filled(mute_rect, 4.0, bg);
+
+                                // Speaker icon
+                                let icon_center = mute_rect.center();
+                                let stroke = egui::Stroke::new(1.5, egui::Color32::WHITE);
+
+                                // Speaker body
+                                let body_rect = egui::Rect::from_center_size(
+                                    icon_center - egui::vec2(2.0, 0.0),
+                                    egui::Vec2::new(4.0, 6.0),
+                                );
+                                ui.painter().rect_filled(body_rect, 0.0, egui::Color32::WHITE);
+
+                                // Speaker cone
+                                let cone_points = vec![
+                                    egui::pos2(body_rect.max.x, body_rect.min.y),
+                                    egui::pos2(body_rect.max.x + 5.0, body_rect.min.y - 4.0),
+                                    egui::pos2(body_rect.max.x + 5.0, body_rect.max.y + 4.0),
+                                    egui::pos2(body_rect.max.x, body_rect.max.y),
+                                ];
+                                ui.painter().add(egui::Shape::convex_polygon(
+                                    cone_points,
+                                    egui::Color32::WHITE,
+                                    egui::Stroke::NONE,
+                                ));
+
+                                if is_muted || volume == 0.0 {
+                                    // X mark for muted
+                                    let x_offset = egui::vec2(8.0, 0.0);
+                                    ui.painter().line_segment(
+                                        [
+                                            icon_center + x_offset + egui::vec2(-3.0, -3.0),
+                                            icon_center + x_offset + egui::vec2(3.0, 3.0),
+                                        ],
+                                        stroke,
+                                    );
+                                    ui.painter().line_segment(
+                                        [
+                                            icon_center + x_offset + egui::vec2(3.0, -3.0),
+                                            icon_center + x_offset + egui::vec2(-3.0, 3.0),
+                                        ],
+                                        stroke,
+                                    );
+                                }
+                            }
+
+                            if mute_response.clicked() {
+                                toggle_mute = true;
+                            }
+
+                            // Volume slider
+                            let vol_slider_width = 60.0;
+                            let vol_slider_height = 4.0;
+                            let (vol_rect, vol_response) = ui.allocate_exact_size(
+                                egui::Vec2::new(vol_slider_width, 16.0),
+                                egui::Sense::click_and_drag(),
+                            );
+
+                            let vol_track = egui::Rect::from_center_size(
+                                vol_rect.center(),
+                                egui::Vec2::new(vol_slider_width, vol_slider_height),
+                            );
+
+                            ui.painter().rect_filled(vol_track, 2.0, egui::Color32::from_gray(60));
+
+                            let effective_volume = if is_muted { 0.0 } else { volume };
+                            let vol_fill_width = vol_track.width() * effective_volume;
+                            let vol_fill_rect = egui::Rect::from_min_size(
+                                vol_track.min,
+                                egui::Vec2::new(vol_fill_width, vol_slider_height),
+                            );
+                            ui.painter().rect_filled(vol_fill_rect, 2.0, egui::Color32::WHITE);
+
+                            // Volume handle
+                            let vol_handle_x = vol_track.min.x + vol_fill_width;
+                            ui.painter().circle_filled(
+                                egui::pos2(vol_handle_x, vol_track.center().y),
+                                5.0,
+                                egui::Color32::WHITE,
+                            );
+
+                            if vol_response.dragged() || vol_response.clicked() {
+                                self.video_control_active = true;
+                                if let Some(pointer_pos) = ui.input(|i| i.pointer.hover_pos()) {
+                                    let relative_x = (pointer_pos.x - vol_track.min.x) / vol_track.width();
+                                    new_volume = Some(relative_x.clamp(0.0, 1.0));
+                                }
+                            }
+                            if vol_response.drag_stopped() {
+                                self.video_control_active = false;
+                            }
+                        }
+                    });
+                });
+            });
+
+        // Apply actions after UI closure to avoid borrow issues
+        if toggle_playback {
+            if let Some(ref v) = self.video {
+                v.toggle_playback();
+            }
+        }
+        if let Some(pos) = seek_to {
+            if let Some(ref mut v) = self.video {
+                v.seek(pos);
+            }
+        }
+        if toggle_mute {
+            if let Some(ref mut v) = self.video {
+                v.toggle_mute();
+            }
+        }
+        if let Some(vol) = new_volume {
+            if let Some(ref mut v) = self.video {
+                v.set_volume(vol);
+                if vol > 0.0 && v.is_muted() {
+                    v.set_muted(false);
+                }
+            }
+        }
+
+        // Request repaint for smooth video playback
+        ctx.request_repaint();
+    }
+
     /// Determine resize direction based on mouse position
     fn get_resize_direction(&self, pos: egui::Pos2, rect: egui::Rect) -> ResizeDirection {
         let border = self.config.resize_border_size;
@@ -852,10 +1306,13 @@ impl ImageViewer {
         if self.is_fullscreen {
             return;
         }
-        let Some(ref img) = self.image else {
-            return;
+        
+        // Get dimensions from either image or video
+        let (img_w_u, img_h_u) = match self.current_media_dimensions() {
+            Some(dims) => dims,
+            None => return,
         };
-        let (img_w_u, img_h_u) = img.display_dimensions();
+        
         if img_w_u == 0 || img_h_u == 0 {
             return;
         }
@@ -1133,33 +1590,25 @@ impl ImageViewer {
             self.offset = egui::Vec2::ZERO;
             self.zoom_velocity = 0.0;
             if self.is_fullscreen {
-                // Fit image vertically to screen height
-                if let Some(ref img) = self.image {
-                    let (_, img_h) = img.display_dimensions();
-                    if img_h > 0 {
+                // Fit media vertically to screen height
+                if let Some((_, media_h)) = self.current_media_dimensions() {
+                    if media_h > 0 {
                         let screen_h = screen_rect.height();
-                        let fit_zoom = screen_h / img_h as f32;
+                        let fit_zoom = screen_h / media_h as f32;
                         self.zoom = fit_zoom.clamp(0.1, 50.0);
                         self.zoom_target = self.zoom;
                     }
                 }
             } else {
-                // Floating mode: fit image to screen while keeping aspect ratio.
-                // For images taller than screen, scale down to fit 100% of screen height.
-                if let Some(ref img) = self.image {
-                    let (img_w, img_h) = img.display_dimensions();
-                    let img_w = img_w as f32;
-                    let img_h = img_h as f32;
+                // Floating mode: fit media to screen while keeping aspect ratio.
+                if let Some((media_w, media_h)) = self.current_media_dimensions() {
+                    let media_w = media_w as f32;
+                    let media_h = media_h as f32;
 
                     let monitor = self.monitor_size_points(ctx);
 
-                    // Determine if image needs to be scaled down to fit the screen.
-                    // If image is taller than screen, fit vertically (100% screen height).
-                    // If image is wider than screen, fit horizontally.
-                    // Otherwise, use 100% zoom.
-                    let fit_zoom = if img_h > monitor.y || img_w > monitor.x {
-                        // Scale to fit: use the smaller scale factor to ensure it fits.
-                        (monitor.y / img_h).min(monitor.x / img_w).min(1.0)
+                    let fit_zoom = if media_h > monitor.y || media_w > monitor.x {
+                        (monitor.y / media_h).min(monitor.x / media_w).min(1.0)
                     } else {
                         1.0
                     };
@@ -1167,14 +1616,10 @@ impl ImageViewer {
                     self.zoom = fit_zoom;
                     self.zoom_target = fit_zoom;
 
-                    // Compute window size based on zoom.
-                    let mut desired = egui::Vec2::new(img_w * fit_zoom, img_h * fit_zoom);
-
-                    // Respect the viewport minimum size.
+                    let mut desired = egui::Vec2::new(media_w * fit_zoom, media_h * fit_zoom);
                     desired.x = desired.x.max(200.0);
                     desired.y = desired.y.max(150.0);
 
-                    // Update cap so autosize doesn't fight this request.
                     self.floating_max_inner_size = Some(desired);
                     self.last_requested_inner_size = Some(desired);
                     ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(desired));
@@ -1183,67 +1628,74 @@ impl ImageViewer {
             }
         }
 
-        // Draw the image
+        // Draw the image or video
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(self.background_color32()))
             .show(ctx, |ui| {
-                if let Some(ref texture) = self.texture {
-                    let available = ui.available_rect_before_wrap();
-                    
+                let available = ui.available_rect_before_wrap();
+
+                // Determine which texture to use and the display size
+                let (texture_to_draw, display_size) = if let Some(ref texture) = self.video_texture {
+                    // Video
+                    if let Some(ref video) = self.video {
+                        let (vid_w, vid_h) = video.display_dimensions();
+                        let size = egui::Vec2::new(vid_w as f32 * self.zoom, vid_h as f32 * self.zoom);
+                        (Some(texture), size)
+                    } else {
+                        (None, egui::Vec2::ZERO)
+                    }
+                } else if let Some(ref texture) = self.texture {
+                    // Image
                     if let Some(ref img) = self.image {
                         let (img_w, img_h) = img.display_dimensions();
-                        let display_size = egui::Vec2::new(
-                            img_w as f32 * self.zoom,
-                            img_h as f32 * self.zoom,
-                        );
-                        
-                        let center = available.center() + self.offset;
-                        let image_rect = egui::Rect::from_center_size(center, display_size);
-
-                        // Fullscreen transition:
-                        // - Entering fullscreen: subtle ease-in scale.
-                        // - Exiting fullscreen: small "grow + settle" overshoot to avoid showing background bars.
-                        let t = self.fullscreen_transition;
-                        let in_transition = t > 0.001 && t < 0.999;
-                        let final_rect = if in_transition {
-                            // smoothstep
-                            let ease = t * t * (3.0 - 2.0 * t);
-
-                            let scale = if self.is_fullscreen {
-                                // Entering: tiny settle so the transition feels responsive.
-                                0.985 + 0.015 * ease
-                            } else {
-                                // Exiting: do not shrink (which can reveal black bars). Instead, overshoot slightly.
-                                // easeOutBack(u) in [0,1] overshoots above 1.0 before settling.
-                                let u = (1.0 - t).clamp(0.0, 1.0);
-                                let c1: f32 = 1.70158;
-                                let c3: f32 = c1 + 1.0;
-                                let x = u - 1.0;
-                                let ease_out_back = 1.0 + c3 * x.powi(3) + c1 * x.powi(2);
-                                let bump = (ease_out_back - u).max(0.0);
-                                1.0 + 0.03 * bump
-                            };
-
-                            let scaled_size = display_size * scale;
-                            egui::Rect::from_center_size(center, scaled_size)
-                        } else {
-                            image_rect
-                        };
-                        
-                        ui.painter().image(
-                            texture.id(),
-                            final_rect,
-                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                            egui::Color32::WHITE,
-                        );
+                        let size = egui::Vec2::new(img_w as f32 * self.zoom, img_h as f32 * self.zoom);
+                        (Some(texture), size)
+                    } else {
+                        (None, egui::Vec2::ZERO)
                     }
+                } else {
+                    (None, egui::Vec2::ZERO)
+                };
+
+                if let Some(texture) = texture_to_draw {
+                    let center = available.center() + self.offset;
+                    let image_rect = egui::Rect::from_center_size(center, display_size);
+
+                    // Fullscreen transition animation
+                    let t = self.fullscreen_transition;
+                    let in_transition = t > 0.001 && t < 0.999;
+                    let final_rect = if in_transition {
+                        let ease = t * t * (3.0 - 2.0 * t);
+                        let scale = if self.is_fullscreen {
+                            0.985 + 0.015 * ease
+                        } else {
+                            let u = (1.0 - t).clamp(0.0, 1.0);
+                            let c1: f32 = 1.70158;
+                            let c3: f32 = c1 + 1.0;
+                            let x = u - 1.0;
+                            let ease_out_back = 1.0 + c3 * x.powi(3) + c1 * x.powi(2);
+                            let bump = (ease_out_back - u).max(0.0);
+                            1.0 + 0.03 * bump
+                        };
+                        let scaled_size = display_size * scale;
+                        egui::Rect::from_center_size(center, scaled_size)
+                    } else {
+                        image_rect
+                    };
+
+                    ui.painter().image(
+                        texture.id(),
+                        final_rect,
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        egui::Color32::WHITE,
+                    );
                 } else if let Some(ref error) = self.error_message {
                     ui.centered_and_justified(|ui| {
                         ui.label(egui::RichText::new(error).color(egui::Color32::RED).size(18.0));
                     });
                 } else {
                     ui.centered_and_justified(|ui| {
-                        ui.label(egui::RichText::new("Drag and drop an image or pass a file path as argument")
+                        ui.label(egui::RichText::new("Drag and drop an image/video or pass a file path as argument")
                             .color(egui::Color32::GRAY)
                             .size(16.0));
                     });
@@ -1259,7 +1711,7 @@ impl eframe::App for ImageViewer {
             if !i.raw.dropped_files.is_empty() {
                 if let Some(path) = i.raw.dropped_files[0].path.clone() {
                     // Layout will be applied via `image_changed`.
-                    self.load_image(&path);
+                    self.load_media(&path);
                 }
             }
         });
@@ -1382,16 +1834,15 @@ impl eframe::App for ImageViewer {
                     // don't restore the previous floating zoom/position; apply normal floating sizing.
                     self.saved_fullscreen_entry_index = None;
                     self.saved_floating_state = None;
-                    // Calculate the new size for the current image
-                    if let Some(ref img) = self.image {
-                        let (img_w_u, img_h_u) = img.display_dimensions();
-                        if img_w_u > 0 && img_h_u > 0 {
-                            let img_w = img_w_u as f32;
-                            let img_h = img_h_u as f32;
+                    // Calculate the new size for the current media
+                    if let Some((media_w_u, media_h_u)) = self.current_media_dimensions() {
+                        if media_w_u > 0 && media_h_u > 0 {
+                            let media_w = media_w_u as f32;
+                            let media_h = media_h_u as f32;
                             let monitor = self.monitor_size_points(ctx);
 
-                            let z = if img_h > monitor.y {
-                                (monitor.y / img_h).clamp(0.1, 50.0)
+                            let z = if media_h > monitor.y {
+                                (monitor.y / media_h).clamp(0.1, 50.0)
                             } else {
                                 1.0
                             };
@@ -1401,7 +1852,7 @@ impl eframe::App for ImageViewer {
                             self.offset = egui::Vec2::ZERO;
                             self.zoom_velocity = 0.0;
 
-                            let mut size = egui::Vec2::new(img_w * z, img_h * z);
+                            let mut size = egui::Vec2::new(media_w * z, media_h * z);
                             size.x = size.x.max(200.0);
                             size.y = size.y.max(150.0);
 
@@ -1454,11 +1905,14 @@ impl eframe::App for ImageViewer {
             self.request_minimize = false;
         }
 
-        // Draw image
+        // Draw image or video
         self.draw_image(ctx);
 
-        // Draw controls overlay
+        // Draw controls overlay (title bar)
         self.draw_controls(ctx);
+
+        // Draw video controls overlay (bottom bar) - only for videos
+        self.draw_video_controls(ctx);
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {

@@ -1,43 +1,56 @@
 //! Image loading and management module.
-//! Supports JPG, PNG, WEBP, and animated GIF files.
+//! Supports JPG, PNG, WEBP, animated GIF files, and video files.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use crate::video_player;
+
 /// Supported image extensions
-pub const SUPPORTED_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "gif", "bmp", "ico", "tiff", "tif"];
+pub const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "gif", "bmp", "ico", "tiff", "tif"];
 
 /// Check if a file is a supported image
 pub fn is_supported_image(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
-        .map(|ext| SUPPORTED_EXTENSIONS.contains(&ext.to_lowercase().as_str()))
+        .map(|ext| IMAGE_EXTENSIONS.contains(&ext.to_lowercase().as_str()))
         .unwrap_or(false)
 }
 
-/// Get all images in the same directory as the given path
-pub fn get_images_in_directory(path: &Path) -> Vec<PathBuf> {
+/// Check if a file is a supported media file (image or video)
+pub fn is_supported_media(path: &Path) -> bool {
+    is_supported_image(path) || video_player::is_supported_video(path)
+}
+
+/// Get all media files (images and videos) in the same directory as the given path
+pub fn get_media_in_directory(path: &Path) -> Vec<PathBuf> {
     let parent = match path.parent() {
         Some(p) => p,
         None => return vec![path.to_path_buf()],
     };
 
-    let mut images: Vec<PathBuf> = std::fs::read_dir(parent)
+    let mut media: Vec<PathBuf> = std::fs::read_dir(parent)
         .into_iter()
         .flatten()
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.path())
-        .filter(|p| p.is_file() && is_supported_image(p))
+        .filter(|p| p.is_file() && is_supported_media(p))
         .collect();
 
-    images.sort_by(|a, b| {
+    media.sort_by(|a, b| {
         natord::compare(
             a.file_name().unwrap_or_default().to_str().unwrap_or(""),
             b.file_name().unwrap_or_default().to_str().unwrap_or(""),
         )
     });
 
-    images
+    media
+}
+
+/// Legacy function name for backwards compatibility
+#[allow(dead_code)]
+pub fn get_images_in_directory(path: &Path) -> Vec<PathBuf> {
+    get_media_in_directory(path)
 }
 
 /// A single frame of an image (for animated GIFs)

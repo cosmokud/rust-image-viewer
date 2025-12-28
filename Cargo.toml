@@ -3,8 +3,16 @@ name = "rust-image-viewer"
 version = "1.0.0"
 edition = "2021"
 authors = ["Image Viewer"]
-description = "High-performance image viewer for Windows 11"
+description = "High-performance image and video viewer for Windows 11"
 license = "MIT"
+build = "build.rs"
+
+[features]
+default = []
+# Enable video support (requires FFmpeg installed on Windows)
+# Install via: vcpkg install ffmpeg:x64-windows
+# Then set VCPKG_ROOT environment variable
+video = ["dep:ffmpeg-next"]
 
 [dependencies]
 # GUI framework
@@ -18,9 +26,23 @@ image = { version = "0.25", features = ["jpeg", "png", "gif", "webp"] }
 # GIF animation support
 gif = "0.13"
 
+# Video playback (optional, requires FFmpeg)
+ffmpeg-next = { version = "7", optional = true }
+
+# Audio playback
+rodio = { version = "0.19", default-features = false, features = ["symphonia-all"] }
+
+# Cross-thread communication for video/audio sync
+crossbeam-channel = "0.5"
+
+# Parking lot for efficient synchronization
+parking_lot = "0.12"
+
 # Windows-specific
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = ["winuser", "dwmapi", "libloaderapi"] }
+
+[build-dependencies]
 
 [profile.release]
 opt-level = 3
