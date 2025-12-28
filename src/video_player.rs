@@ -328,10 +328,25 @@ impl VideoPlayer {
         self.is_playing
     }
 
+    /// Ensure the pipeline is at least in PAUSED state for frame preroll
+    /// This is needed when seeking while paused to get a frame to display
+    fn ensure_paused_state(&self) -> Result<(), String> {
+        let (_, current, _) = self.pipeline.state(gst::ClockTime::from_mseconds(0));
+        if current < gst::State::Paused {
+            self.pipeline
+                .set_state(gst::State::Paused)
+                .map_err(|e| format!("Failed to set paused state: {}", e))?;
+        }
+        Ok(())
+    }
+
     /// Seek to a position (0.0 to 1.0)
     /// Uses frame-accurate seeking for precise positioning
     pub fn seek(&mut self, position: f64) -> Result<(), String> {
         let position = position.clamp(0.0, 1.0);
+        
+        // Ensure we're at least in PAUSED state to get preroll frames
+        let _ = self.ensure_paused_state();
         
         if let Some(duration) = self.duration {
             let seek_pos = Duration::from_secs_f64(duration.as_secs_f64() * position);
