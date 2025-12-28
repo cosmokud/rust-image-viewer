@@ -40,6 +40,8 @@ pub enum Action {
     Pan,
     Minimize,
     Close,
+    VideoPlayPause,
+    VideoMute,
 }
 
 impl Action {
@@ -57,6 +59,8 @@ impl Action {
             "pan" => Some(Action::Pan),
             "minimize" => Some(Action::Minimize),
             "close" => Some(Action::Close),
+            "video_play_pause" | "play_pause" | "playpause" => Some(Action::VideoPlayPause),
+            "video_mute" | "mute" | "toggle_mute" => Some(Action::VideoMute),
             _ => None,
         }
     }
@@ -75,6 +79,8 @@ impl Action {
             Action::Pan => "pan",
             Action::Minimize => "minimize",
             Action::Close => "close",
+            Action::VideoPlayPause => "video_play_pause",
+            Action::VideoMute => "video_mute",
         }
     }
 }
@@ -206,6 +212,14 @@ pub struct Config {
     pub zoom_animation_speed: f32,
     /// Zoom step per scroll wheel notch (1.05 = 5% per step, 1.25 = 25% per step)
     pub zoom_step: f32,
+    /// Whether videos start muted by default
+    pub video_muted_by_default: bool,
+    /// Default video volume (0.0 to 1.0)
+    pub video_default_volume: f64,
+    /// Whether videos loop by default
+    pub video_loop: bool,
+    /// Auto-hide delay for video controls bar (in seconds)
+    pub video_controls_hide_delay: f32,
 }
 
 impl Default for Config {
@@ -219,6 +233,10 @@ impl Default for Config {
             fullscreen_reset_fit_on_enter: true,
             zoom_animation_speed: 20.0,
             zoom_step: 1.02,
+            video_muted_by_default: true,
+            video_default_volume: 0.5,
+            video_loop: true,
+            video_controls_hide_delay: 2.0,
         };
         config.set_defaults();
         config
@@ -253,6 +271,10 @@ impl Config {
 
         // Pan
         self.add_binding(InputBinding::MouseLeft, Action::Pan);
+
+        // Video controls
+        self.add_binding(InputBinding::Key(egui::Key::Space), Action::VideoPlayPause);
+        self.add_binding(InputBinding::Key(egui::Key::M), Action::VideoMute);
     }
 
     /// Add a binding
@@ -315,10 +337,15 @@ impl Config {
             fullscreen_reset_fit_on_enter: true,
             zoom_animation_speed: 8.0,
             zoom_step: 1.08,
+            video_muted_by_default: true,
+            video_default_volume: 0.5,
+            video_loop: true,
+            video_controls_hide_delay: 2.0,
         };
 
         let mut in_shortcuts_section = false;
         let mut in_settings_section = false;
+        let mut in_video_section = false;
 
         for line in content.lines() {
             let line = line.trim();
@@ -333,6 +360,7 @@ impl Config {
                 let section = &line[1..line.len() - 1];
                 in_shortcuts_section = section.eq_ignore_ascii_case("shortcuts");
                 in_settings_section = section.eq_ignore_ascii_case("settings");
+                in_video_section = section.eq_ignore_ascii_case("video");
                 continue;
             }
 
@@ -411,6 +439,38 @@ impl Config {
                     }
                 }
             }
+
+            // Parse key=value pairs in video section
+            if in_video_section {
+                if let Some((key, value)) = line.split_once('=') {
+                    let key = key.trim().to_lowercase();
+                    let value = value.trim();
+                    
+                    match key.as_str() {
+                        "muted_by_default" | "muted" => {
+                            if let Some(v) = parse_bool(value) {
+                                config.video_muted_by_default = v;
+                            }
+                        }
+                        "default_volume" | "volume" => {
+                            if let Ok(v) = value.parse::<f64>() {
+                                config.video_default_volume = v.clamp(0.0, 1.0);
+                            }
+                        }
+                        "loop" => {
+                            if let Some(v) = parse_bool(value) {
+                                config.video_loop = v;
+                            }
+                        }
+                        "controls_hide_delay" => {
+                            if let Ok(v) = value.parse::<f32>() {
+                                config.video_controls_hide_delay = v.max(0.5);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
         }
 
         // Fill in defaults for any missing actions
@@ -461,6 +521,23 @@ impl Config {
         content.push_str("; Zoom step per scroll wheel notch (1.05 = 5%, 1.10 = 10%, 1.25 = 25%)\n");
         content.push_str(&format!("zoom_step = {}\n\n", self.zoom_step));
         
+        // Write video section
+        content.push_str("[Video]\n");
+        content.push_str("; Whether videos start muted by default\n");
+        content.push_str(&format!(
+            "muted_by_default = {}\n",
+            if self.video_muted_by_default { "true" } else { "false" }
+        ));
+        content.push_str("; Default volume level (0.0 to 1.0)\n");
+        content.push_str(&format!("default_volume = {}\n", self.video_default_volume));
+        content.push_str("; Whether videos loop by default\n");
+        content.push_str(&format!(
+            "loop = {}\n",
+            if self.video_loop { "true" } else { "false" }
+        ));
+        content.push_str("; How long the video controls bar stays visible (in seconds)\n");
+        content.push_str(&format!("controls_hide_delay = {}\n\n", self.video_controls_hide_delay));
+
         content.push_str("[Shortcuts]\n");
 
         // Group bindings by action

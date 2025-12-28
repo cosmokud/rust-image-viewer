@@ -1,26 +1,30 @@
-# Rust Image Viewer
+# Rust Image & Video Viewer
 
-A high-performance, minimal image viewer for Windows 11 built with Rust and egui.
+A high-performance, minimal image and video viewer for Windows 11 built with Rust, egui, and GStreamer.
 
 ## Features
 
 ### UI
 
 - **Borderless floating window** - No title bar by default for a clean, minimal look
-- **Smart sizing** - Opens images at 100% zoom, or fits to screen if larger
-- **Floating mode** - Drag the image anywhere on screen
+- **Smart sizing** - Opens images/videos at 100% zoom, or fits to screen if larger
+- **Floating mode** - Drag the media anywhere on screen
 - **Fullscreen mode** - Immersive viewing experience
 - **Auto-hide controls** - Window controls appear when hovering near the top
+- **Video controls bar** - Auto-hide playback controls at the bottom for videos
 
 ### Functionality
 
-- **Smooth zoom** - Mouse scroll wheel with cursor-follow zoom
-- **Free panning** - Hold left mouse button to drag the image
+- **Smooth zoom** - Mouse scroll wheel with cursor-follow zoom (works for both images and videos)
+- **Free panning** - Hold left mouse button to drag the media
 - **Quick reset** - Double-click to reset zoom to 100%
-- **Easy navigation** - Right-click on edges to go to next/previous image
+- **Easy navigation** - Right-click on edges to go to next/previous media
 - **Animation support** - Plays animated GIFs smoothly
+- **Video playback** - Full video playback with seek, volume control, and mute
 
 ### Supported Formats
+
+#### Images
 
 - JPEG (.jpg, .jpeg)
 - PNG (.png)
@@ -30,7 +34,36 @@ A high-performance, minimal image viewer for Windows 11 built with Rust and egui
 - ICO (.ico)
 - TIFF (.tiff, .tif)
 
+#### Videos
+
+- MP4 (.mp4)
+- MKV (.mkv)
+- WebM (.webm)
+- AVI (.avi)
+- MOV (.mov)
+- WMV (.wmv)
+- FLV (.flv)
+- M4V (.m4v)
+- 3GP (.3gp)
+- OGV (.ogv)
+
 ## Installation
+
+### Prerequisites for Video Support
+
+To build with video support, you need GStreamer installed:
+
+1. **Download GStreamer** from https://gstreamer.freedesktop.org/download/
+2. Install both the **runtime** and **development** packages for MSVC (MinGW versions won't work with Rust MSVC toolchain)
+3. Set environment variables:
+
+   ```powershell
+   # Add GStreamer bin to PATH
+   $env:PATH = "C:\gstreamer\1.0\msvc_x86_64\bin;$env:PATH"
+
+   # Set PKG_CONFIG_PATH for the build
+   $env:PKG_CONFIG_PATH = "C:\Program Files\gstreamer\1.0\msvc_x86_64\lib\pkgconfig"
+   ```
 
 ### From Source
 
@@ -43,17 +76,19 @@ cd rust-image-viewer
 cargo build --release
 
 # The executable will be at target/release/image-viewer.exe
+# config.ini will be automatically copied to the target directory
 ```
 
 ## Usage
 
-### Opening an Image
+### Opening Media
 
 ```bash
 # From command line
 image-viewer.exe path/to/image.jpg
+image-viewer.exe path/to/video.mp4
 
-# Or drag and drop an image onto the window
+# Or drag and drop an image/video onto the window
 ```
 
 ### Default Shortcuts
@@ -61,27 +96,44 @@ image-viewer.exe path/to/image.jpg
 | Action                   | Shortcut                              |
 | ------------------------ | ------------------------------------- |
 | Toggle Fullscreen        | `F`, `F12`, or Middle Click           |
-| Next Image               | Right Arrow or Right-click right side |
-| Previous Image           | Left Arrow or Right-click left side   |
-| Rotate Clockwise         | Up Arrow                              |
-| Rotate Counter-clockwise | Down Arrow                            |
+| Next Media               | Right Arrow or Right-click right side |
+| Previous Media           | Left Arrow or Right-click left side   |
+| Rotate Clockwise         | Up Arrow (images only)                |
+| Rotate Counter-clockwise | Down Arrow (images only)              |
 | Zoom In                  | Scroll Up                             |
 | Zoom Out                 | Scroll Down                           |
 | Reset Zoom               | Double-click                          |
-| Pan Image                | Hold Left Mouse Button                |
+| Pan Media                | Hold Left Mouse Button                |
+| **Video Play/Pause**     | **Space** or **Right-click center**   |
+| **Video Mute**           | **M**                                 |
 | Exit                     | `Esc` or `Ctrl+W`                     |
 
 ## Configuration
 
-The viewer creates a `config.ini` file next to the executable on first run. You can customize all shortcuts:
+The viewer creates a `config.ini` file next to the executable on first run. You can customize all shortcuts and settings:
 
 ```ini
-[Shortcuts]
+[Settings]
+controls_hide_delay = 0.5
+resize_border_size = 6
+zoom_animation_speed = 20
+zoom_step = 1.02
 
+[Video]
+; Videos start muted by default
+muted_by_default = true
+; Default volume (0.0 to 1.0)
+default_volume = 0.5
+; Loop videos automatically
+loop = true
+; How long video controls stay visible
+controls_hide_delay = 2.0
+
+[Shortcuts]
 ; Toggle fullscreen mode
 toggle_fullscreen = mouse_middle, f, f12
 
-; Navigate between images
+; Navigate between media
 next_image = right
 previous_image = left
 
@@ -93,10 +145,14 @@ rotate_counterclockwise = down
 zoom_in = scroll_up
 zoom_out = scroll_down
 
+; Video controls
+video_play_pause = space
+video_mute = m
+
 ; Exit application
 exit = ctrl+w, escape
 
-; Pan image
+; Pan media
 pan = mouse_left
 ```
 
