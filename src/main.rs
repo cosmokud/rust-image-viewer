@@ -81,6 +81,8 @@ struct ImageViewer {
     last_requested_inner_size: Option<egui::Vec2>,
     /// Saved floating state before entering fullscreen (zoom, zoom_target, offset, window_size, window_pos)
     saved_floating_state: Option<(f32, f32, egui::Vec2, egui::Vec2, egui::Pos2)>,
+    /// Image index at the moment we entered fullscreen (used to detect next/prev navigation)
+    saved_fullscreen_entry_index: Option<usize>,
     /// Fullscreen transition animation progress (0.0 = floating, 1.0 = fullscreen)
     fullscreen_transition: f32,
     /// Fullscreen transition target (0.0 or 1.0)
@@ -116,6 +118,7 @@ impl Default for ImageViewer {
             floating_max_inner_size: None,
             last_requested_inner_size: None,
             saved_floating_state: None,
+            saved_fullscreen_entry_index: None,
             fullscreen_transition: 0.0,
             fullscreen_transition_target: 0.0,
         }
@@ -123,6 +126,45 @@ impl Default for ImageViewer {
 }
 
 impl ImageViewer {
+    fn apply_floating_layout_exit_fullscreen_current_image(&mut self, ctx: &egui::Context) {
+        self.offset = egui::Vec2::ZERO;
+        self.zoom_velocity = 0.0;
+
+        let Some(ref img) = self.image else {
+            return;
+        };
+
+        let (img_w_u, img_h_u) = img.display_dimensions();
+        if img_w_u == 0 || img_h_u == 0 {
+            return;
+        }
+
+        let img_w = img_w_u as f32;
+        let img_h = img_h_u as f32;
+        let monitor = self.monitor_size_points(ctx);
+
+        // Normal floating behavior for this fullscreen-exit case:
+        // - Prefer 100% image size
+        // - If the image is taller than the screen, fit vertically to consume the full screen height
+        let z = if img_h > monitor.y {
+            (monitor.y / img_h).clamp(0.1, 50.0)
+        } else {
+            1.0
+        };
+
+        self.zoom = z;
+        self.zoom_target = z;
+
+        let mut size = egui::Vec2::new(img_w * z, img_h * z);
+        size.x = size.x.max(200.0);
+        size.y = size.y.max(150.0);
+
+        self.floating_max_inner_size = Some(size);
+        self.last_requested_inner_size = Some(size);
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+        self.center_window_on_monitor(ctx, size);
+    }
+
     fn run_action(&mut self, action: Action) {
         match action {
             Action::Exit => self.should_exit = true,
@@ -1225,6 +1267,7 @@ impl eframe::App for ImageViewer {
                     .map(|r| r.min)
                     .unwrap_or(egui::Pos2::ZERO);
                 self.saved_floating_state = Some((self.zoom, self.zoom_target, self.offset, inner_size, outer_pos));
+                self.saved_fullscreen_entry_index = Some(self.current_index);
 
                 // Start transition animation
                 self.fullscreen_transition_target = 1.0;
@@ -1242,8 +1285,19 @@ impl eframe::App for ImageViewer {
                 // Start transition animation
                 self.fullscreen_transition_target = 0.0;
 
+                let image_changed_while_fullscreen = self
+                    .saved_fullscreen_entry_index
+                    .is_some_and(|idx| idx != self.current_index);
+
                 // Restore previous floating state if available
-                if let Some((saved_zoom, saved_zoom_target, saved_offset, saved_size, saved_pos)) = self.saved_floating_state.take() {
+                if !image_changed_while_fullscreen {
+                    self.saved_fullscreen_entry_index = None;
+                }
+
+                if !image_changed_while_fullscreen {
+                    if let Some((saved_zoom, saved_zoom_target, saved_offset, saved_size, saved_pos)) =
+                        self.saved_floating_state.take()
+                    {
                     self.zoom = saved_zoom;
                     self.zoom_target = saved_zoom_target;
                     self.offset = saved_offset;
@@ -1251,7 +1305,7 @@ impl eframe::App for ImageViewer {
                     self.last_requested_inner_size = Some(saved_size);
                     ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(saved_size));
                     ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(saved_pos));
-                } else {
+                    } else {
                     // Fallback: reset to centered at 100% and resize to 100% image size (capped by fit-to-screen)
                     self.offset = egui::Vec2::ZERO;
                     self.zoom = 1.0;
@@ -1272,6 +1326,13 @@ impl eframe::App for ImageViewer {
                         self.last_requested_inner_size = Some(desired);
                         self.center_window_on_monitor(ctx, desired);
                     }
+                    }
+                } else {
+                    // If the user navigated to a different image while fullscreen,
+                    // don't restore the previous floating zoom/position; apply normal floating sizing.
+                    self.saved_fullscreen_entry_index = None;
+                    self.saved_floating_state = None;
+                    self.apply_floating_layout_exit_fullscreen_current_image(ctx);
                 }
             }
             self.toggle_fullscreen = false;
