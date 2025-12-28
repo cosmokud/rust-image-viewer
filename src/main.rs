@@ -8,7 +8,7 @@ mod image_loader;
 mod video_player;
 
 use config::{Action, Config, InputBinding};
-use image_loader::{get_images_in_directory, get_media_type, is_supported_video, LoadedImage, MediaType};
+use image_loader::{get_images_in_directory, get_media_type, LoadedImage, MediaType};
 use video_player::{format_duration, VideoPlayer};
 
 use eframe::egui;
@@ -65,6 +65,9 @@ struct ImageViewer {
     error_message: Option<String>,
     /// Whether we should apply post-load layout logic next frame
     image_changed: bool,
+    /// For videos, dimensions may be unknown until the first decoded frame.
+    /// When true, we retry applying the appropriate layout once dimensions become available.
+    pending_media_layout: bool,
     /// Screen size
     screen_size: egui::Vec2,
     /// Request to exit
@@ -132,6 +135,7 @@ impl Default for ImageViewer {
             controls_show_time: Instant::now(),
             error_message: None,
             image_changed: false,
+            pending_media_layout: false,
             screen_size: egui::Vec2::new(1920.0, 1080.0),
             should_exit: false,
             toggle_fullscreen: false,
@@ -304,6 +308,13 @@ impl ImageViewer {
         self.texture = None;
         self.show_video_controls = false;
 
+        // Reset view state so we don't carry zoom/offset across media switches.
+        self.offset = egui::Vec2::ZERO;
+        self.zoom_velocity = 0.0;
+        self.zoom = 1.0;
+        self.zoom_target = 1.0;
+        self.pending_media_layout = false;
+
         // Get media in directory
         self.image_list = get_images_in_directory(path);
         self.current_index = self.image_list.iter().position(|p| p == path).unwrap_or(0);
@@ -328,6 +339,8 @@ impl ImageViewer {
                         }
                         self.video_player = Some(player);
                         self.image_changed = true;
+                        // Video dimensions may not be known until the first decoded frame.
+                        self.pending_media_layout = true;
                         self.error_message = None;
                         self.show_video_controls = true;
                         self.video_controls_show_time = Instant::now();
@@ -344,6 +357,7 @@ impl ImageViewer {
                         self.image = Some(img);
                         self.texture_frame = usize::MAX;
                         self.image_changed = true;
+                        self.pending_media_layout = false;
                         self.error_message = None;
                     }
                     Err(e) => {
@@ -435,11 +449,18 @@ impl ImageViewer {
 
             let monitor = self.monitor_size_points(ctx);
 
-            // Determine if media needs to be scaled down to fit the screen.
-            // If media is taller than screen, fit vertically (100% screen height).
-            // If media is wider than screen, fit horizontally.
-            // Otherwise, use 100% zoom.
-            let fit_zoom = if img_h > monitor.y || img_w > monitor.x {
+            // Floating mode sizing:
+            // - Images: keep the existing fit-to-screen behavior (fit by min(width,height) if needed).
+            // - Videos (per spec): fit vertically ONLY if the video is taller than the screen;
+            //   otherwise show at 100% size and center.
+            let is_video = matches!(self.current_media_type, Some(MediaType::Video));
+            let fit_zoom = if is_video {
+                if img_h > monitor.y {
+                    (monitor.y / img_h).clamp(0.1, 50.0)
+                } else {
+                    1.0
+                }
+            } else if img_h > monitor.y || img_w > monitor.x {
                 // Scale to fit: use the smaller scale factor to ensure it fits.
                 (monitor.y / img_h).min(monitor.x / img_w).min(1.0)
             } else {
@@ -687,6 +708,12 @@ impl ImageViewer {
             if player.is_playing() {
                 ctx.request_repaint();
             }
+        }
+
+        // If we are waiting on video dimensions (e.g. right after switching videos),
+        // force a repaint so we get to the first decoded frame ASAP.
+        if self.pending_media_layout {
+            ctx.request_repaint();
         }
     }
 
@@ -1553,7 +1580,14 @@ impl ImageViewer {
                     let monitor = self.monitor_size_points(ctx);
 
                     // Determine if media needs to be scaled down to fit the screen.
-                    let fit_zoom = if img_h > monitor.y || img_w > monitor.x {
+                    let is_video = matches!(self.current_media_type, Some(MediaType::Video));
+                    let fit_zoom = if is_video {
+                        if img_h > monitor.y {
+                            (monitor.y / img_h).clamp(0.1, 50.0)
+                        } else {
+                            1.0
+                        }
+                    } else if img_h > monitor.y || img_w > monitor.x {
                         (monitor.y / img_h).min(monitor.x / img_w).min(1.0)
                     } else {
                         1.0
@@ -1710,6 +1744,19 @@ impl eframe::App for ImageViewer {
         // Update texture for current frame (after any image loads)
         self.update_texture(ctx);
 
+        // For videos, the first frame (and therefore dimensions) may arrive after the initial load.
+        // Retry layout once we have dimensions so next/prev video switches obey the sizing rules.
+        if self.pending_media_layout {
+            if self.media_display_dimensions().is_some() {
+                if self.is_fullscreen {
+                    self.apply_fullscreen_layout_for_current_image(ctx);
+                } else {
+                    self.apply_floating_layout_for_current_image(ctx);
+                }
+                self.pending_media_layout = false;
+            }
+        }
+
         // Process viewport commands
         if self.should_exit {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -1799,14 +1846,23 @@ impl eframe::App for ImageViewer {
                     self.saved_fullscreen_entry_index = None;
                     self.saved_floating_state = None;
                     // Calculate the new size for the current image
-                    if let Some(ref img) = self.image {
-                        let (img_w_u, img_h_u) = img.display_dimensions();
+                    if let Some((img_w_u, img_h_u)) = self.media_display_dimensions() {
                         if img_w_u > 0 && img_h_u > 0 {
                             let img_w = img_w_u as f32;
                             let img_h = img_h_u as f32;
                             let monitor = self.monitor_size_points(ctx);
 
-                            let z = if img_h > monitor.y {
+                            // Floating sizing when leaving fullscreen after navigation:
+                            // - Videos: fit vertically only if taller than the screen, else 100%.
+                            // - Images: keep existing behavior for this branch (fit vertically if taller).
+                            let is_video = matches!(self.current_media_type, Some(MediaType::Video));
+                            let z = if is_video {
+                                if img_h > monitor.y {
+                                    (monitor.y / img_h).clamp(0.1, 50.0)
+                                } else {
+                                    1.0
+                                }
+                            } else if img_h > monitor.y {
                                 (monitor.y / img_h).clamp(0.1, 50.0)
                             } else {
                                 1.0
@@ -1823,13 +1879,17 @@ impl eframe::App for ImageViewer {
 
                             self.floating_max_inner_size = Some(size);
                             self.last_requested_inner_size = Some(size);
-                            
+
                             let x = (monitor.x - size.x) * 0.5;
                             let y = (monitor.y - size.y) * 0.5;
                             let pos = egui::pos2(x.max(0.0), y.max(0.0));
                             // Delay window resize by 2 frames to prevent flash
                             self.pending_window_resize = Some((size, pos, 2));
                         }
+                    } else {
+                        // If we don't have dimensions yet (possible for videos right after switching),
+                        // schedule a retry once dimensions become available.
+                        self.pending_media_layout = matches!(self.current_media_type, Some(MediaType::Video));
                     }
                 }
             }
