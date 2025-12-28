@@ -1467,68 +1467,29 @@ impl ImageViewer {
         let media_h = media_h_u as f32;
         let aspect = media_w / media_h;
 
-        // IMPORTANT: egui pointer positions/deltas are expressed in *window-local* coordinates.
-        // When resizing from top/left edges, we move the window, which can make the local
-        // pointer position appear to jump even if the OS cursor hasn't moved.
-        // To avoid jitter/shaking, compute the cursor position in *global* (screen) coordinates
-        // by adding current window outer position + current local pointer position.
-        let pointer_local = ctx
-            .input(|i| i.pointer.hover_pos())
-            .or(self.last_mouse_pos);
-        let Some(pointer_local) = pointer_local else {
-            return;
-        };
-        self.last_mouse_pos = Some(pointer_local);
+        // Accumulate pointer delta each frame. This is stable because pointer.delta() is
+        // reported in screen-space and doesn't jump when the window moves.
+        let frame_delta = ctx.input(|i| i.pointer.delta());
+        self.resize_accumulated_delta += frame_delta;
 
-        let outer_pos_now = ctx
-            .input(|i| i.raw.viewport().outer_rect)
-            .map(|r| r.min)
-            .unwrap_or(egui::Pos2::ZERO);
-        let cursor_global = egui::pos2(
-            outer_pos_now.x + pointer_local.x,
-            outer_pos_now.y + pointer_local.y,
-        );
-
-        // On first call (resize just started), capture initial window state and the
-        // cursor-to-border offset so the grabbed edge/corner stays "attached".
-        let (start_outer_pos, start_inner_size, grab_offset) = match (
+        // On first call (resize just started), capture initial window state.
+        let (start_outer_pos, start_inner_size) = match (
             self.resize_start_outer_pos,
             self.resize_start_inner_size,
-            self.resize_grab_offset,
         ) {
-            (Some(p), Some(s), Some(o)) => (p, s, o),
+            (Some(p), Some(s)) => (p, s),
             _ => {
-                let outer_pos = outer_pos_now;
+                let outer_pos = ctx
+                    .input(|i| i.raw.viewport().outer_rect)
+                    .map(|r| r.min)
+                    .unwrap_or(egui::Pos2::ZERO);
                 let inner_size = ctx
                     .input(|i| i.raw.viewport().inner_rect)
                     .map(|r| r.size())
                     .unwrap_or_else(|| ctx.screen_rect().size());
 
-                let left0 = outer_pos.x;
-                let top0 = outer_pos.y;
-                let right0 = left0 + inner_size.x;
-                let bottom0 = top0 + inner_size.y;
-
-                let offset = match direction {
-                    ResizeDirection::Left => egui::vec2(cursor_global.x - left0, 0.0),
-                    ResizeDirection::Right => egui::vec2(cursor_global.x - right0, 0.0),
-                    ResizeDirection::Top => egui::vec2(0.0, cursor_global.y - top0),
-                    ResizeDirection::Bottom => egui::vec2(0.0, cursor_global.y - bottom0),
-                    ResizeDirection::TopLeft => egui::vec2(cursor_global.x - left0, cursor_global.y - top0),
-                    ResizeDirection::TopRight => egui::vec2(cursor_global.x - right0, cursor_global.y - top0),
-                    ResizeDirection::BottomLeft => {
-                        egui::vec2(cursor_global.x - left0, cursor_global.y - bottom0)
-                    }
-                    ResizeDirection::BottomRight => {
-                        egui::vec2(cursor_global.x - right0, cursor_global.y - bottom0)
-                    }
-                    ResizeDirection::None => egui::Vec2::ZERO,
-                };
-
                 self.resize_start_outer_pos = Some(outer_pos);
                 self.resize_start_inner_size = Some(inner_size);
-                self.resize_start_cursor_global = Some(cursor_global);
-                self.resize_grab_offset = Some(offset);
                 self.resize_accumulated_delta = egui::Vec2::ZERO;
                 self.resize_last_size = None;
                 return;
@@ -1537,24 +1498,23 @@ impl ImageViewer {
 
         let clamp_min_w: f32 = 200.0;
         let clamp_min_h: f32 = 150.0;
-        // Manual resizing should not be capped to the initial 100%/fit-to-screen size.
-        // Keep a practical upper bound to avoid pathological values.
         let max_size = egui::Vec2::new(16000.0, 16000.0);
 
-        // Compute anchored edges based on resize direction
-        let right_edge = start_outer_pos.x + start_inner_size.x;
-        let bottom_edge = start_outer_pos.y + start_inner_size.y;
+        // Use rounded anchor edges from the start state.
+        let start_left = start_outer_pos.x.round();
+        let start_top = start_outer_pos.y.round();
+        let start_right = (start_outer_pos.x + start_inner_size.x).round();
+        let start_bottom = (start_outer_pos.y + start_inner_size.y).round();
+        let start_w = start_right - start_left;
+        let start_h = start_bottom - start_top;
 
-        // Compute the desired border/corner position in global coordinates.
-        // By subtracting the grab offset captured at resize start, we keep the cursor
-        // "attached" to the grabbed border region.
-        let target_global = egui::pos2(cursor_global.x - grab_offset.x, cursor_global.y - grab_offset.y);
+        let delta = self.resize_accumulated_delta;
 
         // Helper to compute new size from width, maintaining aspect ratio
         let size_from_width = |w: f32| -> (f32, f32) {
             let w = w.clamp(clamp_min_w, max_size.x);
             let h = (w / aspect).clamp(clamp_min_h, max_size.y);
-            let w = h * aspect; // Recalculate to respect height constraint
+            let w = h * aspect;
             (w.round(), h.round())
         };
 
@@ -1562,84 +1522,86 @@ impl ImageViewer {
         let size_from_height = |h: f32| -> (f32, f32) {
             let h = h.clamp(clamp_min_h, max_size.y);
             let w = (h * aspect).clamp(clamp_min_w, max_size.x);
-            let h = w / aspect; // Recalculate to respect width constraint
+            let h = w / aspect;
             (w.round(), h.round())
         };
 
-        let (new_w, new_h, new_x, new_y) = match direction {
+        // Compute new size based on direction and accumulated delta.
+        // For right/bottom/bottom-right (stable edges), delta adds to size.
+        // For left/top edges, delta subtracts from size (moving left = smaller delta.x but bigger width).
+        let (new_w, new_h) = match direction {
             ResizeDirection::Right => {
-                // Right edge moves, left edge anchored
-                let desired_w = (target_global.x - start_outer_pos.x).max(1.0);
-                let (w, h) = size_from_width(desired_w);
-                (w, h, start_outer_pos.x, start_outer_pos.y)
-            }
-            ResizeDirection::Left => {
-                // Left edge moves, right edge anchored
-                let desired_w = (right_edge - target_global.x).max(1.0);
-                let (w, h) = size_from_width(desired_w);
-                (w, h, right_edge - w, start_outer_pos.y)
+                let desired_w = start_w + delta.x;
+                size_from_width(desired_w)
             }
             ResizeDirection::Bottom => {
-                // Bottom edge moves, top edge anchored
-                let desired_h = (target_global.y - start_outer_pos.y).max(1.0);
-                let (w, h) = size_from_height(desired_h);
-                (w, h, start_outer_pos.x, start_outer_pos.y)
-            }
-            ResizeDirection::Top => {
-                // Top edge moves, bottom edge anchored
-                let desired_h = (bottom_edge - target_global.y).max(1.0);
-                let (w, h) = size_from_height(desired_h);
-                (w, h, start_outer_pos.x, bottom_edge - h)
+                let desired_h = start_h + delta.y;
+                size_from_height(desired_h)
             }
             ResizeDirection::BottomRight => {
-                // Bottom-right corner moves, top-left anchored - use larger delta
-                let dx = (target_global.x - start_outer_pos.x).max(1.0);
-                let dy = (target_global.y - start_outer_pos.y).max(1.0);
+                let dx = start_w + delta.x;
+                let dy = start_h + delta.y;
                 let (w1, h1) = size_from_width(dx);
                 let (w2, h2) = size_from_height(dy);
                 let e1 = (w1 - dx).powi(2) + (h1 - dy).powi(2);
                 let e2 = (w2 - dx).powi(2) + (h2 - dy).powi(2);
-                let (w, h) = if e1 <= e2 { (w1, h1) } else { (w2, h2) };
-                (w, h, start_outer_pos.x, start_outer_pos.y)
+                if e1 <= e2 { (w1, h1) } else { (w2, h2) }
             }
-            ResizeDirection::BottomLeft => {
-                // Bottom-left corner moves, top-right anchored
-                let dx = (right_edge - target_global.x).max(1.0);
-                let dy = (target_global.y - start_outer_pos.y).max(1.0);
-                let (w1, h1) = size_from_width(dx);
-                let (w2, h2) = size_from_height(dy);
-                let e1 = (w1 - dx).powi(2) + (h1 - dy).powi(2);
-                let e2 = (w2 - dx).powi(2) + (h2 - dy).powi(2);
-                let (w, h) = if e1 <= e2 { (w1, h1) } else { (w2, h2) };
-                (w, h, right_edge - w, start_outer_pos.y)
+            ResizeDirection::Left => {
+                // Moving left (negative delta.x) increases width
+                let desired_w = start_w - delta.x;
+                size_from_width(desired_w)
             }
-            ResizeDirection::TopRight => {
-                // Top-right corner moves, bottom-left anchored
-                let dx = (target_global.x - start_outer_pos.x).max(1.0);
-                let dy = (bottom_edge - target_global.y).max(1.0);
-                let (w1, h1) = size_from_width(dx);
-                let (w2, h2) = size_from_height(dy);
-                let e1 = (w1 - dx).powi(2) + (h1 - dy).powi(2);
-                let e2 = (w2 - dx).powi(2) + (h2 - dy).powi(2);
-                let (w, h) = if e1 <= e2 { (w1, h1) } else { (w2, h2) };
-                (w, h, start_outer_pos.x, bottom_edge - h)
+            ResizeDirection::Top => {
+                // Moving up (negative delta.y) increases height
+                let desired_h = start_h - delta.y;
+                size_from_height(desired_h)
             }
             ResizeDirection::TopLeft => {
-                // Top-left corner moves, bottom-right anchored
-                let dx = (right_edge - target_global.x).max(1.0);
-                let dy = (bottom_edge - target_global.y).max(1.0);
+                let dx = start_w - delta.x;
+                let dy = start_h - delta.y;
                 let (w1, h1) = size_from_width(dx);
                 let (w2, h2) = size_from_height(dy);
                 let e1 = (w1 - dx).powi(2) + (h1 - dy).powi(2);
                 let e2 = (w2 - dx).powi(2) + (h2 - dy).powi(2);
-                let (w, h) = if e1 <= e2 { (w1, h1) } else { (w2, h2) };
-                (w, h, right_edge - w, bottom_edge - h)
+                if e1 <= e2 { (w1, h1) } else { (w2, h2) }
+            }
+            ResizeDirection::TopRight => {
+                let dx = start_w + delta.x;
+                let dy = start_h - delta.y;
+                let (w1, h1) = size_from_width(dx);
+                let (w2, h2) = size_from_height(dy);
+                let e1 = (w1 - dx).powi(2) + (h1 - dy).powi(2);
+                let e2 = (w2 - dx).powi(2) + (h2 - dy).powi(2);
+                if e1 <= e2 { (w1, h1) } else { (w2, h2) }
+            }
+            ResizeDirection::BottomLeft => {
+                let dx = start_w - delta.x;
+                let dy = start_h + delta.y;
+                let (w1, h1) = size_from_width(dx);
+                let (w2, h2) = size_from_height(dy);
+                let e1 = (w1 - dx).powi(2) + (h1 - dy).powi(2);
+                let e2 = (w2 - dx).powi(2) + (h2 - dy).powi(2);
+                if e1 <= e2 { (w1, h1) } else { (w2, h2) }
             }
             ResizeDirection::None => return,
         };
 
+        // Compute new position: anchor the opposite edge/corner.
+        let (new_x, new_y) = match direction {
+            ResizeDirection::Right | ResizeDirection::Bottom | ResizeDirection::BottomRight => {
+                (start_left, start_top)
+            }
+            ResizeDirection::Left => (start_right - new_w, start_top),
+            ResizeDirection::Top => (start_left, start_bottom - new_h),
+            ResizeDirection::TopLeft => (start_right - new_w, start_bottom - new_h),
+            ResizeDirection::TopRight => (start_left, start_bottom - new_h),
+            ResizeDirection::BottomLeft => (start_right - new_w, start_top),
+            ResizeDirection::None => return,
+        };
+
         let new_size = egui::Vec2::new(new_w, new_h);
-        let new_pos = egui::pos2(new_x.round(), new_y.round());
+        let new_pos = egui::pos2(new_x, new_y);
 
         // Update zoom based on new window size
         let new_zoom = (new_h / media_h).clamp(0.1, 50.0);
@@ -1651,10 +1613,18 @@ impl ImageViewer {
         // Store the commanded size for stable content rendering
         self.resize_last_size = Some(new_size);
 
-        // Apply size first for directions where position depends on size
-        // This ordering can help reduce flicker
-        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(new_size));
-        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(new_pos));
+        // Send viewport commands: position first (if needed), then size.
+        // For edges that don't move position, only send size.
+        match direction {
+            ResizeDirection::Right | ResizeDirection::Bottom | ResizeDirection::BottomRight => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(new_size));
+            }
+            _ => {
+                // For edges/corners that require position change, send position first.
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(new_pos));
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(new_size));
+            }
+        }
         self.last_requested_inner_size = Some(new_size);
     }
 
