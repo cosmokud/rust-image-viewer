@@ -290,11 +290,20 @@ impl ImageViewer {
         // x'' = -omega^2 * (x - target) - 2 * omega * x'
         //
         // Higher omega = faster response (snappier)
-        // We use omega based on user's speed setting, scaled for snappiness
+        // speed=0 means instant snap, speed=1-10 provides smooth animation
 
-        let speed = self.config.zoom_animation_speed.max(0.1);
-        // Scale omega for snappy feel: speed=2 gives omega~25 (very fast)
-        let omega = speed * 12.0;
+        let speed = self.config.zoom_animation_speed;
+
+        // Speed 0 = instant snap
+        if speed <= 0.0 {
+            self.zoom = self.zoom_target;
+            self.zoom_velocity = 0.0;
+            return;
+        }
+
+        // Scale omega: speed=5 gives omega~10 (smooth), speed=10 gives omega~20 (snappy)
+        // Lower values = slower/smoother animation
+        let omega = speed * 2.0;
         let omega_sq = omega * omega;
 
         let dt = ctx.input(|i| i.stable_dt).min(0.033); // Cap at ~30fps minimum for stability
@@ -1145,37 +1154,21 @@ fn main() -> eframe::Result<()> {
 }
 
 fn build_app_icon() -> egui::IconData {
-    // Try to load the icon from assets folder next to executable
-    let exe_path = std::env::current_exe().unwrap_or_default();
-    let exe_dir = exe_path.parent().unwrap_or(std::path::Path::new("."));
+    // Embed the icon at compile time so it's always available
+    static ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");
 
-    // Try PNG first (better quality), then ICO
-    let icon_paths = [
-        exe_dir.join("assets").join("icon.png"),
-        exe_dir.join("assets").join("icon.ico"),
-        // Also check if assets is in current working directory
-        std::path::PathBuf::from("assets").join("icon.png"),
-        std::path::PathBuf::from("assets").join("icon.ico"),
-    ];
-
-    for icon_path in &icon_paths {
-        if icon_path.exists() {
-            if let Ok(icon_data) = std::fs::read(icon_path) {
-                // Decode the image
-                if let Ok(img) = image::load_from_memory(&icon_data) {
-                    let rgba_img = img.to_rgba8();
-                    let (width, height) = rgba_img.dimensions();
-                    return egui::IconData {
-                        rgba: rgba_img.into_raw(),
-                        width,
-                        height,
-                    };
-                }
-            }
-        }
+    // Decode the embedded PNG
+    if let Ok(img) = image::load_from_memory(ICON_PNG) {
+        let rgba_img = img.to_rgba8();
+        let (width, height) = rgba_img.dimensions();
+        return egui::IconData {
+            rgba: rgba_img.into_raw(),
+            width,
+            height,
+        };
     }
 
-    // Fallback: generate a simple procedural icon if files not found
+    // Fallback: generate a simple procedural icon if decode fails
     build_fallback_icon()
 }
 

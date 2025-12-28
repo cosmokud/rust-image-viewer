@@ -218,7 +218,7 @@ impl Default for Config {
             resize_border_size: 6.0,
             background_rgb: [0, 0, 0],
             fullscreen_reset_fit_on_enter: true,
-            zoom_animation_speed: 2.0,
+            zoom_animation_speed: 8.0,
         };
         config.set_defaults();
         config
@@ -311,7 +311,7 @@ impl Config {
             resize_border_size: 6.0,
             background_rgb: [0, 0, 0],
             fullscreen_reset_fit_on_enter: true,
-            zoom_animation_speed: 2.0,
+            zoom_animation_speed: 8.0,
         };
 
         let mut in_shortcuts_section = false;
