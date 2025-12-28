@@ -138,6 +138,14 @@ fn configure_gstreamer_env_windows() {
     let plugin_dir = plugin_dir_for_prefix(&prefix);
     let [scanner_path_primary, scanner_path_fallback] = scanner_paths_for_prefix(&prefix);
 
+    // Make sure GStreamer's bin directory is on PATH. This is critical for plugin DLLs and
+    // their transitive dependencies when the app is launched from a parent process with a
+    // stale/sanitized PATH (common when opening files from browsers).
+    let bin_dir = prefix.join("bin");
+    if bin_dir.exists() {
+        prepend_env_path("PATH", &bin_dir);
+    }
+
     if plugin_dir.exists() {
         // Versioned vars are preferred; set both system+non-system for maximum compatibility.
         prepend_env_path("GST_PLUGIN_SYSTEM_PATH_1_0", &plugin_dir);

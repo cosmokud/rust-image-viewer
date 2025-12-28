@@ -27,7 +27,7 @@ gstreamer-audio = "0.23"
 
 # Windows-specific
 [target.'cfg(windows)'.dependencies]
-winapi = { version = "0.3", features = ["winuser", "dwmapi", "libloaderapi"] }
+winapi = { version = "0.3", features = ["winuser", "dwmapi", "libloaderapi", "winreg", "processenv"] }
 
 [build-dependencies]
 # For build script to copy config.ini

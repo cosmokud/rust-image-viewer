@@ -6,6 +6,8 @@
 mod config;
 mod image_loader;
 mod video_player;
+#[cfg(target_os = "windows")]
+mod windows_env;
 
 use config::{Action, Config, InputBinding};
 use image_loader::{get_images_in_directory, get_media_type, LoadedImage, MediaType};
@@ -2250,6 +2252,9 @@ fn get_global_cursor_pos() -> Option<egui::Pos2> {
 }
 
 fn main() -> eframe::Result<()> {
+    #[cfg(target_os = "windows")]
+    windows_env::refresh_process_path_from_registry();
+
     // Initialize GStreamer for video playback
     if let Err(e) = VideoPlayer::init() {
         eprintln!("Warning: Failed to initialize GStreamer: {}", e);
