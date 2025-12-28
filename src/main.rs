@@ -1296,16 +1296,15 @@ impl ImageViewer {
         if self.is_fullscreen {
             return;
         }
-        let Some(ref img) = self.image else {
+        let Some((media_w_u, media_h_u)) = self.media_display_dimensions() else {
             return;
         };
-        let (img_w_u, img_h_u) = img.display_dimensions();
-        if img_w_u == 0 || img_h_u == 0 {
+        if media_w_u == 0 || media_h_u == 0 {
             return;
         }
-        let img_w = img_w_u as f32;
-        let img_h = img_h_u as f32;
-        let aspect = img_w / img_h;
+        let media_w = media_w_u as f32;
+        let media_h = media_h_u as f32;
+        let aspect = media_w / media_h;
 
         let delta = ctx.input(|i| i.pointer.delta());
         if delta == egui::Vec2::ZERO {
@@ -1416,7 +1415,7 @@ impl ImageViewer {
         let new_size = egui::Vec2::new(new_w, new_h);
 
         // Window size defines zoom in floating mode (no bars).
-        let new_zoom = (new_h / img_h).clamp(0.1, 50.0);
+        let new_zoom = (new_h / media_h).clamp(0.1, 50.0);
         self.zoom = new_zoom;
         self.zoom_target = new_zoom;
         self.zoom_velocity = 0.0;
@@ -1426,10 +1425,11 @@ impl ImageViewer {
         if let Some(outer) = outer_rect {
             let mut pos = outer.min;
             if move_left {
-                pos.x += outer.width() - new_w;
+                // Use inner-size delta to avoid outer/inner mismatch jitter (borders/titlebar).
+                pos.x += inner_size.x - new_w;
             }
             if move_up {
-                pos.y += outer.height() - new_h;
+                pos.y += inner_size.y - new_h;
             }
             ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
         }

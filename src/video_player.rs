@@ -25,6 +25,63 @@ struct VideoState {
     video_width: u32,
     video_height: u32,
     frame_updated: bool,
+    needs_range_expand: Option<bool>,
+}
+
+fn guess_limited_range_rgba(pixels: &[u8]) -> bool {
+    // Heuristic for cases where upstream fails to signal limited range.
+    // We sample pixels and look for values largely confined to ~[16..235].
+    let pixel_count = pixels.len() / 4;
+    if pixel_count < 64 {
+        return false;
+    }
+
+    let target_samples: usize = 20_000;
+    let step = (pixel_count / target_samples).max(1);
+
+    let mut min_rgb = [255u8; 3];
+    let mut max_rgb = [0u8; 3];
+
+    let mut saw_near_black = false;
+    let mut saw_near_white = false;
+
+    let mut samples = 0usize;
+    for p in (0..pixel_count).step_by(step) {
+        let i = p * 4;
+        let r = pixels[i];
+        let g = pixels[i + 1];
+        let b = pixels[i + 2];
+
+        min_rgb[0] = min_rgb[0].min(r);
+        min_rgb[1] = min_rgb[1].min(g);
+        min_rgb[2] = min_rgb[2].min(b);
+        max_rgb[0] = max_rgb[0].max(r);
+        max_rgb[1] = max_rgb[1].max(g);
+        max_rgb[2] = max_rgb[2].max(b);
+
+        // "Near" in limited-range space.
+        if r <= 20 || g <= 20 || b <= 20 {
+            saw_near_black = true;
+        }
+        if r >= 235 || g >= 235 || b >= 235 {
+            saw_near_white = true;
+        }
+
+        samples += 1;
+        if samples >= target_samples {
+            break;
+        }
+    }
+
+    let min_all = *min_rgb.iter().min().unwrap_or(&0);
+    let max_all = *max_rgb.iter().max().unwrap_or(&255);
+
+    // Conservative: require confinement + at least some content near one of the edges.
+    // This avoids falsely expanding mid-tone-only images/videos.
+    let confined = min_all >= 12 && max_all <= 243;
+    let touched_edges = saw_near_black || saw_near_white;
+
+    confined && touched_edges
 }
 
 fn expand_limited_range_rgba_in_place(pixels: &mut [u8]) {
@@ -158,6 +215,7 @@ impl VideoPlayer {
             video_width: 0,
             video_height: 0,
             frame_updated: false,
+            needs_range_expand: None,
         }));
 
         // Set up appsink callbacks
@@ -175,19 +233,28 @@ impl VideoPlayer {
                                 
                                 if let Ok(map) = buffer.map_readable() {
                                     let mut data = map.as_slice().to_vec();
-
-                                    // Safety net: if the negotiated output is still TV-range, expand
-                                    // to full-range before handing pixels to egui.
-                                    let should_expand = match video_info.colorimetry().range() {
-                                        gst_video::VideoColorRange::Range16_235 => true,
-                                        gst_video::VideoColorRange::Range0_255 => false,
-                                        _ => false,
-                                    };
-                                    if should_expand {
-                                        expand_limited_range_rgba_in_place(&mut data);
-                                    }
                                     
                                     if let Ok(mut state) = state_clone.lock() {
+                                        let should_expand = match state.needs_range_expand {
+                                            Some(v) => v,
+                                            None => {
+                                                let by_caps = match video_info.colorimetry().range() {
+                                                    gst_video::VideoColorRange::Range16_235 => Some(true),
+                                                    gst_video::VideoColorRange::Range0_255 => Some(false),
+                                                    _ => None,
+                                                };
+
+                                                // If caps don't clearly say, infer from first frame.
+                                                let inferred = by_caps.unwrap_or_else(|| guess_limited_range_rgba(&data));
+                                                state.needs_range_expand = Some(inferred);
+                                                inferred
+                                            }
+                                        };
+
+                                        if should_expand {
+                                            expand_limited_range_rgba_in_place(&mut data);
+                                        }
+
                                         state.video_width = width;
                                         state.video_height = height;
                                         state.current_frame = Some(VideoFrame {
