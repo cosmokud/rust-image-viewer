@@ -225,23 +225,45 @@ impl ImageViewer {
     fn apply_floating_layout_for_current_image(&mut self, ctx: &egui::Context) {
         self.offset = egui::Vec2::ZERO;
 
-        let available = self.floating_available_size(ctx);
-        let size = self.initial_window_size_for_available(available);
-
-        // Derive zoom from the window size so the image fits exactly (no black bars).
+        // For images larger than the screen, fit to screen while keeping aspect ratio.
+        // This matches the double-click behavior.
         if let Some(ref img) = self.image {
-            let (_, img_h) = img.display_dimensions();
-            if img_h > 0 {
-                let z = (size.y / img_h as f32).clamp(0.1, 50.0);
-                self.zoom = z;
-                self.zoom_target = z;
-            }
-        }
+            let (img_w, img_h) = img.display_dimensions();
+            let img_w = img_w as f32;
+            let img_h = img_h as f32;
 
-        self.floating_max_inner_size = Some(size);
-        self.last_requested_inner_size = Some(size);
-        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
-        self.center_window_on_monitor(ctx, size);
+            if img_w <= 0.0 || img_h <= 0.0 {
+                return;
+            }
+
+            let monitor = self.monitor_size_points(ctx);
+
+            // Determine if image needs to be scaled down to fit the screen.
+            // If image is taller than screen, fit vertically (100% screen height).
+            // If image is wider than screen, fit horizontally.
+            // Otherwise, use 100% zoom.
+            let fit_zoom = if img_h > monitor.y || img_w > monitor.x {
+                // Scale to fit: use the smaller scale factor to ensure it fits.
+                (monitor.y / img_h).min(monitor.x / img_w).min(1.0)
+            } else {
+                1.0
+            };
+
+            self.zoom = fit_zoom;
+            self.zoom_target = fit_zoom;
+
+            // Compute window size based on zoom.
+            let mut size = egui::Vec2::new(img_w * fit_zoom, img_h * fit_zoom);
+
+            // Respect the viewport minimum size.
+            size.x = size.x.max(200.0);
+            size.y = size.y.max(150.0);
+
+            self.floating_max_inner_size = Some(size);
+            self.last_requested_inner_size = Some(size);
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+            self.center_window_on_monitor(ctx, size);
+        }
     }
 
     fn apply_fullscreen_layout_for_current_image(&mut self, ctx: &egui::Context) {
@@ -877,8 +899,21 @@ impl ImageViewer {
                     self.zoom_target = self.zoom;
                     self.zoom_velocity = 0.0;
                 } else {
+                    // In floating mode, follow cursor when zoomed past 100%
+                    let old_zoom = self.zoom;
                     self.zoom_target = (self.zoom_target * factor).clamp(0.1, 50.0);
-                    self.offset = egui::Vec2::ZERO;
+                    self.zoom = (self.zoom * factor).clamp(0.1, 50.0);
+
+                    if self.zoom > 1.0 || old_zoom > 1.0 {
+                        // When zoomed past 100%, follow cursor like fullscreen mode
+                        let rect_center = screen_rect.center();
+                        let cursor_offset = pos - rect_center;
+                        let zoom_ratio = self.zoom / old_zoom;
+                        self.offset = self.offset * zoom_ratio - cursor_offset * (zoom_ratio - 1.0);
+                    } else {
+                        // At or below 100%, keep centered
+                        self.offset = egui::Vec2::ZERO;
+                    }
                     // Reset velocity on new scroll input for immediate response
                     self.zoom_velocity = 0.0;
                 }
@@ -924,12 +959,18 @@ impl ImageViewer {
             // Handle panning/window dragging (only if not resizing)
             if primary_down && hover_resize_direction == ResizeDirection::None {
                 if let Some(pos) = pointer_pos {
+                    // Check if drag started from title bar area (top 50px) for window dragging
+                    let in_title_bar = self.last_mouse_pos.map_or(pos.y < 50.0, |lp| lp.y < 50.0);
+
                     if let Some(_last_pos) = self.last_mouse_pos {
                         if self.is_panning {
                             if self.is_fullscreen {
                                 // In fullscreen, pan the image
                                 let delta = ctx.input(|i| i.pointer.delta());
                                 self.offset += delta;
+                            } else if in_title_bar {
+                                // In floating mode, dragging from title bar always moves window
+                                ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
                             } else if self.zoom > 1.0 {
                                 // In floating mode when zoomed past 100%, pan image inside window
                                 let delta = ctx.input(|i| i.pointer.delta());
