@@ -123,18 +123,14 @@ struct ImageViewer {
     /// Whether user is dragging the volume slider
     is_volume_dragging: bool,
     // ============ RESIZE STATE FIELDS ============
-    /// Initial window outer position when resize started
+    /// Initial window outer position when resize started (in screen coordinates)
     resize_start_outer_pos: Option<egui::Pos2>,
     /// Initial window inner size when resize started
     resize_start_inner_size: Option<egui::Vec2>,
-    /// Accumulated mouse delta since resize started (using pointer.delta() each frame)
-    resize_accumulated_delta: egui::Vec2,
-    /// Last commanded window size during resize (to compute stable content center)
+    /// Global screen cursor position when resize started (from Windows API GetCursorPos)
+    resize_start_cursor_screen: Option<egui::Pos2>,
+    /// Last commanded window size during resize (for stable content rendering)
     resize_last_size: Option<egui::Vec2>,
-    /// Global cursor position (in egui points) when resize started
-    resize_start_cursor_global: Option<egui::Pos2>,
-    /// Offset between cursor and grabbed border/corner at resize start (in global points)
-    resize_grab_offset: Option<egui::Vec2>,
 }
 
 impl Default for ImageViewer {
@@ -188,10 +184,8 @@ impl Default for ImageViewer {
             // Resize state fields
             resize_start_outer_pos: None,
             resize_start_inner_size: None,
-            resize_accumulated_delta: egui::Vec2::ZERO,
+            resize_start_cursor_screen: None,
             resize_last_size: None,
-            resize_start_cursor_global: None,
-            resize_grab_offset: None,
         }
     }
 }
@@ -1467,18 +1461,21 @@ impl ImageViewer {
         let media_h = media_h_u as f32;
         let aspect = media_w / media_h;
 
-        // Accumulate pointer delta each frame. This is stable because pointer.delta() is
-        // reported in screen-space and doesn't jump when the window moves.
-        let frame_delta = ctx.input(|i| i.pointer.delta());
-        self.resize_accumulated_delta += frame_delta;
+        // Get current global cursor position using Windows API.
+        // This is completely independent of window position and has no frame delay.
+        let Some(current_cursor_screen) = get_global_cursor_pos() else {
+            return;
+        };
 
-        // On first call (resize just started), capture initial window state.
-        let (start_outer_pos, start_inner_size) = match (
+        // On first call (resize just started), capture initial window state and cursor position.
+        let (start_outer_pos, start_inner_size, start_cursor_screen) = match (
             self.resize_start_outer_pos,
             self.resize_start_inner_size,
+            self.resize_start_cursor_screen,
         ) {
-            (Some(p), Some(s)) => (p, s),
+            (Some(p), Some(s), Some(c)) => (p, s, c),
             _ => {
+                // Capture the window position at resize start
                 let outer_pos = ctx
                     .input(|i| i.raw.viewport().outer_rect)
                     .map(|r| r.min)
@@ -1490,11 +1487,18 @@ impl ImageViewer {
 
                 self.resize_start_outer_pos = Some(outer_pos);
                 self.resize_start_inner_size = Some(inner_size);
-                self.resize_accumulated_delta = egui::Vec2::ZERO;
+                self.resize_start_cursor_screen = Some(current_cursor_screen);
                 self.resize_last_size = None;
                 return;
             }
         };
+
+        // Calculate mouse delta in TRUE SCREEN SPACE.
+        // Using Windows API GetCursorPos gives us coordinates that are:
+        // 1. Completely independent of the window position
+        // 2. Not subject to any frame delays from viewport updates
+        // 3. Stable even when the window origin is moving (top/left resize)
+        let delta = current_cursor_screen - start_cursor_screen;
 
         let clamp_min_w: f32 = 200.0;
         let clamp_min_h: f32 = 150.0;
@@ -1507,8 +1511,6 @@ impl ImageViewer {
         let start_bottom = (start_outer_pos.y + start_inner_size.y).round();
         let start_w = start_right - start_left;
         let start_h = start_bottom - start_top;
-
-        let delta = self.resize_accumulated_delta;
 
         // Helper to compute new size from width, maintaining aspect ratio
         let size_from_width = |w: f32| -> (f32, f32) {
@@ -1718,10 +1720,8 @@ impl ImageViewer {
             // Clear any stale resize state - it will be captured fresh on first resize call
             self.resize_start_outer_pos = None;
             self.resize_start_inner_size = None;
-            self.resize_accumulated_delta = egui::Vec2::ZERO;
+            self.resize_start_cursor_screen = None;
             self.resize_last_size = None;
-            self.resize_start_cursor_global = None;
-            self.resize_grab_offset = None;
         }
 
         // Handle resizing
@@ -1745,10 +1745,8 @@ impl ImageViewer {
             // Clear resize start state
             self.resize_start_outer_pos = None;
             self.resize_start_inner_size = None;
-            self.resize_accumulated_delta = egui::Vec2::ZERO;
+            self.resize_start_cursor_screen = None;
             self.resize_last_size = None;
-            self.resize_start_cursor_global = None;
-            self.resize_grab_offset = None;
         } else if !self.is_resizing {
             // Handle panning/window dragging (only if not resizing, not seeking, and not over video controls)
             if primary_down && hover_resize_direction == ResizeDirection::None && !over_video_controls && !self.is_seeking && !self.is_volume_dragging {
@@ -2226,6 +2224,29 @@ fn get_primary_monitor_size() -> egui::Vec2 {
 #[cfg(not(target_os = "windows"))]
 fn get_primary_monitor_size() -> egui::Vec2 {
     egui::Vec2::new(1920.0, 1080.0)
+}
+
+/// Get the global cursor position in screen coordinates using Windows API.
+/// This is completely independent of window position and has no frame delay.
+#[cfg(target_os = "windows")]
+fn get_global_cursor_pos() -> Option<egui::Pos2> {
+    use winapi::shared::windef::POINT;
+    use winapi::um::winuser::GetCursorPos;
+    
+    unsafe {
+        let mut point = POINT { x: 0, y: 0 };
+        if GetCursorPos(&mut point) != 0 {
+            Some(egui::pos2(point.x as f32, point.y as f32))
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn get_global_cursor_pos() -> Option<egui::Pos2> {
+    // Fallback for non-Windows: return None and let the caller handle it
+    None
 }
 
 fn main() -> eframe::Result<()> {
