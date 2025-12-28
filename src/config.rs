@@ -236,7 +236,7 @@ impl Default for Config {
             video_muted_by_default: true,
             video_default_volume: 0.5,
             video_loop: true,
-            video_controls_hide_delay: 2.0,
+            video_controls_hide_delay: 0.5,
         };
         config.set_defaults();
         config
@@ -340,7 +340,7 @@ impl Config {
             video_muted_by_default: true,
             video_default_volume: 0.5,
             video_loop: true,
-            video_controls_hide_delay: 2.0,
+            video_controls_hide_delay: 0.5,
         };
 
         let mut in_shortcuts_section = false;
@@ -462,9 +462,9 @@ impl Config {
                                 config.video_loop = v;
                             }
                         }
-                        "controls_hide_delay" => {
+                        "controls_hide_delay" | "video_controls_hide_delay" => {
                             if let Ok(v) = value.parse::<f32>() {
-                                config.video_controls_hide_delay = v.max(0.5);
+                                config.video_controls_hide_delay = v.max(0.1);
                             }
                         }
                         _ => {}

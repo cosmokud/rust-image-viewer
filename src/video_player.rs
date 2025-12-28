@@ -329,6 +329,7 @@ impl VideoPlayer {
     }
 
     /// Seek to a position (0.0 to 1.0)
+    /// Uses frame-accurate seeking for precise positioning
     pub fn seek(&mut self, position: f64) -> Result<(), String> {
         let position = position.clamp(0.0, 1.0);
         
@@ -336,9 +337,11 @@ impl VideoPlayer {
             let seek_pos = Duration::from_secs_f64(duration.as_secs_f64() * position);
             let seek_pos_ns = seek_pos.as_nanos() as i64;
             
+            // Use ACCURATE flag for frame-precise seeking instead of KEY_UNIT
+            // This may be slower but provides exact frame positioning
             self.pipeline
                 .seek_simple(
-                    gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT,
+                    gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
                     gst::ClockTime::from_nseconds(seek_pos_ns as u64),
                 )
                 .map_err(|e| format!("Failed to seek: {}", e))?;
@@ -348,12 +351,14 @@ impl VideoPlayer {
     }
 
     /// Seek to a specific time in seconds
+    /// Uses frame-accurate seeking for precise positioning
     pub fn seek_to_time(&mut self, seconds: f64) -> Result<(), String> {
         let seek_pos_ns = (seconds * 1_000_000_000.0) as u64;
         
+        // Use ACCURATE flag for frame-precise seeking instead of KEY_UNIT
         self.pipeline
             .seek_simple(
-                gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT,
+                gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
                 gst::ClockTime::from_nseconds(seek_pos_ns),
             )
             .map_err(|e| format!("Failed to seek: {}", e))?;
