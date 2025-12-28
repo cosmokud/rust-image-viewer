@@ -206,6 +206,10 @@ pub struct Config {
     pub zoom_animation_speed: f32,
     /// Zoom step per scroll wheel notch (1.05 = 5% per step, 1.25 = 25% per step)
     pub zoom_step: f32,
+    /// Whether videos should start muted by default
+    pub video_mute_default: bool,
+    /// Default video volume (0-100)
+    pub video_default_volume: i64,
 }
 
 impl Default for Config {
@@ -219,6 +223,8 @@ impl Default for Config {
             fullscreen_reset_fit_on_enter: true,
             zoom_animation_speed: 20.0,
             zoom_step: 1.02,
+            video_mute_default: true,
+            video_default_volume: 100,
         };
         config.set_defaults();
         config
@@ -315,6 +321,8 @@ impl Config {
             fullscreen_reset_fit_on_enter: true,
             zoom_animation_speed: 8.0,
             zoom_step: 1.08,
+            video_mute_default: true,
+            video_default_volume: 100,
         };
 
         let mut in_shortcuts_section = false;
@@ -405,6 +413,16 @@ impl Config {
                             if let Ok(v) = value.parse::<f32>() {
                                 // Zoom multiplier per scroll step (1.05 = 5%, 1.25 = 25%)
                                 config.zoom_step = v.clamp(1.01, 2.0);
+                            }
+                        }
+                        "video_mute_default" => {
+                            if let Some(v) = parse_bool(value) {
+                                config.video_mute_default = v;
+                            }
+                        }
+                        "video_default_volume" => {
+                            if let Ok(v) = value.parse::<i64>() {
+                                config.video_default_volume = v.clamp(0, 100);
                             }
                         }
                         _ => {}

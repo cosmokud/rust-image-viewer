@@ -1,13 +1,15 @@
-//! High-performance Image Viewer for Windows 11
-//! Built with Rust + egui (eframe)
+//! High-performance Image and Video Viewer for Windows 11
+//! Built with Rust + egui (eframe) + libmpv
 
 #![windows_subsystem = "windows"]
 
 mod config;
 mod image_loader;
+mod video_player;
 
 use config::{Action, Config, InputBinding};
-use image_loader::{get_images_in_directory, LoadedImage};
+use image_loader::{get_images_in_directory, is_supported_video, LoadedImage};
+use video_player::VideoPlayer;
 
 use eframe::egui;
 use std::path::PathBuf;
@@ -31,6 +33,10 @@ enum ResizeDirection {
 struct ImageViewer {
     /// Current loaded image
     image: Option<LoadedImage>,
+    /// Video player for video files
+    video_player: VideoPlayer,
+    /// Whether we're currently viewing a video
+    is_video: bool,
     /// Texture handle for the current frame
     texture: Option<egui::TextureHandle>,
     /// Current texture frame index (for animation detection)
@@ -55,10 +61,14 @@ struct ImageViewer {
     config: Config,
     /// Whether we're in fullscreen mode
     is_fullscreen: bool,
-    /// Whether to show the control bar
+    /// Whether to show the control bar (for images)
     show_controls: bool,
     /// Time when controls were last shown
     controls_show_time: Instant,
+    /// Whether to show video controls bar
+    show_video_controls: bool,
+    /// Time when video controls were last shown
+    video_controls_show_time: Instant,
     /// Error message to display
     error_message: Option<String>,
     /// Whether we should apply post-load layout logic next frame
@@ -97,6 +107,8 @@ impl Default for ImageViewer {
     fn default() -> Self {
         Self {
             image: None,
+            video_player: VideoPlayer::new(),
+            is_video: false,
             texture: None,
             texture_frame: 0,
             image_list: Vec::new(),
@@ -111,6 +123,8 @@ impl Default for ImageViewer {
             is_fullscreen: false,
             show_controls: false,
             controls_show_time: Instant::now(),
+            show_video_controls: false,
+            video_controls_show_time: Instant::now(),
             error_message: None,
             image_changed: false,
             screen_size: egui::Vec2::new(1920.0, 1080.0),
@@ -137,11 +151,10 @@ impl ImageViewer {
         self.offset = egui::Vec2::ZERO;
         self.zoom_velocity = 0.0;
 
-        let Some(ref img) = self.image else {
+        let Some((img_w_u, img_h_u)) = self.current_media_dimensions() else {
             return;
         };
 
-        let (img_w_u, img_h_u) = img.display_dimensions();
         if img_w_u == 0 || img_h_u == 0 {
             return;
         }
@@ -252,23 +265,54 @@ impl ImageViewer {
         viewer
     }
 
-    /// Load an image from path
+    /// Load an image or video from path
     fn load_image(&mut self, path: &PathBuf) {
-        match LoadedImage::load(path) {
-            Ok(img) => {
-                // Get images in directory
-                self.image_list = get_images_in_directory(path);
-                self.current_index = self.image_list.iter().position(|p| p == path).unwrap_or(0);
-                
-                self.image = Some(img);
-                // Don't clear texture here - keep showing old image until new one loads
-                // The texture will be updated in update_texture()
-                self.texture_frame = usize::MAX;
-                self.image_changed = true;
-                self.error_message = None;
+        // Get all media files in directory
+        self.image_list = get_images_in_directory(path);
+        self.current_index = self.image_list.iter().position(|p| p == path).unwrap_or(0);
+
+        // Check if this is a video file
+        if is_supported_video(path) {
+            // Unload any current image
+            self.image = None;
+            self.texture = None;
+            self.is_video = true;
+
+            // Load video with mpv
+            match self.video_player.load(
+                path,
+                self.config.video_mute_default,
+                self.config.video_default_volume,
+            ) {
+                Ok(()) => {
+                    self.image_changed = true;
+                    self.error_message = None;
+                    self.show_video_controls = true;
+                    self.video_controls_show_time = Instant::now();
+                }
+                Err(e) => {
+                    self.error_message = Some(e);
+                    self.is_video = false;
+                }
             }
-            Err(e) => {
-                self.error_message = Some(e);
+        } else {
+            // Unload any current video
+            self.video_player.unload();
+            self.is_video = false;
+
+            // Load image
+            match LoadedImage::load(path) {
+                Ok(img) => {
+                    self.image = Some(img);
+                    // Don't clear texture here - keep showing old image until new one loads
+                    // The texture will be updated in update_texture()
+                    self.texture_frame = usize::MAX;
+                    self.image_changed = true;
+                    self.error_message = None;
+                }
+                Err(e) => {
+                    self.error_message = Some(e);
+                }
             }
         }
     }
@@ -309,10 +353,9 @@ impl ImageViewer {
     }
 
     fn initial_window_size_for_available(&self, available: egui::Vec2) -> egui::Vec2 {
-        if let Some(ref img) = self.image {
-            let (img_w, img_h) = img.display_dimensions();
-            let img_w = img_w as f32;
-            let img_h = img_h as f32;
+        if let Some((img_w_u, img_h_u)) = self.current_media_dimensions() {
+            let img_w = img_w_u as f32;
+            let img_h = img_h_u as f32;
 
             if img_w <= 0.0 || img_h <= 0.0 {
                 return egui::Vec2::new(800.0, 600.0);
@@ -339,12 +382,11 @@ impl ImageViewer {
     fn apply_floating_layout_for_current_image(&mut self, ctx: &egui::Context) {
         self.offset = egui::Vec2::ZERO;
 
-        // For images larger than the screen, fit to screen while keeping aspect ratio.
+        // For media larger than the screen, fit to screen while keeping aspect ratio.
         // This matches the double-click behavior.
-        if let Some(ref img) = self.image {
-            let (img_w, img_h) = img.display_dimensions();
-            let img_w = img_w as f32;
-            let img_h = img_h as f32;
+        if let Some((img_w_u, img_h_u)) = self.current_media_dimensions() {
+            let img_w = img_w_u as f32;
+            let img_h = img_h_u as f32;
 
             if img_w <= 0.0 || img_h <= 0.0 {
                 return;
@@ -352,9 +394,9 @@ impl ImageViewer {
 
             let monitor = self.monitor_size_points(ctx);
 
-            // Determine if image needs to be scaled down to fit the screen.
-            // If image is taller than screen, fit vertically (100% screen height).
-            // If image is wider than screen, fit horizontally.
+            // Determine if media needs to be scaled down to fit the screen.
+            // If media is taller than screen, fit vertically (100% screen height).
+            // If media is wider than screen, fit horizontally.
             // Otherwise, use 100% zoom.
             let fit_zoom = if img_h > monitor.y || img_w > monitor.x {
                 // Scale to fit: use the smaller scale factor to ensure it fits.
@@ -382,11 +424,11 @@ impl ImageViewer {
 
     fn apply_fullscreen_layout_for_current_image(&mut self, ctx: &egui::Context) {
         self.offset = egui::Vec2::ZERO;
-        if let Some(ref img) = self.image {
-            let (_, img_h) = img.display_dimensions();
-            if img_h > 0 {
+        if let Some((_, img_h_u)) = self.current_media_dimensions() {
+            let img_h = img_h_u as f32;
+            if img_h > 0.0 {
                 let target_h = self.monitor_size_points(ctx).y.max(ctx.screen_rect().height());
-                let z = (target_h / img_h as f32).clamp(0.1, 50.0);
+                let z = (target_h / img_h).clamp(0.1, 50.0);
                 self.zoom = z;
                 self.zoom_target = z;
             }
@@ -496,9 +538,28 @@ impl ImageViewer {
     }
 
     fn image_display_size_at_zoom(&self) -> Option<egui::Vec2> {
+        if self.is_video {
+            let (w, h) = self.video_player.display_dimensions();
+            if w > 0 && h > 0 {
+                return Some(egui::Vec2::new(w as f32 * self.zoom, h as f32 * self.zoom));
+            }
+            return None;
+        }
         let img = self.image.as_ref()?;
         let (img_w, img_h) = img.display_dimensions();
         Some(egui::Vec2::new(img_w as f32 * self.zoom, img_h as f32 * self.zoom))
+    }
+
+    /// Get current media dimensions (image or video)
+    fn current_media_dimensions(&self) -> Option<(u32, u32)> {
+        if self.is_video {
+            let (w, h) = self.video_player.display_dimensions();
+            if w > 0 && h > 0 {
+                return Some((w, h));
+            }
+            return None;
+        }
+        self.image.as_ref().map(|img| img.display_dimensions())
     }
 
     fn request_floating_autosize(&mut self, ctx: &egui::Context) {
@@ -561,9 +622,11 @@ impl ImageViewer {
     /// Handle keyboard and mouse input
     fn handle_input(&mut self, ctx: &egui::Context) {
         let screen_width = ctx.screen_rect().width();
+        let is_video = self.is_video;
         
         // Collect actions to run (we can't mutate self inside ctx.input closure)
         let mut actions_to_run: Vec<Action> = Vec::new();
+        let mut toggle_video_playback = false;
         
         ctx.input(|input| {
             let ctrl = input.modifiers.ctrl;
@@ -633,6 +696,7 @@ impl ImageViewer {
             }
 
             // Right-click navigation processed here (pre-draw) to avoid a one-frame flash.
+            // For videos, the center area toggles play/pause instead of navigation.
             if input.pointer.button_clicked(egui::PointerButton::Secondary) {
                 if let Some(pos) = input.pointer.hover_pos() {
                     let third = screen_width / 3.0;
@@ -640,10 +704,18 @@ impl ImageViewer {
                         actions_to_run.push(Action::PreviousImage);
                     } else if pos.x > screen_width - third {
                         actions_to_run.push(Action::NextImage);
+                    } else if is_video {
+                        // Center area: toggle video playback
+                        toggle_video_playback = true;
                     }
                 }
             }
         });
+        
+        // Handle video playback toggle
+        if toggle_video_playback {
+            self.video_player.toggle_play();
+        }
         
         // Run all collected actions
         for action in actions_to_run {
@@ -703,8 +775,30 @@ impl ImageViewer {
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                         ui.add_space(10.0);
                         
-                        // Show filename
-                        if let Some(ref img) = self.image {
+                        // Show filename - handle both images and videos
+                        if self.is_video {
+                            if let Some(ref path) = self.video_player.path {
+                                let filename = path.file_name()
+                                    .and_then(|n| n.to_str())
+                                    .unwrap_or("Unknown");
+                                ui.label(egui::RichText::new(filename).color(egui::Color32::WHITE));
+                                
+                                let (w, h) = self.video_player.display_dimensions();
+                                if w > 0 && h > 0 {
+                                    ui.label(egui::RichText::new(format!("{}x{}", w, h))
+                                        .color(egui::Color32::GRAY));
+                                }
+                                
+                                ui.label(egui::RichText::new(format!("{:.0}%", self.zoom * 100.0))
+                                    .color(egui::Color32::GRAY));
+                                
+                                if !self.image_list.is_empty() {
+                                    ui.label(egui::RichText::new(
+                                        format!("[{}/{}]", self.current_index + 1, self.image_list.len())
+                                    ).color(egui::Color32::GRAY));
+                                }
+                            }
+                        } else if let Some(ref img) = self.image {
                             let filename = img.path.file_name()
                                 .and_then(|n| n.to_str())
                                 .unwrap_or("Unknown");
@@ -816,6 +910,147 @@ impl ImageViewer {
             });
     }
 
+    /// Draw video controls bar at the bottom (auto-hide)
+    fn draw_video_controls(&mut self, ctx: &egui::Context) {
+        if !self.is_video {
+            return;
+        }
+
+        let screen_rect = ctx.screen_rect();
+        let bar_height = 48.0;
+        
+        // Check if mouse is near bottom for auto-show
+        let mouse_pos = ctx.input(|i| i.pointer.hover_pos());
+        if let Some(pos) = mouse_pos {
+            if pos.y > screen_rect.height() - 80.0 {
+                self.show_video_controls = true;
+                self.video_controls_show_time = Instant::now();
+            }
+        }
+
+        // Auto-hide controls after configured delay
+        if self.video_controls_show_time.elapsed().as_secs_f32() > self.config.controls_hide_delay + 1.0 {
+            if let Some(pos) = mouse_pos {
+                if pos.y <= screen_rect.height() - 80.0 {
+                    self.show_video_controls = false;
+                }
+            } else {
+                self.show_video_controls = false;
+            }
+        }
+
+        if !self.show_video_controls {
+            return;
+        }
+
+        // Draw video controls bar at bottom
+        let bar_rect = egui::Rect::from_min_size(
+            egui::pos2(0.0, screen_rect.height() - bar_height),
+            egui::Vec2::new(screen_rect.width(), bar_height),
+        );
+
+        egui::Area::new(egui::Id::new("video_control_bar"))
+            .fixed_pos(bar_rect.min)
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                let painter = ui.painter();
+                painter.rect_filled(
+                    bar_rect,
+                    0.0,
+                    egui::Color32::from_rgba_unmultiplied(30, 30, 30, 230),
+                );
+
+                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(bar_rect), |ui| {
+                    ui.set_min_height(bar_height);
+
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.add_space(15.0);
+
+                        // Play/Pause button
+                        let play_icon = if self.video_player.is_playing { "⏸" } else { "▶" };
+                        if ui.add(egui::Button::new(
+                            egui::RichText::new(play_icon).size(18.0).color(egui::Color32::WHITE)
+                        ).frame(false)).clicked() {
+                            self.video_player.toggle_play();
+                        }
+
+                        ui.add_space(15.0);
+
+                        // Current time
+                        ui.label(
+                            egui::RichText::new(VideoPlayer::format_time(self.video_player.position))
+                                .color(egui::Color32::WHITE)
+                                .size(13.0)
+                        );
+
+                        ui.add_space(8.0);
+
+                        // Seek bar
+                        let seekbar_width = (screen_rect.width() - 380.0).max(100.0);
+                        let mut seek_pos = self.video_player.position;
+                        let duration = self.video_player.duration.max(0.001);
+                        
+                        let seek_response = ui.add_sized(
+                            [seekbar_width, 20.0],
+                            egui::Slider::new(&mut seek_pos, 0.0..=duration)
+                                .show_value(false)
+                                .trailing_fill(true)
+                        );
+                        
+                        if seek_response.changed() || seek_response.drag_stopped() {
+                            self.video_player.seek(seek_pos);
+                        }
+
+                        ui.add_space(8.0);
+
+                        // Duration
+                        ui.label(
+                            egui::RichText::new(VideoPlayer::format_time(self.video_player.duration))
+                                .color(egui::Color32::GRAY)
+                                .size(13.0)
+                        );
+
+                        // Right side: Volume controls
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.add_space(15.0);
+
+                            // Mute button
+                            let mute_icon = if self.video_player.is_muted { "🔇" } else { "🔊" };
+                            if ui.add(egui::Button::new(
+                                egui::RichText::new(mute_icon).size(16.0).color(egui::Color32::WHITE)
+                            ).frame(false)).clicked() {
+                                self.video_player.toggle_mute();
+                            }
+
+                            ui.add_space(8.0);
+
+                            // Volume slider
+                            let mut vol = self.video_player.volume as f32;
+                            let vol_response = ui.add_sized(
+                                [80.0, 20.0],
+                                egui::Slider::new(&mut vol, 0.0..=100.0)
+                                    .show_value(false)
+                            );
+                            if vol_response.changed() {
+                                self.video_player.set_volume(vol as i64);
+                                if self.video_player.is_muted && vol > 0.0 {
+                                    self.video_player.is_muted = false;
+                                    if let Some(ref mpv) = self.video_player.mpv {
+                                        let _ = mpv.set_property::<bool>("mute", false);
+                                    }
+                                }
+                            }
+
+                            ui.add_space(15.0);
+                        });
+                    });
+                });
+            });
+
+        // Request repaint to keep video position updated
+        ctx.request_repaint();
+    }
+
     /// Determine resize direction based on mouse position
     fn get_resize_direction(&self, pos: egui::Pos2, rect: egui::Rect) -> ResizeDirection {
         let border = self.config.resize_border_size;
@@ -852,10 +1087,9 @@ impl ImageViewer {
         if self.is_fullscreen {
             return;
         }
-        let Some(ref img) = self.image else {
+        let Some((img_w_u, img_h_u)) = self.current_media_dimensions() else {
             return;
         };
-        let (img_w_u, img_h_u) = img.display_dimensions();
         if img_w_u == 0 || img_h_u == 0 {
             return;
         }
@@ -1128,34 +1362,33 @@ impl ImageViewer {
             }
         }
 
-        // Handle double-click to fit image to screen (fullscreen) or reset zoom (floating)
+        // Handle double-click to fit media to screen (fullscreen) or reset zoom (floating)
         if ctx.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary)) {
             self.offset = egui::Vec2::ZERO;
             self.zoom_velocity = 0.0;
             if self.is_fullscreen {
-                // Fit image vertically to screen height
-                if let Some(ref img) = self.image {
-                    let (_, img_h) = img.display_dimensions();
-                    if img_h > 0 {
+                // Fit media vertically to screen height
+                if let Some((_, img_h_u)) = self.current_media_dimensions() {
+                    let img_h = img_h_u as f32;
+                    if img_h > 0.0 {
                         let screen_h = screen_rect.height();
-                        let fit_zoom = screen_h / img_h as f32;
+                        let fit_zoom = screen_h / img_h;
                         self.zoom = fit_zoom.clamp(0.1, 50.0);
                         self.zoom_target = self.zoom;
                     }
                 }
             } else {
-                // Floating mode: fit image to screen while keeping aspect ratio.
-                // For images taller than screen, scale down to fit 100% of screen height.
-                if let Some(ref img) = self.image {
-                    let (img_w, img_h) = img.display_dimensions();
-                    let img_w = img_w as f32;
-                    let img_h = img_h as f32;
+                // Floating mode: fit media to screen while keeping aspect ratio.
+                // For media taller than screen, scale down to fit 100% of screen height.
+                if let Some((img_w_u, img_h_u)) = self.current_media_dimensions() {
+                    let img_w = img_w_u as f32;
+                    let img_h = img_h_u as f32;
 
                     let monitor = self.monitor_size_points(ctx);
 
-                    // Determine if image needs to be scaled down to fit the screen.
-                    // If image is taller than screen, fit vertically (100% screen height).
-                    // If image is wider than screen, fit horizontally.
+                    // Determine if media needs to be scaled down to fit the screen.
+                    // If media is taller than screen, fit vertically (100% screen height).
+                    // If media is wider than screen, fit horizontally.
                     // Otherwise, use 100% zoom.
                     let fit_zoom = if img_h > monitor.y || img_w > monitor.x {
                         // Scale to fit: use the smaller scale factor to ensure it fits.
@@ -1183,11 +1416,73 @@ impl ImageViewer {
             }
         }
 
-        // Draw the image
+        // Draw the image or video placeholder
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(self.background_color32()))
             .show(ctx, |ui| {
-                if let Some(ref texture) = self.texture {
+                // Handle video display
+                if self.is_video && self.video_player.is_loaded() {
+                    let available = ui.available_rect_before_wrap();
+                    let (vid_w, vid_h) = self.video_player.display_dimensions();
+                    
+                    if vid_w > 0 && vid_h > 0 {
+                        let display_size = egui::Vec2::new(
+                            vid_w as f32 * self.zoom,
+                            vid_h as f32 * self.zoom,
+                        );
+                        
+                        let center = available.center() + self.offset;
+                        let video_rect = egui::Rect::from_center_size(center, display_size);
+                        
+                        // Draw a dark background where the video would appear
+                        // (MPV renders via its own overlay, this is a placeholder)
+                        ui.painter().rect_filled(
+                            video_rect,
+                            0.0,
+                            egui::Color32::from_rgb(20, 20, 20),
+                        );
+                        
+                        // Draw a play icon in the center if paused
+                        if !self.video_player.is_playing {
+                            let icon_size = 60.0;
+                            
+                            // Draw semi-transparent circle
+                            ui.painter().circle_filled(
+                                center,
+                                icon_size / 2.0,
+                                egui::Color32::from_rgba_unmultiplied(0, 0, 0, 150),
+                            );
+                            
+                            // Draw play triangle
+                            let triangle_size = 20.0;
+                            let points = vec![
+                                egui::pos2(center.x - triangle_size * 0.3, center.y - triangle_size * 0.5),
+                                egui::pos2(center.x - triangle_size * 0.3, center.y + triangle_size * 0.5),
+                                egui::pos2(center.x + triangle_size * 0.5, center.y),
+                            ];
+                            ui.painter().add(egui::Shape::convex_polygon(
+                                points,
+                                egui::Color32::WHITE,
+                                egui::Stroke::NONE,
+                            ));
+                        }
+                        
+                        // Show video info
+                        let info_text = format!(
+                            "🎬 {} - {}",
+                            VideoPlayer::format_time(self.video_player.position),
+                            VideoPlayer::format_time(self.video_player.duration)
+                        );
+                        let text_pos = egui::pos2(video_rect.left() + 10.0, video_rect.top() + 10.0);
+                        ui.painter().text(
+                            text_pos,
+                            egui::Align2::LEFT_TOP,
+                            &info_text,
+                            egui::FontId::proportional(14.0),
+                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 180),
+                        );
+                    }
+                } else if let Some(ref texture) = self.texture {
                     let available = ui.available_rect_before_wrap();
                     
                     if let Some(ref img) = self.image {
@@ -1243,7 +1538,7 @@ impl ImageViewer {
                     });
                 } else {
                     ui.centered_and_justified(|ui| {
-                        ui.label(egui::RichText::new("Drag and drop an image or pass a file path as argument")
+                        ui.label(egui::RichText::new("Drag and drop an image/video or pass a file path as argument")
                             .color(egui::Color32::GRAY)
                             .size(16.0));
                     });
@@ -1289,6 +1584,13 @@ impl eframe::App for ImageViewer {
                 self.apply_floating_layout_for_current_image(ctx);
             }
             self.image_rotated = false;
+        }
+
+        // Update video player state
+        if self.is_video {
+            self.video_player.update();
+            // Request repaint to keep video UI updated
+            ctx.request_repaint();
         }
 
         // Update texture for current frame (after any image loads)
@@ -1351,13 +1653,12 @@ impl eframe::App for ImageViewer {
                         // Delay window resize by 2 frames to prevent flash
                         self.pending_window_resize = Some((saved_size, saved_pos, 2));
                     } else {
-                        // Fallback: reset to centered at 100% and resize to 100% image size (capped by fit-to-screen)
+                        // Fallback: reset to centered at 100% and resize to 100% media size (capped by fit-to-screen)
                         self.offset = egui::Vec2::ZERO;
                         self.zoom = 1.0;
                         self.zoom_target = 1.0;
 
-                        if let Some(img) = self.image.as_ref() {
-                            let (w, h) = img.display_dimensions();
+                        if let Some((w, h)) = self.current_media_dimensions() {
                             let mut desired = egui::Vec2::new(w as f32, h as f32);
                             let available = self.floating_available_size(ctx);
                             let cap = self.initial_window_size_for_available(available);
@@ -1378,13 +1679,12 @@ impl eframe::App for ImageViewer {
                         }
                     }
                 } else {
-                    // If the user navigated to a different image while fullscreen,
+                    // If the user navigated to a different media while fullscreen,
                     // don't restore the previous floating zoom/position; apply normal floating sizing.
                     self.saved_fullscreen_entry_index = None;
                     self.saved_floating_state = None;
-                    // Calculate the new size for the current image
-                    if let Some(ref img) = self.image {
-                        let (img_w_u, img_h_u) = img.display_dimensions();
+                    // Calculate the new size for the current media
+                    if let Some((img_w_u, img_h_u)) = self.current_media_dimensions() {
                         if img_w_u > 0 && img_h_u > 0 {
                             let img_w = img_w_u as f32;
                             let img_h = img_h_u as f32;
@@ -1459,6 +1759,9 @@ impl eframe::App for ImageViewer {
 
         // Draw controls overlay
         self.draw_controls(ctx);
+
+        // Draw video controls bar at bottom (only for videos)
+        self.draw_video_controls(ctx);
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {

@@ -1,10 +1,11 @@
 [package]
 name = "rust-image-viewer"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 authors = ["Image Viewer"]
-description = "High-performance image viewer for Windows 11"
+description = "High-performance image and video viewer for Windows 11"
 license = "MIT"
+build = "build.rs"
 
 [dependencies]
 # GUI framework
@@ -18,9 +19,12 @@ image = { version = "0.25", features = ["jpeg", "png", "gif", "webp"] }
 # GIF animation support
 gif = "0.13"
 
+# Video playback via libmpv
+libmpv = "2.0"
+
 # Windows-specific
 [target.'cfg(windows)'.dependencies]
-winapi = { version = "0.3", features = ["winuser", "dwmapi", "libloaderapi"] }
+winapi = { version = "0.3", features = ["winuser", "dwmapi", "libloaderapi", "winbase"] }
 
 [profile.release]
 opt-level = 3
