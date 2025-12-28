@@ -1125,13 +1125,30 @@ impl ImageViewer {
                         let center = available.center() + self.offset;
                         let image_rect = egui::Rect::from_center_size(center, display_size);
 
-                        // Smooth fullscreen transition (no fade, no bounce): subtle ease scale.
+                        // Fullscreen transition:
+                        // - Entering fullscreen: subtle ease-in scale.
+                        // - Exiting fullscreen: small "grow + settle" overshoot to avoid showing background bars.
                         let t = self.fullscreen_transition;
                         let in_transition = t > 0.001 && t < 0.999;
                         let final_rect = if in_transition {
                             // smoothstep
                             let ease = t * t * (3.0 - 2.0 * t);
-                            let scale = 0.985 + 0.015 * ease;
+
+                            let scale = if self.is_fullscreen {
+                                // Entering: tiny settle so the transition feels responsive.
+                                0.985 + 0.015 * ease
+                            } else {
+                                // Exiting: do not shrink (which can reveal black bars). Instead, overshoot slightly.
+                                // easeOutBack(u) in [0,1] overshoots above 1.0 before settling.
+                                let u = (1.0 - t).clamp(0.0, 1.0);
+                                let c1: f32 = 1.70158;
+                                let c3: f32 = c1 + 1.0;
+                                let x = u - 1.0;
+                                let ease_out_back = 1.0 + c3 * x.powi(3) + c1 * x.powi(2);
+                                let bump = (ease_out_back - u).max(0.0);
+                                1.0 + 0.03 * bump
+                            };
+
                             let scaled_size = display_size * scale;
                             egui::Rect::from_center_size(center, scaled_size)
                         } else {
