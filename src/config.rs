@@ -205,8 +205,10 @@ pub struct Config {
     pub background_rgb: [u8; 3],
     /// When entering fullscreen, reset image to center and fit-to-screen.
     pub fullscreen_reset_fit_on_enter: bool,
-    /// Floating-mode zoom animation speed. Higher = faster.
+    /// Floating-mode zoom animation speed. Higher = faster. 0 = instant snap.
     pub zoom_animation_speed: f32,
+    /// Zoom step per scroll wheel notch (1.05 = 5% per step, 1.25 = 25% per step)
+    pub zoom_step: f32,
 }
 
 impl Default for Config {
@@ -219,6 +221,7 @@ impl Default for Config {
             background_rgb: [0, 0, 0],
             fullscreen_reset_fit_on_enter: true,
             zoom_animation_speed: 8.0,
+            zoom_step: 1.08,
         };
         config.set_defaults();
         config
@@ -312,6 +315,7 @@ impl Config {
             background_rgb: [0, 0, 0],
             fullscreen_reset_fit_on_enter: true,
             zoom_animation_speed: 8.0,
+            zoom_step: 1.08,
         };
 
         let mut in_shortcuts_section = false;
@@ -394,8 +398,14 @@ impl Config {
                         }
                         "zoom_animation_speed" => {
                             if let Ok(v) = value.parse::<f32>() {
-                                // 0 disables animation (snap), otherwise speed is an exponential smoothing constant.
+                                // 0 disables animation (snap), otherwise speed controls spring stiffness.
                                 config.zoom_animation_speed = v.clamp(0.0, 60.0);
+                            }
+                        }
+                        "zoom_step" => {
+                            if let Ok(v) = value.parse::<f32>() {
+                                // Zoom multiplier per scroll step (1.05 = 5%, 1.25 = 25%)
+                                config.zoom_step = v.clamp(1.01, 2.0);
                             }
                         }
                         _ => {}
@@ -448,6 +458,9 @@ impl Config {
 
         content.push_str("; Floating-mode zoom animation speed. Higher = faster, 0 = snap instantly\n");
         content.push_str(&format!("zoom_animation_speed = {}\n\n", self.zoom_animation_speed));
+        
+        content.push_str("; Zoom step per scroll wheel notch (1.05 = 5%, 1.10 = 10%, 1.25 = 25%)\n");
+        content.push_str(&format!("zoom_step = {}\n\n", self.zoom_step));
         
         content.push_str("[Shortcuts]\n");
 

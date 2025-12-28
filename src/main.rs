@@ -478,24 +478,24 @@ impl ImageViewer {
                                 }
                             }
                             Action::ZoomIn => {
+                                let step = self.config.zoom_step;
                                 if self.is_fullscreen {
-                                    self.zoom = (self.zoom * 1.1).min(50.0);
+                                    self.zoom = (self.zoom * step).min(50.0);
                                     self.zoom_target = self.zoom;
                                     self.zoom_velocity = 0.0;
                                 } else {
-                                    self.zoom_target = (self.zoom_target * 1.1).min(50.0);
-                                    // Reset velocity for immediate response to new input
+                                    self.zoom_target = (self.zoom_target * step).min(50.0);
                                     self.zoom_velocity = 0.0;
                                 }
                             }
                             Action::ZoomOut => {
+                                let step = self.config.zoom_step;
                                 if self.is_fullscreen {
-                                    self.zoom = (self.zoom / 1.1).max(0.1);
+                                    self.zoom = (self.zoom / step).max(0.1);
                                     self.zoom_target = self.zoom;
                                     self.zoom_velocity = 0.0;
                                 } else {
-                                    self.zoom_target = (self.zoom_target / 1.1).max(0.1);
-                                    // Reset velocity for immediate response to new input
+                                    self.zoom_target = (self.zoom_target / step).max(0.1);
                                     self.zoom_velocity = 0.0;
                                 }
                             }
@@ -869,7 +869,9 @@ impl ImageViewer {
         let scroll_delta = ctx.input(|i| i.smooth_scroll_delta.y);
         if scroll_delta != 0.0 {
             if let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) {
-                let factor = if scroll_delta > 0.0 { 1.1 } else { 1.0 / 1.1 };
+                // Use configurable zoom step (default 1.08 = 8% per scroll notch)
+                let step = self.config.zoom_step;
+                let factor = if scroll_delta > 0.0 { step } else { 1.0 / step };
                 if self.is_fullscreen {
                     self.zoom_at(pos, factor, screen_rect);
                     self.zoom_target = self.zoom;
@@ -955,13 +957,21 @@ impl ImageViewer {
             }
         }
 
-        // Handle double-click to reset zoom
+        // Handle double-click to fit image to screen (fullscreen) or reset zoom (floating)
         if ctx.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary)) {
             self.offset = egui::Vec2::ZERO;
             self.zoom_velocity = 0.0;
             if self.is_fullscreen {
-                self.zoom = 1.0;
-                self.zoom_target = 1.0;
+                // Fit image vertically to screen height
+                if let Some(ref img) = self.image {
+                    let (_, img_h) = img.display_dimensions();
+                    if img_h > 0 {
+                        let screen_h = screen_rect.height();
+                        let fit_zoom = screen_h / img_h as f32;
+                        self.zoom = fit_zoom.clamp(0.1, 50.0);
+                        self.zoom_target = self.zoom;
+                    }
+                }
             } else {
                 self.zoom_target = 1.0;
             }
