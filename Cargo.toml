@@ -1,0 +1,34 @@
+[package]
+name = "rust-image-viewer"
+version = "1.0.0"
+edition = "2021"
+authors = ["Image Viewer"]
+description = "High-performance image viewer for Windows 11"
+license = "MIT"
+
+[dependencies]
+# GUI framework
+eframe = { version = "0.29", features = ["persistence"] }
+egui = "0.29"
+egui_extras = { version = "0.29", features = ["image"] }
+
+# Image handling
+image = { version = "0.25", features = ["jpeg", "png", "gif", "webp"] }
+
+# GIF animation support
+gif = "0.13"
+
+# Windows-specific
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["winuser", "dwmapi", "libloaderapi"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[[bin]]
+name = "image-viewer"
+path = "src/main.rs"
