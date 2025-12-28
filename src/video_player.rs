@@ -2,6 +2,7 @@
 //! Supports MP4, MKV, WEBM and other popular video formats.
 
 use std::path::Path;
+use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -24,6 +25,22 @@ struct VideoState {
     video_width: u32,
     video_height: u32,
     frame_updated: bool,
+}
+
+fn expand_limited_range_rgba_in_place(pixels: &mut [u8]) {
+    // Map limited-range (TV) RGB [16..235] to full-range [0..255].
+    // This fixes the classic "washed out" look when limited-range RGB is displayed as full-range.
+    const OFFSET: i32 = 16;
+    const SCALE_NUM: i32 = 255;
+    const SCALE_DEN: i32 = 219;
+
+    for px in pixels.chunks_exact_mut(4) {
+        for c in &mut px[0..3] {
+            let v = *c as i32;
+            let scaled = ((v - OFFSET) * SCALE_NUM + (SCALE_DEN / 2)) / SCALE_DEN;
+            *c = scaled.clamp(0, 255) as u8;
+        }
+    }
 }
 
 /// Video player using GStreamer
@@ -65,13 +82,13 @@ impl VideoPlayer {
             .map_err(|_| "Failed to cast to Pipeline")?;
 
         // Create appsink for video frames
+        // Explicitly request sRGB RGBA output. This nudges GStreamer into producing full-range RGB
+        // and avoids washed-out output when input colorimetry/range metadata is incomplete.
+        let video_caps = gst::Caps::from_str("video/x-raw,format=RGBA,colorimetry=sRGB")
+            .map_err(|e| format!("Failed to create video caps: {}", e))?;
         let appsink = gst_app::AppSink::builder()
             .name("videosink")
-            .caps(
-                &gst_video::VideoCapsBuilder::new()
-                    .format(gst_video::VideoFormat::Rgba)
-                    .build(),
-            )
+            .caps(&video_caps)
             .build();
 
         // Create a bin to hold the appsink with video conversion
@@ -157,7 +174,18 @@ impl VideoPlayer {
                                 let height = video_info.height();
                                 
                                 if let Ok(map) = buffer.map_readable() {
-                                    let data = map.as_slice().to_vec();
+                                    let mut data = map.as_slice().to_vec();
+
+                                    // Safety net: if the negotiated output is still TV-range, expand
+                                    // to full-range before handing pixels to egui.
+                                    let should_expand = match video_info.colorimetry().range() {
+                                        gst_video::VideoColorRange::Range16_235 => true,
+                                        gst_video::VideoColorRange::Range0_255 => false,
+                                        _ => false,
+                                    };
+                                    if should_expand {
+                                        expand_limited_range_rgba_in_place(&mut data);
+                                    }
                                     
                                     if let Ok(mut state) = state_clone.lock() {
                                         state.video_width = width;
