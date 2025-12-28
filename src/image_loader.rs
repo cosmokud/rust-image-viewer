@@ -1,48 +1,21 @@
 //! Image loading and management module.
-//! Supports JPG, PNG, WEBP, animated GIF files, and video files.
+//! Supports JPG, PNG, WEBP, and animated GIF files.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// Supported image extensions
-#[allow(dead_code)]
-pub const SUPPORTED_IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "gif", "bmp", "ico", "tiff", "tif"];
-
-/// Supported video extensions
-pub const SUPPORTED_VIDEO_EXTENSIONS: &[&str] = &["mp4", "mkv", "webm", "avi", "mov", "wmv", "flv", "m4v", "3gp"];
-
-/// All supported media extensions (images + videos)
-pub const SUPPORTED_EXTENSIONS: &[&str] = &[
-    "jpg", "jpeg", "png", "webp", "gif", "bmp", "ico", "tiff", "tif",
-    "mp4", "mkv", "webm", "avi", "mov", "wmv", "flv", "m4v", "3gp"
-];
+pub const SUPPORTED_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "gif", "bmp", "ico", "tiff", "tif"];
 
 /// Check if a file is a supported image
-#[allow(dead_code)]
 pub fn is_supported_image(path: &Path) -> bool {
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| SUPPORTED_IMAGE_EXTENSIONS.contains(&ext.to_lowercase().as_str()))
-        .unwrap_or(false)
-}
-
-/// Check if a file is a supported video
-pub fn is_supported_video(path: &Path) -> bool {
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| SUPPORTED_VIDEO_EXTENSIONS.contains(&ext.to_lowercase().as_str()))
-        .unwrap_or(false)
-}
-
-/// Check if a file is any supported media (image or video)
-pub fn is_supported_media(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
         .map(|ext| SUPPORTED_EXTENSIONS.contains(&ext.to_lowercase().as_str()))
         .unwrap_or(false)
 }
 
-/// Get all media files (images and videos) in the same directory as the given path
+/// Get all images in the same directory as the given path
 pub fn get_images_in_directory(path: &Path) -> Vec<PathBuf> {
     let parent = match path.parent() {
         Some(p) => p,
@@ -54,7 +27,7 @@ pub fn get_images_in_directory(path: &Path) -> Vec<PathBuf> {
         .flatten()
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.path())
-        .filter(|p| p.is_file() && is_supported_media(p))
+        .filter(|p| p.is_file() && is_supported_image(p))
         .collect();
 
     images.sort_by(|a, b| {
