@@ -87,6 +87,10 @@ struct ImageViewer {
     fullscreen_transition: f32,
     /// Fullscreen transition target (0.0 or 1.0)
     fullscreen_transition_target: f32,
+    /// Whether the image was rotated and needs layout update
+    image_rotated: bool,
+    /// Pending window resize to apply after a frame delay (to prevent flash on fullscreen exit)
+    pending_window_resize: Option<(egui::Vec2, egui::Pos2, u8)>,
 }
 
 impl Default for ImageViewer {
@@ -121,11 +125,14 @@ impl Default for ImageViewer {
             saved_fullscreen_entry_index: None,
             fullscreen_transition: 0.0,
             fullscreen_transition_target: 0.0,
+            image_rotated: false,
+            pending_window_resize: None,
         }
     }
 }
 
 impl ImageViewer {
+    #[allow(dead_code)]
     fn apply_floating_layout_exit_fullscreen_current_image(&mut self, ctx: &egui::Context) {
         self.offset = egui::Vec2::ZERO;
         self.zoom_velocity = 0.0;
@@ -175,12 +182,14 @@ impl ImageViewer {
                 if let Some(ref mut img) = self.image {
                     img.rotate_clockwise();
                     self.texture = None;
+                    self.image_rotated = true;
                 }
             }
             Action::RotateCounterClockwise => {
                 if let Some(ref mut img) = self.image {
                     img.rotate_counter_clockwise();
                     self.texture = None;
+                    self.image_rotated = true;
                 }
             }
             Action::ResetZoom => {
@@ -491,7 +500,7 @@ impl ImageViewer {
     }
 
     fn request_floating_autosize(&mut self, ctx: &egui::Context) {
-        if self.is_fullscreen || self.is_resizing {
+        if self.is_fullscreen || self.is_resizing || self.pending_window_resize.is_some() {
             return;
         }
 
@@ -550,55 +559,74 @@ impl ImageViewer {
     /// Handle keyboard and mouse input
     fn handle_input(&mut self, ctx: &egui::Context) {
         let screen_width = ctx.screen_rect().width();
+        
+        // Collect actions to run (we can't mutate self inside ctx.input closure)
+        let mut actions_to_run: Vec<Action> = Vec::new();
+        
         ctx.input(|input| {
             let ctrl = input.modifiers.ctrl;
             let shift = input.modifiers.shift;
             let alt = input.modifiers.alt;
 
-            // Keyboard shortcuts
-            for key in &[
-                egui::Key::Escape,
-                egui::Key::F,
-                egui::Key::F12,
-                egui::Key::W,
-                egui::Key::ArrowLeft,
-                egui::Key::ArrowRight,
-                egui::Key::ArrowUp,
-                egui::Key::ArrowDown,
-            ] {
-                if input.key_pressed(*key) {
-                    let binding = if ctrl {
-                        InputBinding::KeyWithCtrl(*key)
-                    } else if shift {
-                        InputBinding::KeyWithShift(*key)
-                    } else if alt {
-                        InputBinding::KeyWithAlt(*key)
-                    } else {
-                        InputBinding::Key(*key)
-                    };
-
-                    if let Some(action) = self.config.bindings.get(&binding) {
-                        self.run_action(*action);
+            // Check all keyboard bindings from config
+            // We iterate through all configured bindings and check if the corresponding key was pressed
+            for (binding, action) in &self.config.bindings {
+                match binding {
+                    InputBinding::Key(key) => {
+                        if !ctrl && !shift && !alt && input.key_pressed(*key) {
+                            actions_to_run.push(*action);
+                        }
                     }
-                }
-            }
-
-            // Mouse middle click for fullscreen toggle
-            if input.pointer.button_pressed(egui::PointerButton::Middle) {
-                if self.config.is_action(&InputBinding::MouseMiddle, Action::ToggleFullscreen) {
-                    self.toggle_fullscreen = true;
-                }
-            }
-
-            // Mouse4 / Mouse5 bindings (Extra buttons)
-            if input.pointer.button_pressed(egui::PointerButton::Extra1) {
-                if let Some(action) = self.config.bindings.get(&InputBinding::Mouse4) {
-                    self.run_action(*action);
-                }
-            }
-            if input.pointer.button_pressed(egui::PointerButton::Extra2) {
-                if let Some(action) = self.config.bindings.get(&InputBinding::Mouse5) {
-                    self.run_action(*action);
+                    InputBinding::KeyWithCtrl(key) => {
+                        if ctrl && !shift && !alt && input.key_pressed(*key) {
+                            actions_to_run.push(*action);
+                        }
+                    }
+                    InputBinding::KeyWithShift(key) => {
+                        if !ctrl && shift && !alt && input.key_pressed(*key) {
+                            actions_to_run.push(*action);
+                        }
+                    }
+                    InputBinding::KeyWithAlt(key) => {
+                        if !ctrl && !shift && alt && input.key_pressed(*key) {
+                            actions_to_run.push(*action);
+                        }
+                    }
+                    InputBinding::MouseMiddle => {
+                        if input.pointer.button_pressed(egui::PointerButton::Middle) {
+                            actions_to_run.push(*action);
+                        }
+                    }
+                    InputBinding::Mouse4 => {
+                        if input.pointer.button_pressed(egui::PointerButton::Extra1) {
+                            actions_to_run.push(*action);
+                        }
+                    }
+                    InputBinding::Mouse5 => {
+                        if input.pointer.button_pressed(egui::PointerButton::Extra2) {
+                            actions_to_run.push(*action);
+                        }
+                    }
+                    InputBinding::ScrollUp => {
+                        // ScrollUp/ScrollDown are handled in draw_image for zoom
+                        // but we check here for other actions (like navigation)
+                        if input.smooth_scroll_delta.y > 0.0 {
+                            // Only trigger non-zoom actions here; zoom is handled elsewhere
+                            if *action != Action::ZoomIn && *action != Action::ZoomOut {
+                                actions_to_run.push(*action);
+                            }
+                        }
+                    }
+                    InputBinding::ScrollDown => {
+                        if input.smooth_scroll_delta.y < 0.0 {
+                            // Only trigger non-zoom actions here; zoom is handled elsewhere
+                            if *action != Action::ZoomIn && *action != Action::ZoomOut {
+                                actions_to_run.push(*action);
+                            }
+                        }
+                    }
+                    // MouseLeft and MouseRight are handled separately for panning/navigation
+                    InputBinding::MouseLeft | InputBinding::MouseRight => {}
                 }
             }
 
@@ -607,13 +635,18 @@ impl ImageViewer {
                 if let Some(pos) = input.pointer.hover_pos() {
                     let third = screen_width / 3.0;
                     if pos.x < third {
-                        self.prev_image();
+                        actions_to_run.push(Action::PreviousImage);
                     } else if pos.x > screen_width - third {
-                        self.next_image();
+                        actions_to_run.push(Action::NextImage);
                     }
                 }
             }
         });
+        
+        // Run all collected actions
+        for action in actions_to_run {
+            self.run_action(action);
+        }
     }
 
     /// Draw the control bar
@@ -1246,6 +1279,18 @@ impl eframe::App for ImageViewer {
             self.image_changed = false;
         }
 
+        // Apply layout changes after image rotation (resize window to match new dimensions)
+        if self.image_rotated {
+            if self.is_fullscreen {
+                // Fullscreen: fit vertically to screen, centered.
+                self.apply_fullscreen_layout_for_current_image(ctx);
+            } else {
+                // Floating: resize window to match new image dimensions (swapped after rotation)
+                self.apply_floating_layout_for_current_image(ctx);
+            }
+            self.image_rotated = false;
+        }
+
         // Update texture for current frame (after any image loads)
         self.update_texture(ctx);
 
@@ -1282,7 +1327,7 @@ impl eframe::App for ImageViewer {
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(monitor));
                 self.last_requested_inner_size = Some(monitor);
             } else {
-                // Start transition animation
+                // Exiting fullscreen - use delayed resize to prevent flash
                 self.fullscreen_transition_target = 0.0;
 
                 let image_changed_while_fullscreen = self
@@ -1298,41 +1343,78 @@ impl eframe::App for ImageViewer {
                     if let Some((saved_zoom, saved_zoom_target, saved_offset, saved_size, saved_pos)) =
                         self.saved_floating_state.take()
                     {
-                    self.zoom = saved_zoom;
-                    self.zoom_target = saved_zoom_target;
-                    self.offset = saved_offset;
-                    self.floating_max_inner_size = Some(saved_size);
-                    self.last_requested_inner_size = Some(saved_size);
-                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(saved_size));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(saved_pos));
+                        self.zoom = saved_zoom;
+                        self.zoom_target = saved_zoom_target;
+                        self.offset = saved_offset;
+                        self.floating_max_inner_size = Some(saved_size);
+                        self.last_requested_inner_size = Some(saved_size);
+                        // Delay window resize by 2 frames to prevent flash
+                        self.pending_window_resize = Some((saved_size, saved_pos, 2));
                     } else {
-                    // Fallback: reset to centered at 100% and resize to 100% image size (capped by fit-to-screen)
-                    self.offset = egui::Vec2::ZERO;
-                    self.zoom = 1.0;
-                    self.zoom_target = 1.0;
+                        // Fallback: reset to centered at 100% and resize to 100% image size (capped by fit-to-screen)
+                        self.offset = egui::Vec2::ZERO;
+                        self.zoom = 1.0;
+                        self.zoom_target = 1.0;
 
-                    if let Some(img) = self.image.as_ref() {
-                        let (w, h) = img.display_dimensions();
-                        let mut desired = egui::Vec2::new(w as f32, h as f32);
-                        let available = self.floating_available_size(ctx);
-                        let cap = self.initial_window_size_for_available(available);
-                        self.floating_max_inner_size = Some(cap);
-                        if desired.x > cap.x || desired.y > cap.y {
-                            desired = cap;
+                        if let Some(img) = self.image.as_ref() {
+                            let (w, h) = img.display_dimensions();
+                            let mut desired = egui::Vec2::new(w as f32, h as f32);
+                            let available = self.floating_available_size(ctx);
+                            let cap = self.initial_window_size_for_available(available);
+                            self.floating_max_inner_size = Some(cap);
+                            if desired.x > cap.x || desired.y > cap.y {
+                                desired = cap;
+                            }
+                            desired.x = desired.x.max(200.0);
+                            desired.y = desired.y.max(150.0);
+                            self.last_requested_inner_size = Some(desired);
+                            // Calculate center position
+                            let monitor = self.monitor_size_points(ctx);
+                            let x = (monitor.x - desired.x) * 0.5;
+                            let y = (monitor.y - desired.y) * 0.5;
+                            let pos = egui::pos2(x.max(0.0), y.max(0.0));
+                            // Delay window resize by 2 frames to prevent flash
+                            self.pending_window_resize = Some((desired, pos, 2));
                         }
-                        desired.x = desired.x.max(200.0);
-                        desired.y = desired.y.max(150.0);
-                        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(desired));
-                        self.last_requested_inner_size = Some(desired);
-                        self.center_window_on_monitor(ctx, desired);
-                    }
                     }
                 } else {
                     // If the user navigated to a different image while fullscreen,
                     // don't restore the previous floating zoom/position; apply normal floating sizing.
                     self.saved_fullscreen_entry_index = None;
                     self.saved_floating_state = None;
-                    self.apply_floating_layout_exit_fullscreen_current_image(ctx);
+                    // Calculate the new size for the current image
+                    if let Some(ref img) = self.image {
+                        let (img_w_u, img_h_u) = img.display_dimensions();
+                        if img_w_u > 0 && img_h_u > 0 {
+                            let img_w = img_w_u as f32;
+                            let img_h = img_h_u as f32;
+                            let monitor = self.monitor_size_points(ctx);
+
+                            let z = if img_h > monitor.y {
+                                (monitor.y / img_h).clamp(0.1, 50.0)
+                            } else {
+                                1.0
+                            };
+
+                            self.zoom = z;
+                            self.zoom_target = z;
+                            self.offset = egui::Vec2::ZERO;
+                            self.zoom_velocity = 0.0;
+
+                            let mut size = egui::Vec2::new(img_w * z, img_h * z);
+                            size.x = size.x.max(200.0);
+                            size.y = size.y.max(150.0);
+
+                            self.floating_max_inner_size = Some(size);
+                            self.last_requested_inner_size = Some(size);
+                            
+                            let x = (monitor.x - size.x) * 0.5;
+                            let y = (monitor.y - size.y) * 0.5;
+                            let pos = egui::pos2(x.max(0.0), y.max(0.0));
+                            // Delay window resize by 2 frames to prevent flash
+                            self.pending_window_resize = Some((size, pos, 2));
+                        }
+                    }
                 }
             }
             self.toggle_fullscreen = false;
@@ -1351,6 +1433,19 @@ impl eframe::App for ImageViewer {
                 ctx.request_repaint();
             } else {
                 self.fullscreen_transition = target;
+            }
+        }
+
+        // Process pending window resize (delayed to prevent flash on fullscreen exit)
+        if let Some((size, pos, frames_remaining)) = self.pending_window_resize.take() {
+            if frames_remaining <= 1 {
+                // Apply the resize now
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+            } else {
+                // Wait another frame
+                self.pending_window_resize = Some((size, pos, frames_remaining - 1));
+                ctx.request_repaint();
             }
         }
 

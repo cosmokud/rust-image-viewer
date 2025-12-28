@@ -485,6 +485,7 @@ impl Config {
     }
 
     /// Check if an input matches a specific action
+    #[allow(dead_code)]
     pub fn is_action(&self, input: &InputBinding, action: Action) -> bool {
         self.bindings.get(input) == Some(&action)
     }
