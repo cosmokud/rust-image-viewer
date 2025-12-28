@@ -1231,12 +1231,16 @@ impl eframe::App for ImageViewer {
 
                 // Requirement: when moving from floating -> fullscreen, always fit vertically and center.
                 self.apply_fullscreen_layout_for_current_image(ctx);
-                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+
+                // Use borderless "pseudo-fullscreen" instead of OS fullscreen.
+                // This avoids a brief desktop flash on Windows caused by toggling window styles/swapchain.
+                let monitor = self.monitor_size_points(ctx);
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::Pos2::ZERO));
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(monitor));
+                self.last_requested_inner_size = Some(monitor);
             } else {
                 // Start transition animation
                 self.fullscreen_transition_target = 0.0;
-
-                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
 
                 // Restore previous floating state if available
                 if let Some((saved_zoom, saved_zoom_target, saved_offset, saved_size, saved_pos)) = self.saved_floating_state.take() {
