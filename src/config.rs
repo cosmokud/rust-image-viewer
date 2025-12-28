@@ -206,12 +206,6 @@ pub struct Config {
     pub zoom_animation_speed: f32,
     /// Zoom step per scroll wheel notch (1.05 = 5% per step, 1.25 = 25% per step)
     pub zoom_step: f32,
-    /// Whether videos should start muted by default
-    pub video_mute_by_default: bool,
-    /// Default video volume (0.0 to 1.0)
-    pub video_default_volume: f32,
-    /// How long the video controls bar stays visible (in seconds)
-    pub video_controls_hide_delay: f32,
 }
 
 impl Default for Config {
@@ -225,9 +219,6 @@ impl Default for Config {
             fullscreen_reset_fit_on_enter: true,
             zoom_animation_speed: 20.0,
             zoom_step: 1.02,
-            video_mute_by_default: true,
-            video_default_volume: 1.0,
-            video_controls_hide_delay: 2.0,
         };
         config.set_defaults();
         config
@@ -324,9 +315,6 @@ impl Config {
             fullscreen_reset_fit_on_enter: true,
             zoom_animation_speed: 8.0,
             zoom_step: 1.08,
-            video_mute_by_default: true,
-            video_default_volume: 1.0,
-            video_controls_hide_delay: 2.0,
         };
 
         let mut in_shortcuts_section = false;
@@ -419,21 +407,6 @@ impl Config {
                                 config.zoom_step = v.clamp(1.01, 2.0);
                             }
                         }
-                        "video_mute_by_default" => {
-                            if let Some(v) = parse_bool(value) {
-                                config.video_mute_by_default = v;
-                            }
-                        }
-                        "video_default_volume" => {
-                            if let Ok(v) = value.parse::<f32>() {
-                                config.video_default_volume = v.clamp(0.0, 1.0);
-                            }
-                        }
-                        "video_controls_hide_delay" => {
-                            if let Ok(v) = value.parse::<f32>() {
-                                config.video_controls_hide_delay = v.max(0.5);
-                            }
-                        }
                         _ => {}
                     }
                 }
@@ -487,17 +460,6 @@ impl Config {
         
         content.push_str("; Zoom step per scroll wheel notch (1.05 = 5%, 1.10 = 10%, 1.25 = 25%)\n");
         content.push_str(&format!("zoom_step = {}\n\n", self.zoom_step));
-
-        content.push_str("; --- Video Settings ---\n");
-        content.push_str("; Whether videos should start muted by default (true/false)\n");
-        content.push_str(&format!(
-            "video_mute_by_default = {}\n",
-            if self.video_mute_by_default { "true" } else { "false" }
-        ));
-        content.push_str("; Default video volume (0.0 to 1.0)\n");
-        content.push_str(&format!("video_default_volume = {}\n", self.video_default_volume));
-        content.push_str("; How long the video controls bar stays visible (in seconds)\n");
-        content.push_str(&format!("video_controls_hide_delay = {}\n\n", self.video_controls_hide_delay));
         
         content.push_str("[Shortcuts]\n");
 

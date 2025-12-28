@@ -22,8 +22,6 @@ A high-performance, minimal image viewer for Windows 11 built with Rust and egui
 
 ### Supported Formats
 
-#### Images
-
 - JPEG (.jpg, .jpeg)
 - PNG (.png)
 - WebP (.webp)
@@ -32,22 +30,9 @@ A high-performance, minimal image viewer for Windows 11 built with Rust and egui
 - ICO (.ico)
 - TIFF (.tiff, .tif)
 
-#### Videos (Optional - requires FFmpeg)
-
-- MP4 (.mp4)
-- MKV (.mkv)
-- WebM (.webm)
-- AVI (.avi)
-- MOV (.mov)
-- WMV (.wmv)
-- FLV (.flv)
-- M4V (.m4v)
-- 3GP (.3gp)
-- OGV (.ogv)
-
 ## Installation
 
-### From Source (Image-only build)
+### From Source
 
 ```bash
 # Clone the repository
@@ -58,26 +43,6 @@ cd rust-image-viewer
 cargo build --release
 
 # The executable will be at target/release/image-viewer.exe
-```
-
-### With Video Support (requires FFmpeg)
-
-Video support requires FFmpeg libraries to be installed on your system. On Windows, the easiest way is to use vcpkg:
-
-```bash
-# Install vcpkg (if not already installed)
-git clone https://github.com/microsoft/vcpkg.git
-cd vcpkg
-.\bootstrap-vcpkg.bat
-
-# Install FFmpeg
-.\vcpkg install ffmpeg:x64-windows
-
-# Set environment variable (adjust path as needed)
-set VCPKG_ROOT=C:\path\to\vcpkg
-
-# Build with video support
-cargo build --release --features video
 ```
 
 ## Usage
@@ -105,20 +70,6 @@ image-viewer.exe path/to/image.jpg
 | Reset Zoom               | Double-click                          |
 | Pan Image                | Hold Left Mouse Button                |
 | Exit                     | `Esc` or `Ctrl+W`                     |
-
-### Video Controls (when video feature is enabled)
-
-When viewing a video, an auto-hide control bar appears at the bottom of the screen:
-
-| Control      | Function                                   |
-| ------------ | ------------------------------------------ |
-| Play/Pause   | Click the play/pause button                |
-| Pause/Resume | Right-click at the center of the video     |
-| Seek         | Click or drag anywhere on the progress bar |
-| Volume       | Drag the volume slider                     |
-| Mute/Unmute  | Click the speaker icon                     |
-
-Video controls auto-hide after 2 seconds (configurable). Videos start muted by default (configurable via `config.ini`).
 
 ## Configuration
 
@@ -187,23 +138,6 @@ next_image = d, right
 previous_image = a, left
 rotate_clockwise = w, up
 rotate_counterclockwise = s, down
-```
-
-### Video Configuration (requires video feature)
-
-When built with video support, you can configure video playback behavior:
-
-```ini
-[Video]
-
-; Start videos muted (true/false)
-video_mute_by_default = true
-
-; Default volume level (0.0 to 1.0)
-video_default_volume = 1.0
-
-; Seconds before video controls auto-hide
-video_controls_hide_delay = 2.0
 ```
 
 ## Technical Notes
