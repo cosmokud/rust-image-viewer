@@ -81,10 +81,6 @@ struct ImageViewer {
     last_requested_inner_size: Option<egui::Vec2>,
     /// Saved floating state before entering fullscreen (zoom, zoom_target, offset, window_size, window_pos)
     saved_floating_state: Option<(f32, f32, egui::Vec2, egui::Vec2, egui::Pos2)>,
-    /// Last known viewport inner size (from egui raw viewport), used as a fallback when the OS hasn't applied a resize yet.
-    last_known_inner_size: Option<egui::Vec2>,
-    /// Last known viewport outer position (from egui raw viewport), used as a fallback when the OS hasn't reported geometry yet.
-    last_known_outer_pos: Option<egui::Pos2>,
     /// Fullscreen transition animation progress (0.0 = floating, 1.0 = fullscreen)
     fullscreen_transition: f32,
     /// Fullscreen transition target (0.0 or 1.0)
@@ -120,8 +116,6 @@ impl Default for ImageViewer {
             floating_max_inner_size: None,
             last_requested_inner_size: None,
             saved_floating_state: None,
-            last_known_inner_size: None,
-            last_known_outer_pos: None,
             fullscreen_transition: 0.0,
             fullscreen_transition_target: 0.0,
         }
@@ -1195,16 +1189,6 @@ impl eframe::App for ImageViewer {
             }
         });
 
-        // Track last known viewport geometry (helps avoid transient None during async OS resize/move).
-        ctx.input(|i| {
-            if let Some(inner) = i.raw.viewport().inner_rect {
-                self.last_known_inner_size = Some(inner.size());
-            }
-            if let Some(outer) = i.raw.viewport().outer_rect {
-                self.last_known_outer_pos = Some(outer.min);
-            }
-        });
-
         // Handle input
         self.handle_input(ctx);
 
@@ -1234,17 +1218,11 @@ impl eframe::App for ImageViewer {
 
             if entering_fullscreen {
                 // Save current floating state before entering fullscreen
-                // Prefer our last requested inner size (autosize-to-image), then current/known viewport geometry.
-                let inner_size = self
-                    .last_requested_inner_size
-                    .or_else(|| ctx.input(|i| i.raw.viewport().inner_rect).map(|r| r.size()))
-                    .or(self.last_known_inner_size)
+                let inner_size = ctx.input(|i| i.raw.viewport().inner_rect)
+                    .map(|r| r.size())
                     .unwrap_or(egui::Vec2::new(800.0, 600.0));
-
-                let outer_pos = ctx
-                    .input(|i| i.raw.viewport().outer_rect)
+                let outer_pos = ctx.input(|i| i.raw.viewport().outer_rect)
                     .map(|r| r.min)
-                    .or(self.last_known_outer_pos)
                     .unwrap_or(egui::Pos2::ZERO);
                 self.saved_floating_state = Some((self.zoom, self.zoom_target, self.offset, inner_size, outer_pos));
 
