@@ -1603,6 +1603,28 @@ impl ImageViewer {
         let new_size = egui::Vec2::new(new_w, new_h);
         let new_pos = egui::pos2(new_x, new_y);
 
+        // CRITICAL: Correct the accumulated delta to match the actual size change.
+        // This prevents cursor drift: the cursor stays "glued" to the window border.
+        // Without this correction, aspect ratio constraints and rounding cause the
+        // accumulated delta to diverge from reality, making the cursor drift inside
+        // the window and causing jitter on subsequent frames.
+        let actual_dw = new_w - start_w;
+        let actual_dh = new_h - start_h;
+        self.resize_accumulated_delta = match direction {
+            // For right/bottom edges: delta directly equals size change
+            ResizeDirection::Right => egui::vec2(actual_dw, delta.y),
+            ResizeDirection::Bottom => egui::vec2(delta.x, actual_dh),
+            ResizeDirection::BottomRight => egui::vec2(actual_dw, actual_dh),
+            // For left/top edges: delta is negated (moving left = negative delta, but positive size change)
+            ResizeDirection::Left => egui::vec2(-actual_dw, delta.y),
+            ResizeDirection::Top => egui::vec2(delta.x, -actual_dh),
+            ResizeDirection::TopLeft => egui::vec2(-actual_dw, -actual_dh),
+            // For mixed corners: one axis is direct, one is negated
+            ResizeDirection::TopRight => egui::vec2(actual_dw, -actual_dh),
+            ResizeDirection::BottomLeft => egui::vec2(-actual_dw, actual_dh),
+            ResizeDirection::None => delta,
+        };
+
         // Update zoom based on new window size
         let new_zoom = (new_h / media_h).clamp(0.1, 50.0);
         self.zoom = new_zoom;
