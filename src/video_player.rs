@@ -218,63 +218,76 @@ impl VideoPlayer {
             needs_range_expand: None,
         }));
 
-        // Set up appsink callbacks
+        // Set up appsink callbacks.
+        // NOTE: In PAUSED state (e.g. when the user pauses or when seeking while paused),
+        // playbin/appsink typically delivers the next frame as a *preroll* buffer, not a
+        // regular sample. To show the exact frame when seeking while paused, handle BOTH.
+
+        fn process_sample(sample: gst::Sample, state: &Arc<Mutex<VideoState>>) {
+            if let Some(buffer) = sample.buffer() {
+                if let Some(caps) = sample.caps() {
+                    if let Ok(video_info) = gst_video::VideoInfo::from_caps(caps) {
+                        let width = video_info.width();
+                        let height = video_info.height();
+
+                        if let Ok(map) = buffer.map_readable() {
+                            let mut data = map.as_slice().to_vec();
+
+                            if let Ok(mut state) = state.lock() {
+                                let should_expand = match state.needs_range_expand {
+                                    Some(v) => v,
+                                    None => {
+                                        let by_caps = match video_info.colorimetry().range() {
+                                            gst_video::VideoColorRange::Range16_235 => Some(true),
+                                            gst_video::VideoColorRange::Range0_255 => Some(false),
+                                            _ => None,
+                                        };
+
+                                        // If caps don't clearly say, infer from first frame.
+                                        let inferred =
+                                            by_caps.unwrap_or_else(|| guess_limited_range_rgba(&data));
+                                        state.needs_range_expand = Some(inferred);
+                                        inferred
+                                    }
+                                };
+
+                                if should_expand {
+                                    expand_limited_range_rgba_in_place(&mut data);
+                                }
+
+                                state.video_width = width;
+                                state.video_height = height;
+                                state.current_frame = Some(VideoFrame {
+                                    pixels: data,
+                                    width,
+                                    height,
+                                });
+                                state.frame_updated = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         let state_clone = Arc::clone(&state);
+        let state_clone_preroll = Arc::clone(&state);
         appsink.set_callbacks(
             gst_app::AppSinkCallbacks::builder()
                 .new_sample(move |sink| {
                     let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
-                    
-                    if let Some(buffer) = sample.buffer() {
-                        if let Some(caps) = sample.caps() {
-                            if let Ok(video_info) = gst_video::VideoInfo::from_caps(caps) {
-                                let width = video_info.width();
-                                let height = video_info.height();
-                                
-                                if let Ok(map) = buffer.map_readable() {
-                                    let mut data = map.as_slice().to_vec();
-                                    
-                                    if let Ok(mut state) = state_clone.lock() {
-                                        let should_expand = match state.needs_range_expand {
-                                            Some(v) => v,
-                                            None => {
-                                                let by_caps = match video_info.colorimetry().range() {
-                                                    gst_video::VideoColorRange::Range16_235 => Some(true),
-                                                    gst_video::VideoColorRange::Range0_255 => Some(false),
-                                                    _ => None,
-                                                };
-
-                                                // If caps don't clearly say, infer from first frame.
-                                                let inferred = by_caps.unwrap_or_else(|| guess_limited_range_rgba(&data));
-                                                state.needs_range_expand = Some(inferred);
-                                                inferred
-                                            }
-                                        };
-
-                                        if should_expand {
-                                            expand_limited_range_rgba_in_place(&mut data);
-                                        }
-
-                                        state.video_width = width;
-                                        state.video_height = height;
-                                        state.current_frame = Some(VideoFrame {
-                                            pixels: data,
-                                            width,
-                                            height,
-                                        });
-                                        state.frame_updated = true;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    
+                    process_sample(sample, &state_clone);
+                    Ok(gst::FlowSuccess::Ok)
+                })
+                .new_preroll(move |sink| {
+                    let sample = sink.pull_preroll().map_err(|_| gst::FlowError::Eos)?;
+                    process_sample(sample, &state_clone_preroll);
                     Ok(gst::FlowSuccess::Ok)
                 })
                 .build(),
         );
 
-        let mut player = VideoPlayer {
+        let player = VideoPlayer {
             pipeline,
             state,
             volume_element: volume,
