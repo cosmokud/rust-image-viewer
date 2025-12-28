@@ -11,6 +11,160 @@ use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 use gstreamer_video as gst_video;
 
+#[cfg(target_os = "windows")]
+fn configure_gstreamer_env_windows() {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::PathBuf;
+
+    fn prepend_env_path(var: &str, path: &PathBuf) {
+        let path_os = path.as_os_str();
+        match std::env::var_os(var) {
+            None => std::env::set_var(var, path_os),
+            Some(existing) => {
+                // Avoid duplicates; simple substring check is fine for Windows paths here.
+                let existing_s = existing.to_string_lossy();
+                let path_s = path.to_string_lossy();
+                if existing_s.contains(path_s.as_ref()) {
+                    return;
+                }
+                let combined = format!("{};{}", path_s, existing_s);
+                std::env::set_var(var, combined);
+            }
+        }
+    }
+
+    fn wide(s: &OsStr) -> Vec<u16> {
+        s.encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    unsafe fn get_module_path(module_name: &OsStr) -> Option<PathBuf> {
+        use winapi::shared::minwindef::HMODULE;
+        use winapi::um::libloaderapi::{GetModuleFileNameW, GetModuleHandleW};
+
+        let h: HMODULE = GetModuleHandleW(wide(module_name).as_ptr());
+        if h.is_null() {
+            return None;
+        }
+
+        let mut buf: Vec<u16> = vec![0; 32768];
+        let len = GetModuleFileNameW(h, buf.as_mut_ptr(), buf.len() as u32);
+        if len == 0 {
+            return None;
+        }
+        buf.truncate(len as usize);
+        Some(PathBuf::from(String::from_utf16_lossy(&buf)))
+    }
+
+    fn prefix_from_bin_dir(bin_dir: &std::path::Path) -> Option<PathBuf> {
+        bin_dir.parent().map(|p| p.to_path_buf())
+    }
+
+    fn plugin_dir_for_prefix(prefix: &std::path::Path) -> PathBuf {
+        prefix.join("lib").join("gstreamer-1.0")
+    }
+
+    fn scanner_paths_for_prefix(prefix: &std::path::Path) -> [PathBuf; 2] {
+        [
+            prefix
+                .join("libexec")
+                .join("gstreamer-1.0")
+                .join("gst-plugin-scanner.exe"),
+            prefix.join("bin").join("gst-plugin-scanner.exe"),
+        ]
+    }
+
+    fn find_prefix_from_path_env() -> Vec<PathBuf> {
+        let mut prefixes = Vec::new();
+        let Some(path_os) = std::env::var_os("PATH") else {
+            return prefixes;
+        };
+        let path = path_os.to_string_lossy();
+        for entry in path.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+            let bin_dir = std::path::Path::new(entry);
+            let gst_inspect = bin_dir.join("gst-inspect-1.0.exe");
+            let gst_dll = bin_dir.join("gstreamer-1.0-0.dll");
+            if gst_inspect.exists() || gst_dll.exists() {
+                if let Some(prefix) = prefix_from_bin_dir(bin_dir) {
+                    prefixes.push(prefix);
+                }
+            }
+        }
+        prefixes
+    }
+
+    fn common_prefixes() -> Vec<PathBuf> {
+        [
+            r"C:\Program Files\gstreamer\1.0\msvc_x86_64",
+            r"C:\gstreamer\1.0\msvc_x86_64",
+            r"C:\Program Files (x86)\gstreamer\1.0\msvc_x86_64",
+        ]
+        .into_iter()
+        .map(PathBuf::from)
+        .collect()
+    }
+
+    fn choose_prefix(candidates: Vec<PathBuf>) -> Option<PathBuf> {
+        for prefix in candidates {
+            if plugin_dir_for_prefix(&prefix).exists() {
+                return Some(prefix);
+            }
+        }
+        None
+    }
+
+    // Prefer a prefix derived from the actually loaded GStreamer DLL. If that prefix doesn't
+    // contain plugins (common when only some DLLs were copied next to the .exe), fall back to
+    // discovering an installed GStreamer via PATH or common install locations.
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    let dll_name = OsStr::new("gstreamer-1.0-0.dll");
+    if let Some(dll_path) = unsafe { get_module_path(dll_name) } {
+        if let Some(bin_dir) = dll_path.parent() {
+            if let Some(prefix) = prefix_from_bin_dir(bin_dir) {
+                candidates.push(prefix);
+            }
+        }
+    }
+
+    candidates.extend(find_prefix_from_path_env());
+    candidates.extend(common_prefixes());
+
+    let Some(prefix) = choose_prefix(candidates) else {
+        // Nothing we can do automatically.
+        return;
+    };
+
+    let plugin_dir = plugin_dir_for_prefix(&prefix);
+    let [scanner_path_primary, scanner_path_fallback] = scanner_paths_for_prefix(&prefix);
+
+    if plugin_dir.exists() {
+        // Versioned vars are preferred; set both system+non-system for maximum compatibility.
+        prepend_env_path("GST_PLUGIN_SYSTEM_PATH_1_0", &plugin_dir);
+        prepend_env_path("GST_PLUGIN_PATH_1_0", &plugin_dir);
+        prepend_env_path("GST_PLUGIN_PATH", &plugin_dir);
+    }
+    if std::env::var_os("GST_PLUGIN_SCANNER").is_none() {
+        if scanner_path_primary.exists() {
+            std::env::set_var("GST_PLUGIN_SCANNER", &scanner_path_primary);
+        } else if scanner_path_fallback.exists() {
+            std::env::set_var("GST_PLUGIN_SCANNER", &scanner_path_fallback);
+        }
+    }
+
+    // Ensure the registry path is writable (some setups can end up pointing at a non-writable
+    // location, which breaks plugin discovery and makes factories "disappear").
+    if std::env::var_os("GST_REGISTRY").is_none() {
+        if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+            let dir = PathBuf::from(local_app_data)
+                .join("rust-image-viewer")
+                .join("gstreamer");
+            let _ = std::fs::create_dir_all(&dir);
+            std::env::set_var("GST_REGISTRY", dir.join("registry.x86_64.bin"));
+        }
+    }
+}
+
 /// Video frame data extracted from GStreamer
 #[derive(Clone)]
 pub struct VideoFrame {
@@ -116,23 +270,57 @@ pub struct VideoPlayer {
 impl VideoPlayer {
     /// Initialize GStreamer (call once at startup)
     pub fn init() -> Result<(), String> {
+        #[cfg(target_os = "windows")]
+        configure_gstreamer_env_windows();
+
         gst::init().map_err(|e| format!("Failed to initialize GStreamer: {}", e))
+            .and_then(|_| {
+                // Provide an early, actionable error if playback elements are missing.
+                // (We still try both names at actual pipeline creation time.)
+                let has_playbin = gst::ElementFactory::find("playbin").is_some()
+                    || gst::ElementFactory::find("playbin3").is_some();
+                if has_playbin {
+                    Ok(())
+                } else {
+                    Err("GStreamer initialized, but neither `playbin` nor `playbin3` is available. This usually means the playback plugins (gst-plugins-base) were not found/loaded. Verify your GStreamer *runtime* install and plugin paths.".to_string())
+                }
+            })
     }
 
     /// Create a new video player for the given file
     pub fn new(path: &Path, muted: bool, initial_volume: f64) -> Result<Self, String> {
-        let uri = if path.starts_with("file://") {
-            path.to_string_lossy().to_string()
-        } else {
-            format!("file:///{}", path.to_string_lossy().replace('\\', "/"))
-        };
+        // Build a correct file:// URI (including percent-encoding for spaces, etc.).
+        // Using a raw `file:///C:/path with spaces.mp4` string is not a valid URI.
+        let uri = gst::glib::filename_to_uri(path, None)
+            .map_err(|e| format!("Failed to build file URI for {:?}: {}", path, e))?
+            .to_string();
 
-        // Create the pipeline with playbin3
-        let pipeline = gst::ElementFactory::make("playbin3")
+        // Create the pipeline.
+        // Some GStreamer distributions (especially minimal Windows runtimes) ship `playbin` but
+        // not `playbin3`. Prefer `playbin3` when available, but fall back to `playbin`.
+        let pipeline = match gst::ElementFactory::make("playbin3")
             .name("playbin")
             .property("uri", &uri)
             .build()
-            .map_err(|e| format!("Failed to create playbin: {}", e))?;
+        {
+            Ok(p) => p,
+            Err(e_playbin3) => {
+                match gst::ElementFactory::make("playbin")
+                    .name("playbin")
+                    .property("uri", &uri)
+                    .build()
+                {
+                    Ok(p) => p,
+                    Err(e_playbin) => {
+                        return Err(format!(
+                            "Failed to create video pipeline. Tried `playbin3` ({}) and `playbin` ({}). \
+Ensure your GStreamer installation includes the playback elements (usually from gst-plugins-base).",
+                            e_playbin3, e_playbin
+                        ));
+                    }
+                }
+            }
+        };
 
         let pipeline = pipeline
             .downcast::<gst::Pipeline>()
@@ -307,15 +495,54 @@ impl VideoPlayer {
 
     /// Start playback
     pub fn play(&mut self) -> Result<(), String> {
-        self.pipeline
-            .set_state(gst::State::Playing)
-            .map_err(|e| format!("Failed to start playback: {}", e))?;
+        self.pipeline.set_state(gst::State::Playing).map_err(|e| {
+            // State-change errors are often just a symptom. Try to extract the *real* reason
+            // from the bus (missing demuxer/decoder, invalid URI, missing device/sink, etc.).
+            let details = self.drain_bus_error_string();
+            match details {
+                Some(d) => format!("Failed to start playback: {} ({})", e, d),
+                None => format!("Failed to start playback: {}", e),
+            }
+        })?;
         self.is_playing = true;
         
         // Try to get duration after starting
         self.update_duration();
         
         Ok(())
+    }
+
+    fn drain_bus_error_string(&self) -> Option<String> {
+        let bus = self.pipeline.bus()?;
+        let mut last_warning: Option<String> = None;
+
+        // Drain a small burst of messages (non-blocking). On a failed state change, the
+        // corresponding error is typically already queued.
+        for _ in 0..64 {
+            let Some(msg) = bus.pop() else {
+                break;
+            };
+            match msg.view() {
+                gst::MessageView::Error(err) => {
+                    let debug = err.debug().unwrap_or_else(|| gst::glib::GString::from(""));
+                    if debug.is_empty() {
+                        return Some(format!("{}", err.error()));
+                    }
+                    return Some(format!("{}: {}", err.error(), debug));
+                }
+                gst::MessageView::Warning(warn) => {
+                    let debug = warn.debug().unwrap_or_else(|| gst::glib::GString::from(""));
+                    if debug.is_empty() {
+                        last_warning = Some(format!("{}", warn.error()));
+                    } else {
+                        last_warning = Some(format!("{}: {}", warn.error(), debug));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        last_warning
     }
 
     /// Pause playback
