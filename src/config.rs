@@ -201,6 +201,10 @@ pub struct Config {
     pub controls_hide_delay: f32,
     /// Size of the resize border in pixels
     pub resize_border_size: f32,
+    /// Background color as RGB (0-255)
+    pub background_rgb: [u8; 3],
+    /// When entering fullscreen, reset image to center and fit-to-screen.
+    pub fullscreen_reset_fit_on_enter: bool,
 }
 
 impl Default for Config {
@@ -210,6 +214,8 @@ impl Default for Config {
             action_bindings: HashMap::new(),
             controls_hide_delay: 0.5,
             resize_border_size: 6.0,
+            background_rgb: [0, 0, 0],
+            fullscreen_reset_fit_on_enter: true,
         };
         config.set_defaults();
         config
@@ -253,11 +259,26 @@ impl Config {
             .push(input);
     }
 
-    /// Get config file path
+    /// Get settings file path.
+    ///
+    /// Prefers `setting.ini` (as requested), but migrates from legacy `config.ini` if present.
     pub fn config_path() -> PathBuf {
         let exe_path = std::env::current_exe().unwrap_or_default();
         let exe_dir = exe_path.parent().unwrap_or(std::path::Path::new("."));
-        exe_dir.join("config.ini")
+
+        let preferred = exe_dir.join("setting.ini");
+        if preferred.exists() {
+            return preferred;
+        }
+
+        let legacy = exe_dir.join("config.ini");
+        if legacy.exists() {
+            // Best-effort migration so users can edit `setting.ini` going forward.
+            let _ = fs::copy(&legacy, &preferred);
+            return preferred;
+        }
+
+        preferred
     }
 
     /// Load configuration from INI file
@@ -283,6 +304,8 @@ impl Config {
             action_bindings: HashMap::new(),
             controls_hide_delay: 0.5,
             resize_border_size: 6.0,
+            background_rgb: [0, 0, 0],
+            fullscreen_reset_fit_on_enter: true,
         };
 
         let mut in_shortcuts_section = false;
@@ -338,6 +361,31 @@ impl Config {
                                 config.resize_border_size = v.clamp(2.0, 20.0);
                             }
                         }
+                        "background_rgb" => {
+                            if let Some(rgb) = parse_rgb_triplet(value) {
+                                config.background_rgb = rgb;
+                            }
+                        }
+                        "background_r" => {
+                            if let Ok(v) = value.parse::<u8>() {
+                                config.background_rgb[0] = v;
+                            }
+                        }
+                        "background_g" => {
+                            if let Ok(v) = value.parse::<u8>() {
+                                config.background_rgb[1] = v;
+                            }
+                        }
+                        "background_b" => {
+                            if let Ok(v) = value.parse::<u8>() {
+                                config.background_rgb[2] = v;
+                            }
+                        }
+                        "fullscreen_reset_fit_on_enter" => {
+                            if let Some(v) = parse_bool(value) {
+                                config.fullscreen_reset_fit_on_enter = v;
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -362,7 +410,7 @@ impl Config {
         let mut content = String::new();
         
         content.push_str("; Image Viewer Configuration\n");
-        content.push_str("; See config.ini in the application directory for examples\n\n");
+        content.push_str("; See setting.ini in the application directory for examples\n\n");
         
         // Write settings section
         content.push_str("[Settings]\n");
@@ -370,6 +418,21 @@ impl Config {
         content.push_str(&format!("controls_hide_delay = {}\n", self.controls_hide_delay));
         content.push_str(&format!("; Size of the window resize border in pixels\n"));
         content.push_str(&format!("resize_border_size = {}\n\n", self.resize_border_size));
+
+        content.push_str("; Background color (RGB 0-255). You can either set background_rgb or background_r/g/b\n");
+        content.push_str(&format!(
+            "background_rgb = {}, {}, {}\n",
+            self.background_rgb[0], self.background_rgb[1], self.background_rgb[2]
+        ));
+        content.push_str(&format!("background_r = {}\n", self.background_rgb[0]));
+        content.push_str(&format!("background_g = {}\n", self.background_rgb[1]));
+        content.push_str(&format!("background_b = {}\n\n", self.background_rgb[2]));
+
+        content.push_str("; When entering fullscreen, reset image position to center and fit-to-screen\n");
+        content.push_str(&format!(
+            "fullscreen_reset_fit_on_enter = {}\n\n",
+            if self.fullscreen_reset_fit_on_enter { "true" } else { "false" }
+        ));
         
         content.push_str("[Shortcuts]\n");
 
@@ -422,4 +485,23 @@ fn binding_to_string(binding: &InputBinding) -> String {
 
 fn key_to_string(key: &egui::Key) -> String {
     format!("{:?}", key).to_lowercase()
+}
+
+fn parse_bool(value: &str) -> Option<bool> {
+    match value.trim().to_lowercase().as_str() {
+        "1" | "true" | "yes" | "y" | "on" => Some(true),
+        "0" | "false" | "no" | "n" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn parse_rgb_triplet(value: &str) -> Option<[u8; 3]> {
+    let parts: Vec<&str> = value.split(',').map(|p| p.trim()).filter(|p| !p.is_empty()).collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let r = parts[0].parse::<u8>().ok()?;
+    let g = parts[1].parse::<u8>().ok()?;
+    let b = parts[2].parse::<u8>().ok()?;
+    Some([r, g, b])
 }

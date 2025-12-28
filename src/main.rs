@@ -71,6 +71,10 @@ struct ImageViewer {
     resize_direction: ResizeDirection,
     /// Whether we're currently resizing
     is_resizing: bool,
+    /// Captured maximum inner size for floating autosize-to-image (fit-to-screen cap)
+    floating_max_inner_size: Option<egui::Vec2>,
+    /// Last inner size we requested (to avoid spamming viewport commands)
+    last_requested_inner_size: Option<egui::Vec2>,
 }
 
 impl Default for ImageViewer {
@@ -97,6 +101,8 @@ impl Default for ImageViewer {
             request_minimize: false,
             resize_direction: ResizeDirection::None,
             is_resizing: false,
+            floating_max_inner_size: None,
+            last_requested_inner_size: None,
         }
     }
 }
@@ -104,13 +110,14 @@ impl Default for ImageViewer {
 impl ImageViewer {
     /// Create new viewer with an image path
     fn new(cc: &eframe::CreationContext<'_>, path: Option<PathBuf>) -> Self {
-        // Configure visuals for transparency
-        let mut visuals = egui::Visuals::dark();
-        visuals.window_fill = egui::Color32::from_rgba_unmultiplied(30, 30, 30, 240);
-        visuals.panel_fill = egui::Color32::from_rgba_unmultiplied(20, 20, 20, 200);
-        cc.egui_ctx.set_visuals(visuals);
-
         let mut viewer = Self::default();
+
+        // Configure visuals (background driven by config)
+        let mut visuals = egui::Visuals::dark();
+        let bg = viewer.background_color32();
+        visuals.window_fill = bg;
+        visuals.panel_fill = bg;
+        cc.egui_ctx.set_visuals(visuals);
 
         // Get screen size from monitor info if available
         #[cfg(target_os = "windows")]
@@ -138,6 +145,9 @@ impl ImageViewer {
                 // The texture will be updated in update_texture()
                 self.texture_frame = usize::MAX;
                 self.reset_view();
+                self.initial_setup_done = false;
+                self.floating_max_inner_size = Some(self.get_initial_window_size());
+                self.last_requested_inner_size = None;
                 self.error_message = None;
             }
             Err(e) => {
@@ -176,6 +186,16 @@ impl ImageViewer {
         self.offset = egui::Vec2::ZERO;
     }
 
+    fn background_color32(&self) -> egui::Color32 {
+        let [r, g, b] = self.config.background_rgb;
+        egui::Color32::from_rgb(r, g, b)
+    }
+
+    fn background_clear_color(&self) -> [f32; 4] {
+        let [r, g, b] = self.config.background_rgb;
+        [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0]
+    }
+
     /// Calculate initial zoom to fit image in screen if larger
     fn calculate_fit_zoom(&self) -> f32 {
         if let Some(ref img) = self.image {
@@ -190,6 +210,28 @@ impl ImageViewer {
                 let scale_x = screen_w / img_w;
                 let scale_y = screen_h / img_h;
                 scale_x.min(scale_y)
+            } else {
+                1.0
+            }
+        } else {
+            1.0
+        }
+    }
+
+    fn calculate_fit_zoom_for_available(&self, available_size: egui::Vec2) -> f32 {
+        if let Some(ref img) = self.image {
+            let (img_w, img_h) = img.display_dimensions();
+            let img_w = img_w as f32;
+            let img_h = img_h as f32;
+
+            if img_w <= 0.0 || img_h <= 0.0 {
+                return 1.0;
+            }
+
+            if img_w > available_size.x || img_h > available_size.y {
+                let scale_x = available_size.x / img_w;
+                let scale_y = available_size.y / img_h;
+                scale_x.min(scale_y).min(1.0)
             } else {
                 1.0
             }
@@ -223,12 +265,55 @@ impl ImageViewer {
     fn zoom_at(&mut self, center: egui::Pos2, factor: f32, available_rect: egui::Rect) {
         let old_zoom = self.zoom;
         self.zoom = (self.zoom * factor).clamp(0.1, 50.0);
-        
-        let rect_center = available_rect.center();
-        let cursor_offset = center - rect_center;
-        
-        let zoom_ratio = self.zoom / old_zoom;
-        self.offset = self.offset * zoom_ratio - cursor_offset * (zoom_ratio - 1.0);
+
+        // In fullscreen we allow panning and cursor-follow zoom.
+        // In floating mode we keep the image centered and let the window autosize instead.
+        if self.is_fullscreen {
+            let rect_center = available_rect.center();
+            let cursor_offset = center - rect_center;
+
+            let zoom_ratio = self.zoom / old_zoom;
+            self.offset = self.offset * zoom_ratio - cursor_offset * (zoom_ratio - 1.0);
+        } else {
+            self.offset = egui::Vec2::ZERO;
+        }
+    }
+
+    fn image_display_size_at_zoom(&self) -> Option<egui::Vec2> {
+        let img = self.image.as_ref()?;
+        let (img_w, img_h) = img.display_dimensions();
+        Some(egui::Vec2::new(img_w as f32 * self.zoom, img_h as f32 * self.zoom))
+    }
+
+    fn request_floating_autosize(&mut self, ctx: &egui::Context) {
+        if self.is_fullscreen {
+            return;
+        }
+
+        let Some(mut desired) = self.image_display_size_at_zoom() else {
+            return;
+        };
+
+        if let Some(max_size) = self.floating_max_inner_size {
+            // Only grow up to the captured fit-to-screen cap.
+            if desired.x > max_size.x || desired.y > max_size.y {
+                desired = max_size;
+            }
+        }
+
+        // Respect the viewport minimum size.
+        desired.x = desired.x.max(200.0);
+        desired.y = desired.y.max(150.0);
+
+        let should_send = match self.last_requested_inner_size {
+            None => true,
+            Some(last) => (last - desired).length() > 0.5,
+        };
+
+        if should_send {
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(desired));
+            self.last_requested_inner_size = Some(desired);
+        }
     }
 
     /// Update texture for current frame
@@ -396,20 +481,87 @@ impl ImageViewer {
                         // Right-aligned buttons
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.add_space(5.0);
-                            
+
+                            #[derive(Clone, Copy)]
+                            enum WindowButton {
+                                Minimize,
+                                Maximize,
+                                Restore,
+                                Close,
+                            }
+
+                            fn window_icon_button(ui: &mut egui::Ui, kind: WindowButton) -> egui::Response {
+                                let size = egui::Vec2::new(32.0, 24.0);
+                                let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+
+                                if ui.is_rect_visible(rect) {
+                                    let bg = if response.is_pointer_button_down_on() {
+                                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 40)
+                                    } else if response.hovered() {
+                                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 20)
+                                    } else {
+                                        egui::Color32::TRANSPARENT
+                                    };
+                                    ui.painter().rect_filled(rect, 4.0, bg);
+
+                                    let stroke = egui::Stroke::new(1.6, egui::Color32::WHITE);
+                                    let pad_x = 10.0;
+                                    let pad_y = 7.0;
+                                    let icon_rect = egui::Rect::from_min_max(
+                                        egui::pos2(rect.min.x + pad_x, rect.min.y + pad_y),
+                                        egui::pos2(rect.max.x - pad_x, rect.max.y - pad_y),
+                                    );
+
+                                    match kind {
+                                        WindowButton::Minimize => {
+                                            let y = icon_rect.max.y - 1.0;
+                                            ui.painter().line_segment(
+                                                [egui::pos2(icon_rect.min.x, y), egui::pos2(icon_rect.max.x, y)],
+                                                stroke,
+                                            );
+                                        }
+                                        WindowButton::Maximize => {
+                                            ui.painter().rect_stroke(icon_rect, 0.0, stroke);
+                                        }
+                                        WindowButton::Restore => {
+                                            let back = icon_rect.translate(egui::vec2(2.0, -2.0));
+                                            let front = icon_rect.translate(egui::vec2(-2.0, 2.0));
+                                            ui.painter().rect_stroke(back, 0.0, stroke);
+                                            ui.painter().rect_stroke(front, 0.0, stroke);
+                                        }
+                                        WindowButton::Close => {
+                                            ui.painter().line_segment(
+                                                [icon_rect.left_top(), icon_rect.right_bottom()],
+                                                stroke,
+                                            );
+                                            ui.painter().line_segment(
+                                                [icon_rect.right_top(), icon_rect.left_bottom()],
+                                                stroke,
+                                            );
+                                        }
+                                    }
+                                }
+
+                                response
+                            }
+
                             // Close button
-                            if ui.add(egui::Button::new("✕").min_size(egui::Vec2::new(32.0, 24.0))).clicked() {
+                            if window_icon_button(ui, WindowButton::Close).clicked() {
                                 self.should_exit = true;
                             }
-                            
+
                             // Maximize/Restore button
-                            let max_text = if self.is_fullscreen { "❐" } else { "□" };
-                            if ui.add(egui::Button::new(max_text).min_size(egui::Vec2::new(32.0, 24.0))).clicked() {
+                            let button = if self.is_fullscreen {
+                                WindowButton::Restore
+                            } else {
+                                WindowButton::Maximize
+                            };
+                            if window_icon_button(ui, button).clicked() {
                                 self.toggle_fullscreen = true;
                             }
-                            
+
                             // Minimize button
-                            if ui.add(egui::Button::new("─").min_size(egui::Vec2::new(32.0, 24.0))).clicked() {
+                            if window_icon_button(ui, WindowButton::Minimize).clicked() {
                                 self.request_minimize = true;
                             }
                         });
@@ -462,6 +614,9 @@ impl ImageViewer {
                 self.zoom_at(pos, factor, screen_rect);
             }
         }
+
+        // Floating mode: autosize the window to match the image (up to a cap).
+        self.request_floating_autosize(ctx);
 
         // Get pointer state
         let pointer_pos = ctx.input(|i| i.pointer.hover_pos());
@@ -572,7 +727,7 @@ impl ImageViewer {
 
         // Draw the image
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(egui::Color32::from_rgb(30, 30, 30)))
+            .frame(egui::Frame::none().fill(self.background_color32()))
             .show(ctx, |ui| {
                 if let Some(ref texture) = self.texture {
                     let available = ui.available_rect_before_wrap();
@@ -615,6 +770,7 @@ impl eframe::App for ImageViewer {
         if !self.initial_setup_done && self.image.is_some() {
             let size = self.get_initial_window_size();
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+            self.last_requested_inner_size = Some(size);
             
             let fit_zoom = self.calculate_fit_zoom();
             if fit_zoom < 1.0 {
@@ -645,8 +801,35 @@ impl eframe::App for ImageViewer {
         }
 
         if self.toggle_fullscreen {
-            self.is_fullscreen = !self.is_fullscreen;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.is_fullscreen));
+            let entering_fullscreen = !self.is_fullscreen;
+            self.is_fullscreen = entering_fullscreen;
+
+            if entering_fullscreen {
+                if self.config.fullscreen_reset_fit_on_enter {
+                    self.offset = egui::Vec2::ZERO;
+                    self.zoom = self.calculate_fit_zoom_for_available(ctx.screen_rect().size());
+                }
+                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+            } else {
+                // Restore down: reset to centered at 100% and resize to 100% image size (capped by fit-to-screen)
+                self.offset = egui::Vec2::ZERO;
+                self.zoom = 1.0;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+
+                if let Some(img) = self.image.as_ref() {
+                    let (w, h) = img.display_dimensions();
+                    let mut desired = egui::Vec2::new(w as f32, h as f32);
+                    if let Some(max_size) = self.floating_max_inner_size {
+                        if desired.x > max_size.x || desired.y > max_size.y {
+                            desired = max_size;
+                        }
+                    }
+                    desired.x = desired.x.max(200.0);
+                    desired.y = desired.y.max(150.0);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(desired));
+                    self.last_requested_inner_size = Some(desired);
+                }
+            }
             self.toggle_fullscreen = false;
         }
 
@@ -663,7 +846,7 @@ impl eframe::App for ImageViewer {
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        [0.1, 0.1, 0.1, 1.0]
+        self.background_clear_color()
     }
 }
 
@@ -699,6 +882,7 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_decorations(false) // No title bar
             .with_transparent(false) // Avoid compositing issues
+            .with_icon(build_app_icon())
             .with_min_inner_size([200.0, 150.0])
             .with_inner_size([800.0, 600.0])
             .with_drag_and_drop(true),
@@ -713,4 +897,60 @@ fn main() -> eframe::Result<()> {
             Ok(Box::new(ImageViewer::new(cc, image_path)))
         }),
     )
+}
+
+fn build_app_icon() -> egui::IconData {
+    let w: usize = 64;
+    let h: usize = 64;
+    let mut rgba = vec![0u8; w * h * 4];
+
+    // Simple "photo frame" glyph: crisp white lines on transparent background.
+    // (Let the OS decide icon background depending on theme.)
+    let set_px = |rgba: &mut [u8], x: usize, y: usize, r: u8, g: u8, b: u8, a: u8| {
+        let idx = (y * w + x) * 4;
+        rgba[idx] = r;
+        rgba[idx + 1] = g;
+        rgba[idx + 2] = b;
+        rgba[idx + 3] = a;
+    };
+
+    // Draw a rounded-ish rectangle border + a small sun circle.
+    for y in 0..h {
+        for x in 0..w {
+            let fx = x as f32 + 0.5;
+            let fy = y as f32 + 0.5;
+            let border = 6.0;
+            let left = border;
+            let right = (w as f32) - border;
+            let top = border;
+            let bottom = (h as f32) - border;
+
+            let on_border = (fx >= left && fx <= right && (fy - top).abs() < 1.2)
+                || (fx >= left && fx <= right && (fy - bottom).abs() < 1.2)
+                || (fy >= top && fy <= bottom && (fx - left).abs() < 1.2)
+                || (fy >= top && fy <= bottom && (fx - right).abs() < 1.2);
+
+            let sun_cx = right - 12.0;
+            let sun_cy = top + 12.0;
+            let d2 = (fx - sun_cx) * (fx - sun_cx) + (fy - sun_cy) * (fy - sun_cy);
+            let on_sun = d2 <= 5.5 * 5.5;
+
+            // A diagonal "mountain" line.
+            let line_y = bottom - (fx - left) * 0.55;
+            let on_mountain = fx >= left + 4.0
+                && fx <= right - 6.0
+                && (fy - line_y).abs() < 1.2
+                && fy <= bottom - 6.0;
+
+            if on_border || on_sun || on_mountain {
+                set_px(&mut rgba, x, y, 255, 255, 255, 235);
+            }
+        }
+    }
+
+    egui::IconData {
+        rgba,
+        width: w as u32,
+        height: h as u32,
+    }
 }

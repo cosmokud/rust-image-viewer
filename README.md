@@ -73,7 +73,7 @@ image-viewer.exe path/to/image.jpg
 
 ## Configuration
 
-The viewer creates a `config.ini` file next to the executable on first run. You can customize all shortcuts:
+The viewer creates a `setting.ini` file next to the executable on first run (and will migrate from a legacy `config.ini` if present). You can customize all shortcuts:
 
 ```ini
 [Shortcuts]
