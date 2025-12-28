@@ -101,6 +101,9 @@ struct ImageViewer {
     video_player: Option<VideoPlayer>,
     /// Video texture for rendering video frames
     video_texture: Option<egui::TextureHandle>,
+    /// Dimensions corresponding to the current `video_texture`.
+    /// Used to keep showing the last frame while a new video is loading.
+    video_texture_dims: Option<(u32, u32)>,
     /// Current media type being displayed
     current_media_type: Option<MediaType>,
     /// Whether to show video controls bar
@@ -153,6 +156,7 @@ impl Default for ImageViewer {
             // Video-specific fields
             video_player: None,
             video_texture: None,
+            video_texture_dims: None,
             current_media_type: None,
             show_video_controls: false,
             video_controls_show_time: Instant::now(),
@@ -301,14 +305,28 @@ impl ImageViewer {
 
     /// Load any media (image or video) from path
     fn load_media(&mut self, path: &PathBuf) {
-        // Clear previous media state
+        // Determine media type up-front so we can decide whether to keep a placeholder frame.
+        let previous_media_type = self.current_media_type;
+        let media_type = get_media_type(path);
+        self.current_media_type = media_type;
+
+        let keep_video_placeholder = matches!(previous_media_type, Some(MediaType::Video))
+            && matches!(media_type, Some(MediaType::Video));
+
+        // Clear previous media state.
+        // For video-to-video navigation we keep the previous video texture as a placeholder
+        // until the first decoded frame of the new video arrives.
         self.video_player = None;
-        self.video_texture = None;
+        if !keep_video_placeholder {
+            self.video_texture = None;
+            self.video_texture_dims = None;
+        }
         self.image = None;
         self.texture = None;
         self.show_video_controls = false;
 
         // Reset view state so we don't carry zoom/offset across media switches.
+        // (The correct layout will be applied once we have dimensions.)
         self.offset = egui::Vec2::ZERO;
         self.zoom_velocity = 0.0;
         self.zoom = 1.0;
@@ -318,10 +336,6 @@ impl ImageViewer {
         // Get media in directory
         self.image_list = get_images_in_directory(path);
         self.current_index = self.image_list.iter().position(|p| p == path).unwrap_or(0);
-
-        // Determine media type and load accordingly
-        let media_type = get_media_type(path);
-        self.current_media_type = media_type;
 
         match media_type {
             Some(MediaType::Video) => {
@@ -702,6 +716,7 @@ impl ImageViewer {
                     color_image,
                     egui::TextureOptions::LINEAR,
                 ));
+                self.video_texture_dims = Some((frame.width, frame.height));
             }
 
             // Always request repaint for video playback
@@ -1618,16 +1633,19 @@ impl ImageViewer {
             .show(ctx, |ui| {
                 // Determine which texture to use and get dimensions
                 let (active_texture, display_dims) = if let Some(ref texture) = self.video_texture {
-                    // Video mode
-                    if let Some(ref player) = self.video_player {
-                        let dims = player.dimensions();
-                        if dims.0 > 0 && dims.1 > 0 {
-                            (Some(texture), Some(dims))
-                        } else {
-                            (None, None)
-                        }
+                    // Video mode (or video placeholder while the next video is loading)
+                    let dims = self
+                        .video_player
+                        .as_ref()
+                        .map(|p| p.dimensions())
+                        .unwrap_or((0, 0));
+
+                    if dims.0 > 0 && dims.1 > 0 {
+                        (Some(texture), Some(dims))
                     } else {
-                        (None, None)
+                        // Dimensions not ready yet (common right after switching videos).
+                        // Keep showing the last decoded frame to avoid a black flash.
+                        (Some(texture), self.video_texture_dims)
                     }
                 } else if let Some(ref texture) = self.texture {
                     // Image mode
@@ -1692,11 +1710,20 @@ impl ImageViewer {
                         ui.label(egui::RichText::new(error).color(egui::Color32::RED).size(18.0));
                     });
                 } else {
-                    ui.centered_and_justified(|ui| {
-                        ui.label(egui::RichText::new("Drag and drop an image/video or pass a file path as argument")
-                            .color(egui::Color32::GRAY)
-                            .size(16.0));
-                    });
+                    // Only show the empty-state hint when nothing is loaded.
+                    // When switching videos, we can have a player but not yet have the first decoded frame,
+                    // so avoid flashing this message.
+                    if self.image.is_none() && self.video_player.is_none() {
+                        ui.centered_and_justified(|ui| {
+                            ui.label(
+                                egui::RichText::new(
+                                    "Drag and drop an image/video or pass a file path as argument",
+                                )
+                                .color(egui::Color32::GRAY)
+                                .size(16.0),
+                            );
+                        });
+                    }
                 }
             });
     }
