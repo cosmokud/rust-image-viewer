@@ -18,6 +18,8 @@ use std::borrow::Cow;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use eframe::glow::HasContext;
+
 fn downscale_rgba_if_needed<'a>(
     width: u32,
     height: u32,
@@ -473,11 +475,15 @@ impl ImageViewer {
         let mut viewer = Self::default();
 
         // Determine the maximum texture size supported by the active backend.
-        // eframe defaults to wgpu; very large images (e.g. 47424x2019) can crash when uploaded.
+        // This viewer uses eframe's OpenGL (glow) integration; oversized textures can crash.
         viewer.max_texture_side = cc
-            .wgpu_render_state
+            .gl
             .as_ref()
-            .map(|rs| rs.device.limits().max_texture_dimension_2d)
+            .and_then(|gl| unsafe {
+                gl.get_parameter_i32(eframe::glow::MAX_TEXTURE_SIZE)
+                    .try_into()
+                    .ok()
+            })
             .unwrap_or(4096)
             .max(512);
 
