@@ -6,6 +6,49 @@ use std::time::{Duration, Instant};
 
 use image::GenericImageView;
 
+const DEFAULT_MAX_DECODE_ALLOC_BYTES: u64 = 4 * 1024 * 1024 * 1024; // 4 GiB
+
+fn open_image_with_reasonable_limits(path: &Path) -> Result<image::DynamicImage, String> {
+    // `image::open()` uses conservative decoder limits to protect against decompression bombs.
+    // For a viewer, we want to allow legitimately large images while still keeping a hard cap.
+    //
+    // We size limits from the container header dimensions (fast, no full decode).
+    let (w, h) = image::image_dimensions(path).unwrap_or((0, 0));
+
+    // Conservative upper bound: assume 4 bytes/pixel worst case.
+    let estimated = (w as u64)
+        .saturating_mul(h as u64)
+        .saturating_mul(4)
+        .saturating_add(16 * 1024 * 1024);
+
+    let max_alloc = estimated.clamp(256 * 1024 * 1024, DEFAULT_MAX_DECODE_ALLOC_BYTES);
+    let max_alloc_u64 = max_alloc;
+
+    let mut reader = image::ImageReader::open(path)
+        .map_err(|e| format!("Failed to open image: {}", e))?;
+
+    // Best-effort format detection for cases where extensions are unusual.
+    reader = reader
+        .with_guessed_format()
+        .map_err(|e| format!("Failed to guess image format: {}", e))?;
+
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(max_alloc_u64);
+
+    // Also relax dimension limits (still bounded by whatever the header claims).
+    if w > 0 {
+        limits.max_image_width = Some(w);
+    }
+    if h > 0 {
+        limits.max_image_height = Some(h);
+    }
+
+    reader.limits(limits);
+    reader
+        .decode()
+        .map_err(|e| format!("Failed to load image: {}", e))
+}
+
 /// Supported image extensions
 pub const SUPPORTED_IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "gif", "bmp", "ico", "tiff", "tif"];
 
@@ -139,7 +182,7 @@ impl LoadedImage {
     fn load_static(path: &Path, max_texture_side: Option<u32>) -> Result<Self, String> {
         use image::imageops::FilterType;
 
-        let img = image::open(path).map_err(|e| format!("Failed to load image: {}", e))?;
+        let img = open_image_with_reasonable_limits(path)?;
         let img = if let Some(max_side) = max_texture_side {
             if max_side > 0 {
                 let (w, h) = img.dimensions();
