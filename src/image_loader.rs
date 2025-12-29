@@ -4,6 +4,8 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use image::GenericImageView;
+
 /// Supported image extensions
 pub const SUPPORTED_IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "gif", "bmp", "ico", "tiff", "tif"];
 
@@ -112,6 +114,14 @@ pub struct LoadedImage {
 impl LoadedImage {
     /// Load an image from path
     pub fn load(path: &Path) -> Result<Self, String> {
+        Self::load_with_max_texture_side(path, None)
+    }
+
+    /// Load an image with an optional maximum texture side constraint.
+    ///
+    /// If provided, oversized images/frames are downscaled to fit within `max_texture_side`
+    /// to avoid GPU texture creation crashes (common with wgpu validation).
+    pub fn load_with_max_texture_side(path: &Path, max_texture_side: Option<u32>) -> Result<Self, String> {
         let extension = path
             .extension()
             .and_then(|e| e.to_str())
@@ -119,15 +129,33 @@ impl LoadedImage {
             .unwrap_or_default();
 
         if extension == "gif" {
-            Self::load_gif(path)
+            Self::load_gif(path, max_texture_side)
         } else {
-            Self::load_static(path)
+            Self::load_static(path, max_texture_side)
         }
     }
 
     /// Load a static image (JPG, PNG, WEBP, etc.)
-    fn load_static(path: &Path) -> Result<Self, String> {
+    fn load_static(path: &Path, max_texture_side: Option<u32>) -> Result<Self, String> {
+        use image::imageops::FilterType;
+
         let img = image::open(path).map_err(|e| format!("Failed to load image: {}", e))?;
+        let img = if let Some(max_side) = max_texture_side {
+            if max_side > 0 {
+                let (w, h) = img.dimensions();
+                if w > max_side || h > max_side {
+                    // Preserve aspect ratio; `resize` interprets (max_width, max_height).
+                    img.resize(max_side, max_side, FilterType::Lanczos3)
+                } else {
+                    img
+                }
+            } else {
+                img
+            }
+        } else {
+            img
+        };
+
         let rgba = img.to_rgba8();
         let (width, height) = rgba.dimensions();
 
@@ -149,9 +177,10 @@ impl LoadedImage {
     }
 
     /// Load an animated GIF
-    fn load_gif(path: &Path) -> Result<Self, String> {
+    fn load_gif(path: &Path, max_texture_side: Option<u32>) -> Result<Self, String> {
         use std::fs::File;
         use gif::DecodeOptions;
+        use image::imageops::FilterType;
 
         let file = File::open(path).map_err(|e| format!("Failed to open file: {}", e))?;
         let mut decoder = DecodeOptions::new();
@@ -204,6 +233,40 @@ impl LoadedImage {
 
         if frames.is_empty() {
             return Err("No frames in GIF".to_string());
+        }
+
+        // Downscale the entire animation if it exceeds the max texture side.
+        if let Some(max_side) = max_texture_side {
+            if max_side > 0 && (width > max_side || height > max_side) {
+                // Compute the resized dimensions preserving aspect ratio.
+                let scale = (max_side as f64 / width as f64).min(max_side as f64 / height as f64);
+                let new_w = ((width as f64) * scale).round().max(1.0) as u32;
+                let new_h = ((height as f64) * scale).round().max(1.0) as u32;
+
+                let mut resized_frames = Vec::with_capacity(frames.len());
+                for f in frames.into_iter() {
+                    let Some(img) = image::RgbaImage::from_raw(width, height, f.pixels) else {
+                        return Err("Failed to build RGBA image for GIF resizing".to_string());
+                    };
+                    let resized = image::imageops::resize(&img, new_w, new_h, FilterType::Lanczos3);
+                    resized_frames.push(ImageFrame {
+                        pixels: resized.into_raw(),
+                        width: new_w,
+                        height: new_h,
+                        delay_ms: f.delay_ms,
+                    });
+                }
+                frames = resized_frames;
+
+                return Ok(LoadedImage {
+                    path: path.to_path_buf(),
+                    frames,
+                    current_frame: 0,
+                    last_frame_time: Instant::now(),
+                    original_width: new_w,
+                    original_height: new_h,
+                });
+            }
         }
 
         Ok(LoadedImage {

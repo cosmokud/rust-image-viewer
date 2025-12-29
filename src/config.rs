@@ -220,6 +220,32 @@ pub struct Config {
     pub video_loop: bool,
     /// Auto-hide delay for video controls bar (in seconds)
     pub video_controls_hide_delay: f32,
+
+    /// Startup window mode: `floating` (default) or `fullscreen`
+    pub startup_window_mode: StartupWindowMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartupWindowMode {
+    Floating,
+    Fullscreen,
+}
+
+impl StartupWindowMode {
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "floating" | "windowed" | "normal" => Some(Self::Floating),
+            "fullscreen" | "full" => Some(Self::Fullscreen),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Floating => "floating",
+            Self::Fullscreen => "fullscreen",
+        }
+    }
 }
 
 impl Default for Config {
@@ -237,6 +263,7 @@ impl Default for Config {
             video_default_volume: 0.5,
             video_loop: true,
             video_controls_hide_delay: 0.5,
+            startup_window_mode: StartupWindowMode::Floating,
         };
         config.set_defaults();
         config
@@ -341,6 +368,7 @@ impl Config {
             video_default_volume: 0.5,
             video_loop: true,
             video_controls_hide_delay: 0.5,
+            startup_window_mode: StartupWindowMode::Floating,
         };
 
         let mut in_shortcuts_section = false;
@@ -435,6 +463,11 @@ impl Config {
                                 config.zoom_step = v.clamp(1.01, 2.0);
                             }
                         }
+                        "startup_window_mode" | "startup_mode" | "window_mode" => {
+                            if let Some(mode) = StartupWindowMode::from_str(value) {
+                                config.startup_window_mode = mode;
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -499,6 +532,12 @@ impl Config {
         content.push_str(&format!("controls_hide_delay = {}\n", self.controls_hide_delay));
         content.push_str("; Size of the window resize border in pixels\n");
         content.push_str(&format!("resize_border_size = {}\n\n", self.resize_border_size));
+
+        content.push_str("; Startup window mode: floating (default) or fullscreen\n");
+        content.push_str(&format!(
+            "startup_window_mode = {}\n\n",
+            self.startup_window_mode.as_str()
+        ));
 
         content.push_str("; Background color (RGB 0-255). You can either set background_rgb or background_r/g/b\n");
         content.push_str(&format!(

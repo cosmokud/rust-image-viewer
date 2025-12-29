@@ -9,13 +9,94 @@ mod video_player;
 #[cfg(target_os = "windows")]
 mod windows_env;
 
-use config::{Action, Config, InputBinding};
+use config::{Action, Config, InputBinding, StartupWindowMode};
 use image_loader::{get_images_in_directory, get_media_type, LoadedImage, MediaType};
 use video_player::{format_duration, VideoPlayer};
 
 use eframe::egui;
+use std::borrow::Cow;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
+
+fn downscale_rgba_if_needed<'a>(
+    width: u32,
+    height: u32,
+    pixels: &'a [u8],
+    max_texture_side: u32,
+) -> (u32, u32, Cow<'a, [u8]>) {
+    use image::imageops::FilterType;
+
+    if max_texture_side == 0 {
+        return (width, height, Cow::Borrowed(pixels));
+    }
+
+    if width <= max_texture_side && height <= max_texture_side {
+        return (width, height, Cow::Borrowed(pixels));
+    }
+
+    // Preserve aspect ratio; clamp to at least 1x1.
+    let scale = (max_texture_side as f64 / width as f64).min(max_texture_side as f64 / height as f64);
+    let new_w = ((width as f64) * scale).round().max(1.0) as u32;
+    let new_h = ((height as f64) * scale).round().max(1.0) as u32;
+
+    // Convert to an owned buffer for resizing.
+    let Some(img) = image::RgbaImage::from_raw(width, height, pixels.to_vec()) else {
+        return (width, height, Cow::Borrowed(pixels));
+    };
+    let resized = image::imageops::resize(&img, new_w, new_h, FilterType::Lanczos3);
+    (new_w, new_h, Cow::Owned(resized.into_raw()))
+}
+
+#[cfg(target_os = "windows")]
+fn install_windows_cjk_fonts(ctx: &egui::Context) {
+    // egui's default font set is Latin-focused; without adding a font that contains
+    // CJK glyphs, filenames will show as tofu boxes in our custom title bar.
+    let mut fonts = egui::FontDefinitions::default();
+
+    let candidates: [(&str, &str); 6] = [
+        // Japanese
+        ("cjk_meiryo", r"C:\Windows\Fonts\meiryo.ttc"),
+        ("cjk_msgothic", r"C:\Windows\Fonts\msgothic.ttc"),
+        // Simplified Chinese
+        ("cjk_msyh", r"C:\Windows\Fonts\msyh.ttc"),
+        // Traditional Chinese
+        ("cjk_msjh", r"C:\Windows\Fonts\msjh.ttc"),
+        // Korean
+        ("cjk_malgun", r"C:\Windows\Fonts\malgun.ttf"),
+        // Broad fallback (varies by Windows install)
+        ("cjk_segoeui", r"C:\Windows\Fonts\segoeui.ttf"),
+    ];
+
+    let mut loaded_any = false;
+    for (name, path) in candidates {
+        if let Ok(bytes) = std::fs::read(path) {
+            fonts
+                .font_data
+                .insert(name.to_owned(), egui::FontData::from_owned(bytes));
+
+            // Put CJK fonts first so they are preferred for matching glyphs.
+            if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+                if !family.iter().any(|f| f == name) {
+                    family.insert(0, name.to_owned());
+                }
+            }
+            if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
+                if !family.iter().any(|f| f == name) {
+                    family.push(name.to_owned());
+                }
+            }
+
+            loaded_any = true;
+        }
+    }
+
+    if loaded_any {
+        ctx.set_fonts(fonts);
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn install_windows_cjk_fonts(_ctx: &egui::Context) {}
 
 /// Resize direction for window edge dragging
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -78,6 +159,16 @@ struct ImageViewer {
     toggle_fullscreen: bool,
     /// Request minimize
     request_minimize: bool,
+
+    /// Maximum supported texture side for the active GPU backend.
+    /// Used to prevent crashes when attempting to upload oversized images.
+    max_texture_side: u32,
+
+    /// Apply startup window mode (floating/fullscreen) exactly once.
+    startup_window_mode_applied: bool,
+
+    /// Pending native window title update (e.g., when switching media).
+    pending_window_title: Option<String>,
     /// Current resize direction
     resize_direction: ResizeDirection,
     /// Whether we're currently resizing
@@ -168,6 +259,9 @@ impl Default for ImageViewer {
             should_exit: false,
             toggle_fullscreen: false,
             request_minimize: false,
+            max_texture_side: 4096,
+            startup_window_mode_applied: false,
+            pending_window_title: None,
             resize_direction: ResizeDirection::None,
             is_resizing: false,
             floating_max_inner_size: None,
@@ -204,6 +298,24 @@ impl Default for ImageViewer {
 }
 
 impl ImageViewer {
+    fn compute_window_title_for_path(&self, path: &PathBuf) -> String {
+        let filename = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy();
+        if filename.is_empty() {
+            "Image & Video Viewer".to_string()
+        } else {
+            format!("Image & Video Viewer - {}", filename)
+        }
+    }
+
+    fn apply_pending_window_title(&mut self, ctx: &egui::Context) {
+        if let Some(title) = self.pending_window_title.take() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+        }
+    }
+
     fn track_floating_window_position(&mut self, ctx: &egui::Context) {
         let Some(pos) = ctx
             .input(|i| i.raw.viewport().outer_rect)
@@ -360,12 +472,24 @@ impl ImageViewer {
     fn new(cc: &eframe::CreationContext<'_>, path: Option<PathBuf>) -> Self {
         let mut viewer = Self::default();
 
+        // Determine the maximum texture size supported by the active backend.
+        // eframe defaults to wgpu; very large images (e.g. 47424x2019) can crash when uploaded.
+        viewer.max_texture_side = cc
+            .wgpu_render_state
+            .as_ref()
+            .map(|rs| rs.device.limits().max_texture_dimension_2d)
+            .unwrap_or(4096)
+            .max(512);
+
         // Configure visuals (background driven by config)
         let mut visuals = egui::Visuals::dark();
         let bg = viewer.background_color32();
         visuals.window_fill = bg;
         visuals.panel_fill = bg;
         cc.egui_ctx.set_visuals(visuals);
+
+        // Ensure filenames in the custom control bar render for Japanese/Chinese/Korean.
+        install_windows_cjk_fonts(&cc.egui_ctx);
 
         // Get screen size from monitor info if available
         #[cfg(target_os = "windows")]
@@ -387,6 +511,9 @@ impl ImageViewer {
 
     /// Load any media (image or video) from path
     fn load_media(&mut self, path: &PathBuf) {
+        // Update the native window title (taskbar title) using Unicode-safe conversion.
+        self.pending_window_title = Some(self.compute_window_title_for_path(path));
+
         // Determine media type up-front so we can decide whether to keep a placeholder frame.
         let previous_media_type = self.current_media_type;
         let media_type = get_media_type(path);
@@ -448,7 +575,7 @@ impl ImageViewer {
             }
             Some(MediaType::Image) => {
                 // Load as image
-                match LoadedImage::load(path) {
+                match LoadedImage::load_with_max_texture_side(path, Some(self.max_texture_side)) {
                     Ok(img) => {
                         self.image = Some(img);
                         self.texture_frame = usize::MAX;
@@ -769,9 +896,17 @@ impl ImageViewer {
             
             if self.texture.is_none() || frame_changed || self.texture_frame != img.current_frame {
                 let frame = img.current_frame_data();
-                let color_image = egui::ColorImage::from_rgba_unmultiplied(
-                    [frame.width as usize, frame.height as usize],
+                // This should already be constrained in the loader, but keep this guard to
+                // avoid backend crashes if a frame slips through.
+                let (w, h, pixels) = downscale_rgba_if_needed(
+                    frame.width,
+                    frame.height,
                     &frame.pixels,
+                    self.max_texture_side,
+                );
+                let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                    [w as usize, h as usize],
+                    pixels.as_ref(),
                 );
                 
                 self.texture = Some(ctx.load_texture(
@@ -801,9 +936,15 @@ impl ImageViewer {
 
             // Get new frame if available
             if let Some(frame) = player.get_frame() {
-                let color_image = egui::ColorImage::from_rgba_unmultiplied(
-                    [frame.width as usize, frame.height as usize],
+                let (w, h, pixels) = downscale_rgba_if_needed(
+                    frame.width,
+                    frame.height,
                     &frame.pixels,
+                    self.max_texture_side,
+                );
+                let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                    [w as usize, h as usize],
+                    pixels.as_ref(),
                 );
                 
                 self.video_texture = Some(ctx.load_texture(
@@ -811,7 +952,7 @@ impl ImageViewer {
                     color_image,
                     egui::TextureOptions::LINEAR,
                 ));
-                self.video_texture_dims = Some((frame.width, frame.height));
+                self.video_texture_dims = Some((w, h));
             }
 
             // Always request repaint for video playback or when seeking (to show new frames when paused)
@@ -1031,8 +1172,8 @@ impl ImageViewer {
                             if let Some(path) = current_path {
                                 let filename = path
                                     .file_name()
-                                    .and_then(|n| n.to_str())
-                                    .unwrap_or("Unknown");
+                                    .map(|n| n.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| "Unknown".to_string());
 
                                 ui.add(
                                     egui::Label::new(
@@ -2045,6 +2186,14 @@ impl ImageViewer {
 
 impl eframe::App for ImageViewer {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Apply requested startup window mode (exactly once).
+        if !self.startup_window_mode_applied {
+            self.startup_window_mode_applied = true;
+            if self.config.startup_window_mode == StartupWindowMode::Fullscreen {
+                self.toggle_fullscreen = true;
+            }
+        }
+
         // Track current floating window position so we can preserve it across media changes.
         self.track_floating_window_position(ctx);
 
@@ -2058,11 +2207,23 @@ impl eframe::App for ImageViewer {
             }
         });
 
+        // Window title might have changed due to file drops.
+        self.apply_pending_window_title(ctx);
+
         // Handle input
         self.handle_input(ctx);
 
+        // Input can switch media, which updates the title.
+        self.apply_pending_window_title(ctx);
+
         // Apply layout changes after image changes.
         if self.image_changed {
+            // If we're about to enter fullscreen (startup or user toggle), skip applying
+            // a floating layout first to avoid a one-frame flash.
+            if !self.is_fullscreen && self.toggle_fullscreen {
+                // Fullscreen entry logic will apply the appropriate layout.
+                self.image_changed = false;
+            } else {
             if self.is_fullscreen {
                 // Fullscreen: keep fullscreen and fit vertically, centered.
                 self.apply_fullscreen_layout_for_current_image(ctx);
@@ -2071,6 +2232,7 @@ impl eframe::App for ImageViewer {
                 self.apply_floating_layout_for_current_image(ctx);
             }
             self.image_changed = false;
+            }
         }
 
         // Apply layout changes after image rotation (resize window to match new dimensions)
