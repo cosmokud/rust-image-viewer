@@ -53,4 +53,25 @@ fn main() {
     // Tell cargo to rerun this script if config.ini changes
     println!("cargo:rerun-if-changed=config.ini");
     println!("cargo:rerun-if-changed=build.rs");
+
+    // Embed Windows icon into PE resources when building for windows-msvc
+    // This makes Explorer and shortcuts show the app icon
+    #[cfg(target_os = "windows")]
+    {
+        println!("cargo:rerun-if-changed=assets/icon.ico");
+        let target = env::var("TARGET").unwrap_or_default();
+        if target.contains("windows") {
+            if target.contains("msvc") {
+                let mut res = winres::WindowsResource::new();
+                res.set_icon("assets/icon.ico");
+                if let Err(e) = res.compile() {
+                    println!("cargo:warning=Failed to embed assets/icon.ico: {}", e);
+                } else {
+                    println!("cargo:warning=Embedded assets/icon.ico into EXE");
+                }
+            } else {
+                println!("cargo:warning=Skipping icon embedding: non-msvc Windows target ({})", target);
+            }
+        }
+    }
 }

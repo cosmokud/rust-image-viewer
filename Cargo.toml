@@ -30,8 +30,9 @@ gstreamer-audio = "0.23"
 winapi = { version = "0.3", features = ["winuser", "dwmapi", "libloaderapi", "winreg", "processenv"] }
 
 [build-dependencies]
-# For build script to copy config.ini
+# For build script to copy config.ini and embed Windows icon (.ico)
 fs_extra = "1.3"
+winres = "0.1"
 
 [profile.release]
 opt-level = 3
