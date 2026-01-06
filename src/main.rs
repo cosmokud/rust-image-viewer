@@ -14,7 +14,6 @@ use image_loader::{get_images_in_directory, get_media_type, LoadedImage, MediaTy
 use video_player::{format_duration, VideoPlayer};
 
 use eframe::egui;
-use gstreamer;
 use std::borrow::Cow;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -2191,19 +2190,6 @@ impl ImageViewer {
     }
 }
 
-impl Drop for ImageViewer {
-    fn drop(&mut self) {
-        // Explicitly drop the video player first to ensure GStreamer pipeline
-        // is set to Null state and resources are released before process exit.
-        if let Some(player) = self.video_player.take() {
-            drop(player);
-        }
-        // Clear textures to release GPU resources
-        self.texture = None;
-        self.video_texture = None;
-    }
-}
-
 impl eframe::App for ImageViewer {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Apply requested startup window mode (exactly once).
@@ -2285,14 +2271,6 @@ impl eframe::App for ImageViewer {
 
         // Process viewport commands
         if self.should_exit {
-            // Explicitly clean up video player before closing to prevent lingering GStreamer threads
-            if let Some(player) = self.video_player.take() {
-                drop(player);
-            }
-            // Clear textures
-            self.texture = None;
-            self.video_texture = None;
-            
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
 
@@ -2553,30 +2531,14 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
 
-    let result = eframe::run_native(
+    eframe::run_native(
         "Image & Video Viewer",
         options,
         Box::new(move |cc| {
             egui_extras::install_image_loaders(&cc.egui_ctx);
             Ok(Box::new(ImageViewer::new(cc, image_path)))
         }),
-    );
-
-    // Deinitialize GStreamer to ensure all background threads are terminated.
-    // This prevents lingering processes after the window is closed.
-    // SAFETY: We are calling deinit() after all GStreamer operations have completed
-    // and the application is shutting down. No further GStreamer calls will be made.
-    unsafe {
-        gstreamer::deinit();
-    }
-
-    // Force process termination to ensure no lingering threads (e.g., from audio/video backends).
-    // This is necessary because some GStreamer plugins or system audio APIs may spawn
-    // background threads that don't automatically terminate on main() exit.
-    match &result {
-        Ok(()) => std::process::exit(0),
-        Err(_) => std::process::exit(1),
-    }
+    )
 }
 
 fn build_app_icon() -> egui::IconData {
