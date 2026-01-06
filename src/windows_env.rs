@@ -158,6 +158,7 @@ pub fn refresh_process_path_from_registry() {
 }
 
 /// Prepends a directory to the process `PATH` if it exists.
+#[allow(dead_code)]
 pub fn prepend_dir_to_path_if_exists(dir: &Path) {
     if !dir.exists() {
         return;

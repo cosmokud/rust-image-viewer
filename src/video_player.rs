@@ -4,6 +4,7 @@
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use gstreamer as gst;
@@ -276,27 +277,40 @@ pub struct VideoPlayer {
 }
 
 impl VideoPlayer {
-    /// Initialize GStreamer (call once at startup)
-    pub fn init() -> Result<(), String> {
-        #[cfg(target_os = "windows")]
-        configure_gstreamer_env_windows();
+    fn ensure_init() -> Result<(), String> {
+        static GST_INIT_RESULT: OnceLock<Result<(), String>> = OnceLock::new();
+        GST_INIT_RESULT
+            .get_or_init(|| {
+                #[cfg(target_os = "windows")]
+                configure_gstreamer_env_windows();
 
-        gst::init().map_err(|e| format!("Failed to initialize GStreamer: {}", e))
-            .and_then(|_| {
-                // Provide an early, actionable error if playback elements are missing.
-                // (We still try both names at actual pipeline creation time.)
-                let has_playbin = gst::ElementFactory::find("playbin").is_some()
-                    || gst::ElementFactory::find("playbin3").is_some();
-                if has_playbin {
-                    Ok(())
-                } else {
-                    Err("GStreamer initialized, but neither `playbin` nor `playbin3` is available. This usually means the playback plugins (gst-plugins-base) were not found/loaded. Verify your GStreamer *runtime* install and plugin paths.".to_string())
-                }
+                gst::init()
+                    .map_err(|e| format!("Failed to initialize GStreamer: {}", e))
+                    .and_then(|_| {
+                        // Provide an early, actionable error if playback elements are missing.
+                        // (We still try both names at actual pipeline creation time.)
+                        let has_playbin = gst::ElementFactory::find("playbin").is_some()
+                            || gst::ElementFactory::find("playbin3").is_some();
+                        if has_playbin {
+                            Ok(())
+                        } else {
+                            Err("GStreamer initialized, but neither `playbin` nor `playbin3` is available. This usually means the playback plugins (gst-plugins-base) were not found/loaded. Verify your GStreamer *runtime* install and plugin paths.".to_string())
+                        }
+                    })
             })
+            .clone()
+    }
+
+    /// Initialize GStreamer (call once at startup)
+    #[allow(dead_code)]
+    pub fn init() -> Result<(), String> {
+        Self::ensure_init()
     }
 
     /// Create a new video player for the given file
     pub fn new(path: &Path, muted: bool, initial_volume: f64) -> Result<Self, String> {
+        Self::ensure_init()?;
+
         // Build a correct file:// URI (including percent-encoding for spaces, etc.).
         // Using a raw `file:///C:/path with spaces.mp4` string is not a valid URI.
         let uri = gst::glib::filename_to_uri(path, None)
@@ -702,6 +716,7 @@ Ensure your GStreamer installation includes the playback elements (usually from 
     }
 
     /// Check if a new frame is available
+    #[allow(dead_code)]
     pub fn has_new_frame(&self) -> bool {
         if let Ok(state) = self.state.lock() {
             state.frame_updated
@@ -734,6 +749,7 @@ Ensure your GStreamer installation includes the playback elements (usually from 
     }
 
     /// Check for errors
+    #[allow(dead_code)]
     pub fn check_error(&self) -> Option<String> {
         if let Some(bus) = self.pipeline.bus() {
             while let Some(msg) = bus.pop() {

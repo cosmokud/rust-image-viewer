@@ -43,8 +43,6 @@ fn main() {
             if should_copy {
                 if let Err(e) = fs::copy(src_config, &dst_config) {
                     println!("cargo:warning=Failed to copy config.ini to target directory: {}", e);
-                } else {
-                    println!("cargo:warning=Copied config.ini to {:?}", dst_config);
                 }
             }
         }
@@ -66,11 +64,9 @@ fn main() {
                 res.set_icon("assets/icon.ico");
                 if let Err(e) = res.compile() {
                     println!("cargo:warning=Failed to embed assets/icon.ico: {}", e);
-                } else {
-                    println!("cargo:warning=Embedded assets/icon.ico into EXE");
                 }
             } else {
-                println!("cargo:warning=Skipping icon embedding: non-msvc Windows target ({})", target);
+                // Non-MSVC Windows targets don't use winres in the same way; skip silently.
             }
         }
     }

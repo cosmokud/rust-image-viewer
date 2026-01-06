@@ -28,6 +28,7 @@ fn downscale_rgba_if_needed<'a>(
     height: u32,
     pixels: &'a [u8],
     max_texture_side: u32,
+    filter: image::imageops::FilterType,
 ) -> (u32, u32, Cow<'a, [u8]>) {
     use image::imageops::FilterType;
 
@@ -48,8 +49,16 @@ fn downscale_rgba_if_needed<'a>(
     let Some(img) = image::RgbaImage::from_raw(width, height, pixels.to_vec()) else {
         return (width, height, Cow::Borrowed(pixels));
     };
-    // Use Triangle filter instead of Lanczos3 - faster with acceptable quality
-    let resized = image::imageops::resize(&img, new_w, new_h, FilterType::Triangle);
+    let filter = match filter {
+        // Be defensive: always downscaling here, so avoid an accidental "upscale"-only filter.
+        // (All current variants are valid for both directions, but keep this guard for future changes.)
+        FilterType::Nearest
+        | FilterType::Triangle
+        | FilterType::CatmullRom
+        | FilterType::Gaussian
+        | FilterType::Lanczos3 => filter,
+    };
+    let resized = image::imageops::resize(&img, new_w, new_h, filter);
     (new_w, new_h, Cow::Owned(resized.into_raw()))
 }
 
@@ -246,6 +255,10 @@ struct ImageViewer {
     last_activity_time: Instant,
     /// Whether the viewer is in idle state (no animations, no user interaction)
     is_idle: bool,
+
+    /// Whether we've installed extra Windows fonts for CJK filename rendering.
+    /// These font files can be quite large, so we install them lazily only when needed.
+    windows_cjk_fonts_installed: bool,
 }
 
 impl Default for ImageViewer {
@@ -312,11 +325,56 @@ impl Default for ImageViewer {
             needs_repaint: false,
             last_activity_time: Instant::now(),
             is_idle: true,
+
+            windows_cjk_fonts_installed: false,
         }
     }
 }
 
 impl ImageViewer {
+    fn filename_needs_cjk_fonts(filename: &str) -> bool {
+        // Check common CJK Unicode blocks (Han, Hiragana, Katakana, Hangul).
+        filename.chars().any(|ch| {
+            let c = ch as u32;
+            (0x3400..=0x4DBF).contains(&c) // CJK Unified Ideographs Extension A
+                || (0x4E00..=0x9FFF).contains(&c) // CJK Unified Ideographs
+                || (0xF900..=0xFAFF).contains(&c) // CJK Compatibility Ideographs
+                || (0x3040..=0x309F).contains(&c) // Hiragana
+                || (0x30A0..=0x30FF).contains(&c) // Katakana
+                || (0x31F0..=0x31FF).contains(&c) // Katakana Phonetic Extensions
+                || (0x1100..=0x11FF).contains(&c) // Hangul Jamo
+                || (0xAC00..=0xD7AF).contains(&c) // Hangul Syllables
+        })
+    }
+
+    fn ensure_windows_cjk_fonts_if_needed(&mut self, ctx: &egui::Context) {
+        #[cfg(target_os = "windows")]
+        {
+            if self.windows_cjk_fonts_installed {
+                return;
+            }
+
+            let Some(path) = self.image_list.get(self.current_index) else {
+                return;
+            };
+
+            let filename = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+
+            if filename.is_empty() {
+                return;
+            }
+
+            if Self::filename_needs_cjk_fonts(&filename) {
+                install_windows_cjk_fonts(ctx);
+                self.windows_cjk_fonts_installed = true;
+                self.needs_repaint = true;
+            }
+        }
+    }
+
     fn compute_window_title_for_path(&self, path: &PathBuf) -> String {
         let filename = path
             .file_name()
@@ -510,9 +568,6 @@ impl ImageViewer {
         visuals.window_fill = bg;
         visuals.panel_fill = bg;
         cc.egui_ctx.set_visuals(visuals);
-
-        // Ensure filenames in the custom control bar render for Japanese/Chinese/Korean.
-        install_windows_cjk_fonts(&cc.egui_ctx);
 
         // Get screen size from monitor info if available
         #[cfg(target_os = "windows")]
@@ -924,11 +979,18 @@ impl ImageViewer {
                 let frame = img.current_frame_data();
                 // This should already be constrained in the loader, but keep this guard to
                 // avoid backend crashes if a frame slips through.
+                let downscale_filter = if img.is_animated() {
+                    self.config.gif_resize_filter.to_image_filter()
+                } else {
+                    self.config.downscale_filter.to_image_filter()
+                };
+
                 let (w, h, pixels) = downscale_rgba_if_needed(
                     frame.width,
                     frame.height,
                     &frame.pixels,
                     self.max_texture_side,
+                    downscale_filter,
                 );
                 let color_image = egui::ColorImage::from_rgba_unmultiplied(
                     [w as usize, h as usize],
@@ -985,6 +1047,7 @@ impl ImageViewer {
                     frame.height,
                     &frame.pixels,
                     self.max_texture_side,
+                    self.config.downscale_filter.to_image_filter(),
                 );
                 let color_image = egui::ColorImage::from_rgba_unmultiplied(
                     [w as usize, h as usize],
@@ -2246,6 +2309,10 @@ impl eframe::App for ImageViewer {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Reset per-frame repaint tracking
         self.needs_repaint = false;
+
+        // Lazily install large CJK fonts only when we actually have a filename that needs them.
+        self.ensure_windows_cjk_fonts_if_needed(ctx);
+
         // Apply requested startup window mode (exactly once).
         if !self.startup_window_mode_applied {
             self.startup_window_mode_applied = true;
@@ -2590,12 +2657,6 @@ fn get_global_cursor_pos() -> Option<egui::Pos2> {
 fn main() -> eframe::Result<()> {
     #[cfg(target_os = "windows")]
     windows_env::refresh_process_path_from_registry();
-
-    // Initialize GStreamer for video playback
-    if let Err(e) = VideoPlayer::init() {
-        eprintln!("Warning: Failed to initialize GStreamer: {}", e);
-        eprintln!("Video playback may not be available.");
-    }
 
     // Parse command line arguments
     let args: Vec<String> = std::env::args().collect();
