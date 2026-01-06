@@ -153,11 +153,35 @@ fn configure_gstreamer_env_windows() {
         prepend_env_path("GST_PLUGIN_PATH_1_0", &plugin_dir);
         prepend_env_path("GST_PLUGIN_PATH", &plugin_dir);
     }
+    // Prevent a brief console-window flash during plugin scanning on some Windows setups.
+    // We point GST_PLUGIN_SCANNER to our GUI-subsystem wrapper, which then launches the real
+    // scanner with CREATE_NO_WINDOW while preserving redirected stdio.
     if std::env::var_os("GST_PLUGIN_SCANNER").is_none() {
-        if scanner_path_primary.exists() {
-            std::env::set_var("GST_PLUGIN_SCANNER", &scanner_path_primary);
+        let real_scanner = if scanner_path_primary.exists() {
+            Some(scanner_path_primary)
         } else if scanner_path_fallback.exists() {
-            std::env::set_var("GST_PLUGIN_SCANNER", &scanner_path_fallback);
+            Some(scanner_path_fallback)
+        } else {
+            None
+        };
+
+        if let Some(real_scanner) = real_scanner {
+            std::env::set_var("GST_PLUGIN_SCANNER_REAL", &real_scanner);
+
+            let wrapper = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.join("gst-plugin-scanner-wrapper.exe")));
+
+            if let Some(wrapper) = wrapper {
+                if wrapper.exists() {
+                    std::env::set_var("GST_PLUGIN_SCANNER", &wrapper);
+                } else {
+                    // Fallback: use the real scanner directly.
+                    std::env::set_var("GST_PLUGIN_SCANNER", &real_scanner);
+                }
+            } else {
+                std::env::set_var("GST_PLUGIN_SCANNER", &real_scanner);
+            }
         }
     }
 

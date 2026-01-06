@@ -20,6 +20,44 @@ use std::time::{Duration, Instant};
 
 use eframe::glow::HasContext;
 
+#[cfg(target_os = "windows")]
+fn spawn_early_window_hider() {
+    use std::time::Instant;
+
+    // Best-effort mitigation for a tiny startup flash on some Windows setups:
+    // if the OS briefly shows the window before winit applies the initial visibility,
+    // hide any top-level windows belonging to this process as soon as they appear.
+    std::thread::spawn(|| {
+        use winapi::shared::minwindef::{BOOL, DWORD, LPARAM};
+        use winapi::shared::windef::HWND;
+        use winapi::um::winuser::{
+            EnumWindows, GetWindowThreadProcessId, IsWindowVisible, ShowWindow, SW_HIDE,
+        };
+
+        unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+            let pid = lparam as DWORD;
+            let mut win_pid: DWORD = 0;
+            GetWindowThreadProcessId(hwnd, &mut win_pid);
+            if win_pid == pid {
+                if IsWindowVisible(hwnd) != 0 {
+                    ShowWindow(hwnd, SW_HIDE);
+                }
+            }
+            1
+        }
+
+        let pid = std::process::id() as DWORD;
+        let start = Instant::now();
+        // Only run very briefly at startup.
+        while start.elapsed() < Duration::from_millis(600) {
+            unsafe {
+                EnumWindows(Some(enum_proc), pid as LPARAM);
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    });
+}
+
 /// Downscale RGBA pixel data if it exceeds the maximum texture size.
 /// Uses Cow to avoid unnecessary allocations when no downscaling is needed.
 /// Uses Triangle filter (faster than Lanczos3) for better performance.
@@ -2880,6 +2918,9 @@ fn get_global_cursor_pos() -> Option<egui::Pos2> {
 fn main() -> eframe::Result<()> {
     #[cfg(target_os = "windows")]
     windows_env::refresh_process_path_from_registry();
+
+    #[cfg(target_os = "windows")]
+    spawn_early_window_hider();
 
     // Parse command line arguments
     let args: Vec<String> = std::env::args().collect();
