@@ -5,6 +5,90 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
+/// Image resampling filter types for scaling operations.
+/// Listed from fastest (lowest quality) to slowest (highest quality).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageFilter {
+    /// Nearest neighbor - fastest, pixelated look (good for pixel art)
+    Nearest,
+    /// Triangle (bilinear) - fast, smooth but can be blurry
+    Triangle,
+    /// Catmull-Rom - good balance of speed and quality (recommended default)
+    CatmullRom,
+    /// Gaussian - smooth results, slightly soft
+    Gaussian,
+    /// Lanczos3 - highest quality, sharpest results, slowest
+    Lanczos3,
+}
+
+impl ImageFilter {
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "nearest" | "point" | "nn" => Some(Self::Nearest),
+            "triangle" | "bilinear" | "linear" => Some(Self::Triangle),
+            "catmullrom" | "catmull-rom" | "catmull_rom" | "cubic" => Some(Self::CatmullRom),
+            "gaussian" | "gauss" => Some(Self::Gaussian),
+            "lanczos" | "lanczos3" | "sinc" => Some(Self::Lanczos3),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Nearest => "nearest",
+            Self::Triangle => "triangle",
+            Self::CatmullRom => "catmullrom",
+            Self::Gaussian => "gaussian",
+            Self::Lanczos3 => "lanczos3",
+        }
+    }
+
+    /// Convert to image crate's FilterType
+    pub fn to_image_filter(&self) -> image::imageops::FilterType {
+        match self {
+            Self::Nearest => image::imageops::FilterType::Nearest,
+            Self::Triangle => image::imageops::FilterType::Triangle,
+            Self::CatmullRom => image::imageops::FilterType::CatmullRom,
+            Self::Gaussian => image::imageops::FilterType::Gaussian,
+            Self::Lanczos3 => image::imageops::FilterType::Lanczos3,
+        }
+    }
+}
+
+/// Texture filtering mode for GPU rendering
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextureFilter {
+    /// Nearest neighbor - sharp pixels, no smoothing (good for pixel art, uses less VRAM)
+    Nearest,
+    /// Linear (bilinear) - smooth interpolation between pixels (recommended for photos)
+    Linear,
+}
+
+impl TextureFilter {
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "nearest" | "point" | "nn" | "sharp" => Some(Self::Nearest),
+            "linear" | "bilinear" | "smooth" => Some(Self::Linear),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Nearest => "nearest",
+            Self::Linear => "linear",
+        }
+    }
+
+    /// Convert to egui TextureOptions
+    pub fn to_egui_options(&self) -> egui::TextureOptions {
+        match self {
+            Self::Nearest => egui::TextureOptions::NEAREST,
+            Self::Linear => egui::TextureOptions::LINEAR,
+        }
+    }
+}
+
 /// Represents all possible input types for shortcuts
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum InputBinding {
@@ -223,6 +307,20 @@ pub struct Config {
 
     /// Startup window mode: `floating` (default) or `fullscreen`
     pub startup_window_mode: StartupWindowMode,
+
+    // ============ IMAGE QUALITY SETTINGS ============
+    /// Filter for upscaling images (making them larger)
+    pub upscale_filter: ImageFilter,
+    /// Filter for downscaling images (making them smaller)
+    pub downscale_filter: ImageFilter,
+    /// Filter for GIF animation frame resizing (affects performance)
+    pub gif_resize_filter: ImageFilter,
+    /// GPU texture filtering for static images
+    pub texture_filter_static: TextureFilter,
+    /// GPU texture filtering for animated images (GIFs)
+    pub texture_filter_animated: TextureFilter,
+    /// GPU texture filtering for video frames
+    pub texture_filter_video: TextureFilter,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -264,6 +362,13 @@ impl Default for Config {
             video_loop: true,
             video_controls_hide_delay: 0.5,
             startup_window_mode: StartupWindowMode::Floating,
+            // Image quality defaults - use high quality filters
+            upscale_filter: ImageFilter::CatmullRom,      // Best balance of quality and speed
+            downscale_filter: ImageFilter::Lanczos3,      // Highest quality for downscaling
+            gif_resize_filter: ImageFilter::CatmullRom,   // Good quality, reasonable speed for animations
+            texture_filter_static: TextureFilter::Linear, // Smooth rendering for photos
+            texture_filter_animated: TextureFilter::Linear, // Smooth for animations
+            texture_filter_video: TextureFilter::Linear,  // Smooth for video
         };
         config.set_defaults();
         config
@@ -313,24 +418,69 @@ impl Config {
             .push(input);
     }
 
+    /// Get the configuration directory in AppData/Roaming.
+    /// Creates the directory if it doesn't exist.
+    fn config_dir() -> PathBuf {
+        // Use APPDATA environment variable on Windows (AppData/Roaming)
+        // Falls back to executable directory if APPDATA is not set
+        let base_dir = if cfg!(target_os = "windows") {
+            std::env::var("APPDATA")
+                .ok()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    std::env::current_exe()
+                        .ok()
+                        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+                        .unwrap_or_else(|| PathBuf::from("."))
+                })
+        } else {
+            // On Unix-like systems, use ~/.config
+            std::env::var("XDG_CONFIG_HOME")
+                .ok()
+                .map(PathBuf::from)
+                .or_else(|| {
+                    std::env::var("HOME")
+                        .ok()
+                        .map(|h| PathBuf::from(h).join(".config"))
+                })
+                .unwrap_or_else(|| PathBuf::from("."))
+        };
+
+        let config_dir = base_dir.join("rust-image-viewer");
+        
+        // Create directory if it doesn't exist
+        let _ = fs::create_dir_all(&config_dir);
+        
+        config_dir
+    }
+
     /// Get settings file path.
     ///
-    /// Uses `config.ini` next to the executable.
+    /// Uses `config.ini` in AppData/Roaming/rust-image-viewer/ on Windows.
     ///
-    /// If a legacy `setting.ini` exists (from a prior build), we migrate it back to `config.ini`.
+    /// Migrates from legacy locations (exe directory, setting.ini) if needed.
     pub fn config_path() -> PathBuf {
-        let exe_path = std::env::current_exe().unwrap_or_default();
-        let exe_dir = exe_path.parent().unwrap_or(std::path::Path::new("."));
+        let config_dir = Self::config_dir();
+        let config = config_dir.join("config.ini");
 
-        let config = exe_dir.join("config.ini");
-
-        // Best-effort migration back from `setting.ini` -> `config.ini`.
-        // We only do this if `config.ini` is missing so we don't overwrite user edits.
+        // Migration from legacy locations
         if !config.exists() {
-            let legacy_setting = exe_dir.join("setting.ini");
-            if legacy_setting.exists() {
-                let _ = fs::copy(&legacy_setting, &config);
-                let _ = fs::remove_file(&legacy_setting);
+            // Try to migrate from exe directory (old location)
+            if let Ok(exe_path) = std::env::current_exe() {
+                if let Some(exe_dir) = exe_path.parent() {
+                    // Check for config.ini in exe directory
+                    let legacy_config = exe_dir.join("config.ini");
+                    if legacy_config.exists() {
+                        let _ = fs::copy(&legacy_config, &config);
+                        // Don't delete - user might want to keep it
+                    }
+                    
+                    // Check for setting.ini (very old location)
+                    let legacy_setting = exe_dir.join("setting.ini");
+                    if legacy_setting.exists() && !config.exists() {
+                        let _ = fs::copy(&legacy_setting, &config);
+                    }
+                }
             }
         }
 
@@ -369,11 +519,19 @@ impl Config {
             video_loop: true,
             video_controls_hide_delay: 0.5,
             startup_window_mode: StartupWindowMode::Floating,
+            // Image quality defaults
+            upscale_filter: ImageFilter::CatmullRom,
+            downscale_filter: ImageFilter::Lanczos3,
+            gif_resize_filter: ImageFilter::CatmullRom,
+            texture_filter_static: TextureFilter::Linear,
+            texture_filter_animated: TextureFilter::Linear,
+            texture_filter_video: TextureFilter::Linear,
         };
 
         let mut in_shortcuts_section = false;
         let mut in_settings_section = false;
         let mut in_video_section = false;
+        let mut in_quality_section = false;
 
         for line in content.lines() {
             let line = line.trim();
@@ -389,6 +547,9 @@ impl Config {
                 in_shortcuts_section = section.eq_ignore_ascii_case("shortcuts");
                 in_settings_section = section.eq_ignore_ascii_case("settings");
                 in_video_section = section.eq_ignore_ascii_case("video");
+                in_quality_section = section.eq_ignore_ascii_case("quality") 
+                    || section.eq_ignore_ascii_case("image_quality")
+                    || section.eq_ignore_ascii_case("filters");
                 continue;
             }
 
@@ -504,6 +665,48 @@ impl Config {
                     }
                 }
             }
+
+            // Parse key=value pairs in quality section
+            if in_quality_section {
+                if let Some((key, value)) = line.split_once('=') {
+                    let key = key.trim().to_lowercase();
+                    let value = value.trim();
+                    
+                    match key.as_str() {
+                        "upscale_filter" => {
+                            if let Some(f) = ImageFilter::from_str(value) {
+                                config.upscale_filter = f;
+                            }
+                        }
+                        "downscale_filter" => {
+                            if let Some(f) = ImageFilter::from_str(value) {
+                                config.downscale_filter = f;
+                            }
+                        }
+                        "gif_resize_filter" => {
+                            if let Some(f) = ImageFilter::from_str(value) {
+                                config.gif_resize_filter = f;
+                            }
+                        }
+                        "texture_filter_static" => {
+                            if let Some(f) = TextureFilter::from_str(value) {
+                                config.texture_filter_static = f;
+                            }
+                        }
+                        "texture_filter_animated" => {
+                            if let Some(f) = TextureFilter::from_str(value) {
+                                config.texture_filter_animated = f;
+                            }
+                        }
+                        "texture_filter_video" => {
+                            if let Some(f) = TextureFilter::from_str(value) {
+                                config.texture_filter_video = f;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
         }
 
         // Fill in defaults for any missing actions
@@ -576,6 +779,35 @@ impl Config {
         ));
         content.push_str("; How long the video controls bar stays visible (in seconds)\n");
         content.push_str(&format!("controls_hide_delay = {}\n\n", self.video_controls_hide_delay));
+
+        // Write quality section with comprehensive documentation
+        content.push_str("[Quality]\n");
+        content.push_str("; Image scaling filters - affects quality when images are resized to fit the window\n");
+        content.push_str("; Available options (from fastest to highest quality):\n");
+        content.push_str(";   nearest   - Fastest, pixelated look (good for pixel art)\n");
+        content.push_str(";   triangle  - Fast bilinear interpolation, decent quality\n");
+        content.push_str(";   catmullrom - Good balance of speed and quality (recommended for upscaling)\n");
+        content.push_str(";   gaussian  - Smooth results, slightly blurry\n");
+        content.push_str(";   lanczos3  - Highest quality, sharpest results (recommended for downscaling)\n\n");
+        
+        content.push_str("; Filter used when enlarging images (displaying small images larger)\n");
+        content.push_str(&format!("upscale_filter = {}\n", self.upscale_filter.as_str()));
+        content.push_str("; Filter used when shrinking images (displaying large images smaller)\n");
+        content.push_str(&format!("downscale_filter = {}\n", self.downscale_filter.as_str()));
+        content.push_str("; Filter used when resizing GIF frames (affects memory usage and quality)\n");
+        content.push_str(&format!("gif_resize_filter = {}\n\n", self.gif_resize_filter.as_str()));
+        
+        content.push_str("; GPU texture filtering - affects how images look when zoomed/scaled on screen\n");
+        content.push_str("; Available options:\n");
+        content.push_str(";   nearest - Sharp pixels, no blending (good for pixel art, crisp at 100%)\n");
+        content.push_str(";   linear  - Smooth blending between pixels (recommended for photos)\n\n");
+        
+        content.push_str("; Texture filter for static images (photos, PNG, JPEG, etc.)\n");
+        content.push_str(&format!("texture_filter_static = {}\n", self.texture_filter_static.as_str()));
+        content.push_str("; Texture filter for animated images (GIFs)\n");
+        content.push_str(&format!("texture_filter_animated = {}\n", self.texture_filter_animated.as_str()));
+        content.push_str("; Texture filter for video frames\n");
+        content.push_str(&format!("texture_filter_video = {}\n\n", self.texture_filter_video.as_str()));
 
         content.push_str("[Shortcuts]\n");
 

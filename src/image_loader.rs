@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use image::GenericImageView;
+use image::imageops::FilterType;
 
 // Reduced from 4 GiB to 1 GiB for more reasonable memory limits
 const DEFAULT_MAX_DECODE_ALLOC_BYTES: u64 = 1 * 1024 * 1024 * 1024; // 1 GiB
@@ -161,14 +162,22 @@ impl LoadedImage {
     /// Load an image from path
     #[allow(dead_code)]
     pub fn load(path: &Path) -> Result<Self, String> {
-        Self::load_with_max_texture_side(path, None)
+        Self::load_with_max_texture_side(path, None, FilterType::Lanczos3, FilterType::Triangle)
     }
 
     /// Load an image with an optional maximum texture side constraint.
     ///
     /// If provided, oversized images/frames are downscaled to fit within `max_texture_side`
     /// to avoid GPU texture creation crashes (common with wgpu validation).
-    pub fn load_with_max_texture_side(path: &Path, max_texture_side: Option<u32>) -> Result<Self, String> {
+    /// 
+    /// `downscale_filter` - Filter used when downscaling images to fit max texture size
+    /// `gif_filter` - Filter used when resizing GIF frames
+    pub fn load_with_max_texture_side(
+        path: &Path, 
+        max_texture_side: Option<u32>,
+        downscale_filter: FilterType,
+        gif_filter: FilterType,
+    ) -> Result<Self, String> {
         let extension = path
             .extension()
             .and_then(|e| e.to_str())
@@ -176,23 +185,21 @@ impl LoadedImage {
             .unwrap_or_default();
 
         if extension == "gif" {
-            Self::load_gif(path, max_texture_side)
+            Self::load_gif(path, max_texture_side, gif_filter)
         } else {
-            Self::load_static(path, max_texture_side)
+            Self::load_static(path, max_texture_side, downscale_filter)
         }
     }
 
     /// Load a static image (JPG, PNG, WEBP, etc.)
-    fn load_static(path: &Path, max_texture_side: Option<u32>) -> Result<Self, String> {
-        use image::imageops::FilterType;
-
+    fn load_static(path: &Path, max_texture_side: Option<u32>, downscale_filter: FilterType) -> Result<Self, String> {
         let img = open_image_with_reasonable_limits(path)?;
         let img = if let Some(max_side) = max_texture_side {
             if max_side > 0 {
                 let (w, h) = img.dimensions();
                 if w > max_side || h > max_side {
                     // Preserve aspect ratio; `resize` interprets (max_width, max_height).
-                    img.resize(max_side, max_side, FilterType::Lanczos3)
+                    img.resize(max_side, max_side, downscale_filter)
                 } else {
                     img
                 }
@@ -225,10 +232,9 @@ impl LoadedImage {
 
     /// Load an animated GIF
     /// Optimized for memory: limits frame count and uses efficient downscaling
-    fn load_gif(path: &Path, max_texture_side: Option<u32>) -> Result<Self, String> {
+    fn load_gif(path: &Path, max_texture_side: Option<u32>, gif_filter: FilterType) -> Result<Self, String> {
         use std::fs::File;
         use gif::DecodeOptions;
-        use image::imageops::FilterType;
 
         let file = File::open(path).map_err(|e| format!("Failed to open file: {}", e))?;
         let mut decoder = DecodeOptions::new();
@@ -310,8 +316,8 @@ impl LoadedImage {
                 let Some(img) = image::RgbaImage::from_raw(width, height, canvas.clone()) else {
                     return Err("Failed to build RGBA image for GIF resizing".to_string());
                 };
-                // Use faster Triangle filter instead of Lanczos3 for animated GIFs
-                let resized = image::imageops::resize(&img, target_width, target_height, FilterType::Triangle);
+                // Use configurable filter for animated GIFs
+                let resized = image::imageops::resize(&img, target_width, target_height, gif_filter);
                 resized.into_raw()
             } else {
                 canvas.clone()

@@ -597,8 +597,10 @@ impl ImageViewer {
                 }
             }
             Some(MediaType::Image) => {
-                // Load as image
-                match LoadedImage::load_with_max_texture_side(path, Some(self.max_texture_side)) {
+                // Load as image with configured filters
+                let downscale_filter = self.config.downscale_filter.to_image_filter();
+                let gif_filter = self.config.gif_resize_filter.to_image_filter();
+                match LoadedImage::load_with_max_texture_side(path, Some(self.max_texture_side), downscale_filter, gif_filter) {
                     Ok(img) => {
                         self.image = Some(img);
                         self.texture_frame = usize::MAX;
@@ -933,11 +935,11 @@ impl ImageViewer {
                     pixels.as_ref(),
                 );
                 
-                // Use NEAREST for static images (less VRAM, faster), LINEAR for animations
+                // Use configured texture filter based on content type
                 let texture_options = if img.is_animated() {
-                    egui::TextureOptions::LINEAR
+                    self.config.texture_filter_animated.to_egui_options()
                 } else {
-                    egui::TextureOptions::NEAREST
+                    self.config.texture_filter_static.to_egui_options()
                 };
                 
                 self.texture = Some(ctx.load_texture(
@@ -989,11 +991,11 @@ impl ImageViewer {
                     pixels.as_ref(),
                 );
                 
-                // Use LINEAR for video for smooth motion
+                // Use configured texture filter for video
                 self.video_texture = Some(ctx.load_texture(
                     "video",
                     color_image,
-                    egui::TextureOptions::LINEAR,
+                    self.config.texture_filter_video.to_egui_options(),
                 ));
                 self.video_texture_dims = Some((w, h));
                 needs_repaint = true;
