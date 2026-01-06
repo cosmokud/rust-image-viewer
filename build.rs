@@ -65,6 +65,34 @@ fn main() {
                 if let Err(e) = res.compile() {
                     println!("cargo:warning=Failed to embed assets/icon.ico: {}", e);
                 }
+
+                // ---- Idle RAM optimization (Windows/MSVC): delay-load GStreamer DLLs ----
+                //
+                // Even if the app never opens a video, linking against gstreamer-sys means
+                // Windows will eagerly load the imported DLLs at process start by default.
+                // Using /DELAYLOAD keeps idle memory low; the DLLs load on first actual use
+                // (i.e., when a video is opened and we call into GStreamer).
+                //
+                // This does not change image/video quality; it only changes when the
+                // dependencies are mapped into the process.
+                println!("cargo:rustc-link-lib=delayimp");
+
+                // Core GStreamer runtime
+                for dll in [
+                    "gstreamer-1.0-0.dll",
+                    "gstbase-1.0-0.dll",
+                    "gstapp-1.0-0.dll",
+                    "gstvideo-1.0-0.dll",
+                    "gstaudio-1.0-0.dll",
+                    // GLib/GObject stack (pulled in by GStreamer)
+                    "glib-2.0-0.dll",
+                    "gobject-2.0-0.dll",
+                    "gmodule-2.0-0.dll",
+                    "gthread-2.0-0.dll",
+                    "gio-2.0-0.dll",
+                ] {
+                    println!("cargo:rustc-link-arg=/DELAYLOAD:{}", dll);
+                }
             } else {
                 // Non-MSVC Windows targets don't use winres in the same way; skip silently.
             }

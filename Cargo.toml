@@ -9,7 +9,7 @@ build = "build.rs"
 
 [dependencies]
 # GUI framework
-eframe = { version = "0.29", features = ["persistence"] }
+eframe = { version = "0.29" }
 egui = "0.29"
 egui_extras = { version = "0.29", features = ["image"] }
 

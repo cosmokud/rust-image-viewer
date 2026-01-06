@@ -2669,6 +2669,11 @@ fn main() -> eframe::Result<()> {
     // Configure native options
     // Note: We don't set fullscreen in the viewport to avoid triggering NVIDIA GSYNC
     let options = eframe::NativeOptions {
+        // Keep the renderer lightweight at idle. This viewer renders 2D UI + a single image/video
+        // texture; MSAA and a depth buffer are not required for perceptible quality.
+        renderer: eframe::Renderer::Glow,
+        multisampling: 0,
+        depth_buffer: 0,
         viewport: egui::ViewportBuilder::default()
             .with_decorations(false) // No title bar
             .with_transparent(false) // Avoid compositing issues
