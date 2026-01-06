@@ -56,7 +56,3 @@ codegen-units = 4
 [[bin]]
 name = "image-viewer"
 path = "src/main.rs"
-
-[[bin]]
-name = "gst-plugin-scanner-wrapper"
-path = "src/gst_plugin_scanner_wrapper.rs"
