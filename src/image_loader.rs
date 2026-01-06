@@ -8,8 +8,9 @@ use std::time::{Duration, Instant};
 use image::GenericImageView;
 use image::imageops::FilterType;
 
-// Reduced from 4 GiB to 1 GiB for more reasonable memory limits
-const DEFAULT_MAX_DECODE_ALLOC_BYTES: u64 = 1 * 1024 * 1024 * 1024; // 1 GiB
+// Reduced from 4 GiB to 512 MiB for more reasonable memory limits
+// This prevents loading extremely large images that would consume too much RAM
+const DEFAULT_MAX_DECODE_ALLOC_BYTES: u64 = 512 * 1024 * 1024; // 512 MiB
 
 fn open_image_with_reasonable_limits(path: &Path) -> Result<image::DynamicImage, String> {
     // `image::open()` uses conservative decoder limits to protect against decompression bombs.
@@ -249,8 +250,9 @@ impl LoadedImage {
         let height = decoder.height() as u32;
 
         // Memory optimization: limit maximum frames to prevent excessive RAM usage
-        // A 1920x1080 RGBA frame is ~8MB, so 100 frames = ~800MB
-        const MAX_FRAMES: usize = 100;
+        // A 1920x1080 RGBA frame is ~8MB, so 50 frames = ~400MB max for large GIFs
+        // Reduced from 100 to 50 for better memory efficiency
+        const MAX_FRAMES: usize = 50;
         
         // Determine if we need to downscale upfront based on memory constraints
         // For large GIFs, downscale immediately to reduce per-frame memory

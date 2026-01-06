@@ -11,7 +11,9 @@ build = "build.rs"
 # GUI framework
 eframe = { version = "0.29" }
 egui = "0.29"
-egui_extras = { version = "0.29", features = ["image"] }
+# egui_extras is optional - we use our own optimized image loader
+# Keeping it as optional dependency in case needed for future features
+egui_extras = { version = "0.29", features = ["image"], optional = true }
 
 # Image handling
 image = { version = "0.25", features = ["jpeg", "png", "gif", "webp"] }
@@ -40,6 +42,16 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# Debug profile optimizations - reduce memory usage during development too
+[profile.dev]
+opt-level = 1
+
+# Use thin LTO for faster builds with good optimization
+[profile.release-fast]
+inherits = "release"
+lto = "thin"
+codegen-units = 4
 
 [[bin]]
 name = "image-viewer"

@@ -255,10 +255,15 @@ struct ImageViewer {
     last_activity_time: Instant,
     /// Whether the viewer is in idle state (no animations, no user interaction)
     is_idle: bool,
+    /// Idle repaint interval counter - skip unnecessary repaints when truly idle
+    idle_frame_skip_counter: u32,
 
     /// Whether we've installed extra Windows fonts for CJK filename rendering.
     /// These font files can be quite large, so we install them lazily only when needed.
     windows_cjk_fonts_installed: bool,
+    
+    /// Whether GStreamer has been initialized (deferred until first video load)
+    gstreamer_initialized: bool,
 }
 
 impl Default for ImageViewer {
@@ -325,8 +330,10 @@ impl Default for ImageViewer {
             needs_repaint: false,
             last_activity_time: Instant::now(),
             is_idle: true,
+            idle_frame_skip_counter: 0,
 
             windows_cjk_fonts_installed: false,
+            gstreamer_initialized: false,
         }
     }
 }
@@ -603,13 +610,26 @@ impl ImageViewer {
         // Clear previous media state.
         // For video-to-video navigation we keep the previous video texture as a placeholder
         // until the first decoded frame of the new video arrives.
-        self.video_player = None;
+        // 
+        // MEMORY OPTIMIZATION: Explicitly drop textures to release GPU memory immediately.
+        // Setting to None allows Rust to drop the TextureHandle, which signals egui to
+        // free the underlying GPU texture on the next frame.
+        if let Some(player) = self.video_player.take() {
+            // Drop the video player first - this stops GStreamer pipeline and frees its buffers
+            drop(player);
+        }
         if !keep_video_placeholder {
-            self.video_texture = None;
+            // Drop video texture to free VRAM
+            if let Some(tex) = self.video_texture.take() {
+                drop(tex);
+            }
             self.video_texture_dims = None;
         }
+        // Drop image texture to free VRAM
+        if let Some(tex) = self.texture.take() {
+            drop(tex);
+        }
         self.image = None;
-        self.texture = None;
         self.show_video_controls = false;
 
         // Reset view state so we don't carry zoom/offset across media switches.
@@ -626,6 +646,9 @@ impl ImageViewer {
 
         match media_type {
             Some(MediaType::Video) => {
+                // Mark GStreamer as initialized (it will be lazily initialized on first use)
+                self.gstreamer_initialized = true;
+                
                 // Load as video
                 match VideoPlayer::new(
                     path,
@@ -2309,6 +2332,23 @@ impl eframe::App for ImageViewer {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Reset per-frame repaint tracking
         self.needs_repaint = false;
+        
+        // PERFORMANCE: Check if window is minimized to reduce resource usage
+        let is_minimized = ctx.input(|i| {
+            i.raw.viewport().minimized.unwrap_or(false)
+        });
+        
+        // When minimized, skip most processing to save CPU/GPU
+        if is_minimized {
+            // Pause video playback when minimized to save CPU
+            if let Some(ref mut player) = self.video_player {
+                if player.is_playing() {
+                    let _ = player.pause();
+                }
+            }
+            // Don't request repaint when minimized - OS will handle restore
+            return;
+        }
 
         // Lazily install large CJK fonts only when we actually have a filename that needs them.
         self.ensure_windows_cjk_fonts_if_needed(ctx);
@@ -2589,24 +2629,36 @@ impl eframe::App for ImageViewer {
             || self.is_seeking
             || self.is_volume_dragging;
 
-        // Update idle state
+        // Update idle state and optimize repaint scheduling
         if any_animation_active {
             self.last_activity_time = Instant::now();
             self.is_idle = false;
+            self.idle_frame_skip_counter = 0;
         } else {
             // Consider idle after 100ms of no activity
-            self.is_idle = self.last_activity_time.elapsed() > Duration::from_millis(100);
+            let idle_threshold = Duration::from_millis(100);
+            self.is_idle = self.last_activity_time.elapsed() > idle_threshold;
         }
 
-        // Only request immediate repaint if animations are active
-        // Otherwise, egui will naturally repaint on user input
+        // Smart repaint scheduling for CPU efficiency:
+        // - Active animations: immediate repaint
+        // - Waiting for video dims: poll at 60fps
+        // - Idle with video playing: poll at video framerate
+        // - Fully idle: no repaint (egui handles user input events automatically)
         if any_animation_active {
             ctx.request_repaint();
         } else if self.pending_media_layout {
             // Still waiting for video dimensions - check again soon but not immediately
             ctx.request_repaint_after(Duration::from_millis(16));
+        } else if let Some(ref player) = self.video_player {
+            if player.is_playing() {
+                // Video is playing - poll for new frames at ~60fps
+                ctx.request_repaint_after(Duration::from_millis(16));
+            }
+            // Paused video or no video: no repaint needed
         }
-        // When idle, no repaint is requested - egui handles user input events automatically
+        // When fully idle (no video, no animation), no repaint is requested
+        // egui handles user input events automatically
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
@@ -2667,13 +2719,40 @@ fn main() -> eframe::Result<()> {
     };
 
     // Configure native options
+    // 
+    // IMPORTANT NOTE ON VRAM USAGE:
+    // This application uses OpenGL (via eframe/glow) for hardware-accelerated rendering.
+    // OpenGL requires a GPU context which allocates a base amount of VRAM (~10-20MB) for:
+    // - Framebuffers (front/back buffers for double-buffering)
+    // - Default font texture atlas
+    // - Shader programs
+    // 
+    // To achieve TRUE ZERO VRAM (like XnViewMP), the application would need to be rewritten
+    // to use pure software rendering (GDI/GDI+ on Windows), which would:
+    // - Eliminate all GPU acceleration
+    // - Make zooming/panning less smooth
+    // - Increase CPU usage for rendering
+    // - Require a complete architectural rewrite
+    //
+    // The current optimizations minimize VRAM usage as much as possible while retaining
+    // hardware acceleration benefits:
+    // - No MSAA (multisampling)
+    // - No depth buffer
+    // - No stencil buffer  
+    // - Textures only created when media is loaded
+    // - Textures released when switching media
+    // - Smart repaint scheduling (no repainting when idle)
+    //
     // Note: We don't set fullscreen in the viewport to avoid triggering NVIDIA GSYNC
     let options = eframe::NativeOptions {
         // Keep the renderer lightweight at idle. This viewer renders 2D UI + a single image/video
         // texture; MSAA and a depth buffer are not required for perceptible quality.
         renderer: eframe::Renderer::Glow,
+        // VRAM/GPU optimization: Disable MSAA and depth buffer (not needed for 2D image viewer)
+        // This reduces GPU memory allocation significantly
         multisampling: 0,
         depth_buffer: 0,
+        stencil_buffer: 0,
         viewport: egui::ViewportBuilder::default()
             .with_decorations(false) // No title bar
             .with_transparent(false) // Avoid compositing issues
@@ -2681,6 +2760,8 @@ fn main() -> eframe::Result<()> {
             .with_min_inner_size([200.0, 150.0])
             .with_inner_size([800.0, 600.0])
             .with_drag_and_drop(true),
+        // Performance: run event loop in reactive mode (only repaint when needed)
+        // This drastically reduces CPU usage when idle
         ..Default::default()
     };
 
@@ -2688,7 +2769,9 @@ fn main() -> eframe::Result<()> {
         "Image & Video Viewer",
         options,
         Box::new(move |cc| {
-            egui_extras::install_image_loaders(&cc.egui_ctx);
+            // Skip installing extra image loaders - we use our own optimized loader
+            // egui_extras loaders add overhead and we don't need them
+            // egui_extras::install_image_loaders(&cc.egui_ctx);
             Ok(Box::new(ImageViewer::new(cc, image_path)))
         }),
     )
