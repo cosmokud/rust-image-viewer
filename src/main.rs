@@ -603,8 +603,12 @@ impl ImageViewer {
     }
 
     /// Create new viewer with an image path
-    fn new(cc: &eframe::CreationContext<'_>, path: Option<PathBuf>) -> Self {
+    /// `start_visible`: true if window was created visible (images), false if hidden (videos)
+    fn new(cc: &eframe::CreationContext<'_>, path: Option<PathBuf>, start_visible: bool) -> Self {
         let mut viewer = Self::default();
+
+        // If window started visible, mark it as shown already
+        viewer.startup_window_shown = start_visible;
 
         // Mark the start of the hidden startup period.
         viewer.startup_hide_started_at = Instant::now();
@@ -2436,6 +2440,12 @@ impl eframe::App for ImageViewer {
         // Input can switch media, which updates the title.
         self.apply_pending_window_title(ctx);
 
+        // CRITICAL: Update textures BEFORE layout checks.
+        // For videos, the first frame (and dimensions) become available in update_texture.
+        // We must decode frames first so that pending_media_layout and show_window_if_ready
+        // can see the correct dimensions and apply layout before showing the window.
+        let texture_animation_active = self.update_texture(ctx);
+
         // Apply layout changes after image changes.
         if self.image_changed {
             // If we're about to enter fullscreen (startup or user toggle), skip applying
@@ -2660,9 +2670,6 @@ impl eframe::App for ImageViewer {
             self.request_minimize = false;
         }
 
-        // Update texture and check if animation needs repaint
-        let texture_animation_active = self.update_texture(ctx);
-
         // Draw image/video and check if draw animations need repaint
         let draw_animation_active = self.draw_image(ctx);
 
@@ -2775,6 +2782,55 @@ fn main() -> eframe::Result<()> {
         None
     };
 
+    // NO FILE = NO WINDOW. Exit immediately if no file is provided.
+    let Some(file_path) = image_path else {
+        // No file provided, exit without creating any window
+        return Ok(());
+    };
+
+    // Determine media type and calculate initial window size BEFORE creating the window.
+    // This prevents the flash of a default-sized window.
+    let media_type = get_media_type(&file_path);
+    let screen_size = get_primary_monitor_size();
+    
+    // For images, we can get dimensions immediately from the file header.
+    // For videos, we start hidden and show once GStreamer decodes the first frame.
+    let (initial_size, start_visible) = match media_type {
+        Some(MediaType::Image) => {
+            // Get image dimensions from file header (fast, no full decode)
+            let (img_w, img_h) = image::image_dimensions(&file_path).unwrap_or((800, 600));
+            let img_w = img_w as f32;
+            let img_h = img_h as f32;
+            
+            // Calculate window size: fit to screen if needed, otherwise use image size
+            let fit_zoom = if img_h > screen_size.y || img_w > screen_size.x {
+                (screen_size.y / img_h).min(screen_size.x / img_w).min(1.0)
+            } else {
+                1.0
+            };
+            
+            let size = egui::Vec2::new(
+                (img_w * fit_zoom).max(200.0),
+                (img_h * fit_zoom).max(150.0),
+            );
+            (size, true) // Images: show window immediately with correct size
+        }
+        Some(MediaType::Video) => {
+            // Videos: start hidden, show after first frame decode reveals dimensions
+            (egui::Vec2::new(800.0, 600.0), false)
+        }
+        None => {
+            // Unknown file type, show error window
+            (egui::Vec2::new(400.0, 200.0), true)
+        }
+    };
+
+    // Calculate centered window position
+    let initial_pos = egui::Pos2::new(
+        ((screen_size.x - initial_size.x) * 0.5).max(0.0),
+        ((screen_size.y - initial_size.y) * 0.5).max(0.0),
+    );
+
     // Configure native options
     // 
     // IMPORTANT NOTE ON VRAM USAGE:
@@ -2814,9 +2870,10 @@ fn main() -> eframe::Result<()> {
             .with_decorations(false) // No title bar
             .with_transparent(false) // Avoid compositing issues
             .with_icon(build_app_icon())
-            .with_visible(false)
+            .with_visible(start_visible) // Images: visible immediately; Videos: hidden until first frame
             .with_min_inner_size([200.0, 150.0])
-            .with_inner_size([800.0, 600.0])
+            .with_inner_size(initial_size) // Pre-calculated size based on media dimensions
+            .with_position(initial_pos) // Pre-calculated centered position
             .with_drag_and_drop(true),
         // Performance: run event loop in reactive mode (only repaint when needed)
         // This drastically reduces CPU usage when idle
@@ -2830,7 +2887,7 @@ fn main() -> eframe::Result<()> {
             // Skip installing extra image loaders - we use our own optimized loader
             // egui_extras loaders add overhead and we don't need them
             // egui_extras::install_image_loaders(&cc.egui_ctx);
-            Ok(Box::new(ImageViewer::new(cc, image_path)))
+            Ok(Box::new(ImageViewer::new(cc, Some(file_path), start_visible)))
         }),
     )
 }
