@@ -682,6 +682,7 @@ Ensure your GStreamer installation includes the playback elements (usually from 
     }
 
     /// Get the latest video frame if updated
+    /// Takes ownership of the frame to avoid cloning (memory optimization)
     pub fn get_frame(&mut self) -> Option<VideoFrame> {
         if let Ok(mut state) = self.state.lock() {
             if state.frame_updated {
@@ -693,7 +694,8 @@ Ensure your GStreamer installation includes the playback elements (usually from 
                     self.original_height = state.video_height;
                 }
                 
-                return state.current_frame.clone();
+                // Take ownership instead of cloning to save memory
+                return state.current_frame.take();
             }
         }
         None

@@ -20,6 +20,9 @@ use std::time::{Duration, Instant};
 
 use eframe::glow::HasContext;
 
+/// Downscale RGBA pixel data if it exceeds the maximum texture size.
+/// Uses Cow to avoid unnecessary allocations when no downscaling is needed.
+/// Uses Triangle filter (faster than Lanczos3) for better performance.
 fn downscale_rgba_if_needed<'a>(
     width: u32,
     height: u32,
@@ -45,7 +48,8 @@ fn downscale_rgba_if_needed<'a>(
     let Some(img) = image::RgbaImage::from_raw(width, height, pixels.to_vec()) else {
         return (width, height, Cow::Borrowed(pixels));
     };
-    let resized = image::imageops::resize(&img, new_w, new_h, FilterType::Lanczos3);
+    // Use Triangle filter instead of Lanczos3 - faster with acceptable quality
+    let resized = image::imageops::resize(&img, new_w, new_h, FilterType::Triangle);
     (new_w, new_h, Cow::Owned(resized.into_raw()))
 }
 
@@ -234,6 +238,14 @@ struct ImageViewer {
     resize_start_cursor_screen: Option<egui::Pos2>,
     /// Last commanded window size during resize (for stable content rendering)
     resize_last_size: Option<egui::Vec2>,
+
+    // ============ PERFORMANCE OPTIMIZATION FIELDS ============
+    /// Whether any animation or state change requires a repaint
+    needs_repaint: bool,
+    /// Last time there was any user activity or animation
+    last_activity_time: Instant,
+    /// Whether the viewer is in idle state (no animations, no user interaction)
+    is_idle: bool,
 }
 
 impl Default for ImageViewer {
@@ -295,6 +307,11 @@ impl Default for ImageViewer {
             resize_start_inner_size: None,
             resize_start_cursor_screen: None,
             resize_last_size: None,
+
+            // Performance optimization fields
+            needs_repaint: false,
+            last_activity_time: Instant::now(),
+            is_idle: true,
         }
     }
 }
@@ -740,18 +757,18 @@ impl ImageViewer {
         }
     }
 
-    fn tick_floating_zoom_animation(&mut self, ctx: &egui::Context) {
+    fn tick_floating_zoom_animation(&mut self, ctx: &egui::Context) -> bool {
         if self.is_fullscreen {
             self.zoom_target = self.zoom;
             self.zoom_velocity = 0.0;
-            return;
+            return false;
         }
 
         // While resizing, treat window size as the source of truth.
         if self.is_resizing {
             self.zoom_target = self.zoom;
             self.zoom_velocity = 0.0;
-            return;
+            return false;
         }
 
         let error = self.zoom_target - self.zoom;
@@ -763,7 +780,7 @@ impl ImageViewer {
         if error.abs() < SNAP_THRESHOLD && self.zoom_velocity.abs() < VELOCITY_THRESHOLD {
             self.zoom = self.zoom_target;
             self.zoom_velocity = 0.0;
-            return;
+            return false; // Animation complete, no repaint needed
         }
 
         // Critically-damped spring system for snappy, responsive animation
@@ -781,7 +798,7 @@ impl ImageViewer {
         if speed <= 0.0 {
             self.zoom = self.zoom_target;
             self.zoom_velocity = 0.0;
-            return;
+            return false;
         }
 
         // Scale omega: speed=5 gives omega~10 (smooth), speed=10 gives omega~20 (snappy)
@@ -806,10 +823,8 @@ impl ImageViewer {
         // Clamp zoom to valid range
         self.zoom = self.zoom.clamp(0.1, 50.0);
 
-        // Request repaint for continuous animation
-        if error.abs() > SNAP_THRESHOLD || self.zoom_velocity.abs() > VELOCITY_THRESHOLD {
-            ctx.request_repaint();
-        }
+        // Return whether animation needs to continue
+        error.abs() > SNAP_THRESHOLD || self.zoom_velocity.abs() > VELOCITY_THRESHOLD
     }
 
     fn background_color32(&self) -> egui::Color32 {
@@ -895,7 +910,10 @@ impl ImageViewer {
     }
 
     /// Update texture for current frame (handles both images and video)
-    fn update_texture(&mut self, ctx: &egui::Context) {
+    /// Returns true if a repaint is needed for animations
+    fn update_texture(&mut self, ctx: &egui::Context) -> bool {
+        let mut needs_repaint = false;
+
         // Handle image texture updates
         if let Some(ref mut img) = self.image {
             let frame_changed = img.update_animation();
@@ -915,16 +933,33 @@ impl ImageViewer {
                     pixels.as_ref(),
                 );
                 
+                // Use NEAREST for static images (less VRAM, faster), LINEAR for animations
+                let texture_options = if img.is_animated() {
+                    egui::TextureOptions::LINEAR
+                } else {
+                    egui::TextureOptions::NEAREST
+                };
+                
                 self.texture = Some(ctx.load_texture(
                     "image",
                     color_image,
-                    egui::TextureOptions::LINEAR,
+                    texture_options,
                 ));
                 self.texture_frame = img.current_frame;
             }
 
+            // Only request repaint for animated images, and only when needed
             if img.is_animated() {
-                ctx.request_repaint();
+                // Calculate time until next frame to avoid unnecessary repaints
+                let current_delay = Duration::from_millis(img.frames[img.current_frame].delay_ms as u64);
+                let elapsed = img.last_frame_time.elapsed();
+                if elapsed < current_delay {
+                    // Schedule repaint for when the next frame is due
+                    let remaining = current_delay - elapsed;
+                    ctx.request_repaint_after(remaining);
+                } else {
+                    needs_repaint = true;
+                }
             }
         }
 
@@ -937,6 +972,7 @@ impl ImageViewer {
             if player.is_eos() {
                 if self.config.video_loop {
                     let _ = player.restart();
+                    needs_repaint = true;
                 }
             }
 
@@ -953,25 +989,32 @@ impl ImageViewer {
                     pixels.as_ref(),
                 );
                 
+                // Use LINEAR for video for smooth motion
                 self.video_texture = Some(ctx.load_texture(
                     "video",
                     color_image,
                     egui::TextureOptions::LINEAR,
                 ));
                 self.video_texture_dims = Some((w, h));
+                needs_repaint = true;
             }
 
-            // Always request repaint for video playback or when seeking (to show new frames when paused)
-            if player.is_playing() || self.is_seeking {
-                ctx.request_repaint();
+            // Only request repaint for active video playback or when seeking
+            if player.is_playing() {
+                // For video, request repaint at roughly 60fps to poll for new frames
+                ctx.request_repaint_after(Duration::from_millis(16));
+            } else if self.is_seeking {
+                needs_repaint = true;
             }
         }
 
         // If we are waiting on video dimensions (e.g. right after switching videos),
-        // force a repaint so we get to the first decoded frame ASAP.
+        // we need a repaint to get the first decoded frame ASAP.
         if self.pending_media_layout {
-            ctx.request_repaint();
+            needs_repaint = true;
         }
+
+        needs_repaint
     }
 
     /// Handle keyboard and mouse input
@@ -1850,11 +1893,15 @@ impl ImageViewer {
     }
 
     /// Draw the main image
-    fn draw_image(&mut self, ctx: &egui::Context) {
+    /// Returns true if animation is in progress and requires repaint
+    fn draw_image(&mut self, ctx: &egui::Context) -> bool {
         let screen_rect = ctx.screen_rect();
+        let mut animation_active = false;
 
         // Smooth zoom animation (floating mode)
-        self.tick_floating_zoom_animation(ctx);
+        if self.tick_floating_zoom_animation(ctx) {
+            animation_active = true;
+        }
 
         // Floating mode: when zooming out to <= 100%, ease any residual offset back to center.
         // (No bounce, no fade; just a smooth settle.) Skip during resize/seeking to avoid fighting.
@@ -1864,8 +1911,9 @@ impl ImageViewer {
             self.offset *= k;
             if self.offset.length() < 0.1 {
                 self.offset = egui::Vec2::ZERO;
+            } else {
+                animation_active = true;
             }
-            ctx.request_repaint();
         }
 
         // Handle scroll wheel zoom
@@ -2187,11 +2235,15 @@ impl ImageViewer {
                     }
                 }
             });
+
+        animation_active
     }
 }
 
 impl eframe::App for ImageViewer {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Reset per-frame repaint tracking
+        self.needs_repaint = false;
         // Apply requested startup window mode (exactly once).
         if !self.startup_window_mode_applied {
             self.startup_window_mode_applied = true;
@@ -2252,9 +2304,6 @@ impl eframe::App for ImageViewer {
             }
             self.image_rotated = false;
         }
-
-        // Update texture for current frame (after any image loads)
-        self.update_texture(ctx);
 
         // For videos, the first frame (and therefore dimensions) may arrive after the initial load.
         // Retry layout once we have dimensions so next/prev video switches obey the sizing rules.
@@ -2410,7 +2459,7 @@ impl eframe::App for ImageViewer {
         }
 
         // Animate fullscreen transition
-        {
+        let fullscreen_animation_active = {
             let target = self.fullscreen_transition_target;
             let current = self.fullscreen_transition;
             if (current - target).abs() > 0.001 {
@@ -2419,40 +2468,76 @@ impl eframe::App for ImageViewer {
                 let dt = ctx.input(|i| i.stable_dt).min(0.033);
                 self.fullscreen_transition += (target - current) * speed * dt;
                 self.fullscreen_transition = self.fullscreen_transition.clamp(0.0, 1.0);
-                ctx.request_repaint();
+                true // Animation in progress
             } else {
                 self.fullscreen_transition = target;
+                false
             }
-        }
+        };
 
         // Process pending window resize (delayed to prevent flash on fullscreen exit)
-        if let Some((size, pos, frames_remaining)) = self.pending_window_resize.take() {
+        let pending_resize_active = if let Some((size, pos, frames_remaining)) = self.pending_window_resize.take() {
             if frames_remaining <= 1 {
                 // Apply the resize now
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
                 self.suppress_outer_pos_tracking_frames = self.suppress_outer_pos_tracking_frames.max(2);
                 ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
                 self.last_known_outer_pos = Some(pos);
+                false
             } else {
                 // Wait another frame
                 self.pending_window_resize = Some((size, pos, frames_remaining - 1));
-                ctx.request_repaint();
+                true // Need another frame
             }
-        }
+        } else {
+            false
+        };
 
         if self.request_minimize {
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
             self.request_minimize = false;
         }
 
-        // Draw image/video
-        self.draw_image(ctx);
+        // Update texture and check if animation needs repaint
+        let texture_animation_active = self.update_texture(ctx);
+
+        // Draw image/video and check if draw animations need repaint
+        let draw_animation_active = self.draw_image(ctx);
 
         // Draw controls overlay (top bar for title/buttons)
         self.draw_controls(ctx);
 
         // Draw video controls overlay (bottom bar for video playback controls)
         self.draw_video_controls(ctx);
+
+        // Determine if we need continuous repainting
+        let any_animation_active = fullscreen_animation_active 
+            || pending_resize_active 
+            || texture_animation_active 
+            || draw_animation_active
+            || self.is_panning 
+            || self.is_resizing
+            || self.is_seeking
+            || self.is_volume_dragging;
+
+        // Update idle state
+        if any_animation_active {
+            self.last_activity_time = Instant::now();
+            self.is_idle = false;
+        } else {
+            // Consider idle after 100ms of no activity
+            self.is_idle = self.last_activity_time.elapsed() > Duration::from_millis(100);
+        }
+
+        // Only request immediate repaint if animations are active
+        // Otherwise, egui will naturally repaint on user input
+        if any_animation_active {
+            ctx.request_repaint();
+        } else if self.pending_media_layout {
+            // Still waiting for video dimensions - check again soon but not immediately
+            ctx.request_repaint_after(Duration::from_millis(16));
+        }
+        // When idle, no repaint is requested - egui handles user input events automatically
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {

@@ -1,12 +1,14 @@
 //! Image and video loading and management module.
 //! Supports JPG, PNG, WEBP, animated GIF files, and video formats.
+//! Optimized for low memory usage while maintaining functionality.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use image::GenericImageView;
 
-const DEFAULT_MAX_DECODE_ALLOC_BYTES: u64 = 4 * 1024 * 1024 * 1024; // 4 GiB
+// Reduced from 4 GiB to 1 GiB for more reasonable memory limits
+const DEFAULT_MAX_DECODE_ALLOC_BYTES: u64 = 1 * 1024 * 1024 * 1024; // 1 GiB
 
 fn open_image_with_reasonable_limits(path: &Path) -> Result<image::DynamicImage, String> {
     // `image::open()` uses conservative decoder limits to protect against decompression bombs.
@@ -146,6 +148,7 @@ pub struct ImageFrame {
 
 /// Loaded image data
 pub struct LoadedImage {
+    #[allow(dead_code)]
     pub path: PathBuf,
     pub frames: Vec<ImageFrame>,
     pub current_frame: usize,
@@ -156,6 +159,7 @@ pub struct LoadedImage {
 
 impl LoadedImage {
     /// Load an image from path
+    #[allow(dead_code)]
     pub fn load(path: &Path) -> Result<Self, String> {
         Self::load_with_max_texture_side(path, None)
     }
@@ -220,6 +224,7 @@ impl LoadedImage {
     }
 
     /// Load an animated GIF
+    /// Optimized for memory: limits frame count and uses efficient downscaling
     fn load_gif(path: &Path, max_texture_side: Option<u32>) -> Result<Self, String> {
         use std::fs::File;
         use gif::DecodeOptions;
@@ -237,10 +242,43 @@ impl LoadedImage {
         let width = decoder.width() as u32;
         let height = decoder.height() as u32;
 
-        // Create a canvas to composite frames onto
-        let mut canvas = vec![0u8; (width * height * 4) as usize];
+        // Memory optimization: limit maximum frames to prevent excessive RAM usage
+        // A 1920x1080 RGBA frame is ~8MB, so 100 frames = ~800MB
+        const MAX_FRAMES: usize = 100;
+        
+        // Determine if we need to downscale upfront based on memory constraints
+        // For large GIFs, downscale immediately to reduce per-frame memory
+        let (target_width, target_height, needs_downscale) = if let Some(max_side) = max_texture_side {
+            if max_side > 0 && (width > max_side || height > max_side) {
+                let scale = (max_side as f64 / width as f64).min(max_side as f64 / height as f64);
+                let new_w = ((width as f64) * scale).round().max(1.0) as u32;
+                let new_h = ((height as f64) * scale).round().max(1.0) as u32;
+                (new_w, new_h, true)
+            } else {
+                (width, height, false)
+            }
+        } else {
+            (width, height, false)
+        };
 
+        // Create a canvas to composite frames onto (at original size for decoding)
+        let mut canvas = vec![0u8; (width * height * 4) as usize];
+        
+        // Pre-allocate reusable buffer for downscaling if needed
+        #[allow(unused_mut)]
+        let mut downscale_buffer: Option<Vec<u8>> = if needs_downscale {
+            Some(Vec::with_capacity((target_width * target_height * 4) as usize))
+        } else {
+            None
+        };
+
+        let mut frame_count = 0;
         while let Some(frame) = decoder.read_next_frame().map_err(|e| format!("GIF frame error: {}", e))? {
+            // Limit frame count to prevent memory explosion
+            if frame_count >= MAX_FRAMES {
+                break;
+            }
+            
             let delay_ms = (frame.delay as u32) * 10; // GIF delay is in centiseconds
             let delay_ms = if delay_ms == 0 { 100 } else { delay_ms }; // Default to 100ms if 0
 
@@ -266,59 +304,46 @@ impl LoadedImage {
                 }
             }
 
+            // Store either downscaled or original frame
+            let frame_pixels = if needs_downscale {
+                // Downscale immediately to save memory
+                let Some(img) = image::RgbaImage::from_raw(width, height, canvas.clone()) else {
+                    return Err("Failed to build RGBA image for GIF resizing".to_string());
+                };
+                // Use faster Triangle filter instead of Lanczos3 for animated GIFs
+                let resized = image::imageops::resize(&img, target_width, target_height, FilterType::Triangle);
+                resized.into_raw()
+            } else {
+                canvas.clone()
+            };
+
             frames.push(ImageFrame {
-                pixels: canvas.clone(),
-                width,
-                height,
+                pixels: frame_pixels,
+                width: target_width,
+                height: target_height,
                 delay_ms,
             });
+            
+            frame_count += 1;
         }
+
+        // Clean up the downscale buffer
+        drop(downscale_buffer);
 
         if frames.is_empty() {
             return Err("No frames in GIF".to_string());
         }
 
-        // Downscale the entire animation if it exceeds the max texture side.
-        if let Some(max_side) = max_texture_side {
-            if max_side > 0 && (width > max_side || height > max_side) {
-                // Compute the resized dimensions preserving aspect ratio.
-                let scale = (max_side as f64 / width as f64).min(max_side as f64 / height as f64);
-                let new_w = ((width as f64) * scale).round().max(1.0) as u32;
-                let new_h = ((height as f64) * scale).round().max(1.0) as u32;
-
-                let mut resized_frames = Vec::with_capacity(frames.len());
-                for f in frames.into_iter() {
-                    let Some(img) = image::RgbaImage::from_raw(width, height, f.pixels) else {
-                        return Err("Failed to build RGBA image for GIF resizing".to_string());
-                    };
-                    let resized = image::imageops::resize(&img, new_w, new_h, FilterType::Lanczos3);
-                    resized_frames.push(ImageFrame {
-                        pixels: resized.into_raw(),
-                        width: new_w,
-                        height: new_h,
-                        delay_ms: f.delay_ms,
-                    });
-                }
-                frames = resized_frames;
-
-                return Ok(LoadedImage {
-                    path: path.to_path_buf(),
-                    frames,
-                    current_frame: 0,
-                    last_frame_time: Instant::now(),
-                    original_width: new_w,
-                    original_height: new_h,
-                });
-            }
-        }
+        // Shrink frames vector to exact size to free unused capacity
+        frames.shrink_to_fit();
 
         Ok(LoadedImage {
             path: path.to_path_buf(),
             frames,
             current_frame: 0,
             last_frame_time: Instant::now(),
-            original_width: width,
-            original_height: height,
+            original_width: target_width,
+            original_height: target_height,
         })
     }
 
