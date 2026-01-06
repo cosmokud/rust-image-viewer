@@ -274,12 +274,6 @@ struct ImageViewer {
     startup_show_pending: bool,
     /// Frames to wait before showing once scheduled.
     startup_show_delay_frames: u8,
-
-    /// Target geometry to apply while the window is still hidden.
-    /// We keep this separate from `last_known_outer_pos` because the latter is overwritten
-    /// by real-time tracking and suppression logic.
-    startup_target_inner_size: Option<egui::Vec2>,
-    startup_target_outer_pos: Option<egui::Pos2>,
     /// Used as a safety fallback to avoid staying hidden forever (e.g., if a video never yields dimensions).
     startup_hide_started_at: Instant,
 }
@@ -356,39 +350,12 @@ impl Default for ImageViewer {
             startup_window_shown: false,
             startup_show_pending: false,
             startup_show_delay_frames: 0,
-            startup_target_inner_size: None,
-            startup_target_outer_pos: None,
             startup_hide_started_at: Instant::now(),
         }
     }
 }
 
 impl ImageViewer {
-    fn startup_geometry_in_sync(&self, ctx: &egui::Context) -> bool {
-        let Some(target_size) = self.startup_target_inner_size else {
-            // If no target was recorded, don't block showing on geometry sync.
-            return true;
-        };
-
-        let Some(current_inner) = ctx.input(|i| i.raw.viewport().inner_rect).map(|r| r.size()) else {
-            return false;
-        };
-
-        let size_ok = (current_inner - target_size).length() <= 2.0;
-
-        let pos_ok = if let Some(target_pos) = self.startup_target_outer_pos {
-            if let Some(current_pos) = ctx.input(|i| i.raw.viewport().outer_rect).map(|r| r.min) {
-                (current_pos - target_pos).length() <= 2.0
-            } else {
-                false
-            }
-        } else {
-            true
-        };
-
-        size_ok && pos_ok
-    }
-
     fn startup_ready_to_show(&self) -> bool {
         if self.error_message.is_some() {
             return true;
@@ -424,13 +391,6 @@ impl ImageViewer {
                 return;
             }
 
-            // Ensure Windows has applied the requested geometry before we show,
-            // otherwise users can see a brief flash at the default position/size.
-            if !self.startup_geometry_in_sync(ctx) {
-                ctx.request_repaint();
-                return;
-            }
-
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
             self.startup_window_shown = true;
             self.needs_repaint = true;
@@ -444,16 +404,10 @@ impl ImageViewer {
         // If we were launched without a file, ensure the initial window is centered
         // while still hidden.
         if self.current_media_type.is_none() && !self.is_fullscreen {
-            // Keep the default initial size, but center it before showing.
-            let inner = egui::Vec2::new(800.0, 600.0);
-            self.startup_target_inner_size = Some(inner);
-            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(inner));
-
-            let monitor = self.monitor_size_points(ctx);
-            let x = (monitor.x - inner.x) * 0.5;
-            let y = (monitor.y - inner.y) * 0.5;
-            let pos = egui::pos2(x.max(0.0), y.max(0.0));
-            self.startup_target_outer_pos = Some(pos);
+            let mut inner = ctx.screen_rect().size();
+            if inner.x <= 0.0 || inner.y <= 0.0 {
+                inner = egui::Vec2::new(800.0, 600.0);
+            }
             self.center_window_on_monitor(ctx, inner);
         }
 
@@ -464,7 +418,7 @@ impl ImageViewer {
             // Images already behave well; keep them immediate to avoid changing UX.
             Some(MediaType::Image) => 0,
             // No-args and video: delay one frame to prevent a micro-flash at the default position.
-            _ => 2,
+            _ => 1,
         };
 
         if self.startup_show_delay_frames == 0 {
@@ -949,43 +903,16 @@ impl ImageViewer {
             self.last_requested_inner_size = Some(size);
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
 
-            // Startup: capture the intended geometry for videos so we can show the window only
-            // after the OS has applied size/position (prevents a brief flash).
-            if !self.startup_window_shown
-                && matches!(self.current_media_type, Some(MediaType::Video))
-                && self.startup_target_inner_size.is_none()
-            {
-                self.startup_target_inner_size = Some(size);
-            }
-
             // In floating mode, keep the user's window placement once they've moved/resized it.
             // Otherwise, keep the existing behavior: center on the monitor.
             if self.floating_user_moved_window {
                 if let Some(pos) = self.last_known_outer_pos {
                     self.send_outer_position(ctx, pos);
-
-                    if !self.startup_window_shown
-                        && matches!(self.current_media_type, Some(MediaType::Video))
-                        && self.startup_target_outer_pos.is_none()
-                    {
-                        self.startup_target_outer_pos = Some(pos);
-                    }
                 } else {
-                    // Fall back to centering.
                     self.center_window_on_monitor(ctx, size);
                 }
             } else {
                 self.center_window_on_monitor(ctx, size);
-            }
-
-            if !self.startup_window_shown
-                && matches!(self.current_media_type, Some(MediaType::Video))
-                && self.startup_target_outer_pos.is_none()
-            {
-                let monitor = self.monitor_size_points(ctx);
-                let x = (monitor.x - size.x) * 0.5;
-                let y = (monitor.y - size.y) * 0.5;
-                self.startup_target_outer_pos = Some(egui::pos2(x.max(0.0), y.max(0.0)));
             }
         }
     }
