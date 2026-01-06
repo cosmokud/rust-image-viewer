@@ -264,6 +264,12 @@ struct ImageViewer {
     
     /// Whether GStreamer has been initialized (deferred until first video load)
     gstreamer_initialized: bool,
+
+    /// Keep the window hidden until we've applied initial layout.
+    /// This prevents the default empty window flashing for a few milliseconds on startup.
+    startup_window_shown: bool,
+    /// Used as a safety fallback to avoid staying hidden forever (e.g., if a video never yields dimensions).
+    startup_hide_started_at: Instant,
 }
 
 impl Default for ImageViewer {
@@ -334,11 +340,55 @@ impl Default for ImageViewer {
 
             windows_cjk_fonts_installed: false,
             gstreamer_initialized: false,
+
+            startup_window_shown: false,
+            startup_hide_started_at: Instant::now(),
         }
     }
 }
 
 impl ImageViewer {
+    fn startup_ready_to_show(&self) -> bool {
+        if self.error_message.is_some() {
+            return true;
+        }
+
+        match self.current_media_type {
+            None => true,
+            Some(MediaType::Image) => self.image.is_some(),
+            Some(MediaType::Video) => {
+                // Prefer waiting for the first decoded frame so we can size/center correctly.
+                // Safety fallback: don't stay hidden forever.
+                self.media_display_dimensions().is_some()
+                    || self.startup_hide_started_at.elapsed() > Duration::from_secs(2)
+            }
+        }
+    }
+
+    fn show_window_if_ready(&mut self, ctx: &egui::Context) {
+        if self.startup_window_shown {
+            return;
+        }
+
+        if !self.startup_ready_to_show() {
+            return;
+        }
+
+        // If we were launched without a file, ensure the initial window is centered
+        // (and do so while still hidden to avoid any visible reposition flash).
+        if self.current_media_type.is_none() && !self.is_fullscreen {
+            let mut inner = ctx.screen_rect().size();
+            if inner.x <= 0.0 || inner.y <= 0.0 {
+                inner = egui::Vec2::new(800.0, 600.0);
+            }
+            self.center_window_on_monitor(ctx, inner);
+        }
+
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        self.startup_window_shown = true;
+        self.needs_repaint = true;
+    }
+
     fn filename_needs_cjk_fonts(filename: &str) -> bool {
         // Check common CJK Unicode blocks (Han, Hiragana, Katakana, Hangul).
         filename.chars().any(|ch| {
@@ -555,6 +605,9 @@ impl ImageViewer {
     /// Create new viewer with an image path
     fn new(cc: &eframe::CreationContext<'_>, path: Option<PathBuf>) -> Self {
         let mut viewer = Self::default();
+
+        // Mark the start of the hidden startup period.
+        viewer.startup_hide_started_at = Instant::now();
 
         // Determine the maximum texture size supported by the active backend.
         // This viewer uses eframe's OpenGL (glow) integration; oversized textures can crash.
@@ -2619,6 +2672,10 @@ impl eframe::App for ImageViewer {
         // Draw video controls overlay (bottom bar for video playback controls)
         self.draw_video_controls(ctx);
 
+        // Startup UX: keep the window hidden until initial layout is applied.
+        // This avoids the brief flash of the default empty window on Explorer-open.
+        self.show_window_if_ready(ctx);
+
         // Determine if we need continuous repainting
         let any_animation_active = fullscreen_animation_active 
             || pending_resize_active 
@@ -2757,6 +2814,7 @@ fn main() -> eframe::Result<()> {
             .with_decorations(false) // No title bar
             .with_transparent(false) // Avoid compositing issues
             .with_icon(build_app_icon())
+            .with_visible(false)
             .with_min_inner_size([200.0, 150.0])
             .with_inner_size([800.0, 600.0])
             .with_drag_and_drop(true),
