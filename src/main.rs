@@ -380,14 +380,39 @@ impl ImageViewer {
             return;
         }
 
-        // If we were launched without a file, ensure the initial window is centered
-        // (and do so while still hidden to avoid any visible reposition flash).
-        if self.current_media_type.is_none() && !self.is_fullscreen {
-            let mut inner = ctx.screen_rect().size();
-            if inner.x <= 0.0 || inner.y <= 0.0 {
-                inner = egui::Vec2::new(800.0, 600.0);
+        // For videos: the window was created off-screen (-10000, -10000).
+        // Now that we're ready, move it on-screen with the correct size and position.
+        if matches!(self.current_media_type, Some(MediaType::Video)) {
+            if let Some((vid_w, vid_h)) = self.media_display_dimensions() {
+                let monitor = self.monitor_size_points(ctx);
+                let vid_w = vid_w as f32;
+                let vid_h = vid_h as f32;
+                
+                // Calculate fit zoom (same logic as images)
+                let fit_zoom = if vid_h > monitor.y {
+                    (monitor.y / vid_h).clamp(0.1, 50.0)
+                } else {
+                    1.0
+                };
+                
+                let size = egui::Vec2::new(
+                    (vid_w * fit_zoom).max(200.0),
+                    (vid_h * fit_zoom).max(150.0),
+                );
+                
+                // Center on screen
+                let pos = egui::Pos2::new(
+                    ((monitor.x - size.x) * 0.5).max(0.0),
+                    ((monitor.y - size.y) * 0.5).max(0.0),
+                );
+                
+                // Move window on-screen with correct size
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+                self.last_known_outer_pos = Some(pos);
+                self.floating_max_inner_size = Some(size);
+                self.last_requested_inner_size = Some(size);
             }
-            self.center_window_on_monitor(ctx, inner);
         }
 
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
@@ -2815,7 +2840,7 @@ fn main() -> eframe::Result<()> {
     
     // For images, we can get dimensions immediately from the file header.
     // For videos, we start hidden and show once GStreamer decodes the first frame.
-    let (initial_size, start_visible) = match media_type {
+    let (initial_size, initial_pos, start_visible) = match media_type {
         Some(MediaType::Image) => {
             // Get image dimensions from file header (fast, no full decode)
             let (img_w, img_h) = image::image_dimensions(&file_path).unwrap_or((800, 600));
@@ -2833,23 +2858,32 @@ fn main() -> eframe::Result<()> {
                 (img_w * fit_zoom).max(200.0),
                 (img_h * fit_zoom).max(150.0),
             );
-            (size, true) // Images: show window immediately with correct size
+            
+            // Calculate centered position for images
+            let pos = egui::Pos2::new(
+                ((screen_size.x - size.x) * 0.5).max(0.0),
+                ((screen_size.y - size.y) * 0.5).max(0.0),
+            );
+            (size, pos, true) // Images: show window immediately with correct size
         }
         Some(MediaType::Video) => {
-            // Videos: start hidden, show after first frame decode reveals dimensions
-            (egui::Vec2::new(800.0, 600.0), false)
+            // Videos: position window OFF-SCREEN initially
+            // This completely hides the window until the first frame is ready.
+            // The window will be moved on-screen once video dimensions and first frame are available.
+            let size = egui::Vec2::new(800.0, 600.0);
+            let off_screen_pos = egui::Pos2::new(-10000.0, -10000.0);
+            (size, off_screen_pos, false)
         }
         None => {
             // Unknown file type, show error window
-            (egui::Vec2::new(400.0, 200.0), true)
+            let size = egui::Vec2::new(400.0, 200.0);
+            let pos = egui::Pos2::new(
+                ((screen_size.x - size.x) * 0.5).max(0.0),
+                ((screen_size.y - size.y) * 0.5).max(0.0),
+            );
+            (size, pos, true)
         }
     };
-
-    // Calculate centered window position
-    let initial_pos = egui::Pos2::new(
-        ((screen_size.x - initial_size.x) * 0.5).max(0.0),
-        ((screen_size.y - initial_size.y) * 0.5).max(0.0),
-    );
 
     // Configure native options
     // 
