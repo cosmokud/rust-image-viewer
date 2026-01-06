@@ -357,10 +357,16 @@ impl ImageViewer {
             None => true,
             Some(MediaType::Image) => self.image.is_some(),
             Some(MediaType::Video) => {
-                // Prefer waiting for the first decoded frame so we can size/center correctly.
+                // For videos, we need ALL of these conditions to show the window:
+                // 1. Video dimensions are known (first frame decoded)
+                // 2. Layout has been applied (pending_media_layout is false)
+                // 3. Video texture exists (first frame is ready to display)
+                // This ensures the window appears with the correct size AND the first frame visible.
                 // Safety fallback: don't stay hidden forever.
-                self.media_display_dimensions().is_some()
-                    || self.startup_hide_started_at.elapsed() > Duration::from_secs(2)
+                let ready = self.media_display_dimensions().is_some()
+                    && !self.pending_media_layout
+                    && self.video_texture.is_some();
+                ready || self.startup_hide_started_at.elapsed() > Duration::from_secs(2)
             }
         }
     }
@@ -2670,14 +2676,28 @@ impl eframe::App for ImageViewer {
             self.request_minimize = false;
         }
 
+        // For videos during startup: skip ALL drawing until we have dimensions and layout is applied.
+        // This prevents the flash of an empty window with controls before the video frame appears.
+        // Like MPV, we want the window to appear only when it has the first frame ready.
+        let skip_drawing = !self.startup_window_shown 
+            && matches!(self.current_media_type, Some(MediaType::Video));
+
         // Draw image/video and check if draw animations need repaint
-        let draw_animation_active = self.draw_image(ctx);
+        let draw_animation_active = if skip_drawing {
+            false
+        } else {
+            self.draw_image(ctx)
+        };
 
         // Draw controls overlay (top bar for title/buttons)
-        self.draw_controls(ctx);
+        if !skip_drawing {
+            self.draw_controls(ctx);
+        }
 
         // Draw video controls overlay (bottom bar for video playback controls)
-        self.draw_video_controls(ctx);
+        if !skip_drawing {
+            self.draw_video_controls(ctx);
+        }
 
         // Startup UX: keep the window hidden until initial layout is applied.
         // This avoids the brief flash of the default empty window on Explorer-open.
