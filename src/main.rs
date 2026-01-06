@@ -268,12 +268,6 @@ struct ImageViewer {
     /// Keep the window hidden until we've applied initial layout.
     /// This prevents the default empty window flashing for a few milliseconds on startup.
     startup_window_shown: bool,
-    /// Once startup conditions are met, we schedule the show for a later frame.
-    /// This prevents a micro-flash where the window becomes visible before size/position
-    /// commands have taken effect.
-    startup_show_pending: bool,
-    /// Frames to wait before showing once scheduled.
-    startup_show_delay_frames: u8,
     /// Used as a safety fallback to avoid staying hidden forever (e.g., if a video never yields dimensions).
     startup_hide_started_at: Instant,
 }
@@ -348,8 +342,6 @@ impl Default for ImageViewer {
             gstreamer_initialized: false,
 
             startup_window_shown: false,
-            startup_show_pending: false,
-            startup_show_delay_frames: 0,
             startup_hide_started_at: Instant::now(),
         }
     }
@@ -365,14 +357,9 @@ impl ImageViewer {
             None => true,
             Some(MediaType::Image) => self.image.is_some(),
             Some(MediaType::Video) => {
-                // Prefer waiting for the first decoded frame (texture) so we don't show
-                // a blank window even if dimensions are known early.
-                let has_first_frame = self.video_texture.is_some();
-                // Also ensure we've applied the initial layout (pending_media_layout clears
-                // once we have dimensions and have run the layout).
-                let layout_applied = !self.pending_media_layout;
-
-                (has_first_frame && layout_applied)
+                // Prefer waiting for the first decoded frame so we can size/center correctly.
+                // Safety fallback: don't stay hidden forever.
+                self.media_display_dimensions().is_some()
                     || self.startup_hide_started_at.elapsed() > Duration::from_secs(2)
             }
         }
@@ -383,26 +370,12 @@ impl ImageViewer {
             return;
         }
 
-        // If we already decided to show, wait the requested number of frames.
-        if self.startup_show_pending {
-            if self.startup_show_delay_frames > 0 {
-                self.startup_show_delay_frames = self.startup_show_delay_frames.saturating_sub(1);
-                ctx.request_repaint();
-                return;
-            }
-
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-            self.startup_window_shown = true;
-            self.needs_repaint = true;
-            return;
-        }
-
         if !self.startup_ready_to_show() {
             return;
         }
 
         // If we were launched without a file, ensure the initial window is centered
-        // while still hidden.
+        // (and do so while still hidden to avoid any visible reposition flash).
         if self.current_media_type.is_none() && !self.is_fullscreen {
             let mut inner = ctx.screen_rect().size();
             if inner.x <= 0.0 || inner.y <= 0.0 {
@@ -411,23 +384,9 @@ impl ImageViewer {
             self.center_window_on_monitor(ctx, inner);
         }
 
-        // Schedule showing for a later frame so the size/position commands have time
-        // to take effect while the window is still hidden.
-        self.startup_show_pending = true;
-        self.startup_show_delay_frames = match self.current_media_type {
-            // Images already behave well; keep them immediate to avoid changing UX.
-            Some(MediaType::Image) => 0,
-            // No-args and video: delay one frame to prevent a micro-flash at the default position.
-            _ => 1,
-        };
-
-        if self.startup_show_delay_frames == 0 {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-            self.startup_window_shown = true;
-            self.needs_repaint = true;
-        } else {
-            ctx.request_repaint();
-        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        self.startup_window_shown = true;
+        self.needs_repaint = true;
     }
 
     fn filename_needs_cjk_fonts(filename: &str) -> bool {
