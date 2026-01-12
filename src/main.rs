@@ -15,6 +15,7 @@ use video_player::{format_duration, VideoPlayer};
 
 use eframe::egui;
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -127,6 +128,39 @@ enum ResizeDirection {
     BottomRight,
 }
 
+/// Per-image view state for fullscreen mode memory.
+/// Stores zoom, pan, and transformation settings for each image path.
+#[derive(Clone, Debug)]
+struct FullscreenViewState {
+    /// Zoom level
+    zoom: f32,
+    /// Target zoom for animation
+    zoom_target: f32,
+    /// Pan offset
+    offset: egui::Vec2,
+    /// Number of 90° clockwise rotations applied (0-3)
+    rotation_steps: u8,
+    /// Horizontal flip applied (reserved for future use)
+    #[allow(dead_code)]
+    flip_horizontal: bool,
+    /// Vertical flip applied (reserved for future use)
+    #[allow(dead_code)]
+    flip_vertical: bool,
+}
+
+impl Default for FullscreenViewState {
+    fn default() -> Self {
+        Self {
+            zoom: 1.0,
+            zoom_target: 1.0,
+            offset: egui::Vec2::ZERO,
+            rotation_steps: 0,
+            flip_horizontal: false,
+            flip_vertical: false,
+        }
+    }
+}
+
 /// Application state
 struct ImageViewer {
     /// Current loaded image
@@ -204,6 +238,11 @@ struct ImageViewer {
     image_rotated: bool,
     /// Pending window resize to apply after a frame delay (to prevent flash on fullscreen exit)
     pending_window_resize: Option<(egui::Vec2, egui::Pos2, u8)>,
+
+    /// Per-image view state cache for fullscreen mode.
+    /// Maps image paths to their saved view states (zoom, pan, rotation, flip).
+    /// Only active in fullscreen mode; cleared when exiting fullscreen.
+    fullscreen_view_states: HashMap<PathBuf, FullscreenViewState>,
 
     /// Last observed window outer position (top-left in screen coordinates).
     /// Used to keep the window location stable in floating mode after the user moves it.
@@ -310,6 +349,7 @@ impl Default for ImageViewer {
             fullscreen_transition_target: 0.0,
             image_rotated: false,
             pending_window_resize: None,
+            fullscreen_view_states: HashMap::new(),
             last_known_outer_pos: None,
             floating_user_moved_window: false,
             suppress_outer_pos_tracking_frames: 0,
@@ -579,6 +619,8 @@ impl ImageViewer {
                     self.texture = None;
                     self.image_rotated = true;
                     self.zoom_velocity = 0.0;
+                    // Track rotation in fullscreen state
+                    self.update_fullscreen_rotation(true);
                 }
             }
             Action::RotateCounterClockwise => {
@@ -587,6 +629,8 @@ impl ImageViewer {
                     self.texture = None;
                     self.image_rotated = true;
                     self.zoom_velocity = 0.0;
+                    // Track rotation in fullscreen state
+                    self.update_fullscreen_rotation(false);
                 }
             }
             Action::ResetZoom => {
@@ -785,11 +829,109 @@ impl ImageViewer {
         }
     }
 
+    /// Save the current view state for the current image (fullscreen only).
+    /// This allows restoring zoom, pan, and rotation when returning to this image.
+    fn save_current_fullscreen_view_state(&mut self) {
+        if !self.is_fullscreen {
+            return;
+        }
+        
+        let Some(path) = self.image_list.get(self.current_index).cloned() else {
+            return;
+        };
+        
+        // Count rotation steps from the image (we track this separately since
+        // the image_loader applies rotation physically to pixel data)
+        let rotation_steps = if self.image.is_some() {
+            // We don't have direct access to rotation count in LoadedImage,
+            // so we store it in our state. The rotation is tracked incrementally.
+            self.fullscreen_view_states
+                .get(&path)
+                .map(|s| s.rotation_steps)
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        
+        let state = FullscreenViewState {
+            zoom: self.zoom,
+            zoom_target: self.zoom_target,
+            offset: self.offset,
+            rotation_steps,
+            flip_horizontal: false, // Currently not implemented in the viewer
+            flip_vertical: false,   // Currently not implemented in the viewer
+        };
+        
+        self.fullscreen_view_states.insert(path, state);
+    }
+    
+    /// Restore the saved view state for a given image path (fullscreen only).
+    /// Returns true if state was restored, false if no saved state exists.
+    fn restore_fullscreen_view_state(&mut self, path: &PathBuf) -> bool {
+        if !self.is_fullscreen {
+            return false;
+        }
+        
+        if let Some(state) = self.fullscreen_view_states.get(path).cloned() {
+            self.zoom = state.zoom;
+            self.zoom_target = state.zoom_target;
+            self.offset = state.offset;
+            self.zoom_velocity = 0.0;
+            
+            // Apply saved rotations if image was reloaded
+            if let Some(ref mut img) = self.image {
+                for _ in 0..state.rotation_steps {
+                    img.rotate_clockwise();
+                }
+                if state.rotation_steps > 0 {
+                    self.texture = None; // Force texture rebuild
+                }
+            }
+            
+            true
+        } else {
+            false
+        }
+    }
+    
+    /// Update the rotation count for the current image in fullscreen state.
+    /// Called after rotation actions to track cumulative rotations.
+    fn update_fullscreen_rotation(&mut self, clockwise: bool) {
+        if !self.is_fullscreen {
+            return;
+        }
+        
+        let Some(path) = self.image_list.get(self.current_index).cloned() else {
+            return;
+        };
+        
+        let entry = self.fullscreen_view_states.entry(path).or_insert_with(|| {
+            FullscreenViewState {
+                zoom: self.zoom,
+                zoom_target: self.zoom_target,
+                offset: self.offset,
+                rotation_steps: 0,
+                flip_horizontal: false,
+                flip_vertical: false,
+            }
+        });
+        
+        if clockwise {
+            entry.rotation_steps = (entry.rotation_steps + 1) % 4;
+        } else {
+            entry.rotation_steps = (entry.rotation_steps + 3) % 4; // +3 mod 4 = -1 mod 4
+        }
+    }
+
     /// Load next image
     fn next_image(&mut self) {
         if self.image_list.is_empty() {
             return;
         }
+        
+        // Save current view state before navigating (fullscreen only)
+        self.save_current_fullscreen_view_state();
+        
         self.current_index = (self.current_index + 1) % self.image_list.len();
         let path = self.image_list[self.current_index].clone();
         self.load_image(&path);
@@ -800,6 +942,10 @@ impl ImageViewer {
         if self.image_list.is_empty() {
             return;
         }
+        
+        // Save current view state before navigating (fullscreen only)
+        self.save_current_fullscreen_view_state();
+        
         self.current_index = if self.current_index == 0 {
             self.image_list.len() - 1
         } else {
@@ -912,6 +1058,15 @@ impl ImageViewer {
     }
 
     fn apply_fullscreen_layout_for_current_image(&mut self, ctx: &egui::Context) {
+        // Check if we have a saved view state for this image (fullscreen per-image memory)
+        if let Some(path) = self.image_list.get(self.current_index).cloned() {
+            if self.restore_fullscreen_view_state(&path) {
+                // State was restored, don't apply default layout
+                return;
+            }
+        }
+        
+        // No saved state - apply default fullscreen layout
         self.offset = egui::Vec2::ZERO;
         
         // Get dimensions from either image or video
@@ -2500,7 +2655,18 @@ impl eframe::App for ImageViewer {
         if self.image_rotated {
             if self.is_fullscreen {
                 // Fullscreen: fit vertically to screen, centered.
-                self.apply_fullscreen_layout_for_current_image(ctx);
+                // Don't call apply_fullscreen_layout_for_current_image here because it would
+                // try to restore the saved state (which has old rotation). Instead, just
+                // recalculate zoom for the new rotated dimensions.
+                self.offset = egui::Vec2::ZERO;
+                if let Some((_, img_h)) = self.media_display_dimensions() {
+                    if img_h > 0 {
+                        let target_h = self.monitor_size_points(ctx).y.max(ctx.screen_rect().height());
+                        let z = (target_h / img_h as f32).clamp(0.1, 50.0);
+                        self.zoom = z;
+                        self.zoom_target = z;
+                    }
+                }
             } else {
                 // Floating: resize window to match new image dimensions (swapped after rotation)
                 self.apply_floating_layout_for_current_image(ctx);
@@ -2557,6 +2723,10 @@ impl eframe::App for ImageViewer {
             } else {
                 // Exiting fullscreen - use delayed resize to prevent flash
                 self.fullscreen_transition_target = 0.0;
+                
+                // Clear the per-image fullscreen view state cache when exiting fullscreen
+                // (since it's only meant for fullscreen mode comparisons within a session)
+                self.fullscreen_view_states.clear();
 
                 let image_changed_while_fullscreen = self
                     .saved_fullscreen_entry_index
