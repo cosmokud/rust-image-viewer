@@ -1633,6 +1633,8 @@ impl ImageViewer {
     }
 
     /// Update manga scroll animation (smooth scrolling)
+    /// Uses a critically-damped spring system with sub-pixel precision for buttery-smooth motion.
+    /// The animation is frame-rate independent and respects VSync timing.
     fn manga_tick_scroll_animation(&mut self, dt: f32) -> bool {
         if !self.manga_mode {
             return false;
@@ -1640,9 +1642,10 @@ impl ImageViewer {
 
         let error = self.manga_scroll_target - self.manga_scroll_offset;
         
-        // Snap threshold
-        const SNAP_THRESHOLD: f32 = 0.5;
-        const VELOCITY_THRESHOLD: f32 = 1.0;
+        // Sub-pixel precision thresholds for smooth stopping
+        // Using smaller thresholds (0.1px) prevents visible "snapping" artifacts
+        const SNAP_THRESHOLD: f32 = 0.1;
+        const VELOCITY_THRESHOLD: f32 = 0.5;
 
         if error.abs() < SNAP_THRESHOLD && self.manga_scroll_velocity.abs() < VELOCITY_THRESHOLD {
             self.manga_scroll_offset = self.manga_scroll_target;
@@ -1650,15 +1653,29 @@ impl ImageViewer {
             return false;
         }
 
-        // Critically-damped spring for smooth scrolling
-        let omega = 12.0;
+        // High-quality critically-damped spring for buttery-smooth scrolling.
+        // omega = 18 provides fast response without overshoot.
+        // Higher omega = snappier response, lower = smoother but slower.
+        //
+        // Physics: critically damped when damping_ratio = 1.0
+        // x'' = -omega^2 * (x - target) - 2 * omega * x'
+        let omega = 18.0;
         let omega_sq = omega * omega;
         
+        // Cap dt to prevent instability on frame drops (max ~30fps equivalent)
+        let dt = dt.min(0.033);
+        
+        // Semi-implicit Euler integration for stability:
+        // 1. Compute acceleration from spring force and damping
+        // 2. Update velocity with acceleration
+        // 3. Update position with new velocity
         let spring_force = omega_sq * error;
         let damping_force = 2.0 * omega * self.manga_scroll_velocity;
         let acceleration = spring_force - damping_force;
 
         self.manga_scroll_velocity += acceleration * dt;
+        
+        // Apply velocity with sub-pixel precision
         self.manga_scroll_offset += self.manga_scroll_velocity * dt;
 
         // Clamp to valid range
@@ -1666,6 +1683,9 @@ impl ImageViewer {
         let visible_height = self.screen_size.y;
         let max_scroll = (total_height - visible_height).max(0.0);
         self.manga_scroll_offset = self.manga_scroll_offset.clamp(0.0, max_scroll);
+        
+        // Also clamp target to prevent overshooting past bounds
+        self.manga_scroll_target = self.manga_scroll_target.clamp(0.0, max_scroll);
 
         // Update current_index based on scroll position
         self.manga_update_current_index();
@@ -1979,13 +1999,26 @@ impl ImageViewer {
             }
             
             if primary_down && self.is_panning {
-                // Vertical panning - scroll the strip
+                // Vertical panning - scroll the strip with momentum tracking
                 let drag_speed = self.config.manga_drag_pan_speed;
-                self.manga_scroll_by(-pointer_delta.y * drag_speed);
-                // While actively dragging, apply immediately for 1:1 feel (prevents stutter).
-                self.manga_scroll_offset = self.manga_scroll_target;
-                self.manga_scroll_velocity = 0.0;
-                // Horizontal panning - offset
+                let delta_y = -pointer_delta.y * drag_speed;
+                
+                // Track velocity for momentum scrolling when drag ends.
+                // Use exponential smoothing for stable velocity estimation.
+                let velocity_alpha = 0.3; // Blend factor for velocity smoothing
+                let instant_velocity = delta_y / ctx.input(|i| i.stable_dt).max(0.001);
+                self.manga_scroll_velocity = self.manga_scroll_velocity * (1.0 - velocity_alpha) 
+                    + instant_velocity * velocity_alpha;
+                
+                // Apply scroll delta directly for 1:1 feel during drag.
+                // This provides immediate response without the spring delay.
+                let total_height = self.manga_total_height();
+                let visible_height = self.screen_size.y;
+                let max_scroll = (total_height - visible_height).max(0.0);
+                self.manga_scroll_offset = (self.manga_scroll_offset + delta_y).clamp(0.0, max_scroll);
+                self.manga_scroll_target = self.manga_scroll_offset;
+                
+                // Horizontal panning - offset with same 1:1 feel
                 self.offset.x += pointer_delta.x * drag_speed;
                 self.manga_update_preload_queue();
                 ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
@@ -1995,6 +2028,25 @@ impl ImageViewer {
             if primary_released {
                 self.is_panning = false;
                 self.last_mouse_pos = None;
+                
+                // Apply momentum scrolling on release.
+                // The tracked velocity continues the scroll motion with natural deceleration.
+                // Only apply if velocity is significant (prevents micro-drifts).
+                if self.manga_scroll_velocity.abs() > 50.0 {
+                    // Project where the scroll would naturally stop based on current velocity.
+                    // Using the spring's settling distance approximation.
+                    let omega = 18.0;
+                    let momentum_distance = self.manga_scroll_velocity / omega;
+                    let total_height = self.manga_total_height();
+                    let visible_height = self.screen_size.y;
+                    let max_scroll = (total_height - visible_height).max(0.0);
+                    self.manga_scroll_target = (self.manga_scroll_offset + momentum_distance).clamp(0.0, max_scroll);
+                    animation_active = true;
+                } else {
+                    // Small velocity - just snap to current position
+                    self.manga_scroll_velocity = 0.0;
+                    self.manga_scroll_target = self.manga_scroll_offset;
+                }
             }
         }
 
@@ -2491,19 +2543,27 @@ impl ImageViewer {
 
         // Handle manga mode specific keys (arrows, Page Up/Down, Home/End)
         if self.manga_mode && self.is_fullscreen {
-            // Arrow keys: use the same behavior and speed as mouse wheel scrolling.
+            // Arrow keys: support both press (discrete scroll) and hold (continuous scroll).
             // LEFT/UP = scroll up, RIGHT/DOWN = scroll down.
-            let arrow_left = ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft));
-            let arrow_right = ctx.input(|i| i.key_pressed(egui::Key::ArrowRight));
-            let arrow_up = ctx.input(|i| i.key_pressed(egui::Key::ArrowUp));
-            let arrow_down = ctx.input(|i| i.key_pressed(egui::Key::ArrowDown));
+            // Using key_down for continuous scrolling when held, with velocity-based smooth motion.
+            let arrow_left = ctx.input(|i| i.key_down(egui::Key::ArrowLeft));
+            let arrow_right = ctx.input(|i| i.key_down(egui::Key::ArrowRight));
+            let arrow_up = ctx.input(|i| i.key_down(egui::Key::ArrowUp));
+            let arrow_down = ctx.input(|i| i.key_down(egui::Key::ArrowDown));
+            
+            let dt = ctx.input(|i| i.stable_dt).min(0.033);
+            let scroll_speed = self.config.manga_arrow_scroll_speed;
 
             if arrow_left || arrow_up {
-                self.manga_scroll_by(-self.config.manga_arrow_scroll_speed);
+                // Continuous scrolling: add velocity impulse per frame
+                // This creates smooth acceleration while holding the key
+                let impulse = scroll_speed * dt * 60.0; // Scale to ~60fps equivalent
+                self.manga_scroll_by(-impulse);
                 self.manga_update_preload_queue();
             }
             if arrow_right || arrow_down {
-                self.manga_scroll_by(self.config.manga_arrow_scroll_speed);
+                let impulse = scroll_speed * dt * 60.0;
+                self.manga_scroll_by(impulse);
                 self.manga_update_preload_queue();
             }
 
@@ -3968,7 +4028,17 @@ impl eframe::App for ImageViewer {
 
         // Determine if we need continuous repainting
         let manga_loading_active = self.manga_mode && !self.manga_loading_indices.is_empty();
-        let manga_scroll_active = self.manga_mode && (self.manga_scroll_target - self.manga_scroll_offset).abs() > 0.5;
+        let manga_scroll_active = self.manga_mode && (
+            (self.manga_scroll_target - self.manga_scroll_offset).abs() > 0.1
+            || self.manga_scroll_velocity.abs() > 0.5
+        );
+        // Check if arrow keys are held for continuous scrolling in manga mode
+        let manga_arrow_held = self.manga_mode && self.is_fullscreen && ctx.input(|i| {
+            i.key_down(egui::Key::ArrowLeft) 
+            || i.key_down(egui::Key::ArrowRight) 
+            || i.key_down(egui::Key::ArrowUp) 
+            || i.key_down(egui::Key::ArrowDown)
+        });
         
         let any_animation_active = fullscreen_animation_active 
             || pending_resize_active 
@@ -3979,7 +4049,8 @@ impl eframe::App for ImageViewer {
             || self.is_seeking
             || self.is_volume_dragging
             || manga_loading_active
-            || manga_scroll_active;
+            || manga_scroll_active
+            || manga_arrow_held;
 
         // Update idle state and optimize repaint scheduling
         if any_animation_active {
@@ -4158,6 +4229,9 @@ fn main() -> eframe::Result<()> {
         // Keep the renderer lightweight at idle. This viewer renders 2D UI + a single image/video
         // texture; MSAA and a depth buffer are not required for perceptible quality.
         renderer: eframe::Renderer::Glow,
+        // CRITICAL: Enable VSync to eliminate screen tearing during scrolling/panning.
+        // This synchronizes frame presentation with the display's refresh rate.
+        vsync: true,
         // VRAM/GPU optimization: Disable MSAA and depth buffer (not needed for 2D image viewer)
         // This reduces GPU memory allocation significantly
         multisampling: 0,
