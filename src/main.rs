@@ -1678,13 +1678,10 @@ impl ImageViewer {
         self.manga_scroll_target = 0.0;
         self.manga_scroll_velocity = 0.0;
         self.current_index = 0;
-        // Update last scroll position for jump detection
-        self.manga_last_scroll_position = 0.0;
-        // NO cooldown - immediately update preload queue
-        self.manga_preload_cooldown = 0;
-        // Force immediate preload queue update
+        // Delay preload update briefly to let the view settle
+        self.manga_preload_cooldown = 3;
+        // Force preload queue update with new position
         self.manga_last_preload_update = Instant::now() - Duration::from_millis(100);
-        self.manga_update_preload_queue();
     }
 
     /// Scroll to the last image in manga mode
@@ -1708,13 +1705,9 @@ impl ImageViewer {
         self.manga_scroll_offset = target;
         self.manga_scroll_target = target;
         self.manga_scroll_velocity = 0.0;
-        // Update last scroll position for jump detection
-        self.manga_last_scroll_position = target;
-        // NO cooldown - immediately update preload queue
-        self.manga_preload_cooldown = 0;
-        // Force immediate preload queue update
+        // Delay preload update briefly
+        self.manga_preload_cooldown = 3;
         self.manga_last_preload_update = Instant::now() - Duration::from_millis(100);
-        self.manga_update_preload_queue();
     }
 
     /// Update manga scroll animation (smooth scrolling)
@@ -1962,50 +1955,27 @@ impl ImageViewer {
                     let step = self.config.zoom_step;
                     let max_zoom = self.max_zoom_factor();
                     let mut new_zoom = self.zoom;
-                    let mut zoom_changed = false;
 
                     ui.horizontal(|ui| {
-                        // Minus button - uses sense(Click) for hold-to-repeat
                         let minus = ui.add_sized(
                             [28.0, 24.0],
-                            egui::Button::new(egui::RichText::new("-").color(egui::Color32::WHITE).size(18.0))
-                                .sense(egui::Sense::click()),
+                            egui::Button::new(egui::RichText::new("-").color(egui::Color32::WHITE).size(18.0)),
                         );
-                        // Handle both click and drag (hold) for repeated zoom
-                        if minus.is_pointer_button_down_on() {
-                            // While held, zoom out at ~10x per second
-                            let dt = ui.ctx().input(|i| i.stable_dt);
-                            let repeat_factor = step.powf(dt * 10.0);
-                            new_zoom = self.clamp_zoom(new_zoom / repeat_factor);
-                            zoom_changed = true;
-                            // Keep the bar visible while interacting
-                            self.manga_zoom_bar_show_time = Instant::now();
+                        if minus.clicked() {
+                            new_zoom = self.clamp_zoom(new_zoom / step);
                         }
 
                         let slider = egui::Slider::new(&mut new_zoom, 0.1..=max_zoom)
                             .show_value(false)
                             .clamping(egui::SliderClamping::Always);
                         let slider_resp = ui.add_sized([170.0, 24.0], slider);
-                        if slider_resp.changed() {
-                            zoom_changed = true;
-                            self.manga_zoom_bar_show_time = Instant::now();
-                        }
 
-                        // Plus button - uses sense(Click) for hold-to-repeat
                         let plus = ui.add_sized(
                             [28.0, 24.0],
-                            egui::Button::new(egui::RichText::new("+").color(egui::Color32::WHITE).size(18.0))
-                                .sense(egui::Sense::click()),
+                            egui::Button::new(egui::RichText::new("+").color(egui::Color32::WHITE).size(18.0)),
                         );
-                        // Handle both click and drag (hold) for repeated zoom
-                        if plus.is_pointer_button_down_on() {
-                            // While held, zoom in at ~10x per second
-                            let dt = ui.ctx().input(|i| i.stable_dt);
-                            let repeat_factor = step.powf(dt * 10.0);
-                            new_zoom = self.clamp_zoom(new_zoom * repeat_factor);
-                            zoom_changed = true;
-                            // Keep the bar visible while interacting
-                            self.manga_zoom_bar_show_time = Instant::now();
+                        if plus.clicked() {
+                            new_zoom = self.clamp_zoom(new_zoom * step);
                         }
 
                         ui.add_space(6.0);
@@ -2015,14 +1985,13 @@ impl ImageViewer {
                                 .size(13.0),
                         );
 
-                        if zoom_changed {
+                        if slider_resp.changed() || minus.clicked() || plus.clicked() {
                             let old_zoom = self.zoom.max(0.0001);
                             let zoom_ratio = (new_zoom / old_zoom).clamp(0.01, 100.0);
 
                             // Anchor at viewport center for slider/buttons.
                             let anchor_y = self.screen_size.y.max(1.0) * 0.5;
 
-                            // Set both zoom and zoom_target to prevent animation fighting
                             self.zoom = new_zoom;
                             self.zoom_target = new_zoom;
                             self.zoom_velocity = 0.0;
@@ -2038,7 +2007,7 @@ impl ImageViewer {
                             let max_scroll = (total_height - self.screen_size.y).max(0.0);
                             self.manga_scroll_offset = self.manga_scroll_offset.clamp(0.0, max_scroll);
                             self.manga_scroll_target = self.manga_scroll_target.clamp(0.0, max_scroll);
-                            // Don't call preload update here - let the main loop handle it
+                            self.manga_update_preload_queue();
                         }
                     });
                 });
@@ -2216,13 +2185,10 @@ impl ImageViewer {
                 animation_active = true;
             } else if scroll_delta != 0.0 {
                 // Regular scroll = Pan vertically.
-                // Use raw scroll delta for immediate 1:1 response without smoothing artifacts.
-                // smooth_scroll_delta can cause "bouncy" feeling due to interpolation.
-                let raw_scroll = ctx.input(|i| i.raw_scroll_delta.y);
+                // Use direct offset update (like drag) for smoother, more responsive scrolling.
+                // This avoids the spring animation delay that causes perceived stuttering.
                 let scroll_speed = self.config.manga_wheel_scroll_speed;
-                // Use raw delta if available, otherwise fall back to smooth delta
-                let effective_delta = if raw_scroll.abs() > 0.1 { raw_scroll } else { scroll_delta };
-                let delta = -effective_delta * scroll_speed;
+                let delta = -scroll_delta * scroll_speed;
                 
                 let total_height = self.manga_total_height();
                 let visible_height = self.screen_size.y;
@@ -2451,46 +2417,6 @@ impl ImageViewer {
                         6.0,
                         thumb_color,
                     );
-                    
-                    // Draw page indicator next to scrollbar (left of the scrollbar)
-                    if !self.image_list.is_empty() {
-                        let visible_idx = self.current_index;
-                        let page_text = format!("{}/{}", visible_idx + 1, self.image_list.len());
-                        
-                        // Position to the left of the scrollbar
-                        let page_indicator_pos = egui::pos2(
-                            scrollbar_track_rect.min.x - 10.0, // 10px left of scrollbar
-                            scrollbar_thumb_rect.center().y,   // Vertically aligned with thumb
-                        );
-                        
-                        // Draw semi-transparent background pill
-                        let text_galley = ui.painter().layout_no_wrap(
-                            page_text.clone(),
-                            egui::FontId::proportional(12.0),
-                            egui::Color32::WHITE,
-                        );
-                        let pill_rect = egui::Rect::from_center_size(
-                            page_indicator_pos,
-                            egui::Vec2::new(text_galley.rect.width() + 12.0, 20.0),
-                        );
-                        // Move pill to the left so it doesn't overlap scrollbar
-                        let pill_rect = pill_rect.translate(egui::vec2(-text_galley.rect.width() / 2.0 - 6.0, 0.0));
-                        
-                        ui.painter().rect_filled(
-                            pill_rect,
-                            10.0,
-                            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 150),
-                        );
-                        
-                        // Draw text
-                        ui.painter().text(
-                            pill_rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            page_text,
-                            egui::FontId::proportional(12.0),
-                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200),
-                        );
-                    }
                 }
 
                 // Draw page indicator (current image / total) (hover-only)
