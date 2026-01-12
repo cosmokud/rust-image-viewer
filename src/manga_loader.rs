@@ -194,52 +194,50 @@ impl MangaLoader {
             let _current_gen = generation.load(Ordering::Acquire);
 
             // Process batch in parallel using Rayon
-            let results: Vec<Option<DecodedImage>> = batch
+            let results: Vec<(usize, Option<DecodedImage>)> = batch
                 .par_iter()
                 .map(|req| {
                     // Skip if already loaded or if we've been shut down
                     if shutdown.load(Ordering::Relaxed) {
-                        return None;
+                        return (req.index, None);
                     }
 
                     // Check if already in loaded set
                     {
                         let loaded = loaded_indices.read();
                         if loaded.contains(&req.index) {
-                            // Remove from loading set
-                            loading_indices.write().remove(&req.index);
-                            return None;
+                            return (req.index, None);
                         }
                     }
 
                     // Load the image
                     let decoded = Self::load_single_image(req);
 
-                    // Mark as no longer loading, add to loaded
-                    {
-                        let mut loading = loading_indices.write();
-                        loading.remove(&req.index);
-                    }
-                    {
-                        let mut loaded = loaded_indices.write();
-                        if let Some(ref d) = decoded {
-                            loaded.insert(d.index);
-                        }
-                    }
-
-                    decoded
+                    (req.index, decoded)
                 })
                 .collect();
 
-            // Send results to main thread (drop any that don't fit)
-            for decoded in results.into_iter().flatten() {
-                // Try to send; if the channel is full, skip (main thread will re-request if needed)
+            // Publish results to main thread.
+            // IMPORTANT: only mark an index as loaded after the decoded image is successfully enqueued.
+            // Otherwise, a full result channel would cause the image to be permanently considered "loaded"
+            // even though the main thread never received it, leaving placeholders stuck forever.
+            for (idx, decoded_opt) in results {
+                // Request has finished one way or another; allow it to be re-requested if needed.
+                loading_indices.write().remove(&idx);
+
+                let Some(decoded) = decoded_opt else {
+                    continue;
+                };
+
                 match result_tx.try_send(decoded) {
-                    Ok(_) => {}
-                    Err(TrySendError::Full(_)) => {
-                        // Channel full, drop this result (it will be re-requested)
+                    Ok(_) => {
+                        loaded_indices.write().insert(idx);
                     }
-                    Err(TrySendError::Disconnected(_)) => {
+                    Err(TrySendError::Full(_decoded)) => {
+                        // Channel full: drop decoded result.
+                        // We intentionally do NOT mark as loaded so the main thread can re-request.
+                    }
+                    Err(TrySendError::Disconnected(_decoded)) => {
                         return; // Main thread gone, exit
                     }
                 }

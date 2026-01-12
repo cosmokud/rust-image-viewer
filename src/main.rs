@@ -2248,6 +2248,9 @@ impl ImageViewer {
                     self.manga_scroll_target = new_scroll;
                     self.manga_scroll_offset = new_scroll; // Instant scroll for responsiveness
                     self.manga_last_scroll_position = new_scroll;
+
+                    // Keep the page indicator in sync even for instant jumps.
+                    self.manga_update_current_index();
                     
                     // Only update preload queue if we've settled (throttled inside)
                     self.manga_update_preload_queue();
@@ -2322,6 +2325,9 @@ impl ImageViewer {
                 let max_scroll = (total_height - screen_height).max(0.0);
                 self.manga_scroll_offset = self.manga_scroll_offset.clamp(0.0, max_scroll);
                 self.manga_scroll_target = self.manga_scroll_target.clamp(0.0, max_scroll);
+
+                // Scroll offset moved; update page index immediately.
+                self.manga_update_current_index();
                 self.manga_update_preload_queue();
                 animation_active = true;
             } else if scroll_delta != 0.0 {
@@ -2339,7 +2345,9 @@ impl ImageViewer {
                 self.manga_scroll_offset = (self.manga_scroll_offset + delta).clamp(0.0, max_scroll);
                 self.manga_scroll_target = self.manga_scroll_offset;
                 self.manga_scroll_velocity = 0.0; // Stop any ongoing animation
-                
+
+                // Wheel scrolling is instant; update page indicator immediately.
+                self.manga_update_current_index();
                 self.manga_update_preload_queue();
             }
         }
@@ -2387,6 +2395,7 @@ impl ImageViewer {
                     self.manga_scroll_offset = self.manga_scroll_offset.clamp(0.0, max_scroll);
                     self.manga_scroll_target = self.manga_scroll_target.clamp(0.0, max_scroll);
 
+                    self.manga_update_current_index();
                     self.manga_update_preload_queue();
                     animation_active = true;
                 }
@@ -2423,6 +2432,8 @@ impl ImageViewer {
                 
                 // Horizontal panning - offset with same 1:1 feel
                 self.offset.x += pointer_delta.x * drag_speed;
+
+                self.manga_update_current_index();
                 self.manga_update_preload_queue();
                 ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
                 animation_active = true;
