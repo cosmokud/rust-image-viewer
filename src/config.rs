@@ -311,6 +311,9 @@ pub struct Config {
     /// Zoom step per scroll wheel notch (1.05 = 5% per step, 1.25 = 25% per step)
     pub zoom_step: f32,
 
+    /// Maximum zoom level in percent (100 = 1.0x, 1000 = 10.0x)
+    pub max_zoom_percent: f32,
+
     /// Manga mode: drag pan speed multiplier (1.0 = 1:1 pointer delta)
     pub manga_drag_pan_speed: f32,
     /// Manga mode: mouse wheel scroll speed (pixels per normalized scroll unit)
@@ -379,6 +382,7 @@ impl Default for Config {
             fullscreen_reset_fit_on_enter: true,
             zoom_animation_speed: 20.0,
             zoom_step: 1.02,
+            max_zoom_percent: 1000.0,
             manga_drag_pan_speed: 2.5,
             manga_wheel_scroll_speed: 40.0,
             manga_arrow_scroll_speed: 140.0,
@@ -548,6 +552,7 @@ impl Config {
             fullscreen_reset_fit_on_enter: true,
             zoom_animation_speed: 8.0,
             zoom_step: 1.08,
+            max_zoom_percent: 1000.0,
             manga_drag_pan_speed: 2.5,
             manga_wheel_scroll_speed: 40.0,
             manga_arrow_scroll_speed: 140.0,
@@ -659,6 +664,13 @@ impl Config {
                             if let Ok(v) = value.parse::<f32>() {
                                 // Zoom multiplier per scroll step (1.05 = 5%, 1.25 = 25%)
                                 config.zoom_step = v.clamp(1.01, 2.0);
+                            }
+                        }
+                        "max_zoom_percent" | "max_zoom_percentage" | "max_zoom" => {
+                            if let Ok(v) = value.parse::<f32>() {
+                                // Clamp defensively: allow very large values, but keep it finite.
+                                // 1000% = 10x is the default.
+                                config.max_zoom_percent = v.clamp(10.0, 100000.0);
                             }
                         }
                         "manga_drag_pan_speed" | "manga_drag_pan_multiplier" => {
@@ -814,6 +826,9 @@ impl Config {
         
         content.push_str("; Zoom step per scroll wheel notch (1.05 = 5%, 1.10 = 10%, 1.25 = 25%)\n");
         content.push_str(&format!("zoom_step = {}\n\n", self.zoom_step));
+
+        content.push_str("; Maximum zoom level in percent (100 = 1.0x, 1000 = 10.0x)\n");
+        content.push_str(&format!("max_zoom_percent = {}\n\n", self.max_zoom_percent));
 
         content.push_str("; Manga mode: drag pan speed multiplier (1.0 = 1:1, higher = faster)\n");
         content.push_str(&format!("manga_drag_pan_speed = {}\n", self.manga_drag_pan_speed));

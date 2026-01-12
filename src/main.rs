@@ -317,6 +317,11 @@ struct ImageViewer {
     show_manga_toggle: bool,
     /// Time when manga toggle was last shown (for auto-hide)
     manga_toggle_show_time: Instant,
+
+    /// Whether the manga zoom bar should be shown (on hover bottom-right)
+    show_manga_zoom_bar: bool,
+    /// Time when manga zoom bar was last shown (for auto-hide)
+    manga_zoom_bar_show_time: Instant,
     /// Vertical scroll offset for manga mode (in pixels)
     manga_scroll_offset: f32,
     /// Target scroll offset for smooth scrolling animation
@@ -421,6 +426,8 @@ impl Default for ImageViewer {
             manga_mode: false,
             show_manga_toggle: false,
             manga_toggle_show_time: Instant::now(),
+            show_manga_zoom_bar: false,
+            manga_zoom_bar_show_time: Instant::now(),
             manga_scroll_offset: 0.0,
             manga_scroll_target: 0.0,
             manga_scroll_velocity: 0.0,
@@ -440,6 +447,17 @@ impl Default for ImageViewer {
 }
 
 impl ImageViewer {
+    fn max_zoom_factor(&self) -> f32 {
+        // Config stored as percent: 100 = 1.0x, 1000 = 10.0x.
+        // Clamp defensively to keep math stable even if config is extreme.
+        let factor = (self.config.max_zoom_percent / 100.0).max(0.1);
+        factor.clamp(0.1, 1000.0)
+    }
+
+    fn clamp_zoom(&self, zoom: f32) -> f32 {
+        zoom.clamp(0.1, self.max_zoom_factor())
+    }
+
     fn startup_ready_to_show(&self) -> bool {
         if self.error_message.is_some() {
             return true;
@@ -482,7 +500,7 @@ impl ImageViewer {
                 
                 // Calculate fit zoom (same logic as images)
                 let fit_zoom = if vid_h > monitor.y {
-                    (monitor.y / vid_h).clamp(0.1, 50.0)
+                    (monitor.y / vid_h).clamp(0.1, self.max_zoom_factor())
                 } else {
                     1.0
                 };
@@ -632,7 +650,7 @@ impl ImageViewer {
         // - Prefer 100% image size
         // - If the image is taller than the screen, fit vertically to consume the full screen height
         let z = if img_h > monitor.y {
-            (monitor.y / img_h).clamp(0.1, 50.0)
+            (monitor.y / img_h).clamp(0.1, self.max_zoom_factor())
         } else {
             1.0
         };
@@ -696,11 +714,11 @@ impl ImageViewer {
             Action::ZoomIn => {
                 let step = self.config.zoom_step;
                 if self.is_fullscreen {
-                    self.zoom = (self.zoom * step).min(50.0);
+                    self.zoom = (self.zoom * step).min(self.max_zoom_factor());
                     self.zoom_target = self.zoom;
                     self.zoom_velocity = 0.0;
                 } else {
-                    self.zoom_target = (self.zoom_target * step).min(50.0);
+                    self.zoom_target = (self.zoom_target * step).min(self.max_zoom_factor());
                     self.zoom_velocity = 0.0;
                 }
             }
@@ -1094,7 +1112,7 @@ impl ImageViewer {
             let is_video = matches!(self.current_media_type, Some(MediaType::Video));
             let fit_zoom = if is_video {
                 if img_h > monitor.y {
-                    (monitor.y / img_h).clamp(0.1, 50.0)
+                    (monitor.y / img_h).clamp(0.1, self.max_zoom_factor())
                 } else {
                     1.0
                 }
@@ -1149,7 +1167,7 @@ impl ImageViewer {
         if let Some((_, img_h)) = self.media_display_dimensions() {
             if img_h > 0 {
                 let target_h = self.monitor_size_points(ctx).y.max(ctx.screen_rect().height());
-                let z = (target_h / img_h as f32).clamp(0.1, 50.0);
+                let z = (target_h / img_h as f32).clamp(0.1, self.max_zoom_factor());
                 self.zoom = z;
                 self.zoom_target = z;
             }
@@ -1220,7 +1238,7 @@ impl ImageViewer {
         self.zoom += self.zoom_velocity * dt;
 
         // Clamp zoom to valid range
-        self.zoom = self.zoom.clamp(0.1, 50.0);
+        self.zoom = self.clamp_zoom(self.zoom);
 
         // Return whether animation needs to continue
         error.abs() > SNAP_THRESHOLD || self.zoom_velocity.abs() > VELOCITY_THRESHOLD
@@ -1241,7 +1259,7 @@ impl ImageViewer {
     /// Zoom at a specific point
     fn zoom_at(&mut self, center: egui::Pos2, factor: f32, available_rect: egui::Rect) {
         let old_zoom = self.zoom;
-        self.zoom = (self.zoom * factor).clamp(0.1, 50.0);
+        self.zoom = self.clamp_zoom(self.zoom * factor);
 
         // In fullscreen we allow panning and cursor-follow zoom.
         // In floating mode we keep the image centered and let the window autosize instead.
@@ -1290,7 +1308,7 @@ impl ImageViewer {
                 if img_h > 0.0 {
                     let base_scale = if img_h > screen_h { screen_h / img_h } else { 1.0 };
                     let desired_total_scale = screen_h / img_h;
-                    let new_zoom = (desired_total_scale / base_scale).clamp(0.1, 10.0);
+                    let new_zoom = self.clamp_zoom(desired_total_scale / base_scale);
                     self.zoom = new_zoom;
                     self.zoom_target = new_zoom;
                     self.zoom_velocity = 0.0;
@@ -1828,6 +1846,131 @@ impl ImageViewer {
             });
     }
 
+    /// Draw manga zoom HUD (bottom-right in fullscreen manga mode)
+    fn draw_manga_zoom_bar(&mut self, ctx: &egui::Context) {
+        if !self.is_fullscreen || !self.manga_mode {
+            self.show_manga_zoom_bar = false;
+            return;
+        }
+
+        // Don't show manga zoom HUD for videos
+        if self.video_player.is_some() {
+            self.show_manga_zoom_bar = false;
+            return;
+        }
+
+        let screen_rect = ctx.screen_rect();
+        let margin = 20.0;
+
+        // Hover zone around bottom-right corner
+        let hover_zone = egui::Rect::from_min_size(
+            egui::pos2(screen_rect.max.x - 360.0, screen_rect.max.y - 160.0),
+            egui::Vec2::new(360.0, 160.0),
+        );
+
+        let mouse_pos = ctx.input(|i| i.pointer.hover_pos());
+        if let Some(pos) = mouse_pos {
+            if hover_zone.contains(pos) {
+                self.show_manga_zoom_bar = true;
+                self.manga_zoom_bar_show_time = Instant::now();
+            }
+        }
+
+        // Auto-hide after delay
+        if self.manga_zoom_bar_show_time.elapsed().as_secs_f32() > 2.0 {
+            if let Some(pos) = mouse_pos {
+                if !hover_zone.contains(pos) {
+                    self.show_manga_zoom_bar = false;
+                }
+            } else {
+                self.show_manga_zoom_bar = false;
+            }
+        }
+
+        if !self.show_manga_zoom_bar {
+            return;
+        }
+
+        let bar_size = egui::Vec2::new(300.0, 36.0);
+        let bar_pos = egui::pos2(
+            screen_rect.max.x - bar_size.x - margin,
+            screen_rect.max.y - bar_size.y - margin - 44.0,
+        );
+
+        egui::Area::new(egui::Id::new("manga_zoom_bar"))
+            .fixed_pos(bar_pos)
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                let frame = egui::Frame::none()
+                    .fill(egui::Color32::from_rgba_unmultiplied(0, 0, 0, 180))
+                    .rounding(10.0)
+                    .inner_margin(egui::Margin::same(8.0));
+
+                frame.show(ui, |ui| {
+                    ui.set_min_size(bar_size);
+
+                    let step = self.config.zoom_step;
+                    let max_zoom = self.max_zoom_factor();
+                    let mut new_zoom = self.zoom;
+
+                    ui.horizontal(|ui| {
+                        let minus = ui.add_sized(
+                            [28.0, 24.0],
+                            egui::Button::new(egui::RichText::new("-").color(egui::Color32::WHITE).size(18.0)),
+                        );
+                        if minus.clicked() {
+                            new_zoom = self.clamp_zoom(new_zoom / step);
+                        }
+
+                        let slider = egui::Slider::new(&mut new_zoom, 0.1..=max_zoom)
+                            .show_value(false)
+                            .clamping(egui::SliderClamping::Always);
+                        let slider_resp = ui.add_sized([170.0, 24.0], slider);
+
+                        let plus = ui.add_sized(
+                            [28.0, 24.0],
+                            egui::Button::new(egui::RichText::new("+").color(egui::Color32::WHITE).size(18.0)),
+                        );
+                        if plus.clicked() {
+                            new_zoom = self.clamp_zoom(new_zoom * step);
+                        }
+
+                        ui.add_space(6.0);
+                        ui.label(
+                            egui::RichText::new(format!("{:.0}%", (new_zoom * 100.0).round()))
+                                .color(egui::Color32::WHITE)
+                                .size(13.0),
+                        );
+
+                        if slider_resp.changed() || minus.clicked() || plus.clicked() {
+                            let old_zoom = self.zoom.max(0.0001);
+                            let zoom_ratio = (new_zoom / old_zoom).clamp(0.01, 100.0);
+
+                            // Anchor at viewport center for slider/buttons.
+                            let anchor_y = self.screen_size.y.max(1.0) * 0.5;
+
+                            self.zoom = new_zoom;
+                            self.zoom_target = new_zoom;
+                            self.zoom_velocity = 0.0;
+                            self.manga_total_height_cache_valid = false;
+
+                            self.manga_scroll_offset =
+                                self.manga_scroll_offset * zoom_ratio + anchor_y * (zoom_ratio - 1.0);
+                            self.manga_scroll_target =
+                                self.manga_scroll_target * zoom_ratio + anchor_y * (zoom_ratio - 1.0);
+                            self.manga_scroll_velocity = 0.0;
+
+                            let total_height = self.manga_total_height();
+                            let max_scroll = (total_height - self.screen_size.y).max(0.0);
+                            self.manga_scroll_offset = self.manga_scroll_offset.clamp(0.0, max_scroll);
+                            self.manga_scroll_target = self.manga_scroll_target.clamp(0.0, max_scroll);
+                            self.manga_update_preload_queue();
+                        }
+                    });
+                });
+            });
+    }
+
     /// Draw images in manga (vertical strip) mode
     fn draw_manga_mode(&mut self, ctx: &egui::Context) -> bool {
         if !self.manga_mode || !self.is_fullscreen {
@@ -1871,29 +2014,52 @@ impl ImageViewer {
             egui::Vec2::new(scrollbar_width, scrollbar_height),
         );
 
+        // Hover-only visibility zones.
+        // - Scrollbar: show when hovering near the right edge (or while dragging).
+        // - Page label: show when hovering near the bottom.
+        let scrollbar_hover_zone = egui::Rect::from_min_max(
+            egui::pos2((screen_width - (scrollbar_width + scrollbar_margin + 40.0)).max(0.0), 0.0),
+            egui::pos2(screen_width, screen_height),
+        );
+        let page_label_hover_zone = egui::Rect::from_min_max(
+            egui::pos2(0.0, (screen_height - 80.0).max(0.0)),
+            egui::pos2(screen_width, screen_height),
+        );
+
         // Check if pointer is over scrollbar
         let over_scrollbar = pointer_pos.map_or(false, |p| scrollbar_track_rect.contains(p));
+        let show_scrollbar = total_height > screen_height
+            && (self.manga_scrollbar_dragging
+                || over_scrollbar
+                || pointer_pos.map_or(false, |p| scrollbar_hover_zone.contains(p)));
+        let show_page_label = pointer_pos.map_or(false, |p| page_label_hover_zone.contains(p));
 
         // Handle scrollbar dragging
-        if over_scrollbar && primary_pressed {
-            self.manga_scrollbar_dragging = true;
-        }
-        if primary_released {
-            self.manga_scrollbar_dragging = false;
-        }
-
-        if self.manga_scrollbar_dragging || (over_scrollbar && primary_down) {
-            if let Some(pos) = pointer_pos {
-                // Calculate scroll position from mouse Y
-                let relative_y = (pos.y - 10.0 - scrollbar_height / 2.0) / (scrollbar_track_height - scrollbar_height);
-                let new_scroll = relative_y.clamp(0.0, 1.0) * max_scroll;
-                self.manga_scroll_target = new_scroll;
-                self.manga_scroll_offset = new_scroll; // Instant scroll for responsiveness
-                self.manga_update_preload_queue();
+        if show_scrollbar {
+            if over_scrollbar && primary_pressed {
+                self.manga_scrollbar_dragging = true;
             }
-            ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
-        } else if over_scrollbar {
-            ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+            if primary_released {
+                self.manga_scrollbar_dragging = false;
+            }
+
+            if self.manga_scrollbar_dragging || (over_scrollbar && primary_down) {
+                if let Some(pos) = pointer_pos {
+                    // Calculate scroll position from mouse Y
+                    let relative_y =
+                        (pos.y - 10.0 - scrollbar_height / 2.0) / (scrollbar_track_height - scrollbar_height);
+                    let new_scroll = relative_y.clamp(0.0, 1.0) * max_scroll;
+                    self.manga_scroll_target = new_scroll;
+                    self.manga_scroll_offset = new_scroll; // Instant scroll for responsiveness
+                    self.manga_update_preload_queue();
+                }
+                ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+            } else if over_scrollbar {
+                ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+        } else if primary_released {
+            // If the scrollbar isn't visible, ensure we don't get stuck in a dragging state.
+            self.manga_scrollbar_dragging = false;
         }
 
         // Determine whether Ctrl+wheel zoom is bound for manga mode.
@@ -1936,7 +2102,7 @@ impl ImageViewer {
                 // The entire strip scales approximately linearly with `self.zoom`, so we can keep
                 // the content under an anchor point fixed by compensating scroll offset.
                 let old_zoom = self.zoom.max(0.0001);
-                let new_zoom = (self.zoom * factor).clamp(0.1, 10.0);
+                let new_zoom = self.clamp_zoom(self.zoom * factor);
                 let zoom_ratio = (new_zoom / old_zoom).clamp(0.01, 100.0);
 
                 // Anchor at pointer Y when available, otherwise at screen center.
@@ -1984,7 +2150,7 @@ impl ImageViewer {
 
             if let Some(img_h) = img_h {
                 if img_h > 0.0 {
-                    let new_zoom = if img_h > screen_h { 1.0 } else { (screen_h / img_h).clamp(0.1, 10.0) };
+                    let new_zoom = if img_h > screen_h { 1.0 } else { self.clamp_zoom(screen_h / img_h) };
                     let zoom_ratio = (new_zoom / old_zoom).clamp(0.01, 100.0);
 
                     // Reset horizontal offset and stop any ongoing drag/pan.
@@ -2166,8 +2332,8 @@ impl ImageViewer {
                     y_offset += img_height;
                 }
 
-                // Draw scrollbar track and thumb
-                if total_height > screen_height {
+                // Draw scrollbar track and thumb (hover-only)
+                if show_scrollbar {
                     // Track background
                     ui.painter().rect_filled(
                         scrollbar_track_rect,
@@ -2188,8 +2354,8 @@ impl ImageViewer {
                     );
                 }
 
-                // Draw page indicator (current image / total)
-                if !self.image_list.is_empty() {
+                // Draw page indicator (current image / total) (hover-only)
+                if !self.image_list.is_empty() && show_page_label {
                     // Find which image is most visible
                     let mut cumulative_y: f32 = 0.0;
                     let mut visible_idx = 0;
@@ -3329,7 +3495,7 @@ impl ImageViewer {
         let new_pos = egui::pos2(new_x, new_y);
 
         // Update zoom based on new window size
-        let new_zoom = (new_h / media_h).clamp(0.1, 50.0);
+        let new_zoom = self.clamp_zoom(new_h / media_h);
         self.zoom = new_zoom;
         self.zoom_target = new_zoom;
         self.zoom_velocity = 0.0;
@@ -3396,8 +3562,8 @@ impl ImageViewer {
                 } else {
                     // In floating mode, follow cursor when zoomed past 100%
                     let old_zoom = self.zoom;
-                    self.zoom_target = (self.zoom_target * factor).clamp(0.1, 50.0);
-                    self.zoom = (self.zoom * factor).clamp(0.1, 50.0);
+                    self.zoom_target = self.clamp_zoom(self.zoom_target * factor);
+                    self.zoom = self.clamp_zoom(self.zoom * factor);
 
                     // Keep cursor-follow behavior when zooming and/or after panning.
                     // When we cross <= 100%, we don't snap to center; the offset eases back via the settle block above.
@@ -3551,7 +3717,7 @@ impl ImageViewer {
                     if img_h > 0.0 {
                         let screen_h = screen_rect.height();
                         let fit_zoom = screen_h / img_h;
-                        self.zoom = fit_zoom.clamp(0.1, 50.0);
+                        self.zoom = self.clamp_zoom(fit_zoom);
                         self.zoom_target = self.zoom;
                     }
                 } else {
@@ -3562,7 +3728,7 @@ impl ImageViewer {
                     let is_video = matches!(self.current_media_type, Some(MediaType::Video));
                     let fit_zoom = if is_video {
                         if img_h > monitor.y {
-                            (monitor.y / img_h).clamp(0.1, 50.0)
+                            (monitor.y / img_h).clamp(0.1, self.max_zoom_factor())
                         } else {
                             1.0
                         }
@@ -3802,7 +3968,7 @@ impl eframe::App for ImageViewer {
                 if let Some((_, img_h)) = self.media_display_dimensions() {
                     if img_h > 0 {
                         let target_h = self.monitor_size_points(ctx).y.max(ctx.screen_rect().height());
-                        let z = (target_h / img_h as f32).clamp(0.1, 50.0);
+                        let z = (target_h / img_h as f32).clamp(0.1, self.max_zoom_factor());
                         self.zoom = z;
                         self.zoom_target = z;
                     }
@@ -3939,12 +4105,12 @@ impl eframe::App for ImageViewer {
                             let is_video = matches!(self.current_media_type, Some(MediaType::Video));
                             let z = if is_video {
                                 if img_h > monitor.y {
-                                    (monitor.y / img_h).clamp(0.1, 50.0)
+                                    (monitor.y / img_h).clamp(0.1, self.max_zoom_factor())
                                 } else {
                                     1.0
                                 }
                             } else if img_h > monitor.y {
-                                (monitor.y / img_h).clamp(0.1, 50.0)
+                                (monitor.y / img_h).clamp(0.1, self.max_zoom_factor())
                             } else {
                                 1.0
                             };
@@ -4043,6 +4209,7 @@ impl eframe::App for ImageViewer {
         // Draw manga mode toggle button (bottom-right in fullscreen)
         if !skip_drawing {
             self.draw_manga_toggle_button(ctx);
+            self.draw_manga_zoom_bar(ctx);
         }
 
         // Startup UX: keep the window hidden until initial layout is applied.
