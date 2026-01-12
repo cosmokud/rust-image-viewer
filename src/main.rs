@@ -5,17 +5,19 @@
 
 mod config;
 mod image_loader;
+mod manga_loader;
 mod video_player;
 #[cfg(target_os = "windows")]
 mod windows_env;
 
 use config::{Action, Config, InputBinding, StartupWindowMode};
-use image_loader::{get_images_in_directory, get_media_type, is_supported_image, LoadedImage, MediaType};
+use image_loader::{get_images_in_directory, get_media_type, LoadedImage, MediaType};
+use manga_loader::{MangaLoader, MangaTextureCache};
 use video_player::{format_duration, VideoPlayer};
 
 use eframe::egui;
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -328,15 +330,10 @@ struct ImageViewer {
     manga_scroll_target: f32,
     /// Scroll velocity for momentum scrolling
     manga_scroll_velocity: f32,
-    /// Cache of loaded images for manga mode: maps image index to (texture, width, height)
-    manga_image_cache: HashMap<usize, (egui::TextureHandle, u32, u32)>,
-    /// Cached image dimensions for manga mode (width, height). Used to keep layout stable
-    /// even before textures are loaded (prevents jitter/overlap as pages stream in).
-    manga_dim_cache: HashMap<usize, (u32, u32)>,
-    /// Indices of images currently being loaded (to avoid duplicate loads)
-    manga_loading_indices: std::collections::HashSet<usize>,
-    /// How many images to preload forward/backward from current view
-    manga_preload_count: usize,
+    /// High-performance parallel image loader for manga mode
+    manga_loader: Option<MangaLoader>,
+    /// LRU texture cache for manga mode
+    manga_texture_cache: MangaTextureCache,
     /// Whether the scrollbar is being dragged
     manga_scrollbar_dragging: bool,
 
@@ -431,10 +428,8 @@ impl Default for ImageViewer {
             manga_scroll_offset: 0.0,
             manga_scroll_target: 0.0,
             manga_scroll_velocity: 0.0,
-            manga_image_cache: HashMap::new(),
-            manga_dim_cache: HashMap::new(),
-            manga_loading_indices: HashSet::new(),
-            manga_preload_count: 5,
+            manga_loader: None,
+            manga_texture_cache: MangaTextureCache::default(),
             manga_scrollbar_dragging: false,
 
             manga_total_height_cache: 0.0,
@@ -1284,16 +1279,14 @@ impl ImageViewer {
             // Manga layout cache must be rebuilt for the new mode.
             self.manga_total_height_cache_valid = false;
 
-            // Precompute image dimensions for stable layout (prevents overlap/jitter when pages load).
-            // This reads headers only (fast) and avoids layout changing mid-scroll.
-            self.manga_dim_cache.clear();
-            for (idx, path) in self.image_list.iter().enumerate() {
-                if !is_supported_image(path) {
-                    continue;
-                }
-                if let Ok((w, h)) = image::image_dimensions(path) {
-                    self.manga_dim_cache.insert(idx, (w, h));
-                }
+            // Initialize the parallel manga loader if not already created
+            if self.manga_loader.is_none() {
+                self.manga_loader = Some(MangaLoader::new());
+            }
+
+            // Pre-cache all image dimensions in parallel (reads file headers only - very fast)
+            if let Some(ref mut loader) = self.manga_loader {
+                loader.cache_all_dimensions(&self.image_list);
             }
 
             // Dimensions may have changed; rebuild height cache.
@@ -1351,9 +1344,13 @@ impl ImageViewer {
 
     /// Clear the manga image cache to free GPU memory
     fn manga_clear_cache(&mut self) {
-        self.manga_image_cache.clear();
-        self.manga_loading_indices.clear();
-        self.manga_dim_cache.clear();
+        // Clear the texture cache
+        self.manga_texture_cache.clear();
+        
+        // Clear and reset the parallel loader
+        if let Some(ref mut loader) = self.manga_loader {
+            loader.clear();
+        }
 
         self.manga_total_height_cache_valid = false;
     }
@@ -1378,39 +1375,43 @@ impl ImageViewer {
             cumulative_y += img_height;
         }
 
-        // Calculate range of images to keep loaded: current ± preload_count
-        let start_idx = current_visible_index.saturating_sub(self.manga_preload_count);
-        let end_idx = (current_visible_index + self.manga_preload_count + 1).min(self.image_list.len());
-
-        // Remove images outside the range from cache
-        let indices_to_remove: Vec<usize> = self.manga_image_cache
-            .keys()
-            .filter(|&&idx| idx < start_idx || idx >= end_idx)
-            .copied()
-            .collect();
-        
-        for idx in indices_to_remove {
-            self.manga_image_cache.remove(&idx);
+        // Update the parallel loader's preload queue
+        if let Some(ref mut loader) = self.manga_loader {
+            loader.update_preload_queue(
+                &self.image_list,
+                current_visible_index,
+                self.screen_size.y,
+                self.max_texture_side,
+            );
         }
 
-        // Mark indices that need loading
-        for idx in start_idx..end_idx {
-            if !self.manga_image_cache.contains_key(&idx) && !self.manga_loading_indices.contains(&idx) {
-                self.manga_loading_indices.insert(idx);
+        // Evict textures that are far from the visible range to control VRAM usage
+        let keep_behind = 8;
+        let keep_ahead = 16;
+        let keep_start = current_visible_index.saturating_sub(keep_behind);
+        let keep_end = (current_visible_index + keep_ahead + 1).min(self.image_list.len());
+
+        let cached_indices = self.manga_texture_cache.cached_indices();
+        for idx in cached_indices {
+            if idx < keep_start || idx >= keep_end {
+                self.manga_texture_cache.remove(idx);
+                if let Some(ref mut loader) = self.manga_loader {
+                    loader.mark_unloaded(idx);
+                }
             }
         }
     }
 
     /// Get the display height of an image at a given index (scaled to fit screen height)
     fn manga_get_image_display_height(&self, index: usize) -> f32 {
-        // IMPORTANT: for layout stability, prefer header dimensions from `manga_dim_cache`.
+        // IMPORTANT: for layout stability, prefer header dimensions from the manga loader.
         // The texture we upload may be downscaled to fit GPU limits; using texture dimensions
         // for layout would cause pages to "shrink" as they load, producing visible jitter.
         let img_h = self
-            .manga_dim_cache
-            .get(&index)
-            .map(|(_w, h)| *h as f32)
-            .or_else(|| self.manga_image_cache.get(&index).map(|(_, _w, h)| *h as f32));
+            .manga_loader
+            .as_ref()
+            .and_then(|loader| loader.get_dimensions(index))
+            .map(|(_w, h)| h as f32);
 
         if let Some(img_h) = img_h {
             if img_h > 0.0 {
@@ -1430,13 +1431,11 @@ impl ImageViewer {
 
     /// Get the display width of an image at a given index (scaled to fit screen height)
     fn manga_get_image_display_width(&self, index: usize) -> f32 {
-        // Prefer original/header dimensions for stable layout; fall back to texture size only
-        // when we truly don't know the original dimensions.
+        // Prefer original/header dimensions for stable layout
         let dims = self
-            .manga_dim_cache
-            .get(&index)
-            .copied()
-            .or_else(|| self.manga_image_cache.get(&index).map(|(_, w, h)| (*w, *h)));
+            .manga_loader
+            .as_ref()
+            .and_then(|loader| loader.get_dimensions(index));
 
         if let Some((w, h)) = dims {
             let img_w = w as f32;
@@ -1456,81 +1455,55 @@ impl ImageViewer {
         self.screen_size.y * 0.67 * self.zoom
     }
 
-    /// Load an image for manga mode at a specific index
-    fn manga_load_image_at_index(&mut self, index: usize, ctx: &egui::Context) {
-        if index >= self.image_list.len() {
-            return;
-        }
-
-        // Skip if already loaded or currently loading
-        if self.manga_image_cache.contains_key(&index) {
-            self.manga_loading_indices.remove(&index);
-            return;
-        }
-
-        let path = &self.image_list[index];
-        
-        // Skip video files in manga mode
-        if !is_supported_image(path) {
-            self.manga_loading_indices.remove(&index);
-            return;
-        }
-
-        // Ensure we have stable/original dimensions cached for layout.
-        // Do NOT overwrite this with downscaled texture sizes.
-        if !self.manga_dim_cache.contains_key(&index) {
-            if let Ok((w, h)) = image::image_dimensions(path) {
-                self.manga_dim_cache.insert(index, (w, h));
-                self.manga_total_height_cache_valid = false;
-            }
-        }
-
-        // Load the image synchronously (could be made async in the future)
-        let downscale_filter = self.config.downscale_filter.to_image_filter();
-        let gif_filter = self.config.gif_resize_filter.to_image_filter();
-        
-        match LoadedImage::load_with_max_texture_side(path, Some(self.max_texture_side), downscale_filter, gif_filter) {
-            Ok(img) => {
-                let frame = img.current_frame_data();
-                let (w, h, pixels) = downscale_rgba_if_needed(
-                    frame.width,
-                    frame.height,
-                    &frame.pixels,
-                    self.max_texture_side,
-                    downscale_filter,
-                );
-                
-                let color_image = egui::ColorImage::from_rgba_unmultiplied(
-                    [w as usize, h as usize],
-                    pixels.as_ref(),
-                );
-                
-                let texture = ctx.load_texture(
-                    format!("manga_{}", index),
-                    color_image,
-                    self.config.texture_filter_static.to_egui_options(),
-                );
-                
-                self.manga_image_cache.insert(index, (texture, w, h));
-            }
-            Err(_) => {
-                // Failed to load, skip this image
-            }
-        }
-        
-        self.manga_loading_indices.remove(&index);
-    }
-
-    /// Process pending manga image loads (called each frame, loads one image at a time)
+    /// Process decoded images from the parallel loader and upload them as GPU textures.
+    /// This is called every frame and uploads a limited batch to prevent stutters.
     fn manga_process_pending_loads(&mut self, ctx: &egui::Context) {
-        if !self.manga_mode || self.manga_loading_indices.is_empty() {
+        if !self.manga_mode {
             return;
         }
 
-        // Load one image per frame to avoid blocking
-        if let Some(&index) = self.manga_loading_indices.iter().next() {
-            self.manga_load_image_at_index(index, ctx);
+        let Some(ref mut loader) = self.manga_loader else {
+            return;
+        };
+
+        // Poll for decoded images from the background threads
+        let decoded_images = loader.poll_decoded_images();
+
+        // Upload decoded images to GPU as textures
+        for decoded in decoded_images {
+            // Skip if already in texture cache
+            if self.manga_texture_cache.contains(decoded.index) {
+                continue;
+            }
+
+            // Create the texture
+            let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                [decoded.width as usize, decoded.height as usize],
+                &decoded.pixels,
+            );
+
+            let texture = ctx.load_texture(
+                format!("manga_{}", decoded.index),
+                color_image,
+                self.config.texture_filter_static.to_egui_options(),
+            );
+
+            // Insert into cache (this may evict old entries)
+            let evicted = self.manga_texture_cache.insert(
+                decoded.index,
+                texture,
+                decoded.width,
+                decoded.height,
+            );
+
+            // Mark evicted textures as unloaded so they can be re-requested
+            for evicted_idx in evicted {
+                loader.mark_unloaded(evicted_idx);
+            }
         }
+
+        // Tick the cache's frame counter for LRU tracking
+        self.manga_texture_cache.tick();
     }
 
     /// Calculate total height of all images in manga mode
@@ -2146,10 +2119,10 @@ impl ImageViewer {
 
             // Prefer cached dimensions for the currently visible image.
             let img_h = self
-                .manga_dim_cache
-                .get(&self.current_index)
-                .map(|(_w, h)| *h as f32)
-                .or_else(|| self.manga_image_cache.get(&self.current_index).map(|(_, _w, h)| *h as f32))
+                .manga_loader
+                .as_ref()
+                .and_then(|loader| loader.get_dimensions(self.current_index))
+                .map(|(_w, h)| h as f32)
                 .or_else(|| self.media_display_dimensions().map(|(_w, h)| h as f32));
 
             if let Some(img_h) = img_h {
@@ -2254,16 +2227,16 @@ impl ImageViewer {
             animation_active = true;
         }
 
-        // Process pending image loads.
-        // Loading/decoding is synchronous right now; avoid doing it while the user is actively
-        // scrolling/panning to prevent a visible "hitch" at the start of scrolling.
-        let allow_sync_loads = !self.is_panning
-            && !self.manga_scrollbar_dragging
-            && scroll_delta == 0.0
-            && (self.manga_scroll_target - self.manga_scroll_offset).abs() < 0.1;
-        if allow_sync_loads {
-            self.manga_process_pending_loads(ctx);
-        }
+        // Process decoded images from background threads and upload to GPU.
+        // This is now non-blocking - images are decoded in parallel on background threads.
+        // We always call this to keep uploading decoded images even while scrolling.
+        self.manga_process_pending_loads(ctx);
+
+        // Check if there are images still loading in the background
+        let has_pending_loads = self.manga_loader
+            .as_ref()
+            .map(|loader| loader.stats.images_pending > 0)
+            .unwrap_or(false);
 
         // Draw images in vertical strip
         egui::CentralPanel::default()
@@ -2285,31 +2258,26 @@ impl ImageViewer {
                         break;
                     }
 
-                    // Draw this image if it's in cache
-                    if let Some((texture, _tex_w, _tex_h)) = self.manga_image_cache.get(&idx) {
-                        // Use layout-stable display sizes derived from original/header dimensions.
-                        let display_height = img_height;
-                        let display_width = self.manga_get_image_display_width(idx);
-                        
-                        // Center horizontally with offset
-                        let x = (screen_width - display_width) / 2.0 + self.offset.x;
-                        
+                    // Get display dimensions first (uses manga_loader, not texture cache)
+                    let display_height = img_height;
+                    let display_width = self.manga_get_image_display_width(idx);
+                    let x = (screen_width - display_width) / 2.0 + self.offset.x;
+
+                    // Draw this image if it's in texture cache
+                    if let Some((texture_id, _tex_w, _tex_h)) = self.manga_texture_cache.get_texture_info(idx) {
                         let image_rect = egui::Rect::from_min_size(
                             egui::pos2(x, y_offset),
                             egui::Vec2::new(display_width, display_height),
                         );
                         
                         ui.painter().image(
-                            texture.id(),
+                            texture_id,
                             image_rect,
                             egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                             egui::Color32::WHITE,
                         );
                     } else {
                         // Image not loaded yet - draw a placeholder
-                        let display_width = self.manga_get_image_display_width(idx);
-                        let x = (screen_width - display_width) / 2.0 + self.offset.x;
-                        
                         let placeholder_rect = egui::Rect::from_min_size(
                             egui::pos2(x, y_offset),
                             egui::Vec2::new(display_width, img_height),
@@ -2321,16 +2289,22 @@ impl ImageViewer {
                             egui::Color32::from_gray(30),
                         );
                         
-                        // Draw loading indicator
-                        ui.painter().text(
-                            placeholder_rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            "Loading...",
-                            egui::FontId::proportional(16.0),
-                            egui::Color32::GRAY,
-                        );
+                        // Draw a subtle loading spinner or indicator
+                        // Only show "Loading..." if we're still loading this image
+                        let is_loading = self.manga_loader
+                            .as_ref()
+                            .map(|loader| loader.is_loading(idx) || !loader.is_loaded(idx))
+                            .unwrap_or(true);
                         
-                        animation_active = true; // Need repaint while loading
+                        if is_loading {
+                            ui.painter().text(
+                                placeholder_rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                "⏳",
+                                egui::FontId::proportional(24.0),
+                                egui::Color32::from_gray(80),
+                            );
+                        }
                     }
                     
                     y_offset += img_height;
@@ -2406,7 +2380,7 @@ impl ImageViewer {
         // Update preload queue based on current visible position
         self.manga_update_preload_queue();
 
-        animation_active || !self.manga_loading_indices.is_empty()
+        animation_active || has_pending_loads
     }
 
     /// Get the current media display dimensions (works for both images and videos)
@@ -2738,25 +2712,29 @@ impl ImageViewer {
         if self.manga_mode && self.is_fullscreen {
             // Arrow keys: support both press (discrete scroll) and hold (continuous scroll).
             // LEFT/UP = scroll up, RIGHT/DOWN = scroll down.
-            // Using key_down for continuous scrolling when held, with velocity-based smooth motion.
+            // Using velocity-based scrolling for smooth, responsive motion.
             let arrow_left = ctx.input(|i| i.key_down(egui::Key::ArrowLeft));
             let arrow_right = ctx.input(|i| i.key_down(egui::Key::ArrowRight));
             let arrow_up = ctx.input(|i| i.key_down(egui::Key::ArrowUp));
             let arrow_down = ctx.input(|i| i.key_down(egui::Key::ArrowDown));
             
-            let dt = ctx.input(|i| i.stable_dt).min(0.033);
             let scroll_speed = self.config.manga_arrow_scroll_speed;
 
+            // Use velocity-based scrolling for smooth acceleration/deceleration
+            // This provides a more natural feeling when holding arrow keys
             if arrow_left || arrow_up {
-                // Continuous scrolling: add velocity impulse per frame
-                // This creates smooth acceleration while holding the key
-                let impulse = scroll_speed * dt * 60.0; // Scale to ~60fps equivalent
-                self.manga_scroll_by(-impulse);
+                // Add velocity impulse for scrolling up
+                // The target moves continuously, creating smooth scrolling
+                let scroll_amount = scroll_speed * 0.5; // Per-frame amount
+                self.manga_scroll_target = (self.manga_scroll_target - scroll_amount).max(0.0);
                 self.manga_update_preload_queue();
             }
             if arrow_right || arrow_down {
-                let impulse = scroll_speed * dt * 60.0;
-                self.manga_scroll_by(impulse);
+                // Add velocity impulse for scrolling down
+                let total_height = self.manga_total_height();
+                let max_scroll = (total_height - self.screen_size.y).max(0.0);
+                let scroll_amount = scroll_speed * 0.5;
+                self.manga_scroll_target = (self.manga_scroll_target + scroll_amount).min(max_scroll);
                 self.manga_update_preload_queue();
             }
 
@@ -4221,7 +4199,10 @@ impl eframe::App for ImageViewer {
         self.show_window_if_ready(ctx);
 
         // Determine if we need continuous repainting
-        let manga_loading_active = self.manga_mode && !self.manga_loading_indices.is_empty();
+        let manga_loading_active = self.manga_mode && self.manga_loader
+            .as_ref()
+            .map(|loader| loader.stats.images_pending > 0)
+            .unwrap_or(false);
         let manga_scroll_active = self.manga_mode && (
             (self.manga_scroll_target - self.manga_scroll_offset).abs() > 0.1
             || self.manga_scroll_velocity.abs() > 0.5

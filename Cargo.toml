@@ -27,6 +27,11 @@ gstreamer-video = "0.23"
 gstreamer-app = "0.23"
 gstreamer-audio = "0.23"
 
+# Concurrency & parallelism for high-performance manga mode
+rayon = "1.10"
+crossbeam-channel = "0.5"
+parking_lot = "0.12"
+
 # Windows-specific
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = ["winuser", "dwmapi", "libloaderapi", "winreg", "processenv"] }
