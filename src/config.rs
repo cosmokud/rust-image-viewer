@@ -103,6 +103,9 @@ pub enum InputBinding {
     // Scroll wheel
     ScrollUp,
     ScrollDown,
+    // Scroll wheel with modifiers
+    CtrlScrollUp,
+    CtrlScrollDown,
     // Key modifiers
     KeyWithCtrl(egui::Key),
     KeyWithShift(egui::Key),
@@ -126,6 +129,9 @@ pub enum Action {
     Close,
     VideoPlayPause,
     VideoMute,
+    // Manga reading mode
+    MangaZoomIn,
+    MangaZoomOut,
 }
 
 impl Action {
@@ -145,6 +151,8 @@ impl Action {
             "close" => Some(Action::Close),
             "video_play_pause" | "play_pause" | "playpause" => Some(Action::VideoPlayPause),
             "video_mute" | "mute" | "toggle_mute" => Some(Action::VideoMute),
+            "manga_zoom_in" | "manga_zoomin" => Some(Action::MangaZoomIn),
+            "manga_zoom_out" | "manga_zoomout" => Some(Action::MangaZoomOut),
             _ => None,
         }
     }
@@ -165,6 +173,8 @@ impl Action {
             Action::Close => "close",
             Action::VideoPlayPause => "video_play_pause",
             Action::VideoMute => "video_mute",
+            Action::MangaZoomIn => "manga_zoom_in",
+            Action::MangaZoomOut => "manga_zoom_out",
         }
     }
 }
@@ -173,9 +183,13 @@ impl Action {
 pub fn parse_input_binding(s: &str) -> Option<InputBinding> {
     let s = s.trim().to_lowercase();
     
-    // Check for modifiers
-    if let Some(key_str) = s.strip_prefix("ctrl+") {
-        return parse_key(key_str).map(InputBinding::KeyWithCtrl);
+    // Check for modifiers with scroll wheel first (special case)
+    if let Some(scroll_str) = s.strip_prefix("ctrl+") {
+        match scroll_str {
+            "scroll_up" | "wheel_up" => return Some(InputBinding::CtrlScrollUp),
+            "scroll_down" | "wheel_down" => return Some(InputBinding::CtrlScrollDown),
+            _ => return parse_key(scroll_str).map(InputBinding::KeyWithCtrl),
+        }
     }
     if let Some(key_str) = s.strip_prefix("shift+") {
         return parse_key(key_str).map(InputBinding::KeyWithShift);
@@ -407,6 +421,10 @@ impl Config {
         // Video controls
         self.add_binding(InputBinding::Key(egui::Key::Space), Action::VideoPlayPause);
         self.add_binding(InputBinding::Key(egui::Key::M), Action::VideoMute);
+
+        // Manga reading mode zoom (CTRL+Scroll)
+        self.add_binding(InputBinding::CtrlScrollUp, Action::MangaZoomIn);
+        self.add_binding(InputBinding::CtrlScrollDown, Action::MangaZoomOut);
     }
 
     /// Add a binding
@@ -498,7 +516,12 @@ impl Config {
         }
 
         match fs::read_to_string(&config_path) {
-            Ok(content) => Self::parse_ini(&content),
+            Ok(content) => {
+                let config = Self::parse_ini(&content);
+                // Save to update the config file with any new default bindings
+                config.save();
+                config
+            }
             Err(_) => Config::default(),
         }
     }
@@ -853,6 +876,8 @@ fn binding_to_string(binding: &InputBinding) -> String {
         InputBinding::Mouse5 => "mouse5".to_string(),
         InputBinding::ScrollUp => "scroll_up".to_string(),
         InputBinding::ScrollDown => "scroll_down".to_string(),
+        InputBinding::CtrlScrollUp => "ctrl+scroll_up".to_string(),
+        InputBinding::CtrlScrollDown => "ctrl+scroll_down".to_string(),
         InputBinding::KeyWithCtrl(key) => format!("ctrl+{}", key_to_string(key)),
         InputBinding::KeyWithShift(key) => format!("shift+{}", key_to_string(key)),
         InputBinding::KeyWithAlt(key) => format!("alt+{}", key_to_string(key)),

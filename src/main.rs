@@ -1323,13 +1323,20 @@ impl ImageViewer {
         if let Some((_, _w, h)) = self.manga_image_cache.get(&index) {
             let img_h = *h as f32;
             if img_h > 0.0 {
-                // Scale to fit screen height with zoom (vertical fit)
-                let scale = (self.screen_size.y * self.zoom) / img_h;
+                // Calculate base scale:
+                // - If image is taller than screen: fit to screen height (scale down)
+                // - If image is smaller than screen: show at 100% (no upscaling)
+                let base_scale = if img_h > self.screen_size.y {
+                    self.screen_size.y / img_h
+                } else {
+                    1.0
+                };
+                let scale = base_scale * self.zoom;
                 return img_h * scale;
             }
         }
         
-        // Fallback: estimate based on screen size
+        // Fallback: estimate based on screen size (assume 100% screen height at zoom 1.0)
         self.screen_size.y * self.zoom
     }
 
@@ -1340,8 +1347,15 @@ impl ImageViewer {
             let img_w = *w as f32;
             let img_h = *h as f32;
             if img_h > 0.0 {
-                // Scale to fit screen height with zoom (vertical fit)
-                let scale = (self.screen_size.y * self.zoom) / img_h;
+                // Calculate base scale:
+                // - If image is taller than screen: fit to screen height (scale down)
+                // - If image is smaller than screen: show at 100% (no upscaling)
+                let base_scale = if img_h > self.screen_size.y {
+                    self.screen_size.y / img_h
+                } else {
+                    1.0
+                };
+                let scale = base_scale * self.zoom;
                 return img_w * scale;
             }
         }
@@ -1694,18 +1708,26 @@ impl ImageViewer {
             ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
         }
 
-        // Handle CTRL+scroll for zooming (only when not over scrollbar)
+        // Check manga zoom bindings from config
+        let manga_zoom_in_triggered = scroll_delta > 0.0 && !over_scrollbar && self.config.action_bindings.get(&Action::MangaZoomIn).map_or(false, |bindings| {
+            bindings.iter().any(|b| matches!(b, InputBinding::CtrlScrollUp) && ctrl_held)
+        });
+        let manga_zoom_out_triggered = scroll_delta < 0.0 && !over_scrollbar && self.config.action_bindings.get(&Action::MangaZoomOut).map_or(false, |bindings| {
+            bindings.iter().any(|b| matches!(b, InputBinding::CtrlScrollDown) && ctrl_held)
+        });
+
+        // Handle scroll for zooming or panning (only when not over scrollbar)
         if scroll_delta != 0.0 && !over_scrollbar {
-            if ctrl_held {
-                // CTRL + Scroll = Zoom
+            if manga_zoom_in_triggered || manga_zoom_out_triggered {
+                // Manga zoom using config bindings
                 let step = self.config.zoom_step;
                 let factor = if scroll_delta > 0.0 { step } else { 1.0 / step };
                 self.zoom = (self.zoom * factor).clamp(0.1, 10.0);
                 self.zoom_target = self.zoom;
                 self.manga_update_preload_queue();
                 animation_active = true;
-            } else {
-                // Regular scroll = Pan vertically
+            } else if !ctrl_held {
+                // Regular scroll = Pan vertically (only when CTRL not held)
                 let scroll_speed = 80.0; // pixels per scroll unit
                 self.manga_scroll_by(-scroll_delta * scroll_speed);
                 self.manga_update_preload_queue();
@@ -1770,8 +1792,17 @@ impl ImageViewer {
                         let img_w = *img_w as f32;
                         let img_h = *img_h as f32;
                         
-                        // Calculate display size (fit to screen height, scaled by zoom)
-                        let scale = (screen_height * self.zoom) / img_h;
+                        // Calculate base scale:
+                        // - If image is taller than screen: fit to screen height (scale down)
+                        // - If image is smaller than screen: show at 100% (no upscaling)
+                        let base_scale = if img_h > screen_height {
+                            screen_height / img_h  // Fit to screen (scale down)
+                        } else {
+                            1.0  // No upscaling, show at 100%
+                        };
+                        
+                        // Apply user zoom on top of base scale
+                        let scale = base_scale * self.zoom;
                         let display_width = img_w * scale;
                         let display_height = img_h * scale;
                         
@@ -2130,6 +2161,8 @@ impl ImageViewer {
                             }
                         }
                     }
+                    // CTRL+Scroll handled in draw_manga_mode for manga zoom
+                    InputBinding::CtrlScrollUp | InputBinding::CtrlScrollDown => {}
                     // MouseLeft and MouseRight are handled separately for panning/navigation
                     InputBinding::MouseLeft | InputBinding::MouseRight => {}
                 }
