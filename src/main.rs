@@ -1540,13 +1540,17 @@ impl ImageViewer {
             return 0.0;
         }
 
-        let zoom = self.zoom;
-        let screen_y = self.screen_size.y;
+        // Quantize inputs used for cache invalidation.
+        // On some platforms/backends, `ctx.screen_rect()` and derived sizes can vary by tiny
+        // sub-pixel amounts frame-to-frame, which would otherwise force an O(n) recompute
+        // every call and make wheel scrolling feel laggy.
+        let zoom = (self.zoom * 10_000.0).round() / 10_000.0;
+        let screen_y = self.screen_size.y.round();
         let len = self.image_list.len();
 
         let needs_recompute = !self.manga_total_height_cache_valid
             || (self.manga_total_height_cache_zoom - zoom).abs() > 1e-6
-            || (self.manga_total_height_cache_screen_y - screen_y).abs() > 1e-3
+            || (self.manga_total_height_cache_screen_y - screen_y).abs() > 1e-6
             || self.manga_total_height_cache_len != len;
 
         if needs_recompute {
