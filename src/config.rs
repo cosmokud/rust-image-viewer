@@ -315,6 +315,8 @@ pub struct Config {
     pub manga_drag_pan_speed: f32,
     /// Manga mode: mouse wheel scroll speed (pixels per normalized scroll unit)
     pub manga_wheel_scroll_speed: f32,
+    /// Manga mode: arrow-key scroll speed (pixels per key press)
+    pub manga_arrow_scroll_speed: f32,
 
     /// Whether videos start muted by default
     pub video_muted_by_default: bool,
@@ -379,6 +381,7 @@ impl Default for Config {
             zoom_step: 1.02,
             manga_drag_pan_speed: 2.5,
             manga_wheel_scroll_speed: 40.0,
+            manga_arrow_scroll_speed: 140.0,
             video_muted_by_default: true,
             video_default_volume: 0.5,
             video_loop: true,
@@ -547,6 +550,7 @@ impl Config {
             zoom_step: 1.08,
             manga_drag_pan_speed: 2.5,
             manga_wheel_scroll_speed: 40.0,
+            manga_arrow_scroll_speed: 140.0,
             video_muted_by_default: true,
             video_default_volume: 0.5,
             video_loop: true,
@@ -665,6 +669,11 @@ impl Config {
                         "manga_wheel_scroll_speed" | "manga_scroll_wheel_speed" => {
                             if let Ok(v) = value.parse::<f32>() {
                                 config.manga_wheel_scroll_speed = v.clamp(1.0, 2000.0);
+                            }
+                        }
+                        "manga_arrow_scroll_speed" | "manga_arrow_key_scroll_speed" => {
+                            if let Ok(v) = value.parse::<f32>() {
+                                config.manga_arrow_scroll_speed = v.clamp(1.0, 5000.0);
                             }
                         }
                         "startup_window_mode" | "startup_mode" | "window_mode" => {
@@ -809,7 +818,9 @@ impl Config {
         content.push_str("; Manga mode: drag pan speed multiplier (1.0 = 1:1, higher = faster)\n");
         content.push_str(&format!("manga_drag_pan_speed = {}\n", self.manga_drag_pan_speed));
         content.push_str("; Manga mode: mouse wheel scroll speed in pixels per step (smaller = slower)\n");
-        content.push_str(&format!("manga_wheel_scroll_speed = {}\n\n", self.manga_wheel_scroll_speed));
+        content.push_str(&format!("manga_wheel_scroll_speed = {}\n", self.manga_wheel_scroll_speed));
+        content.push_str("; Manga mode: arrow key scroll speed in pixels per key press (separate from wheel)\n");
+        content.push_str(&format!("manga_arrow_scroll_speed = {}\n\n", self.manga_arrow_scroll_speed));
         
         // Write video section
         content.push_str("[Video]\n");

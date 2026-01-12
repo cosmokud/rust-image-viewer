@@ -1549,13 +1549,32 @@ impl ImageViewer {
         visible_idx
     }
 
+    /// Compute the manga page index whose TOP is currently at/above the viewport top.
+    /// This is the correct basis for PageUp/PageDown so we never skip files.
+    fn manga_top_index(&self) -> usize {
+        if !self.manga_mode || self.image_list.is_empty() {
+            return self.current_index.min(self.image_list.len().saturating_sub(1));
+        }
+
+        let mut cumulative_y: f32 = 0.0;
+        for idx in 0..self.image_list.len() {
+            let img_height = self.manga_get_image_display_height(idx);
+            // If the viewport top is within this page, that's our top index.
+            if cumulative_y + img_height > self.manga_scroll_offset {
+                return idx;
+            }
+            cumulative_y += img_height;
+        }
+        self.image_list.len().saturating_sub(1)
+    }
+
     /// Scroll up by one page (screen height) in manga mode
     fn manga_page_up(&mut self) {
         if !self.manga_mode {
             return;
         }
         // PageUp in manga mode: go to the previous file and align its top to the viewport top.
-        let current = self.manga_visible_index();
+        let current = self.manga_top_index();
         if current == 0 {
             return;
         }
@@ -1577,7 +1596,7 @@ impl ImageViewer {
         if self.image_list.is_empty() {
             return;
         }
-        let current = self.manga_visible_index();
+        let current = self.manga_top_index();
         let target = (current + 1).min(self.image_list.len() - 1);
         if target == current {
             return;
@@ -2480,11 +2499,11 @@ impl ImageViewer {
             let arrow_down = ctx.input(|i| i.key_pressed(egui::Key::ArrowDown));
 
             if arrow_left || arrow_up {
-                self.manga_scroll_by(-self.config.manga_wheel_scroll_speed);
+                self.manga_scroll_by(-self.config.manga_arrow_scroll_speed);
                 self.manga_update_preload_queue();
             }
             if arrow_right || arrow_down {
-                self.manga_scroll_by(self.config.manga_wheel_scroll_speed);
+                self.manga_scroll_by(self.config.manga_arrow_scroll_speed);
                 self.manga_update_preload_queue();
             }
 
