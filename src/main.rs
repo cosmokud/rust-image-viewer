@@ -1289,20 +1289,7 @@ impl ImageViewer {
         }
 
         // Exiting manga mode: switch fullscreen view to the currently visible page.
-        // Compute the most visible index using the same rule as `manga_update_current_index`.
-        let visible_height = self.screen_size.y.max(1.0);
-        let mut cumulative_y: f32 = 0.0;
-        let mut visible_idx = self.current_index;
-        for idx in 0..self.image_list.len() {
-            let img_height = self.manga_get_image_display_height(idx);
-            if cumulative_y + img_height / 2.0 > self.manga_scroll_offset + visible_height / 2.0 {
-                visible_idx = idx;
-                break;
-            }
-            cumulative_y += img_height;
-            visible_idx = idx;
-        }
-
+        let visible_idx = self.manga_visible_index();
         self.current_index = visible_idx;
         let target_path = self.image_list.get(visible_idx).cloned();
 
@@ -1541,12 +1528,43 @@ impl ImageViewer {
         self.manga_scroll_target = (self.manga_scroll_target + delta).clamp(0.0, max_scroll);
     }
 
+    /// Compute the most visible manga page index for the current scroll offset.
+    fn manga_visible_index(&self) -> usize {
+        if !self.manga_mode || self.image_list.is_empty() {
+            return self.current_index.min(self.image_list.len().saturating_sub(1));
+        }
+
+        let visible_height = self.screen_size.y.max(1.0);
+        let mut cumulative_y: f32 = 0.0;
+        let mut visible_idx = self.current_index.min(self.image_list.len().saturating_sub(1));
+        for idx in 0..self.image_list.len() {
+            let img_height = self.manga_get_image_display_height(idx);
+            if cumulative_y + img_height / 2.0 > self.manga_scroll_offset + visible_height / 2.0 {
+                visible_idx = idx;
+                break;
+            }
+            cumulative_y += img_height;
+            visible_idx = idx;
+        }
+        visible_idx
+    }
+
     /// Scroll up by one page (screen height) in manga mode
     fn manga_page_up(&mut self) {
         if !self.manga_mode {
             return;
         }
-        self.manga_scroll_by(-self.screen_size.y * 0.9);
+        // PageUp in manga mode: go to the previous file and align its top to the viewport top.
+        let current = self.manga_visible_index();
+        if current == 0 {
+            return;
+        }
+        let target = current - 1;
+        self.current_index = target;
+        let scroll_to = self.manga_get_scroll_offset_for_index(target);
+        self.manga_scroll_target = scroll_to;
+        self.manga_scroll_offset = scroll_to;
+        self.manga_scroll_velocity = 0.0;
         self.manga_update_preload_queue();
     }
 
@@ -1555,7 +1573,20 @@ impl ImageViewer {
         if !self.manga_mode {
             return;
         }
-        self.manga_scroll_by(self.screen_size.y * 0.9);
+        // PageDown in manga mode: go to the next file and align its top to the viewport top.
+        if self.image_list.is_empty() {
+            return;
+        }
+        let current = self.manga_visible_index();
+        let target = (current + 1).min(self.image_list.len() - 1);
+        if target == current {
+            return;
+        }
+        self.current_index = target;
+        let scroll_to = self.manga_get_scroll_offset_for_index(target);
+        self.manga_scroll_target = scroll_to;
+        self.manga_scroll_offset = scroll_to;
+        self.manga_scroll_velocity = 0.0;
         self.manga_update_preload_queue();
     }
 
@@ -2293,12 +2324,35 @@ impl ImageViewer {
             let ctrl = input.modifiers.ctrl;
             let shift = input.modifiers.shift;
             let alt = input.modifiers.alt;
+            let manga_fullscreen = self.manga_mode && self.is_fullscreen;
 
             // Check all keyboard bindings from config
             // We iterate through all configured bindings and check if the corresponding key was pressed
             for (binding, action) in &self.config.bindings {
                 match binding {
                     InputBinding::Key(key) => {
+                        // In manga mode, repurpose arrow keys for navigation/scroll and disable their
+                        // default image-manipulation bindings (e.g., up/down rotation).
+                        if manga_fullscreen {
+                            let is_arrow = matches!(
+                                key,
+                                egui::Key::ArrowLeft
+                                    | egui::Key::ArrowRight
+                                    | egui::Key::ArrowUp
+                                    | egui::Key::ArrowDown
+                            );
+                            if is_arrow
+                                && matches!(
+                                    action,
+                                    Action::PreviousImage
+                                        | Action::NextImage
+                                        | Action::RotateClockwise
+                                        | Action::RotateCounterClockwise
+                                )
+                            {
+                                continue;
+                            }
+                        }
                         if !ctrl && !shift && !alt && input.key_pressed(*key) {
                             actions_to_run.push(*action);
                         }
@@ -2416,8 +2470,24 @@ impl ImageViewer {
             self.run_action(action);
         }
 
-        // Handle manga mode specific keys (Page Up/Down, Home/End)
+        // Handle manga mode specific keys (arrows, Page Up/Down, Home/End)
         if self.manga_mode && self.is_fullscreen {
+            // Arrow keys: use the same behavior and speed as mouse wheel scrolling.
+            // LEFT/UP = scroll up, RIGHT/DOWN = scroll down.
+            let arrow_left = ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft));
+            let arrow_right = ctx.input(|i| i.key_pressed(egui::Key::ArrowRight));
+            let arrow_up = ctx.input(|i| i.key_pressed(egui::Key::ArrowUp));
+            let arrow_down = ctx.input(|i| i.key_pressed(egui::Key::ArrowDown));
+
+            if arrow_left || arrow_up {
+                self.manga_scroll_by(-self.config.manga_wheel_scroll_speed);
+                self.manga_update_preload_queue();
+            }
+            if arrow_right || arrow_down {
+                self.manga_scroll_by(self.config.manga_wheel_scroll_speed);
+                self.manga_update_preload_queue();
+            }
+
             // Check for manga-specific keys
             let page_up = ctx.input(|i| i.key_pressed(egui::Key::PageUp));
             let page_down = ctx.input(|i| i.key_pressed(egui::Key::PageDown));
