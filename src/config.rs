@@ -310,6 +310,12 @@ pub struct Config {
     pub zoom_animation_speed: f32,
     /// Zoom step per scroll wheel notch (1.05 = 5% per step, 1.25 = 25% per step)
     pub zoom_step: f32,
+
+    /// Manga mode: drag pan speed multiplier (1.0 = 1:1 pointer delta)
+    pub manga_drag_pan_speed: f32,
+    /// Manga mode: mouse wheel scroll speed (pixels per normalized scroll unit)
+    pub manga_wheel_scroll_speed: f32,
+
     /// Whether videos start muted by default
     pub video_muted_by_default: bool,
     /// Default video volume (0.0 to 1.0)
@@ -371,6 +377,8 @@ impl Default for Config {
             fullscreen_reset_fit_on_enter: true,
             zoom_animation_speed: 20.0,
             zoom_step: 1.02,
+            manga_drag_pan_speed: 2.5,
+            manga_wheel_scroll_speed: 40.0,
             video_muted_by_default: true,
             video_default_volume: 0.5,
             video_loop: true,
@@ -537,6 +545,8 @@ impl Config {
             fullscreen_reset_fit_on_enter: true,
             zoom_animation_speed: 8.0,
             zoom_step: 1.08,
+            manga_drag_pan_speed: 2.5,
+            manga_wheel_scroll_speed: 40.0,
             video_muted_by_default: true,
             video_default_volume: 0.5,
             video_loop: true,
@@ -645,6 +655,16 @@ impl Config {
                             if let Ok(v) = value.parse::<f32>() {
                                 // Zoom multiplier per scroll step (1.05 = 5%, 1.25 = 25%)
                                 config.zoom_step = v.clamp(1.01, 2.0);
+                            }
+                        }
+                        "manga_drag_pan_speed" | "manga_drag_pan_multiplier" => {
+                            if let Ok(v) = value.parse::<f32>() {
+                                config.manga_drag_pan_speed = v.clamp(0.1, 20.0);
+                            }
+                        }
+                        "manga_wheel_scroll_speed" | "manga_scroll_wheel_speed" => {
+                            if let Ok(v) = value.parse::<f32>() {
+                                config.manga_wheel_scroll_speed = v.clamp(1.0, 2000.0);
                             }
                         }
                         "startup_window_mode" | "startup_mode" | "window_mode" => {
@@ -785,6 +805,11 @@ impl Config {
         
         content.push_str("; Zoom step per scroll wheel notch (1.05 = 5%, 1.10 = 10%, 1.25 = 25%)\n");
         content.push_str(&format!("zoom_step = {}\n\n", self.zoom_step));
+
+        content.push_str("; Manga mode: drag pan speed multiplier (1.0 = 1:1, higher = faster)\n");
+        content.push_str(&format!("manga_drag_pan_speed = {}\n", self.manga_drag_pan_speed));
+        content.push_str("; Manga mode: mouse wheel scroll speed in pixels per step (smaller = slower)\n");
+        content.push_str(&format!("manga_wheel_scroll_speed = {}\n\n", self.manga_wheel_scroll_speed));
         
         // Write video section
         content.push_str("[Video]\n");

@@ -1244,13 +1244,28 @@ impl ImageViewer {
     fn toggle_manga_mode(&mut self) {
         self.manga_mode = !self.manga_mode;
         if self.manga_mode {
-            // Enter manga mode: scroll to current image position
+            // Enter manga mode: start in a "fit-to-screen by height" zoom (like fullscreen fit).
+            // In manga mode we apply a per-image `base_scale` (fit tall pages down) and then multiply by `self.zoom`.
+            // We want the *total* scale to be `screen_h / img_h`, so compute the user zoom relative to `base_scale`.
+            let screen_h = self.screen_size.y.max(1.0);
+            if let Some((_w, h)) = self.media_display_dimensions() {
+                let img_h = h as f32;
+                if img_h > 0.0 {
+                    let base_scale = if img_h > screen_h { screen_h / img_h } else { 1.0 };
+                    let desired_total_scale = screen_h / img_h;
+                    let new_zoom = (desired_total_scale / base_scale).clamp(0.1, 10.0);
+                    self.zoom = new_zoom;
+                    self.zoom_target = new_zoom;
+                    self.zoom_velocity = 0.0;
+                }
+            }
+
+            // Reset offset (horizontal pan) and scroll to current image position
+            self.offset = egui::Vec2::ZERO;
             let scroll_to = self.manga_get_scroll_offset_for_index(self.current_index);
             self.manga_scroll_offset = scroll_to;
             self.manga_scroll_target = scroll_to;
             self.manga_scroll_velocity = 0.0;
-            // Reset horizontal offset
-            self.offset.x = 0.0;
             // Start preloading from current image
             self.manga_update_preload_queue();
         } else {
@@ -1776,8 +1791,10 @@ impl ImageViewer {
                 animation_active = true;
             } else if scroll_delta != 0.0 {
                 // Regular scroll = Pan vertically.
-                let scroll_speed = 80.0; // pixels per scroll unit
-                self.manga_scroll_by(-scroll_delta * scroll_speed);
+                // Normalize to avoid huge device-specific wheel deltas (e.g. some mice/trackpads).
+                let scroll_units = scroll_delta.clamp(-1.0, 1.0);
+                let scroll_speed = self.config.manga_wheel_scroll_speed;
+                self.manga_scroll_by(-scroll_units * scroll_speed);
                 self.manga_update_preload_queue();
             }
         }
@@ -1792,9 +1809,10 @@ impl ImageViewer {
             
             if primary_down && self.is_panning {
                 // Vertical panning - scroll the strip
-                self.manga_scroll_by(-pointer_delta.y);
+                let drag_speed = self.config.manga_drag_pan_speed;
+                self.manga_scroll_by(-pointer_delta.y * drag_speed);
                 // Horizontal panning - offset
-                self.offset.x += pointer_delta.x;
+                self.offset.x += pointer_delta.x * drag_speed;
                 self.manga_update_preload_queue();
                 ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
                 animation_active = true;
