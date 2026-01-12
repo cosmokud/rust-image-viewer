@@ -329,6 +329,8 @@ struct ImageViewer {
     manga_loading_indices: std::collections::HashSet<usize>,
     /// How many images to preload forward/backward from current view
     manga_preload_count: usize,
+    /// Whether the scrollbar is being dragged
+    manga_scrollbar_dragging: bool,
 }
 
 impl Default for ImageViewer {
@@ -414,6 +416,7 @@ impl Default for ImageViewer {
             manga_image_cache: HashMap::new(),
             manga_loading_indices: HashSet::new(),
             manga_preload_count: 5,
+            manga_scrollbar_dragging: false,
         }
     }
 }
@@ -1314,21 +1317,37 @@ impl ImageViewer {
         }
     }
 
-    /// Get the display height of an image at a given index (scaled to screen width)
+    /// Get the display height of an image at a given index (scaled to fit screen height)
     fn manga_get_image_display_height(&self, index: usize) -> f32 {
         // If the image is in cache, use its actual dimensions
-        if let Some((_, w, h)) = self.manga_image_cache.get(&index) {
-            let img_w = *w as f32;
+        if let Some((_, _w, h)) = self.manga_image_cache.get(&index) {
             let img_h = *h as f32;
-            if img_w > 0.0 {
-                // Scale to fit screen width with zoom
-                let scale = (self.screen_size.x * self.zoom) / img_w;
+            if img_h > 0.0 {
+                // Scale to fit screen height with zoom (vertical fit)
+                let scale = (self.screen_size.y * self.zoom) / img_h;
                 return img_h * scale;
             }
         }
         
-        // Fallback: estimate based on screen size (assume 16:9 aspect)
-        self.screen_size.y * 0.75 * self.zoom
+        // Fallback: estimate based on screen size
+        self.screen_size.y * self.zoom
+    }
+
+    /// Get the display width of an image at a given index (scaled to fit screen height)
+    fn manga_get_image_display_width(&self, index: usize) -> f32 {
+        // If the image is in cache, use its actual dimensions
+        if let Some((_, w, h)) = self.manga_image_cache.get(&index) {
+            let img_w = *w as f32;
+            let img_h = *h as f32;
+            if img_h > 0.0 {
+                // Scale to fit screen height with zoom (vertical fit)
+                let scale = (self.screen_size.y * self.zoom) / img_h;
+                return img_w * scale;
+            }
+        }
+        
+        // Fallback: estimate based on screen size (assume 2:3 aspect for manga)
+        self.screen_size.y * 0.67 * self.zoom
     }
 
     /// Load an image for manga mode at a specific index
@@ -1622,36 +1641,99 @@ impl ImageViewer {
         let screen_height = screen_rect.height();
         let mut animation_active = false;
 
-        // Handle CTRL+scroll for zooming in manga mode
+        // Get input states
         let ctrl_held = ctx.input(|i| i.modifiers.ctrl);
         let scroll_delta = ctx.input(|i| i.smooth_scroll_delta.y);
+        let pointer_pos = ctx.input(|i| i.pointer.hover_pos());
+        let primary_down = ctx.input(|i| i.pointer.button_down(egui::PointerButton::Primary));
+        let primary_pressed = ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary));
+        let primary_released = ctx.input(|i| i.pointer.button_released(egui::PointerButton::Primary));
+        let pointer_delta = ctx.input(|i| i.pointer.delta());
+
+        // Calculate scrollbar metrics for interaction
+        let total_height = self.manga_total_height();
+        let scrollbar_height = 100.0;
+        let scrollbar_width = 12.0; // Wider for easier clicking
+        let scrollbar_margin = 8.0;
+        let scrollbar_track_height = screen_height - 20.0;
+        let max_scroll = (total_height - screen_height).max(0.0);
+        let scroll_fraction = if max_scroll > 0.0 { self.manga_scroll_offset / max_scroll } else { 0.0 };
+        let scrollbar_y = 10.0 + scroll_fraction * (scrollbar_track_height - scrollbar_height);
         
-        if scroll_delta != 0.0 {
+        let scrollbar_track_rect = egui::Rect::from_min_size(
+            egui::pos2(screen_width - scrollbar_width - scrollbar_margin, 10.0),
+            egui::Vec2::new(scrollbar_width, scrollbar_track_height),
+        );
+        let scrollbar_thumb_rect = egui::Rect::from_min_size(
+            egui::pos2(screen_width - scrollbar_width - scrollbar_margin, scrollbar_y),
+            egui::Vec2::new(scrollbar_width, scrollbar_height),
+        );
+
+        // Check if pointer is over scrollbar
+        let over_scrollbar = pointer_pos.map_or(false, |p| scrollbar_track_rect.contains(p));
+
+        // Handle scrollbar dragging
+        if over_scrollbar && primary_pressed {
+            self.manga_scrollbar_dragging = true;
+        }
+        if primary_released {
+            self.manga_scrollbar_dragging = false;
+        }
+
+        if self.manga_scrollbar_dragging || (over_scrollbar && primary_down) {
+            if let Some(pos) = pointer_pos {
+                // Calculate scroll position from mouse Y
+                let relative_y = (pos.y - 10.0 - scrollbar_height / 2.0) / (scrollbar_track_height - scrollbar_height);
+                let new_scroll = relative_y.clamp(0.0, 1.0) * max_scroll;
+                self.manga_scroll_target = new_scroll;
+                self.manga_scroll_offset = new_scroll; // Instant scroll for responsiveness
+                self.manga_update_preload_queue();
+            }
+            ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+        } else if over_scrollbar {
+            ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+
+        // Handle CTRL+scroll for zooming (only when not over scrollbar)
+        if scroll_delta != 0.0 && !over_scrollbar {
             if ctrl_held {
                 // CTRL + Scroll = Zoom
                 let step = self.config.zoom_step;
                 let factor = if scroll_delta > 0.0 { step } else { 1.0 / step };
-                self.zoom = (self.zoom * factor).clamp(0.1, 50.0);
+                self.zoom = (self.zoom * factor).clamp(0.1, 10.0);
                 self.zoom_target = self.zoom;
-                // Update preload queue as visible range may change with zoom
                 self.manga_update_preload_queue();
+                animation_active = true;
             } else {
                 // Regular scroll = Pan vertically
-                let scroll_speed = 60.0; // pixels per scroll unit
-                self.manga_scroll_by(-scroll_delta * scroll_speed / self.zoom);
+                let scroll_speed = 80.0; // pixels per scroll unit
+                self.manga_scroll_by(-scroll_delta * scroll_speed);
                 self.manga_update_preload_queue();
             }
         }
 
-        // Handle drag panning in manga mode
-        let primary_down = ctx.input(|i| i.pointer.button_down(egui::PointerButton::Primary));
-        if primary_down && self.is_panning {
-            let delta = ctx.input(|i| i.pointer.delta());
-            // Vertical panning - scroll the strip
-            self.manga_scroll_by(-delta.y / self.zoom);
-            // Horizontal panning - offset
-            self.offset.x += delta.x;
-            self.manga_update_preload_queue();
+        // Handle drag panning (when not interacting with scrollbar)
+        if !self.manga_scrollbar_dragging && !over_scrollbar {
+            if primary_pressed {
+                self.is_panning = true;
+                self.last_mouse_pos = pointer_pos;
+                ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+            }
+            
+            if primary_down && self.is_panning {
+                // Vertical panning - scroll the strip
+                self.manga_scroll_by(-pointer_delta.y);
+                // Horizontal panning - offset
+                self.offset.x += pointer_delta.x;
+                self.manga_update_preload_queue();
+                ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+                animation_active = true;
+            }
+            
+            if primary_released {
+                self.is_panning = false;
+                self.last_mouse_pos = None;
+            }
         }
 
         // Tick scroll animation
@@ -1688,8 +1770,8 @@ impl ImageViewer {
                         let img_w = *img_w as f32;
                         let img_h = *img_h as f32;
                         
-                        // Calculate display size (fit to screen width, scaled by zoom)
-                        let scale = (screen_width * self.zoom) / img_w;
+                        // Calculate display size (fit to screen height, scaled by zoom)
+                        let scale = (screen_height * self.zoom) / img_h;
                         let display_width = img_w * scale;
                         let display_height = img_h * scale;
                         
@@ -1709,9 +1791,12 @@ impl ImageViewer {
                         );
                     } else {
                         // Image not loaded yet - draw a placeholder
+                        let display_width = self.manga_get_image_display_width(idx);
+                        let x = (screen_width - display_width) / 2.0 + self.offset.x;
+                        
                         let placeholder_rect = egui::Rect::from_min_size(
-                            egui::pos2(0.0, y_offset),
-                            egui::Vec2::new(screen_width, img_height),
+                            egui::pos2(x, y_offset),
+                            egui::Vec2::new(display_width, img_height),
                         );
                         
                         ui.painter().rect_filled(
@@ -1735,25 +1820,25 @@ impl ImageViewer {
                     y_offset += img_height;
                 }
 
-                // Draw scroll indicator
-                let total_height = self.manga_total_height();
+                // Draw scrollbar track and thumb
                 if total_height > screen_height {
-                    let scrollbar_height = 100.0;
-                    let scrollbar_width = 6.0;
-                    let scrollbar_margin = 10.0;
-                    
-                    let scroll_fraction = self.manga_scroll_offset / (total_height - screen_height);
-                    let scrollbar_y = scroll_fraction * (screen_height - scrollbar_height);
-                    
-                    let scrollbar_rect = egui::Rect::from_min_size(
-                        egui::pos2(screen_width - scrollbar_width - scrollbar_margin, scrollbar_y),
-                        egui::Vec2::new(scrollbar_width, scrollbar_height),
+                    // Track background
+                    ui.painter().rect_filled(
+                        scrollbar_track_rect,
+                        6.0,
+                        egui::Color32::from_rgba_unmultiplied(50, 50, 50, 150),
                     );
                     
+                    // Thumb
+                    let thumb_color = if self.manga_scrollbar_dragging || over_scrollbar {
+                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200)
+                    } else {
+                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 100)
+                    };
                     ui.painter().rect_filled(
-                        scrollbar_rect,
-                        3.0,
-                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 100),
+                        scrollbar_thumb_rect,
+                        6.0,
+                        thumb_color,
                     );
                 }
 
