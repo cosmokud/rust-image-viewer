@@ -348,6 +348,8 @@ struct ImageViewer {
     manga_preload_cooldown: u32,
     /// Last frame when preload queue was updated (throttle updates)
     manga_last_preload_update: std::time::Instant,
+    /// Last scroll position for detecting large jumps
+    manga_last_scroll_position: f32,
 }
 
 impl Default for ImageViewer {
@@ -443,6 +445,7 @@ impl Default for ImageViewer {
             manga_total_height_cache_valid: false,
             manga_preload_cooldown: 0,
             manga_last_preload_update: Instant::now(),
+            manga_last_scroll_position: 0.0,
         }
     }
 }
@@ -1379,6 +1382,7 @@ impl ImageViewer {
             return;
         }
         self.manga_last_preload_update = Instant::now();
+        self.manga_last_scroll_position = self.manga_scroll_offset;
 
         // Determine which image is currently most visible based on scroll offset
         let mut current_visible_index = self.current_index;
@@ -1392,6 +1396,13 @@ impl ImageViewer {
                 break;
             }
             cumulative_y += img_height;
+        }
+
+        // Cache dimensions for the visible range on-demand (for fast startup)
+        let cache_start = current_visible_index.saturating_sub(10);
+        let cache_end = (current_visible_index + 20).min(self.image_list.len());
+        if let Some(ref mut loader) = self.manga_loader {
+            loader.cache_dimensions_range(&self.image_list, cache_start, cache_end);
         }
 
         // Update the parallel loader's preload queue
@@ -1561,6 +1572,7 @@ impl ImageViewer {
     }
 
     /// Scroll manga view by a delta amount
+    #[allow(dead_code)]
     fn manga_scroll_by(&mut self, delta: f32) {
         let total_height = self.manga_total_height();
         let visible_height = self.screen_size.y;
@@ -1655,14 +1667,21 @@ impl ImageViewer {
         if !self.manga_mode {
             return;
         }
+        // Cancel all pending loads - we're jumping to a new position
+        if let Some(ref mut loader) = self.manga_loader {
+            loader.cancel_pending_loads();
+            // Pre-cache dimensions for the target area
+            loader.cache_dimensions_range(&self.image_list, 0, 30);
+        }
         // Use INSTANT scroll for large jumps to avoid cache churn
-        // No animation - immediately snap to position
         self.manga_scroll_offset = 0.0;
         self.manga_scroll_target = 0.0;
         self.manga_scroll_velocity = 0.0;
         self.current_index = 0;
-        // Delay preload update to let the view settle
-        self.manga_preload_cooldown = 10; // frames to wait
+        // Delay preload update briefly to let the view settle
+        self.manga_preload_cooldown = 3;
+        // Force preload queue update with new position
+        self.manga_last_preload_update = Instant::now() - Duration::from_millis(100);
     }
 
     /// Scroll to the last image in manga mode
@@ -1671,17 +1690,24 @@ impl ImageViewer {
             return;
         }
         let last_index = self.image_list.len() - 1;
+        // Cancel all pending loads - we're jumping to a new position
+        if let Some(ref mut loader) = self.manga_loader {
+            loader.cancel_pending_loads();
+            // Pre-cache dimensions for the target area
+            let start = last_index.saturating_sub(30);
+            loader.cache_dimensions_range(&self.image_list, start, self.image_list.len());
+        }
         self.current_index = last_index;
         let total_height = self.manga_total_height();
         let visible_height = self.screen_size.y;
         let target = (total_height - visible_height).max(0.0);
-        // Use INSTANT scroll for large jumps to avoid cache churn
-        // No animation - immediately snap to position
+        // Use INSTANT scroll for large jumps
         self.manga_scroll_offset = target;
         self.manga_scroll_target = target;
         self.manga_scroll_velocity = 0.0;
-        // Delay preload update to let the view settle
-        self.manga_preload_cooldown = 10; // frames to wait
+        // Delay preload update briefly
+        self.manga_preload_cooldown = 3;
+        self.manga_last_preload_update = Instant::now() - Duration::from_millis(100);
     }
 
     /// Update manga scroll animation (smooth scrolling)
@@ -2066,8 +2092,23 @@ impl ImageViewer {
                     let relative_y =
                         (pos.y - 10.0 - scrollbar_height / 2.0) / (scrollbar_track_height - scrollbar_height);
                     let new_scroll = relative_y.clamp(0.0, 1.0) * max_scroll;
+                    
+                    // Detect large jump (more than 20% of total height)
+                    let jump_distance = (new_scroll - self.manga_last_scroll_position).abs();
+                    let is_large_jump = jump_distance > total_height * 0.2;
+                    
+                    if is_large_jump {
+                        // Cancel pending loads - we're jumping far
+                        if let Some(ref mut loader) = self.manga_loader {
+                            loader.cancel_pending_loads();
+                        }
+                    }
+                    
                     self.manga_scroll_target = new_scroll;
                     self.manga_scroll_offset = new_scroll; // Instant scroll for responsiveness
+                    self.manga_last_scroll_position = new_scroll;
+                    
+                    // Only update preload queue if we've settled (throttled inside)
                     self.manga_update_preload_queue();
                 }
                 ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
@@ -2144,10 +2185,20 @@ impl ImageViewer {
                 animation_active = true;
             } else if scroll_delta != 0.0 {
                 // Regular scroll = Pan vertically.
-                // Normalize to avoid huge device-specific wheel deltas (e.g. some mice/trackpads).
-                let scroll_units = scroll_delta.clamp(-1.0, 1.0);
+                // Use direct offset update (like drag) for smoother, more responsive scrolling.
+                // This avoids the spring animation delay that causes perceived stuttering.
                 let scroll_speed = self.config.manga_wheel_scroll_speed;
-                self.manga_scroll_by(-scroll_units * scroll_speed);
+                let delta = -scroll_delta * scroll_speed;
+                
+                let total_height = self.manga_total_height();
+                let visible_height = self.screen_size.y;
+                let max_scroll = (total_height - visible_height).max(0.0);
+                
+                // Update both offset and target together for immediate response
+                self.manga_scroll_offset = (self.manga_scroll_offset + delta).clamp(0.0, max_scroll);
+                self.manga_scroll_target = self.manga_scroll_offset;
+                self.manga_scroll_velocity = 0.0; // Stop any ongoing animation
+                
                 self.manga_update_preload_queue();
             }
         }

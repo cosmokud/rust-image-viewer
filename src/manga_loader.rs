@@ -400,19 +400,61 @@ impl MangaLoader {
         results
     }
 
-    /// Pre-cache dimensions for all images in the list (reads file headers only).
-    /// This is O(n) but only reads a few bytes from each file header.
+    /// Start async dimension caching for all images in the list.
+    /// This returns immediately and caches dimensions in the background.
+    /// The first few visible images are prioritized.
     pub fn cache_all_dimensions(&mut self, image_list: &[PathBuf]) {
+        // For fast startup, only cache the first batch of visible images synchronously.
+        // The rest will be cached on-demand or when images are loaded.
+        const INITIAL_CACHE_COUNT: usize = 30;
+
         // Clear existing cache
         self.dimension_cache.clear();
 
-        // Parallel dimension reading using Rayon
-        let dims: Vec<(usize, Option<(u32, u32)>)> = image_list
+        // Cache first batch synchronously for immediate layout
+        let initial_batch: Vec<(usize, Option<(u32, u32)>)> = image_list
             .par_iter()
+            .take(INITIAL_CACHE_COUNT)
             .enumerate()
             .filter(|(_, path)| is_supported_image(path))
             .map(|(idx, path)| {
                 let dims = image::image_dimensions(path).ok();
+                (idx, dims)
+            })
+            .collect();
+
+        for (idx, opt_dims) in initial_batch {
+            if let Some((w, h)) = opt_dims {
+                self.dimension_cache.insert(idx, (w, h));
+            }
+        }
+
+        // The rest will be cached on-demand when images are loaded
+        // or when manga_get_image_display_height is called
+    }
+
+    /// Cache dimensions for a specific range of indices (called on-demand).
+    pub fn cache_dimensions_range(&mut self, image_list: &[PathBuf], start: usize, end: usize) {
+        let end = end.min(image_list.len());
+        if start >= end {
+            return;
+        }
+
+        // Only cache indices we don't have yet
+        let indices_to_cache: Vec<usize> = (start..end)
+            .filter(|&idx| !self.dimension_cache.contains_key(&idx))
+            .collect();
+
+        if indices_to_cache.is_empty() {
+            return;
+        }
+
+        // Cache in parallel
+        let dims: Vec<(usize, Option<(u32, u32)>)> = indices_to_cache
+            .par_iter()
+            .filter(|&&idx| is_supported_image(&image_list[idx]))
+            .map(|&idx| {
+                let dims = image::image_dimensions(&image_list[idx]).ok();
                 (idx, dims)
             })
             .collect();
@@ -455,6 +497,23 @@ impl MangaLoader {
     /// Mark an index as needing reload (called when cache is evicted).
     pub fn mark_unloaded(&mut self, index: usize) {
         self.loaded_indices.write().remove(&index);
+    }
+
+    /// Cancel all pending load requests (called on large jumps like Home/End or fast scrollbar drag).
+    /// This prevents loading intermediate images when jumping to a distant position.
+    pub fn cancel_pending_loads(&mut self) {
+        // Increment generation to invalidate in-flight requests
+        // The coordinator thread will check this and skip stale requests
+        self.current_generation += 1;
+        self.generation.store(self.current_generation, Ordering::Release);
+
+        // Clear loading indices (they'll be re-requested around the new position)
+        self.loading_indices.write().clear();
+
+        // Drain result channel to clear stale decoded images
+        while self.result_rx.try_recv().is_ok() {}
+
+        self.stats.images_pending = 0;
     }
 
     /// Check if an index is currently being loaded.
