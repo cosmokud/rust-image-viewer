@@ -1657,7 +1657,10 @@ impl ImageViewer {
 
         // Get input states
         let ctrl_held = ctx.input(|i| i.modifiers.ctrl);
+        // NOTE: In egui/eframe, Ctrl+mouse-wheel is commonly routed into `zoom_delta` (not `scroll_delta`).
+        // We support both so Ctrl+wheel zoom works reliably across platforms/devices.
         let scroll_delta = ctx.input(|i| i.smooth_scroll_delta.y);
+        let zoom_delta = ctx.input(|i| i.zoom_delta());
         let pointer_pos = ctx.input(|i| i.pointer.hover_pos());
         let primary_down = ctx.input(|i| i.pointer.button_down(egui::PointerButton::Primary));
         let primary_pressed = ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary));
@@ -1708,26 +1711,48 @@ impl ImageViewer {
             ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
         }
 
-        // Check manga zoom bindings from config
-        let manga_zoom_in_triggered = scroll_delta > 0.0 && !over_scrollbar && self.config.action_bindings.get(&Action::MangaZoomIn).map_or(false, |bindings| {
-            bindings.iter().any(|b| matches!(b, InputBinding::CtrlScrollUp) && ctrl_held)
-        });
-        let manga_zoom_out_triggered = scroll_delta < 0.0 && !over_scrollbar && self.config.action_bindings.get(&Action::MangaZoomOut).map_or(false, |bindings| {
-            bindings.iter().any(|b| matches!(b, InputBinding::CtrlScrollDown) && ctrl_held)
-        });
+        // Determine whether Ctrl+wheel zoom is bound for manga mode.
+        // If bound, we treat Ctrl+wheel (and corresponding `zoom_delta`) as zoom input.
+        let manga_ctrl_scroll_zoom_bound = self
+            .config
+            .action_bindings
+            .get(&Action::MangaZoomIn)
+            .map_or(false, |bindings| bindings.iter().any(|b| matches!(b, InputBinding::CtrlScrollUp)))
+            || self
+                .config
+                .action_bindings
+                .get(&Action::MangaZoomOut)
+                .map_or(false, |bindings| bindings.iter().any(|b| matches!(b, InputBinding::CtrlScrollDown)));
 
-        // Handle scroll for zooming or panning (only when not over scrollbar)
-        if scroll_delta != 0.0 && !over_scrollbar {
-            if manga_zoom_in_triggered || manga_zoom_out_triggered {
-                // Manga zoom using config bindings
+        // Handle scroll/zoom (only when not over scrollbar)
+        if !over_scrollbar {
+            let wants_ctrl_zoom = ctrl_held
+                && manga_ctrl_scroll_zoom_bound
+                && (zoom_delta != 1.0 || scroll_delta != 0.0);
+
+            if wants_ctrl_zoom {
+                // Prefer `zoom_delta` (Ctrl+wheel/pinch gesture) if present; otherwise fall back to scroll direction.
                 let step = self.config.zoom_step;
-                let factor = if scroll_delta > 0.0 { step } else { 1.0 / step };
+                let mut factor = if zoom_delta != 1.0 {
+                    zoom_delta
+                } else if scroll_delta > 0.0 {
+                    step
+                } else {
+                    1.0 / step
+                };
+
+                // Be defensive against any weird/invalid input.
+                if !factor.is_finite() {
+                    factor = 1.0;
+                }
+                factor = factor.clamp(0.01, 100.0);
+
                 self.zoom = (self.zoom * factor).clamp(0.1, 10.0);
                 self.zoom_target = self.zoom;
                 self.manga_update_preload_queue();
                 animation_active = true;
-            } else if !ctrl_held {
-                // Regular scroll = Pan vertically (only when CTRL not held)
+            } else if scroll_delta != 0.0 {
+                // Regular scroll = Pan vertically.
                 let scroll_speed = 80.0; // pixels per scroll unit
                 self.manga_scroll_by(-scroll_delta * scroll_speed);
                 self.manga_update_preload_queue();
