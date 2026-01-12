@@ -1747,8 +1747,31 @@ impl ImageViewer {
                 }
                 factor = factor.clamp(0.01, 100.0);
 
-                self.zoom = (self.zoom * factor).clamp(0.1, 10.0);
-                self.zoom_target = self.zoom;
+                // Anchor zoom so it doesn't also "scroll" the strip.
+                // The entire strip scales approximately linearly with `self.zoom`, so we can keep
+                // the content under an anchor point fixed by compensating scroll offset.
+                let old_zoom = self.zoom.max(0.0001);
+                let new_zoom = (self.zoom * factor).clamp(0.1, 10.0);
+                let zoom_ratio = (new_zoom / old_zoom).clamp(0.01, 100.0);
+
+                // Anchor at pointer Y when available, otherwise at screen center.
+                let anchor_y = pointer_pos
+                    .map(|p| (p.y - screen_rect.min.y).clamp(0.0, screen_height))
+                    .unwrap_or(screen_height * 0.5);
+
+                self.zoom = new_zoom;
+                self.zoom_target = new_zoom;
+
+                // Adjust scroll offset/target to preserve the anchored content position.
+                self.manga_scroll_offset = self.manga_scroll_offset * zoom_ratio + anchor_y * (zoom_ratio - 1.0);
+                self.manga_scroll_target = self.manga_scroll_target * zoom_ratio + anchor_y * (zoom_ratio - 1.0);
+                self.manga_scroll_velocity = 0.0;
+
+                // Clamp to new valid range after zoom.
+                let total_height = self.manga_total_height();
+                let max_scroll = (total_height - screen_height).max(0.0);
+                self.manga_scroll_offset = self.manga_scroll_offset.clamp(0.0, max_scroll);
+                self.manga_scroll_target = self.manga_scroll_target.clamp(0.0, max_scroll);
                 self.manga_update_preload_queue();
                 animation_active = true;
             } else if scroll_delta != 0.0 {
