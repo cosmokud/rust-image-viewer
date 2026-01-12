@@ -80,11 +80,6 @@ pub struct MangaLoader {
     loaded_indices: Arc<RwLock<HashSet<usize>>>,
     /// Cached original dimensions (from file headers) for stable layout
     pub dimension_cache: HashMap<usize, (u32, u32)>,
-    /// Background dimension-cache updates (gen, index, width, height)
-    dimension_update_tx: Sender<(usize, usize, u32, u32)>,
-    dimension_update_rx: Receiver<(usize, usize, u32, u32)>,
-    /// Generation for dimension updates (used to ignore stale background results)
-    dimension_update_generation: usize,
     /// Flag to signal shutdown to worker threads
     shutdown: Arc<AtomicBool>,
     /// Current scroll direction: positive = scrolling down, negative = scrolling up
@@ -112,8 +107,6 @@ impl MangaLoader {
         // Create bounded channels to prevent unbounded memory growth
         let (request_tx, request_rx) = crossbeam_channel::bounded::<LoadRequest>(256);
         let (result_tx, result_rx) = crossbeam_channel::bounded::<DecodedImage>(MAX_PENDING_UPLOADS);
-        let (dimension_update_tx, dimension_update_rx) =
-            crossbeam_channel::bounded::<(usize, usize, u32, u32)>(8192);
 
         let loading_indices = Arc::new(RwLock::new(HashSet::new()));
         let loaded_indices = Arc::new(RwLock::new(HashSet::new()));
@@ -146,9 +139,6 @@ impl MangaLoader {
             loading_indices,
             loaded_indices,
             dimension_cache: HashMap::new(),
-            dimension_update_tx,
-            dimension_update_rx,
-            dimension_update_generation: 0,
             shutdown,
             scroll_direction: 1,
             last_visible_index: 0,
@@ -156,28 +146,6 @@ impl MangaLoader {
             current_generation: 0,
             stats: LoaderStats::default(),
         }
-    }
-
-    /// Drain background dimension updates into the main-thread cache.
-    /// Returns how many update messages were processed.
-    pub fn poll_dimension_updates(&mut self) -> usize {
-        let mut processed = 0usize;
-        // Drain a generous batch per frame to keep up with large folders.
-        const MAX_PER_CALL: usize = 2048;
-
-        while processed < MAX_PER_CALL {
-            match self.dimension_update_rx.try_recv() {
-                Ok((gen, idx, w, h)) => {
-                    if gen == self.dimension_update_generation {
-                        self.dimension_cache.entry(idx).or_insert((w, h));
-                    }
-                    processed += 1;
-                }
-                Err(_) => break,
-            }
-        }
-
-        processed
     }
 
     /// Coordinator loop that processes requests in parallel using Rayon.
@@ -440,20 +408,19 @@ impl MangaLoader {
         // The rest will be cached on-demand or when images are loaded.
         const INITIAL_CACHE_COUNT: usize = 30;
 
-        // Clear existing cache and bump generation so old background tasks are ignored.
+        // Clear existing cache
         self.dimension_cache.clear();
-        self.dimension_update_generation = self.dimension_update_generation.wrapping_add(1);
-        while self.dimension_update_rx.try_recv().is_ok() {}
-
-        let gen = self.dimension_update_generation;
 
         // Cache first batch synchronously for immediate layout
         let initial_batch: Vec<(usize, Option<(u32, u32)>)> = image_list
             .par_iter()
-            .enumerate()
             .take(INITIAL_CACHE_COUNT)
+            .enumerate()
             .filter(|(_, path)| is_supported_image(path))
-            .map(|(idx, path)| (idx, image::image_dimensions(path).ok()))
+            .map(|(idx, path)| {
+                let dims = image::image_dimensions(path).ok();
+                (idx, dims)
+            })
             .collect();
 
         for (idx, opt_dims) in initial_batch {
@@ -462,23 +429,8 @@ impl MangaLoader {
             }
         }
 
-        // Cache the rest in the background (file header reads only).
-        // This prevents layout/scroll/zoom jitter when pages first come into view.
-        let tx = self.dimension_update_tx.clone();
-        let paths: Vec<PathBuf> = image_list.iter().cloned().collect();
-        rayon::spawn(move || {
-            for (idx, path) in paths.into_iter().enumerate() {
-                if idx < INITIAL_CACHE_COUNT {
-                    continue;
-                }
-                if !is_supported_image(&path) {
-                    continue;
-                }
-                if let Ok((w, h)) = image::image_dimensions(&path) {
-                    let _ = tx.try_send((gen, idx, w, h));
-                }
-            }
-        });
+        // The rest will be cached on-demand when images are loaded
+        // or when manga_get_image_display_height is called
     }
 
     /// Cache dimensions for a specific range of indices (called on-demand).
@@ -524,10 +476,8 @@ impl MangaLoader {
         self.loading_indices.write().clear();
         self.loaded_indices.write().clear();
 
-        // Clear dimension cache and invalidate any in-flight background dimension caching.
+        // Clear dimension cache
         self.dimension_cache.clear();
-        self.dimension_update_generation = self.dimension_update_generation.wrapping_add(1);
-        while self.dimension_update_rx.try_recv().is_ok() {}
 
         // Drain result channel
         while self.result_rx.try_recv().is_ok() {}

@@ -324,10 +324,6 @@ struct ImageViewer {
     show_manga_zoom_bar: bool,
     /// Time when manga zoom bar was last shown (for auto-hide)
     manga_zoom_bar_show_time: Instant,
-    /// Direction of the currently-held manga zoom button: -1, 0, +1
-    manga_zoom_hold_dir: i8,
-    /// Countdown timer (seconds) until the next repeat zoom step while holding +/-
-    manga_zoom_hold_timer: f32,
     /// Vertical scroll offset for manga mode (in pixels)
     manga_scroll_offset: f32,
     /// Target scroll offset for smooth scrolling animation
@@ -435,8 +431,6 @@ impl Default for ImageViewer {
             manga_toggle_show_time: Instant::now(),
             show_manga_zoom_bar: false,
             manga_zoom_bar_show_time: Instant::now(),
-            manga_zoom_hold_dir: 0,
-            manga_zoom_hold_timer: 0.0,
             manga_scroll_offset: 0.0,
             manga_scroll_target: 0.0,
             manga_scroll_velocity: 0.0,
@@ -466,41 +460,6 @@ impl ImageViewer {
 
     fn clamp_zoom(&self, zoom: f32) -> f32 {
         zoom.clamp(0.1, self.max_zoom_factor())
-    }
-
-    fn clamp_manga_zoom(&self, zoom: f32) -> f32 {
-        // Manga zoom bar is specified to operate from 100%..1000%.
-        zoom.clamp(1.0, 10.0)
-    }
-
-    fn apply_manga_zoom(&mut self, new_zoom: f32, anchor_y: f32) {
-        if !self.manga_mode || !self.is_fullscreen {
-            return;
-        }
-
-        let new_zoom = self.clamp_manga_zoom(new_zoom);
-        let old_zoom = self.zoom.max(0.0001);
-        let zoom_ratio = (new_zoom / old_zoom).clamp(0.01, 100.0);
-
-        self.zoom = new_zoom;
-        self.zoom_target = new_zoom;
-        self.zoom_velocity = 0.0;
-        self.manga_total_height_cache_valid = false;
-
-        // Preserve anchored content position under scaling.
-        self.manga_scroll_offset = self.manga_scroll_offset * zoom_ratio + anchor_y * (zoom_ratio - 1.0);
-        self.manga_scroll_target = self.manga_scroll_target * zoom_ratio + anchor_y * (zoom_ratio - 1.0);
-        self.manga_scroll_velocity = 0.0;
-
-        // Clamp to new valid range after zoom.
-        let total_height = self.manga_total_height();
-        let max_scroll = (total_height - self.screen_size.y).max(0.0);
-        self.manga_scroll_offset = self.manga_scroll_offset.clamp(0.0, max_scroll);
-        self.manga_scroll_target = self.manga_scroll_target.clamp(0.0, max_scroll);
-
-        // Keep page indicator and preload logic consistent even for instant jumps.
-        self.manga_update_current_index();
-        self.manga_update_preload_queue();
     }
 
     fn startup_ready_to_show(&self) -> bool {
@@ -1439,9 +1398,6 @@ impl ImageViewer {
             cumulative_y += img_height;
         }
 
-        // Keep `current_index` aligned with scroll for page counter and jump navigation.
-        self.current_index = current_visible_index;
-
         // Cache dimensions for the visible range on-demand (for fast startup)
         let cache_start = current_visible_index.saturating_sub(10);
         let cache_end = (current_visible_index + 20).min(self.image_list.len());
@@ -1539,9 +1495,6 @@ impl ImageViewer {
         let Some(ref mut loader) = self.manga_loader else {
             return;
         };
-
-        // Keep header-dimension cache filling in the background so layout is stable.
-        loader.poll_dimension_updates();
 
         // Poll for decoded images from the background threads
         let decoded_images = loader.poll_decoded_images();
@@ -1725,12 +1678,10 @@ impl ImageViewer {
         self.manga_scroll_target = 0.0;
         self.manga_scroll_velocity = 0.0;
         self.current_index = 0;
-
-        // Force immediate preload update so Home always loads without extra input.
-        self.manga_preload_cooldown = 0;
-        self.manga_last_preload_update = Instant::now() - Duration::from_millis(200);
-        self.manga_last_scroll_position = 0.0;
-        self.manga_update_preload_queue();
+        // Delay preload update briefly to let the view settle
+        self.manga_preload_cooldown = 3;
+        // Force preload queue update with new position
+        self.manga_last_preload_update = Instant::now() - Duration::from_millis(100);
     }
 
     /// Scroll to the last image in manga mode
@@ -1754,12 +1705,9 @@ impl ImageViewer {
         self.manga_scroll_offset = target;
         self.manga_scroll_target = target;
         self.manga_scroll_velocity = 0.0;
-
-        // Force immediate preload update so End always loads without extra input.
-        self.manga_preload_cooldown = 0;
-        self.manga_last_preload_update = Instant::now() - Duration::from_millis(200);
-        self.manga_last_scroll_position = target;
-        self.manga_update_preload_queue();
+        // Delay preload update briefly
+        self.manga_preload_cooldown = 3;
+        self.manga_last_preload_update = Instant::now() - Duration::from_millis(100);
     }
 
     /// Update manga scroll animation (smooth scrolling)
@@ -1768,16 +1716,6 @@ impl ImageViewer {
     fn manga_tick_scroll_animation(&mut self, dt: f32) -> bool {
         if !self.manga_mode {
             return false;
-        }
-
-        // Ensure preload cooldown advances even when there is no active animation.
-        // Otherwise, instant jumps (Home/End) can stall until another input changes the target.
-        if self.manga_preload_cooldown > 0 {
-            self.manga_preload_cooldown -= 1;
-            if self.manga_preload_cooldown == 0 {
-                self.manga_last_preload_update = Instant::now() - Duration::from_millis(200);
-                self.manga_update_preload_queue();
-            }
         }
 
         let error = self.manga_scroll_target - self.manga_scroll_offset;
@@ -1828,6 +1766,17 @@ impl ImageViewer {
 
         // Update current_index based on scroll position (lightweight, no I/O)
         self.manga_update_current_index();
+
+        // Decrement preload cooldown if active
+        // When cooldown hits zero, force a preload update
+        if self.manga_preload_cooldown > 0 {
+            self.manga_preload_cooldown -= 1;
+            if self.manga_preload_cooldown == 0 {
+                // Force immediate preload update after cooldown expires
+                // Reset the last update time so throttling doesn't block it
+                self.manga_last_preload_update = Instant::now() - Duration::from_millis(100);
+            }
+        }
 
         true
     }
@@ -1991,8 +1940,6 @@ impl ImageViewer {
             screen_rect.max.y - bar_size.y - margin - 44.0,
         );
 
-        let dt = ctx.input(|i| i.stable_dt).min(0.05);
-
         egui::Area::new(egui::Id::new("manga_zoom_bar"))
             .fixed_pos(bar_pos)
             .order(egui::Order::Foreground)
@@ -2005,16 +1952,20 @@ impl ImageViewer {
                 frame.show(ui, |ui| {
                     ui.set_min_size(bar_size);
 
-                    let step = self.config.zoom_step.max(1.0001);
-                    let mut desired_zoom = self.zoom;
+                    let step = self.config.zoom_step;
+                    let max_zoom = self.max_zoom_factor();
+                    let mut new_zoom = self.zoom;
 
                     ui.horizontal(|ui| {
                         let minus = ui.add_sized(
                             [28.0, 24.0],
                             egui::Button::new(egui::RichText::new("-").color(egui::Color32::WHITE).size(18.0)),
                         );
+                        if minus.clicked() {
+                            new_zoom = self.clamp_zoom(new_zoom / step);
+                        }
 
-                        let slider = egui::Slider::new(&mut desired_zoom, 1.0..=10.0)
+                        let slider = egui::Slider::new(&mut new_zoom, 0.1..=max_zoom)
                             .show_value(false)
                             .clamping(egui::SliderClamping::Always);
                         let slider_resp = ui.add_sized([170.0, 24.0], slider);
@@ -2023,62 +1974,40 @@ impl ImageViewer {
                             [28.0, 24.0],
                             egui::Button::new(egui::RichText::new("+").color(egui::Color32::WHITE).size(18.0)),
                         );
-
-                        // Hold-to-repeat: immediate step on press, then fast repeat.
-                        // Reset repeat state while dragging the slider.
-                        if slider_resp.dragged() {
-                            self.manga_zoom_hold_dir = 0;
-                            self.manga_zoom_hold_timer = 0.0;
-                        } else {
-                            let minus_down = minus.is_pointer_button_down_on();
-                            let plus_down = plus.is_pointer_button_down_on();
-                            let hold_dir: i8 = if plus_down && !minus_down {
-                                1
-                            } else if minus_down && !plus_down {
-                                -1
-                            } else {
-                                0
-                            };
-
-                            if hold_dir == 0 {
-                                self.manga_zoom_hold_dir = 0;
-                                self.manga_zoom_hold_timer = 0.0;
-                            } else if hold_dir != self.manga_zoom_hold_dir {
-                                // New press.
-                                self.manga_zoom_hold_dir = hold_dir;
-                                self.manga_zoom_hold_timer = 0.18;
-                                if hold_dir > 0 {
-                                    desired_zoom *= step;
-                                } else {
-                                    desired_zoom /= step;
-                                }
-                            } else {
-                                // Held.
-                                self.manga_zoom_hold_timer -= dt;
-                                while self.manga_zoom_hold_timer <= 0.0 {
-                                    if hold_dir > 0 {
-                                        desired_zoom *= step;
-                                    } else {
-                                        desired_zoom /= step;
-                                    }
-                                    self.manga_zoom_hold_timer += 0.05;
-                                }
-                            }
+                        if plus.clicked() {
+                            new_zoom = self.clamp_zoom(new_zoom * step);
                         }
-
-                        desired_zoom = self.clamp_manga_zoom(desired_zoom);
 
                         ui.add_space(6.0);
                         ui.label(
-                            egui::RichText::new(format!("{:.0}%", (desired_zoom * 100.0).round()))
+                            egui::RichText::new(format!("{:.0}%", (new_zoom * 100.0).round()))
                                 .color(egui::Color32::WHITE)
                                 .size(13.0),
                         );
 
-                        if slider_resp.changed() || (desired_zoom - self.zoom).abs() > 1e-6 {
+                        if slider_resp.changed() || minus.clicked() || plus.clicked() {
+                            let old_zoom = self.zoom.max(0.0001);
+                            let zoom_ratio = (new_zoom / old_zoom).clamp(0.01, 100.0);
+
                             // Anchor at viewport center for slider/buttons.
                             let anchor_y = self.screen_size.y.max(1.0) * 0.5;
-                            self.apply_manga_zoom(desired_zoom, anchor_y);
+
+                            self.zoom = new_zoom;
+                            self.zoom_target = new_zoom;
+                            self.zoom_velocity = 0.0;
+                            self.manga_total_height_cache_valid = false;
+
+                            self.manga_scroll_offset =
+                                self.manga_scroll_offset * zoom_ratio + anchor_y * (zoom_ratio - 1.0);
+                            self.manga_scroll_target =
+                                self.manga_scroll_target * zoom_ratio + anchor_y * (zoom_ratio - 1.0);
+                            self.manga_scroll_velocity = 0.0;
+
+                            let total_height = self.manga_total_height();
+                            let max_scroll = (total_height - self.screen_size.y).max(0.0);
+                            self.manga_scroll_offset = self.manga_scroll_offset.clamp(0.0, max_scroll);
+                            self.manga_scroll_target = self.manga_scroll_target.clamp(0.0, max_scroll);
+                            self.manga_update_preload_queue();
                         }
                     });
                 });
@@ -2146,7 +2075,7 @@ impl ImageViewer {
             && (self.manga_scrollbar_dragging
                 || over_scrollbar
                 || pointer_pos.map_or(false, |p| scrollbar_hover_zone.contains(p)));
-        let _show_page_label = pointer_pos.map_or(false, |p| page_label_hover_zone.contains(p));
+        let show_page_label = pointer_pos.map_or(false, |p| page_label_hover_zone.contains(p));
 
         // Handle scrollbar dragging
         if show_scrollbar {
@@ -2178,8 +2107,6 @@ impl ImageViewer {
                     self.manga_scroll_target = new_scroll;
                     self.manga_scroll_offset = new_scroll; // Instant scroll for responsiveness
                     self.manga_last_scroll_position = new_scroll;
-
-                    self.manga_update_current_index();
                     
                     // Only update preload queue if we've settled (throttled inside)
                     self.manga_update_preload_queue();
@@ -2232,13 +2159,29 @@ impl ImageViewer {
                 // Anchor zoom so it doesn't also "scroll" the strip.
                 // The entire strip scales approximately linearly with `self.zoom`, so we can keep
                 // the content under an anchor point fixed by compensating scroll offset.
+                let old_zoom = self.zoom.max(0.0001);
+                let new_zoom = self.clamp_zoom(self.zoom * factor);
+                let zoom_ratio = (new_zoom / old_zoom).clamp(0.01, 100.0);
+
                 // Anchor at pointer Y when available, otherwise at screen center.
                 let anchor_y = pointer_pos
                     .map(|p| (p.y - screen_rect.min.y).clamp(0.0, screen_height))
                     .unwrap_or(screen_height * 0.5);
 
-                let new_zoom = self.clamp_manga_zoom(self.zoom * factor);
-                self.apply_manga_zoom(new_zoom, anchor_y);
+                self.zoom = new_zoom;
+                self.zoom_target = new_zoom;
+
+                // Adjust scroll offset/target to preserve the anchored content position.
+                self.manga_scroll_offset = self.manga_scroll_offset * zoom_ratio + anchor_y * (zoom_ratio - 1.0);
+                self.manga_scroll_target = self.manga_scroll_target * zoom_ratio + anchor_y * (zoom_ratio - 1.0);
+                self.manga_scroll_velocity = 0.0;
+
+                // Clamp to new valid range after zoom.
+                let total_height = self.manga_total_height();
+                let max_scroll = (total_height - screen_height).max(0.0);
+                self.manga_scroll_offset = self.manga_scroll_offset.clamp(0.0, max_scroll);
+                self.manga_scroll_target = self.manga_scroll_target.clamp(0.0, max_scroll);
+                self.manga_update_preload_queue();
                 animation_active = true;
             } else if scroll_delta != 0.0 {
                 // Regular scroll = Pan vertically.
@@ -2255,14 +2198,14 @@ impl ImageViewer {
                 self.manga_scroll_offset = (self.manga_scroll_offset + delta).clamp(0.0, max_scroll);
                 self.manga_scroll_target = self.manga_scroll_offset;
                 self.manga_scroll_velocity = 0.0; // Stop any ongoing animation
-
-                self.manga_update_current_index();
+                
                 self.manga_update_preload_queue();
             }
         }
 
         // Double-click: reset manga zoom to fit-to-height (like fullscreen double-click behavior).
         if primary_double_clicked && !over_scrollbar {
+            let old_zoom = self.zoom.max(0.0001);
             let screen_h = screen_height.max(1.0);
 
             // Prefer cached dimensions for the currently visible image.
@@ -2275,11 +2218,8 @@ impl ImageViewer {
 
             if let Some(img_h) = img_h {
                 if img_h > 0.0 {
-                    let new_zoom = if img_h > screen_h {
-                        1.0
-                    } else {
-                        self.clamp_manga_zoom(screen_h / img_h)
-                    };
+                    let new_zoom = if img_h > screen_h { 1.0 } else { self.clamp_zoom(screen_h / img_h) };
+                    let zoom_ratio = (new_zoom / old_zoom).clamp(0.01, 100.0);
 
                     // Reset horizontal offset and stop any ongoing drag/pan.
                     self.offset = egui::Vec2::ZERO;
@@ -2291,7 +2231,22 @@ impl ImageViewer {
                         .map(|p| (p.y - screen_rect.min.y).clamp(0.0, screen_height))
                         .unwrap_or(screen_height * 0.5);
 
-                    self.apply_manga_zoom(new_zoom, anchor_y);
+                    self.zoom = new_zoom;
+                    self.zoom_target = new_zoom;
+                    self.zoom_velocity = 0.0;
+
+                    // Compensate scroll so the anchored content position stays stable.
+                    self.manga_scroll_offset = self.manga_scroll_offset * zoom_ratio + anchor_y * (zoom_ratio - 1.0);
+                    self.manga_scroll_target = self.manga_scroll_target * zoom_ratio + anchor_y * (zoom_ratio - 1.0);
+                    self.manga_scroll_velocity = 0.0;
+
+                    // Clamp to valid range after zoom.
+                    let total_height = self.manga_total_height();
+                    let max_scroll = (total_height - screen_height).max(0.0);
+                    self.manga_scroll_offset = self.manga_scroll_offset.clamp(0.0, max_scroll);
+                    self.manga_scroll_target = self.manga_scroll_target.clamp(0.0, max_scroll);
+
+                    self.manga_update_preload_queue();
                     animation_active = true;
                 }
             }
@@ -2324,8 +2279,6 @@ impl ImageViewer {
                 let max_scroll = (total_height - visible_height).max(0.0);
                 self.manga_scroll_offset = (self.manga_scroll_offset + delta_y).clamp(0.0, max_scroll);
                 self.manga_scroll_target = self.manga_scroll_offset;
-
-                self.manga_update_current_index();
                 
                 // Horizontal panning - offset with same 1:1 feel
                 self.offset.x += pointer_delta.x * drag_speed;
@@ -2466,19 +2419,15 @@ impl ImageViewer {
                     );
                 }
 
-                // Draw page indicator (current / total) near the left of the right-side scrollbar.
-                if !self.image_list.is_empty() {
-                    let visible_idx = self.current_index.min(self.image_list.len().saturating_sub(1));
+                // Draw page indicator (current image / total) (hover-only)
+                if !self.image_list.is_empty() && show_page_label {
+                    // Use the already-updated current_index (maintained by manga_update_current_index)
+                    let visible_idx = self.current_index;
+
                     let indicator_text = format!("{} / {}", visible_idx + 1, self.image_list.len());
-
-                    let indicator_pos = egui::pos2(
-                        (scrollbar_track_rect.min.x - 10.0).max(0.0),
-                        scrollbar_thumb_rect
-                            .center()
-                            .y
-                            .clamp(14.0, (screen_height - 14.0).max(14.0)),
-                    );
-
+                    let indicator_pos = egui::pos2(screen_width / 2.0, screen_height - 30.0);
+                    
+                    // Background pill
                     let text_galley = ui.painter().layout_no_wrap(
                         indicator_text.clone(),
                         egui::FontId::proportional(14.0),
@@ -2493,6 +2442,8 @@ impl ImageViewer {
                         13.0,
                         egui::Color32::from_rgba_unmultiplied(0, 0, 0, 180),
                     );
+                    
+                    // Text
                     ui.painter().text(
                         indicator_pos,
                         egui::Align2::CENTER_CENTER,
