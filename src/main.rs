@@ -334,6 +334,14 @@ struct ImageViewer {
     manga_preload_count: usize,
     /// Whether the scrollbar is being dragged
     manga_scrollbar_dragging: bool,
+
+    /// Cached total height of all pages in manga mode for the current zoom/screen height.
+    /// This avoids an O(n) scan on every scroll tick for large folders.
+    manga_total_height_cache: f32,
+    manga_total_height_cache_zoom: f32,
+    manga_total_height_cache_screen_y: f32,
+    manga_total_height_cache_len: usize,
+    manga_total_height_cache_valid: bool,
 }
 
 impl Default for ImageViewer {
@@ -421,6 +429,12 @@ impl Default for ImageViewer {
             manga_loading_indices: HashSet::new(),
             manga_preload_count: 5,
             manga_scrollbar_dragging: false,
+
+            manga_total_height_cache: 0.0,
+            manga_total_height_cache_zoom: 1.0,
+            manga_total_height_cache_screen_y: 0.0,
+            manga_total_height_cache_len: 0,
+            manga_total_height_cache_valid: false,
         }
     }
 }
@@ -1249,6 +1263,9 @@ impl ImageViewer {
         if !self.manga_mode {
             self.manga_mode = true;
 
+            // Manga layout cache must be rebuilt for the new mode.
+            self.manga_total_height_cache_valid = false;
+
             // Precompute image dimensions for stable layout (prevents overlap/jitter when pages load).
             // This reads headers only (fast) and avoids layout changing mid-scroll.
             self.manga_dim_cache.clear();
@@ -1260,6 +1277,9 @@ impl ImageViewer {
                     self.manga_dim_cache.insert(idx, (w, h));
                 }
             }
+
+            // Dimensions may have changed; rebuild height cache.
+            self.manga_total_height_cache_valid = false;
 
             // Enter manga mode: start in a "fit-to-screen by height" zoom (like fullscreen fit).
             // In manga mode we apply a per-image `base_scale` (fit tall pages down) and then multiply by `self.zoom`.
@@ -1316,6 +1336,8 @@ impl ImageViewer {
         self.manga_image_cache.clear();
         self.manga_loading_indices.clear();
         self.manga_dim_cache.clear();
+
+        self.manga_total_height_cache_valid = false;
     }
 
     /// Update the preload queue based on current scroll position
@@ -1363,26 +1385,16 @@ impl ImageViewer {
 
     /// Get the display height of an image at a given index (scaled to fit screen height)
     fn manga_get_image_display_height(&self, index: usize) -> f32 {
-        // If the image is in cache, use its actual dimensions
-        if let Some((_, _w, h)) = self.manga_image_cache.get(&index) {
-            let img_h = *h as f32;
-            if img_h > 0.0 {
-                // Calculate base scale:
-                // - If image is taller than screen: fit to screen height (scale down)
-                // - If image is smaller than screen: show at 100% (no upscaling)
-                let base_scale = if img_h > self.screen_size.y {
-                    self.screen_size.y / img_h
-                } else {
-                    1.0
-                };
-                let scale = base_scale * self.zoom;
-                return img_h * scale;
-            }
-        }
+        // IMPORTANT: for layout stability, prefer header dimensions from `manga_dim_cache`.
+        // The texture we upload may be downscaled to fit GPU limits; using texture dimensions
+        // for layout would cause pages to "shrink" as they load, producing visible jitter.
+        let img_h = self
+            .manga_dim_cache
+            .get(&index)
+            .map(|(_w, h)| *h as f32)
+            .or_else(|| self.manga_image_cache.get(&index).map(|(_, _w, h)| *h as f32));
 
-        // If we know dimensions (but texture not loaded yet), use them to keep layout stable.
-        if let Some((_w, h)) = self.manga_dim_cache.get(&index) {
-            let img_h = *h as f32;
+        if let Some(img_h) = img_h {
             if img_h > 0.0 {
                 let base_scale = if img_h > self.screen_size.y {
                     self.screen_size.y / img_h
@@ -1400,28 +1412,17 @@ impl ImageViewer {
 
     /// Get the display width of an image at a given index (scaled to fit screen height)
     fn manga_get_image_display_width(&self, index: usize) -> f32 {
-        // If the image is in cache, use its actual dimensions
-        if let Some((_, w, h)) = self.manga_image_cache.get(&index) {
-            let img_w = *w as f32;
-            let img_h = *h as f32;
-            if img_h > 0.0 {
-                // Calculate base scale:
-                // - If image is taller than screen: fit to screen height (scale down)
-                // - If image is smaller than screen: show at 100% (no upscaling)
-                let base_scale = if img_h > self.screen_size.y {
-                    self.screen_size.y / img_h
-                } else {
-                    1.0
-                };
-                let scale = base_scale * self.zoom;
-                return img_w * scale;
-            }
-        }
+        // Prefer original/header dimensions for stable layout; fall back to texture size only
+        // when we truly don't know the original dimensions.
+        let dims = self
+            .manga_dim_cache
+            .get(&index)
+            .copied()
+            .or_else(|| self.manga_image_cache.get(&index).map(|(_, w, h)| (*w, *h)));
 
-        // If we know dimensions (but texture not loaded yet), use them to keep layout stable.
-        if let Some((w, h)) = self.manga_dim_cache.get(&index) {
-            let img_w = *w as f32;
-            let img_h = *h as f32;
+        if let Some((w, h)) = dims {
+            let img_w = w as f32;
+            let img_h = h as f32;
             if img_h > 0.0 {
                 let base_scale = if img_h > self.screen_size.y {
                     self.screen_size.y / img_h
@@ -1457,6 +1458,15 @@ impl ImageViewer {
             return;
         }
 
+        // Ensure we have stable/original dimensions cached for layout.
+        // Do NOT overwrite this with downscaled texture sizes.
+        if !self.manga_dim_cache.contains_key(&index) {
+            if let Ok((w, h)) = image::image_dimensions(path) {
+                self.manga_dim_cache.insert(index, (w, h));
+                self.manga_total_height_cache_valid = false;
+            }
+        }
+
         // Load the image synchronously (could be made async in the future)
         let downscale_filter = self.config.downscale_filter.to_image_filter();
         let gif_filter = self.config.gif_resize_filter.to_image_filter();
@@ -1484,7 +1494,6 @@ impl ImageViewer {
                 );
                 
                 self.manga_image_cache.insert(index, (texture, w, h));
-                self.manga_dim_cache.insert(index, (w, h));
             }
             Err(_) => {
                 // Failed to load, skip this image
@@ -1507,16 +1516,34 @@ impl ImageViewer {
     }
 
     /// Calculate total height of all images in manga mode
-    fn manga_total_height(&self) -> f32 {
+    fn manga_total_height(&mut self) -> f32 {
         if !self.manga_mode || self.image_list.is_empty() {
+            self.manga_total_height_cache_valid = false;
             return 0.0;
         }
 
-        let mut total = 0.0;
-        for idx in 0..self.image_list.len() {
-            total += self.manga_get_image_display_height(idx);
+        let zoom = self.zoom;
+        let screen_y = self.screen_size.y;
+        let len = self.image_list.len();
+
+        let needs_recompute = !self.manga_total_height_cache_valid
+            || (self.manga_total_height_cache_zoom - zoom).abs() > 1e-6
+            || (self.manga_total_height_cache_screen_y - screen_y).abs() > 1e-3
+            || self.manga_total_height_cache_len != len;
+
+        if needs_recompute {
+            let mut total = 0.0;
+            for idx in 0..len {
+                total += self.manga_get_image_display_height(idx);
+            }
+            self.manga_total_height_cache = total;
+            self.manga_total_height_cache_zoom = zoom;
+            self.manga_total_height_cache_screen_y = screen_y;
+            self.manga_total_height_cache_len = len;
+            self.manga_total_height_cache_valid = true;
         }
-        total
+
+        self.manga_total_height_cache
     }
 
     /// Scroll manga view by a delta amount
@@ -1949,9 +1976,10 @@ impl ImageViewer {
 
             // Prefer cached dimensions for the currently visible image.
             let img_h = self
-                .manga_image_cache
+                .manga_dim_cache
                 .get(&self.current_index)
-                .map(|(_, _w, h)| *h as f32)
+                .map(|(_w, h)| *h as f32)
+                .or_else(|| self.manga_image_cache.get(&self.current_index).map(|(_, _w, h)| *h as f32))
                 .or_else(|| self.media_display_dimensions().map(|(_w, h)| h as f32));
 
             if let Some(img_h) = img_h {
@@ -2056,8 +2084,16 @@ impl ImageViewer {
             animation_active = true;
         }
 
-        // Process pending image loads
-        self.manga_process_pending_loads(ctx);
+        // Process pending image loads.
+        // Loading/decoding is synchronous right now; avoid doing it while the user is actively
+        // scrolling/panning to prevent a visible "hitch" at the start of scrolling.
+        let allow_sync_loads = !self.is_panning
+            && !self.manga_scrollbar_dragging
+            && scroll_delta == 0.0
+            && (self.manga_scroll_target - self.manga_scroll_offset).abs() < 0.1;
+        if allow_sync_loads {
+            self.manga_process_pending_loads(ctx);
+        }
 
         // Draw images in vertical strip
         egui::CentralPanel::default()
@@ -2080,23 +2116,10 @@ impl ImageViewer {
                     }
 
                     // Draw this image if it's in cache
-                    if let Some((texture, img_w, img_h)) = self.manga_image_cache.get(&idx) {
-                        let img_w = *img_w as f32;
-                        let img_h = *img_h as f32;
-                        
-                        // Calculate base scale:
-                        // - If image is taller than screen: fit to screen height (scale down)
-                        // - If image is smaller than screen: show at 100% (no upscaling)
-                        let base_scale = if img_h > screen_height {
-                            screen_height / img_h  // Fit to screen (scale down)
-                        } else {
-                            1.0  // No upscaling, show at 100%
-                        };
-                        
-                        // Apply user zoom on top of base scale
-                        let scale = base_scale * self.zoom;
-                        let display_width = img_w * scale;
-                        let display_height = img_h * scale;
+                    if let Some((texture, _tex_w, _tex_h)) = self.manga_image_cache.get(&idx) {
+                        // Use layout-stable display sizes derived from original/header dimensions.
+                        let display_height = img_height;
+                        let display_width = self.manga_get_image_display_width(idx);
                         
                         // Center horizontally with offset
                         let x = (screen_width - display_width) / 2.0 + self.offset.x;
