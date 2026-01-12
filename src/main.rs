@@ -325,6 +325,9 @@ struct ImageViewer {
     manga_scroll_velocity: f32,
     /// Cache of loaded images for manga mode: maps image index to (texture, width, height)
     manga_image_cache: HashMap<usize, (egui::TextureHandle, u32, u32)>,
+    /// Cached image dimensions for manga mode (width, height). Used to keep layout stable
+    /// even before textures are loaded (prevents jitter/overlap as pages stream in).
+    manga_dim_cache: HashMap<usize, (u32, u32)>,
     /// Indices of images currently being loaded (to avoid duplicate loads)
     manga_loading_indices: std::collections::HashSet<usize>,
     /// How many images to preload forward/backward from current view
@@ -414,6 +417,7 @@ impl Default for ImageViewer {
             manga_scroll_target: 0.0,
             manga_scroll_velocity: 0.0,
             manga_image_cache: HashMap::new(),
+            manga_dim_cache: HashMap::new(),
             manga_loading_indices: HashSet::new(),
             manga_preload_count: 5,
             manga_scrollbar_dragging: false,
@@ -1242,8 +1246,21 @@ impl ImageViewer {
 
     /// Toggle manga reading mode on/off
     fn toggle_manga_mode(&mut self) {
-        self.manga_mode = !self.manga_mode;
-        if self.manga_mode {
+        if !self.manga_mode {
+            self.manga_mode = true;
+
+            // Precompute image dimensions for stable layout (prevents overlap/jitter when pages load).
+            // This reads headers only (fast) and avoids layout changing mid-scroll.
+            self.manga_dim_cache.clear();
+            for (idx, path) in self.image_list.iter().enumerate() {
+                if !is_supported_image(path) {
+                    continue;
+                }
+                if let Ok((w, h)) = image::image_dimensions(path) {
+                    self.manga_dim_cache.insert(idx, (w, h));
+                }
+            }
+
             // Enter manga mode: start in a "fit-to-screen by height" zoom (like fullscreen fit).
             // In manga mode we apply a per-image `base_scale` (fit tall pages down) and then multiply by `self.zoom`.
             // We want the *total* scale to be `screen_h / img_h`, so compute the user zoom relative to `base_scale`.
@@ -1268,9 +1285,33 @@ impl ImageViewer {
             self.manga_scroll_velocity = 0.0;
             // Start preloading from current image
             self.manga_update_preload_queue();
-        } else {
-            // Exit manga mode: clear cache to free memory
-            self.manga_clear_cache();
+            return;
+        }
+
+        // Exiting manga mode: switch fullscreen view to the currently visible page.
+        // Compute the most visible index using the same rule as `manga_update_current_index`.
+        let visible_height = self.screen_size.y.max(1.0);
+        let mut cumulative_y: f32 = 0.0;
+        let mut visible_idx = self.current_index;
+        for idx in 0..self.image_list.len() {
+            let img_height = self.manga_get_image_display_height(idx);
+            if cumulative_y + img_height / 2.0 > self.manga_scroll_offset + visible_height / 2.0 {
+                visible_idx = idx;
+                break;
+            }
+            cumulative_y += img_height;
+            visible_idx = idx;
+        }
+
+        self.current_index = visible_idx;
+        let target_path = self.image_list.get(visible_idx).cloned();
+
+        self.manga_mode = false;
+        self.manga_clear_cache();
+
+        if let Some(path) = target_path {
+            // Load the selected page into normal fullscreen mode.
+            self.load_image(&path);
         }
     }
 
@@ -1287,6 +1328,7 @@ impl ImageViewer {
     fn manga_clear_cache(&mut self) {
         self.manga_image_cache.clear();
         self.manga_loading_indices.clear();
+        self.manga_dim_cache.clear();
     }
 
     /// Update the preload queue based on current scroll position
@@ -1350,6 +1392,20 @@ impl ImageViewer {
                 return img_h * scale;
             }
         }
+
+        // If we know dimensions (but texture not loaded yet), use them to keep layout stable.
+        if let Some((_w, h)) = self.manga_dim_cache.get(&index) {
+            let img_h = *h as f32;
+            if img_h > 0.0 {
+                let base_scale = if img_h > self.screen_size.y {
+                    self.screen_size.y / img_h
+                } else {
+                    1.0
+                };
+                let scale = base_scale * self.zoom;
+                return img_h * scale;
+            }
+        }
         
         // Fallback: estimate based on screen size (assume 100% screen height at zoom 1.0)
         self.screen_size.y * self.zoom
@@ -1365,6 +1421,21 @@ impl ImageViewer {
                 // Calculate base scale:
                 // - If image is taller than screen: fit to screen height (scale down)
                 // - If image is smaller than screen: show at 100% (no upscaling)
+                let base_scale = if img_h > self.screen_size.y {
+                    self.screen_size.y / img_h
+                } else {
+                    1.0
+                };
+                let scale = base_scale * self.zoom;
+                return img_w * scale;
+            }
+        }
+
+        // If we know dimensions (but texture not loaded yet), use them to keep layout stable.
+        if let Some((w, h)) = self.manga_dim_cache.get(&index) {
+            let img_w = *w as f32;
+            let img_h = *h as f32;
+            if img_h > 0.0 {
                 let base_scale = if img_h > self.screen_size.y {
                     self.screen_size.y / img_h
                 } else {
@@ -1426,6 +1497,7 @@ impl ImageViewer {
                 );
                 
                 self.manga_image_cache.insert(index, (texture, w, h));
+                self.manga_dim_cache.insert(index, (w, h));
             }
             Err(_) => {
                 // Failed to load, skip this image
@@ -1860,6 +1932,9 @@ impl ImageViewer {
                 // Vertical panning - scroll the strip
                 let drag_speed = self.config.manga_drag_pan_speed;
                 self.manga_scroll_by(-pointer_delta.y * drag_speed);
+                // While actively dragging, apply immediately for 1:1 feel (prevents stutter).
+                self.manga_scroll_offset = self.manga_scroll_target;
+                self.manga_scroll_velocity = 0.0;
                 // Horizontal panning - offset
                 self.offset.x += pointer_delta.x * drag_speed;
                 self.manga_update_preload_queue();
@@ -3463,6 +3538,11 @@ impl eframe::App for ImageViewer {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Reset per-frame repaint tracking
         self.needs_repaint = false;
+
+        // Keep our cached screen size in sync with the real viewport.
+        // Manga mode uses this for layout/scroll math; if it drifts from `ctx.screen_rect()`,
+        // you can get clamping oscillations and visible jitter.
+        self.screen_size = ctx.screen_rect().size();
         
         // PERFORMANCE: Check if window is minimized to reduce resource usage
         let is_minimized = ctx.input(|i| {
