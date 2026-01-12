@@ -1680,6 +1680,7 @@ impl ImageViewer {
         let primary_down = ctx.input(|i| i.pointer.button_down(egui::PointerButton::Primary));
         let primary_pressed = ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary));
         let primary_released = ctx.input(|i| i.pointer.button_released(egui::PointerButton::Primary));
+        let primary_double_clicked = ctx.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary));
         let pointer_delta = ctx.input(|i| i.pointer.delta());
 
         // Calculate scrollbar metrics for interaction
@@ -1799,9 +1800,57 @@ impl ImageViewer {
             }
         }
 
+        // Double-click: reset manga zoom to fit-to-height (like fullscreen double-click behavior).
+        if primary_double_clicked && !over_scrollbar {
+            let old_zoom = self.zoom.max(0.0001);
+            let screen_h = screen_height.max(1.0);
+
+            // Prefer cached dimensions for the currently visible image.
+            let img_h = self
+                .manga_image_cache
+                .get(&self.current_index)
+                .map(|(_, _w, h)| *h as f32)
+                .or_else(|| self.media_display_dimensions().map(|(_w, h)| h as f32));
+
+            if let Some(img_h) = img_h {
+                if img_h > 0.0 {
+                    let new_zoom = if img_h > screen_h { 1.0 } else { (screen_h / img_h).clamp(0.1, 10.0) };
+                    let zoom_ratio = (new_zoom / old_zoom).clamp(0.01, 100.0);
+
+                    // Reset horizontal offset and stop any ongoing drag/pan.
+                    self.offset = egui::Vec2::ZERO;
+                    self.is_panning = false;
+                    self.last_mouse_pos = None;
+
+                    // Anchor the zoom at the pointer Y if available, otherwise at screen center.
+                    let anchor_y = pointer_pos
+                        .map(|p| (p.y - screen_rect.min.y).clamp(0.0, screen_height))
+                        .unwrap_or(screen_height * 0.5);
+
+                    self.zoom = new_zoom;
+                    self.zoom_target = new_zoom;
+                    self.zoom_velocity = 0.0;
+
+                    // Compensate scroll so the anchored content position stays stable.
+                    self.manga_scroll_offset = self.manga_scroll_offset * zoom_ratio + anchor_y * (zoom_ratio - 1.0);
+                    self.manga_scroll_target = self.manga_scroll_target * zoom_ratio + anchor_y * (zoom_ratio - 1.0);
+                    self.manga_scroll_velocity = 0.0;
+
+                    // Clamp to valid range after zoom.
+                    let total_height = self.manga_total_height();
+                    let max_scroll = (total_height - screen_height).max(0.0);
+                    self.manga_scroll_offset = self.manga_scroll_offset.clamp(0.0, max_scroll);
+                    self.manga_scroll_target = self.manga_scroll_target.clamp(0.0, max_scroll);
+
+                    self.manga_update_preload_queue();
+                    animation_active = true;
+                }
+            }
+        }
+
         // Handle drag panning (when not interacting with scrollbar)
         if !self.manga_scrollbar_dragging && !over_scrollbar {
-            if primary_pressed {
+            if primary_pressed && !primary_double_clicked {
                 self.is_panning = true;
                 self.last_mouse_pos = pointer_pos;
                 ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
