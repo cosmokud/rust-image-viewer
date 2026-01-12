@@ -10,12 +10,12 @@ mod video_player;
 mod windows_env;
 
 use config::{Action, Config, InputBinding, StartupWindowMode};
-use image_loader::{get_images_in_directory, get_media_type, LoadedImage, MediaType};
+use image_loader::{get_images_in_directory, get_media_type, is_supported_image, LoadedImage, MediaType};
 use video_player::{format_duration, VideoPlayer};
 
 use eframe::egui;
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -309,6 +309,26 @@ struct ImageViewer {
     startup_window_shown: bool,
     /// Used as a safety fallback to avoid staying hidden forever (e.g., if a video never yields dimensions).
     startup_hide_started_at: Instant,
+
+    // ============ MANGA READING MODE FIELDS ============
+    /// Whether manga reading mode is enabled (vertical strip scrolling)
+    manga_mode: bool,
+    /// Whether the manga mode toggle button should be shown (on hover bottom-right)
+    show_manga_toggle: bool,
+    /// Time when manga toggle was last shown (for auto-hide)
+    manga_toggle_show_time: Instant,
+    /// Vertical scroll offset for manga mode (in pixels)
+    manga_scroll_offset: f32,
+    /// Target scroll offset for smooth scrolling animation
+    manga_scroll_target: f32,
+    /// Scroll velocity for momentum scrolling
+    manga_scroll_velocity: f32,
+    /// Cache of loaded images for manga mode: maps image index to (texture, width, height)
+    manga_image_cache: HashMap<usize, (egui::TextureHandle, u32, u32)>,
+    /// Indices of images currently being loaded (to avoid duplicate loads)
+    manga_loading_indices: std::collections::HashSet<usize>,
+    /// How many images to preload forward/backward from current view
+    manga_preload_count: usize,
 }
 
 impl Default for ImageViewer {
@@ -383,6 +403,17 @@ impl Default for ImageViewer {
 
             startup_window_shown: false,
             startup_hide_started_at: Instant::now(),
+
+            // Manga reading mode fields
+            manga_mode: false,
+            show_manga_toggle: false,
+            manga_toggle_show_time: Instant::now(),
+            manga_scroll_offset: 0.0,
+            manga_scroll_target: 0.0,
+            manga_scroll_velocity: 0.0,
+            manga_image_cache: HashMap::new(),
+            manga_loading_indices: HashSet::new(),
+            manga_preload_count: 5,
         }
     }
 }
@@ -929,6 +960,16 @@ impl ImageViewer {
             return;
         }
         
+        // In manga mode, scroll to next image instead of loading
+        if self.manga_mode && self.is_fullscreen {
+            let next_index = (self.current_index + 1) % self.image_list.len();
+            self.current_index = next_index;
+            let scroll_to = self.manga_get_scroll_offset_for_index(next_index);
+            self.manga_scroll_target = scroll_to;
+            self.manga_update_preload_queue();
+            return;
+        }
+        
         // Save current view state before navigating (fullscreen only)
         self.save_current_fullscreen_view_state();
         
@@ -940,6 +981,20 @@ impl ImageViewer {
     /// Load previous image
     fn prev_image(&mut self) {
         if self.image_list.is_empty() {
+            return;
+        }
+        
+        // In manga mode, scroll to previous image instead of loading
+        if self.manga_mode && self.is_fullscreen {
+            let prev_index = if self.current_index == 0 {
+                self.image_list.len() - 1
+            } else {
+                self.current_index - 1
+            };
+            self.current_index = prev_index;
+            let scroll_to = self.manga_get_scroll_offset_for_index(prev_index);
+            self.manga_scroll_target = scroll_to;
+            self.manga_update_preload_queue();
             return;
         }
         
@@ -1178,6 +1233,579 @@ impl ImageViewer {
         } else {
             self.offset = egui::Vec2::ZERO;
         }
+    }
+
+    // ============ MANGA READING MODE METHODS ============
+
+    /// Toggle manga reading mode on/off
+    fn toggle_manga_mode(&mut self) {
+        self.manga_mode = !self.manga_mode;
+        if self.manga_mode {
+            // Enter manga mode: scroll to current image position
+            let scroll_to = self.manga_get_scroll_offset_for_index(self.current_index);
+            self.manga_scroll_offset = scroll_to;
+            self.manga_scroll_target = scroll_to;
+            self.manga_scroll_velocity = 0.0;
+            // Reset horizontal offset
+            self.offset.x = 0.0;
+            // Start preloading from current image
+            self.manga_update_preload_queue();
+        } else {
+            // Exit manga mode: clear cache to free memory
+            self.manga_clear_cache();
+        }
+    }
+
+    /// Get the scroll offset to show a specific image at the top
+    fn manga_get_scroll_offset_for_index(&self, target_index: usize) -> f32 {
+        let mut cumulative_y: f32 = 0.0;
+        for idx in 0..target_index.min(self.image_list.len()) {
+            cumulative_y += self.manga_get_image_display_height(idx);
+        }
+        cumulative_y
+    }
+
+    /// Clear the manga image cache to free GPU memory
+    fn manga_clear_cache(&mut self) {
+        self.manga_image_cache.clear();
+        self.manga_loading_indices.clear();
+    }
+
+    /// Update the preload queue based on current scroll position
+    fn manga_update_preload_queue(&mut self) {
+        if !self.manga_mode || self.image_list.is_empty() {
+            return;
+        }
+
+        // Determine which image is currently most visible based on scroll offset
+        let mut current_visible_index = self.current_index;
+        
+        // Calculate cumulative heights to find current visible image
+        let mut cumulative_y: f32 = 0.0;
+        for idx in 0..self.image_list.len() {
+            let img_height = self.manga_get_image_display_height(idx);
+            if cumulative_y + img_height > self.manga_scroll_offset {
+                current_visible_index = idx;
+                break;
+            }
+            cumulative_y += img_height;
+        }
+
+        // Calculate range of images to keep loaded: current ± preload_count
+        let start_idx = current_visible_index.saturating_sub(self.manga_preload_count);
+        let end_idx = (current_visible_index + self.manga_preload_count + 1).min(self.image_list.len());
+
+        // Remove images outside the range from cache
+        let indices_to_remove: Vec<usize> = self.manga_image_cache
+            .keys()
+            .filter(|&&idx| idx < start_idx || idx >= end_idx)
+            .copied()
+            .collect();
+        
+        for idx in indices_to_remove {
+            self.manga_image_cache.remove(&idx);
+        }
+
+        // Mark indices that need loading
+        for idx in start_idx..end_idx {
+            if !self.manga_image_cache.contains_key(&idx) && !self.manga_loading_indices.contains(&idx) {
+                self.manga_loading_indices.insert(idx);
+            }
+        }
+    }
+
+    /// Get the display height of an image at a given index (scaled to screen width)
+    fn manga_get_image_display_height(&self, index: usize) -> f32 {
+        // If the image is in cache, use its actual dimensions
+        if let Some((_, w, h)) = self.manga_image_cache.get(&index) {
+            let img_w = *w as f32;
+            let img_h = *h as f32;
+            if img_w > 0.0 {
+                // Scale to fit screen width with zoom
+                let scale = (self.screen_size.x * self.zoom) / img_w;
+                return img_h * scale;
+            }
+        }
+        
+        // Fallback: estimate based on screen size (assume 16:9 aspect)
+        self.screen_size.y * 0.75 * self.zoom
+    }
+
+    /// Load an image for manga mode at a specific index
+    fn manga_load_image_at_index(&mut self, index: usize, ctx: &egui::Context) {
+        if index >= self.image_list.len() {
+            return;
+        }
+
+        // Skip if already loaded or currently loading
+        if self.manga_image_cache.contains_key(&index) {
+            self.manga_loading_indices.remove(&index);
+            return;
+        }
+
+        let path = &self.image_list[index];
+        
+        // Skip video files in manga mode
+        if !is_supported_image(path) {
+            self.manga_loading_indices.remove(&index);
+            return;
+        }
+
+        // Load the image synchronously (could be made async in the future)
+        let downscale_filter = self.config.downscale_filter.to_image_filter();
+        let gif_filter = self.config.gif_resize_filter.to_image_filter();
+        
+        match LoadedImage::load_with_max_texture_side(path, Some(self.max_texture_side), downscale_filter, gif_filter) {
+            Ok(img) => {
+                let frame = img.current_frame_data();
+                let (w, h, pixels) = downscale_rgba_if_needed(
+                    frame.width,
+                    frame.height,
+                    &frame.pixels,
+                    self.max_texture_side,
+                    downscale_filter,
+                );
+                
+                let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                    [w as usize, h as usize],
+                    pixels.as_ref(),
+                );
+                
+                let texture = ctx.load_texture(
+                    format!("manga_{}", index),
+                    color_image,
+                    self.config.texture_filter_static.to_egui_options(),
+                );
+                
+                self.manga_image_cache.insert(index, (texture, w, h));
+            }
+            Err(_) => {
+                // Failed to load, skip this image
+            }
+        }
+        
+        self.manga_loading_indices.remove(&index);
+    }
+
+    /// Process pending manga image loads (called each frame, loads one image at a time)
+    fn manga_process_pending_loads(&mut self, ctx: &egui::Context) {
+        if !self.manga_mode || self.manga_loading_indices.is_empty() {
+            return;
+        }
+
+        // Load one image per frame to avoid blocking
+        if let Some(&index) = self.manga_loading_indices.iter().next() {
+            self.manga_load_image_at_index(index, ctx);
+        }
+    }
+
+    /// Calculate total height of all images in manga mode
+    fn manga_total_height(&self) -> f32 {
+        if !self.manga_mode || self.image_list.is_empty() {
+            return 0.0;
+        }
+
+        let mut total = 0.0;
+        for idx in 0..self.image_list.len() {
+            total += self.manga_get_image_display_height(idx);
+        }
+        total
+    }
+
+    /// Scroll manga view by a delta amount
+    fn manga_scroll_by(&mut self, delta: f32) {
+        let total_height = self.manga_total_height();
+        let visible_height = self.screen_size.y;
+        let max_scroll = (total_height - visible_height).max(0.0);
+        
+        self.manga_scroll_target = (self.manga_scroll_target + delta).clamp(0.0, max_scroll);
+    }
+
+    /// Scroll up by one page (screen height) in manga mode
+    fn manga_page_up(&mut self) {
+        if !self.manga_mode {
+            return;
+        }
+        self.manga_scroll_by(-self.screen_size.y * 0.9);
+        self.manga_update_preload_queue();
+    }
+
+    /// Scroll down by one page (screen height) in manga mode
+    fn manga_page_down(&mut self) {
+        if !self.manga_mode {
+            return;
+        }
+        self.manga_scroll_by(self.screen_size.y * 0.9);
+        self.manga_update_preload_queue();
+    }
+
+    /// Scroll to the first image in manga mode
+    fn manga_go_to_start(&mut self) {
+        if !self.manga_mode {
+            return;
+        }
+        self.manga_scroll_target = 0.0;
+        self.current_index = 0;
+        self.manga_update_preload_queue();
+    }
+
+    /// Scroll to the last image in manga mode
+    fn manga_go_to_end(&mut self) {
+        if !self.manga_mode || self.image_list.is_empty() {
+            return;
+        }
+        let last_index = self.image_list.len() - 1;
+        self.current_index = last_index;
+        let total_height = self.manga_total_height();
+        let visible_height = self.screen_size.y;
+        self.manga_scroll_target = (total_height - visible_height).max(0.0);
+        self.manga_update_preload_queue();
+    }
+
+    /// Update manga scroll animation (smooth scrolling)
+    fn manga_tick_scroll_animation(&mut self, dt: f32) -> bool {
+        if !self.manga_mode {
+            return false;
+        }
+
+        let error = self.manga_scroll_target - self.manga_scroll_offset;
+        
+        // Snap threshold
+        const SNAP_THRESHOLD: f32 = 0.5;
+        const VELOCITY_THRESHOLD: f32 = 1.0;
+
+        if error.abs() < SNAP_THRESHOLD && self.manga_scroll_velocity.abs() < VELOCITY_THRESHOLD {
+            self.manga_scroll_offset = self.manga_scroll_target;
+            self.manga_scroll_velocity = 0.0;
+            return false;
+        }
+
+        // Critically-damped spring for smooth scrolling
+        let omega = 12.0;
+        let omega_sq = omega * omega;
+        
+        let spring_force = omega_sq * error;
+        let damping_force = 2.0 * omega * self.manga_scroll_velocity;
+        let acceleration = spring_force - damping_force;
+
+        self.manga_scroll_velocity += acceleration * dt;
+        self.manga_scroll_offset += self.manga_scroll_velocity * dt;
+
+        // Clamp to valid range
+        let total_height = self.manga_total_height();
+        let visible_height = self.screen_size.y;
+        let max_scroll = (total_height - visible_height).max(0.0);
+        self.manga_scroll_offset = self.manga_scroll_offset.clamp(0.0, max_scroll);
+
+        // Update current_index based on scroll position
+        self.manga_update_current_index();
+
+        true
+    }
+
+    /// Update current_index based on manga scroll position
+    fn manga_update_current_index(&mut self) {
+        if !self.manga_mode || self.image_list.is_empty() {
+            return;
+        }
+
+        let mut cumulative_y: f32 = 0.0;
+        for idx in 0..self.image_list.len() {
+            let img_height = self.manga_get_image_display_height(idx);
+            // Use the center of the viewport to determine current image
+            if cumulative_y + img_height / 2.0 > self.manga_scroll_offset + self.screen_size.y / 2.0 {
+                if self.current_index != idx {
+                    self.current_index = idx;
+                }
+                return;
+            }
+            cumulative_y += img_height;
+        }
+        // If we've scrolled past all images, set to last one
+        if !self.image_list.is_empty() {
+            self.current_index = self.image_list.len() - 1;
+        }
+    }
+
+    /// Draw the manga reading mode toggle button (bottom-right in fullscreen)
+    fn draw_manga_toggle_button(&mut self, ctx: &egui::Context) {
+        if !self.is_fullscreen {
+            self.show_manga_toggle = false;
+            return;
+        }
+
+        // Don't show manga toggle for videos
+        if self.video_player.is_some() {
+            self.show_manga_toggle = false;
+            return;
+        }
+
+        let screen_rect = ctx.screen_rect();
+        let button_size = egui::Vec2::new(140.0, 36.0);
+        let margin = 20.0;
+        
+        // Check if mouse is near bottom-right corner
+        let hover_zone = egui::Rect::from_min_size(
+            egui::pos2(screen_rect.max.x - 200.0, screen_rect.max.y - 100.0),
+            egui::Vec2::new(200.0, 100.0),
+        );
+        
+        let mouse_pos = ctx.input(|i| i.pointer.hover_pos());
+        if let Some(pos) = mouse_pos {
+            if hover_zone.contains(pos) {
+                self.show_manga_toggle = true;
+                self.manga_toggle_show_time = Instant::now();
+            }
+        }
+
+        // Auto-hide after delay
+        if self.manga_toggle_show_time.elapsed().as_secs_f32() > 2.0 {
+            if let Some(pos) = mouse_pos {
+                if !hover_zone.contains(pos) {
+                    self.show_manga_toggle = false;
+                }
+            } else {
+                self.show_manga_toggle = false;
+            }
+        }
+
+        if !self.show_manga_toggle {
+            return;
+        }
+
+        // Draw the toggle button
+        let button_rect = egui::Rect::from_min_size(
+            egui::pos2(
+                screen_rect.max.x - button_size.x - margin,
+                screen_rect.max.y - button_size.y - margin,
+            ),
+            button_size,
+        );
+
+        egui::Area::new(egui::Id::new("manga_toggle_button"))
+            .fixed_pos(button_rect.min)
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                let label = if self.manga_mode {
+                    "📖 Manga Mode: ON"
+                } else {
+                    "📖 Manga Mode: OFF"
+                };
+
+                let button = egui::Button::new(
+                    egui::RichText::new(label)
+                        .color(egui::Color32::WHITE)
+                        .size(14.0)
+                )
+                .fill(if self.manga_mode {
+                    egui::Color32::from_rgba_unmultiplied(66, 133, 244, 220)
+                } else {
+                    egui::Color32::from_rgba_unmultiplied(60, 60, 60, 220)
+                })
+                .min_size(button_size)
+                .rounding(8.0);
+
+                if ui.add(button).clicked() {
+                    self.toggle_manga_mode();
+                }
+            });
+    }
+
+    /// Draw images in manga (vertical strip) mode
+    fn draw_manga_mode(&mut self, ctx: &egui::Context) -> bool {
+        if !self.manga_mode || !self.is_fullscreen {
+            return false;
+        }
+
+        let screen_rect = ctx.screen_rect();
+        let screen_width = screen_rect.width();
+        let screen_height = screen_rect.height();
+        let mut animation_active = false;
+
+        // Handle CTRL+scroll for zooming in manga mode
+        let ctrl_held = ctx.input(|i| i.modifiers.ctrl);
+        let scroll_delta = ctx.input(|i| i.smooth_scroll_delta.y);
+        
+        if scroll_delta != 0.0 {
+            if ctrl_held {
+                // CTRL + Scroll = Zoom
+                let step = self.config.zoom_step;
+                let factor = if scroll_delta > 0.0 { step } else { 1.0 / step };
+                self.zoom = (self.zoom * factor).clamp(0.1, 50.0);
+                self.zoom_target = self.zoom;
+                // Update preload queue as visible range may change with zoom
+                self.manga_update_preload_queue();
+            } else {
+                // Regular scroll = Pan vertically
+                let scroll_speed = 60.0; // pixels per scroll unit
+                self.manga_scroll_by(-scroll_delta * scroll_speed / self.zoom);
+                self.manga_update_preload_queue();
+            }
+        }
+
+        // Handle drag panning in manga mode
+        let primary_down = ctx.input(|i| i.pointer.button_down(egui::PointerButton::Primary));
+        if primary_down && self.is_panning {
+            let delta = ctx.input(|i| i.pointer.delta());
+            // Vertical panning - scroll the strip
+            self.manga_scroll_by(-delta.y / self.zoom);
+            // Horizontal panning - offset
+            self.offset.x += delta.x;
+            self.manga_update_preload_queue();
+        }
+
+        // Tick scroll animation
+        let dt = ctx.input(|i| i.stable_dt).min(0.033);
+        if self.manga_tick_scroll_animation(dt) {
+            animation_active = true;
+        }
+
+        // Process pending image loads
+        self.manga_process_pending_loads(ctx);
+
+        // Draw images in vertical strip
+        egui::CentralPanel::default()
+            .frame(egui::Frame::none().fill(self.background_color32()))
+            .show(ctx, |ui| {
+                let mut y_offset: f32 = -self.manga_scroll_offset;
+                
+                for idx in 0..self.image_list.len() {
+                    let img_height = self.manga_get_image_display_height(idx);
+                    
+                    // Skip images that are completely above the viewport
+                    if y_offset + img_height < 0.0 {
+                        y_offset += img_height;
+                        continue;
+                    }
+                    
+                    // Stop drawing if we're past the viewport
+                    if y_offset > screen_height {
+                        break;
+                    }
+
+                    // Draw this image if it's in cache
+                    if let Some((texture, img_w, img_h)) = self.manga_image_cache.get(&idx) {
+                        let img_w = *img_w as f32;
+                        let img_h = *img_h as f32;
+                        
+                        // Calculate display size (fit to screen width, scaled by zoom)
+                        let scale = (screen_width * self.zoom) / img_w;
+                        let display_width = img_w * scale;
+                        let display_height = img_h * scale;
+                        
+                        // Center horizontally with offset
+                        let x = (screen_width - display_width) / 2.0 + self.offset.x;
+                        
+                        let image_rect = egui::Rect::from_min_size(
+                            egui::pos2(x, y_offset),
+                            egui::Vec2::new(display_width, display_height),
+                        );
+                        
+                        ui.painter().image(
+                            texture.id(),
+                            image_rect,
+                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                            egui::Color32::WHITE,
+                        );
+                    } else {
+                        // Image not loaded yet - draw a placeholder
+                        let placeholder_rect = egui::Rect::from_min_size(
+                            egui::pos2(0.0, y_offset),
+                            egui::Vec2::new(screen_width, img_height),
+                        );
+                        
+                        ui.painter().rect_filled(
+                            placeholder_rect,
+                            0.0,
+                            egui::Color32::from_gray(30),
+                        );
+                        
+                        // Draw loading indicator
+                        ui.painter().text(
+                            placeholder_rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            "Loading...",
+                            egui::FontId::proportional(16.0),
+                            egui::Color32::GRAY,
+                        );
+                        
+                        animation_active = true; // Need repaint while loading
+                    }
+                    
+                    y_offset += img_height;
+                }
+
+                // Draw scroll indicator
+                let total_height = self.manga_total_height();
+                if total_height > screen_height {
+                    let scrollbar_height = 100.0;
+                    let scrollbar_width = 6.0;
+                    let scrollbar_margin = 10.0;
+                    
+                    let scroll_fraction = self.manga_scroll_offset / (total_height - screen_height);
+                    let scrollbar_y = scroll_fraction * (screen_height - scrollbar_height);
+                    
+                    let scrollbar_rect = egui::Rect::from_min_size(
+                        egui::pos2(screen_width - scrollbar_width - scrollbar_margin, scrollbar_y),
+                        egui::Vec2::new(scrollbar_width, scrollbar_height),
+                    );
+                    
+                    ui.painter().rect_filled(
+                        scrollbar_rect,
+                        3.0,
+                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 100),
+                    );
+                }
+
+                // Draw page indicator (current image / total)
+                if !self.image_list.is_empty() {
+                    // Find which image is most visible
+                    let mut cumulative_y: f32 = 0.0;
+                    let mut visible_idx = 0;
+                    for idx in 0..self.image_list.len() {
+                        let img_height = self.manga_get_image_display_height(idx);
+                        if cumulative_y + img_height / 2.0 > self.manga_scroll_offset {
+                            visible_idx = idx;
+                            break;
+                        }
+                        cumulative_y += img_height;
+                        visible_idx = idx;
+                    }
+
+                    let indicator_text = format!("{} / {}", visible_idx + 1, self.image_list.len());
+                    let indicator_pos = egui::pos2(screen_width / 2.0, screen_height - 30.0);
+                    
+                    // Background pill
+                    let text_galley = ui.painter().layout_no_wrap(
+                        indicator_text.clone(),
+                        egui::FontId::proportional(14.0),
+                        egui::Color32::WHITE,
+                    );
+                    let pill_rect = egui::Rect::from_center_size(
+                        indicator_pos,
+                        egui::Vec2::new(text_galley.rect.width() + 20.0, 26.0),
+                    );
+                    ui.painter().rect_filled(
+                        pill_rect,
+                        13.0,
+                        egui::Color32::from_rgba_unmultiplied(0, 0, 0, 180),
+                    );
+                    
+                    // Text
+                    ui.painter().text(
+                        indicator_pos,
+                        egui::Align2::CENTER_CENTER,
+                        indicator_text,
+                        egui::FontId::proportional(14.0),
+                        egui::Color32::WHITE,
+                    );
+                }
+            });
+
+        // Update preload queue based on current visible position
+        self.manga_update_preload_queue();
+
+        animation_active || !self.manga_loading_indices.is_empty()
     }
 
     /// Get the current media display dimensions (works for both images and videos)
@@ -1478,6 +2106,28 @@ impl ImageViewer {
         // Run all collected actions
         for action in actions_to_run {
             self.run_action(action);
+        }
+
+        // Handle manga mode specific keys (Page Up/Down, Home/End)
+        if self.manga_mode && self.is_fullscreen {
+            // Check for manga-specific keys
+            let page_up = ctx.input(|i| i.key_pressed(egui::Key::PageUp));
+            let page_down = ctx.input(|i| i.key_pressed(egui::Key::PageDown));
+            let home = ctx.input(|i| i.key_pressed(egui::Key::Home));
+            let end = ctx.input(|i| i.key_pressed(egui::Key::End));
+
+            if page_up {
+                self.manga_page_up();
+            }
+            if page_down {
+                self.manga_page_down();
+            }
+            if home {
+                self.manga_go_to_start();
+            }
+            if end {
+                self.manga_go_to_end();
+            }
         }
     }
 
@@ -2226,6 +2876,11 @@ impl ImageViewer {
     /// Draw the main image
     /// Returns true if animation is in progress and requires repaint
     fn draw_image(&mut self, ctx: &egui::Context) -> bool {
+        // In manga mode, delegate to the manga-specific drawing routine
+        if self.manga_mode && self.is_fullscreen {
+            return self.draw_manga_mode(ctx);
+        }
+
         let screen_rect = ctx.screen_rect();
         let mut animation_active = false;
 
@@ -2247,7 +2902,7 @@ impl ImageViewer {
             }
         }
 
-        // Handle scroll wheel zoom
+        // Handle scroll wheel zoom (not in manga mode - that's handled in draw_manga_mode)
         let scroll_delta = ctx.input(|i| i.smooth_scroll_delta.y);
         if scroll_delta != 0.0 {
             if let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) {
@@ -2724,6 +3379,12 @@ impl eframe::App for ImageViewer {
                 // Exiting fullscreen - use delayed resize to prevent flash
                 self.fullscreen_transition_target = 0.0;
                 
+                // Exit manga mode when leaving fullscreen
+                if self.manga_mode {
+                    self.manga_mode = false;
+                    self.manga_clear_cache();
+                }
+                
                 // Clear the per-image fullscreen view state cache when exiting fullscreen
                 // (since it's only meant for fullscreen mode comparisons within a session)
                 self.fullscreen_view_states.clear();
@@ -2894,11 +3555,19 @@ impl eframe::App for ImageViewer {
             self.draw_video_controls(ctx);
         }
 
+        // Draw manga mode toggle button (bottom-right in fullscreen)
+        if !skip_drawing {
+            self.draw_manga_toggle_button(ctx);
+        }
+
         // Startup UX: keep the window hidden until initial layout is applied.
         // This avoids the brief flash of the default empty window on Explorer-open.
         self.show_window_if_ready(ctx);
 
         // Determine if we need continuous repainting
+        let manga_loading_active = self.manga_mode && !self.manga_loading_indices.is_empty();
+        let manga_scroll_active = self.manga_mode && (self.manga_scroll_target - self.manga_scroll_offset).abs() > 0.5;
+        
         let any_animation_active = fullscreen_animation_active 
             || pending_resize_active 
             || texture_animation_active 
@@ -2906,7 +3575,9 @@ impl eframe::App for ImageViewer {
             || self.is_panning 
             || self.is_resizing
             || self.is_seeking
-            || self.is_volume_dragging;
+            || self.is_volume_dragging
+            || manga_loading_active
+            || manga_scroll_active;
 
         // Update idle state and optimize repaint scheduling
         if any_animation_active {
