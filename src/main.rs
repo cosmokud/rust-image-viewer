@@ -1868,8 +1868,8 @@ impl ImageViewer {
             return;
         }
 
-        // Position: bottom-right, above the zoom bar if in manga mode, with scrollbar padding
-        let y_offset = if self.manga_mode { 48.0 } else { 0.0 };
+        // Position: bottom-right, above the zoom bar if it's visible, with scrollbar padding
+        let y_offset = if self.show_manga_zoom_bar { 48.0 } else { 0.0 };
         let button_pos = egui::pos2(
             screen_rect.max.x - button_size.x - margin - scrollbar_padding,
             screen_rect.max.y - button_size.y - margin - y_offset,
@@ -1879,34 +1879,33 @@ impl ImageViewer {
             .fixed_pos(button_pos)
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
-                let label = if self.manga_mode {
-                    "📖 Manga: ON"
+                let label = if self.manga_mode { "Manga: ON" } else { "Manga: OFF" };
+
+                let (rect, response) = ui.allocate_exact_size(button_size, egui::Sense::click());
+                let bg_color = if response.hovered() {
+                    egui::Color32::from_rgba_unmultiplied(60, 60, 60, 200)
                 } else {
-                    "📖 Manga: OFF"
+                    egui::Color32::from_rgba_unmultiplied(40, 40, 40, 180)
                 };
 
-                // Simple transparent grayish background
-                let bg_color = egui::Color32::from_rgba_unmultiplied(40, 40, 40, 180);
+                ui.painter().rect_filled(rect, 6.0, bg_color);
+                ui.painter().text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    label,
+                    egui::FontId::proportional(13.0),
+                    egui::Color32::WHITE,
+                );
 
-                let button = egui::Button::new(
-                    egui::RichText::new(label)
-                        .color(egui::Color32::WHITE)
-                        .size(13.0)
-                )
-                .fill(bg_color)
-                .stroke(egui::Stroke::NONE)
-                .min_size(button_size)
-                .rounding(6.0);
-
-                if ui.add(button).clicked() {
+                if response.clicked() {
                     self.toggle_manga_mode();
                 }
             });
     }
 
-    /// Draw manga zoom HUD (bottom-right in fullscreen manga mode)
+    /// Draw zoom HUD (bottom-right in fullscreen)
     fn draw_manga_zoom_bar(&mut self, ctx: &egui::Context) {
-        if !self.is_fullscreen || !self.manga_mode {
+        if !self.is_fullscreen {
             self.show_manga_zoom_bar = false;
             // Reset hold states when bar is hidden
             self.manga_zoom_plus_held = false;
@@ -1914,8 +1913,14 @@ impl ImageViewer {
             return;
         }
 
-        // Don't show manga zoom HUD for videos
+        // Don't show zoom HUD for videos
         if self.video_player.is_some() {
+            self.show_manga_zoom_bar = false;
+            return;
+        }
+
+        // Only show for images (including manga mode)
+        if !self.manga_mode && !matches!(self.current_media_type, Some(MediaType::Image)) {
             self.show_manga_zoom_bar = false;
             return;
         }
@@ -1989,22 +1994,30 @@ impl ImageViewer {
             
             if (new_zoom - old_zoom).abs() > 0.0001 {
                 let zoom_ratio = new_zoom / old_zoom;
-                let anchor_y = self.screen_size.y.max(1.0) * 0.5;
                 
                 self.zoom = new_zoom;
                 self.zoom_target = new_zoom;
                 self.zoom_velocity = 0.0;
-                self.manga_total_height_cache_valid = false;
-                
-                self.manga_scroll_offset = self.manga_scroll_offset * zoom_ratio + anchor_y * (zoom_ratio - 1.0);
-                self.manga_scroll_target = self.manga_scroll_target * zoom_ratio + anchor_y * (zoom_ratio - 1.0);
-                self.manga_scroll_velocity = 0.0;
-                
-                let total_height = self.manga_total_height();
-                let max_scroll = (total_height - self.screen_size.y).max(0.0);
-                self.manga_scroll_offset = self.manga_scroll_offset.clamp(0.0, max_scroll);
-                self.manga_scroll_target = self.manga_scroll_target.clamp(0.0, max_scroll);
-                self.manga_update_preload_queue();
+
+                if self.manga_mode {
+                    let anchor_y = self.screen_size.y.max(1.0) * 0.5;
+                    self.manga_total_height_cache_valid = false;
+
+                    self.manga_scroll_offset =
+                        self.manga_scroll_offset * zoom_ratio + anchor_y * (zoom_ratio - 1.0);
+                    self.manga_scroll_target =
+                        self.manga_scroll_target * zoom_ratio + anchor_y * (zoom_ratio - 1.0);
+                    self.manga_scroll_velocity = 0.0;
+
+                    let total_height = self.manga_total_height();
+                    let max_scroll = (total_height - self.screen_size.y).max(0.0);
+                    self.manga_scroll_offset = self.manga_scroll_offset.clamp(0.0, max_scroll);
+                    self.manga_scroll_target = self.manga_scroll_target.clamp(0.0, max_scroll);
+                    self.manga_update_preload_queue();
+                } else {
+                    // Keep the viewport centered on the same point.
+                    self.offset = self.offset * zoom_ratio;
+                }
             }
             
             ctx.request_repaint(); // Ensure continuous updates while holding
@@ -2045,7 +2058,11 @@ impl ImageViewer {
                                 self.manga_zoom_minus_held = true;
                                 self.manga_zoom_plus_held = false;
                                 self.manga_zoom_hold_start = Instant::now();
-                                self.apply_manga_zoom_step(false);
+                                if self.manga_mode {
+                                    self.apply_manga_zoom_step(false);
+                                } else {
+                                    self.apply_fullscreen_zoom_step(false);
+                                }
                             }
                             self.manga_zoom_bar_show_time = Instant::now();
                         } else if self.manga_zoom_minus_held {
@@ -2065,22 +2082,29 @@ impl ImageViewer {
                             
                             if (new_zoom - old_zoom).abs() > 0.0001 {
                                 let zoom_ratio = new_zoom / old_zoom;
-                                let anchor_y = self.screen_size.y.max(1.0) * 0.5;
                                 
                                 self.zoom = new_zoom;
                                 self.zoom_target = new_zoom;
                                 self.zoom_velocity = 0.0;
-                                self.manga_total_height_cache_valid = false;
-                                
-                                self.manga_scroll_offset = self.manga_scroll_offset * zoom_ratio + anchor_y * (zoom_ratio - 1.0);
-                                self.manga_scroll_target = self.manga_scroll_target * zoom_ratio + anchor_y * (zoom_ratio - 1.0);
-                                self.manga_scroll_velocity = 0.0;
-                                
-                                let total_height = self.manga_total_height();
-                                let max_scroll = (total_height - self.screen_size.y).max(0.0);
-                                self.manga_scroll_offset = self.manga_scroll_offset.clamp(0.0, max_scroll);
-                                self.manga_scroll_target = self.manga_scroll_target.clamp(0.0, max_scroll);
-                                self.manga_update_preload_queue();
+
+                                if self.manga_mode {
+                                    let anchor_y = self.screen_size.y.max(1.0) * 0.5;
+                                    self.manga_total_height_cache_valid = false;
+                                    
+                                    self.manga_scroll_offset =
+                                        self.manga_scroll_offset * zoom_ratio + anchor_y * (zoom_ratio - 1.0);
+                                    self.manga_scroll_target =
+                                        self.manga_scroll_target * zoom_ratio + anchor_y * (zoom_ratio - 1.0);
+                                    self.manga_scroll_velocity = 0.0;
+                                    
+                                    let total_height = self.manga_total_height();
+                                    let max_scroll = (total_height - self.screen_size.y).max(0.0);
+                                    self.manga_scroll_offset = self.manga_scroll_offset.clamp(0.0, max_scroll);
+                                    self.manga_scroll_target = self.manga_scroll_target.clamp(0.0, max_scroll);
+                                    self.manga_update_preload_queue();
+                                } else {
+                                    self.offset = self.offset * zoom_ratio;
+                                }
                             }
                             
                             self.manga_zoom_plus_held = false;
@@ -2101,7 +2125,11 @@ impl ImageViewer {
                                 self.manga_zoom_plus_held = true;
                                 self.manga_zoom_minus_held = false;
                                 self.manga_zoom_hold_start = Instant::now();
-                                self.apply_manga_zoom_step(true);
+                                if self.manga_mode {
+                                    self.apply_manga_zoom_step(true);
+                                } else {
+                                    self.apply_fullscreen_zoom_step(true);
+                                }
                             }
                             self.manga_zoom_bar_show_time = Instant::now();
                         } else if self.manga_zoom_plus_held {
@@ -2149,6 +2177,25 @@ impl ImageViewer {
             self.manga_scroll_offset = self.manga_scroll_offset.clamp(0.0, max_scroll);
             self.manga_scroll_target = self.manga_scroll_target.clamp(0.0, max_scroll);
             self.manga_update_preload_queue();
+        }
+    }
+
+    /// Apply a single zoom step in fullscreen image mode (used for initial click)
+    fn apply_fullscreen_zoom_step(&mut self, zoom_in: bool) {
+        let step = self.config.zoom_step;
+        let old_zoom = self.zoom.max(0.0001);
+        let new_zoom = if zoom_in {
+            self.clamp_zoom(self.zoom * step)
+        } else {
+            self.clamp_zoom(self.zoom / step)
+        };
+
+        if (new_zoom - old_zoom).abs() > 0.0001 {
+            let zoom_ratio = new_zoom / old_zoom;
+            self.zoom = new_zoom;
+            self.zoom_target = new_zoom;
+            self.zoom_velocity = 0.0;
+            self.offset = self.offset * zoom_ratio;
         }
     }
 
@@ -4453,10 +4500,10 @@ impl eframe::App for ImageViewer {
             self.draw_video_controls(ctx);
         }
 
-        // Draw manga mode toggle button (bottom-right in fullscreen)
+        // Draw manga mode toggle button and zoom HUD (bottom-right in fullscreen)
         if !skip_drawing {
-            self.draw_manga_toggle_button(ctx);
             self.draw_manga_zoom_bar(ctx);
+            self.draw_manga_toggle_button(ctx);
         }
 
         // Startup UX: keep the window hidden until initial layout is applied.
