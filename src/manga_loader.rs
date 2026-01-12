@@ -458,11 +458,13 @@ impl MangaLoader {
     }
 
     /// Check if an index is currently being loaded.
+    #[allow(dead_code)]
     pub fn is_loading(&self, index: usize) -> bool {
         self.loading_indices.read().contains(&index)
     }
 
     /// Check if an index has been loaded.
+    #[allow(dead_code)]
     pub fn is_loaded(&self, index: usize) -> bool {
         self.loaded_indices.read().contains(&index)
     }

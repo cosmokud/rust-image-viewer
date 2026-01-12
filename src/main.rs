@@ -344,6 +344,10 @@ struct ImageViewer {
     manga_total_height_cache_screen_y: f32,
     manga_total_height_cache_len: usize,
     manga_total_height_cache_valid: bool,
+    /// Cooldown frames before updating preload queue (prevents cache churn during rapid navigation)
+    manga_preload_cooldown: u32,
+    /// Last frame when preload queue was updated (throttle updates)
+    manga_last_preload_update: std::time::Instant,
 }
 
 impl Default for ImageViewer {
@@ -437,6 +441,8 @@ impl Default for ImageViewer {
             manga_total_height_cache_screen_y: 0.0,
             manga_total_height_cache_len: 0,
             manga_total_height_cache_valid: false,
+            manga_preload_cooldown: 0,
+            manga_last_preload_update: Instant::now(),
         }
     }
 }
@@ -1361,6 +1367,19 @@ impl ImageViewer {
             return;
         }
 
+        // Respect cooldown after large jumps (Home/End keys)
+        if self.manga_preload_cooldown > 0 {
+            return;
+        }
+
+        // Throttle updates to prevent cache churn during rapid scrolling
+        // Only update every 50ms minimum
+        const MIN_UPDATE_INTERVAL: Duration = Duration::from_millis(50);
+        if self.manga_last_preload_update.elapsed() < MIN_UPDATE_INTERVAL {
+            return;
+        }
+        self.manga_last_preload_update = Instant::now();
+
         // Determine which image is currently most visible based on scroll offset
         let mut current_visible_index = self.current_index;
         
@@ -1636,9 +1655,14 @@ impl ImageViewer {
         if !self.manga_mode {
             return;
         }
+        // Use INSTANT scroll for large jumps to avoid cache churn
+        // No animation - immediately snap to position
+        self.manga_scroll_offset = 0.0;
         self.manga_scroll_target = 0.0;
+        self.manga_scroll_velocity = 0.0;
         self.current_index = 0;
-        self.manga_update_preload_queue();
+        // Delay preload update to let the view settle
+        self.manga_preload_cooldown = 10; // frames to wait
     }
 
     /// Scroll to the last image in manga mode
@@ -1650,8 +1674,14 @@ impl ImageViewer {
         self.current_index = last_index;
         let total_height = self.manga_total_height();
         let visible_height = self.screen_size.y;
-        self.manga_scroll_target = (total_height - visible_height).max(0.0);
-        self.manga_update_preload_queue();
+        let target = (total_height - visible_height).max(0.0);
+        // Use INSTANT scroll for large jumps to avoid cache churn
+        // No animation - immediately snap to position
+        self.manga_scroll_offset = target;
+        self.manga_scroll_target = target;
+        self.manga_scroll_velocity = 0.0;
+        // Delay preload update to let the view settle
+        self.manga_preload_cooldown = 10; // frames to wait
     }
 
     /// Update manga scroll animation (smooth scrolling)
@@ -1664,10 +1694,9 @@ impl ImageViewer {
 
         let error = self.manga_scroll_target - self.manga_scroll_offset;
         
-        // Sub-pixel precision thresholds for smooth stopping
-        // Using smaller thresholds (0.1px) prevents visible "snapping" artifacts
-        const SNAP_THRESHOLD: f32 = 0.1;
-        const VELOCITY_THRESHOLD: f32 = 0.5;
+        // Larger snap threshold for faster settling (reduces animation duration)
+        const SNAP_THRESHOLD: f32 = 0.5;
+        const VELOCITY_THRESHOLD: f32 = 1.0;
 
         if error.abs() < SNAP_THRESHOLD && self.manga_scroll_velocity.abs() < VELOCITY_THRESHOLD {
             self.manga_scroll_offset = self.manga_scroll_target;
@@ -1675,13 +1704,13 @@ impl ImageViewer {
             return false;
         }
 
-        // High-quality critically-damped spring for buttery-smooth scrolling.
-        // omega = 18 provides fast response without overshoot.
-        // Higher omega = snappier response, lower = smoother but slower.
+        // Faster critically-damped spring for snappier scrolling.
+        // omega = 25 provides very fast response without overshoot.
+        // This makes scrolling feel more immediate and responsive.
         //
         // Physics: critically damped when damping_ratio = 1.0
         // x'' = -omega^2 * (x - target) - 2 * omega * x'
-        let omega = 18.0;
+        let omega = 25.0;
         let omega_sq = omega * omega;
         
         // Cap dt to prevent instability on frame drops (max ~30fps equivalent)
@@ -1709,8 +1738,19 @@ impl ImageViewer {
         // Also clamp target to prevent overshooting past bounds
         self.manga_scroll_target = self.manga_scroll_target.clamp(0.0, max_scroll);
 
-        // Update current_index based on scroll position
+        // Update current_index based on scroll position (lightweight, no I/O)
         self.manga_update_current_index();
+
+        // Decrement preload cooldown if active
+        // When cooldown hits zero, force a preload update
+        if self.manga_preload_cooldown > 0 {
+            self.manga_preload_cooldown -= 1;
+            if self.manga_preload_cooldown == 0 {
+                // Force immediate preload update after cooldown expires
+                // Reset the last update time so throttling doesn't block it
+                self.manga_last_preload_update = Instant::now() - Duration::from_millis(100);
+            }
+        }
 
         true
     }
@@ -2225,6 +2265,8 @@ impl ImageViewer {
         let dt = ctx.input(|i| i.stable_dt).min(0.033);
         if self.manga_tick_scroll_animation(dt) {
             animation_active = true;
+            // Update preload queue during scroll (throttling is handled inside)
+            self.manga_update_preload_queue();
         }
 
         // Process decoded images from background threads and upload to GPU.
@@ -2290,21 +2332,15 @@ impl ImageViewer {
                         );
                         
                         // Draw a subtle loading spinner or indicator
-                        // Only show "Loading..." if we're still loading this image
-                        let is_loading = self.manga_loader
-                            .as_ref()
-                            .map(|loader| loader.is_loading(idx) || !loader.is_loaded(idx))
-                            .unwrap_or(true);
-                        
-                        if is_loading {
-                            ui.painter().text(
-                                placeholder_rect.center(),
-                                egui::Align2::CENTER_CENTER,
-                                "⏳",
-                                egui::FontId::proportional(24.0),
-                                egui::Color32::from_gray(80),
-                            );
-                        }
+                        // Show loading indicator for pending images
+                        // (Since we're in the else branch, the image isn't cached yet)
+                        ui.painter().text(
+                            placeholder_rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            "⏳",
+                            egui::FontId::proportional(24.0),
+                            egui::Color32::from_gray(80),
+                        );
                     }
                     
                     y_offset += img_height;
@@ -2334,18 +2370,8 @@ impl ImageViewer {
 
                 // Draw page indicator (current image / total) (hover-only)
                 if !self.image_list.is_empty() && show_page_label {
-                    // Find which image is most visible
-                    let mut cumulative_y: f32 = 0.0;
-                    let mut visible_idx = 0;
-                    for idx in 0..self.image_list.len() {
-                        let img_height = self.manga_get_image_display_height(idx);
-                        if cumulative_y + img_height / 2.0 > self.manga_scroll_offset {
-                            visible_idx = idx;
-                            break;
-                        }
-                        cumulative_y += img_height;
-                        visible_idx = idx;
-                    }
+                    // Use the already-updated current_index (maintained by manga_update_current_index)
+                    let visible_idx = self.current_index;
 
                     let indicator_text = format!("{} / {}", visible_idx + 1, self.image_list.len());
                     let indicator_pos = egui::pos2(screen_width / 2.0, screen_height - 30.0);
