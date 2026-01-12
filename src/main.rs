@@ -324,6 +324,12 @@ struct ImageViewer {
     show_manga_zoom_bar: bool,
     /// Time when manga zoom bar was last shown (for auto-hide)
     manga_zoom_bar_show_time: Instant,
+    /// Whether the plus button is being held
+    manga_zoom_plus_held: bool,
+    /// Whether the minus button is being held
+    manga_zoom_minus_held: bool,
+    /// Time when zoom button hold started (for acceleration)
+    manga_zoom_hold_start: Instant,
     /// Vertical scroll offset for manga mode (in pixels)
     manga_scroll_offset: f32,
     /// Target scroll offset for smooth scrolling animation
@@ -431,6 +437,9 @@ impl Default for ImageViewer {
             manga_toggle_show_time: Instant::now(),
             show_manga_zoom_bar: false,
             manga_zoom_bar_show_time: Instant::now(),
+            manga_zoom_plus_held: false,
+            manga_zoom_minus_held: false,
+            manga_zoom_hold_start: Instant::now(),
             manga_scroll_offset: 0.0,
             manga_scroll_target: 0.0,
             manga_scroll_velocity: 0.0,
@@ -1678,10 +1687,13 @@ impl ImageViewer {
         self.manga_scroll_target = 0.0;
         self.manga_scroll_velocity = 0.0;
         self.current_index = 0;
-        // Delay preload update briefly to let the view settle
-        self.manga_preload_cooldown = 3;
-        // Force preload queue update with new position
+        // Invalidate height cache since we're at a new position
+        self.manga_total_height_cache_valid = false;
+        // Immediately trigger preload for new position (no cooldown)
+        self.manga_preload_cooldown = 0;
         self.manga_last_preload_update = Instant::now() - Duration::from_millis(100);
+        // Force immediate preload queue update
+        self.manga_update_preload_queue();
     }
 
     /// Scroll to the last image in manga mode
@@ -1698,6 +1710,8 @@ impl ImageViewer {
             loader.cache_dimensions_range(&self.image_list, start, self.image_list.len());
         }
         self.current_index = last_index;
+        // Invalidate height cache since we're at a new position
+        self.manga_total_height_cache_valid = false;
         let total_height = self.manga_total_height();
         let visible_height = self.screen_size.y;
         let target = (total_height - visible_height).max(0.0);
@@ -1705,9 +1719,11 @@ impl ImageViewer {
         self.manga_scroll_offset = target;
         self.manga_scroll_target = target;
         self.manga_scroll_velocity = 0.0;
-        // Delay preload update briefly
-        self.manga_preload_cooldown = 3;
+        // Immediately trigger preload for new position (no cooldown)
+        self.manga_preload_cooldown = 0;
         self.manga_last_preload_update = Instant::now() - Duration::from_millis(100);
+        // Force immediate preload queue update
+        self.manga_update_preload_queue();
     }
 
     /// Update manga scroll animation (smooth scrolling)
@@ -1819,13 +1835,13 @@ impl ImageViewer {
         }
 
         let screen_rect = ctx.screen_rect();
-        let button_size = egui::Vec2::new(140.0, 36.0);
+        let button_size = egui::Vec2::new(160.0, 40.0);
         let margin = 20.0;
         
         // Check if mouse is near bottom-right corner
         let hover_zone = egui::Rect::from_min_size(
-            egui::pos2(screen_rect.max.x - 200.0, screen_rect.max.y - 100.0),
-            egui::Vec2::new(200.0, 100.0),
+            egui::pos2(screen_rect.max.x - 220.0, screen_rect.max.y - 120.0),
+            egui::Vec2::new(220.0, 120.0),
         );
         
         let mouse_pos = ctx.input(|i| i.pointer.hover_pos());
@@ -1865,25 +1881,80 @@ impl ImageViewer {
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
                 let label = if self.manga_mode {
-                    "📖 Manga Mode: ON"
+                    "📖 Manga Mode"
                 } else {
-                    "📖 Manga Mode: OFF"
+                    "📖 Manga Mode"
                 };
+
+                // Modern gradient-style button with better visual design
+                let (bg_color, border_color, glow_color) = if self.manga_mode {
+                    // Active state: vibrant blue gradient
+                    (
+                        egui::Color32::from_rgba_unmultiplied(56, 120, 220, 240),
+                        egui::Color32::from_rgba_unmultiplied(100, 160, 255, 255),
+                        egui::Color32::from_rgba_unmultiplied(56, 120, 220, 60),
+                    )
+                } else {
+                    // Inactive state: subtle dark with transparency
+                    (
+                        egui::Color32::from_rgba_unmultiplied(40, 40, 45, 220),
+                        egui::Color32::from_rgba_unmultiplied(80, 80, 90, 180),
+                        egui::Color32::from_rgba_unmultiplied(0, 0, 0, 0),
+                    )
+                };
+
+                // Draw subtle glow behind button when active
+                if self.manga_mode {
+                    let glow_rect = button_rect.expand(4.0);
+                    ui.painter().rect_filled(glow_rect, 14.0, glow_color);
+                }
 
                 let button = egui::Button::new(
                     egui::RichText::new(label)
                         .color(egui::Color32::WHITE)
                         .size(14.0)
+                        .strong()
                 )
-                .fill(if self.manga_mode {
-                    egui::Color32::from_rgba_unmultiplied(66, 133, 244, 220)
-                } else {
-                    egui::Color32::from_rgba_unmultiplied(60, 60, 60, 220)
-                })
+                .fill(bg_color)
+                .stroke(egui::Stroke::new(1.5, border_color))
                 .min_size(button_size)
-                .rounding(8.0);
+                .rounding(12.0);
 
-                if ui.add(button).clicked() {
+                let response = ui.add(button);
+                
+                // Add ON/OFF indicator as a separate pill badge
+                let indicator_text = if self.manga_mode { "ON" } else { "OFF" };
+                let indicator_color = if self.manga_mode {
+                    egui::Color32::from_rgb(100, 220, 100)
+                } else {
+                    egui::Color32::from_rgb(150, 150, 150)
+                };
+                let indicator_pos = egui::pos2(
+                    button_rect.max.x - 32.0,
+                    button_rect.center().y,
+                );
+                let indicator_rect = egui::Rect::from_center_size(
+                    indicator_pos,
+                    egui::Vec2::new(28.0, 18.0),
+                );
+                ui.painter().rect_filled(
+                    indicator_rect,
+                    9.0,
+                    if self.manga_mode {
+                        egui::Color32::from_rgba_unmultiplied(60, 180, 60, 200)
+                    } else {
+                        egui::Color32::from_rgba_unmultiplied(80, 80, 80, 180)
+                    },
+                );
+                ui.painter().text(
+                    indicator_pos,
+                    egui::Align2::CENTER_CENTER,
+                    indicator_text,
+                    egui::FontId::proportional(10.0),
+                    indicator_color,
+                );
+
+                if response.clicked() {
                     self.toggle_manga_mode();
                 }
             });
@@ -1893,6 +1964,9 @@ impl ImageViewer {
     fn draw_manga_zoom_bar(&mut self, ctx: &egui::Context) {
         if !self.is_fullscreen || !self.manga_mode {
             self.show_manga_zoom_bar = false;
+            // Reset hold states when bar is hidden
+            self.manga_zoom_plus_held = false;
+            self.manga_zoom_minus_held = false;
             return;
         }
 
@@ -1905,13 +1979,15 @@ impl ImageViewer {
         let screen_rect = ctx.screen_rect();
         let margin = 20.0;
 
-        // Hover zone around bottom-right corner
+        // Hover zone around bottom-right corner (larger to accommodate both controls)
         let hover_zone = egui::Rect::from_min_size(
-            egui::pos2(screen_rect.max.x - 360.0, screen_rect.max.y - 160.0),
-            egui::Vec2::new(360.0, 160.0),
+            egui::pos2(screen_rect.max.x - 380.0, screen_rect.max.y - 180.0),
+            egui::Vec2::new(380.0, 180.0),
         );
 
         let mouse_pos = ctx.input(|i| i.pointer.hover_pos());
+        let primary_down = ctx.input(|i| i.pointer.button_down(egui::PointerButton::Primary));
+        
         if let Some(pos) = mouse_pos {
             if hover_zone.contains(pos) {
                 self.show_manga_zoom_bar = true;
@@ -1919,8 +1995,11 @@ impl ImageViewer {
             }
         }
 
-        // Auto-hide after delay
-        if self.manga_zoom_bar_show_time.elapsed().as_secs_f32() > 2.0 {
+        // Don't auto-hide while buttons are being held
+        let is_holding_button = self.manga_zoom_plus_held || self.manga_zoom_minus_held;
+        
+        // Auto-hide after delay (unless holding a button)
+        if self.manga_zoom_bar_show_time.elapsed().as_secs_f32() > 2.0 && !is_holding_button {
             if let Some(pos) = mouse_pos {
                 if !hover_zone.contains(pos) {
                     self.show_manga_zoom_bar = false;
@@ -1934,84 +2013,240 @@ impl ImageViewer {
             return;
         }
 
-        let bar_size = egui::Vec2::new(300.0, 36.0);
+        // Calculate zoom change from held buttons BEFORE drawing UI
+        // This ensures the displayed value is always correct
+        let mut zoom_delta_from_hold: f32 = 0.0;
+        
+        if is_holding_button && primary_down {
+            // Calculate acceleration based on hold duration
+            let hold_duration = self.manga_zoom_hold_start.elapsed().as_secs_f32();
+            
+            // Fast acceleration: starts at 2% per frame, increases to 8% after 1 second
+            let base_speed = 0.02; // 2% per frame at 60fps = 120% per second
+            let acceleration = (hold_duration * 3.0).min(4.0); // Up to 4x acceleration
+            let speed = base_speed * (1.0 + acceleration);
+            
+            if self.manga_zoom_plus_held {
+                zoom_delta_from_hold = speed;
+            } else if self.manga_zoom_minus_held {
+                zoom_delta_from_hold = -speed;
+            }
+        }
+        
+        // Apply zoom from hold before drawing
+        if zoom_delta_from_hold != 0.0 {
+            let old_zoom = self.zoom.max(0.0001);
+            let factor = if zoom_delta_from_hold > 0.0 {
+                1.0 + zoom_delta_from_hold
+            } else {
+                1.0 / (1.0 - zoom_delta_from_hold)
+            };
+            let new_zoom = self.clamp_zoom(self.zoom * factor);
+            
+            if (new_zoom - old_zoom).abs() > 0.0001 {
+                let zoom_ratio = new_zoom / old_zoom;
+                let anchor_y = self.screen_size.y.max(1.0) * 0.5;
+                
+                self.zoom = new_zoom;
+                self.zoom_target = new_zoom;
+                self.zoom_velocity = 0.0;
+                self.manga_total_height_cache_valid = false;
+                
+                self.manga_scroll_offset = self.manga_scroll_offset * zoom_ratio + anchor_y * (zoom_ratio - 1.0);
+                self.manga_scroll_target = self.manga_scroll_target * zoom_ratio + anchor_y * (zoom_ratio - 1.0);
+                self.manga_scroll_velocity = 0.0;
+                
+                let total_height = self.manga_total_height();
+                let max_scroll = (total_height - self.screen_size.y).max(0.0);
+                self.manga_scroll_offset = self.manga_scroll_offset.clamp(0.0, max_scroll);
+                self.manga_scroll_target = self.manga_scroll_target.clamp(0.0, max_scroll);
+                self.manga_update_preload_queue();
+            }
+            
+            ctx.request_repaint(); // Ensure continuous updates while holding
+        }
+
+        let bar_size = egui::Vec2::new(320.0, 44.0);
         let bar_pos = egui::pos2(
             screen_rect.max.x - bar_size.x - margin,
-            screen_rect.max.y - bar_size.y - margin - 44.0,
+            screen_rect.max.y - bar_size.y - margin - 52.0,
         );
 
         egui::Area::new(egui::Id::new("manga_zoom_bar"))
             .fixed_pos(bar_pos)
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
+                // Modern frame style matching the toggle button
                 let frame = egui::Frame::none()
-                    .fill(egui::Color32::from_rgba_unmultiplied(0, 0, 0, 180))
-                    .rounding(10.0)
-                    .inner_margin(egui::Margin::same(8.0));
+                    .fill(egui::Color32::from_rgba_unmultiplied(40, 40, 45, 230))
+                    .stroke(egui::Stroke::new(1.5, egui::Color32::from_rgba_unmultiplied(80, 80, 90, 180)))
+                    .rounding(12.0)
+                    .inner_margin(egui::Margin::same(10.0));
 
                 frame.show(ui, |ui| {
                     ui.set_min_size(bar_size);
 
-                    let step = self.config.zoom_step;
+                    // Use current zoom value for display - no mutable binding needed
+                    let display_zoom = self.zoom;
                     let max_zoom = self.max_zoom_factor();
-                    let mut new_zoom = self.zoom;
 
                     ui.horizontal(|ui| {
-                        let minus = ui.add_sized(
-                            [28.0, 24.0],
-                            egui::Button::new(egui::RichText::new("-").color(egui::Color32::WHITE).size(18.0)),
-                        );
-                        if minus.clicked() {
-                            new_zoom = self.clamp_zoom(new_zoom / step);
-                        }
-
-                        let slider = egui::Slider::new(&mut new_zoom, 0.1..=max_zoom)
-                            .show_value(false)
-                            .clamping(egui::SliderClamping::Always);
-                        let slider_resp = ui.add_sized([170.0, 24.0], slider);
-
-                        let plus = ui.add_sized(
-                            [28.0, 24.0],
-                            egui::Button::new(egui::RichText::new("+").color(egui::Color32::WHITE).size(18.0)),
-                        );
-                        if plus.clicked() {
-                            new_zoom = self.clamp_zoom(new_zoom * step);
+                        ui.add_space(2.0);
+                        
+                        // Styled minus button
+                        let minus_btn = egui::Button::new(
+                            egui::RichText::new("−").color(egui::Color32::WHITE).size(20.0).strong()
+                        )
+                        .fill(if self.manga_zoom_minus_held {
+                            egui::Color32::from_rgba_unmultiplied(56, 120, 220, 200)
+                        } else {
+                            egui::Color32::from_rgba_unmultiplied(60, 60, 70, 200)
+                        })
+                        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(100, 100, 120, 150)))
+                        .rounding(8.0);
+                        
+                        let minus_resp = ui.add_sized([32.0, 28.0], minus_btn);
+                        
+                        // Handle minus button hold
+                        if minus_resp.is_pointer_button_down_on() {
+                            if !self.manga_zoom_minus_held {
+                                self.manga_zoom_minus_held = true;
+                                self.manga_zoom_plus_held = false;
+                                self.manga_zoom_hold_start = Instant::now();
+                                // Apply initial click zoom
+                                self.apply_manga_zoom_step(false);
+                            }
+                            self.manga_zoom_bar_show_time = Instant::now();
+                        } else if self.manga_zoom_minus_held {
+                            self.manga_zoom_minus_held = false;
                         }
 
                         ui.add_space(6.0);
-                        ui.label(
-                            egui::RichText::new(format!("{:.0}%", (new_zoom * 100.0).round()))
-                                .color(egui::Color32::WHITE)
-                                .size(13.0),
-                        );
-
-                        if slider_resp.changed() || minus.clicked() || plus.clicked() {
+                        
+                        // Custom slider with better styling - use display value only
+                        let mut slider_value = display_zoom;
+                        let slider = egui::Slider::new(&mut slider_value, 0.1..=max_zoom)
+                            .show_value(false)
+                            .clamping(egui::SliderClamping::Always);
+                        let slider_resp = ui.add_sized([160.0, 28.0], slider);
+                        
+                        // Handle slider changes separately (only when actively dragged)
+                        if slider_resp.changed() && slider_resp.dragged() {
                             let old_zoom = self.zoom.max(0.0001);
-                            let zoom_ratio = (new_zoom / old_zoom).clamp(0.01, 100.0);
-
-                            // Anchor at viewport center for slider/buttons.
-                            let anchor_y = self.screen_size.y.max(1.0) * 0.5;
-
-                            self.zoom = new_zoom;
-                            self.zoom_target = new_zoom;
-                            self.zoom_velocity = 0.0;
-                            self.manga_total_height_cache_valid = false;
-
-                            self.manga_scroll_offset =
-                                self.manga_scroll_offset * zoom_ratio + anchor_y * (zoom_ratio - 1.0);
-                            self.manga_scroll_target =
-                                self.manga_scroll_target * zoom_ratio + anchor_y * (zoom_ratio - 1.0);
-                            self.manga_scroll_velocity = 0.0;
-
-                            let total_height = self.manga_total_height();
-                            let max_scroll = (total_height - self.screen_size.y).max(0.0);
-                            self.manga_scroll_offset = self.manga_scroll_offset.clamp(0.0, max_scroll);
-                            self.manga_scroll_target = self.manga_scroll_target.clamp(0.0, max_scroll);
-                            self.manga_update_preload_queue();
+                            let new_zoom = self.clamp_zoom(slider_value);
+                            
+                            if (new_zoom - old_zoom).abs() > 0.0001 {
+                                let zoom_ratio = new_zoom / old_zoom;
+                                let anchor_y = self.screen_size.y.max(1.0) * 0.5;
+                                
+                                self.zoom = new_zoom;
+                                self.zoom_target = new_zoom;
+                                self.zoom_velocity = 0.0;
+                                self.manga_total_height_cache_valid = false;
+                                
+                                self.manga_scroll_offset = self.manga_scroll_offset * zoom_ratio + anchor_y * (zoom_ratio - 1.0);
+                                self.manga_scroll_target = self.manga_scroll_target * zoom_ratio + anchor_y * (zoom_ratio - 1.0);
+                                self.manga_scroll_velocity = 0.0;
+                                
+                                let total_height = self.manga_total_height();
+                                let max_scroll = (total_height - self.screen_size.y).max(0.0);
+                                self.manga_scroll_offset = self.manga_scroll_offset.clamp(0.0, max_scroll);
+                                self.manga_scroll_target = self.manga_scroll_target.clamp(0.0, max_scroll);
+                                self.manga_update_preload_queue();
+                            }
+                            
+                            // Reset hold states when using slider
+                            self.manga_zoom_plus_held = false;
+                            self.manga_zoom_minus_held = false;
                         }
+                        
+                        ui.add_space(6.0);
+                        
+                        // Styled plus button
+                        let plus_btn = egui::Button::new(
+                            egui::RichText::new("+").color(egui::Color32::WHITE).size(20.0).strong()
+                        )
+                        .fill(if self.manga_zoom_plus_held {
+                            egui::Color32::from_rgba_unmultiplied(56, 120, 220, 200)
+                        } else {
+                            egui::Color32::from_rgba_unmultiplied(60, 60, 70, 200)
+                        })
+                        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(100, 100, 120, 150)))
+                        .rounding(8.0);
+                        
+                        let plus_resp = ui.add_sized([32.0, 28.0], plus_btn);
+                        
+                        // Handle plus button hold
+                        if plus_resp.is_pointer_button_down_on() {
+                            if !self.manga_zoom_plus_held {
+                                self.manga_zoom_plus_held = true;
+                                self.manga_zoom_minus_held = false;
+                                self.manga_zoom_hold_start = Instant::now();
+                                // Apply initial click zoom
+                                self.apply_manga_zoom_step(true);
+                            }
+                            self.manga_zoom_bar_show_time = Instant::now();
+                        } else if self.manga_zoom_plus_held {
+                            self.manga_zoom_plus_held = false;
+                        }
+
+                        ui.add_space(8.0);
+                        
+                        // Zoom percentage label with pill background
+                        let zoom_text = format!("{:.0}%", (display_zoom * 100.0).round());
+                        let text_width = 52.0;
+                        let label_rect = egui::Rect::from_min_size(
+                            ui.cursor().min,
+                            egui::Vec2::new(text_width, 24.0),
+                        );
+                        ui.painter().rect_filled(
+                            label_rect,
+                            6.0,
+                            egui::Color32::from_rgba_unmultiplied(30, 30, 35, 200),
+                        );
+                        ui.add_sized(
+                            [text_width, 24.0],
+                            egui::Label::new(
+                                egui::RichText::new(zoom_text)
+                                    .color(egui::Color32::from_rgb(200, 200, 210))
+                                    .size(12.0)
+                                    .strong()
+                            ),
+                        );
                     });
                 });
             });
+    }
+
+    /// Apply a single zoom step for manga mode (used for initial click)
+    fn apply_manga_zoom_step(&mut self, zoom_in: bool) {
+        let step = self.config.zoom_step;
+        let old_zoom = self.zoom.max(0.0001);
+        let new_zoom = if zoom_in {
+            self.clamp_zoom(self.zoom * step)
+        } else {
+            self.clamp_zoom(self.zoom / step)
+        };
+        
+        if (new_zoom - old_zoom).abs() > 0.0001 {
+            let zoom_ratio = new_zoom / old_zoom;
+            let anchor_y = self.screen_size.y.max(1.0) * 0.5;
+            
+            self.zoom = new_zoom;
+            self.zoom_target = new_zoom;
+            self.zoom_velocity = 0.0;
+            self.manga_total_height_cache_valid = false;
+            
+            self.manga_scroll_offset = self.manga_scroll_offset * zoom_ratio + anchor_y * (zoom_ratio - 1.0);
+            self.manga_scroll_target = self.manga_scroll_target * zoom_ratio + anchor_y * (zoom_ratio - 1.0);
+            self.manga_scroll_velocity = 0.0;
+            
+            let total_height = self.manga_total_height();
+            let max_scroll = (total_height - self.screen_size.y).max(0.0);
+            self.manga_scroll_offset = self.manga_scroll_offset.clamp(0.0, max_scroll);
+            self.manga_scroll_target = self.manga_scroll_target.clamp(0.0, max_scroll);
+            self.manga_update_preload_queue();
+        }
     }
 
     /// Draw images in manga (vertical strip) mode
@@ -2057,15 +2292,10 @@ impl ImageViewer {
             egui::Vec2::new(scrollbar_width, scrollbar_height),
         );
 
-        // Hover-only visibility zones.
-        // - Scrollbar: show when hovering near the right edge (or while dragging).
-        // - Page label: show when hovering near the bottom.
+        // Hover-only visibility zone for scrollbar.
+        // Scrollbar: show when hovering near the right edge (or while dragging).
         let scrollbar_hover_zone = egui::Rect::from_min_max(
             egui::pos2((screen_width - (scrollbar_width + scrollbar_margin + 40.0)).max(0.0), 0.0),
-            egui::pos2(screen_width, screen_height),
-        );
-        let page_label_hover_zone = egui::Rect::from_min_max(
-            egui::pos2(0.0, (screen_height - 80.0).max(0.0)),
             egui::pos2(screen_width, screen_height),
         );
 
@@ -2075,7 +2305,8 @@ impl ImageViewer {
             && (self.manga_scrollbar_dragging
                 || over_scrollbar
                 || pointer_pos.map_or(false, |p| scrollbar_hover_zone.contains(p)));
-        let show_page_label = pointer_pos.map_or(false, |p| page_label_hover_zone.contains(p));
+        // Show page indicator whenever scrollbar is visible (same visibility logic)
+        let show_page_indicator = show_scrollbar;
 
         // Handle scrollbar dragging
         if show_scrollbar {
@@ -2419,28 +2650,37 @@ impl ImageViewer {
                     );
                 }
 
-                // Draw page indicator (current image / total) (hover-only)
-                if !self.image_list.is_empty() && show_page_label {
+                // Draw page indicator (current image / total) - positioned near scrollbar
+                if !self.image_list.is_empty() && show_page_indicator {
                     // Use the already-updated current_index (maintained by manga_update_current_index)
                     let visible_idx = self.current_index;
 
                     let indicator_text = format!("{} / {}", visible_idx + 1, self.image_list.len());
-                    let indicator_pos = egui::pos2(screen_width / 2.0, screen_height - 30.0);
                     
-                    // Background pill
+                    // Position to the left of the scrollbar, vertically centered
+                    let indicator_x = screen_width - scrollbar_width - scrollbar_margin - 60.0;
+                    let indicator_y = screen_height / 2.0;
+                    let indicator_pos = egui::pos2(indicator_x, indicator_y);
+                    
+                    // Background pill (vertical orientation for sidebar placement)
                     let text_galley = ui.painter().layout_no_wrap(
                         indicator_text.clone(),
-                        egui::FontId::proportional(14.0),
+                        egui::FontId::proportional(13.0),
                         egui::Color32::WHITE,
                     );
                     let pill_rect = egui::Rect::from_center_size(
                         indicator_pos,
-                        egui::Vec2::new(text_galley.rect.width() + 20.0, 26.0),
+                        egui::Vec2::new(text_galley.rect.width() + 16.0, 28.0),
                     );
                     ui.painter().rect_filled(
                         pill_rect,
-                        13.0,
-                        egui::Color32::from_rgba_unmultiplied(0, 0, 0, 180),
+                        8.0,
+                        egui::Color32::from_rgba_unmultiplied(30, 30, 35, 220),
+                    );
+                    ui.painter().rect_stroke(
+                        pill_rect,
+                        8.0,
+                        egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(80, 80, 90, 150)),
                     );
                     
                     // Text
@@ -2448,8 +2688,8 @@ impl ImageViewer {
                         indicator_pos,
                         egui::Align2::CENTER_CENTER,
                         indicator_text,
-                        egui::FontId::proportional(14.0),
-                        egui::Color32::WHITE,
+                        egui::FontId::proportional(13.0),
+                        egui::Color32::from_rgb(220, 220, 230),
                     );
                 }
             });
