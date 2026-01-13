@@ -488,6 +488,78 @@ impl Default for ImageViewer {
 }
 
 impl ImageViewer {
+    fn touch_bottom_overlays(&mut self) {
+        let now = Instant::now();
+        self.video_controls_show_time = now;
+        self.manga_toggle_show_time = now;
+        self.manga_zoom_bar_show_time = now;
+    }
+
+    fn update_bottom_overlays_visibility(&mut self, ctx: &egui::Context) {
+        let screen_rect = ctx.screen_rect();
+        let mouse_pos = ctx.input(|i| i.pointer.hover_pos());
+
+        let hover_bottom = mouse_pos
+            .map(|p| p.y > screen_rect.height() - 100.0)
+            .unwrap_or(false);
+
+        // One combined hover zone for the bottom-right overlays (covers both the zoom HUD and manga toggle).
+        let hover_bottom_right = mouse_pos
+            .map(|p| {
+                let hover_zone = egui::Rect::from_min_size(
+                    egui::pos2(screen_rect.max.x - 280.0, screen_rect.max.y - 120.0),
+                    egui::Vec2::new(280.0, 120.0),
+                );
+                hover_zone.contains(p)
+            })
+            .unwrap_or(false);
+
+        let video_open = self.video_player.is_some();
+
+        // Treat these as active interaction states that should keep the overlays alive.
+        let interacting_video = self.is_seeking || self.is_volume_dragging;
+        let interacting_manga_zoom = self.manga_zoom_plus_held || self.manga_zoom_minus_held;
+
+        // Track whether the pointer is currently over the bottom video controls region.
+        // (Used for input suppression and for keeping overlays alive while hovering.)
+        let bar_height = 56.0;
+        self.mouse_over_video_controls = video_open
+            && mouse_pos
+                .map(|p| p.y > screen_rect.height() - bar_height)
+                .unwrap_or(false);
+
+        let should_show = if video_open {
+            hover_bottom
+                || hover_bottom_right
+                || interacting_video
+                || self.mouse_over_video_controls
+                || interacting_manga_zoom
+        } else {
+            hover_bottom_right || interacting_manga_zoom
+        };
+
+        if should_show {
+            self.touch_bottom_overlays();
+        }
+
+        let visible = should_show
+            || self.video_controls_show_time.elapsed().as_secs_f32() <= self.config.bottom_overlay_hide_delay;
+
+        self.show_video_controls = video_open && visible;
+
+        // Manga toggle / zoom HUD are fullscreen-only overlays.
+        self.show_manga_toggle = self.is_fullscreen && visible;
+        let allow_zoom_bar = self.manga_mode
+            || matches!(self.current_media_type, Some(MediaType::Image | MediaType::Video));
+        self.show_manga_zoom_bar = self.is_fullscreen && visible && allow_zoom_bar;
+
+        if !visible {
+            // Defensive: ensure we never get stuck in a held state if the HUD hides.
+            self.manga_zoom_plus_held = false;
+            self.manga_zoom_minus_held = false;
+        }
+    }
+
     fn max_zoom_factor(&self) -> f32 {
         // Config stored as percent: 100 = 1.0x, 1000 = 10.0x.
         // Clamp defensively to keep math stable even if config is extreme.
@@ -910,7 +982,7 @@ impl ImageViewer {
                         self.pending_media_layout = true;
                         self.error_message = None;
                         self.show_video_controls = true;
-                        self.video_controls_show_time = Instant::now();
+                        self.touch_bottom_overlays();
                     }
                     Err(e) => {
                         self.error_message = Some(format!("Failed to load video: {}", e));
@@ -1026,7 +1098,7 @@ impl ImageViewer {
                 flip_vertical: false,
             }
         });
-        
+
         if clockwise {
             entry.rotation_steps = (entry.rotation_steps + 1) % 4;
         } else {
@@ -2209,54 +2281,17 @@ impl ImageViewer {
             return;
         }
 
-        let screen_rect = ctx.screen_rect();
-        let button_size = egui::Vec2::new(130.0, 32.0);
-        let scrollbar_padding = 35.0; // Padding to avoid scrollbar
-        let margin = 16.0;
-        
-        // Check if mouse is near bottom-right corner
-        let hover_zone = egui::Rect::from_min_size(
-            egui::pos2(screen_rect.max.x - 200.0, screen_rect.max.y - 120.0),
-            egui::Vec2::new(200.0, 120.0),
-        );
-        
-        let mouse_pos = ctx.input(|i| i.pointer.hover_pos());
-        if let Some(pos) = mouse_pos {
-            if hover_zone.contains(pos) {
-                self.show_manga_toggle = true;
-                self.manga_toggle_show_time = Instant::now();
-            }
-        }
-
-        // Auto-hide after delay
-        if self.manga_toggle_show_time.elapsed().as_secs_f32() > 2.0 {
-            if let Some(pos) = mouse_pos {
-                if !hover_zone.contains(pos) {
-                    self.show_manga_toggle = false;
-                }
-            } else {
-                self.show_manga_toggle = false;
-            }
-        }
-
         if !self.show_manga_toggle {
             return;
         }
 
-        // If video controls are visible (or about to be shown via hover), lift the manga button above them.
-        // This prevents overlap with the seek bar / playback controls.
-        let video_controls_offset = if self.video_player.is_some() {
-            let pointer_near_bottom = mouse_pos
-                .map(|p| p.y > screen_rect.height() - 100.0)
-                .unwrap_or(false);
-            if self.show_video_controls || pointer_near_bottom {
-                56.0 + 8.0
-            } else {
-                0.0
-            }
-        } else {
-            0.0
-        };
+        let screen_rect = ctx.screen_rect();
+        let button_size = egui::Vec2::new(130.0, 32.0);
+        let scrollbar_padding = 35.0; // Padding to avoid scrollbar
+        let margin = 16.0;
+
+        // If video controls are visible, lift the manga button above them.
+        let video_controls_offset = if self.show_video_controls { 56.0 + 8.0 } else { 0.0 };
 
         // Position: bottom-right, above the zoom bar if it's visible, with scrollbar padding
         let y_offset = if self.show_manga_zoom_bar { 48.0 } else { 0.0 };
@@ -2295,7 +2330,7 @@ impl ImageViewer {
 
     /// Draw zoom HUD (bottom-right in fullscreen)
     fn draw_manga_zoom_bar(&mut self, ctx: &egui::Context) {
-        if !self.is_fullscreen {
+        if !self.is_fullscreen || !self.show_manga_zoom_bar {
             self.show_manga_zoom_bar = false;
             // Reset hold states when bar is hidden
             self.manga_zoom_plus_held = false;
@@ -2308,6 +2343,9 @@ impl ImageViewer {
             && !matches!(self.current_media_type, Some(MediaType::Image | MediaType::Video))
         {
             self.show_manga_zoom_bar = false;
+            // Reset hold states when bar is hidden
+            self.manga_zoom_plus_held = false;
+            self.manga_zoom_minus_held = false;
             return;
         }
 
@@ -2315,53 +2353,13 @@ impl ImageViewer {
         let scrollbar_padding = 35.0; // Padding to avoid scrollbar
         let margin = 16.0;
 
-        // Hover zone around bottom-right corner
-        let hover_zone = egui::Rect::from_min_size(
-            egui::pos2(screen_rect.max.x - 280.0, screen_rect.max.y - 120.0),
-            egui::Vec2::new(280.0, 120.0),
-        );
-
-        let mouse_pos = ctx.input(|i| i.pointer.hover_pos());
         let primary_down = ctx.input(|i| i.pointer.button_down(egui::PointerButton::Primary));
-        
-        if let Some(pos) = mouse_pos {
-            if hover_zone.contains(pos) {
-                self.show_manga_zoom_bar = true;
-                self.manga_zoom_bar_show_time = Instant::now();
-            }
-        }
 
         // Don't auto-hide while buttons are being held
         let is_holding_button = self.manga_zoom_plus_held || self.manga_zoom_minus_held;
-        
-        // Auto-hide after delay (unless holding a button)
-        if self.manga_zoom_bar_show_time.elapsed().as_secs_f32() > 2.0 && !is_holding_button {
-            if let Some(pos) = mouse_pos {
-                if !hover_zone.contains(pos) {
-                    self.show_manga_zoom_bar = false;
-                }
-            } else {
-                self.show_manga_zoom_bar = false;
-            }
-        }
 
-        if !self.show_manga_zoom_bar {
-            return;
-        }
-
-        // If video controls are visible (or about to be shown via hover), lift the zoom HUD above them.
-        let video_controls_offset = if self.video_player.is_some() {
-            let pointer_near_bottom = mouse_pos
-                .map(|p| p.y > screen_rect.height() - 100.0)
-                .unwrap_or(false);
-            if self.show_video_controls || pointer_near_bottom {
-                56.0 + 8.0
-            } else {
-                0.0
-            }
-        } else {
-            0.0
-        };
+        // If video controls are visible, lift the zoom HUD above them.
+        let video_controls_offset = if self.show_video_controls { 56.0 + 8.0 } else { 0.0 };
 
         // Calculate zoom change from held buttons BEFORE drawing UI
         let mut zoom_delta_from_hold: f32 = 0.0;
@@ -2464,7 +2462,7 @@ impl ImageViewer {
                                     self.apply_fullscreen_zoom_step(false);
                                 }
                             }
-                            self.manga_zoom_bar_show_time = Instant::now();
+                            self.touch_bottom_overlays();
                         } else if self.manga_zoom_minus_held {
                             self.manga_zoom_minus_held = false;
                         }
@@ -2531,7 +2529,7 @@ impl ImageViewer {
                                     self.apply_fullscreen_zoom_step(true);
                                 }
                             }
-                            self.manga_zoom_bar_show_time = Instant::now();
+                            self.touch_bottom_overlays();
                         } else if self.manga_zoom_plus_held {
                             self.manga_zoom_plus_held = false;
                         }
@@ -3792,39 +3790,14 @@ impl ImageViewer {
             return;
         }
 
+        if !self.show_video_controls {
+            self.mouse_over_video_controls = false;
+            return;
+        }
+
         let screen_rect = ctx.screen_rect();
         let bar_height = 56.0; // Increased height for bottom padding
         let bottom_padding = 8.0; // Gap at the bottom so buttons don't look cramped
-        
-        // Check if mouse is near bottom or over controls
-        let mouse_pos = ctx.input(|i| i.pointer.hover_pos());
-        if let Some(pos) = mouse_pos {
-            // Show controls when mouse is in bottom 100px or over the controls bar
-            if pos.y > screen_rect.height() - 100.0 {
-                self.show_video_controls = true;
-                self.video_controls_show_time = Instant::now();
-            }
-        }
-
-        // Auto-hide controls after delay (unless interacting)
-        let hide_delay = self.config.video_controls_hide_delay;
-        if self.video_controls_show_time.elapsed().as_secs_f32() > hide_delay 
-            && !self.mouse_over_video_controls
-            && !self.is_seeking
-            && !self.is_volume_dragging 
-        {
-            if let Some(pos) = mouse_pos {
-                if pos.y <= screen_rect.height() - 100.0 {
-                    self.show_video_controls = false;
-                }
-            } else {
-                self.show_video_controls = false;
-            }
-        }
-
-        if !self.show_video_controls {
-            return;
-        }
 
         // Draw control bar
         let bar_rect = egui::Rect::from_min_size(
@@ -4712,11 +4685,18 @@ impl eframe::App for ImageViewer {
         // Window title might have changed due to file drops.
         self.apply_pending_window_title(ctx);
 
+        // Keep bottom overlays (video controls + manga toggle + zoom HUD) in sync.
+        // Run this before input so the input handler can properly suppress actions over the video bar.
+        self.update_bottom_overlays_visibility(ctx);
+
         // Handle input
         self.handle_input(ctx);
 
         // Input can switch media, which updates the title.
         self.apply_pending_window_title(ctx);
+
+        // Input can switch media; update bottom overlay state again for this frame's drawing.
+        self.update_bottom_overlays_visibility(ctx);
 
         // CRITICAL: Update textures BEFORE layout checks.
         // For videos, the first frame (and dimensions) become available in update_texture.

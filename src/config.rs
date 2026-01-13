@@ -300,6 +300,8 @@ pub struct Config {
     pub action_bindings: HashMap<Action, Vec<InputBinding>>,
     /// How long the controls bar stays visible (in seconds)
     pub controls_hide_delay: f32,
+    /// How long bottom overlays stay visible (video controls + manga toggle + zoom HUD), in seconds
+    pub bottom_overlay_hide_delay: f32,
     /// Size of the resize border in pixels
     pub resize_border_size: f32,
     /// Background color as RGB (0-255)
@@ -327,8 +329,6 @@ pub struct Config {
     pub video_default_volume: f64,
     /// Whether videos loop by default
     pub video_loop: bool,
-    /// Auto-hide delay for video controls bar (in seconds)
-    pub video_controls_hide_delay: f32,
 
     /// Startup window mode: `floating` (default) or `fullscreen`
     pub startup_window_mode: StartupWindowMode,
@@ -377,6 +377,7 @@ impl Default for Config {
             bindings: HashMap::new(),
             action_bindings: HashMap::new(),
             controls_hide_delay: 0.5,
+            bottom_overlay_hide_delay: 0.5,
             resize_border_size: 6.0,
             background_rgb: [0, 0, 0],
             fullscreen_reset_fit_on_enter: true,
@@ -389,7 +390,6 @@ impl Default for Config {
             video_muted_by_default: true,
             video_default_volume: 0.5,
             video_loop: true,
-            video_controls_hide_delay: 0.5,
             startup_window_mode: StartupWindowMode::Floating,
             // Image quality defaults - use high quality filters
             upscale_filter: ImageFilter::CatmullRom,      // Best balance of quality and speed
@@ -547,6 +547,7 @@ impl Config {
             bindings: HashMap::new(),
             action_bindings: HashMap::new(),
             controls_hide_delay: 0.5,
+            bottom_overlay_hide_delay: 0.5,
             resize_border_size: 6.0,
             background_rgb: [0, 0, 0],
             fullscreen_reset_fit_on_enter: true,
@@ -559,7 +560,6 @@ impl Config {
             video_muted_by_default: true,
             video_default_volume: 0.5,
             video_loop: true,
-            video_controls_hide_delay: 0.5,
             startup_window_mode: StartupWindowMode::Floating,
             // Image quality defaults
             upscale_filter: ImageFilter::CatmullRom,
@@ -622,6 +622,13 @@ impl Config {
                         "controls_hide_delay" => {
                             if let Ok(v) = value.parse::<f32>() {
                                 config.controls_hide_delay = v.max(0.1);
+                            }
+                        }
+                        "bottom_overlay_hide_delay"
+                        | "bottom_controls_hide_delay"
+                        | "bottom_hud_hide_delay" => {
+                            if let Ok(v) = value.parse::<f32>() {
+                                config.bottom_overlay_hide_delay = v.max(0.1);
                             }
                         }
                         "resize_border_size" => {
@@ -720,9 +727,10 @@ impl Config {
                                 config.video_loop = v;
                             }
                         }
+                        // Backwards-compat: legacy per-video hide delay now maps to the unified bottom overlay delay.
                         "controls_hide_delay" | "video_controls_hide_delay" => {
                             if let Ok(v) = value.parse::<f32>() {
-                                config.video_controls_hide_delay = v.max(0.1);
+                                config.bottom_overlay_hide_delay = v.max(0.1);
                             }
                         }
                         _ => {}
@@ -797,6 +805,11 @@ impl Config {
         content.push_str("[Settings]\n");
         content.push_str("; How long the title bar stays visible (in seconds)\n");
         content.push_str(&format!("controls_hide_delay = {}\n", self.controls_hide_delay));
+        content.push_str("; How long bottom overlays stay visible (video controls + manga toggle + zoom HUD) (in seconds)\n");
+        content.push_str(&format!(
+            "bottom_overlay_hide_delay = {}\n\n",
+            self.bottom_overlay_hide_delay
+        ));
         content.push_str("; Size of the window resize border in pixels\n");
         content.push_str(&format!("resize_border_size = {}\n\n", self.resize_border_size));
 
@@ -851,8 +864,7 @@ impl Config {
             "loop = {}\n",
             if self.video_loop { "true" } else { "false" }
         ));
-        content.push_str("; How long the video controls bar stays visible (in seconds)\n");
-        content.push_str(&format!("controls_hide_delay = {}\n\n", self.video_controls_hide_delay));
+        content.push_str("; Video controls auto-hide uses [Settings].bottom_overlay_hide_delay\n\n");
 
         // Write quality section with comprehensive documentation
         content.push_str("[Quality]\n");
