@@ -543,11 +543,17 @@ impl ImageViewer {
             .unwrap_or(false);
 
         // One combined hover zone for the bottom-right overlays (covers both the zoom HUD and manga toggle).
+        // The height must account for the manga toggle button being lifted above video controls (64px)
+        // and the zoom bar (48px), plus the button height (32px) and margin (16px).
+        // Base height is 120px, but expands when overlays push the button higher.
+        let video_controls_lift = if self.show_video_controls { 64.0 } else { 0.0 };
+        let zoom_bar_lift = if self.show_manga_zoom_bar { 48.0 } else { 0.0 };
+        let hover_zone_height = 120.0 + video_controls_lift + zoom_bar_lift;
         let hover_bottom_right = mouse_pos
             .map(|p| {
                 let hover_zone = egui::Rect::from_min_size(
-                    egui::pos2(screen_rect.max.x - 280.0, screen_rect.max.y - 120.0),
-                    egui::Vec2::new(280.0, 120.0),
+                    egui::pos2(screen_rect.max.x - 280.0, screen_rect.max.y - hover_zone_height),
+                    egui::Vec2::new(280.0, hover_zone_height),
                 );
                 hover_zone.contains(p)
             })
@@ -2966,8 +2972,14 @@ impl ImageViewer {
             }
         }
 
-        // Handle drag panning (when not interacting with scrollbar)
-        if !self.manga_scrollbar_dragging && !over_scrollbar {
+        // Handle drag panning (when not interacting with scrollbar, video controls, or seekbars)
+        let panning_allowed = !self.manga_scrollbar_dragging
+            && !over_scrollbar
+            && !over_controls
+            && !self.manga_video_seeking
+            && !self.gif_seeking
+            && !self.manga_video_volume_dragging;
+        if panning_allowed {
             if primary_pressed && !primary_double_clicked {
                 self.is_panning = true;
                 self.last_mouse_pos = pointer_pos;
@@ -5115,6 +5127,8 @@ impl ImageViewer {
                 && !over_video_controls
                 && !self.is_seeking
                 && !self.is_volume_dragging
+                && !self.gif_seeking
+                && !self.manga_video_seeking
                 && !self.mouse_over_window_buttons
             {
                 if let Some(pos) = pointer_pos {
