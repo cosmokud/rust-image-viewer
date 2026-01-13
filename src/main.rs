@@ -163,13 +163,6 @@ impl Default for FullscreenViewState {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-struct MangaScrollAnchor {
-    page_index: usize,
-    offset_within_page_px: f32,
-    viewport_y_px: f32,
-}
-
 /// Application state
 struct ImageViewer {
     /// Current loaded image
@@ -1639,64 +1632,50 @@ impl ImageViewer {
         cumulative_y
     }
     
-    /// Capture the current manga scroll position as a stable anchor.
+    /// Capture the current manga scroll position as a stable "top-of-viewport" anchor.
     ///
     /// This is used to prevent jitter when page heights change as we lazily discover
     /// dimensions for previously-uncached images (common in large folders).
-    ///
-    /// `viewport_y_px` is the Y position inside the viewport to keep stable:
-    /// - `0.0` anchors the top edge (default, best for reading/scrolling)
-    /// - `screen_h * 0.5` anchors the center (matches the zoom HUD behavior)
-    fn manga_capture_scroll_anchor_at(&self, viewport_y_px: f32) -> Option<MangaScrollAnchor> {
+    /// Returns (page_index, offset_within_page_px).
+    fn manga_capture_scroll_anchor(&self) -> Option<(usize, f32)> {
         if !self.manga_mode || self.image_list.is_empty() {
             return None;
         }
 
-        let viewport_y_px = viewport_y_px.clamp(0.0, self.screen_size.y.max(1.0));
-        let scroll = (self.manga_scroll_offset + viewport_y_px).max(0.0);
+        let scroll = self.manga_scroll_offset.max(0.0);
         let mut cumulative_y: f32 = 0.0;
         for idx in 0..self.image_list.len() {
             let img_h = self.manga_get_image_display_height(idx).max(0.0001);
             if cumulative_y + img_h > scroll {
                 let within = (scroll - cumulative_y).clamp(0.0, img_h);
-                return Some(MangaScrollAnchor {
-                    page_index: idx,
-                    offset_within_page_px: within,
-                    viewport_y_px,
-                });
+                return Some((idx, within));
             }
             cumulative_y += img_h;
         }
 
         // If we're beyond the end (can happen briefly during layout changes), anchor to last page.
-        Some(MangaScrollAnchor {
-            page_index: self.image_list.len().saturating_sub(1),
-            offset_within_page_px: 0.0,
-            viewport_y_px,
-        })
+        Some((self.image_list.len().saturating_sub(1), 0.0))
     }
 
     /// Re-apply a previously captured manga scroll anchor.
-    /// Keeps the same page/position at the chosen viewport Y even if page heights changed.
-    fn manga_apply_scroll_anchor(&mut self, anchor: MangaScrollAnchor) {
+    /// Keeps the same page/position at the top of the viewport even if page heights changed.
+    fn manga_apply_scroll_anchor(&mut self, anchor: (usize, f32)) {
         if !self.manga_mode || self.image_list.is_empty() {
             return;
         }
 
-        if anchor.page_index >= self.image_list.len() {
+        let (anchor_idx, anchor_within) = anchor;
+        if anchor_idx >= self.image_list.len() {
             return;
         }
 
         let mut cumulative_y: f32 = 0.0;
-        for idx in 0..anchor.page_index {
+        for idx in 0..anchor_idx {
             cumulative_y += self.manga_get_image_display_height(idx).max(0.0001);
         }
 
-        let anchor_h = self
-            .manga_get_image_display_height(anchor.page_index)
-            .max(0.0001);
-        let within = anchor.offset_within_page_px.clamp(0.0, anchor_h);
-        let new_offset = cumulative_y + within - anchor.viewport_y_px;
+        let anchor_h = self.manga_get_image_display_height(anchor_idx).max(0.0001);
+        let new_offset = cumulative_y + anchor_within.clamp(0.0, anchor_h);
 
         let total_height = self.manga_total_height();
         let max_scroll = (total_height - self.screen_size.y).max(0.0);
@@ -3234,12 +3213,7 @@ impl ImageViewer {
         // Process decoded images from background threads and upload to GPU.
         // This is now non-blocking - images are decoded in parallel on background threads.
         // We always call this to keep uploading decoded images even while scrolling.
-        let anchor_y = if self.manga_zoom_plus_held || self.manga_zoom_minus_held {
-            screen_height * 0.5
-        } else {
-            0.0
-        };
-        let load_anchor = self.manga_capture_scroll_anchor_at(anchor_y);
+        let load_anchor = self.manga_capture_scroll_anchor();
         let dims_updated = self.manga_process_pending_loads(ctx);
         if dims_updated {
             if let Some(anchor) = load_anchor {
