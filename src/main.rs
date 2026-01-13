@@ -396,6 +396,11 @@ struct ImageViewer {
     manga_video_last_seek_sent: Instant,
     /// Whether volume dragging is active in manga video controls
     manga_video_volume_dragging: bool,
+    /// User-chosen mute state for manga mode videos (persists across video changes)
+    /// None means use config default, Some(bool) means user has explicitly set it
+    manga_video_user_muted: Option<bool>,
+    /// User-chosen volume for manga mode videos (persists across video changes)
+    manga_video_user_volume: Option<f64>,
 }
 
 impl Default for ImageViewer {
@@ -515,6 +520,8 @@ impl Default for ImageViewer {
             manga_video_seek_was_playing: false,
             manga_video_last_seek_sent: Instant::now(),
             manga_video_volume_dragging: false,
+            manga_video_user_muted: None,
+            manga_video_user_volume: None,
         }
     }
 }
@@ -1453,6 +1460,22 @@ impl ImageViewer {
         if !self.manga_mode {
             self.manga_mode = true;
 
+            // Close any playing fullscreen video when entering manga mode
+            // This prevents audio from the fullscreen video continuing to play
+            if let Some(player) = self.video_player.take() {
+                drop(player);
+            }
+            if let Some(tex) = self.video_texture.take() {
+                drop(tex);
+            }
+            self.video_texture_dims = None;
+            self.show_video_controls = false;
+
+            // Reset manga video user preferences when entering manga mode
+            // (they'll use config defaults initially)
+            self.manga_video_user_muted = None;
+            self.manga_video_user_volume = None;
+
             // Manga layout cache must be rebuilt for the new mode.
             self.manga_total_height_cache_valid = false;
 
@@ -1619,16 +1642,27 @@ impl ImageViewer {
                     if !player.is_playing() {
                         let _ = player.play();
                     }
+                    // Apply user's persisted mute/volume settings to existing player
+                    if let Some(muted) = self.manga_video_user_muted {
+                        player.set_muted(muted);
+                    }
+                    if let Some(vol) = self.manga_video_user_volume {
+                        player.set_volume(vol);
+                    }
                 } else {
                     // Create new video player for focused item
                     if let Some(path) = self.image_list.get(focused_idx) {
                         // Ensure GStreamer is initialized
                         self.gstreamer_initialized = true;
                         
+                        // Use user's persisted settings, or config defaults if not set
+                        let muted = self.manga_video_user_muted.unwrap_or(self.config.video_muted_by_default);
+                        let volume = self.manga_video_user_volume.unwrap_or(self.config.video_default_volume);
+                        
                         match VideoPlayer::new(
                             path,
-                            self.config.video_muted_by_default,
-                            self.config.video_default_volume,
+                            muted,
+                            volume,
                         ) {
                             Ok(mut player) => {
                                 let _ = player.play();
@@ -2684,6 +2718,32 @@ impl ImageViewer {
         let primary_released = ctx.input(|i| i.pointer.button_released(egui::PointerButton::Primary));
         let primary_double_clicked = ctx.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary));
         let pointer_delta = ctx.input(|i| i.pointer.delta());
+        let secondary_clicked = ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Secondary));
+
+        // Handle right-click to toggle play/pause for videos and GIFs in manga mode
+        // Skip if pointer is over the video controls bar at the bottom
+        let controls_bar_height = 56.0;
+        let over_controls = pointer_pos.map_or(false, |p| p.y > screen_height - controls_bar_height);
+        
+        if secondary_clicked && !over_controls {
+            // Check if we have a focused video
+            if let Some(video_idx) = self.manga_focused_video_index {
+                if let Some(player) = self.manga_video_players.get_mut(&video_idx) {
+                    let _ = player.toggle_play_pause();
+                }
+            } else {
+                // Check if focused item is an animated GIF
+                let focused_idx = self.manga_get_focused_media_index();
+                let is_animated = self.manga_loader
+                    .as_ref()
+                    .and_then(|loader| loader.get_media_type(focused_idx))
+                    .map_or(false, |mt| mt == MangaMediaType::AnimatedImage);
+                
+                if is_animated {
+                    self.gif_paused = !self.gif_paused;
+                }
+            }
+        }
 
         // Calculate scrollbar metrics for interaction
         let total_height = self.manga_total_height();
@@ -3518,11 +3578,14 @@ impl ImageViewer {
             }
         });
 
-        // Handle center right-click for video play/pause toggle (but not over video controls)
-        let should_toggle_video = {
+        // Handle center right-click for video/GIF play/pause toggle (but not over video controls)
+        let has_video = self.video_player.is_some();
+        let has_animated_gif = !self.manga_mode && self.image.as_ref().map_or(false, |img| img.is_animated());
+        
+        let should_toggle_media = {
             let bar_height = 56.0;
             let over_video_controls = self.show_video_controls 
-                && self.video_player.is_some();
+                && (has_video || has_animated_gif);
             
             ctx.input(|input| {
                 if input.pointer.button_clicked(egui::PointerButton::Secondary) {
@@ -3542,9 +3605,12 @@ impl ImageViewer {
             })
         };
 
-        if should_toggle_video {
+        if should_toggle_media {
             if let Some(ref mut player) = self.video_player {
                 let _ = player.toggle_play_pause();
+            } else if has_animated_gif {
+                // Toggle GIF pause state
+                self.gif_paused = !self.gif_paused;
             }
         }
         
@@ -4502,6 +4568,8 @@ impl ImageViewer {
                     
                     if mute_btn.clicked() {
                         player.toggle_mute();
+                        // Persist user's mute choice for all manga videos
+                        self.manga_video_user_muted = Some(player.is_muted());
                     }
 
                     // Volume slider
@@ -4538,8 +4606,12 @@ impl ImageViewer {
                         if let Some(pos) = vol_response.interact_pointer_pos() {
                             let new_vol = ((pos.x - vol_bar.min.x) / vol_bar.width()).clamp(0.0, 1.0);
                             player.set_volume(new_vol as f64);
+                            // Persist user's volume choice for all manga videos
+                            self.manga_video_user_volume = Some(new_vol as f64);
                             if player.is_muted() && new_vol > 0.0 {
                                 player.set_muted(false);
+                                // Also persist unmuted state
+                                self.manga_video_user_muted = Some(false);
                             }
                         }
                     }
