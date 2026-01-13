@@ -29,7 +29,7 @@ use image::imageops::FilterType;
 use parking_lot::RwLock;
 use rayon::prelude::*;
 
-use crate::image_loader::{is_supported_image, LoadedImage};
+use crate::image_loader::{is_supported_image, is_supported_video, LoadedImage, MediaType, get_media_type};
 
 /// Maximum number of decoded images to hold in memory awaiting GPU upload.
 /// This bounds memory usage even if the main thread is slow to consume results.
@@ -47,6 +47,17 @@ const PRELOAD_BEHIND: usize = 6;
 /// Uploading too many textures in one frame can cause stutters.
 const UPLOAD_BATCH_SIZE: usize = 4;
 
+/// Media type for manga items (extended to include videos/animations)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MangaMediaType {
+    /// Static image (JPG, PNG, etc.)
+    StaticImage,
+    /// Animated image (GIF, animated WebP)
+    AnimatedImage,
+    /// Video file (MP4, MKV, WEBM, etc.)
+    Video,
+}
+
 /// A decoded image ready for GPU upload.
 #[derive(Clone)]
 pub struct DecodedImage {
@@ -57,6 +68,8 @@ pub struct DecodedImage {
     /// Original dimensions from file header (may differ from texture dims if downscaled)
     pub original_width: u32,
     pub original_height: u32,
+    /// Media type of this item
+    pub media_type: MangaMediaType,
 }
 
 /// Request sent to the loader thread pool.
@@ -78,8 +91,9 @@ pub struct MangaLoader {
     loading_indices: Arc<RwLock<HashSet<usize>>>,
     /// Set of indices that have been loaded (to avoid re-requesting)
     loaded_indices: Arc<RwLock<HashSet<usize>>>,
-    /// Cached original dimensions (from file headers) for stable layout
-    pub dimension_cache: HashMap<usize, (u32, u32)>,
+    /// Cached original dimensions and media type (from file headers) for stable layout
+    /// Maps index -> (width, height, media_type)
+    pub dimension_cache: HashMap<usize, (u32, u32, MangaMediaType)>,
     /// Flag to signal shutdown to worker threads
     shutdown: Arc<AtomicBool>,
     /// Current scroll direction: positive = scrolling down, negative = scrolling up
@@ -246,41 +260,103 @@ impl MangaLoader {
     }
 
     /// Load a single image on a worker thread.
+    /// For video files, this extracts dimensions but doesn't decode - video playback is handled separately.
     fn load_single_image(req: &LoadRequest) -> Option<DecodedImage> {
-        // Get original dimensions from file header first (fast, no decode)
-        let (original_width, original_height) = image::image_dimensions(&req.path).ok()?;
+        // Determine media type
+        let media_type = get_media_type(&req.path)?;
+        
+        match media_type {
+            MediaType::Video => {
+                // For videos, we need to probe dimensions without full decode
+                // Return a placeholder with dimensions - actual video playback is handled by VideoPlayer
+                // Try to get video dimensions using GStreamer's discovery or fallback to a default
+                let (original_width, original_height) = Self::probe_video_dimensions(&req.path)
+                    .unwrap_or((1920, 1080)); // Fallback to 1080p
+                
+                // Return a minimal decoded image marker for videos
+                // The actual video texture will be created by the VideoPlayer
+                Some(DecodedImage {
+                    index: req.index,
+                    pixels: Vec::new(), // Empty - video textures are handled separately
+                    width: 0,
+                    height: 0,
+                    original_width,
+                    original_height,
+                    media_type: MangaMediaType::Video,
+                })
+            }
+            MediaType::Image => {
+                // Get original dimensions from file header first (fast, no decode)
+                let (original_width, original_height) = image::image_dimensions(&req.path).ok()?;
 
-        // Load and decode the image
-        let downscale_filter = FilterType::Triangle; // Fast filter for manga
-        let gif_filter = FilterType::Triangle;
+                // Load and decode the image
+                let downscale_filter = FilterType::Triangle; // Fast filter for manga
+                let gif_filter = FilterType::Triangle;
 
-        let img = LoadedImage::load_with_max_texture_side(
-            &req.path,
-            Some(req.max_texture_side),
-            downscale_filter,
-            gif_filter,
-        )
-        .ok()?;
+                let img = LoadedImage::load_with_max_texture_side(
+                    &req.path,
+                    Some(req.max_texture_side),
+                    downscale_filter,
+                    gif_filter,
+                )
+                .ok()?;
 
-        let frame = img.current_frame_data();
+                // Determine if this is an animated image
+                let is_animated = img.is_animated();
+                let manga_media_type = if is_animated {
+                    MangaMediaType::AnimatedImage
+                } else {
+                    MangaMediaType::StaticImage
+                };
 
-        // Downscale if needed (should already be done by loader, but safety check)
-        let (width, height, pixels) = downscale_rgba_if_needed(
-            frame.width,
-            frame.height,
-            &frame.pixels,
-            req.max_texture_side,
-            downscale_filter,
-        );
+                let frame = img.current_frame_data();
 
-        Some(DecodedImage {
-            index: req.index,
-            pixels: pixels.into_owned(),
-            width,
-            height,
-            original_width,
-            original_height,
-        })
+                // Downscale if needed (should already be done by loader, but safety check)
+                let (width, height, pixels) = downscale_rgba_if_needed(
+                    frame.width,
+                    frame.height,
+                    &frame.pixels,
+                    req.max_texture_side,
+                    downscale_filter,
+                );
+
+                Some(DecodedImage {
+                    index: req.index,
+                    pixels: pixels.into_owned(),
+                    width,
+                    height,
+                    original_width,
+                    original_height,
+                    media_type: manga_media_type,
+                })
+            }
+        }
+    }
+
+    /// Probe video dimensions without full decode (using file metadata if available)
+    fn probe_video_dimensions(path: &std::path::Path) -> Option<(u32, u32)> {
+        // For now, we use a simple heuristic based on common video resolutions
+        // In a production system, you'd use GStreamer's discoverer or ffprobe
+        // But since GStreamer init is expensive and should happen on main thread,
+        // we return a reasonable default and update dimensions when video is played
+        
+        // Try to infer from filename patterns (e.g., "video_1080p.mp4")
+        let filename = path.file_name()?.to_string_lossy().to_lowercase();
+        
+        if filename.contains("4k") || filename.contains("2160") {
+            Some((3840, 2160))
+        } else if filename.contains("1440") || filename.contains("2k") {
+            Some((2560, 1440))
+        } else if filename.contains("1080") || filename.contains("fhd") {
+            Some((1920, 1080))
+        } else if filename.contains("720") || filename.contains("hd") {
+            Some((1280, 720))
+        } else if filename.contains("480") || filename.contains("sd") {
+            Some((854, 480))
+        } else {
+            // Default to 1080p for unknown videos
+            Some((1920, 1080))
+        }
     }
 
     /// Request loading of images around the visible range.
@@ -327,8 +403,10 @@ impl MangaLoader {
             let loaded = self.loaded_indices.read();
 
             for idx in start_idx..end_idx {
-                // Skip non-image files
-                if !is_supported_image(&image_list[idx]) {
+                // Check if file is a supported media type (image or video)
+                let is_image = is_supported_image(&image_list[idx]);
+                let is_video = is_supported_video(&image_list[idx]);
+                if !is_image && !is_video {
                     continue;
                 }
 
@@ -383,10 +461,10 @@ impl MangaLoader {
         for _ in 0..UPLOAD_BATCH_SIZE {
             match self.result_rx.try_recv() {
                 Ok(decoded) => {
-                    // Cache dimensions for stable layout
+                    // Cache dimensions and media type for stable layout
                     self.dimension_cache.insert(
                         decoded.index,
-                        (decoded.original_width, decoded.original_height),
+                        (decoded.original_width, decoded.original_height, decoded.media_type),
                     );
                     results.push(decoded);
                     self.stats.images_loaded += 1;
@@ -402,32 +480,45 @@ impl MangaLoader {
     /// This returns immediately and caches dimensions in the background.
     /// The first few visible images are prioritized.
     pub fn cache_all_dimensions(&mut self, image_list: &[PathBuf]) {
-        // For fast startup, only cache the first batch of visible images synchronously.
-        // The rest will be cached on-demand or when images are loaded.
+        // For fast startup, only cache the first batch of visible media synchronously.
+        // The rest will be cached on-demand or when media is loaded.
         const INITIAL_CACHE_COUNT: usize = 30;
 
         // Clear existing cache
         self.dimension_cache.clear();
 
         // Cache first batch synchronously for immediate layout
-        let initial_batch: Vec<(usize, Option<(u32, u32)>)> = image_list
+        let initial_batch: Vec<(usize, Option<(u32, u32, MangaMediaType)>)> = image_list
             .par_iter()
             .take(INITIAL_CACHE_COUNT)
             .enumerate()
-            .filter(|(_, path)| is_supported_image(path))
             .map(|(idx, path)| {
-                let dims = image::image_dimensions(path).ok();
-                (idx, dims)
+                let is_video = is_supported_video(path);
+                let is_image = is_supported_image(path);
+                
+                if is_video {
+                    // For videos, probe dimensions
+                    let dims = Self::probe_video_dimensions(path);
+                    (idx, dims.map(|(w, h)| (w, h, MangaMediaType::Video)))
+                } else if is_image {
+                    // For images, get from file header
+                    let dims = image::image_dimensions(path).ok();
+                    // We can't easily determine if an image is animated without loading it
+                    // Default to static, will be updated when actually loaded
+                    (idx, dims.map(|(w, h)| (w, h, MangaMediaType::StaticImage)))
+                } else {
+                    (idx, None)
+                }
             })
             .collect();
 
         for (idx, opt_dims) in initial_batch {
-            if let Some((w, h)) = opt_dims {
-                self.dimension_cache.insert(idx, (w, h));
+            if let Some((w, h, media_type)) = opt_dims {
+                self.dimension_cache.insert(idx, (w, h, media_type));
             }
         }
 
-        // The rest will be cached on-demand when images are loaded
+        // The rest will be cached on-demand when media is loaded
         // or when manga_get_image_display_height is called
     }
 
@@ -448,18 +539,28 @@ impl MangaLoader {
         }
 
         // Cache in parallel
-        let dims: Vec<(usize, Option<(u32, u32)>)> = indices_to_cache
+        let dims: Vec<(usize, Option<(u32, u32, MangaMediaType)>)> = indices_to_cache
             .par_iter()
-            .filter(|&&idx| is_supported_image(&image_list[idx]))
             .map(|&idx| {
-                let dims = image::image_dimensions(&image_list[idx]).ok();
-                (idx, dims)
+                let path = &image_list[idx];
+                let is_video = is_supported_video(path);
+                let is_image = is_supported_image(path);
+                
+                if is_video {
+                    let dims = Self::probe_video_dimensions(path);
+                    (idx, dims.map(|(w, h)| (w, h, MangaMediaType::Video)))
+                } else if is_image {
+                    let dims = image::image_dimensions(path).ok();
+                    (idx, dims.map(|(w, h)| (w, h, MangaMediaType::StaticImage)))
+                } else {
+                    (idx, None)
+                }
             })
             .collect();
 
         for (idx, opt_dims) in dims {
-            if let Some((w, h)) = opt_dims {
-                self.dimension_cache.insert(idx, (w, h));
+            if let Some((w, h, media_type)) = opt_dims {
+                self.dimension_cache.insert(idx, (w, h, media_type));
             }
         }
     }
@@ -526,9 +627,30 @@ impl MangaLoader {
         self.loaded_indices.read().contains(&index)
     }
 
-    /// Get cached dimensions for an index.
+    /// Get cached dimensions for an index (width, height only).
     pub fn get_dimensions(&self, index: usize) -> Option<(u32, u32)> {
+        self.dimension_cache.get(&index).map(|(w, h, _)| (*w, *h))
+    }
+
+    /// Get cached media info for an index (width, height, media_type).
+    #[allow(dead_code)]
+    pub fn get_media_info(&self, index: usize) -> Option<(u32, u32, MangaMediaType)> {
         self.dimension_cache.get(&index).copied()
+    }
+
+    /// Get media type for an index.
+    pub fn get_media_type(&self, index: usize) -> Option<MangaMediaType> {
+        self.dimension_cache.get(&index).map(|(_, _, mt)| *mt)
+    }
+
+    /// Update dimensions for a video (called when actual dimensions are known from playback).
+    pub fn update_video_dimensions(&mut self, index: usize, width: u32, height: u32) {
+        if let Some(entry) = self.dimension_cache.get_mut(&index) {
+            entry.0 = width;
+            entry.1 = height;
+        } else {
+            self.dimension_cache.insert(index, (width, height, MangaMediaType::Video));
+        }
     }
 }
 
@@ -579,8 +701,8 @@ fn downscale_rgba_if_needed<'a>(
 /// LRU-style texture cache for manga mode.
 /// Keeps track of usage order for eviction.
 pub struct MangaTextureCache {
-    /// Maps index to (texture_handle, width, height, last_access_frame)
-    entries: HashMap<usize, (egui::TextureHandle, u32, u32, u64)>,
+    /// Maps index to (texture_handle, width, height, media_type, last_access_frame)
+    entries: HashMap<usize, (egui::TextureHandle, u32, u32, MangaMediaType, u64)>,
     /// Current frame counter for LRU tracking
     frame_counter: u64,
     /// Maximum number of entries to cache
@@ -605,7 +727,7 @@ impl MangaTextureCache {
     #[allow(dead_code)]
     pub fn get(&mut self, index: usize) -> Option<&egui::TextureHandle> {
         if let Some(entry) = self.entries.get_mut(&index) {
-            entry.3 = self.frame_counter;
+            entry.4 = self.frame_counter;
             Some(&entry.0)
         } else {
             None
@@ -616,8 +738,20 @@ impl MangaTextureCache {
     /// Returns (texture_id, width, height) if found.
     pub fn get_texture_info(&mut self, index: usize) -> Option<(egui::TextureId, u32, u32)> {
         if let Some(entry) = self.entries.get_mut(&index) {
-            entry.3 = self.frame_counter;
+            entry.4 = self.frame_counter;
             Some((entry.0.id(), entry.1, entry.2))
+        } else {
+            None
+        }
+    }
+
+    /// Get texture ID, dimensions, and media type from cache.
+    /// Returns (texture_id, width, height, media_type) if found.
+    #[allow(dead_code)]
+    pub fn get_texture_info_with_type(&mut self, index: usize) -> Option<(egui::TextureId, u32, u32, MangaMediaType)> {
+        if let Some(entry) = self.entries.get_mut(&index) {
+            entry.4 = self.frame_counter;
+            Some((entry.0.id(), entry.1, entry.2, entry.3))
         } else {
             None
         }
@@ -627,7 +761,7 @@ impl MangaTextureCache {
     #[allow(dead_code)]
     pub fn get_with_dims(&mut self, index: usize) -> Option<(&egui::TextureHandle, u32, u32)> {
         if let Some(entry) = self.entries.get_mut(&index) {
-            entry.3 = self.frame_counter;
+            entry.4 = self.frame_counter;
             Some((&entry.0, entry.1, entry.2))
         } else {
             None
@@ -641,12 +775,26 @@ impl MangaTextureCache {
 
     /// Insert a texture into the cache.
     /// Returns evicted indices if cache was full.
+    #[allow(dead_code)]
     pub fn insert(
         &mut self,
         index: usize,
         texture: egui::TextureHandle,
         width: u32,
         height: u32,
+    ) -> Vec<usize> {
+        self.insert_with_type(index, texture, width, height, MangaMediaType::StaticImage)
+    }
+
+    /// Insert a texture into the cache with explicit media type.
+    /// Returns evicted indices if cache was full.
+    pub fn insert_with_type(
+        &mut self,
+        index: usize,
+        texture: egui::TextureHandle,
+        width: u32,
+        height: u32,
+        media_type: MangaMediaType,
     ) -> Vec<usize> {
         let mut evicted = Vec::new();
 
@@ -656,7 +804,7 @@ impl MangaTextureCache {
             let oldest = self
                 .entries
                 .iter()
-                .min_by_key(|(_, (_, _, _, frame))| *frame)
+                .min_by_key(|(_, (_, _, _, _, frame))| *frame)
                 .map(|(&idx, _)| idx);
 
             if let Some(oldest_idx) = oldest {
@@ -668,9 +816,27 @@ impl MangaTextureCache {
         }
 
         self.entries
-            .insert(index, (texture, width, height, self.frame_counter));
+            .insert(index, (texture, width, height, media_type, self.frame_counter));
 
         evicted
+    }
+
+    /// Update an existing texture in the cache (for video frame updates).
+    /// Does not evict anything, just replaces the existing entry.
+    #[allow(dead_code)]
+    pub fn update_texture(
+        &mut self,
+        index: usize,
+        texture: egui::TextureHandle,
+        width: u32,
+        height: u32,
+    ) {
+        if let Some(entry) = self.entries.get_mut(&index) {
+            entry.0 = texture;
+            entry.1 = width;
+            entry.2 = height;
+            entry.4 = self.frame_counter;
+        }
     }
 
     /// Remove an entry from the cache.

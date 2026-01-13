@@ -11,8 +11,8 @@ mod video_player;
 mod windows_env;
 
 use config::{Action, Config, InputBinding, StartupWindowMode};
-use image_loader::{get_images_in_directory, get_media_type, LoadedImage, MediaType};
-use manga_loader::{MangaLoader, MangaTextureCache};
+use image_loader::{get_images_in_directory, get_media_type, is_supported_video, LoadedImage, MediaType};
+use manga_loader::{MangaLoader, MangaMediaType, MangaTextureCache};
 use video_player::{format_duration, VideoPlayer};
 
 use eframe::egui;
@@ -359,6 +359,23 @@ struct ImageViewer {
     manga_last_preload_update: std::time::Instant,
     /// Last scroll position for detecting large jumps
     manga_last_scroll_position: f32,
+
+    // ============ MANGA VIDEO PLAYBACK FIELDS ============
+    /// Video players for manga mode, keyed by image list index.
+    /// Only the focused video is actively playing; others are paused or not yet created.
+    manga_video_players: HashMap<usize, VideoPlayer>,
+    /// Video textures for manga mode, keyed by image list index.
+    /// Stores the latest frame texture for each video.
+    manga_video_textures: HashMap<usize, (egui::TextureHandle, u32, u32)>,
+    /// Index of the currently focused (playing) video in manga mode.
+    /// Only one video plays at a time; all others are paused.
+    manga_focused_video_index: Option<usize>,
+    /// Maximum number of video players to keep alive in manga mode.
+    /// Beyond this, the furthest-from-view players are disposed.
+    manga_max_video_players: usize,
+    /// Animated images (GIFs) for manga mode, keyed by image list index.
+    /// These hold the LoadedImage with all frames for animation updates.
+    manga_animated_images: HashMap<usize, LoadedImage>,
 }
 
 impl Default for ImageViewer {
@@ -459,6 +476,13 @@ impl Default for ImageViewer {
             manga_preload_cooldown: 0,
             manga_last_preload_update: Instant::now(),
             manga_last_scroll_position: 0.0,
+
+            // Manga video playback fields
+            manga_video_players: HashMap::new(),
+            manga_video_textures: HashMap::new(),
+            manga_focused_video_index: None,
+            manga_max_video_players: 3, // Keep at most 3 video players alive
+            manga_animated_images: HashMap::new(),
         }
     }
 }
@@ -1374,7 +1398,342 @@ impl ImageViewer {
             loader.clear();
         }
 
+        // Clear manga video players and textures
+        self.manga_video_players.clear();
+        self.manga_video_textures.clear();
+        self.manga_focused_video_index = None;
+        
+        // Clear animated images
+        self.manga_animated_images.clear();
+
         self.manga_total_height_cache_valid = false;
+    }
+
+    /// Determine the focused media index in manga mode.
+    /// The focused item is the one with the most viewport coverage (center-weighted).
+    /// Returns the index of the media item that should be actively playing.
+    fn manga_get_focused_media_index(&self) -> usize {
+        if !self.manga_mode || self.image_list.is_empty() {
+            return self.current_index;
+        }
+
+        let viewport_top = self.manga_scroll_offset;
+        let viewport_bottom = viewport_top + self.screen_size.y;
+        let viewport_center = viewport_top + self.screen_size.y / 2.0;
+
+        let mut best_idx = self.current_index;
+        let mut best_center_distance = f32::MAX;
+
+        let mut cumulative_y: f32 = 0.0;
+        for idx in 0..self.image_list.len() {
+            let img_height = self.manga_get_image_display_height(idx);
+            let item_top = cumulative_y;
+            let item_bottom = cumulative_y + img_height;
+            let item_center = cumulative_y + img_height / 2.0;
+
+            // Skip items completely outside viewport
+            if item_bottom < viewport_top {
+                cumulative_y += img_height;
+                continue;
+            }
+            if item_top > viewport_bottom {
+                break;
+            }
+
+            // Calculate distance from item center to viewport center
+            let center_distance = (item_center - viewport_center).abs();
+            if center_distance < best_center_distance {
+                best_center_distance = center_distance;
+                best_idx = idx;
+            }
+
+            cumulative_y += img_height;
+        }
+
+        best_idx
+    }
+
+    /// Update manga video playback based on current scroll position.
+    /// Ensures only one video plays at a time (the focused one).
+    fn manga_update_video_focus(&mut self) {
+        if !self.manga_mode || self.image_list.is_empty() {
+            return;
+        }
+
+        let focused_idx = self.manga_get_focused_media_index();
+
+        // Check if the focused item is a video
+        let focused_is_video = self.manga_loader
+            .as_ref()
+            .and_then(|loader| loader.get_media_type(focused_idx))
+            .map_or(false, |mt| mt == MangaMediaType::Video);
+
+        // Also check by file extension as a fallback
+        let focused_is_video = focused_is_video || 
+            self.image_list.get(focused_idx)
+                .map_or(false, |p| is_supported_video(p));
+
+        if focused_is_video {
+            // Focus changed to a video
+            if self.manga_focused_video_index != Some(focused_idx) {
+                // Pause all other videos
+                for (&idx, player) in self.manga_video_players.iter_mut() {
+                    if idx != focused_idx && player.is_playing() {
+                        let _ = player.pause();
+                    }
+                }
+
+                // Create or resume the focused video player
+                if let Some(player) = self.manga_video_players.get_mut(&focused_idx) {
+                    if !player.is_playing() {
+                        let _ = player.play();
+                    }
+                } else {
+                    // Create new video player for focused item
+                    if let Some(path) = self.image_list.get(focused_idx) {
+                        // Ensure GStreamer is initialized
+                        self.gstreamer_initialized = true;
+                        
+                        match VideoPlayer::new(
+                            path,
+                            self.config.video_muted_by_default,
+                            self.config.video_default_volume,
+                        ) {
+                            Ok(mut player) => {
+                                let _ = player.play();
+                                
+                                // Update dimensions from video if available
+                                let dims = player.dimensions();
+                                if dims.0 > 0 && dims.1 > 0 {
+                                    if let Some(ref mut loader) = self.manga_loader {
+                                        loader.update_video_dimensions(focused_idx, dims.0, dims.1);
+                                    }
+                                }
+                                
+                                self.manga_video_players.insert(focused_idx, player);
+                            }
+                            Err(e) => {
+                                eprintln!("Failed to create video player for manga index {}: {}", focused_idx, e);
+                            }
+                        }
+                    }
+                }
+
+                self.manga_focused_video_index = Some(focused_idx);
+
+                // Evict video players that are far from view
+                self.manga_evict_distant_video_players(focused_idx);
+            }
+        } else {
+            // Focused item is not a video - pause all videos
+            if self.manga_focused_video_index.is_some() {
+                for player in self.manga_video_players.values_mut() {
+                    if player.is_playing() {
+                        let _ = player.pause();
+                    }
+                }
+                self.manga_focused_video_index = None;
+            }
+        }
+    }
+
+    /// Evict video players that are far from the current view to conserve resources.
+    fn manga_evict_distant_video_players(&mut self, focused_idx: usize) {
+        if self.manga_video_players.len() <= self.manga_max_video_players {
+            return;
+        }
+
+        // Calculate distances and sort by distance from focused
+        let mut indexed_distances: Vec<(usize, usize)> = self.manga_video_players
+            .keys()
+            .map(|&idx| {
+                let dist = if idx > focused_idx { idx - focused_idx } else { focused_idx - idx };
+                (idx, dist)
+            })
+            .collect();
+
+        indexed_distances.sort_by_key(|&(_, dist)| std::cmp::Reverse(dist));
+
+        // Remove the furthest players until we're under the limit
+        while self.manga_video_players.len() > self.manga_max_video_players {
+            if let Some((idx, _)) = indexed_distances.pop() {
+                if Some(idx) != self.manga_focused_video_index {
+                    self.manga_video_players.remove(&idx);
+                    self.manga_video_textures.remove(&idx);
+                }
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Poll video frames for manga mode and update textures.
+    fn manga_update_video_textures(&mut self, ctx: &egui::Context) {
+        if !self.manga_mode {
+            return;
+        }
+
+        // Only update the focused video's texture (to save resources)
+        if let Some(focused_idx) = self.manga_focused_video_index {
+            if let Some(player) = self.manga_video_players.get_mut(&focused_idx) {
+                // Update duration cache
+                player.update_duration();
+
+                // Check for video end and handle looping
+                if player.is_eos() {
+                    if self.config.video_loop {
+                        let _ = player.restart();
+                    }
+                }
+
+                // Get new frame if available
+                if let Some(frame) = player.get_frame() {
+                    // Update dimensions in loader if changed
+                    if frame.width > 0 && frame.height > 0 {
+                        if let Some(ref mut loader) = self.manga_loader {
+                            loader.update_video_dimensions(focused_idx, frame.width, frame.height);
+                        }
+                    }
+
+                    let (w, h, pixels) = downscale_rgba_if_needed(
+                        frame.width,
+                        frame.height,
+                        &frame.pixels,
+                        self.max_texture_side,
+                        self.config.downscale_filter.to_image_filter(),
+                    );
+                    let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                        [w as usize, h as usize],
+                        pixels.as_ref(),
+                    );
+
+                    let texture = ctx.load_texture(
+                        format!("manga_video_{}", focused_idx),
+                        color_image,
+                        self.config.texture_filter_video.to_egui_options(),
+                    );
+
+                    self.manga_video_textures.insert(focused_idx, (texture, w, h));
+                }
+            }
+        }
+    }
+
+    /// Update animated GIF/WebP textures in manga mode.
+    /// Only the focused animated image is updated to save resources.
+    fn manga_update_animated_textures(&mut self, ctx: &egui::Context) -> bool {
+        if !self.manga_mode {
+            return false;
+        }
+
+        let focused_idx = self.manga_get_focused_media_index();
+        let mut needs_repaint = false;
+
+        // Check if the focused item is an animated image
+        let is_animated = self.manga_loader
+            .as_ref()
+            .and_then(|loader| loader.get_media_type(focused_idx))
+            .map_or(false, |mt| mt == MangaMediaType::AnimatedImage);
+
+        if !is_animated {
+            return false;
+        }
+
+        // Load the animated image if not already loaded
+        if !self.manga_animated_images.contains_key(&focused_idx) {
+            if let Some(path) = self.image_list.get(focused_idx) {
+                let downscale_filter = self.config.downscale_filter.to_image_filter();
+                let gif_filter = self.config.gif_resize_filter.to_image_filter();
+                
+                if let Ok(img) = LoadedImage::load_with_max_texture_side(
+                    path,
+                    Some(self.max_texture_side),
+                    downscale_filter,
+                    gif_filter,
+                ) {
+                    if img.is_animated() {
+                        self.manga_animated_images.insert(focused_idx, img);
+                    }
+                }
+            }
+        }
+
+        // Update the animation frame for the focused animated image
+        if let Some(img) = self.manga_animated_images.get_mut(&focused_idx) {
+            let frame_changed = img.update_animation();
+            
+            if frame_changed || !self.manga_texture_cache.contains(focused_idx) {
+                let frame = img.current_frame_data();
+                
+                let (w, h, pixels) = downscale_rgba_if_needed(
+                    frame.width,
+                    frame.height,
+                    &frame.pixels,
+                    self.max_texture_side,
+                    self.config.gif_resize_filter.to_image_filter(),
+                );
+                
+                let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                    [w as usize, h as usize],
+                    pixels.as_ref(),
+                );
+
+                let texture = ctx.load_texture(
+                    format!("manga_anim_{}", focused_idx),
+                    color_image,
+                    self.config.texture_filter_animated.to_egui_options(),
+                );
+
+                // Update the texture cache with the new frame
+                self.manga_texture_cache.insert_with_type(
+                    focused_idx,
+                    texture,
+                    w,
+                    h,
+                    MangaMediaType::AnimatedImage,
+                );
+                
+                needs_repaint = true;
+            }
+
+            // Schedule next repaint for animation
+            if img.is_animated() {
+                let current_delay = Duration::from_millis(img.frames[img.current_frame].delay_ms as u64);
+                let elapsed = img.last_frame_time.elapsed();
+                if elapsed < current_delay {
+                    let remaining = current_delay - elapsed;
+                    ctx.request_repaint_after(remaining);
+                } else {
+                    needs_repaint = true;
+                }
+            }
+        }
+
+        // Evict animated images that are far from the focused index
+        let keep_radius = 3;
+        let keep_start = focused_idx.saturating_sub(keep_radius);
+        let keep_end = focused_idx.saturating_add(keep_radius);
+        
+        let indices_to_remove: Vec<usize> = self.manga_animated_images
+            .keys()
+            .filter(|&&idx| idx < keep_start || idx > keep_end)
+            .copied()
+            .collect();
+        
+        for idx in indices_to_remove {
+            self.manga_animated_images.remove(&idx);
+        }
+
+        needs_repaint
+    }
+
+    /// Check if a manga item at the given index is a video/animated content.
+    #[allow(dead_code)]
+    fn manga_is_video_or_animated(&self, index: usize) -> bool {
+        self.manga_loader
+            .as_ref()
+            .and_then(|loader| loader.get_media_type(index))
+            .map_or(false, |mt| matches!(mt, MangaMediaType::Video | MangaMediaType::AnimatedImage))
     }
 
     /// Update the preload queue based on current scroll position
@@ -1514,8 +1873,18 @@ impl ImageViewer {
 
         // Upload decoded images to GPU as textures
         for decoded in decoded_images {
+            // Skip videos - they are handled separately by VideoPlayer
+            if decoded.media_type == MangaMediaType::Video {
+                continue;
+            }
+
             // Skip if already in texture cache
             if self.manga_texture_cache.contains(decoded.index) {
+                continue;
+            }
+
+            // Skip if no pixel data (video placeholder)
+            if decoded.pixels.is_empty() {
                 continue;
             }
 
@@ -1525,18 +1894,26 @@ impl ImageViewer {
                 &decoded.pixels,
             );
 
+            // Use appropriate texture filter based on media type
+            let texture_options = if decoded.media_type == MangaMediaType::AnimatedImage {
+                self.config.texture_filter_animated.to_egui_options()
+            } else {
+                self.config.texture_filter_static.to_egui_options()
+            };
+
             let texture = ctx.load_texture(
                 format!("manga_{}", decoded.index),
                 color_image,
-                self.config.texture_filter_static.to_egui_options(),
+                texture_options,
             );
 
-            // Insert into cache (this may evict old entries)
-            let evicted = self.manga_texture_cache.insert(
+            // Insert into cache with media type (this may evict old entries)
+            let evicted = self.manga_texture_cache.insert_with_type(
                 decoded.index,
                 texture,
                 decoded.width,
                 decoded.height,
+                decoded.media_type,
             );
 
             // Mark evicted textures as unloaded so they can be re-requested
@@ -2523,11 +2900,25 @@ impl ImageViewer {
         // We always call this to keep uploading decoded images even while scrolling.
         self.manga_process_pending_loads(ctx);
 
+        // Update video focus - ensures only one video plays at a time (the focused one)
+        self.manga_update_video_focus();
+
+        // Update video textures for the focused video
+        self.manga_update_video_textures(ctx);
+
+        // Update animated images (GIF, animated WebP)
+        let has_active_animation = self.manga_update_animated_textures(ctx);
+
         // Check if there are images still loading in the background
         let has_pending_loads = self.manga_loader
             .as_ref()
             .map(|loader| loader.stats.images_pending > 0)
             .unwrap_or(false);
+
+        // Check if there's an active video playing
+        let has_active_video = self.manga_focused_video_index
+            .and_then(|idx| self.manga_video_players.get(&idx))
+            .map_or(false, |p| p.is_playing());
 
         // Draw images in vertical strip
         egui::CentralPanel::default()
@@ -2554,42 +2945,99 @@ impl ImageViewer {
                     let display_width = self.manga_get_image_display_width(idx);
                     let x = (screen_width - display_width) / 2.0 + self.offset.x;
 
-                    // Draw this image if it's in texture cache
-                    if let Some((texture_id, _tex_w, _tex_h)) = self.manga_texture_cache.get_texture_info(idx) {
-                        let image_rect = egui::Rect::from_min_size(
-                            egui::pos2(x, y_offset),
-                            egui::Vec2::new(display_width, display_height),
-                        );
-                        
-                        ui.painter().image(
-                            texture_id,
-                            image_rect,
-                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                            egui::Color32::WHITE,
-                        );
+                    let image_rect = egui::Rect::from_min_size(
+                        egui::pos2(x, y_offset),
+                        egui::Vec2::new(display_width, display_height),
+                    );
+
+                    // Check if this item is a video
+                    let is_video = self.manga_loader
+                        .as_ref()
+                        .and_then(|loader| loader.get_media_type(idx))
+                        .map_or(false, |mt| mt == MangaMediaType::Video);
+
+                    // Also check by file extension as a fallback
+                    let is_video = is_video || 
+                        self.image_list.get(idx)
+                            .map_or(false, |p| is_supported_video(p));
+
+                    if is_video {
+                        // Video item: use video texture if available
+                        if let Some((texture, _tex_w, _tex_h)) = self.manga_video_textures.get(&idx) {
+                            ui.painter().image(
+                                texture.id(),
+                                image_rect,
+                                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                egui::Color32::WHITE,
+                            );
+
+                            // Draw play/pause indicator for video
+                            let is_focused = self.manga_focused_video_index == Some(idx);
+                            let is_playing = self.manga_video_players
+                                .get(&idx)
+                                .map_or(false, |p| p.is_playing());
+
+                            // Draw a subtle play icon overlay for non-focused videos
+                            if !is_focused || !is_playing {
+                                let icon = if is_playing { "▶" } else { "⏸" };
+                                let icon_bg_rect = egui::Rect::from_center_size(
+                                    image_rect.center(),
+                                    egui::Vec2::splat(50.0),
+                                );
+                                ui.painter().rect_filled(
+                                    icon_bg_rect,
+                                    25.0,
+                                    egui::Color32::from_rgba_unmultiplied(0, 0, 0, 128),
+                                );
+                                ui.painter().text(
+                                    image_rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    icon,
+                                    egui::FontId::proportional(28.0),
+                                    egui::Color32::WHITE,
+                                );
+                            }
+                        } else {
+                            // Video not yet loaded - draw placeholder with video icon
+                            ui.painter().rect_filled(
+                                image_rect,
+                                0.0,
+                                egui::Color32::from_gray(25),
+                            );
+                            ui.painter().text(
+                                image_rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                "🎬",
+                                egui::FontId::proportional(32.0),
+                                egui::Color32::from_gray(100),
+                            );
+                        }
                     } else {
-                        // Image not loaded yet - draw a placeholder
-                        let placeholder_rect = egui::Rect::from_min_size(
-                            egui::pos2(x, y_offset),
-                            egui::Vec2::new(display_width, img_height),
-                        );
-                        
-                        ui.painter().rect_filled(
-                            placeholder_rect,
-                            0.0,
-                            egui::Color32::from_gray(30),
-                        );
-                        
-                        // Draw a subtle loading spinner or indicator
-                        // Show loading indicator for pending images
-                        // (Since we're in the else branch, the image isn't cached yet)
-                        ui.painter().text(
-                            placeholder_rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            "⏳",
-                            egui::FontId::proportional(24.0),
-                            egui::Color32::from_gray(80),
-                        );
+                        // Image item: use regular texture cache
+                        if let Some((texture_id, _tex_w, _tex_h)) = self.manga_texture_cache.get_texture_info(idx) {
+                            ui.painter().image(
+                                texture_id,
+                                image_rect,
+                                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                egui::Color32::WHITE,
+                            );
+                        } else {
+                            // Image not loaded yet - draw a placeholder
+                            ui.painter().rect_filled(
+                                image_rect,
+                                0.0,
+                                egui::Color32::from_gray(30),
+                            );
+                            
+                            // Draw a subtle loading spinner or indicator
+                            ui.painter().text(
+                                image_rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                "⏳",
+                                egui::FontId::proportional(24.0),
+                                egui::Color32::from_gray(80),
+                            );
+                        }
                     }
                     
                     y_offset += img_height;
@@ -2691,7 +3139,7 @@ impl ImageViewer {
         // Update preload queue based on current visible position
         self.manga_update_preload_queue();
 
-        animation_active || has_pending_loads
+        animation_active || has_pending_loads || has_active_video || has_active_animation
     }
 
     /// Get the current media display dimensions (works for both images and videos)
