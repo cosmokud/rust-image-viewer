@@ -574,13 +574,33 @@ impl ImageViewer {
             .order(egui::Order::Foreground)
             .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-8.0, y_offset))
             .show(ctx, |ui| {
-                egui::Frame::none()
-                    .fill(egui::Color32::from_rgba_unmultiplied(0, 0, 0, 160))
-                    .rounding(egui::Rounding::same(6.0))
-                    .inner_margin(egui::Margin::same(6.0))
-                    .show(ui, |ui| {
-                        ui.label(egui::RichText::new(text).color(egui::Color32::WHITE));
-                    });
+                // Use a no-wrap galley + explicit rect sizing to prevent wrapping.
+                let font = egui::FontId::proportional(13.0);
+                let text_color = egui::Color32::WHITE;
+                let galley = ui.painter().layout_no_wrap(text.clone(), font.clone(), text_color);
+
+                let padding_x = 10.0;
+                let padding_y = 6.0;
+                let min_w = 170.0; // Keep a stable width even when FPS is short.
+
+                let size = egui::Vec2::new(
+                    (galley.rect.width() + padding_x * 2.0).max(min_w),
+                    galley.rect.height() + padding_y * 2.0,
+                );
+
+                let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+                ui.painter().rect_filled(
+                    rect,
+                    6.0,
+                    egui::Color32::from_rgba_unmultiplied(0, 0, 0, 160),
+                );
+                ui.painter().text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    text,
+                    font,
+                    text_color,
+                );
             });
     }
 

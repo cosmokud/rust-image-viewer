@@ -83,6 +83,9 @@ pub struct DecodedImage {
 /// Request sent to the loader thread pool.
 #[derive(Clone)]
 pub struct LoadRequest {
+    /// Generation for cancellation/coalescing.
+    /// Requests from older generations are ignored by the coordinator.
+    pub generation: usize,
     pub index: usize,
     pub path: PathBuf,
     pub max_texture_side: u32,
@@ -382,7 +385,7 @@ impl MangaLoader {
             batch.sort_by_key(|r| r.priority);
 
             // Get current generation for filtering stale requests
-            let _current_gen = generation.load(Ordering::Acquire);
+            let current_gen = generation.load(Ordering::Acquire);
 
             // Process batch in parallel using Rayon
             let results: Vec<(usize, Option<DecodedImage>)> = batch
@@ -390,6 +393,11 @@ impl MangaLoader {
                 .map(|req| {
                     // Skip if already loaded or if we've been shut down
                     if shutdown.load(Ordering::Relaxed) {
+                        return (req.index, None);
+                    }
+
+                    // Skip stale requests (e.g., after fast scrollbar jumps / cancel).
+                    if req.generation != current_gen {
                         return (req.index, None);
                     }
 
@@ -574,6 +582,7 @@ impl MangaLoader {
 
         // Collect indices that need loading
         let mut requests: Vec<LoadRequest> = Vec::new();
+        let generation = self.current_generation;
 
         {
             let loading = self.loading_indices.read();
@@ -604,6 +613,7 @@ impl MangaLoader {
                 let priority = distance + direction_bonus;
 
                 requests.push(LoadRequest {
+                    generation,
                     index: idx,
                     path: image_list[idx].clone(),
                     max_texture_side,
@@ -612,19 +622,26 @@ impl MangaLoader {
             }
         }
 
-        // Mark indices as loading
-        if !requests.is_empty() {
-            let mut loading = self.loading_indices.write();
-            for req in &requests {
-                loading.insert(req.index);
-            }
-        }
-
-        // Send requests (sorted by priority)
+        // Send requests (sorted by priority). IMPORTANT:
+        // Only mark an index as "loading" after the request is successfully enqueued.
+        // If the channel is full during fast scrollbar drags, dropping a request while still
+        // marking it as loading will permanently wedge that item in the UI.
         requests.sort_by_key(|r| r.priority);
         for req in requests {
-            // Non-blocking send; if channel is full, skip (will retry next frame)
-            let _ = self.request_tx.try_send(req);
+            let idx = req.index;
+            match self.request_tx.try_send(req) {
+                Ok(()) => {
+                    self.loading_indices.write().insert(idx);
+                }
+                Err(TrySendError::Full(_req)) => {
+                    // Backpressure: stop here so already-enqueued high priority work runs first.
+                    // Remaining items will be retried next frame.
+                    break;
+                }
+                Err(TrySendError::Disconnected(_req)) => {
+                    break;
+                }
+            }
         }
 
         self.stats.images_pending = self.loading_indices.read().len();
@@ -688,7 +705,6 @@ impl MangaLoader {
                 }
             })
             .collect();
-
         for (idx, opt_dims) in initial_batch {
             if let Some((w, h, media_type)) = opt_dims {
                 self.dimension_cache.insert(idx, (w, h, media_type));
@@ -764,13 +780,8 @@ impl MangaLoader {
         // Drain result channel
         while self.result_rx.try_recv().is_ok() {}
 
-        // Drain request channel
-        while self.request_tx.try_send(LoadRequest {
-            index: usize::MAX, // Sentinel value to skip
-            path: PathBuf::new(),
-            max_texture_side: 0,
-            priority: i32::MAX,
-        }).is_ok() {}
+        // Note: we can't directly drain the request channel from here because we only own
+        // the Sender; cancellation is handled via generation checks in the coordinator.
 
         // Reset stats
         self.stats = LoaderStats::default();
