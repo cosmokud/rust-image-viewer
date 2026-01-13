@@ -269,6 +269,9 @@ struct ImageViewer {
     video_controls_show_time: Instant,
     /// Whether mouse is over the video controls bar
     mouse_over_video_controls: bool,
+    /// Whether mouse is over the window control buttons (top-right).
+    /// Used to prevent our custom window-drag handler from stealing clicks.
+    mouse_over_window_buttons: bool,
     /// Whether user is dragging the seek bar
     is_seeking: bool,
     /// Seekbar fraction to display while dragging (prevents flicker)
@@ -408,6 +411,7 @@ impl Default for ImageViewer {
             show_video_controls: false,
             video_controls_show_time: Instant::now(),
             mouse_over_video_controls: false,
+            mouse_over_window_buttons: false,
             is_seeking: false,
             seek_preview_fraction: None,
             last_seek_sent_at: Instant::now(),
@@ -3074,6 +3078,9 @@ impl ImageViewer {
     /// Draw the control bar
     fn draw_controls(&mut self, ctx: &egui::Context) {
         let screen_rect = ctx.screen_rect();
+
+        // Default to false each frame; updated below when the bar is visible.
+        self.mouse_over_window_buttons = false;
         
         // Check if mouse is near top
         let mouse_pos = ctx.input(|i| i.pointer.hover_pos());
@@ -3122,12 +3129,21 @@ impl ImageViewer {
 
                     // Reserve a fixed right-side region for window buttons so they never get pushed out.
                     // Left side will collapse its detailed description into "..." when space is tight.
-                    let button_size = egui::Vec2::new(32.0, 24.0);
+                    // IMPORTANT: The window buttons must be clickable at y=0.
+                    // If the button rect is vertically centered inside the bar, the top few pixels
+                    // become a "dead zone" where dragging starts instead of clicking.
+                    // Make the hit-rect as tall as the bar.
+                    let button_size = egui::Vec2::new(32.0, bar_height);
                     let buttons_area_w = 5.0 + (button_size.x * 3.0) + (ui.spacing().item_spacing.x * 2.0) + 6.0;
                     let buttons_rect = egui::Rect::from_min_max(
                         egui::pos2(bar_rect.max.x - buttons_area_w, bar_rect.min.y),
                         bar_rect.max,
                     );
+
+                    // If the pointer is over the window buttons region, suppress window dragging.
+                    if let Some(pos) = mouse_pos {
+                        self.mouse_over_window_buttons = buttons_rect.contains(pos);
+                    }
                     let left_rect = egui::Rect::from_min_max(
                         bar_rect.min,
                         egui::pos2(buttons_rect.min.x, bar_rect.max.y),
@@ -3220,7 +3236,8 @@ impl ImageViewer {
                             }
 
                             fn window_icon_button(ui: &mut egui::Ui, kind: WindowButton) -> egui::Response {
-                                let size = egui::Vec2::new(32.0, 24.0);
+                                // Match the control bar height so the hit area reaches the very top (y=0).
+                                let size = egui::Vec2::new(32.0, 32.0);
                                 let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
 
                                 if ui.is_rect_visible(rect) {
@@ -3234,8 +3251,9 @@ impl ImageViewer {
                                     ui.painter().rect_filled(rect, 4.0, bg);
 
                                     let stroke = egui::Stroke::new(1.6, egui::Color32::WHITE);
+                                    // Keep icons visually consistent while using a taller hit-rect.
                                     let pad_x = 10.0;
-                                    let pad_y = 7.0;
+                                    let pad_y = 11.0;
                                     let icon_rect = egui::Rect::from_min_max(
                                         egui::pos2(rect.min.x + pad_x, rect.min.y + pad_y),
                                         egui::pos2(rect.max.x - pad_x, rect.max.y - pad_y),
@@ -3947,7 +3965,13 @@ impl ImageViewer {
             self.resize_last_size = None;
         } else if !self.is_resizing {
             // Handle panning/window dragging (only if not resizing, not seeking, and not over video controls)
-            if primary_down && hover_resize_direction == ResizeDirection::None && !over_video_controls && !self.is_seeking && !self.is_volume_dragging {
+            if primary_down
+                && hover_resize_direction == ResizeDirection::None
+                && !over_video_controls
+                && !self.is_seeking
+                && !self.is_volume_dragging
+                && !self.mouse_over_window_buttons
+            {
                 if let Some(pos) = pointer_pos {
                     // Check if drag started from title bar area (top 50px) for window dragging
                     let in_title_bar = self.last_mouse_pos.map_or(pos.y < 50.0, |lp| lp.y < 50.0);
