@@ -360,6 +360,69 @@ impl LoadedImage {
         self.frames.len() > 1
     }
 
+    /// Get total number of frames
+    pub fn frame_count(&self) -> usize {
+        self.frames.len()
+    }
+
+    /// Get total duration of the animation in milliseconds
+    pub fn total_duration_ms(&self) -> u32 {
+        self.frames.iter().map(|f| f.delay_ms).sum()
+    }
+
+    /// Get current frame index
+    pub fn current_frame_index(&self) -> usize {
+        self.current_frame
+    }
+
+    /// Set current frame index directly (for seeking)
+    pub fn set_frame(&mut self, frame_index: usize) {
+        if !self.frames.is_empty() {
+            self.current_frame = frame_index.min(self.frames.len() - 1);
+            self.last_frame_time = Instant::now();
+        }
+    }
+
+    /// Seek to a position (0.0 to 1.0) based on time
+    pub fn seek_to_fraction(&mut self, fraction: f64) {
+        if !self.is_animated() {
+            return;
+        }
+        let fraction = fraction.clamp(0.0, 1.0);
+        let total_duration = self.total_duration_ms() as f64;
+        let target_time = total_duration * fraction;
+        
+        let mut cumulative_time: f64 = 0.0;
+        for (idx, frame) in self.frames.iter().enumerate() {
+            cumulative_time += frame.delay_ms as f64;
+            if cumulative_time >= target_time {
+                self.set_frame(idx);
+                return;
+            }
+        }
+        // If we reach here, set to last frame
+        self.set_frame(self.frames.len().saturating_sub(1));
+    }
+
+    /// Get current position as a fraction (0.0 to 1.0) based on frame index
+    pub fn position_fraction(&self) -> f64 {
+        if self.frames.len() <= 1 {
+            return 0.0;
+        }
+        
+        // Calculate position based on cumulative time of frames before current
+        let total_duration = self.total_duration_ms() as f64;
+        if total_duration <= 0.0 {
+            return self.current_frame as f64 / (self.frames.len() - 1) as f64;
+        }
+        
+        let mut cumulative_time: f64 = 0.0;
+        for i in 0..self.current_frame {
+            cumulative_time += self.frames[i].delay_ms as f64;
+        }
+        cumulative_time / total_duration
+    }
+
     /// Update animation frame if needed, returns true if frame changed
     pub fn update_animation(&mut self) -> bool {
         if !self.is_animated() {

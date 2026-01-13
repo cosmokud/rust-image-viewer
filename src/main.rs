@@ -376,6 +376,26 @@ struct ImageViewer {
     /// Animated images (GIFs) for manga mode, keyed by image list index.
     /// These hold the LoadedImage with all frames for animation updates.
     manga_animated_images: HashMap<usize, LoadedImage>,
+
+    // ============ GIF PLAYBACK CONTROL FIELDS ============
+    /// Whether the current GIF animation is paused (for non-manga mode)
+    gif_paused: bool,
+    /// Whether user is seeking the GIF (dragging seek bar)
+    gif_seeking: bool,
+    /// Preview frame index while seeking GIF
+    gif_seek_preview_frame: Option<usize>,
+
+    // ============ MANGA VIDEO CONTROLS FIELDS ============
+    /// Whether seeking is active in manga mode video controls
+    manga_video_seeking: bool,
+    /// Preview fraction for manga video seekbar
+    manga_video_seek_preview_fraction: Option<f32>,
+    /// Whether the manga video was playing when seek started
+    manga_video_seek_was_playing: bool,
+    /// Last seek sent time for manga video (rate limiting)
+    manga_video_last_seek_sent: Instant,
+    /// Whether volume dragging is active in manga video controls
+    manga_video_volume_dragging: bool,
 }
 
 impl Default for ImageViewer {
@@ -483,6 +503,18 @@ impl Default for ImageViewer {
             manga_focused_video_index: None,
             manga_max_video_players: 3, // Keep at most 3 video players alive
             manga_animated_images: HashMap::new(),
+
+            // GIF playback control fields
+            gif_paused: false,
+            gif_seeking: false,
+            gif_seek_preview_frame: None,
+
+            // Manga video controls fields
+            manga_video_seeking: false,
+            manga_video_seek_preview_fraction: None,
+            manga_video_seek_was_playing: false,
+            manga_video_last_seek_sent: Instant::now(),
+            manga_video_volume_dragging: false,
         }
     }
 }
@@ -515,23 +547,42 @@ impl ImageViewer {
             .unwrap_or(false);
 
         let video_open = self.video_player.is_some();
+        
+        // Check if we have an animated GIF in non-manga mode
+        let has_animated_gif = !self.manga_mode && self.image.as_ref().map_or(false, |img| img.is_animated());
+        
+        // Check if manga mode has active video/GIF content that needs controls
+        let manga_has_video_or_anim = self.manga_mode && self.is_fullscreen && {
+            let focused_idx = self.manga_get_focused_media_index();
+            let focused_type = self.manga_loader
+                .as_ref()
+                .and_then(|loader| loader.get_media_type(focused_idx));
+            matches!(focused_type, Some(MangaMediaType::Video | MangaMediaType::AnimatedImage))
+                || self.manga_focused_video_index.is_some()
+        };
+        
+        // Any media that needs controls (video, animated GIF, or manga video/anim)
+        let has_controllable_media = video_open || has_animated_gif || manga_has_video_or_anim;
 
         // Treat these as active interaction states that should keep the overlays alive.
         let interacting_video = self.is_seeking || self.is_volume_dragging;
+        let interacting_manga_video = self.manga_video_seeking || self.manga_video_volume_dragging || self.gif_seeking;
         let interacting_manga_zoom = self.manga_zoom_plus_held || self.manga_zoom_minus_held;
 
         // Track whether the pointer is currently over the bottom video controls region.
         // (Used for input suppression and for keeping overlays alive while hovering.)
         let bar_height = 56.0;
-        self.mouse_over_video_controls = video_open
-            && mouse_pos
-                .map(|p| p.y > screen_rect.height() - bar_height)
-                .unwrap_or(false);
+        let over_controls_bar = mouse_pos
+            .map(|p| p.y > screen_rect.height() - bar_height)
+            .unwrap_or(false);
+        
+        self.mouse_over_video_controls = has_controllable_media && over_controls_bar;
 
-        let should_show = if video_open {
+        let should_show = if has_controllable_media {
             hover_bottom
                 || hover_bottom_right
                 || interacting_video
+                || interacting_manga_video
                 || self.mouse_over_video_controls
                 || interacting_manga_zoom
         } else {
@@ -545,7 +596,7 @@ impl ImageViewer {
         let visible = should_show
             || self.video_controls_show_time.elapsed().as_secs_f32() <= self.config.bottom_overlay_hide_delay;
 
-        self.show_video_controls = video_open && visible;
+        self.show_video_controls = has_controllable_media && visible;
 
         // Manga toggle / zoom HUD are fullscreen-only overlays.
         self.show_manga_toggle = self.is_fullscreen && visible;
@@ -557,6 +608,9 @@ impl ImageViewer {
             // Defensive: ensure we never get stuck in a held state if the HUD hides.
             self.manga_zoom_plus_held = false;
             self.manga_zoom_minus_held = false;
+            self.manga_video_seeking = false;
+            self.manga_video_volume_dragging = false;
+            self.gif_seeking = false;
         }
     }
 
@@ -946,6 +1000,11 @@ impl ImageViewer {
         }
         self.image = None;
         self.show_video_controls = false;
+
+        // Reset GIF playback state for new media
+        self.gif_paused = false;
+        self.gif_seeking = false;
+        self.gif_seek_preview_frame = None;
 
         // Reset view state so we don't carry zoom/offset across media switches.
         // (The correct layout will be applied once we have dimensions.)
@@ -1731,8 +1790,13 @@ impl ImageViewer {
         }
 
         // Update the animation frame for the focused animated image
+        // Only update if not paused
         if let Some(img) = self.manga_animated_images.get_mut(&focused_idx) {
-            let frame_changed = img.update_animation();
+            let frame_changed = if !self.gif_paused {
+                img.update_animation()
+            } else {
+                false
+            };
             
             if frame_changed || !self.manga_texture_cache.contains(focused_idx) {
                 let frame = img.current_frame_data();
@@ -3218,7 +3282,12 @@ impl ImageViewer {
 
         // Handle image texture updates
         if let Some(ref mut img) = self.image {
-            let frame_changed = img.update_animation();
+            // Only update animation if not paused
+            let frame_changed = if !self.gif_paused && img.is_animated() {
+                img.update_animation()
+            } else {
+                false
+            };
             
             if self.texture.is_none() || frame_changed || self.texture_frame != img.current_frame {
                 let frame = img.current_frame_data();
@@ -3257,8 +3326,8 @@ impl ImageViewer {
                 self.texture_frame = img.current_frame;
             }
 
-            // Only request repaint for animated images, and only when needed
-            if img.is_animated() {
+            // Only request repaint for animated images that are not paused
+            if img.is_animated() && !self.gif_paused {
                 // Calculate time until next frame to avoid unnecessary repaints
                 let current_delay = Duration::from_millis(img.frames[img.current_frame].delay_ms as u64);
                 let elapsed = img.last_frame_time.elapsed();
@@ -3785,8 +3854,16 @@ impl ImageViewer {
 
     /// Draw video controls bar at the bottom of the screen
     fn draw_video_controls(&mut self, ctx: &egui::Context) {
-        // Only show for videos
-        if self.video_player.is_none() {
+        // Skip if we're in manga mode (manga has its own controls)
+        if self.manga_mode && self.is_fullscreen {
+            return;
+        }
+
+        // Check if we have a video or animated GIF
+        let has_video = self.video_player.is_some();
+        let has_animated_gif = self.image.as_ref().map_or(false, |img| img.is_animated());
+        
+        if !has_video && !has_animated_gif {
             return;
         }
 
@@ -3830,231 +3907,786 @@ impl ImageViewer {
                 ui.allocate_new_ui(egui::UiBuilder::new().max_rect(inner_rect), |ui| {
                     ui.set_min_height(inner_rect.height());
 
-                    ui.vertical(|ui| {
-                        // === Seek bar (top row) ===
-                        let Some(player) = self.video_player.as_mut() else { return; };
-
-                        let position_fraction = player.position_fraction() as f32;
-                        let duration = player.duration();
-                        let position = player.position();
-                        
-                        // Seek bar
-                        let seek_bar_height = 6.0;
-                        let available_width = ui.available_width();
-                        let (seek_rect, seek_response) = ui.allocate_exact_size(
-                            egui::Vec2::new(available_width, seek_bar_height + 8.0),
-                            egui::Sense::click_and_drag(),
-                        );
-
-                        let bar_inner = egui::Rect::from_min_size(
-                            egui::pos2(seek_rect.min.x, seek_rect.center().y - seek_bar_height / 2.0),
-                            egui::Vec2::new(seek_rect.width(), seek_bar_height),
-                        );
-
-                        // Background bar
-                        ui.painter().rect_filled(
-                            bar_inner,
-                            3.0,
-                            egui::Color32::from_gray(60),
-                        );
-
-                        // Progress bar (freeze display while dragging to avoid flicker)
-                        let display_fraction = if self.is_seeking {
-                            self.seek_preview_fraction.unwrap_or(position_fraction)
-                        } else {
-                            position_fraction
-                        };
-                        let progress_width = bar_inner.width() * display_fraction;
-                        if progress_width > 0.0 {
-                            let progress_rect = egui::Rect::from_min_size(
-                                bar_inner.min,
-                                egui::Vec2::new(progress_width, seek_bar_height),
-                            );
-                            ui.painter().rect_filled(
-                                progress_rect,
-                                3.0,
-                                egui::Color32::from_rgb(66, 133, 244),
-                            );
-                        }
-
-                        // Seek handle
-                        let handle_x = bar_inner.min.x + progress_width;
-                        let handle_center = egui::pos2(handle_x, bar_inner.center().y);
-                        let handle_radius = if seek_response.hovered() || seek_response.dragged() { 8.0 } else { 6.0 };
-                        ui.painter().circle_filled(
-                            handle_center,
-                            handle_radius,
-                            egui::Color32::WHITE,
-                        );
-
-                        // Handle seeking
-                        let primary_down = ctx.input(|i| i.pointer.button_down(egui::PointerButton::Primary));
-                        let primary_released = ctx.input(|i| i.pointer.button_released(egui::PointerButton::Primary));
-
-                        // If the pointer is held down on the seek bar, enter seeking mode immediately.
-                        // This ensures "click-and-hold without moving" pauses playback.
-                        if seek_response.is_pointer_button_down_on() && !self.is_seeking {
-                            self.is_seeking = true;
-                            self.seek_was_playing = player.is_playing();
-                            if self.seek_was_playing {
-                                let _ = player.pause();
-                            }
-                            // Allow an immediate seek on the first frame of interaction.
-                            self.last_seek_sent_at = Instant::now() - Duration::from_millis(1000);
-                        }
-
-                        // While the button is held and we're in seeking mode, update preview and seek.
-                        if self.is_seeking && primary_down {
-                            if let Some(pos) = seek_response
-                                .interact_pointer_pos()
-                                .or_else(|| ctx.input(|i| i.pointer.hover_pos()))
-                            {
-                                let seek_fraction = ((pos.x - bar_inner.min.x) / bar_inner.width()).clamp(0.0, 1.0);
-
-                                let fraction_changed = self
-                                    .seek_preview_fraction
-                                    .map_or(true, |prev| (prev - seek_fraction).abs() > 0.001);
-
-                                self.seek_preview_fraction = Some(seek_fraction);
-
-                                if fraction_changed
-                                    && self.last_seek_sent_at.elapsed() >= Duration::from_millis(50)
-                                {
-                                    let _ = player.seek(seek_fraction as f64);
-                                    self.last_seek_sent_at = Instant::now();
-                                }
-                            }
-                            ctx.request_repaint();
-                        }
-
-                        // Single-click seek (no hold): seek immediately, don't change play state.
-                        if seek_response.clicked() && !self.is_seeking {
-                            if let Some(pos) = seek_response.interact_pointer_pos() {
-                                let seek_fraction = ((pos.x - bar_inner.min.x) / bar_inner.width()).clamp(0.0, 1.0);
-                                let _ = player.seek(seek_fraction as f64);
-                                ctx.request_repaint();
-                            }
-                        }
-
-                        // On mouse release, finalize seek and restore prior play state.
-                        if self.is_seeking && primary_released {
-                            if let Some(final_fraction) = self.seek_preview_fraction.take() {
-                                let _ = player.seek(final_fraction as f64);
-                            }
-                            self.is_seeking = false;
-                            self.last_seek_sent_at = Instant::now();
-
-                            if self.seek_was_playing {
-                                let _ = player.play();
-                            }
-                            self.seek_was_playing = false;
-                        }
-
-                        ui.add_space(4.0);
-
-                        // === Bottom row: controls ===
-                        ui.horizontal(|ui| {
-                            let Some(player) = self.video_player.as_mut() else { return; };
-                            
-                            // Play/Pause button
-                            let is_playing = player.is_playing();
-                            let play_btn = ui.add(egui::Button::new(
-                                if is_playing { "⏸" } else { "▶" }
-                            ).min_size(egui::vec2(32.0, 24.0)));
-                            
-                            if play_btn.clicked() {
-                                let _ = player.toggle_play_pause();
-                            }
-
-                            ui.add_space(8.0);
-
-                            // Time display
-                            let pos_str = position.map(format_duration).unwrap_or_else(|| "0:00".to_string());
-                            let dur_str = duration.map(format_duration).unwrap_or_else(|| "0:00".to_string());
-                            ui.label(
-                                egui::RichText::new(format!("{} / {}", pos_str, dur_str))
-                                    .color(egui::Color32::WHITE)
-                                    .size(12.0)
-                            );
-
-                            // Spacer
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                let Some(player) = self.video_player.as_mut() else { return; };
-                                
-                                // Mute button
-                                let is_muted = player.is_muted();
-                                let mute_btn = ui.add(egui::Button::new(
-                                    if is_muted { "🔇" } else { "🔊" }
-                                ).min_size(egui::vec2(32.0, 24.0)));
-                                
-                                if mute_btn.clicked() {
-                                    player.toggle_mute();
-                                }
-
-                                // Volume slider
-                                let volume = player.volume() as f32;
-                                let vol_slider_width = 80.0;
-                                let vol_slider_height = 4.0;
-                                let (vol_rect, vol_response) = ui.allocate_exact_size(
-                                    egui::Vec2::new(vol_slider_width, 20.0),
-                                    egui::Sense::click_and_drag(),
-                                );
-
-                                let vol_bar = egui::Rect::from_min_size(
-                                    egui::pos2(vol_rect.min.x, vol_rect.center().y - vol_slider_height / 2.0),
-                                    egui::Vec2::new(vol_slider_width, vol_slider_height),
-                                );
-
-                                // Volume background
-                                ui.painter().rect_filled(
-                                    vol_bar,
-                                    2.0,
-                                    egui::Color32::from_gray(60),
-                                );
-
-                                // Volume level
-                                let vol_width = vol_bar.width() * volume;
-                                if vol_width > 0.0 {
-                                    let vol_progress = egui::Rect::from_min_size(
-                                        vol_bar.min,
-                                        egui::Vec2::new(vol_width, vol_slider_height),
-                                    );
-                                    ui.painter().rect_filled(
-                                        vol_progress,
-                                        2.0,
-                                        egui::Color32::WHITE,
-                                    );
-                                }
-
-                                // Volume handle
-                                let vol_handle_x = vol_bar.min.x + vol_width;
-                                let vol_handle_center = egui::pos2(vol_handle_x, vol_bar.center().y);
-                                ui.painter().circle_filled(
-                                    vol_handle_center,
-                                    5.0,
-                                    egui::Color32::WHITE,
-                                );
-
-                                // Handle volume changes
-                                if vol_response.dragged() || vol_response.clicked() {
-                                    self.is_volume_dragging = true;
-                                    if let Some(pos) = vol_response.interact_pointer_pos() {
-                                        let new_vol = ((pos.x - vol_bar.min.x) / vol_bar.width()).clamp(0.0, 1.0);
-                                        player.set_volume(new_vol as f64);
-                                        // Unmute when adjusting volume
-                                        if player.is_muted() && new_vol > 0.0 {
-                                            player.set_muted(false);
-                                        }
-                                    }
-                                }
-                                if vol_response.drag_stopped() {
-                                    self.is_volume_dragging = false;
-                                }
-                            });
-                        });
-                    });
+                    if has_video {
+                        self.draw_video_seekbar_inner(ui, ctx);
+                    } else if has_animated_gif {
+                        self.draw_gif_seekbar_inner(ui, ctx);
+                    }
                 });
             });
+    }
+
+    /// Draw video seekbar and controls (called from draw_video_controls)
+    fn draw_video_seekbar_inner(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.vertical(|ui| {
+            // === Seek bar (top row) ===
+            let Some(player) = self.video_player.as_mut() else { return; };
+
+            let position_fraction = player.position_fraction() as f32;
+            let duration = player.duration();
+            let position = player.position();
+            
+            // Seek bar
+            let seek_bar_height = 6.0;
+            let available_width = ui.available_width();
+            let (seek_rect, seek_response) = ui.allocate_exact_size(
+                egui::Vec2::new(available_width, seek_bar_height + 8.0),
+                egui::Sense::click_and_drag(),
+            );
+
+            let bar_inner = egui::Rect::from_min_size(
+                egui::pos2(seek_rect.min.x, seek_rect.center().y - seek_bar_height / 2.0),
+                egui::Vec2::new(seek_rect.width(), seek_bar_height),
+            );
+
+            // Background bar
+            ui.painter().rect_filled(
+                bar_inner,
+                3.0,
+                egui::Color32::from_gray(60),
+            );
+
+            // Progress bar (freeze display while dragging to avoid flicker)
+            let display_fraction = if self.is_seeking {
+                self.seek_preview_fraction.unwrap_or(position_fraction)
+            } else {
+                position_fraction
+            };
+            let progress_width = bar_inner.width() * display_fraction;
+            if progress_width > 0.0 {
+                let progress_rect = egui::Rect::from_min_size(
+                    bar_inner.min,
+                    egui::Vec2::new(progress_width, seek_bar_height),
+                );
+                ui.painter().rect_filled(
+                    progress_rect,
+                    3.0,
+                    egui::Color32::from_rgb(66, 133, 244),
+                );
+            }
+
+            // Seek handle
+            let handle_x = bar_inner.min.x + progress_width;
+            let handle_center = egui::pos2(handle_x, bar_inner.center().y);
+            let handle_radius = if seek_response.hovered() || seek_response.dragged() { 8.0 } else { 6.0 };
+            ui.painter().circle_filled(
+                handle_center,
+                handle_radius,
+                egui::Color32::WHITE,
+            );
+
+            // Handle seeking
+            let primary_down = ctx.input(|i| i.pointer.button_down(egui::PointerButton::Primary));
+            let primary_released = ctx.input(|i| i.pointer.button_released(egui::PointerButton::Primary));
+
+            // If the pointer is held down on the seek bar, enter seeking mode immediately.
+            // This ensures "click-and-hold without moving" pauses playback.
+            if seek_response.is_pointer_button_down_on() && !self.is_seeking {
+                self.is_seeking = true;
+                self.seek_was_playing = player.is_playing();
+                if self.seek_was_playing {
+                    let _ = player.pause();
+                }
+                // Allow an immediate seek on the first frame of interaction.
+                self.last_seek_sent_at = Instant::now() - Duration::from_millis(1000);
+            }
+
+            // While the button is held and we're in seeking mode, update preview and seek.
+            if self.is_seeking && primary_down {
+                if let Some(pos) = seek_response
+                    .interact_pointer_pos()
+                    .or_else(|| ctx.input(|i| i.pointer.hover_pos()))
+                {
+                    let seek_fraction = ((pos.x - bar_inner.min.x) / bar_inner.width()).clamp(0.0, 1.0);
+
+                    let fraction_changed = self
+                        .seek_preview_fraction
+                        .map_or(true, |prev| (prev - seek_fraction).abs() > 0.001);
+
+                    self.seek_preview_fraction = Some(seek_fraction);
+
+                    if fraction_changed
+                        && self.last_seek_sent_at.elapsed() >= Duration::from_millis(50)
+                    {
+                        let _ = player.seek(seek_fraction as f64);
+                        self.last_seek_sent_at = Instant::now();
+                    }
+                }
+                ctx.request_repaint();
+            }
+
+            // Single-click seek (no hold): seek immediately, don't change play state.
+            if seek_response.clicked() && !self.is_seeking {
+                if let Some(pos) = seek_response.interact_pointer_pos() {
+                    let seek_fraction = ((pos.x - bar_inner.min.x) / bar_inner.width()).clamp(0.0, 1.0);
+                    let _ = player.seek(seek_fraction as f64);
+                    ctx.request_repaint();
+                }
+            }
+
+            // On mouse release, finalize seek and restore prior play state.
+            if self.is_seeking && primary_released {
+                if let Some(final_fraction) = self.seek_preview_fraction.take() {
+                    let _ = player.seek(final_fraction as f64);
+                }
+                self.is_seeking = false;
+                self.last_seek_sent_at = Instant::now();
+
+                if self.seek_was_playing {
+                    let _ = player.play();
+                }
+                self.seek_was_playing = false;
+            }
+
+            ui.add_space(4.0);
+
+            // === Bottom row: controls ===
+            ui.horizontal(|ui| {
+                let Some(player) = self.video_player.as_mut() else { return; };
+                
+                // Play/Pause button
+                let is_playing = player.is_playing();
+                let play_btn = ui.add(egui::Button::new(
+                    if is_playing { "⏸" } else { "▶" }
+                ).min_size(egui::vec2(32.0, 24.0)));
+                
+                if play_btn.clicked() {
+                    let _ = player.toggle_play_pause();
+                }
+
+                ui.add_space(8.0);
+
+                // Time display
+                let pos_str = position.map(format_duration).unwrap_or_else(|| "0:00".to_string());
+                let dur_str = duration.map(format_duration).unwrap_or_else(|| "0:00".to_string());
+                ui.label(
+                    egui::RichText::new(format!("{} / {}", pos_str, dur_str))
+                        .color(egui::Color32::WHITE)
+                        .size(12.0)
+                );
+
+                // Spacer
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let Some(player) = self.video_player.as_mut() else { return; };
+                    
+                    // Mute button
+                    let is_muted = player.is_muted();
+                    let mute_btn = ui.add(egui::Button::new(
+                        if is_muted { "🔇" } else { "🔊" }
+                    ).min_size(egui::vec2(32.0, 24.0)));
+                    
+                    if mute_btn.clicked() {
+                        player.toggle_mute();
+                    }
+
+                    // Volume slider
+                    let volume = player.volume() as f32;
+                    let vol_slider_width = 80.0;
+                    let vol_slider_height = 4.0;
+                    let (vol_rect, vol_response) = ui.allocate_exact_size(
+                        egui::Vec2::new(vol_slider_width, 20.0),
+                        egui::Sense::click_and_drag(),
+                    );
+
+                    let vol_bar = egui::Rect::from_min_size(
+                        egui::pos2(vol_rect.min.x, vol_rect.center().y - vol_slider_height / 2.0),
+                        egui::Vec2::new(vol_slider_width, vol_slider_height),
+                    );
+
+                    // Volume background
+                    ui.painter().rect_filled(
+                        vol_bar,
+                        2.0,
+                        egui::Color32::from_gray(60),
+                    );
+
+                    // Volume level
+                    let vol_width = vol_bar.width() * volume;
+                    if vol_width > 0.0 {
+                        let vol_progress = egui::Rect::from_min_size(
+                            vol_bar.min,
+                            egui::Vec2::new(vol_width, vol_slider_height),
+                        );
+                        ui.painter().rect_filled(
+                            vol_progress,
+                            2.0,
+                            egui::Color32::WHITE,
+                        );
+                    }
+
+                    // Volume handle
+                    let vol_handle_x = vol_bar.min.x + vol_width;
+                    let vol_handle_center = egui::pos2(vol_handle_x, vol_bar.center().y);
+                    ui.painter().circle_filled(
+                        vol_handle_center,
+                        5.0,
+                        egui::Color32::WHITE,
+                    );
+
+                    // Handle volume changes
+                    if vol_response.dragged() || vol_response.clicked() {
+                        self.is_volume_dragging = true;
+                        if let Some(pos) = vol_response.interact_pointer_pos() {
+                            let new_vol = ((pos.x - vol_bar.min.x) / vol_bar.width()).clamp(0.0, 1.0);
+                            player.set_volume(new_vol as f64);
+                            // Unmute when adjusting volume
+                            if player.is_muted() && new_vol > 0.0 {
+                                player.set_muted(false);
+                            }
+                        }
+                    }
+                    if vol_response.drag_stopped() {
+                        self.is_volume_dragging = false;
+                    }
+                });
+            });
+        });
+    }
+
+    /// Draw GIF seekbar and controls for non-manga mode
+    fn draw_gif_seekbar_inner(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let Some(ref img) = self.image else { return; };
+        if !img.is_animated() { return; }
+
+        let frame_count = img.frame_count();
+        let current_frame = img.current_frame_index();
+        let total_duration_ms = img.total_duration_ms();
+        let position_fraction = img.position_fraction() as f32;
+
+        ui.vertical(|ui| {
+            // === Seek bar (top row) ===
+            let seek_bar_height = 6.0;
+            let available_width = ui.available_width();
+            let (seek_rect, seek_response) = ui.allocate_exact_size(
+                egui::Vec2::new(available_width, seek_bar_height + 8.0),
+                egui::Sense::click_and_drag(),
+            );
+
+            let bar_inner = egui::Rect::from_min_size(
+                egui::pos2(seek_rect.min.x, seek_rect.center().y - seek_bar_height / 2.0),
+                egui::Vec2::new(seek_rect.width(), seek_bar_height),
+            );
+
+            // Background bar
+            ui.painter().rect_filled(bar_inner, 3.0, egui::Color32::from_gray(60));
+
+            // Progress bar
+            let display_fraction = if self.gif_seeking {
+                self.gif_seek_preview_frame
+                    .map(|f| f as f32 / (frame_count - 1).max(1) as f32)
+                    .unwrap_or(position_fraction)
+            } else {
+                position_fraction
+            };
+            let progress_width = bar_inner.width() * display_fraction;
+            if progress_width > 0.0 {
+                let progress_rect = egui::Rect::from_min_size(
+                    bar_inner.min,
+                    egui::Vec2::new(progress_width, seek_bar_height),
+                );
+                ui.painter().rect_filled(progress_rect, 3.0, egui::Color32::from_rgb(76, 175, 80)); // Green for GIF
+            }
+
+            // Seek handle
+            let handle_x = bar_inner.min.x + progress_width;
+            let handle_center = egui::pos2(handle_x, bar_inner.center().y);
+            let handle_radius = if seek_response.hovered() || seek_response.dragged() { 8.0 } else { 6.0 };
+            ui.painter().circle_filled(handle_center, handle_radius, egui::Color32::WHITE);
+
+            // Handle seeking
+            let primary_down = ctx.input(|i| i.pointer.button_down(egui::PointerButton::Primary));
+            let primary_released = ctx.input(|i| i.pointer.button_released(egui::PointerButton::Primary));
+
+            if seek_response.is_pointer_button_down_on() && !self.gif_seeking {
+                self.gif_seeking = true;
+            }
+
+            if self.gif_seeking && primary_down {
+                if let Some(pos) = seek_response.interact_pointer_pos().or_else(|| ctx.input(|i| i.pointer.hover_pos())) {
+                    let seek_fraction = ((pos.x - bar_inner.min.x) / bar_inner.width()).clamp(0.0, 1.0);
+                    let target_frame = ((frame_count - 1) as f32 * seek_fraction).round() as usize;
+                    self.gif_seek_preview_frame = Some(target_frame);
+                    
+                    // Update the actual frame
+                    if let Some(ref mut img) = self.image {
+                        img.set_frame(target_frame);
+                        self.texture = None; // Force texture rebuild
+                    }
+                }
+                ctx.request_repaint();
+            }
+
+            if seek_response.clicked() && !self.gif_seeking {
+                if let Some(pos) = seek_response.interact_pointer_pos() {
+                    let seek_fraction = ((pos.x - bar_inner.min.x) / bar_inner.width()).clamp(0.0, 1.0);
+                    let target_frame = ((frame_count - 1) as f32 * seek_fraction).round() as usize;
+                    if let Some(ref mut img) = self.image {
+                        img.set_frame(target_frame);
+                        self.texture = None;
+                    }
+                    ctx.request_repaint();
+                }
+            }
+
+            if self.gif_seeking && primary_released {
+                self.gif_seeking = false;
+                self.gif_seek_preview_frame = None;
+            }
+
+            ui.add_space(4.0);
+
+            // === Bottom row: controls ===
+            ui.horizontal(|ui| {
+                // Play/Pause button
+                let play_btn = ui.add(egui::Button::new(
+                    if self.gif_paused { "▶" } else { "⏸" }
+                ).min_size(egui::vec2(32.0, 24.0)));
+                
+                if play_btn.clicked() {
+                    self.gif_paused = !self.gif_paused;
+                }
+
+                ui.add_space(8.0);
+
+                // Frame display
+                let duration_secs = total_duration_ms as f64 / 1000.0;
+                let current_time = (position_fraction as f64 * duration_secs).max(0.0);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Frame {}/{} ({:.1}s / {:.1}s)",
+                        current_frame + 1,
+                        frame_count,
+                        current_time,
+                        duration_secs
+                    ))
+                        .color(egui::Color32::WHITE)
+                        .size(12.0)
+                );
+
+                // GIF indicator on right
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new("GIF")
+                            .color(egui::Color32::from_rgb(76, 175, 80))
+                            .size(14.0)
+                    );
+                });
+            });
+        });
+    }
+
+    /// Draw video/GIF controls bar for manga reading mode at the bottom of the screen.
+    /// Shows seekbar and audio controls for the currently focused video,
+    /// or a GIF seekbar for animated images.
+    fn draw_manga_video_controls(&mut self, ctx: &egui::Context) {
+        // Only show in manga mode fullscreen
+        if !self.manga_mode || !self.is_fullscreen {
+            return;
+        }
+
+        if !self.show_video_controls {
+            return;
+        }
+
+        let focused_idx = self.manga_focused_video_index;
+        
+        // Determine the type of focused media
+        let focused_media_type = if let Some(idx) = focused_idx {
+            self.manga_loader
+                .as_ref()
+                .and_then(|loader| loader.get_media_type(idx))
+        } else {
+            // Check if current image is an animated GIF
+            let current_idx = self.manga_get_focused_media_index();
+            self.manga_loader
+                .as_ref()
+                .and_then(|loader| loader.get_media_type(current_idx))
+        };
+
+        // Check if we have a video playing or an animated image
+        let has_video = focused_idx.is_some() && matches!(focused_media_type, Some(MangaMediaType::Video));
+        let has_animated = matches!(focused_media_type, Some(MangaMediaType::AnimatedImage));
+        
+        if !has_video && !has_animated {
+            return;
+        }
+
+        let screen_rect = ctx.screen_rect();
+        let bar_height = 56.0;
+        let bottom_padding = 8.0;
+
+        let bar_rect = egui::Rect::from_min_size(
+            egui::pos2(0.0, screen_rect.height() - bar_height),
+            egui::Vec2::new(screen_rect.width(), bar_height),
+        );
+
+        egui::Area::new(egui::Id::new("manga_video_control_bar"))
+            .fixed_pos(bar_rect.min)
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                let painter = ui.painter();
+                
+                // Semi-transparent background
+                painter.rect_filled(
+                    bar_rect,
+                    0.0,
+                    egui::Color32::from_rgba_unmultiplied(20, 20, 20, 230),
+                );
+
+                self.mouse_over_video_controls = ui.rect_contains_pointer(bar_rect);
+
+                let inner_rect = egui::Rect::from_min_max(
+                    egui::pos2(bar_rect.min.x + 8.0, bar_rect.min.y + 6.0),
+                    egui::pos2(bar_rect.max.x - 8.0, bar_rect.max.y - bottom_padding - 4.0),
+                );
+
+                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(inner_rect), |ui| {
+                    ui.set_min_height(inner_rect.height());
+
+                    if has_video {
+                        self.draw_manga_video_seekbar(ui, ctx, focused_idx.unwrap());
+                    } else if has_animated {
+                        let current_idx = self.manga_get_focused_media_index();
+                        self.draw_manga_gif_seekbar(ui, ctx, current_idx);
+                    }
+                });
+            });
+    }
+
+    /// Draw seekbar and controls for a video in manga mode
+    fn draw_manga_video_seekbar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, video_idx: usize) {
+        let Some(player) = self.manga_video_players.get_mut(&video_idx) else {
+            return;
+        };
+
+        let position_fraction = player.position_fraction() as f32;
+        let duration = player.duration();
+        let position = player.position();
+
+        ui.vertical(|ui| {
+            // === Seek bar (top row) ===
+            let seek_bar_height = 6.0;
+            let available_width = ui.available_width();
+            let (seek_rect, seek_response) = ui.allocate_exact_size(
+                egui::Vec2::new(available_width, seek_bar_height + 8.0),
+                egui::Sense::click_and_drag(),
+            );
+
+            let bar_inner = egui::Rect::from_min_size(
+                egui::pos2(seek_rect.min.x, seek_rect.center().y - seek_bar_height / 2.0),
+                egui::Vec2::new(seek_rect.width(), seek_bar_height),
+            );
+
+            // Background bar
+            ui.painter().rect_filled(bar_inner, 3.0, egui::Color32::from_gray(60));
+
+            // Progress bar
+            let display_fraction = if self.manga_video_seeking {
+                self.manga_video_seek_preview_fraction.unwrap_or(position_fraction)
+            } else {
+                position_fraction
+            };
+            let progress_width = bar_inner.width() * display_fraction;
+            if progress_width > 0.0 {
+                let progress_rect = egui::Rect::from_min_size(
+                    bar_inner.min,
+                    egui::Vec2::new(progress_width, seek_bar_height),
+                );
+                ui.painter().rect_filled(progress_rect, 3.0, egui::Color32::from_rgb(66, 133, 244));
+            }
+
+            // Seek handle
+            let handle_x = bar_inner.min.x + progress_width;
+            let handle_center = egui::pos2(handle_x, bar_inner.center().y);
+            let handle_radius = if seek_response.hovered() || seek_response.dragged() { 8.0 } else { 6.0 };
+            ui.painter().circle_filled(handle_center, handle_radius, egui::Color32::WHITE);
+
+            // Handle seeking
+            let primary_down = ctx.input(|i| i.pointer.button_down(egui::PointerButton::Primary));
+            let primary_released = ctx.input(|i| i.pointer.button_released(egui::PointerButton::Primary));
+
+            if seek_response.is_pointer_button_down_on() && !self.manga_video_seeking {
+                if let Some(player) = self.manga_video_players.get(&video_idx) {
+                    self.manga_video_seeking = true;
+                    self.manga_video_seek_was_playing = player.is_playing();
+                    if self.manga_video_seek_was_playing {
+                        if let Some(p) = self.manga_video_players.get_mut(&video_idx) {
+                            let _ = p.pause();
+                        }
+                    }
+                    self.manga_video_last_seek_sent = Instant::now() - Duration::from_millis(1000);
+                }
+            }
+
+            if self.manga_video_seeking && primary_down {
+                if let Some(pos) = seek_response.interact_pointer_pos().or_else(|| ctx.input(|i| i.pointer.hover_pos())) {
+                    let seek_fraction = ((pos.x - bar_inner.min.x) / bar_inner.width()).clamp(0.0, 1.0);
+                    let fraction_changed = self.manga_video_seek_preview_fraction
+                        .map_or(true, |prev| (prev - seek_fraction).abs() > 0.001);
+                    
+                    self.manga_video_seek_preview_fraction = Some(seek_fraction);
+                    
+                    if fraction_changed && self.manga_video_last_seek_sent.elapsed() >= Duration::from_millis(50) {
+                        if let Some(player) = self.manga_video_players.get_mut(&video_idx) {
+                            let _ = player.seek(seek_fraction as f64);
+                        }
+                        self.manga_video_last_seek_sent = Instant::now();
+                    }
+                }
+                ctx.request_repaint();
+            }
+
+            if seek_response.clicked() && !self.manga_video_seeking {
+                if let Some(pos) = seek_response.interact_pointer_pos() {
+                    let seek_fraction = ((pos.x - bar_inner.min.x) / bar_inner.width()).clamp(0.0, 1.0);
+                    if let Some(player) = self.manga_video_players.get_mut(&video_idx) {
+                        let _ = player.seek(seek_fraction as f64);
+                    }
+                    ctx.request_repaint();
+                }
+            }
+
+            if self.manga_video_seeking && primary_released {
+                if let Some(final_fraction) = self.manga_video_seek_preview_fraction.take() {
+                    if let Some(player) = self.manga_video_players.get_mut(&video_idx) {
+                        let _ = player.seek(final_fraction as f64);
+                    }
+                }
+                self.manga_video_seeking = false;
+                self.manga_video_last_seek_sent = Instant::now();
+                
+                if self.manga_video_seek_was_playing {
+                    if let Some(player) = self.manga_video_players.get_mut(&video_idx) {
+                        let _ = player.play();
+                    }
+                }
+                self.manga_video_seek_was_playing = false;
+            }
+
+            ui.add_space(4.0);
+
+            // === Bottom row: controls ===
+            ui.horizontal(|ui| {
+                let Some(player) = self.manga_video_players.get_mut(&video_idx) else { return; };
+                
+                // Play/Pause button
+                let is_playing = player.is_playing();
+                let play_btn = ui.add(egui::Button::new(
+                    if is_playing { "⏸" } else { "▶" }
+                ).min_size(egui::vec2(32.0, 24.0)));
+                
+                if play_btn.clicked() {
+                    let _ = player.toggle_play_pause();
+                }
+
+                ui.add_space(8.0);
+
+                // Time display
+                let pos_str = position.map(format_duration).unwrap_or_else(|| "0:00".to_string());
+                let dur_str = duration.map(format_duration).unwrap_or_else(|| "0:00".to_string());
+                ui.label(
+                    egui::RichText::new(format!("{} / {}", pos_str, dur_str))
+                        .color(egui::Color32::WHITE)
+                        .size(12.0)
+                );
+
+                // Right side: volume controls
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let Some(player) = self.manga_video_players.get_mut(&video_idx) else { return; };
+                    
+                    // Mute button
+                    let is_muted = player.is_muted();
+                    let mute_btn = ui.add(egui::Button::new(
+                        if is_muted { "🔇" } else { "🔊" }
+                    ).min_size(egui::vec2(32.0, 24.0)));
+                    
+                    if mute_btn.clicked() {
+                        player.toggle_mute();
+                    }
+
+                    // Volume slider
+                    let volume = player.volume() as f32;
+                    let vol_slider_width = 80.0;
+                    let vol_slider_height = 4.0;
+                    let (vol_rect, vol_response) = ui.allocate_exact_size(
+                        egui::Vec2::new(vol_slider_width, 20.0),
+                        egui::Sense::click_and_drag(),
+                    );
+
+                    let vol_bar = egui::Rect::from_min_size(
+                        egui::pos2(vol_rect.min.x, vol_rect.center().y - vol_slider_height / 2.0),
+                        egui::Vec2::new(vol_slider_width, vol_slider_height),
+                    );
+
+                    ui.painter().rect_filled(vol_bar, 2.0, egui::Color32::from_gray(60));
+
+                    let vol_width = vol_bar.width() * volume;
+                    if vol_width > 0.0 {
+                        let vol_progress = egui::Rect::from_min_size(
+                            vol_bar.min,
+                            egui::Vec2::new(vol_width, vol_slider_height),
+                        );
+                        ui.painter().rect_filled(vol_progress, 2.0, egui::Color32::WHITE);
+                    }
+
+                    let vol_handle_x = vol_bar.min.x + vol_width;
+                    let vol_handle_center = egui::pos2(vol_handle_x, vol_bar.center().y);
+                    ui.painter().circle_filled(vol_handle_center, 5.0, egui::Color32::WHITE);
+
+                    if vol_response.dragged() || vol_response.clicked() {
+                        self.manga_video_volume_dragging = true;
+                        if let Some(pos) = vol_response.interact_pointer_pos() {
+                            let new_vol = ((pos.x - vol_bar.min.x) / vol_bar.width()).clamp(0.0, 1.0);
+                            player.set_volume(new_vol as f64);
+                            if player.is_muted() && new_vol > 0.0 {
+                                player.set_muted(false);
+                            }
+                        }
+                    }
+                    if vol_response.drag_stopped() {
+                        self.manga_video_volume_dragging = false;
+                    }
+                });
+            });
+        });
+    }
+
+    /// Draw seekbar for animated GIFs in manga mode
+    fn draw_manga_gif_seekbar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, gif_idx: usize) {
+        let Some(img) = self.manga_animated_images.get(&gif_idx) else {
+            return;
+        };
+
+        if !img.is_animated() {
+            return;
+        }
+
+        let frame_count = img.frame_count();
+        let current_frame = img.current_frame_index();
+        let total_duration_ms = img.total_duration_ms();
+        let position_fraction = img.position_fraction() as f32;
+
+        ui.vertical(|ui| {
+            // === Seek bar (top row) ===
+            let seek_bar_height = 6.0;
+            let available_width = ui.available_width();
+            let (seek_rect, seek_response) = ui.allocate_exact_size(
+                egui::Vec2::new(available_width, seek_bar_height + 8.0),
+                egui::Sense::click_and_drag(),
+            );
+
+            let bar_inner = egui::Rect::from_min_size(
+                egui::pos2(seek_rect.min.x, seek_rect.center().y - seek_bar_height / 2.0),
+                egui::Vec2::new(seek_rect.width(), seek_bar_height),
+            );
+
+            // Background bar
+            ui.painter().rect_filled(bar_inner, 3.0, egui::Color32::from_gray(60));
+
+            // Progress bar
+            let display_fraction = if self.gif_seeking {
+                self.gif_seek_preview_frame
+                    .map(|f| f as f32 / (frame_count - 1).max(1) as f32)
+                    .unwrap_or(position_fraction)
+            } else {
+                position_fraction
+            };
+            let progress_width = bar_inner.width() * display_fraction;
+            if progress_width > 0.0 {
+                let progress_rect = egui::Rect::from_min_size(
+                    bar_inner.min,
+                    egui::Vec2::new(progress_width, seek_bar_height),
+                );
+                ui.painter().rect_filled(progress_rect, 3.0, egui::Color32::from_rgb(76, 175, 80)); // Green for GIF
+            }
+
+            // Seek handle
+            let handle_x = bar_inner.min.x + progress_width;
+            let handle_center = egui::pos2(handle_x, bar_inner.center().y);
+            let handle_radius = if seek_response.hovered() || seek_response.dragged() { 8.0 } else { 6.0 };
+            ui.painter().circle_filled(handle_center, handle_radius, egui::Color32::WHITE);
+
+            // Handle seeking
+            let primary_down = ctx.input(|i| i.pointer.button_down(egui::PointerButton::Primary));
+            let primary_released = ctx.input(|i| i.pointer.button_released(egui::PointerButton::Primary));
+
+            if seek_response.is_pointer_button_down_on() && !self.gif_seeking {
+                self.gif_seeking = true;
+            }
+
+            if self.gif_seeking && primary_down {
+                if let Some(pos) = seek_response.interact_pointer_pos().or_else(|| ctx.input(|i| i.pointer.hover_pos())) {
+                    let seek_fraction = ((pos.x - bar_inner.min.x) / bar_inner.width()).clamp(0.0, 1.0);
+                    let target_frame = ((frame_count - 1) as f32 * seek_fraction).round() as usize;
+                    self.gif_seek_preview_frame = Some(target_frame);
+                    
+                    // Update the actual frame
+                    if let Some(img) = self.manga_animated_images.get_mut(&gif_idx) {
+                        img.set_frame(target_frame);
+                    }
+                    // Force texture update
+                    self.manga_texture_cache.remove(gif_idx);
+                }
+                ctx.request_repaint();
+            }
+
+            if seek_response.clicked() && !self.gif_seeking {
+                if let Some(pos) = seek_response.interact_pointer_pos() {
+                    let seek_fraction = ((pos.x - bar_inner.min.x) / bar_inner.width()).clamp(0.0, 1.0);
+                    let target_frame = ((frame_count - 1) as f32 * seek_fraction).round() as usize;
+                    if let Some(img) = self.manga_animated_images.get_mut(&gif_idx) {
+                        img.set_frame(target_frame);
+                    }
+                    self.manga_texture_cache.remove(gif_idx);
+                    ctx.request_repaint();
+                }
+            }
+
+            if self.gif_seeking && primary_released {
+                self.gif_seeking = false;
+                self.gif_seek_preview_frame = None;
+            }
+
+            ui.add_space(4.0);
+
+            // === Bottom row: controls ===
+            ui.horizontal(|ui| {
+                // Play/Pause button
+                let play_btn = ui.add(egui::Button::new(
+                    if self.gif_paused { "▶" } else { "⏸" }
+                ).min_size(egui::vec2(32.0, 24.0)));
+                
+                if play_btn.clicked() {
+                    self.gif_paused = !self.gif_paused;
+                }
+
+                ui.add_space(8.0);
+
+                // Frame display
+                let duration_secs = total_duration_ms as f64 / 1000.0;
+                let current_time = (position_fraction as f64 * duration_secs).max(0.0);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Frame {}/{} ({:.1}s / {:.1}s)",
+                        current_frame + 1,
+                        frame_count,
+                        current_time,
+                        duration_secs
+                    ))
+                        .color(egui::Color32::WHITE)
+                        .size(12.0)
+                );
+
+                // GIF indicator on right
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new("GIF")
+                            .color(egui::Color32::from_rgb(76, 175, 80))
+                            .size(14.0)
+                    );
+                });
+            });
+        });
     }
 
     /// Determine resize direction based on mouse position
@@ -4970,6 +5602,8 @@ impl eframe::App for ImageViewer {
         // Draw video controls overlay (bottom bar for video playback controls)
         if !skip_drawing {
             self.draw_video_controls(ctx);
+            // Also draw manga mode video controls if in manga mode
+            self.draw_manga_video_controls(ctx);
         }
 
         // Draw manga mode toggle button and zoom HUD (bottom-right in fullscreen)
