@@ -302,6 +302,8 @@ pub struct Config {
     pub controls_hide_delay: f32,
     /// How long bottom overlays stay visible (video controls + manga toggle + zoom HUD), in seconds
     pub bottom_overlay_hide_delay: f32,
+    /// Show an FPS overlay in the top-right corner (debug)
+    pub show_fps: bool,
     /// Size of the resize border in pixels
     pub resize_border_size: f32,
     /// Background color as RGB (0-255)
@@ -378,6 +380,7 @@ impl Default for Config {
             action_bindings: HashMap::new(),
             controls_hide_delay: 0.5,
             bottom_overlay_hide_delay: 0.5,
+            show_fps: false,
             resize_border_size: 6.0,
             background_rgb: [0, 0, 0],
             fullscreen_reset_fit_on_enter: true,
@@ -548,6 +551,7 @@ impl Config {
             action_bindings: HashMap::new(),
             controls_hide_delay: 0.5,
             bottom_overlay_hide_delay: 0.5,
+            show_fps: false,
             resize_border_size: 6.0,
             background_rgb: [0, 0, 0],
             fullscreen_reset_fit_on_enter: true,
@@ -634,6 +638,11 @@ impl Config {
                         "resize_border_size" => {
                             if let Ok(v) = value.parse::<f32>() {
                                 config.resize_border_size = v.clamp(2.0, 20.0);
+                            }
+                        }
+                        "show_fps" | "show_fps_overlay" | "fps_overlay" => {
+                            if let Some(v) = parse_bool(value) {
+                                config.show_fps = v;
                             }
                         }
                         "background_rgb" => {
@@ -809,6 +818,12 @@ impl Config {
         content.push_str(&format!(
             "bottom_overlay_hide_delay = {}\n\n",
             self.bottom_overlay_hide_delay
+        ));
+
+        content.push_str("; Show FPS overlay in the top-right corner (debug) (true/false)\n");
+        content.push_str(&format!(
+            "show_fps = {}\n\n",
+            if self.show_fps { "true" } else { "false" }
         ));
         content.push_str("; Size of the window resize border in pixels\n");
         content.push_str(&format!("resize_border_size = {}\n\n", self.resize_border_size));

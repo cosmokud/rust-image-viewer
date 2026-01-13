@@ -302,6 +302,14 @@ struct ImageViewer {
     /// Idle repaint interval counter - skip unnecessary repaints when truly idle
     idle_frame_skip_counter: u32,
 
+    // ============ FPS DEBUG OVERLAY ============
+    /// Last time we recorded a frame (for FPS calculation)
+    fps_last_frame_at: Instant,
+    /// Exponentially-smoothed FPS value
+    fps_smoothed: f32,
+    /// Most recent frame delta time in seconds
+    fps_last_dt_s: f32,
+
     /// Whether we've installed extra Windows fonts for CJK filename rendering.
     /// These font files can be quite large, so we install them lazily only when needed.
     windows_cjk_fonts_installed: bool,
@@ -471,6 +479,10 @@ impl Default for ImageViewer {
             is_idle: true,
             idle_frame_skip_counter: 0,
 
+            fps_last_frame_at: Instant::now(),
+            fps_smoothed: 0.0,
+            fps_last_dt_s: 0.0,
+
             windows_cjk_fonts_installed: false,
             gstreamer_initialized: false,
 
@@ -527,6 +539,51 @@ impl Default for ImageViewer {
 }
 
 impl ImageViewer {
+    fn update_fps_stats(&mut self) {
+        let now = Instant::now();
+        let dt = now.saturating_duration_since(self.fps_last_frame_at);
+        self.fps_last_frame_at = now;
+
+        let dt_s = dt.as_secs_f32();
+        // Guard against huge dt (e.g., debugging breakpoints / system sleep)
+        if dt_s.is_finite() && dt_s > 0.0 && dt_s < 1.0 {
+            self.fps_last_dt_s = dt_s;
+            let fps = 1.0 / dt_s;
+            if self.fps_smoothed <= 0.0 {
+                self.fps_smoothed = fps;
+            } else {
+                // Simple EMA smoothing to avoid jitter
+                let alpha = 0.10;
+                self.fps_smoothed = (1.0 - alpha) * self.fps_smoothed + alpha * fps;
+            }
+        }
+    }
+
+    fn draw_fps_overlay(&self, ctx: &egui::Context) {
+        if !self.config.show_fps {
+            return;
+        }
+
+        let fps = if self.fps_smoothed.is_finite() { self.fps_smoothed } else { 0.0 };
+        let ms = (self.fps_last_dt_s * 1000.0).max(0.0);
+        let text = format!("{fps:.0} FPS  ({ms:.1} ms)");
+
+        // Keep it below the title bar buttons when the bar is visible.
+        let y_offset = if self.show_controls { 40.0 } else { 8.0 };
+        egui::Area::new(egui::Id::new("fps_overlay"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-8.0, y_offset))
+            .show(ctx, |ui| {
+                egui::Frame::none()
+                    .fill(egui::Color32::from_rgba_unmultiplied(0, 0, 0, 160))
+                    .rounding(egui::Rounding::same(6.0))
+                    .inner_margin(egui::Margin::same(6.0))
+                    .show(ui, |ui| {
+                        ui.label(egui::RichText::new(text).color(egui::Color32::WHITE));
+                    });
+            });
+    }
+
     fn touch_bottom_overlays(&mut self) {
         let now = Instant::now();
         self.video_controls_show_time = now;
@@ -5481,6 +5538,9 @@ impl eframe::App for ImageViewer {
             return;
         }
 
+        // Update FPS stats for the debug overlay (and for general diagnostics).
+        self.update_fps_stats();
+
         // Lazily install large CJK fonts only when we actually have a filename that needs them.
         self.ensure_windows_cjk_fonts_if_needed(ctx);
 
@@ -5803,6 +5863,11 @@ impl eframe::App for ImageViewer {
             self.draw_manga_toggle_button(ctx);
         }
 
+        // Draw FPS overlay (top-right) when enabled.
+        if !skip_drawing {
+            self.draw_fps_overlay(ctx);
+        }
+
         // Startup UX: keep the window hidden until initial layout is applied.
         // This avoids the brief flash of the default empty window on Explorer-open.
         self.show_window_if_ready(ctx);
@@ -5863,6 +5928,9 @@ impl eframe::App for ImageViewer {
                 ctx.request_repaint_after(Duration::from_millis(16));
             }
             // Paused video or no video: no repaint needed
+        } else if self.config.show_fps {
+            // Debug FPS overlay: keep the UI ticking so the number stays live.
+            ctx.request_repaint_after(Duration::from_millis(16));
         }
         // When fully idle (no video, no animation), no repaint is requested
         // egui handles user input events automatically
