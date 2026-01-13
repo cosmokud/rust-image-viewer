@@ -23,6 +23,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender, TrySendError};
 use image::imageops::FilterType;
@@ -46,6 +47,13 @@ const PRELOAD_BEHIND: usize = 6;
 /// Batch size for GPU texture uploads per frame.
 /// Uploading too many textures in one frame can cause stutters.
 const UPLOAD_BATCH_SIZE: usize = 4;
+
+/// Maximum number of dimension probe items to include in a single request.
+/// Larger values increase background throughput but can increase burstiness.
+const DIM_REQUEST_BATCH_SIZE: usize = 64;
+
+/// Maximum number of dimension results bundled into a single result message.
+const DIM_RESULT_CHUNK_SIZE: usize = 64;
 
 /// Media type for manga items (extended to include videos/animations)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -81,6 +89,17 @@ pub struct LoadRequest {
     pub priority: i32, // Lower = higher priority
 }
 
+#[derive(Clone)]
+struct DimRequest {
+    generation: usize,
+    items: Vec<(usize, PathBuf)>,
+}
+
+struct DimResult {
+    generation: usize,
+    items: Vec<(usize, u32, u32, MangaMediaType)>,
+}
+
 /// High-performance manga image loader with parallel decoding.
 pub struct MangaLoader {
     /// Channel to send load requests to worker threads
@@ -94,6 +113,13 @@ pub struct MangaLoader {
     /// Cached original dimensions and media type (from file headers) for stable layout
     /// Maps index -> (width, height, media_type)
     pub dimension_cache: HashMap<usize, (u32, u32, MangaMediaType)>,
+
+    /// Async dimension-probe request channel (main thread -> worker).
+    dim_request_tx: Sender<DimRequest>,
+    /// Async dimension-probe result channel (worker -> main thread).
+    dim_result_rx: Receiver<DimResult>,
+    /// Indices currently queued for async dimension probing (main thread only).
+    dim_pending: HashSet<usize>,
     /// Flag to signal shutdown to worker threads
     shutdown: Arc<AtomicBool>,
     /// Current scroll direction: positive = scrolling down, negative = scrolling up
@@ -122,6 +148,9 @@ impl MangaLoader {
         let (request_tx, request_rx) = crossbeam_channel::bounded::<LoadRequest>(256);
         let (result_tx, result_rx) = crossbeam_channel::bounded::<DecodedImage>(MAX_PENDING_UPLOADS);
 
+        let (dim_request_tx, dim_request_rx) = crossbeam_channel::bounded::<DimRequest>(64);
+        let (dim_result_tx, dim_result_rx) = crossbeam_channel::bounded::<DimResult>(64);
+
         let loading_indices = Arc::new(RwLock::new(HashSet::new()));
         let loaded_indices = Arc::new(RwLock::new(HashSet::new()));
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -147,12 +176,75 @@ impl MangaLoader {
             })
             .expect("Failed to spawn manga loader coordinator thread");
 
+        // Spawn a lightweight dimension probe worker.
+        // This keeps file header reads (image::image_dimensions) off the UI thread.
+        let shutdown_clone = Arc::clone(&shutdown);
+        std::thread::Builder::new()
+            .name("manga-dimension-worker".into())
+            .spawn(move || {
+                while !shutdown_clone.load(Ordering::Acquire) {
+                    let req = match dim_request_rx.recv_timeout(Duration::from_millis(50)) {
+                        Ok(r) => r,
+                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                    };
+
+                    let mut out: Vec<(usize, u32, u32, MangaMediaType)> = Vec::with_capacity(req.items.len());
+                    for (idx, path) in req.items {
+                        let is_video = is_supported_video(&path);
+                        let is_image = is_supported_image(&path);
+
+                        let dims = if is_video {
+                            Self::probe_video_dimensions(&path)
+                        } else if is_image {
+                            image::image_dimensions(&path).ok()
+                        } else {
+                            None
+                        };
+
+                        if let Some((w, h)) = dims {
+                            let mt = if is_video { MangaMediaType::Video } else { MangaMediaType::StaticImage };
+                            out.push((idx, w, h, mt));
+                        }
+
+                        if out.len() >= DIM_RESULT_CHUNK_SIZE {
+                            let chunk = std::mem::take(&mut out);
+                            if dim_result_tx
+                                .send(DimResult {
+                                    generation: req.generation,
+                                    items: chunk,
+                                })
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    }
+
+                    if !out.is_empty() {
+                        if dim_result_tx
+                            .send(DimResult {
+                                generation: req.generation,
+                                items: out,
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                }
+            })
+            .expect("Failed to spawn manga dimension worker thread");
+
         Self {
             request_tx,
             result_rx,
             loading_indices,
             loaded_indices,
             dimension_cache: HashMap::new(),
+            dim_request_tx,
+            dim_result_rx,
+            dim_pending: HashSet::new(),
             shutdown,
             scroll_direction: 1,
             last_visible_index: 0,
@@ -160,6 +252,91 @@ impl MangaLoader {
             current_generation: 0,
             stats: LoaderStats::default(),
         }
+    }
+
+    /// Queue async dimension probes for a range of indices.
+    ///
+    /// This does not block the UI thread. Results are applied when `poll_dimension_results` is called.
+    pub fn request_dimensions_range(&mut self, image_list: &[PathBuf], start: usize, end: usize) {
+        let end = end.min(image_list.len());
+        if start >= end {
+            return;
+        }
+
+        // Build a bounded batch of missing indices.
+        let mut items: Vec<(usize, PathBuf)> = Vec::new();
+        for idx in start..end {
+            if items.len() >= DIM_REQUEST_BATCH_SIZE {
+                break;
+            }
+
+            if self.dimension_cache.contains_key(&idx) || self.dim_pending.contains(&idx) {
+                continue;
+            }
+
+            let path = match image_list.get(idx) {
+                Some(p) => p.clone(),
+                None => continue,
+            };
+
+            // Only request for supported media.
+            if !is_supported_image(&path) && !is_supported_video(&path) {
+                continue;
+            }
+
+            items.push((idx, path));
+        }
+
+        if items.is_empty() {
+            return;
+        }
+
+        let indices: Vec<usize> = items.iter().map(|(i, _)| *i).collect();
+        match self.dim_request_tx.try_send(DimRequest {
+            generation: self.current_generation,
+            items,
+        }) {
+            Ok(()) => {
+                for idx in indices {
+                    self.dim_pending.insert(idx);
+                }
+            }
+            Err(TrySendError::Full(_)) => {
+                // Backpressure: try again next frame/update.
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                // Worker gone; ignore.
+            }
+        }
+    }
+
+    /// Drain async dimension results and apply them to `dimension_cache`.
+    /// Returns indices whose dimensions were updated.
+    pub fn poll_dimension_results(&mut self, max_messages: usize) -> Vec<usize> {
+        let mut updated: Vec<usize> = Vec::new();
+
+        for _ in 0..max_messages {
+            let res = match self.dim_result_rx.try_recv() {
+                Ok(r) => r,
+                Err(_) => break,
+            };
+
+            // Drop stale results (e.g., after cancel/clear).
+            if res.generation != self.current_generation {
+                for (idx, _w, _h, _mt) in res.items {
+                    self.dim_pending.remove(&idx);
+                }
+                continue;
+            }
+
+            for (idx, w, h, mt) in res.items {
+                self.dimension_cache.insert(idx, (w, h, mt));
+                self.dim_pending.remove(&idx);
+                updated.push(idx);
+            }
+        }
+
+        updated
     }
 
     /// Coordinator loop that processes requests in parallel using Rayon.
@@ -578,6 +755,12 @@ impl MangaLoader {
         // Clear dimension cache
         self.dimension_cache.clear();
 
+        // Clear any queued dimension probes
+        self.dim_pending.clear();
+
+        // Drain dimension result channel
+        while self.dim_result_rx.try_recv().is_ok() {}
+
         // Drain result channel
         while self.result_rx.try_recv().is_ok() {}
 
@@ -611,6 +794,10 @@ impl MangaLoader {
 
         // Drain result channel to clear stale decoded images
         while self.result_rx.try_recv().is_ok() {}
+
+        // Clear any queued dimension probes and drain stale results
+        self.dim_pending.clear();
+        while self.dim_result_rx.try_recv().is_ok() {}
 
         self.stats.images_pending = 0;
     }

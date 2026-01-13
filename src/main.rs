@@ -1988,9 +1988,6 @@ impl ImageViewer {
         let prev_scroll_pos = self.manga_last_scroll_position;
         self.manga_last_preload_update = Instant::now();
 
-        // Capture a stable scroll anchor before we potentially change layout by caching dimensions.
-        let anchor = self.manga_capture_scroll_anchor();
-
         // Determine which image is currently visible based on the current (possibly estimated) layout.
         let mut current_visible_index = self.current_index;
         let mut cumulative_y: f32 = 0.0;
@@ -2012,24 +2009,7 @@ impl ImageViewer {
         let cache_start = current_visible_index.saturating_sub(behind);
         let cache_end = (current_visible_index + ahead).min(self.image_list.len());
         if let Some(ref mut loader) = self.manga_loader {
-            loader.cache_dimensions_range(&self.image_list, cache_start, cache_end);
-        }
-
-        // Re-apply anchor after dimension caching to prevent the viewport from jumping.
-        if let Some(anchor) = anchor {
-            self.manga_apply_scroll_anchor(anchor);
-        }
-
-        // Recompute visible index using the updated layout after anchoring.
-        let mut current_visible_index = self.current_index;
-        let mut cumulative_y: f32 = 0.0;
-        for idx in 0..self.image_list.len() {
-            let img_height = self.manga_get_image_display_height(idx);
-            if cumulative_y + img_height > self.manga_scroll_offset {
-                current_visible_index = idx;
-                break;
-            }
-            cumulative_y += img_height;
+            loader.request_dimensions_range(&self.image_list, cache_start, cache_end);
         }
 
         // Now that layout is stabilized, update the last scroll position.
@@ -2045,9 +2025,11 @@ impl ImageViewer {
             );
         }
 
-        // Evict textures that are far from the visible range to control VRAM usage
-        let keep_behind = 8;
-        let keep_ahead = 16;
+        // Evict textures that are far from the visible range to control VRAM usage.
+        // Important for perceived smoothness: when scrolling UP we are moving toward smaller
+        // indices, so we want to keep a larger window *behind* the visible index to avoid
+        // constant re-decode/re-upload churn.
+        let (keep_behind, keep_ahead) = if scrolling_up { (16, 8) } else { (8, 16) };
         let keep_start = current_visible_index.saturating_sub(keep_behind);
         let keep_end = (current_visible_index + keep_ahead + 1).min(self.image_list.len());
 
@@ -2128,7 +2110,12 @@ impl ImageViewer {
 
         // Poll for decoded images from the background threads
         let decoded_images = loader.poll_decoded_images();
-        let dims_updated = !decoded_images.is_empty();
+
+        // Also poll async dimension probe results (header reads), applied incrementally.
+        // Limiting messages per frame prevents layout updates from causing bursts of work.
+        let dim_updates = loader.poll_dimension_results(4);
+
+        let dims_updated = !decoded_images.is_empty() || !dim_updates.is_empty();
 
         // Upload decoded images to GPU as textures
         for decoded in decoded_images {
@@ -2322,7 +2309,7 @@ impl ImageViewer {
         if let Some(ref mut loader) = self.manga_loader {
             loader.cancel_pending_loads();
             // Pre-cache dimensions for the target area
-            loader.cache_dimensions_range(&self.image_list, 0, 30);
+            loader.request_dimensions_range(&self.image_list, 0, 30);
         }
         // Use INSTANT scroll for large jumps to avoid cache churn
         self.manga_scroll_offset = 0.0;
@@ -2349,7 +2336,7 @@ impl ImageViewer {
             loader.cancel_pending_loads();
             // Pre-cache dimensions for the target area
             let start = last_index.saturating_sub(30);
-            loader.cache_dimensions_range(&self.image_list, start, self.image_list.len());
+            loader.request_dimensions_range(&self.image_list, start, self.image_list.len());
         }
         self.current_index = last_index;
         // Invalidate height cache since we're at a new position
