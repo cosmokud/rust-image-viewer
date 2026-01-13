@@ -2209,12 +2209,6 @@ impl ImageViewer {
             return;
         }
 
-        // Don't show manga toggle for videos
-        if self.video_player.is_some() {
-            self.show_manga_toggle = false;
-            return;
-        }
-
         let screen_rect = ctx.screen_rect();
         let button_size = egui::Vec2::new(130.0, 32.0);
         let scrollbar_padding = 35.0; // Padding to avoid scrollbar
@@ -2249,11 +2243,26 @@ impl ImageViewer {
             return;
         }
 
+        // If video controls are visible (or about to be shown via hover), lift the manga button above them.
+        // This prevents overlap with the seek bar / playback controls.
+        let video_controls_offset = if self.video_player.is_some() {
+            let pointer_near_bottom = mouse_pos
+                .map(|p| p.y > screen_rect.height() - 100.0)
+                .unwrap_or(false);
+            if self.show_video_controls || pointer_near_bottom {
+                56.0 + 8.0
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+
         // Position: bottom-right, above the zoom bar if it's visible, with scrollbar padding
         let y_offset = if self.show_manga_zoom_bar { 48.0 } else { 0.0 };
         let button_pos = egui::pos2(
             screen_rect.max.x - button_size.x - margin - scrollbar_padding,
-            screen_rect.max.y - button_size.y - margin - y_offset,
+            screen_rect.max.y - button_size.y - margin - y_offset - video_controls_offset,
         );
 
         egui::Area::new(egui::Id::new("manga_toggle_button"))
@@ -2294,14 +2303,10 @@ impl ImageViewer {
             return;
         }
 
-        // Don't show zoom HUD for videos
-        if self.video_player.is_some() {
-            self.show_manga_zoom_bar = false;
-            return;
-        }
-
-        // Only show for images (including manga mode)
-        if !self.manga_mode && !matches!(self.current_media_type, Some(MediaType::Image)) {
+        // Only show for viewable media (including manga mode)
+        if !self.manga_mode
+            && !matches!(self.current_media_type, Some(MediaType::Image | MediaType::Video))
+        {
             self.show_manga_zoom_bar = false;
             return;
         }
@@ -2343,6 +2348,20 @@ impl ImageViewer {
         if !self.show_manga_zoom_bar {
             return;
         }
+
+        // If video controls are visible (or about to be shown via hover), lift the zoom HUD above them.
+        let video_controls_offset = if self.video_player.is_some() {
+            let pointer_near_bottom = mouse_pos
+                .map(|p| p.y > screen_rect.height() - 100.0)
+                .unwrap_or(false);
+            if self.show_video_controls || pointer_near_bottom {
+                56.0 + 8.0
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
 
         // Calculate zoom change from held buttons BEFORE drawing UI
         let mut zoom_delta_from_hold: f32 = 0.0;
@@ -2407,7 +2426,7 @@ impl ImageViewer {
         let bar_size = egui::Vec2::new(220.0, 32.0);
         let bar_pos = egui::pos2(
             screen_rect.max.x - bar_size.x - margin - scrollbar_padding,
-            screen_rect.max.y - bar_size.y - margin,
+            screen_rect.max.y - bar_size.y - margin - video_controls_offset,
         );
 
         egui::Area::new(egui::Id::new("manga_zoom_bar"))
