@@ -611,7 +611,7 @@ impl ImageViewer {
         self.manga_zoom_bar_show_time = now;
     }
 
-    fn update_bottom_overlays_visibility(&mut self, ctx: &egui::Context) {
+    fn update_bottom_overlays_visibility(&mut self, ctx: &egui::Context) -> bool {
         let screen_rect = ctx.screen_rect();
         let mouse_pos = ctx.input(|i| i.pointer.hover_pos());
 
@@ -704,6 +704,11 @@ impl ImageViewer {
             self.manga_video_volume_dragging = false;
             self.gif_seeking = false;
         }
+
+        // Return whether the overlays are currently being kept alive by active hover/interaction.
+        // Callers can use this to schedule a single repaint for auto-hide without running
+        // a continuous frame loop.
+        should_show
     }
 
     fn max_zoom_factor(&self) -> f32 {
@@ -2005,8 +2010,8 @@ impl ImageViewer {
                 needs_repaint = true;
             }
 
-            // Schedule next repaint for animation
-            if img.is_animated() {
+            // Schedule next repaint for animation (only when playing).
+            if img.is_animated() && !self.gif_paused {
                 let current_delay = Duration::from_millis(img.frames[img.current_frame].delay_ms as u64);
                 let elapsed = img.last_frame_time.elapsed();
                 if elapsed < current_delay {
@@ -3226,10 +3231,16 @@ impl ImageViewer {
         // Update animated images (GIF, animated WebP)
         let has_active_animation = self.manga_update_animated_textures(ctx);
 
-        // Check if there are images still loading in the background
-        let has_pending_loads = self.manga_loader
+        // Check if there is any pending work in the background loader.
+        // Use the authoritative counters instead of the cached stats (which can lag).
+        let has_pending_loads = self
+            .manga_loader
             .as_ref()
-            .map(|loader| loader.stats.images_pending > 0)
+            .map(|loader| {
+                loader.pending_load_count() > 0
+                    || loader.pending_decoded_count() > 0
+                    || loader.pending_dimension_results_count() > 0
+            })
             .unwrap_or(false);
 
         // Check if there's an active video playing
@@ -3453,8 +3464,11 @@ impl ImageViewer {
                 }
             });
 
-        // Update preload queue based on current visible position
-        self.manga_update_preload_queue();
+        // Retry preload updates only while there is still background work in flight.
+        // When fully idle, avoid periodic O(n) scans that keep CPU usage elevated.
+        if has_pending_loads {
+            self.manga_update_preload_queue();
+        }
 
         animation_active || has_pending_loads || has_active_video || has_active_animation
     }
@@ -5590,7 +5604,7 @@ impl eframe::App for ImageViewer {
 
         // Keep bottom overlays (video controls + manga toggle + zoom HUD) in sync.
         // Run this before input so the input handler can properly suppress actions over the video bar.
-        self.update_bottom_overlays_visibility(ctx);
+        let _ = self.update_bottom_overlays_visibility(ctx);
 
         // Handle input
         self.handle_input(ctx);
@@ -5599,7 +5613,7 @@ impl eframe::App for ImageViewer {
         self.apply_pending_window_title(ctx);
 
         // Input can switch media; update bottom overlay state again for this frame's drawing.
-        self.update_bottom_overlays_visibility(ctx);
+        let bottom_overlays_should_show = self.update_bottom_overlays_visibility(ctx);
 
         // CRITICAL: Update textures BEFORE layout checks.
         // For videos, the first frame (and dimensions) become available in update_texture.
@@ -5893,10 +5907,16 @@ impl eframe::App for ImageViewer {
         self.show_window_if_ready(ctx);
 
         // Determine if we need continuous repainting
-        let manga_loading_active = self.manga_mode && self.manga_loader
-            .as_ref()
-            .map(|loader| loader.stats.images_pending > 0)
-            .unwrap_or(false);
+        let manga_loading_active = self.manga_mode
+            && self
+                .manga_loader
+                .as_ref()
+                .map(|loader| {
+                    loader.pending_load_count() > 0
+                        || loader.pending_decoded_count() > 0
+                        || loader.pending_dimension_results_count() > 0
+                })
+                .unwrap_or(false);
         let manga_scroll_active = self.manga_mode && (
             (self.manga_scroll_target - self.manga_scroll_offset).abs() > 0.1
             || self.manga_scroll_velocity.abs() > 0.5
@@ -5936,24 +5956,62 @@ impl eframe::App for ImageViewer {
         // - Active animations: immediate repaint
         // - Waiting for video dims: poll at 60fps
         // - Idle with video playing: poll at video framerate
-        // - Fully idle: no repaint (egui handles user input events automatically)
+        // - Time-based auto-hide UI: repaint once at its deadline
+        // - Fully idle: push repaint far into the future (event loop will still wake on input)
         if any_animation_active {
             ctx.request_repaint();
         } else if self.pending_media_layout {
-            // Still waiting for video dimensions - check again soon but not immediately
             ctx.request_repaint_after(Duration::from_millis(16));
         } else if let Some(ref player) = self.video_player {
             if player.is_playing() {
-                // Video is playing - poll for new frames at ~60fps
                 ctx.request_repaint_after(Duration::from_millis(16));
+            } else {
+                // Paused video: no repaint needed.
+                // Any input will trigger an event-driven repaint.
             }
-            // Paused video or no video: no repaint needed
         } else if self.config.show_fps {
-            // Debug FPS overlay: keep the UI ticking so the number stays live.
             ctx.request_repaint_after(Duration::from_millis(16));
+        } else {
+            let mut next_repaint: Option<Duration> = None;
+
+            let mut schedule_min = |d: Duration| {
+                next_repaint = Some(match next_repaint {
+                    Some(cur) => cur.min(d),
+                    None => d,
+                });
+            };
+
+            // Top control bar auto-hide: schedule a single repaint right when it should disappear.
+            if self.show_controls {
+                let hovering_top = ctx
+                    .input(|i| i.pointer.hover_pos().map_or(false, |p| p.y < 50.0));
+                if !hovering_top {
+                    let delay = Duration::from_secs_f32(self.config.controls_hide_delay.max(0.0));
+                    let elapsed = self.controls_show_time.elapsed();
+                    let remaining = if elapsed < delay { delay - elapsed } else { Duration::ZERO };
+                    schedule_min(remaining);
+                }
+            }
+
+            // Bottom overlays auto-hide: only schedule when they are being shown by the timer
+            // (i.e. not actively kept alive by hover/drag interaction).
+            if (self.show_video_controls || self.show_manga_toggle || self.show_manga_zoom_bar)
+                && !bottom_overlays_should_show
+            {
+                let delay = Duration::from_secs_f32(self.config.bottom_overlay_hide_delay.max(0.0));
+                let elapsed = self.video_controls_show_time.elapsed();
+                let remaining = if elapsed < delay { delay - elapsed } else { Duration::ZERO };
+                schedule_min(remaining);
+            }
+
+            if let Some(d) = next_repaint {
+                ctx.request_repaint_after(d);
+            } else {
+                // Force truly idle behavior even if the integration's default would otherwise
+                // keep repainting. Input events still wake the event loop immediately.
+                ctx.request_repaint_after(Duration::from_secs(60 * 60 * 24));
+            }
         }
-        // When fully idle (no video, no animation), no repaint is requested
-        // egui handles user input events automatically
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {

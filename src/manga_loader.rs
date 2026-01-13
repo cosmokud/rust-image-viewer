@@ -257,6 +257,24 @@ impl MangaLoader {
         }
     }
 
+    /// Number of indices currently being decoded on background workers.
+    ///
+    /// This is the authoritative source for "are we still loading?".
+    /// `stats.images_pending` is updated opportunistically and may lag.
+    pub fn pending_load_count(&self) -> usize {
+        self.loading_indices.read().len()
+    }
+
+    /// Number of decoded-image messages waiting to be consumed by the UI thread.
+    pub fn pending_decoded_count(&self) -> usize {
+        self.result_rx.len()
+    }
+
+    /// Number of async dimension-probe results waiting to be consumed by the UI thread.
+    pub fn pending_dimension_results_count(&self) -> usize {
+        self.dim_result_rx.len()
+    }
+
     /// Queue async dimension probes for a range of indices.
     ///
     /// This does not block the UI thread. Results are applied when `poll_dimension_results` is called.
