@@ -2382,24 +2382,19 @@ impl ImageViewer {
                 self.manga_update_preload_queue();
                 animation_active = true;
             } else if scroll_delta != 0.0 {
-                // Regular scroll = Pan vertically.
-                // Use direct offset update (like drag) for smoother, more responsive scrolling.
-                // This avoids the spring animation delay that causes perceived stuttering.
+                // Regular scroll = pan vertically.
+                // Mimic the arrow-keys behavior: adjust the target and let the spring animation
+                // (manga_tick_scroll_animation) produce smooth motion.
                 let scroll_speed = self.config.manga_wheel_scroll_speed;
                 let delta = -scroll_delta * scroll_speed;
-                
+
                 let total_height = self.manga_total_height();
                 let visible_height = self.screen_size.y;
                 let max_scroll = (total_height - visible_height).max(0.0);
-                
-                // Update both offset and target together for immediate response
-                self.manga_scroll_offset = (self.manga_scroll_offset + delta).clamp(0.0, max_scroll);
-                self.manga_scroll_target = self.manga_scroll_offset;
-                self.manga_scroll_velocity = 0.0; // Stop any ongoing animation
 
-                // Wheel scrolling is instant; update page indicator immediately.
-                self.manga_update_current_index();
+                self.manga_scroll_target = (self.manga_scroll_target + delta).clamp(0.0, max_scroll);
                 self.manga_update_preload_queue();
+                animation_active = true;
             }
         }
 
