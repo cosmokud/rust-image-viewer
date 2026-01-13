@@ -3141,8 +3141,12 @@ impl ImageViewer {
                     );
 
                     // If the pointer is over the window buttons region, suppress window dragging.
+                    // Be inclusive on the max edge so the very last pixel doesn't fall through.
                     if let Some(pos) = mouse_pos {
-                        self.mouse_over_window_buttons = buttons_rect.contains(pos);
+                        self.mouse_over_window_buttons = pos.x >= buttons_rect.min.x
+                            && pos.x <= buttons_rect.max.x
+                            && pos.y >= buttons_rect.min.y
+                            && pos.y <= buttons_rect.max.y;
                     }
                     let left_rect = egui::Rect::from_min_max(
                         bar_rect.min,
@@ -3225,8 +3229,6 @@ impl ImageViewer {
                     // Right side: window buttons
                     ui.allocate_new_ui(egui::UiBuilder::new().max_rect(buttons_rect), |ui| {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.add_space(5.0);
-
                             #[derive(Clone, Copy)]
                             enum WindowButton {
                                 Minimize,
@@ -3311,6 +3313,10 @@ impl ImageViewer {
                             if window_icon_button(ui, WindowButton::Minimize).clicked() {
                                 self.request_minimize = true;
                             }
+
+                            // Add padding on the LEFT of the button cluster (not on the right),
+                            // so the close button remains clickable at the very top-right pixel.
+                            ui.add_space(5.0);
                         });
                     });
                 });
