@@ -542,23 +542,6 @@ impl ImageViewer {
             .map(|p| p.y > screen_rect.height() - 100.0)
             .unwrap_or(false);
 
-        // One combined hover zone for the bottom-right overlays (covers both the zoom HUD and manga toggle).
-        // The height must account for the manga toggle button being lifted above video controls (64px)
-        // and the zoom bar (48px), plus the button height (32px) and margin (16px).
-        // Base height is 120px, but expands when overlays push the button higher.
-        let video_controls_lift = if self.show_video_controls { 64.0 } else { 0.0 };
-        let zoom_bar_lift = if self.show_manga_zoom_bar { 48.0 } else { 0.0 };
-        let hover_zone_height = 120.0 + video_controls_lift + zoom_bar_lift;
-        let hover_bottom_right = mouse_pos
-            .map(|p| {
-                let hover_zone = egui::Rect::from_min_size(
-                    egui::pos2(screen_rect.max.x - 280.0, screen_rect.max.y - hover_zone_height),
-                    egui::Vec2::new(280.0, hover_zone_height),
-                );
-                hover_zone.contains(p)
-            })
-            .unwrap_or(false);
-
         let video_open = self.video_player.is_some();
         
         // Check if we have an animated GIF in non-manga mode
@@ -576,6 +559,27 @@ impl ImageViewer {
         
         // Any media that needs controls (video, animated GIF, or manga video/anim)
         let has_controllable_media = video_open || has_animated_gif || manga_has_video_or_anim;
+
+        // Whether the zoom HUD is eligible to appear (even if it is currently hidden by auto-hide).
+        let allow_zoom_bar = self.manga_mode
+            || matches!(self.current_media_type, Some(MediaType::Image | MediaType::Video));
+
+        // One combined hover zone for the bottom-right overlays (covers both the zoom HUD and manga toggle).
+        // IMPORTANT: this must be based on *potential* overlay layout, not the current visibility flags.
+        // Otherwise, videos can get stuck where the manga button is drawn higher (above the video controls)
+        // but the hover zone is still computed as if the controls are hidden, preventing activation.
+        let hover_zone_height = 120.0
+            + if has_controllable_media { 64.0 } else { 0.0 }
+            + if allow_zoom_bar { 48.0 } else { 0.0 };
+        let hover_bottom_right = mouse_pos
+            .map(|p| {
+                let hover_zone = egui::Rect::from_min_size(
+                    egui::pos2(screen_rect.max.x - 280.0, screen_rect.max.y - hover_zone_height),
+                    egui::Vec2::new(280.0, hover_zone_height),
+                );
+                hover_zone.contains(p)
+            })
+            .unwrap_or(false);
 
         // Treat these as active interaction states that should keep the overlays alive.
         let interacting_video = self.is_seeking || self.is_volume_dragging;
@@ -613,8 +617,6 @@ impl ImageViewer {
 
         // Manga toggle / zoom HUD are fullscreen-only overlays.
         self.show_manga_toggle = self.is_fullscreen && visible;
-        let allow_zoom_bar = self.manga_mode
-            || matches!(self.current_media_type, Some(MediaType::Image | MediaType::Video));
         self.show_manga_zoom_bar = self.is_fullscreen && visible && allow_zoom_bar;
 
         if !visible {
