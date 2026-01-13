@@ -44,6 +44,11 @@ const MAX_CACHED_TEXTURES: usize = 64;
 const PRELOAD_AHEAD: usize = 12;
 const PRELOAD_BEHIND: usize = 6;
 
+/// If the visible index jumps by more than this many pages, treat it as a "large jump".
+///
+/// For large jumps we want latency (load the target page ASAP) over throughput (prefetch neighbors).
+const LARGE_JUMP_INDEX_THRESHOLD: usize = 32;
+
 /// Batch size for GPU texture uploads per frame.
 /// Uploading too many textures in one frame can cause stutters.
 const UPLOAD_BATCH_SIZE: usize = 4;
@@ -405,39 +410,77 @@ impl MangaLoader {
             // Get current generation for filtering stale requests
             let current_gen = generation.load(Ordering::Acquire);
 
-            // Process batch in parallel using Rayon
-            let results: Vec<(usize, Option<DecodedImage>)> = batch
-                .par_iter()
-                .map(|req| {
-                    // Skip if already loaded or if we've been shut down
-                    if shutdown.load(Ordering::Relaxed) {
+            // If the generation changes while we're decoding (e.g., a fast scrollbar jump),
+            // we prefer to drop the whole batch's outputs rather than clog the result channel
+            // with stale work.
+            let generation_changed = || generation.load(Ordering::Acquire) != current_gen;
+
+            let process_one = |req: &LoadRequest| -> (usize, Option<DecodedImage>) {
+                // Skip if already loaded or if we've been shut down
+                if shutdown.load(Ordering::Relaxed) {
+                    return (req.index, None);
+                }
+
+                // Skip stale requests (e.g., after fast scrollbar jumps / cancel).
+                if req.generation != current_gen {
+                    return (req.index, None);
+                }
+
+                // Check if already in loaded set
+                {
+                    let loaded = loaded_indices.read();
+                    if loaded.contains(&req.index) {
                         return (req.index, None);
                     }
+                }
 
-                    // Skip stale requests (e.g., after fast scrollbar jumps / cancel).
-                    if req.generation != current_gen {
-                        return (req.index, None);
+                // Load the image
+                let decoded = Self::load_single_image(req);
+
+                (req.index, decoded)
+            };
+
+            // IMPORTANT: for "urgent" requests (negative priority), decode the single highest
+            // priority request first (serially) so it is not competing with neighbor prefetch.
+            // This is the key to making far jumps feel instant.
+            let mut results: Vec<(usize, Option<DecodedImage>)> = Vec::with_capacity(batch.len());
+
+            if batch.first().map_or(false, |r| r.priority < 0) {
+                if let Some(first) = batch.first() {
+                    results.push(process_one(first));
+                }
+
+                if generation_changed() {
+                    // Drop everything from this batch (stale now).
+                    for (idx, _decoded_opt) in results.drain(..) {
+                        loading_indices.write().remove(&idx);
                     }
+                    continue;
+                }
 
-                    // Check if already in loaded set
-                    {
-                        let loaded = loaded_indices.read();
-                        if loaded.contains(&req.index) {
-                            return (req.index, None);
-                        }
-                    }
-
-                    // Load the image
-                    let decoded = Self::load_single_image(req);
-
-                    (req.index, decoded)
-                })
-                .collect();
+                if batch.len() > 1 {
+                    let tail: Vec<(usize, Option<DecodedImage>)> = batch[1..]
+                        .par_iter()
+                        .map(process_one)
+                        .collect();
+                    results.extend(tail);
+                }
+            } else {
+                results = batch.par_iter().map(process_one).collect();
+            }
 
             // Publish results to main thread.
             // IMPORTANT: only mark an index as loaded after the decoded image is successfully enqueued.
             // Otherwise, a full result channel would cause the image to be permanently considered "loaded"
             // even though the main thread never received it, leaving placeholders stuck forever.
+            if generation_changed() {
+                // Generation changed while decoding; treat all results as stale.
+                for (idx, _decoded_opt) in results {
+                    loading_indices.write().remove(&idx);
+                }
+                continue;
+            }
+
             for (idx, decoded_opt) in results {
                 // Request has finished one way or another; allow it to be re-requested if needed.
                 loading_indices.write().remove(&idx);
@@ -575,10 +618,19 @@ impl MangaLoader {
             return;
         }
 
+        // Detect a far jump (e.g., dragging the scrollbar, Home/End, or any other big reposition).
+        // On a far jump we cancel older work and make the target page the only "urgent" item.
+        let prev_visible_index = self.last_visible_index;
+        let index_delta = visible_index.abs_diff(prev_visible_index);
+        let is_large_jump = index_delta > LARGE_JUMP_INDEX_THRESHOLD;
+        if is_large_jump {
+            self.cancel_pending_loads();
+        }
+
         // Update scroll direction based on visible index change
-        if visible_index > self.last_visible_index {
+        if visible_index > prev_visible_index {
             self.scroll_direction = 1; // Scrolling down
-        } else if visible_index < self.last_visible_index {
+        } else if visible_index < prev_visible_index {
             self.scroll_direction = -1; // Scrolling up
         }
         self.last_visible_index = visible_index;
@@ -628,7 +680,13 @@ impl MangaLoader {
                     if idx < visible_index { 0 } else { 10 }
                 };
 
-                let priority = distance + direction_bonus;
+                // On a far jump, mark the actual target page as "urgent" so it can preempt
+                // any neighbor prefetch and be decoded first.
+                let priority = if is_large_jump && idx == visible_index {
+                    -100_000
+                } else {
+                    distance + direction_bonus
+                };
 
                 requests.push(LoadRequest {
                     generation,
