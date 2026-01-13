@@ -1549,6 +1549,60 @@ impl ImageViewer {
         }
         cumulative_y
     }
+    
+    /// Capture the current manga scroll position as a stable "top-of-viewport" anchor.
+    ///
+    /// This is used to prevent jitter when page heights change as we lazily discover
+    /// dimensions for previously-uncached images (common in large folders).
+    /// Returns (page_index, offset_within_page_px).
+    fn manga_capture_scroll_anchor(&self) -> Option<(usize, f32)> {
+        if !self.manga_mode || self.image_list.is_empty() {
+            return None;
+        }
+
+        let scroll = self.manga_scroll_offset.max(0.0);
+        let mut cumulative_y: f32 = 0.0;
+        for idx in 0..self.image_list.len() {
+            let img_h = self.manga_get_image_display_height(idx).max(0.0001);
+            if cumulative_y + img_h > scroll {
+                let within = (scroll - cumulative_y).clamp(0.0, img_h);
+                return Some((idx, within));
+            }
+            cumulative_y += img_h;
+        }
+
+        // If we're beyond the end (can happen briefly during layout changes), anchor to last page.
+        Some((self.image_list.len().saturating_sub(1), 0.0))
+    }
+
+    /// Re-apply a previously captured manga scroll anchor.
+    /// Keeps the same page/position at the top of the viewport even if page heights changed.
+    fn manga_apply_scroll_anchor(&mut self, anchor: (usize, f32)) {
+        if !self.manga_mode || self.image_list.is_empty() {
+            return;
+        }
+
+        let (anchor_idx, anchor_within) = anchor;
+        if anchor_idx >= self.image_list.len() {
+            return;
+        }
+
+        let mut cumulative_y: f32 = 0.0;
+        for idx in 0..anchor_idx {
+            cumulative_y += self.manga_get_image_display_height(idx).max(0.0001);
+        }
+
+        let anchor_h = self.manga_get_image_display_height(anchor_idx).max(0.0001);
+        let new_offset = cumulative_y + anchor_within.clamp(0.0, anchor_h);
+
+        let total_height = self.manga_total_height();
+        let max_scroll = (total_height - self.screen_size.y).max(0.0);
+        let new_offset = new_offset.clamp(0.0, max_scroll);
+
+        self.manga_scroll_offset = new_offset;
+        self.manga_scroll_target = new_offset;
+        self.manga_scroll_velocity = 0.0;
+    }
 
     /// Clear the manga image cache to free GPU memory
     fn manga_clear_cache(&mut self) {
@@ -1931,13 +1985,14 @@ impl ImageViewer {
         if self.manga_last_preload_update.elapsed() < MIN_UPDATE_INTERVAL {
             return;
         }
+        let prev_scroll_pos = self.manga_last_scroll_position;
         self.manga_last_preload_update = Instant::now();
-        self.manga_last_scroll_position = self.manga_scroll_offset;
 
-        // Determine which image is currently most visible based on scroll offset
+        // Capture a stable scroll anchor before we potentially change layout by caching dimensions.
+        let anchor = self.manga_capture_scroll_anchor();
+
+        // Determine which image is currently visible based on the current (possibly estimated) layout.
         let mut current_visible_index = self.current_index;
-        
-        // Calculate cumulative heights to find current visible image
         let mut cumulative_y: f32 = 0.0;
         for idx in 0..self.image_list.len() {
             let img_height = self.manga_get_image_display_height(idx);
@@ -1948,12 +2003,37 @@ impl ImageViewer {
             cumulative_y += img_height;
         }
 
-        // Cache dimensions for the visible range on-demand (for fast startup)
-        let cache_start = current_visible_index.saturating_sub(10);
-        let cache_end = (current_visible_index + 20).min(self.image_list.len());
+        // Cache dimensions for a window around the visible range.
+        // Bias the window by scroll direction: when scrolling UP we need much more behind cached
+        // to avoid "unknown height -> real height" corrections from pushing the viewport around.
+        let scrolling_up = self.manga_scroll_offset < prev_scroll_pos - 0.5;
+        let (behind, ahead) = if scrolling_up { (80usize, 20usize) } else { (20usize, 80usize) };
+
+        let cache_start = current_visible_index.saturating_sub(behind);
+        let cache_end = (current_visible_index + ahead).min(self.image_list.len());
         if let Some(ref mut loader) = self.manga_loader {
             loader.cache_dimensions_range(&self.image_list, cache_start, cache_end);
         }
+
+        // Re-apply anchor after dimension caching to prevent the viewport from jumping.
+        if let Some(anchor) = anchor {
+            self.manga_apply_scroll_anchor(anchor);
+        }
+
+        // Recompute visible index using the updated layout after anchoring.
+        let mut current_visible_index = self.current_index;
+        let mut cumulative_y: f32 = 0.0;
+        for idx in 0..self.image_list.len() {
+            let img_height = self.manga_get_image_display_height(idx);
+            if cumulative_y + img_height > self.manga_scroll_offset {
+                current_visible_index = idx;
+                break;
+            }
+            cumulative_y += img_height;
+        }
+
+        // Now that layout is stabilized, update the last scroll position.
+        self.manga_last_scroll_position = self.manga_scroll_offset;
 
         // Update the parallel loader's preload queue
         if let Some(ref mut loader) = self.manga_loader {
@@ -2037,17 +2117,18 @@ impl ImageViewer {
 
     /// Process decoded images from the parallel loader and upload them as GPU textures.
     /// This is called every frame and uploads a limited batch to prevent stutters.
-    fn manga_process_pending_loads(&mut self, ctx: &egui::Context) {
+    fn manga_process_pending_loads(&mut self, ctx: &egui::Context) -> bool {
         if !self.manga_mode {
-            return;
+            return false;
         }
 
         let Some(ref mut loader) = self.manga_loader else {
-            return;
+            return false;
         };
 
         // Poll for decoded images from the background threads
         let decoded_images = loader.poll_decoded_images();
+        let dims_updated = !decoded_images.is_empty();
 
         // Upload decoded images to GPU as textures
         for decoded in decoded_images {
@@ -2102,6 +2183,8 @@ impl ImageViewer {
 
         // Tick the cache's frame counter for LRU tracking
         self.manga_texture_cache.tick();
+
+        dims_updated
     }
 
     /// Calculate total height of all images in manga mode
@@ -3061,7 +3144,14 @@ impl ImageViewer {
         // Process decoded images from background threads and upload to GPU.
         // This is now non-blocking - images are decoded in parallel on background threads.
         // We always call this to keep uploading decoded images even while scrolling.
-        self.manga_process_pending_loads(ctx);
+        let load_anchor = self.manga_capture_scroll_anchor();
+        let dims_updated = self.manga_process_pending_loads(ctx);
+        if dims_updated {
+            if let Some(anchor) = load_anchor {
+                self.manga_apply_scroll_anchor(anchor);
+                self.manga_update_current_index();
+            }
+        }
 
         // Update video focus - ensures only one video plays at a time (the focused one)
         self.manga_update_video_focus();
