@@ -3476,6 +3476,9 @@ impl ImageViewer {
         
         // Collect actions to run (we can't mutate self inside ctx.input closure)
         let mut actions_to_run: Vec<Action> = Vec::new();
+        // Special-case: in fullscreen manga mode, middle click should exit manga mode
+        // (returning to normal fullscreen viewing) rather than toggling fullscreen.
+        let mut middle_click_exit_manga = false;
         
         ctx.input(|input| {
             let ctrl = input.modifiers.ctrl;
@@ -3531,7 +3534,11 @@ impl ImageViewer {
                     }
                     InputBinding::MouseMiddle => {
                         if input.pointer.button_pressed(egui::PointerButton::Middle) {
-                            actions_to_run.push(*action);
+                            if manga_fullscreen {
+                                middle_click_exit_manga = true;
+                            } else {
+                                actions_to_run.push(*action);
+                            }
                         }
                     }
                     InputBinding::Mouse4 => {
@@ -3591,6 +3598,14 @@ impl ImageViewer {
                 }
             }
         });
+
+        // Apply the manga-mode middle click override immediately and stop further input processing
+        // for this frame. This prevents accidental fullscreen toggles and avoids interacting with
+        // manga-mode-only bindings after we've exited the mode.
+        if middle_click_exit_manga {
+            self.toggle_manga_mode();
+            return;
+        }
 
         // Handle center right-click for video/GIF play/pause toggle (but not over video controls)
         let has_video = self.video_player.is_some();
