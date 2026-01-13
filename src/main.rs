@@ -2891,6 +2891,7 @@ impl ImageViewer {
 
                 self.zoom = new_zoom;
                 self.zoom_target = new_zoom;
+                self.zoom_velocity = 0.0;
 
                 // Adjust scroll offset/target to preserve the anchored content position.
                 self.manga_scroll_offset = self.manga_scroll_offset * zoom_ratio + anchor_y * (zoom_ratio - 1.0);
@@ -2918,7 +2919,14 @@ impl ImageViewer {
                 let visible_height = self.screen_size.y;
                 let max_scroll = (total_height - visible_height).max(0.0);
 
-                self.manga_scroll_target = (self.manga_scroll_target + delta).clamp(0.0, max_scroll);
+                // Wheel scroll is direct user input; apply it immediately and cancel any
+                // ongoing spring/momentum velocity to prevent oscillation/jitter under load.
+                let new_offset = (self.manga_scroll_offset + delta).clamp(0.0, max_scroll);
+                self.manga_scroll_offset = new_offset;
+                self.manga_scroll_target = new_offset;
+                self.manga_scroll_velocity = 0.0;
+
+                self.manga_update_current_index();
                 self.manga_update_preload_queue();
                 animation_active = true;
             }
@@ -3554,7 +3562,10 @@ impl ImageViewer {
                     InputBinding::ScrollUp => {
                         // ScrollUp/ScrollDown are handled in draw_image for zoom
                         // but we check here for other actions (like navigation)
-                        if input.smooth_scroll_delta.y > 0.0 {
+                        // In manga fullscreen mode, the mouse wheel is reserved for scrolling the
+                        // manga strip (handled in draw_manga_mode). Triggering bindings here can
+                        // fight with scrolling and cause jitter/reversal.
+                        if !manga_fullscreen && input.smooth_scroll_delta.y > 0.0 {
                             // Only trigger non-zoom actions here; zoom is handled elsewhere
                             if *action != Action::ZoomIn && *action != Action::ZoomOut {
                                 actions_to_run.push(*action);
@@ -3562,7 +3573,7 @@ impl ImageViewer {
                         }
                     }
                     InputBinding::ScrollDown => {
-                        if input.smooth_scroll_delta.y < 0.0 {
+                        if !manga_fullscreen && input.smooth_scroll_delta.y < 0.0 {
                             // Only trigger non-zoom actions here; zoom is handled elsewhere
                             if *action != Action::ZoomIn && *action != Action::ZoomOut {
                                 actions_to_run.push(*action);
