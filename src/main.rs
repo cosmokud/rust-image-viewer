@@ -1657,6 +1657,68 @@ impl ImageViewer {
         Some((self.image_list.len().saturating_sub(1), 0.0))
     }
 
+    /// Capture the current manga scroll position as a stable **center-of-viewport** anchor.
+    ///
+    /// This is specifically designed for zooming operations, where we want the image at
+    /// the center of the screen to remain visually stable as zoom changes.
+    /// Returns (page_index, fraction_within_page) where fraction is 0.0-1.0.
+    fn manga_capture_center_anchor(&self) -> Option<(usize, f32)> {
+        if !self.manga_mode || self.image_list.is_empty() {
+            return None;
+        }
+
+        let center_y = self.manga_scroll_offset.max(0.0) + self.screen_size.y * 0.5;
+        let mut cumulative_y: f32 = 0.0;
+        for idx in 0..self.image_list.len() {
+            let img_h = self.manga_get_image_display_height(idx).max(0.0001);
+            if cumulative_y + img_h > center_y {
+                // The fraction (0.0 to 1.0) representing where within this image the center lies
+                let fraction = ((center_y - cumulative_y) / img_h).clamp(0.0, 1.0);
+                return Some((idx, fraction));
+            }
+            cumulative_y += img_h;
+        }
+
+        // If we're beyond the end, anchor to the bottom of the last page.
+        Some((self.image_list.len().saturating_sub(1), 1.0))
+    }
+
+    /// Re-apply a previously captured center-of-viewport anchor after a zoom change.
+    ///
+    /// Places the same fractional position of the same image at the center of the viewport.
+    /// This provides perfectly stable zooming even when images have widely varying dimensions.
+    fn manga_apply_center_anchor(&mut self, anchor: (usize, f32)) {
+        if !self.manga_mode || self.image_list.is_empty() {
+            return;
+        }
+
+        let (anchor_idx, anchor_fraction) = anchor;
+        if anchor_idx >= self.image_list.len() {
+            return;
+        }
+
+        // Calculate cumulative height up to the anchor image
+        let mut cumulative_y: f32 = 0.0;
+        for idx in 0..anchor_idx {
+            cumulative_y += self.manga_get_image_display_height(idx).max(0.0001);
+        }
+
+        // Calculate the Y position of the anchor point within the anchor image (now at new zoom)
+        let anchor_h = self.manga_get_image_display_height(anchor_idx).max(0.0001);
+        let anchor_y_in_image = anchor_fraction.clamp(0.0, 1.0) * anchor_h;
+
+        // The scroll offset that places this anchor point at the center of the viewport
+        let new_offset = cumulative_y + anchor_y_in_image - self.screen_size.y * 0.5;
+
+        let total_height = self.manga_total_height();
+        let max_scroll = (total_height - self.screen_size.y).max(0.0);
+        let new_offset = new_offset.clamp(0.0, max_scroll);
+
+        self.manga_scroll_offset = new_offset;
+        self.manga_scroll_target = new_offset;
+        self.manga_scroll_velocity = 0.0;
+    }
+
     /// Re-apply a previously captured manga scroll anchor.
     /// Keeps the same page/position at the top of the viewport even if page heights changed.
     fn manga_apply_scroll_anchor(&mut self, anchor: (usize, f32)) {
@@ -1676,6 +1738,68 @@ impl ImageViewer {
 
         let anchor_h = self.manga_get_image_display_height(anchor_idx).max(0.0001);
         let new_offset = cumulative_y + anchor_within.clamp(0.0, anchor_h);
+
+        let total_height = self.manga_total_height();
+        let max_scroll = (total_height - self.screen_size.y).max(0.0);
+        let new_offset = new_offset.clamp(0.0, max_scroll);
+
+        self.manga_scroll_offset = new_offset;
+        self.manga_scroll_target = new_offset;
+        self.manga_scroll_velocity = 0.0;
+    }
+
+    /// Capture the manga scroll position at a specific screen Y coordinate as a stable anchor.
+    ///
+    /// This is used for pointer-anchored zooming (Ctrl+scroll wheel), where the content
+    /// under the mouse pointer should remain stationary during zoom.
+    /// Returns (page_index, fraction_within_page, screen_y_position).
+    fn manga_capture_anchor_at_screen_y(&self, screen_y: f32) -> Option<(usize, f32, f32)> {
+        if !self.manga_mode || self.image_list.is_empty() {
+            return None;
+        }
+
+        let target_y = self.manga_scroll_offset.max(0.0) + screen_y;
+        let mut cumulative_y: f32 = 0.0;
+        for idx in 0..self.image_list.len() {
+            let img_h = self.manga_get_image_display_height(idx).max(0.0001);
+            if cumulative_y + img_h > target_y {
+                // The fraction (0.0 to 1.0) representing where within this image the point lies
+                let fraction = ((target_y - cumulative_y) / img_h).clamp(0.0, 1.0);
+                return Some((idx, fraction, screen_y));
+            }
+            cumulative_y += img_h;
+        }
+
+        // If we're beyond the end, anchor to the bottom of the last page.
+        Some((self.image_list.len().saturating_sub(1), 1.0, screen_y))
+    }
+
+    /// Re-apply a previously captured anchor at a specific screen Y position after zoom.
+    ///
+    /// Places the same fractional position of the same image at the same screen Y position.
+    /// This provides perfectly stable pointer-anchored zooming.
+    fn manga_apply_anchor_at_screen_y(&mut self, anchor: (usize, f32, f32)) {
+        if !self.manga_mode || self.image_list.is_empty() {
+            return;
+        }
+
+        let (anchor_idx, anchor_fraction, screen_y) = anchor;
+        if anchor_idx >= self.image_list.len() {
+            return;
+        }
+
+        // Calculate cumulative height up to the anchor image
+        let mut cumulative_y: f32 = 0.0;
+        for idx in 0..anchor_idx {
+            cumulative_y += self.manga_get_image_display_height(idx).max(0.0001);
+        }
+
+        // Calculate the absolute Y position of the anchor point (now at new zoom)
+        let anchor_h = self.manga_get_image_display_height(anchor_idx).max(0.0001);
+        let anchor_abs_y = cumulative_y + anchor_fraction.clamp(0.0, 1.0) * anchor_h;
+
+        // The scroll offset that places this anchor point at the specified screen Y
+        let new_offset = anchor_abs_y - screen_y;
 
         let total_height = self.manga_total_height();
         let max_scroll = (total_height - self.screen_size.y).max(0.0);
@@ -2651,27 +2775,28 @@ impl ImageViewer {
             if (new_zoom - old_zoom).abs() > 0.0001 {
                 let zoom_ratio = new_zoom / old_zoom;
                 
-                self.zoom = new_zoom;
-                self.zoom_target = new_zoom;
-                self.zoom_velocity = 0.0;
-
                 if self.manga_mode {
-                    let anchor_y = self.screen_size.y.max(1.0) * 0.5;
+                    // CRITICAL FIX: Use index-based anchoring for stable zooming with varying image sizes.
+                    // Capture which image is at the center and the fractional position within it BEFORE zoom.
+                    let center_anchor = self.manga_capture_center_anchor();
+                    
+                    // Apply the new zoom level
+                    self.zoom = new_zoom;
+                    self.zoom_target = new_zoom;
+                    self.zoom_velocity = 0.0;
                     self.manga_total_height_cache_valid = false;
-
-                    self.manga_scroll_offset =
-                        self.manga_scroll_offset * zoom_ratio + anchor_y * (zoom_ratio - 1.0);
-                    self.manga_scroll_target =
-                        self.manga_scroll_target * zoom_ratio + anchor_y * (zoom_ratio - 1.0);
-                    self.manga_scroll_velocity = 0.0;
-
-                    let total_height = self.manga_total_height();
-                    let max_scroll = (total_height - self.screen_size.y).max(0.0);
-                    self.manga_scroll_offset = self.manga_scroll_offset.clamp(0.0, max_scroll);
-                    self.manga_scroll_target = self.manga_scroll_target.clamp(0.0, max_scroll);
+                    
+                    // Re-apply the anchor to keep the same image position at the center
+                    if let Some(anchor) = center_anchor {
+                        self.manga_apply_center_anchor(anchor);
+                    }
+                    
                     self.manga_update_preload_queue();
                 } else {
-                    // Keep the viewport centered on the same point.
+                    // Non-manga mode: simple ratio-based offset adjustment
+                    self.zoom = new_zoom;
+                    self.zoom_target = new_zoom;
+                    self.zoom_velocity = 0.0;
                     self.offset = self.offset * zoom_ratio;
                 }
             }
@@ -2739,26 +2864,24 @@ impl ImageViewer {
                             if (new_zoom - old_zoom).abs() > 0.0001 {
                                 let zoom_ratio = new_zoom / old_zoom;
                                 
-                                self.zoom = new_zoom;
-                                self.zoom_target = new_zoom;
-                                self.zoom_velocity = 0.0;
-
                                 if self.manga_mode {
-                                    let anchor_y = self.screen_size.y.max(1.0) * 0.5;
+                                    // CRITICAL FIX: Use index-based anchoring for stable zooming with varying image sizes.
+                                    let center_anchor = self.manga_capture_center_anchor();
+                                    
+                                    self.zoom = new_zoom;
+                                    self.zoom_target = new_zoom;
+                                    self.zoom_velocity = 0.0;
                                     self.manga_total_height_cache_valid = false;
                                     
-                                    self.manga_scroll_offset =
-                                        self.manga_scroll_offset * zoom_ratio + anchor_y * (zoom_ratio - 1.0);
-                                    self.manga_scroll_target =
-                                        self.manga_scroll_target * zoom_ratio + anchor_y * (zoom_ratio - 1.0);
-                                    self.manga_scroll_velocity = 0.0;
+                                    if let Some(anchor) = center_anchor {
+                                        self.manga_apply_center_anchor(anchor);
+                                    }
                                     
-                                    let total_height = self.manga_total_height();
-                                    let max_scroll = (total_height - self.screen_size.y).max(0.0);
-                                    self.manga_scroll_offset = self.manga_scroll_offset.clamp(0.0, max_scroll);
-                                    self.manga_scroll_target = self.manga_scroll_target.clamp(0.0, max_scroll);
                                     self.manga_update_preload_queue();
                                 } else {
+                                    self.zoom = new_zoom;
+                                    self.zoom_target = new_zoom;
+                                    self.zoom_velocity = 0.0;
                                     self.offset = self.offset * zoom_ratio;
                                 }
                             }
@@ -2816,22 +2939,21 @@ impl ImageViewer {
         };
         
         if (new_zoom - old_zoom).abs() > 0.0001 {
-            let zoom_ratio = new_zoom / old_zoom;
-            let anchor_y = self.screen_size.y.max(1.0) * 0.5;
+            // CRITICAL FIX: Use index-based anchoring for stable zooming with varying image sizes.
+            // Capture which image is at the center and the fractional position within it BEFORE zoom.
+            let center_anchor = self.manga_capture_center_anchor();
             
+            // Apply the new zoom level
             self.zoom = new_zoom;
             self.zoom_target = new_zoom;
             self.zoom_velocity = 0.0;
             self.manga_total_height_cache_valid = false;
             
-            self.manga_scroll_offset = self.manga_scroll_offset * zoom_ratio + anchor_y * (zoom_ratio - 1.0);
-            self.manga_scroll_target = self.manga_scroll_target * zoom_ratio + anchor_y * (zoom_ratio - 1.0);
-            self.manga_scroll_velocity = 0.0;
+            // Re-apply the anchor to keep the same image position at the center
+            if let Some(anchor) = center_anchor {
+                self.manga_apply_center_anchor(anchor);
+            }
             
-            let total_height = self.manga_total_height();
-            let max_scroll = (total_height - self.screen_size.y).max(0.0);
-            self.manga_scroll_offset = self.manga_scroll_offset.clamp(0.0, max_scroll);
-            self.manga_scroll_target = self.manga_scroll_target.clamp(0.0, max_scroll);
             self.manga_update_preload_queue();
         }
     }
@@ -3029,37 +3151,33 @@ impl ImageViewer {
                 }
                 factor = factor.clamp(0.01, 100.0);
 
-                // Anchor zoom so it doesn't also "scroll" the strip.
-                // The entire strip scales approximately linearly with `self.zoom`, so we can keep
-                // the content under an anchor point fixed by compensating scroll offset.
                 let old_zoom = self.zoom.max(0.0001);
                 let new_zoom = self.clamp_zoom(self.zoom * factor);
-                let zoom_ratio = (new_zoom / old_zoom).clamp(0.01, 100.0);
 
-                // Anchor at pointer Y when available, otherwise at screen center.
-                let anchor_y = pointer_pos
-                    .map(|p| (p.y - screen_rect.min.y).clamp(0.0, screen_height))
-                    .unwrap_or(screen_height * 0.5);
+                if (new_zoom - old_zoom).abs() > 0.0001 {
+                    // CRITICAL FIX: Use index-based anchoring for stable zooming with varying image sizes.
+                    // Anchor at pointer Y when available, otherwise at screen center.
+                    let anchor_screen_y = pointer_pos
+                        .map(|p| (p.y - screen_rect.min.y).clamp(0.0, screen_height))
+                        .unwrap_or(screen_height * 0.5);
+                    
+                    let anchor = self.manga_capture_anchor_at_screen_y(anchor_screen_y);
 
-                self.zoom = new_zoom;
-                self.zoom_target = new_zoom;
-                self.zoom_velocity = 0.0;
+                    self.zoom = new_zoom;
+                    self.zoom_target = new_zoom;
+                    self.zoom_velocity = 0.0;
+                    self.manga_total_height_cache_valid = false;
 
-                // Adjust scroll offset/target to preserve the anchored content position.
-                self.manga_scroll_offset = self.manga_scroll_offset * zoom_ratio + anchor_y * (zoom_ratio - 1.0);
-                self.manga_scroll_target = self.manga_scroll_target * zoom_ratio + anchor_y * (zoom_ratio - 1.0);
-                self.manga_scroll_velocity = 0.0;
+                    // Re-apply the anchor to keep the same image position at the pointer/center
+                    if let Some(a) = anchor {
+                        self.manga_apply_anchor_at_screen_y(a);
+                    }
 
-                // Clamp to new valid range after zoom.
-                let total_height = self.manga_total_height();
-                let max_scroll = (total_height - screen_height).max(0.0);
-                self.manga_scroll_offset = self.manga_scroll_offset.clamp(0.0, max_scroll);
-                self.manga_scroll_target = self.manga_scroll_target.clamp(0.0, max_scroll);
-
-                // Scroll offset moved; update page index immediately.
-                self.manga_update_current_index();
-                self.manga_update_preload_queue();
-                animation_active = true;
+                    // Scroll offset moved; update page index immediately.
+                    self.manga_update_current_index();
+                    self.manga_update_preload_queue();
+                    animation_active = true;
+                }
             } else if scroll_delta != 0.0 {
                 // Regular scroll = pan vertically.
                 // Mimic the arrow-keys behavior: adjust the target and let the spring animation
@@ -3100,36 +3218,35 @@ impl ImageViewer {
             if let Some(img_h) = img_h {
                 if img_h > 0.0 {
                     let new_zoom = if img_h > screen_h { 1.0 } else { self.clamp_zoom(screen_h / img_h) };
-                    let zoom_ratio = (new_zoom / old_zoom).clamp(0.01, 100.0);
 
-                    // Reset horizontal offset and stop any ongoing drag/pan.
-                    self.offset = egui::Vec2::ZERO;
-                    self.is_panning = false;
-                    self.last_mouse_pos = None;
+                    if (new_zoom - old_zoom).abs() > 0.0001 {
+                        // Reset horizontal offset and stop any ongoing drag/pan.
+                        self.offset = egui::Vec2::ZERO;
+                        self.is_panning = false;
+                        self.last_mouse_pos = None;
 
-                    // Anchor the zoom at the pointer Y if available, otherwise at screen center.
-                    let anchor_y = pointer_pos
-                        .map(|p| (p.y - screen_rect.min.y).clamp(0.0, screen_height))
-                        .unwrap_or(screen_height * 0.5);
+                        // CRITICAL FIX: Use index-based anchoring for stable zooming with varying image sizes.
+                        // Anchor the zoom at the pointer Y if available, otherwise at screen center.
+                        let anchor_screen_y = pointer_pos
+                            .map(|p| (p.y - screen_rect.min.y).clamp(0.0, screen_height))
+                            .unwrap_or(screen_height * 0.5);
+                        
+                        let anchor = self.manga_capture_anchor_at_screen_y(anchor_screen_y);
 
-                    self.zoom = new_zoom;
-                    self.zoom_target = new_zoom;
-                    self.zoom_velocity = 0.0;
+                        self.zoom = new_zoom;
+                        self.zoom_target = new_zoom;
+                        self.zoom_velocity = 0.0;
+                        self.manga_total_height_cache_valid = false;
 
-                    // Compensate scroll so the anchored content position stays stable.
-                    self.manga_scroll_offset = self.manga_scroll_offset * zoom_ratio + anchor_y * (zoom_ratio - 1.0);
-                    self.manga_scroll_target = self.manga_scroll_target * zoom_ratio + anchor_y * (zoom_ratio - 1.0);
-                    self.manga_scroll_velocity = 0.0;
+                        // Re-apply the anchor to keep the same image position at the pointer/center
+                        if let Some(a) = anchor {
+                            self.manga_apply_anchor_at_screen_y(a);
+                        }
 
-                    // Clamp to valid range after zoom.
-                    let total_height = self.manga_total_height();
-                    let max_scroll = (total_height - screen_height).max(0.0);
-                    self.manga_scroll_offset = self.manga_scroll_offset.clamp(0.0, max_scroll);
-                    self.manga_scroll_target = self.manga_scroll_target.clamp(0.0, max_scroll);
-
-                    self.manga_update_current_index();
-                    self.manga_update_preload_queue();
-                    animation_active = true;
+                        self.manga_update_current_index();
+                        self.manga_update_preload_queue();
+                        animation_active = true;
+                    }
                 }
             }
         }
