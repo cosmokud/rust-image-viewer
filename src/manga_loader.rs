@@ -203,7 +203,9 @@ impl MangaLoader {
             .name("manga-dimension-worker".into())
             .spawn(move || {
                 while !shutdown_clone.load(Ordering::Acquire) {
-                    let req = match dim_request_rx.recv_timeout(Duration::from_millis(50)) {
+                    // Use a long timeout (500ms) to minimize CPU usage when idle.
+                    // The channel will wake immediately when a real request arrives.
+                    let req = match dim_request_rx.recv_timeout(Duration::from_millis(500)) {
                         Ok(r) => r,
                         Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
                         Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
@@ -398,8 +400,9 @@ impl MangaLoader {
             // Collect available requests (non-blocking after first)
             batch.clear();
 
-            // Block on first request (saves CPU when idle)
-            match request_rx.recv_timeout(std::time::Duration::from_millis(100)) {
+            // Block on first request with a long timeout (500ms) to minimize CPU usage when idle.
+            // The channel will wake immediately when a real request arrives.
+            match request_rx.recv_timeout(std::time::Duration::from_millis(500)) {
                 Ok(req) => batch.push(req),
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
