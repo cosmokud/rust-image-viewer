@@ -436,6 +436,10 @@ impl Config {
         self.add_binding(InputBinding::ScrollUp, Action::ZoomIn);
         self.add_binding(InputBinding::ScrollDown, Action::ZoomOut);
 
+        // Zoom with CTRL + scroll wheel (common muscle memory)
+        self.add_binding(InputBinding::CtrlScrollUp, Action::ZoomIn);
+        self.add_binding(InputBinding::CtrlScrollDown, Action::ZoomOut);
+
         // Exit
         self.add_binding(InputBinding::KeyWithCtrl(egui::Key::W), Action::Exit);
         self.add_binding(InputBinding::Key(egui::Key::Escape), Action::Exit);
@@ -447,9 +451,7 @@ impl Config {
         self.add_binding(InputBinding::Key(egui::Key::Space), Action::VideoPlayPause);
         self.add_binding(InputBinding::Key(egui::Key::M), Action::VideoMute);
 
-        // Manga reading mode zoom (CTRL+Scroll)
-        self.add_binding(InputBinding::CtrlScrollUp, Action::MangaZoomIn);
-        self.add_binding(InputBinding::CtrlScrollDown, Action::MangaZoomOut);
+        // Manga mode uses the same CTRL+wheel zoom handling (see main input routing).
     }
 
     /// Add a binding

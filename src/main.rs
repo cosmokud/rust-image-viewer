@@ -3451,13 +3451,25 @@ impl ImageViewer {
             self.manga_scrollbar_dragging = false;
         }
 
-        // Determine whether Ctrl+wheel zoom is bound for manga mode.
+        // Determine whether Ctrl+wheel zoom is bound.
+        // - New default: Ctrl+wheel is part of zoom_in/zoom_out
+        // - Backwards-compat: older configs may bind Ctrl+wheel to manga_zoom_in/out
         // If bound, we treat Ctrl+wheel (and corresponding `zoom_delta`) as zoom input.
         let manga_ctrl_scroll_zoom_bound = self
             .config
             .action_bindings
-            .get(&Action::MangaZoomIn)
+            .get(&Action::ZoomIn)
             .map_or(false, |bindings| bindings.iter().any(|b| matches!(b, InputBinding::CtrlScrollUp)))
+            || self
+                .config
+                .action_bindings
+                .get(&Action::ZoomOut)
+                .map_or(false, |bindings| bindings.iter().any(|b| matches!(b, InputBinding::CtrlScrollDown)))
+            || self
+                .config
+                .action_bindings
+                .get(&Action::MangaZoomIn)
+                .map_or(false, |bindings| bindings.iter().any(|b| matches!(b, InputBinding::CtrlScrollUp)))
             || self
                 .config
                 .action_bindings
@@ -4252,7 +4264,7 @@ impl ImageViewer {
                             }
                         }
                     }
-                    // CTRL+Scroll handled in draw_manga_mode for manga zoom
+                    // Ctrl+Scroll zoom is handled in draw_manga_mode (manga) and draw_image (normal).
                     InputBinding::CtrlScrollUp | InputBinding::CtrlScrollDown => {}
                     // MouseLeft and MouseRight are handled separately for panning/navigation
                     InputBinding::MouseLeft | InputBinding::MouseRight => {}
@@ -5788,40 +5800,112 @@ impl ImageViewer {
             }
         }
 
-        // Handle scroll wheel zoom (not in manga mode - that's handled in draw_manga_mode)
-        let scroll_delta = ctx.input(|i| i.smooth_scroll_delta.y);
-        if scroll_delta != 0.0 {
-            if let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) {
-                // Only suppress zoom when the pointer is on the title *text* (or window buttons),
-                // not on the empty title bar area.
-                if title_ui_blocking {
-                    // Intentionally ignore scroll for zoom while selecting/copying title text.
-                } else {
-                // Use configurable zoom step (default 1.08 = 8% per scroll notch)
-                let step = self.config.zoom_step;
-                let factor = if scroll_delta > 0.0 { step } else { 1.0 / step };
-                if self.is_fullscreen {
-                    self.zoom_at(pos, factor, screen_rect);
-                    self.zoom_target = self.zoom;
-                    self.zoom_velocity = 0.0;
-                } else {
-                    // In floating mode, follow cursor when zoomed past 100%
-                    let old_zoom = self.zoom;
-                    self.zoom_target = self.clamp_zoom(self.zoom_target * factor);
-                    self.zoom = self.clamp_zoom(self.zoom * factor);
+        // Handle zoom input (not in manga mode - that's handled in draw_manga_mode)
+        // NOTE: In egui/eframe, Ctrl+mouse-wheel is commonly routed into `zoom_delta` (not `smooth_scroll_delta`).
+        let ctrl_held = ctx.input(|i| i.modifiers.ctrl);
+        let zoom_delta = ctx.input(|i| i.zoom_delta());
 
-                    // Keep cursor-follow behavior when zooming and/or after panning.
-                    // When we cross <= 100%, we don't snap to center; the offset eases back via the settle block above.
-                    let has_offset = self.offset.length() > 0.1;
-                    if old_zoom > 1.0 || self.zoom > 1.0 || has_offset {
-                        let rect_center = screen_rect.center();
-                        let cursor_offset = pos - rect_center;
-                        let zoom_ratio = self.zoom / old_zoom;
-                        self.offset = self.offset * zoom_ratio - cursor_offset * (zoom_ratio - 1.0);
-                    }
-                    // Reset velocity on new scroll input for immediate response
-                    self.zoom_velocity = 0.0;
+        // Also detect Ctrl+wheel via raw events as a fallback.
+        const WHEEL_POINTS_PER_LINE: f32 = 50.0;
+        const WHEEL_MAX_STEPS_PER_EVENT: f32 = 6.0;
+        let wheel_steps_ctrl = ctx.input(|i| {
+            let mut ctrl_steps = 0.0f32;
+            for e in &i.raw.events {
+                let egui::Event::MouseWheel { unit, delta, modifiers } = e else {
+                    continue;
+                };
+                if !modifiers.ctrl {
+                    continue;
                 }
+                let dy = delta.y;
+                if !dy.is_finite() || dy == 0.0 {
+                    continue;
+                }
+                let mut steps = match unit {
+                    egui::MouseWheelUnit::Line => dy,
+                    egui::MouseWheelUnit::Page => dy,
+                    egui::MouseWheelUnit::Point => dy / WHEEL_POINTS_PER_LINE,
+                };
+                steps = steps.clamp(-WHEEL_MAX_STEPS_PER_EVENT, WHEEL_MAX_STEPS_PER_EVENT);
+                ctrl_steps += steps;
+            }
+            ctrl_steps
+        });
+
+        let mut handled_ctrl_zoom = false;
+        if ctrl_held && (zoom_delta != 1.0 || wheel_steps_ctrl != 0.0) {
+            if let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) {
+                if !title_ui_blocking {
+                    let step = self.config.zoom_step;
+                    let mut factor = if zoom_delta != 1.0 {
+                        zoom_delta
+                    } else if wheel_steps_ctrl > 0.0 {
+                        step
+                    } else {
+                        1.0 / step
+                    };
+
+                    if !factor.is_finite() {
+                        factor = 1.0;
+                    }
+                    factor = factor.clamp(0.01, 100.0);
+
+                    if self.is_fullscreen {
+                        self.zoom_at(pos, factor, screen_rect);
+                        self.zoom_target = self.zoom;
+                        self.zoom_velocity = 0.0;
+                    } else {
+                        // In floating mode, follow cursor when zoomed past 100%
+                        let old_zoom = self.zoom;
+                        self.zoom_target = self.clamp_zoom(self.zoom_target * factor);
+                        self.zoom = self.clamp_zoom(self.zoom * factor);
+
+                        let has_offset = self.offset.length() > 0.1;
+                        if old_zoom > 1.0 || self.zoom > 1.0 || has_offset {
+                            let rect_center = screen_rect.center();
+                            let cursor_offset = pos - rect_center;
+                            let zoom_ratio = self.zoom / old_zoom;
+                            self.offset = self.offset * zoom_ratio - cursor_offset * (zoom_ratio - 1.0);
+                        }
+                        self.zoom_velocity = 0.0;
+                    }
+
+                    handled_ctrl_zoom = true;
+                }
+            }
+        }
+
+        // Regular (non-CTRL) scroll wheel zoom.
+        if !handled_ctrl_zoom {
+            let scroll_delta = ctx.input(|i| i.smooth_scroll_delta.y);
+            if scroll_delta != 0.0 {
+                if let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) {
+                    // Only suppress zoom when the pointer is on the title *text* (or window buttons),
+                    // not on the empty title bar area.
+                    if title_ui_blocking {
+                        // Intentionally ignore scroll for zoom while selecting/copying title text.
+                    } else {
+                        let step = self.config.zoom_step;
+                        let factor = if scroll_delta > 0.0 { step } else { 1.0 / step };
+                        if self.is_fullscreen {
+                            self.zoom_at(pos, factor, screen_rect);
+                            self.zoom_target = self.zoom;
+                            self.zoom_velocity = 0.0;
+                        } else {
+                            let old_zoom = self.zoom;
+                            self.zoom_target = self.clamp_zoom(self.zoom_target * factor);
+                            self.zoom = self.clamp_zoom(self.zoom * factor);
+
+                            let has_offset = self.offset.length() > 0.1;
+                            if old_zoom > 1.0 || self.zoom > 1.0 || has_offset {
+                                let rect_center = screen_rect.center();
+                                let cursor_offset = pos - rect_center;
+                                let zoom_ratio = self.zoom / old_zoom;
+                                self.offset = self.offset * zoom_ratio - cursor_offset * (zoom_ratio - 1.0);
+                            }
+                            self.zoom_velocity = 0.0;
+                        }
+                    }
                 }
             }
         }
