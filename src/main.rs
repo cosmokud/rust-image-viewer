@@ -1636,7 +1636,11 @@ impl ImageViewer {
     ///
     /// This is used to prevent jitter when page heights change as we lazily discover
     /// dimensions for previously-uncached images (common in large folders).
-    /// Returns (page_index, offset_within_page_px).
+    ///
+    /// IMPORTANT: we store the anchor as a *fraction within the page*, not an absolute
+    /// pixel offset. When an image's true height becomes known (or changes), preserving
+    /// the fraction keeps the same visual content row at the top of the viewport.
+    /// Returns (page_index, fraction_within_page_0_to_1).
     fn manga_capture_scroll_anchor(&self) -> Option<(usize, f32)> {
         if !self.manga_mode || self.image_list.is_empty() {
             return None;
@@ -1648,7 +1652,8 @@ impl ImageViewer {
             let img_h = self.manga_get_image_display_height(idx).max(0.0001);
             if cumulative_y + img_h > scroll {
                 let within = (scroll - cumulative_y).clamp(0.0, img_h);
-                return Some((idx, within));
+                let fraction = (within / img_h).clamp(0.0, 1.0);
+                return Some((idx, fraction));
             }
             cumulative_y += img_h;
         }
@@ -1721,15 +1726,21 @@ impl ImageViewer {
 
     /// Re-apply a previously captured manga scroll anchor.
     /// Keeps the same page/position at the top of the viewport even if page heights changed.
+    ///
+    /// We preserve any in-flight scroll momentum by keeping the target/velocity deltas,
+    /// since async load/dimension updates should not cancel the user's scrolling.
     fn manga_apply_scroll_anchor(&mut self, anchor: (usize, f32)) {
         if !self.manga_mode || self.image_list.is_empty() {
             return;
         }
 
-        let (anchor_idx, anchor_within) = anchor;
+        let (anchor_idx, anchor_fraction) = anchor;
         if anchor_idx >= self.image_list.len() {
             return;
         }
+
+        let delta_to_target = self.manga_scroll_target - self.manga_scroll_offset;
+        let preserved_velocity = self.manga_scroll_velocity;
 
         let mut cumulative_y: f32 = 0.0;
         for idx in 0..anchor_idx {
@@ -1737,15 +1748,18 @@ impl ImageViewer {
         }
 
         let anchor_h = self.manga_get_image_display_height(anchor_idx).max(0.0001);
-        let new_offset = cumulative_y + anchor_within.clamp(0.0, anchor_h);
+        let within = anchor_fraction.clamp(0.0, 1.0) * anchor_h;
+        let new_offset = cumulative_y + within;
 
         let total_height = self.manga_total_height();
         let max_scroll = (total_height - self.screen_size.y).max(0.0);
         let new_offset = new_offset.clamp(0.0, max_scroll);
 
         self.manga_scroll_offset = new_offset;
-        self.manga_scroll_target = new_offset;
-        self.manga_scroll_velocity = 0.0;
+
+        // Preserve the user's current scroll intention/momentum.
+        self.manga_scroll_target = (new_offset + delta_to_target).clamp(0.0, max_scroll);
+        self.manga_scroll_velocity = preserved_velocity;
     }
 
     /// Capture the manga scroll position at a specific screen Y coordinate as a stable anchor.
