@@ -373,6 +373,10 @@ struct ImageViewer {
     manga_last_preload_update: std::time::Instant,
     /// Last scroll position for detecting large jumps
     manga_last_scroll_position: f32,
+    /// Track if left arrow was down last frame (to detect hold vs single tap)
+    manga_arrow_left_was_down: bool,
+    /// Track if right arrow was down last frame (to detect hold vs single tap)
+    manga_arrow_right_was_down: bool,
 
     // ============ MANGA VIDEO PLAYBACK FIELDS ============
     /// Video players for manga mode, keyed by image list index.
@@ -520,6 +524,8 @@ impl Default for ImageViewer {
             manga_preload_cooldown: 0,
             manga_last_preload_update: Instant::now(),
             manga_last_scroll_position: 0.0,
+            manga_arrow_left_was_down: false,
+            manga_arrow_right_was_down: false,
 
             // Manga video playback fields
             manga_video_players: HashMap::new(),
@@ -2667,6 +2673,73 @@ impl ImageViewer {
         self.manga_update_preload_queue();
     }
 
+    /// Continuous scrolling version of manga_page_up_smooth for holding ArrowLeft.
+    /// This version always navigates to the previous image without checking if
+    /// the top of the current image is visible.
+    fn manga_page_up_smooth_continuous(&mut self) {
+        if !self.manga_mode {
+            return;
+        }
+
+        let current = self.manga_top_index().min(self.current_index);
+        if current == 0 {
+            return;
+        }
+        let target = current - 1;
+        self.current_index = target;
+        let scroll_to = self.manga_get_scroll_offset_for_index(target);
+        self.manga_scroll_target = scroll_to;
+        self.manga_scroll_velocity = 0.0;
+
+        // Prime the loader around the destination so the transition stays smooth.
+        if let Some(ref mut loader) = self.manga_loader {
+            let len = self.image_list.len();
+            if len > 0 {
+                let start = target.saturating_sub(30);
+                let end = (target + 60).min(len);
+                loader.request_dimensions_range(&self.image_list, start, end);
+                loader.update_preload_queue(&self.image_list, target, self.screen_size.y, self.max_texture_side);
+            }
+        }
+
+        self.manga_update_preload_queue();
+    }
+
+    /// Continuous scrolling version of manga_page_down_smooth for holding ArrowRight.
+    /// This version always navigates to the next image without checking if
+    /// the bottom of the current image is visible.
+    fn manga_page_down_smooth_continuous(&mut self) {
+        if !self.manga_mode {
+            return;
+        }
+
+        if self.image_list.is_empty() {
+            return;
+        }
+
+        let current = self.manga_top_index().max(self.current_index);
+        let target = (current + 1).min(self.image_list.len() - 1);
+        if target == current {
+            return;
+        }
+
+        self.current_index = target;
+        let scroll_to = self.manga_get_scroll_offset_for_index(target);
+        self.manga_scroll_target = scroll_to;
+        self.manga_scroll_velocity = 0.0;
+
+        // Prime the loader around the destination so the transition stays smooth.
+        if let Some(ref mut loader) = self.manga_loader {
+            let len = self.image_list.len();
+            let start = target.saturating_sub(30);
+            let end = (target + 60).min(len);
+            loader.request_dimensions_range(&self.image_list, start, end);
+            loader.update_preload_queue(&self.image_list, target, self.screen_size.y, self.max_texture_side);
+        }
+
+        self.manga_update_preload_queue();
+    }
+
     /// Scroll to the first image in manga mode
     fn manga_go_to_start(&mut self) {
         if !self.manga_mode {
@@ -4137,20 +4210,45 @@ impl ImageViewer {
         if self.manga_mode && self.is_fullscreen {
             // Arrow keys in manga mode:
             // - Left/Right: PageUp/PageDown-style page navigation with smooth motion.
+            //   Single tap: check if top/bottom is visible first before navigating.
+            //   Hold: continuous scrolling without the visibility check.
             // - Up/Down: continuous smooth scrolling.
             let arrow_left_pressed = ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft));
             let arrow_right_pressed = ctx.input(|i| i.key_pressed(egui::Key::ArrowRight));
+            let arrow_left_down = ctx.input(|i| i.key_down(egui::Key::ArrowLeft));
+            let arrow_right_down = ctx.input(|i| i.key_down(egui::Key::ArrowRight));
             let arrow_up = ctx.input(|i| i.key_down(egui::Key::ArrowUp));
             let arrow_down = ctx.input(|i| i.key_down(egui::Key::ArrowDown));
             
             let scroll_speed = self.config.manga_arrow_scroll_speed;
 
-            if arrow_left_pressed {
+            // Detect if this is a first press (single tap) or a repeat from holding.
+            // First press: key_pressed fires AND the key was NOT down last frame.
+            // Hold/repeat: key_pressed fires AND the key WAS down last frame.
+            let arrow_left_is_first_press = arrow_left_pressed && !self.manga_arrow_left_was_down;
+            let arrow_left_is_holding = arrow_left_pressed && self.manga_arrow_left_was_down;
+            let arrow_right_is_first_press = arrow_right_pressed && !self.manga_arrow_right_was_down;
+            let arrow_right_is_holding = arrow_right_pressed && self.manga_arrow_right_was_down;
+
+            if arrow_left_is_first_press {
+                // Single tap: use the new functionality (checks if top is visible)
                 self.manga_page_up_smooth();
+            } else if arrow_left_is_holding {
+                // Holding: use continuous scrolling (old behavior - always navigate)
+                self.manga_page_up_smooth_continuous();
             }
-            if arrow_right_pressed {
+            
+            if arrow_right_is_first_press {
+                // Single tap: use the new functionality (checks if bottom is visible)
                 self.manga_page_down_smooth();
+            } else if arrow_right_is_holding {
+                // Holding: use continuous scrolling (old behavior - always navigate)
+                self.manga_page_down_smooth_continuous();
             }
+
+            // Update the "was down" state for next frame
+            self.manga_arrow_left_was_down = arrow_left_down;
+            self.manga_arrow_right_was_down = arrow_right_down;
 
             // Use velocity-based scrolling for smooth acceleration/deceleration.
             // This provides a more natural feeling when holding Up/Down.
