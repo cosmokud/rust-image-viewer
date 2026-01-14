@@ -402,9 +402,9 @@ impl Default for Config {
             video_loop: true,
             startup_window_mode: StartupWindowMode::Floating,
             // Image quality defaults - use high quality filters
-            upscale_filter: ImageFilter::CatmullRom,      // Best balance of quality and speed
-            downscale_filter: ImageFilter::Lanczos3,      // Highest quality for downscaling
-            gif_resize_filter: ImageFilter::CatmullRom,   // Good quality, reasonable speed for animations
+            upscale_filter: ImageFilter::Triangle,      // Best balance of quality and speed
+            downscale_filter: ImageFilter::Triangle,      // Highest quality for downscaling
+            gif_resize_filter: ImageFilter::Triangle,   // Good quality, reasonable speed for animations
             texture_filter_static: TextureFilter::Linear, // Smooth rendering for photos
             texture_filter_animated: TextureFilter::Linear, // Smooth for animations
             texture_filter_video: TextureFilter::Linear,  // Smooth for video
@@ -575,9 +575,9 @@ impl Config {
             video_loop: true,
             startup_window_mode: StartupWindowMode::Floating,
             // Image quality defaults
-            upscale_filter: ImageFilter::CatmullRom,
-            downscale_filter: ImageFilter::Lanczos3,
-            gif_resize_filter: ImageFilter::CatmullRom,
+            upscale_filter: ImageFilter::Triangle,
+            downscale_filter: ImageFilter::Triangle,
+            gif_resize_filter: ImageFilter::Triangle,
             texture_filter_static: TextureFilter::Linear,
             texture_filter_animated: TextureFilter::Linear,
             texture_filter_video: TextureFilter::Linear,
