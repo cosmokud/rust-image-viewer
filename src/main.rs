@@ -3369,7 +3369,18 @@ impl ImageViewer {
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(self.background_color32()))
             .show(ctx, |ui| {
-                let mut y_offset: f32 = -self.manga_scroll_offset;
+                // CRITICAL FIX: Round scroll offset to whole pixels to eliminate sub-pixel jitter.
+                // Sub-pixel scroll positions cause texture sampling artifacts that appear as
+                // stuttering/tearing even at high frame rates with VSync enabled.
+                // The animation system uses floats for smooth interpolation, but the final
+                // rendered position must snap to pixel boundaries.
+                //
+                // We track both the precise float offset (for accurate culling) and round
+                // only at render time. This prevents cumulative rounding errors while
+                // ensuring pixel-perfect rendering.
+                let scroll_offset_rounded = self.manga_scroll_offset.round();
+                let scroll_rounding_delta = scroll_offset_rounded - self.manga_scroll_offset;
+                let mut y_offset: f32 = -self.manga_scroll_offset; // Use unrounded for culling
                 
                 for idx in 0..self.image_list.len() {
                     let img_height = self.manga_get_image_display_height(idx);
@@ -3390,9 +3401,19 @@ impl ImageViewer {
                     let display_width = self.manga_get_image_display_width(idx);
                     let x = (screen_width - display_width) / 2.0 + self.offset.x;
 
+                    // CRITICAL FIX: Round image position to whole pixels to eliminate sub-pixel jitter.
+                    // Combined with scroll offset rounding, this ensures all images are always
+                    // rendered at exact pixel boundaries, eliminating the "swimming" or
+                    // micro-stutter effect during scrolling.
+                    //
+                    // For the Y position, we apply the rounding delta from scroll offset to
+                    // the unrounded y_offset. This ensures consistent relative positioning
+                    // between images while snapping to pixel boundaries.
+                    let render_y = y_offset + scroll_rounding_delta;
+                    
                     let image_rect = egui::Rect::from_min_size(
-                        egui::pos2(x, y_offset),
-                        egui::Vec2::new(display_width, display_height),
+                        egui::pos2(x.round(), render_y.round()),
+                        egui::Vec2::new(display_width.round(), display_height.round()),
                     );
 
                     // Check if this item is a video
