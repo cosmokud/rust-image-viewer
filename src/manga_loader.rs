@@ -40,9 +40,13 @@ const MAX_PENDING_UPLOADS: usize = 32;
 /// Beyond this, the oldest entries are evicted to control VRAM usage.
 const MAX_CACHED_TEXTURES: usize = 64;
 
-/// Fixed buffer to add ahead/behind the visible page count for preloading.
-/// If 14 pages are visible, we preload 14 + PRELOAD_BUFFER ahead and behind.
-const PRELOAD_BUFFER: usize = 4;
+/// Fixed buffer to add AHEAD of visible pages (in scroll direction) for preloading.
+/// If 14 pages are visible and scrolling down, we preload 14 + 4 = 18 ahead.
+const PRELOAD_BUFFER_AHEAD: usize = 4;
+
+/// Fixed buffer to add BEHIND visible pages (opposite scroll direction) for preloading.
+/// If 14 pages are visible and scrolling down, we preload 14 + 2 = 16 behind.
+const PRELOAD_BUFFER_BEHIND: usize = 2;
 
 /// Minimum preload counts (even when only 1 page is visible)
 const MIN_PRELOAD: usize = 4;
@@ -779,17 +783,23 @@ impl MangaLoader {
 
     /// Calculate preload counts based on visible page count.
     /// 
-    /// Simple formula: visible_pages + PRELOAD_BUFFER for both ahead and behind.
-    /// For example, if 14 pages are visible, we preload 14 + 4 = 18 ahead and 18 behind.
+    /// Formula: 
+    /// - AHEAD (scroll direction): visible_pages + 4
+    /// - BEHIND (opposite direction): visible_pages + 2
+    /// 
+    /// For example, if 14 pages are visible:
+    /// - Scrolling down: 18 ahead, 16 behind
+    /// - Scrolling up: 18 behind, 16 ahead
     /// 
     /// Returns (preload_ahead, preload_behind)
     fn calculate_preload_counts(&self) -> (usize, usize) {
         let visible_pages = self.visible_page_count.max(1);
         
-        // Simple: visible pages + fixed buffer
-        let preload = (visible_pages + PRELOAD_BUFFER).clamp(MIN_PRELOAD, MAX_PRELOAD);
+        // More buffer ahead (in scroll direction), less behind
+        let ahead = (visible_pages + PRELOAD_BUFFER_AHEAD).clamp(MIN_PRELOAD, MAX_PRELOAD);
+        let behind = (visible_pages + PRELOAD_BUFFER_BEHIND).clamp(MIN_PRELOAD, MAX_PRELOAD);
         
-        (preload, preload)
+        (ahead, behind)
     }
 
     /// Update the visible page count for adaptive preloading.
