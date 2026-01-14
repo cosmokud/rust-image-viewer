@@ -130,6 +130,12 @@ enum ResizeDirection {
     BottomRight,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VerticalSnapEdge {
+    Top,
+    Bottom,
+}
+
 /// Per-image view state for fullscreen mode memory.
 /// Stores zoom, pan, and transformation settings for each image path.
 #[derive(Clone, Debug)]
@@ -3747,6 +3753,81 @@ impl ImageViewer {
         Some(egui::Vec2::new(img_w as f32 * self.zoom, img_h as f32 * self.zoom))
     }
 
+    /// If the current *image* is vertically clipped (top or bottom off-screen), snap the view so
+    /// the requested edge becomes visible.
+    ///
+    /// Returns `true` if we adjusted `self.offset` (i.e., the key should be considered consumed).
+    fn try_snap_current_image_vertical_edge_into_view(
+        &mut self,
+        ctx: &egui::Context,
+        edge: VerticalSnapEdge,
+    ) -> bool {
+        // Manga mode has its own scrolling/navigation model.
+        if self.manga_mode && self.is_fullscreen {
+            return false;
+        }
+
+        // Only applies to images (not videos).
+        if !matches!(self.current_media_type, Some(MediaType::Image)) {
+            return false;
+        }
+
+        if self.image.is_none() || self.texture.is_none() {
+            return false;
+        }
+
+        // Avoid fighting with resize/drag interactions.
+        if self.is_resizing || self.is_panning {
+            return false;
+        }
+
+        // In floating mode at/below 100% the viewer intentionally eases offsets back to center.
+        // Only allow this snap when fullscreen, or when the user is zoomed in.
+        if !self.is_fullscreen && self.zoom <= 1.0 {
+            return false;
+        }
+
+        let Some((_w, h)) = self.media_display_dimensions() else {
+            return false;
+        };
+
+        let viewport = ctx.screen_rect();
+        let viewport_top = viewport.min.y;
+        let viewport_bottom = viewport.max.y;
+        let viewport_center_y = viewport.center().y;
+
+        let display_h = h as f32 * self.zoom;
+        if display_h <= 0.0 {
+            return false;
+        }
+
+        let current_center_y = viewport_center_y + self.offset.y;
+        let current_top = current_center_y - display_h * 0.5;
+        let current_bottom = current_center_y + display_h * 0.5;
+
+        const EPS: f32 = 0.5;
+        match edge {
+            VerticalSnapEdge::Top => {
+                if current_top < viewport_top - EPS {
+                    let target_center_y = viewport_top + display_h * 0.5;
+                    self.offset.y = target_center_y - viewport_center_y;
+                    true
+                } else {
+                    false
+                }
+            }
+            VerticalSnapEdge::Bottom => {
+                if current_bottom > viewport_bottom + EPS {
+                    let target_center_y = viewport_bottom - display_h * 0.5;
+                    self.offset.y = target_center_y - viewport_center_y;
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
     fn request_floating_autosize(&mut self, ctx: &egui::Context) {
         if self.is_fullscreen || self.is_resizing || self.pending_window_resize.is_some() {
             return;
@@ -4072,6 +4153,26 @@ impl ImageViewer {
             } else if has_animated_gif {
                 // Toggle GIF pause state
                 self.gif_paused = !self.gif_paused;
+            }
+        }
+
+        // Arrow-left/right: if the current image is vertically clipped, prefer snapping the view
+        // to the missing edge instead of navigating away.
+        //
+        // - ArrowLeft: if top is not visible, snap to top; otherwise keep normal PreviousImage.
+        // - ArrowRight: if bottom is not visible, snap to bottom; otherwise keep normal NextImage.
+        let arrow_left_pressed = ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft));
+        let arrow_right_pressed = ctx.input(|i| i.key_pressed(egui::Key::ArrowRight));
+
+        if arrow_left_pressed && actions_to_run.iter().any(|a| *a == Action::PreviousImage) {
+            if self.try_snap_current_image_vertical_edge_into_view(ctx, VerticalSnapEdge::Top) {
+                actions_to_run.retain(|a| *a != Action::PreviousImage);
+            }
+        }
+
+        if arrow_right_pressed && actions_to_run.iter().any(|a| *a == Action::NextImage) {
+            if self.try_snap_current_image_vertical_edge_into_view(ctx, VerticalSnapEdge::Bottom) {
+                actions_to_run.retain(|a| *a != Action::NextImage);
             }
         }
         
