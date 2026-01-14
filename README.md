@@ -50,29 +50,31 @@ A high-performance, minimal, and feature-rich image and video viewer for Windows
 ### Supported Formats
 
 #### Images
-| Format | Extensions |
-|--------|------------|
-| JPEG | `.jpg`, `.jpeg` |
-| PNG | `.png` |
-| WebP | `.webp` |
-| GIF | `.gif` (including animated) |
-| BMP | `.bmp` |
-| ICO | `.ico` |
-| TIFF | `.tiff`, `.tif` |
+
+| Format | Extensions                  |
+| ------ | --------------------------- |
+| JPEG   | `.jpg`, `.jpeg`             |
+| PNG    | `.png`                      |
+| WebP   | `.webp`                     |
+| GIF    | `.gif` (including animated) |
+| BMP    | `.bmp`                      |
+| ICO    | `.ico`                      |
+| TIFF   | `.tiff`, `.tif`             |
 
 #### Videos
-| Format | Extensions |
-|--------|------------|
-| MP4 | `.mp4` |
-| MKV | `.mkv` |
-| WebM | `.webm` |
-| AVI | `.avi` |
-| QuickTime | `.mov` |
-| WMV | `.wmv` |
-| FLV | `.flv` |
-| M4V | `.m4v` |
-| 3GP | `.3gp` |
-| OGV | `.ogv` |
+
+| Format    | Extensions |
+| --------- | ---------- |
+| MP4       | `.mp4`     |
+| MKV       | `.mkv`     |
+| WebM      | `.webm`    |
+| AVI       | `.avi`     |
+| QuickTime | `.mov`     |
+| WMV       | `.wmv`     |
+| FLV       | `.flv`     |
+| M4V       | `.m4v`     |
+| 3GP       | `.3gp`     |
+| OGV       | `.ogv`     |
 
 ## Installation
 
@@ -127,28 +129,28 @@ image-viewer.exe path\to\video.mp4
 
 ### Default Keyboard Shortcuts
 
-| Action | Shortcut |
-|--------|----------|
-| Toggle Fullscreen | `F`, `F12`, or Middle-click |
-| Next Image/Video | `→` Right Arrow, or Mouse5 |
-| Previous Image/Video | `←` Left Arrow, or Mouse4 |
-| Rotate Clockwise | `↑` Up Arrow |
-| Rotate Counter-clockwise | `↓` Down Arrow |
-| Zoom In | Scroll Up |
-| Zoom Out | Scroll Down |
-| Pan Image | Hold Left Mouse Button + Drag |
-| Play/Pause (Video/GIF) | `Space` |
-| Mute/Unmute (Video) | `M` |
-| Exit | `Esc` or `Ctrl+W` |
+| Action                   | Shortcut                      |
+| ------------------------ | ----------------------------- |
+| Toggle Fullscreen        | `F`, `F12`, or Middle-click   |
+| Next Image/Video         | `→` Right Arrow, or Mouse5    |
+| Previous Image/Video     | `←` Left Arrow, or Mouse4     |
+| Rotate Clockwise         | `↑` Up Arrow                  |
+| Rotate Counter-clockwise | `↓` Down Arrow                |
+| Zoom In                  | Scroll Up                     |
+| Zoom Out                 | Scroll Down                   |
+| Pan Image                | Hold Left Mouse Button + Drag |
+| Play/Pause (Video/GIF)   | `Space`                       |
+| Mute/Unmute (Video)      | `M`                           |
+| Exit                     | `Esc` or `Ctrl+W`             |
 
 ### Manga Mode Shortcuts
 
-| Action | Shortcut |
-|--------|----------|
-| Scroll | Mouse Wheel or Drag |
-| Zoom In | `Ctrl` + Scroll Up |
-| Zoom Out | `Ctrl` + Scroll Down |
-| Navigate by Page | `↑`/`↓` Arrow Keys |
+| Action            | Shortcut                        |
+| ----------------- | ------------------------------- |
+| Scroll            | Mouse Wheel or Drag             |
+| Zoom In           | `Ctrl` + Scroll Up              |
+| Zoom Out          | `Ctrl` + Scroll Down            |
+| Navigate by Page  | `↑`/`↓` Arrow Keys              |
 | Toggle Manga Mode | Click manga icon (bottom-right) |
 
 ## Configuration
@@ -270,16 +272,16 @@ manga_zoom_out = ctrl+scroll_down
 
 ### Available Input Bindings
 
-| Type | Values |
-|------|--------|
-| Mouse Buttons | `mouse_left`, `mouse_right`, `mouse_middle`, `mouse4`, `mouse5` |
-| Scroll Wheel | `scroll_up`, `scroll_down` |
-| Modifiers | `ctrl+<key>`, `shift+<key>`, `alt+<key>` |
-| Letters | `a` - `z` |
-| Numbers | `0` - `9` |
-| Function Keys | `f1` - `f12` |
-| Arrow Keys | `left`, `right`, `up`, `down` |
-| Special Keys | `escape`, `enter`, `space`, `tab`, `backspace`, `delete`, `insert`, `home`, `end`, `pageup`, `pagedown` |
+| Type          | Values                                                                                                  |
+| ------------- | ------------------------------------------------------------------------------------------------------- |
+| Mouse Buttons | `mouse_left`, `mouse_right`, `mouse_middle`, `mouse4`, `mouse5`                                         |
+| Scroll Wheel  | `scroll_up`, `scroll_down`                                                                              |
+| Modifiers     | `ctrl+<key>`, `shift+<key>`, `alt+<key>`                                                                |
+| Letters       | `a` - `z`                                                                                               |
+| Numbers       | `0` - `9`                                                                                               |
+| Function Keys | `f1` - `f12`                                                                                            |
+| Arrow Keys    | `left`, `right`, `up`, `down`                                                                           |
+| Special Keys  | `escape`, `enter`, `space`, `tab`, `backspace`, `delete`, `insert`, `home`, `end`, `pageup`, `pagedown` |
 
 ## Technical Details
 
@@ -294,6 +296,7 @@ manga_zoom_out = ctrl+scroll_down
 ### Build Optimizations
 
 The release profile includes:
+
 - Maximum optimization (`opt-level = 3`)
 - Link-time optimization (`lto = true`)
 - Single codegen unit for best optimization
