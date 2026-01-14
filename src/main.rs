@@ -2195,18 +2195,18 @@ impl ImageViewer {
         let current_visible_index = self.manga_index_at_y(self.manga_scroll_offset.max(0.0));
 
         // Calculate how many pages are currently visible on screen
-        // This is essential for zoom-aware preloading
+        // This determines preload count: visible_pages + 4 ahead and behind
         let visible_page_count = self.manga_calculate_visible_page_count();
 
-        // Update the loader's zoom state for adaptive preloading
+        // Update the loader's visible page count for adaptive preloading
         if let Some(ref mut loader) = self.manga_loader {
-            loader.update_zoom_state(self.zoom, visible_page_count);
+            loader.update_visible_page_count(visible_page_count);
         }
 
         // Cache dimensions for a window around the visible range.
         // Bias the window by scroll direction: when scrolling UP we need much more behind cached
         // to avoid "unknown height -> real height" corrections from pushing the viewport around.
-        // Scale the dimension cache window based on visible pages for better coverage at low zoom
+        // Scale the dimension cache window based on visible pages for better coverage
         let scrolling_up = self.manga_scroll_offset < prev_scroll_pos - 0.5;
         let dim_scale = (visible_page_count as f32 / 2.0).max(1.0) as usize;
         let (behind, ahead) = if scrolling_up { 
