@@ -42,16 +42,16 @@ const MAX_CACHED_TEXTURES: usize = 64;
 
 /// Base number of images to preload ahead/behind the current view.
 /// These are dynamically scaled based on zoom level and visible page count.
-const BASE_PRELOAD_AHEAD: usize = 12;
-const BASE_PRELOAD_BEHIND: usize = 6;
+const BASE_PRELOAD_AHEAD: usize = 4;
+const BASE_PRELOAD_BEHIND: usize = 4;
 
 /// Minimum preload counts (even at maximum zoom out)
-const MIN_PRELOAD_AHEAD: usize = 4;
+const MIN_PRELOAD_AHEAD: usize = 2;
 const MIN_PRELOAD_BEHIND: usize = 2;
 
 /// Maximum preload counts (for very zoomed out views with many visible pages)
-const MAX_PRELOAD_AHEAD: usize = 64;
-const MAX_PRELOAD_BEHIND: usize = 32;
+const MAX_PRELOAD_AHEAD: usize = 12;
+const MAX_PRELOAD_BEHIND: usize = 12;
 
 /// If the visible index jumps by more than this many pages, treat it as a "large jump".
 ///
