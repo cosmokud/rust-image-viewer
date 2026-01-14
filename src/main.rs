@@ -3194,8 +3194,8 @@ impl ImageViewer {
                 }
             } else if scroll_delta != 0.0 {
                 // Regular scroll = pan vertically.
-                // Use the spring target (not instant jumps) so wheel scrolling is as smooth
-                // as zooming, even at high refresh rates.
+                // Mimic the arrow-keys behavior: adjust the target and let the spring animation
+                // (manga_tick_scroll_animation) produce smooth motion.
                 let scroll_speed = self.config.manga_wheel_scroll_speed;
                 let delta = -scroll_delta * scroll_speed;
 
@@ -3203,12 +3203,14 @@ impl ImageViewer {
                 let visible_height = self.screen_size.y;
                 let max_scroll = (total_height - visible_height).max(0.0);
 
-                // New wheel input: update target and reset velocity for immediate response
-                // without oscillations.
-                self.manga_scroll_target = (self.manga_scroll_target + delta).clamp(0.0, max_scroll);
+                // Wheel scroll is direct user input; apply it immediately and cancel any
+                // ongoing spring/momentum velocity to prevent oscillation/jitter under load.
+                let new_offset = (self.manga_scroll_offset + delta).clamp(0.0, max_scroll);
+                self.manga_scroll_offset = new_offset;
+                self.manga_scroll_target = new_offset;
                 self.manga_scroll_velocity = 0.0;
 
-                // Animation tick below will update offset + current_index.
+                self.manga_update_current_index();
                 self.manga_update_preload_queue();
                 animation_active = true;
             }
@@ -3331,12 +3333,9 @@ impl ImageViewer {
             }
         }
 
-        // Tick scroll animation.
-        // IMPORTANT: while the user is actively dragging, we apply deltas directly for a true
-        // 1:1 feel. Running the spring integrator during drag effectively applies the tracked
-        // drag velocity a second time, which feels like lag/jitter.
+        // Tick scroll animation
         let dt = ctx.input(|i| i.stable_dt).min(0.033);
-        if !self.is_panning && self.manga_tick_scroll_animation(dt) {
+        if self.manga_tick_scroll_animation(dt) {
             animation_active = true;
             // Update preload queue during scroll (throttling is handled inside)
             self.manga_update_preload_queue();
