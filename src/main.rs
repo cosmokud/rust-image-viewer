@@ -3521,8 +3521,34 @@ impl ImageViewer {
             }
         }
 
-        // Double-click: reset manga zoom to fit-to-height (like fullscreen double-click behavior).
+        // Double-click: reset manga view (zoom + pan + inertia) to a stable baseline.
+        // IMPORTANT: This should work even if the zoom is already at the baseline, so we always clear pan/inertia.
         if primary_double_clicked && !over_scrollbar {
+            let mut did_reset = false;
+
+            // Always reset horizontal offset and stop any ongoing drag/pan.
+            if self.offset != egui::Vec2::ZERO {
+                self.offset = egui::Vec2::ZERO;
+                did_reset = true;
+            }
+            if self.is_panning {
+                self.is_panning = false;
+                did_reset = true;
+            }
+            if self.last_mouse_pos.take().is_some() {
+                did_reset = true;
+            }
+
+            // Cancel any inertial scrolling (double-click is an explicit "reset" intent).
+            if self.manga_scroll_velocity != 0.0 {
+                self.manga_scroll_velocity = 0.0;
+                did_reset = true;
+            }
+            if (self.manga_scroll_target - self.manga_scroll_offset).abs() > 0.01 {
+                self.manga_scroll_target = self.manga_scroll_offset;
+                did_reset = true;
+            }
+
             let old_zoom = self.zoom.max(0.0001);
             let screen_h = screen_height.max(1.0);
 
@@ -3539,34 +3565,32 @@ impl ImageViewer {
                     let new_zoom = if img_h > screen_h { 1.0 } else { self.clamp_zoom(screen_h / img_h) };
 
                     if (new_zoom - old_zoom).abs() > 0.0001 {
-                        // Reset horizontal offset and stop any ongoing drag/pan.
-                        self.offset = egui::Vec2::ZERO;
-                        self.is_panning = false;
-                        self.last_mouse_pos = None;
-
                         // CRITICAL FIX: Use index-based anchoring for stable zooming with varying image sizes.
                         // Anchor the zoom at the pointer Y if available, otherwise at screen center.
                         let anchor_screen_y = pointer_pos
                             .map(|p| (p.y - screen_rect.min.y).clamp(0.0, screen_height))
                             .unwrap_or(screen_height * 0.5);
-                        
+
                         let anchor = self.manga_capture_anchor_at_screen_y(anchor_screen_y);
 
                         self.zoom = new_zoom;
                         self.zoom_target = new_zoom;
                         self.zoom_velocity = 0.0;
                         self.manga_total_height_cache_valid = false;
+                        did_reset = true;
 
                         // Re-apply the anchor to keep the same image position at the pointer/center
                         if let Some(a) = anchor {
                             self.manga_apply_anchor_at_screen_y(a);
                         }
-
-                        self.manga_update_current_index();
-                        self.manga_update_preload_queue();
-                        animation_active = true;
                     }
                 }
+            }
+
+            if did_reset {
+                self.manga_update_current_index();
+                self.manga_update_preload_queue();
+                animation_active = true;
             }
         }
 
