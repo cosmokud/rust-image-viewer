@@ -50,8 +50,8 @@ const MIN_PRELOAD_AHEAD: usize = 2;
 const MIN_PRELOAD_BEHIND: usize = 2;
 
 /// Maximum preload counts (for very zoomed out views with many visible pages)
-const MAX_PRELOAD_AHEAD: usize = 12;
-const MAX_PRELOAD_BEHIND: usize = 12;
+const MAX_PRELOAD_AHEAD: usize = 24;
+const MAX_PRELOAD_BEHIND: usize = 24;
 
 /// If the visible index jumps by more than this many pages, treat it as a "large jump".
 ///
