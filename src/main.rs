@@ -2507,6 +2507,40 @@ impl ImageViewer {
         self.manga_update_preload_queue();
     }
 
+    /// PageUp-style navigation, but with smooth inertial motion (no instant snap).
+    ///
+    /// Intended for ArrowLeft in manga mode: move to the previous file and animate
+    /// the scroll to align its top with the viewport top.
+    fn manga_page_up_smooth(&mut self) {
+        if !self.manga_mode {
+            return;
+        }
+
+        let current = self.manga_top_index();
+        if current == 0 {
+            return;
+        }
+        let target = current - 1;
+        self.current_index = target;
+        let scroll_to = self.manga_get_scroll_offset_for_index(target);
+        self.manga_scroll_target = scroll_to;
+        self.manga_scroll_velocity = 0.0;
+
+        // Prime the loader around the destination so the transition stays smooth.
+        if let Some(ref mut loader) = self.manga_loader {
+            let len = self.image_list.len();
+            if len > 0 {
+                let start = target.saturating_sub(30);
+                let end = (target + 60).min(len);
+                loader.request_dimensions_range(&self.image_list, start, end);
+                loader.update_preload_queue(&self.image_list, target, self.screen_size.y, self.max_texture_side);
+            }
+        }
+
+        // Still run the standard queue update (throttled) for eviction bookkeeping.
+        self.manga_update_preload_queue();
+    }
+
     /// Scroll down by one page (screen height) in manga mode
     fn manga_page_down(&mut self) {
         if !self.manga_mode {
@@ -2526,6 +2560,43 @@ impl ImageViewer {
         self.manga_scroll_target = scroll_to;
         self.manga_scroll_offset = scroll_to;
         self.manga_scroll_velocity = 0.0;
+        self.manga_update_preload_queue();
+    }
+
+    /// PageDown-style navigation, but with smooth inertial motion (no instant snap).
+    ///
+    /// Intended for ArrowRight in manga mode: move to the next file and animate
+    /// the scroll to align its top with the viewport top.
+    fn manga_page_down_smooth(&mut self) {
+        if !self.manga_mode {
+            return;
+        }
+
+        if self.image_list.is_empty() {
+            return;
+        }
+
+        let current = self.manga_top_index();
+        let target = (current + 1).min(self.image_list.len() - 1);
+        if target == current {
+            return;
+        }
+
+        self.current_index = target;
+        let scroll_to = self.manga_get_scroll_offset_for_index(target);
+        self.manga_scroll_target = scroll_to;
+        self.manga_scroll_velocity = 0.0;
+
+        // Prime the loader around the destination so the transition stays smooth.
+        if let Some(ref mut loader) = self.manga_loader {
+            let len = self.image_list.len();
+            let start = target.saturating_sub(30);
+            let end = (target + 60).min(len);
+            loader.request_dimensions_range(&self.image_list, start, end);
+            loader.update_preload_queue(&self.image_list, target, self.screen_size.y, self.max_texture_side);
+        }
+
+        // Still run the standard queue update (throttled) for eviction bookkeeping.
         self.manga_update_preload_queue();
     }
 
@@ -3997,27 +4068,31 @@ impl ImageViewer {
 
         // Handle manga mode specific keys (arrows, Page Up/Down, Home/End)
         if self.manga_mode && self.is_fullscreen {
-            // Arrow keys: support both press (discrete scroll) and hold (continuous scroll).
-            // LEFT/UP = scroll up, RIGHT/DOWN = scroll down.
-            // Using velocity-based scrolling for smooth, responsive motion.
-            let arrow_left = ctx.input(|i| i.key_down(egui::Key::ArrowLeft));
-            let arrow_right = ctx.input(|i| i.key_down(egui::Key::ArrowRight));
+            // Arrow keys in manga mode:
+            // - Left/Right: PageUp/PageDown-style page navigation with smooth motion.
+            // - Up/Down: continuous smooth scrolling.
+            let arrow_left_pressed = ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft));
+            let arrow_right_pressed = ctx.input(|i| i.key_pressed(egui::Key::ArrowRight));
             let arrow_up = ctx.input(|i| i.key_down(egui::Key::ArrowUp));
             let arrow_down = ctx.input(|i| i.key_down(egui::Key::ArrowDown));
             
             let scroll_speed = self.config.manga_arrow_scroll_speed;
 
-            // Use velocity-based scrolling for smooth acceleration/deceleration
-            // This provides a more natural feeling when holding arrow keys
-            if arrow_left || arrow_up {
-                // Add velocity impulse for scrolling up
-                // The target moves continuously, creating smooth scrolling
+            if arrow_left_pressed {
+                self.manga_page_up_smooth();
+            }
+            if arrow_right_pressed {
+                self.manga_page_down_smooth();
+            }
+
+            // Use velocity-based scrolling for smooth acceleration/deceleration.
+            // This provides a more natural feeling when holding Up/Down.
+            if arrow_up {
                 let scroll_amount = scroll_speed * 0.5; // Per-frame amount
                 self.manga_scroll_target = (self.manga_scroll_target - scroll_amount).max(0.0);
                 self.manga_update_preload_queue();
             }
-            if arrow_right || arrow_down {
-                // Add velocity impulse for scrolling down
+            if arrow_down {
                 let total_height = self.manga_total_height();
                 let max_scroll = (total_height - self.screen_size.y).max(0.0);
                 let scroll_amount = scroll_speed * 0.5;
