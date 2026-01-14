@@ -3483,21 +3483,16 @@ impl ImageViewer {
                 && (zoom_delta != 1.0 || wheel_steps_ctrl != 0.0);
 
             if wants_ctrl_zoom {
-                // Prefer `zoom_delta` (Ctrl+wheel/pinch gesture) if present; otherwise fall back to scroll direction.
+                // Use the same step-based algorithm as normal wheel zoom.
+                // `zoom_delta` can be device/platform-dependent and may feel jumpy; only use it
+                // to determine direction when raw Ctrl-wheel steps aren't available.
                 let step = self.config.zoom_step;
-                let mut factor = if zoom_delta != 1.0 {
-                    zoom_delta
-                } else if wheel_steps_ctrl > 0.0 {
-                    step
+                let zoom_in = if wheel_steps_ctrl != 0.0 {
+                    wheel_steps_ctrl > 0.0
                 } else {
-                    1.0 / step
+                    zoom_delta > 1.0
                 };
-
-                // Be defensive against any weird/invalid input.
-                if !factor.is_finite() {
-                    factor = 1.0;
-                }
-                factor = factor.clamp(0.01, 100.0);
+                let factor = if zoom_in { step } else { 1.0 / step };
 
                 let old_zoom = self.zoom.max(0.0001);
                 let new_zoom = self.clamp_zoom(self.zoom * factor);
@@ -5836,19 +5831,16 @@ impl ImageViewer {
         if ctrl_held && (zoom_delta != 1.0 || wheel_steps_ctrl != 0.0) {
             if let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) {
                 if !title_ui_blocking {
+                    // IMPORTANT: Use the *same* step-based zoom algorithm as normal wheel zoom.
+                    // `zoom_delta` can be device/platform-dependent and may feel jumpy; we only
+                    // use it to determine direction when raw wheel steps aren't available.
                     let step = self.config.zoom_step;
-                    let mut factor = if zoom_delta != 1.0 {
-                        zoom_delta
-                    } else if wheel_steps_ctrl > 0.0 {
-                        step
+                    let zoom_in = if wheel_steps_ctrl != 0.0 {
+                        wheel_steps_ctrl > 0.0
                     } else {
-                        1.0 / step
+                        zoom_delta > 1.0
                     };
-
-                    if !factor.is_finite() {
-                        factor = 1.0;
-                    }
-                    factor = factor.clamp(0.01, 100.0);
+                    let factor = if zoom_in { step } else { 1.0 / step };
 
                     if self.is_fullscreen {
                         self.zoom_at(pos, factor, screen_rect);
