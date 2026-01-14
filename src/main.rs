@@ -2576,58 +2576,52 @@ impl ImageViewer {
     }
 
     /// Update manga scroll animation (smooth scrolling)
-    /// Uses a critically-damped spring system with sub-pixel precision for buttery-smooth motion.
-    /// The animation is frame-rate independent and respects VSync timing.
+    /// Uses a dt-independent inertial lerp (momentum-style) model.
+    ///
+    /// Golden rule: input updates `manga_scroll_target`, render loop eases `manga_scroll_offset` toward it.
     fn manga_tick_scroll_animation(&mut self, dt: f32) -> bool {
         if !self.manga_mode {
             return false;
         }
 
-        let error = self.manga_scroll_target - self.manga_scroll_offset;
-        
-        // Larger snap threshold for faster settling (reduces animation duration)
-        const SNAP_THRESHOLD: f32 = 0.5;
-        const VELOCITY_THRESHOLD: f32 = 1.0;
+        // Cap dt to keep behavior stable across frame drops.
+        let dt = dt.clamp(0.0, 0.033);
 
-        if error.abs() < SNAP_THRESHOLD && self.manga_scroll_velocity.abs() < VELOCITY_THRESHOLD {
+        // Clamp target first so we never chase an invalid position.
+        let total_height = self.manga_total_height();
+        let visible_height = self.screen_size.y;
+        let max_scroll = (total_height - visible_height).max(0.0);
+        self.manga_scroll_target = self.manga_scroll_target.clamp(0.0, max_scroll);
+
+        let diff = self.manga_scroll_target - self.manga_scroll_offset;
+
+        const SNAP_THRESHOLD: f32 = 0.5;
+        if diff.abs() <= SNAP_THRESHOLD {
             self.manga_scroll_offset = self.manga_scroll_target;
             self.manga_scroll_velocity = 0.0;
             return false;
         }
 
-        // Faster critically-damped spring for snappier scrolling.
-        // omega = 25 provides very fast response without overshoot.
-        // This makes scrolling feel more immediate and responsive.
+        // Convert a "per-60fps-frame" friction into a dt-independent alpha.
+        // If friction=0.12 and dt=1/60, alpha=0.12.
         //
-        // Physics: critically damped when damping_ratio = 1.0
-        // x'' = -omega^2 * (x - target) - 2 * omega * x'
-        let omega = 25.0;
-        let omega_sq = omega * omega;
-        
-        // Cap dt to prevent instability on frame drops (max ~30fps equivalent)
-        let dt = dt.min(0.033);
-        
-        // Semi-implicit Euler integration for stability:
-        // 1. Compute acceleration from spring force and damping
-        // 2. Update velocity with acceleration
-        // 3. Update position with new velocity
-        let spring_force = omega_sq * error;
-        let damping_force = 2.0 * omega * self.manga_scroll_velocity;
-        let acceleration = spring_force - damping_force;
+        // Premium feel: when the target is far away (big wheel flick / momentum),
+        // temporarily boost the effective friction so we catch up quickly; when close,
+        // fall back to the base friction for a gentle settle.
+        let base_friction = self.config.manga_inertial_friction.clamp(0.01, 0.5);
+        let catchup_t = (diff.abs() / 800.0).clamp(0.0, 1.0);
+        let friction = base_friction + (0.25 - base_friction) * catchup_t;
+        let alpha = 1.0 - (1.0 - friction).powf((dt * 60.0).clamp(0.0, 10.0));
 
-        self.manga_scroll_velocity += acceleration * dt;
-        
-        // Apply velocity with sub-pixel precision
-        self.manga_scroll_offset += self.manga_scroll_velocity * dt;
-
-        // Clamp to valid range
-        let total_height = self.manga_total_height();
-        let visible_height = self.screen_size.y;
-        let max_scroll = (total_height - visible_height).max(0.0);
+        let prev_offset = self.manga_scroll_offset;
+        self.manga_scroll_offset += diff * alpha;
         self.manga_scroll_offset = self.manga_scroll_offset.clamp(0.0, max_scroll);
-        
-        // Also clamp target to prevent overshooting past bounds
-        self.manga_scroll_target = self.manga_scroll_target.clamp(0.0, max_scroll);
+
+        // Maintain a smoothed velocity estimate for momentum/idle detection.
+        let instant_velocity = (self.manga_scroll_offset - prev_offset) / dt.max(0.001);
+        let velocity_alpha = 0.35;
+        self.manga_scroll_velocity = self.manga_scroll_velocity * (1.0 - velocity_alpha)
+            + instant_velocity * velocity_alpha;
 
         // Update current_index based on scroll position (lightweight, no I/O)
         self.manga_update_current_index();
@@ -3006,7 +3000,6 @@ impl ImageViewer {
         let ctrl_held = ctx.input(|i| i.modifiers.ctrl);
         // NOTE: In egui/eframe, Ctrl+mouse-wheel is commonly routed into `zoom_delta` (not `scroll_delta`).
         // We support both so Ctrl+wheel zoom works reliably across platforms/devices.
-        let scroll_delta = ctx.input(|i| i.smooth_scroll_delta.y);
         let zoom_delta = ctx.input(|i| i.zoom_delta());
         let pointer_pos = ctx.input(|i| i.pointer.hover_pos());
         let primary_down = ctx.input(|i| i.pointer.button_down(egui::PointerButton::Primary));
@@ -3015,6 +3008,52 @@ impl ImageViewer {
         let primary_double_clicked = ctx.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary));
         let pointer_delta = ctx.input(|i| i.pointer.delta());
         let secondary_clicked = ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Secondary));
+
+        // Wheel normalization (mouse vs trackpad):
+        // - Mouse wheels are usually "line" deltas (1.0 per notch)
+        // - Trackpads are usually "point" deltas (many small pixel-ish deltas)
+        // We normalize both into "wheel steps" so config.manga_wheel_scroll_speed stays consistent.
+        const MANGA_WHEEL_POINTS_PER_LINE: f32 = 50.0;
+        const MANGA_WHEEL_MAX_STEPS_PER_EVENT: f32 = 6.0;
+        let (wheel_steps, wheel_steps_ctrl) = ctx.input(|i| {
+            let mut normal = 0.0f32;
+            let mut ctrl = 0.0f32;
+
+            for e in &i.raw.events {
+                let egui::Event::MouseWheel { unit, delta, modifiers } = e else {
+                    continue;
+                };
+
+                // egui uses +Y for "scroll up".
+                let dy = delta.y;
+                if !dy.is_finite() || dy == 0.0 {
+                    continue;
+                }
+
+                let mut steps = match unit {
+                    egui::MouseWheelUnit::Line => dy,
+                    egui::MouseWheelUnit::Page => dy * (screen_height / MANGA_WHEEL_POINTS_PER_LINE).max(1.0),
+                    egui::MouseWheelUnit::Point => dy / MANGA_WHEEL_POINTS_PER_LINE,
+                };
+                steps = steps.clamp(-MANGA_WHEEL_MAX_STEPS_PER_EVENT, MANGA_WHEEL_MAX_STEPS_PER_EVENT);
+
+                if modifiers.ctrl {
+                    ctrl += steps;
+                } else {
+                    normal += steps;
+                }
+            }
+
+            (normal, ctrl)
+        });
+
+        // In manga fullscreen mode, the wheel is owned by our custom inertial scroller.
+        // Remove wheel events so other widgets don't accidentally react to them in the same frame.
+        if wheel_steps != 0.0 || wheel_steps_ctrl != 0.0 {
+            ctx.input_mut(|i| {
+                i.raw.events.retain(|e| !matches!(e, egui::Event::MouseWheel { .. }));
+            });
+        }
 
         // Handle right-click to toggle play/pause for videos and GIFs in manga mode
         // Skip if pointer is over the video controls bar at the bottom
@@ -3146,14 +3185,14 @@ impl ImageViewer {
         if !over_scrollbar {
             let wants_ctrl_zoom = ctrl_held
                 && manga_ctrl_scroll_zoom_bound
-                && (zoom_delta != 1.0 || scroll_delta != 0.0);
+                && (zoom_delta != 1.0 || wheel_steps_ctrl != 0.0);
 
             if wants_ctrl_zoom {
                 // Prefer `zoom_delta` (Ctrl+wheel/pinch gesture) if present; otherwise fall back to scroll direction.
                 let step = self.config.zoom_step;
                 let mut factor = if zoom_delta != 1.0 {
                     zoom_delta
-                } else if scroll_delta > 0.0 {
+                } else if wheel_steps_ctrl > 0.0 {
                     step
                 } else {
                     1.0 / step
@@ -3192,25 +3231,20 @@ impl ImageViewer {
                     self.manga_update_preload_queue();
                     animation_active = true;
                 }
-            } else if scroll_delta != 0.0 {
-                // Regular scroll = pan vertically.
-                // Mimic the arrow-keys behavior: adjust the target and let the spring animation
-                // (manga_tick_scroll_animation) produce smooth motion.
+            } else if wheel_steps != 0.0 {
+                // Regular wheel/trackpad scroll = inertial pan vertically.
+                // Input updates the TARGET; output (manga_tick_scroll_animation) eases the CURRENT toward it.
                 let scroll_speed = self.config.manga_wheel_scroll_speed;
-                let delta = -scroll_delta * scroll_speed;
+                let multiplier = self.config.manga_wheel_multiplier;
+                let delta = -wheel_steps * scroll_speed * multiplier;
 
                 let total_height = self.manga_total_height();
                 let visible_height = self.screen_size.y;
                 let max_scroll = (total_height - visible_height).max(0.0);
 
-                // Wheel scroll is direct user input; apply it immediately and cancel any
-                // ongoing spring/momentum velocity to prevent oscillation/jitter under load.
-                let new_offset = (self.manga_scroll_offset + delta).clamp(0.0, max_scroll);
-                self.manga_scroll_offset = new_offset;
-                self.manga_scroll_target = new_offset;
-                self.manga_scroll_velocity = 0.0;
+                self.manga_scroll_target = (self.manga_scroll_target + delta).clamp(0.0, max_scroll);
 
-                self.manga_update_current_index();
+                // Let the inertial loop do the motion; keep current velocity estimate derived from motion.
                 self.manga_update_preload_queue();
                 animation_active = true;
             }

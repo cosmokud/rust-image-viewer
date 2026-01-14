@@ -322,6 +322,11 @@ pub struct Config {
     pub manga_drag_pan_speed: f32,
     /// Manga mode: mouse wheel scroll speed (pixels per normalized scroll unit)
     pub manga_wheel_scroll_speed: f32,
+    /// Manga mode: inertial scroll friction (0.0-1.0). Lower = heavier/smoother.
+    /// Sweet spot for manga is ~0.08-0.15.
+    pub manga_inertial_friction: f32,
+    /// Manga mode: mouse wheel multiplier applied after normalization.
+    pub manga_wheel_multiplier: f32,
     /// Manga mode: arrow-key scroll speed (pixels per key press)
     pub manga_arrow_scroll_speed: f32,
 
@@ -389,6 +394,8 @@ impl Default for Config {
             max_zoom_percent: 1000.0,
             manga_drag_pan_speed: 2.5,
             manga_wheel_scroll_speed: 40.0,
+            manga_inertial_friction: 0.12,
+            manga_wheel_multiplier: 1.5,
             manga_arrow_scroll_speed: 140.0,
             video_muted_by_default: true,
             video_default_volume: 0.5,
@@ -560,6 +567,8 @@ impl Config {
             max_zoom_percent: 1000.0,
             manga_drag_pan_speed: 2.5,
             manga_wheel_scroll_speed: 40.0,
+            manga_inertial_friction: 0.12,
+            manga_wheel_multiplier: 1.5,
             manga_arrow_scroll_speed: 140.0,
             video_muted_by_default: true,
             video_default_volume: 0.5,
@@ -697,6 +706,18 @@ impl Config {
                         "manga_wheel_scroll_speed" | "manga_scroll_wheel_speed" => {
                             if let Ok(v) = value.parse::<f32>() {
                                 config.manga_wheel_scroll_speed = v.clamp(1.0, 2000.0);
+                            }
+                        }
+                        "manga_inertial_friction" | "manga_scroll_friction" | "manga_inertia_friction" => {
+                            if let Ok(v) = value.parse::<f32>() {
+                                // Keep within a practical range to avoid "teleport" (too high)
+                                // or excessively sluggish motion (too low).
+                                config.manga_inertial_friction = v.clamp(0.01, 0.5);
+                            }
+                        }
+                        "manga_wheel_multiplier" | "manga_scroll_wheel_multiplier" => {
+                            if let Ok(v) = value.parse::<f32>() {
+                                config.manga_wheel_multiplier = v.clamp(0.1, 10.0);
                             }
                         }
                         "manga_arrow_scroll_speed" | "manga_arrow_key_scroll_speed" => {
@@ -862,6 +883,10 @@ impl Config {
         content.push_str(&format!("manga_drag_pan_speed = {}\n", self.manga_drag_pan_speed));
         content.push_str("; Manga mode: mouse wheel scroll speed in pixels per step (smaller = slower)\n");
         content.push_str(&format!("manga_wheel_scroll_speed = {}\n", self.manga_wheel_scroll_speed));
+        content.push_str("; Manga mode: inertial scrolling friction (0.08-0.15 feels premium for manga)\n");
+        content.push_str(&format!("manga_inertial_friction = {}\n", self.manga_inertial_friction));
+        content.push_str("; Manga mode: extra wheel multiplier after normalization (mouse vs trackpad)\n");
+        content.push_str(&format!("manga_wheel_multiplier = {}\n", self.manga_wheel_multiplier));
         content.push_str("; Manga mode: arrow key scroll speed in pixels per key press (separate from wheel)\n");
         content.push_str(&format!("manga_arrow_scroll_speed = {}\n\n", self.manga_arrow_scroll_speed));
         
