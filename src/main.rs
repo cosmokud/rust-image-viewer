@@ -361,6 +361,12 @@ struct ImageViewer {
     manga_total_height_cache_screen_y: f32,
     manga_total_height_cache_len: usize,
     manga_total_height_cache_valid: bool,
+
+    /// Cached cumulative Y offsets for manga pages.
+    ///
+    /// When valid: `manga_layout_offsets.len() == image_list.len() + 1` and
+    /// page `i` spans `offsets[i]..offsets[i+1]` in absolute strip coordinates.
+    manga_layout_offsets: Vec<f32>,
     /// Cooldown frames before updating preload queue (prevents cache churn during rapid navigation)
     manga_preload_cooldown: u32,
     /// Last frame when preload queue was updated (throttle updates)
@@ -510,6 +516,7 @@ impl Default for ImageViewer {
             manga_total_height_cache_screen_y: 0.0,
             manga_total_height_cache_len: 0,
             manga_total_height_cache_valid: false,
+            manga_layout_offsets: Vec::new(),
             manga_preload_cooldown: 0,
             manga_last_preload_update: Instant::now(),
             manga_last_scroll_position: 0.0,
@@ -1641,25 +1648,18 @@ impl ImageViewer {
     /// pixel offset. When an image's true height becomes known (or changes), preserving
     /// the fraction keeps the same visual content row at the top of the viewport.
     /// Returns (page_index, fraction_within_page_0_to_1).
-    fn manga_capture_scroll_anchor(&self) -> Option<(usize, f32)> {
+    fn manga_capture_scroll_anchor(&mut self) -> Option<(usize, f32)> {
         if !self.manga_mode || self.image_list.is_empty() {
             return None;
         }
 
         let scroll = self.manga_scroll_offset.max(0.0);
-        let mut cumulative_y: f32 = 0.0;
-        for idx in 0..self.image_list.len() {
-            let img_h = self.manga_get_image_display_height(idx).max(0.0001);
-            if cumulative_y + img_h > scroll {
-                let within = (scroll - cumulative_y).clamp(0.0, img_h);
-                let fraction = (within / img_h).clamp(0.0, 1.0);
-                return Some((idx, fraction));
-            }
-            cumulative_y += img_h;
-        }
-
-        // If we're beyond the end (can happen briefly during layout changes), anchor to last page.
-        Some((self.image_list.len().saturating_sub(1), 0.0))
+        let idx = self.manga_index_at_y(scroll);
+        let start = self.manga_page_start_y(idx);
+        let h = self.manga_page_height_cached(idx).max(0.0001);
+        let within = (scroll - start).clamp(0.0, h);
+        let fraction = (within / h).clamp(0.0, 1.0);
+        Some((idx, fraction))
     }
 
     /// Capture the current manga scroll position as a stable **center-of-viewport** anchor.
@@ -1667,25 +1667,17 @@ impl ImageViewer {
     /// This is specifically designed for zooming operations, where we want the image at
     /// the center of the screen to remain visually stable as zoom changes.
     /// Returns (page_index, fraction_within_page) where fraction is 0.0-1.0.
-    fn manga_capture_center_anchor(&self) -> Option<(usize, f32)> {
+    fn manga_capture_center_anchor(&mut self) -> Option<(usize, f32)> {
         if !self.manga_mode || self.image_list.is_empty() {
             return None;
         }
 
         let center_y = self.manga_scroll_offset.max(0.0) + self.screen_size.y * 0.5;
-        let mut cumulative_y: f32 = 0.0;
-        for idx in 0..self.image_list.len() {
-            let img_h = self.manga_get_image_display_height(idx).max(0.0001);
-            if cumulative_y + img_h > center_y {
-                // The fraction (0.0 to 1.0) representing where within this image the center lies
-                let fraction = ((center_y - cumulative_y) / img_h).clamp(0.0, 1.0);
-                return Some((idx, fraction));
-            }
-            cumulative_y += img_h;
-        }
-
-        // If we're beyond the end, anchor to the bottom of the last page.
-        Some((self.image_list.len().saturating_sub(1), 1.0))
+        let idx = self.manga_index_at_y(center_y);
+        let start = self.manga_page_start_y(idx);
+        let h = self.manga_page_height_cached(idx).max(0.0001);
+        let fraction = ((center_y - start) / h).clamp(0.0, 1.0);
+        Some((idx, fraction))
     }
 
     /// Re-apply a previously captured center-of-viewport anchor after a zoom change.
@@ -1702,20 +1694,14 @@ impl ImageViewer {
             return;
         }
 
-        // Calculate cumulative height up to the anchor image
-        let mut cumulative_y: f32 = 0.0;
-        for idx in 0..anchor_idx {
-            cumulative_y += self.manga_get_image_display_height(idx).max(0.0001);
-        }
-
-        // Calculate the Y position of the anchor point within the anchor image (now at new zoom)
-        let anchor_h = self.manga_get_image_display_height(anchor_idx).max(0.0001);
-        let anchor_y_in_image = anchor_fraction.clamp(0.0, 1.0) * anchor_h;
+        let total_height = self.manga_total_height();
+        let start_y = self.manga_page_start_y(anchor_idx);
+        let anchor_h = self.manga_page_height_cached(anchor_idx).max(0.0001);
+        let anchor_abs_y = start_y + anchor_fraction.clamp(0.0, 1.0) * anchor_h;
 
         // The scroll offset that places this anchor point at the center of the viewport
-        let new_offset = cumulative_y + anchor_y_in_image - self.screen_size.y * 0.5;
+        let new_offset = anchor_abs_y - self.screen_size.y * 0.5;
 
-        let total_height = self.manga_total_height();
         let max_scroll = (total_height - self.screen_size.y).max(0.0);
         let new_offset = new_offset.clamp(0.0, max_scroll);
 
@@ -1742,16 +1728,12 @@ impl ImageViewer {
         let delta_to_target = self.manga_scroll_target - self.manga_scroll_offset;
         let preserved_velocity = self.manga_scroll_velocity;
 
-        let mut cumulative_y: f32 = 0.0;
-        for idx in 0..anchor_idx {
-            cumulative_y += self.manga_get_image_display_height(idx).max(0.0001);
-        }
-
-        let anchor_h = self.manga_get_image_display_height(anchor_idx).max(0.0001);
-        let within = anchor_fraction.clamp(0.0, 1.0) * anchor_h;
-        let new_offset = cumulative_y + within;
-
         let total_height = self.manga_total_height();
+        let start_y = self.manga_page_start_y(anchor_idx);
+        let anchor_h = self.manga_page_height_cached(anchor_idx).max(0.0001);
+        let within = anchor_fraction.clamp(0.0, 1.0) * anchor_h;
+        let new_offset = start_y + within;
+
         let max_scroll = (total_height - self.screen_size.y).max(0.0);
         let new_offset = new_offset.clamp(0.0, max_scroll);
 
@@ -1767,25 +1749,17 @@ impl ImageViewer {
     /// This is used for pointer-anchored zooming (Ctrl+scroll wheel), where the content
     /// under the mouse pointer should remain stationary during zoom.
     /// Returns (page_index, fraction_within_page, screen_y_position).
-    fn manga_capture_anchor_at_screen_y(&self, screen_y: f32) -> Option<(usize, f32, f32)> {
+    fn manga_capture_anchor_at_screen_y(&mut self, screen_y: f32) -> Option<(usize, f32, f32)> {
         if !self.manga_mode || self.image_list.is_empty() {
             return None;
         }
 
         let target_y = self.manga_scroll_offset.max(0.0) + screen_y;
-        let mut cumulative_y: f32 = 0.0;
-        for idx in 0..self.image_list.len() {
-            let img_h = self.manga_get_image_display_height(idx).max(0.0001);
-            if cumulative_y + img_h > target_y {
-                // The fraction (0.0 to 1.0) representing where within this image the point lies
-                let fraction = ((target_y - cumulative_y) / img_h).clamp(0.0, 1.0);
-                return Some((idx, fraction, screen_y));
-            }
-            cumulative_y += img_h;
-        }
-
-        // If we're beyond the end, anchor to the bottom of the last page.
-        Some((self.image_list.len().saturating_sub(1), 1.0, screen_y))
+        let idx = self.manga_index_at_y(target_y);
+        let start = self.manga_page_start_y(idx);
+        let h = self.manga_page_height_cached(idx).max(0.0001);
+        let fraction = ((target_y - start) / h).clamp(0.0, 1.0);
+        Some((idx, fraction, screen_y))
     }
 
     /// Re-apply a previously captured anchor at a specific screen Y position after zoom.
@@ -1802,20 +1776,14 @@ impl ImageViewer {
             return;
         }
 
-        // Calculate cumulative height up to the anchor image
-        let mut cumulative_y: f32 = 0.0;
-        for idx in 0..anchor_idx {
-            cumulative_y += self.manga_get_image_display_height(idx).max(0.0001);
-        }
-
-        // Calculate the absolute Y position of the anchor point (now at new zoom)
-        let anchor_h = self.manga_get_image_display_height(anchor_idx).max(0.0001);
-        let anchor_abs_y = cumulative_y + anchor_fraction.clamp(0.0, 1.0) * anchor_h;
+        let total_height = self.manga_total_height();
+        let start_y = self.manga_page_start_y(anchor_idx);
+        let anchor_h = self.manga_page_height_cached(anchor_idx).max(0.0001);
+        let anchor_abs_y = start_y + anchor_fraction.clamp(0.0, 1.0) * anchor_h;
 
         // The scroll offset that places this anchor point at the specified screen Y
         let new_offset = anchor_abs_y - screen_y;
 
-        let total_height = self.manga_total_height();
         let max_scroll = (total_height - self.screen_size.y).max(0.0);
         let new_offset = new_offset.clamp(0.0, max_scroll);
 
@@ -1843,47 +1811,48 @@ impl ImageViewer {
         self.manga_animated_images.clear();
 
         self.manga_total_height_cache_valid = false;
+        self.manga_layout_offsets.clear();
     }
 
     /// Determine the focused media index in manga mode.
     /// The focused item is the one with the most viewport coverage (center-weighted).
     /// Returns the index of the media item that should be actively playing.
-    fn manga_get_focused_media_index(&self) -> usize {
+    fn manga_get_focused_media_index(&mut self) -> usize {
         if !self.manga_mode || self.image_list.is_empty() {
             return self.current_index;
         }
 
-        let viewport_top = self.manga_scroll_offset;
-        let viewport_bottom = viewport_top + self.screen_size.y;
-        let viewport_center = viewport_top + self.screen_size.y / 2.0;
+        let viewport_top = self.manga_scroll_offset.max(0.0);
+        let viewport_h = self.screen_size.y.max(1.0);
+        let viewport_bottom = viewport_top + viewport_h;
+        let viewport_center = viewport_top + viewport_h * 0.5;
 
-        let mut best_idx = self.current_index;
+        // Only consider items intersecting the viewport.
+        let start_idx = self.manga_index_at_y(viewport_top);
+        let mut end_idx = self.manga_index_at_y(viewport_bottom);
+        if end_idx < start_idx {
+            end_idx = start_idx;
+        }
+
+        self.manga_ensure_layout_cache();
+        let len = self.image_list.len();
+        if self.manga_layout_offsets.len() != len + 1 {
+            return self.current_index.min(len.saturating_sub(1));
+        }
+
+        let mut best_idx = self.current_index.min(len.saturating_sub(1));
         let mut best_center_distance = f32::MAX;
 
-        let mut cumulative_y: f32 = 0.0;
-        for idx in 0..self.image_list.len() {
-            let img_height = self.manga_get_image_display_height(idx);
-            let item_top = cumulative_y;
-            let item_bottom = cumulative_y + img_height;
-            let item_center = cumulative_y + img_height / 2.0;
-
-            // Skip items completely outside viewport
-            if item_bottom < viewport_top {
-                cumulative_y += img_height;
-                continue;
-            }
-            if item_top > viewport_bottom {
-                break;
-            }
-
-            // Calculate distance from item center to viewport center
-            let center_distance = (item_center - viewport_center).abs();
+        // Use prefix sums directly for speed.
+        for idx in start_idx..=end_idx.min(len.saturating_sub(1)) {
+            let start = self.manga_layout_offsets[idx];
+            let end = self.manga_layout_offsets[idx + 1];
+            let center = (start + end) * 0.5;
+            let center_distance = (center - viewport_center).abs();
             if center_distance < best_center_distance {
                 best_center_distance = center_distance;
                 best_idx = idx;
             }
-
-            cumulative_y += img_height;
         }
 
         best_idx
@@ -2208,17 +2177,8 @@ impl ImageViewer {
         let prev_scroll_pos = self.manga_last_scroll_position;
         self.manga_last_preload_update = Instant::now();
 
-        // Determine which image is currently visible based on the current (possibly estimated) layout.
-        let mut current_visible_index = self.current_index;
-        let mut cumulative_y: f32 = 0.0;
-        for idx in 0..self.image_list.len() {
-            let img_height = self.manga_get_image_display_height(idx);
-            if cumulative_y + img_height > self.manga_scroll_offset {
-                current_visible_index = idx;
-                break;
-            }
-            cumulative_y += img_height;
-        }
+        // Determine which image is currently at the viewport top.
+        let current_visible_index = self.manga_index_at_y(self.manga_scroll_offset.max(0.0));
 
         // Cache dimensions for a window around the visible range.
         // Bias the window by scroll direction: when scrolling UP we need much more behind cached
@@ -2335,6 +2295,12 @@ impl ImageViewer {
         // Limiting messages per frame prevents layout updates from causing bursts of work.
         let dim_updates = loader.poll_dimension_results(4);
 
+        // Dimension updates can change page heights; invalidate cached layout/prefix sums.
+        if !dim_updates.is_empty() {
+            self.manga_total_height_cache_valid = false;
+            self.manga_layout_offsets.clear();
+        }
+
         let dims_updated = !decoded_images.is_empty() || !dim_updates.is_empty();
 
         // Upload decoded images to GPU as textures
@@ -2398,6 +2364,7 @@ impl ImageViewer {
     fn manga_total_height(&mut self) -> f32 {
         if !self.manga_mode || self.image_list.is_empty() {
             self.manga_total_height_cache_valid = false;
+            self.manga_layout_offsets.clear();
             return 0.0;
         }
 
@@ -2416,8 +2383,13 @@ impl ImageViewer {
 
         if needs_recompute {
             let mut total = 0.0;
+            self.manga_layout_offsets.clear();
+            self.manga_layout_offsets.reserve(len + 1);
+            self.manga_layout_offsets.push(0.0);
             for idx in 0..len {
-                total += self.manga_get_image_display_height(idx);
+                let h = self.manga_get_image_display_height(idx).max(0.0);
+                total += h;
+                self.manga_layout_offsets.push(total);
             }
             self.manga_total_height_cache = total;
             self.manga_total_height_cache_zoom = zoom;
@@ -2427,6 +2399,63 @@ impl ImageViewer {
         }
 
         self.manga_total_height_cache
+    }
+
+    /// Ensure the cached manga layout offsets are available.
+    ///
+    /// This uses `manga_total_height` as the single cache rebuild point.
+    fn manga_ensure_layout_cache(&mut self) {
+        let _ = self.manga_total_height();
+
+        // Be defensive: if the cache says it's valid but the vector size is wrong,
+        // force a rebuild next call.
+        let expected = self.image_list.len().saturating_add(1);
+        if self.manga_total_height_cache_valid && self.manga_layout_offsets.len() != expected {
+            self.manga_total_height_cache_valid = false;
+        }
+    }
+
+    /// Find the page index that contains absolute strip coordinate `y`.
+    fn manga_index_at_y(&mut self, y: f32) -> usize {
+        if !self.manga_mode || self.image_list.is_empty() {
+            return self.current_index.min(self.image_list.len().saturating_sub(1));
+        }
+
+        self.manga_ensure_layout_cache();
+
+        let len = self.image_list.len();
+        if self.manga_layout_offsets.len() != len + 1 {
+            return self.current_index.min(len.saturating_sub(1));
+        }
+
+        let total = *self.manga_layout_offsets.last().unwrap_or(&0.0);
+        let y = if y.is_finite() { y.clamp(0.0, total.max(0.0)) } else { 0.0 };
+
+        // Use only start offsets (len entries). Find insertion point for start <= y.
+        let starts = &self.manga_layout_offsets[..len];
+        let insertion = starts.partition_point(|&start| start <= y);
+        insertion.saturating_sub(1).min(len.saturating_sub(1))
+    }
+
+    /// Cached page start offset (top Y) for index.
+    fn manga_page_start_y(&mut self, index: usize) -> f32 {
+        if !self.manga_mode || self.image_list.is_empty() {
+            return 0.0;
+        }
+        self.manga_ensure_layout_cache();
+        self.manga_layout_offsets.get(index).copied().unwrap_or(0.0)
+    }
+
+    /// Cached page height for index.
+    fn manga_page_height_cached(&mut self, index: usize) -> f32 {
+        if !self.manga_mode || self.image_list.is_empty() {
+            return 0.0;
+        }
+        self.manga_ensure_layout_cache();
+        if index + 1 >= self.manga_layout_offsets.len() {
+            return 0.0;
+        }
+        (self.manga_layout_offsets[index + 1] - self.manga_layout_offsets[index]).max(0.0)
     }
 
     /// Scroll manga view by a delta amount
@@ -2440,43 +2469,23 @@ impl ImageViewer {
     }
 
     /// Compute the most visible manga page index for the current scroll offset.
-    fn manga_visible_index(&self) -> usize {
+    fn manga_visible_index(&mut self) -> usize {
         if !self.manga_mode || self.image_list.is_empty() {
             return self.current_index.min(self.image_list.len().saturating_sub(1));
         }
 
-        let visible_height = self.screen_size.y.max(1.0);
-        let mut cumulative_y: f32 = 0.0;
-        let mut visible_idx = self.current_index.min(self.image_list.len().saturating_sub(1));
-        for idx in 0..self.image_list.len() {
-            let img_height = self.manga_get_image_display_height(idx);
-            if cumulative_y + img_height / 2.0 > self.manga_scroll_offset + visible_height / 2.0 {
-                visible_idx = idx;
-                break;
-            }
-            cumulative_y += img_height;
-            visible_idx = idx;
-        }
-        visible_idx
+        let visible_h = self.screen_size.y.max(1.0);
+        let y_center = self.manga_scroll_offset.max(0.0) + visible_h * 0.5;
+        self.manga_index_at_y(y_center)
     }
 
     /// Compute the manga page index whose TOP is currently at/above the viewport top.
     /// This is the correct basis for PageUp/PageDown so we never skip files.
-    fn manga_top_index(&self) -> usize {
+    fn manga_top_index(&mut self) -> usize {
         if !self.manga_mode || self.image_list.is_empty() {
             return self.current_index.min(self.image_list.len().saturating_sub(1));
         }
-
-        let mut cumulative_y: f32 = 0.0;
-        for idx in 0..self.image_list.len() {
-            let img_height = self.manga_get_image_display_height(idx);
-            // If the viewport top is within this page, that's our top index.
-            if cumulative_y + img_height > self.manga_scroll_offset {
-                return idx;
-            }
-            cumulative_y += img_height;
-        }
-        self.image_list.len().saturating_sub(1)
+        self.manga_index_at_y(self.manga_scroll_offset.max(0.0))
     }
 
     /// Scroll up by one page (screen height) in manga mode
@@ -2646,21 +2655,11 @@ impl ImageViewer {
             return;
         }
 
-        let mut cumulative_y: f32 = 0.0;
-        for idx in 0..self.image_list.len() {
-            let img_height = self.manga_get_image_display_height(idx);
-            // Use the center of the viewport to determine current image
-            if cumulative_y + img_height / 2.0 > self.manga_scroll_offset + self.screen_size.y / 2.0 {
-                if self.current_index != idx {
-                    self.current_index = idx;
-                }
-                return;
-            }
-            cumulative_y += img_height;
-        }
-        // If we've scrolled past all images, set to last one
-        if !self.image_list.is_empty() {
-            self.current_index = self.image_list.len() - 1;
+        let viewport_h = self.screen_size.y.max(1.0);
+        let y_center = self.manga_scroll_offset.max(0.0) + viewport_h * 0.5;
+        let idx = self.manga_index_at_y(y_center);
+        if self.current_index != idx {
+            self.current_index = idx;
         }
     }
 
@@ -3413,13 +3412,17 @@ impl ImageViewer {
             .and_then(|idx| self.manga_video_players.get(&idx))
             .map_or(false, |p| p.is_playing());
 
+        // Compute the first visible page so we don't scan from the beginning every frame.
+        let first_visible_idx = self.manga_index_at_y(self.manga_scroll_offset.max(0.0));
+        let first_visible_y = self.manga_page_start_y(first_visible_idx);
+
         // Draw images in vertical strip
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(self.background_color32()))
             .show(ctx, |ui| {
-                let mut y_offset: f32 = -self.manga_scroll_offset;
-                
-                for idx in 0..self.image_list.len() {
+                let mut y_offset: f32 = first_visible_y - self.manga_scroll_offset;
+
+                for idx in first_visible_idx..self.image_list.len() {
                     let img_height = self.manga_get_image_display_height(idx);
                     
                     // Skip images that are completely above the viewport
