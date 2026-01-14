@@ -2194,11 +2194,26 @@ impl ImageViewer {
         // Determine which image is currently at the viewport top.
         let current_visible_index = self.manga_index_at_y(self.manga_scroll_offset.max(0.0));
 
+        // Calculate how many pages are currently visible on screen
+        // This is essential for zoom-aware preloading
+        let visible_page_count = self.manga_calculate_visible_page_count();
+
+        // Update the loader's zoom state for adaptive preloading
+        if let Some(ref mut loader) = self.manga_loader {
+            loader.update_zoom_state(self.zoom, visible_page_count);
+        }
+
         // Cache dimensions for a window around the visible range.
         // Bias the window by scroll direction: when scrolling UP we need much more behind cached
         // to avoid "unknown height -> real height" corrections from pushing the viewport around.
+        // Scale the dimension cache window based on visible pages for better coverage at low zoom
         let scrolling_up = self.manga_scroll_offset < prev_scroll_pos - 0.5;
-        let (behind, ahead) = if scrolling_up { (80usize, 20usize) } else { (20usize, 80usize) };
+        let dim_scale = (visible_page_count as f32 / 2.0).max(1.0) as usize;
+        let (behind, ahead) = if scrolling_up { 
+            (80usize.saturating_mul(dim_scale).min(200), 20usize.saturating_mul(dim_scale).min(100)) 
+        } else { 
+            (20usize.saturating_mul(dim_scale).min(100), 80usize.saturating_mul(dim_scale).min(200)) 
+        };
 
         let cache_start = current_visible_index.saturating_sub(behind);
         let cache_end = (current_visible_index + ahead).min(self.image_list.len());
@@ -2220,12 +2235,24 @@ impl ImageViewer {
         }
 
         // Evict textures that are far from the visible range to control VRAM usage.
-        // Important for perceived smoothness: when scrolling UP we are moving toward smaller
-        // indices, so we want to keep a larger window *behind* the visible index to avoid
-        // constant re-decode/re-upload churn.
-        let (keep_behind, keep_ahead) = if scrolling_up { (16, 8) } else { (8, 16) };
-        let keep_start = current_visible_index.saturating_sub(keep_behind);
-        let keep_end = (current_visible_index + keep_ahead + 1).min(self.image_list.len());
+        // Use adaptive eviction based on zoom level: at low zoom, we need more cached
+        // textures since more are visible simultaneously.
+        // Get preload counts from the loader (they're zoom-aware)
+        let (keep_ahead, keep_behind) = if let Some(ref loader) = self.manga_loader {
+            (loader.get_preload_ahead(), loader.get_preload_behind())
+        } else {
+            (16, 8)
+        };
+        
+        // Apply scroll direction bias to eviction
+        let (final_keep_behind, final_keep_ahead) = if scrolling_up { 
+            (keep_ahead, keep_behind) // Keep more behind when scrolling up
+        } else { 
+            (keep_behind, keep_ahead) // Keep more ahead when scrolling down
+        };
+        
+        let keep_start = current_visible_index.saturating_sub(final_keep_behind);
+        let keep_end = (current_visible_index + final_keep_ahead + 1).min(self.image_list.len());
 
         let cached_indices = self.manga_texture_cache.cached_indices();
         for idx in cached_indices {
@@ -2236,6 +2263,43 @@ impl ImageViewer {
                 }
             }
         }
+    }
+
+    /// Calculate the number of pages currently visible on screen.
+    /// This is used for zoom-aware preloading - at low zoom, many pages are visible.
+    fn manga_calculate_visible_page_count(&mut self) -> usize {
+        if !self.manga_mode || self.image_list.is_empty() {
+            return 1;
+        }
+
+        let viewport_top = self.manga_scroll_offset.max(0.0);
+        let viewport_bottom = viewport_top + self.screen_size.y;
+
+        // Find first visible index
+        let first_idx = self.manga_index_at_y(viewport_top);
+        
+        // Count how many pages fit in the viewport
+        let mut count = 0usize;
+        let mut y = self.manga_page_start_y(first_idx);
+        
+        for idx in first_idx..self.image_list.len() {
+            let page_height = self.manga_page_height_cached(idx);
+            let page_bottom = y + page_height;
+            
+            // Check if page is at least partially visible
+            if y < viewport_bottom && page_bottom > viewport_top {
+                count += 1;
+            }
+            
+            // Stop if we've passed the viewport
+            if y >= viewport_bottom {
+                break;
+            }
+            
+            y = page_bottom;
+        }
+
+        count.max(1) // At least 1 page is always "visible"
     }
 
     /// Get the display height of an image at a given index (scaled to fit screen height)
@@ -2319,17 +2383,12 @@ impl ImageViewer {
 
         // Upload decoded images to GPU as textures
         for decoded in decoded_images {
-            // Skip videos - they are handled separately by VideoPlayer
-            if decoded.media_type == MangaMediaType::Video {
-                continue;
-            }
-
             // Skip if already in texture cache
             if self.manga_texture_cache.contains(decoded.index) {
                 continue;
             }
 
-            // Skip if no pixel data (video placeholder)
+            // Skip if no pixel data (failed to extract frame or empty placeholder)
             if decoded.pixels.is_empty() {
                 continue;
             }
@@ -2341,7 +2400,9 @@ impl ImageViewer {
             );
 
             // Use appropriate texture filter based on media type
-            let texture_options = if decoded.media_type == MangaMediaType::AnimatedImage {
+            // Videos and animated images use the animated filter for smoother playback
+            let texture_options = if decoded.media_type == MangaMediaType::AnimatedImage 
+                || decoded.media_type == MangaMediaType::Video {
                 self.config.texture_filter_animated.to_egui_options()
             } else {
                 self.config.texture_filter_static.to_egui_options()
@@ -3669,8 +3730,9 @@ impl ImageViewer {
                             .map_or(false, |p| is_supported_video(p));
 
                     if is_video {
-                        // Video item: use video texture if available
+                        // Video item: prioritize live video texture, fall back to first-frame thumbnail
                         if let Some((texture, _tex_w, _tex_h)) = self.manga_video_textures.get(&idx) {
+                            // Live video frame available - use it
                             ui.painter().image(
                                 texture.id(),
                                 image_rect,
@@ -3704,6 +3766,32 @@ impl ImageViewer {
                                     egui::Color32::WHITE,
                                 );
                             }
+                        } else if let Some((texture_id, _tex_w, _tex_h)) = self.manga_texture_cache.get_texture_info(idx) {
+                            // First-frame thumbnail from texture cache - use it as a preview
+                            ui.painter().image(
+                                texture_id,
+                                image_rect,
+                                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                egui::Color32::WHITE,
+                            );
+
+                            // Draw a play icon overlay to indicate it's a video
+                            let icon_bg_rect = egui::Rect::from_center_size(
+                                image_rect.center(),
+                                egui::Vec2::splat(60.0),
+                            );
+                            ui.painter().rect_filled(
+                                icon_bg_rect,
+                                30.0,
+                                egui::Color32::from_rgba_unmultiplied(0, 0, 0, 160),
+                            );
+                            ui.painter().text(
+                                image_rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                "▶",
+                                egui::FontId::proportional(32.0),
+                                egui::Color32::WHITE,
+                            );
                         } else {
                             // Video not yet loaded - draw placeholder with video icon
                             ui.painter().rect_filled(

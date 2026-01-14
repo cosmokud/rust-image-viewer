@@ -40,9 +40,18 @@ const MAX_PENDING_UPLOADS: usize = 32;
 /// Beyond this, the oldest entries are evicted to control VRAM usage.
 const MAX_CACHED_TEXTURES: usize = 64;
 
-/// Number of images to preload ahead/behind the current view.
-const PRELOAD_AHEAD: usize = 12;
-const PRELOAD_BEHIND: usize = 6;
+/// Base number of images to preload ahead/behind the current view.
+/// These are dynamically scaled based on zoom level and visible page count.
+const BASE_PRELOAD_AHEAD: usize = 12;
+const BASE_PRELOAD_BEHIND: usize = 6;
+
+/// Minimum preload counts (even at maximum zoom out)
+const MIN_PRELOAD_AHEAD: usize = 4;
+const MIN_PRELOAD_BEHIND: usize = 2;
+
+/// Maximum preload counts (for very zoomed out views with many visible pages)
+const MAX_PRELOAD_AHEAD: usize = 64;
+const MAX_PRELOAD_BEHIND: usize = 32;
 
 /// If the visible index jumps by more than this many pages, treat it as a "large jump".
 ///
@@ -140,6 +149,10 @@ pub struct MangaLoader {
     current_generation: usize,
     /// Statistics for debugging
     pub stats: LoaderStats,
+    /// Current zoom level for adaptive preloading
+    current_zoom: f32,
+    /// Estimated number of pages visible on screen (for adaptive preloading)
+    visible_page_count: usize,
 }
 
 /// Statistics for monitoring loader performance.
@@ -259,6 +272,8 @@ impl MangaLoader {
             generation,
             current_generation: 0,
             stats: LoaderStats::default(),
+            current_zoom: 1.0,
+            visible_page_count: 1,
         }
     }
 
@@ -506,30 +521,43 @@ impl MangaLoader {
     }
 
     /// Load a single image on a worker thread.
-    /// For video files, this extracts dimensions but doesn't decode - video playback is handled separately.
+    /// For video files, this extracts the first frame as a thumbnail placeholder.
     fn load_single_image(req: &LoadRequest) -> Option<DecodedImage> {
         // Determine media type
         let media_type = get_media_type(&req.path)?;
         
         match media_type {
             MediaType::Video => {
-                // For videos, we need to probe dimensions without full decode
-                // Return a placeholder with dimensions - actual video playback is handled by VideoPlayer
-                // Try to get video dimensions using GStreamer's discovery or fallback to a default
-                let (original_width, original_height) = Self::probe_video_dimensions(&req.path)
-                    .unwrap_or((1920, 1080)); // Fallback to 1080p
-                
-                // Return a minimal decoded image marker for videos
-                // The actual video texture will be created by the VideoPlayer
-                Some(DecodedImage {
-                    index: req.index,
-                    pixels: Vec::new(), // Empty - video textures are handled separately
-                    width: 0,
-                    height: 0,
-                    original_width,
-                    original_height,
-                    media_type: MangaMediaType::Video,
-                })
+                // For videos, try to extract the first frame as a thumbnail
+                // This provides a visual preview instead of a gray placeholder
+                match Self::extract_video_first_frame(&req.path, req.max_texture_side) {
+                    Some((pixels, width, height, original_width, original_height)) => {
+                        Some(DecodedImage {
+                            index: req.index,
+                            pixels,
+                            width,
+                            height,
+                            original_width,
+                            original_height,
+                            media_type: MangaMediaType::Video,
+                        })
+                    }
+                    None => {
+                        // Fallback: probe dimensions only, no thumbnail
+                        let (original_width, original_height) = Self::probe_video_dimensions(&req.path)
+                            .unwrap_or((1920, 1080)); // Fallback to 1080p
+                        
+                        Some(DecodedImage {
+                            index: req.index,
+                            pixels: Vec::new(),
+                            width: 0,
+                            height: 0,
+                            original_width,
+                            original_height,
+                            media_type: MangaMediaType::Video,
+                        })
+                    }
+                }
             }
             MediaType::Image => {
                 // Get original dimensions from file header first (fast, no decode)
@@ -605,8 +633,214 @@ impl MangaLoader {
         }
     }
 
+    /// Extract the first frame from a video file as a thumbnail.
+    /// 
+    /// Uses GStreamer to decode just the first frame without loading the entire video.
+    /// This is much faster than full video playback initialization and provides
+    /// a visual preview for videos in manga mode.
+    /// 
+    /// Returns: Some((pixels, width, height, original_width, original_height)) or None on failure
+    fn extract_video_first_frame(
+        path: &std::path::Path,
+        max_texture_side: u32,
+    ) -> Option<(Vec<u8>, u32, u32, u32, u32)> {
+        use gstreamer as gst;
+        use gstreamer::prelude::*;
+        use gstreamer_app as gst_app;
+        use gstreamer_video as gst_video;
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        // Initialize GStreamer if needed (static check to avoid repeated init)
+        static GST_INIT: std::sync::OnceLock<Result<(), ()>> = std::sync::OnceLock::new();
+        let init_result = GST_INIT.get_or_init(|| {
+            gst::init().map_err(|_| ())
+        });
+        if init_result.is_err() {
+            return None;
+        }
+
+        // Build URI from path
+        let uri = gst::glib::filename_to_uri(path, None).ok()?.to_string();
+
+        // Create a minimal pipeline for frame extraction
+        // Use decodebin for auto-detection and videoscale/videoconvert for format conversion
+        let pipeline_str = format!(
+            "uridecodebin uri=\"{}\" name=dec ! videoconvert ! videoscale ! \
+             video/x-raw,format=RGBA ! appsink name=sink max-buffers=1 drop=true",
+            uri.replace("\"", "\\\"")
+        );
+
+        let pipeline = gst::parse::launch(&pipeline_str).ok()?;
+        let pipeline = pipeline.downcast::<gst::Pipeline>().ok()?;
+
+        // Get the appsink element
+        let appsink = pipeline
+            .by_name("sink")?
+            .dynamic_cast::<gst_app::AppSink>()
+            .ok()?;
+
+        // Storage for extracted frame
+        let frame_data: Arc<Mutex<Option<(Vec<u8>, u32, u32)>>> = Arc::new(Mutex::new(None));
+        let frame_data_clone = Arc::clone(&frame_data);
+
+        // Set up preroll callback to capture the first frame
+        appsink.set_callbacks(
+            gst_app::AppSinkCallbacks::builder()
+                .new_preroll(move |sink| {
+                    if let Ok(sample) = sink.pull_preroll() {
+                        if let (Some(buffer), Some(caps)) = (sample.buffer(), sample.caps()) {
+                            if let Ok(video_info) = gst_video::VideoInfo::from_caps(caps) {
+                                let width = video_info.width();
+                                let height = video_info.height();
+                                if let Ok(map) = buffer.map_readable() {
+                                    let pixels = map.as_slice().to_vec();
+                                    if let Ok(mut data) = frame_data_clone.lock() {
+                                        *data = Some((pixels, width, height));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Ok(gst::FlowSuccess::Ok)
+                })
+                .build(),
+        );
+
+        // Set to PAUSED to get the first frame (preroll)
+        if pipeline.set_state(gst::State::Paused).is_err() {
+            let _ = pipeline.set_state(gst::State::Null);
+            return None;
+        }
+
+        // Wait for state change or timeout (500ms max for responsiveness)
+        let bus = pipeline.bus()?;
+        let mut got_frame = false;
+
+        // Wait for ASYNC_DONE or ERROR, with timeout
+        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        while std::time::Instant::now() < deadline {
+            if let Some(msg) = bus.timed_pop(gst::ClockTime::from_mseconds(50)) {
+                match msg.view() {
+                    gst::MessageView::AsyncDone(_) => {
+                        got_frame = true;
+                        break;
+                    }
+                    gst::MessageView::Error(_) => {
+                        break;
+                    }
+                    gst::MessageView::Eos(_) => {
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+
+            // Check if we already got frame data
+            if let Ok(data) = frame_data.lock() {
+                if data.is_some() {
+                    got_frame = true;
+                    break;
+                }
+            }
+        }
+
+        // Cleanup pipeline
+        let _ = pipeline.set_state(gst::State::Null);
+
+        if !got_frame {
+            return None;
+        }
+
+        // Extract the frame data
+        let (pixels, width, height) = {
+            let data = frame_data.lock().ok()?;
+            data.clone()?
+        };
+
+        if pixels.is_empty() || width == 0 || height == 0 {
+            return None;
+        }
+
+        let original_width = width;
+        let original_height = height;
+
+        // Downscale if needed for GPU texture limits
+        let (final_width, final_height, final_pixels) = downscale_rgba_if_needed(
+            width,
+            height,
+            &pixels,
+            max_texture_side,
+            FilterType::Triangle,
+        );
+
+        Some((
+            final_pixels.into_owned(),
+            final_width,
+            final_height,
+            original_width,
+            original_height,
+        ))
+    }
+
+    /// Calculate adaptive preload counts based on zoom level and visible pages.
+    /// 
+    /// When zoomed out (e.g., 10%), multiple images are visible simultaneously,
+    /// so we need to preload more images to ensure smooth scrolling.
+    /// 
+    /// Returns (preload_ahead, preload_behind)
+    fn calculate_adaptive_preload_counts(&self) -> (usize, usize) {
+        // At zoom 1.0 (100%), typically 1-2 pages visible
+        // At zoom 0.1 (10%), up to 10+ pages may be visible
+        // Scale preload proportionally to visible pages
+        
+        let zoom = self.current_zoom.max(0.01);
+        let visible_pages = self.visible_page_count.max(1);
+        
+        // Calculate scaling factor based on visible pages
+        // More visible pages = more aggressive preloading needed
+        let visibility_scale = (visible_pages as f32).sqrt();
+        
+        // Zoom also affects preload: lower zoom = more preload needed
+        // At zoom 0.1, we want roughly 3-4x the base preload
+        let zoom_scale = (1.0 / zoom).sqrt().clamp(1.0, 3.0);
+        
+        // Combined scale factor
+        let scale = (visibility_scale * zoom_scale).max(1.0);
+        
+        // Calculate scaled preload counts
+        let ahead = ((BASE_PRELOAD_AHEAD as f32 * scale) as usize)
+            .clamp(MIN_PRELOAD_AHEAD, MAX_PRELOAD_AHEAD);
+        let behind = ((BASE_PRELOAD_BEHIND as f32 * scale) as usize)
+            .clamp(MIN_PRELOAD_BEHIND, MAX_PRELOAD_BEHIND);
+        
+        (ahead, behind)
+    }
+
+    /// Update the zoom level and visible page count for adaptive preloading.
+    /// Call this whenever zoom changes or after calculating how many pages are visible.
+    pub fn update_zoom_state(&mut self, zoom: f32, visible_page_count: usize) {
+        self.current_zoom = zoom.max(0.01);
+        self.visible_page_count = visible_page_count.max(1);
+    }
+
+    /// Get current preload ahead count (useful for cache eviction in main.rs)
+    pub fn get_preload_ahead(&self) -> usize {
+        self.calculate_adaptive_preload_counts().0
+    }
+
+    /// Get current preload behind count (useful for cache eviction in main.rs)
+    pub fn get_preload_behind(&self) -> usize {
+        self.calculate_adaptive_preload_counts().1
+    }
+
     /// Request loading of images around the visible range.
-    /// Uses priority-based loading with scroll direction awareness.
+    /// Uses priority-based loading with scroll direction and zoom awareness.
+    /// 
+    /// The algorithm adapts to zoom level:
+    /// - At 100% zoom: ~1 page visible, base preload (12 ahead, 6 behind)
+    /// - At 50% zoom: ~2 pages visible, scaled preload
+    /// - At 10% zoom: ~10+ pages visible, aggressive preload (up to 64 ahead, 32 behind)
     pub fn update_preload_queue(
         &mut self,
         image_list: &[PathBuf],
@@ -635,16 +869,19 @@ impl MangaLoader {
         }
         self.last_visible_index = visible_index;
 
-        // Calculate the range of indices to preload
+        // Calculate adaptive preload counts based on zoom level and visible pages
+        let (base_ahead, base_behind) = self.calculate_adaptive_preload_counts();
+
+        // Apply scroll direction bias
         let ahead = if self.scroll_direction > 0 {
-            PRELOAD_AHEAD
+            base_ahead
         } else {
-            PRELOAD_BEHIND
+            base_behind
         };
         let behind = if self.scroll_direction > 0 {
-            PRELOAD_BEHIND
+            base_behind
         } else {
-            PRELOAD_AHEAD
+            base_ahead
         };
 
         let start_idx = visible_index.saturating_sub(behind);
