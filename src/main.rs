@@ -347,6 +347,12 @@ struct ImageViewer {
     manga_scroll_target: f32,
     /// Scroll velocity for momentum scrolling
     manga_scroll_velocity: f32,
+
+    /// Active horizontal arrow navigation direction in manga mode.
+    /// -1 = ArrowLeft, +1 = ArrowRight, 0 = inactive.
+    manga_lr_nav_dir: i8,
+    /// Next scheduled repeat time for horizontal arrow navigation while the key is held.
+    manga_lr_nav_next_repeat_at: Instant,
     /// High-performance parallel image loader for manga mode
     manga_loader: Option<MangaLoader>,
     /// LRU texture cache for manga mode
@@ -507,6 +513,8 @@ impl Default for ImageViewer {
             manga_scroll_offset: 0.0,
             manga_scroll_target: 0.0,
             manga_scroll_velocity: 0.0,
+            manga_lr_nav_dir: 0,
+            manga_lr_nav_next_repeat_at: Instant::now(),
             manga_loader: None,
             manga_texture_cache: MangaTextureCache::default(),
             manga_scrollbar_dragging: false,
@@ -2517,6 +2525,31 @@ impl ImageViewer {
         }
 
         let current = self.manga_top_index();
+        if self.image_list.is_empty() {
+            return;
+        }
+
+        // If we're partway through the current page (top is not visible), first align to
+        // the current page's top instead of skipping to the previous page.
+        let start_y = self.manga_page_start_y(current);
+        const ALIGN_EPS: f32 = 1.0;
+        if self.manga_scroll_offset > start_y + ALIGN_EPS {
+            self.current_index = current;
+            self.manga_scroll_target = start_y;
+            self.manga_scroll_velocity = 0.0;
+
+            if let Some(ref mut loader) = self.manga_loader {
+                let len = self.image_list.len();
+                let start = current.saturating_sub(30);
+                let end = (current + 60).min(len);
+                loader.request_dimensions_range(&self.image_list, start, end);
+                loader.update_preload_queue(&self.image_list, current, self.screen_size.y, self.max_texture_side);
+            }
+
+            self.manga_update_preload_queue();
+            return;
+        }
+
         if current == 0 {
             return;
         }
@@ -2529,12 +2562,10 @@ impl ImageViewer {
         // Prime the loader around the destination so the transition stays smooth.
         if let Some(ref mut loader) = self.manga_loader {
             let len = self.image_list.len();
-            if len > 0 {
-                let start = target.saturating_sub(30);
-                let end = (target + 60).min(len);
-                loader.request_dimensions_range(&self.image_list, start, end);
-                loader.update_preload_queue(&self.image_list, target, self.screen_size.y, self.max_texture_side);
-            }
+            let start = target.saturating_sub(30);
+            let end = (target + 60).min(len);
+            loader.request_dimensions_range(&self.image_list, start, end);
+            loader.update_preload_queue(&self.image_list, target, self.screen_size.y, self.max_texture_side);
         }
 
         // Still run the standard queue update (throttled) for eviction bookkeeping.
@@ -2577,6 +2608,37 @@ impl ImageViewer {
         }
 
         let current = self.manga_top_index();
+
+        // If the bottom of the current page is not visible, first align so the bottom becomes
+        // visible instead of skipping to the next page.
+        let start_y = self.manga_page_start_y(current);
+        let page_h = self.manga_page_height_cached(current).max(0.0);
+        let end_y = start_y + page_h;
+        let viewport_h = self.screen_size.y.max(1.0);
+        let viewport_bottom = self.manga_scroll_offset + viewport_h;
+        const ALIGN_EPS: f32 = 1.0;
+
+        if viewport_bottom < end_y - ALIGN_EPS {
+            let total_height = self.manga_total_height();
+            let max_scroll = (total_height - viewport_h).max(0.0);
+            let scroll_to = (end_y - viewport_h).clamp(0.0, max_scroll);
+
+            self.current_index = current;
+            self.manga_scroll_target = scroll_to;
+            self.manga_scroll_velocity = 0.0;
+
+            if let Some(ref mut loader) = self.manga_loader {
+                let len = self.image_list.len();
+                let start = current.saturating_sub(30);
+                let end = (current + 60).min(len);
+                loader.request_dimensions_range(&self.image_list, start, end);
+                loader.update_preload_queue(&self.image_list, current, self.screen_size.y, self.max_texture_side);
+            }
+
+            self.manga_update_preload_queue();
+            return;
+        }
+
         let target = (current + 1).min(self.image_list.len() - 1);
         if target == current {
             return;
@@ -4073,16 +4135,48 @@ impl ImageViewer {
             // - Up/Down: continuous smooth scrolling.
             let arrow_left_pressed = ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft));
             let arrow_right_pressed = ctx.input(|i| i.key_pressed(egui::Key::ArrowRight));
+            let arrow_left_down = ctx.input(|i| i.key_down(egui::Key::ArrowLeft));
+            let arrow_right_down = ctx.input(|i| i.key_down(egui::Key::ArrowRight));
             let arrow_up = ctx.input(|i| i.key_down(egui::Key::ArrowUp));
             let arrow_down = ctx.input(|i| i.key_down(egui::Key::ArrowDown));
             
             let scroll_speed = self.config.manga_arrow_scroll_speed;
 
+            // Left/Right: smooth page navigation with our own hold-to-repeat.
+            // Do not rely on OS key-repeat behavior (can vary across systems/layouts).
+            const INITIAL_REPEAT_DELAY: Duration = Duration::from_millis(260);
+            const REPEAT_INTERVAL: Duration = Duration::from_millis(90);
+            let now = Instant::now();
+
             if arrow_left_pressed {
                 self.manga_page_up_smooth();
-            }
-            if arrow_right_pressed {
+                self.manga_lr_nav_dir = -1;
+                self.manga_lr_nav_next_repeat_at = now + INITIAL_REPEAT_DELAY;
+            } else if arrow_right_pressed {
                 self.manga_page_down_smooth();
+                self.manga_lr_nav_dir = 1;
+                self.manga_lr_nav_next_repeat_at = now + INITIAL_REPEAT_DELAY;
+            }
+
+            // Continue repeating while the active key is held.
+            match self.manga_lr_nav_dir {
+                -1 => {
+                    if !arrow_left_down {
+                        self.manga_lr_nav_dir = 0;
+                    } else if now >= self.manga_lr_nav_next_repeat_at {
+                        self.manga_page_up_smooth();
+                        self.manga_lr_nav_next_repeat_at = now + REPEAT_INTERVAL;
+                    }
+                }
+                1 => {
+                    if !arrow_right_down {
+                        self.manga_lr_nav_dir = 0;
+                    } else if now >= self.manga_lr_nav_next_repeat_at {
+                        self.manga_page_down_smooth();
+                        self.manga_lr_nav_next_repeat_at = now + REPEAT_INTERVAL;
+                    }
+                }
+                _ => {}
             }
 
             // Use velocity-based scrolling for smooth acceleration/deceleration.
