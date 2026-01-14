@@ -2524,7 +2524,10 @@ impl ImageViewer {
             return;
         }
 
-        let current = self.manga_top_index();
+        // When a smooth scroll is in-flight, `manga_top_index()` stays pinned until the
+        // viewport actually crosses the next page boundary. Use `current_index` as a
+        // forward-looking destination so holding the key can continue stepping.
+        let current = self.manga_top_index().min(self.current_index);
         if current == 0 {
             return;
         }
@@ -2584,7 +2587,10 @@ impl ImageViewer {
             return;
         }
 
-        let current = self.manga_top_index();
+        // Same rationale as `manga_page_up_smooth`: while animating toward the next page,
+        // the top index won't update until we reach the destination. Use `current_index`
+        // as a forward-looking anchor so holding ArrowRight continues stepping.
+        let current = self.manga_top_index().max(self.current_index);
         let target = (current + 1).min(self.image_list.len() - 1);
         if target == current {
             return;
