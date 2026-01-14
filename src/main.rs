@@ -3024,6 +3024,16 @@ impl ImageViewer {
 
         let primary_down = ctx.input(|i| i.pointer.button_down(egui::PointerButton::Primary));
 
+        // If the primary button is no longer held, stop any latched zoom-repeat.
+        // Important: don't rely on `is_pointer_button_down_on()` to clear the hold state,
+        // because the HUD can shift during zooming (e.g. scrollbar appearing), causing
+        // the pointer to no longer be considered "on" the widget even though the user
+        // is still holding the mouse button.
+        if !primary_down {
+            self.manga_zoom_plus_held = false;
+            self.manga_zoom_minus_held = false;
+        }
+
         // Don't auto-hide while buttons are being held
         let is_holding_button = self.manga_zoom_plus_held || self.manga_zoom_minus_held;
 
@@ -3133,8 +3143,6 @@ impl ImageViewer {
                                 }
                             }
                             self.touch_bottom_overlays();
-                        } else if self.manga_zoom_minus_held {
-                            self.manga_zoom_minus_held = false;
                         }
 
                         // Slider
@@ -3198,8 +3206,6 @@ impl ImageViewer {
                                 }
                             }
                             self.touch_bottom_overlays();
-                        } else if self.manga_zoom_plus_held {
-                            self.manga_zoom_plus_held = false;
                         }
 
                         ui.add_space(4.0);
