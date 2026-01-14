@@ -272,6 +272,12 @@ struct ImageViewer {
     /// Whether mouse is over the window control buttons (top-right).
     /// Used to prevent our custom window-drag handler from stealing clicks.
     mouse_over_window_buttons: bool,
+    /// Whether the pointer is over selectable title-bar text (filename, resolution, zoom, etc.).
+    /// Used to suppress drag/pan/double-click gestures while selecting/copying title text.
+    mouse_over_title_text: bool,
+    /// Whether title-bar text is currently being drag-selected.
+    /// This stays true even if the pointer leaves the title bar during the drag.
+    title_text_dragging: bool,
     /// Whether user is dragging the seek bar
     is_seeking: bool,
     /// Seekbar fraction to display while dragging (prevents flicker)
@@ -472,6 +478,8 @@ impl Default for ImageViewer {
             video_controls_show_time: Instant::now(),
             mouse_over_video_controls: false,
             mouse_over_window_buttons: false,
+            mouse_over_title_text: false,
+            title_text_dragging: false,
             is_seeking: false,
             seek_preview_fraction: None,
             last_seek_sent_at: Instant::now(),
@@ -3280,6 +3288,10 @@ impl ImageViewer {
         let pointer_delta = ctx.input(|i| i.pointer.delta());
         let secondary_clicked = ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Secondary));
 
+        // Avoid triggering manga interactions while selecting/copying title-bar text.
+        let title_bar_height = 32.0;
+        let over_title_bar = self.show_controls && pointer_pos.map_or(false, |p| p.y <= title_bar_height);
+
         // Wheel normalization (mouse vs trackpad):
         // - Mouse wheels are usually "line" deltas (1.0 per notch)
         // - Trackpads are usually "point" deltas (many small pixel-ish deltas)
@@ -3331,7 +3343,7 @@ impl ImageViewer {
         let controls_bar_height = 56.0;
         let over_controls = pointer_pos.map_or(false, |p| p.y > screen_height - controls_bar_height);
         
-        if secondary_clicked && !over_controls {
+        if secondary_clicked && !over_controls && !over_title_bar {
             // Check if we have a focused video
             if let Some(video_idx) = self.manga_focused_video_index {
                 if let Some(player) = self.manga_video_players.get_mut(&video_idx) {
@@ -3395,14 +3407,14 @@ impl ImageViewer {
 
         // Handle scrollbar dragging
         if show_scrollbar {
-            if over_scrollbar && primary_pressed {
+            if over_scrollbar && primary_pressed && !over_title_bar && !self.title_text_dragging {
                 self.manga_scrollbar_dragging = true;
             }
             if primary_released {
                 self.manga_scrollbar_dragging = false;
             }
 
-            if self.manga_scrollbar_dragging || (over_scrollbar && primary_down) {
+            if !over_title_bar && !self.title_text_dragging && (self.manga_scrollbar_dragging || (over_scrollbar && primary_down)) {
                 if let Some(pos) = pointer_pos {
                     // Calculate scroll position from mouse Y
                     let relative_y =
@@ -3453,7 +3465,7 @@ impl ImageViewer {
                 .map_or(false, |bindings| bindings.iter().any(|b| matches!(b, InputBinding::CtrlScrollDown)));
 
         // Handle scroll/zoom (only when not over scrollbar)
-        if !over_scrollbar {
+        if !over_scrollbar && !over_title_bar && !self.title_text_dragging {
             let wants_ctrl_zoom = ctrl_held
                 && manga_ctrl_scroll_zoom_bound
                 && (zoom_delta != 1.0 || wheel_steps_ctrl != 0.0);
@@ -3523,7 +3535,7 @@ impl ImageViewer {
 
         // Double-click: reset manga view (zoom + pan + inertia) to a stable baseline.
         // IMPORTANT: This should work even if the zoom is already at the baseline, so we always clear pan/inertia.
-        if primary_double_clicked && !over_scrollbar {
+        if primary_double_clicked && !over_scrollbar && !over_title_bar && !self.title_text_dragging {
             let mut did_reset = false;
 
             // Always reset horizontal offset and stop any ongoing drag/pan.
@@ -3595,7 +3607,9 @@ impl ImageViewer {
         }
 
         // Handle drag panning (when not interacting with scrollbar, video controls, or seekbars)
-        let panning_allowed = !self.manga_scrollbar_dragging
+        let panning_allowed = !over_title_bar
+            && !self.title_text_dragging
+            && !self.manga_scrollbar_dragging
             && !over_scrollbar
             && !over_controls
             && !self.manga_video_seeking
@@ -4404,6 +4418,8 @@ impl ImageViewer {
 
         // Default to false each frame; updated below when the bar is visible.
         self.mouse_over_window_buttons = false;
+        self.mouse_over_title_text = false;
+        self.title_text_dragging = false;
         
         // Check if mouse is near top
         let mouse_pos = ctx.input(|i| i.pointer.hover_pos());
@@ -4481,6 +4497,11 @@ impl ImageViewer {
                         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                             ui.add_space(10.0);
 
+                            // Track whether the pointer is interacting with title text so we can
+                            // suppress drag/pan/double-click gestures while selecting/copying.
+                            let mut over_title_text = false;
+                            let mut title_text_dragging = false;
+
                             let current_path = self.image_list.get(self.current_index).cloned();
                             if let Some(path) = current_path {
                                 let filename = path
@@ -4488,12 +4509,15 @@ impl ImageViewer {
                                     .map(|n| n.to_string_lossy().to_string())
                                     .unwrap_or_else(|| "Unknown".to_string());
 
-                                ui.add(
+                                let resp = ui.add(
                                     egui::Label::new(
                                         egui::RichText::new(filename).color(egui::Color32::WHITE),
                                     )
+                                    .selectable(true)
                                     .truncate(),
                                 );
+                                over_title_text |= resp.contains_pointer();
+                                title_text_dragging |= resp.dragged();
 
                                 ui.add_space(8.0);
 
@@ -4501,39 +4525,51 @@ impl ImageViewer {
                                 // (Keep the buttons intact by design, and avoid wrapping the title bar.)
                                 let show_details = ui.available_width() >= 220.0;
                                 if !show_details {
-                                    ui.add(
+                                    let resp = ui.add(
                                         egui::Label::new(
                                             egui::RichText::new("...").color(egui::Color32::GRAY),
-                                        ),
+                                        )
+                                        .selectable(true),
                                     );
+                                    over_title_text |= resp.contains_pointer();
+                                    title_text_dragging |= resp.dragged();
                                 } else {
                                     if let Some((w, h)) = self.media_display_dimensions() {
-                                        ui.add(
+                                        let resp = ui.add(
                                             egui::Label::new(
                                                 egui::RichText::new(format!("{}x{}", w, h))
                                                     .color(egui::Color32::GRAY),
-                                            ),
+                                            )
+                                            .selectable(true),
                                         );
+                                        over_title_text |= resp.contains_pointer();
+                                        title_text_dragging |= resp.dragged();
                                     }
 
-                                    ui.add(
+                                    let resp = ui.add(
                                         egui::Label::new(
                                             egui::RichText::new(format!("{:.0}%", self.zoom * 100.0))
                                                 .color(egui::Color32::GRAY),
-                                        ),
+                                        )
+                                        .selectable(true),
                                     );
+                                    over_title_text |= resp.contains_pointer();
+                                    title_text_dragging |= resp.dragged();
 
                                     if self.video_player.is_some() {
-                                        ui.add(
+                                        let resp = ui.add(
                                             egui::Label::new(
-                                                egui::RichText::new(" VIDEO")
+                                                egui::RichText::new("\u{007f}\u{007f} VIDEO")
                                                     .color(egui::Color32::from_rgb(66, 133, 244)),
-                                            ),
+                                            )
+                                            .selectable(true),
                                         );
+                                        over_title_text |= resp.contains_pointer();
+                                        title_text_dragging |= resp.dragged();
                                     }
 
                                     if !self.image_list.is_empty() {
-                                        ui.add(
+                                        let resp = ui.add(
                                             egui::Label::new(
                                                 egui::RichText::new(format!(
                                                     "[{}/{}]",
@@ -4541,11 +4577,17 @@ impl ImageViewer {
                                                     self.image_list.len()
                                                 ))
                                                 .color(egui::Color32::GRAY),
-                                            ),
+                                            )
+                                            .selectable(true),
                                         );
+                                        over_title_text |= resp.contains_pointer();
+                                        title_text_dragging |= resp.dragged();
                                     }
                                 }
                             }
+
+                            self.mouse_over_title_text = over_title_text;
+                            self.title_text_dragging = title_text_dragging;
                         });
                     });
 
@@ -5714,6 +5756,7 @@ impl ImageViewer {
 
         let screen_rect = ctx.screen_rect();
         let mut animation_active = false;
+        let title_bar_height = 32.0;
 
         // Smooth zoom animation (floating mode)
         if self.tick_floating_zoom_animation(ctx) {
@@ -5737,6 +5780,10 @@ impl ImageViewer {
         let scroll_delta = ctx.input(|i| i.smooth_scroll_delta.y);
         if scroll_delta != 0.0 {
             if let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) {
+                // Don't zoom while interacting with/selecting title-bar text.
+                if self.show_controls && pos.y <= title_bar_height {
+                    // Intentionally ignore scroll for zoom while the title bar is visible/hovered.
+                } else {
                 // Use configurable zoom step (default 1.08 = 8% per scroll notch)
                 let step = self.config.zoom_step;
                 let factor = if scroll_delta > 0.0 { step } else { 1.0 / step };
@@ -5762,6 +5809,7 @@ impl ImageViewer {
                     // Reset velocity on new scroll input for immediate response
                     self.zoom_velocity = 0.0;
                 }
+                }
             }
         }
 
@@ -5770,6 +5818,11 @@ impl ImageViewer {
         let primary_down = ctx.input(|i| i.pointer.button_down(egui::PointerButton::Primary));
         let primary_pressed = ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary));
         let primary_released = ctx.input(|i| i.pointer.button_released(egui::PointerButton::Primary));
+
+        // Title bar gesture suppression:
+        // - In fullscreen: never pan/gesture from the title bar region.
+        // - In floating: allow window drag from empty title bar area, but suppress when on title text.
+        let over_title_bar = self.show_controls && pointer_pos.map_or(false, |p| p.y <= title_bar_height);
 
         // Determine if we're over a resize edge (only in floating mode)
         let hover_resize_direction = if !self.is_fullscreen {
@@ -5846,6 +5899,8 @@ impl ImageViewer {
                 && !self.gif_seeking
                 && !self.manga_video_seeking
                 && !self.mouse_over_window_buttons
+                && !self.title_text_dragging
+                && !(over_title_bar && (self.is_fullscreen || self.mouse_over_title_text))
             {
                 if let Some(pos) = pointer_pos {
                     // Check if drag started from title bar area (top 50px) for window dragging
@@ -5883,10 +5938,13 @@ impl ImageViewer {
                 self.last_mouse_pos = None;
                 
                 // Set cursor based on hover state
-                if hover_resize_direction != ResizeDirection::None {
-                    ctx.set_cursor_icon(self.get_resize_cursor(hover_resize_direction));
-                } else {
-                    ctx.set_cursor_icon(egui::CursorIcon::Default);
+                // Don't fight egui's cursor when the pointer is over title-bar UI (text selection, buttons).
+                if !(self.title_text_dragging || (over_title_bar && (self.mouse_over_title_text || self.mouse_over_window_buttons))) {
+                    if hover_resize_direction != ResizeDirection::None {
+                        ctx.set_cursor_icon(self.get_resize_cursor(hover_resize_direction));
+                    } else {
+                        ctx.set_cursor_icon(egui::CursorIcon::Default);
+                    }
                 }
             }
         }
@@ -5896,7 +5954,7 @@ impl ImageViewer {
         self.request_floating_autosize(ctx);
 
         // Handle double-click to fit media to screen (fullscreen) or reset zoom (floating)
-        if ctx.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary)) {
+        if ctx.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary)) && !over_title_bar {
             self.offset = egui::Vec2::ZERO;
             self.zoom_velocity = 0.0;
             
@@ -6392,17 +6450,19 @@ impl eframe::App for ImageViewer {
         let skip_drawing = !self.startup_window_shown 
             && matches!(self.current_media_type, Some(MediaType::Video));
 
+        // Draw controls overlay (top bar for title/buttons) BEFORE the main view.
+        // This ensures title-bar hover/selection state is available to suppress gestures
+        // (drag/pan/double-click) in the same frame.
+        if !skip_drawing {
+            self.draw_controls(ctx);
+        }
+
         // Draw image/video and check if draw animations need repaint
         let draw_animation_active = if skip_drawing {
             false
         } else {
             self.draw_image(ctx)
         };
-
-        // Draw controls overlay (top bar for title/buttons)
-        if !skip_drawing {
-            self.draw_controls(ctx);
-        }
 
         // Draw video controls overlay (bottom bar for video playback controls)
         if !skip_drawing {
