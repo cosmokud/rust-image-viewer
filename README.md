@@ -1,240 +1,325 @@
 # Rust Image & Video Viewer
 
-A high-performance, minimal image and video viewer for Windows 11 built with Rust, egui, and GStreamer.
+A high-performance, minimal, and feature-rich image and video viewer for Windows, built with Rust, egui, and GStreamer.
+
+![License](https://img.shields.io/badge/license-MIT-blue.svg)
+![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)
+![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-lightgrey.svg)
 
 ## Features
 
-### UI
+### User Interface
 
-- **Borderless floating window** - No title bar by default for a clean, minimal look
-- **Smart sizing** - Opens images/videos at 100% zoom, or fits to screen if larger
-- **Floating mode** - Drag the media anywhere on screen
-- **Fullscreen mode** - Immersive viewing experience
-- **Auto-hide controls** - Window controls appear when hovering near the top
-- **Video controls bar** - Auto-hide playback controls at the bottom for videos
+- **Borderless Floating Window** — Clean, minimal design with no title bar by default
+- **Smart Window Sizing** — Opens images/videos at 100% zoom, or fits to screen if larger
+- **Floating Mode** — Freely position and resize the window anywhere on screen
+- **Fullscreen Mode** — Immersive viewing experience with `F`, `F12`, or middle-click
+- **Auto-hide Controls** — Window controls appear on hover near the top edge
+- **CJK Filename Support** — Properly displays Chinese, Japanese, and Korean characters
 
-### Functionality
+### Image Viewing
 
-- **Smooth zoom** - Mouse scroll wheel with cursor-follow zoom (works for both images and videos)
-- **Free panning** - Hold left mouse button to drag the media
-- **Quick reset** - Double-click to reset zoom to 100%
-- **Easy navigation** - Right-click on edges to go to next/previous media
-- **Animation support** - Plays animated GIFs smoothly
-- **Video playback** - Full video playback with seek, volume control, and mute
+- **Smooth Zoom** — Mouse wheel zoom with cursor-follow (zooms toward cursor position)
+- **Free Panning** — Hold left mouse button to drag the image
+- **Rotation** — Rotate images clockwise/counter-clockwise with arrow keys
+- **Quick Reset** — Double-click to reset zoom to 100%
+- **Per-image View State** — Fullscreen mode remembers zoom, pan, and rotation for each image
+
+### Animated GIF Support
+
+- **Smooth Playback** — Efficient GIF animation with proper frame timing
+- **Playback Controls** — Play/pause with spacebar, seek with progress bar
+- **Frame-by-frame Navigation** — When paused, use arrow keys or click on the seek bar
+
+### Video Playback
+
+- **Full Playback Controls** — Play/pause, seek, volume, and mute
+- **Auto-hide Video Controls** — Controls appear on hover at the bottom
+- **Looping** — Videos loop automatically (configurable)
+- **Volume Memory** — Volume and mute settings persist across videos
+
+### Manga Reading Mode
+
+- **Vertical Strip View** — View all images in a folder as a continuous vertical strip
+- **Smooth Scrolling** — Inertial scrolling with momentum (configurable friction)
+- **High-performance Preloading** — Parallel background loading with priority-based queue
+- **Video Thumbnails** — Videos show first-frame thumbnails in manga strip
+- **Zoom Control** — Ctrl+Scroll to zoom in/out in manga mode
+- **Toggle Button** — Bottom-right button to switch between single-image and manga modes
 
 ### Supported Formats
 
 #### Images
-
-- JPEG (.jpg, .jpeg)
-- PNG (.png)
-- WebP (.webp)
-- GIF (.gif) - including animated
-- BMP (.bmp)
-- ICO (.ico)
-- TIFF (.tiff, .tif)
+| Format | Extensions |
+|--------|------------|
+| JPEG | `.jpg`, `.jpeg` |
+| PNG | `.png` |
+| WebP | `.webp` |
+| GIF | `.gif` (including animated) |
+| BMP | `.bmp` |
+| ICO | `.ico` |
+| TIFF | `.tiff`, `.tif` |
 
 #### Videos
-
-- MP4 (.mp4)
-- MKV (.mkv)
-- WebM (.webm)
-- AVI (.avi)
-- MOV (.mov)
-- WMV (.wmv)
-- FLV (.flv)
-- M4V (.m4v)
-- 3GP (.3gp)
-- OGV (.ogv)
+| Format | Extensions |
+|--------|------------|
+| MP4 | `.mp4` |
+| MKV | `.mkv` |
+| WebM | `.webm` |
+| AVI | `.avi` |
+| QuickTime | `.mov` |
+| WMV | `.wmv` |
+| FLV | `.flv` |
+| M4V | `.m4v` |
+| 3GP | `.3gp` |
+| OGV | `.ogv` |
 
 ## Installation
 
+### Download Release
+
+Download the latest release from the [Releases](https://github.com/yourusername/rust-image-viewer/releases) page.
+
 ### Prerequisites for Video Support
 
-To build with video support, you need GStreamer installed:
+Video playback requires GStreamer. If you only need image viewing, GStreamer is optional.
 
 1. **Download GStreamer** from https://gstreamer.freedesktop.org/download/
-2. Install both the **runtime** and **development** packages for MSVC (MinGW versions won't work with Rust MSVC toolchain)
-3. Set environment variables:
+2. Install both the **runtime** and **development** packages for MSVC 64-bit
+3. Add to system PATH (usually done automatically by installer)
 
-   ```powershell
-   # Add GStreamer bin to PATH
-   $env:PATH = "C:\gstreamer\1.0\msvc_x86_64\bin;$env:PATH"
-
-   # Set PKG_CONFIG_PATH for the build
-   $env:PKG_CONFIG_PATH = "C:\Program Files\gstreamer\1.0\msvc_x86_64\lib\pkgconfig"
-   ```
-
-### From Source
+### Build from Source
 
 ```bash
 # Clone the repository
 git clone https://github.com/yourusername/rust-image-viewer.git
 cd rust-image-viewer
 
-# Build release version
+# Build release version (optimized)
 cargo build --release
 
 # The executable will be at target/release/image-viewer.exe
-# config.ini will be automatically copied to the target directory
+```
+
+#### Build Requirements
+
+- Rust 1.70+ (install from https://rustup.rs/)
+- Windows 10/11
+- GStreamer MSVC runtime + development packages (for video support)
+- PKG_CONFIG_PATH set to GStreamer's pkgconfig directory
+
+```powershell
+# Set environment for building (if not auto-detected)
+$env:PKG_CONFIG_PATH = "C:\gstreamer\1.0\msvc_x86_64\lib\pkgconfig"
 ```
 
 ## Usage
 
-### Opening Media
+### Opening Files
 
 ```bash
-# From command line
-image-viewer.exe path/to/image.jpg
-image-viewer.exe path/to/video.mp4
+# Open a single image or video
+image-viewer.exe path\to\file.jpg
+image-viewer.exe path\to\video.mp4
 
-# Or drag and drop an image/video onto the window
+# The viewer will list all media files in the same directory for navigation
 ```
 
-### Default Shortcuts
+### Default Keyboard Shortcuts
 
-| Action                   | Shortcut                              |
-| ------------------------ | ------------------------------------- |
-| Toggle Fullscreen        | `F`, `F12`, or Middle Click           |
-| Next Media               | Right Arrow or Right-click right side |
-| Previous Media           | Left Arrow or Right-click left side   |
-| Rotate Clockwise         | Up Arrow (images only)                |
-| Rotate Counter-clockwise | Down Arrow (images only)              |
-| Zoom In                  | Scroll Up                             |
-| Zoom Out                 | Scroll Down                           |
-| Reset Zoom               | Double-click                          |
-| Pan Media                | Hold Left Mouse Button                |
-| **Video Play/Pause**     | **Space** or **Right-click center**   |
-| **Video Mute**           | **M**                                 |
-| Exit                     | `Esc` or `Ctrl+W`                     |
+| Action | Shortcut |
+|--------|----------|
+| Toggle Fullscreen | `F`, `F12`, or Middle-click |
+| Next Image/Video | `→` Right Arrow, or Mouse5 |
+| Previous Image/Video | `←` Left Arrow, or Mouse4 |
+| Rotate Clockwise | `↑` Up Arrow |
+| Rotate Counter-clockwise | `↓` Down Arrow |
+| Zoom In | Scroll Up |
+| Zoom Out | Scroll Down |
+| Pan Image | Hold Left Mouse Button + Drag |
+| Play/Pause (Video/GIF) | `Space` |
+| Mute/Unmute (Video) | `M` |
+| Exit | `Esc` or `Ctrl+W` |
+
+### Manga Mode Shortcuts
+
+| Action | Shortcut |
+|--------|----------|
+| Scroll | Mouse Wheel or Drag |
+| Zoom In | `Ctrl` + Scroll Up |
+| Zoom Out | `Ctrl` + Scroll Down |
+| Navigate by Page | `↑`/`↓` Arrow Keys |
+| Toggle Manga Mode | Click manga icon (bottom-right) |
 
 ## Configuration
 
-The viewer creates a `config.ini` file next to the executable on first run. You can customize all shortcuts and settings:
+The viewer creates a `config.ini` file in `%APPDATA%\rust-image-viewer\` on first run. All shortcuts and settings are fully customizable.
+
+### Settings Section
 
 ```ini
 [Settings]
+; Title bar auto-hide delay (seconds)
 controls_hide_delay = 0.5
+
+; Bottom overlays (video controls, manga toggle) auto-hide delay (seconds)
+bottom_overlay_hide_delay = 0.5
+
+; Show FPS overlay for debugging (true/false)
+show_fps = false
+
+; Window resize border width in pixels
 resize_border_size = 6
+
+; Startup mode: floating or fullscreen
+startup_window_mode = floating
+
+; Background color (RGB 0-255)
+background_rgb = 0, 0, 0
+
+; Zoom animation speed (0 = instant, 1-30 = animated)
 zoom_animation_speed = 20
+
+; Zoom step per scroll notch (1.02 = 2%, 1.10 = 10%)
 zoom_step = 1.02
 
+; Maximum zoom level in percent (1000 = 10x)
+max_zoom_percent = 1000
+
+; Reset view when entering fullscreen (true/false)
+fullscreen_reset_fit_on_enter = true
+```
+
+### Manga Mode Settings
+
+```ini
+[Settings]
+; Drag pan speed multiplier (1.0 = 1:1)
+manga_drag_pan_speed = 2.5
+
+; Mouse wheel scroll speed (pixels per step)
+manga_wheel_scroll_speed = 160
+
+; Inertial scrolling friction (lower = smoother glide)
+manga_inertial_friction = 0.33
+
+; Extra wheel multiplier for trackpad vs mouse
+manga_wheel_multiplier = 1.5
+
+; Arrow key scroll speed (pixels per press)
+manga_arrow_scroll_speed = 140
+```
+
+### Video Settings
+
+```ini
 [Video]
-; Videos start muted by default
+; Start videos muted (true/false)
 muted_by_default = true
-; Default volume (0.0 to 1.0)
+
+; Default volume level (0.0 to 1.0)
 default_volume = 0.5
-; Loop videos automatically
+
+; Auto-loop videos (true/false)
 loop = true
-; How long video controls stay visible
-controls_hide_delay = 2.0
+```
 
+### Image Quality Settings
+
+```ini
+[Quality]
+; Image scaling filters (from fastest to highest quality):
+; nearest, triangle, catmullrom, gaussian, lanczos3
+
+; Filter for enlarging images
+upscale_filter = triangle
+
+; Filter for shrinking images
+downscale_filter = triangle
+
+; Filter for GIF frame resizing
+gif_resize_filter = triangle
+
+; GPU texture filtering: nearest (sharp) or linear (smooth)
+texture_filter_static = linear
+texture_filter_animated = linear
+texture_filter_video = linear
+```
+
+### Custom Shortcuts
+
+```ini
 [Shortcuts]
-; Toggle fullscreen mode
+; Multiple bindings separated by commas
 toggle_fullscreen = mouse_middle, f, f12
-
-; Navigate between media
-next_image = right
-previous_image = left
-
-; Rotate image
+next_image = right, mouse5
+previous_image = left, mouse4
 rotate_clockwise = up
 rotate_counterclockwise = down
-
-; Zoom controls
 zoom_in = scroll_up
 zoom_out = scroll_down
-
-; Video controls
 video_play_pause = space
 video_mute = m
-
-; Exit application
 exit = ctrl+w, escape
-
-; Pan media
 pan = mouse_left
+
+; Manga mode zoom
+manga_zoom_in = ctrl+scroll_up
+manga_zoom_out = ctrl+scroll_down
 ```
 
 ### Available Input Bindings
 
-**Mouse:**
+| Type | Values |
+|------|--------|
+| Mouse Buttons | `mouse_left`, `mouse_right`, `mouse_middle`, `mouse4`, `mouse5` |
+| Scroll Wheel | `scroll_up`, `scroll_down` |
+| Modifiers | `ctrl+<key>`, `shift+<key>`, `alt+<key>` |
+| Letters | `a` - `z` |
+| Numbers | `0` - `9` |
+| Function Keys | `f1` - `f12` |
+| Arrow Keys | `left`, `right`, `up`, `down` |
+| Special Keys | `escape`, `enter`, `space`, `tab`, `backspace`, `delete`, `insert`, `home`, `end`, `pageup`, `pagedown` |
 
-- `mouse_left`, `mouse_right`, `mouse_middle`
-- `mouse4`, `mouse5` (extra buttons)
-- `scroll_up`, `scroll_down`
+## Technical Details
 
-**Modifiers:**
+### Performance Optimizations
 
-- `ctrl+<key>`, `shift+<key>`, `alt+<key>`
+- **Delay-loaded DLLs** — GStreamer DLLs are loaded on-demand, keeping memory low when viewing images only
+- **Parallel Image Decoding** — Manga mode uses Rayon thread pool for parallel loading
+- **LRU Texture Cache** — Efficient GPU memory management for large image collections
+- **Lock-free Communication** — Crossbeam channels for zero-contention multi-threading
+- **Adaptive Preloading** — Priority-based prefetching based on scroll direction
 
-**Keys:**
-
-- Letters: `a` - `z`
-- Numbers: `0` - `9`
-- Function keys: `f1` - `f12`
-- Arrow keys: `left`, `right`, `up`, `down`
-- Special: `escape`, `enter`, `space`, `tab`, `backspace`, `delete`, `insert`, `home`, `end`, `pageup`, `pagedown`
-
-### Example Custom Configurations
-
-**Use scroll wheel for navigation:**
-
-```ini
-next_image = scroll_down, right
-previous_image = scroll_up, left
-zoom_in = ctrl+scroll_up
-zoom_out = ctrl+scroll_down
-```
-
-**Use WASD keys:**
-
-```ini
-next_image = d, right
-previous_image = a, left
-rotate_clockwise = w, up
-rotate_counterclockwise = s, down
-```
-
-## Technical Notes
-
-### NVIDIA G-SYNC Compatibility
-
-The viewer uses a borderless window approach rather than true exclusive fullscreen, which prevents triggering G-SYNC's exclusive mode. This ensures the viewer doesn't interfere with your display settings.
-
-### Performance
-
-- Built with Rust for maximum performance
-- Efficient texture caching
-- Optimized for smooth animations and zooming
-- Release builds are fully optimized with LTO
-
-## Building from Source
-
-### Requirements
-
-- Rust 1.70+ (install from https://rustup.rs/)
-- Windows 10/11
-
-### Build Commands
-
-```bash
-# Debug build (faster compilation, slower runtime)
-cargo build
-
-# Release build (slower compilation, optimized runtime)
-cargo build --release
-```
-
-### Build Features
+### Build Optimizations
 
 The release profile includes:
-
 - Maximum optimization (`opt-level = 3`)
 - Link-time optimization (`lto = true`)
-- Single codegen unit for better optimization
-- Stripped binaries for smaller size
+- Single codegen unit for best optimization
+- Stripped binaries for smaller file size
+
+### G-SYNC Compatibility
+
+Uses borderless windowed mode rather than exclusive fullscreen, ensuring the viewer doesn't interfere with G-SYNC settings.
+
+## Troubleshooting
+
+### Video Playback Issues
+
+1. **"Failed to create video pipeline"** — Ensure GStreamer runtime is installed and in PATH
+2. **No audio** — Install the GStreamer "good" and "bad" plugin packages
+3. **Codec errors** — Some formats may require additional GStreamer plugins
+
+### Build Issues
+
+1. **pkg-config errors** — Set `PKG_CONFIG_PATH` to GStreamer's pkgconfig directory
+2. **Linker errors** — Ensure both GStreamer runtime and development packages are installed
 
 ## License
 
-MIT License - See [LICENSE](LICENSE) file for details.
+MIT License — See [LICENSE](LICENSE) for details.
+
+## Contributing
+
+Contributions are welcome! Please feel free to submit a Pull Request.

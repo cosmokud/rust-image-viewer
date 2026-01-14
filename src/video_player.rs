@@ -301,12 +301,6 @@ impl VideoPlayer {
             .clone()
     }
 
-    /// Initialize GStreamer (call once at startup)
-    #[allow(dead_code)]
-    pub fn init() -> Result<(), String> {
-        Self::ensure_init()
-    }
-
     /// Create a new video player for the given file
     pub fn new(path: &Path, muted: bool, initial_volume: f64) -> Result<Self, String> {
         Self::ensure_init()?;

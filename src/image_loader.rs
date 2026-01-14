@@ -383,27 +383,6 @@ impl LoadedImage {
         }
     }
 
-    /// Seek to a position (0.0 to 1.0) based on time
-    pub fn seek_to_fraction(&mut self, fraction: f64) {
-        if !self.is_animated() {
-            return;
-        }
-        let fraction = fraction.clamp(0.0, 1.0);
-        let total_duration = self.total_duration_ms() as f64;
-        let target_time = total_duration * fraction;
-        
-        let mut cumulative_time: f64 = 0.0;
-        for (idx, frame) in self.frames.iter().enumerate() {
-            cumulative_time += frame.delay_ms as f64;
-            if cumulative_time >= target_time {
-                self.set_frame(idx);
-                return;
-            }
-        }
-        // If we reach here, set to last frame
-        self.set_frame(self.frames.len().saturating_sub(1));
-    }
-
     /// Get current position as a fraction (0.0 to 1.0) based on frame index
     pub fn position_fraction(&self) -> f64 {
         if self.frames.len() <= 1 {

@@ -1011,49 +1011,6 @@ impl MangaLoader {
         // or when manga_get_image_display_height is called
     }
 
-    /// Cache dimensions for a specific range of indices (called on-demand).
-    pub fn cache_dimensions_range(&mut self, image_list: &[PathBuf], start: usize, end: usize) {
-        let end = end.min(image_list.len());
-        if start >= end {
-            return;
-        }
-
-        // Only cache indices we don't have yet
-        let indices_to_cache: Vec<usize> = (start..end)
-            .filter(|&idx| !self.dimension_cache.contains_key(&idx))
-            .collect();
-
-        if indices_to_cache.is_empty() {
-            return;
-        }
-
-        // Cache in parallel
-        let dims: Vec<(usize, Option<(u32, u32, MangaMediaType)>)> = indices_to_cache
-            .par_iter()
-            .map(|&idx| {
-                let path = &image_list[idx];
-                let is_video = is_supported_video(path);
-                let is_image = is_supported_image(path);
-                
-                if is_video {
-                    let dims = Self::probe_video_dimensions(path);
-                    (idx, dims.map(|(w, h)| (w, h, MangaMediaType::Video)))
-                } else if is_image {
-                    let dims = image::image_dimensions(path).ok();
-                    (idx, dims.map(|(w, h)| (w, h, MangaMediaType::StaticImage)))
-                } else {
-                    (idx, None)
-                }
-            })
-            .collect();
-
-        for (idx, opt_dims) in dims {
-            if let Some((w, h, media_type)) = opt_dims {
-                self.dimension_cache.insert(idx, (w, h, media_type));
-            }
-        }
-    }
-
     /// Clear all caches and reset state (called when exiting manga mode).
     pub fn clear(&mut self) {
         // Increment generation to invalidate pending requests
@@ -1107,18 +1064,6 @@ impl MangaLoader {
         while self.dim_result_rx.try_recv().is_ok() {}
 
         self.stats.images_pending = 0;
-    }
-
-    /// Check if an index is currently being loaded.
-    #[allow(dead_code)]
-    pub fn is_loading(&self, index: usize) -> bool {
-        self.loading_indices.read().contains(&index)
-    }
-
-    /// Check if an index has been loaded.
-    #[allow(dead_code)]
-    pub fn is_loaded(&self, index: usize) -> bool {
-        self.loaded_indices.read().contains(&index)
     }
 
     /// Get cached dimensions for an index (width, height only).

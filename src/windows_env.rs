@@ -2,7 +2,6 @@
 
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
-use std::path::Path;
 
 fn wide(s: &OsStr) -> Vec<u16> {
     s.encode_wide().chain(std::iter::once(0)).collect()
@@ -152,22 +151,6 @@ pub fn refresh_process_path_from_registry() {
     let current = std::env::var("PATH").unwrap_or_default();
     let merged = merge_path_lists(&reg_path, &current);
 
-    if merged != current {
-        std::env::set_var("PATH", merged);
-    }
-}
-
-/// Prepends a directory to the process `PATH` if it exists.
-#[allow(dead_code)]
-pub fn prepend_dir_to_path_if_exists(dir: &Path) {
-    if !dir.exists() {
-        return;
-    }
-    let Some(dir_s) = dir.to_str() else {
-        return;
-    };
-    let current = std::env::var("PATH").unwrap_or_default();
-    let merged = merge_path_lists(dir_s, &current);
     if merged != current {
         std::env::set_var("PATH", merged);
     }
