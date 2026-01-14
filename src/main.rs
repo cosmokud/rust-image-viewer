@@ -3621,34 +3621,32 @@ impl ImageViewer {
             && !self.manga_video_seeking
             && !self.gif_seeking
             && !self.manga_video_volume_dragging;
+        // Match the normal viewer's drag-pan algorithm:
+        // - No momentum model
+        // - Apply pointer delta 1:1 (optionally scaled via config)
+        // Manga mode maps vertical drag to strip scrolling and horizontal drag to X offset.
         if panning_allowed {
             if primary_pressed && !primary_double_clicked {
                 self.is_panning = true;
                 self.last_mouse_pos = pointer_pos;
                 ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
             }
-            
+
             if primary_down && self.is_panning {
-                // Vertical panning - scroll the strip with momentum tracking
                 let drag_speed = self.config.manga_drag_pan_speed;
+
+                // Stop any residual inertial scroll while the user is actively dragging.
+                self.manga_scroll_velocity = 0.0;
+
+                // Vertical drag = scroll the manga strip (1:1 feel).
                 let delta_y = -pointer_delta.y * drag_speed;
-                
-                // Track velocity for momentum scrolling when drag ends.
-                // Use exponential smoothing for stable velocity estimation.
-                let velocity_alpha = 0.3; // Blend factor for velocity smoothing
-                let instant_velocity = delta_y / ctx.input(|i| i.stable_dt).max(0.001);
-                self.manga_scroll_velocity = self.manga_scroll_velocity * (1.0 - velocity_alpha) 
-                    + instant_velocity * velocity_alpha;
-                
-                // Apply scroll delta directly for 1:1 feel during drag.
-                // This provides immediate response without the spring delay.
                 let total_height = self.manga_total_height();
                 let visible_height = self.screen_size.y;
                 let max_scroll = (total_height - visible_height).max(0.0);
                 self.manga_scroll_offset = (self.manga_scroll_offset + delta_y).clamp(0.0, max_scroll);
                 self.manga_scroll_target = self.manga_scroll_offset;
-                
-                // Horizontal panning - offset with same 1:1 feel
+
+                // Horizontal drag = pan X.
                 self.offset.x += pointer_delta.x * drag_speed;
 
                 self.manga_update_current_index();
@@ -3656,30 +3654,14 @@ impl ImageViewer {
                 ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
                 animation_active = true;
             }
-            
-            if primary_released {
-                self.is_panning = false;
-                self.last_mouse_pos = None;
-                
-                // Apply momentum scrolling on release.
-                // The tracked velocity continues the scroll motion with natural deceleration.
-                // Only apply if velocity is significant (prevents micro-drifts).
-                if self.manga_scroll_velocity.abs() > 50.0 {
-                    // Project where the scroll would naturally stop based on current velocity.
-                    // Using the spring's settling distance approximation.
-                    let omega = 18.0;
-                    let momentum_distance = self.manga_scroll_velocity / omega;
-                    let total_height = self.manga_total_height();
-                    let visible_height = self.screen_size.y;
-                    let max_scroll = (total_height - visible_height).max(0.0);
-                    self.manga_scroll_target = (self.manga_scroll_offset + momentum_distance).clamp(0.0, max_scroll);
-                    animation_active = true;
-                } else {
-                    // Small velocity - just snap to current position
-                    self.manga_scroll_velocity = 0.0;
-                    self.manga_scroll_target = self.manga_scroll_offset;
-                }
-            }
+        }
+
+        // Always clear pan state on release (even if panning_allowed changed mid-drag).
+        if primary_released {
+            self.is_panning = false;
+            self.last_mouse_pos = None;
+            self.manga_scroll_velocity = 0.0;
+            self.manga_scroll_target = self.manga_scroll_offset;
         }
 
         // Tick scroll animation
