@@ -2519,6 +2519,10 @@ impl ImageViewer {
     ///
     /// Intended for ArrowLeft in manga mode: move to the previous file and animate
     /// the scroll to align its top with the viewport top.
+    /// 
+    /// Special behavior: If the top of the current image is not visible (we've scrolled
+    /// down within it), first scroll up to show the top of the current image instead
+    /// of navigating to the previous image.
     fn manga_page_up_smooth(&mut self) {
         if !self.manga_mode {
             return;
@@ -2528,6 +2532,25 @@ impl ImageViewer {
         // viewport actually crosses the next page boundary. Use `current_index` as a
         // forward-looking destination so holding the key can continue stepping.
         let current = self.manga_top_index().min(self.current_index);
+        
+        // Check if the top of the current image is visible.
+        // The top is visible if the scroll offset is at or before the image's start position.
+        let current_image_start_y = self.manga_page_start_y(current);
+        let viewport_top = self.manga_scroll_offset.max(0.0);
+        
+        // Use a small tolerance to avoid floating point precision issues
+        const TOLERANCE: f32 = 1.0;
+        let top_is_visible = viewport_top <= current_image_start_y + TOLERANCE;
+        
+        if !top_is_visible {
+            // Top of current image is not visible - scroll to show it instead of navigating
+            self.manga_scroll_target = current_image_start_y;
+            self.manga_scroll_velocity = 0.0;
+            self.manga_update_preload_queue();
+            return;
+        }
+        
+        // Top is already visible, navigate to the previous image
         if current == 0 {
             return;
         }
@@ -2578,6 +2601,10 @@ impl ImageViewer {
     ///
     /// Intended for ArrowRight in manga mode: move to the next file and animate
     /// the scroll to align its top with the viewport top.
+    /// 
+    /// Special behavior: If the bottom of the current image is not visible (we haven't
+    /// scrolled far enough to see it), first scroll down to show the bottom of the 
+    /// current image instead of navigating to the next image.
     fn manga_page_down_smooth(&mut self) {
         if !self.manga_mode {
             return;
@@ -2591,6 +2618,32 @@ impl ImageViewer {
         // the top index won't update until we reach the destination. Use `current_index`
         // as a forward-looking anchor so holding ArrowRight continues stepping.
         let current = self.manga_top_index().max(self.current_index);
+        
+        // Check if the bottom of the current image is visible.
+        // The bottom is visible if viewport_bottom >= image_end_y
+        let current_image_start_y = self.manga_page_start_y(current);
+        let current_image_height = self.manga_page_height_cached(current);
+        let current_image_end_y = current_image_start_y + current_image_height;
+        let viewport_top = self.manga_scroll_offset.max(0.0);
+        let viewport_bottom = viewport_top + self.screen_size.y;
+        
+        // Use a small tolerance to avoid floating point precision issues
+        const TOLERANCE: f32 = 1.0;
+        let bottom_is_visible = viewport_bottom >= current_image_end_y - TOLERANCE;
+        
+        if !bottom_is_visible {
+            // Bottom of current image is not visible - scroll to show it instead of navigating
+            // Scroll so that the bottom of the current image aligns with the bottom of the viewport
+            let total_height = self.manga_total_height();
+            let max_scroll = (total_height - self.screen_size.y).max(0.0);
+            let scroll_to = (current_image_end_y - self.screen_size.y).clamp(0.0, max_scroll);
+            self.manga_scroll_target = scroll_to;
+            self.manga_scroll_velocity = 0.0;
+            self.manga_update_preload_queue();
+            return;
+        }
+        
+        // Bottom is already visible, navigate to the next image
         let target = (current + 1).min(self.image_list.len() - 1);
         if target == current {
             return;
