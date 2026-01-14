@@ -1277,7 +1277,11 @@ impl ImageViewer {
         
         // In manga mode, scroll to next image instead of loading
         if self.manga_mode && self.is_fullscreen {
-            let next_index = (self.current_index + 1) % self.image_list.len();
+            let next_index = if self.current_index + 1 >= self.image_list.len() {
+                0
+            } else {
+                self.current_index + 1
+            };
             self.current_index = next_index;
             let scroll_to = self.manga_get_scroll_offset_for_index(next_index);
             self.manga_scroll_target = scroll_to;
@@ -1288,7 +1292,11 @@ impl ImageViewer {
         // Save current view state before navigating (fullscreen only)
         self.save_current_fullscreen_view_state();
         
-        self.current_index = (self.current_index + 1) % self.image_list.len();
+        self.current_index = if self.current_index + 1 >= self.image_list.len() {
+            0
+        } else {
+            self.current_index + 1
+        };
         let path = self.image_list[self.current_index].clone();
         self.load_image(&path);
     }
