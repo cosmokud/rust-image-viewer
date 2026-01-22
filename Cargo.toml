@@ -34,7 +34,7 @@ parking_lot = "0.12"
 
 # Windows-specific
 [target.'cfg(windows)'.dependencies]
-winapi = { version = "0.3", features = ["winuser", "dwmapi", "libloaderapi", "winreg", "processenv"] }
+winapi = { version = "0.3", features = ["winuser", "dwmapi", "libloaderapi", "winreg", "processenv", "synchapi", "handleapi", "namedpipeapi", "fileapi", "winbase", "errhandlingapi", "winerror", "minwinbase"] }
 
 [build-dependencies]
 # For build script to copy config.ini and embed Windows icon (.ico)

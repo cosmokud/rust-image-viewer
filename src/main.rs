@@ -6,6 +6,8 @@
 mod config;
 mod image_loader;
 mod manga_loader;
+#[cfg(target_os = "windows")]
+mod single_instance;
 mod video_player;
 #[cfg(target_os = "windows")]
 mod windows_env;
@@ -13,6 +15,8 @@ mod windows_env;
 use config::{Action, Config, InputBinding, StartupWindowMode};
 use image_loader::{get_images_in_directory, get_media_type, is_supported_video, LoadedImage, MediaType};
 use manga_loader::{MangaLoader, MangaMediaType, MangaTextureCache};
+#[cfg(target_os = "windows")]
+use single_instance::{FileReceiver, SingleInstanceResult};
 use video_player::{format_duration, VideoPlayer};
 
 use eframe::egui;
@@ -425,6 +429,11 @@ struct ImageViewer {
     manga_video_user_muted: Option<bool>,
     /// User-chosen volume for manga mode videos (persists across video changes)
     manga_video_user_volume: Option<f64>,
+
+    // ============ SINGLE INSTANCE FIELDS ============
+    /// Receiver for file paths from secondary instances (single-instance mode)
+    #[cfg(target_os = "windows")]
+    file_receiver: Option<FileReceiver>,
 }
 
 impl Default for ImageViewer {
@@ -555,6 +564,10 @@ impl Default for ImageViewer {
             manga_video_volume_dragging: false,
             manga_video_user_muted: None,
             manga_video_user_volume: None,
+
+            // Single instance fields
+            #[cfg(target_os = "windows")]
+            file_receiver: None,
         }
     }
 }
@@ -1034,9 +1047,39 @@ impl ImageViewer {
 
     /// Create new viewer with an image path
     /// `start_visible`: true if window was created visible (images), false if hidden (videos)
-    fn new(cc: &eframe::CreationContext<'_>, path: Option<PathBuf>, start_visible: bool) -> Self {
+    #[cfg(target_os = "windows")]
+    fn new(
+        cc: &eframe::CreationContext<'_>,
+        path: Option<PathBuf>,
+        start_visible: bool,
+        file_receiver: Option<FileReceiver>,
+    ) -> Self {
         let mut viewer = Self::default();
 
+        // Store the file receiver for single-instance mode
+        viewer.file_receiver = file_receiver;
+
+        Self::init_viewer(&mut viewer, cc, path, start_visible);
+        viewer
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn new(
+        cc: &eframe::CreationContext<'_>,
+        path: Option<PathBuf>,
+        start_visible: bool,
+    ) -> Self {
+        let mut viewer = Self::default();
+        Self::init_viewer(&mut viewer, cc, path, start_visible);
+        viewer
+    }
+
+    fn init_viewer(
+        viewer: &mut Self,
+        cc: &eframe::CreationContext<'_>,
+        path: Option<PathBuf>,
+        start_visible: bool,
+    ) {
         // If window started visible, mark it as shown already
         viewer.startup_window_shown = start_visible;
 
@@ -1072,8 +1115,6 @@ impl ImageViewer {
         if let Some(path) = path {
             viewer.load_image(&path);
         }
-
-        viewer
     }
 
     /// Load an image from path
@@ -6205,6 +6246,37 @@ impl eframe::App for ImageViewer {
         // Reset per-frame repaint tracking
         self.needs_repaint = false;
 
+        // ============ SINGLE INSTANCE: CHECK FOR INCOMING FILES ============
+        // Check if another instance sent us a file path to open
+        #[cfg(target_os = "windows")]
+        if let Some(ref receiver) = self.file_receiver {
+            if let Some(path) = receiver.try_recv() {
+                // Load the new file
+                self.load_media(&path);
+                
+                // Bring window to foreground
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                
+                // If we're in fullscreen manga mode, exit it to show the new file normally
+                if self.manga_mode && self.is_fullscreen {
+                    self.manga_mode = false;
+                    // Clear manga state
+                    self.manga_loader = None;
+                    self.manga_texture_cache.clear();
+                    self.manga_video_players.clear();
+                    self.manga_video_textures.clear();
+                    self.manga_animated_images.clear();
+                }
+                
+                // Request repaint to show the new content
+                ctx.request_repaint();
+            } else {
+                // Schedule a periodic check for incoming files (every 100ms)
+                // This is necessary because the app runs in reactive mode
+                ctx.request_repaint_after(Duration::from_millis(100));
+            }
+        }
+
         // Keep our cached screen size in sync with the real viewport.
         // Manga mode uses this for layout/scroll math; if it drifts from `ctx.screen_rect()`,
         // you can get clamping oscillations and visible jitter.
@@ -6734,6 +6806,34 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     };
 
+    // Load config early to check single_instance setting
+    let config = Config::load();
+
+    // ============ SINGLE INSTANCE MODE ============
+    // Try to become the primary instance or send the file to an existing instance
+    #[cfg(target_os = "windows")]
+    let (file_receiver, _lock) = {
+        let (receiver, callback) = FileReceiver::new();
+        match single_instance::try_acquire_lock(config.single_instance, Some(&file_path), callback) {
+            SingleInstanceResult::Primary(lock) => {
+                // We are the primary instance - proceed with window creation
+                (Some(receiver), Some(lock))
+            }
+            SingleInstanceResult::Secondary => {
+                // Another instance is running and we sent our file path to it
+                // Exit this instance
+                return Ok(());
+            }
+            SingleInstanceResult::Disabled => {
+                // Single instance mode is disabled, proceed normally
+                (None, None)
+            }
+        }
+    };
+
+    #[cfg(not(target_os = "windows"))]
+    let file_receiver: Option<FileReceiver> = None;
+
     // Determine media type and calculate initial window size BEFORE creating the window.
     // This prevents the flash of a default-sized window.
     let media_type = get_media_type(&file_path);
@@ -6845,7 +6945,14 @@ fn main() -> eframe::Result<()> {
             // Skip installing extra image loaders - we use our own optimized loader
             // egui_extras loaders add overhead and we don't need them
             // egui_extras::install_image_loaders(&cc.egui_ctx);
-            Ok(Box::new(ImageViewer::new(cc, Some(file_path), start_visible)))
+            #[cfg(target_os = "windows")]
+            {
+                Ok(Box::new(ImageViewer::new(cc, Some(file_path), start_visible, file_receiver)))
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                Ok(Box::new(ImageViewer::new(cc, Some(file_path), start_visible)))
+            }
         }),
     )
 }

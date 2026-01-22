@@ -340,6 +340,10 @@ pub struct Config {
     /// Startup window mode: `floating` (default) or `fullscreen`
     pub startup_window_mode: StartupWindowMode,
 
+    /// Single instance mode: when true, opening a file reuses the existing window
+    /// instead of creating a new one
+    pub single_instance: bool,
+
     // ============ IMAGE QUALITY SETTINGS ============
     /// Filter for upscaling images (making them larger)
     pub upscale_filter: ImageFilter,
@@ -401,6 +405,7 @@ impl Default for Config {
             video_default_volume: 0.5,
             video_loop: true,
             startup_window_mode: StartupWindowMode::Floating,
+            single_instance: true,
             // Image quality defaults - use high quality filters
             upscale_filter: ImageFilter::Triangle,      // Best balance of quality and speed
             downscale_filter: ImageFilter::Triangle,      // Highest quality for downscaling
@@ -576,6 +581,7 @@ impl Config {
             video_default_volume: 0.5,
             video_loop: true,
             startup_window_mode: StartupWindowMode::Floating,
+            single_instance: true,
             // Image quality defaults
             upscale_filter: ImageFilter::Triangle,
             downscale_filter: ImageFilter::Triangle,
@@ -732,6 +738,11 @@ impl Config {
                                 config.startup_window_mode = mode;
                             }
                         }
+                        "single_instance" | "single_window" | "reuse_window" => {
+                            if let Some(v) = parse_bool(value) {
+                                config.single_instance = v;
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -855,6 +866,14 @@ impl Config {
         content.push_str(&format!(
             "startup_window_mode = {}\n\n",
             self.startup_window_mode.as_str()
+        ));
+
+        content.push_str("; Single instance mode: reuse existing window when opening new files (true/false)\n");
+        content.push_str("; When true, double-clicking a file will open it in the existing window\n");
+        content.push_str("; When false, each file opens in a new window\n");
+        content.push_str(&format!(
+            "single_instance = {}\n\n",
+            if self.single_instance { "true" } else { "false" }
         ));
 
         content.push_str("; Background color (RGB 0-255). You can either set background_rgb or background_r/g/b\n");
