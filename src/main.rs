@@ -4852,14 +4852,10 @@ impl ImageViewer {
             let primary_released = ctx.input(|i| i.pointer.button_released(egui::PointerButton::Primary));
 
             // If the pointer is held down on the seek bar, enter seeking mode immediately.
-            // This ensures "click-and-hold without moving" pauses playback.
             if seek_response.is_pointer_button_down_on() && !self.is_seeking {
                 self.is_seeking = true;
                 self.seek_was_playing = player.is_playing();
-                if self.seek_was_playing {
-                    let _ = player.pause();
-                }
-                // Allow an immediate seek on the first frame of interaction.
+                player.start_seek();
                 self.last_seek_sent_at = Instant::now() - Duration::from_millis(1000);
             }
 
@@ -4878,9 +4874,9 @@ impl ImageViewer {
                     self.seek_preview_fraction = Some(seek_fraction);
 
                     if fraction_changed
-                        && self.last_seek_sent_at.elapsed() >= Duration::from_millis(50)
+                        && self.last_seek_sent_at.elapsed() >= Duration::from_millis(100)
                     {
-                        let _ = player.seek(seek_fraction as f64);
+                        player.preview_seek(seek_fraction as f64);
                         self.last_seek_sent_at = Instant::now();
                     }
                 }
@@ -4898,15 +4894,13 @@ impl ImageViewer {
 
             // On mouse release, finalize seek and restore prior play state.
             if self.is_seeking && primary_released {
-                if let Some(final_fraction) = self.seek_preview_fraction.take() {
-                    let _ = player.seek(final_fraction as f64);
+                let final_fraction = self.seek_preview_fraction.take();
+                if let Some(frac) = final_fraction {
+                    player.preview_seek(frac as f64);
                 }
+                let _ = player.end_seek(self.seek_was_playing);
                 self.is_seeking = false;
                 self.last_seek_sent_at = Instant::now();
-
-                if self.seek_was_playing {
-                    let _ = player.play();
-                }
                 self.seek_was_playing = false;
             }
 
@@ -5278,14 +5272,10 @@ impl ImageViewer {
             let primary_released = ctx.input(|i| i.pointer.button_released(egui::PointerButton::Primary));
 
             if seek_response.is_pointer_button_down_on() && !self.manga_video_seeking {
-                if let Some(player) = self.manga_video_players.get(&video_idx) {
+                if let Some(player) = self.manga_video_players.get_mut(&video_idx) {
                     self.manga_video_seeking = true;
                     self.manga_video_seek_was_playing = player.is_playing();
-                    if self.manga_video_seek_was_playing {
-                        if let Some(p) = self.manga_video_players.get_mut(&video_idx) {
-                            let _ = p.pause();
-                        }
-                    }
+                    player.start_seek();
                     self.manga_video_last_seek_sent = Instant::now() - Duration::from_millis(1000);
                 }
             }
@@ -5298,9 +5288,9 @@ impl ImageViewer {
                     
                     self.manga_video_seek_preview_fraction = Some(seek_fraction);
                     
-                    if fraction_changed && self.manga_video_last_seek_sent.elapsed() >= Duration::from_millis(50) {
+                    if fraction_changed && self.manga_video_last_seek_sent.elapsed() >= Duration::from_millis(100) {
                         if let Some(player) = self.manga_video_players.get_mut(&video_idx) {
-                            let _ = player.seek(seek_fraction as f64);
+                            player.preview_seek(seek_fraction as f64);
                         }
                         self.manga_video_last_seek_sent = Instant::now();
                     }
@@ -5319,19 +5309,15 @@ impl ImageViewer {
             }
 
             if self.manga_video_seeking && primary_released {
-                if let Some(final_fraction) = self.manga_video_seek_preview_fraction.take() {
-                    if let Some(player) = self.manga_video_players.get_mut(&video_idx) {
-                        let _ = player.seek(final_fraction as f64);
+                let final_fraction = self.manga_video_seek_preview_fraction.take();
+                if let Some(player) = self.manga_video_players.get_mut(&video_idx) {
+                    if let Some(frac) = final_fraction {
+                        player.preview_seek(frac as f64);
                     }
+                    let _ = player.end_seek(self.manga_video_seek_was_playing);
                 }
                 self.manga_video_seeking = false;
                 self.manga_video_last_seek_sent = Instant::now();
-                
-                if self.manga_video_seek_was_playing {
-                    if let Some(player) = self.manga_video_players.get_mut(&video_idx) {
-                        let _ = player.play();
-                    }
-                }
                 self.manga_video_seek_was_playing = false;
             }
 

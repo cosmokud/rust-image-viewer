@@ -35,6 +35,7 @@ pub struct VideoPlayer {
     paused_position: f64,
     current_seek_position: f64,
     stop_signal: Arc<Mutex<bool>>,
+    is_seeking: bool,
 }
 
 #[cfg(target_os = "windows")]
@@ -82,6 +83,7 @@ impl VideoPlayer {
             paused_position: 0.0,
             current_seek_position: 0.0,
             stop_signal: Arc::new(Mutex::new(false)),
+            is_seeking: false,
         })
     }
 
@@ -326,19 +328,93 @@ impl VideoPlayer {
     }
 
     pub fn seek_to_time(&mut self, seconds: f64) -> Result<(), String> {
-        let was_playing = self.is_playing;
-        self.stop_decoding();
+        let seconds = seconds.max(0.0);
         self.paused_position = seconds;
-
-        if was_playing {
+        self.current_seek_position = seconds;
+        
+        if self.is_playing && !self.is_seeking {
+            self.stop_decoding();
             self.start_decoding(seconds)?;
+        }
+
+        Ok(())
+    }
+
+    pub fn start_seek(&mut self) {
+        if self.is_seeking {
+            return;
+        }
+        self.is_seeking = true;
+        self.stop_decoding();
+    }
+
+    pub fn preview_seek(&mut self, position: f64) {
+        let position = position.clamp(0.0, 1.0);
+        if let Some(duration) = self.duration_secs {
+            let seek_pos = duration * position;
+            self.paused_position = seek_pos;
+            self.current_seek_position = seek_pos;
+            self.extract_frame_at(seek_pos);
+        }
+    }
+
+    pub fn end_seek(&mut self, resume_playing: bool) -> Result<(), String> {
+        if !self.is_seeking {
+            return Ok(());
+        }
+        self.is_seeking = false;
+
+        if resume_playing {
+            self.start_decoding(self.paused_position)?;
             self.is_playing = true;
         }
 
         Ok(())
     }
 
+    fn extract_frame_at(&mut self, seconds: f64) {
+        let path = self.path.clone();
+        let width = self.original_width;
+        let height = self.original_height;
+        let state = Arc::clone(&self.state);
+        let seconds = seconds.max(0.0);
+
+        thread::spawn(move || {
+            let mut cmd = Command::new("ffmpeg");
+            cmd.args(["-ss", &format!("{:.3}", seconds)])
+                .args(["-i"])
+                .arg(&path)
+                .args(["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgba", "-"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null());
+
+            configure_no_window(&mut cmd);
+
+            if let Ok(output) = cmd.output() {
+                let expected_size = (width * height * 4) as usize;
+                if output.stdout.len() == expected_size {
+                    if let Ok(mut state) = state.lock() {
+                        state.current_frame = Some(VideoFrame {
+                            pixels: output.stdout,
+                            width,
+                            height,
+                        });
+                        state.frame_updated = true;
+                    }
+                }
+            }
+        });
+    }
+
+    #[allow(dead_code)]
+    pub fn is_in_seek_mode(&self) -> bool {
+        self.is_seeking
+    }
+
     pub fn position(&self) -> Option<Duration> {
+        if self.is_seeking {
+            return Some(Duration::from_secs_f64(self.paused_position));
+        }
         if self.is_playing {
             if let Some(start) = self.start_time {
                 let elapsed = start.elapsed().as_secs_f64();
