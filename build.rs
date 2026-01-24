@@ -47,10 +47,33 @@ fn main() {
             }
         }
     }
+
+    // Also update the per-user AppData config.ini to the latest format/defaults
+    // so cargo build keeps the installed config in sync with the repo config.
+    if let Ok(appdata_dir) = env::var("APPDATA") {
+        let app_config_dir = Path::new(&appdata_dir).join("rust-image-viewer");
+        let app_config = app_config_dir.join("config.ini");
+        let src_config = Path::new("config.ini");
+
+        if src_config.exists() {
+            if let Err(e) = fs::create_dir_all(&app_config_dir) {
+                println!(
+                    "cargo:warning=Failed to create AppData config directory: {}",
+                    e
+                );
+            } else if let Err(e) = fs::copy(src_config, &app_config) {
+                println!(
+                    "cargo:warning=Failed to update AppData config.ini: {}",
+                    e
+                );
+            }
+        }
+    }
     
     // Tell cargo to rerun this script if config.ini changes
     println!("cargo:rerun-if-changed=config.ini");
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=APPDATA");
 
     // Embed Windows icon into PE resources when building for windows-msvc
     // This makes Explorer and shortcuts show the app icon

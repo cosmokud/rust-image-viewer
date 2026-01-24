@@ -4296,7 +4296,7 @@ impl ImageViewer {
             }
 
             // Right-click navigation processed here (pre-draw) to avoid a one-frame flash.
-            // For videos: center third triggers play/pause, sides trigger prev/next.
+            // For videos: center region triggers play/pause, side zones trigger prev/next.
             // Skip if over video controls bar
             let bar_height = 56.0;
             let over_video_controls = self.show_video_controls 
@@ -4305,13 +4305,13 @@ impl ImageViewer {
             
             if input.pointer.button_clicked(egui::PointerButton::Secondary) && !over_video_controls {
                 if let Some(pos) = input.pointer.hover_pos() {
-                    let third = screen_width / 3.0;
-                    if pos.x < third {
+                    let side_zone = screen_width / 9.0;
+                    if pos.x < side_zone {
                         actions_to_run.push(Action::PreviousImage);
-                    } else if pos.x > screen_width - third {
+                    } else if pos.x > screen_width - side_zone {
                         actions_to_run.push(Action::NextImage);
                     } else {
-                        // Center third: toggle play/pause for videos, do nothing for images
+                        // Center region: toggle play/pause for videos, do nothing for images
                         // We'll handle this outside the closure since we need &mut self
                     }
                 }
@@ -4342,8 +4342,8 @@ impl ImageViewer {
                         if over_video_controls && pos.y > input.screen_rect.height() - bar_height {
                             return false;
                         }
-                        let third = screen_width / 3.0;
-                        pos.x >= third && pos.x <= screen_width - third
+                        let side_zone = screen_width / 9.0;
+                        pos.x >= side_zone && pos.x <= screen_width - side_zone
                     } else {
                         false
                     }
