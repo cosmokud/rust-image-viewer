@@ -1,576 +1,350 @@
-//! Video player module using GStreamer for video playback.
-//! Supports MP4, MKV, WEBM and other popular video formats.
+//! Video player using ffmpeg/ffplay processes with optimized seeking.
+//! 
+//! Key optimizations:
+//! - Throttled frame extraction during seeking (50ms minimum interval)
+//! - Caches the last extracted frame to avoid duplicate extractions
+//! - Only one extraction process runs at a time
+//! - Uses generation counters to discard stale results
 
+use std::io::Read;
 use std::path::Path;
-use std::str::FromStr;
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::sync::OnceLock;
-use std::time::Duration;
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
-use gstreamer as gst;
-use gstreamer::prelude::*;
-use gstreamer_app as gst_app;
-use gstreamer_video as gst_video;
+/// Minimum interval between frame extractions during seeking (in milliseconds)
+const SEEK_PREVIEW_THROTTLE_MS: u64 = 50;
 
-#[cfg(target_os = "windows")]
-fn configure_gstreamer_env_windows() {
-    use std::ffi::OsStr;
-    use std::os::windows::ffi::OsStrExt;
-    use std::path::PathBuf;
-
-    fn prepend_env_path(var: &str, path: &PathBuf) {
-        let path_os = path.as_os_str();
-        match std::env::var_os(var) {
-            None => std::env::set_var(var, path_os),
-            Some(existing) => {
-                // Avoid duplicates; simple substring check is fine for Windows paths here.
-                let existing_s = existing.to_string_lossy();
-                let path_s = path.to_string_lossy();
-                if existing_s.contains(path_s.as_ref()) {
-                    return;
-                }
-                let combined = format!("{};{}", path_s, existing_s);
-                std::env::set_var(var, combined);
-            }
-        }
-    }
-
-    fn wide(s: &OsStr) -> Vec<u16> {
-        s.encode_wide().chain(std::iter::once(0)).collect()
-    }
-
-    unsafe fn get_module_path(module_name: &OsStr) -> Option<PathBuf> {
-        use winapi::shared::minwindef::HMODULE;
-        use winapi::um::libloaderapi::{GetModuleFileNameW, GetModuleHandleW};
-
-        let h: HMODULE = GetModuleHandleW(wide(module_name).as_ptr());
-        if h.is_null() {
-            return None;
-        }
-
-        let mut buf: Vec<u16> = vec![0; 32768];
-        let len = GetModuleFileNameW(h, buf.as_mut_ptr(), buf.len() as u32);
-        if len == 0 {
-            return None;
-        }
-        buf.truncate(len as usize);
-        Some(PathBuf::from(String::from_utf16_lossy(&buf)))
-    }
-
-    fn prefix_from_bin_dir(bin_dir: &std::path::Path) -> Option<PathBuf> {
-        bin_dir.parent().map(|p| p.to_path_buf())
-    }
-
-    fn plugin_dir_for_prefix(prefix: &std::path::Path) -> PathBuf {
-        prefix.join("lib").join("gstreamer-1.0")
-    }
-
-    fn scanner_paths_for_prefix(prefix: &std::path::Path) -> [PathBuf; 2] {
-        [
-            prefix
-                .join("libexec")
-                .join("gstreamer-1.0")
-                .join("gst-plugin-scanner.exe"),
-            prefix.join("bin").join("gst-plugin-scanner.exe"),
-        ]
-    }
-
-    fn find_prefix_from_path_env() -> Vec<PathBuf> {
-        let mut prefixes = Vec::new();
-        let Some(path_os) = std::env::var_os("PATH") else {
-            return prefixes;
-        };
-        let path = path_os.to_string_lossy();
-        for entry in path.split(';').map(str::trim).filter(|s| !s.is_empty()) {
-            let bin_dir = std::path::Path::new(entry);
-            let gst_inspect = bin_dir.join("gst-inspect-1.0.exe");
-            let gst_dll = bin_dir.join("gstreamer-1.0-0.dll");
-            if gst_inspect.exists() || gst_dll.exists() {
-                if let Some(prefix) = prefix_from_bin_dir(bin_dir) {
-                    prefixes.push(prefix);
-                }
-            }
-        }
-        prefixes
-    }
-
-    fn common_prefixes() -> Vec<PathBuf> {
-        [
-            r"C:\Program Files\gstreamer\1.0\msvc_x86_64",
-            r"C:\gstreamer\1.0\msvc_x86_64",
-            r"C:\Program Files (x86)\gstreamer\1.0\msvc_x86_64",
-        ]
-        .into_iter()
-        .map(PathBuf::from)
-        .collect()
-    }
-
-    fn choose_prefix(candidates: Vec<PathBuf>) -> Option<PathBuf> {
-        for prefix in candidates {
-            if plugin_dir_for_prefix(&prefix).exists() {
-                return Some(prefix);
-            }
-        }
-        None
-    }
-
-    // Prefer a prefix derived from the actually loaded GStreamer DLL. If that prefix doesn't
-    // contain plugins (common when only some DLLs were copied next to the .exe), fall back to
-    // discovering an installed GStreamer via PATH or common install locations.
-    let mut candidates: Vec<PathBuf> = Vec::new();
-
-    let dll_name = OsStr::new("gstreamer-1.0-0.dll");
-    if let Some(dll_path) = unsafe { get_module_path(dll_name) } {
-        if let Some(bin_dir) = dll_path.parent() {
-            if let Some(prefix) = prefix_from_bin_dir(bin_dir) {
-                candidates.push(prefix);
-            }
-        }
-    }
-
-    candidates.extend(find_prefix_from_path_env());
-    candidates.extend(common_prefixes());
-
-    let Some(prefix) = choose_prefix(candidates) else {
-        // Nothing we can do automatically.
-        return;
-    };
-
-    let plugin_dir = plugin_dir_for_prefix(&prefix);
-    let [scanner_path_primary, scanner_path_fallback] = scanner_paths_for_prefix(&prefix);
-
-    // Make sure GStreamer's bin directory is on PATH. This is critical for plugin DLLs and
-    // their transitive dependencies when the app is launched from a parent process with a
-    // stale/sanitized PATH (common when opening files from browsers).
-    let bin_dir = prefix.join("bin");
-    if bin_dir.exists() {
-        prepend_env_path("PATH", &bin_dir);
-    }
-
-    if plugin_dir.exists() {
-        // Versioned vars are preferred; set both system+non-system for maximum compatibility.
-        prepend_env_path("GST_PLUGIN_SYSTEM_PATH_1_0", &plugin_dir);
-        prepend_env_path("GST_PLUGIN_PATH_1_0", &plugin_dir);
-        prepend_env_path("GST_PLUGIN_PATH", &plugin_dir);
-    }
-    if std::env::var_os("GST_PLUGIN_SCANNER").is_none() {
-        if scanner_path_primary.exists() {
-            std::env::set_var("GST_PLUGIN_SCANNER", &scanner_path_primary);
-        } else if scanner_path_fallback.exists() {
-            std::env::set_var("GST_PLUGIN_SCANNER", &scanner_path_fallback);
-        }
-    }
-
-    // Ensure the registry path is writable (some setups can end up pointing at a non-writable
-    // location, which breaks plugin discovery and makes factories "disappear").
-    if std::env::var_os("GST_REGISTRY").is_none() {
-        if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
-            let dir = PathBuf::from(local_app_data)
-                .join("rust-image-viewer")
-                .join("gstreamer");
-            let _ = std::fs::create_dir_all(&dir);
-            std::env::set_var("GST_REGISTRY", dir.join("registry.x86_64.bin"));
-        }
-    }
-}
-
-/// Video frame data extracted from GStreamer
-#[derive(Clone)]
 pub struct VideoFrame {
     pub pixels: Vec<u8>,
     pub width: u32,
     pub height: u32,
 }
 
-/// Shared state between GStreamer callbacks and the main application
 struct VideoState {
     current_frame: Option<VideoFrame>,
-    video_width: u32,
-    video_height: u32,
     frame_updated: bool,
-    needs_range_expand: Option<bool>,
+    is_eos: bool,
+    error: Option<String>,
+    generation: u64,
 }
 
-fn guess_limited_range_rgba(pixels: &[u8]) -> bool {
-    // Heuristic for cases where upstream fails to signal limited range.
-    // We sample pixels and look for values largely confined to ~[16..235].
-    let pixel_count = pixels.len() / 4;
-    if pixel_count < 64 {
-        return false;
-    }
-
-    let target_samples: usize = 20_000;
-    let step = (pixel_count / target_samples).max(1);
-
-    let mut min_rgb = [255u8; 3];
-    let mut max_rgb = [0u8; 3];
-
-    let mut saw_near_black = false;
-    let mut saw_near_white = false;
-
-    let mut samples = 0usize;
-    for p in (0..pixel_count).step_by(step) {
-        let i = p * 4;
-        let r = pixels[i];
-        let g = pixels[i + 1];
-        let b = pixels[i + 2];
-
-        min_rgb[0] = min_rgb[0].min(r);
-        min_rgb[1] = min_rgb[1].min(g);
-        min_rgb[2] = min_rgb[2].min(b);
-        max_rgb[0] = max_rgb[0].max(r);
-        max_rgb[1] = max_rgb[1].max(g);
-        max_rgb[2] = max_rgb[2].max(b);
-
-        // "Near" in limited-range space.
-        if r <= 20 || g <= 20 || b <= 20 {
-            saw_near_black = true;
-        }
-        if r >= 235 || g >= 235 || b >= 235 {
-            saw_near_white = true;
-        }
-
-        samples += 1;
-        if samples >= target_samples {
-            break;
-        }
-    }
-
-    let min_all = *min_rgb.iter().min().unwrap_or(&0);
-    let max_all = *max_rgb.iter().max().unwrap_or(&255);
-
-    // Conservative: require confinement + at least some content near one of the edges.
-    // This avoids falsely expanding mid-tone-only images/videos.
-    let confined = min_all >= 12 && max_all <= 243;
-    let touched_edges = saw_near_black || saw_near_white;
-
-    confined && touched_edges
-}
-
-fn expand_limited_range_rgba_in_place(pixels: &mut [u8]) {
-    // Map limited-range (TV) RGB [16..235] to full-range [0..255].
-    // This fixes the classic "washed out" look when limited-range RGB is displayed as full-range.
-    const OFFSET: i32 = 16;
-    const SCALE_NUM: i32 = 255;
-    const SCALE_DEN: i32 = 219;
-
-    for px in pixels.chunks_exact_mut(4) {
-        for c in &mut px[0..3] {
-            let v = *c as i32;
-            let scaled = ((v - OFFSET) * SCALE_NUM + (SCALE_DEN / 2)) / SCALE_DEN;
-            *c = scaled.clamp(0, 255) as u8;
-        }
-    }
-}
-
-/// Video player using GStreamer
 pub struct VideoPlayer {
-    pipeline: gst::Pipeline,
+    ffmpeg_process: Option<Child>,
+    ffplay_audio: Option<Child>,
+    reader_thread: Option<JoinHandle<()>>,
     state: Arc<Mutex<VideoState>>,
-    volume_element: Option<gst::Element>,
-    duration: Option<Duration>,
+    generation: Arc<AtomicU64>,
+    path: std::path::PathBuf,
     is_playing: bool,
     is_muted: bool,
-    volume: f64, // 0.0 to 1.0
+    volume: f64,
     original_width: u32,
     original_height: u32,
+    duration_secs: Option<f64>,
+    fps: f64,
+    start_time: Option<Instant>,
+    paused_position: f64,
+    current_seek_position: f64,
+    stop_signal: Arc<Mutex<bool>>,
+    is_seeking: bool,
+    // Throttling for seek preview
+    last_seek_preview_time: Option<Instant>,
+    pending_seek_position: Option<f64>,
+    // Track if an extraction is in progress to avoid spawning multiple
+    extraction_in_progress: Arc<AtomicBool>,
+    // Cache the last extracted position to avoid duplicate extractions
+    last_extracted_position: Option<f64>,
+}
+
+#[cfg(target_os = "windows")]
+fn configure_no_window(cmd: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    cmd.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(target_os = "windows"))]
+fn configure_no_window(_cmd: &mut Command) {}
+
+fn kill_process_async(mut child: Child) {
+    thread::spawn(move || {
+        let _ = child.kill();
+        let _ = child.wait();
+    });
 }
 
 impl VideoPlayer {
-    fn ensure_init() -> Result<(), String> {
-        static GST_INIT_RESULT: OnceLock<Result<(), String>> = OnceLock::new();
-        GST_INIT_RESULT
-            .get_or_init(|| {
-                #[cfg(target_os = "windows")]
-                configure_gstreamer_env_windows();
-
-                gst::init()
-                    .map_err(|e| format!("Failed to initialize GStreamer: {}", e))
-                    .and_then(|_| {
-                        // Provide an early, actionable error if playback elements are missing.
-                        // (We still try both names at actual pipeline creation time.)
-                        let has_playbin = gst::ElementFactory::find("playbin").is_some()
-                            || gst::ElementFactory::find("playbin3").is_some();
-                        if has_playbin {
-                            Ok(())
-                        } else {
-                            Err("GStreamer initialized, but neither `playbin` nor `playbin3` is available. This usually means the playback plugins (gst-plugins-base) were not found/loaded. Verify your GStreamer *runtime* install and plugin paths.".to_string())
-                        }
-                    })
-            })
-            .clone()
-    }
-
-    /// Create a new video player for the given file
     pub fn new(path: &Path, muted: bool, initial_volume: f64) -> Result<Self, String> {
-        Self::ensure_init()?;
-
-        // Build a correct file:// URI (including percent-encoding for spaces, etc.).
-        // Using a raw `file:///C:/path with spaces.mp4` string is not a valid URI.
-        let uri = gst::glib::filename_to_uri(path, None)
-            .map_err(|e| format!("Failed to build file URI for {:?}: {}", path, e))?
-            .to_string();
-
-        // Create the pipeline.
-        // Some GStreamer distributions (especially minimal Windows runtimes) ship `playbin` but
-        // not `playbin3`. Prefer `playbin3` when available, but fall back to `playbin`.
-        let pipeline = match gst::ElementFactory::make("playbin3")
-            .name("playbin")
-            .property("uri", &uri)
-            .build()
-        {
-            Ok(p) => p,
-            Err(e_playbin3) => {
-                match gst::ElementFactory::make("playbin")
-                    .name("playbin")
-                    .property("uri", &uri)
-                    .build()
-                {
-                    Ok(p) => p,
-                    Err(e_playbin) => {
-                        return Err(format!(
-                            "Failed to create video pipeline. Tried `playbin3` ({}) and `playbin` ({}). \
-Ensure your GStreamer installation includes the playback elements (usually from gst-plugins-base).",
-                            e_playbin3, e_playbin
-                        ));
-                    }
-                }
-            }
-        };
-
-        let pipeline = pipeline
-            .downcast::<gst::Pipeline>()
-            .map_err(|_| "Failed to cast to Pipeline")?;
-
-        // Create appsink for video frames
-        // Explicitly request sRGB RGBA output. This nudges GStreamer into producing full-range RGB
-        // and avoids washed-out output when input colorimetry/range metadata is incomplete.
-        let video_caps = gst::Caps::from_str("video/x-raw,format=RGBA,colorimetry=sRGB")
-            .map_err(|e| format!("Failed to create video caps: {}", e))?;
-        let appsink = gst_app::AppSink::builder()
-            .name("videosink")
-            .caps(&video_caps)
-            .build();
-
-        // Create a bin to hold the appsink with video conversion
-        let video_bin = gst::Bin::new();
-        
-        let videoconvert = gst::ElementFactory::make("videoconvert")
-            .build()
-            .map_err(|e| format!("Failed to create videoconvert: {}", e))?;
-        
-        let videoscale = gst::ElementFactory::make("videoscale")
-            .build()
-            .map_err(|e| format!("Failed to create videoscale: {}", e))?;
-
-        video_bin.add_many([&videoconvert, &videoscale, appsink.upcast_ref()])
-            .map_err(|e| format!("Failed to add elements to bin: {}", e))?;
-
-        gst::Element::link_many([&videoconvert, &videoscale, appsink.upcast_ref()])
-            .map_err(|e| format!("Failed to link video elements: {}", e))?;
-
-        // Create ghost pad for the bin
-        let pad = videoconvert
-            .static_pad("sink")
-            .ok_or("Failed to get sink pad")?;
-        let ghost_pad = gst::GhostPad::with_target(&pad)
-            .map_err(|e| format!("Failed to create ghost pad: {}", e))?;
-        ghost_pad.set_active(true).map_err(|e| format!("Failed to activate ghost pad: {}", e))?;
-        video_bin.add_pad(&ghost_pad).map_err(|e| format!("Failed to add ghost pad: {}", e))?;
-
-        pipeline.set_property("video-sink", &video_bin);
-
-        // Set up audio with volume control
-        let volume = gst::ElementFactory::make("volume")
-            .name("volume")
-            .build()
-            .ok();
-
-        if let Some(ref vol) = volume {
-            let audio_bin = gst::Bin::new();
-            let audioconvert = gst::ElementFactory::make("audioconvert")
-                .build()
-                .map_err(|e| format!("Failed to create audioconvert: {}", e))?;
-            let audioresample = gst::ElementFactory::make("audioresample")
-                .build()
-                .map_err(|e| format!("Failed to create audioresample: {}", e))?;
-            let audiosink = gst::ElementFactory::make("autoaudiosink")
-                .build()
-                .map_err(|e| format!("Failed to create audiosink: {}", e))?;
-
-            audio_bin.add_many([&audioconvert, &audioresample, vol, &audiosink])
-                .map_err(|e| format!("Failed to add audio elements to bin: {}", e))?;
-            gst::Element::link_many([&audioconvert, &audioresample, vol, &audiosink])
-                .map_err(|e| format!("Failed to link audio elements: {}", e))?;
-
-            let audio_pad = audioconvert
-                .static_pad("sink")
-                .ok_or("Failed to get audio sink pad")?;
-            let audio_ghost_pad = gst::GhostPad::with_target(&audio_pad)
-                .map_err(|e| format!("Failed to create audio ghost pad: {}", e))?;
-            audio_ghost_pad.set_active(true).map_err(|e| format!("Failed to activate audio ghost pad: {}", e))?;
-            audio_bin.add_pad(&audio_ghost_pad).map_err(|e| format!("Failed to add audio ghost pad: {}", e))?;
-
-            pipeline.set_property("audio-sink", &audio_bin);
-        }
+        let (width, height, duration, fps) = Self::probe_video_info(path)?;
 
         let state = Arc::new(Mutex::new(VideoState {
             current_frame: None,
-            video_width: 0,
-            video_height: 0,
             frame_updated: false,
-            needs_range_expand: None,
+            is_eos: false,
+            error: None,
+            generation: 0,
         }));
 
-        // Set up appsink callbacks.
-        // NOTE: In PAUSED state (e.g. when the user pauses or when seeking while paused),
-        // playbin/appsink typically delivers the next frame as a *preroll* buffer, not a
-        // regular sample. To show the exact frame when seeking while paused, handle BOTH.
+        Ok(VideoPlayer {
+            ffmpeg_process: None,
+            ffplay_audio: None,
+            reader_thread: None,
+            state,
+            generation: Arc::new(AtomicU64::new(0)),
+            path: path.to_path_buf(),
+            is_playing: false,
+            is_muted: muted,
+            volume: initial_volume.clamp(0.0, 1.0),
+            original_width: width,
+            original_height: height,
+            duration_secs: duration,
+            fps: fps.max(24.0),
+            start_time: None,
+            paused_position: 0.0,
+            current_seek_position: 0.0,
+            stop_signal: Arc::new(Mutex::new(false)),
+            is_seeking: false,
+            last_seek_preview_time: None,
+            pending_seek_position: None,
+            extraction_in_progress: Arc::new(AtomicBool::new(false)),
+            last_extracted_position: None,
+        })
+    }
 
-        fn process_sample(sample: gst::Sample, state: &Arc<Mutex<VideoState>>) {
-            if let Some(buffer) = sample.buffer() {
-                if let Some(caps) = sample.caps() {
-                    if let Ok(video_info) = gst_video::VideoInfo::from_caps(caps) {
-                        let width = video_info.width();
-                        let height = video_info.height();
+    fn probe_video_info(path: &Path) -> Result<(u32, u32, Option<f64>, f64), String> {
+        let mut cmd = Command::new("ffprobe");
+        cmd.args([
+            "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height,duration,r_frame_rate",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1",
+        ])
+        .arg(path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
 
-                        if let Ok(map) = buffer.map_readable() {
-                            let mut data = map.as_slice().to_vec();
+        configure_no_window(&mut cmd);
 
-                            if let Ok(mut state) = state.lock() {
-                                let should_expand = match state.needs_range_expand {
-                                    Some(v) => v,
-                                    None => {
-                                        let by_caps = match video_info.colorimetry().range() {
-                                            gst_video::VideoColorRange::Range16_235 => Some(true),
-                                            gst_video::VideoColorRange::Range0_255 => Some(false),
-                                            _ => None,
-                                        };
+        let output = cmd
+            .output()
+            .map_err(|e| format!("Failed to run ffprobe: {}. Make sure ffmpeg is in PATH.", e))?;
 
-                                        // If caps don't clearly say, infer from first frame.
-                                        let inferred =
-                                            by_caps.unwrap_or_else(|| guess_limited_range_rgba(&data));
-                                        state.needs_range_expand = Some(inferred);
-                                        inferred
-                                    }
-                                };
+        let stdout = String::from_utf8_lossy(&output.stdout);
 
-                                if should_expand {
-                                    expand_limited_range_rgba_in_place(&mut data);
-                                }
+        let mut width = 0u32;
+        let mut height = 0u32;
+        let mut duration: Option<f64> = None;
+        let mut fps = 30.0f64;
 
-                                state.video_width = width;
-                                state.video_height = height;
+        for line in stdout.lines() {
+            if let Some(val) = line.strip_prefix("width=") {
+                width = val.trim().parse().unwrap_or(0);
+            } else if let Some(val) = line.strip_prefix("height=") {
+                height = val.trim().parse().unwrap_or(0);
+            } else if let Some(val) = line.strip_prefix("duration=") {
+                if let Ok(d) = val.trim().parse::<f64>() {
+                    if d > 0.0 {
+                        duration = Some(d);
+                    }
+                }
+            } else if let Some(val) = line.strip_prefix("r_frame_rate=") {
+                let parts: Vec<&str> = val.trim().split('/').collect();
+                if parts.len() == 2 {
+                    if let (Ok(num), Ok(den)) = (parts[0].parse::<f64>(), parts[1].parse::<f64>()) {
+                        if den > 0.0 {
+                            fps = num / den;
+                        }
+                    }
+                }
+            }
+        }
+
+        if width == 0 || height == 0 {
+            return Err("Could not determine video dimensions. Make sure ffprobe is in PATH.".to_string());
+        }
+
+        Ok((width, height, duration, fps))
+    }
+
+    fn start_audio(&mut self, start_position: f64) {
+        self.stop_audio();
+
+        if self.is_muted {
+            return;
+        }
+
+        let volume_percent = (self.volume * 100.0) as i32;
+
+        let mut cmd = Command::new("ffplay");
+        cmd.args(["-nodisp", "-autoexit", "-loglevel", "quiet"]);
+        cmd.args(["-volume", &volume_percent.to_string()]);
+
+        if start_position > 0.0 {
+            cmd.args(["-ss", &format!("{:.3}", start_position)]);
+        }
+
+        cmd.arg(&self.path);
+        cmd.stdout(Stdio::null());
+        cmd.stderr(Stdio::null());
+
+        configure_no_window(&mut cmd);
+
+        if let Ok(child) = cmd.spawn() {
+            self.ffplay_audio = Some(child);
+        }
+    }
+
+    fn stop_audio(&mut self) {
+        if let Some(child) = self.ffplay_audio.take() {
+            kill_process_async(child);
+        }
+    }
+
+    fn start_decoding(&mut self, start_position: f64) -> Result<(), String> {
+        self.stop_decoding();
+
+        // Increment generation to invalidate any in-flight frame extractions
+        let gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        
+        self.stop_signal = Arc::new(Mutex::new(false));
+
+        if let Ok(mut state) = self.state.lock() {
+            state.is_eos = false;
+            state.error = None;
+            state.generation = gen;
+        }
+
+        let mut cmd = Command::new("ffmpeg");
+
+        if start_position > 0.0 {
+            cmd.args(["-ss", &format!("{:.3}", start_position)]);
+        }
+
+        cmd.args(["-i"])
+            .arg(&self.path)
+            .args(["-f", "rawvideo", "-pix_fmt", "rgba", "-vsync", "cfr", "-"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+
+        configure_no_window(&mut cmd);
+
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| format!("Failed to spawn ffmpeg: {}. Make sure ffmpeg is in PATH.", e))?;
+
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "Failed to capture ffmpeg stdout".to_string())?;
+
+        let state = Arc::clone(&self.state);
+        let stop_signal = Arc::clone(&self.stop_signal);
+        let width = self.original_width;
+        let height = self.original_height;
+        let frame_size = (width * height * 4) as usize;
+        let target_fps = self.fps;
+
+        let reader_thread = thread::spawn(move || {
+            let mut reader = std::io::BufReader::with_capacity(frame_size * 2, stdout);
+            let mut buffer = vec![0u8; frame_size];
+            let frame_duration = Duration::from_secs_f64(1.0 / target_fps);
+            let mut last_frame_time = Instant::now();
+
+            loop {
+                if *stop_signal.lock().unwrap() {
+                    break;
+                }
+
+                match reader.read_exact(&mut buffer) {
+                    Ok(()) => {
+                        let elapsed = last_frame_time.elapsed();
+                        if elapsed < frame_duration {
+                            thread::sleep(frame_duration - elapsed);
+                        }
+                        last_frame_time = Instant::now();
+
+                        if let Ok(mut state) = state.lock() {
+                            // Only update if generation matches
+                            if state.generation == gen {
                                 state.current_frame = Some(VideoFrame {
-                                    pixels: data,
+                                    pixels: buffer.clone(),
                                     width,
                                     height,
                                 });
                                 state.frame_updated = true;
+                            } else {
+                                // Generation changed, stop this thread
+                                break;
                             }
                         }
                     }
+                    Err(e) => {
+                        if let Ok(mut state) = state.lock() {
+                            if state.generation == gen {
+                                if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                                    state.is_eos = true;
+                                } else {
+                                    state.error = Some(format!("Read error: {}", e));
+                                }
+                            }
+                        }
+                        break;
+                    }
                 }
             }
-        }
+        });
 
-        let state_clone = Arc::clone(&state);
-        let state_clone_preroll = Arc::clone(&state);
-        appsink.set_callbacks(
-            gst_app::AppSinkCallbacks::builder()
-                .new_sample(move |sink| {
-                    let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
-                    process_sample(sample, &state_clone);
-                    Ok(gst::FlowSuccess::Ok)
-                })
-                .new_preroll(move |sink| {
-                    let sample = sink.pull_preroll().map_err(|_| gst::FlowError::Eos)?;
-                    process_sample(sample, &state_clone_preroll);
-                    Ok(gst::FlowSuccess::Ok)
-                })
-                .build(),
-        );
+        self.ffmpeg_process = Some(child);
+        self.reader_thread = Some(reader_thread);
+        self.current_seek_position = start_position;
+        self.start_time = Some(Instant::now());
 
-        let player = VideoPlayer {
-            pipeline,
-            state,
-            volume_element: volume,
-            duration: None,
-            is_playing: false,
-            is_muted: muted,
-            volume: initial_volume.clamp(0.0, 1.0),
-            original_width: 0,
-            original_height: 0,
-        };
+        self.start_audio(start_position);
 
-        // Apply initial volume/mute settings
-        player.apply_volume();
-
-        Ok(player)
-    }
-
-    /// Start playback
-    pub fn play(&mut self) -> Result<(), String> {
-        self.pipeline.set_state(gst::State::Playing).map_err(|e| {
-            // State-change errors are often just a symptom. Try to extract the *real* reason
-            // from the bus (missing demuxer/decoder, invalid URI, missing device/sink, etc.).
-            let details = self.drain_bus_error_string();
-            match details {
-                Some(d) => format!("Failed to start playback: {} ({})", e, d),
-                None => format!("Failed to start playback: {}", e),
-            }
-        })?;
-        self.is_playing = true;
-        
-        // Try to get duration after starting
-        self.update_duration();
-        
         Ok(())
     }
 
-    fn drain_bus_error_string(&self) -> Option<String> {
-        let bus = self.pipeline.bus()?;
-        let mut last_warning: Option<String> = None;
+    fn stop_decoding(&mut self) {
+        *self.stop_signal.lock().unwrap() = true;
 
-        // Drain a small burst of messages (non-blocking). On a failed state change, the
-        // corresponding error is typically already queued.
-        for _ in 0..64 {
-            let Some(msg) = bus.pop() else {
-                break;
-            };
-            match msg.view() {
-                gst::MessageView::Error(err) => {
-                    let debug = err.debug().unwrap_or_else(|| gst::glib::GString::from(""));
-                    if debug.is_empty() {
-                        return Some(format!("{}", err.error()));
-                    }
-                    return Some(format!("{}: {}", err.error(), debug));
-                }
-                gst::MessageView::Warning(warn) => {
-                    let debug = warn.debug().unwrap_or_else(|| gst::glib::GString::from(""));
-                    if debug.is_empty() {
-                        last_warning = Some(format!("{}", warn.error()));
-                    } else {
-                        last_warning = Some(format!("{}: {}", warn.error(), debug));
-                    }
-                }
-                _ => {}
-            }
+        self.stop_audio();
+
+        if let Some(child) = self.ffmpeg_process.take() {
+            kill_process_async(child);
         }
 
-        last_warning
+        if let Some(thread) = self.reader_thread.take() {
+            thread::spawn(move || {
+                let _ = thread.join();
+            });
+        }
     }
 
-    /// Pause playback
+    pub fn play(&mut self) -> Result<(), String> {
+        if self.is_playing {
+            return Ok(());
+        }
+
+        self.start_decoding(self.paused_position)?;
+        self.is_playing = true;
+        Ok(())
+    }
+
     pub fn pause(&mut self) -> Result<(), String> {
-        self.pipeline
-            .set_state(gst::State::Paused)
-            .map_err(|e| format!("Failed to pause playback: {}", e))?;
+        if !self.is_playing {
+            return Ok(());
+        }
+
+        self.paused_position = self.position().map(|d| d.as_secs_f64()).unwrap_or(0.0);
+        self.stop_decoding();
         self.is_playing = false;
         Ok(())
     }
 
-    /// Toggle play/pause
     pub fn toggle_play_pause(&mut self) -> Result<(), String> {
         if self.is_playing {
             self.pause()
@@ -579,137 +353,297 @@ Ensure your GStreamer installation includes the playback elements (usually from 
         }
     }
 
-    /// Check if currently playing
     pub fn is_playing(&self) -> bool {
         self.is_playing
     }
 
-    /// Seek to a position (0.0 to 1.0)
-    /// Uses frame-accurate seeking for precise positioning
+    #[allow(dead_code)]
     pub fn seek(&mut self, position: f64) -> Result<(), String> {
         let position = position.clamp(0.0, 1.0);
-        
-        if let Some(duration) = self.duration {
-            let seek_pos = Duration::from_secs_f64(duration.as_secs_f64() * position);
-            let seek_pos_ns = seek_pos.as_nanos() as i64;
-            
-            // Use ACCURATE flag for frame-precise seeking instead of KEY_UNIT
-            // This may be slower but provides exact frame positioning
-            self.pipeline
-                .seek_simple(
-                    gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
-                    gst::ClockTime::from_nseconds(seek_pos_ns as u64),
-                )
-                .map_err(|e| format!("Failed to seek: {}", e))?;
+        if let Some(duration) = self.duration_secs {
+            let seek_pos = duration * position;
+            self.seek_to_time(seek_pos)?;
         }
-        
         Ok(())
     }
 
-    /// Seek to a specific time in seconds
-    /// Uses frame-accurate seeking for precise positioning
+    #[allow(dead_code)]
     pub fn seek_to_time(&mut self, seconds: f64) -> Result<(), String> {
-        let seek_pos_ns = (seconds * 1_000_000_000.0) as u64;
+        let seconds = seconds.max(0.0);
+        self.paused_position = seconds;
+        self.current_seek_position = seconds;
         
-        // Use ACCURATE flag for frame-precise seeking instead of KEY_UNIT
-        self.pipeline
-            .seek_simple(
-                gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
-                gst::ClockTime::from_nseconds(seek_pos_ns),
-            )
-            .map_err(|e| format!("Failed to seek: {}", e))?;
-        
+        if self.is_playing && !self.is_seeking {
+            self.stop_decoding();
+            self.start_decoding(seconds)?;
+        }
+
         Ok(())
     }
 
-    /// Get current playback position in seconds
-    pub fn position(&self) -> Option<Duration> {
-        self.pipeline
-            .query_position::<gst::ClockTime>()
-            .map(|pos| Duration::from_nanos(pos.nseconds()))
+    pub fn start_seek(&mut self) {
+        if self.is_seeking {
+            return;
+        }
+        self.is_seeking = true;
+        
+        // Reset throttling state for new seek session
+        self.last_seek_preview_time = None;
+        self.pending_seek_position = None;
+        self.last_extracted_position = None;
+        
+        // Save current position before stopping
+        if self.is_playing {
+            if let Some(start) = self.start_time {
+                let elapsed = start.elapsed().as_secs_f64();
+                let pos = self.current_seek_position + elapsed;
+                if let Some(dur) = self.duration_secs {
+                    self.paused_position = pos.min(dur);
+                } else {
+                    self.paused_position = pos;
+                }
+            }
+        }
+        
+        self.stop_decoding();
+        self.is_playing = false;
     }
 
-    /// Get total duration
-    pub fn duration(&self) -> Option<Duration> {
-        self.duration
-    }
-
-    /// Update cached duration (call periodically)
-    pub fn update_duration(&mut self) {
-        if self.duration.is_none() {
-            self.duration = self.pipeline
-                .query_duration::<gst::ClockTime>()
-                .map(|dur| Duration::from_nanos(dur.nseconds()));
+    pub fn preview_seek(&mut self, position: f64) {
+        let position = position.clamp(0.0, 1.0);
+        if let Some(duration) = self.duration_secs {
+            let seek_pos = duration * position;
+            self.paused_position = seek_pos;
+            self.current_seek_position = seek_pos;
+            
+            // Skip if we already extracted this position (within 0.1 second tolerance)
+            if let Some(last_pos) = self.last_extracted_position {
+                if (seek_pos - last_pos).abs() < 0.1 {
+                    return;
+                }
+            }
+            
+            // Skip if an extraction is already in progress
+            if self.extraction_in_progress.load(Ordering::SeqCst) {
+                // Store as pending instead
+                self.pending_seek_position = Some(seek_pos);
+                return;
+            }
+            
+            // Throttle frame extraction
+            let now = Instant::now();
+            let should_extract = match self.last_seek_preview_time {
+                Some(last_time) => now.duration_since(last_time).as_millis() >= SEEK_PREVIEW_THROTTLE_MS as u128,
+                None => true,
+            };
+            
+            if should_extract {
+                self.last_seek_preview_time = Some(now);
+                self.pending_seek_position = None;
+                self.last_extracted_position = Some(seek_pos);
+                self.extract_frame_at(seek_pos);
+            } else {
+                // Store the position for later extraction
+                self.pending_seek_position = Some(seek_pos);
+            }
         }
     }
 
-    /// Get current position as a fraction (0.0 to 1.0)
-    pub fn position_fraction(&self) -> f64 {
-        match (self.position(), self.duration) {
-            (Some(pos), Some(dur)) if dur.as_nanos() > 0 => {
-                pos.as_secs_f64() / dur.as_secs_f64()
+    /// Call this periodically (e.g., in your update loop) to process pending seek previews
+    pub fn update_seek_preview(&mut self) {
+        if !self.is_seeking {
+            return;
+        }
+        
+        // Don't process pending if extraction is in progress
+        if self.extraction_in_progress.load(Ordering::SeqCst) {
+            return;
+        }
+        
+        if let Some(pending_pos) = self.pending_seek_position.take() {
+            // Skip if we already extracted this position
+            if let Some(last_pos) = self.last_extracted_position {
+                if (pending_pos - last_pos).abs() < 0.1 {
+                    return;
+                }
             }
+            
+            if let Some(last_time) = self.last_seek_preview_time {
+                let now = Instant::now();
+                if now.duration_since(last_time).as_millis() >= SEEK_PREVIEW_THROTTLE_MS as u128 {
+                    self.last_seek_preview_time = Some(now);
+                    self.last_extracted_position = Some(pending_pos);
+                    self.extract_frame_at(pending_pos);
+                } else {
+                    // Still throttled, put it back
+                    self.pending_seek_position = Some(pending_pos);
+                }
+            }
+        }
+    }
+
+    pub fn end_seek(&mut self, resume_playing: bool) -> Result<(), String> {
+        if !self.is_seeking {
+            return Ok(());
+        }
+        self.is_seeking = false;
+        
+        // Clear pending seek and throttle state
+        self.pending_seek_position = None;
+        self.last_seek_preview_time = None;
+
+        if resume_playing {
+            self.start_decoding(self.paused_position)?;
+            self.is_playing = true;
+        } else {
+            // Extract final frame at the exact position when not resuming
+            // Only if different from last extracted position
+            if self.last_extracted_position.map(|p| (p - self.paused_position).abs() > 0.1).unwrap_or(true) {
+                self.extract_frame_at(self.paused_position);
+            }
+        }
+        
+        self.last_extracted_position = None;
+
+        Ok(())
+    }
+
+    fn extract_frame_at(&mut self, seconds: f64) {
+        let path = self.path.clone();
+        let width = self.original_width;
+        let height = self.original_height;
+        let state = Arc::clone(&self.state);
+        let seconds = seconds.max(0.0);
+        let extraction_in_progress = Arc::clone(&self.extraction_in_progress);
+        
+        // Increment generation to invalidate any previous in-flight extractions
+        let gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        
+        // Update generation in state so this extraction's frames are accepted
+        if let Ok(mut s) = state.lock() {
+            s.generation = gen;
+        }
+        
+        // Mark extraction as in progress
+        extraction_in_progress.store(true, Ordering::SeqCst);
+
+        thread::spawn(move || {
+            let mut cmd = Command::new("ffmpeg");
+            cmd.args(["-ss", &format!("{:.3}", seconds)])
+                .args(["-i"])
+                .arg(&path)
+                .args(["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgba", "-"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null());
+
+            configure_no_window(&mut cmd);
+
+            let result = cmd.output();
+            
+            // Mark extraction as complete
+            extraction_in_progress.store(false, Ordering::SeqCst);
+            
+            if let Ok(output) = result {
+                let expected_size = (width * height * 4) as usize;
+                if output.stdout.len() == expected_size {
+                    if let Ok(mut state) = state.lock() {
+                        // Only update if generation still matches
+                        if state.generation == gen {
+                            state.current_frame = Some(VideoFrame {
+                                pixels: output.stdout,
+                                width,
+                                height,
+                            });
+                            state.frame_updated = true;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    #[allow(dead_code)]
+    pub fn is_in_seek_mode(&self) -> bool {
+        self.is_seeking
+    }
+
+    pub fn position(&self) -> Option<Duration> {
+        if self.is_seeking {
+            return Some(Duration::from_secs_f64(self.paused_position));
+        }
+        if self.is_playing {
+            if let Some(start) = self.start_time {
+                let elapsed = start.elapsed().as_secs_f64();
+                let pos = self.current_seek_position + elapsed;
+                if let Some(dur) = self.duration_secs {
+                    if pos >= dur {
+                        return Some(Duration::from_secs_f64(dur));
+                    }
+                }
+                return Some(Duration::from_secs_f64(pos));
+            }
+        }
+        Some(Duration::from_secs_f64(self.paused_position))
+    }
+
+    pub fn duration(&self) -> Option<Duration> {
+        self.duration_secs.map(Duration::from_secs_f64)
+    }
+
+    pub fn update_duration(&mut self) {}
+
+    pub fn position_fraction(&self) -> f64 {
+        match (self.position(), self.duration()) {
+            (Some(pos), Some(dur)) if dur.as_nanos() > 0 => pos.as_secs_f64() / dur.as_secs_f64(),
             _ => 0.0,
         }
     }
 
-    /// Set volume (0.0 to 1.0)
     pub fn set_volume(&mut self, volume: f64) {
         self.volume = volume.clamp(0.0, 1.0);
-        self.apply_volume();
+        if self.is_playing && !self.is_muted {
+            let pos = self.position().map(|d| d.as_secs_f64()).unwrap_or(0.0);
+            self.stop_audio();
+            self.start_audio(pos);
+        }
     }
 
-    /// Get current volume
     pub fn volume(&self) -> f64 {
         self.volume
     }
 
-    /// Set muted state
     pub fn set_muted(&mut self, muted: bool) {
+        let was_muted = self.is_muted;
         self.is_muted = muted;
-        self.apply_volume();
+
+        if self.is_playing {
+            if muted && !was_muted {
+                self.stop_audio();
+            } else if !muted && was_muted {
+                let pos = self.position().map(|d| d.as_secs_f64()).unwrap_or(0.0);
+                self.start_audio(pos);
+            }
+        }
     }
 
-    /// Toggle mute
     pub fn toggle_mute(&mut self) {
-        self.is_muted = !self.is_muted;
-        self.apply_volume();
+        self.set_muted(!self.is_muted);
     }
 
-    /// Check if muted
     pub fn is_muted(&self) -> bool {
         self.is_muted
     }
 
-    /// Apply volume settings to the pipeline
-    fn apply_volume(&self) {
-        if let Some(ref vol) = self.volume_element {
-            let effective_volume = if self.is_muted { 0.0 } else { self.volume };
-            vol.set_property("volume", effective_volume);
-        }
-    }
-
-    /// Get the latest video frame if updated
-    /// Takes ownership of the frame to avoid cloning (memory optimization)
     pub fn get_frame(&mut self) -> Option<VideoFrame> {
         if let Ok(mut state) = self.state.lock() {
             if state.frame_updated {
                 state.frame_updated = false;
-                
-                // Update dimensions
-                if state.video_width > 0 && state.video_height > 0 {
-                    self.original_width = state.video_width;
-                    self.original_height = state.video_height;
-                }
-                
-                // Take ownership instead of cloning to save memory
                 return state.current_frame.take();
             }
         }
         None
     }
 
-    /// Check if a new frame is available
     #[allow(dead_code)]
     pub fn has_new_frame(&self) -> bool {
         if let Ok(state) = self.state.lock() {
@@ -719,59 +653,42 @@ Ensure your GStreamer installation includes the playback elements (usually from 
         }
     }
 
-    /// Get video dimensions
     pub fn dimensions(&self) -> (u32, u32) {
-        if self.original_width > 0 && self.original_height > 0 {
-            (self.original_width, self.original_height)
-        } else if let Ok(state) = self.state.lock() {
-            (state.video_width, state.video_height)
-        } else {
-            (0, 0)
-        }
+        (self.original_width, self.original_height)
     }
 
-    /// Check if video has ended
     pub fn is_eos(&self) -> bool {
-        if let Some(bus) = self.pipeline.bus() {
-            while let Some(msg) = bus.pop() {
-                if let gst::MessageView::Eos(_) = msg.view() {
-                    return true;
-                }
-            }
+        if let Ok(state) = self.state.lock() {
+            state.is_eos
+        } else {
+            false
         }
-        false
     }
 
-    /// Check for errors
     #[allow(dead_code)]
     pub fn check_error(&self) -> Option<String> {
-        if let Some(bus) = self.pipeline.bus() {
-            while let Some(msg) = bus.pop() {
-                if let gst::MessageView::Error(err) = msg.view() {
-                    return Some(format!("{}: {:?}", err.error(), err.debug()));
-                }
-            }
+        if let Ok(state) = self.state.lock() {
+            state.error.clone()
+        } else {
+            None
         }
-        None
     }
 
-    /// Restart playback from the beginning
     pub fn restart(&mut self) -> Result<(), String> {
-        self.seek_to_time(0.0)?;
-        if !self.is_playing {
-            self.play()?;
-        }
+        self.stop_decoding();
+        self.paused_position = 0.0;
+        self.start_decoding(0.0)?;
+        self.is_playing = true;
         Ok(())
     }
 }
 
 impl Drop for VideoPlayer {
     fn drop(&mut self) {
-        let _ = self.pipeline.set_state(gst::State::Null);
+        self.stop_decoding();
     }
 }
 
-/// Format duration as MM:SS or HH:MM:SS
 pub fn format_duration(duration: Duration) -> String {
     let total_secs = duration.as_secs();
     let hours = total_secs / 3600;

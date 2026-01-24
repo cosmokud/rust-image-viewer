@@ -1,45 +1,29 @@
-//! Image and video loading and management module.
-//! Supports JPG, PNG, WEBP, animated GIF files, and video formats.
-//! Optimized for low memory usage while maintaining functionality.
-
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use image::GenericImageView;
 use image::imageops::FilterType;
 
-// Reduced from 4 GiB to 512 MiB for more reasonable memory limits
-// This prevents loading extremely large images that would consume too much RAM
-const DEFAULT_MAX_DECODE_ALLOC_BYTES: u64 = 512 * 1024 * 1024; // 512 MiB
+const DEFAULT_MAX_DECODE_ALLOC_BYTES: u64 = 512 * 1024 * 1024;
 
 fn open_image_with_reasonable_limits(path: &Path) -> Result<image::DynamicImage, String> {
-    // `image::open()` uses conservative decoder limits to protect against decompression bombs.
-    // For a viewer, we want to allow legitimately large images while still keeping a hard cap.
-    //
-    // We size limits from the container header dimensions (fast, no full decode).
     let (w, h) = image::image_dimensions(path).unwrap_or((0, 0));
-
-    // Conservative upper bound: assume 4 bytes/pixel worst case.
     let estimated = (w as u64)
         .saturating_mul(h as u64)
         .saturating_mul(4)
         .saturating_add(16 * 1024 * 1024);
 
     let max_alloc = estimated.clamp(256 * 1024 * 1024, DEFAULT_MAX_DECODE_ALLOC_BYTES);
-    let max_alloc_u64 = max_alloc;
 
     let mut reader = image::ImageReader::open(path)
         .map_err(|e| format!("Failed to open image: {}", e))?;
 
-    // Best-effort format detection for cases where extensions are unusual.
     reader = reader
         .with_guessed_format()
         .map_err(|e| format!("Failed to guess image format: {}", e))?;
 
     let mut limits = image::Limits::default();
-    limits.max_alloc = Some(max_alloc_u64);
-
-    // Also relax dimension limits (still bounded by whatever the header claims).
+    limits.max_alloc = Some(max_alloc);
     if w > 0 {
         limits.max_image_width = Some(w);
     }
@@ -48,9 +32,7 @@ fn open_image_with_reasonable_limits(path: &Path) -> Result<image::DynamicImage,
     }
 
     reader.limits(limits);
-    reader
-        .decode()
-        .map_err(|e| format!("Failed to load image: {}", e))
+    reader.decode().map_err(|e| format!("Failed to load image: {}", e))
 }
 
 /// Supported image extensions
@@ -231,8 +213,6 @@ impl LoadedImage {
         })
     }
 
-    /// Load an animated GIF
-    /// Optimized for memory: limits frame count and uses efficient downscaling
     fn load_gif(path: &Path, max_texture_side: Option<u32>, gif_filter: FilterType) -> Result<Self, String> {
         use std::fs::File;
         use gif::DecodeOptions;
@@ -240,7 +220,7 @@ impl LoadedImage {
         let file = File::open(path).map_err(|e| format!("Failed to open file: {}", e))?;
         let mut decoder = DecodeOptions::new();
         decoder.set_color_output(gif::ColorOutput::RGBA);
-        
+
         let mut decoder = decoder
             .read_info(file)
             .map_err(|e| format!("Failed to read GIF: {}", e))?;
@@ -248,14 +228,8 @@ impl LoadedImage {
         let mut frames = Vec::new();
         let width = decoder.width() as u32;
         let height = decoder.height() as u32;
-
-        // Memory optimization: limit maximum frames to prevent excessive RAM usage
-        // A 1920x1080 RGBA frame is ~8MB, so 50 frames = ~400MB max for large GIFs
-        // Reduced from 100 to 50 for better memory efficiency
         const MAX_FRAMES: usize = 50;
-        
-        // Determine if we need to downscale upfront based on memory constraints
-        // For large GIFs, downscale immediately to reduce per-frame memory
+
         let (target_width, target_height, needs_downscale) = if let Some(max_side) = max_texture_side {
             if max_side > 0 && (width > max_side || height > max_side) {
                 let scale = (max_side as f64 / width as f64).min(max_side as f64 / height as f64);
@@ -269,10 +243,8 @@ impl LoadedImage {
             (width, height, false)
         };
 
-        // Create a canvas to composite frames onto (at original size for decoding)
         let mut canvas = vec![0u8; (width * height * 4) as usize];
-        
-        // Pre-allocate reusable buffer for downscaling if needed
+
         #[allow(unused_mut)]
         let mut downscale_buffer: Option<Vec<u8>> = if needs_downscale {
             Some(Vec::with_capacity((target_width * target_height * 4) as usize))
@@ -282,15 +254,13 @@ impl LoadedImage {
 
         let mut frame_count = 0;
         while let Some(frame) = decoder.read_next_frame().map_err(|e| format!("GIF frame error: {}", e))? {
-            // Limit frame count to prevent memory explosion
             if frame_count >= MAX_FRAMES {
                 break;
             }
-            
-            let delay_ms = (frame.delay as u32) * 10; // GIF delay is in centiseconds
-            let delay_ms = if delay_ms == 0 { 100 } else { delay_ms }; // Default to 100ms if 0
 
-            // Handle different disposal methods
+            let delay_ms = (frame.delay as u32) * 10;
+            let delay_ms = if delay_ms == 0 { 100 } else { delay_ms };
+
             let frame_x = frame.left as usize;
             let frame_y = frame.top as usize;
             let frame_width = frame.width as usize;
@@ -312,13 +282,10 @@ impl LoadedImage {
                 }
             }
 
-            // Store either downscaled or original frame
             let frame_pixels = if needs_downscale {
-                // Downscale immediately to save memory
                 let Some(img) = image::RgbaImage::from_raw(width, height, canvas.clone()) else {
                     return Err("Failed to build RGBA image for GIF resizing".to_string());
                 };
-                // Use configurable filter for animated GIFs
                 let resized = image::imageops::resize(&img, target_width, target_height, gif_filter);
                 resized.into_raw()
             } else {
@@ -331,18 +298,16 @@ impl LoadedImage {
                 height: target_height,
                 delay_ms,
             });
-            
+
             frame_count += 1;
         }
 
-        // Clean up the downscale buffer
         drop(downscale_buffer);
 
         if frames.is_empty() {
             return Err("No frames in GIF".to_string());
         }
 
-        // Shrink frames vector to exact size to free unused capacity
         frames.shrink_to_fit();
 
         Ok(LoadedImage {
@@ -355,17 +320,14 @@ impl LoadedImage {
         })
     }
 
-    /// Check if this is an animated image
     pub fn is_animated(&self) -> bool {
         self.frames.len() > 1
     }
 
-    /// Get total number of frames
     pub fn frame_count(&self) -> usize {
         self.frames.len()
     }
 
-    /// Get total duration of the animation in milliseconds
     pub fn total_duration_ms(&self) -> u32 {
         self.frames.iter().map(|f| f.delay_ms).sum()
     }

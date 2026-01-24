@@ -1,6 +1,3 @@
-//! High-performance Image & Video Viewer for Windows 11
-//! Built with Rust + egui (eframe) + GStreamer
-
 #![windows_subsystem = "windows"]
 
 mod config;
@@ -324,8 +321,7 @@ struct ImageViewer {
     /// These font files can be quite large, so we install them lazily only when needed.
     windows_cjk_fonts_installed: bool,
     
-    /// Whether GStreamer has been initialized (deferred until first video load)
-    gstreamer_initialized: bool,
+
 
     /// Keep the window hidden until we've applied initial layout.
     /// This prevents the default empty window flashing for a few milliseconds on startup.
@@ -511,7 +507,7 @@ impl Default for ImageViewer {
             fps_last_dt_s: 0.0,
 
             windows_cjk_fonts_installed: false,
-            gstreamer_initialized: false,
+
 
             startup_window_shown: false,
             startup_hide_started_at: Instant::now(),
@@ -1136,29 +1132,29 @@ impl ImageViewer {
             && matches!(media_type, Some(MediaType::Video));
 
         // Clear previous media state.
-        // For video-to-video navigation we keep the previous video texture as a placeholder
-        // until the first decoded frame of the new video arrives.
         // 
         // MEMORY OPTIMIZATION: Explicitly drop textures to release GPU memory immediately.
         // Setting to None allows Rust to drop the TextureHandle, which signals egui to
         // free the underlying GPU texture on the next frame.
         if let Some(player) = self.video_player.take() {
-            // Drop the video player first - this stops GStreamer pipeline and frees its buffers
             drop(player);
         }
-        if !keep_video_placeholder {
-            // Drop video texture to free VRAM
-            if let Some(tex) = self.video_texture.take() {
-                drop(tex);
-            }
-            self.video_texture_dims = None;
+        // Always clear video texture on navigation - keeping the old texture causes
+        // visible stretching when the new video has different dimensions
+        if let Some(tex) = self.video_texture.take() {
+            drop(tex);
         }
+        self.video_texture_dims = None;
+        
         // Drop image texture to free VRAM
         if let Some(tex) = self.texture.take() {
             drop(tex);
         }
         self.image = None;
         self.show_video_controls = false;
+
+        // Consume keep_video_placeholder to suppress warning (placeholder logic removed)
+        let _ = keep_video_placeholder;
 
         // Reset GIF playback state for new media
         self.gif_paused = false;
@@ -1179,9 +1175,6 @@ impl ImageViewer {
 
         match media_type {
             Some(MediaType::Video) => {
-                // Mark GStreamer as initialized (it will be lazily initialized on first use)
-                self.gstreamer_initialized = true;
-                
                 // Load as video
                 match VideoPlayer::new(
                     path,
@@ -1966,9 +1959,6 @@ impl ImageViewer {
                 } else {
                     // Create new video player for focused item
                     if let Some(path) = self.image_list.get(focused_idx) {
-                        // Ensure GStreamer is initialized
-                        self.gstreamer_initialized = true;
-                        
                         // Use user's persisted settings, or config defaults if not set
                         let muted = self.manga_video_user_muted.unwrap_or(self.config.video_muted_by_default);
                         let volume = self.manga_video_user_volume.unwrap_or(self.config.video_default_volume);
@@ -2057,6 +2047,9 @@ impl ImageViewer {
             if let Some(player) = self.manga_video_players.get_mut(&focused_idx) {
                 // Update duration cache
                 player.update_duration();
+                
+                // Process pending seek previews (for throttled seeking)
+                player.update_seek_preview();
 
                 // Check for video end and handle looping
                 if player.is_eos() {
@@ -4135,6 +4128,9 @@ impl ImageViewer {
         if let Some(ref mut player) = self.video_player {
             // Update duration cache
             player.update_duration();
+            
+            // Process pending seek previews (for throttled seeking)
+            player.update_seek_preview();
 
             // Check for video end and handle looping
             if player.is_eos() {
@@ -4863,15 +4859,19 @@ impl ImageViewer {
             let primary_released = ctx.input(|i| i.pointer.button_released(egui::PointerButton::Primary));
 
             // If the pointer is held down on the seek bar, enter seeking mode immediately.
-            // This ensures "click-and-hold without moving" pauses playback.
             if seek_response.is_pointer_button_down_on() && !self.is_seeking {
                 self.is_seeking = true;
                 self.seek_was_playing = player.is_playing();
-                if self.seek_was_playing {
-                    let _ = player.pause();
-                }
-                // Allow an immediate seek on the first frame of interaction.
+                player.start_seek();
                 self.last_seek_sent_at = Instant::now() - Duration::from_millis(1000);
+                
+                // Immediately preview the clicked position
+                if let Some(pos) = seek_response.interact_pointer_pos() {
+                    let seek_fraction = ((pos.x - bar_inner.min.x) / bar_inner.width()).clamp(0.0, 1.0);
+                    self.seek_preview_fraction = Some(seek_fraction);
+                    player.preview_seek(seek_fraction as f64);
+                    self.last_seek_sent_at = Instant::now();
+                }
             }
 
             // While the button is held and we're in seeking mode, update preview and seek.
@@ -4889,35 +4889,24 @@ impl ImageViewer {
                     self.seek_preview_fraction = Some(seek_fraction);
 
                     if fraction_changed
-                        && self.last_seek_sent_at.elapsed() >= Duration::from_millis(50)
+                        && self.last_seek_sent_at.elapsed() >= Duration::from_millis(100)
                     {
-                        let _ = player.seek(seek_fraction as f64);
+                        player.preview_seek(seek_fraction as f64);
                         self.last_seek_sent_at = Instant::now();
                     }
                 }
                 ctx.request_repaint();
             }
 
-            // Single-click seek (no hold): seek immediately, don't change play state.
-            if seek_response.clicked() && !self.is_seeking {
-                if let Some(pos) = seek_response.interact_pointer_pos() {
-                    let seek_fraction = ((pos.x - bar_inner.min.x) / bar_inner.width()).clamp(0.0, 1.0);
-                    let _ = player.seek(seek_fraction as f64);
-                    ctx.request_repaint();
-                }
-            }
-
             // On mouse release, finalize seek and restore prior play state.
             if self.is_seeking && primary_released {
-                if let Some(final_fraction) = self.seek_preview_fraction.take() {
-                    let _ = player.seek(final_fraction as f64);
+                let final_fraction = self.seek_preview_fraction.take();
+                if let Some(frac) = final_fraction {
+                    player.preview_seek(frac as f64);
                 }
+                let _ = player.end_seek(self.seek_was_playing);
                 self.is_seeking = false;
                 self.last_seek_sent_at = Instant::now();
-
-                if self.seek_was_playing {
-                    let _ = player.play();
-                }
                 self.seek_was_playing = false;
             }
 
@@ -5289,15 +5278,19 @@ impl ImageViewer {
             let primary_released = ctx.input(|i| i.pointer.button_released(egui::PointerButton::Primary));
 
             if seek_response.is_pointer_button_down_on() && !self.manga_video_seeking {
-                if let Some(player) = self.manga_video_players.get(&video_idx) {
+                if let Some(player) = self.manga_video_players.get_mut(&video_idx) {
                     self.manga_video_seeking = true;
                     self.manga_video_seek_was_playing = player.is_playing();
-                    if self.manga_video_seek_was_playing {
-                        if let Some(p) = self.manga_video_players.get_mut(&video_idx) {
-                            let _ = p.pause();
-                        }
-                    }
+                    player.start_seek();
                     self.manga_video_last_seek_sent = Instant::now() - Duration::from_millis(1000);
+                    
+                    // Immediately preview the clicked position
+                    if let Some(pos) = seek_response.interact_pointer_pos() {
+                        let seek_fraction = ((pos.x - bar_inner.min.x) / bar_inner.width()).clamp(0.0, 1.0);
+                        self.manga_video_seek_preview_fraction = Some(seek_fraction);
+                        player.preview_seek(seek_fraction as f64);
+                        self.manga_video_last_seek_sent = Instant::now();
+                    }
                 }
             }
 
@@ -5309,9 +5302,9 @@ impl ImageViewer {
                     
                     self.manga_video_seek_preview_fraction = Some(seek_fraction);
                     
-                    if fraction_changed && self.manga_video_last_seek_sent.elapsed() >= Duration::from_millis(50) {
+                    if fraction_changed && self.manga_video_last_seek_sent.elapsed() >= Duration::from_millis(100) {
                         if let Some(player) = self.manga_video_players.get_mut(&video_idx) {
-                            let _ = player.seek(seek_fraction as f64);
+                            player.preview_seek(seek_fraction as f64);
                         }
                         self.manga_video_last_seek_sent = Instant::now();
                     }
@@ -5319,30 +5312,16 @@ impl ImageViewer {
                 ctx.request_repaint();
             }
 
-            if seek_response.clicked() && !self.manga_video_seeking {
-                if let Some(pos) = seek_response.interact_pointer_pos() {
-                    let seek_fraction = ((pos.x - bar_inner.min.x) / bar_inner.width()).clamp(0.0, 1.0);
-                    if let Some(player) = self.manga_video_players.get_mut(&video_idx) {
-                        let _ = player.seek(seek_fraction as f64);
-                    }
-                    ctx.request_repaint();
-                }
-            }
-
             if self.manga_video_seeking && primary_released {
-                if let Some(final_fraction) = self.manga_video_seek_preview_fraction.take() {
-                    if let Some(player) = self.manga_video_players.get_mut(&video_idx) {
-                        let _ = player.seek(final_fraction as f64);
+                let final_fraction = self.manga_video_seek_preview_fraction.take();
+                if let Some(player) = self.manga_video_players.get_mut(&video_idx) {
+                    if let Some(frac) = final_fraction {
+                        player.preview_seek(frac as f64);
                     }
+                    let _ = player.end_seek(self.manga_video_seek_was_playing);
                 }
                 self.manga_video_seeking = false;
                 self.manga_video_last_seek_sent = Instant::now();
-                
-                if self.manga_video_seek_was_playing {
-                    if let Some(player) = self.manga_video_players.get_mut(&video_idx) {
-                        let _ = player.play();
-                    }
-                }
                 self.manga_video_seek_was_playing = false;
             }
 
