@@ -2047,6 +2047,9 @@ impl ImageViewer {
             if let Some(player) = self.manga_video_players.get_mut(&focused_idx) {
                 // Update duration cache
                 player.update_duration();
+                
+                // Process pending seek previews (for throttled seeking)
+                player.update_seek_preview();
 
                 // Check for video end and handle looping
                 if player.is_eos() {
@@ -4125,6 +4128,9 @@ impl ImageViewer {
         if let Some(ref mut player) = self.video_player {
             // Update duration cache
             player.update_duration();
+            
+            // Process pending seek previews (for throttled seeking)
+            player.update_seek_preview();
 
             // Check for video end and handle looping
             if player.is_eos() {

@@ -1,10 +1,13 @@
 use std::io::Read;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+
+/// Minimum interval between frame extractions during seeking (in milliseconds)
+const SEEK_PREVIEW_THROTTLE_MS: u64 = 100;
 
 pub struct VideoFrame {
     pub pixels: Vec<u8>,
@@ -39,6 +42,10 @@ pub struct VideoPlayer {
     current_seek_position: f64,
     stop_signal: Arc<Mutex<bool>>,
     is_seeking: bool,
+    // Throttling for seek preview
+    last_seek_preview_time: Option<Instant>,
+    pending_seek_position: Option<f64>,
+    seek_extraction_cancel: Arc<AtomicBool>,
 }
 
 #[cfg(target_os = "windows")]
@@ -89,6 +96,9 @@ impl VideoPlayer {
             current_seek_position: 0.0,
             stop_signal: Arc::new(Mutex::new(false)),
             is_seeking: false,
+            last_seek_preview_time: None,
+            pending_seek_position: None,
+            seek_extraction_cancel: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -365,6 +375,12 @@ impl VideoPlayer {
         }
         self.is_seeking = true;
         
+        // Reset throttling state for new seek session
+        self.last_seek_preview_time = None;
+        self.pending_seek_position = None;
+        self.seek_extraction_cancel.store(true, Ordering::SeqCst);
+        self.seek_extraction_cancel = Arc::new(AtomicBool::new(false));
+        
         // Save current position before stopping
         if self.is_playing {
             if let Some(start) = self.start_time {
@@ -388,7 +404,50 @@ impl VideoPlayer {
             let seek_pos = duration * position;
             self.paused_position = seek_pos;
             self.current_seek_position = seek_pos;
-            self.extract_frame_at(seek_pos);
+            
+            // Throttle frame extraction to avoid spawning too many ffmpeg processes
+            let now = Instant::now();
+            let should_extract = match self.last_seek_preview_time {
+                Some(last_time) => now.duration_since(last_time).as_millis() >= SEEK_PREVIEW_THROTTLE_MS as u128,
+                None => true,
+            };
+            
+            if should_extract {
+                // Cancel any pending extraction
+                self.seek_extraction_cancel.store(true, Ordering::SeqCst);
+                self.seek_extraction_cancel = Arc::new(AtomicBool::new(false));
+                
+                self.last_seek_preview_time = Some(now);
+                self.pending_seek_position = None;
+                self.extract_frame_at(seek_pos);
+            } else {
+                // Store the position for later extraction when throttle period ends
+                self.pending_seek_position = Some(seek_pos);
+            }
+        }
+    }
+
+    /// Call this periodically (e.g., in your update loop) to process pending seek previews
+    pub fn update_seek_preview(&mut self) {
+        if !self.is_seeking {
+            return;
+        }
+        
+        if let Some(pending_pos) = self.pending_seek_position.take() {
+            if let Some(last_time) = self.last_seek_preview_time {
+                let now = Instant::now();
+                if now.duration_since(last_time).as_millis() >= SEEK_PREVIEW_THROTTLE_MS as u128 {
+                    // Cancel any pending extraction
+                    self.seek_extraction_cancel.store(true, Ordering::SeqCst);
+                    self.seek_extraction_cancel = Arc::new(AtomicBool::new(false));
+                    
+                    self.last_seek_preview_time = Some(now);
+                    self.extract_frame_at(pending_pos);
+                } else {
+                    // Still throttled, put it back
+                    self.pending_seek_position = Some(pending_pos);
+                }
+            }
         }
     }
 
@@ -397,10 +456,21 @@ impl VideoPlayer {
             return Ok(());
         }
         self.is_seeking = false;
+        
+        // Cancel any in-progress frame extractions
+        self.seek_extraction_cancel.store(true, Ordering::SeqCst);
+        self.seek_extraction_cancel = Arc::new(AtomicBool::new(false));
+        
+        // Clear pending seek and throttle state
+        self.pending_seek_position = None;
+        self.last_seek_preview_time = None;
 
         if resume_playing {
             self.start_decoding(self.paused_position)?;
             self.is_playing = true;
+        } else {
+            // Extract final frame at the exact position when not resuming
+            self.extract_frame_at(self.paused_position);
         }
 
         Ok(())
@@ -412,10 +482,10 @@ impl VideoPlayer {
         let height = self.original_height;
         let state = Arc::clone(&self.state);
         let seconds = seconds.max(0.0);
+        let cancel_flag = Arc::clone(&self.seek_extraction_cancel);
         
-        // Get current generation - frames from this extraction are only valid
-        // if generation hasn't changed by the time they arrive
-        let gen = self.generation.load(Ordering::SeqCst);
+        // Increment generation to invalidate any previous in-flight extractions
+        let gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         
         // Update generation in state so this extraction's frames are accepted
         if let Ok(mut s) = state.lock() {
@@ -423,6 +493,11 @@ impl VideoPlayer {
         }
 
         thread::spawn(move || {
+            // Check if cancelled before starting
+            if cancel_flag.load(Ordering::SeqCst) {
+                return;
+            }
+            
             let mut cmd = Command::new("ffmpeg");
             cmd.args(["-ss", &format!("{:.3}", seconds)])
                 .args(["-i"])
@@ -434,6 +509,11 @@ impl VideoPlayer {
             configure_no_window(&mut cmd);
 
             if let Ok(output) = cmd.output() {
+                // Check if cancelled after extraction completed
+                if cancel_flag.load(Ordering::SeqCst) {
+                    return;
+                }
+                
                 let expected_size = (width * height * 4) as usize;
                 if output.stdout.len() == expected_size {
                     if let Ok(mut state) = state.lock() {
