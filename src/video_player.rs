@@ -1,3 +1,11 @@
+//! Video player using ffmpeg/ffplay processes with optimized seeking.
+//! 
+//! Key optimizations:
+//! - Throttled frame extraction during seeking (50ms minimum interval)
+//! - Caches the last extracted frame to avoid duplicate extractions
+//! - Only one extraction process runs at a time
+//! - Uses generation counters to discard stale results
+
 use std::io::Read;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -7,7 +15,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 /// Minimum interval between frame extractions during seeking (in milliseconds)
-const SEEK_PREVIEW_THROTTLE_MS: u64 = 100;
+const SEEK_PREVIEW_THROTTLE_MS: u64 = 50;
 
 pub struct VideoFrame {
     pub pixels: Vec<u8>,
@@ -45,7 +53,10 @@ pub struct VideoPlayer {
     // Throttling for seek preview
     last_seek_preview_time: Option<Instant>,
     pending_seek_position: Option<f64>,
-    seek_extraction_cancel: Arc<AtomicBool>,
+    // Track if an extraction is in progress to avoid spawning multiple
+    extraction_in_progress: Arc<AtomicBool>,
+    // Cache the last extracted position to avoid duplicate extractions
+    last_extracted_position: Option<f64>,
 }
 
 #[cfg(target_os = "windows")]
@@ -98,7 +109,8 @@ impl VideoPlayer {
             is_seeking: false,
             last_seek_preview_time: None,
             pending_seek_position: None,
-            seek_extraction_cancel: Arc::new(AtomicBool::new(false)),
+            extraction_in_progress: Arc::new(AtomicBool::new(false)),
+            last_extracted_position: None,
         })
     }
 
@@ -378,8 +390,7 @@ impl VideoPlayer {
         // Reset throttling state for new seek session
         self.last_seek_preview_time = None;
         self.pending_seek_position = None;
-        self.seek_extraction_cancel.store(true, Ordering::SeqCst);
-        self.seek_extraction_cancel = Arc::new(AtomicBool::new(false));
+        self.last_extracted_position = None;
         
         // Save current position before stopping
         if self.is_playing {
@@ -405,7 +416,21 @@ impl VideoPlayer {
             self.paused_position = seek_pos;
             self.current_seek_position = seek_pos;
             
-            // Throttle frame extraction to avoid spawning too many ffmpeg processes
+            // Skip if we already extracted this position (within 0.1 second tolerance)
+            if let Some(last_pos) = self.last_extracted_position {
+                if (seek_pos - last_pos).abs() < 0.1 {
+                    return;
+                }
+            }
+            
+            // Skip if an extraction is already in progress
+            if self.extraction_in_progress.load(Ordering::SeqCst) {
+                // Store as pending instead
+                self.pending_seek_position = Some(seek_pos);
+                return;
+            }
+            
+            // Throttle frame extraction
             let now = Instant::now();
             let should_extract = match self.last_seek_preview_time {
                 Some(last_time) => now.duration_since(last_time).as_millis() >= SEEK_PREVIEW_THROTTLE_MS as u128,
@@ -413,15 +438,12 @@ impl VideoPlayer {
             };
             
             if should_extract {
-                // Cancel any pending extraction
-                self.seek_extraction_cancel.store(true, Ordering::SeqCst);
-                self.seek_extraction_cancel = Arc::new(AtomicBool::new(false));
-                
                 self.last_seek_preview_time = Some(now);
                 self.pending_seek_position = None;
+                self.last_extracted_position = Some(seek_pos);
                 self.extract_frame_at(seek_pos);
             } else {
-                // Store the position for later extraction when throttle period ends
+                // Store the position for later extraction
                 self.pending_seek_position = Some(seek_pos);
             }
         }
@@ -433,15 +455,24 @@ impl VideoPlayer {
             return;
         }
         
+        // Don't process pending if extraction is in progress
+        if self.extraction_in_progress.load(Ordering::SeqCst) {
+            return;
+        }
+        
         if let Some(pending_pos) = self.pending_seek_position.take() {
+            // Skip if we already extracted this position
+            if let Some(last_pos) = self.last_extracted_position {
+                if (pending_pos - last_pos).abs() < 0.1 {
+                    return;
+                }
+            }
+            
             if let Some(last_time) = self.last_seek_preview_time {
                 let now = Instant::now();
                 if now.duration_since(last_time).as_millis() >= SEEK_PREVIEW_THROTTLE_MS as u128 {
-                    // Cancel any pending extraction
-                    self.seek_extraction_cancel.store(true, Ordering::SeqCst);
-                    self.seek_extraction_cancel = Arc::new(AtomicBool::new(false));
-                    
                     self.last_seek_preview_time = Some(now);
+                    self.last_extracted_position = Some(pending_pos);
                     self.extract_frame_at(pending_pos);
                 } else {
                     // Still throttled, put it back
@@ -457,10 +488,6 @@ impl VideoPlayer {
         }
         self.is_seeking = false;
         
-        // Cancel any in-progress frame extractions
-        self.seek_extraction_cancel.store(true, Ordering::SeqCst);
-        self.seek_extraction_cancel = Arc::new(AtomicBool::new(false));
-        
         // Clear pending seek and throttle state
         self.pending_seek_position = None;
         self.last_seek_preview_time = None;
@@ -470,8 +497,13 @@ impl VideoPlayer {
             self.is_playing = true;
         } else {
             // Extract final frame at the exact position when not resuming
-            self.extract_frame_at(self.paused_position);
+            // Only if different from last extracted position
+            if self.last_extracted_position.map(|p| (p - self.paused_position).abs() > 0.1).unwrap_or(true) {
+                self.extract_frame_at(self.paused_position);
+            }
         }
+        
+        self.last_extracted_position = None;
 
         Ok(())
     }
@@ -482,7 +514,7 @@ impl VideoPlayer {
         let height = self.original_height;
         let state = Arc::clone(&self.state);
         let seconds = seconds.max(0.0);
-        let cancel_flag = Arc::clone(&self.seek_extraction_cancel);
+        let extraction_in_progress = Arc::clone(&self.extraction_in_progress);
         
         // Increment generation to invalidate any previous in-flight extractions
         let gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
@@ -491,13 +523,11 @@ impl VideoPlayer {
         if let Ok(mut s) = state.lock() {
             s.generation = gen;
         }
+        
+        // Mark extraction as in progress
+        extraction_in_progress.store(true, Ordering::SeqCst);
 
         thread::spawn(move || {
-            // Check if cancelled before starting
-            if cancel_flag.load(Ordering::SeqCst) {
-                return;
-            }
-            
             let mut cmd = Command::new("ffmpeg");
             cmd.args(["-ss", &format!("{:.3}", seconds)])
                 .args(["-i"])
@@ -508,12 +538,12 @@ impl VideoPlayer {
 
             configure_no_window(&mut cmd);
 
-            if let Ok(output) = cmd.output() {
-                // Check if cancelled after extraction completed
-                if cancel_flag.load(Ordering::SeqCst) {
-                    return;
-                }
-                
+            let result = cmd.output();
+            
+            // Mark extraction as complete
+            extraction_in_progress.store(false, Ordering::SeqCst);
+            
+            if let Ok(output) = result {
                 let expected_size = (width * height * 4) as usize;
                 if output.stdout.len() == expected_size {
                     if let Ok(mut state) = state.lock() {
