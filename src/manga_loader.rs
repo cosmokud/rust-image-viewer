@@ -580,18 +580,25 @@ impl MangaLoader {
     fn probe_video_dimensions(path: &std::path::Path) -> Option<(u32, u32)> {
         use std::process::{Command, Stdio};
 
-        let output = Command::new("ffprobe")
-            .args([
-                "-v", "error",
-                "-select_streams", "v:0",
-                "-show_entries", "stream=width,height",
-                "-of", "csv=p=0:s=x",
-            ])
-            .arg(path)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .output()
-            .ok()?;
+        let mut cmd = Command::new("ffprobe");
+        cmd.args([
+            "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height",
+            "-of", "csv=p=0:s=x",
+        ])
+        .arg(path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+
+        let output = cmd.output().ok()?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let parts: Vec<&str> = stdout.trim().split('x').collect();
@@ -623,10 +630,8 @@ impl MangaLoader {
             String::new()
         };
 
-        let output = Command::new("ffmpeg")
-            .args([
-                "-i",
-            ])
+        let mut cmd = Command::new("ffmpeg");
+        cmd.args(["-i"])
             .arg(path)
             .args([
                 "-vf", &format!("format=rgba{}", scale_filter),
@@ -636,9 +641,16 @@ impl MangaLoader {
                 "-",
             ])
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .output()
-            .ok()?;
+            .stderr(Stdio::null());
+
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+
+        let output = cmd.output().ok()?;
 
         if output.stdout.is_empty() {
             return None;

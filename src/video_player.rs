@@ -37,6 +37,23 @@ pub struct VideoPlayer {
     stop_signal: Arc<Mutex<bool>>,
 }
 
+#[cfg(target_os = "windows")]
+fn configure_no_window(cmd: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    cmd.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(target_os = "windows"))]
+fn configure_no_window(_cmd: &mut Command) {}
+
+fn kill_process_async(mut child: Child) {
+    thread::spawn(move || {
+        let _ = child.kill();
+        let _ = child.wait();
+    });
+}
+
 impl VideoPlayer {
     pub fn new(path: &Path, muted: bool, initial_volume: f64) -> Result<Self, String> {
         let (width, height, duration, fps) = Self::probe_video_info(path)?;
@@ -69,17 +86,21 @@ impl VideoPlayer {
     }
 
     fn probe_video_info(path: &Path) -> Result<(u32, u32, Option<f64>, f64), String> {
-        let output = Command::new("ffprobe")
-            .args([
-                "-v", "error",
-                "-select_streams", "v:0",
-                "-show_entries", "stream=width,height,duration,r_frame_rate",
-                "-show_entries", "format=duration",
-                "-of", "default=noprint_wrappers=1",
-            ])
-            .arg(path)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+        let mut cmd = Command::new("ffprobe");
+        cmd.args([
+            "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height,duration,r_frame_rate",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1",
+        ])
+        .arg(path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+
+        configure_no_window(&mut cmd);
+
+        let output = cmd
             .output()
             .map_err(|e| format!("Failed to run ffprobe: {}. Make sure ffmpeg is in PATH.", e))?;
 
@@ -141,12 +162,7 @@ impl VideoPlayer {
         cmd.stdout(Stdio::null());
         cmd.stderr(Stdio::null());
 
-        #[cfg(target_os = "windows")]
-        {
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x08000000;
-            cmd.creation_flags(CREATE_NO_WINDOW);
-        }
+        configure_no_window(&mut cmd);
 
         if let Ok(child) = cmd.spawn() {
             self.ffplay_audio = Some(child);
@@ -154,16 +170,15 @@ impl VideoPlayer {
     }
 
     fn stop_audio(&mut self) {
-        if let Some(mut child) = self.ffplay_audio.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+        if let Some(child) = self.ffplay_audio.take() {
+            kill_process_async(child);
         }
     }
 
     fn start_decoding(&mut self, start_position: f64) -> Result<(), String> {
         self.stop_decoding();
 
-        *self.stop_signal.lock().unwrap() = false;
+        self.stop_signal = Arc::new(Mutex::new(false));
 
         if let Ok(mut state) = self.state.lock() {
             state.is_eos = false;
@@ -182,12 +197,7 @@ impl VideoPlayer {
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
 
-        #[cfg(target_os = "windows")]
-        {
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x08000000;
-            cmd.creation_flags(CREATE_NO_WINDOW);
-        }
+        configure_no_window(&mut cmd);
 
         let mut child = cmd
             .spawn()
@@ -262,13 +272,14 @@ impl VideoPlayer {
 
         self.stop_audio();
 
-        if let Some(mut child) = self.ffmpeg_process.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+        if let Some(child) = self.ffmpeg_process.take() {
+            kill_process_async(child);
         }
 
         if let Some(thread) = self.reader_thread.take() {
-            let _ = thread.join();
+            thread::spawn(move || {
+                let _ = thread.join();
+            });
         }
     }
 
