@@ -318,6 +318,7 @@ impl VideoPlayer {
         self.is_playing
     }
 
+    #[allow(dead_code)]
     pub fn seek(&mut self, position: f64) -> Result<(), String> {
         let position = position.clamp(0.0, 1.0);
         if let Some(duration) = self.duration_secs {
@@ -327,6 +328,7 @@ impl VideoPlayer {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn seek_to_time(&mut self, seconds: f64) -> Result<(), String> {
         let seconds = seconds.max(0.0);
         self.paused_position = seconds;
@@ -345,7 +347,22 @@ impl VideoPlayer {
             return;
         }
         self.is_seeking = true;
+        
+        // Save current position before stopping
+        if self.is_playing {
+            if let Some(start) = self.start_time {
+                let elapsed = start.elapsed().as_secs_f64();
+                let pos = self.current_seek_position + elapsed;
+                if let Some(dur) = self.duration_secs {
+                    self.paused_position = pos.min(dur);
+                } else {
+                    self.paused_position = pos;
+                }
+            }
+        }
+        
         self.stop_decoding();
+        self.is_playing = false;
     }
 
     pub fn preview_seek(&mut self, position: f64) {

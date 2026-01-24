@@ -4857,6 +4857,14 @@ impl ImageViewer {
                 self.seek_was_playing = player.is_playing();
                 player.start_seek();
                 self.last_seek_sent_at = Instant::now() - Duration::from_millis(1000);
+                
+                // Immediately preview the clicked position
+                if let Some(pos) = seek_response.interact_pointer_pos() {
+                    let seek_fraction = ((pos.x - bar_inner.min.x) / bar_inner.width()).clamp(0.0, 1.0);
+                    self.seek_preview_fraction = Some(seek_fraction);
+                    player.preview_seek(seek_fraction as f64);
+                    self.last_seek_sent_at = Instant::now();
+                }
             }
 
             // While the button is held and we're in seeking mode, update preview and seek.
@@ -4881,15 +4889,6 @@ impl ImageViewer {
                     }
                 }
                 ctx.request_repaint();
-            }
-
-            // Single-click seek (no hold): seek immediately, don't change play state.
-            if seek_response.clicked() && !self.is_seeking {
-                if let Some(pos) = seek_response.interact_pointer_pos() {
-                    let seek_fraction = ((pos.x - bar_inner.min.x) / bar_inner.width()).clamp(0.0, 1.0);
-                    let _ = player.seek(seek_fraction as f64);
-                    ctx.request_repaint();
-                }
             }
 
             // On mouse release, finalize seek and restore prior play state.
@@ -5277,6 +5276,14 @@ impl ImageViewer {
                     self.manga_video_seek_was_playing = player.is_playing();
                     player.start_seek();
                     self.manga_video_last_seek_sent = Instant::now() - Duration::from_millis(1000);
+                    
+                    // Immediately preview the clicked position
+                    if let Some(pos) = seek_response.interact_pointer_pos() {
+                        let seek_fraction = ((pos.x - bar_inner.min.x) / bar_inner.width()).clamp(0.0, 1.0);
+                        self.manga_video_seek_preview_fraction = Some(seek_fraction);
+                        player.preview_seek(seek_fraction as f64);
+                        self.manga_video_last_seek_sent = Instant::now();
+                    }
                 }
             }
 
@@ -5296,16 +5303,6 @@ impl ImageViewer {
                     }
                 }
                 ctx.request_repaint();
-            }
-
-            if seek_response.clicked() && !self.manga_video_seeking {
-                if let Some(pos) = seek_response.interact_pointer_pos() {
-                    let seek_fraction = ((pos.x - bar_inner.min.x) / bar_inner.width()).clamp(0.0, 1.0);
-                    if let Some(player) = self.manga_video_players.get_mut(&video_idx) {
-                        let _ = player.seek(seek_fraction as f64);
-                    }
-                    ctx.request_repaint();
-                }
             }
 
             if self.manga_video_seeking && primary_released {
