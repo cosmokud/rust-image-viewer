@@ -1,23 +1,13 @@
-//! Configuration module for customizable shortcuts and settings.
-//! Supports keyboard keys and mouse buttons including scroll wheel.
-
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
-/// Image resampling filter types for scaling operations.
-/// Listed from fastest (lowest quality) to slowest (highest quality).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageFilter {
-    /// Nearest neighbor - fastest, pixelated look (good for pixel art)
     Nearest,
-    /// Triangle (bilinear) - fast, smooth but can be blurry
     Triangle,
-    /// Catmull-Rom - good balance of speed and quality (recommended default)
     CatmullRom,
-    /// Gaussian - smooth results, slightly soft
     Gaussian,
-    /// Lanczos3 - highest quality, sharpest results, slowest
     Lanczos3,
 }
 
@@ -43,7 +33,6 @@ impl ImageFilter {
         }
     }
 
-    /// Convert to image crate's FilterType
     pub fn to_image_filter(&self) -> image::imageops::FilterType {
         match self {
             Self::Nearest => image::imageops::FilterType::Nearest,
@@ -55,12 +44,9 @@ impl ImageFilter {
     }
 }
 
-/// Texture filtering mode for GPU rendering
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TextureFilter {
-    /// Nearest neighbor - sharp pixels, no smoothing (good for pixel art, uses less VRAM)
     Nearest,
-    /// Linear (bilinear) - smooth interpolation between pixels (recommended for photos)
     Linear,
 }
 
@@ -80,7 +66,6 @@ impl TextureFilter {
         }
     }
 
-    /// Convert to egui TextureOptions
     pub fn to_egui_options(&self) -> egui::TextureOptions {
         match self {
             Self::Nearest => egui::TextureOptions::NEAREST,
@@ -89,12 +74,9 @@ impl TextureFilter {
     }
 }
 
-/// Represents all possible input types for shortcuts
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum InputBinding {
-    // Keyboard keys
     Key(egui::Key),
-    // Mouse buttons
     MouseLeft,
     MouseRight,
     MouseMiddle,

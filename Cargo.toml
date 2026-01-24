@@ -21,12 +21,6 @@ image = { version = "0.25", features = ["jpeg", "png", "gif", "webp"] }
 # GIF animation support
 gif = "0.13"
 
-# GStreamer for video playback
-gstreamer = "0.23"
-gstreamer-video = "0.23"
-gstreamer-app = "0.23"
-gstreamer-audio = "0.23"
-
 # Concurrency & parallelism for high-performance manga mode
 rayon = "1.10"
 crossbeam-channel = "0.5"

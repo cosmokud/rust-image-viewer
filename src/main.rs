@@ -1,6 +1,3 @@
-//! High-performance Image & Video Viewer for Windows 11
-//! Built with Rust + egui (eframe) + GStreamer
-
 #![windows_subsystem = "windows"]
 
 mod config;
@@ -324,8 +321,7 @@ struct ImageViewer {
     /// These font files can be quite large, so we install them lazily only when needed.
     windows_cjk_fonts_installed: bool,
     
-    /// Whether GStreamer has been initialized (deferred until first video load)
-    gstreamer_initialized: bool,
+
 
     /// Keep the window hidden until we've applied initial layout.
     /// This prevents the default empty window flashing for a few milliseconds on startup.
@@ -511,7 +507,7 @@ impl Default for ImageViewer {
             fps_last_dt_s: 0.0,
 
             windows_cjk_fonts_installed: false,
-            gstreamer_initialized: false,
+
 
             startup_window_shown: false,
             startup_hide_started_at: Instant::now(),
@@ -1143,7 +1139,6 @@ impl ImageViewer {
         // Setting to None allows Rust to drop the TextureHandle, which signals egui to
         // free the underlying GPU texture on the next frame.
         if let Some(player) = self.video_player.take() {
-            // Drop the video player first - this stops GStreamer pipeline and frees its buffers
             drop(player);
         }
         if !keep_video_placeholder {
@@ -1179,9 +1174,6 @@ impl ImageViewer {
 
         match media_type {
             Some(MediaType::Video) => {
-                // Mark GStreamer as initialized (it will be lazily initialized on first use)
-                self.gstreamer_initialized = true;
-                
                 // Load as video
                 match VideoPlayer::new(
                     path,
@@ -1966,9 +1958,6 @@ impl ImageViewer {
                 } else {
                     // Create new video player for focused item
                     if let Some(path) = self.image_list.get(focused_idx) {
-                        // Ensure GStreamer is initialized
-                        self.gstreamer_initialized = true;
-                        
                         // Use user's persisted settings, or config defaults if not set
                         let muted = self.manga_video_user_muted.unwrap_or(self.config.video_muted_by_default);
                         let volume = self.manga_video_user_volume.unwrap_or(self.config.video_default_volume);

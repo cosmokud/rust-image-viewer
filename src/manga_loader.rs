@@ -1,23 +1,3 @@
-//! High-performance parallel image loader for Manga Reading Mode.
-//!
-//! This module implements a sophisticated multi-threaded image loading system
-//! optimized for seamless scrolling through hundreds of images. Key features:
-//!
-//! - **Lock-free communication**: Uses crossbeam channels for zero-contention
-//!   message passing between the main thread and worker threads.
-//!
-//! - **Parallel decoding**: Uses Rayon's thread pool for parallel image decoding,
-//!   utilizing all available CPU cores for maximum throughput.
-//!
-//! - **Priority-based loading**: Images closer to the viewport are loaded first,
-//!   with scroll direction awareness for predictive prefetching.
-//!
-//! - **Batch texture uploads**: Decoded images are batched for GPU upload to
-//!   minimize driver overhead and prevent frame drops.
-//!
-//! - **Memory-efficient caching**: LRU-style eviction keeps memory bounded
-//!   while maximizing cache hit rate.
-
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -32,20 +12,9 @@ use rayon::prelude::*;
 
 use crate::image_loader::{is_supported_image, is_supported_video, LoadedImage, MediaType, get_media_type};
 
-/// Maximum number of decoded images to hold in memory awaiting GPU upload.
-/// This bounds memory usage even if the main thread is slow to consume results.
 const MAX_PENDING_UPLOADS: usize = 32;
-
-/// Maximum number of images to keep in the texture cache.
-/// Beyond this, the oldest entries are evicted to control VRAM usage.
 const MAX_CACHED_TEXTURES: usize = 64;
-
-/// Fixed buffer to add AHEAD of visible pages (in scroll direction) for preloading.
-/// If 14 pages are visible and scrolling down, we preload 14 + 4 = 18 ahead.
 const PRELOAD_BUFFER_AHEAD: usize = 4;
-
-/// Fixed buffer to add BEHIND visible pages (opposite scroll direction) for preloading.
-/// If 14 pages are visible and scrolling down, we preload 14 + 2 = 16 behind.
 const PRELOAD_BUFFER_BEHIND: usize = 2;
 
 /// Minimum preload counts (even when only 1 page is visible)
@@ -608,180 +577,90 @@ impl MangaLoader {
         }
     }
 
-    /// Probe video dimensions without full decode (using file metadata if available)
     fn probe_video_dimensions(path: &std::path::Path) -> Option<(u32, u32)> {
-        // For now, we use a simple heuristic based on common video resolutions
-        // In a production system, you'd use GStreamer's discoverer or ffprobe
-        // But since GStreamer init is expensive and should happen on main thread,
-        // we return a reasonable default and update dimensions when video is played
-        
-        // Try to infer from filename patterns (e.g., "video_1080p.mp4")
-        let filename = path.file_name()?.to_string_lossy().to_lowercase();
-        
-        if filename.contains("4k") || filename.contains("2160") {
-            Some((3840, 2160))
-        } else if filename.contains("1440") || filename.contains("2k") {
-            Some((2560, 1440))
-        } else if filename.contains("1080") || filename.contains("fhd") {
-            Some((1920, 1080))
-        } else if filename.contains("720") || filename.contains("hd") {
-            Some((1280, 720))
-        } else if filename.contains("480") || filename.contains("sd") {
-            Some((854, 480))
-        } else {
-            // Default to 1080p for unknown videos
-            Some((1920, 1080))
+        use std::process::{Command, Stdio};
+
+        let output = Command::new("ffprobe")
+            .args([
+                "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=width,height",
+                "-of", "csv=p=0:s=x",
+            ])
+            .arg(path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let parts: Vec<&str> = stdout.trim().split('x').collect();
+        if parts.len() >= 2 {
+            if let (Ok(w), Ok(h)) = (parts[0].trim().parse::<u32>(), parts[1].trim().parse::<u32>()) {
+                if w > 0 && h > 0 {
+                    return Some((w, h));
+                }
+            }
         }
+        Some((1920, 1080))
     }
 
-    /// Extract the first frame from a video file as a thumbnail.
-    /// 
-    /// Uses GStreamer to decode just the first frame without loading the entire video.
-    /// This is much faster than full video playback initialization and provides
-    /// a visual preview for videos in manga mode.
-    /// 
-    /// Returns: Some((pixels, width, height, original_width, original_height)) or None on failure
     fn extract_video_first_frame(
         path: &std::path::Path,
         max_texture_side: u32,
     ) -> Option<(Vec<u8>, u32, u32, u32, u32)> {
-        use gstreamer as gst;
-        use gstreamer::prelude::*;
-        use gstreamer_app as gst_app;
-        use gstreamer_video as gst_video;
-        use std::sync::{Arc, Mutex};
-        use std::time::Duration;
+        use std::process::{Command, Stdio};
 
-        // Initialize GStreamer if needed (static check to avoid repeated init)
-        static GST_INIT: std::sync::OnceLock<Result<(), ()>> = std::sync::OnceLock::new();
-        let init_result = GST_INIT.get_or_init(|| {
-            gst::init().map_err(|_| ())
-        });
-        if init_result.is_err() {
-            return None;
-        }
+        let (original_width, original_height) = Self::probe_video_dimensions(path)?;
 
-        // Build URI from path
-        let uri = gst::glib::filename_to_uri(path, None).ok()?.to_string();
-
-        // Create a minimal pipeline for frame extraction
-        // Use decodebin for auto-detection and videoscale/videoconvert for format conversion
-        let pipeline_str = format!(
-            "uridecodebin uri=\"{}\" name=dec ! videoconvert ! videoscale ! \
-             video/x-raw,format=RGBA ! appsink name=sink max-buffers=1 drop=true",
-            uri.replace("\"", "\\\"")
-        );
-
-        let pipeline = gst::parse::launch(&pipeline_str).ok()?;
-        let pipeline = pipeline.downcast::<gst::Pipeline>().ok()?;
-
-        // Get the appsink element
-        let appsink = pipeline
-            .by_name("sink")?
-            .dynamic_cast::<gst_app::AppSink>()
-            .ok()?;
-
-        // Storage for extracted frame
-        let frame_data: Arc<Mutex<Option<(Vec<u8>, u32, u32)>>> = Arc::new(Mutex::new(None));
-        let frame_data_clone = Arc::clone(&frame_data);
-
-        // Set up preroll callback to capture the first frame
-        appsink.set_callbacks(
-            gst_app::AppSinkCallbacks::builder()
-                .new_preroll(move |sink| {
-                    if let Ok(sample) = sink.pull_preroll() {
-                        if let (Some(buffer), Some(caps)) = (sample.buffer(), sample.caps()) {
-                            if let Ok(video_info) = gst_video::VideoInfo::from_caps(caps) {
-                                let width = video_info.width();
-                                let height = video_info.height();
-                                if let Ok(map) = buffer.map_readable() {
-                                    let pixels = map.as_slice().to_vec();
-                                    if let Ok(mut data) = frame_data_clone.lock() {
-                                        *data = Some((pixels, width, height));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Ok(gst::FlowSuccess::Ok)
-                })
-                .build(),
-        );
-
-        // Set to PAUSED to get the first frame (preroll)
-        if pipeline.set_state(gst::State::Paused).is_err() {
-            let _ = pipeline.set_state(gst::State::Null);
-            return None;
-        }
-
-        // Wait for state change or timeout (500ms max for responsiveness)
-        let bus = pipeline.bus()?;
-        let mut got_frame = false;
-
-        // Wait for ASYNC_DONE or ERROR, with timeout
-        let deadline = std::time::Instant::now() + Duration::from_millis(500);
-        while std::time::Instant::now() < deadline {
-            if let Some(msg) = bus.timed_pop(gst::ClockTime::from_mseconds(50)) {
-                match msg.view() {
-                    gst::MessageView::AsyncDone(_) => {
-                        got_frame = true;
-                        break;
-                    }
-                    gst::MessageView::Error(_) => {
-                        break;
-                    }
-                    gst::MessageView::Eos(_) => {
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-
-            // Check if we already got frame data
-            if let Ok(data) = frame_data.lock() {
-                if data.is_some() {
-                    got_frame = true;
-                    break;
-                }
-            }
-        }
-
-        // Cleanup pipeline
-        let _ = pipeline.set_state(gst::State::Null);
-
-        if !got_frame {
-            return None;
-        }
-
-        // Extract the frame data
-        let (pixels, width, height) = {
-            let data = frame_data.lock().ok()?;
-            data.clone()?
+        let scale_filter = if original_width > max_texture_side || original_height > max_texture_side {
+            let scale = (max_texture_side as f64 / original_width as f64)
+                .min(max_texture_side as f64 / original_height as f64);
+            let new_w = ((original_width as f64) * scale).round() as u32;
+            let new_h = ((original_height as f64) * scale).round() as u32;
+            format!(",scale={}:{}", new_w, new_h)
+        } else {
+            String::new()
         };
 
-        if pixels.is_empty() || width == 0 || height == 0 {
+        let output = Command::new("ffmpeg")
+            .args([
+                "-i",
+            ])
+            .arg(path)
+            .args([
+                "-vf", &format!("format=rgba{}", scale_filter),
+                "-frames:v", "1",
+                "-f", "rawvideo",
+                "-pix_fmt", "rgba",
+                "-",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+
+        if output.stdout.is_empty() {
             return None;
         }
 
-        let original_width = width;
-        let original_height = height;
+        let pixels = output.stdout;
+        let (final_width, final_height) = if !scale_filter.is_empty() {
+            let scale = (max_texture_side as f64 / original_width as f64)
+                .min(max_texture_side as f64 / original_height as f64);
+            let new_w = ((original_width as f64) * scale).round() as u32;
+            let new_h = ((original_height as f64) * scale).round() as u32;
+            (new_w, new_h)
+        } else {
+            (original_width, original_height)
+        };
 
-        // Downscale if needed for GPU texture limits
-        let (final_width, final_height, final_pixels) = downscale_rgba_if_needed(
-            width,
-            height,
-            &pixels,
-            max_texture_side,
-            FilterType::Triangle,
-        );
+        let expected_size = (final_width * final_height * 4) as usize;
+        if pixels.len() != expected_size {
+            return None;
+        }
 
-        Some((
-            final_pixels.into_owned(),
-            final_width,
-            final_height,
-            original_width,
-            original_height,
-        ))
+        Some((pixels, final_width, final_height, original_width, original_height))
     }
 
     /// Calculate preload counts based on visible page count.
