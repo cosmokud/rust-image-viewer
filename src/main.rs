@@ -1132,8 +1132,6 @@ impl ImageViewer {
             && matches!(media_type, Some(MediaType::Video));
 
         // Clear previous media state.
-        // For video-to-video navigation we keep the previous video texture as a placeholder
-        // until the first decoded frame of the new video arrives.
         // 
         // MEMORY OPTIMIZATION: Explicitly drop textures to release GPU memory immediately.
         // Setting to None allows Rust to drop the TextureHandle, which signals egui to
@@ -1141,19 +1139,22 @@ impl ImageViewer {
         if let Some(player) = self.video_player.take() {
             drop(player);
         }
-        if !keep_video_placeholder {
-            // Drop video texture to free VRAM
-            if let Some(tex) = self.video_texture.take() {
-                drop(tex);
-            }
-            self.video_texture_dims = None;
+        // Always clear video texture on navigation - keeping the old texture causes
+        // visible stretching when the new video has different dimensions
+        if let Some(tex) = self.video_texture.take() {
+            drop(tex);
         }
+        self.video_texture_dims = None;
+        
         // Drop image texture to free VRAM
         if let Some(tex) = self.texture.take() {
             drop(tex);
         }
         self.image = None;
         self.show_video_controls = false;
+
+        // Consume keep_video_placeholder to suppress warning (placeholder logic removed)
+        let _ = keep_video_placeholder;
 
         // Reset GIF playback state for new media
         self.gif_paused = false;

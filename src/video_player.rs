@@ -1,6 +1,7 @@
 use std::io::Read;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -16,6 +17,7 @@ struct VideoState {
     frame_updated: bool,
     is_eos: bool,
     error: Option<String>,
+    generation: u64,
 }
 
 pub struct VideoPlayer {
@@ -23,6 +25,7 @@ pub struct VideoPlayer {
     ffplay_audio: Option<Child>,
     reader_thread: Option<JoinHandle<()>>,
     state: Arc<Mutex<VideoState>>,
+    generation: Arc<AtomicU64>,
     path: std::path::PathBuf,
     is_playing: bool,
     is_muted: bool,
@@ -64,6 +67,7 @@ impl VideoPlayer {
             frame_updated: false,
             is_eos: false,
             error: None,
+            generation: 0,
         }));
 
         Ok(VideoPlayer {
@@ -71,6 +75,7 @@ impl VideoPlayer {
             ffplay_audio: None,
             reader_thread: None,
             state,
+            generation: Arc::new(AtomicU64::new(0)),
             path: path.to_path_buf(),
             is_playing: false,
             is_muted: muted,
@@ -180,11 +185,15 @@ impl VideoPlayer {
     fn start_decoding(&mut self, start_position: f64) -> Result<(), String> {
         self.stop_decoding();
 
+        // Increment generation to invalidate any in-flight frame extractions
+        let gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        
         self.stop_signal = Arc::new(Mutex::new(false));
 
         if let Ok(mut state) = self.state.lock() {
             state.is_eos = false;
             state.error = None;
+            state.generation = gen;
         }
 
         let mut cmd = Command::new("ffmpeg");
@@ -237,20 +246,28 @@ impl VideoPlayer {
                         last_frame_time = Instant::now();
 
                         if let Ok(mut state) = state.lock() {
-                            state.current_frame = Some(VideoFrame {
-                                pixels: buffer.clone(),
-                                width,
-                                height,
-                            });
-                            state.frame_updated = true;
+                            // Only update if generation matches
+                            if state.generation == gen {
+                                state.current_frame = Some(VideoFrame {
+                                    pixels: buffer.clone(),
+                                    width,
+                                    height,
+                                });
+                                state.frame_updated = true;
+                            } else {
+                                // Generation changed, stop this thread
+                                break;
+                            }
                         }
                     }
                     Err(e) => {
                         if let Ok(mut state) = state.lock() {
-                            if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                                state.is_eos = true;
-                            } else {
-                                state.error = Some(format!("Read error: {}", e));
+                            if state.generation == gen {
+                                if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                                    state.is_eos = true;
+                                } else {
+                                    state.error = Some(format!("Read error: {}", e));
+                                }
                             }
                         }
                         break;
@@ -395,6 +412,15 @@ impl VideoPlayer {
         let height = self.original_height;
         let state = Arc::clone(&self.state);
         let seconds = seconds.max(0.0);
+        
+        // Get current generation - frames from this extraction are only valid
+        // if generation hasn't changed by the time they arrive
+        let gen = self.generation.load(Ordering::SeqCst);
+        
+        // Update generation in state so this extraction's frames are accepted
+        if let Ok(mut s) = state.lock() {
+            s.generation = gen;
+        }
 
         thread::spawn(move || {
             let mut cmd = Command::new("ffmpeg");
@@ -411,12 +437,15 @@ impl VideoPlayer {
                 let expected_size = (width * height * 4) as usize;
                 if output.stdout.len() == expected_size {
                     if let Ok(mut state) = state.lock() {
-                        state.current_frame = Some(VideoFrame {
-                            pixels: output.stdout,
-                            width,
-                            height,
-                        });
-                        state.frame_updated = true;
+                        // Only update if generation still matches
+                        if state.generation == gen {
+                            state.current_frame = Some(VideoFrame {
+                                pixels: output.stdout,
+                                width,
+                                height,
+                            });
+                            state.frame_updated = true;
+                        }
                     }
                 }
             }
