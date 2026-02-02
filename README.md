@@ -86,6 +86,8 @@ A high-performance, minimal, and feature-rich image and video viewer for Windows
 
 Download the latest release from the [Releases](https://github.com/cosmonoumi/rust-image-viewer/releases) page.
 
+This is a portable app. Copy or place the folder anywhere you like, then use Windows **Open with** to open images or videos with the executable.
+
 ### Prerequisites for Video Support
 
 Video playback requires GStreamer. If you only need image viewing, GStreamer is optional.
