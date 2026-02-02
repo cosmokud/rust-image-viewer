@@ -243,9 +243,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release view nightly 2>$null
+          gh release view nightly 2>$null | Out-Null
           if ($LASTEXITCODE -eq 0) {
             gh release delete nightly -y --cleanup-tag
+          } else {
+            $global:LASTEXITCODE = 0
           }
 
       - name: Publish Nightly Release
