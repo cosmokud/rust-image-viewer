@@ -109,7 +109,7 @@ jobs:
       - name: Set executable icon
         shell: pwsh
         run: |
-          if (Test-Path "dist/rust-image-viewer.exe" -and Test-Path "assets/icon.ico") {
+          if ((Test-Path "dist/rust-image-viewer.exe") -and (Test-Path "assets/icon.ico")) {
             rcedit "dist/rust-image-viewer.exe" --set-icon "assets/icon.ico"
           }
 
@@ -228,7 +228,7 @@ jobs:
       - name: Set executable icon
         shell: pwsh
         run: |
-          if (Test-Path "dist/rust-image-viewer.exe" -and Test-Path "assets/icon.ico") {
+          if ((Test-Path "dist/rust-image-viewer.exe") -and (Test-Path "assets/icon.ico")) {
             rcedit "dist/rust-image-viewer.exe" --set-icon "assets/icon.ico"
           }
 
