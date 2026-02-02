@@ -45,14 +45,79 @@ jobs:
           PKG_CONFIG_PATH: /mingw64/lib/pkgconfig:/mingw64/share/pkgconfig
         run: cargo build --release
 
+      - name: Collect runtime DLLs (GStreamer + GLib)
+        shell: msys2 {0}
+        run: |
+          dist="$GITHUB_WORKSPACE/dist"
+          mkdir -p "$dist"
+
+          cp "$GITHUB_WORKSPACE/target/release/rust-image-viewer.exe" "$dist/"
+          if [ -f "$GITHUB_WORKSPACE/target/release/config.ini" ]; then
+            cp "$GITHUB_WORKSPACE/target/release/config.ini" "$dist/"
+          fi
+
+          copy_deps() {
+            local file="$1"
+            ldd "$file" | awk '/=> \/mingw64\/bin/ {print $3}' | while read -r dep; do
+              if [ -f "$dep" ]; then
+                cp -u "$dep" "$dist/"
+              fi
+            done
+          }
+
+          copy_deps "$dist/rust-image-viewer.exe"
+
+          for dll in \
+            gstreamer-1.0-0.dll \
+            gstbase-1.0-0.dll \
+            gstapp-1.0-0.dll \
+            gstvideo-1.0-0.dll \
+            gstaudio-1.0-0.dll \
+            libglib-2.0-0.dll \
+            libgobject-2.0-0.dll \
+            libgio-2.0-0.dll \
+            libgmodule-2.0-0.dll \
+            libgthread-2.0-0.dll
+          do
+            if [ -f "/mingw64/bin/$dll" ]; then
+              cp -u "/mingw64/bin/$dll" "$dist/"
+              copy_deps "/mingw64/bin/$dll"
+            fi
+          done
+
+          if [ -d "/mingw64/lib/gstreamer-1.0" ]; then
+            mkdir -p "$dist/lib/gstreamer-1.0"
+            cp -u /mingw64/lib/gstreamer-1.0/*.dll "$dist/lib/gstreamer-1.0/" 2>/dev/null || true
+            for plugin in /mingw64/lib/gstreamer-1.0/*.dll; do
+              if [ -f "$plugin" ]; then
+                copy_deps "$plugin"
+              fi
+            done
+          fi
+
+          for scanner in /mingw64/bin/gst-plugin-scanner.exe /mingw64/libexec/gstreamer-1.0/gst-plugin-scanner.exe; do
+            if [ -f "$scanner" ]; then
+              mkdir -p "$dist/libexec/gstreamer-1.0"
+              cp -u "$scanner" "$dist/libexec/gstreamer-1.0/"
+            fi
+          done
+
+      - name: Install rcedit
+        shell: pwsh
+        run: choco install rcedit -y
+
+      - name: Set executable icon
+        shell: pwsh
+        run: |
+          if (Test-Path "dist/rust-image-viewer.exe" -and Test-Path "assets/icon.ico") {
+            rcedit "dist/rust-image-viewer.exe" --set-icon "assets/icon.ico"
+          }
+
       - name: Package release assets
         shell: pwsh
         run: |
-          $dist = "dist"
-          New-Item -ItemType Directory -Force $dist | Out-Null
-          Copy-Item "target/release/rust-image-viewer.exe" $dist
-          if (Test-Path "target/release/config.ini") { Copy-Item "target/release/config.ini" $dist }
-          Compress-Archive -Path "$dist/*" -DestinationPath "rust-image-viewer-windows-x64-gnu.zip" -Force
+          if (Test-Path "rust-image-viewer-windows-x64-gnu.zip") { Remove-Item "rust-image-viewer-windows-x64-gnu.zip" -Force }
+          Compress-Archive -Path "dist/*" -DestinationPath "rust-image-viewer-windows-x64-gnu.zip" -Force
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
@@ -99,14 +164,79 @@ jobs:
           PKG_CONFIG_PATH: /mingw64/lib/pkgconfig:/mingw64/share/pkgconfig
         run: cargo build --release
 
+      - name: Collect runtime DLLs (GStreamer + GLib)
+        shell: msys2 {0}
+        run: |
+          dist="$GITHUB_WORKSPACE/dist"
+          mkdir -p "$dist"
+
+          cp "$GITHUB_WORKSPACE/target/release/rust-image-viewer.exe" "$dist/"
+          if [ -f "$GITHUB_WORKSPACE/target/release/config.ini" ]; then
+            cp "$GITHUB_WORKSPACE/target/release/config.ini" "$dist/"
+          fi
+
+          copy_deps() {
+            local file="$1"
+            ldd "$file" | awk '/=> \/mingw64\/bin/ {print $3}' | while read -r dep; do
+              if [ -f "$dep" ]; then
+                cp -u "$dep" "$dist/"
+              fi
+            done
+          }
+
+          copy_deps "$dist/rust-image-viewer.exe"
+
+          for dll in \
+            gstreamer-1.0-0.dll \
+            gstbase-1.0-0.dll \
+            gstapp-1.0-0.dll \
+            gstvideo-1.0-0.dll \
+            gstaudio-1.0-0.dll \
+            libglib-2.0-0.dll \
+            libgobject-2.0-0.dll \
+            libgio-2.0-0.dll \
+            libgmodule-2.0-0.dll \
+            libgthread-2.0-0.dll
+          do
+            if [ -f "/mingw64/bin/$dll" ]; then
+              cp -u "/mingw64/bin/$dll" "$dist/"
+              copy_deps "/mingw64/bin/$dll"
+            fi
+          done
+
+          if [ -d "/mingw64/lib/gstreamer-1.0" ]; then
+            mkdir -p "$dist/lib/gstreamer-1.0"
+            cp -u /mingw64/lib/gstreamer-1.0/*.dll "$dist/lib/gstreamer-1.0/" 2>/dev/null || true
+            for plugin in /mingw64/lib/gstreamer-1.0/*.dll; do
+              if [ -f "$plugin" ]; then
+                copy_deps "$plugin"
+              fi
+            done
+          fi
+
+          for scanner in /mingw64/bin/gst-plugin-scanner.exe /mingw64/libexec/gstreamer-1.0/gst-plugin-scanner.exe; do
+            if [ -f "$scanner" ]; then
+              mkdir -p "$dist/libexec/gstreamer-1.0"
+              cp -u "$scanner" "$dist/libexec/gstreamer-1.0/"
+            fi
+          done
+
+      - name: Install rcedit
+        shell: pwsh
+        run: choco install rcedit -y
+
+      - name: Set executable icon
+        shell: pwsh
+        run: |
+          if (Test-Path "dist/rust-image-viewer.exe" -and Test-Path "assets/icon.ico") {
+            rcedit "dist/rust-image-viewer.exe" --set-icon "assets/icon.ico"
+          }
+
       - name: Package nightly assets
         shell: pwsh
         run: |
-          $dist = "dist"
-          New-Item -ItemType Directory -Force $dist | Out-Null
-          Copy-Item "target/release/rust-image-viewer.exe" $dist
-          if (Test-Path "target/release/config.ini") { Copy-Item "target/release/config.ini" $dist }
-          Compress-Archive -Path "$dist/*" -DestinationPath "rust-image-viewer-windows-x64-gnu.zip" -Force
+          if (Test-Path "rust-image-viewer-windows-x64-gnu.zip") { Remove-Item "rust-image-viewer-windows-x64-gnu.zip" -Force }
+          Compress-Archive -Path "dist/*" -DestinationPath "rust-image-viewer-windows-x64-gnu.zip" -Force
 
       - name: Delete existing Nightly release
         shell: pwsh
