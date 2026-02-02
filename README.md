@@ -121,8 +121,8 @@ $env:PKG_CONFIG_PATH = "C:\gstreamer\1.0\msvc_x86_64\lib\pkgconfig"
 
 ```bash
 # Open a single image or video
-image-viewer.exe path\to\file.jpg
-image-viewer.exe path\to\video.mp4
+rust-image-viewer.exe path\to\file.jpg
+rust-image-viewer.exe path\to\video.mp4
 
 # The viewer will list all media files in the same directory for navigation
 ```
