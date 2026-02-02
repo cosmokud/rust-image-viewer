@@ -60,3 +60,71 @@ jobs:
           files: |
             dist/rust-image-viewer.exe
             rust-image-viewer-windows-x64-gnu.zip
+
+  nightly:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable-x86_64-pc-windows-gnu
+
+      - name: Install MSYS2 dependencies
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          path-type: inherit
+          install: >-
+            mingw-w64-x86_64-toolchain
+            mingw-w64-x86_64-pkg-config
+            mingw-w64-x86_64-glib2
+            mingw-w64-x86_64-gstreamer
+            mingw-w64-x86_64-gst-plugins-base
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build (release, GNU)
+        shell: msys2 {0}
+        env:
+          PATH: /c/Users/runneradmin/.cargo/bin:/mingw64/bin:/usr/bin
+          RUSTUP_TOOLCHAIN: stable-x86_64-pc-windows-gnu
+          PKG_CONFIG_PATH: /mingw64/lib/pkgconfig:/mingw64/share/pkgconfig
+        run: cargo build --release
+
+      - name: Package nightly assets
+        shell: pwsh
+        run: |
+          $dist = "dist"
+          New-Item -ItemType Directory -Force $dist | Out-Null
+          Copy-Item "target/release/rust-image-viewer.exe" $dist
+          if (Test-Path "target/release/config.ini") { Copy-Item "target/release/config.ini" $dist }
+          Compress-Archive -Path "$dist/*" -DestinationPath "rust-image-viewer-windows-x64-gnu.zip" -Force
+
+      - name: Delete existing Nightly release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view nightly 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            gh release delete nightly -y --cleanup-tag
+          }
+
+      - name: Publish Nightly Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: nightly
+          name: Nightly
+          prerelease: true
+          target_commitish: ${{ github.sha }}
+          files: |
+            dist/rust-image-viewer.exe
+            rust-image-viewer-windows-x64-gnu.zip
