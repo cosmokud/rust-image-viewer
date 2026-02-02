@@ -14,7 +14,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-pc-windows-gnu
+          toolchain: stable-x86_64-pc-windows-gnu
 
       - name: Install MSYS2 dependencies
         uses: msys2/setup-msys2@v2
@@ -32,8 +32,8 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build (release, GNU)
-        shell: bash
-        run: |
-          export PATH="/c/msys64/mingw64/bin:$PATH"
-          export PKG_CONFIG_PATH="/c/msys64/mingw64/lib/pkgconfig:/c/msys64/mingw64/share/pkgconfig"
-          cargo build --release --target x86_64-pc-windows-gnu
+        shell: msys2 {0}
+        env:
+          RUSTUP_TOOLCHAIN: stable-x86_64-pc-windows-gnu
+          PKG_CONFIG_PATH: /mingw64/lib/pkgconfig:/mingw64/share/pkgconfig
+        run: cargo build --release
