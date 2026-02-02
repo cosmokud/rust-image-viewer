@@ -6959,10 +6959,10 @@ fn main() -> eframe::Result<()> {
 
 fn build_app_icon() -> egui::IconData {
     // Embed the icon at compile time so it's always available
-    static ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");
+    static ICON_ICO: &[u8] = include_bytes!("../assets/icon.ico");
 
-    // Decode the embedded PNG
-    if let Ok(img) = image::load_from_memory(ICON_PNG) {
+    // Decode the embedded ICO
+    if let Ok(img) = image::load_from_memory(ICON_ICO) {
         let rgba_img = img.to_rgba8();
         let (width, height) = rgba_img.dimensions();
         return egui::IconData {

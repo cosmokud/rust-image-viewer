@@ -22,7 +22,7 @@ egui = "0.29"
 egui_extras = { version = "0.29", features = ["image"], optional = true }
 
 # Image handling
-image = { version = "0.25", features = ["jpeg", "png", "gif", "webp"] }
+image = { version = "0.25", features = ["jpeg", "png", "gif", "webp", "ico"] }
 
 # GIF animation support
 gif = "0.13"
