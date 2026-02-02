@@ -56,28 +56,41 @@ jobs:
             cp "$GITHUB_WORKSPACE/target/release/config.ini" "$dist/"
           fi
 
+          # Recursive function to copy DLL dependencies
           copy_deps() {
             local file="$1"
-            ldd "$file" | awk '/=> \/mingw64\/bin/ {print $3}' | while read -r dep; do
-              if [ -f "$dep" ]; then
+            ldd "$file" 2>/dev/null | grep -E '=> /mingw64' | awk '{print $3}' | while read -r dep; do
+              if [ -f "$dep" ] && [ ! -f "$dist/$(basename "$dep")" ]; then
                 cp -u "$dep" "$dist/"
+                copy_deps "$dep"
               fi
             done
           }
 
+          # Copy all dependencies of the main executable
           copy_deps "$dist/rust-image-viewer.exe"
 
+          # Explicitly copy GLib and GStreamer core DLLs (correct naming with dots)
           for dll in \
-            gstreamer-1.0-0.dll \
-            gstbase-1.0-0.dll \
-            gstapp-1.0-0.dll \
-            gstvideo-1.0-0.dll \
-            gstaudio-1.0-0.dll \
+            libgstreamer-1.0-0.dll \
+            libgstbase-1.0-0.dll \
+            libgstapp-1.0-0.dll \
+            libgstvideo-1.0-0.dll \
+            libgstaudio-1.0-0.dll \
             libglib-2.0-0.dll \
             libgobject-2.0-0.dll \
             libgio-2.0-0.dll \
             libgmodule-2.0-0.dll \
-            libgthread-2.0-0.dll
+            libgthread-2.0-0.dll \
+            libintl-8.dll \
+            libiconv-2.dll \
+            libffi-8.dll \
+            libpcre2-8-0.dll \
+            zlib1.dll \
+            libwinpthread-1.dll \
+            libgcc_s_seh-1.dll \
+            libstdc++-6.dll \
+            liborc-0.4-0.dll
           do
             if [ -f "/mingw64/bin/$dll" ]; then
               cp -u "/mingw64/bin/$dll" "$dist/"
@@ -85,6 +98,7 @@ jobs:
             fi
           done
 
+          # Copy GStreamer plugins
           if [ -d "/mingw64/lib/gstreamer-1.0" ]; then
             mkdir -p "$dist/lib/gstreamer-1.0"
             cp -u /mingw64/lib/gstreamer-1.0/*.dll "$dist/lib/gstreamer-1.0/" 2>/dev/null || true
@@ -95,12 +109,20 @@ jobs:
             done
           fi
 
+          # Copy gst-plugin-scanner
           for scanner in /mingw64/bin/gst-plugin-scanner.exe /mingw64/libexec/gstreamer-1.0/gst-plugin-scanner.exe; do
             if [ -f "$scanner" ]; then
               mkdir -p "$dist/libexec/gstreamer-1.0"
               cp -u "$scanner" "$dist/libexec/gstreamer-1.0/"
+              copy_deps "$scanner"
             fi
           done
+
+          # Debug: List collected DLLs
+          echo "=== Collected DLLs ==="
+          ls -la "$dist"/*.dll 2>/dev/null | head -50 || echo "No DLLs found"
+          echo "=== GLib DLLs check ==="
+          ls -la "$dist"/libglib* "$dist"/libgobject* "$dist"/libgio* 2>/dev/null || echo "GLib DLLs missing!"
 
       - name: Install rcedit
         shell: pwsh
@@ -175,28 +197,41 @@ jobs:
             cp "$GITHUB_WORKSPACE/target/release/config.ini" "$dist/"
           fi
 
+          # Recursive function to copy DLL dependencies
           copy_deps() {
             local file="$1"
-            ldd "$file" | awk '/=> \/mingw64\/bin/ {print $3}' | while read -r dep; do
-              if [ -f "$dep" ]; then
+            ldd "$file" 2>/dev/null | grep -E '=> /mingw64' | awk '{print $3}' | while read -r dep; do
+              if [ -f "$dep" ] && [ ! -f "$dist/$(basename "$dep")" ]; then
                 cp -u "$dep" "$dist/"
+                copy_deps "$dep"
               fi
             done
           }
 
+          # Copy all dependencies of the main executable
           copy_deps "$dist/rust-image-viewer.exe"
 
+          # Explicitly copy GLib and GStreamer core DLLs (correct naming with dots)
           for dll in \
-            gstreamer-1.0-0.dll \
-            gstbase-1.0-0.dll \
-            gstapp-1.0-0.dll \
-            gstvideo-1.0-0.dll \
-            gstaudio-1.0-0.dll \
+            libgstreamer-1.0-0.dll \
+            libgstbase-1.0-0.dll \
+            libgstapp-1.0-0.dll \
+            libgstvideo-1.0-0.dll \
+            libgstaudio-1.0-0.dll \
             libglib-2.0-0.dll \
             libgobject-2.0-0.dll \
             libgio-2.0-0.dll \
             libgmodule-2.0-0.dll \
-            libgthread-2.0-0.dll
+            libgthread-2.0-0.dll \
+            libintl-8.dll \
+            libiconv-2.dll \
+            libffi-8.dll \
+            libpcre2-8-0.dll \
+            zlib1.dll \
+            libwinpthread-1.dll \
+            libgcc_s_seh-1.dll \
+            libstdc++-6.dll \
+            liborc-0.4-0.dll
           do
             if [ -f "/mingw64/bin/$dll" ]; then
               cp -u "/mingw64/bin/$dll" "$dist/"
@@ -204,6 +239,7 @@ jobs:
             fi
           done
 
+          # Copy GStreamer plugins
           if [ -d "/mingw64/lib/gstreamer-1.0" ]; then
             mkdir -p "$dist/lib/gstreamer-1.0"
             cp -u /mingw64/lib/gstreamer-1.0/*.dll "$dist/lib/gstreamer-1.0/" 2>/dev/null || true
@@ -214,12 +250,20 @@ jobs:
             done
           fi
 
+          # Copy gst-plugin-scanner
           for scanner in /mingw64/bin/gst-plugin-scanner.exe /mingw64/libexec/gstreamer-1.0/gst-plugin-scanner.exe; do
             if [ -f "$scanner" ]; then
               mkdir -p "$dist/libexec/gstreamer-1.0"
               cp -u "$scanner" "$dist/libexec/gstreamer-1.0/"
+              copy_deps "$scanner"
             fi
           done
+
+          # Debug: List collected DLLs
+          echo "=== Collected DLLs ==="
+          ls -la "$dist"/*.dll 2>/dev/null | head -50 || echo "No DLLs found"
+          echo "=== GLib DLLs check ==="
+          ls -la "$dist"/libglib* "$dist"/libgobject* "$dist"/libgio* 2>/dev/null || echo "GLib DLLs missing!"
 
       - name: Install rcedit
         shell: pwsh
