@@ -848,7 +848,7 @@ impl Config {
         content.push_str("[Settings]\n");
         content.push_str("; How long the title bar stays visible (in seconds)\n");
         content.push_str(&format!("controls_hide_delay = {}\n", self.controls_hide_delay));
-        content.push_str("; How long bottom overlays stay visible (video controls + manga toggle + zoom HUD) (in seconds)\n");
+        content.push_str("; How long bottom overlays stay visible (video controls + Long Strip toggle + zoom HUD) (in seconds)\n");
         content.push_str(&format!(
             "bottom_overlay_hide_delay = {}\n\n",
             self.bottom_overlay_hide_delay

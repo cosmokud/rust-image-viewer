@@ -3014,7 +3014,7 @@ impl ImageViewer {
             .fixed_pos(button_pos)
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
-                let label = if self.manga_mode { "Manga: ON" } else { "Manga: OFF" };
+                let label = if self.manga_mode { "Long Strip: ON" } else { "Long Strip: OFF" };
 
                 let (rect, response) = ui.allocate_exact_size(button_size, egui::Sense::click());
                 let bg_color = if response.hovered() {

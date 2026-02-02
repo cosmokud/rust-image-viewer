@@ -49,7 +49,7 @@ A high-performance, minimal, and feature-rich image and video viewer for Windows
 - **Zoom Control** — Ctrl+Scroll to zoom in/out in manga mode
 - **Keyboard Navigation** — Left/Right for page up/down, Up/Down for smooth scrolling
 - **Quick Jump** — PageUp/PageDown and Home/End
-- **Toggle Button** — Bottom-right button to switch between single-image and manga modes
+- **Toggle Button** — Bottom-right Long Strip toggle to switch between single-image and manga modes
 
 ### Supported Formats
 
@@ -151,16 +151,16 @@ rust-image-viewer.exe path\to\video.mp4
 
 ### Manga Mode Shortcuts
 
-| Action            | Shortcut                        |
-| ----------------- | ------------------------------- |
-| Scroll            | Mouse Wheel or Drag             |
-| Zoom In           | `Ctrl` + Scroll Up              |
-| Zoom Out          | `Ctrl` + Scroll Down            |
-| Page Up/Down      | `←`/`→` or `PageUp`/`PageDown`  |
-| Smooth Scroll     | `↑`/`↓` Arrow Keys              |
-| Jump to Start/End | `Home` / `End`                  |
-| Reset View        | Double-click                    |
-| Toggle Manga Mode | Click manga icon (bottom-right) |
+| Action            | Shortcut                               |
+| ----------------- | -------------------------------------- |
+| Scroll            | Mouse Wheel or Drag                    |
+| Zoom In           | `Ctrl` + Scroll Up                     |
+| Zoom Out          | `Ctrl` + Scroll Down                   |
+| Page Up/Down      | `←`/`→` or `PageUp`/`PageDown`         |
+| Smooth Scroll     | `↑`/`↓` Arrow Keys                     |
+| Jump to Start/End | `Home` / `End`                         |
+| Reset View        | Double-click                           |
+| Toggle Manga Mode | Click Long Strip toggle (bottom-right) |
 
 ## Configuration
 
@@ -173,7 +173,7 @@ The viewer creates a `config.ini` file in `%APPDATA%\rust-image-viewer\` on firs
 ; Title bar auto-hide delay (seconds)
 controls_hide_delay = 0.5
 
-; Bottom overlays (video controls, manga toggle) auto-hide delay (seconds)
+; Bottom overlays (video controls, Long Strip toggle) auto-hide delay (seconds)
 bottom_overlay_hide_delay = 0.5
 
 ; Show FPS overlay for debugging (true/false)
