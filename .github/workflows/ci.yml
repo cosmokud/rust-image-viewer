@@ -21,6 +21,9 @@ jobs:
         with:
           toolchain: stable-x86_64-pc-windows-gnu
 
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
       - name: Install MSYS2 dependencies
         uses: msys2/setup-msys2@v2
         with:
@@ -33,9 +36,6 @@ jobs:
             mingw-w64-x86_64-glib2
             mingw-w64-x86_64-gstreamer
             mingw-w64-x86_64-gst-plugins-base
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
 
       - name: Build (release, GNU)
         shell: msys2 {0}
@@ -140,6 +140,9 @@ jobs:
         with:
           toolchain: stable-x86_64-pc-windows-gnu
 
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
       - name: Install MSYS2 dependencies
         uses: msys2/setup-msys2@v2
         with:
@@ -152,9 +155,6 @@ jobs:
             mingw-w64-x86_64-glib2
             mingw-w64-x86_64-gstreamer
             mingw-w64-x86_64-gst-plugins-base
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
 
       - name: Build (release, GNU)
         shell: msys2 {0}
