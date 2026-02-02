@@ -5,6 +5,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
+const DEFAULT_CONFIG_INI: &str = include_str!("../config.ini");
+
 /// Image resampling filter types for scaling operations.
 /// Listed from fastest (lowest quality) to slowest (highest quality).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -540,21 +542,33 @@ impl Config {
     /// Load configuration from INI file
     pub fn load() -> Self {
         let config_path = Self::config_path();
-        
+
+        let mut created_from_template = false;
         if !config_path.exists() {
-            let config = Config::default();
-            config.save();
-            return config;
+            if fs::write(&config_path, DEFAULT_CONFIG_INI).is_ok() {
+                created_from_template = true;
+            } else {
+                let config = Config::default();
+                config.save();
+                return config;
+            }
         }
 
         match fs::read_to_string(&config_path) {
             Ok(content) => {
+                let is_template_copy = content == DEFAULT_CONFIG_INI;
                 let config = Self::parse_ini(&content);
-                // Save to update the config file with any new default bindings
-                config.save();
+                if !created_from_template && !is_template_copy {
+                    // Save to update the config file with any new default bindings
+                    config.save();
+                }
                 config
             }
-            Err(_) => Config::default(),
+            Err(_) => {
+                let config = Self::parse_ini(DEFAULT_CONFIG_INI);
+                let _ = fs::write(&config_path, DEFAULT_CONFIG_INI);
+                config
+            }
         }
     }
 
