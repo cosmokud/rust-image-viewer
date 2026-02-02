@@ -407,8 +407,8 @@ impl Default for Config {
             startup_window_mode: StartupWindowMode::Floating,
             single_instance: true,
             // Image quality defaults - use high quality filters
-            upscale_filter: ImageFilter::Triangle,      // Best balance of quality and speed
-            downscale_filter: ImageFilter::Triangle,      // Highest quality for downscaling
+            upscale_filter: ImageFilter::CatmullRom,    // Good balance of quality and speed for upscaling
+            downscale_filter: ImageFilter::Lanczos3,    // Highest quality for downscaling
             gif_resize_filter: ImageFilter::Triangle,   // Good quality, reasonable speed for animations
             texture_filter_static: TextureFilter::Linear, // Smooth rendering for photos
             texture_filter_animated: TextureFilter::Linear, // Smooth for animations
@@ -569,8 +569,8 @@ impl Config {
             resize_border_size: 6.0,
             background_rgb: [0, 0, 0],
             fullscreen_reset_fit_on_enter: true,
-            zoom_animation_speed: 8.0,
-            zoom_step: 1.08,
+            zoom_animation_speed: 20.0,
+            zoom_step: 1.02,
             max_zoom_percent: 1000.0,
             manga_drag_pan_speed: 1.0,
             manga_wheel_scroll_speed: 160.0,
@@ -583,8 +583,8 @@ impl Config {
             startup_window_mode: StartupWindowMode::Floating,
             single_instance: true,
             // Image quality defaults
-            upscale_filter: ImageFilter::Triangle,
-            downscale_filter: ImageFilter::Triangle,
+            upscale_filter: ImageFilter::CatmullRom,
+            downscale_filter: ImageFilter::Lanczos3,
             gif_resize_filter: ImageFilter::Triangle,
             texture_filter_static: TextureFilter::Linear,
             texture_filter_animated: TextureFilter::Linear,

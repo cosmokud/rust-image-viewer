@@ -3,8 +3,14 @@ name = "rust-image-viewer"
 version = "1.0.0"
 edition = "2021"
 authors = ["Image Viewer"]
-description = "High-performance image and video viewer for Windows 11"
+description = "High-performance image and video viewer for Windows 10/11"
 license = "MIT"
+readme = "README.md"
+repository = "https://github.com/cosmonoumi/rust-image-viewer"
+homepage = "https://github.com/cosmonoumi/rust-image-viewer"
+keywords = ["image", "video", "viewer", "egui", "gstreamer"]
+categories = ["multimedia", "graphics", "gui"]
+rust-version = "1.76"
 build = "build.rs"
 
 [dependencies]
