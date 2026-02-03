@@ -1,6 +1,6 @@
 # Rust Image & Video Viewer
 
-A high-performance, minimal, and feature-rich image and video viewer for Windows, built with Rust, egui, and GStreamer.
+A high-performance, minimal, borderless, and feature-rich image and video viewer for Windows, built with Rust, egui, and GStreamer. Inspired by Google Picasa.
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Rust](https://img.shields.io/badge/rust-1.76%2B-orange.svg)
