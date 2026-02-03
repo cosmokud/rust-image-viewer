@@ -16,8 +16,10 @@ jobs:
         id: setup_gstreamer
         uses: blinemedical/setup-gstreamer@v1.4.0
         with:
-          version: "1.22.7"
+          version: "1.27.90"
           arch: "x86_64"
+          msiUrl: https://gstreamer.freedesktop.org/data/pkg/windows/1.27.90/msvc/gstreamer-1.0-msvc-x86-1.27.90.msi
+          devMsiUrl: https://gstreamer.freedesktop.org/data/pkg/windows/1.27.90/msvc/gstreamer-1.0-devel-msvc-x86_64-1.27.90.msi
 
       - name: Install Rust (MSVC)
         uses: dtolnay/rust-toolchain@stable
