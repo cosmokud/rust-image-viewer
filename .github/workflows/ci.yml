@@ -1,155 +1,10 @@
-name: build
+name: Nightly Build
 
 on:
-  push:
-    tags:
-      - "v*"
   workflow_dispatch:
 
 jobs:
-  release:
-    if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: windows-latest
-    permissions:
-      contents: write
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: stable-x86_64-pc-windows-gnu
-
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
-
-      - name: Install MSYS2 dependencies
-        uses: msys2/setup-msys2@v2
-        with:
-          msystem: MINGW64
-          update: true
-          path-type: inherit
-          install: >-
-            mingw-w64-x86_64-toolchain
-            mingw-w64-x86_64-pkg-config
-            mingw-w64-x86_64-glib2
-            mingw-w64-x86_64-gstreamer
-            mingw-w64-x86_64-gst-plugins-base
-
-      - name: Build (release, GNU)
-        shell: msys2 {0}
-        env:
-          PATH: /c/Users/runneradmin/.cargo/bin:/mingw64/bin:/usr/bin
-          RUSTUP_TOOLCHAIN: stable-x86_64-pc-windows-gnu
-          PKG_CONFIG_PATH: /mingw64/lib/pkgconfig:/mingw64/share/pkgconfig
-        run: cargo build --release
-
-      - name: Collect runtime DLLs (GStreamer + GLib)
-        shell: msys2 {0}
-        run: |
-          dist="$GITHUB_WORKSPACE/dist"
-          mkdir -p "$dist"
-
-          cp "$GITHUB_WORKSPACE/target/release/rust-image-viewer.exe" "$dist/"
-          if [ -f "$GITHUB_WORKSPACE/target/release/config.ini" ]; then
-            cp "$GITHUB_WORKSPACE/target/release/config.ini" "$dist/"
-          fi
-
-          # Recursive function to copy DLL dependencies
-          copy_deps() {
-            local file="$1"
-            ldd "$file" 2>/dev/null | grep -E '=> /mingw64' | awk '{print $3}' | while read -r dep; do
-              if [ -f "$dep" ] && [ ! -f "$dist/$(basename "$dep")" ]; then
-                cp -u "$dep" "$dist/"
-                copy_deps "$dep"
-              fi
-            done
-          }
-
-          # Copy all dependencies of the main executable
-          copy_deps "$dist/rust-image-viewer.exe"
-
-          # Explicitly copy GLib and GStreamer core DLLs (correct naming with dots)
-          for dll in \
-            libgstreamer-1.0-0.dll \
-            libgstbase-1.0-0.dll \
-            libgstapp-1.0-0.dll \
-            libgstvideo-1.0-0.dll \
-            libgstaudio-1.0-0.dll \
-            libglib-2.0-0.dll \
-            libgobject-2.0-0.dll \
-            libgio-2.0-0.dll \
-            libgmodule-2.0-0.dll \
-            libgthread-2.0-0.dll \
-            libintl-8.dll \
-            libiconv-2.dll \
-            libffi-8.dll \
-            libpcre2-8-0.dll \
-            zlib1.dll \
-            libwinpthread-1.dll \
-            libgcc_s_seh-1.dll \
-            libstdc++-6.dll \
-            liborc-0.4-0.dll
-          do
-            if [ -f "/mingw64/bin/$dll" ]; then
-              cp -u "/mingw64/bin/$dll" "$dist/"
-              copy_deps "/mingw64/bin/$dll"
-            fi
-          done
-
-          # Copy GStreamer plugins
-          if [ -d "/mingw64/lib/gstreamer-1.0" ]; then
-            mkdir -p "$dist/lib/gstreamer-1.0"
-            cp -u /mingw64/lib/gstreamer-1.0/*.dll "$dist/lib/gstreamer-1.0/" 2>/dev/null || true
-            for plugin in /mingw64/lib/gstreamer-1.0/*.dll; do
-              if [ -f "$plugin" ]; then
-                copy_deps "$plugin"
-              fi
-            done
-          fi
-
-          # Copy gst-plugin-scanner
-          for scanner in /mingw64/bin/gst-plugin-scanner.exe /mingw64/libexec/gstreamer-1.0/gst-plugin-scanner.exe; do
-            if [ -f "$scanner" ]; then
-              mkdir -p "$dist/libexec/gstreamer-1.0"
-              cp -u "$scanner" "$dist/libexec/gstreamer-1.0/"
-              copy_deps "$scanner"
-            fi
-          done
-
-          # Debug: List collected DLLs
-          echo "=== Collected DLLs ==="
-          ls -la "$dist"/*.dll 2>/dev/null | head -50 || echo "No DLLs found"
-          echo "=== GLib DLLs check ==="
-          ls -la "$dist"/libglib* "$dist"/libgobject* "$dist"/libgio* 2>/dev/null || echo "GLib DLLs missing!"
-
-      - name: Install rcedit
-        shell: pwsh
-        run: choco install rcedit -y
-
-      - name: Set executable icon
-        shell: pwsh
-        run: |
-          if ((Test-Path "dist/rust-image-viewer.exe") -and (Test-Path "assets/icon.ico")) {
-            rcedit "dist/rust-image-viewer.exe" --set-icon "assets/icon.ico"
-          }
-
-      - name: Package release assets
-        shell: pwsh
-        run: |
-          if (Test-Path "rust-image-viewer-windows-x64-gnu.zip") { Remove-Item "rust-image-viewer-windows-x64-gnu.zip" -Force }
-          Compress-Archive -Path "dist/*" -DestinationPath "rust-image-viewer-windows-x64-gnu.zip" -Force
-
-      - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            dist/rust-image-viewer.exe
-            rust-image-viewer-windows-x64-gnu.zip
-
   nightly:
-    if: github.event_name == 'workflow_dispatch'
     runs-on: windows-latest
     permissions:
       contents: write
@@ -157,150 +12,51 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Rust
+      - name: Setup GStreamer
+        id: setup_gstreamer
+        uses: blinemedical/setup-gstreamer@v1.4.0
+        with:
+          version: "1.22.7"
+          arch: "x86_64"
+
+      - name: Install Rust (MSVC)
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable-x86_64-pc-windows-gnu
+          toolchain: stable-x86_64-pc-windows-msvc
 
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
 
-      - name: Install MSYS2 dependencies
-        uses: msys2/setup-msys2@v2
-        with:
-          msystem: MINGW64
-          update: true
-          path-type: inherit
-          install: >-
-            mingw-w64-x86_64-toolchain
-            mingw-w64-x86_64-pkg-config
-            mingw-w64-x86_64-glib2
-            mingw-w64-x86_64-gstreamer
-            mingw-w64-x86_64-gst-plugins-base
-
-      - name: Build (release, GNU)
-        shell: msys2 {0}
-        env:
-          PATH: /c/Users/runneradmin/.cargo/bin:/mingw64/bin:/usr/bin
-          RUSTUP_TOOLCHAIN: stable-x86_64-pc-windows-gnu
-          PKG_CONFIG_PATH: /mingw64/lib/pkgconfig:/mingw64/share/pkgconfig
+      - name: Build (release)
+        shell: pwsh
         run: cargo build --release
 
-      - name: Collect runtime DLLs (GStreamer + GLib)
-        shell: msys2 {0}
-        run: |
-          dist="$GITHUB_WORKSPACE/dist"
-          mkdir -p "$dist"
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-image-viewer-nightly
+          path: target/release/rust-image-viewer.exe
 
-          cp "$GITHUB_WORKSPACE/target/release/rust-image-viewer.exe" "$dist/"
-          if [ -f "$GITHUB_WORKSPACE/target/release/config.ini" ]; then
-            cp "$GITHUB_WORKSPACE/target/release/config.ini" "$dist/"
-          fi
-
-          # Recursive function to copy DLL dependencies
-          copy_deps() {
-            local file="$1"
-            ldd "$file" 2>/dev/null | grep -E '=> /mingw64' | awk '{print $3}' | while read -r dep; do
-              if [ -f "$dep" ] && [ ! -f "$dist/$(basename "$dep")" ]; then
-                cp -u "$dep" "$dist/"
-                copy_deps "$dep"
-              fi
-            done
-          }
-
-          # Copy all dependencies of the main executable
-          copy_deps "$dist/rust-image-viewer.exe"
-
-          # Explicitly copy GLib and GStreamer core DLLs (correct naming with dots)
-          for dll in \
-            libgstreamer-1.0-0.dll \
-            libgstbase-1.0-0.dll \
-            libgstapp-1.0-0.dll \
-            libgstvideo-1.0-0.dll \
-            libgstaudio-1.0-0.dll \
-            libglib-2.0-0.dll \
-            libgobject-2.0-0.dll \
-            libgio-2.0-0.dll \
-            libgmodule-2.0-0.dll \
-            libgthread-2.0-0.dll \
-            libintl-8.dll \
-            libiconv-2.dll \
-            libffi-8.dll \
-            libpcre2-8-0.dll \
-            zlib1.dll \
-            libwinpthread-1.dll \
-            libgcc_s_seh-1.dll \
-            libstdc++-6.dll \
-            liborc-0.4-0.dll
-          do
-            if [ -f "/mingw64/bin/$dll" ]; then
-              cp -u "/mingw64/bin/$dll" "$dist/"
-              copy_deps "/mingw64/bin/$dll"
-            fi
-          done
-
-          # Copy GStreamer plugins
-          if [ -d "/mingw64/lib/gstreamer-1.0" ]; then
-            mkdir -p "$dist/lib/gstreamer-1.0"
-            cp -u /mingw64/lib/gstreamer-1.0/*.dll "$dist/lib/gstreamer-1.0/" 2>/dev/null || true
-            for plugin in /mingw64/lib/gstreamer-1.0/*.dll; do
-              if [ -f "$plugin" ]; then
-                copy_deps "$plugin"
-              fi
-            done
-          fi
-
-          # Copy gst-plugin-scanner
-          for scanner in /mingw64/bin/gst-plugin-scanner.exe /mingw64/libexec/gstreamer-1.0/gst-plugin-scanner.exe; do
-            if [ -f "$scanner" ]; then
-              mkdir -p "$dist/libexec/gstreamer-1.0"
-              cp -u "$scanner" "$dist/libexec/gstreamer-1.0/"
-              copy_deps "$scanner"
-            fi
-          done
-
-          # Debug: List collected DLLs
-          echo "=== Collected DLLs ==="
-          ls -la "$dist"/*.dll 2>/dev/null | head -50 || echo "No DLLs found"
-          echo "=== GLib DLLs check ==="
-          ls -la "$dist"/libglib* "$dist"/libgobject* "$dist"/libgio* 2>/dev/null || echo "GLib DLLs missing!"
-
-      - name: Install rcedit
-        shell: pwsh
-        run: choco install rcedit -y
-
-      - name: Set executable icon
-        shell: pwsh
-        run: |
-          if ((Test-Path "dist/rust-image-viewer.exe") -and (Test-Path "assets/icon.ico")) {
-            rcedit "dist/rust-image-viewer.exe" --set-icon "assets/icon.ico"
-          }
-
-      - name: Package nightly assets
-        shell: pwsh
-        run: |
-          if (Test-Path "rust-image-viewer-windows-x64-gnu.zip") { Remove-Item "rust-image-viewer-windows-x64-gnu.zip" -Force }
-          Compress-Archive -Path "dist/*" -DestinationPath "rust-image-viewer-windows-x64-gnu.zip" -Force
-
-      - name: Delete existing Nightly release
+      - name: Delete existing nightly release
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release view nightly 2>$null | Out-Null
+          $release = gh release view nightly 2>&1
           if ($LASTEXITCODE -eq 0) {
             gh release delete nightly -y --cleanup-tag
-          } else {
-            $global:LASTEXITCODE = 0
           }
+          $global:LASTEXITCODE = 0
 
-      - name: Publish Nightly Release
+      - name: Create nightly release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: nightly
-          name: Nightly
+          name: Nightly Build
           prerelease: true
-          target_commitish: ${{ github.sha }}
-          files: |
-            dist/rust-image-viewer.exe
-            rust-image-viewer-windows-x64-gnu.zip
+          files: target/release/rust-image-viewer.exe
+          body: |
+            Automated nightly build from the latest commit.
+
+            **Note:** This build requires GStreamer to be installed on your system.
+            Download GStreamer from: https://gstreamer.freedesktop.org/download/
