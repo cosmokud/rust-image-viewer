@@ -1,5 +1,5 @@
 //! Image and video loading and management module.
-//! Supports JPG, PNG, WEBP, animated GIF files, and video formats.
+//! Supports JPG, PNG, WEBP (including animated), animated GIF files, and video formats.
 //! Optimized for low memory usage while maintaining functionality.
 
 use std::path::{Path, PathBuf};
@@ -187,6 +187,13 @@ impl LoadedImage {
 
         if extension == "gif" {
             Self::load_gif(path, max_texture_side, gif_filter)
+        } else if extension == "webp" {
+            // Try loading as animated WEBP; fall back to static if decoding
+            // fails or the file contains only a single frame.
+            match Self::load_animated_webp(path, max_texture_side, gif_filter) {
+                Ok(img) if img.frames.len() > 1 => Ok(img),
+                _ => Self::load_static(path, max_texture_side, downscale_filter),
+            }
         } else {
             Self::load_static(path, max_texture_side, downscale_filter)
         }
@@ -352,6 +359,108 @@ impl LoadedImage {
             last_frame_time: Instant::now(),
             original_width: target_width,
             original_height: target_height,
+        })
+    }
+
+    /// Load an animated WEBP file.
+    /// Uses the `image` crate's `AnimationDecoder` to extract all frames.
+    /// Falls back gracefully – callers should check `frames.len()` and use
+    /// `load_static` when the file is not actually animated.
+    fn load_animated_webp(
+        path: &Path,
+        max_texture_side: Option<u32>,
+        filter: FilterType,
+    ) -> Result<Self, String> {
+        use std::fs::File;
+        use std::io::BufReader;
+        use image::AnimationDecoder;
+        use image::codecs::webp::WebPDecoder;
+
+        let file = File::open(path).map_err(|e| format!("Failed to open file: {}", e))?;
+        let reader = BufReader::new(file);
+        let decoder = WebPDecoder::new(reader)
+            .map_err(|e| format!("Failed to decode WEBP: {}", e))?;
+
+        let frames_iter = decoder
+            .into_frames();
+
+        let mut frames = Vec::new();
+
+        // Same cap as GIF to avoid excessive memory usage.
+        const MAX_FRAMES: usize = 50;
+
+        // Determine downscale targets once (using the first frame's dimensions later).
+        let mut target_width: Option<u32> = None;
+        let mut target_height: Option<u32> = None;
+
+        for frame_result in frames_iter {
+            if frames.len() >= MAX_FRAMES {
+                break;
+            }
+
+            let frame = frame_result.map_err(|e| format!("WEBP frame error: {}", e))?;
+
+            // Extract delay in milliseconds.
+            let (numer, denom) = frame.delay().numer_denom_ms();
+            let delay_ms = if denom > 0 { numer / denom } else { 100 };
+            let delay_ms = if delay_ms == 0 { 100 } else { delay_ms };
+
+            let rgba = frame.into_buffer();
+            let width = rgba.width();
+            let height = rgba.height();
+
+            // Compute downscale targets on the first frame.
+            if target_width.is_none() {
+                if let Some(max_side) = max_texture_side {
+                    if max_side > 0 && (width > max_side || height > max_side) {
+                        let scale = (max_side as f64 / width as f64)
+                            .min(max_side as f64 / height as f64);
+                        target_width = Some(((width as f64) * scale).round().max(1.0) as u32);
+                        target_height = Some(((height as f64) * scale).round().max(1.0) as u32);
+                    } else {
+                        target_width = Some(width);
+                        target_height = Some(height);
+                    }
+                } else {
+                    target_width = Some(width);
+                    target_height = Some(height);
+                }
+            }
+
+            let tw = target_width.unwrap_or(width);
+            let th = target_height.unwrap_or(height);
+
+            let (final_w, final_h, pixels) = if tw != width || th != height {
+                let resized = image::imageops::resize(&rgba, tw, th, filter);
+                (tw, th, resized.into_raw())
+            } else {
+                (width, height, rgba.into_raw())
+            };
+
+            frames.push(ImageFrame {
+                pixels,
+                width: final_w,
+                height: final_h,
+                delay_ms,
+            });
+        }
+
+        if frames.is_empty() {
+            return Err("No frames in animated WEBP".to_string());
+        }
+
+        frames.shrink_to_fit();
+
+        let out_w = frames[0].width;
+        let out_h = frames[0].height;
+
+        Ok(LoadedImage {
+            path: path.to_path_buf(),
+            frames,
+            current_frame: 0,
+            last_frame_time: Instant::now(),
+            original_width: out_w,
+            original_height: out_h,
         })
     }
 
