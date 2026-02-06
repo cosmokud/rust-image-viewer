@@ -289,9 +289,9 @@ impl LoadedImage {
 
         let frames_iter = decoder.into_frames();
 
-        const MAX_ANIMATION_MEMORY: usize = 512 * 1024 * 1024;
-        const MAX_FRAMES_SAFETY: usize = 1000;
-        let mut total_decoded_bytes: usize = 0;
+        // Streaming mode is expected to decode the full animation. Keep a very
+        // high safety cap to avoid infinite loops on corrupt files.
+        const MAX_FRAMES_SAFETY: usize = 20000;
         let mut target_width: Option<u32> = None;
         let mut target_height: Option<u32> = None;
         let mut frame_index: usize = 0;
@@ -341,7 +341,6 @@ impl LoadedImage {
                 (width, height, rgba.into_raw())
             };
 
-            total_decoded_bytes += pixels.len();
 
             // Skip the first frame — the caller already has it.
             if frame_index > 0 {
@@ -359,9 +358,7 @@ impl LoadedImage {
 
             frame_index += 1;
 
-            if total_decoded_bytes >= MAX_ANIMATION_MEMORY {
-                break;
-            }
+            // No memory budget here; streaming is responsible for full decode.
         }
         // tx is dropped here → receiver sees Disconnected
     }
