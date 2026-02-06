@@ -199,6 +199,271 @@ impl LoadedImage {
         }
     }
 
+    /// Fast load for animated WebP: decode only the first frame so the UI can
+    /// show something immediately.  Returns a single-frame `LoadedImage` that
+    /// appears static.  Call `load_full_animated_webp` later to get all frames.
+    ///
+    /// For GIF or non-animated WebP files this falls through to the normal loader.
+    pub fn load_first_frame_only(
+        path: &Path,
+        max_texture_side: Option<u32>,
+        downscale_filter: FilterType,
+        gif_filter: FilterType,
+    ) -> Result<Self, String> {
+        let extension = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_lowercase())
+            .unwrap_or_default();
+
+        if extension == "webp" {
+            // Try to decode just the first frame of an animated WebP.
+            match Self::load_webp_first_frame(path, max_texture_side, gif_filter) {
+                Ok(img) => Ok(img),
+                // Fall back to the normal static path if the fast path fails.
+                Err(_) => Self::load_static(path, max_texture_side, downscale_filter),
+            }
+        } else {
+            // Non-WebP: use the normal full loader (GIFs are fast enough with
+            // the existing code; this fast-path is specifically for WebP).
+            Self::load_with_max_texture_side(path, max_texture_side, downscale_filter, gif_filter)
+        }
+    }
+
+    /// Start streaming WebP animation frames one-by-one through an `mpsc` channel.
+    ///
+    /// The **first frame** is intentionally skipped because the caller already
+    /// has it from `load_first_frame_only`.  Each subsequent frame is sent as
+    /// soon as it is decoded.  When the sender is dropped (thread exits) the
+    /// receiver will see `Disconnected`, which means "all frames sent" (or an
+    /// unrecoverable error, but partial frames are still usable).
+    ///
+    /// Returns `None` if the file is not an animated WebP or cannot be opened.
+    pub fn start_streaming_webp(
+        path: &Path,
+        max_texture_side: Option<u32>,
+        filter: FilterType,
+    ) -> Option<std::sync::mpsc::Receiver<ImageFrame>> {
+        use std::sync::mpsc;
+
+        if !Self::is_animated_webp(path) {
+            return None;
+        }
+
+        let (tx, rx) = mpsc::channel::<ImageFrame>();
+        let path = path.to_path_buf();
+
+        std::thread::Builder::new()
+            .name("webp-stream".into())
+            .spawn(move || {
+                Self::stream_webp_frames(&path, max_texture_side, filter, &tx);
+            })
+            .ok();
+
+        Some(rx)
+    }
+
+    /// Worker function that decodes animated WebP frames and sends them
+    /// through `tx`.  Skips the first frame (caller already has it).
+    /// Silently stops when the receiver is dropped or on unrecoverable errors.
+    fn stream_webp_frames(
+        path: &Path,
+        max_texture_side: Option<u32>,
+        filter: FilterType,
+        tx: &std::sync::mpsc::Sender<ImageFrame>,
+    ) {
+        use std::fs::File;
+        use std::io::BufReader;
+        use image::AnimationDecoder;
+        use image::codecs::webp::WebPDecoder;
+
+        let file = match File::open(path) {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        let reader = BufReader::new(file);
+        let decoder = match WebPDecoder::new(reader) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+
+        let frames_iter = decoder.into_frames();
+
+        const MAX_ANIMATION_MEMORY: usize = 512 * 1024 * 1024;
+        const MAX_FRAMES_SAFETY: usize = 1000;
+        let mut total_decoded_bytes: usize = 0;
+        let mut target_width: Option<u32> = None;
+        let mut target_height: Option<u32> = None;
+        let mut frame_index: usize = 0;
+
+        for frame_result in frames_iter {
+            if frame_index >= MAX_FRAMES_SAFETY {
+                break;
+            }
+
+            let frame = match frame_result {
+                Ok(f) => f,
+                Err(_) => { frame_index += 1; continue; }
+            };
+
+            let (numer, denom) = frame.delay().numer_denom_ms();
+            let delay_ms = if denom > 0 { numer / denom } else { 100 };
+            let delay_ms = if delay_ms == 0 { 100 } else { delay_ms };
+
+            let rgba = frame.into_buffer();
+            let width = rgba.width();
+            let height = rgba.height();
+
+            if target_width.is_none() {
+                if let Some(max_side) = max_texture_side {
+                    if max_side > 0 && (width > max_side || height > max_side) {
+                        let scale = (max_side as f64 / width as f64)
+                            .min(max_side as f64 / height as f64);
+                        target_width = Some(((width as f64) * scale).round().max(1.0) as u32);
+                        target_height = Some(((height as f64) * scale).round().max(1.0) as u32);
+                    } else {
+                        target_width = Some(width);
+                        target_height = Some(height);
+                    }
+                } else {
+                    target_width = Some(width);
+                    target_height = Some(height);
+                }
+            }
+
+            let tw = target_width.unwrap_or(width);
+            let th = target_height.unwrap_or(height);
+
+            let (final_w, final_h, pixels) = if tw != width || th != height {
+                let resized = image::imageops::resize(&rgba, tw, th, filter);
+                (tw, th, resized.into_raw())
+            } else {
+                (width, height, rgba.into_raw())
+            };
+
+            total_decoded_bytes += pixels.len();
+
+            // Skip the first frame — the caller already has it.
+            if frame_index > 0 {
+                let img_frame = ImageFrame {
+                    pixels,
+                    width: final_w,
+                    height: final_h,
+                    delay_ms,
+                };
+                // If send fails, the receiver was dropped (user navigated away).
+                if tx.send(img_frame).is_err() {
+                    return;
+                }
+            }
+
+            frame_index += 1;
+
+            if total_decoded_bytes >= MAX_ANIMATION_MEMORY {
+                break;
+            }
+        }
+        // tx is dropped here → receiver sees Disconnected
+    }
+
+    /// Check whether a WebP file contains animation without fully decoding it.
+    /// This is cheap — it only reads the file header, not any frame data.
+    pub fn is_animated_webp(path: &Path) -> bool {
+        use std::fs::File;
+        use std::io::BufReader;
+        use image::codecs::webp::WebPDecoder;
+
+        let extension = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_lowercase())
+            .unwrap_or_default();
+
+        if extension != "webp" {
+            return false;
+        }
+
+        let file = match File::open(path) {
+            Ok(f) => f,
+            Err(_) => return false,
+        };
+        let reader = BufReader::new(file);
+        match WebPDecoder::new(reader) {
+            Ok(dec) => dec.has_animation(),
+            Err(_) => false,
+        }
+    }
+
+    /// Decode only the very first frame of an animated WebP file.
+    /// Much faster than `load_animated_webp` because it stops after one frame.
+    fn load_webp_first_frame(
+        path: &Path,
+        max_texture_side: Option<u32>,
+        filter: FilterType,
+    ) -> Result<Self, String> {
+        use std::fs::File;
+        use std::io::BufReader;
+        use image::AnimationDecoder;
+        use image::codecs::webp::WebPDecoder;
+
+        let file = File::open(path).map_err(|e| format!("Failed to open file: {}", e))?;
+        let reader = BufReader::new(file);
+        let decoder = WebPDecoder::new(reader)
+            .map_err(|e| format!("Failed to decode WEBP: {}", e))?;
+
+        // Get the first frame from the animation iterator.
+        let frame = decoder
+            .into_frames()
+            .next()
+            .ok_or_else(|| "No frames in WEBP".to_string())?
+            .map_err(|e| format!("WEBP frame error: {}", e))?;
+
+        let (numer, denom) = frame.delay().numer_denom_ms();
+        let delay_ms = if denom > 0 { numer / denom } else { 100 };
+        let delay_ms = if delay_ms == 0 { 100 } else { delay_ms };
+
+        let rgba = frame.into_buffer();
+        let width = rgba.width();
+        let height = rgba.height();
+
+        // Downscale if necessary
+        let (tw, th) = if let Some(max_side) = max_texture_side {
+            if max_side > 0 && (width > max_side || height > max_side) {
+                let scale = (max_side as f64 / width as f64)
+                    .min(max_side as f64 / height as f64);
+                (
+                    ((width as f64) * scale).round().max(1.0) as u32,
+                    ((height as f64) * scale).round().max(1.0) as u32,
+                )
+            } else {
+                (width, height)
+            }
+        } else {
+            (width, height)
+        };
+
+        let (final_w, final_h, pixels) = if tw != width || th != height {
+            let resized = image::imageops::resize(&rgba, tw, th, filter);
+            (tw, th, resized.into_raw())
+        } else {
+            (width, height, rgba.into_raw())
+        };
+
+        Ok(LoadedImage {
+            path: path.to_path_buf(),
+            frames: vec![ImageFrame {
+                pixels,
+                width: final_w,
+                height: final_h,
+                delay_ms,
+            }],
+            current_frame: 0,
+            last_frame_time: Instant::now(),
+            original_width: final_w,
+            original_height: final_h,
+        })
+    }
+
     /// Load a static image (JPG, PNG, WEBP, etc.)
     fn load_static(path: &Path, max_texture_side: Option<u32>, downscale_filter: FilterType) -> Result<Self, String> {
         let img = open_image_with_reasonable_limits(path)?;

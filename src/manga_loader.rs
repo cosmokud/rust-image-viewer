@@ -564,21 +564,37 @@ impl MangaLoader {
                 // Get original dimensions from file header first (fast, no decode)
                 let (original_width, original_height) = image::image_dimensions(&req.path).ok()?;
 
-                // Load and decode the image
+                // For animated WebP files we only decode the first frame here so that
+                // the manga scroll view isn't blocked by a potentially very expensive
+                // full-animation decode.  The full animation will be loaded lazily by
+                // `manga_update_animated_textures` when the user actually focuses on it.
+                let is_animated_webp = LoadedImage::is_animated_webp(&req.path);
+
                 let downscale_filter = FilterType::Triangle; // Fast filter for manga
                 let gif_filter = FilterType::Triangle;
 
-                let img = LoadedImage::load_with_max_texture_side(
-                    &req.path,
-                    Some(req.max_texture_side),
-                    downscale_filter,
-                    gif_filter,
-                )
-                .ok()?;
+                let img = if is_animated_webp {
+                    LoadedImage::load_first_frame_only(
+                        &req.path,
+                        Some(req.max_texture_side),
+                        downscale_filter,
+                        gif_filter,
+                    )
+                    .ok()?
+                } else {
+                    LoadedImage::load_with_max_texture_side(
+                        &req.path,
+                        Some(req.max_texture_side),
+                        downscale_filter,
+                        gif_filter,
+                    )
+                    .ok()?
+                };
 
-                // Determine if this is an animated image
-                let is_animated = img.is_animated();
-                let manga_media_type = if is_animated {
+                // Determine if this is an animated image.
+                // For animated WebP, we loaded only the first frame, but we still
+                // know it's animated from the header check above.
+                let manga_media_type = if is_animated_webp || img.is_animated() {
                     MangaMediaType::AnimatedImage
                 } else {
                     MangaMediaType::StaticImage

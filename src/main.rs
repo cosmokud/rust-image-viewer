@@ -13,19 +13,67 @@ mod video_player;
 mod windows_env;
 
 use config::{Action, Config, InputBinding, StartupWindowMode};
-use image_loader::{get_images_in_directory, get_media_type, is_supported_video, LoadedImage, MediaType};
+use image_loader::{get_images_in_directory, get_media_type, is_supported_video, ImageFrame, LoadedImage, MediaType};
 use manga_loader::{MangaLoader, MangaMediaType, MangaTextureCache};
 #[cfg(target_os = "windows")]
 use single_instance::{FileReceiver, SingleInstanceResult};
 use video_player::{format_duration, VideoPlayer};
 
 use eframe::egui;
+use image::imageops::FilterType;
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use eframe::glow::HasContext;
+
+/// Paint a smooth, semi-transparent loading spinner in the bottom-right corner
+/// of the given rectangle.  The spinner is a rotating arc that indicates
+/// background frame decoding is in progress.
+///
+/// * `painter` – the egui painter to draw on.
+/// * `rect`    – bounding rectangle of the image being loaded.
+/// * `time`    – monotonic time in seconds (e.g. `ctx.input(|i| i.time)`).
+fn paint_loading_spinner(painter: &egui::Painter, rect: egui::Rect, time: f64) {
+    let margin = 16.0;
+    let radius = 10.0;
+    let center = egui::pos2(
+        rect.right() - margin - radius,
+        rect.bottom() - margin - radius,
+    );
+
+    // Semi-transparent background disc so the spinner is visible on any image.
+    painter.circle_filled(
+        center,
+        radius + 4.0,
+        egui::Color32::from_rgba_unmultiplied(0, 0, 0, 100),
+    );
+
+    // Faint track ring.
+    painter.circle_stroke(
+        center,
+        radius,
+        egui::Stroke::new(2.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 35)),
+    );
+
+    // Spinning arc — approximated with a polyline.
+    let start_angle = (time * 4.0) as f32; // ~4 rad/s ≈ 0.64 rev/s
+    let sweep = std::f32::consts::PI * 1.4; // ~250°
+    let segments = 28;
+    let points: Vec<egui::Pos2> = (0..=segments)
+        .map(|i| {
+            let t = i as f32 / segments as f32;
+            let angle = start_angle + sweep * t;
+            center + radius * egui::vec2(angle.cos(), angle.sin())
+        })
+        .collect();
+    let stroke = egui::Stroke::new(
+        2.5,
+        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200),
+    );
+    painter.add(egui::Shape::line(points, stroke));
+}
 
 /// Downscale RGBA pixel data if it exceeds the maximum texture size.
 /// Uses Cow to avoid unnecessary allocations when no downscaling is needed.
@@ -413,6 +461,26 @@ struct ImageViewer {
     /// Preview frame index while seeking GIF
     gif_seek_preview_frame: Option<usize>,
 
+    // ============ BACKGROUND ANIMATION STREAMING ============
+    /// Receiver that yields individual `ImageFrame`s as they are decoded on a
+    /// background thread (non-manga mode).  Frames are appended to `self.image`
+    /// progressively so the animation can start playing immediately.
+    anim_stream_rx: Option<std::sync::mpsc::Receiver<ImageFrame>>,
+    /// Path of the image currently being streamed.
+    anim_stream_path: Option<PathBuf>,
+    /// `true` once the background decoder has finished (sender dropped).
+    anim_stream_done: bool,
+
+    /// Per-index streaming receivers for manga mode animated WebPs.
+    /// Multiple animations can stream in parallel (one per visible animated item).
+    manga_anim_streams: HashMap<usize, std::sync::mpsc::Receiver<ImageFrame>>,
+    /// Tracks which manga animated-image entries still have frames incoming.
+    /// `true` = still streaming, `false` = done.
+    manga_anim_stream_done: HashMap<usize, bool>,
+    /// Set of manga indices that were attempted and confirmed non-animated or
+    /// failed to decode, so we don't retry them forever.
+    manga_anim_failed: HashSet<usize>,
+
     // ============ MANGA VIDEO CONTROLS FIELDS ============
     /// Whether seeking is active in manga mode video controls
     manga_video_seeking: bool,
@@ -555,6 +623,14 @@ impl Default for ImageViewer {
             gif_paused: false,
             gif_seeking: false,
             gif_seek_preview_frame: None,
+
+            // Background animation streaming fields
+            anim_stream_rx: None,
+            anim_stream_path: None,
+            anim_stream_done: true,
+            manga_anim_streams: HashMap::new(),
+            manga_anim_stream_done: HashMap::new(),
+            manga_anim_failed: HashSet::new(),
 
             // Manga video controls fields
             manga_video_seeking: false,
@@ -1173,6 +1249,11 @@ impl ImageViewer {
         self.image = None;
         self.show_video_controls = false;
 
+        // Cancel any in-flight background animation stream.
+        self.anim_stream_rx = None;
+        self.anim_stream_path = None;
+        self.anim_stream_done = true;
+
         // Reset GIF playback state for new media
         self.gif_paused = false;
         self.gif_seeking = false;
@@ -1221,16 +1302,40 @@ impl ImageViewer {
                 }
             }
             Some(MediaType::Image) => {
-                // Load as image with configured filters
+                // Cancel any in-flight background animation stream.
+                self.anim_stream_rx = None;
+                self.anim_stream_path = None;
+                self.anim_stream_done = true;
+
+                // Load as image with configured filters.
+                // For animated WebP we only decode the FIRST frame here so the
+                // window appears instantly, then start streaming remaining frames
+                // in the background so the animation begins playing progressively.
                 let downscale_filter = self.config.downscale_filter.to_image_filter();
                 let gif_filter = self.config.gif_resize_filter.to_image_filter();
-                match LoadedImage::load_with_max_texture_side(path, Some(self.max_texture_side), downscale_filter, gif_filter) {
+                let max_tex = self.max_texture_side;
+
+                match LoadedImage::load_first_frame_only(path, Some(max_tex), downscale_filter, gif_filter) {
                     Ok(img) => {
+                        let is_animated_webp = LoadedImage::is_animated_webp(path);
                         self.image = Some(img);
                         self.texture_frame = usize::MAX;
                         self.image_changed = true;
                         self.pending_media_layout = false;
                         self.error_message = None;
+
+                        if is_animated_webp {
+                            // Start streaming frames one-by-one from a background thread.
+                            if let Some(rx) = LoadedImage::start_streaming_webp(
+                                path,
+                                Some(max_tex),
+                                gif_filter,
+                            ) {
+                                self.anim_stream_rx = Some(rx);
+                                self.anim_stream_path = Some(path.to_path_buf());
+                                self.anim_stream_done = false;
+                            }
+                        }
                     }
                     Err(e) => {
                         self.error_message = Some(e);
@@ -1883,8 +1988,11 @@ impl ImageViewer {
         self.manga_video_textures.clear();
         self.manga_focused_video_index = None;
         
-        // Clear animated images
+        // Clear animated images and streaming state
         self.manga_animated_images.clear();
+        self.manga_anim_streams.clear();
+        self.manga_anim_stream_done.clear();
+        self.manga_anim_failed.clear();
 
         self.manga_total_height_cache_valid = false;
         self.manga_layout_offsets.clear();
@@ -2113,112 +2221,196 @@ impl ImageViewer {
 
     /// Update animated GIF/WebP textures in manga mode.
     /// Only the focused animated image is updated to save resources.
+    /// Loading of the full animation is done on a background thread to avoid
+    /// blocking the UI — the manga texture cache already has a first-frame
+    /// thumbnail from the normal manga loader pipeline.
     fn manga_update_animated_textures(&mut self, ctx: &egui::Context) -> bool {
         if !self.manga_mode {
             return false;
         }
 
-        let focused_idx = self.manga_get_focused_media_index();
         let mut needs_repaint = false;
 
-        // Check if the focused item is an animated image
-        let is_animated = self.manga_loader
-            .as_ref()
-            .and_then(|loader| loader.get_media_type(focused_idx))
-            .map_or(false, |mt| mt == MangaMediaType::AnimatedImage);
+        // ── Determine visible animated-image indices ──
+        let viewport_top = self.manga_scroll_offset.max(0.0);
+        let viewport_h = self.screen_size.y.max(1.0);
+        let viewport_bottom = viewport_top + viewport_h;
+        let vis_start = self.manga_index_at_y(viewport_top);
+        let vis_end = self.manga_index_at_y(viewport_bottom);
+        let prefetch_radius: usize = 2; // also start streaming items just off-screen
+        let stream_start = vis_start.saturating_sub(prefetch_radius);
+        let stream_end = (vis_end + prefetch_radius).min(self.image_list.len().saturating_sub(1));
 
-        if !is_animated {
-            return false;
+        // Collect indices of visible animated images.
+        let animated_indices: Vec<usize> = (stream_start..=stream_end)
+            .filter(|&idx| {
+                self.manga_loader
+                    .as_ref()
+                    .and_then(|loader| loader.get_media_type(idx))
+                    .map_or(false, |mt| mt == MangaMediaType::AnimatedImage)
+            })
+            .collect();
+
+        // Maximum number of concurrent streaming threads.
+        const MAX_CONCURRENT_STREAMS: usize = 3;
+
+        // ── Start streaming for visible animated items that need it ──
+        for &idx in &animated_indices {
+            // Already have the full animation?
+            if self.manga_animated_images.contains_key(&idx)
+                && self.manga_anim_stream_done.get(&idx).copied().unwrap_or(true)
+            {
+                continue;
+            }
+            // Already streaming?
+            if self.manga_anim_streams.contains_key(&idx) {
+                continue;
+            }
+            // Already tried and failed?
+            if self.manga_anim_failed.contains(&idx) {
+                continue;
+            }
+            // Cap concurrent streams.
+            if self.manga_anim_streams.len() >= MAX_CONCURRENT_STREAMS {
+                break;
+            }
+
+            if let Some(path) = self.image_list.get(idx).cloned() {
+                let gif_filter = self.config.gif_resize_filter.to_image_filter();
+                let max_tex = self.max_texture_side;
+
+                if let Some(rx) = LoadedImage::start_streaming_webp(&path, Some(max_tex), gif_filter) {
+                    self.manga_anim_streams.insert(idx, rx);
+                    self.manga_anim_stream_done.insert(idx, false);
+
+                    // Ensure there's a LoadedImage entry with at least the first frame.
+                    if !self.manga_animated_images.contains_key(&idx) {
+                        let downscale_f = FilterType::Triangle;
+                        if let Ok(img) = LoadedImage::load_first_frame_only(
+                            &path,
+                            Some(max_tex),
+                            downscale_f,
+                            gif_filter,
+                        ) {
+                            self.manga_animated_images.insert(idx, img);
+                        }
+                    }
+                } else {
+                    // Not actually an animated WebP — mark as failed so we don't retry.
+                    self.manga_anim_failed.insert(idx);
+                }
+            }
         }
 
-        // Load the animated image if not already loaded
-        if !self.manga_animated_images.contains_key(&focused_idx) {
-            if let Some(path) = self.image_list.get(focused_idx) {
-                let downscale_filter = self.config.downscale_filter.to_image_filter();
-                let gif_filter = self.config.gif_resize_filter.to_image_filter();
-                
-                if let Ok(img) = LoadedImage::load_with_max_texture_side(
-                    path,
-                    Some(self.max_texture_side),
-                    downscale_filter,
-                    gif_filter,
-                ) {
-                    if img.is_animated() {
-                        self.manga_animated_images.insert(focused_idx, img);
+        // ── Drain frames from all active streams ──
+        let stream_indices: Vec<usize> = self.manga_anim_streams.keys().copied().collect();
+        for idx in stream_indices {
+            let mut disconnected = false;
+            if let Some(rx) = self.manga_anim_streams.get(&idx) {
+                loop {
+                    match rx.try_recv() {
+                        Ok(frame) => {
+                            if let Some(img) = self.manga_animated_images.get_mut(&idx) {
+                                img.frames.push(frame);
+                            }
+                            needs_repaint = true;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            disconnected = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if disconnected {
+                self.manga_anim_streams.remove(&idx);
+                self.manga_anim_stream_done.insert(idx, true);
+            }
+        }
+
+        // Request repaint while any stream is active.
+        if !self.manga_anim_streams.is_empty() {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        }
+
+        // ── Update animation frames for ALL visible animated images ──
+        for &idx in &animated_indices {
+            let stream_done = self.manga_anim_stream_done.get(&idx).copied().unwrap_or(true);
+
+            if let Some(img) = self.manga_animated_images.get_mut(&idx) {
+                let frame_changed = if !self.gif_paused && img.frames.len() > 1 {
+                    // If still streaming and on the last frame, hold rather than wrap.
+                    if !stream_done && img.current_frame == img.frames.len() - 1 {
+                        false
+                    } else {
+                        img.update_animation()
+                    }
+                } else {
+                    false
+                };
+
+                if frame_changed || !self.manga_texture_cache.contains(idx) {
+                    let frame = img.current_frame_data();
+
+                    let (w, h, pixels) = downscale_rgba_if_needed(
+                        frame.width,
+                        frame.height,
+                        &frame.pixels,
+                        self.max_texture_side,
+                        self.config.gif_resize_filter.to_image_filter(),
+                    );
+
+                    let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                        [w as usize, h as usize],
+                        pixels.as_ref(),
+                    );
+
+                    let texture = ctx.load_texture(
+                        format!("manga_anim_{}", idx),
+                        color_image,
+                        self.config.texture_filter_animated.to_egui_options(),
+                    );
+
+                    self.manga_texture_cache.insert_with_type(
+                        idx,
+                        texture,
+                        w,
+                        h,
+                        MangaMediaType::AnimatedImage,
+                    );
+
+                    needs_repaint = true;
+                }
+
+                // Schedule next repaint for animation.
+                if img.frames.len() > 1 && !self.gif_paused {
+                    let current_delay =
+                        Duration::from_millis(img.frames[img.current_frame].delay_ms as u64);
+                    let elapsed = img.last_frame_time.elapsed();
+                    if elapsed < current_delay {
+                        ctx.request_repaint_after(current_delay - elapsed);
+                    } else {
+                        needs_repaint = true;
                     }
                 }
             }
         }
 
-        // Update the animation frame for the focused animated image
-        // Only update if not paused
-        if let Some(img) = self.manga_animated_images.get_mut(&focused_idx) {
-            let frame_changed = if !self.gif_paused {
-                img.update_animation()
-            } else {
-                false
-            };
-            
-            if frame_changed || !self.manga_texture_cache.contains(focused_idx) {
-                let frame = img.current_frame_data();
-                
-                let (w, h, pixels) = downscale_rgba_if_needed(
-                    frame.width,
-                    frame.height,
-                    &frame.pixels,
-                    self.max_texture_side,
-                    self.config.gif_resize_filter.to_image_filter(),
-                );
-                
-                let color_image = egui::ColorImage::from_rgba_unmultiplied(
-                    [w as usize, h as usize],
-                    pixels.as_ref(),
-                );
+        // ── Evict animated images that are far from the viewport ──
+        let keep_start = vis_start.saturating_sub(5);
+        let keep_end = vis_end.saturating_add(5);
 
-                let texture = ctx.load_texture(
-                    format!("manga_anim_{}", focused_idx),
-                    color_image,
-                    self.config.texture_filter_animated.to_egui_options(),
-                );
-
-                // Update the texture cache with the new frame
-                self.manga_texture_cache.insert_with_type(
-                    focused_idx,
-                    texture,
-                    w,
-                    h,
-                    MangaMediaType::AnimatedImage,
-                );
-                
-                needs_repaint = true;
-            }
-
-            // Schedule next repaint for animation (only when playing).
-            if img.is_animated() && !self.gif_paused {
-                let current_delay = Duration::from_millis(img.frames[img.current_frame].delay_ms as u64);
-                let elapsed = img.last_frame_time.elapsed();
-                if elapsed < current_delay {
-                    let remaining = current_delay - elapsed;
-                    ctx.request_repaint_after(remaining);
-                } else {
-                    needs_repaint = true;
-                }
-            }
-        }
-
-        // Evict animated images that are far from the focused index
-        let keep_radius = 3;
-        let keep_start = focused_idx.saturating_sub(keep_radius);
-        let keep_end = focused_idx.saturating_add(keep_radius);
-        
         let indices_to_remove: Vec<usize> = self.manga_animated_images
             .keys()
             .filter(|&&idx| idx < keep_start || idx > keep_end)
             .copied()
             .collect();
-        
+
         for idx in indices_to_remove {
             self.manga_animated_images.remove(&idx);
+            self.manga_anim_streams.remove(&idx);
+            self.manga_anim_stream_done.remove(&idx);
         }
 
         needs_repaint
@@ -3902,6 +4094,16 @@ impl ImageViewer {
                                 egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                                 egui::Color32::WHITE,
                             );
+
+                            // Show loading spinner for animated images still streaming.
+                            let still_streaming = self.manga_anim_stream_done
+                                .get(&idx)
+                                .map_or(false, |&done| !done);
+                            let has_active_stream = self.manga_anim_streams.contains_key(&idx);
+                            if still_streaming || has_active_stream {
+                                let time = ui.input(|i| i.time);
+                                paint_loading_spinner(ui.painter(), image_rect, time);
+                            }
                         } else {
                             // Image not loaded yet - draw a placeholder
                             ui.painter().rect_filled(
@@ -4083,11 +4285,59 @@ impl ImageViewer {
     fn update_texture(&mut self, ctx: &egui::Context) -> bool {
         let mut needs_repaint = false;
 
+        // ── Drain streamed animation frames (animated WebP) ──
+        // The background thread sends individual frames as they are decoded.
+        // We append them to `self.image.frames` so the animation plays
+        // progressively — no need to wait for the full decode.
+        if let Some(ref rx) = self.anim_stream_rx {
+            let mut got_frames = false;
+            loop {
+                match rx.try_recv() {
+                    Ok(frame) => {
+                        // Only accept if path still matches what we are viewing.
+                        let path_ok = self
+                            .anim_stream_path
+                            .as_ref()
+                            .and_then(|p| self.image.as_ref().map(|img| img.path == *p))
+                            .unwrap_or(false);
+                        if path_ok {
+                            if let Some(ref mut img) = self.image {
+                                img.frames.push(frame);
+                                got_frames = true;
+                            }
+                        }
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        self.anim_stream_done = true;
+                        self.anim_stream_rx = None;
+                        self.anim_stream_path = None;
+                        break;
+                    }
+                }
+            }
+            if got_frames {
+                needs_repaint = true;
+            }
+        }
+        // While still streaming, keep polling at a high rate.
+        if !self.anim_stream_done {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        }
+
         // Handle image texture updates
         if let Some(ref mut img) = self.image {
-            // Only update animation if not paused
+            // Only update animation if not paused and we have more than one frame.
             let frame_changed = if !self.gif_paused && img.is_animated() {
-                img.update_animation()
+                // If we are still streaming and the current frame is the last
+                // available one, hold it until the next frame arrives instead of
+                // wrapping back to frame 0. Once streaming is done, normal
+                // looping resumes.
+                if !self.anim_stream_done && img.current_frame == img.frames.len() - 1 {
+                    false // wait for more frames
+                } else {
+                    img.update_animation()
+                }
             } else {
                 false
             };
@@ -6234,6 +6484,14 @@ impl ImageViewer {
                         egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                         egui::Color32::WHITE,
                     );
+
+                    // Show loading spinner while animated WebP frames are still streaming.
+                    if !self.anim_stream_done {
+                        let time = ui.input(|i| i.time);
+                        paint_loading_spinner(ui.painter(), final_rect, time);
+                        // Keep repainting so the spinner animates smoothly.
+                        ctx.request_repaint();
+                    }
                 } else if let Some(ref error) = self.error_message {
                     ui.centered_and_justified(|ui| {
                         ui.label(egui::RichText::new(error).color(egui::Color32::RED).size(18.0));
@@ -6285,6 +6543,9 @@ impl eframe::App for ImageViewer {
                     self.manga_video_players.clear();
                     self.manga_video_textures.clear();
                     self.manga_animated_images.clear();
+                    self.manga_anim_streams.clear();
+                    self.manga_anim_stream_done.clear();
+                    self.manga_anim_failed.clear();
                 }
                 
                 // Request repaint to show the new content
