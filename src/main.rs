@@ -470,6 +470,8 @@ struct ImageViewer {
     anim_stream_path: Option<PathBuf>,
     /// `true` once the background decoder has finished (sender dropped).
     anim_stream_done: bool,
+    /// Stabilized frame count for the GIF/WebP seekbar while streaming.
+    anim_seekbar_total_frames: Option<usize>,
 
     /// Per-index streaming receivers for manga mode animated WebPs.
     /// Multiple animations can stream in parallel (one per visible animated item).
@@ -480,6 +482,8 @@ struct ImageViewer {
     /// Set of manga indices that were attempted and confirmed non-animated or
     /// failed to decode, so we don't retry them forever.
     manga_anim_failed: HashSet<usize>,
+    /// Stabilized frame count for manga seekbars while streaming.
+    manga_anim_seekbar_total_frames: HashMap<usize, usize>,
 
     // ============ MANGA VIDEO CONTROLS FIELDS ============
     /// Whether seeking is active in manga mode video controls
@@ -628,9 +632,11 @@ impl Default for ImageViewer {
             anim_stream_rx: None,
             anim_stream_path: None,
             anim_stream_done: true,
+            anim_seekbar_total_frames: None,
             manga_anim_streams: HashMap::new(),
             manga_anim_stream_done: HashMap::new(),
             manga_anim_failed: HashSet::new(),
+            manga_anim_seekbar_total_frames: HashMap::new(),
 
             // Manga video controls fields
             manga_video_seeking: false,
@@ -1253,6 +1259,7 @@ impl ImageViewer {
         self.anim_stream_rx = None;
         self.anim_stream_path = None;
         self.anim_stream_done = true;
+        self.anim_seekbar_total_frames = None;
 
         // Reset GIF playback state for new media
         self.gif_paused = false;
@@ -1306,6 +1313,7 @@ impl ImageViewer {
                 self.anim_stream_rx = None;
                 self.anim_stream_path = None;
                 self.anim_stream_done = true;
+                self.anim_seekbar_total_frames = None;
 
                 // Load as image with configured filters.
                 // For animated WebP we only decode the FIRST frame here so the
@@ -1334,6 +1342,9 @@ impl ImageViewer {
                                 self.anim_stream_rx = Some(rx);
                                 self.anim_stream_path = Some(path.to_path_buf());
                                 self.anim_stream_done = false;
+                                self.anim_seekbar_total_frames = Some(
+                                    self.image.as_ref().map(|i| i.frame_count()).unwrap_or(1),
+                                );
                             }
                         }
                     }
@@ -1993,6 +2004,7 @@ impl ImageViewer {
         self.manga_anim_streams.clear();
         self.manga_anim_stream_done.clear();
         self.manga_anim_failed.clear();
+        self.manga_anim_seekbar_total_frames.clear();
 
         self.manga_total_height_cache_valid = false;
         self.manga_layout_offsets.clear();
@@ -2295,6 +2307,14 @@ impl ImageViewer {
                             self.manga_animated_images.insert(idx, img);
                         }
                     }
+                    let base_frames = self
+                        .manga_animated_images
+                        .get(&idx)
+                        .map(|img| img.frame_count())
+                        .unwrap_or(1);
+                    self.manga_anim_seekbar_total_frames
+                        .entry(idx)
+                        .or_insert(base_frames);
                 } else {
                     // Not actually an animated WebP — mark as failed so we don't retry.
                     self.manga_anim_failed.insert(idx);
@@ -2326,6 +2346,7 @@ impl ImageViewer {
             if disconnected {
                 self.manga_anim_streams.remove(&idx);
                 self.manga_anim_stream_done.insert(idx, true);
+                self.manga_anim_seekbar_total_frames.remove(&idx);
             }
         }
 
@@ -2411,6 +2432,7 @@ impl ImageViewer {
             self.manga_animated_images.remove(&idx);
             self.manga_anim_streams.remove(&idx);
             self.manga_anim_stream_done.remove(&idx);
+            self.manga_anim_seekbar_total_frames.remove(&idx);
         }
 
         needs_repaint
@@ -4312,6 +4334,7 @@ impl ImageViewer {
                         self.anim_stream_done = true;
                         self.anim_stream_rx = None;
                         self.anim_stream_path = None;
+                        self.anim_seekbar_total_frames = None;
                         break;
                     }
                 }
@@ -5297,7 +5320,21 @@ impl ImageViewer {
         let frame_count = img.frame_count();
         let current_frame = img.current_frame_index();
         let total_duration_ms = img.total_duration_ms();
-        let position_fraction = img.position_fraction() as f32;
+        let mut display_frame_count = frame_count;
+        if !self.anim_stream_done {
+            let base = self.anim_seekbar_total_frames.unwrap_or(frame_count.max(1));
+            display_frame_count = base.max(current_frame + 1).max(1);
+            self.anim_seekbar_total_frames = Some(display_frame_count);
+        }
+        let position_fraction = if !self.anim_stream_done {
+            if display_frame_count > 1 {
+                current_frame as f32 / (display_frame_count - 1) as f32
+            } else {
+                0.0
+            }
+        } else {
+            img.position_fraction() as f32
+        };
         let animated_label = Self::animated_image_label_for_path(
             self.image_list
                 .get(self.current_index)
@@ -5324,7 +5361,7 @@ impl ImageViewer {
             // Progress bar
             let display_fraction = if self.gif_seeking {
                 self.gif_seek_preview_frame
-                    .map(|f| f as f32 / (frame_count - 1).max(1) as f32)
+                    .map(|f| f as f32 / (display_frame_count - 1).max(1) as f32)
                     .unwrap_or(position_fraction)
             } else {
                 position_fraction
@@ -5721,7 +5758,28 @@ impl ImageViewer {
         let frame_count = img.frame_count();
         let current_frame = img.current_frame_index();
         let total_duration_ms = img.total_duration_ms();
-        let position_fraction = img.position_fraction() as f32;
+        let mut display_frame_count = frame_count;
+        let is_streaming = self.manga_anim_streams.contains_key(&gif_idx)
+            || self.manga_anim_stream_done.get(&gif_idx).map_or(false, |d| !d);
+        if is_streaming {
+            let base = self
+                .manga_anim_seekbar_total_frames
+                .get(&gif_idx)
+                .copied()
+                .unwrap_or(frame_count.max(1));
+            display_frame_count = base.max(current_frame + 1).max(1);
+            self.manga_anim_seekbar_total_frames
+                .insert(gif_idx, display_frame_count);
+        }
+        let position_fraction = if is_streaming {
+            if display_frame_count > 1 {
+                current_frame as f32 / (display_frame_count - 1) as f32
+            } else {
+                0.0
+            }
+        } else {
+            img.position_fraction() as f32
+        };
         let animated_label = Self::animated_image_label_for_path(self.image_list.get(gif_idx));
 
         ui.vertical(|ui| {
@@ -5744,7 +5802,7 @@ impl ImageViewer {
             // Progress bar
             let display_fraction = if self.gif_seeking {
                 self.gif_seek_preview_frame
-                    .map(|f| f as f32 / (frame_count - 1).max(1) as f32)
+                    .map(|f| f as f32 / (display_frame_count - 1).max(1) as f32)
                     .unwrap_or(position_fraction)
             } else {
                 position_fraction
@@ -6546,6 +6604,7 @@ impl eframe::App for ImageViewer {
                     self.manga_anim_streams.clear();
                     self.manga_anim_stream_done.clear();
                     self.manga_anim_failed.clear();
+                    self.manga_anim_seekbar_total_frames.clear();
                 }
                 
                 // Request repaint to show the new content
