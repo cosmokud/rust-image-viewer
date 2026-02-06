@@ -256,10 +256,11 @@ impl LoadedImage {
         let width = decoder.width() as u32;
         let height = decoder.height() as u32;
 
-        // Memory optimization: limit maximum frames to prevent excessive RAM usage
-        // A 1920x1080 RGBA frame is ~8MB, so 50 frames = ~400MB max for large GIFs
-        // Reduced from 100 to 50 for better memory efficiency
-        const MAX_FRAMES: usize = 50;
+        // Use a memory budget instead of a hard frame-count cap so that
+        // long animations can play fully without being truncated.
+        const MAX_ANIMATION_MEMORY: usize = 512 * 1024 * 1024; // 512 MiB
+        const MAX_FRAMES_SAFETY: usize = 1000; // generous hard cap
+        let mut total_decoded_bytes: usize = 0;
         
         // Determine if we need to downscale upfront based on memory constraints
         // For large GIFs, downscale immediately to reduce per-frame memory
@@ -289,8 +290,8 @@ impl LoadedImage {
 
         let mut frame_count = 0;
         while let Some(frame) = decoder.read_next_frame().map_err(|e| format!("GIF frame error: {}", e))? {
-            // Limit frame count to prevent memory explosion
-            if frame_count >= MAX_FRAMES {
+            // Stop when we exceed the memory budget or the safety cap.
+            if frame_count >= MAX_FRAMES_SAFETY {
                 break;
             }
             
@@ -332,6 +333,8 @@ impl LoadedImage {
                 canvas.clone()
             };
 
+            total_decoded_bytes += frame_pixels.len();
+
             frames.push(ImageFrame {
                 pixels: frame_pixels,
                 width: target_width,
@@ -340,6 +343,11 @@ impl LoadedImage {
             });
             
             frame_count += 1;
+
+            // Stop if we have exceeded the memory budget.
+            if total_decoded_bytes >= MAX_ANIMATION_MEMORY {
+                break;
+            }
         }
 
         // Clean up the downscale buffer
@@ -386,19 +394,28 @@ impl LoadedImage {
 
         let mut frames = Vec::new();
 
-        // Same cap as GIF to avoid excessive memory usage.
-        const MAX_FRAMES: usize = 50;
+        // Use a memory budget instead of a hard frame-count cap so that
+        // long animations (common in WebP – often 100-500+ frames) can
+        // play from start to finish without being truncated.
+        const MAX_ANIMATION_MEMORY: usize = 512 * 1024 * 1024; // 512 MiB
+        const MAX_FRAMES_SAFETY: usize = 1000; // generous hard cap
+        let mut total_decoded_bytes: usize = 0;
 
         // Determine downscale targets once (using the first frame's dimensions later).
         let mut target_width: Option<u32> = None;
         let mut target_height: Option<u32> = None;
 
         for frame_result in frames_iter {
-            if frames.len() >= MAX_FRAMES {
+            if frames.len() >= MAX_FRAMES_SAFETY {
                 break;
             }
 
-            let frame = frame_result.map_err(|e| format!("WEBP frame error: {}", e))?;
+            // Tolerate individual frame errors – skip the bad frame and
+            // keep going so we don't lose the entire animation.
+            let frame = match frame_result {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
 
             // Extract delay in milliseconds.
             let (numer, denom) = frame.delay().numer_denom_ms();
@@ -437,12 +454,19 @@ impl LoadedImage {
                 (width, height, rgba.into_raw())
             };
 
+            total_decoded_bytes += pixels.len();
+
             frames.push(ImageFrame {
                 pixels,
                 width: final_w,
                 height: final_h,
                 delay_ms,
             });
+
+            // Stop if we have exceeded the memory budget.
+            if total_decoded_bytes >= MAX_ANIMATION_MEMORY {
+                break;
+            }
         }
 
         if frames.is_empty() {
