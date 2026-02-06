@@ -336,7 +336,3 @@ Uses borderless windowed mode rather than exclusive fullscreen, ensuring the vie
 ## License
 
 MIT License — See [LICENSE](LICENSE) for details.
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
