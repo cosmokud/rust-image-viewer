@@ -883,6 +883,19 @@ impl ImageViewer {
         }
     }
 
+    fn animated_image_label_for_path(path: Option<&PathBuf>) -> &'static str {
+        if let Some(path) = path {
+            let is_webp = path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext.eq_ignore_ascii_case("webp"))
+                .unwrap_or(false);
+            if is_webp { "WEBP" } else { "GIF" }
+        } else {
+            "GIF"
+        }
+    }
+
     fn apply_pending_window_title(&mut self, ctx: &egui::Context) {
         if let Some(title) = self.pending_window_title.take() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
@@ -5035,6 +5048,11 @@ impl ImageViewer {
         let current_frame = img.current_frame_index();
         let total_duration_ms = img.total_duration_ms();
         let position_fraction = img.position_fraction() as f32;
+        let animated_label = Self::animated_image_label_for_path(
+            self.image_list
+                .get(self.current_index)
+                .or(Some(&img.path)),
+        );
 
         ui.vertical(|ui| {
             // === Seek bar (top row) ===
@@ -5146,10 +5164,10 @@ impl ImageViewer {
                         .size(12.0)
                 );
 
-                // GIF indicator on right
+                // Animated image indicator on right
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(
-                        egui::RichText::new("GIF")
+                        egui::RichText::new(animated_label)
                             .color(egui::Color32::from_rgb(76, 175, 80))
                             .size(14.0)
                     );
@@ -5454,6 +5472,7 @@ impl ImageViewer {
         let current_frame = img.current_frame_index();
         let total_duration_ms = img.total_duration_ms();
         let position_fraction = img.position_fraction() as f32;
+        let animated_label = Self::animated_image_label_for_path(self.image_list.get(gif_idx));
 
         ui.vertical(|ui| {
             // === Seek bar (top row) ===
@@ -5566,10 +5585,10 @@ impl ImageViewer {
                         .size(12.0)
                 );
 
-                // GIF indicator on right
+                // Animated image indicator on right
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(
-                        egui::RichText::new("GIF")
+                        egui::RichText::new(animated_label)
                             .color(egui::Color32::from_rgb(76, 175, 80))
                             .size(14.0)
                     );
