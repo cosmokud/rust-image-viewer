@@ -13,7 +13,9 @@ mod video_player;
 mod windows_env;
 
 use config::{Action, Config, InputBinding, StartupWindowMode};
-use image_loader::{get_images_in_directory, get_media_type, is_supported_video, ImageFrame, LoadedImage, MediaType};
+use image_loader::{
+    get_images_in_directory, get_media_type, is_supported_video, ImageFrame, LoadedImage, MediaType,
+};
 use manga_loader::{MangaLoader, MangaMediaType, MangaTextureCache};
 #[cfg(target_os = "windows")]
 use single_instance::{FileReceiver, SingleInstanceResult};
@@ -54,7 +56,10 @@ fn paint_loading_spinner(painter: &egui::Painter, rect: egui::Rect, time: f64) {
     painter.circle_stroke(
         center,
         radius,
-        egui::Stroke::new(2.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 35)),
+        egui::Stroke::new(
+            2.0,
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 35),
+        ),
     );
 
     // Spinning arc — approximated with a polyline.
@@ -96,7 +101,8 @@ fn downscale_rgba_if_needed<'a>(
     }
 
     // Preserve aspect ratio; clamp to at least 1x1.
-    let scale = (max_texture_side as f64 / width as f64).min(max_texture_side as f64 / height as f64);
+    let scale =
+        (max_texture_side as f64 / width as f64).min(max_texture_side as f64 / height as f64);
     let new_w = ((width as f64) * scale).round().max(1.0) as u32;
     let new_h = ((height as f64) * scale).round().max(1.0) as u32;
 
@@ -371,7 +377,7 @@ struct ImageViewer {
     /// Whether we've installed extra Windows fonts for CJK filename rendering.
     /// These font files can be quite large, so we install them lazily only when needed.
     windows_cjk_fonts_installed: bool,
-    
+
     /// Whether GStreamer has been initialized (deferred until first video load)
     gstreamer_initialized: bool,
 
@@ -452,6 +458,9 @@ struct ImageViewer {
     /// Animated images (GIFs) for manga mode, keyed by image list index.
     /// These hold the LoadedImage with all frames for animation updates.
     manga_animated_images: HashMap<usize, LoadedImage>,
+    /// Index of the currently focused animated image in manga mode.
+    /// Only this item is allowed to animate/stream at a time.
+    manga_focused_anim_index: Option<usize>,
 
     // ============ GIF PLAYBACK CONTROL FIELDS ============
     /// Whether the current GIF animation is paused (for non-manga mode)
@@ -622,6 +631,7 @@ impl Default for ImageViewer {
             manga_focused_video_index: None,
             manga_max_video_players: 3, // Keep at most 3 video players alive
             manga_animated_images: HashMap::new(),
+            manga_focused_anim_index: None,
 
             // GIF playback control fields
             gif_paused: false,
@@ -680,7 +690,11 @@ impl ImageViewer {
             return;
         }
 
-        let fps = if self.fps_smoothed.is_finite() { self.fps_smoothed } else { 0.0 };
+        let fps = if self.fps_smoothed.is_finite() {
+            self.fps_smoothed
+        } else {
+            0.0
+        };
         let ms = (self.fps_last_dt_s * 1000.0).max(0.0);
         let text = format!("{fps:.0} FPS  ({ms:.1} ms)");
 
@@ -693,7 +707,9 @@ impl ImageViewer {
                 // Use a no-wrap galley + explicit rect sizing to prevent wrapping.
                 let font = egui::FontId::proportional(13.0);
                 let text_color = egui::Color32::WHITE;
-                let galley = ui.painter().layout_no_wrap(text.clone(), font.clone(), text_color);
+                let galley = ui
+                    .painter()
+                    .layout_no_wrap(text.clone(), font.clone(), text_color);
 
                 let padding_x = 10.0;
                 let padding_y = 6.0;
@@ -736,26 +752,33 @@ impl ImageViewer {
             .unwrap_or(false);
 
         let video_open = self.video_player.is_some();
-        
+
         // Check if we have an animated GIF in non-manga mode
-        let has_animated_gif = !self.manga_mode && self.image.as_ref().map_or(false, |img| img.is_animated());
-        
+        let has_animated_gif =
+            !self.manga_mode && self.image.as_ref().map_or(false, |img| img.is_animated());
+
         // Check if manga mode has active video/GIF content that needs controls
         let manga_has_video_or_anim = self.manga_mode && self.is_fullscreen && {
             let focused_idx = self.manga_get_focused_media_index();
-            let focused_type = self.manga_loader
+            let focused_type = self
+                .manga_loader
                 .as_ref()
                 .and_then(|loader| loader.get_media_type(focused_idx));
-            matches!(focused_type, Some(MangaMediaType::Video | MangaMediaType::AnimatedImage))
-                || self.manga_focused_video_index.is_some()
+            matches!(
+                focused_type,
+                Some(MangaMediaType::Video | MangaMediaType::AnimatedImage)
+            ) || self.manga_focused_video_index.is_some()
         };
-        
+
         // Any media that needs controls (video, animated GIF, or manga video/anim)
         let has_controllable_media = video_open || has_animated_gif || manga_has_video_or_anim;
 
         // Whether the zoom HUD is eligible to appear (even if it is currently hidden by auto-hide).
         let allow_zoom_bar = self.manga_mode
-            || matches!(self.current_media_type, Some(MediaType::Image | MediaType::Video));
+            || matches!(
+                self.current_media_type,
+                Some(MediaType::Image | MediaType::Video)
+            );
 
         // One combined hover zone for the bottom-right overlays (covers both the zoom HUD and manga toggle).
         // IMPORTANT: this must be based on *potential* overlay layout, not the current visibility flags.
@@ -767,7 +790,10 @@ impl ImageViewer {
         let hover_bottom_right = mouse_pos
             .map(|p| {
                 let hover_zone = egui::Rect::from_min_size(
-                    egui::pos2(screen_rect.max.x - 280.0, screen_rect.max.y - hover_zone_height),
+                    egui::pos2(
+                        screen_rect.max.x - 280.0,
+                        screen_rect.max.y - hover_zone_height,
+                    ),
                     egui::Vec2::new(280.0, hover_zone_height),
                 );
                 hover_zone.contains(p)
@@ -776,7 +802,8 @@ impl ImageViewer {
 
         // Treat these as active interaction states that should keep the overlays alive.
         let interacting_video = self.is_seeking || self.is_volume_dragging;
-        let interacting_manga_video = self.manga_video_seeking || self.manga_video_volume_dragging || self.gif_seeking;
+        let interacting_manga_video =
+            self.manga_video_seeking || self.manga_video_volume_dragging || self.gif_seeking;
         let interacting_manga_zoom = self.manga_zoom_plus_held || self.manga_zoom_minus_held;
 
         // Track whether the pointer is currently over the bottom video controls region.
@@ -785,7 +812,7 @@ impl ImageViewer {
         let over_controls_bar = mouse_pos
             .map(|p| p.y > screen_rect.height() - bar_height)
             .unwrap_or(false);
-        
+
         self.mouse_over_video_controls = has_controllable_media && over_controls_bar;
 
         let should_show = if has_controllable_media {
@@ -804,7 +831,8 @@ impl ImageViewer {
         }
 
         let visible = should_show
-            || self.video_controls_show_time.elapsed().as_secs_f32() <= self.config.bottom_overlay_hide_delay;
+            || self.video_controls_show_time.elapsed().as_secs_f32()
+                <= self.config.bottom_overlay_hide_delay;
 
         self.show_video_controls = has_controllable_media && visible;
 
@@ -877,25 +905,23 @@ impl ImageViewer {
                 let monitor = self.monitor_size_points(ctx);
                 let vid_w = vid_w as f32;
                 let vid_h = vid_h as f32;
-                
+
                 // Calculate fit zoom (same logic as images)
                 let fit_zoom = if vid_h > monitor.y {
                     (monitor.y / vid_h).clamp(0.1, self.max_zoom_factor())
                 } else {
                     1.0
                 };
-                
-                let size = egui::Vec2::new(
-                    (vid_w * fit_zoom).max(200.0),
-                    (vid_h * fit_zoom).max(150.0),
-                );
-                
+
+                let size =
+                    egui::Vec2::new((vid_w * fit_zoom).max(200.0), (vid_h * fit_zoom).max(150.0));
+
                 // Center on screen
                 let pos = egui::Pos2::new(
                     ((monitor.x - size.x) * 0.5).max(0.0),
                     ((monitor.y - size.y) * 0.5).max(0.0),
                 );
-                
+
                 // Move window on-screen with correct size
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
                 ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
@@ -954,10 +980,7 @@ impl ImageViewer {
     }
 
     fn compute_window_title_for_path(&self, path: &PathBuf) -> String {
-        let filename = path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy();
+        let filename = path.file_name().unwrap_or_default().to_string_lossy();
         if filename.is_empty() {
             "Image & Video Viewer".to_string()
         } else {
@@ -972,7 +995,11 @@ impl ImageViewer {
                 .and_then(|ext| ext.to_str())
                 .map(|ext| ext.eq_ignore_ascii_case("webp"))
                 .unwrap_or(false);
-            if is_webp { "WEBP" } else { "GIF" }
+            if is_webp {
+                "WEBP"
+            } else {
+                "GIF"
+            }
         } else {
             "GIF"
         }
@@ -985,10 +1012,7 @@ impl ImageViewer {
     }
 
     fn track_floating_window_position(&mut self, ctx: &egui::Context) {
-        let Some(pos) = ctx
-            .input(|i| i.raw.viewport().outer_rect)
-            .map(|r| r.min)
-        else {
+        let Some(pos) = ctx.input(|i| i.raw.viewport().outer_rect).map(|r| r.min) else {
             return;
         };
 
@@ -999,7 +1023,8 @@ impl ImageViewer {
         }
 
         if self.suppress_outer_pos_tracking_frames > 0 {
-            self.suppress_outer_pos_tracking_frames = self.suppress_outer_pos_tracking_frames.saturating_sub(1);
+            self.suppress_outer_pos_tracking_frames =
+                self.suppress_outer_pos_tracking_frames.saturating_sub(1);
             self.last_known_outer_pos = Some(pos);
             return;
         }
@@ -1159,11 +1184,7 @@ impl ImageViewer {
     }
 
     #[cfg(not(target_os = "windows"))]
-    fn new(
-        cc: &eframe::CreationContext<'_>,
-        path: Option<PathBuf>,
-        start_visible: bool,
-    ) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, path: Option<PathBuf>, start_visible: bool) -> Self {
         let mut viewer = Self::default();
         Self::init_viewer(&mut viewer, cc, path, start_visible);
         viewer
@@ -1233,7 +1254,7 @@ impl ImageViewer {
         // Clear previous media state.
         // For video-to-video navigation we keep the previous video texture as a placeholder
         // until the first decoded frame of the new video arrives.
-        // 
+        //
         // MEMORY OPTIMIZATION: Explicitly drop textures to release GPU memory immediately.
         // Setting to None allows Rust to drop the TextureHandle, which signals egui to
         // free the underlying GPU texture on the next frame.
@@ -1282,7 +1303,7 @@ impl ImageViewer {
             Some(MediaType::Video) => {
                 // Mark GStreamer as initialized (it will be lazily initialized on first use)
                 self.gstreamer_initialized = true;
-                
+
                 // Load as video
                 match VideoPlayer::new(
                     path,
@@ -1323,7 +1344,12 @@ impl ImageViewer {
                 let gif_filter = self.config.gif_resize_filter.to_image_filter();
                 let max_tex = self.max_texture_side;
 
-                match LoadedImage::load_first_frame_only(path, Some(max_tex), downscale_filter, gif_filter) {
+                match LoadedImage::load_first_frame_only(
+                    path,
+                    Some(max_tex),
+                    downscale_filter,
+                    gif_filter,
+                ) {
                     Ok(img) => {
                         let is_animated_webp = LoadedImage::is_animated_webp(path);
                         self.image = Some(img);
@@ -1334,17 +1360,14 @@ impl ImageViewer {
 
                         if is_animated_webp {
                             // Start streaming frames one-by-one from a background thread.
-                            if let Some(rx) = LoadedImage::start_streaming_webp(
-                                path,
-                                Some(max_tex),
-                                gif_filter,
-                            ) {
+                            if let Some(rx) =
+                                LoadedImage::start_streaming_webp(path, Some(max_tex), gif_filter)
+                            {
                                 self.anim_stream_rx = Some(rx);
                                 self.anim_stream_path = Some(path.to_path_buf());
                                 self.anim_stream_done = false;
-                                self.anim_seekbar_total_frames = Some(
-                                    self.image.as_ref().map(|i| i.frame_count()).unwrap_or(1),
-                                );
+                                self.anim_seekbar_total_frames =
+                                    Some(self.image.as_ref().map(|i| i.frame_count()).unwrap_or(1));
                             }
                         }
                     }
@@ -1365,11 +1388,11 @@ impl ImageViewer {
         if !self.is_fullscreen {
             return;
         }
-        
+
         let Some(path) = self.image_list.get(self.current_index).cloned() else {
             return;
         };
-        
+
         // Count rotation steps from the image (we track this separately since
         // the image_loader applies rotation physically to pixel data)
         let rotation_steps = if self.image.is_some() {
@@ -1382,7 +1405,7 @@ impl ImageViewer {
         } else {
             0
         };
-        
+
         let state = FullscreenViewState {
             zoom: self.zoom,
             zoom_target: self.zoom_target,
@@ -1391,23 +1414,23 @@ impl ImageViewer {
             flip_horizontal: false, // Currently not implemented in the viewer
             flip_vertical: false,   // Currently not implemented in the viewer
         };
-        
+
         self.fullscreen_view_states.insert(path, state);
     }
-    
+
     /// Restore the saved view state for a given image path (fullscreen only).
     /// Returns true if state was restored, false if no saved state exists.
     fn restore_fullscreen_view_state(&mut self, path: &PathBuf) -> bool {
         if !self.is_fullscreen {
             return false;
         }
-        
+
         if let Some(state) = self.fullscreen_view_states.get(path).cloned() {
             self.zoom = state.zoom;
             self.zoom_target = state.zoom_target;
             self.offset = state.offset;
             self.zoom_velocity = 0.0;
-            
+
             // Apply saved rotations if image was reloaded
             if let Some(ref mut img) = self.image {
                 for _ in 0..state.rotation_steps {
@@ -1417,34 +1440,35 @@ impl ImageViewer {
                     self.texture = None; // Force texture rebuild
                 }
             }
-            
+
             true
         } else {
             false
         }
     }
-    
+
     /// Update the rotation count for the current image in fullscreen state.
     /// Called after rotation actions to track cumulative rotations.
     fn update_fullscreen_rotation(&mut self, clockwise: bool) {
         if !self.is_fullscreen {
             return;
         }
-        
+
         let Some(path) = self.image_list.get(self.current_index).cloned() else {
             return;
         };
-        
-        let entry = self.fullscreen_view_states.entry(path).or_insert_with(|| {
-            FullscreenViewState {
-                zoom: self.zoom,
-                zoom_target: self.zoom_target,
-                offset: self.offset,
-                rotation_steps: 0,
-                flip_horizontal: false,
-                flip_vertical: false,
-            }
-        });
+
+        let entry =
+            self.fullscreen_view_states
+                .entry(path)
+                .or_insert_with(|| FullscreenViewState {
+                    zoom: self.zoom,
+                    zoom_target: self.zoom_target,
+                    offset: self.offset,
+                    rotation_steps: 0,
+                    flip_horizontal: false,
+                    flip_vertical: false,
+                });
 
         if clockwise {
             entry.rotation_steps = (entry.rotation_steps + 1) % 4;
@@ -1458,7 +1482,7 @@ impl ImageViewer {
         if self.image_list.is_empty() {
             return;
         }
-        
+
         // In manga mode, scroll to next image instead of loading
         if self.manga_mode && self.is_fullscreen {
             let next_index = if self.current_index + 1 >= self.image_list.len() {
@@ -1472,10 +1496,10 @@ impl ImageViewer {
             self.manga_update_preload_queue();
             return;
         }
-        
+
         // Save current view state before navigating (fullscreen only)
         self.save_current_fullscreen_view_state();
-        
+
         self.current_index = if self.current_index + 1 >= self.image_list.len() {
             0
         } else {
@@ -1490,7 +1514,7 @@ impl ImageViewer {
         if self.image_list.is_empty() {
             return;
         }
-        
+
         // In manga mode, scroll to previous image instead of loading
         if self.manga_mode && self.is_fullscreen {
             let prev_index = if self.current_index == 0 {
@@ -1504,10 +1528,10 @@ impl ImageViewer {
             self.manga_update_preload_queue();
             return;
         }
-        
+
         // Save current view state before navigating (fullscreen only)
         self.save_current_fullscreen_view_state();
-        
+
         self.current_index = if self.current_index == 0 {
             self.image_list.len() - 1
         } else {
@@ -1517,9 +1541,9 @@ impl ImageViewer {
         self.load_image(&path);
     }
 
-
     fn monitor_size_points(&self, ctx: &egui::Context) -> egui::Vec2 {
-        ctx.input(|i| i.raw.viewport().monitor_size).unwrap_or(self.screen_size)
+        ctx.input(|i| i.raw.viewport().monitor_size)
+            .unwrap_or(self.screen_size)
     }
 
     fn floating_available_size(&self, ctx: &egui::Context) -> egui::Vec2 {
@@ -1627,14 +1651,17 @@ impl ImageViewer {
                 return;
             }
         }
-        
+
         // No saved state - apply default fullscreen layout
         self.offset = egui::Vec2::ZERO;
-        
+
         // Get dimensions from either image or video
         if let Some((_, img_h)) = self.media_display_dimensions() {
             if img_h > 0 {
-                let target_h = self.monitor_size_points(ctx).y.max(ctx.screen_rect().height());
+                let target_h = self
+                    .monitor_size_points(ctx)
+                    .y
+                    .max(ctx.screen_rect().height());
                 let z = (target_h / img_h as f32).clamp(0.1, self.max_zoom_factor());
                 self.zoom = z;
                 self.zoom_target = z;
@@ -1722,8 +1749,6 @@ impl ImageViewer {
         [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0]
     }
 
-
-
     /// Zoom at a specific point
     fn zoom_at(&mut self, center: egui::Pos2, factor: f32, available_rect: egui::Rect) {
         let old_zoom = self.zoom;
@@ -1760,6 +1785,12 @@ impl ImageViewer {
             self.video_texture_dims = None;
             self.show_video_controls = false;
 
+            // Stop any non-manga animated WebP streaming; manga mode manages animation per item.
+            self.anim_stream_rx = None;
+            self.anim_stream_path = None;
+            self.anim_stream_done = true;
+            self.anim_seekbar_total_frames = None;
+
             // Reset manga video user preferences when entering manga mode
             // (they'll use config defaults initially)
             self.manga_video_user_muted = None;
@@ -1788,7 +1819,11 @@ impl ImageViewer {
             if let Some((_w, h)) = self.media_display_dimensions() {
                 let img_h = h as f32;
                 if img_h > 0.0 {
-                    let base_scale = if img_h > screen_h { screen_h / img_h } else { 1.0 };
+                    let base_scale = if img_h > screen_h {
+                        screen_h / img_h
+                    } else {
+                        1.0
+                    };
                     let desired_total_scale = screen_h / img_h;
                     let new_zoom = self.clamp_zoom(desired_total_scale / base_scale);
                     self.zoom = new_zoom;
@@ -1830,7 +1865,7 @@ impl ImageViewer {
         }
         cumulative_y
     }
-    
+
     /// Capture the current manga scroll position as a stable "top-of-viewport" anchor.
     ///
     /// This is used to prevent jitter when page heights change as we lazily discover
@@ -1988,7 +2023,7 @@ impl ImageViewer {
     fn manga_clear_cache(&mut self) {
         // Clear the texture cache
         self.manga_texture_cache.clear();
-        
+
         // Clear and reset the parallel loader
         if let Some(ref mut loader) = self.manga_loader {
             loader.clear();
@@ -1998,9 +2033,10 @@ impl ImageViewer {
         self.manga_video_players.clear();
         self.manga_video_textures.clear();
         self.manga_focused_video_index = None;
-        
+
         // Clear animated images and streaming state
         self.manga_animated_images.clear();
+        self.manga_focused_anim_index = None;
         self.manga_anim_streams.clear();
         self.manga_anim_stream_done.clear();
         self.manga_anim_failed.clear();
@@ -2054,6 +2090,27 @@ impl ImageViewer {
         best_idx
     }
 
+    /// Determine the focused animated image index in manga mode.
+    /// Returns Some(idx) only if the focused media is an animated image.
+    fn manga_get_focused_animated_index(&mut self) -> Option<usize> {
+        if !self.manga_mode || self.image_list.is_empty() {
+            return None;
+        }
+
+        let focused_idx = self.manga_get_focused_media_index();
+        let focused_is_animated = self
+            .manga_loader
+            .as_ref()
+            .and_then(|loader| loader.get_media_type(focused_idx))
+            .map_or(false, |mt| mt == MangaMediaType::AnimatedImage);
+
+        if focused_is_animated {
+            Some(focused_idx)
+        } else {
+            None
+        }
+    }
+
     /// Update manga video playback based on current scroll position.
     /// Ensures only one video plays at a time (the focused one).
     fn manga_update_video_focus(&mut self) {
@@ -2064,14 +2121,17 @@ impl ImageViewer {
         let focused_idx = self.manga_get_focused_media_index();
 
         // Check if the focused item is a video
-        let focused_is_video = self.manga_loader
+        let focused_is_video = self
+            .manga_loader
             .as_ref()
             .and_then(|loader| loader.get_media_type(focused_idx))
             .map_or(false, |mt| mt == MangaMediaType::Video);
 
         // Also check by file extension as a fallback
-        let focused_is_video = focused_is_video || 
-            self.image_list.get(focused_idx)
+        let focused_is_video = focused_is_video
+            || self
+                .image_list
+                .get(focused_idx)
                 .map_or(false, |p| is_supported_video(p));
 
         if focused_is_video {
@@ -2101,19 +2161,19 @@ impl ImageViewer {
                     if let Some(path) = self.image_list.get(focused_idx) {
                         // Ensure GStreamer is initialized
                         self.gstreamer_initialized = true;
-                        
+
                         // Use user's persisted settings, or config defaults if not set
-                        let muted = self.manga_video_user_muted.unwrap_or(self.config.video_muted_by_default);
-                        let volume = self.manga_video_user_volume.unwrap_or(self.config.video_default_volume);
-                        
-                        match VideoPlayer::new(
-                            path,
-                            muted,
-                            volume,
-                        ) {
+                        let muted = self
+                            .manga_video_user_muted
+                            .unwrap_or(self.config.video_muted_by_default);
+                        let volume = self
+                            .manga_video_user_volume
+                            .unwrap_or(self.config.video_default_volume);
+
+                        match VideoPlayer::new(path, muted, volume) {
                             Ok(mut player) => {
                                 let _ = player.play();
-                                
+
                                 // Update dimensions from video if available
                                 let dims = player.dimensions();
                                 if dims.0 > 0 && dims.1 > 0 {
@@ -2121,11 +2181,14 @@ impl ImageViewer {
                                         loader.update_video_dimensions(focused_idx, dims.0, dims.1);
                                     }
                                 }
-                                
+
                                 self.manga_video_players.insert(focused_idx, player);
                             }
                             Err(e) => {
-                                eprintln!("Failed to create video player for manga index {}: {}", focused_idx, e);
+                                eprintln!(
+                                    "Failed to create video player for manga index {}: {}",
+                                    focused_idx, e
+                                );
                             }
                         }
                     }
@@ -2156,10 +2219,15 @@ impl ImageViewer {
         }
 
         // Calculate distances and sort by distance from focused
-        let mut indexed_distances: Vec<(usize, usize)> = self.manga_video_players
+        let mut indexed_distances: Vec<(usize, usize)> = self
+            .manga_video_players
             .keys()
             .map(|&idx| {
-                let dist = if idx > focused_idx { idx - focused_idx } else { focused_idx - idx };
+                let dist = if idx > focused_idx {
+                    idx - focused_idx
+                } else {
+                    focused_idx - idx
+                };
                 (idx, dist)
             })
             .collect();
@@ -2225,7 +2293,8 @@ impl ImageViewer {
                         self.config.texture_filter_video.to_egui_options(),
                     );
 
-                    self.manga_video_textures.insert(focused_idx, (texture, w, h));
+                    self.manga_video_textures
+                        .insert(focused_idx, (texture, w, h));
                 }
             }
         }
@@ -2243,86 +2312,107 @@ impl ImageViewer {
 
         let mut needs_repaint = false;
 
+        let prev_focused = self.manga_focused_anim_index;
+        // Determine which animated image should be active (center of viewport).
+        let focused_anim_idx = self.manga_get_focused_animated_index();
+        self.manga_focused_anim_index = focused_anim_idx;
+
+        // Ensure only one animated WebP stream is active at a time.
+        // Any non-focused streams are dropped and their animations reset to the first frame.
+        let focused = focused_anim_idx;
+        let streams_to_drop: Vec<usize> = self
+            .manga_anim_streams
+            .keys()
+            .copied()
+            .filter(|idx| Some(*idx) != focused)
+            .collect();
+        for idx in &streams_to_drop {
+            let stream_done = self
+                .manga_anim_stream_done
+                .get(idx)
+                .copied()
+                .unwrap_or(true);
+
+            self.manga_anim_streams.remove(idx);
+            self.manga_anim_seekbar_total_frames.remove(idx);
+            self.manga_reset_anim_to_first_frame(ctx, *idx, stream_done);
+            if !stream_done {
+                self.manga_anim_stream_done.insert(*idx, false);
+            }
+        }
+
+        if prev_focused != focused_anim_idx {
+            if let Some(prev_idx) = prev_focused {
+                if !streams_to_drop.contains(&prev_idx) {
+                    let stream_done = self
+                        .manga_anim_stream_done
+                        .get(&prev_idx)
+                        .copied()
+                        .unwrap_or(true);
+                    self.manga_reset_anim_to_first_frame(ctx, prev_idx, stream_done);
+                }
+            }
+        }
+
         // ── Determine visible animated-image indices ──
         let viewport_top = self.manga_scroll_offset.max(0.0);
         let viewport_h = self.screen_size.y.max(1.0);
         let viewport_bottom = viewport_top + viewport_h;
         let vis_start = self.manga_index_at_y(viewport_top);
         let vis_end = self.manga_index_at_y(viewport_bottom);
-        let prefetch_radius: usize = 2; // also start streaming items just off-screen
-        let stream_start = vis_start.saturating_sub(prefetch_radius);
-        let stream_end = (vis_end + prefetch_radius).min(self.image_list.len().saturating_sub(1));
-
-        // Collect indices of visible animated images.
-        let animated_indices: Vec<usize> = (stream_start..=stream_end)
-            .filter(|&idx| {
-                self.manga_loader
-                    .as_ref()
-                    .and_then(|loader| loader.get_media_type(idx))
-                    .map_or(false, |mt| mt == MangaMediaType::AnimatedImage)
-            })
-            .collect();
-
-        // Maximum number of concurrent streaming threads.
-        const MAX_CONCURRENT_STREAMS: usize = 3;
-
-        // ── Start streaming for visible animated items that need it ──
-        for &idx in &animated_indices {
+        // ── Start streaming for the focused animated item only ──
+        if let Some(idx) = focused_anim_idx {
             // Already have the full animation?
-            if self.manga_animated_images.contains_key(&idx)
-                && self.manga_anim_stream_done.get(&idx).copied().unwrap_or(true)
+            if !(self.manga_animated_images.contains_key(&idx)
+                && self
+                    .manga_anim_stream_done
+                    .get(&idx)
+                    .copied()
+                    .unwrap_or(true))
+                // Already streaming?
+                && !self.manga_anim_streams.contains_key(&idx)
+                // Already tried and failed?
+                && !self.manga_anim_failed.contains(&idx)
             {
-                continue;
-            }
-            // Already streaming?
-            if self.manga_anim_streams.contains_key(&idx) {
-                continue;
-            }
-            // Already tried and failed?
-            if self.manga_anim_failed.contains(&idx) {
-                continue;
-            }
-            // Cap concurrent streams.
-            if self.manga_anim_streams.len() >= MAX_CONCURRENT_STREAMS {
-                break;
-            }
+                if let Some(path) = self.image_list.get(idx).cloned() {
+                    let gif_filter = self.config.gif_resize_filter.to_image_filter();
+                    let max_tex = self.max_texture_side;
 
-            if let Some(path) = self.image_list.get(idx).cloned() {
-                let gif_filter = self.config.gif_resize_filter.to_image_filter();
-                let max_tex = self.max_texture_side;
+                    if let Some(rx) =
+                        LoadedImage::start_streaming_webp(&path, Some(max_tex), gif_filter)
+                    {
+                        self.manga_anim_streams.insert(idx, rx);
+                        self.manga_anim_stream_done.insert(idx, false);
 
-                if let Some(rx) = LoadedImage::start_streaming_webp(&path, Some(max_tex), gif_filter) {
-                    self.manga_anim_streams.insert(idx, rx);
-                    self.manga_anim_stream_done.insert(idx, false);
-
-                    // Ensure there's a LoadedImage entry with at least the first frame.
-                    if !self.manga_animated_images.contains_key(&idx) {
-                        let downscale_f = FilterType::Triangle;
-                        if let Ok(img) = LoadedImage::load_first_frame_only(
-                            &path,
-                            Some(max_tex),
-                            downscale_f,
-                            gif_filter,
-                        ) {
-                            self.manga_animated_images.insert(idx, img);
+                        // Ensure there's a LoadedImage entry with at least the first frame.
+                        if !self.manga_animated_images.contains_key(&idx) {
+                            let downscale_f = FilterType::Triangle;
+                            if let Ok(img) = LoadedImage::load_first_frame_only(
+                                &path,
+                                Some(max_tex),
+                                downscale_f,
+                                gif_filter,
+                            ) {
+                                self.manga_animated_images.insert(idx, img);
+                            }
                         }
+                        let base_frames = self
+                            .manga_animated_images
+                            .get(&idx)
+                            .map(|img| img.frame_count())
+                            .unwrap_or(1);
+                        self.manga_anim_seekbar_total_frames
+                            .entry(idx)
+                            .or_insert(base_frames);
+                    } else {
+                        // Not actually an animated WebP — mark as failed so we don't retry.
+                        self.manga_anim_failed.insert(idx);
                     }
-                    let base_frames = self
-                        .manga_animated_images
-                        .get(&idx)
-                        .map(|img| img.frame_count())
-                        .unwrap_or(1);
-                    self.manga_anim_seekbar_total_frames
-                        .entry(idx)
-                        .or_insert(base_frames);
-                } else {
-                    // Not actually an animated WebP — mark as failed so we don't retry.
-                    self.manga_anim_failed.insert(idx);
                 }
             }
         }
 
-        // ── Drain frames from all active streams ──
+        // ── Drain frames from active streams ──
         let stream_indices: Vec<usize> = self.manga_anim_streams.keys().copied().collect();
         for idx in stream_indices {
             let mut disconnected = false;
@@ -2355,9 +2445,13 @@ impl ImageViewer {
             ctx.request_repaint_after(Duration::from_millis(16));
         }
 
-        // ── Update animation frames for ALL visible animated images ──
-        for &idx in &animated_indices {
-            let stream_done = self.manga_anim_stream_done.get(&idx).copied().unwrap_or(true);
+        // ── Update animation frames for the focused animated image only ──
+        for &idx in focused_anim_idx.iter() {
+            let stream_done = self
+                .manga_anim_stream_done
+                .get(&idx)
+                .copied()
+                .unwrap_or(true);
 
             if let Some(img) = self.manga_animated_images.get_mut(&idx) {
                 let frame_changed = if !self.gif_paused && img.frames.len() > 1 {
@@ -2422,7 +2516,8 @@ impl ImageViewer {
         let keep_start = vis_start.saturating_sub(5);
         let keep_end = vis_end.saturating_add(5);
 
-        let indices_to_remove: Vec<usize> = self.manga_animated_images
+        let indices_to_remove: Vec<usize> = self
+            .manga_animated_images
             .keys()
             .filter(|&&idx| idx < keep_start || idx > keep_end)
             .copied()
@@ -2433,9 +2528,55 @@ impl ImageViewer {
             self.manga_anim_streams.remove(&idx);
             self.manga_anim_stream_done.remove(&idx);
             self.manga_anim_seekbar_total_frames.remove(&idx);
+            if self.manga_focused_anim_index == Some(idx) {
+                self.manga_focused_anim_index = None;
+            }
         }
 
         needs_repaint
+    }
+
+    fn manga_reset_anim_to_first_frame(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+        stream_done: bool,
+    ) {
+        if let Some(img) = self.manga_animated_images.get_mut(&idx) {
+            if !stream_done && img.frames.len() > 1 {
+                img.frames.truncate(1);
+            }
+            img.current_frame = 0;
+            img.last_frame_time = Instant::now();
+
+            // Force the texture back to the first frame so off-focus items stay static.
+            let frame = img.current_frame_data();
+            let (w, h, pixels) = downscale_rgba_if_needed(
+                frame.width,
+                frame.height,
+                &frame.pixels,
+                self.max_texture_side,
+                self.config.gif_resize_filter.to_image_filter(),
+            );
+            let color_image =
+                egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], pixels.as_ref());
+            let texture = ctx.load_texture(
+                format!("manga_anim_{}", idx),
+                color_image,
+                self.config.texture_filter_animated.to_egui_options(),
+            );
+            if self.manga_texture_cache.contains(idx) {
+                self.manga_texture_cache.update_texture(idx, texture, w, h);
+            } else {
+                self.manga_texture_cache.insert_with_type(
+                    idx,
+                    texture,
+                    w,
+                    h,
+                    MangaMediaType::AnimatedImage,
+                );
+            }
+        }
     }
 
     /// Check if a manga item at the given index is a video/animated content.
@@ -2444,7 +2585,9 @@ impl ImageViewer {
         self.manga_loader
             .as_ref()
             .and_then(|loader| loader.get_media_type(index))
-            .map_or(false, |mt| matches!(mt, MangaMediaType::Video | MangaMediaType::AnimatedImage))
+            .map_or(false, |mt| {
+                matches!(mt, MangaMediaType::Video | MangaMediaType::AnimatedImage)
+            })
     }
 
     /// Update the preload queue based on current scroll position
@@ -2485,10 +2628,16 @@ impl ImageViewer {
         // Scale the dimension cache window based on visible pages for better coverage
         let scrolling_up = self.manga_scroll_offset < prev_scroll_pos - 0.5;
         let dim_scale = (visible_page_count as f32 / 2.0).max(1.0) as usize;
-        let (behind, ahead) = if scrolling_up { 
-            (80usize.saturating_mul(dim_scale).min(200), 20usize.saturating_mul(dim_scale).min(100)) 
-        } else { 
-            (20usize.saturating_mul(dim_scale).min(100), 80usize.saturating_mul(dim_scale).min(200)) 
+        let (behind, ahead) = if scrolling_up {
+            (
+                80usize.saturating_mul(dim_scale).min(200),
+                20usize.saturating_mul(dim_scale).min(100),
+            )
+        } else {
+            (
+                20usize.saturating_mul(dim_scale).min(100),
+                80usize.saturating_mul(dim_scale).min(200),
+            )
         };
 
         let cache_start = current_visible_index.saturating_sub(behind);
@@ -2519,14 +2668,14 @@ impl ImageViewer {
         } else {
             (16, 8)
         };
-        
+
         // Apply scroll direction bias to eviction
-        let (final_keep_behind, final_keep_ahead) = if scrolling_up { 
+        let (final_keep_behind, final_keep_ahead) = if scrolling_up {
             (keep_ahead, keep_behind) // Keep more behind when scrolling up
-        } else { 
+        } else {
             (keep_behind, keep_ahead) // Keep more ahead when scrolling down
         };
-        
+
         let keep_start = current_visible_index.saturating_sub(final_keep_behind);
         let keep_end = (current_visible_index + final_keep_ahead + 1).min(self.image_list.len());
 
@@ -2553,25 +2702,25 @@ impl ImageViewer {
 
         // Find first visible index
         let first_idx = self.manga_index_at_y(viewport_top);
-        
+
         // Count how many pages fit in the viewport
         let mut count = 0usize;
         let mut y = self.manga_page_start_y(first_idx);
-        
+
         for idx in first_idx..self.image_list.len() {
             let page_height = self.manga_page_height_cached(idx);
             let page_bottom = y + page_height;
-            
+
             // Check if page is at least partially visible
             if y < viewport_bottom && page_bottom > viewport_top {
                 count += 1;
             }
-            
+
             // Stop if we've passed the viewport
             if y >= viewport_bottom {
                 break;
             }
-            
+
             y = page_bottom;
         }
 
@@ -2600,7 +2749,7 @@ impl ImageViewer {
                 return img_h * scale;
             }
         }
-        
+
         // Fallback: estimate based on screen size (assume 100% screen height at zoom 1.0)
         self.screen_size.y * self.zoom
     }
@@ -2626,7 +2775,7 @@ impl ImageViewer {
                 return img_w * scale;
             }
         }
-        
+
         // Fallback: estimate based on screen size (assume 2:3 aspect for manga)
         self.screen_size.y * 0.67 * self.zoom
     }
@@ -2677,8 +2826,9 @@ impl ImageViewer {
 
             // Use appropriate texture filter based on media type
             // Videos and animated images use the animated filter for smoother playback
-            let texture_options = if decoded.media_type == MangaMediaType::AnimatedImage 
-                || decoded.media_type == MangaMediaType::Video {
+            let texture_options = if decoded.media_type == MangaMediaType::AnimatedImage
+                || decoded.media_type == MangaMediaType::Video
+            {
                 self.config.texture_filter_animated.to_egui_options()
             } else {
                 self.config.texture_filter_static.to_egui_options()
@@ -2769,7 +2919,9 @@ impl ImageViewer {
     /// Find the page index that contains absolute strip coordinate `y`.
     fn manga_index_at_y(&mut self, y: f32) -> usize {
         if !self.manga_mode || self.image_list.is_empty() {
-            return self.current_index.min(self.image_list.len().saturating_sub(1));
+            return self
+                .current_index
+                .min(self.image_list.len().saturating_sub(1));
         }
 
         self.manga_ensure_layout_cache();
@@ -2780,7 +2932,11 @@ impl ImageViewer {
         }
 
         let total = *self.manga_layout_offsets.last().unwrap_or(&0.0);
-        let y = if y.is_finite() { y.clamp(0.0, total.max(0.0)) } else { 0.0 };
+        let y = if y.is_finite() {
+            y.clamp(0.0, total.max(0.0))
+        } else {
+            0.0
+        };
 
         // Use only start offsets (len entries). Find insertion point for start <= y.
         let starts = &self.manga_layout_offsets[..len];
@@ -2815,14 +2971,16 @@ impl ImageViewer {
         let total_height = self.manga_total_height();
         let visible_height = self.screen_size.y;
         let max_scroll = (total_height - visible_height).max(0.0);
-        
+
         self.manga_scroll_target = (self.manga_scroll_target + delta).clamp(0.0, max_scroll);
     }
 
     /// Compute the most visible manga page index for the current scroll offset.
     fn manga_visible_index(&mut self) -> usize {
         if !self.manga_mode || self.image_list.is_empty() {
-            return self.current_index.min(self.image_list.len().saturating_sub(1));
+            return self
+                .current_index
+                .min(self.image_list.len().saturating_sub(1));
         }
 
         let visible_h = self.screen_size.y.max(1.0);
@@ -2834,7 +2992,9 @@ impl ImageViewer {
     /// This is the correct basis for PageUp/PageDown so we never skip files.
     fn manga_top_index(&mut self) -> usize {
         if !self.manga_mode || self.image_list.is_empty() {
-            return self.current_index.min(self.image_list.len().saturating_sub(1));
+            return self
+                .current_index
+                .min(self.image_list.len().saturating_sub(1));
         }
         self.manga_index_at_y(self.manga_scroll_offset.max(0.0))
     }
@@ -2862,7 +3022,7 @@ impl ImageViewer {
     ///
     /// Intended for ArrowLeft in manga mode: move to the previous file and animate
     /// the scroll to align its top with the viewport top.
-    /// 
+    ///
     /// Special behavior: If the top of the current image is not visible (we've scrolled
     /// down within it), first scroll up to show the top of the current image instead
     /// of navigating to the previous image.
@@ -2875,16 +3035,16 @@ impl ImageViewer {
         // viewport actually crosses the next page boundary. Use `current_index` as a
         // forward-looking destination so holding the key can continue stepping.
         let current = self.manga_top_index().min(self.current_index);
-        
+
         // Check if the top of the current image is visible.
         // The top is visible if the scroll offset is at or before the image's start position.
         let current_image_start_y = self.manga_page_start_y(current);
         let viewport_top = self.manga_scroll_offset.max(0.0);
-        
+
         // Use a small tolerance to avoid floating point precision issues
         const TOLERANCE: f32 = 1.0;
         let top_is_visible = viewport_top <= current_image_start_y + TOLERANCE;
-        
+
         if !top_is_visible {
             // Top of current image is not visible - scroll to show it instead of navigating
             self.manga_scroll_target = current_image_start_y;
@@ -2892,7 +3052,7 @@ impl ImageViewer {
             self.manga_update_preload_queue();
             return;
         }
-        
+
         // Top is already visible, navigate to the previous image
         if current == 0 {
             return;
@@ -2910,7 +3070,12 @@ impl ImageViewer {
                 let start = target.saturating_sub(30);
                 let end = (target + 60).min(len);
                 loader.request_dimensions_range(&self.image_list, start, end);
-                loader.update_preload_queue(&self.image_list, target, self.screen_size.y, self.max_texture_side);
+                loader.update_preload_queue(
+                    &self.image_list,
+                    target,
+                    self.screen_size.y,
+                    self.max_texture_side,
+                );
             }
         }
 
@@ -2944,9 +3109,9 @@ impl ImageViewer {
     ///
     /// Intended for ArrowRight in manga mode: move to the next file and animate
     /// the scroll to align its top with the viewport top.
-    /// 
+    ///
     /// Special behavior: If the bottom of the current image is not visible (we haven't
-    /// scrolled far enough to see it), first scroll down to show the bottom of the 
+    /// scrolled far enough to see it), first scroll down to show the bottom of the
     /// current image instead of navigating to the next image.
     fn manga_page_down_smooth(&mut self) {
         if !self.manga_mode {
@@ -2961,7 +3126,7 @@ impl ImageViewer {
         // the top index won't update until we reach the destination. Use `current_index`
         // as a forward-looking anchor so holding ArrowRight continues stepping.
         let current = self.manga_top_index().max(self.current_index);
-        
+
         // Check if the bottom of the current image is visible.
         // The bottom is visible if viewport_bottom >= image_end_y
         let current_image_start_y = self.manga_page_start_y(current);
@@ -2969,11 +3134,11 @@ impl ImageViewer {
         let current_image_end_y = current_image_start_y + current_image_height;
         let viewport_top = self.manga_scroll_offset.max(0.0);
         let viewport_bottom = viewport_top + self.screen_size.y;
-        
+
         // Use a small tolerance to avoid floating point precision issues
         const TOLERANCE: f32 = 1.0;
         let bottom_is_visible = viewport_bottom >= current_image_end_y - TOLERANCE;
-        
+
         if !bottom_is_visible {
             // Bottom of current image is not visible - scroll to show it instead of navigating
             // Scroll so that the bottom of the current image aligns with the bottom of the viewport
@@ -2985,7 +3150,7 @@ impl ImageViewer {
             self.manga_update_preload_queue();
             return;
         }
-        
+
         // Bottom is already visible, navigate to the next image
         let target = (current + 1).min(self.image_list.len() - 1);
         if target == current {
@@ -3003,7 +3168,12 @@ impl ImageViewer {
             let start = target.saturating_sub(30);
             let end = (target + 60).min(len);
             loader.request_dimensions_range(&self.image_list, start, end);
-            loader.update_preload_queue(&self.image_list, target, self.screen_size.y, self.max_texture_side);
+            loader.update_preload_queue(
+                &self.image_list,
+                target,
+                self.screen_size.y,
+                self.max_texture_side,
+            );
         }
 
         // Still run the standard queue update (throttled) for eviction bookkeeping.
@@ -3035,7 +3205,12 @@ impl ImageViewer {
                 let start = target.saturating_sub(30);
                 let end = (target + 60).min(len);
                 loader.request_dimensions_range(&self.image_list, start, end);
-                loader.update_preload_queue(&self.image_list, target, self.screen_size.y, self.max_texture_side);
+                loader.update_preload_queue(
+                    &self.image_list,
+                    target,
+                    self.screen_size.y,
+                    self.max_texture_side,
+                );
             }
         }
 
@@ -3071,7 +3246,12 @@ impl ImageViewer {
             let start = target.saturating_sub(30);
             let end = (target + 60).min(len);
             loader.request_dimensions_range(&self.image_list, start, end);
-            loader.update_preload_queue(&self.image_list, target, self.screen_size.y, self.max_texture_side);
+            loader.update_preload_queue(
+                &self.image_list,
+                target,
+                self.screen_size.y,
+                self.max_texture_side,
+            );
         }
 
         self.manga_update_preload_queue();
@@ -3177,8 +3357,8 @@ impl ImageViewer {
         // Maintain a smoothed velocity estimate for momentum/idle detection.
         let instant_velocity = (self.manga_scroll_offset - prev_offset) / dt.max(0.001);
         let velocity_alpha = 0.35;
-        self.manga_scroll_velocity = self.manga_scroll_velocity * (1.0 - velocity_alpha)
-            + instant_velocity * velocity_alpha;
+        self.manga_scroll_velocity =
+            self.manga_scroll_velocity * (1.0 - velocity_alpha) + instant_velocity * velocity_alpha;
 
         // Update current_index based on scroll position (lightweight, no I/O)
         self.manga_update_current_index();
@@ -3228,7 +3408,11 @@ impl ImageViewer {
         let margin = 16.0;
 
         // If video controls are visible, lift the manga button above them.
-        let video_controls_offset = if self.show_video_controls { 56.0 + 8.0 } else { 0.0 };
+        let video_controls_offset = if self.show_video_controls {
+            56.0 + 8.0
+        } else {
+            0.0
+        };
 
         // Position: bottom-right, above the zoom bar if it's visible, with scrollbar padding
         let y_offset = if self.show_manga_zoom_bar { 48.0 } else { 0.0 };
@@ -3241,7 +3425,11 @@ impl ImageViewer {
             .fixed_pos(button_pos)
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
-                let label = if self.manga_mode { "Long Strip: ON" } else { "Long Strip: OFF" };
+                let label = if self.manga_mode {
+                    "Long Strip: ON"
+                } else {
+                    "Long Strip: OFF"
+                };
 
                 let (rect, response) = ui.allocate_exact_size(button_size, egui::Sense::click());
                 let bg_color = if response.hovered() {
@@ -3277,7 +3465,10 @@ impl ImageViewer {
 
         // Only show for viewable media (including manga mode)
         if !self.manga_mode
-            && !matches!(self.current_media_type, Some(MediaType::Image | MediaType::Video))
+            && !matches!(
+                self.current_media_type,
+                Some(MediaType::Image | MediaType::Video)
+            )
         {
             self.show_manga_zoom_bar = false;
             // Reset hold states when bar is hidden
@@ -3306,27 +3497,31 @@ impl ImageViewer {
         let is_holding_button = self.manga_zoom_plus_held || self.manga_zoom_minus_held;
 
         // If video controls are visible, lift the zoom HUD above them.
-        let video_controls_offset = if self.show_video_controls { 56.0 + 8.0 } else { 0.0 };
+        let video_controls_offset = if self.show_video_controls {
+            56.0 + 8.0
+        } else {
+            0.0
+        };
 
         // Calculate zoom change from held buttons BEFORE drawing UI
         let mut zoom_delta_from_hold: f32 = 0.0;
-        
+
         if is_holding_button && primary_down {
             // Calculate acceleration based on hold duration
             let hold_duration = self.manga_zoom_hold_start.elapsed().as_secs_f32();
-            
+
             // Slower zoom: starts at 0.5% per frame, increases to 2% after 1 second
             let base_speed = 0.005; // 0.5% per frame at 60fps = 30% per second
             let acceleration = (hold_duration * 2.0).min(3.0); // Up to 3x acceleration
             let speed = base_speed * (1.0 + acceleration);
-            
+
             if self.manga_zoom_plus_held {
                 zoom_delta_from_hold = speed;
             } else if self.manga_zoom_minus_held {
                 zoom_delta_from_hold = -speed;
             }
         }
-        
+
         // Apply zoom from hold before drawing
         if zoom_delta_from_hold != 0.0 {
             let old_zoom = self.zoom.max(0.0001);
@@ -3336,26 +3531,26 @@ impl ImageViewer {
                 1.0 / (1.0 - zoom_delta_from_hold)
             };
             let new_zoom = self.clamp_zoom(self.zoom * factor);
-            
+
             if (new_zoom - old_zoom).abs() > 0.0001 {
                 let zoom_ratio = new_zoom / old_zoom;
-                
+
                 if self.manga_mode {
                     // CRITICAL FIX: Use index-based anchoring for stable zooming with varying image sizes.
                     // Capture which image is at the center and the fractional position within it BEFORE zoom.
                     let center_anchor = self.manga_capture_center_anchor();
-                    
+
                     // Apply the new zoom level
                     self.zoom = new_zoom;
                     self.zoom_target = new_zoom;
                     self.zoom_velocity = 0.0;
                     self.manga_total_height_cache_valid = false;
-                    
+
                     // Re-apply the anchor to keep the same image position at the center
                     if let Some(anchor) = center_anchor {
                         self.manga_apply_center_anchor(anchor);
                     }
-                    
+
                     self.manga_update_preload_queue();
                 } else {
                     // Non-manga mode: simple ratio-based offset adjustment
@@ -3365,7 +3560,7 @@ impl ImageViewer {
                     self.offset = self.offset * zoom_ratio;
                 }
             }
-            
+
             ctx.request_repaint(); // Ensure continuous updates while holding
         }
 
@@ -3392,13 +3587,15 @@ impl ImageViewer {
                     ui.horizontal(|ui| {
                         // Simple minus button
                         let minus_btn = egui::Button::new(
-                            egui::RichText::new("−").color(egui::Color32::WHITE).size(16.0)
+                            egui::RichText::new("−")
+                                .color(egui::Color32::WHITE)
+                                .size(16.0),
                         )
                         .fill(egui::Color32::TRANSPARENT)
                         .stroke(egui::Stroke::NONE);
-                        
+
                         let minus_resp = ui.add_sized([24.0, 24.0], minus_btn);
-                        
+
                         if minus_resp.is_pointer_button_down_on() {
                             if !self.manga_zoom_minus_held {
                                 self.manga_zoom_minus_held = true;
@@ -3419,27 +3616,27 @@ impl ImageViewer {
                             .show_value(false)
                             .clamping(egui::SliderClamping::Always);
                         let slider_resp = ui.add_sized([110.0, 24.0], slider);
-                        
+
                         if slider_resp.changed() && slider_resp.dragged() {
                             let old_zoom = self.zoom.max(0.0001);
                             let new_zoom = self.clamp_zoom(slider_value);
-                            
+
                             if (new_zoom - old_zoom).abs() > 0.0001 {
                                 let zoom_ratio = new_zoom / old_zoom;
-                                
+
                                 if self.manga_mode {
                                     // CRITICAL FIX: Use index-based anchoring for stable zooming with varying image sizes.
                                     let center_anchor = self.manga_capture_center_anchor();
-                                    
+
                                     self.zoom = new_zoom;
                                     self.zoom_target = new_zoom;
                                     self.zoom_velocity = 0.0;
                                     self.manga_total_height_cache_valid = false;
-                                    
+
                                     if let Some(anchor) = center_anchor {
                                         self.manga_apply_center_anchor(anchor);
                                     }
-                                    
+
                                     self.manga_update_preload_queue();
                                 } else {
                                     self.zoom = new_zoom;
@@ -3448,20 +3645,22 @@ impl ImageViewer {
                                     self.offset = self.offset * zoom_ratio;
                                 }
                             }
-                            
+
                             self.manga_zoom_plus_held = false;
                             self.manga_zoom_minus_held = false;
                         }
 
                         // Simple plus button
                         let plus_btn = egui::Button::new(
-                            egui::RichText::new("+").color(egui::Color32::WHITE).size(16.0)
+                            egui::RichText::new("+")
+                                .color(egui::Color32::WHITE)
+                                .size(16.0),
                         )
                         .fill(egui::Color32::TRANSPARENT)
                         .stroke(egui::Stroke::NONE);
-                        
+
                         let plus_resp = ui.add_sized([24.0, 24.0], plus_btn);
-                        
+
                         if plus_resp.is_pointer_button_down_on() {
                             if !self.manga_zoom_plus_held {
                                 self.manga_zoom_plus_held = true;
@@ -3477,12 +3676,12 @@ impl ImageViewer {
                         }
 
                         ui.add_space(4.0);
-                        
+
                         // Zoom percentage label
                         ui.label(
                             egui::RichText::new(format!("{:.0}%", (display_zoom * 100.0).round()))
                                 .color(egui::Color32::from_rgb(200, 200, 200))
-                                .size(12.0)
+                                .size(12.0),
                         );
                     });
                 });
@@ -3498,23 +3697,23 @@ impl ImageViewer {
         } else {
             self.clamp_zoom(self.zoom / step)
         };
-        
+
         if (new_zoom - old_zoom).abs() > 0.0001 {
             // CRITICAL FIX: Use index-based anchoring for stable zooming with varying image sizes.
             // Capture which image is at the center and the fractional position within it BEFORE zoom.
             let center_anchor = self.manga_capture_center_anchor();
-            
+
             // Apply the new zoom level
             self.zoom = new_zoom;
             self.zoom_target = new_zoom;
             self.zoom_velocity = 0.0;
             self.manga_total_height_cache_valid = false;
-            
+
             // Re-apply the anchor to keep the same image position at the center
             if let Some(anchor) = center_anchor {
                 self.manga_apply_center_anchor(anchor);
             }
-            
+
             self.manga_update_preload_queue();
         }
     }
@@ -3557,14 +3756,21 @@ impl ImageViewer {
         let pointer_pos = ctx.input(|i| i.pointer.hover_pos());
         let primary_down = ctx.input(|i| i.pointer.button_down(egui::PointerButton::Primary));
         let primary_pressed = ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary));
-        let primary_released = ctx.input(|i| i.pointer.button_released(egui::PointerButton::Primary));
-        let primary_double_clicked = ctx.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary));
+        let primary_released =
+            ctx.input(|i| i.pointer.button_released(egui::PointerButton::Primary));
+        let primary_double_clicked = ctx.input(|i| {
+            i.pointer
+                .button_double_clicked(egui::PointerButton::Primary)
+        });
         let pointer_delta = ctx.input(|i| i.pointer.delta());
-        let secondary_clicked = ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Secondary));
+        let secondary_clicked =
+            ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Secondary));
 
         // Avoid triggering manga interactions while selecting/copying title-bar text.
         // IMPORTANT: allow click-through on the empty title bar area.
-        let title_ui_blocking = self.mouse_over_window_buttons || self.mouse_over_title_text || self.title_text_dragging;
+        let title_ui_blocking = self.mouse_over_window_buttons
+            || self.mouse_over_title_text
+            || self.title_text_dragging;
 
         // Wheel normalization (mouse vs trackpad):
         // - Mouse wheels are usually "line" deltas (1.0 per notch)
@@ -3577,7 +3783,12 @@ impl ImageViewer {
             let mut ctrl = 0.0f32;
 
             for e in &i.raw.events {
-                let egui::Event::MouseWheel { unit, delta, modifiers } = e else {
+                let egui::Event::MouseWheel {
+                    unit,
+                    delta,
+                    modifiers,
+                } = e
+                else {
                     continue;
                 };
 
@@ -3589,10 +3800,15 @@ impl ImageViewer {
 
                 let mut steps = match unit {
                     egui::MouseWheelUnit::Line => dy,
-                    egui::MouseWheelUnit::Page => dy * (screen_height / MANGA_WHEEL_POINTS_PER_LINE).max(1.0),
+                    egui::MouseWheelUnit::Page => {
+                        dy * (screen_height / MANGA_WHEEL_POINTS_PER_LINE).max(1.0)
+                    }
                     egui::MouseWheelUnit::Point => dy / MANGA_WHEEL_POINTS_PER_LINE,
                 };
-                steps = steps.clamp(-MANGA_WHEEL_MAX_STEPS_PER_EVENT, MANGA_WHEEL_MAX_STEPS_PER_EVENT);
+                steps = steps.clamp(
+                    -MANGA_WHEEL_MAX_STEPS_PER_EVENT,
+                    MANGA_WHEEL_MAX_STEPS_PER_EVENT,
+                );
 
                 if modifiers.ctrl {
                     ctrl += steps;
@@ -3608,15 +3824,18 @@ impl ImageViewer {
         // Remove wheel events so other widgets don't accidentally react to them in the same frame.
         if wheel_steps != 0.0 || wheel_steps_ctrl != 0.0 {
             ctx.input_mut(|i| {
-                i.raw.events.retain(|e| !matches!(e, egui::Event::MouseWheel { .. }));
+                i.raw
+                    .events
+                    .retain(|e| !matches!(e, egui::Event::MouseWheel { .. }));
             });
         }
 
         // Handle right-click to toggle play/pause for videos and GIFs in manga mode
         // Skip if pointer is over the video controls bar at the bottom
         let controls_bar_height = 56.0;
-        let over_controls = pointer_pos.map_or(false, |p| p.y > screen_height - controls_bar_height);
-        
+        let over_controls =
+            pointer_pos.map_or(false, |p| p.y > screen_height - controls_bar_height);
+
         if secondary_clicked && !over_controls && !title_ui_blocking {
             // Check if we have a focused video
             if let Some(video_idx) = self.manga_focused_video_index {
@@ -3624,13 +3843,14 @@ impl ImageViewer {
                     let _ = player.toggle_play_pause();
                 }
             } else {
-                // Check if focused item is an animated GIF
+                // Check if focused item is an animated GIF/WebP
                 let focused_idx = self.manga_get_focused_media_index();
-                let is_animated = self.manga_loader
+                let is_animated = self
+                    .manga_loader
                     .as_ref()
                     .and_then(|loader| loader.get_media_type(focused_idx))
                     .map_or(false, |mt| mt == MangaMediaType::AnimatedImage);
-                
+
                 if is_animated {
                     self.gif_paused = !self.gif_paused;
                 }
@@ -3644,22 +3864,32 @@ impl ImageViewer {
         let scrollbar_margin = 8.0;
         let scrollbar_track_height = screen_height - 20.0;
         let max_scroll = (total_height - screen_height).max(0.0);
-        let scroll_fraction = if max_scroll > 0.0 { self.manga_scroll_offset / max_scroll } else { 0.0 };
+        let scroll_fraction = if max_scroll > 0.0 {
+            self.manga_scroll_offset / max_scroll
+        } else {
+            0.0
+        };
         let scrollbar_y = 10.0 + scroll_fraction * (scrollbar_track_height - scrollbar_height);
-        
+
         let scrollbar_track_rect = egui::Rect::from_min_size(
             egui::pos2(screen_width - scrollbar_width - scrollbar_margin, 10.0),
             egui::Vec2::new(scrollbar_width, scrollbar_track_height),
         );
         let scrollbar_thumb_rect = egui::Rect::from_min_size(
-            egui::pos2(screen_width - scrollbar_width - scrollbar_margin, scrollbar_y),
+            egui::pos2(
+                screen_width - scrollbar_width - scrollbar_margin,
+                scrollbar_y,
+            ),
             egui::Vec2::new(scrollbar_width, scrollbar_height),
         );
 
         // Hover-only visibility zone for scrollbar.
         // Scrollbar: show when hovering near the right edge (or while dragging).
         let scrollbar_hover_zone = egui::Rect::from_min_max(
-            egui::pos2((screen_width - (scrollbar_width + scrollbar_margin + 40.0)).max(0.0), 0.0),
+            egui::pos2(
+                (screen_width - (scrollbar_width + scrollbar_margin + 40.0)).max(0.0),
+                0.0,
+            ),
             egui::pos2(screen_width, screen_height),
         );
 
@@ -3671,13 +3901,14 @@ impl ImageViewer {
                 || pointer_pos.map_or(false, |p| scrollbar_hover_zone.contains(p)));
         // Show page indicator whenever scrollbar is visible (same visibility logic)
         let show_page_indicator = show_scrollbar;
-        
+
         // Bottom-center page label: show when hovering near bottom of screen
         let page_label_hover_zone = egui::Rect::from_min_max(
             egui::pos2(0.0, (screen_height - 100.0).max(0.0)),
             egui::pos2(screen_width, screen_height),
         );
-        let show_bottom_page_label = pointer_pos.map_or(false, |p| page_label_hover_zone.contains(p));
+        let show_bottom_page_label =
+            pointer_pos.map_or(false, |p| page_label_hover_zone.contains(p));
 
         // Handle scrollbar dragging
         if show_scrollbar {
@@ -3688,31 +3919,33 @@ impl ImageViewer {
                 self.manga_scrollbar_dragging = false;
             }
 
-            if !title_ui_blocking && (self.manga_scrollbar_dragging || (over_scrollbar && primary_down)) {
+            if !title_ui_blocking
+                && (self.manga_scrollbar_dragging || (over_scrollbar && primary_down))
+            {
                 if let Some(pos) = pointer_pos {
                     // Calculate scroll position from mouse Y
-                    let relative_y =
-                        (pos.y - 10.0 - scrollbar_height / 2.0) / (scrollbar_track_height - scrollbar_height);
+                    let relative_y = (pos.y - 10.0 - scrollbar_height / 2.0)
+                        / (scrollbar_track_height - scrollbar_height);
                     let new_scroll = relative_y.clamp(0.0, 1.0) * max_scroll;
-                    
+
                     // Detect large jump (more than 20% of total height)
                     let jump_distance = (new_scroll - self.manga_last_scroll_position).abs();
                     let is_large_jump = jump_distance > total_height * 0.2;
-                    
+
                     if is_large_jump {
                         // Cancel pending loads - we're jumping far
                         if let Some(ref mut loader) = self.manga_loader {
                             loader.cancel_pending_loads();
                         }
                     }
-                    
+
                     self.manga_scroll_target = new_scroll;
                     self.manga_scroll_offset = new_scroll; // Instant scroll for responsiveness
                     self.manga_last_scroll_position = new_scroll;
 
                     // Keep the page indicator in sync even for instant jumps.
                     self.manga_update_current_index();
-                    
+
                     // Only update preload queue if we've settled (throttled inside)
                     self.manga_update_preload_queue();
                 }
@@ -3729,26 +3962,42 @@ impl ImageViewer {
         // - New default: Ctrl+wheel is part of zoom_in/zoom_out
         // - Backwards-compat: older configs may bind Ctrl+wheel to manga_zoom_in/out
         // If bound, we treat Ctrl+wheel (and corresponding `zoom_delta`) as zoom input.
-        let manga_ctrl_scroll_zoom_bound = self
-            .config
-            .action_bindings
-            .get(&Action::ZoomIn)
-            .map_or(false, |bindings| bindings.iter().any(|b| matches!(b, InputBinding::CtrlScrollUp)))
-            || self
-                .config
+        let manga_ctrl_scroll_zoom_bound =
+            self.config
                 .action_bindings
-                .get(&Action::ZoomOut)
-                .map_or(false, |bindings| bindings.iter().any(|b| matches!(b, InputBinding::CtrlScrollDown)))
-            || self
-                .config
-                .action_bindings
-                .get(&Action::MangaZoomIn)
-                .map_or(false, |bindings| bindings.iter().any(|b| matches!(b, InputBinding::CtrlScrollUp)))
-            || self
-                .config
-                .action_bindings
-                .get(&Action::MangaZoomOut)
-                .map_or(false, |bindings| bindings.iter().any(|b| matches!(b, InputBinding::CtrlScrollDown)));
+                .get(&Action::ZoomIn)
+                .map_or(false, |bindings| {
+                    bindings
+                        .iter()
+                        .any(|b| matches!(b, InputBinding::CtrlScrollUp))
+                })
+                || self
+                    .config
+                    .action_bindings
+                    .get(&Action::ZoomOut)
+                    .map_or(false, |bindings| {
+                        bindings
+                            .iter()
+                            .any(|b| matches!(b, InputBinding::CtrlScrollDown))
+                    })
+                || self
+                    .config
+                    .action_bindings
+                    .get(&Action::MangaZoomIn)
+                    .map_or(false, |bindings| {
+                        bindings
+                            .iter()
+                            .any(|b| matches!(b, InputBinding::CtrlScrollUp))
+                    })
+                || self
+                    .config
+                    .action_bindings
+                    .get(&Action::MangaZoomOut)
+                    .map_or(false, |bindings| {
+                        bindings
+                            .iter()
+                            .any(|b| matches!(b, InputBinding::CtrlScrollDown))
+                    });
 
         // Handle scroll/zoom (only when not over scrollbar)
         if !over_scrollbar && !title_ui_blocking {
@@ -3777,7 +4026,7 @@ impl ImageViewer {
                     let anchor_screen_y = pointer_pos
                         .map(|p| (p.y - screen_rect.min.y).clamp(0.0, screen_height))
                         .unwrap_or(screen_height * 0.5);
-                    
+
                     let anchor = self.manga_capture_anchor_at_screen_y(anchor_screen_y);
 
                     self.zoom = new_zoom;
@@ -3806,7 +4055,8 @@ impl ImageViewer {
                 let visible_height = self.screen_size.y;
                 let max_scroll = (total_height - visible_height).max(0.0);
 
-                self.manga_scroll_target = (self.manga_scroll_target + delta).clamp(0.0, max_scroll);
+                self.manga_scroll_target =
+                    (self.manga_scroll_target + delta).clamp(0.0, max_scroll);
 
                 // Let the inertial loop do the motion; keep current velocity estimate derived from motion.
                 self.manga_update_preload_queue();
@@ -3855,7 +4105,11 @@ impl ImageViewer {
 
             if let Some(img_h) = img_h {
                 if img_h > 0.0 {
-                    let new_zoom = if img_h > screen_h { 1.0 } else { self.clamp_zoom(screen_h / img_h) };
+                    let new_zoom = if img_h > screen_h {
+                        1.0
+                    } else {
+                        self.clamp_zoom(screen_h / img_h)
+                    };
 
                     if (new_zoom - old_zoom).abs() > 0.0001 {
                         // CRITICAL FIX: Use index-based anchoring for stable zooming with varying image sizes.
@@ -3917,7 +4171,8 @@ impl ImageViewer {
                 let total_height = self.manga_total_height();
                 let visible_height = self.screen_size.y;
                 let max_scroll = (total_height - visible_height).max(0.0);
-                self.manga_scroll_offset = (self.manga_scroll_offset + delta_y).clamp(0.0, max_scroll);
+                self.manga_scroll_offset =
+                    (self.manga_scroll_offset + delta_y).clamp(0.0, max_scroll);
                 self.manga_scroll_target = self.manga_scroll_offset;
 
                 // Horizontal drag = pan X.
@@ -3980,7 +4235,8 @@ impl ImageViewer {
             .unwrap_or(false);
 
         // Check if there's an active video playing
-        let has_active_video = self.manga_focused_video_index
+        let has_active_video = self
+            .manga_focused_video_index
             .and_then(|idx| self.manga_video_players.get(&idx))
             .map_or(false, |p| p.is_playing());
 
@@ -3996,13 +4252,13 @@ impl ImageViewer {
 
                 for idx in first_visible_idx..self.image_list.len() {
                     let img_height = self.manga_get_image_display_height(idx);
-                    
+
                     // Skip images that are completely above the viewport
                     if y_offset + img_height < 0.0 {
                         y_offset += img_height;
                         continue;
                     }
-                    
+
                     // Stop drawing if we're past the viewport
                     if y_offset > screen_height {
                         break;
@@ -4019,30 +4275,38 @@ impl ImageViewer {
                     );
 
                     // Check if this item is a video
-                    let is_video = self.manga_loader
+                    let is_video = self
+                        .manga_loader
                         .as_ref()
                         .and_then(|loader| loader.get_media_type(idx))
                         .map_or(false, |mt| mt == MangaMediaType::Video);
 
                     // Also check by file extension as a fallback
-                    let is_video = is_video || 
-                        self.image_list.get(idx)
+                    let is_video = is_video
+                        || self
+                            .image_list
+                            .get(idx)
                             .map_or(false, |p| is_supported_video(p));
 
                     if is_video {
                         // Video item: prioritize live video texture, fall back to first-frame thumbnail
-                        if let Some((texture, _tex_w, _tex_h)) = self.manga_video_textures.get(&idx) {
+                        if let Some((texture, _tex_w, _tex_h)) = self.manga_video_textures.get(&idx)
+                        {
                             // Live video frame available - use it
                             ui.painter().image(
                                 texture.id(),
                                 image_rect,
-                                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                egui::Rect::from_min_max(
+                                    egui::pos2(0.0, 0.0),
+                                    egui::pos2(1.0, 1.0),
+                                ),
                                 egui::Color32::WHITE,
                             );
 
                             // Draw play/pause indicator for video
                             let is_focused = self.manga_focused_video_index == Some(idx);
-                            let is_playing = self.manga_video_players
+                            let is_playing = self
+                                .manga_video_players
                                 .get(&idx)
                                 .map_or(false, |p| p.is_playing());
 
@@ -4066,12 +4330,17 @@ impl ImageViewer {
                                     egui::Color32::WHITE,
                                 );
                             }
-                        } else if let Some((texture_id, _tex_w, _tex_h)) = self.manga_texture_cache.get_texture_info(idx) {
+                        } else if let Some((texture_id, _tex_w, _tex_h)) =
+                            self.manga_texture_cache.get_texture_info(idx)
+                        {
                             // First-frame thumbnail from texture cache - use it as a preview
                             ui.painter().image(
                                 texture_id,
                                 image_rect,
-                                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                egui::Rect::from_min_max(
+                                    egui::pos2(0.0, 0.0),
+                                    egui::pos2(1.0, 1.0),
+                                ),
                                 egui::Color32::WHITE,
                             );
 
@@ -4094,11 +4363,8 @@ impl ImageViewer {
                             );
                         } else {
                             // Video not yet loaded - draw placeholder with video icon
-                            ui.painter().rect_filled(
-                                image_rect,
-                                0.0,
-                                egui::Color32::from_gray(25),
-                            );
+                            ui.painter()
+                                .rect_filled(image_rect, 0.0, egui::Color32::from_gray(25));
                             ui.painter().text(
                                 image_rect.center(),
                                 egui::Align2::CENTER_CENTER,
@@ -4109,31 +4375,35 @@ impl ImageViewer {
                         }
                     } else {
                         // Image item: use regular texture cache
-                        if let Some((texture_id, _tex_w, _tex_h)) = self.manga_texture_cache.get_texture_info(idx) {
+                        if let Some((texture_id, _tex_w, _tex_h)) =
+                            self.manga_texture_cache.get_texture_info(idx)
+                        {
                             ui.painter().image(
                                 texture_id,
                                 image_rect,
-                                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                egui::Rect::from_min_max(
+                                    egui::pos2(0.0, 0.0),
+                                    egui::pos2(1.0, 1.0),
+                                ),
                                 egui::Color32::WHITE,
                             );
 
-                            // Show loading spinner for animated images still streaming.
-                            let still_streaming = self.manga_anim_stream_done
+                            // Show loading spinner only for the focused animated image.
+                            let is_focused_anim = self.manga_focused_anim_index == Some(idx);
+                            let still_streaming = self
+                                .manga_anim_stream_done
                                 .get(&idx)
                                 .map_or(false, |&done| !done);
                             let has_active_stream = self.manga_anim_streams.contains_key(&idx);
-                            if still_streaming || has_active_stream {
+                            if is_focused_anim && (still_streaming || has_active_stream) {
                                 let time = ui.input(|i| i.time);
                                 paint_loading_spinner(ui.painter(), image_rect, time);
                             }
                         } else {
                             // Image not loaded yet - draw a placeholder
-                            ui.painter().rect_filled(
-                                image_rect,
-                                0.0,
-                                egui::Color32::from_gray(30),
-                            );
-                            
+                            ui.painter()
+                                .rect_filled(image_rect, 0.0, egui::Color32::from_gray(30));
+
                             // Draw a subtle loading spinner or indicator
                             ui.painter().text(
                                 image_rect.center(),
@@ -4144,7 +4414,7 @@ impl ImageViewer {
                             );
                         }
                     }
-                    
+
                     y_offset += img_height;
                 }
 
@@ -4156,18 +4426,15 @@ impl ImageViewer {
                         6.0,
                         egui::Color32::from_rgba_unmultiplied(50, 50, 50, 150),
                     );
-                    
+
                     // Thumb
                     let thumb_color = if self.manga_scrollbar_dragging || over_scrollbar {
                         egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200)
                     } else {
                         egui::Color32::from_rgba_unmultiplied(255, 255, 255, 100)
                     };
-                    ui.painter().rect_filled(
-                        scrollbar_thumb_rect,
-                        6.0,
-                        thumb_color,
-                    );
+                    ui.painter()
+                        .rect_filled(scrollbar_thumb_rect, 6.0, thumb_color);
                 }
 
                 // Draw page indicator (current image / total) - positioned near scrollbar
@@ -4176,12 +4443,12 @@ impl ImageViewer {
                     let visible_idx = self.current_index;
 
                     let indicator_text = format!("{} / {}", visible_idx + 1, self.image_list.len());
-                    
+
                     // Position to the left of the scrollbar, vertically centered
                     let indicator_x = screen_width - scrollbar_width - scrollbar_margin - 60.0;
                     let indicator_y = screen_height / 2.0;
                     let indicator_pos = egui::pos2(indicator_x, indicator_y);
-                    
+
                     // Background pill
                     let text_galley = ui.painter().layout_no_wrap(
                         indicator_text.clone(),
@@ -4197,7 +4464,7 @@ impl ImageViewer {
                         6.0,
                         egui::Color32::from_rgba_unmultiplied(40, 40, 40, 180),
                     );
-                    
+
                     // Text
                     ui.painter().text(
                         indicator_pos,
@@ -4207,13 +4474,13 @@ impl ImageViewer {
                         egui::Color32::WHITE,
                     );
                 }
-                
+
                 // Draw bottom-center page label (hover-only at bottom of screen)
                 if !self.image_list.is_empty() && show_bottom_page_label {
                     let visible_idx = self.current_index;
                     let indicator_text = format!("{} / {}", visible_idx + 1, self.image_list.len());
                     let indicator_pos = egui::pos2(screen_width / 2.0, screen_height - 40.0);
-                    
+
                     // Background pill
                     let text_galley = ui.painter().layout_no_wrap(
                         indicator_text.clone(),
@@ -4229,7 +4496,7 @@ impl ImageViewer {
                         6.0,
                         egui::Color32::from_rgba_unmultiplied(40, 40, 40, 180),
                     );
-                    
+
                     // Text
                     ui.painter().text(
                         indicator_pos,
@@ -4268,7 +4535,10 @@ impl ImageViewer {
 
     fn image_display_size_at_zoom(&self) -> Option<egui::Vec2> {
         let (img_w, img_h) = self.media_display_dimensions()?;
-        Some(egui::Vec2::new(img_w as f32 * self.zoom, img_h as f32 * self.zoom))
+        Some(egui::Vec2::new(
+            img_w as f32 * self.zoom,
+            img_h as f32 * self.zoom,
+        ))
     }
 
     fn request_floating_autosize(&mut self, ctx: &egui::Context) {
@@ -4307,51 +4577,65 @@ impl ImageViewer {
     fn update_texture(&mut self, ctx: &egui::Context) -> bool {
         let mut needs_repaint = false;
 
+        // In manga mode, animated WebPs are handled per-item; don't stream/play the
+        // fullscreen animation pipeline.
+        if self.manga_mode {
+            self.anim_stream_rx = None;
+            self.anim_stream_path = None;
+            self.anim_stream_done = true;
+            self.anim_seekbar_total_frames = None;
+        }
+
         // ── Drain streamed animation frames (animated WebP) ──
         // The background thread sends individual frames as they are decoded.
         // We append them to `self.image.frames` so the animation plays
         // progressively — no need to wait for the full decode.
-        if let Some(ref rx) = self.anim_stream_rx {
-            let mut got_frames = false;
-            loop {
-                match rx.try_recv() {
-                    Ok(frame) => {
-                        // Only accept if path still matches what we are viewing.
-                        let path_ok = self
-                            .anim_stream_path
-                            .as_ref()
-                            .and_then(|p| self.image.as_ref().map(|img| img.path == *p))
-                            .unwrap_or(false);
-                        if path_ok {
-                            if let Some(ref mut img) = self.image {
-                                img.frames.push(frame);
-                                got_frames = true;
+        if !self.manga_mode {
+            if let Some(ref rx) = self.anim_stream_rx {
+                let mut got_frames = false;
+                loop {
+                    match rx.try_recv() {
+                        Ok(frame) => {
+                            // Only accept if path still matches what we are viewing.
+                            let path_ok = self
+                                .anim_stream_path
+                                .as_ref()
+                                .and_then(|p| self.image.as_ref().map(|img| img.path == *p))
+                                .unwrap_or(false);
+                            if path_ok {
+                                if let Some(ref mut img) = self.image {
+                                    img.frames.push(frame);
+                                    got_frames = true;
+                                }
                             }
                         }
-                    }
-                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        self.anim_stream_done = true;
-                        self.anim_stream_rx = None;
-                        self.anim_stream_path = None;
-                        self.anim_seekbar_total_frames = None;
-                        break;
+                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            self.anim_stream_done = true;
+                            self.anim_stream_rx = None;
+                            self.anim_stream_path = None;
+                            self.anim_seekbar_total_frames = None;
+                            break;
+                        }
                     }
                 }
+                if got_frames {
+                    needs_repaint = true;
+                }
             }
-            if got_frames {
-                needs_repaint = true;
+            // While still streaming, keep polling at a high rate.
+            if !self.anim_stream_done {
+                ctx.request_repaint_after(Duration::from_millis(16));
             }
-        }
-        // While still streaming, keep polling at a high rate.
-        if !self.anim_stream_done {
-            ctx.request_repaint_after(Duration::from_millis(16));
         }
 
         // Handle image texture updates
         if let Some(ref mut img) = self.image {
+            // In manga mode, keep the main image static (first frame only).
+            let allow_animation = !self.manga_mode;
+
             // Only update animation if not paused and we have more than one frame.
-            let frame_changed = if !self.gif_paused && img.is_animated() {
+            let frame_changed = if allow_animation && !self.gif_paused && img.is_animated() {
                 // If we are still streaming and the current frame is the last
                 // available one, hold it until the next frame arrives instead of
                 // wrapping back to frame 0. Once streaming is done, normal
@@ -4364,7 +4648,7 @@ impl ImageViewer {
             } else {
                 false
             };
-            
+
             if self.texture.is_none() || frame_changed || self.texture_frame != img.current_frame {
                 let frame = img.current_frame_data();
                 // This should already be constrained in the loader, but keep this guard to
@@ -4386,26 +4670,23 @@ impl ImageViewer {
                     [w as usize, h as usize],
                     pixels.as_ref(),
                 );
-                
+
                 // Use configured texture filter based on content type
                 let texture_options = if img.is_animated() {
                     self.config.texture_filter_animated.to_egui_options()
                 } else {
                     self.config.texture_filter_static.to_egui_options()
                 };
-                
-                self.texture = Some(ctx.load_texture(
-                    "image",
-                    color_image,
-                    texture_options,
-                ));
+
+                self.texture = Some(ctx.load_texture("image", color_image, texture_options));
                 self.texture_frame = img.current_frame;
             }
 
             // Only request repaint for animated images that are not paused
-            if img.is_animated() && !self.gif_paused {
+            if allow_animation && img.is_animated() && !self.gif_paused {
                 // Calculate time until next frame to avoid unnecessary repaints
-                let current_delay = Duration::from_millis(img.frames[img.current_frame].delay_ms as u64);
+                let current_delay =
+                    Duration::from_millis(img.frames[img.current_frame].delay_ms as u64);
                 let elapsed = img.last_frame_time.elapsed();
                 if elapsed < current_delay {
                     // Schedule repaint for when the next frame is due
@@ -4443,7 +4724,7 @@ impl ImageViewer {
                     [w as usize, h as usize],
                     pixels.as_ref(),
                 );
-                
+
                 // Use configured texture filter for video
                 self.video_texture = Some(ctx.load_texture(
                     "video",
@@ -4475,13 +4756,13 @@ impl ImageViewer {
     /// Handle keyboard and mouse input
     fn handle_input(&mut self, ctx: &egui::Context) {
         let screen_width = ctx.screen_rect().width();
-        
+
         // Collect actions to run (we can't mutate self inside ctx.input closure)
         let mut actions_to_run: Vec<Action> = Vec::new();
         // Special-case: in fullscreen manga mode, middle click should exit manga mode
         // (returning to normal fullscreen viewing) rather than toggling fullscreen.
         let mut middle_click_exit_manga = false;
-        
+
         ctx.input(|input| {
             let ctrl = input.modifiers.ctrl;
             let shift = input.modifiers.shift;
@@ -4585,11 +4866,15 @@ impl ImageViewer {
             // For videos: center region triggers play/pause, side zones trigger prev/next.
             // Skip if over video controls bar
             let bar_height = 56.0;
-            let over_video_controls = self.show_video_controls 
-                && self.video_player.is_some() 
-                && input.pointer.hover_pos().map_or(false, |p| p.y > input.screen_rect.height() - bar_height);
-            
-            if input.pointer.button_clicked(egui::PointerButton::Secondary) && !over_video_controls {
+            let over_video_controls = self.show_video_controls
+                && self.video_player.is_some()
+                && input
+                    .pointer
+                    .hover_pos()
+                    .map_or(false, |p| p.y > input.screen_rect.height() - bar_height);
+
+            if input.pointer.button_clicked(egui::PointerButton::Secondary) && !over_video_controls
+            {
                 if let Some(pos) = input.pointer.hover_pos() {
                     let side_zone = screen_width / 9.0;
                     if pos.x < side_zone {
@@ -4614,13 +4899,13 @@ impl ImageViewer {
 
         // Handle center right-click for video/GIF play/pause toggle (but not over video controls)
         let has_video = self.video_player.is_some();
-        let has_animated_gif = !self.manga_mode && self.image.as_ref().map_or(false, |img| img.is_animated());
-        
+        let has_animated_gif =
+            !self.manga_mode && self.image.as_ref().map_or(false, |img| img.is_animated());
+
         let should_toggle_media = {
             let bar_height = 56.0;
-            let over_video_controls = self.show_video_controls 
-                && (has_video || has_animated_gif);
-            
+            let over_video_controls = self.show_video_controls && (has_video || has_animated_gif);
+
             ctx.input(|input| {
                 if input.pointer.button_clicked(egui::PointerButton::Secondary) {
                     if let Some(pos) = input.pointer.hover_pos() {
@@ -4647,7 +4932,7 @@ impl ImageViewer {
                 self.gif_paused = !self.gif_paused;
             }
         }
-        
+
         // Run all collected actions
         for action in actions_to_run {
             self.run_action(action);
@@ -4666,7 +4951,7 @@ impl ImageViewer {
             let arrow_right_down = ctx.input(|i| i.key_down(egui::Key::ArrowRight));
             let arrow_up = ctx.input(|i| i.key_down(egui::Key::ArrowUp));
             let arrow_down = ctx.input(|i| i.key_down(egui::Key::ArrowDown));
-            
+
             let scroll_speed = self.config.manga_arrow_scroll_speed;
 
             // Detect if this is a first press (single tap) or a repeat from holding.
@@ -4674,7 +4959,8 @@ impl ImageViewer {
             // Hold/repeat: key_pressed fires AND the key WAS down last frame.
             let arrow_left_is_first_press = arrow_left_pressed && !self.manga_arrow_left_was_down;
             let arrow_left_is_holding = arrow_left_pressed && self.manga_arrow_left_was_down;
-            let arrow_right_is_first_press = arrow_right_pressed && !self.manga_arrow_right_was_down;
+            let arrow_right_is_first_press =
+                arrow_right_pressed && !self.manga_arrow_right_was_down;
             let arrow_right_is_holding = arrow_right_pressed && self.manga_arrow_right_was_down;
 
             if arrow_left_is_first_press {
@@ -4684,7 +4970,7 @@ impl ImageViewer {
                 // Holding: use continuous scrolling (old behavior - always navigate)
                 self.manga_page_up_smooth_continuous();
             }
-            
+
             if arrow_right_is_first_press {
                 // Single tap: use the new functionality (checks if bottom is visible)
                 self.manga_page_down_smooth();
@@ -4708,7 +4994,8 @@ impl ImageViewer {
                 let total_height = self.manga_total_height();
                 let max_scroll = (total_height - self.screen_size.y).max(0.0);
                 let scroll_amount = scroll_speed * 0.5;
-                self.manga_scroll_target = (self.manga_scroll_target + scroll_amount).min(max_scroll);
+                self.manga_scroll_target =
+                    (self.manga_scroll_target + scroll_amount).min(max_scroll);
                 self.manga_update_preload_queue();
             }
 
@@ -4746,7 +5033,7 @@ impl ImageViewer {
         if !ctx.input(|i| i.pointer.button_down(egui::PointerButton::Primary)) {
             self.title_text_dragging = false;
         }
-        
+
         // Check if mouse is near top
         let mouse_pos = ctx.input(|i| i.pointer.hover_pos());
         if let Some(pos) = mouse_pos {
@@ -4804,7 +5091,8 @@ impl ImageViewer {
                     // become a "dead zone" where dragging starts instead of clicking.
                     // Make the hit-rect as tall as the bar.
                     let button_size = egui::Vec2::new(32.0, bar_height);
-                    let buttons_area_w = 5.0 + (button_size.x * 3.0) + (ui.spacing().item_spacing.x * 2.0) + 6.0;
+                    let buttons_area_w =
+                        5.0 + (button_size.x * 3.0) + (ui.spacing().item_spacing.x * 2.0) + 6.0;
                     let buttons_rect = egui::Rect::from_min_max(
                         egui::pos2(bar_rect.max.x - buttons_area_w, bar_rect.min.y),
                         bar_rect.max,
@@ -4863,7 +5151,8 @@ impl ImageViewer {
                                         .selectable(true),
                                     );
                                     over_title_text |= resp.contains_pointer();
-                                    started_title_text_drag |= resp.drag_started() || resp.dragged();
+                                    started_title_text_drag |=
+                                        resp.drag_started() || resp.dragged();
                                 } else {
                                     if let Some((w, h)) = self.media_display_dimensions() {
                                         let resp = ui.add(
@@ -4874,18 +5163,23 @@ impl ImageViewer {
                                             .selectable(true),
                                         );
                                         over_title_text |= resp.contains_pointer();
-                                        started_title_text_drag |= resp.drag_started() || resp.dragged();
+                                        started_title_text_drag |=
+                                            resp.drag_started() || resp.dragged();
                                     }
 
                                     let resp = ui.add(
                                         egui::Label::new(
-                                            egui::RichText::new(format!("{:.0}%", self.zoom * 100.0))
-                                                .color(egui::Color32::GRAY),
+                                            egui::RichText::new(format!(
+                                                "{:.0}%",
+                                                self.zoom * 100.0
+                                            ))
+                                            .color(egui::Color32::GRAY),
                                         )
                                         .selectable(true),
                                     );
                                     over_title_text |= resp.contains_pointer();
-                                    started_title_text_drag |= resp.drag_started() || resp.dragged();
+                                    started_title_text_drag |=
+                                        resp.drag_started() || resp.dragged();
 
                                     if self.video_player.is_some() {
                                         let resp = ui.add(
@@ -4896,7 +5190,8 @@ impl ImageViewer {
                                             .selectable(true),
                                         );
                                         over_title_text |= resp.contains_pointer();
-                                        started_title_text_drag |= resp.drag_started() || resp.dragged();
+                                        started_title_text_drag |=
+                                            resp.drag_started() || resp.dragged();
                                     }
 
                                     if !self.image_list.is_empty() {
@@ -4912,7 +5207,8 @@ impl ImageViewer {
                                             .selectable(true),
                                         );
                                         over_title_text |= resp.contains_pointer();
-                                        started_title_text_drag |= resp.drag_started() || resp.dragged();
+                                        started_title_text_drag |=
+                                            resp.drag_started() || resp.dragged();
                                     }
                                 }
                             }
@@ -4935,10 +5231,14 @@ impl ImageViewer {
                                 Close,
                             }
 
-                            fn window_icon_button(ui: &mut egui::Ui, kind: WindowButton) -> egui::Response {
+                            fn window_icon_button(
+                                ui: &mut egui::Ui,
+                                kind: WindowButton,
+                            ) -> egui::Response {
                                 // Match the control bar height so the hit area reaches the very top (y=0).
                                 let size = egui::Vec2::new(32.0, 32.0);
-                                let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+                                let (rect, response) =
+                                    ui.allocate_exact_size(size, egui::Sense::click());
 
                                 if ui.is_rect_visible(rect) {
                                     let bg = if response.is_pointer_button_down_on() {
@@ -4963,7 +5263,10 @@ impl ImageViewer {
                                         WindowButton::Minimize => {
                                             let y = icon_rect.max.y - 1.0;
                                             ui.painter().line_segment(
-                                                [egui::pos2(icon_rect.min.x, y), egui::pos2(icon_rect.max.x, y)],
+                                                [
+                                                    egui::pos2(icon_rect.min.x, y),
+                                                    egui::pos2(icon_rect.max.x, y),
+                                                ],
                                                 stroke,
                                             );
                                         }
@@ -5031,7 +5334,7 @@ impl ImageViewer {
         // Check if we have a video or animated GIF
         let has_video = self.video_player.is_some();
         let has_animated_gif = self.image.as_ref().map_or(false, |img| img.is_animated());
-        
+
         if !has_video && !has_animated_gif {
             return;
         }
@@ -5056,7 +5359,7 @@ impl ImageViewer {
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
                 let painter = ui.painter();
-                
+
                 // Semi-transparent background
                 painter.rect_filled(
                     bar_rect,
@@ -5089,12 +5392,14 @@ impl ImageViewer {
     fn draw_video_seekbar_inner(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.vertical(|ui| {
             // === Seek bar (top row) ===
-            let Some(player) = self.video_player.as_mut() else { return; };
+            let Some(player) = self.video_player.as_mut() else {
+                return;
+            };
 
             let position_fraction = player.position_fraction() as f32;
             let duration = player.duration();
             let position = player.position();
-            
+
             // Seek bar
             let seek_bar_height = 6.0;
             let available_width = ui.available_width();
@@ -5104,16 +5409,16 @@ impl ImageViewer {
             );
 
             let bar_inner = egui::Rect::from_min_size(
-                egui::pos2(seek_rect.min.x, seek_rect.center().y - seek_bar_height / 2.0),
+                egui::pos2(
+                    seek_rect.min.x,
+                    seek_rect.center().y - seek_bar_height / 2.0,
+                ),
                 egui::Vec2::new(seek_rect.width(), seek_bar_height),
             );
 
             // Background bar
-            ui.painter().rect_filled(
-                bar_inner,
-                3.0,
-                egui::Color32::from_gray(60),
-            );
+            ui.painter()
+                .rect_filled(bar_inner, 3.0, egui::Color32::from_gray(60));
 
             // Progress bar (freeze display while dragging to avoid flicker)
             let display_fraction = if self.is_seeking {
@@ -5127,26 +5432,25 @@ impl ImageViewer {
                     bar_inner.min,
                     egui::Vec2::new(progress_width, seek_bar_height),
                 );
-                ui.painter().rect_filled(
-                    progress_rect,
-                    3.0,
-                    egui::Color32::from_rgb(66, 133, 244),
-                );
+                ui.painter()
+                    .rect_filled(progress_rect, 3.0, egui::Color32::from_rgb(66, 133, 244));
             }
 
             // Seek handle
             let handle_x = bar_inner.min.x + progress_width;
             let handle_center = egui::pos2(handle_x, bar_inner.center().y);
-            let handle_radius = if seek_response.hovered() || seek_response.dragged() { 8.0 } else { 6.0 };
-            ui.painter().circle_filled(
-                handle_center,
-                handle_radius,
-                egui::Color32::WHITE,
-            );
+            let handle_radius = if seek_response.hovered() || seek_response.dragged() {
+                8.0
+            } else {
+                6.0
+            };
+            ui.painter()
+                .circle_filled(handle_center, handle_radius, egui::Color32::WHITE);
 
             // Handle seeking
             let primary_down = ctx.input(|i| i.pointer.button_down(egui::PointerButton::Primary));
-            let primary_released = ctx.input(|i| i.pointer.button_released(egui::PointerButton::Primary));
+            let primary_released =
+                ctx.input(|i| i.pointer.button_released(egui::PointerButton::Primary));
 
             // If the pointer is held down on the seek bar, enter seeking mode immediately.
             // This ensures "click-and-hold without moving" pauses playback.
@@ -5166,7 +5470,8 @@ impl ImageViewer {
                     .interact_pointer_pos()
                     .or_else(|| ctx.input(|i| i.pointer.hover_pos()))
                 {
-                    let seek_fraction = ((pos.x - bar_inner.min.x) / bar_inner.width()).clamp(0.0, 1.0);
+                    let seek_fraction =
+                        ((pos.x - bar_inner.min.x) / bar_inner.width()).clamp(0.0, 1.0);
 
                     let fraction_changed = self
                         .seek_preview_fraction
@@ -5187,7 +5492,8 @@ impl ImageViewer {
             // Single-click seek (no hold): seek immediately, don't change play state.
             if seek_response.clicked() && !self.is_seeking {
                 if let Some(pos) = seek_response.interact_pointer_pos() {
-                    let seek_fraction = ((pos.x - bar_inner.min.x) / bar_inner.width()).clamp(0.0, 1.0);
+                    let seek_fraction =
+                        ((pos.x - bar_inner.min.x) / bar_inner.width()).clamp(0.0, 1.0);
                     let _ = player.seek(seek_fraction as f64);
                     ctx.request_repaint();
                 }
@@ -5211,14 +5517,17 @@ impl ImageViewer {
 
             // === Bottom row: controls ===
             ui.horizontal(|ui| {
-                let Some(player) = self.video_player.as_mut() else { return; };
-                
+                let Some(player) = self.video_player.as_mut() else {
+                    return;
+                };
+
                 // Play/Pause button
                 let is_playing = player.is_playing();
-                let play_btn = ui.add(egui::Button::new(
-                    if is_playing { "⏸" } else { "▶" }
-                ).min_size(egui::vec2(32.0, 24.0)));
-                
+                let play_btn = ui.add(
+                    egui::Button::new(if is_playing { "⏸" } else { "▶" })
+                        .min_size(egui::vec2(32.0, 24.0)),
+                );
+
                 if play_btn.clicked() {
                     let _ = player.toggle_play_pause();
                 }
@@ -5226,24 +5535,31 @@ impl ImageViewer {
                 ui.add_space(8.0);
 
                 // Time display
-                let pos_str = position.map(format_duration).unwrap_or_else(|| "0:00".to_string());
-                let dur_str = duration.map(format_duration).unwrap_or_else(|| "0:00".to_string());
+                let pos_str = position
+                    .map(format_duration)
+                    .unwrap_or_else(|| "0:00".to_string());
+                let dur_str = duration
+                    .map(format_duration)
+                    .unwrap_or_else(|| "0:00".to_string());
                 ui.label(
                     egui::RichText::new(format!("{} / {}", pos_str, dur_str))
                         .color(egui::Color32::WHITE)
-                        .size(12.0)
+                        .size(12.0),
                 );
 
                 // Spacer
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let Some(player) = self.video_player.as_mut() else { return; };
-                    
+                    let Some(player) = self.video_player.as_mut() else {
+                        return;
+                    };
+
                     // Mute button
                     let is_muted = player.is_muted();
-                    let mute_btn = ui.add(egui::Button::new(
-                        if is_muted { "🔇" } else { "🔊" }
-                    ).min_size(egui::vec2(32.0, 24.0)));
-                    
+                    let mute_btn = ui.add(
+                        egui::Button::new(if is_muted { "🔇" } else { "🔊" })
+                            .min_size(egui::vec2(32.0, 24.0)),
+                    );
+
                     if mute_btn.clicked() {
                         player.toggle_mute();
                     }
@@ -5258,16 +5574,16 @@ impl ImageViewer {
                     );
 
                     let vol_bar = egui::Rect::from_min_size(
-                        egui::pos2(vol_rect.min.x, vol_rect.center().y - vol_slider_height / 2.0),
+                        egui::pos2(
+                            vol_rect.min.x,
+                            vol_rect.center().y - vol_slider_height / 2.0,
+                        ),
                         egui::Vec2::new(vol_slider_width, vol_slider_height),
                     );
 
                     // Volume background
-                    ui.painter().rect_filled(
-                        vol_bar,
-                        2.0,
-                        egui::Color32::from_gray(60),
-                    );
+                    ui.painter()
+                        .rect_filled(vol_bar, 2.0, egui::Color32::from_gray(60));
 
                     // Volume level
                     let vol_width = vol_bar.width() * volume;
@@ -5276,27 +5592,22 @@ impl ImageViewer {
                             vol_bar.min,
                             egui::Vec2::new(vol_width, vol_slider_height),
                         );
-                        ui.painter().rect_filled(
-                            vol_progress,
-                            2.0,
-                            egui::Color32::WHITE,
-                        );
+                        ui.painter()
+                            .rect_filled(vol_progress, 2.0, egui::Color32::WHITE);
                     }
 
                     // Volume handle
                     let vol_handle_x = vol_bar.min.x + vol_width;
                     let vol_handle_center = egui::pos2(vol_handle_x, vol_bar.center().y);
-                    ui.painter().circle_filled(
-                        vol_handle_center,
-                        5.0,
-                        egui::Color32::WHITE,
-                    );
+                    ui.painter()
+                        .circle_filled(vol_handle_center, 5.0, egui::Color32::WHITE);
 
                     // Handle volume changes
                     if vol_response.dragged() || vol_response.clicked() {
                         self.is_volume_dragging = true;
                         if let Some(pos) = vol_response.interact_pointer_pos() {
-                            let new_vol = ((pos.x - vol_bar.min.x) / vol_bar.width()).clamp(0.0, 1.0);
+                            let new_vol =
+                                ((pos.x - vol_bar.min.x) / vol_bar.width()).clamp(0.0, 1.0);
                             player.set_volume(new_vol as f64);
                             // Unmute when adjusting volume
                             if player.is_muted() && new_vol > 0.0 {
@@ -5314,8 +5625,12 @@ impl ImageViewer {
 
     /// Draw GIF seekbar and controls for non-manga mode
     fn draw_gif_seekbar_inner(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let Some(ref img) = self.image else { return; };
-        if !img.is_animated() { return; }
+        let Some(ref img) = self.image else {
+            return;
+        };
+        if !img.is_animated() {
+            return;
+        }
 
         let frame_count = img.frame_count();
         let current_frame = img.current_frame_index();
@@ -5336,9 +5651,7 @@ impl ImageViewer {
             img.position_fraction() as f32
         };
         let animated_label = Self::animated_image_label_for_path(
-            self.image_list
-                .get(self.current_index)
-                .or(Some(&img.path)),
+            self.image_list.get(self.current_index).or(Some(&img.path)),
         );
 
         ui.vertical(|ui| {
@@ -5351,12 +5664,16 @@ impl ImageViewer {
             );
 
             let bar_inner = egui::Rect::from_min_size(
-                egui::pos2(seek_rect.min.x, seek_rect.center().y - seek_bar_height / 2.0),
+                egui::pos2(
+                    seek_rect.min.x,
+                    seek_rect.center().y - seek_bar_height / 2.0,
+                ),
                 egui::Vec2::new(seek_rect.width(), seek_bar_height),
             );
 
             // Background bar
-            ui.painter().rect_filled(bar_inner, 3.0, egui::Color32::from_gray(60));
+            ui.painter()
+                .rect_filled(bar_inner, 3.0, egui::Color32::from_gray(60));
 
             // Progress bar
             let display_fraction = if self.gif_seeking {
@@ -5372,29 +5689,41 @@ impl ImageViewer {
                     bar_inner.min,
                     egui::Vec2::new(progress_width, seek_bar_height),
                 );
-                ui.painter().rect_filled(progress_rect, 3.0, egui::Color32::from_rgb(76, 175, 80)); // Green for GIF
+                ui.painter()
+                    .rect_filled(progress_rect, 3.0, egui::Color32::from_rgb(76, 175, 80));
+                // Green for GIF
             }
 
             // Seek handle
             let handle_x = bar_inner.min.x + progress_width;
             let handle_center = egui::pos2(handle_x, bar_inner.center().y);
-            let handle_radius = if seek_response.hovered() || seek_response.dragged() { 8.0 } else { 6.0 };
-            ui.painter().circle_filled(handle_center, handle_radius, egui::Color32::WHITE);
+            let handle_radius = if seek_response.hovered() || seek_response.dragged() {
+                8.0
+            } else {
+                6.0
+            };
+            ui.painter()
+                .circle_filled(handle_center, handle_radius, egui::Color32::WHITE);
 
             // Handle seeking
             let primary_down = ctx.input(|i| i.pointer.button_down(egui::PointerButton::Primary));
-            let primary_released = ctx.input(|i| i.pointer.button_released(egui::PointerButton::Primary));
+            let primary_released =
+                ctx.input(|i| i.pointer.button_released(egui::PointerButton::Primary));
 
             if seek_response.is_pointer_button_down_on() && !self.gif_seeking {
                 self.gif_seeking = true;
             }
 
             if self.gif_seeking && primary_down {
-                if let Some(pos) = seek_response.interact_pointer_pos().or_else(|| ctx.input(|i| i.pointer.hover_pos())) {
-                    let seek_fraction = ((pos.x - bar_inner.min.x) / bar_inner.width()).clamp(0.0, 1.0);
+                if let Some(pos) = seek_response
+                    .interact_pointer_pos()
+                    .or_else(|| ctx.input(|i| i.pointer.hover_pos()))
+                {
+                    let seek_fraction =
+                        ((pos.x - bar_inner.min.x) / bar_inner.width()).clamp(0.0, 1.0);
                     let target_frame = ((frame_count - 1) as f32 * seek_fraction).round() as usize;
                     self.gif_seek_preview_frame = Some(target_frame);
-                    
+
                     // Update the actual frame
                     if let Some(ref mut img) = self.image {
                         img.set_frame(target_frame);
@@ -5406,7 +5735,8 @@ impl ImageViewer {
 
             if seek_response.clicked() && !self.gif_seeking {
                 if let Some(pos) = seek_response.interact_pointer_pos() {
-                    let seek_fraction = ((pos.x - bar_inner.min.x) / bar_inner.width()).clamp(0.0, 1.0);
+                    let seek_fraction =
+                        ((pos.x - bar_inner.min.x) / bar_inner.width()).clamp(0.0, 1.0);
                     let target_frame = ((frame_count - 1) as f32 * seek_fraction).round() as usize;
                     if let Some(ref mut img) = self.image {
                         img.set_frame(target_frame);
@@ -5426,10 +5756,11 @@ impl ImageViewer {
             // === Bottom row: controls ===
             ui.horizontal(|ui| {
                 // Play/Pause button
-                let play_btn = ui.add(egui::Button::new(
-                    if self.gif_paused { "▶" } else { "⏸" }
-                ).min_size(egui::vec2(32.0, 24.0)));
-                
+                let play_btn = ui.add(
+                    egui::Button::new(if self.gif_paused { "▶" } else { "⏸" })
+                        .min_size(egui::vec2(32.0, 24.0)),
+                );
+
                 if play_btn.clicked() {
                     self.gif_paused = !self.gif_paused;
                 }
@@ -5447,8 +5778,8 @@ impl ImageViewer {
                         current_time,
                         duration_secs
                     ))
-                        .color(egui::Color32::WHITE)
-                        .size(12.0)
+                    .color(egui::Color32::WHITE)
+                    .size(12.0),
                 );
 
                 // Animated image indicator on right
@@ -5456,7 +5787,7 @@ impl ImageViewer {
                     ui.label(
                         egui::RichText::new(animated_label)
                             .color(egui::Color32::from_rgb(76, 175, 80))
-                            .size(14.0)
+                            .size(14.0),
                     );
                 });
             });
@@ -5477,14 +5808,14 @@ impl ImageViewer {
         }
 
         let focused_idx = self.manga_focused_video_index;
-        
+
         // Determine the type of focused media
         let focused_media_type = if let Some(idx) = focused_idx {
             self.manga_loader
                 .as_ref()
                 .and_then(|loader| loader.get_media_type(idx))
         } else {
-            // Check if current image is an animated GIF
+            // Check if current image is an animated GIF/WebP
             let current_idx = self.manga_get_focused_media_index();
             self.manga_loader
                 .as_ref()
@@ -5492,9 +5823,10 @@ impl ImageViewer {
         };
 
         // Check if we have a video playing or an animated image
-        let has_video = focused_idx.is_some() && matches!(focused_media_type, Some(MangaMediaType::Video));
+        let has_video =
+            focused_idx.is_some() && matches!(focused_media_type, Some(MangaMediaType::Video));
         let has_animated = matches!(focused_media_type, Some(MangaMediaType::AnimatedImage));
-        
+
         if !has_video && !has_animated {
             return;
         }
@@ -5513,7 +5845,7 @@ impl ImageViewer {
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
                 let painter = ui.painter();
-                
+
                 // Semi-transparent background
                 painter.rect_filled(
                     bar_rect,
@@ -5542,7 +5874,12 @@ impl ImageViewer {
     }
 
     /// Draw seekbar and controls for a video in manga mode
-    fn draw_manga_video_seekbar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, video_idx: usize) {
+    fn draw_manga_video_seekbar(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        video_idx: usize,
+    ) {
         let Some(player) = self.manga_video_players.get_mut(&video_idx) else {
             return;
         };
@@ -5561,16 +5898,21 @@ impl ImageViewer {
             );
 
             let bar_inner = egui::Rect::from_min_size(
-                egui::pos2(seek_rect.min.x, seek_rect.center().y - seek_bar_height / 2.0),
+                egui::pos2(
+                    seek_rect.min.x,
+                    seek_rect.center().y - seek_bar_height / 2.0,
+                ),
                 egui::Vec2::new(seek_rect.width(), seek_bar_height),
             );
 
             // Background bar
-            ui.painter().rect_filled(bar_inner, 3.0, egui::Color32::from_gray(60));
+            ui.painter()
+                .rect_filled(bar_inner, 3.0, egui::Color32::from_gray(60));
 
             // Progress bar
             let display_fraction = if self.manga_video_seeking {
-                self.manga_video_seek_preview_fraction.unwrap_or(position_fraction)
+                self.manga_video_seek_preview_fraction
+                    .unwrap_or(position_fraction)
             } else {
                 position_fraction
             };
@@ -5580,18 +5922,25 @@ impl ImageViewer {
                     bar_inner.min,
                     egui::Vec2::new(progress_width, seek_bar_height),
                 );
-                ui.painter().rect_filled(progress_rect, 3.0, egui::Color32::from_rgb(66, 133, 244));
+                ui.painter()
+                    .rect_filled(progress_rect, 3.0, egui::Color32::from_rgb(66, 133, 244));
             }
 
             // Seek handle
             let handle_x = bar_inner.min.x + progress_width;
             let handle_center = egui::pos2(handle_x, bar_inner.center().y);
-            let handle_radius = if seek_response.hovered() || seek_response.dragged() { 8.0 } else { 6.0 };
-            ui.painter().circle_filled(handle_center, handle_radius, egui::Color32::WHITE);
+            let handle_radius = if seek_response.hovered() || seek_response.dragged() {
+                8.0
+            } else {
+                6.0
+            };
+            ui.painter()
+                .circle_filled(handle_center, handle_radius, egui::Color32::WHITE);
 
             // Handle seeking
             let primary_down = ctx.input(|i| i.pointer.button_down(egui::PointerButton::Primary));
-            let primary_released = ctx.input(|i| i.pointer.button_released(egui::PointerButton::Primary));
+            let primary_released =
+                ctx.input(|i| i.pointer.button_released(egui::PointerButton::Primary));
 
             if seek_response.is_pointer_button_down_on() && !self.manga_video_seeking {
                 if let Some(player) = self.manga_video_players.get(&video_idx) {
@@ -5607,14 +5956,21 @@ impl ImageViewer {
             }
 
             if self.manga_video_seeking && primary_down {
-                if let Some(pos) = seek_response.interact_pointer_pos().or_else(|| ctx.input(|i| i.pointer.hover_pos())) {
-                    let seek_fraction = ((pos.x - bar_inner.min.x) / bar_inner.width()).clamp(0.0, 1.0);
-                    let fraction_changed = self.manga_video_seek_preview_fraction
+                if let Some(pos) = seek_response
+                    .interact_pointer_pos()
+                    .or_else(|| ctx.input(|i| i.pointer.hover_pos()))
+                {
+                    let seek_fraction =
+                        ((pos.x - bar_inner.min.x) / bar_inner.width()).clamp(0.0, 1.0);
+                    let fraction_changed = self
+                        .manga_video_seek_preview_fraction
                         .map_or(true, |prev| (prev - seek_fraction).abs() > 0.001);
-                    
+
                     self.manga_video_seek_preview_fraction = Some(seek_fraction);
-                    
-                    if fraction_changed && self.manga_video_last_seek_sent.elapsed() >= Duration::from_millis(50) {
+
+                    if fraction_changed
+                        && self.manga_video_last_seek_sent.elapsed() >= Duration::from_millis(50)
+                    {
                         if let Some(player) = self.manga_video_players.get_mut(&video_idx) {
                             let _ = player.seek(seek_fraction as f64);
                         }
@@ -5626,7 +5982,8 @@ impl ImageViewer {
 
             if seek_response.clicked() && !self.manga_video_seeking {
                 if let Some(pos) = seek_response.interact_pointer_pos() {
-                    let seek_fraction = ((pos.x - bar_inner.min.x) / bar_inner.width()).clamp(0.0, 1.0);
+                    let seek_fraction =
+                        ((pos.x - bar_inner.min.x) / bar_inner.width()).clamp(0.0, 1.0);
                     if let Some(player) = self.manga_video_players.get_mut(&video_idx) {
                         let _ = player.seek(seek_fraction as f64);
                     }
@@ -5642,7 +5999,7 @@ impl ImageViewer {
                 }
                 self.manga_video_seeking = false;
                 self.manga_video_last_seek_sent = Instant::now();
-                
+
                 if self.manga_video_seek_was_playing {
                     if let Some(player) = self.manga_video_players.get_mut(&video_idx) {
                         let _ = player.play();
@@ -5655,14 +6012,17 @@ impl ImageViewer {
 
             // === Bottom row: controls ===
             ui.horizontal(|ui| {
-                let Some(player) = self.manga_video_players.get_mut(&video_idx) else { return; };
-                
+                let Some(player) = self.manga_video_players.get_mut(&video_idx) else {
+                    return;
+                };
+
                 // Play/Pause button
                 let is_playing = player.is_playing();
-                let play_btn = ui.add(egui::Button::new(
-                    if is_playing { "⏸" } else { "▶" }
-                ).min_size(egui::vec2(32.0, 24.0)));
-                
+                let play_btn = ui.add(
+                    egui::Button::new(if is_playing { "⏸" } else { "▶" })
+                        .min_size(egui::vec2(32.0, 24.0)),
+                );
+
                 if play_btn.clicked() {
                     let _ = player.toggle_play_pause();
                 }
@@ -5670,24 +6030,31 @@ impl ImageViewer {
                 ui.add_space(8.0);
 
                 // Time display
-                let pos_str = position.map(format_duration).unwrap_or_else(|| "0:00".to_string());
-                let dur_str = duration.map(format_duration).unwrap_or_else(|| "0:00".to_string());
+                let pos_str = position
+                    .map(format_duration)
+                    .unwrap_or_else(|| "0:00".to_string());
+                let dur_str = duration
+                    .map(format_duration)
+                    .unwrap_or_else(|| "0:00".to_string());
                 ui.label(
                     egui::RichText::new(format!("{} / {}", pos_str, dur_str))
                         .color(egui::Color32::WHITE)
-                        .size(12.0)
+                        .size(12.0),
                 );
 
                 // Right side: volume controls
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let Some(player) = self.manga_video_players.get_mut(&video_idx) else { return; };
-                    
+                    let Some(player) = self.manga_video_players.get_mut(&video_idx) else {
+                        return;
+                    };
+
                     // Mute button
                     let is_muted = player.is_muted();
-                    let mute_btn = ui.add(egui::Button::new(
-                        if is_muted { "🔇" } else { "🔊" }
-                    ).min_size(egui::vec2(32.0, 24.0)));
-                    
+                    let mute_btn = ui.add(
+                        egui::Button::new(if is_muted { "🔇" } else { "🔊" })
+                            .min_size(egui::vec2(32.0, 24.0)),
+                    );
+
                     if mute_btn.clicked() {
                         player.toggle_mute();
                         // Persist user's mute choice for all manga videos
@@ -5704,11 +6071,15 @@ impl ImageViewer {
                     );
 
                     let vol_bar = egui::Rect::from_min_size(
-                        egui::pos2(vol_rect.min.x, vol_rect.center().y - vol_slider_height / 2.0),
+                        egui::pos2(
+                            vol_rect.min.x,
+                            vol_rect.center().y - vol_slider_height / 2.0,
+                        ),
                         egui::Vec2::new(vol_slider_width, vol_slider_height),
                     );
 
-                    ui.painter().rect_filled(vol_bar, 2.0, egui::Color32::from_gray(60));
+                    ui.painter()
+                        .rect_filled(vol_bar, 2.0, egui::Color32::from_gray(60));
 
                     let vol_width = vol_bar.width() * volume;
                     if vol_width > 0.0 {
@@ -5716,17 +6087,20 @@ impl ImageViewer {
                             vol_bar.min,
                             egui::Vec2::new(vol_width, vol_slider_height),
                         );
-                        ui.painter().rect_filled(vol_progress, 2.0, egui::Color32::WHITE);
+                        ui.painter()
+                            .rect_filled(vol_progress, 2.0, egui::Color32::WHITE);
                     }
 
                     let vol_handle_x = vol_bar.min.x + vol_width;
                     let vol_handle_center = egui::pos2(vol_handle_x, vol_bar.center().y);
-                    ui.painter().circle_filled(vol_handle_center, 5.0, egui::Color32::WHITE);
+                    ui.painter()
+                        .circle_filled(vol_handle_center, 5.0, egui::Color32::WHITE);
 
                     if vol_response.dragged() || vol_response.clicked() {
                         self.manga_video_volume_dragging = true;
                         if let Some(pos) = vol_response.interact_pointer_pos() {
-                            let new_vol = ((pos.x - vol_bar.min.x) / vol_bar.width()).clamp(0.0, 1.0);
+                            let new_vol =
+                                ((pos.x - vol_bar.min.x) / vol_bar.width()).clamp(0.0, 1.0);
                             player.set_volume(new_vol as f64);
                             // Persist user's volume choice for all manga videos
                             self.manga_video_user_volume = Some(new_vol as f64);
@@ -5760,7 +6134,10 @@ impl ImageViewer {
         let total_duration_ms = img.total_duration_ms();
         let mut display_frame_count = frame_count;
         let is_streaming = self.manga_anim_streams.contains_key(&gif_idx)
-            || self.manga_anim_stream_done.get(&gif_idx).map_or(false, |d| !d);
+            || self
+                .manga_anim_stream_done
+                .get(&gif_idx)
+                .map_or(false, |d| !d);
         if is_streaming {
             let base = self
                 .manga_anim_seekbar_total_frames
@@ -5792,12 +6169,16 @@ impl ImageViewer {
             );
 
             let bar_inner = egui::Rect::from_min_size(
-                egui::pos2(seek_rect.min.x, seek_rect.center().y - seek_bar_height / 2.0),
+                egui::pos2(
+                    seek_rect.min.x,
+                    seek_rect.center().y - seek_bar_height / 2.0,
+                ),
                 egui::Vec2::new(seek_rect.width(), seek_bar_height),
             );
 
             // Background bar
-            ui.painter().rect_filled(bar_inner, 3.0, egui::Color32::from_gray(60));
+            ui.painter()
+                .rect_filled(bar_inner, 3.0, egui::Color32::from_gray(60));
 
             // Progress bar
             let display_fraction = if self.gif_seeking {
@@ -5813,29 +6194,41 @@ impl ImageViewer {
                     bar_inner.min,
                     egui::Vec2::new(progress_width, seek_bar_height),
                 );
-                ui.painter().rect_filled(progress_rect, 3.0, egui::Color32::from_rgb(76, 175, 80)); // Green for GIF
+                ui.painter()
+                    .rect_filled(progress_rect, 3.0, egui::Color32::from_rgb(76, 175, 80));
+                // Green for GIF
             }
 
             // Seek handle
             let handle_x = bar_inner.min.x + progress_width;
             let handle_center = egui::pos2(handle_x, bar_inner.center().y);
-            let handle_radius = if seek_response.hovered() || seek_response.dragged() { 8.0 } else { 6.0 };
-            ui.painter().circle_filled(handle_center, handle_radius, egui::Color32::WHITE);
+            let handle_radius = if seek_response.hovered() || seek_response.dragged() {
+                8.0
+            } else {
+                6.0
+            };
+            ui.painter()
+                .circle_filled(handle_center, handle_radius, egui::Color32::WHITE);
 
             // Handle seeking
             let primary_down = ctx.input(|i| i.pointer.button_down(egui::PointerButton::Primary));
-            let primary_released = ctx.input(|i| i.pointer.button_released(egui::PointerButton::Primary));
+            let primary_released =
+                ctx.input(|i| i.pointer.button_released(egui::PointerButton::Primary));
 
             if seek_response.is_pointer_button_down_on() && !self.gif_seeking {
                 self.gif_seeking = true;
             }
 
             if self.gif_seeking && primary_down {
-                if let Some(pos) = seek_response.interact_pointer_pos().or_else(|| ctx.input(|i| i.pointer.hover_pos())) {
-                    let seek_fraction = ((pos.x - bar_inner.min.x) / bar_inner.width()).clamp(0.0, 1.0);
+                if let Some(pos) = seek_response
+                    .interact_pointer_pos()
+                    .or_else(|| ctx.input(|i| i.pointer.hover_pos()))
+                {
+                    let seek_fraction =
+                        ((pos.x - bar_inner.min.x) / bar_inner.width()).clamp(0.0, 1.0);
                     let target_frame = ((frame_count - 1) as f32 * seek_fraction).round() as usize;
                     self.gif_seek_preview_frame = Some(target_frame);
-                    
+
                     // Update the actual frame
                     if let Some(img) = self.manga_animated_images.get_mut(&gif_idx) {
                         img.set_frame(target_frame);
@@ -5848,7 +6241,8 @@ impl ImageViewer {
 
             if seek_response.clicked() && !self.gif_seeking {
                 if let Some(pos) = seek_response.interact_pointer_pos() {
-                    let seek_fraction = ((pos.x - bar_inner.min.x) / bar_inner.width()).clamp(0.0, 1.0);
+                    let seek_fraction =
+                        ((pos.x - bar_inner.min.x) / bar_inner.width()).clamp(0.0, 1.0);
                     let target_frame = ((frame_count - 1) as f32 * seek_fraction).round() as usize;
                     if let Some(img) = self.manga_animated_images.get_mut(&gif_idx) {
                         img.set_frame(target_frame);
@@ -5868,10 +6262,11 @@ impl ImageViewer {
             // === Bottom row: controls ===
             ui.horizontal(|ui| {
                 // Play/Pause button
-                let play_btn = ui.add(egui::Button::new(
-                    if self.gif_paused { "▶" } else { "⏸" }
-                ).min_size(egui::vec2(32.0, 24.0)));
-                
+                let play_btn = ui.add(
+                    egui::Button::new(if self.gif_paused { "▶" } else { "⏸" })
+                        .min_size(egui::vec2(32.0, 24.0)),
+                );
+
                 if play_btn.clicked() {
                     self.gif_paused = !self.gif_paused;
                 }
@@ -5889,8 +6284,8 @@ impl ImageViewer {
                         current_time,
                         duration_secs
                     ))
-                        .color(egui::Color32::WHITE)
-                        .size(12.0)
+                    .color(egui::Color32::WHITE)
+                    .size(12.0),
                 );
 
                 // Animated image indicator on right
@@ -5898,7 +6293,7 @@ impl ImageViewer {
                     ui.label(
                         egui::RichText::new(animated_label)
                             .color(egui::Color32::from_rgb(76, 175, 80))
-                            .size(14.0)
+                            .size(14.0),
                     );
                 });
             });
@@ -6037,7 +6432,11 @@ impl ImageViewer {
                 let (w2, h2) = size_from_height(dy);
                 let e1 = (w1 - dx).powi(2) + (h1 - dy).powi(2);
                 let e2 = (w2 - dx).powi(2) + (h2 - dy).powi(2);
-                if e1 <= e2 { (w1, h1) } else { (w2, h2) }
+                if e1 <= e2 {
+                    (w1, h1)
+                } else {
+                    (w2, h2)
+                }
             }
             ResizeDirection::Left => {
                 // Moving left (negative delta.x) increases width
@@ -6056,7 +6455,11 @@ impl ImageViewer {
                 let (w2, h2) = size_from_height(dy);
                 let e1 = (w1 - dx).powi(2) + (h1 - dy).powi(2);
                 let e2 = (w2 - dx).powi(2) + (h2 - dy).powi(2);
-                if e1 <= e2 { (w1, h1) } else { (w2, h2) }
+                if e1 <= e2 {
+                    (w1, h1)
+                } else {
+                    (w2, h2)
+                }
             }
             ResizeDirection::TopRight => {
                 let dx = start_w + delta.x;
@@ -6065,7 +6468,11 @@ impl ImageViewer {
                 let (w2, h2) = size_from_height(dy);
                 let e1 = (w1 - dx).powi(2) + (h1 - dy).powi(2);
                 let e2 = (w2 - dx).powi(2) + (h2 - dy).powi(2);
-                if e1 <= e2 { (w1, h1) } else { (w2, h2) }
+                if e1 <= e2 {
+                    (w1, h1)
+                } else {
+                    (w2, h2)
+                }
             }
             ResizeDirection::BottomLeft => {
                 let dx = start_w - delta.x;
@@ -6074,7 +6481,11 @@ impl ImageViewer {
                 let (w2, h2) = size_from_height(dy);
                 let e1 = (w1 - dx).powi(2) + (h1 - dy).powi(2);
                 let e2 = (w2 - dx).powi(2) + (h2 - dy).powi(2);
-                if e1 <= e2 { (w1, h1) } else { (w2, h2) }
+                if e1 <= e2 {
+                    (w1, h1)
+                } else {
+                    (w2, h2)
+                }
             }
             ResizeDirection::None => return,
         };
@@ -6131,7 +6542,9 @@ impl ImageViewer {
         let screen_rect = ctx.screen_rect();
         let mut animation_active = false;
         let title_bar_height = 32.0;
-        let title_ui_blocking = self.mouse_over_window_buttons || self.mouse_over_title_text || self.title_text_dragging;
+        let title_ui_blocking = self.mouse_over_window_buttons
+            || self.mouse_over_title_text
+            || self.title_text_dragging;
 
         // Smooth zoom animation (floating mode)
         if self.tick_floating_zoom_animation(ctx) {
@@ -6140,7 +6553,13 @@ impl ImageViewer {
 
         // Floating mode: when zooming out to <= 100%, ease any residual offset back to center.
         // (No bounce, no fade; just a smooth settle.) Skip during resize/seeking to avoid fighting.
-        if !self.is_fullscreen && !self.is_panning && !self.is_resizing && !self.is_seeking && self.zoom <= 1.0 && self.offset.length() > 0.1 {
+        if !self.is_fullscreen
+            && !self.is_panning
+            && !self.is_resizing
+            && !self.is_seeking
+            && self.zoom <= 1.0
+            && self.offset.length() > 0.1
+        {
             let dt = ctx.input(|i| i.stable_dt).min(0.033);
             let k = (1.0 - dt * 12.0).clamp(0.0, 1.0);
             self.offset *= k;
@@ -6162,7 +6581,12 @@ impl ImageViewer {
         let wheel_steps_ctrl = ctx.input(|i| {
             let mut ctrl_steps = 0.0f32;
             for e in &i.raw.events {
-                let egui::Event::MouseWheel { unit, delta, modifiers } = e else {
+                let egui::Event::MouseWheel {
+                    unit,
+                    delta,
+                    modifiers,
+                } = e
+                else {
                     continue;
                 };
                 if !modifiers.ctrl {
@@ -6213,7 +6637,8 @@ impl ImageViewer {
                             let rect_center = screen_rect.center();
                             let cursor_offset = pos - rect_center;
                             let zoom_ratio = self.zoom / old_zoom;
-                            self.offset = self.offset * zoom_ratio - cursor_offset * (zoom_ratio - 1.0);
+                            self.offset =
+                                self.offset * zoom_ratio - cursor_offset * (zoom_ratio - 1.0);
                         }
                         self.zoom_velocity = 0.0;
                     }
@@ -6249,7 +6674,8 @@ impl ImageViewer {
                                 let rect_center = screen_rect.center();
                                 let cursor_offset = pos - rect_center;
                                 let zoom_ratio = self.zoom / old_zoom;
-                                self.offset = self.offset * zoom_ratio - cursor_offset * (zoom_ratio - 1.0);
+                                self.offset =
+                                    self.offset * zoom_ratio - cursor_offset * (zoom_ratio - 1.0);
                             }
                             self.zoom_velocity = 0.0;
                         }
@@ -6262,12 +6688,14 @@ impl ImageViewer {
         let pointer_pos = ctx.input(|i| i.pointer.hover_pos());
         let primary_down = ctx.input(|i| i.pointer.button_down(egui::PointerButton::Primary));
         let primary_pressed = ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary));
-        let primary_released = ctx.input(|i| i.pointer.button_released(egui::PointerButton::Primary));
+        let primary_released =
+            ctx.input(|i| i.pointer.button_released(egui::PointerButton::Primary));
 
         // Title bar gesture suppression:
         // Allow click-through on the empty title bar; only suppress when the pointer is on
         // selectable title text (or window buttons), or while a title-text selection drag is active.
-        let over_title_bar = self.show_controls && pointer_pos.map_or(false, |p| p.y <= title_bar_height);
+        let over_title_bar =
+            self.show_controls && pointer_pos.map_or(false, |p| p.y <= title_bar_height);
 
         // Determine if we're over a resize edge (only in floating mode)
         let hover_resize_direction = if !self.is_fullscreen {
@@ -6381,7 +6809,7 @@ impl ImageViewer {
                     self.is_panning = false;
                 }
                 self.last_mouse_pos = None;
-                
+
                 // Set cursor based on hover state
                 // Don't fight egui's cursor when the pointer is over title-bar UI (text selection, buttons).
                 if !(title_ui_blocking && over_title_bar) {
@@ -6399,15 +6827,19 @@ impl ImageViewer {
         self.request_floating_autosize(ctx);
 
         // Handle double-click to fit media to screen (fullscreen) or reset zoom (floating)
-        if ctx.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary)) && !title_ui_blocking {
+        if ctx.input(|i| {
+            i.pointer
+                .button_double_clicked(egui::PointerButton::Primary)
+        }) && !title_ui_blocking
+        {
             self.offset = egui::Vec2::ZERO;
             self.zoom_velocity = 0.0;
-            
+
             // Get dimensions from current media (image or video)
             if let Some((img_w_u, img_h_u)) = self.media_display_dimensions() {
                 let img_w = img_w_u as f32;
                 let img_h = img_h_u as f32;
-                
+
                 if self.is_fullscreen {
                     // Fit media vertically to screen height
                     if img_h > 0.0 {
@@ -6486,12 +6918,10 @@ impl ImageViewer {
 
                 if let (Some(texture), Some((img_w, img_h))) = (active_texture, display_dims) {
                     let available = ui.available_rect_before_wrap();
-                    
-                    let display_size = egui::Vec2::new(
-                        img_w as f32 * self.zoom,
-                        img_h as f32 * self.zoom,
-                    );
-                    
+
+                    let display_size =
+                        egui::Vec2::new(img_w as f32 * self.zoom, img_h as f32 * self.zoom);
+
                     // During resize, use the commanded size to compute center to avoid jitter
                     // from frame timing mismatches when window position changes.
                     let center = if self.is_resizing {
@@ -6535,7 +6965,7 @@ impl ImageViewer {
                     } else {
                         image_rect
                     };
-                    
+
                     ui.painter().image(
                         texture.id(),
                         final_rect,
@@ -6552,7 +6982,11 @@ impl ImageViewer {
                     }
                 } else if let Some(ref error) = self.error_message {
                     ui.centered_and_justified(|ui| {
-                        ui.label(egui::RichText::new(error).color(egui::Color32::RED).size(18.0));
+                        ui.label(
+                            egui::RichText::new(error)
+                                .color(egui::Color32::RED)
+                                .size(18.0),
+                        );
                     });
                 } else {
                     // Only show the empty-state hint when nothing is loaded.
@@ -6588,10 +7022,10 @@ impl eframe::App for ImageViewer {
             if let Some(path) = receiver.try_recv() {
                 // Load the new file
                 self.load_media(&path);
-                
+
                 // Bring window to foreground
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                
+
                 // If we're in fullscreen manga mode, exit it to show the new file normally
                 if self.manga_mode && self.is_fullscreen {
                     self.manga_mode = false;
@@ -6601,12 +7035,13 @@ impl eframe::App for ImageViewer {
                     self.manga_video_players.clear();
                     self.manga_video_textures.clear();
                     self.manga_animated_images.clear();
+                    self.manga_focused_anim_index = None;
                     self.manga_anim_streams.clear();
                     self.manga_anim_stream_done.clear();
                     self.manga_anim_failed.clear();
                     self.manga_anim_seekbar_total_frames.clear();
                 }
-                
+
                 // Request repaint to show the new content
                 ctx.request_repaint();
             } else {
@@ -6620,12 +7055,10 @@ impl eframe::App for ImageViewer {
         // Manga mode uses this for layout/scroll math; if it drifts from `ctx.screen_rect()`,
         // you can get clamping oscillations and visible jitter.
         self.screen_size = ctx.screen_rect().size();
-        
+
         // PERFORMANCE: Check if window is minimized to reduce resource usage
-        let is_minimized = ctx.input(|i| {
-            i.raw.viewport().minimized.unwrap_or(false)
-        });
-        
+        let is_minimized = ctx.input(|i| i.raw.viewport().minimized.unwrap_or(false));
+
         // When minimized, skip most processing to save CPU/GPU
         if is_minimized {
             // Pause video playback when minimized to save CPU
@@ -6695,14 +7128,14 @@ impl eframe::App for ImageViewer {
                 // Fullscreen entry logic will apply the appropriate layout.
                 self.image_changed = false;
             } else {
-            if self.is_fullscreen {
-                // Fullscreen: keep fullscreen and fit vertically, centered.
-                self.apply_fullscreen_layout_for_current_image(ctx);
-            } else {
-                // Floating: size exactly to image (fit-to-screen if needed) and center window.
-                self.apply_floating_layout_for_current_image(ctx);
-            }
-            self.image_changed = false;
+                if self.is_fullscreen {
+                    // Fullscreen: keep fullscreen and fit vertically, centered.
+                    self.apply_fullscreen_layout_for_current_image(ctx);
+                } else {
+                    // Floating: size exactly to image (fit-to-screen if needed) and center window.
+                    self.apply_floating_layout_for_current_image(ctx);
+                }
+                self.image_changed = false;
             }
         }
 
@@ -6716,7 +7149,10 @@ impl eframe::App for ImageViewer {
                 self.offset = egui::Vec2::ZERO;
                 if let Some((_, img_h)) = self.media_display_dimensions() {
                     if img_h > 0 {
-                        let target_h = self.monitor_size_points(ctx).y.max(ctx.screen_rect().height());
+                        let target_h = self
+                            .monitor_size_points(ctx)
+                            .y
+                            .max(ctx.screen_rect().height());
                         let z = (target_h / img_h as f32).clamp(0.1, self.max_zoom_factor());
                         self.zoom = z;
                         self.zoom_target = z;
@@ -6753,13 +7189,21 @@ impl eframe::App for ImageViewer {
 
             if entering_fullscreen {
                 // Save current floating state before entering fullscreen
-                let inner_size = ctx.input(|i| i.raw.viewport().inner_rect)
+                let inner_size = ctx
+                    .input(|i| i.raw.viewport().inner_rect)
                     .map(|r| r.size())
                     .unwrap_or(egui::Vec2::new(800.0, 600.0));
-                let outer_pos = ctx.input(|i| i.raw.viewport().outer_rect)
+                let outer_pos = ctx
+                    .input(|i| i.raw.viewport().outer_rect)
                     .map(|r| r.min)
                     .unwrap_or(egui::Pos2::ZERO);
-                self.saved_floating_state = Some((self.zoom, self.zoom_target, self.offset, inner_size, outer_pos));
+                self.saved_floating_state = Some((
+                    self.zoom,
+                    self.zoom_target,
+                    self.offset,
+                    inner_size,
+                    outer_pos,
+                ));
                 self.saved_fullscreen_entry_index = Some(self.current_index);
 
                 // Start transition animation
@@ -6771,20 +7215,21 @@ impl eframe::App for ImageViewer {
                 // Use borderless "pseudo-fullscreen" instead of OS fullscreen.
                 // This avoids a brief desktop flash on Windows caused by toggling window styles/swapchain.
                 let monitor = self.monitor_size_points(ctx);
-                self.suppress_outer_pos_tracking_frames = self.suppress_outer_pos_tracking_frames.max(2);
+                self.suppress_outer_pos_tracking_frames =
+                    self.suppress_outer_pos_tracking_frames.max(2);
                 ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::Pos2::ZERO));
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(monitor));
                 self.last_requested_inner_size = Some(monitor);
             } else {
                 // Exiting fullscreen - use delayed resize to prevent flash
                 self.fullscreen_transition_target = 0.0;
-                
+
                 // Exit manga mode when leaving fullscreen
                 if self.manga_mode {
                     self.manga_mode = false;
                     self.manga_clear_cache();
                 }
-                
+
                 // Clear the per-image fullscreen view state cache when exiting fullscreen
                 // (since it's only meant for fullscreen mode comparisons within a session)
                 self.fullscreen_view_states.clear();
@@ -6799,8 +7244,13 @@ impl eframe::App for ImageViewer {
                 }
 
                 if !image_changed_while_fullscreen {
-                    if let Some((saved_zoom, saved_zoom_target, saved_offset, saved_size, saved_pos)) =
-                        self.saved_floating_state.take()
+                    if let Some((
+                        saved_zoom,
+                        saved_zoom_target,
+                        saved_offset,
+                        saved_size,
+                        saved_pos,
+                    )) = self.saved_floating_state.take()
                     {
                         self.zoom = saved_zoom;
                         self.zoom_target = saved_zoom_target;
@@ -6851,7 +7301,8 @@ impl eframe::App for ImageViewer {
                             // Floating sizing when leaving fullscreen after navigation:
                             // - Videos: fit vertically only if taller than the screen, else 100%.
                             // - Images: keep existing behavior for this branch (fit vertically if taller).
-                            let is_video = matches!(self.current_media_type, Some(MediaType::Video));
+                            let is_video =
+                                matches!(self.current_media_type, Some(MediaType::Video));
                             let z = if is_video {
                                 if img_h > monitor.y {
                                     (monitor.y / img_h).clamp(0.1, self.max_zoom_factor())
@@ -6885,7 +7336,8 @@ impl eframe::App for ImageViewer {
                     } else {
                         // If we don't have dimensions yet (possible for videos right after switching),
                         // schedule a retry once dimensions become available.
-                        self.pending_media_layout = matches!(self.current_media_type, Some(MediaType::Video));
+                        self.pending_media_layout =
+                            matches!(self.current_media_type, Some(MediaType::Video));
                     }
                 }
             }
@@ -6910,22 +7362,24 @@ impl eframe::App for ImageViewer {
         };
 
         // Process pending window resize (delayed to prevent flash on fullscreen exit)
-        let pending_resize_active = if let Some((size, pos, frames_remaining)) = self.pending_window_resize.take() {
-            if frames_remaining <= 1 {
-                // Apply the resize now
-                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
-                self.suppress_outer_pos_tracking_frames = self.suppress_outer_pos_tracking_frames.max(2);
-                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
-                self.last_known_outer_pos = Some(pos);
-                false
+        let pending_resize_active =
+            if let Some((size, pos, frames_remaining)) = self.pending_window_resize.take() {
+                if frames_remaining <= 1 {
+                    // Apply the resize now
+                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+                    self.suppress_outer_pos_tracking_frames =
+                        self.suppress_outer_pos_tracking_frames.max(2);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+                    self.last_known_outer_pos = Some(pos);
+                    false
+                } else {
+                    // Wait another frame
+                    self.pending_window_resize = Some((size, pos, frames_remaining - 1));
+                    true // Need another frame
+                }
             } else {
-                // Wait another frame
-                self.pending_window_resize = Some((size, pos, frames_remaining - 1));
-                true // Need another frame
-            }
-        } else {
-            false
-        };
+                false
+            };
 
         if self.request_minimize {
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
@@ -6935,8 +7389,8 @@ impl eframe::App for ImageViewer {
         // For videos during startup: skip ALL drawing until we have dimensions and layout is applied.
         // This prevents the flash of an empty window with controls before the video frame appears.
         // Like MPV, we want the window to appear only when it has the first frame ready.
-        let skip_drawing = !self.startup_window_shown 
-            && matches!(self.current_media_type, Some(MediaType::Video));
+        let skip_drawing =
+            !self.startup_window_shown && matches!(self.current_media_type, Some(MediaType::Video));
 
         // Draw controls overlay (top bar for title/buttons) BEFORE the main view.
         // This ensures title-bar hover/selection state is available to suppress gestures
@@ -6985,23 +7439,24 @@ impl eframe::App for ImageViewer {
                         || loader.pending_dimension_results_count() > 0
                 })
                 .unwrap_or(false);
-        let manga_scroll_active = self.manga_mode && (
-            (self.manga_scroll_target - self.manga_scroll_offset).abs() > 0.1
-            || self.manga_scroll_velocity.abs() > 0.5
-        );
+        let manga_scroll_active = self.manga_mode
+            && ((self.manga_scroll_target - self.manga_scroll_offset).abs() > 0.1
+                || self.manga_scroll_velocity.abs() > 0.5);
         // Check if arrow keys are held for continuous scrolling in manga mode
-        let manga_arrow_held = self.manga_mode && self.is_fullscreen && ctx.input(|i| {
-            i.key_down(egui::Key::ArrowLeft) 
-            || i.key_down(egui::Key::ArrowRight) 
-            || i.key_down(egui::Key::ArrowUp) 
-            || i.key_down(egui::Key::ArrowDown)
-        });
-        
-        let any_animation_active = fullscreen_animation_active 
-            || pending_resize_active 
-            || texture_animation_active 
+        let manga_arrow_held = self.manga_mode
+            && self.is_fullscreen
+            && ctx.input(|i| {
+                i.key_down(egui::Key::ArrowLeft)
+                    || i.key_down(egui::Key::ArrowRight)
+                    || i.key_down(egui::Key::ArrowUp)
+                    || i.key_down(egui::Key::ArrowDown)
+            });
+
+        let any_animation_active = fullscreen_animation_active
+            || pending_resize_active
+            || texture_animation_active
             || draw_animation_active
-            || self.is_panning 
+            || self.is_panning
             || self.is_resizing
             || self.is_seeking
             || self.is_volume_dragging
@@ -7051,12 +7506,16 @@ impl eframe::App for ImageViewer {
 
             // Top control bar auto-hide: schedule a single repaint right when it should disappear.
             if self.show_controls {
-                let hovering_top = ctx
-                    .input(|i| i.pointer.hover_pos().map_or(false, |p| p.y < 50.0));
+                let hovering_top =
+                    ctx.input(|i| i.pointer.hover_pos().map_or(false, |p| p.y < 50.0));
                 if !hovering_top {
                     let delay = Duration::from_secs_f32(self.config.controls_hide_delay.max(0.0));
                     let elapsed = self.controls_show_time.elapsed();
-                    let remaining = if elapsed < delay { delay - elapsed } else { Duration::ZERO };
+                    let remaining = if elapsed < delay {
+                        delay - elapsed
+                    } else {
+                        Duration::ZERO
+                    };
                     schedule_min(remaining);
                 }
             }
@@ -7068,7 +7527,11 @@ impl eframe::App for ImageViewer {
             {
                 let delay = Duration::from_secs_f32(self.config.bottom_overlay_hide_delay.max(0.0));
                 let elapsed = self.video_controls_show_time.elapsed();
-                let remaining = if elapsed < delay { delay - elapsed } else { Duration::ZERO };
+                let remaining = if elapsed < delay {
+                    delay - elapsed
+                } else {
+                    Duration::ZERO
+                };
                 schedule_min(remaining);
             }
 
@@ -7091,7 +7554,7 @@ impl eframe::App for ImageViewer {
 #[cfg(target_os = "windows")]
 fn get_primary_monitor_size() -> egui::Vec2 {
     use winapi::um::winuser::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
-    
+
     unsafe {
         let width = GetSystemMetrics(SM_CXSCREEN) as f32;
         let height = GetSystemMetrics(SM_CYSCREEN) as f32;
@@ -7110,7 +7573,7 @@ fn get_primary_monitor_size() -> egui::Vec2 {
 fn get_global_cursor_pos() -> Option<egui::Pos2> {
     use winapi::shared::windef::POINT;
     use winapi::um::winuser::GetCursorPos;
-    
+
     unsafe {
         let mut point = POINT { x: 0, y: 0 };
         if GetCursorPos(&mut point) != 0 {
@@ -7153,7 +7616,8 @@ fn main() -> eframe::Result<()> {
     #[cfg(target_os = "windows")]
     let (file_receiver, _lock) = {
         let (receiver, callback) = FileReceiver::new();
-        match single_instance::try_acquire_lock(config.single_instance, Some(&file_path), callback) {
+        match single_instance::try_acquire_lock(config.single_instance, Some(&file_path), callback)
+        {
             SingleInstanceResult::Primary(lock) => {
                 // We are the primary instance - proceed with window creation
                 (Some(receiver), Some(lock))
@@ -7177,7 +7641,7 @@ fn main() -> eframe::Result<()> {
     // This prevents the flash of a default-sized window.
     let media_type = get_media_type(&file_path);
     let screen_size = get_primary_monitor_size();
-    
+
     // For images, we can get dimensions immediately from the file header.
     // For videos, we start hidden and show once GStreamer decodes the first frame.
     let (initial_size, initial_pos, start_visible) = match media_type {
@@ -7186,19 +7650,17 @@ fn main() -> eframe::Result<()> {
             let (img_w, img_h) = image::image_dimensions(&file_path).unwrap_or((800, 600));
             let img_w = img_w as f32;
             let img_h = img_h as f32;
-            
+
             // Calculate window size: fit to screen if needed, otherwise use image size
             let fit_zoom = if img_h > screen_size.y || img_w > screen_size.x {
                 (screen_size.y / img_h).min(screen_size.x / img_w).min(1.0)
             } else {
                 1.0
             };
-            
-            let size = egui::Vec2::new(
-                (img_w * fit_zoom).max(200.0),
-                (img_h * fit_zoom).max(150.0),
-            );
-            
+
+            let size =
+                egui::Vec2::new((img_w * fit_zoom).max(200.0), (img_h * fit_zoom).max(150.0));
+
             // Calculate centered position for images
             let pos = egui::Pos2::new(
                 ((screen_size.x - size.x) * 0.5).max(0.0),
@@ -7226,14 +7688,14 @@ fn main() -> eframe::Result<()> {
     };
 
     // Configure native options
-    // 
+    //
     // IMPORTANT NOTE ON VRAM USAGE:
     // This application uses OpenGL (via eframe/glow) for hardware-accelerated rendering.
     // OpenGL requires a GPU context which allocates a base amount of VRAM (~10-20MB) for:
     // - Framebuffers (front/back buffers for double-buffering)
     // - Default font texture atlas
     // - Shader programs
-    // 
+    //
     // To achieve TRUE ZERO VRAM (like XnViewMP), the application would need to be rewritten
     // to use pure software rendering (GDI/GDI+ on Windows), which would:
     // - Eliminate all GPU acceleration
@@ -7245,7 +7707,7 @@ fn main() -> eframe::Result<()> {
     // hardware acceleration benefits:
     // - No MSAA (multisampling)
     // - No depth buffer
-    // - No stencil buffer  
+    // - No stencil buffer
     // - Textures only created when media is loaded
     // - Textures released when switching media
     // - Smart repaint scheduling (no repainting when idle)
@@ -7286,11 +7748,20 @@ fn main() -> eframe::Result<()> {
             // egui_extras::install_image_loaders(&cc.egui_ctx);
             #[cfg(target_os = "windows")]
             {
-                Ok(Box::new(ImageViewer::new(cc, Some(file_path), start_visible, file_receiver)))
+                Ok(Box::new(ImageViewer::new(
+                    cc,
+                    Some(file_path),
+                    start_visible,
+                    file_receiver,
+                )))
             }
             #[cfg(not(target_os = "windows"))]
             {
-                Ok(Box::new(ImageViewer::new(cc, Some(file_path), start_visible)))
+                Ok(Box::new(ImageViewer::new(
+                    cc,
+                    Some(file_path),
+                    start_visible,
+                )))
             }
         }),
     )

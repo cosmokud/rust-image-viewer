@@ -30,7 +30,9 @@ use image::imageops::FilterType;
 use parking_lot::RwLock;
 use rayon::prelude::*;
 
-use crate::image_loader::{is_supported_image, is_supported_video, LoadedImage, MediaType, get_media_type};
+use crate::image_loader::{
+    get_media_type, is_supported_image, is_supported_video, LoadedImage, MediaType,
+};
 
 /// Maximum number of decoded images to hold in memory awaiting GPU upload.
 /// This bounds memory usage even if the main thread is slow to consume results.
@@ -166,7 +168,8 @@ impl MangaLoader {
     pub fn new() -> Self {
         // Create bounded channels to prevent unbounded memory growth
         let (request_tx, request_rx) = crossbeam_channel::bounded::<LoadRequest>(256);
-        let (result_tx, result_rx) = crossbeam_channel::bounded::<DecodedImage>(MAX_PENDING_UPLOADS);
+        let (result_tx, result_rx) =
+            crossbeam_channel::bounded::<DecodedImage>(MAX_PENDING_UPLOADS);
 
         let (dim_request_tx, dim_request_rx) = crossbeam_channel::bounded::<DimRequest>(64);
         let (dim_result_tx, dim_result_rx) = crossbeam_channel::bounded::<DimResult>(64);
@@ -211,7 +214,8 @@ impl MangaLoader {
                         Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
                     };
 
-                    let mut out: Vec<(usize, u32, u32, MangaMediaType)> = Vec::with_capacity(req.items.len());
+                    let mut out: Vec<(usize, u32, u32, MangaMediaType)> =
+                        Vec::with_capacity(req.items.len());
                     for (idx, path) in req.items {
                         let is_video = is_supported_video(&path);
                         let is_image = is_supported_image(&path);
@@ -225,7 +229,11 @@ impl MangaLoader {
                         };
 
                         if let Some((w, h)) = dims {
-                            let mt = if is_video { MangaMediaType::Video } else { MangaMediaType::StaticImage };
+                            let mt = if is_video {
+                                MangaMediaType::Video
+                            } else {
+                                MangaMediaType::StaticImage
+                            };
                             out.push((idx, w, h, mt));
                         }
 
@@ -475,10 +483,8 @@ impl MangaLoader {
                 }
 
                 if batch.len() > 1 {
-                    let tail: Vec<(usize, Option<DecodedImage>)> = batch[1..]
-                        .par_iter()
-                        .map(process_one)
-                        .collect();
+                    let tail: Vec<(usize, Option<DecodedImage>)> =
+                        batch[1..].par_iter().map(process_one).collect();
                     results.extend(tail);
                 }
             } else {
@@ -526,7 +532,7 @@ impl MangaLoader {
     fn load_single_image(req: &LoadRequest) -> Option<DecodedImage> {
         // Determine media type
         let media_type = get_media_type(&req.path)?;
-        
+
         match media_type {
             MediaType::Video => {
                 // For videos, try to extract the first frame as a thumbnail
@@ -545,9 +551,9 @@ impl MangaLoader {
                     }
                     None => {
                         // Fallback: probe dimensions only, no thumbnail
-                        let (original_width, original_height) = Self::probe_video_dimensions(&req.path)
-                            .unwrap_or((1920, 1080)); // Fallback to 1080p
-                        
+                        let (original_width, original_height) =
+                            Self::probe_video_dimensions(&req.path).unwrap_or((1920, 1080)); // Fallback to 1080p
+
                         Some(DecodedImage {
                             index: req.index,
                             pixels: Vec::new(),
@@ -630,10 +636,10 @@ impl MangaLoader {
         // In a production system, you'd use GStreamer's discoverer or ffprobe
         // But since GStreamer init is expensive and should happen on main thread,
         // we return a reasonable default and update dimensions when video is played
-        
+
         // Try to infer from filename patterns (e.g., "video_1080p.mp4")
         let filename = path.file_name()?.to_string_lossy().to_lowercase();
-        
+
         if filename.contains("4k") || filename.contains("2160") {
             Some((3840, 2160))
         } else if filename.contains("1440") || filename.contains("2k") {
@@ -651,11 +657,11 @@ impl MangaLoader {
     }
 
     /// Extract the first frame from a video file as a thumbnail.
-    /// 
+    ///
     /// Uses GStreamer to decode just the first frame without loading the entire video.
     /// This is much faster than full video playback initialization and provides
     /// a visual preview for videos in manga mode.
-    /// 
+    ///
     /// Returns: Some((pixels, width, height, original_width, original_height)) or None on failure
     fn extract_video_first_frame(
         path: &std::path::Path,
@@ -670,9 +676,7 @@ impl MangaLoader {
 
         // Initialize GStreamer if needed (static check to avoid repeated init)
         static GST_INIT: std::sync::OnceLock<Result<(), ()>> = std::sync::OnceLock::new();
-        let init_result = GST_INIT.get_or_init(|| {
-            gst::init().map_err(|_| ())
-        });
+        let init_result = GST_INIT.get_or_init(|| gst::init().map_err(|_| ()));
         if init_result.is_err() {
             return None;
         }
@@ -801,23 +805,23 @@ impl MangaLoader {
     }
 
     /// Calculate preload counts based on visible page count.
-    /// 
-    /// Formula: 
+    ///
+    /// Formula:
     /// - AHEAD (scroll direction): visible_pages + 4
     /// - BEHIND (opposite direction): visible_pages + 2
-    /// 
+    ///
     /// For example, if 14 pages are visible:
     /// - Scrolling down: 18 ahead, 16 behind
     /// - Scrolling up: 18 behind, 16 ahead
-    /// 
+    ///
     /// Returns (preload_ahead, preload_behind)
     fn calculate_preload_counts(&self) -> (usize, usize) {
         let visible_pages = self.visible_page_count.max(1);
-        
+
         // More buffer ahead (in scroll direction), less behind
         let ahead = (visible_pages + PRELOAD_BUFFER_AHEAD).clamp(MIN_PRELOAD, MAX_PRELOAD);
         let behind = (visible_pages + PRELOAD_BUFFER_BEHIND).clamp(MIN_PRELOAD, MAX_PRELOAD);
-        
+
         (ahead, behind)
     }
 
@@ -839,7 +843,7 @@ impl MangaLoader {
 
     /// Request loading of images around the visible range.
     /// Uses priority-based loading with scroll direction and visibility awareness.
-    /// 
+    ///
     /// The algorithm adapts to visible pages:
     /// - 1 page visible: preload 1 + 4 = 5 ahead and behind
     /// - 14 pages visible: preload 14 + 4 = 18 ahead and behind
@@ -914,9 +918,17 @@ impl MangaLoader {
                 // and scroll direction
                 let distance = (idx as i32 - visible_index as i32).abs();
                 let direction_bonus = if self.scroll_direction > 0 {
-                    if idx > visible_index { 0 } else { 10 }
+                    if idx > visible_index {
+                        0
+                    } else {
+                        10
+                    }
                 } else {
-                    if idx < visible_index { 0 } else { 10 }
+                    if idx < visible_index {
+                        0
+                    } else {
+                        10
+                    }
                 };
 
                 // On a far jump, mark the actual target page as "urgent" so it can preempt
@@ -973,7 +985,11 @@ impl MangaLoader {
                     // Cache dimensions and media type for stable layout
                     self.dimension_cache.insert(
                         decoded.index,
-                        (decoded.original_width, decoded.original_height, decoded.media_type),
+                        (
+                            decoded.original_width,
+                            decoded.original_height,
+                            decoded.media_type,
+                        ),
                     );
                     results.push(decoded);
                     self.stats.images_loaded += 1;
@@ -1004,7 +1020,7 @@ impl MangaLoader {
             .map(|(idx, path)| {
                 let is_video = is_supported_video(path);
                 let is_image = is_supported_image(path);
-                
+
                 if is_video {
                     // For videos, probe dimensions
                     let dims = Self::probe_video_dimensions(path);
@@ -1034,7 +1050,8 @@ impl MangaLoader {
     pub fn clear(&mut self) {
         // Increment generation to invalidate pending requests
         self.current_generation += 1;
-        self.generation.store(self.current_generation, Ordering::Release);
+        self.generation
+            .store(self.current_generation, Ordering::Release);
 
         // Clear indices
         self.loading_indices.write().clear();
@@ -1070,7 +1087,8 @@ impl MangaLoader {
         // Increment generation to invalidate in-flight requests
         // The coordinator thread will check this and skip stale requests
         self.current_generation += 1;
-        self.generation.store(self.current_generation, Ordering::Release);
+        self.generation
+            .store(self.current_generation, Ordering::Release);
 
         // Clear loading indices (they'll be re-requested around the new position)
         self.loading_indices.write().clear();
@@ -1107,7 +1125,8 @@ impl MangaLoader {
             entry.0 = width;
             entry.1 = height;
         } else {
-            self.dimension_cache.insert(index, (width, height, MangaMediaType::Video));
+            self.dimension_cache
+                .insert(index, (width, height, MangaMediaType::Video));
         }
     }
 }
@@ -1143,7 +1162,8 @@ fn downscale_rgba_if_needed<'a>(
     }
 
     // Preserve aspect ratio; clamp to at least 1x1.
-    let scale = (max_texture_side as f64 / width as f64).min(max_texture_side as f64 / height as f64);
+    let scale =
+        (max_texture_side as f64 / width as f64).min(max_texture_side as f64 / height as f64);
     let new_w = ((width as f64) * scale).round().max(1.0) as u32;
     let new_h = ((height as f64) * scale).round().max(1.0) as u32;
 
@@ -1206,7 +1226,10 @@ impl MangaTextureCache {
     /// Get texture ID, dimensions, and media type from cache.
     /// Returns (texture_id, width, height, media_type) if found.
     #[allow(dead_code)]
-    pub fn get_texture_info_with_type(&mut self, index: usize) -> Option<(egui::TextureId, u32, u32, MangaMediaType)> {
+    pub fn get_texture_info_with_type(
+        &mut self,
+        index: usize,
+    ) -> Option<(egui::TextureId, u32, u32, MangaMediaType)> {
         if let Some(entry) = self.entries.get_mut(&index) {
             entry.4 = self.frame_counter;
             Some((entry.0.id(), entry.1, entry.2, entry.3))
@@ -1273,8 +1296,10 @@ impl MangaTextureCache {
             }
         }
 
-        self.entries
-            .insert(index, (texture, width, height, media_type, self.frame_counter));
+        self.entries.insert(
+            index,
+            (texture, width, height, media_type, self.frame_counter),
+        );
 
         evicted
     }

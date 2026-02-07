@@ -184,7 +184,7 @@ impl Action {
 /// Parse an input binding from string
 pub fn parse_input_binding(s: &str) -> Option<InputBinding> {
     let s = s.trim().to_lowercase();
-    
+
     // Check for modifiers with scroll wheel first (special case)
     if let Some(scroll_str) = s.strip_prefix("ctrl+") {
         match scroll_str {
@@ -409,12 +409,12 @@ impl Default for Config {
             startup_window_mode: StartupWindowMode::Floating,
             single_instance: true,
             // Image quality defaults - use high quality filters
-            upscale_filter: ImageFilter::CatmullRom,    // Good balance of quality and speed for upscaling
-            downscale_filter: ImageFilter::Lanczos3,    // Highest quality for downscaling
-            gif_resize_filter: ImageFilter::Triangle,   // Good quality, reasonable speed for animations
+            upscale_filter: ImageFilter::CatmullRom, // Good balance of quality and speed for upscaling
+            downscale_filter: ImageFilter::Lanczos3, // Highest quality for downscaling
+            gif_resize_filter: ImageFilter::Triangle, // Good quality, reasonable speed for animations
             texture_filter_static: TextureFilter::Linear, // Smooth rendering for photos
             texture_filter_animated: TextureFilter::Linear, // Smooth for animations
-            texture_filter_video: TextureFilter::Linear,  // Smooth for video
+            texture_filter_video: TextureFilter::Linear, // Smooth for video
         };
         config.set_defaults();
         config
@@ -431,13 +431,22 @@ impl Config {
 
         // Navigation
         self.add_binding(InputBinding::Key(egui::Key::ArrowRight), Action::NextImage);
-        self.add_binding(InputBinding::Key(egui::Key::ArrowLeft), Action::PreviousImage);
+        self.add_binding(
+            InputBinding::Key(egui::Key::ArrowLeft),
+            Action::PreviousImage,
+        );
         self.add_binding(InputBinding::Mouse5, Action::NextImage);
         self.add_binding(InputBinding::Mouse4, Action::PreviousImage);
 
         // Rotation
-        self.add_binding(InputBinding::Key(egui::Key::ArrowUp), Action::RotateClockwise);
-        self.add_binding(InputBinding::Key(egui::Key::ArrowDown), Action::RotateCounterClockwise);
+        self.add_binding(
+            InputBinding::Key(egui::Key::ArrowUp),
+            Action::RotateClockwise,
+        );
+        self.add_binding(
+            InputBinding::Key(egui::Key::ArrowDown),
+            Action::RotateCounterClockwise,
+        );
 
         // Zoom
         self.add_binding(InputBinding::ScrollUp, Action::ZoomIn);
@@ -464,10 +473,7 @@ impl Config {
     /// Add a binding
     fn add_binding(&mut self, input: InputBinding, action: Action) {
         self.bindings.insert(input.clone(), action);
-        self.action_bindings
-            .entry(action)
-            .or_default()
-            .push(input);
+        self.action_bindings.entry(action).or_default().push(input);
     }
 
     /// Get the configuration directory in AppData/Roaming.
@@ -499,10 +505,10 @@ impl Config {
         };
 
         let config_dir = base_dir.join("rust-image-viewer");
-        
+
         // Create directory if it doesn't exist
         let _ = fs::create_dir_all(&config_dir);
-        
+
         config_dir
     }
 
@@ -526,7 +532,7 @@ impl Config {
                         let _ = fs::copy(&legacy_config, &config);
                         // Don't delete - user might want to keep it
                     }
-                    
+
                     // Check for setting.ini (very old location)
                     let legacy_setting = exe_dir.join("setting.ini");
                     if legacy_setting.exists() && !config.exists() {
@@ -612,7 +618,7 @@ impl Config {
 
         for line in content.lines() {
             let line = line.trim();
-            
+
             // Skip empty lines and comments
             if line.is_empty() || line.starts_with(';') || line.starts_with('#') {
                 continue;
@@ -624,7 +630,7 @@ impl Config {
                 in_shortcuts_section = section.eq_ignore_ascii_case("shortcuts");
                 in_settings_section = section.eq_ignore_ascii_case("settings");
                 in_video_section = section.eq_ignore_ascii_case("video");
-                in_quality_section = section.eq_ignore_ascii_case("quality") 
+                in_quality_section = section.eq_ignore_ascii_case("quality")
                     || section.eq_ignore_ascii_case("image_quality")
                     || section.eq_ignore_ascii_case("filters");
                 continue;
@@ -635,7 +641,7 @@ impl Config {
                 if let Some((key, value)) = line.split_once('=') {
                     let key = key.trim();
                     let value = value.trim();
-                    
+
                     if let Some(action) = Action::from_str(key) {
                         // Value can be comma-separated for multiple bindings
                         for binding_str in value.split(',') {
@@ -652,7 +658,7 @@ impl Config {
                 if let Some((key, value)) = line.split_once('=') {
                     let key = key.trim().to_lowercase();
                     let value = value.trim();
-                    
+
                     match key.as_str() {
                         "controls_hide_delay" => {
                             if let Ok(v) = value.parse::<f32>() {
@@ -730,7 +736,9 @@ impl Config {
                                 config.manga_wheel_scroll_speed = v.clamp(1.0, 2000.0);
                             }
                         }
-                        "manga_inertial_friction" | "manga_scroll_friction" | "manga_inertia_friction" => {
+                        "manga_inertial_friction"
+                        | "manga_scroll_friction"
+                        | "manga_inertia_friction" => {
                             if let Ok(v) = value.parse::<f32>() {
                                 // Keep within a practical range to avoid "teleport" (too high)
                                 // or excessively sluggish motion (too low).
@@ -767,7 +775,7 @@ impl Config {
                 if let Some((key, value)) = line.split_once('=') {
                     let key = key.trim().to_lowercase();
                     let value = value.trim();
-                    
+
                     match key.as_str() {
                         "muted_by_default" | "muted" => {
                             if let Some(v) = parse_bool(value) {
@@ -800,7 +808,7 @@ impl Config {
                 if let Some((key, value)) = line.split_once('=') {
                     let key = key.trim().to_lowercase();
                     let value = value.trim();
-                    
+
                     match key.as_str() {
                         "upscale_filter" => {
                             if let Some(f) = ImageFilter::from_str(value) {
@@ -854,14 +862,17 @@ impl Config {
     /// Save configuration to INI file
     pub fn save(&self) {
         let mut content = String::new();
-        
+
         content.push_str("; Image Viewer Configuration\n");
         content.push_str("; See config.ini in the application directory for examples\n\n");
-        
+
         // Write settings section
         content.push_str("[Settings]\n");
         content.push_str("; How long the title bar stays visible (in seconds)\n");
-        content.push_str(&format!("controls_hide_delay = {}\n", self.controls_hide_delay));
+        content.push_str(&format!(
+            "controls_hide_delay = {}\n",
+            self.controls_hide_delay
+        ));
         content.push_str("; How long bottom overlays stay visible (video controls + Long Strip toggle + zoom HUD) (in seconds)\n");
         content.push_str(&format!(
             "bottom_overlay_hide_delay = {}\n\n",
@@ -874,7 +885,10 @@ impl Config {
             if self.show_fps { "true" } else { "false" }
         ));
         content.push_str("; Size of the window resize border in pixels\n");
-        content.push_str(&format!("resize_border_size = {}\n\n", self.resize_border_size));
+        content.push_str(&format!(
+            "resize_border_size = {}\n\n",
+            self.resize_border_size
+        ));
 
         content.push_str("; Startup window mode: floating (default) or fullscreen\n");
         content.push_str(&format!(
@@ -882,12 +896,19 @@ impl Config {
             self.startup_window_mode.as_str()
         ));
 
-        content.push_str("; Single instance mode: reuse existing window when opening new files (true/false)\n");
-        content.push_str("; When true, double-clicking a file will open it in the existing window\n");
+        content.push_str(
+            "; Single instance mode: reuse existing window when opening new files (true/false)\n",
+        );
+        content
+            .push_str("; When true, double-clicking a file will open it in the existing window\n");
         content.push_str("; When false, each file opens in a new window\n");
         content.push_str(&format!(
             "single_instance = {}\n\n",
-            if self.single_instance { "true" } else { "false" }
+            if self.single_instance {
+                "true"
+            } else {
+                "false"
+            }
         ));
 
         content.push_str("; Background color (RGB 0-255). You can either set background_rgb or background_r/g/b\n");
@@ -899,38 +920,77 @@ impl Config {
         content.push_str(&format!("background_g = {}\n", self.background_rgb[1]));
         content.push_str(&format!("background_b = {}\n\n", self.background_rgb[2]));
 
-        content.push_str("; When entering fullscreen, reset image position to center and fit-to-screen\n");
+        content.push_str(
+            "; When entering fullscreen, reset image position to center and fit-to-screen\n",
+        );
         content.push_str(&format!(
             "fullscreen_reset_fit_on_enter = {}\n\n",
-            if self.fullscreen_reset_fit_on_enter { "true" } else { "false" }
+            if self.fullscreen_reset_fit_on_enter {
+                "true"
+            } else {
+                "false"
+            }
         ));
 
-        content.push_str("; Floating-mode zoom animation speed. Higher = faster, 0 = snap instantly\n");
-        content.push_str(&format!("zoom_animation_speed = {}\n\n", self.zoom_animation_speed));
-        
-        content.push_str("; Zoom step per scroll wheel notch (1.05 = 5%, 1.10 = 10%, 1.25 = 25%)\n");
+        content.push_str(
+            "; Floating-mode zoom animation speed. Higher = faster, 0 = snap instantly\n",
+        );
+        content.push_str(&format!(
+            "zoom_animation_speed = {}\n\n",
+            self.zoom_animation_speed
+        ));
+
+        content
+            .push_str("; Zoom step per scroll wheel notch (1.05 = 5%, 1.10 = 10%, 1.25 = 25%)\n");
         content.push_str(&format!("zoom_step = {}\n\n", self.zoom_step));
 
         content.push_str("; Maximum zoom level in percent (100 = 1.0x, 1000 = 10.0x)\n");
         content.push_str(&format!("max_zoom_percent = {}\n\n", self.max_zoom_percent));
 
         content.push_str("; Manga mode: drag pan speed multiplier (1.0 = 1:1, higher = faster)\n");
-        content.push_str(&format!("manga_drag_pan_speed = {}\n", self.manga_drag_pan_speed));
-        content.push_str("; Manga mode: mouse wheel scroll speed in pixels per step (smaller = slower)\n");
-        content.push_str(&format!("manga_wheel_scroll_speed = {}\n", self.manga_wheel_scroll_speed));
-        content.push_str("; Manga mode: inertial scrolling friction (0.08-0.15 feels premium for manga)\n");
-        content.push_str(&format!("manga_inertial_friction = {}\n", self.manga_inertial_friction));
-        content.push_str("; Manga mode: extra wheel multiplier after normalization (mouse vs trackpad)\n");
-        content.push_str(&format!("manga_wheel_multiplier = {}\n", self.manga_wheel_multiplier));
-        content.push_str("; Manga mode: arrow key scroll speed in pixels per key press (separate from wheel)\n");
-        content.push_str(&format!("manga_arrow_scroll_speed = {}\n\n", self.manga_arrow_scroll_speed));
-        
+        content.push_str(&format!(
+            "manga_drag_pan_speed = {}\n",
+            self.manga_drag_pan_speed
+        ));
+        content.push_str(
+            "; Manga mode: mouse wheel scroll speed in pixels per step (smaller = slower)\n",
+        );
+        content.push_str(&format!(
+            "manga_wheel_scroll_speed = {}\n",
+            self.manga_wheel_scroll_speed
+        ));
+        content.push_str(
+            "; Manga mode: inertial scrolling friction (0.08-0.15 feels premium for manga)\n",
+        );
+        content.push_str(&format!(
+            "manga_inertial_friction = {}\n",
+            self.manga_inertial_friction
+        ));
+        content.push_str(
+            "; Manga mode: extra wheel multiplier after normalization (mouse vs trackpad)\n",
+        );
+        content.push_str(&format!(
+            "manga_wheel_multiplier = {}\n",
+            self.manga_wheel_multiplier
+        ));
+        content.push_str(
+            "; Manga mode: arrow key scroll speed in pixels per key press (separate from wheel)\n",
+        );
+        content.push_str(&format!(
+            "manga_arrow_scroll_speed = {}\n\n",
+            self.manga_arrow_scroll_speed
+        ));
+
         // Write video section
         content.push_str("[Video]\n");
         content.push_str("; Whether videos start muted by default\n");
         content.push_str(&format!(
             "muted_by_default = {}\n",
-            if self.video_muted_by_default { "true" } else { "false" }
+            if self.video_muted_by_default {
+                "true"
+            } else {
+                "false"
+            }
         ));
         content.push_str("; Default volume level (0.0 to 1.0)\n");
         content.push_str(&format!("default_volume = {}\n", self.video_default_volume));
@@ -939,36 +999,68 @@ impl Config {
             "loop = {}\n",
             if self.video_loop { "true" } else { "false" }
         ));
-        content.push_str("; Video controls auto-hide uses [Settings].bottom_overlay_hide_delay\n\n");
+        content
+            .push_str("; Video controls auto-hide uses [Settings].bottom_overlay_hide_delay\n\n");
 
         // Write quality section with comprehensive documentation
         content.push_str("[Quality]\n");
-        content.push_str("; Image scaling filters - affects quality when images are resized to fit the window\n");
+        content.push_str(
+            "; Image scaling filters - affects quality when images are resized to fit the window\n",
+        );
         content.push_str("; Available options (from fastest to highest quality):\n");
         content.push_str(";   nearest   - Fastest, pixelated look (good for pixel art)\n");
         content.push_str(";   triangle  - Fast bilinear interpolation, decent quality\n");
-        content.push_str(";   catmullrom - Good balance of speed and quality (recommended for upscaling)\n");
+        content.push_str(
+            ";   catmullrom - Good balance of speed and quality (recommended for upscaling)\n",
+        );
         content.push_str(";   gaussian  - Smooth results, slightly blurry\n");
-        content.push_str(";   lanczos3  - Highest quality, sharpest results (recommended for downscaling)\n\n");
-        
+        content.push_str(
+            ";   lanczos3  - Highest quality, sharpest results (recommended for downscaling)\n\n",
+        );
+
         content.push_str("; Filter used when enlarging images (displaying small images larger)\n");
-        content.push_str(&format!("upscale_filter = {}\n", self.upscale_filter.as_str()));
+        content.push_str(&format!(
+            "upscale_filter = {}\n",
+            self.upscale_filter.as_str()
+        ));
         content.push_str("; Filter used when shrinking images (displaying large images smaller)\n");
-        content.push_str(&format!("downscale_filter = {}\n", self.downscale_filter.as_str()));
-        content.push_str("; Filter used when resizing GIF frames (affects memory usage and quality)\n");
-        content.push_str(&format!("gif_resize_filter = {}\n\n", self.gif_resize_filter.as_str()));
-        
-        content.push_str("; GPU texture filtering - affects how images look when zoomed/scaled on screen\n");
+        content.push_str(&format!(
+            "downscale_filter = {}\n",
+            self.downscale_filter.as_str()
+        ));
+        content.push_str(
+            "; Filter used when resizing GIF frames (affects memory usage and quality)\n",
+        );
+        content.push_str(&format!(
+            "gif_resize_filter = {}\n\n",
+            self.gif_resize_filter.as_str()
+        ));
+
+        content.push_str(
+            "; GPU texture filtering - affects how images look when zoomed/scaled on screen\n",
+        );
         content.push_str("; Available options:\n");
-        content.push_str(";   nearest - Sharp pixels, no blending (good for pixel art, crisp at 100%)\n");
-        content.push_str(";   linear  - Smooth blending between pixels (recommended for photos)\n\n");
-        
+        content.push_str(
+            ";   nearest - Sharp pixels, no blending (good for pixel art, crisp at 100%)\n",
+        );
+        content
+            .push_str(";   linear  - Smooth blending between pixels (recommended for photos)\n\n");
+
         content.push_str("; Texture filter for static images (photos, PNG, JPEG, etc.)\n");
-        content.push_str(&format!("texture_filter_static = {}\n", self.texture_filter_static.as_str()));
+        content.push_str(&format!(
+            "texture_filter_static = {}\n",
+            self.texture_filter_static.as_str()
+        ));
         content.push_str("; Texture filter for animated images (GIFs)\n");
-        content.push_str(&format!("texture_filter_animated = {}\n", self.texture_filter_animated.as_str()));
+        content.push_str(&format!(
+            "texture_filter_animated = {}\n",
+            self.texture_filter_animated.as_str()
+        ));
         content.push_str("; Texture filter for video frames\n");
-        content.push_str(&format!("texture_filter_video = {}\n\n", self.texture_filter_video.as_str()));
+        content.push_str(&format!(
+            "texture_filter_video = {}\n\n",
+            self.texture_filter_video.as_str()
+        ));
 
         content.push_str("[Shortcuts]\n");
 
@@ -976,10 +1068,7 @@ impl Config {
         let mut action_strings: HashMap<Action, Vec<String>> = HashMap::new();
         for (binding, action) in &self.bindings {
             let binding_str = binding_to_string(binding);
-            action_strings
-                .entry(*action)
-                .or_default()
-                .push(binding_str);
+            action_strings.entry(*action).or_default().push(binding_str);
         }
 
         // Write shortcuts
@@ -999,7 +1088,10 @@ impl Config {
     /// Get all bindings for an action
     #[allow(dead_code)]
     pub fn get_bindings(&self, action: Action) -> Vec<InputBinding> {
-        self.action_bindings.get(&action).cloned().unwrap_or_default()
+        self.action_bindings
+            .get(&action)
+            .cloned()
+            .unwrap_or_default()
     }
 }
 
@@ -1035,7 +1127,11 @@ fn parse_bool(value: &str) -> Option<bool> {
 }
 
 fn parse_rgb_triplet(value: &str) -> Option<[u8; 3]> {
-    let parts: Vec<&str> = value.split(',').map(|p| p.trim()).filter(|p| !p.is_empty()).collect();
+    let parts: Vec<&str> = value
+        .split(',')
+        .map(|p| p.trim())
+        .filter(|p| !p.is_empty())
+        .collect();
     if parts.len() != 3 {
         return None;
     }

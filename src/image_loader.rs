@@ -5,8 +5,8 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use image::GenericImageView;
 use image::imageops::FilterType;
+use image::GenericImageView;
 
 // Reduced from 4 GiB to 512 MiB for more reasonable memory limits
 // This prevents loading extremely large images that would consume too much RAM
@@ -28,8 +28,8 @@ fn open_image_with_reasonable_limits(path: &Path) -> Result<image::DynamicImage,
     let max_alloc = estimated.clamp(256 * 1024 * 1024, DEFAULT_MAX_DECODE_ALLOC_BYTES);
     let max_alloc_u64 = max_alloc;
 
-    let mut reader = image::ImageReader::open(path)
-        .map_err(|e| format!("Failed to open image: {}", e))?;
+    let mut reader =
+        image::ImageReader::open(path).map_err(|e| format!("Failed to open image: {}", e))?;
 
     // Best-effort format detection for cases where extensions are unusual.
     reader = reader
@@ -54,17 +54,20 @@ fn open_image_with_reasonable_limits(path: &Path) -> Result<image::DynamicImage,
 }
 
 /// Supported image extensions
-pub const SUPPORTED_IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "gif", "bmp", "ico", "tiff", "tif"];
+pub const SUPPORTED_IMAGE_EXTENSIONS: &[&str] = &[
+    "jpg", "jpeg", "png", "webp", "gif", "bmp", "ico", "tiff", "tif",
+];
 
 /// Supported video extensions
-pub const SUPPORTED_VIDEO_EXTENSIONS: &[&str] = &["mp4", "mkv", "webm", "avi", "mov", "wmv", "flv", "m4v", "3gp", "ogv"];
+pub const SUPPORTED_VIDEO_EXTENSIONS: &[&str] = &[
+    "mp4", "mkv", "webm", "avi", "mov", "wmv", "flv", "m4v", "3gp", "ogv",
+];
 
 /// All supported media extensions (images + videos)
 pub const SUPPORTED_EXTENSIONS: &[&str] = &[
     // Images
-    "jpg", "jpeg", "png", "webp", "gif", "bmp", "ico", "tiff", "tif",
-    // Videos
-    "mp4", "mkv", "webm", "avi", "mov", "wmv", "flv", "m4v", "3gp", "ogv"
+    "jpg", "jpeg", "png", "webp", "gif", "bmp", "ico", "tiff", "tif", // Videos
+    "mp4", "mkv", "webm", "avi", "mov", "wmv", "flv", "m4v", "3gp", "ogv",
 ];
 
 /// Media type enum
@@ -170,11 +173,11 @@ impl LoadedImage {
     ///
     /// If provided, oversized images/frames are downscaled to fit within `max_texture_side`
     /// to avoid GPU texture creation crashes (common with wgpu validation).
-    /// 
+    ///
     /// `downscale_filter` - Filter used when downscaling images to fit max texture size
     /// `gif_filter` - Filter used when resizing GIF frames
     pub fn load_with_max_texture_side(
-        path: &Path, 
+        path: &Path,
         max_texture_side: Option<u32>,
         downscale_filter: FilterType,
         gif_filter: FilterType,
@@ -272,10 +275,10 @@ impl LoadedImage {
         filter: FilterType,
         tx: &std::sync::mpsc::Sender<ImageFrame>,
     ) {
+        use image::codecs::webp::WebPDecoder;
+        use image::AnimationDecoder;
         use std::fs::File;
         use std::io::BufReader;
-        use image::AnimationDecoder;
-        use image::codecs::webp::WebPDecoder;
 
         let file = match File::open(path) {
             Ok(f) => f,
@@ -303,7 +306,10 @@ impl LoadedImage {
 
             let frame = match frame_result {
                 Ok(f) => f,
-                Err(_) => { frame_index += 1; continue; }
+                Err(_) => {
+                    frame_index += 1;
+                    continue;
+                }
             };
 
             let (numer, denom) = frame.delay().numer_denom_ms();
@@ -317,8 +323,8 @@ impl LoadedImage {
             if target_width.is_none() {
                 if let Some(max_side) = max_texture_side {
                     if max_side > 0 && (width > max_side || height > max_side) {
-                        let scale = (max_side as f64 / width as f64)
-                            .min(max_side as f64 / height as f64);
+                        let scale =
+                            (max_side as f64 / width as f64).min(max_side as f64 / height as f64);
                         target_width = Some(((width as f64) * scale).round().max(1.0) as u32);
                         target_height = Some(((height as f64) * scale).round().max(1.0) as u32);
                     } else {
@@ -340,7 +346,6 @@ impl LoadedImage {
             } else {
                 (width, height, rgba.into_raw())
             };
-
 
             // Skip the first frame — the caller already has it.
             if frame_index > 0 {
@@ -366,9 +371,9 @@ impl LoadedImage {
     /// Check whether a WebP file contains animation without fully decoding it.
     /// This is cheap — it only reads the file header, not any frame data.
     pub fn is_animated_webp(path: &Path) -> bool {
+        use image::codecs::webp::WebPDecoder;
         use std::fs::File;
         use std::io::BufReader;
-        use image::codecs::webp::WebPDecoder;
 
         let extension = path
             .extension()
@@ -398,15 +403,15 @@ impl LoadedImage {
         max_texture_side: Option<u32>,
         filter: FilterType,
     ) -> Result<Self, String> {
+        use image::codecs::webp::WebPDecoder;
+        use image::AnimationDecoder;
         use std::fs::File;
         use std::io::BufReader;
-        use image::AnimationDecoder;
-        use image::codecs::webp::WebPDecoder;
 
         let file = File::open(path).map_err(|e| format!("Failed to open file: {}", e))?;
         let reader = BufReader::new(file);
-        let decoder = WebPDecoder::new(reader)
-            .map_err(|e| format!("Failed to decode WEBP: {}", e))?;
+        let decoder =
+            WebPDecoder::new(reader).map_err(|e| format!("Failed to decode WEBP: {}", e))?;
 
         // Get the first frame from the animation iterator.
         let frame = decoder
@@ -426,8 +431,7 @@ impl LoadedImage {
         // Downscale if necessary
         let (tw, th) = if let Some(max_side) = max_texture_side {
             if max_side > 0 && (width > max_side || height > max_side) {
-                let scale = (max_side as f64 / width as f64)
-                    .min(max_side as f64 / height as f64);
+                let scale = (max_side as f64 / width as f64).min(max_side as f64 / height as f64);
                 (
                     ((width as f64) * scale).round().max(1.0) as u32,
                     ((height as f64) * scale).round().max(1.0) as u32,
@@ -462,7 +466,11 @@ impl LoadedImage {
     }
 
     /// Load a static image (JPG, PNG, WEBP, etc.)
-    fn load_static(path: &Path, max_texture_side: Option<u32>, downscale_filter: FilterType) -> Result<Self, String> {
+    fn load_static(
+        path: &Path,
+        max_texture_side: Option<u32>,
+        downscale_filter: FilterType,
+    ) -> Result<Self, String> {
         let img = open_image_with_reasonable_limits(path)?;
         let img = if let Some(max_side) = max_texture_side {
             if max_side > 0 {
@@ -502,14 +510,18 @@ impl LoadedImage {
 
     /// Load an animated GIF
     /// Optimized for memory: limits frame count and uses efficient downscaling
-    fn load_gif(path: &Path, max_texture_side: Option<u32>, gif_filter: FilterType) -> Result<Self, String> {
-        use std::fs::File;
+    fn load_gif(
+        path: &Path,
+        max_texture_side: Option<u32>,
+        gif_filter: FilterType,
+    ) -> Result<Self, String> {
         use gif::DecodeOptions;
+        use std::fs::File;
 
         let file = File::open(path).map_err(|e| format!("Failed to open file: {}", e))?;
         let mut decoder = DecodeOptions::new();
         decoder.set_color_output(gif::ColorOutput::RGBA);
-        
+
         let mut decoder = decoder
             .read_info(file)
             .map_err(|e| format!("Failed to read GIF: {}", e))?;
@@ -523,10 +535,12 @@ impl LoadedImage {
         const MAX_ANIMATION_MEMORY: usize = 512 * 1024 * 1024; // 512 MiB
         const MAX_FRAMES_SAFETY: usize = 1000; // generous hard cap
         let mut total_decoded_bytes: usize = 0;
-        
+
         // Determine if we need to downscale upfront based on memory constraints
         // For large GIFs, downscale immediately to reduce per-frame memory
-        let (target_width, target_height, needs_downscale) = if let Some(max_side) = max_texture_side {
+        let (target_width, target_height, needs_downscale) = if let Some(max_side) =
+            max_texture_side
+        {
             if max_side > 0 && (width > max_side || height > max_side) {
                 let scale = (max_side as f64 / width as f64).min(max_side as f64 / height as f64);
                 let new_w = ((width as f64) * scale).round().max(1.0) as u32;
@@ -541,22 +555,27 @@ impl LoadedImage {
 
         // Create a canvas to composite frames onto (at original size for decoding)
         let mut canvas = vec![0u8; (width * height * 4) as usize];
-        
+
         // Pre-allocate reusable buffer for downscaling if needed
         #[allow(unused_mut)]
         let mut downscale_buffer: Option<Vec<u8>> = if needs_downscale {
-            Some(Vec::with_capacity((target_width * target_height * 4) as usize))
+            Some(Vec::with_capacity(
+                (target_width * target_height * 4) as usize,
+            ))
         } else {
             None
         };
 
         let mut frame_count = 0;
-        while let Some(frame) = decoder.read_next_frame().map_err(|e| format!("GIF frame error: {}", e))? {
+        while let Some(frame) = decoder
+            .read_next_frame()
+            .map_err(|e| format!("GIF frame error: {}", e))?
+        {
             // Stop when we exceed the memory budget or the safety cap.
             if frame_count >= MAX_FRAMES_SAFETY {
                 break;
             }
-            
+
             let delay_ms = (frame.delay as u32) * 10; // GIF delay is in centiseconds
             let delay_ms = if delay_ms == 0 { 100 } else { delay_ms }; // Default to 100ms if 0
 
@@ -576,7 +595,8 @@ impl LoadedImage {
                         let dst_idx = (dst_y * width as usize + dst_x) * 4;
                         // Only copy if not fully transparent
                         if frame.buffer.len() > src_idx + 3 && frame.buffer[src_idx + 3] > 0 {
-                            canvas[dst_idx..dst_idx + 4].copy_from_slice(&frame.buffer[src_idx..src_idx + 4]);
+                            canvas[dst_idx..dst_idx + 4]
+                                .copy_from_slice(&frame.buffer[src_idx..src_idx + 4]);
                         }
                     }
                 }
@@ -589,7 +609,8 @@ impl LoadedImage {
                     return Err("Failed to build RGBA image for GIF resizing".to_string());
                 };
                 // Use configurable filter for animated GIFs
-                let resized = image::imageops::resize(&img, target_width, target_height, gif_filter);
+                let resized =
+                    image::imageops::resize(&img, target_width, target_height, gif_filter);
                 resized.into_raw()
             } else {
                 canvas.clone()
@@ -603,7 +624,7 @@ impl LoadedImage {
                 height: target_height,
                 delay_ms,
             });
-            
+
             frame_count += 1;
 
             // Stop if we have exceeded the memory budget.
@@ -641,18 +662,17 @@ impl LoadedImage {
         max_texture_side: Option<u32>,
         filter: FilterType,
     ) -> Result<Self, String> {
+        use image::codecs::webp::WebPDecoder;
+        use image::AnimationDecoder;
         use std::fs::File;
         use std::io::BufReader;
-        use image::AnimationDecoder;
-        use image::codecs::webp::WebPDecoder;
 
         let file = File::open(path).map_err(|e| format!("Failed to open file: {}", e))?;
         let reader = BufReader::new(file);
-        let decoder = WebPDecoder::new(reader)
-            .map_err(|e| format!("Failed to decode WEBP: {}", e))?;
+        let decoder =
+            WebPDecoder::new(reader).map_err(|e| format!("Failed to decode WEBP: {}", e))?;
 
-        let frames_iter = decoder
-            .into_frames();
+        let frames_iter = decoder.into_frames();
 
         let mut frames = Vec::new();
 
@@ -692,8 +712,8 @@ impl LoadedImage {
             if target_width.is_none() {
                 if let Some(max_side) = max_texture_side {
                     if max_side > 0 && (width > max_side || height > max_side) {
-                        let scale = (max_side as f64 / width as f64)
-                            .min(max_side as f64 / height as f64);
+                        let scale =
+                            (max_side as f64 / width as f64).min(max_side as f64 / height as f64);
                         target_width = Some(((width as f64) * scale).round().max(1.0) as u32);
                         target_height = Some(((height as f64) * scale).round().max(1.0) as u32);
                     } else {
@@ -783,13 +803,13 @@ impl LoadedImage {
         if self.frames.len() <= 1 {
             return 0.0;
         }
-        
+
         // Calculate position based on cumulative time of frames before current
         let total_duration = self.total_duration_ms() as f64;
         if total_duration <= 0.0 {
             return self.current_frame as f64 / (self.frames.len() - 1) as f64;
         }
-        
+
         let mut cumulative_time: f64 = 0.0;
         for i in 0..self.current_frame {
             cumulative_time += self.frames[i].delay_ms as f64;
@@ -922,8 +942,14 @@ pub mod natord {
                 (Some(&ac), Some(&bc)) => {
                     if ac.is_ascii_digit() && bc.is_ascii_digit() {
                         // Extract full numbers and compare numerically
-                        let a_num: String = a_chars.by_ref().take_while(|c| c.is_ascii_digit()).collect();
-                        let b_num: String = b_chars.by_ref().take_while(|c| c.is_ascii_digit()).collect();
+                        let a_num: String = a_chars
+                            .by_ref()
+                            .take_while(|c| c.is_ascii_digit())
+                            .collect();
+                        let b_num: String = b_chars
+                            .by_ref()
+                            .take_while(|c| c.is_ascii_digit())
+                            .collect();
                         let a_val: u64 = a_num.parse().unwrap_or(0);
                         let b_val: u64 = b_num.parse().unwrap_or(0);
                         match a_val.cmp(&b_val) {

@@ -32,7 +32,11 @@ fn expand_env_vars(input: &str) -> String {
     }
 }
 
-fn read_reg_string(hkey: winapi::shared::minwindef::HKEY, subkey: &str, value: &str) -> Option<String> {
+fn read_reg_string(
+    hkey: winapi::shared::minwindef::HKEY,
+    subkey: &str,
+    value: &str,
+) -> Option<String> {
     use winapi::shared::minwindef::DWORD;
     use winapi::um::winreg::{RegGetValueW, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ};
 
@@ -106,7 +110,10 @@ fn merge_path_lists(primary: &str, secondary: &str) -> String {
     let mut seen: HashSet<String> = HashSet::new();
     let mut out: Vec<String> = Vec::new();
 
-    for entry in split_path_list(primary).into_iter().chain(split_path_list(secondary)) {
+    for entry in split_path_list(primary)
+        .into_iter()
+        .chain(split_path_list(secondary))
+    {
         let key = normalize_path_key(&entry);
         if key.is_empty() {
             continue;

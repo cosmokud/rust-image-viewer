@@ -3,8 +3,8 @@
 
 use std::path::Path;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
 use std::sync::OnceLock;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use gstreamer as gst;
@@ -354,16 +354,17 @@ Ensure your GStreamer installation includes the playback elements (usually from 
 
         // Create a bin to hold the appsink with video conversion
         let video_bin = gst::Bin::new();
-        
+
         let videoconvert = gst::ElementFactory::make("videoconvert")
             .build()
             .map_err(|e| format!("Failed to create videoconvert: {}", e))?;
-        
+
         let videoscale = gst::ElementFactory::make("videoscale")
             .build()
             .map_err(|e| format!("Failed to create videoscale: {}", e))?;
 
-        video_bin.add_many([&videoconvert, &videoscale, appsink.upcast_ref()])
+        video_bin
+            .add_many([&videoconvert, &videoscale, appsink.upcast_ref()])
             .map_err(|e| format!("Failed to add elements to bin: {}", e))?;
 
         gst::Element::link_many([&videoconvert, &videoscale, appsink.upcast_ref()])
@@ -375,8 +376,12 @@ Ensure your GStreamer installation includes the playback elements (usually from 
             .ok_or("Failed to get sink pad")?;
         let ghost_pad = gst::GhostPad::with_target(&pad)
             .map_err(|e| format!("Failed to create ghost pad: {}", e))?;
-        ghost_pad.set_active(true).map_err(|e| format!("Failed to activate ghost pad: {}", e))?;
-        video_bin.add_pad(&ghost_pad).map_err(|e| format!("Failed to add ghost pad: {}", e))?;
+        ghost_pad
+            .set_active(true)
+            .map_err(|e| format!("Failed to activate ghost pad: {}", e))?;
+        video_bin
+            .add_pad(&ghost_pad)
+            .map_err(|e| format!("Failed to add ghost pad: {}", e))?;
 
         pipeline.set_property("video-sink", &video_bin);
 
@@ -398,7 +403,8 @@ Ensure your GStreamer installation includes the playback elements (usually from 
                 .build()
                 .map_err(|e| format!("Failed to create audiosink: {}", e))?;
 
-            audio_bin.add_many([&audioconvert, &audioresample, vol, &audiosink])
+            audio_bin
+                .add_many([&audioconvert, &audioresample, vol, &audiosink])
                 .map_err(|e| format!("Failed to add audio elements to bin: {}", e))?;
             gst::Element::link_many([&audioconvert, &audioresample, vol, &audiosink])
                 .map_err(|e| format!("Failed to link audio elements: {}", e))?;
@@ -408,8 +414,12 @@ Ensure your GStreamer installation includes the playback elements (usually from 
                 .ok_or("Failed to get audio sink pad")?;
             let audio_ghost_pad = gst::GhostPad::with_target(&audio_pad)
                 .map_err(|e| format!("Failed to create audio ghost pad: {}", e))?;
-            audio_ghost_pad.set_active(true).map_err(|e| format!("Failed to activate audio ghost pad: {}", e))?;
-            audio_bin.add_pad(&audio_ghost_pad).map_err(|e| format!("Failed to add audio ghost pad: {}", e))?;
+            audio_ghost_pad
+                .set_active(true)
+                .map_err(|e| format!("Failed to activate audio ghost pad: {}", e))?;
+            audio_bin
+                .add_pad(&audio_ghost_pad)
+                .map_err(|e| format!("Failed to add audio ghost pad: {}", e))?;
 
             pipeline.set_property("audio-sink", &audio_bin);
         }
@@ -448,8 +458,8 @@ Ensure your GStreamer installation includes the playback elements (usually from 
                                         };
 
                                         // If caps don't clearly say, infer from first frame.
-                                        let inferred =
-                                            by_caps.unwrap_or_else(|| guess_limited_range_rgba(&data));
+                                        let inferred = by_caps
+                                            .unwrap_or_else(|| guess_limited_range_rgba(&data));
                                         state.needs_range_expand = Some(inferred);
                                         inferred
                                     }
@@ -521,10 +531,10 @@ Ensure your GStreamer installation includes the playback elements (usually from 
             }
         })?;
         self.is_playing = true;
-        
+
         // Try to get duration after starting
         self.update_duration();
-        
+
         Ok(())
     }
 
@@ -588,11 +598,11 @@ Ensure your GStreamer installation includes the playback elements (usually from 
     /// Uses frame-accurate seeking for precise positioning
     pub fn seek(&mut self, position: f64) -> Result<(), String> {
         let position = position.clamp(0.0, 1.0);
-        
+
         if let Some(duration) = self.duration {
             let seek_pos = Duration::from_secs_f64(duration.as_secs_f64() * position);
             let seek_pos_ns = seek_pos.as_nanos() as i64;
-            
+
             // Use ACCURATE flag for frame-precise seeking instead of KEY_UNIT
             // This may be slower but provides exact frame positioning
             self.pipeline
@@ -602,7 +612,7 @@ Ensure your GStreamer installation includes the playback elements (usually from 
                 )
                 .map_err(|e| format!("Failed to seek: {}", e))?;
         }
-        
+
         Ok(())
     }
 
@@ -610,7 +620,7 @@ Ensure your GStreamer installation includes the playback elements (usually from 
     /// Uses frame-accurate seeking for precise positioning
     pub fn seek_to_time(&mut self, seconds: f64) -> Result<(), String> {
         let seek_pos_ns = (seconds * 1_000_000_000.0) as u64;
-        
+
         // Use ACCURATE flag for frame-precise seeking instead of KEY_UNIT
         self.pipeline
             .seek_simple(
@@ -618,7 +628,7 @@ Ensure your GStreamer installation includes the playback elements (usually from 
                 gst::ClockTime::from_nseconds(seek_pos_ns),
             )
             .map_err(|e| format!("Failed to seek: {}", e))?;
-        
+
         Ok(())
     }
 
@@ -637,7 +647,8 @@ Ensure your GStreamer installation includes the playback elements (usually from 
     /// Update cached duration (call periodically)
     pub fn update_duration(&mut self) {
         if self.duration.is_none() {
-            self.duration = self.pipeline
+            self.duration = self
+                .pipeline
                 .query_duration::<gst::ClockTime>()
                 .map(|dur| Duration::from_nanos(dur.nseconds()));
         }
@@ -646,9 +657,7 @@ Ensure your GStreamer installation includes the playback elements (usually from 
     /// Get current position as a fraction (0.0 to 1.0)
     pub fn position_fraction(&self) -> f64 {
         match (self.position(), self.duration) {
-            (Some(pos), Some(dur)) if dur.as_nanos() > 0 => {
-                pos.as_secs_f64() / dur.as_secs_f64()
-            }
+            (Some(pos), Some(dur)) if dur.as_nanos() > 0 => pos.as_secs_f64() / dur.as_secs_f64(),
             _ => 0.0,
         }
     }
@@ -695,13 +704,13 @@ Ensure your GStreamer installation includes the playback elements (usually from 
         if let Ok(mut state) = self.state.lock() {
             if state.frame_updated {
                 state.frame_updated = false;
-                
+
                 // Update dimensions
                 if state.video_width > 0 && state.video_height > 0 {
                     self.original_width = state.video_width;
                     self.original_height = state.video_height;
                 }
-                
+
                 // Take ownership instead of cloning to save memory
                 return state.current_frame.take();
             }

@@ -98,7 +98,8 @@ pub fn try_acquire_lock(
 
     // Try to create/acquire the mutex
     let mutex_name_wide = to_wide_null(MUTEX_NAME);
-    let mutex_handle = unsafe { CreateMutexW(std::ptr::null_mut(), FALSE, mutex_name_wide.as_ptr()) };
+    let mutex_handle =
+        unsafe { CreateMutexW(std::ptr::null_mut(), FALSE, mutex_name_wide.as_ptr()) };
 
     if mutex_handle.is_null() {
         return SingleInstanceResult::Disabled;
