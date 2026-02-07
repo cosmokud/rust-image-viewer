@@ -6551,13 +6551,23 @@ impl ImageViewer {
             animation_active = true;
         }
 
-        // Floating mode: when zooming out to <= 100%, ease any residual offset back to center.
+        let floating_image_exceeds_window = if self.is_fullscreen {
+            false
+        } else {
+            self.image_display_size_at_zoom()
+                .map(|size| {
+                    size.x > screen_rect.width() + 0.5 || size.y > screen_rect.height() + 0.5
+                })
+                .unwrap_or(false)
+        };
+
+        // Floating mode: when the image fits the window, ease any residual offset back to center.
         // (No bounce, no fade; just a smooth settle.) Skip during resize/seeking to avoid fighting.
         if !self.is_fullscreen
             && !self.is_panning
             && !self.is_resizing
             && !self.is_seeking
-            && self.zoom <= 1.0
+            && !floating_image_exceeds_window
             && self.offset.length() > 0.1
         {
             let dt = ctx.input(|i| i.stable_dt).min(0.033);
@@ -6788,7 +6798,7 @@ impl ImageViewer {
                             } else if in_title_bar {
                                 // In floating mode, dragging from title bar always moves window
                                 ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
-                            } else if self.zoom > 1.0 {
+                            } else if floating_image_exceeds_window {
                                 // In floating mode when zoomed past 100%, pan image inside window
                                 let delta = ctx.input(|i| i.pointer.delta());
                                 self.offset += delta;
