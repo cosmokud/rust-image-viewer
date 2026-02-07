@@ -4541,6 +4541,61 @@ impl ImageViewer {
         ))
     }
 
+    fn right_click_black_bar_action(
+        &self,
+        pos: egui::Pos2,
+        screen_rect: egui::Rect,
+    ) -> Option<Action> {
+        let display_size = self.image_display_size_at_zoom()?;
+        if display_size.x <= 0.0 || display_size.y <= 0.0 {
+            return None;
+        }
+
+        let center = if self.is_resizing {
+            if let Some(commanded_size) = self.resize_last_size {
+                egui::pos2(commanded_size.x / 2.0, commanded_size.y / 2.0)
+            } else {
+                screen_rect.center()
+            }
+        } else {
+            screen_rect.center() + self.offset
+        };
+
+        let mut image_rect = egui::Rect::from_center_size(center, display_size);
+
+        let t = self.fullscreen_transition;
+        if t > 0.001 && t < 0.999 {
+            let ease = t * t * (3.0 - 2.0 * t);
+            let scale = if self.is_fullscreen {
+                0.985 + 0.015 * ease
+            } else {
+                let u = (1.0 - t).clamp(0.0, 1.0);
+                let c1: f32 = 1.70158;
+                let c3: f32 = c1 + 1.0;
+                let x = u - 1.0;
+                let ease_out_back = 1.0 + c3 * x.powi(3) + c1 * x.powi(2);
+                let bump = (ease_out_back - u).max(0.0);
+                1.0 + 0.03 * bump
+            };
+
+            let scaled_size = display_size * scale;
+            image_rect = egui::Rect::from_center_size(center, scaled_size);
+        }
+
+        const MIN_BAR_WIDTH: f32 = 0.5;
+        let left_gap = image_rect.min.x - screen_rect.min.x;
+        let right_gap = screen_rect.max.x - image_rect.max.x;
+
+        if left_gap > MIN_BAR_WIDTH && pos.x < image_rect.min.x {
+            return Some(Action::PreviousImage);
+        }
+        if right_gap > MIN_BAR_WIDTH && pos.x > image_rect.max.x {
+            return Some(Action::NextImage);
+        }
+
+        None
+    }
+
     fn request_floating_autosize(&mut self, ctx: &egui::Context) {
         if self.is_fullscreen || self.is_resizing || self.pending_window_resize.is_some() {
             return;
@@ -4762,6 +4817,7 @@ impl ImageViewer {
         // Special-case: in fullscreen manga mode, middle click should exit manga mode
         // (returning to normal fullscreen viewing) rather than toggling fullscreen.
         let mut middle_click_exit_manga = false;
+        let mut right_click_navigated = false;
 
         ctx.input(|input| {
             let ctrl = input.modifiers.ctrl;
@@ -4876,11 +4932,23 @@ impl ImageViewer {
             if input.pointer.button_clicked(egui::PointerButton::Secondary) && !over_video_controls
             {
                 if let Some(pos) = input.pointer.hover_pos() {
+                    if !self.manga_mode {
+                        if let Some(action) =
+                            self.right_click_black_bar_action(pos, input.screen_rect)
+                        {
+                            actions_to_run.push(action);
+                            right_click_navigated = true;
+                            return;
+                        }
+                    }
+
                     let side_zone = screen_width / 9.0;
                     if pos.x < side_zone {
                         actions_to_run.push(Action::PreviousImage);
+                        right_click_navigated = true;
                     } else if pos.x > screen_width - side_zone {
                         actions_to_run.push(Action::NextImage);
+                        right_click_navigated = true;
                     } else {
                         // Center region: toggle play/pause for videos, do nothing for images
                         // We'll handle this outside the closure since we need &mut self
@@ -4902,7 +4970,9 @@ impl ImageViewer {
         let has_animated_gif =
             !self.manga_mode && self.image.as_ref().map_or(false, |img| img.is_animated());
 
-        let should_toggle_media = {
+        let should_toggle_media = if right_click_navigated {
+            false
+        } else {
             let bar_height = 56.0;
             let over_video_controls = self.show_video_controls && (has_video || has_animated_gif);
 
@@ -5184,7 +5254,7 @@ impl ImageViewer {
                                     if self.video_player.is_some() {
                                         let resp = ui.add(
                                             egui::Label::new(
-                                                egui::RichText::new("\u{007f}\u{007f} VIDEO")
+                                                egui::RichText::new("VIDEO")
                                                     .color(egui::Color32::from_rgb(66, 133, 244)),
                                             )
                                             .selectable(true),
