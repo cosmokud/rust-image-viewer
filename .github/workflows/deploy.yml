@@ -1,0 +1,50 @@
+name: Deploy
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  deploy:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup GStreamer
+        id: setup_gstreamer
+        uses: blinemedical/setup-gstreamer@v1.4.0
+        with:
+          version: "1.27.90"
+          arch: "x86_64"
+          msiUrl: https://gstreamer.freedesktop.org/data/pkg/windows/1.27.90/msvc/gstreamer-1.0-msvc-x86-1.27.90.msi
+          devMsiUrl: https://gstreamer.freedesktop.org/data/pkg/windows/1.27.90/msvc/gstreamer-1.0-devel-msvc-x86_64-1.27.90.msi
+
+      - name: Install Rust (MSVC)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable-x86_64-pc-windows-msvc
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build (release)
+        shell: pwsh
+        run: cargo build --release
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-image-viewer-nightly
+          path: target/release/rust-image-viewer.exe
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          prerelease: false
+          files: target/release/rust-image-viewer.exe
