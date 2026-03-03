@@ -4693,6 +4693,40 @@ impl ImageViewer {
         }
     }
 
+    /// Apply pointer-anchored zoom for masonry mode using screen-space cursor position.
+    /// Keeps the content point under the cursor stable while zooming.
+    fn apply_masonry_zoom_at_screen_pos(&mut self, new_zoom: f32, anchor_screen: egui::Pos2) -> bool {
+        if !self.is_masonry_mode() {
+            return false;
+        }
+
+        let old_zoom = self.zoom.max(0.0001);
+        let new_zoom = self.clamp_zoom(new_zoom);
+        if (new_zoom - old_zoom).abs() <= 0.0001 {
+            return false;
+        }
+
+        // Convert the anchor screen point to masonry content-space coordinates before zoom.
+        let content_x = (anchor_screen.x - self.offset.x) / old_zoom;
+        let content_y = (anchor_screen.y + self.manga_scroll_offset) / old_zoom;
+
+        self.zoom = new_zoom;
+        self.zoom_target = new_zoom;
+        self.zoom_velocity = 0.0;
+        self.invalidate_manga_layout_cache_for_zoom();
+
+        // Rebuild transforms so the same content-space point maps back to the same screen point.
+        self.offset.x = anchor_screen.x - content_x * new_zoom;
+
+        let max_scroll = (self.manga_total_height() - self.screen_size.y).max(0.0);
+        let new_scroll = (content_y * new_zoom - anchor_screen.y).clamp(0.0, max_scroll);
+        self.manga_scroll_offset = new_scroll;
+        self.manga_scroll_target = new_scroll;
+        self.manga_scroll_velocity = 0.0;
+
+        true
+    }
+
     fn draw_manga_item(&mut self, ui: &mut egui::Ui, idx: usize, image_rect: egui::Rect) {
         // Check if this item is a video
         let is_video = self
@@ -5149,22 +5183,35 @@ impl ImageViewer {
                 let new_zoom = self.clamp_zoom(self.zoom * factor);
 
                 if (new_zoom - old_zoom).abs() > 0.0001 {
-                    // CRITICAL FIX: Use index-based anchoring for stable zooming with varying image sizes.
-                    // Anchor at pointer Y when available, otherwise at screen center.
-                    let anchor_screen_y = pointer_pos
-                        .map(|p| (p.y - screen_rect.min.y).clamp(0.0, screen_height))
-                        .unwrap_or(screen_height * 0.5);
+                    if self.is_masonry_mode() {
+                        // Masonry: follow cursor position (X+Y) like normal image-mode zooming.
+                        let anchor = pointer_pos
+                            .map(|p| {
+                                egui::pos2(
+                                    (p.x - screen_rect.min.x).clamp(0.0, screen_width),
+                                    (p.y - screen_rect.min.y).clamp(0.0, screen_height),
+                                )
+                            })
+                            .unwrap_or(egui::pos2(screen_width * 0.5, screen_height * 0.5));
 
-                    let anchor = self.manga_capture_anchor_at_screen_y(anchor_screen_y);
+                        let _ = self.apply_masonry_zoom_at_screen_pos(new_zoom, anchor);
+                    } else {
+                        // Long strip: keep existing Y-anchor behavior.
+                        let anchor_screen_y = pointer_pos
+                            .map(|p| (p.y - screen_rect.min.y).clamp(0.0, screen_height))
+                            .unwrap_or(screen_height * 0.5);
 
-                    self.zoom = new_zoom;
-                    self.zoom_target = new_zoom;
-                    self.zoom_velocity = 0.0;
-                    self.invalidate_manga_layout_cache_for_zoom();
+                        let anchor = self.manga_capture_anchor_at_screen_y(anchor_screen_y);
 
-                    // Re-apply the anchor to keep the same image position at the pointer/center
-                    if let Some(a) = anchor {
-                        self.manga_apply_anchor_at_screen_y(a);
+                        self.zoom = new_zoom;
+                        self.zoom_target = new_zoom;
+                        self.zoom_velocity = 0.0;
+                        self.invalidate_manga_layout_cache_for_zoom();
+
+                        // Re-apply the anchor to keep the same image position at the pointer/center
+                        if let Some(a) = anchor {
+                            self.manga_apply_anchor_at_screen_y(a);
+                        }
                     }
 
                     // Scroll offset moved; update page index immediately.
@@ -5366,10 +5413,27 @@ impl ImageViewer {
         // Process decoded images from background threads and upload to GPU.
         // This is now non-blocking - images are decoded in parallel on background threads.
         // We always call this to keep uploading decoded images even while scrolling.
-        let load_anchor = self.manga_capture_scroll_anchor();
+        let masonry_prev_scroll = self.manga_scroll_offset;
+        let masonry_prev_target_delta = self.manga_scroll_target - self.manga_scroll_offset;
+        let masonry_prev_velocity = self.manga_scroll_velocity;
+        let load_anchor = if self.is_masonry_mode() {
+            None
+        } else {
+            self.manga_capture_scroll_anchor()
+        };
         let dims_updated = self.manga_process_pending_loads(ctx);
         if dims_updated {
-            if let Some(anchor) = load_anchor {
+            if self.is_masonry_mode() {
+                // Masonry has non-linear row ordering; index/fraction anchors can oscillate when
+                // late dimension updates reshuffle column heights. Preserve absolute scroll instead.
+                let max_scroll = (self.manga_total_height() - self.screen_size.y).max(0.0);
+                let new_offset = masonry_prev_scroll.clamp(0.0, max_scroll);
+                self.manga_scroll_offset = new_offset;
+                self.manga_scroll_target =
+                    (new_offset + masonry_prev_target_delta).clamp(0.0, max_scroll);
+                self.manga_scroll_velocity = masonry_prev_velocity;
+                self.manga_update_current_index();
+            } else if let Some(anchor) = load_anchor {
                 self.manga_apply_scroll_anchor(anchor);
                 self.manga_update_current_index();
             }
