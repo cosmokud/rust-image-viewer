@@ -3357,6 +3357,9 @@ impl ImageViewer {
         // Calculate how many pages are currently visible on screen
         // This determines preload count: visible_pages + 4 ahead and behind
         let visible_page_count = self.manga_calculate_visible_page_count();
+        let is_masonry = self.is_masonry_mode();
+        let masonry_rows = self.masonry_items_per_row.clamp(2, 10);
+        let masonry_side_multiplier = (masonry_rows + 1) / 2;
         let cache_multiplier = self.masonry_cache_multiplier();
 
         // Update the loader's visible page count for adaptive preloading
@@ -3370,8 +3373,16 @@ impl ImageViewer {
         // Scale the dimension cache window based on visible pages for better coverage
         let scrolling_up = self.manga_scroll_offset < prev_scroll_pos - 0.5;
         let dim_scale = (visible_page_count as f32 / 2.0).max(1.0) as usize;
-        let max_behind = if self.is_masonry_mode() { 400 } else { 200 };
-        let max_ahead = if self.is_masonry_mode() { 200 } else { 100 };
+        let max_behind = if is_masonry {
+            240usize.saturating_mul(masonry_rows)
+        } else {
+            200
+        };
+        let max_ahead = if is_masonry {
+            240usize.saturating_mul(masonry_rows)
+        } else {
+            100
+        };
         let (base_behind, base_ahead) = if scrolling_up {
             (
                 80usize.saturating_mul(dim_scale),
@@ -3383,10 +3394,20 @@ impl ImageViewer {
                 80usize.saturating_mul(dim_scale),
             )
         };
-        let behind = base_behind
-            .saturating_mul(cache_multiplier)
-            .min(max_behind);
-        let ahead = base_ahead.saturating_mul(cache_multiplier).min(max_ahead);
+        let behind_raw = base_behind.saturating_mul(cache_multiplier);
+        let ahead_raw = base_ahead.saturating_mul(cache_multiplier);
+        let (behind, ahead) = if is_masonry {
+            // Masonry: keep preload symmetric (same forward/backward window), using the larger side,
+            // and scale with rows-per-row so denser layouts remain seamless.
+            let symmetric = behind_raw
+                .max(ahead_raw)
+                .saturating_mul(masonry_side_multiplier)
+                .max(80usize.saturating_mul(masonry_rows))
+                .min(max_behind.max(max_ahead));
+            (symmetric, symmetric)
+        } else {
+            (behind_raw.min(max_behind), ahead_raw.min(max_ahead))
+        };
 
         let cache_start = current_visible_index.saturating_sub(behind);
         let cache_end = (current_visible_index + ahead).min(self.image_list.len());
@@ -3417,8 +3438,15 @@ impl ImageViewer {
             (16, 8)
         };
 
-        // Apply scroll direction bias to eviction
-        let (final_keep_behind, final_keep_ahead) = if scrolling_up {
+        // Apply eviction policy
+        let (final_keep_behind, final_keep_ahead) = if is_masonry {
+            // Masonry: symmetric keep window from the larger side, scaled by rows-per-row.
+            let symmetric = keep_ahead
+                .max(keep_behind)
+                .saturating_mul(masonry_side_multiplier)
+                .max(12usize.saturating_mul(masonry_rows));
+            (symmetric, symmetric)
+        } else if scrolling_up {
             (keep_ahead, keep_behind) // Keep more behind when scrolling up
         } else {
             (keep_behind, keep_ahead) // Keep more ahead when scrolling down
