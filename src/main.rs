@@ -448,8 +448,6 @@ struct ImageViewer {
     manga_layout_mode: MangaLayoutMode,
     /// Previous strip layout to restore when leaving solo fullscreen via middle click.
     strip_return_mode: Option<MangaLayoutMode>,
-    /// Last time the strip-return back button was shown/refreshed.
-    strip_return_button_show_time: Instant,
     /// Whether the manga mode toggle button should be shown (on hover bottom-right)
     show_manga_toggle: bool,
     /// Time when manga toggle was last shown (for auto-hide)
@@ -672,7 +670,6 @@ impl Default for ImageViewer {
             manga_mode: false,
             manga_layout_mode: MangaLayoutMode::LongStrip,
             strip_return_mode: None,
-            strip_return_button_show_time: Instant::now(),
             show_manga_toggle: false,
             manga_toggle_show_time: Instant::now(),
             show_manga_zoom_bar: false,
@@ -966,12 +963,6 @@ impl ImageViewer {
 
         if !self.is_fullscreen {
             return false;
-        }
-
-        if self.strip_return_mode.is_some() && !self.manga_mode {
-            if self.strip_return_button_hover_zone(screen_rect).contains(pos) {
-                return true;
-            }
         }
 
         let scrollbar_padding = 35.0;
@@ -2007,36 +1998,6 @@ impl ImageViewer {
 
     fn activate_strip_return_context(&mut self, layout_mode: MangaLayoutMode) {
         self.strip_return_mode = Some(layout_mode);
-        self.strip_return_button_show_time = Instant::now();
-    }
-
-    fn strip_return_button_rect(&self, screen_rect: egui::Rect) -> egui::Rect {
-        let size = egui::Vec2::new(42.0, 42.0);
-        let margin = 16.0;
-        let y = if self.show_controls { 40.0 } else { 16.0 };
-        egui::Rect::from_min_size(
-            egui::pos2(screen_rect.min.x + margin, screen_rect.min.y + y),
-            size,
-        )
-    }
-
-    fn strip_return_button_hover_zone(&self, screen_rect: egui::Rect) -> egui::Rect {
-        self.strip_return_button_rect(screen_rect).expand(24.0)
-    }
-
-    fn strip_return_button_alpha(&self) -> f32 {
-        if self.strip_return_mode.is_none() || !self.is_fullscreen || self.manga_mode {
-            return 0.0;
-        }
-
-        let elapsed = self.strip_return_button_show_time.elapsed().as_secs_f32();
-        if elapsed <= 2.2 {
-            1.0
-        } else if elapsed >= 3.0 {
-            0.0
-        } else {
-            1.0 - ((elapsed - 2.2) / 0.8)
-        }
     }
 
     fn return_to_strip_mode_from_middle_click(&mut self) {
@@ -2048,9 +2009,59 @@ impl ImageViewer {
             return;
         }
 
+        let center_index = if layout_mode == MangaLayoutMode::Masonry {
+            Some(self.current_index)
+        } else {
+            None
+        };
+
         self.manga_layout_mode = layout_mode;
         self.clear_strip_return_context();
         self.toggle_manga_mode();
+
+        if let Some(index) = center_index {
+            self.masonry_center_on_index(index);
+        }
+    }
+
+    fn masonry_cache_multiplier(&self) -> usize {
+        if self.is_masonry_mode() {
+            2
+        } else {
+            1
+        }
+    }
+
+    fn navigation_preload_window(&self) -> (usize, usize) {
+        let mul = self.masonry_cache_multiplier();
+        (30usize.saturating_mul(mul), 60usize.saturating_mul(mul))
+    }
+
+    fn masonry_center_on_index(&mut self, index: usize) {
+        if !self.is_masonry_mode() || self.image_list.is_empty() {
+            return;
+        }
+
+        self.masonry_ensure_layout_cache();
+        let Some(item) = self.masonry_layout_items.get(index).copied() else {
+            return;
+        };
+
+        let viewport_center_x = self.screen_size.x * 0.5;
+        let viewport_center_y = self.screen_size.y * 0.5;
+        let item_center_x = item.x + item.width * 0.5;
+        let item_center_y = item.y + item.height * 0.5;
+
+        self.offset.x = viewport_center_x - item_center_x;
+
+        let total_height = self.manga_total_height();
+        let max_scroll = (total_height - self.screen_size.y).max(0.0);
+        let target_scroll = (item_center_y - viewport_center_y).clamp(0.0, max_scroll);
+        self.manga_scroll_offset = target_scroll;
+        self.manga_scroll_target = target_scroll;
+        self.manga_scroll_velocity = 0.0;
+        self.manga_update_current_index();
+        self.manga_update_preload_queue();
     }
 
     fn invalidate_manga_layout_cache(&mut self) {
@@ -3170,10 +3181,11 @@ impl ImageViewer {
         // Calculate how many pages are currently visible on screen
         // This determines preload count: visible_pages + 4 ahead and behind
         let visible_page_count = self.manga_calculate_visible_page_count();
+        let cache_multiplier = self.masonry_cache_multiplier();
 
         // Update the loader's visible page count for adaptive preloading
         if let Some(ref mut loader) = self.manga_loader {
-            loader.update_visible_page_count(visible_page_count);
+            loader.update_visible_page_count(visible_page_count.saturating_mul(cache_multiplier));
         }
 
         // Cache dimensions for a window around the visible range.
@@ -3182,17 +3194,23 @@ impl ImageViewer {
         // Scale the dimension cache window based on visible pages for better coverage
         let scrolling_up = self.manga_scroll_offset < prev_scroll_pos - 0.5;
         let dim_scale = (visible_page_count as f32 / 2.0).max(1.0) as usize;
-        let (behind, ahead) = if scrolling_up {
+        let max_behind = if self.is_masonry_mode() { 400 } else { 200 };
+        let max_ahead = if self.is_masonry_mode() { 200 } else { 100 };
+        let (base_behind, base_ahead) = if scrolling_up {
             (
-                80usize.saturating_mul(dim_scale).min(200),
-                20usize.saturating_mul(dim_scale).min(100),
+                80usize.saturating_mul(dim_scale),
+                20usize.saturating_mul(dim_scale),
             )
         } else {
             (
-                20usize.saturating_mul(dim_scale).min(100),
-                80usize.saturating_mul(dim_scale).min(200),
+                20usize.saturating_mul(dim_scale),
+                80usize.saturating_mul(dim_scale),
             )
         };
+        let behind = base_behind
+            .saturating_mul(cache_multiplier)
+            .min(max_behind);
+        let ahead = base_ahead.saturating_mul(cache_multiplier).min(max_ahead);
 
         let cache_start = current_visible_index.saturating_sub(behind);
         let cache_end = (current_visible_index + ahead).min(self.image_list.len());
@@ -3710,11 +3728,12 @@ impl ImageViewer {
         self.manga_scroll_velocity = 0.0;
 
         // Prime the loader around the destination so the transition stays smooth.
+        let (preload_behind, preload_ahead) = self.navigation_preload_window();
         if let Some(ref mut loader) = self.manga_loader {
             let len = self.image_list.len();
             if len > 0 {
-                let start = target.saturating_sub(30);
-                let end = (target + 60).min(len);
+                let start = target.saturating_sub(preload_behind);
+                let end = target.saturating_add(preload_ahead).min(len);
                 loader.request_dimensions_range(&self.image_list, start, end);
                 loader.update_preload_queue(
                     &self.image_list,
@@ -3809,10 +3828,11 @@ impl ImageViewer {
         self.manga_scroll_velocity = 0.0;
 
         // Prime the loader around the destination so the transition stays smooth.
+        let (preload_behind, preload_ahead) = self.navigation_preload_window();
         if let Some(ref mut loader) = self.manga_loader {
             let len = self.image_list.len();
-            let start = target.saturating_sub(30);
-            let end = (target + 60).min(len);
+            let start = target.saturating_sub(preload_behind);
+            let end = target.saturating_add(preload_ahead).min(len);
             loader.request_dimensions_range(&self.image_list, start, end);
             loader.update_preload_queue(
                 &self.image_list,
@@ -3845,11 +3865,12 @@ impl ImageViewer {
         self.manga_scroll_velocity = 0.0;
 
         // Prime the loader around the destination so the transition stays smooth.
+        let (preload_behind, preload_ahead) = self.navigation_preload_window();
         if let Some(ref mut loader) = self.manga_loader {
             let len = self.image_list.len();
             if len > 0 {
-                let start = target.saturating_sub(30);
-                let end = (target + 60).min(len);
+                let start = target.saturating_sub(preload_behind);
+                let end = target.saturating_add(preload_ahead).min(len);
                 loader.request_dimensions_range(&self.image_list, start, end);
                 loader.update_preload_queue(
                     &self.image_list,
@@ -3887,10 +3908,11 @@ impl ImageViewer {
         self.manga_scroll_velocity = 0.0;
 
         // Prime the loader around the destination so the transition stays smooth.
+        let (preload_behind, preload_ahead) = self.navigation_preload_window();
         if let Some(ref mut loader) = self.manga_loader {
             let len = self.image_list.len();
-            let start = target.saturating_sub(30);
-            let end = (target + 60).min(len);
+            let start = target.saturating_sub(preload_behind);
+            let end = target.saturating_add(preload_ahead).min(len);
             loader.request_dimensions_range(&self.image_list, start, end);
             loader.update_preload_queue(
                 &self.image_list,
@@ -3908,11 +3930,13 @@ impl ImageViewer {
         if !self.manga_mode {
             return;
         }
+        let (_, preload_ahead) = self.navigation_preload_window();
         // Cancel all pending loads - we're jumping to a new position
         if let Some(ref mut loader) = self.manga_loader {
             loader.cancel_pending_loads();
             // Pre-cache dimensions for the target area
-            loader.request_dimensions_range(&self.image_list, 0, 30);
+            let end = preload_ahead.min(self.image_list.len());
+            loader.request_dimensions_range(&self.image_list, 0, end);
         }
         // Use INSTANT scroll for large jumps to avoid cache churn
         self.manga_scroll_offset = 0.0;
@@ -3934,11 +3958,12 @@ impl ImageViewer {
             return;
         }
         let last_index = self.image_list.len() - 1;
+        let (preload_behind, _) = self.navigation_preload_window();
         // Cancel all pending loads - we're jumping to a new position
         if let Some(ref mut loader) = self.manga_loader {
             loader.cancel_pending_loads();
             // Pre-cache dimensions for the target area
-            let start = last_index.saturating_sub(30);
+            let start = last_index.saturating_sub(preload_behind);
             loader.request_dimensions_range(&self.image_list, start, self.image_list.len());
         }
         self.current_index = last_index;
@@ -4050,8 +4075,8 @@ impl ImageViewer {
 
         let screen_rect = ctx.screen_rect();
         let button_size = egui::Vec2::new(130.0, 32.0);
-    let button_spacing = 8.0;
-    let stack_height = button_size.y * 2.0 + button_spacing;
+        let button_spacing = 8.0;
+        let stack_height = button_size.y * 2.0 + button_spacing;
         let scrollbar_padding = 35.0; // Padding to avoid scrollbar
         let margin = 16.0;
 
@@ -4121,84 +4146,6 @@ impl ImageViewer {
                     }
                 }
             });
-    }
-
-    fn draw_strip_return_button(&mut self, ctx: &egui::Context) {
-        if self.strip_return_mode.is_none() || !self.is_fullscreen || self.manga_mode {
-            return;
-        }
-
-        let screen_rect = ctx.screen_rect();
-        let button_rect = self.strip_return_button_rect(screen_rect);
-        let hover_zone = self.strip_return_button_hover_zone(screen_rect);
-
-        let pointer_pos = ctx.input(|i| i.pointer.hover_pos());
-        let hovering_zone = pointer_pos.map_or(false, |p| hover_zone.contains(p));
-        if hovering_zone {
-            self.strip_return_button_show_time = Instant::now();
-        }
-
-        let alpha = self.strip_return_button_alpha();
-        if alpha <= 0.01 {
-            return;
-        }
-
-        egui::Area::new(egui::Id::new("strip_return_button"))
-            .fixed_pos(button_rect.min)
-            .order(egui::Order::Foreground)
-            .show(ctx, |ui| {
-                let (rect, response) =
-                    ui.allocate_exact_size(button_rect.size(), egui::Sense::click());
-
-                let hover = response.hovered();
-                let fill_alpha = ((if hover { 220.0 } else { 180.0 }) * alpha)
-                    .round()
-                    .clamp(0.0, 255.0) as u8;
-                let stroke_alpha = ((if hover { 255.0 } else { 220.0 }) * alpha)
-                    .round()
-                    .clamp(0.0, 255.0) as u8;
-
-                let center = rect.center();
-                let radius = rect.width() * 0.5;
-
-                ui.painter().circle_filled(
-                    center,
-                    radius,
-                    egui::Color32::from_rgba_unmultiplied(35, 35, 35, fill_alpha),
-                );
-                ui.painter().circle_stroke(
-                    center,
-                    radius - 0.5,
-                    egui::Stroke::new(
-                        if hover { 1.8 } else { 1.4 },
-                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, stroke_alpha),
-                    ),
-                );
-
-                let arrow_color = egui::Color32::from_rgba_unmultiplied(255, 255, 255, stroke_alpha);
-                let arrow_stroke = egui::Stroke::new(if hover { 2.4 } else { 2.0 }, arrow_color);
-                let arrow_center = center + egui::vec2(1.0, 0.0);
-                ui.painter().line_segment(
-                    [
-                        arrow_center + egui::vec2(6.0, -8.0),
-                        arrow_center + egui::vec2(-5.0, 0.0),
-                    ],
-                    arrow_stroke,
-                );
-                ui.painter().line_segment(
-                    [
-                        arrow_center + egui::vec2(-5.0, 0.0),
-                        arrow_center + egui::vec2(6.0, 8.0),
-                    ],
-                    arrow_stroke,
-                );
-
-                if response.clicked() {
-                    self.return_to_strip_mode_from_middle_click();
-                }
-            });
-
-        ctx.request_repaint_after(Duration::from_millis(16));
     }
 
     /// Draw zoom HUD (bottom-right in fullscreen)
@@ -8366,7 +8313,6 @@ impl eframe::App for ImageViewer {
         if !skip_drawing {
             self.draw_manga_zoom_bar(ctx);
             self.draw_manga_toggle_button(ctx);
-            self.draw_strip_return_button(ctx);
         }
 
         // Draw FPS overlay (top-right) when enabled.
