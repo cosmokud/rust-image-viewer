@@ -252,12 +252,6 @@ struct MasonryReturnState {
     scroll_target: f32,
 }
 
-const MANGA_HUD_PANEL_WIDTH: f32 = 232.0;
-const MANGA_HUD_PANEL_HEIGHT: f32 = 32.0;
-const MANGA_HUD_PANEL_STRIDE_Y: f32 = 48.0;
-const MASONRY_LAYOUT_SIDE_PADDING: f32 = 16.0;
-const MASONRY_LAYOUT_GUTTER: f32 = 12.0;
-
 /// Per-image view state for fullscreen mode memory.
 /// Stores zoom, pan, and transformation settings for each image path.
 #[derive(Clone, Debug)]
@@ -481,8 +475,6 @@ struct ImageViewer {
     strip_return_masonry_state: Option<MasonryReturnState>,
     /// User-selected masonry density (items per row), controlled by slider.
     masonry_items_per_row: usize,
-    /// Whether masonry performance mode is enabled (pre-resize textures for 200% zoom target).
-    masonry_performance_mode: bool,
     /// Whether the manga mode toggle button should be shown (on hover bottom-right)
     show_manga_toggle: bool,
     /// Time when manga toggle was last shown (for auto-hide)
@@ -708,7 +700,6 @@ impl Default for ImageViewer {
             strip_return_mode: None,
             strip_return_masonry_state: None,
             masonry_items_per_row: 5,
-            masonry_performance_mode: true,
             show_manga_toggle: false,
             manga_toggle_show_time: Instant::now(),
             show_manga_zoom_bar: false,
@@ -854,63 +845,6 @@ impl ImageViewer {
             });
     }
 
-    fn manga_overlay_panel_size(&self) -> egui::Vec2 {
-        egui::vec2(MANGA_HUD_PANEL_WIDTH, MANGA_HUD_PANEL_HEIGHT)
-    }
-
-    fn masonry_zoom_extra_panel_count(&self) -> usize {
-        if self.is_masonry_mode() {
-            2 // Performance panel + Rows panel
-        } else {
-            0
-        }
-    }
-
-    fn masonry_zoom_extra_panel_height(&self) -> f32 {
-        self.masonry_zoom_extra_panel_count() as f32 * MANGA_HUD_PANEL_STRIDE_Y
-    }
-
-    fn manga_zoom_stack_vertical_offset(&self) -> f32 {
-        (1 + self.masonry_zoom_extra_panel_count()) as f32 * MANGA_HUD_PANEL_STRIDE_Y
-    }
-
-    fn masonry_performance_target_width_at_200(&self) -> Option<u32> {
-        if !self.masonry_performance_mode || !self.is_masonry_mode() {
-            return None;
-        }
-
-        let columns = self.masonry_items_per_row.clamp(2, 10).max(1);
-        let available_width = (self.screen_size.x - MASONRY_LAYOUT_SIDE_PADDING * 2.0).max(20.0);
-        let total_gutter = MASONRY_LAYOUT_GUTTER * columns.saturating_sub(1) as f32;
-        let column_width = ((available_width - total_gutter) / columns as f32).max(1.0);
-        let target_width = (column_width * 2.0).ceil().max(1.0) as u32;
-
-        Some(target_width.min(self.max_texture_side.max(1)))
-    }
-
-    fn refresh_masonry_texture_quality(&mut self) {
-        if !self.manga_mode || !self.is_masonry_mode() {
-            return;
-        }
-
-        let cached_indices = self.manga_texture_cache.cached_indices();
-        self.manga_texture_cache.clear();
-
-        if let Some(ref mut loader) = self.manga_loader {
-            loader.cancel_pending_loads();
-            for idx in cached_indices {
-                loader.mark_unloaded(idx);
-            }
-        }
-
-        self.manga_update_preload_queue();
-    }
-
-    fn toggle_masonry_performance_mode(&mut self) {
-        self.masonry_performance_mode = !self.masonry_performance_mode;
-        self.refresh_masonry_texture_quality();
-    }
-
     fn touch_bottom_overlays(&mut self) {
         let now = Instant::now();
         self.video_controls_show_time = now;
@@ -954,8 +888,8 @@ impl ImageViewer {
                 self.current_media_type,
                 Some(MediaType::Image | MediaType::Video)
             );
-        let masonry_extra_panels_height = if allow_zoom_bar && self.is_masonry_mode() {
-            self.masonry_zoom_extra_panel_height()
+        let masonry_rows_bar_height = if allow_zoom_bar && self.is_masonry_mode() {
+            48.0
         } else {
             0.0
         };
@@ -969,7 +903,7 @@ impl ImageViewer {
             + mode_button_stack_height
             + if has_controllable_media { 64.0 } else { 0.0 }
             + if allow_zoom_bar {
-                MANGA_HUD_PANEL_STRIDE_Y + masonry_extra_panels_height
+                48.0 + masonry_rows_bar_height
             } else {
                 0.0
             };
@@ -1078,7 +1012,7 @@ impl ImageViewer {
         };
 
         if self.show_manga_zoom_bar {
-            let bar_size = self.manga_overlay_panel_size();
+            let bar_size = egui::Vec2::new(220.0, 32.0);
             let bar_rect = egui::Rect::from_min_size(
                 egui::pos2(
                     screen_rect.max.x - bar_size.x - margin - scrollbar_padding,
@@ -1092,21 +1026,10 @@ impl ImageViewer {
 
             if self.is_masonry_mode() {
                 let rows_bar_rect = egui::Rect::from_min_size(
-                    egui::pos2(bar_rect.min.x, bar_rect.min.y - MANGA_HUD_PANEL_STRIDE_Y),
+                    egui::pos2(bar_rect.min.x, bar_rect.min.y - 48.0),
                     bar_size,
                 );
                 if rows_bar_rect.contains(pos) {
-                    return true;
-                }
-
-                let performance_bar_rect = egui::Rect::from_min_size(
-                    egui::pos2(
-                        bar_rect.min.x,
-                        bar_rect.min.y - MANGA_HUD_PANEL_STRIDE_Y * 2.0,
-                    ),
-                    bar_size,
-                );
-                if performance_bar_rect.contains(pos) {
                     return true;
                 }
             }
@@ -1117,7 +1040,7 @@ impl ImageViewer {
             let button_spacing = 8.0;
             let stack_height = button_size.y * 2.0 + button_spacing;
             let y_offset = if self.show_manga_zoom_bar {
-                self.manga_zoom_stack_vertical_offset()
+                if self.is_masonry_mode() { 96.0 } else { 48.0 }
             } else {
                 0.0
             };
@@ -2264,10 +2187,6 @@ impl ImageViewer {
             self.manga_update_current_index();
             self.manga_update_preload_queue();
         }
-
-        if self.masonry_performance_mode {
-            self.refresh_masonry_texture_quality();
-        }
     }
 
     fn toggle_strip_mode(&mut self, layout_mode: MangaLayoutMode) {
@@ -2329,12 +2248,14 @@ impl ImageViewer {
             return;
         }
 
+        const SIDE_PADDING: f32 = 16.0;
         const TOP_PADDING: f32 = 10.0;
         const BOTTOM_PADDING: f32 = 10.0;
+        const GUTTER: f32 = 12.0;
 
-        let available_width = (self.screen_size.x - MASONRY_LAYOUT_SIDE_PADDING * 2.0).max(20.0);
+        let available_width = (self.screen_size.x - SIDE_PADDING * 2.0).max(20.0);
         let columns = items_per_row.max(1);
-        let total_gutter = MASONRY_LAYOUT_GUTTER * (columns.saturating_sub(1) as f32);
+        let total_gutter = GUTTER * (columns.saturating_sub(1) as f32);
         let column_width = ((available_width - total_gutter) / columns as f32).max(1.0);
         let used_width = column_width * columns as f32 + total_gutter;
         let start_x = ((self.screen_size.x - used_width) * 0.5).max(0.0);
@@ -2354,7 +2275,7 @@ impl ImageViewer {
                 }
             }
 
-            let x = start_x + target_col as f32 * (column_width + MASONRY_LAYOUT_GUTTER);
+            let x = start_x + target_col as f32 * (column_width + GUTTER);
             let y = column_heights[target_col];
             let height = (column_width * self.masonry_item_aspect_ratio(idx)).max(20.0);
 
@@ -2365,7 +2286,7 @@ impl ImageViewer {
                 height,
             };
 
-            column_heights[target_col] = y + height + MASONRY_LAYOUT_GUTTER;
+            column_heights[target_col] = y + height + GUTTER;
         }
 
         let mut content_bottom = TOP_PADDING;
@@ -2375,7 +2296,7 @@ impl ImageViewer {
             }
         }
         if len > 0 {
-            content_bottom = (content_bottom - MASONRY_LAYOUT_GUTTER).max(TOP_PADDING);
+            content_bottom = (content_bottom - GUTTER).max(TOP_PADDING);
         }
 
         self.masonry_layout_total_height = (content_bottom + BOTTOM_PADDING).max(0.0);
@@ -3498,14 +3419,12 @@ impl ImageViewer {
         self.manga_last_scroll_position = self.manga_scroll_offset;
 
         // Update the parallel loader's preload queue
-        let preferred_decode_width = self.masonry_performance_target_width_at_200();
         if let Some(ref mut loader) = self.manga_loader {
             loader.update_preload_queue(
                 &self.image_list,
                 current_visible_index,
                 self.screen_size.y,
                 self.max_texture_side,
-                preferred_decode_width,
             );
         }
 
@@ -4018,7 +3937,6 @@ impl ImageViewer {
 
         // Prime the loader around the destination so the transition stays smooth.
         let (preload_behind, preload_ahead) = self.navigation_preload_window();
-        let preferred_decode_width = self.masonry_performance_target_width_at_200();
         if let Some(ref mut loader) = self.manga_loader {
             let len = self.image_list.len();
             if len > 0 {
@@ -4030,7 +3948,6 @@ impl ImageViewer {
                     target,
                     self.screen_size.y,
                     self.max_texture_side,
-                    preferred_decode_width,
                 );
             }
         }
@@ -4120,7 +4037,6 @@ impl ImageViewer {
 
         // Prime the loader around the destination so the transition stays smooth.
         let (preload_behind, preload_ahead) = self.navigation_preload_window();
-        let preferred_decode_width = self.masonry_performance_target_width_at_200();
         if let Some(ref mut loader) = self.manga_loader {
             let len = self.image_list.len();
             let start = target.saturating_sub(preload_behind);
@@ -4131,7 +4047,6 @@ impl ImageViewer {
                 target,
                 self.screen_size.y,
                 self.max_texture_side,
-                preferred_decode_width,
             );
         }
 
@@ -4159,7 +4074,6 @@ impl ImageViewer {
 
         // Prime the loader around the destination so the transition stays smooth.
         let (preload_behind, preload_ahead) = self.navigation_preload_window();
-        let preferred_decode_width = self.masonry_performance_target_width_at_200();
         if let Some(ref mut loader) = self.manga_loader {
             let len = self.image_list.len();
             if len > 0 {
@@ -4171,7 +4085,6 @@ impl ImageViewer {
                     target,
                     self.screen_size.y,
                     self.max_texture_side,
-                    preferred_decode_width,
                 );
             }
         }
@@ -4204,7 +4117,6 @@ impl ImageViewer {
 
         // Prime the loader around the destination so the transition stays smooth.
         let (preload_behind, preload_ahead) = self.navigation_preload_window();
-        let preferred_decode_width = self.masonry_performance_target_width_at_200();
         if let Some(ref mut loader) = self.manga_loader {
             let len = self.image_list.len();
             let start = target.saturating_sub(preload_behind);
@@ -4215,7 +4127,6 @@ impl ImageViewer {
                 target,
                 self.screen_size.y,
                 self.max_texture_side,
-                preferred_decode_width,
             );
         }
 
@@ -4386,7 +4297,7 @@ impl ImageViewer {
 
         // Position: bottom-right, above the zoom bar if it's visible, with scrollbar padding
         let y_offset = if self.show_manga_zoom_bar {
-            self.manga_zoom_stack_vertical_offset()
+            if self.is_masonry_mode() { 96.0 } else { 48.0 }
         } else {
             0.0
         };
@@ -4560,64 +4471,14 @@ impl ImageViewer {
             ctx.request_repaint(); // Ensure continuous updates while holding
         }
 
-        let panel_size = self.manga_overlay_panel_size();
-        let panel_content_size =
-            egui::vec2((panel_size.x - 16.0).max(1.0), (panel_size.y - 8.0).max(1.0));
+        let bar_size = egui::Vec2::new(220.0, 32.0);
         let bar_pos = egui::pos2(
-            screen_rect.max.x - panel_size.x - margin - scrollbar_padding,
-            screen_rect.max.y - panel_size.y - margin - video_controls_offset,
+            screen_rect.max.x - bar_size.x - margin - scrollbar_padding,
+            screen_rect.max.y - bar_size.y - margin - video_controls_offset,
         );
 
         if self.is_masonry_mode() {
-            let performance_bar_pos = egui::pos2(bar_pos.x, bar_pos.y - MANGA_HUD_PANEL_STRIDE_Y * 2.0);
-            egui::Area::new(egui::Id::new("masonry_performance_bar"))
-                .fixed_pos(performance_bar_pos)
-                .order(egui::Order::Foreground)
-                .show(ctx, |ui| {
-                    let frame = egui::Frame::none()
-                        .fill(egui::Color32::from_rgba_unmultiplied(40, 40, 40, 180))
-                        .rounding(6.0)
-                        .inner_margin(egui::Margin::symmetric(8.0, 4.0));
-
-                    frame.show(ui, |ui| {
-                        let (perf_rect, perf_resp) =
-                            ui.allocate_exact_size(panel_content_size, egui::Sense::click());
-
-                        let perf_bg = if perf_resp.is_pointer_button_down_on() {
-                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 36)
-                        } else if perf_resp.hovered() {
-                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 20)
-                        } else {
-                            egui::Color32::TRANSPARENT
-                        };
-                        ui.painter().rect_filled(perf_rect, 4.0, perf_bg);
-
-                        let label = if self.masonry_performance_mode {
-                            "Performance: ON"
-                        } else {
-                            "Performance: OFF"
-                        };
-
-                        ui.painter().text(
-                            perf_rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            label,
-                            egui::FontId::proportional(12.5),
-                            egui::Color32::WHITE,
-                        );
-
-                        if perf_resp.clicked() {
-                            self.toggle_masonry_performance_mode();
-                            self.touch_bottom_overlays();
-                        }
-
-                        if perf_resp.hovered() {
-                            self.touch_bottom_overlays();
-                        }
-                    });
-                });
-
-            let rows_bar_pos = egui::pos2(bar_pos.x, bar_pos.y - MANGA_HUD_PANEL_STRIDE_Y);
+            let rows_bar_pos = egui::pos2(bar_pos.x, bar_pos.y - 48.0);
             egui::Area::new(egui::Id::new("masonry_rows_bar"))
                 .fixed_pos(rows_bar_pos)
                 .order(egui::Order::Foreground)
@@ -4628,49 +4489,43 @@ impl ImageViewer {
                         .inner_margin(egui::Margin::symmetric(8.0, 4.0));
 
                     frame.show(ui, |ui| {
-                        ui.allocate_ui_with_layout(
-                            panel_content_size,
-                            egui::Layout::left_to_right(egui::Align::Center),
-                            |ui| {
-                                let (rows_label_rect, _) = ui
-                                    .allocate_exact_size(egui::vec2(34.0, 24.0), egui::Sense::hover());
-                                ui.painter().text(
-                                    rows_label_rect.center(),
-                                    egui::Align2::CENTER_CENTER,
-                                    "Rows",
-                                    egui::FontId::proportional(12.0),
-                                    egui::Color32::from_rgb(220, 220, 220),
-                                );
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            let (rows_label_rect, _) =
+                                ui.allocate_exact_size(egui::vec2(34.0, 24.0), egui::Sense::hover());
+                            ui.painter().text(
+                                rows_label_rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                "Rows",
+                                egui::FontId::proportional(12.0),
+                                egui::Color32::from_rgb(220, 220, 220),
+                            );
 
-                                let mut slider_rows = self.masonry_items_per_row as i32;
-                                let rows_slider = egui::Slider::new(&mut slider_rows, 2..=10)
-                                    .show_value(false)
-                                    .clamping(egui::SliderClamping::Always);
-                                let rows_resp = ui.add_sized([108.0, 24.0], rows_slider);
+                            let mut slider_rows = self.masonry_items_per_row as i32;
+                            let rows_slider = egui::Slider::new(&mut slider_rows, 2..=10)
+                                .show_value(false)
+                                .clamping(egui::SliderClamping::Always);
+                            let rows_resp = ui.add_sized([108.0, 24.0], rows_slider);
 
-                                if rows_resp.changed() {
-                                    self.set_masonry_items_per_row(slider_rows as usize);
-                                }
+                            if rows_resp.changed() {
+                                self.set_masonry_items_per_row(slider_rows as usize);
+                            }
 
-                                if rows_resp.hovered() || rows_resp.dragged() {
-                                    self.touch_bottom_overlays();
-                                }
+                            if rows_resp.hovered() || rows_resp.dragged() {
+                                self.touch_bottom_overlays();
+                            }
 
-                                ui.add_space(4.0);
-                                let rows_value = format!("{} /row", self.masonry_items_per_row);
-                                let (rows_value_rect, _) = ui.allocate_exact_size(
-                                    egui::vec2(56.0, 24.0),
-                                    egui::Sense::hover(),
-                                );
-                                ui.painter().text(
-                                    rows_value_rect.center(),
-                                    egui::Align2::CENTER_CENTER,
-                                    rows_value,
-                                    egui::FontId::proportional(12.0),
-                                    egui::Color32::from_rgb(200, 200, 200),
-                                );
-                            },
-                        );
+                            ui.add_space(4.0);
+                            let rows_value = format!("{} /row", self.masonry_items_per_row);
+                            let (rows_value_rect, _) =
+                                ui.allocate_exact_size(egui::vec2(56.0, 24.0), egui::Sense::hover());
+                            ui.painter().text(
+                                rows_value_rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                rows_value,
+                                egui::FontId::proportional(12.0),
+                                egui::Color32::from_rgb(200, 200, 200),
+                            );
+                        });
                     });
                 });
         }
@@ -4689,134 +4544,130 @@ impl ImageViewer {
                     let display_zoom = self.zoom;
                     let max_zoom = self.max_zoom_factor();
 
-                    ui.allocate_ui_with_layout(
-                        panel_content_size,
-                        egui::Layout::left_to_right(egui::Align::Center),
-                        |ui| {
-                            let (minus_rect, minus_resp) =
-                                ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::click());
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        let (minus_rect, minus_resp) =
+                            ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::click());
 
-                            if ui.is_rect_visible(minus_rect) {
-                                let minus_bg = if minus_resp.is_pointer_button_down_on() {
-                                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 36)
-                                } else if minus_resp.hovered() {
-                                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 20)
-                                } else {
-                                    egui::Color32::TRANSPARENT
-                                };
-                                ui.painter().rect_filled(minus_rect, 4.0, minus_bg);
-                                ui.painter().text(
-                                    minus_rect.center(),
-                                    egui::Align2::CENTER_CENTER,
-                                    "−",
-                                    egui::FontId::proportional(16.0),
-                                    egui::Color32::WHITE,
-                                );
-                            }
-
-                            if minus_resp.is_pointer_button_down_on() {
-                                if !self.manga_zoom_minus_held {
-                                    self.manga_zoom_minus_held = true;
-                                    self.manga_zoom_plus_held = false;
-                                    self.manga_zoom_hold_start = Instant::now();
-                                    if self.manga_mode {
-                                        self.apply_manga_zoom_step(false);
-                                    } else {
-                                        self.apply_fullscreen_zoom_step(false);
-                                    }
-                                }
-                                self.touch_bottom_overlays();
-                            }
-
-                            // Slider
-                            let mut slider_value = display_zoom;
-                            let slider = egui::Slider::new(&mut slider_value, 0.1..=max_zoom)
-                                .show_value(false)
-                                .clamping(egui::SliderClamping::Always);
-                            let slider_resp = ui.add_sized([110.0, 24.0], slider);
-
-                            if slider_resp.changed() && slider_resp.dragged() {
-                                let old_zoom = self.zoom.max(0.0001);
-                                let new_zoom = self.clamp_zoom(slider_value);
-
-                                if (new_zoom - old_zoom).abs() > 0.0001 {
-                                    let zoom_ratio = new_zoom / old_zoom;
-
-                                    if self.manga_mode {
-                                        // CRITICAL FIX: Use index-based anchoring for stable zooming with varying image sizes.
-                                        let center_anchor = self.manga_capture_center_anchor();
-
-                                        self.zoom = new_zoom;
-                                        self.zoom_target = new_zoom;
-                                        self.zoom_velocity = 0.0;
-                                        self.invalidate_manga_layout_cache_for_zoom();
-
-                                        if let Some(anchor) = center_anchor {
-                                            self.manga_apply_center_anchor(anchor);
-                                        }
-
-                                        self.manga_update_preload_queue();
-                                    } else {
-                                        self.zoom = new_zoom;
-                                        self.zoom_target = new_zoom;
-                                        self.zoom_velocity = 0.0;
-                                        self.offset = self.offset * zoom_ratio;
-                                    }
-                                }
-
-                                self.manga_zoom_plus_held = false;
-                                self.manga_zoom_minus_held = false;
-                            }
-
-                            let (plus_rect, plus_resp) =
-                                ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::click());
-
-                            if ui.is_rect_visible(plus_rect) {
-                                let plus_bg = if plus_resp.is_pointer_button_down_on() {
-                                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 36)
-                                } else if plus_resp.hovered() {
-                                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 20)
-                                } else {
-                                    egui::Color32::TRANSPARENT
-                                };
-                                ui.painter().rect_filled(plus_rect, 4.0, plus_bg);
-                                ui.painter().text(
-                                    plus_rect.center(),
-                                    egui::Align2::CENTER_CENTER,
-                                    "+",
-                                    egui::FontId::proportional(16.0),
-                                    egui::Color32::WHITE,
-                                );
-                            }
-
-                            if plus_resp.is_pointer_button_down_on() {
-                                if !self.manga_zoom_plus_held {
-                                    self.manga_zoom_plus_held = true;
-                                    self.manga_zoom_minus_held = false;
-                                    self.manga_zoom_hold_start = Instant::now();
-                                    if self.manga_mode {
-                                        self.apply_manga_zoom_step(true);
-                                    } else {
-                                        self.apply_fullscreen_zoom_step(true);
-                                    }
-                                }
-                                self.touch_bottom_overlays();
-                            }
-
-                            ui.add_space(4.0);
-
-                            let zoom_value = format!("{:.0}%", (display_zoom * 100.0).round());
-                            let (zoom_label_rect, _) = ui
-                                .allocate_exact_size(egui::vec2(46.0, 24.0), egui::Sense::hover());
+                        if ui.is_rect_visible(minus_rect) {
+                            let minus_bg = if minus_resp.is_pointer_button_down_on() {
+                                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 36)
+                            } else if minus_resp.hovered() {
+                                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 20)
+                            } else {
+                                egui::Color32::TRANSPARENT
+                            };
+                            ui.painter().rect_filled(minus_rect, 4.0, minus_bg);
                             ui.painter().text(
-                                zoom_label_rect.center(),
+                                minus_rect.center(),
                                 egui::Align2::CENTER_CENTER,
-                                zoom_value,
-                                egui::FontId::proportional(12.0),
-                                egui::Color32::from_rgb(200, 200, 200),
+                                "−",
+                                egui::FontId::proportional(16.0),
+                                egui::Color32::WHITE,
                             );
-                        },
-                    );
+                        }
+
+                        if minus_resp.is_pointer_button_down_on() {
+                            if !self.manga_zoom_minus_held {
+                                self.manga_zoom_minus_held = true;
+                                self.manga_zoom_plus_held = false;
+                                self.manga_zoom_hold_start = Instant::now();
+                                if self.manga_mode {
+                                    self.apply_manga_zoom_step(false);
+                                } else {
+                                    self.apply_fullscreen_zoom_step(false);
+                                }
+                            }
+                            self.touch_bottom_overlays();
+                        }
+
+                        // Slider
+                        let mut slider_value = display_zoom;
+                        let slider = egui::Slider::new(&mut slider_value, 0.1..=max_zoom)
+                            .show_value(false)
+                            .clamping(egui::SliderClamping::Always);
+                        let slider_resp = ui.add_sized([110.0, 24.0], slider);
+
+                        if slider_resp.changed() && slider_resp.dragged() {
+                            let old_zoom = self.zoom.max(0.0001);
+                            let new_zoom = self.clamp_zoom(slider_value);
+
+                            if (new_zoom - old_zoom).abs() > 0.0001 {
+                                let zoom_ratio = new_zoom / old_zoom;
+
+                                if self.manga_mode {
+                                    // CRITICAL FIX: Use index-based anchoring for stable zooming with varying image sizes.
+                                    let center_anchor = self.manga_capture_center_anchor();
+
+                                    self.zoom = new_zoom;
+                                    self.zoom_target = new_zoom;
+                                    self.zoom_velocity = 0.0;
+                                    self.invalidate_manga_layout_cache_for_zoom();
+
+                                    if let Some(anchor) = center_anchor {
+                                        self.manga_apply_center_anchor(anchor);
+                                    }
+
+                                    self.manga_update_preload_queue();
+                                } else {
+                                    self.zoom = new_zoom;
+                                    self.zoom_target = new_zoom;
+                                    self.zoom_velocity = 0.0;
+                                    self.offset = self.offset * zoom_ratio;
+                                }
+                            }
+
+                            self.manga_zoom_plus_held = false;
+                            self.manga_zoom_minus_held = false;
+                        }
+
+                        let (plus_rect, plus_resp) =
+                            ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::click());
+
+                        if ui.is_rect_visible(plus_rect) {
+                            let plus_bg = if plus_resp.is_pointer_button_down_on() {
+                                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 36)
+                            } else if plus_resp.hovered() {
+                                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 20)
+                            } else {
+                                egui::Color32::TRANSPARENT
+                            };
+                            ui.painter().rect_filled(plus_rect, 4.0, plus_bg);
+                            ui.painter().text(
+                                plus_rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                "+",
+                                egui::FontId::proportional(16.0),
+                                egui::Color32::WHITE,
+                            );
+                        }
+
+                        if plus_resp.is_pointer_button_down_on() {
+                            if !self.manga_zoom_plus_held {
+                                self.manga_zoom_plus_held = true;
+                                self.manga_zoom_minus_held = false;
+                                self.manga_zoom_hold_start = Instant::now();
+                                if self.manga_mode {
+                                    self.apply_manga_zoom_step(true);
+                                } else {
+                                    self.apply_fullscreen_zoom_step(true);
+                                }
+                            }
+                            self.touch_bottom_overlays();
+                        }
+
+                        ui.add_space(4.0);
+
+                        let zoom_value = format!("{:.0}%", (display_zoom * 100.0).round());
+                        let (zoom_label_rect, _) =
+                            ui.allocate_exact_size(egui::vec2(46.0, 24.0), egui::Sense::hover());
+                        ui.painter().text(
+                            zoom_label_rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            zoom_value,
+                            egui::FontId::proportional(12.0),
+                            egui::Color32::from_rgb(200, 200, 200),
+                        );
+                    });
                 });
             });
     }

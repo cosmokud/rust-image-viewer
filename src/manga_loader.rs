@@ -106,9 +106,6 @@ pub struct LoadRequest {
     pub index: usize,
     pub path: PathBuf,
     pub max_texture_side: u32,
-    /// Optional decode target width (pixels).
-    /// When set, decode results wider than this are downscaled before GPU upload.
-    pub preferred_decode_width: Option<u32>,
     pub priority: i32, // Lower = higher priority
 }
 
@@ -540,11 +537,7 @@ impl MangaLoader {
             MediaType::Video => {
                 // For videos, try to extract the first frame as a thumbnail
                 // This provides a visual preview instead of a gray placeholder
-                match Self::extract_video_first_frame(
-                    &req.path,
-                    req.max_texture_side,
-                    req.preferred_decode_width,
-                ) {
+                match Self::extract_video_first_frame(&req.path, req.max_texture_side) {
                     Some((pixels, width, height, original_width, original_height)) => {
                         Some(DecodedImage {
                             index: req.index,
@@ -621,7 +614,6 @@ impl MangaLoader {
                     frame.height,
                     &frame.pixels,
                     req.max_texture_side,
-                    req.preferred_decode_width,
                     downscale_filter,
                 );
 
@@ -674,7 +666,6 @@ impl MangaLoader {
     fn extract_video_first_frame(
         path: &std::path::Path,
         max_texture_side: u32,
-        preferred_decode_width: Option<u32>,
     ) -> Option<(Vec<u8>, u32, u32, u32, u32)> {
         use gstreamer as gst;
         use gstreamer::prelude::*;
@@ -801,7 +792,6 @@ impl MangaLoader {
             height,
             &pixels,
             max_texture_side,
-            preferred_decode_width,
             FilterType::Triangle,
         );
 
@@ -863,7 +853,6 @@ impl MangaLoader {
         visible_index: usize,
         _screen_height: f32,
         max_texture_side: u32,
-        preferred_decode_width: Option<u32>,
     ) {
         if image_list.is_empty() {
             return;
@@ -955,7 +944,6 @@ impl MangaLoader {
                     index: idx,
                     path: image_list[idx].clone(),
                     max_texture_side,
-                    preferred_decode_width,
                     priority,
                 });
             }
@@ -1163,33 +1151,19 @@ fn downscale_rgba_if_needed<'a>(
     height: u32,
     pixels: &'a [u8],
     max_texture_side: u32,
-    preferred_decode_width: Option<u32>,
     filter: FilterType,
 ) -> (u32, u32, Cow<'a, [u8]>) {
-    if width == 0 || height == 0 {
+    if max_texture_side == 0 {
         return (width, height, Cow::Borrowed(pixels));
     }
 
-    let mut scale = 1.0f64;
-
-    if max_texture_side > 0 && (width > max_texture_side || height > max_texture_side) {
-        let texture_scale =
-            (max_texture_side as f64 / width as f64).min(max_texture_side as f64 / height as f64);
-        scale = scale.min(texture_scale);
-    }
-
-    if let Some(target_width) = preferred_decode_width {
-        if target_width > 0 && width > target_width {
-            let width_scale = target_width as f64 / width as f64;
-            scale = scale.min(width_scale);
-        }
-    }
-
-    if scale >= 0.999_999 {
+    if width <= max_texture_side && height <= max_texture_side {
         return (width, height, Cow::Borrowed(pixels));
     }
 
     // Preserve aspect ratio; clamp to at least 1x1.
+    let scale =
+        (max_texture_side as f64 / width as f64).min(max_texture_side as f64 / height as f64);
     let new_w = ((width as f64) * scale).round().max(1.0) as u32;
     let new_h = ((height as f64) * scale).round().max(1.0) as u32;
 
