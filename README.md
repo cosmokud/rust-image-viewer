@@ -1,12 +1,12 @@
 # Rust Image & Video Viewer
 
-A high-performance, minimal, borderless image and video viewer for Windows, built with Rust, egui, and GStreamer.
-
-This app is **not** intended to replace a full-featured image viewer or video player. It is a QuickLook-style preview tool focused on opening media instantly with minimal controls.
-
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Rust](https://img.shields.io/badge/rust-1.76%2B-orange.svg)
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-lightgrey.svg)
+
+A high-performance, minimal, borderless image and video viewer for Windows, built with Rust, egui, and GStreamer.
+
+This app is **not** intended to replace a full-featured image viewer or video player. It is a QuickLook-style preview tool focused on opening media instantly with minimal controls.
 
 ## Features
 
