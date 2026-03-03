@@ -2311,21 +2311,18 @@ impl ImageViewer {
     /// Toggle manga reading mode on/off
     fn toggle_manga_mode(&mut self) {
         if !self.manga_mode {
-            self.manga_mode = true;
+            let current_media_dims = self.media_display_dimensions().or(self.video_texture_dims);
+            let current_media_type = self.current_media_type;
+            let current_image_is_animated =
+                self.image.as_ref().is_some_and(|img| img.is_animated());
 
-            // Seed strip cache with whatever is currently visible in solo mode so the
-            // first strip frame can render immediately without a placeholder flash.
-            self.prime_manga_cache_for_current_item();
+            self.manga_mode = true;
 
             // Close any playing fullscreen video when entering manga mode
             // This prevents audio from the fullscreen video continuing to play
             if let Some(player) = self.video_player.take() {
                 drop(player);
             }
-            if let Some(tex) = self.video_texture.take() {
-                drop(tex);
-            }
-            self.video_texture_dims = None;
             self.show_video_controls = false;
 
             // Stop any non-manga animated WebP streaming; manga mode manages animation per item.
@@ -2350,6 +2347,25 @@ impl ImageViewer {
             // Pre-cache all image dimensions in parallel (reads file headers only - very fast)
             if let Some(ref mut loader) = self.manga_loader {
                 loader.cache_all_dimensions(&self.image_list);
+
+                // Ensure the currently viewed item has accurate dimensions immediately.
+                // This prevents stretched/overlap artifacts while entering strip mode,
+                // especially when the current index is outside the initial cached range.
+                if let (Some((w, h)), Some(media_type)) = (current_media_dims, current_media_type) {
+                    let manga_media_type = match media_type {
+                        MediaType::Video => MangaMediaType::Video,
+                        MediaType::Image => {
+                            if current_image_is_animated {
+                                MangaMediaType::AnimatedImage
+                            } else {
+                                MangaMediaType::StaticImage
+                            }
+                        }
+                    };
+                    loader
+                        .dimension_cache
+                        .insert(self.current_index, (w, h, manga_media_type));
+                }
             }
 
             // Dimensions may have changed; rebuild height cache.
@@ -2448,51 +2464,6 @@ impl ImageViewer {
         let within = (scroll - start).clamp(0.0, h);
         let fraction = (within / h).clamp(0.0, 1.0);
         Some((idx, fraction))
-    }
-
-    fn prime_manga_cache_for_current_item(&mut self) {
-        if self.current_index >= self.image_list.len() {
-            return;
-        }
-
-        if let Some(video_texture) = self.video_texture.as_ref() {
-            let dims = self
-                .video_player
-                .as_ref()
-                .map(|player| player.dimensions())
-                .filter(|(w, h)| *w > 0 && *h > 0)
-                .or(self.video_texture_dims);
-
-            if let Some((w, h)) = dims {
-                self.manga_texture_cache.insert_with_type(
-                    self.current_index,
-                    video_texture.clone(),
-                    w,
-                    h,
-                    MangaMediaType::Video,
-                );
-                return;
-            }
-        }
-
-        if let (Some(texture), Some(img)) = (self.texture.as_ref(), self.image.as_ref()) {
-            let (w, h) = img.display_dimensions();
-            if w > 0 && h > 0 {
-                let media_type = if img.is_animated() {
-                    MangaMediaType::AnimatedImage
-                } else {
-                    MangaMediaType::StaticImage
-                };
-
-                self.manga_texture_cache.insert_with_type(
-                    self.current_index,
-                    texture.clone(),
-                    w,
-                    h,
-                    media_type,
-                );
-            }
-        }
     }
 
     fn prepare_mode_switch_placeholder_from_manga_index(
@@ -4651,6 +4622,27 @@ impl ImageViewer {
                     egui::FontId::proportional(32.0),
                     egui::Color32::WHITE,
                 );
+            } else if idx == self.current_index {
+                // Immediate fallback when entering strip mode from solo-video fullscreen.
+                // Keeps the currently viewed frame visible until manga cache catches up.
+                if let Some(texture) = self.video_texture.as_ref() {
+                    ui.painter().image(
+                        texture.id(),
+                        image_rect,
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        egui::Color32::WHITE,
+                    );
+                } else {
+                    ui.painter()
+                        .rect_filled(image_rect, 0.0, egui::Color32::from_gray(25));
+                    ui.painter().text(
+                        image_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "🎬",
+                        egui::FontId::proportional(32.0),
+                        egui::Color32::from_gray(100),
+                    );
+                }
             } else {
                 // Video not yet loaded - draw placeholder with video icon
                 ui.painter()
@@ -4684,6 +4676,27 @@ impl ImageViewer {
                 if is_focused_anim && (still_streaming || has_active_stream) {
                     let time = ui.input(|i| i.time);
                     paint_loading_spinner(ui.painter(), image_rect, time);
+                }
+            } else if idx == self.current_index {
+                // Immediate fallback when entering strip mode from solo-image fullscreen.
+                // Keeps the current image visible while manga textures are still loading.
+                if let Some(texture) = self.texture.as_ref() {
+                    ui.painter().image(
+                        texture.id(),
+                        image_rect,
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        egui::Color32::WHITE,
+                    );
+                } else {
+                    ui.painter()
+                        .rect_filled(image_rect, 0.0, egui::Color32::from_gray(30));
+                    ui.painter().text(
+                        image_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "⏳",
+                        egui::FontId::proportional(24.0),
+                        egui::Color32::from_gray(80),
+                    );
                 }
             } else {
                 // Image not loaded yet - draw a placeholder
@@ -5419,26 +5432,7 @@ impl ImageViewer {
             screen_rect.center() + self.offset
         };
 
-        let mut image_rect = egui::Rect::from_center_size(center, display_size);
-
-        let t = self.fullscreen_transition;
-        if t > 0.001 && t < 0.999 {
-            let ease = t * t * (3.0 - 2.0 * t);
-            let scale = if self.is_fullscreen {
-                0.985 + 0.015 * ease
-            } else {
-                let u = (1.0 - t).clamp(0.0, 1.0);
-                let c1: f32 = 1.70158;
-                let c3: f32 = c1 + 1.0;
-                let x = u - 1.0;
-                let ease_out_back = 1.0 + c3 * x.powi(3) + c1 * x.powi(2);
-                let bump = (ease_out_back - u).max(0.0);
-                1.0 + 0.03 * bump
-            };
-
-            let scaled_size = display_size * scale;
-            image_rect = egui::Rect::from_center_size(center, scaled_size);
-        }
+        let image_rect = egui::Rect::from_center_size(center, display_size);
 
         const MIN_BAR_WIDTH: f32 = 0.5;
         let left_gap = image_rect.min.x - screen_rect.min.x;
@@ -7981,35 +7975,7 @@ impl ImageViewer {
                     };
                     let image_rect = egui::Rect::from_center_size(center, display_size);
 
-                    // Fullscreen transition:
-                    // - Entering fullscreen: subtle ease-in scale.
-                    // - Exiting fullscreen: small "grow + settle" overshoot to avoid showing background bars.
-                    let t = self.fullscreen_transition;
-                    let in_transition = t > 0.001 && t < 0.999;
-                    let final_rect = if in_transition {
-                        // smoothstep
-                        let ease = t * t * (3.0 - 2.0 * t);
-
-                        let scale = if self.is_fullscreen {
-                            // Entering: tiny settle so the transition feels responsive.
-                            0.985 + 0.015 * ease
-                        } else {
-                            // Exiting: do not shrink (which can reveal black bars). Instead, overshoot slightly.
-                            // easeOutBack(u) in [0,1] overshoots above 1.0 before settling.
-                            let u = (1.0 - t).clamp(0.0, 1.0);
-                            let c1: f32 = 1.70158;
-                            let c3: f32 = c1 + 1.0;
-                            let x = u - 1.0;
-                            let ease_out_back = 1.0 + c3 * x.powi(3) + c1 * x.powi(2);
-                            let bump = (ease_out_back - u).max(0.0);
-                            1.0 + 0.03 * bump
-                        };
-
-                        let scaled_size = display_size * scale;
-                        egui::Rect::from_center_size(center, scaled_size)
-                    } else {
-                        image_rect
-                    };
+                    let final_rect = image_rect;
 
                     ui.painter().image(
                         texture.id(),
@@ -8245,7 +8211,8 @@ impl eframe::App for ImageViewer {
                 ));
                 self.saved_fullscreen_entry_index = Some(self.current_index);
 
-                // Start transition animation
+                // No fullscreen transition animation: switch instantly.
+                self.fullscreen_transition = 1.0;
                 self.fullscreen_transition_target = 1.0;
 
                 // Requirement: when moving from floating -> fullscreen, always fit vertically and center.
@@ -8261,6 +8228,7 @@ impl eframe::App for ImageViewer {
                 self.last_requested_inner_size = Some(monitor);
             } else {
                 // Exiting fullscreen - use delayed resize to prevent flash
+                self.fullscreen_transition = 0.0;
                 self.fullscreen_transition_target = 0.0;
                 self.clear_strip_return_context();
 
@@ -8384,22 +8352,7 @@ impl eframe::App for ImageViewer {
             self.toggle_fullscreen = false;
         }
 
-        // Animate fullscreen transition
-        let fullscreen_animation_active = {
-            let target = self.fullscreen_transition_target;
-            let current = self.fullscreen_transition;
-            if (current - target).abs() > 0.001 {
-                // Smooth easing animation (ease-out cubic)
-                let speed = 8.0;
-                let dt = ctx.input(|i| i.stable_dt).min(0.033);
-                self.fullscreen_transition += (target - current) * speed * dt;
-                self.fullscreen_transition = self.fullscreen_transition.clamp(0.0, 1.0);
-                true // Animation in progress
-            } else {
-                self.fullscreen_transition = target;
-                false
-            }
-        };
+        let fullscreen_animation_active = false;
 
         // Process pending window resize (delayed to prevent flash on fullscreen exit)
         let pending_resize_active =
