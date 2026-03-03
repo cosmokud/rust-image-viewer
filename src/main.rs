@@ -30,8 +30,6 @@ use std::time::{Duration, Instant};
 
 use eframe::glow::HasContext;
 
-const DOUBLE_CLICK_GRACE_SECONDS: f64 = 0.5;
-
 /// Paint a smooth, semi-transparent loading spinner in the bottom-right corner
 /// of the given rectangle.  The spinner is a rotating arc that indicates
 /// background frame decoding is in progress.
@@ -1264,7 +1262,7 @@ impl ImageViewer {
 
         // Give users a more forgiving double-click detection window.
         cc.egui_ctx.options_mut(|opt| {
-            opt.input_options.max_double_click_delay = DOUBLE_CLICK_GRACE_SECONDS;
+            opt.input_options.max_double_click_delay = viewer.config.double_click_grace_period;
         });
 
         // Get screen size from monitor info if available
@@ -5437,7 +5435,7 @@ impl ImageViewer {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             #[derive(Clone, Copy)]
                             enum WindowButton {
-                                Settings,
+                                Menu,
                                 Minimize,
                                 Maximize,
                                 Restore,
@@ -5473,48 +5471,20 @@ impl ImageViewer {
                                     );
 
                                     match kind {
-                                        WindowButton::Settings => {
-                                            let head_center = egui::pos2(
-                                                icon_rect.min.x + icon_rect.width() * 0.34,
-                                                icon_rect.min.y + icon_rect.height() * 0.34,
-                                            );
-                                            let head_radius =
-                                                icon_rect.width().min(icon_rect.height()) * 0.28;
+                                        WindowButton::Menu => {
+                                            let y_top = icon_rect.min.y + 1.0;
+                                            let y_mid = icon_rect.center().y;
+                                            let y_bottom = icon_rect.max.y - 1.0;
 
-                                            // Open-end wrench head (arc with a gap).
-                                            let start_angle = -std::f32::consts::PI * 0.72;
-                                            let end_angle = std::f32::consts::PI * 0.72;
-                                            let segments = 14usize;
-                                            let mut head_points = Vec::with_capacity(segments + 1);
-                                            for i in 0..=segments {
-                                                let t = i as f32 / segments as f32;
-                                                let angle =
-                                                    start_angle + (end_angle - start_angle) * t;
-                                                head_points.push(
-                                                    head_center
-                                                        + head_radius
-                                                            * egui::vec2(
-                                                                angle.cos(),
-                                                                angle.sin(),
-                                                            ),
+                                            for y in [y_top, y_mid, y_bottom] {
+                                                ui.painter().line_segment(
+                                                    [
+                                                        egui::pos2(icon_rect.min.x, y),
+                                                        egui::pos2(icon_rect.max.x, y),
+                                                    ],
+                                                    stroke,
                                                 );
                                             }
-                                            ui.painter().add(egui::Shape::line(head_points, stroke));
-
-                                            // Handle + tail cap.
-                                            let handle_start =
-                                                head_center + egui::vec2(head_radius * 0.45, head_radius * 0.45);
-                                            let handle_end =
-                                                egui::pos2(icon_rect.max.x - 1.6, icon_rect.max.y - 1.8);
-                                            ui.painter().line_segment(
-                                                [handle_start, handle_end],
-                                                stroke,
-                                            );
-                                            ui.painter().circle_filled(
-                                                handle_end,
-                                                1.3,
-                                                egui::Color32::WHITE,
-                                            );
                                         }
                                         WindowButton::Minimize => {
                                             let y = icon_rect.max.y - 1.0;
@@ -5571,13 +5541,37 @@ impl ImageViewer {
                                 self.request_minimize = true;
                             }
 
-                            // Settings button (left of minimize): open AppData config file.
-                            if window_icon_button(ui, WindowButton::Settings)
-                                .on_hover_text("Open config file")
-                                .clicked()
-                            {
-                                self.open_config_file_in_editor();
+                            // Menu button (left of minimize): opens a compact pop-menu.
+                            let menu_button_response =
+                                window_icon_button(ui, WindowButton::Menu).on_hover_text("Menu");
+                            let app_menu_popup_id = ui.make_persistent_id("title_bar_fab_menu");
+
+                            if menu_button_response.clicked() {
+                                ui.memory_mut(|mem| mem.toggle_popup(app_menu_popup_id));
                             }
+
+                            let close_on_click_outside =
+                                egui::popup::PopupCloseBehavior::CloseOnClickOutside;
+                            egui::popup::popup_below_widget(
+                                ui,
+                                app_menu_popup_id,
+                                &menu_button_response,
+                                close_on_click_outside,
+                                |ui| {
+                                    ui.set_min_width(170.0);
+
+                                    if ui
+                                        .button(
+                                            egui::RichText::new("⚙ Edit Settings")
+                                                .color(egui::Color32::WHITE),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.open_config_file_in_editor();
+                                        ui.memory_mut(|mem| mem.close_popup());
+                                    }
+                                },
+                            );
 
                             // Add padding on the LEFT of the button cluster (not on the right),
                             // so the close button remains clickable at the very top-right pixel.

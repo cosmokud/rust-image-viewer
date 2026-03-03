@@ -307,6 +307,8 @@ pub struct Config {
     pub controls_hide_delay: f32,
     /// How long bottom overlays stay visible (video controls + manga toggle + zoom HUD), in seconds
     pub bottom_overlay_hide_delay: f32,
+    /// Maximum delay between clicks for double-click detection (in seconds)
+    pub double_click_grace_period: f64,
     /// Show an FPS overlay in the top-right corner (debug)
     pub show_fps: bool,
     /// Size of the resize border in pixels
@@ -394,6 +396,7 @@ impl Default for Config {
             action_bindings: HashMap::new(),
             controls_hide_delay: 0.5,
             bottom_overlay_hide_delay: 0.5,
+            double_click_grace_period: 0.35,
             show_fps: false,
             resize_border_size: 6.0,
             background_rgb: [0, 0, 0],
@@ -599,6 +602,7 @@ impl Config {
             action_bindings: HashMap::new(),
             controls_hide_delay: 0.5,
             bottom_overlay_hide_delay: 0.5,
+            double_click_grace_period: 0.35,
             show_fps: false,
             resize_border_size: 6.0,
             background_rgb: [0, 0, 0],
@@ -684,6 +688,13 @@ impl Config {
                         | "bottom_hud_hide_delay" => {
                             if let Ok(v) = value.parse::<f32>() {
                                 config.bottom_overlay_hide_delay = v.max(0.1);
+                            }
+                        }
+                        "double_click_grace_period"
+                        | "double_click_delay"
+                        | "double_click_grace_seconds" => {
+                            if let Ok(v) = value.parse::<f64>() {
+                                config.double_click_grace_period = v.clamp(0.1, 1.2);
                             }
                         }
                         "resize_border_size" => {
@@ -929,6 +940,10 @@ impl Config {
         values.insert(
             "bottom_overlay_hide_delay",
             format!("{}", self.bottom_overlay_hide_delay),
+        );
+        values.insert(
+            "double_click_grace_period",
+            format_with_optional_trailing_zero_f64(self.double_click_grace_period),
         );
         values.insert("show_fps", bool_to_ini(self.show_fps).to_string());
         values.insert("resize_border_size", format!("{}", self.resize_border_size));

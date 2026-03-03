@@ -181,6 +181,7 @@ For backward compatibility and portable setups, legacy `config.ini` / `setting.i
 [Settings]
 controls_hide_delay = 0.5
 bottom_overlay_hide_delay = 0.5
+double_click_grace_period = 0.35
 show_fps = false
 resize_border_size = 6
 startup_window_mode = floating
