@@ -204,7 +204,7 @@ manga_arrow_scroll_speed = 140
 
 ```ini
 [Shortcuts]
-toggle_fullscreen = mouse_middle, f, f12
+toggle_fullscreen = mouse_middle, f, f12, enter
 next_image = right, pagedown, mouse5
 previous_image = left, pageup, mouse4
 rotate_clockwise = up

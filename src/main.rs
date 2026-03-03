@@ -30,6 +30,8 @@ use std::time::{Duration, Instant};
 
 use eframe::glow::HasContext;
 
+const DOUBLE_CLICK_GRACE_SECONDS: f64 = 0.5;
+
 /// Paint a smooth, semi-transparent loading spinner in the bottom-right corner
 /// of the given rectangle.  The spinner is a rotating arc that indicates
 /// background frame decoding is in progress.
@@ -173,6 +175,33 @@ fn install_windows_cjk_fonts(ctx: &egui::Context) {
 
 #[cfg(not(target_os = "windows"))]
 fn install_windows_cjk_fonts(_ctx: &egui::Context) {}
+
+fn open_path_in_default_app(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("cmd")
+            .args(["/C", "start", ""])
+            .arg(path)
+            .spawn()
+            .map(|_| ())
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(path)
+            .spawn()
+            .map(|_| ())
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(path)
+            .spawn()
+            .map(|_| ())
+    }
+}
 
 /// Resize direction for window edge dragging
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1011,6 +1040,17 @@ impl ImageViewer {
         }
     }
 
+    fn open_config_file_in_editor(&mut self) {
+        let config_path = Config::config_path();
+        if let Err(e) = open_path_in_default_app(config_path.as_path()) {
+            self.error_message = Some(format!(
+                "Failed to open config file ({}): {}",
+                config_path.display(),
+                e
+            ));
+        }
+    }
+
     fn track_floating_window_position(&mut self, ctx: &egui::Context) {
         let Some(pos) = ctx.input(|i| i.raw.viewport().outer_rect).map(|r| r.min) else {
             return;
@@ -1221,6 +1261,11 @@ impl ImageViewer {
         visuals.window_fill = bg;
         visuals.panel_fill = bg;
         cc.egui_ctx.set_visuals(visuals);
+
+        // Give users a more forgiving double-click detection window.
+        cc.egui_ctx.options_mut(|opt| {
+            opt.input_options.max_double_click_delay = DOUBLE_CLICK_GRACE_SECONDS;
+        });
 
         // Get screen size from monitor info if available
         #[cfg(target_os = "windows")]
@@ -5057,6 +5102,17 @@ impl ImageViewer {
             self.run_action(action);
         }
 
+        // Backward-compatible fallback: treat Enter as fullscreen toggle when unbound.
+        // New defaults bind Enter explicitly, but existing user configs may not include it yet.
+        let enter_pressed = ctx.input(|i| i.key_pressed(egui::Key::Enter));
+        let enter_bound = self
+            .config
+            .bindings
+            .contains_key(&InputBinding::Key(egui::Key::Enter));
+        if enter_pressed && !enter_bound {
+            self.toggle_fullscreen = true;
+        }
+
         // Handle mode-specific navigation keys.
         // - Manga fullscreen: retain manga-specific paging behavior.
         // - Floating/normal fullscreen: PageUp/PageDown/Home/End navigate files.
@@ -5248,7 +5304,7 @@ impl ImageViewer {
                     // Make the hit-rect as tall as the bar.
                     let button_size = egui::Vec2::new(32.0, bar_height);
                     let buttons_area_w =
-                        5.0 + (button_size.x * 3.0) + (ui.spacing().item_spacing.x * 2.0) + 6.0;
+                        5.0 + (button_size.x * 4.0) + (ui.spacing().item_spacing.x * 3.0) + 6.0;
                     let buttons_rect = egui::Rect::from_min_max(
                         egui::pos2(bar_rect.max.x - buttons_area_w, bar_rect.min.y),
                         bar_rect.max,
@@ -5381,6 +5437,7 @@ impl ImageViewer {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             #[derive(Clone, Copy)]
                             enum WindowButton {
+                                Settings,
                                 Minimize,
                                 Maximize,
                                 Restore,
@@ -5416,6 +5473,49 @@ impl ImageViewer {
                                     );
 
                                     match kind {
+                                        WindowButton::Settings => {
+                                            let head_center = egui::pos2(
+                                                icon_rect.min.x + icon_rect.width() * 0.34,
+                                                icon_rect.min.y + icon_rect.height() * 0.34,
+                                            );
+                                            let head_radius =
+                                                icon_rect.width().min(icon_rect.height()) * 0.28;
+
+                                            // Open-end wrench head (arc with a gap).
+                                            let start_angle = -std::f32::consts::PI * 0.72;
+                                            let end_angle = std::f32::consts::PI * 0.72;
+                                            let segments = 14usize;
+                                            let mut head_points = Vec::with_capacity(segments + 1);
+                                            for i in 0..=segments {
+                                                let t = i as f32 / segments as f32;
+                                                let angle =
+                                                    start_angle + (end_angle - start_angle) * t;
+                                                head_points.push(
+                                                    head_center
+                                                        + head_radius
+                                                            * egui::vec2(
+                                                                angle.cos(),
+                                                                angle.sin(),
+                                                            ),
+                                                );
+                                            }
+                                            ui.painter().add(egui::Shape::line(head_points, stroke));
+
+                                            // Handle + tail cap.
+                                            let handle_start =
+                                                head_center + egui::vec2(head_radius * 0.45, head_radius * 0.45);
+                                            let handle_end =
+                                                egui::pos2(icon_rect.max.x - 1.6, icon_rect.max.y - 1.8);
+                                            ui.painter().line_segment(
+                                                [handle_start, handle_end],
+                                                stroke,
+                                            );
+                                            ui.painter().circle_filled(
+                                                handle_end,
+                                                1.3,
+                                                egui::Color32::WHITE,
+                                            );
+                                        }
                                         WindowButton::Minimize => {
                                             let y = icon_rect.max.y - 1.0;
                                             ui.painter().line_segment(
@@ -5469,6 +5569,14 @@ impl ImageViewer {
                             // Minimize button
                             if window_icon_button(ui, WindowButton::Minimize).clicked() {
                                 self.request_minimize = true;
+                            }
+
+                            // Settings button (left of minimize): open AppData config file.
+                            if window_icon_button(ui, WindowButton::Settings)
+                                .on_hover_text("Open config file")
+                                .clicked()
+                            {
+                                self.open_config_file_in_editor();
                             }
 
                             // Add padding on the LEFT of the button cluster (not on the right),

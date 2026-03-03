@@ -431,6 +431,7 @@ impl Config {
         self.add_binding(InputBinding::MouseMiddle, Action::ToggleFullscreen);
         self.add_binding(InputBinding::Key(egui::Key::F), Action::ToggleFullscreen);
         self.add_binding(InputBinding::Key(egui::Key::F12), Action::ToggleFullscreen);
+        self.add_binding(InputBinding::Key(egui::Key::Enter), Action::ToggleFullscreen);
 
         // Navigation
         self.add_binding(InputBinding::Key(egui::Key::ArrowRight), Action::NextImage);
