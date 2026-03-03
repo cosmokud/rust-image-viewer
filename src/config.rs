@@ -434,11 +434,11 @@ impl Config {
 
         // Navigation
         self.add_binding(InputBinding::Key(egui::Key::ArrowRight), Action::NextImage);
-        self.add_binding(InputBinding::Key(egui::Key::PageDown), Action::NextImage);
         self.add_binding(
             InputBinding::Key(egui::Key::ArrowLeft),
             Action::PreviousImage,
         );
+        self.add_binding(InputBinding::Key(egui::Key::PageDown), Action::NextImage);
         self.add_binding(InputBinding::Key(egui::Key::PageUp), Action::PreviousImage);
         self.add_binding(InputBinding::Mouse5, Action::NextImage);
         self.add_binding(InputBinding::Mouse4, Action::PreviousImage);
