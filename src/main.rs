@@ -25,6 +25,8 @@ use eframe::egui;
 use image::imageops::FilterType;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -177,7 +179,9 @@ fn install_windows_cjk_fonts(_ctx: &egui::Context) {}
 fn open_path_in_default_app(path: &std::path::Path) -> std::io::Result<()> {
     #[cfg(target_os = "windows")]
     {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         std::process::Command::new("cmd")
+            .creation_flags(CREATE_NO_WINDOW)
             .args(["/C", "start", ""])
             .arg(path)
             .spawn()
@@ -880,6 +884,78 @@ impl ImageViewer {
         // Callers can use this to schedule a single repaint for auto-hide without running
         // a continuous frame loop.
         should_show
+    }
+
+    fn pointer_over_shortcut_blocking_ui(
+        &self,
+        pointer_pos: Option<egui::Pos2>,
+        screen_rect: egui::Rect,
+    ) -> bool {
+        if self.mouse_over_window_buttons
+            || self.mouse_over_title_text
+            || self.title_text_dragging
+            || self.mouse_over_video_controls
+        {
+            return true;
+        }
+
+        let Some(pos) = pointer_pos else {
+            return false;
+        };
+
+        if self.show_video_controls {
+            let bar_height = 56.0;
+            if pos.y > screen_rect.height() - bar_height {
+                return true;
+            }
+        }
+
+        if !self.is_fullscreen {
+            return false;
+        }
+
+        let scrollbar_padding = 35.0;
+        let margin = 16.0;
+        let video_controls_offset = if self.show_video_controls {
+            56.0 + 8.0
+        } else {
+            0.0
+        };
+
+        if self.show_manga_zoom_bar {
+            let bar_size = egui::Vec2::new(220.0, 32.0);
+            let bar_rect = egui::Rect::from_min_size(
+                egui::pos2(
+                    screen_rect.max.x - bar_size.x - margin - scrollbar_padding,
+                    screen_rect.max.y - bar_size.y - margin - video_controls_offset,
+                ),
+                bar_size,
+            );
+            if bar_rect.contains(pos) {
+                return true;
+            }
+        }
+
+        if self.show_manga_toggle {
+            let button_size = egui::Vec2::new(130.0, 32.0);
+            let y_offset = if self.show_manga_zoom_bar { 48.0 } else { 0.0 };
+            let button_rect = egui::Rect::from_min_size(
+                egui::pos2(
+                    screen_rect.max.x - button_size.x - margin - scrollbar_padding,
+                    screen_rect.max.y
+                        - button_size.y
+                        - margin
+                        - y_offset
+                        - video_controls_offset,
+                ),
+                button_size,
+            );
+            if button_rect.contains(pos) {
+                return true;
+            }
+        }
+
+        false
     }
 
     fn max_zoom_factor(&self) -> f32 {
@@ -3863,6 +3939,8 @@ impl ImageViewer {
         let title_ui_blocking = self.mouse_over_window_buttons
             || self.mouse_over_title_text
             || self.title_text_dragging;
+        let pointer_over_shortcut_ui =
+            self.pointer_over_shortcut_blocking_ui(pointer_pos, screen_rect);
 
         // Wheel normalization (mouse vs trackpad):
         // - Mouse wheels are usually "line" deltas (1.0 per notch)
@@ -3928,7 +4006,7 @@ impl ImageViewer {
         let over_controls =
             pointer_pos.map_or(false, |p| p.y > screen_height - controls_bar_height);
 
-        if secondary_clicked && !over_controls && !title_ui_blocking {
+        if secondary_clicked && !over_controls && !title_ui_blocking && !pointer_over_shortcut_ui {
             // Check if we have a focused video
             if let Some(video_idx) = self.manga_focused_video_index {
                 if let Some(player) = self.manga_video_players.get_mut(&video_idx) {
@@ -4158,7 +4236,11 @@ impl ImageViewer {
 
         // Double-click: reset manga view (zoom + pan + inertia) to a stable baseline.
         // IMPORTANT: This should work even if the zoom is already at the baseline, so we always clear pan/inertia.
-        if primary_double_clicked && !over_scrollbar && !title_ui_blocking {
+        if primary_double_clicked
+            && !over_scrollbar
+            && !title_ui_blocking
+            && !pointer_over_shortcut_ui
+        {
             let mut did_reset = false;
 
             // Always reset horizontal offset and stop any ongoing drag/pan.
@@ -5012,18 +5094,15 @@ impl ImageViewer {
 
             // Right-click navigation processed here (pre-draw) to avoid a one-frame flash.
             // For videos: center region triggers play/pause, side zones trigger prev/next.
-            // Skip if over video controls bar
-            let bar_height = 56.0;
-            let over_video_controls = self.show_video_controls
-                && self.video_player.is_some()
-                && input
-                    .pointer
-                    .hover_pos()
-                    .map_or(false, |p| p.y > input.screen_rect.height() - bar_height);
+            // Skip when pointer is over interactive overlay UI.
+            let pointer_pos = input.pointer.hover_pos();
+            let pointer_over_shortcut_ui =
+                self.pointer_over_shortcut_blocking_ui(pointer_pos, input.screen_rect);
 
-            if input.pointer.button_clicked(egui::PointerButton::Secondary) && !over_video_controls
+            if input.pointer.button_clicked(egui::PointerButton::Secondary)
+                && !pointer_over_shortcut_ui
             {
-                if let Some(pos) = input.pointer.hover_pos() {
+                if let Some(pos) = pointer_pos {
                     if !self.manga_mode {
                         if let Some(action) =
                             self.right_click_black_bar_action(pos, input.screen_rect)
@@ -5058,28 +5137,25 @@ impl ImageViewer {
         }
 
         // Handle center right-click for video/GIF play/pause toggle (but not over video controls)
-        let has_video = self.video_player.is_some();
         let has_animated_gif =
             !self.manga_mode && self.image.as_ref().map_or(false, |img| img.is_animated());
 
         let should_toggle_media = if right_click_navigated {
             false
         } else {
-            let bar_height = 56.0;
-            let over_video_controls = self.show_video_controls && (has_video || has_animated_gif);
-
             ctx.input(|input| {
-                if input.pointer.button_clicked(egui::PointerButton::Secondary) {
-                    if let Some(pos) = input.pointer.hover_pos() {
-                        // Skip if over video controls bar
-                        if over_video_controls && pos.y > input.screen_rect.height() - bar_height {
-                            return false;
-                        }
-                        let side_zone = screen_width / 9.0;
-                        pos.x >= side_zone && pos.x <= screen_width - side_zone
-                    } else {
-                        false
-                    }
+                if !input.pointer.button_clicked(egui::PointerButton::Secondary) {
+                    return false;
+                }
+
+                let pointer_pos = input.pointer.hover_pos();
+                if self.pointer_over_shortcut_blocking_ui(pointer_pos, input.screen_rect) {
+                    return false;
+                }
+
+                if let Some(pos) = pointer_pos {
+                    let side_zone = screen_width / 9.0;
+                    pos.x >= side_zone && pos.x <= screen_width - side_zone
                 } else {
                     false
                 }
@@ -6979,12 +7055,13 @@ impl ImageViewer {
         // Check if pointer is over the video controls bar area (bottom of screen when visible)
         // Important: give resize edges priority over the overlay so bottom/bottom-corner resizing works.
         let over_video_controls = self.show_video_controls
-            && self.video_player.is_some()
             && hover_resize_direction == ResizeDirection::None
             && {
                 let bar_height = 56.0;
                 pointer_pos.map_or(false, |pos| pos.y > screen_rect.height() - bar_height)
             };
+        let pointer_over_shortcut_ui =
+            self.pointer_over_shortcut_blocking_ui(pointer_pos, screen_rect);
 
         // Handle resize start (but not if over video controls)
         if primary_pressed
@@ -7099,6 +7176,7 @@ impl ImageViewer {
             i.pointer
                 .button_double_clicked(egui::PointerButton::Primary)
         }) && !title_ui_blocking
+            && !pointer_over_shortcut_ui
         {
             self.offset = egui::Vec2::ZERO;
             self.zoom_velocity = 0.0;
