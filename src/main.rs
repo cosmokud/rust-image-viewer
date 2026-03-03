@@ -4461,11 +4461,15 @@ impl ImageViewer {
                         .inner_margin(egui::Margin::symmetric(8.0, 4.0));
 
                     frame.show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new("Rows")
-                                    .color(egui::Color32::from_rgb(220, 220, 220))
-                                    .size(12.0),
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            let (rows_label_rect, _) =
+                                ui.allocate_exact_size(egui::vec2(34.0, 24.0), egui::Sense::hover());
+                            ui.painter().text(
+                                rows_label_rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                "Rows",
+                                egui::FontId::proportional(12.0),
+                                egui::Color32::from_rgb(220, 220, 220),
                             );
 
                             let mut slider_rows = self.masonry_items_per_row as i32;
@@ -4483,10 +4487,15 @@ impl ImageViewer {
                             }
 
                             ui.add_space(4.0);
-                            ui.label(
-                                egui::RichText::new(format!("{} /row", self.masonry_items_per_row))
-                                    .color(egui::Color32::from_rgb(200, 200, 200))
-                                    .size(12.0),
+                            let rows_value = format!("{} /row", self.masonry_items_per_row);
+                            let (rows_value_rect, _) =
+                                ui.allocate_exact_size(egui::vec2(56.0, 24.0), egui::Sense::hover());
+                            ui.painter().text(
+                                rows_value_rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                rows_value,
+                                egui::FontId::proportional(12.0),
+                                egui::Color32::from_rgb(200, 200, 200),
                             );
                         });
                     });
@@ -4507,17 +4516,27 @@ impl ImageViewer {
                     let display_zoom = self.zoom;
                     let max_zoom = self.max_zoom_factor();
 
-                    ui.horizontal(|ui| {
-                        // Simple minus button
-                        let minus_btn = egui::Button::new(
-                            egui::RichText::new("−")
-                                .color(egui::Color32::WHITE)
-                                .size(16.0),
-                        )
-                        .fill(egui::Color32::TRANSPARENT)
-                        .stroke(egui::Stroke::NONE);
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        let (minus_rect, minus_resp) =
+                            ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::click());
 
-                        let minus_resp = ui.add_sized([24.0, 24.0], minus_btn);
+                        if ui.is_rect_visible(minus_rect) {
+                            let minus_bg = if minus_resp.is_pointer_button_down_on() {
+                                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 36)
+                            } else if minus_resp.hovered() {
+                                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 20)
+                            } else {
+                                egui::Color32::TRANSPARENT
+                            };
+                            ui.painter().rect_filled(minus_rect, 4.0, minus_bg);
+                            ui.painter().text(
+                                minus_rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                "−",
+                                egui::FontId::proportional(16.0),
+                                egui::Color32::WHITE,
+                            );
+                        }
 
                         if minus_resp.is_pointer_button_down_on() {
                             if !self.manga_zoom_minus_held {
@@ -4573,16 +4592,26 @@ impl ImageViewer {
                             self.manga_zoom_minus_held = false;
                         }
 
-                        // Simple plus button
-                        let plus_btn = egui::Button::new(
-                            egui::RichText::new("+")
-                                .color(egui::Color32::WHITE)
-                                .size(16.0),
-                        )
-                        .fill(egui::Color32::TRANSPARENT)
-                        .stroke(egui::Stroke::NONE);
+                        let (plus_rect, plus_resp) =
+                            ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::click());
 
-                        let plus_resp = ui.add_sized([24.0, 24.0], plus_btn);
+                        if ui.is_rect_visible(plus_rect) {
+                            let plus_bg = if plus_resp.is_pointer_button_down_on() {
+                                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 36)
+                            } else if plus_resp.hovered() {
+                                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 20)
+                            } else {
+                                egui::Color32::TRANSPARENT
+                            };
+                            ui.painter().rect_filled(plus_rect, 4.0, plus_bg);
+                            ui.painter().text(
+                                plus_rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                "+",
+                                egui::FontId::proportional(16.0),
+                                egui::Color32::WHITE,
+                            );
+                        }
 
                         if plus_resp.is_pointer_button_down_on() {
                             if !self.manga_zoom_plus_held {
@@ -4600,11 +4629,15 @@ impl ImageViewer {
 
                         ui.add_space(4.0);
 
-                        // Zoom percentage label
-                        ui.label(
-                            egui::RichText::new(format!("{:.0}%", (display_zoom * 100.0).round()))
-                                .color(egui::Color32::from_rgb(200, 200, 200))
-                                .size(12.0),
+                        let zoom_value = format!("{:.0}%", (display_zoom * 100.0).round());
+                        let (zoom_label_rect, _) =
+                            ui.allocate_exact_size(egui::vec2(46.0, 24.0), egui::Sense::hover());
+                        ui.painter().text(
+                            zoom_label_rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            zoom_value,
+                            egui::FontId::proportional(12.0),
+                            egui::Color32::from_rgb(200, 200, 200),
                         );
                     });
                 });
@@ -5192,42 +5225,71 @@ impl ImageViewer {
             }
 
             let old_zoom = self.zoom.max(0.0001);
-            let screen_h = screen_height.max(1.0);
+            if self.is_masonry_mode() {
+                // Masonry reset baseline: keep current row-count layout, reset zoom to fit that layout,
+                // and center horizontal pan for a deterministic, fast restore.
+                let new_zoom = self.clamp_zoom(1.0);
+                let anchor_screen_y = pointer_pos
+                    .map(|p| (p.y - screen_rect.min.y).clamp(0.0, screen_height))
+                    .unwrap_or(screen_height * 0.5);
+                let anchor = self.manga_capture_anchor_at_screen_y(anchor_screen_y);
 
-            // Prefer cached dimensions for the currently visible image.
-            let img_h = self
-                .manga_loader
-                .as_ref()
-                .and_then(|loader| loader.get_dimensions(self.current_index))
-                .map(|(_w, h)| h as f32)
-                .or_else(|| self.media_display_dimensions().map(|(_w, h)| h as f32));
+                if (new_zoom - old_zoom).abs() > 0.0001 {
+                    self.zoom = new_zoom;
+                    self.zoom_target = new_zoom;
+                    self.zoom_velocity = 0.0;
+                    self.invalidate_manga_layout_cache_for_zoom();
+                    did_reset = true;
+                }
 
-            if let Some(img_h) = img_h {
-                if img_h > 0.0 {
-                    let new_zoom = if img_h > screen_h {
-                        1.0
-                    } else {
-                        self.clamp_zoom(screen_h / img_h)
-                    };
+                if self.offset.x.abs() > 0.01 {
+                    did_reset = true;
+                }
+                self.offset.x = 0.0;
 
-                    if (new_zoom - old_zoom).abs() > 0.0001 {
-                        // CRITICAL FIX: Use index-based anchoring for stable zooming with varying image sizes.
-                        // Anchor the zoom at the pointer Y if available, otherwise at screen center.
-                        let anchor_screen_y = pointer_pos
-                            .map(|p| (p.y - screen_rect.min.y).clamp(0.0, screen_height))
-                            .unwrap_or(screen_height * 0.5);
+                // Keep vertical context stable while restoring zoom baseline.
+                if let Some(a) = anchor {
+                    self.manga_apply_anchor_at_screen_y(a);
+                }
+                self.manga_scroll_target = self.manga_scroll_offset;
+            } else {
+                let screen_h = screen_height.max(1.0);
 
-                        let anchor = self.manga_capture_anchor_at_screen_y(anchor_screen_y);
+                // Prefer cached dimensions for the currently visible image.
+                let img_h = self
+                    .manga_loader
+                    .as_ref()
+                    .and_then(|loader| loader.get_dimensions(self.current_index))
+                    .map(|(_w, h)| h as f32)
+                    .or_else(|| self.media_display_dimensions().map(|(_w, h)| h as f32));
 
-                        self.zoom = new_zoom;
-                        self.zoom_target = new_zoom;
-                        self.zoom_velocity = 0.0;
-                        self.invalidate_manga_layout_cache_for_zoom();
-                        did_reset = true;
+                if let Some(img_h) = img_h {
+                    if img_h > 0.0 {
+                        let new_zoom = if img_h > screen_h {
+                            1.0
+                        } else {
+                            self.clamp_zoom(screen_h / img_h)
+                        };
 
-                        // Re-apply the anchor to keep the same image position at the pointer/center
-                        if let Some(a) = anchor {
-                            self.manga_apply_anchor_at_screen_y(a);
+                        if (new_zoom - old_zoom).abs() > 0.0001 {
+                            // CRITICAL FIX: Use index-based anchoring for stable zooming with varying image sizes.
+                            // Anchor the zoom at the pointer Y if available, otherwise at screen center.
+                            let anchor_screen_y = pointer_pos
+                                .map(|p| (p.y - screen_rect.min.y).clamp(0.0, screen_height))
+                                .unwrap_or(screen_height * 0.5);
+
+                            let anchor = self.manga_capture_anchor_at_screen_y(anchor_screen_y);
+
+                            self.zoom = new_zoom;
+                            self.zoom_target = new_zoom;
+                            self.zoom_velocity = 0.0;
+                            self.invalidate_manga_layout_cache_for_zoom();
+                            did_reset = true;
+
+                            // Re-apply the anchor to keep the same image position at the pointer/center
+                            if let Some(a) = anchor {
+                                self.manga_apply_anchor_at_screen_y(a);
+                            }
                         }
                     }
                 }
