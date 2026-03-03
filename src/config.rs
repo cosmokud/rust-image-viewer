@@ -874,222 +874,185 @@ impl Config {
 
     /// Save configuration to INI file
     pub fn save(&self) {
-        let mut content = String::new();
-
-        content.push_str("; Image Viewer Configuration\n");
-        content.push_str("; See rust-image-viewer-config.ini in the application directory for examples\n\n");
-
-        // Write settings section
-        content.push_str("[Settings]\n");
-        content.push_str("; How long the title bar stays visible (in seconds)\n");
-        content.push_str(&format!(
-            "controls_hide_delay = {}\n",
-            self.controls_hide_delay
-        ));
-        content.push_str("; How long bottom overlays stay visible (video controls + Long Strip toggle + zoom HUD) (in seconds)\n");
-        content.push_str(&format!(
-            "bottom_overlay_hide_delay = {}\n\n",
-            self.bottom_overlay_hide_delay
-        ));
-
-        content.push_str("; Show FPS overlay in the top-right corner (debug) (true/false)\n");
-        content.push_str(&format!(
-            "show_fps = {}\n\n",
-            if self.show_fps { "true" } else { "false" }
-        ));
-        content.push_str("; Size of the window resize border in pixels\n");
-        content.push_str(&format!(
-            "resize_border_size = {}\n\n",
-            self.resize_border_size
-        ));
-
-        content.push_str("; Startup window mode: floating (default) or fullscreen\n");
-        content.push_str(&format!(
-            "startup_window_mode = {}\n\n",
-            self.startup_window_mode.as_str()
-        ));
-
-        content.push_str(
-            "; Single instance mode: reuse existing window when opening new files (true/false)\n",
-        );
-        content
-            .push_str("; When true, double-clicking a file will open it in the existing window\n");
-        content.push_str("; When false, each file opens in a new window\n");
-        content.push_str(&format!(
-            "single_instance = {}\n\n",
-            if self.single_instance {
-                "true"
-            } else {
-                "false"
-            }
-        ));
-
-        content.push_str("; Background color (RGB 0-255). You can either set background_rgb or background_r/g/b\n");
-        content.push_str(&format!(
-            "background_rgb = {}, {}, {}\n",
-            self.background_rgb[0], self.background_rgb[1], self.background_rgb[2]
-        ));
-        content.push_str(&format!("background_r = {}\n", self.background_rgb[0]));
-        content.push_str(&format!("background_g = {}\n", self.background_rgb[1]));
-        content.push_str(&format!("background_b = {}\n\n", self.background_rgb[2]));
-
-        content.push_str(
-            "; When entering fullscreen, reset image position to center and fit-to-screen\n",
-        );
-        content.push_str(&format!(
-            "fullscreen_reset_fit_on_enter = {}\n\n",
-            if self.fullscreen_reset_fit_on_enter {
-                "true"
-            } else {
-                "false"
-            }
-        ));
-
-        content.push_str(
-            "; Floating-mode zoom animation speed. Higher = faster, 0 = snap instantly\n",
-        );
-        content.push_str(&format!(
-            "zoom_animation_speed = {}\n\n",
-            self.zoom_animation_speed
-        ));
-
-        content
-            .push_str("; Zoom step per scroll wheel notch (1.05 = 5%, 1.10 = 10%, 1.25 = 25%)\n");
-        content.push_str(&format!("zoom_step = {}\n\n", self.zoom_step));
-
-        content.push_str("; Maximum zoom level in percent (100 = 1.0x, 1000 = 10.0x)\n");
-        content.push_str(&format!("max_zoom_percent = {}\n\n", self.max_zoom_percent));
-
-        content.push_str("; Manga mode: drag pan speed multiplier (1.0 = 1:1, higher = faster)\n");
-        content.push_str(&format!(
-            "manga_drag_pan_speed = {}\n",
-            self.manga_drag_pan_speed
-        ));
-        content.push_str(
-            "; Manga mode: mouse wheel scroll speed in pixels per step (smaller = slower)\n",
-        );
-        content.push_str(&format!(
-            "manga_wheel_scroll_speed = {}\n",
-            self.manga_wheel_scroll_speed
-        ));
-        content.push_str(
-            "; Manga mode: inertial scrolling friction (0.08-0.15 feels premium for manga)\n",
-        );
-        content.push_str(&format!(
-            "manga_inertial_friction = {}\n",
-            self.manga_inertial_friction
-        ));
-        content.push_str(
-            "; Manga mode: extra wheel multiplier after normalization (mouse vs trackpad)\n",
-        );
-        content.push_str(&format!(
-            "manga_wheel_multiplier = {}\n",
-            self.manga_wheel_multiplier
-        ));
-        content.push_str(
-            "; Manga mode: arrow key scroll speed in pixels per key press (separate from wheel)\n",
-        );
-        content.push_str(&format!(
-            "manga_arrow_scroll_speed = {}\n\n",
-            self.manga_arrow_scroll_speed
-        ));
-
-        // Write video section
-        content.push_str("[Video]\n");
-        content.push_str("; Whether videos start muted by default\n");
-        content.push_str(&format!(
-            "muted_by_default = {}\n",
-            if self.video_muted_by_default {
-                "true"
-            } else {
-                "false"
-            }
-        ));
-        content.push_str("; Default volume level (0.0 to 1.0)\n");
-        content.push_str(&format!("default_volume = {}\n", self.video_default_volume));
-        content.push_str("; Whether videos loop by default\n");
-        content.push_str(&format!(
-            "loop = {}\n",
-            if self.video_loop { "true" } else { "false" }
-        ));
-        content
-            .push_str("; Video controls auto-hide uses [Settings].bottom_overlay_hide_delay\n\n");
-
-        // Write quality section with comprehensive documentation
-        content.push_str("[Quality]\n");
-        content.push_str(
-            "; Image scaling filters - affects quality when images are resized to fit the window\n",
-        );
-        content.push_str("; Available options (from fastest to highest quality):\n");
-        content.push_str(";   nearest   - Fastest, pixelated look (good for pixel art)\n");
-        content.push_str(";   triangle  - Fast bilinear interpolation, decent quality\n");
-        content.push_str(
-            ";   catmullrom - Good balance of speed and quality (recommended for upscaling)\n",
-        );
-        content.push_str(";   gaussian  - Smooth results, slightly blurry\n");
-        content.push_str(
-            ";   lanczos3  - Highest quality, sharpest results (recommended for downscaling)\n\n",
-        );
-
-        content.push_str("; Filter used when enlarging images (displaying small images larger)\n");
-        content.push_str(&format!(
-            "upscale_filter = {}\n",
-            self.upscale_filter.as_str()
-        ));
-        content.push_str("; Filter used when shrinking images (displaying large images smaller)\n");
-        content.push_str(&format!(
-            "downscale_filter = {}\n",
-            self.downscale_filter.as_str()
-        ));
-        content.push_str(
-            "; Filter used when resizing GIF frames (affects memory usage and quality)\n",
-        );
-        content.push_str(&format!(
-            "gif_resize_filter = {}\n\n",
-            self.gif_resize_filter.as_str()
-        ));
-
-        content.push_str(
-            "; GPU texture filtering - affects how images look when zoomed/scaled on screen\n",
-        );
-        content.push_str("; Available options:\n");
-        content.push_str(
-            ";   nearest - Sharp pixels, no blending (good for pixel art, crisp at 100%)\n",
-        );
-        content
-            .push_str(";   linear  - Smooth blending between pixels (recommended for photos)\n\n");
-
-        content.push_str("; Texture filter for static images (photos, PNG, JPEG, etc.)\n");
-        content.push_str(&format!(
-            "texture_filter_static = {}\n",
-            self.texture_filter_static.as_str()
-        ));
-        content.push_str("; Texture filter for animated images (GIFs)\n");
-        content.push_str(&format!(
-            "texture_filter_animated = {}\n",
-            self.texture_filter_animated.as_str()
-        ));
-        content.push_str("; Texture filter for video frames\n");
-        content.push_str(&format!(
-            "texture_filter_video = {}\n\n",
-            self.texture_filter_video.as_str()
-        ));
-
-        content.push_str("[Shortcuts]\n");
-
-        // Group bindings by action
-        let mut action_strings: HashMap<Action, Vec<String>> = HashMap::new();
-        for (binding, action) in &self.bindings {
-            let binding_str = binding_to_string(binding);
-            action_strings.entry(*action).or_default().push(binding_str);
-        }
-
-        // Write shortcuts
-        for (action, bindings) in &action_strings {
-            content.push_str(&format!("{} = {}\n", action.as_str(), bindings.join(", ")));
-        }
-
+        let content = self.render_ini_from_template();
         let _ = fs::write(Self::config_path(), content);
+    }
+
+    fn render_ini_from_template(&self) -> String {
+        let values = self.ini_value_replacements();
+        let mut rendered = String::with_capacity(DEFAULT_CONFIG_INI.len() + 256);
+
+        for line in DEFAULT_CONFIG_INI.split_inclusive('\n') {
+            let (line_body, line_ending) = split_line_ending(line);
+            let trimmed = line_body.trim_start();
+
+            if trimmed.starts_with(';') || trimmed.starts_with('#') || trimmed.starts_with('[') {
+                rendered.push_str(line_body);
+                rendered.push_str(line_ending);
+                continue;
+            }
+
+            if let Some((lhs, rhs)) = line_body.split_once('=') {
+                let key = lhs.trim();
+                if let Some(value) = values.get(key) {
+                    let spacing_end = rhs
+                        .char_indices()
+                        .find(|(_, ch)| !ch.is_whitespace())
+                        .map(|(idx, _)| idx)
+                        .unwrap_or(rhs.len());
+
+                    rendered.push_str(lhs);
+                    rendered.push('=');
+                    if spacing_end == 0 && !value.is_empty() {
+                        rendered.push(' ');
+                    } else {
+                        rendered.push_str(&rhs[..spacing_end]);
+                    }
+                    rendered.push_str(value);
+                    rendered.push_str(line_ending);
+                    continue;
+                }
+            }
+
+            rendered.push_str(line_body);
+            rendered.push_str(line_ending);
+        }
+
+        rendered
+    }
+
+    fn ini_value_replacements(&self) -> HashMap<&'static str, String> {
+        let mut values = HashMap::new();
+
+        values.insert("controls_hide_delay", format!("{}", self.controls_hide_delay));
+        values.insert(
+            "bottom_overlay_hide_delay",
+            format!("{}", self.bottom_overlay_hide_delay),
+        );
+        values.insert("show_fps", bool_to_ini(self.show_fps).to_string());
+        values.insert("resize_border_size", format!("{}", self.resize_border_size));
+        values.insert(
+            "startup_window_mode",
+            self.startup_window_mode.as_str().to_string(),
+        );
+        values.insert(
+            "single_instance",
+            bool_to_ini(self.single_instance).to_string(),
+        );
+        values.insert(
+            "background_rgb",
+            format!(
+                "{}, {}, {}",
+                self.background_rgb[0], self.background_rgb[1], self.background_rgb[2]
+            ),
+        );
+        values.insert("background_r", format!("{}", self.background_rgb[0]));
+        values.insert("background_g", format!("{}", self.background_rgb[1]));
+        values.insert("background_b", format!("{}", self.background_rgb[2]));
+        values.insert(
+            "fullscreen_reset_fit_on_enter",
+            bool_to_ini(self.fullscreen_reset_fit_on_enter).to_string(),
+        );
+        values.insert(
+            "zoom_animation_speed",
+            format!("{}", self.zoom_animation_speed),
+        );
+        values.insert("zoom_step", format!("{}", self.zoom_step));
+        values.insert("max_zoom_percent", format!("{}", self.max_zoom_percent));
+        values.insert(
+            "manga_drag_pan_speed",
+            format_with_optional_trailing_zero_f32(self.manga_drag_pan_speed),
+        );
+        values.insert(
+            "manga_wheel_scroll_speed",
+            format!("{}", self.manga_wheel_scroll_speed),
+        );
+        values.insert(
+            "manga_inertial_friction",
+            format!("{}", self.manga_inertial_friction),
+        );
+        values.insert(
+            "manga_wheel_multiplier",
+            format!("{}", self.manga_wheel_multiplier),
+        );
+        values.insert(
+            "manga_arrow_scroll_speed",
+            format!("{}", self.manga_arrow_scroll_speed),
+        );
+
+        values.insert(
+            "muted_by_default",
+            bool_to_ini(self.video_muted_by_default).to_string(),
+        );
+        values.insert(
+            "default_volume",
+            format_with_optional_trailing_zero_f64(self.video_default_volume),
+        );
+        values.insert("loop", bool_to_ini(self.video_loop).to_string());
+
+        values.insert("upscale_filter", self.upscale_filter.as_str().to_string());
+        values.insert("downscale_filter", self.downscale_filter.as_str().to_string());
+        values.insert("gif_resize_filter", self.gif_resize_filter.as_str().to_string());
+        values.insert(
+            "texture_filter_static",
+            self.texture_filter_static.as_str().to_string(),
+        );
+        values.insert(
+            "texture_filter_animated",
+            self.texture_filter_animated.as_str().to_string(),
+        );
+        values.insert(
+            "texture_filter_video",
+            self.texture_filter_video.as_str().to_string(),
+        );
+
+        values.insert(
+            "toggle_fullscreen",
+            self.action_bindings_csv(Action::ToggleFullscreen),
+        );
+        values.insert("next_image", self.action_bindings_csv(Action::NextImage));
+        values.insert("previous_image", self.action_bindings_csv(Action::PreviousImage));
+        values.insert(
+            "rotate_clockwise",
+            self.action_bindings_csv(Action::RotateClockwise),
+        );
+        values.insert(
+            "rotate_counterclockwise",
+            self.action_bindings_csv(Action::RotateCounterClockwise),
+        );
+        values.insert("zoom_in", self.action_bindings_csv(Action::ZoomIn));
+        values.insert("zoom_out", self.action_bindings_csv(Action::ZoomOut));
+        values.insert("exit", self.action_bindings_csv(Action::Exit));
+        values.insert("pan", self.action_bindings_csv(Action::Pan));
+        values.insert(
+            "video_play_pause",
+            self.action_bindings_csv(Action::VideoPlayPause),
+        );
+        values.insert("video_mute", self.action_bindings_csv(Action::VideoMute));
+        values.insert("manga_zoom_in", self.action_bindings_csv(Action::MangaZoomIn));
+        values.insert(
+            "manga_zoom_out",
+            self.action_bindings_csv(Action::MangaZoomOut),
+        );
+
+        values
+    }
+
+    fn action_bindings_csv(&self, action: Action) -> String {
+        let mut items = Vec::new();
+
+        if let Some(bindings) = self.action_bindings.get(&action) {
+            for binding in bindings {
+                if self.bindings.get(binding) == Some(&action) {
+                    let binding_str = binding_to_string(binding);
+                    if !items.contains(&binding_str) {
+                        items.push(binding_str);
+                    }
+                }
+            }
+        }
+
+        items.join(", ")
     }
 
     /// Check if an input matches a specific action
@@ -1129,6 +1092,40 @@ fn binding_to_string(binding: &InputBinding) -> String {
 
 fn key_to_string(key: &egui::Key) -> String {
     format!("{:?}", key).to_lowercase()
+}
+
+fn bool_to_ini(value: bool) -> &'static str {
+    if value {
+        "true"
+    } else {
+        "false"
+    }
+}
+
+fn split_line_ending(line: &str) -> (&str, &str) {
+    if let Some(without_newline) = line.strip_suffix("\r\n") {
+        (without_newline, "\r\n")
+    } else if let Some(without_newline) = line.strip_suffix('\n') {
+        (without_newline, "\n")
+    } else {
+        (line, "")
+    }
+}
+
+fn format_with_optional_trailing_zero_f32(value: f32) -> String {
+    let mut value_str = format!("{}", value);
+    if !value_str.contains('.') && !value_str.contains('e') && !value_str.contains('E') {
+        value_str.push_str(".0");
+    }
+    value_str
+}
+
+fn format_with_optional_trailing_zero_f64(value: f64) -> String {
+    let mut value_str = format!("{}", value);
+    if !value_str.contains('.') && !value_str.contains('e') && !value_str.contains('E') {
+        value_str.push_str(".0");
+    }
+    value_str
 }
 
 fn parse_bool(value: &str) -> Option<bool> {
