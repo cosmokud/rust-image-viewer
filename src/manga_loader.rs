@@ -1223,6 +1223,20 @@ impl MangaTextureCache {
         }
     }
 
+    /// Get a cloned texture handle, dimensions, and media type from cache.
+    /// Returns (texture_handle, width, height, media_type) if found.
+    pub fn get_texture_handle_info(
+        &mut self,
+        index: usize,
+    ) -> Option<(egui::TextureHandle, u32, u32, MangaMediaType)> {
+        if let Some(entry) = self.entries.get_mut(&index) {
+            entry.4 = self.frame_counter;
+            Some((entry.0.clone(), entry.1, entry.2, entry.3))
+        } else {
+            None
+        }
+    }
+
     /// Get texture ID, dimensions, and media type from cache.
     /// Returns (texture_id, width, height, media_type) if found.
     #[allow(dead_code)]

@@ -275,12 +275,22 @@ impl Default for FullscreenViewState {
     }
 }
 
+#[derive(Clone)]
+struct ModeSwitchPlaceholder {
+    texture: egui::TextureHandle,
+    dims: (u32, u32),
+    media_type: MediaType,
+}
+
 /// Application state
 struct ImageViewer {
     /// Current loaded image
     image: Option<LoadedImage>,
     /// Texture handle for the current frame
     texture: Option<egui::TextureHandle>,
+    /// Dimensions corresponding to the current `texture`.
+    /// Used to keep showing the last image frame while replacement media is loading.
+    image_texture_dims: Option<(u32, u32)>,
     /// Current texture frame index (for animation detection)
     texture_frame: usize,
     /// List of images in the current directory
@@ -375,6 +385,9 @@ struct ImageViewer {
     video_texture_dims: Option<(u32, u32)>,
     /// Current media type being displayed
     current_media_type: Option<MediaType>,
+    /// One-shot placeholder to keep the currently visible strip item on screen
+    /// while switching from strip mode back to solo mode.
+    pending_mode_switch_placeholder: Option<ModeSwitchPlaceholder>,
     /// Whether to show video controls bar
     show_video_controls: bool,
     /// Time when video controls were last shown
@@ -591,6 +604,7 @@ impl Default for ImageViewer {
         Self {
             image: None,
             texture: None,
+            image_texture_dims: None,
             texture_frame: 0,
             image_list: Vec::new(),
             current_index: 0,
@@ -633,6 +647,7 @@ impl Default for ImageViewer {
             video_texture: None,
             video_texture_dims: None,
             current_media_type: None,
+            pending_mode_switch_placeholder: None,
             show_video_controls: false,
             video_controls_show_time: Instant::now(),
             mouse_over_video_controls: false,
@@ -1418,8 +1433,20 @@ impl ImageViewer {
         let media_type = get_media_type(path);
         self.current_media_type = media_type;
 
+        let transition_placeholder = self
+            .pending_mode_switch_placeholder
+            .take()
+            .filter(|placeholder| Some(placeholder.media_type) == media_type);
+
         let keep_video_placeholder = matches!(previous_media_type, Some(MediaType::Video))
-            && matches!(media_type, Some(MediaType::Video));
+            && matches!(media_type, Some(MediaType::Video))
+            || transition_placeholder
+                .as_ref()
+                .is_some_and(|placeholder| placeholder.media_type == MediaType::Video);
+
+        let keep_image_placeholder = transition_placeholder
+            .as_ref()
+            .is_some_and(|placeholder| placeholder.media_type == MediaType::Image);
 
         // Clear previous media state.
         // For video-to-video navigation we keep the previous video texture as a placeholder
@@ -1439,12 +1466,28 @@ impl ImageViewer {
             }
             self.video_texture_dims = None;
         }
-        // Drop image texture to free VRAM
-        if let Some(tex) = self.texture.take() {
-            drop(tex);
+        if !keep_image_placeholder {
+            // Drop image texture to free VRAM
+            if let Some(tex) = self.texture.take() {
+                drop(tex);
+            }
+            self.image_texture_dims = None;
         }
         self.image = None;
         self.show_video_controls = false;
+
+        if let Some(placeholder) = transition_placeholder {
+            match placeholder.media_type {
+                MediaType::Image => {
+                    self.texture = Some(placeholder.texture);
+                    self.image_texture_dims = Some(placeholder.dims);
+                }
+                MediaType::Video => {
+                    self.video_texture = Some(placeholder.texture);
+                    self.video_texture_dims = Some(placeholder.dims);
+                }
+            }
+        }
 
         // Cancel any in-flight background animation stream.
         self.anim_stream_rx = None;
@@ -2256,6 +2299,9 @@ impl ImageViewer {
             return;
         };
 
+        let target_media_type = get_media_type(&path);
+        self.prepare_mode_switch_placeholder_from_manga_index(index, target_media_type);
+
         self.activate_strip_return_context(return_mode);
         self.manga_mode = false;
         self.manga_clear_cache();
@@ -2266,6 +2312,10 @@ impl ImageViewer {
     fn toggle_manga_mode(&mut self) {
         if !self.manga_mode {
             self.manga_mode = true;
+
+            // Seed strip cache with whatever is currently visible in solo mode so the
+            // first strip frame can render immediately without a placeholder flash.
+            self.prime_manga_cache_for_current_item();
 
             // Close any playing fullscreen video when entering manga mode
             // This prevents audio from the fullscreen video continuing to play
@@ -2347,6 +2397,9 @@ impl ImageViewer {
         let visible_idx = self.manga_visible_index();
         self.current_index = visible_idx;
         let target_path = self.image_list.get(visible_idx).cloned();
+        let target_media_type = target_path.as_ref().and_then(|path| get_media_type(path));
+
+        self.prepare_mode_switch_placeholder_from_manga_index(visible_idx, target_media_type);
 
         self.manga_mode = false;
         self.manga_clear_cache();
@@ -2395,6 +2448,95 @@ impl ImageViewer {
         let within = (scroll - start).clamp(0.0, h);
         let fraction = (within / h).clamp(0.0, 1.0);
         Some((idx, fraction))
+    }
+
+    fn prime_manga_cache_for_current_item(&mut self) {
+        if self.current_index >= self.image_list.len() {
+            return;
+        }
+
+        if let Some(video_texture) = self.video_texture.as_ref() {
+            let dims = self
+                .video_player
+                .as_ref()
+                .map(|player| player.dimensions())
+                .filter(|(w, h)| *w > 0 && *h > 0)
+                .or(self.video_texture_dims);
+
+            if let Some((w, h)) = dims {
+                self.manga_texture_cache.insert_with_type(
+                    self.current_index,
+                    video_texture.clone(),
+                    w,
+                    h,
+                    MangaMediaType::Video,
+                );
+                return;
+            }
+        }
+
+        if let (Some(texture), Some(img)) = (self.texture.as_ref(), self.image.as_ref()) {
+            let (w, h) = img.display_dimensions();
+            if w > 0 && h > 0 {
+                let media_type = if img.is_animated() {
+                    MangaMediaType::AnimatedImage
+                } else {
+                    MangaMediaType::StaticImage
+                };
+
+                self.manga_texture_cache.insert_with_type(
+                    self.current_index,
+                    texture.clone(),
+                    w,
+                    h,
+                    media_type,
+                );
+            }
+        }
+    }
+
+    fn prepare_mode_switch_placeholder_from_manga_index(
+        &mut self,
+        index: usize,
+        target_media_type: Option<MediaType>,
+    ) {
+        self.pending_mode_switch_placeholder = None;
+
+        let Some(target_media_type) = target_media_type else {
+            return;
+        };
+
+        if target_media_type == MediaType::Video {
+            if let Some((texture, w, h)) = self.manga_video_textures.get(&index) {
+                if *w > 0 && *h > 0 {
+                    self.pending_mode_switch_placeholder = Some(ModeSwitchPlaceholder {
+                        texture: texture.clone(),
+                        dims: (*w, *h),
+                        media_type: MediaType::Video,
+                    });
+                    return;
+                }
+            }
+        }
+
+        if let Some((texture, w, h, manga_media_type)) =
+            self.manga_texture_cache.get_texture_handle_info(index)
+        {
+            let compatible = matches!(
+                (target_media_type, manga_media_type),
+                (MediaType::Image, MangaMediaType::StaticImage)
+                    | (MediaType::Image, MangaMediaType::AnimatedImage)
+                    | (MediaType::Video, MangaMediaType::Video)
+            );
+
+            if compatible && w > 0 && h > 0 {
+                self.pending_mode_switch_placeholder = Some(ModeSwitchPlaceholder {
+                    texture,
+                    dims: (w, h),
+                    media_type: target_media_type,
+                });
+            }
+        }
     }
 
     /// Capture the current manga scroll position as a stable **center-of-viewport** anchor.
@@ -5450,6 +5592,7 @@ impl ImageViewer {
                 };
 
                 self.texture = Some(ctx.load_texture("image", color_image, texture_options));
+                self.image_texture_dims = Some((w, h));
                 self.texture_frame = img.current_frame;
             }
 
@@ -7808,11 +7951,12 @@ impl ImageViewer {
                     }
                 } else if let Some(ref texture) = self.texture {
                     // Image mode
-                    if let Some(ref img) = self.image {
-                        (Some(texture), Some(img.display_dimensions()))
-                    } else {
-                        (None, None)
-                    }
+                    let dims = self
+                        .image
+                        .as_ref()
+                        .map(|img| img.display_dimensions())
+                        .or(self.image_texture_dims);
+                    (Some(texture), dims)
                 } else {
                     (None, None)
                 };
