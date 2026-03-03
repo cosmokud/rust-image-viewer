@@ -446,6 +446,10 @@ struct ImageViewer {
     manga_mode: bool,
     /// Active strip layout when manga mode is enabled.
     manga_layout_mode: MangaLayoutMode,
+    /// Previous strip layout to restore when leaving solo fullscreen via middle click.
+    strip_return_mode: Option<MangaLayoutMode>,
+    /// Last time the strip-return back button was shown/refreshed.
+    strip_return_button_show_time: Instant,
     /// Whether the manga mode toggle button should be shown (on hover bottom-right)
     show_manga_toggle: bool,
     /// Time when manga toggle was last shown (for auto-hide)
@@ -667,6 +671,8 @@ impl Default for ImageViewer {
             // Manga reading mode fields
             manga_mode: false,
             manga_layout_mode: MangaLayoutMode::LongStrip,
+            strip_return_mode: None,
+            strip_return_button_show_time: Instant::now(),
             show_manga_toggle: false,
             manga_toggle_show_time: Instant::now(),
             show_manga_zoom_bar: false,
@@ -960,6 +966,12 @@ impl ImageViewer {
 
         if !self.is_fullscreen {
             return false;
+        }
+
+        if self.strip_return_mode.is_some() && !self.manga_mode {
+            if self.strip_return_button_hover_zone(screen_rect).contains(pos) {
+                return true;
+            }
         }
 
         let scrollbar_padding = 35.0;
@@ -1989,6 +2001,58 @@ impl ImageViewer {
         self.manga_mode && self.manga_layout_mode == MangaLayoutMode::Masonry
     }
 
+    fn clear_strip_return_context(&mut self) {
+        self.strip_return_mode = None;
+    }
+
+    fn activate_strip_return_context(&mut self, layout_mode: MangaLayoutMode) {
+        self.strip_return_mode = Some(layout_mode);
+        self.strip_return_button_show_time = Instant::now();
+    }
+
+    fn strip_return_button_rect(&self, screen_rect: egui::Rect) -> egui::Rect {
+        let size = egui::Vec2::new(42.0, 42.0);
+        let margin = 16.0;
+        let y = if self.show_controls { 40.0 } else { 16.0 };
+        egui::Rect::from_min_size(
+            egui::pos2(screen_rect.min.x + margin, screen_rect.min.y + y),
+            size,
+        )
+    }
+
+    fn strip_return_button_hover_zone(&self, screen_rect: egui::Rect) -> egui::Rect {
+        self.strip_return_button_rect(screen_rect).expand(24.0)
+    }
+
+    fn strip_return_button_alpha(&self) -> f32 {
+        if self.strip_return_mode.is_none() || !self.is_fullscreen || self.manga_mode {
+            return 0.0;
+        }
+
+        let elapsed = self.strip_return_button_show_time.elapsed().as_secs_f32();
+        if elapsed <= 2.2 {
+            1.0
+        } else if elapsed >= 3.0 {
+            0.0
+        } else {
+            1.0 - ((elapsed - 2.2) / 0.8)
+        }
+    }
+
+    fn return_to_strip_mode_from_middle_click(&mut self) {
+        let Some(layout_mode) = self.strip_return_mode else {
+            return;
+        };
+
+        if !self.is_fullscreen || self.manga_mode {
+            return;
+        }
+
+        self.manga_layout_mode = layout_mode;
+        self.clear_strip_return_context();
+        self.toggle_manga_mode();
+    }
+
     fn invalidate_manga_layout_cache(&mut self) {
         self.manga_total_height_cache_valid = false;
         self.manga_layout_offsets.clear();
@@ -2175,11 +2239,13 @@ impl ImageViewer {
             return;
         }
 
+        let return_mode = self.manga_layout_mode;
         self.current_index = index;
         let Some(path) = self.image_list.get(index).cloned() else {
             return;
         };
 
+        self.activate_strip_return_context(return_mode);
         self.manga_mode = false;
         self.manga_clear_cache();
         self.load_image(&path);
@@ -4041,6 +4107,7 @@ impl ImageViewer {
                     );
 
                     if response.clicked() {
+                        self.clear_strip_return_context();
                         if *is_masonry {
                             self.toggle_masonry_mode();
                         } else {
@@ -4054,6 +4121,84 @@ impl ImageViewer {
                     }
                 }
             });
+    }
+
+    fn draw_strip_return_button(&mut self, ctx: &egui::Context) {
+        if self.strip_return_mode.is_none() || !self.is_fullscreen || self.manga_mode {
+            return;
+        }
+
+        let screen_rect = ctx.screen_rect();
+        let button_rect = self.strip_return_button_rect(screen_rect);
+        let hover_zone = self.strip_return_button_hover_zone(screen_rect);
+
+        let pointer_pos = ctx.input(|i| i.pointer.hover_pos());
+        let hovering_zone = pointer_pos.map_or(false, |p| hover_zone.contains(p));
+        if hovering_zone {
+            self.strip_return_button_show_time = Instant::now();
+        }
+
+        let alpha = self.strip_return_button_alpha();
+        if alpha <= 0.01 {
+            return;
+        }
+
+        egui::Area::new(egui::Id::new("strip_return_button"))
+            .fixed_pos(button_rect.min)
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                let (rect, response) =
+                    ui.allocate_exact_size(button_rect.size(), egui::Sense::click());
+
+                let hover = response.hovered();
+                let fill_alpha = ((if hover { 220.0 } else { 180.0 }) * alpha)
+                    .round()
+                    .clamp(0.0, 255.0) as u8;
+                let stroke_alpha = ((if hover { 255.0 } else { 220.0 }) * alpha)
+                    .round()
+                    .clamp(0.0, 255.0) as u8;
+
+                let center = rect.center();
+                let radius = rect.width() * 0.5;
+
+                ui.painter().circle_filled(
+                    center,
+                    radius,
+                    egui::Color32::from_rgba_unmultiplied(35, 35, 35, fill_alpha),
+                );
+                ui.painter().circle_stroke(
+                    center,
+                    radius - 0.5,
+                    egui::Stroke::new(
+                        if hover { 1.8 } else { 1.4 },
+                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, stroke_alpha),
+                    ),
+                );
+
+                let arrow_color = egui::Color32::from_rgba_unmultiplied(255, 255, 255, stroke_alpha);
+                let arrow_stroke = egui::Stroke::new(if hover { 2.4 } else { 2.0 }, arrow_color);
+                let arrow_center = center + egui::vec2(1.0, 0.0);
+                ui.painter().line_segment(
+                    [
+                        arrow_center + egui::vec2(6.0, -8.0),
+                        arrow_center + egui::vec2(-5.0, 0.0),
+                    ],
+                    arrow_stroke,
+                );
+                ui.painter().line_segment(
+                    [
+                        arrow_center + egui::vec2(-5.0, 0.0),
+                        arrow_center + egui::vec2(6.0, 8.0),
+                    ],
+                    arrow_stroke,
+                );
+
+                if response.clicked() {
+                    self.return_to_strip_mode_from_middle_click();
+                }
+            });
+
+        ctx.request_repaint_after(Duration::from_millis(16));
     }
 
     /// Draw zoom HUD (bottom-right in fullscreen)
@@ -4880,6 +5025,7 @@ impl ImageViewer {
 
         // Handle drag panning (when not interacting with scrollbar, video controls, or seekbars)
         let panning_allowed = !title_ui_blocking
+            && !pointer_over_shortcut_ui
             && !self.manga_scrollbar_dragging
             && !over_scrollbar
             && !over_controls
@@ -5437,11 +5583,11 @@ impl ImageViewer {
 
         // Collect actions to run (we can't mutate self inside ctx.input closure)
         let mut actions_to_run: Vec<Action> = Vec::new();
-        // Special-case middle-click behavior while in fullscreen strip mode:
-        // - Long Strip: middle click exits strip mode.
-        // - Masonry: middle click on an item opens it in solo fullscreen mode.
-        let mut middle_click_exit_manga = false;
-        let mut middle_click_open_solo_from_masonry = false;
+        // Special-case middle-click behavior:
+        // - In fullscreen strip mode (Masonry or Long Strip), middle click opens clicked item in solo fullscreen.
+        // - In solo fullscreen reached from strip-middle-click, middle click returns to that strip mode.
+        let mut middle_click_open_solo_from_strip = false;
+        let mut middle_click_return_to_strip = false;
         let mut right_click_navigated = false;
 
         ctx.input(|input| {
@@ -5449,6 +5595,7 @@ impl ImageViewer {
             let shift = input.modifiers.shift;
             let alt = input.modifiers.alt;
             let manga_fullscreen = self.manga_mode && self.is_fullscreen;
+            let middle_pressed = input.pointer.button_pressed(egui::PointerButton::Middle);
 
             // Check all keyboard bindings from config
             // We iterate through all configured bindings and check if the corresponding key was pressed
@@ -5497,13 +5644,11 @@ impl ImageViewer {
                         }
                     }
                     InputBinding::MouseMiddle => {
-                        if input.pointer.button_pressed(egui::PointerButton::Middle) {
+                        if middle_pressed {
                             if manga_fullscreen {
-                                if self.is_masonry_mode() {
-                                    middle_click_open_solo_from_masonry = true;
-                                } else {
-                                    middle_click_exit_manga = true;
-                                }
+                                middle_click_open_solo_from_strip = true;
+                            } else if self.is_fullscreen && self.strip_return_mode.is_some() {
+                                middle_click_return_to_strip = true;
                             } else {
                                 actions_to_run.push(*action);
                             }
@@ -5583,22 +5728,18 @@ impl ImageViewer {
             }
         });
 
-        if middle_click_open_solo_from_masonry {
+        if middle_click_open_solo_from_strip {
             let pointer_pos =
                 ctx.input(|i| i.pointer.interact_pos().or_else(|| i.pointer.hover_pos()));
-            if let Some(pos) = pointer_pos {
-                if let Some(index) = self.manga_index_at_screen_pos(pos) {
-                    self.open_strip_item_in_solo_fullscreen(index);
-                    return;
-                }
-            }
+            let target_index = pointer_pos
+                .and_then(|pos| self.manga_index_at_screen_pos(pos))
+                .unwrap_or(self.current_index);
+            self.open_strip_item_in_solo_fullscreen(target_index);
+            return;
         }
 
-        // Apply the manga-mode middle click override immediately and stop further input processing
-        // for this frame. This prevents accidental fullscreen toggles and avoids interacting with
-        // manga-mode-only bindings after we've exited the mode.
-        if middle_click_exit_manga {
-            self.toggle_manga_mode();
+        if middle_click_return_to_strip {
+            self.return_to_strip_mode_from_middle_click();
             return;
         }
 
@@ -7584,6 +7725,7 @@ impl ImageViewer {
                 && !self.manga_video_seeking
                 && !self.mouse_over_window_buttons
                 && !self.title_text_dragging
+                && !pointer_over_shortcut_ui
                 && !(over_title_bar && self.mouse_over_title_text)
             {
                 if let Some(pos) = pointer_pos {
@@ -8029,6 +8171,7 @@ impl eframe::App for ImageViewer {
             } else {
                 // Exiting fullscreen - use delayed resize to prevent flash
                 self.fullscreen_transition_target = 0.0;
+                self.clear_strip_return_context();
 
                 // Exit manga mode when leaving fullscreen
                 if self.manga_mode {
@@ -8223,6 +8366,7 @@ impl eframe::App for ImageViewer {
         if !skip_drawing {
             self.draw_manga_zoom_bar(ctx);
             self.draw_manga_toggle_button(ctx);
+            self.draw_strip_return_button(ctx);
         }
 
         // Draw FPS overlay (top-right) when enabled.
