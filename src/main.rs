@@ -774,6 +774,14 @@ impl Default for ImageViewer {
 }
 
 impl ImageViewer {
+    const BOTTOM_RIGHT_OVERLAY_MARGIN: f32 = 16.0;
+    const BOTTOM_RIGHT_OVERLAY_SCROLLBAR_PADDING: f32 = 35.0;
+    const MANGA_HUD_PANEL_WIDTH: f32 = 224.0;
+    const MANGA_HUD_PANEL_HEIGHT: f32 = 32.0;
+    const MANGA_HUD_PANEL_INNER_WIDTH: f32 = 208.0;
+    const MANGA_HUD_PANEL_INNER_HEIGHT: f32 = 24.0;
+    const MANGA_HUD_PANEL_VERTICAL_STEP: f32 = 48.0;
+
     fn update_fps_stats(&mut self) {
         let now = Instant::now();
         let dt = now.saturating_duration_since(self.fps_last_frame_at);
@@ -889,7 +897,7 @@ impl ImageViewer {
                 Some(MediaType::Image | MediaType::Video)
             );
         let masonry_rows_bar_height = if allow_zoom_bar && self.is_masonry_mode() {
-            48.0
+            Self::MANGA_HUD_PANEL_VERTICAL_STEP
         } else {
             0.0
         };
@@ -903,7 +911,7 @@ impl ImageViewer {
             + mode_button_stack_height
             + if has_controllable_media { 64.0 } else { 0.0 }
             + if allow_zoom_bar {
-                48.0 + masonry_rows_bar_height
+                Self::MANGA_HUD_PANEL_VERTICAL_STEP + masonry_rows_bar_height
             } else {
                 0.0
             };
@@ -1003,8 +1011,8 @@ impl ImageViewer {
             return false;
         }
 
-        let scrollbar_padding = 35.0;
-        let margin = 16.0;
+        let scrollbar_padding = Self::BOTTOM_RIGHT_OVERLAY_SCROLLBAR_PADDING;
+        let margin = Self::BOTTOM_RIGHT_OVERLAY_MARGIN;
         let video_controls_offset = if self.show_video_controls {
             56.0 + 8.0
         } else {
@@ -1012,7 +1020,7 @@ impl ImageViewer {
         };
 
         if self.show_manga_zoom_bar {
-            let bar_size = egui::Vec2::new(220.0, 32.0);
+            let bar_size = egui::Vec2::new(Self::MANGA_HUD_PANEL_WIDTH, Self::MANGA_HUD_PANEL_HEIGHT);
             let bar_rect = egui::Rect::from_min_size(
                 egui::pos2(
                     screen_rect.max.x - bar_size.x - margin - scrollbar_padding,
@@ -1026,7 +1034,7 @@ impl ImageViewer {
 
             if self.is_masonry_mode() {
                 let rows_bar_rect = egui::Rect::from_min_size(
-                    egui::pos2(bar_rect.min.x, bar_rect.min.y - 48.0),
+                    egui::pos2(bar_rect.min.x, bar_rect.min.y - Self::MANGA_HUD_PANEL_VERTICAL_STEP),
                     bar_size,
                 );
                 if rows_bar_rect.contains(pos) {
@@ -1040,7 +1048,11 @@ impl ImageViewer {
             let button_spacing = 8.0;
             let stack_height = button_size.y * 2.0 + button_spacing;
             let y_offset = if self.show_manga_zoom_bar {
-                if self.is_masonry_mode() { 96.0 } else { 48.0 }
+                if self.is_masonry_mode() {
+                    Self::MANGA_HUD_PANEL_VERTICAL_STEP * 2.0
+                } else {
+                    Self::MANGA_HUD_PANEL_VERTICAL_STEP
+                }
             } else {
                 0.0
             };
@@ -4285,8 +4297,8 @@ impl ImageViewer {
         let button_size = egui::Vec2::new(130.0, 32.0);
         let button_spacing = 8.0;
         let stack_height = button_size.y * 2.0 + button_spacing;
-        let scrollbar_padding = 35.0; // Padding to avoid scrollbar
-        let margin = 16.0;
+        let scrollbar_padding = Self::BOTTOM_RIGHT_OVERLAY_SCROLLBAR_PADDING; // Padding to avoid scrollbar
+        let margin = Self::BOTTOM_RIGHT_OVERLAY_MARGIN;
 
         // If video controls are visible, lift the manga button above them.
         let video_controls_offset = if self.show_video_controls {
@@ -4297,7 +4309,11 @@ impl ImageViewer {
 
         // Position: bottom-right, above the zoom bar if it's visible, with scrollbar padding
         let y_offset = if self.show_manga_zoom_bar {
-            if self.is_masonry_mode() { 96.0 } else { 48.0 }
+            if self.is_masonry_mode() {
+                Self::MANGA_HUD_PANEL_VERTICAL_STEP * 2.0
+            } else {
+                Self::MANGA_HUD_PANEL_VERTICAL_STEP
+            }
         } else {
             0.0
         };
@@ -4385,8 +4401,8 @@ impl ImageViewer {
         }
 
         let screen_rect = ctx.screen_rect();
-        let scrollbar_padding = 35.0; // Padding to avoid scrollbar
-        let margin = 16.0;
+        let scrollbar_padding = Self::BOTTOM_RIGHT_OVERLAY_SCROLLBAR_PADDING; // Padding to avoid scrollbar
+        let margin = Self::BOTTOM_RIGHT_OVERLAY_MARGIN;
 
         let primary_down = ctx.input(|i| i.pointer.button_down(egui::PointerButton::Primary));
 
@@ -4471,14 +4487,14 @@ impl ImageViewer {
             ctx.request_repaint(); // Ensure continuous updates while holding
         }
 
-        let bar_size = egui::Vec2::new(220.0, 32.0);
+        let bar_size = egui::Vec2::new(Self::MANGA_HUD_PANEL_WIDTH, Self::MANGA_HUD_PANEL_HEIGHT);
         let bar_pos = egui::pos2(
             screen_rect.max.x - bar_size.x - margin - scrollbar_padding,
             screen_rect.max.y - bar_size.y - margin - video_controls_offset,
         );
 
         if self.is_masonry_mode() {
-            let rows_bar_pos = egui::pos2(bar_pos.x, bar_pos.y - 48.0);
+            let rows_bar_pos = egui::pos2(bar_pos.x, bar_pos.y - Self::MANGA_HUD_PANEL_VERTICAL_STEP);
             egui::Area::new(egui::Id::new("masonry_rows_bar"))
                 .fixed_pos(rows_bar_pos)
                 .order(egui::Order::Foreground)
@@ -4489,43 +4505,54 @@ impl ImageViewer {
                         .inner_margin(egui::Margin::symmetric(8.0, 4.0));
 
                     frame.show(ui, |ui| {
-                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                            let (rows_label_rect, _) =
-                                ui.allocate_exact_size(egui::vec2(34.0, 24.0), egui::Sense::hover());
-                            ui.painter().text(
-                                rows_label_rect.center(),
-                                egui::Align2::CENTER_CENTER,
-                                "Rows",
-                                egui::FontId::proportional(12.0),
-                                egui::Color32::from_rgb(220, 220, 220),
-                            );
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(
+                                Self::MANGA_HUD_PANEL_INNER_WIDTH,
+                                Self::MANGA_HUD_PANEL_INNER_HEIGHT,
+                            ),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                let (rows_label_rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(32.0, 24.0),
+                                    egui::Sense::hover(),
+                                );
+                                ui.painter().text(
+                                    rows_label_rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    "Rows",
+                                    egui::FontId::proportional(12.0),
+                                    egui::Color32::from_rgb(220, 220, 220),
+                                );
 
-                            let mut slider_rows = self.masonry_items_per_row as i32;
-                            let rows_slider = egui::Slider::new(&mut slider_rows, 2..=10)
-                                .show_value(false)
-                                .clamping(egui::SliderClamping::Always);
-                            let rows_resp = ui.add_sized([108.0, 24.0], rows_slider);
+                                let mut slider_rows = self.masonry_items_per_row as i32;
+                                let rows_slider = egui::Slider::new(&mut slider_rows, 2..=10)
+                                    .show_value(false)
+                                    .clamping(egui::SliderClamping::Always);
+                                let rows_resp = ui.add_sized([100.0, 24.0], rows_slider);
 
-                            if rows_resp.changed() {
-                                self.set_masonry_items_per_row(slider_rows as usize);
-                            }
+                                if rows_resp.changed() {
+                                    self.set_masonry_items_per_row(slider_rows as usize);
+                                }
 
-                            if rows_resp.hovered() || rows_resp.dragged() {
-                                self.touch_bottom_overlays();
-                            }
+                                if rows_resp.hovered() || rows_resp.dragged() {
+                                    self.touch_bottom_overlays();
+                                }
 
-                            ui.add_space(4.0);
-                            let rows_value = format!("{} /row", self.masonry_items_per_row);
-                            let (rows_value_rect, _) =
-                                ui.allocate_exact_size(egui::vec2(56.0, 24.0), egui::Sense::hover());
-                            ui.painter().text(
-                                rows_value_rect.center(),
-                                egui::Align2::CENTER_CENTER,
-                                rows_value,
-                                egui::FontId::proportional(12.0),
-                                egui::Color32::from_rgb(200, 200, 200),
-                            );
-                        });
+                                let rows_value = format!("{} /row", self.masonry_items_per_row);
+                                let (rows_value_rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(68.0, 24.0),
+                                    egui::Sense::hover(),
+                                );
+                                ui.painter().text(
+                                    rows_value_rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    rows_value,
+                                    egui::FontId::proportional(12.0),
+                                    egui::Color32::from_rgb(200, 200, 200),
+                                );
+                            },
+                        );
                     });
                 });
         }
@@ -4544,130 +4571,137 @@ impl ImageViewer {
                     let display_zoom = self.zoom;
                     let max_zoom = self.max_zoom_factor();
 
-                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                        let (minus_rect, minus_resp) =
-                            ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::click());
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(
+                            Self::MANGA_HUD_PANEL_INNER_WIDTH,
+                            Self::MANGA_HUD_PANEL_INNER_HEIGHT,
+                        ),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            let (minus_rect, minus_resp) =
+                                ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::click());
 
-                        if ui.is_rect_visible(minus_rect) {
-                            let minus_bg = if minus_resp.is_pointer_button_down_on() {
-                                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 36)
-                            } else if minus_resp.hovered() {
-                                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 20)
-                            } else {
-                                egui::Color32::TRANSPARENT
-                            };
-                            ui.painter().rect_filled(minus_rect, 4.0, minus_bg);
-                            ui.painter().text(
-                                minus_rect.center(),
-                                egui::Align2::CENTER_CENTER,
-                                "−",
-                                egui::FontId::proportional(16.0),
-                                egui::Color32::WHITE,
-                            );
-                        }
-
-                        if minus_resp.is_pointer_button_down_on() {
-                            if !self.manga_zoom_minus_held {
-                                self.manga_zoom_minus_held = true;
-                                self.manga_zoom_plus_held = false;
-                                self.manga_zoom_hold_start = Instant::now();
-                                if self.manga_mode {
-                                    self.apply_manga_zoom_step(false);
+                            if ui.is_rect_visible(minus_rect) {
+                                let minus_bg = if minus_resp.is_pointer_button_down_on() {
+                                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 36)
+                                } else if minus_resp.hovered() {
+                                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 20)
                                 } else {
-                                    self.apply_fullscreen_zoom_step(false);
-                                }
+                                    egui::Color32::TRANSPARENT
+                                };
+                                ui.painter().rect_filled(minus_rect, 4.0, minus_bg);
+                                ui.painter().text(
+                                    minus_rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    "−",
+                                    egui::FontId::proportional(16.0),
+                                    egui::Color32::WHITE,
+                                );
                             }
-                            self.touch_bottom_overlays();
-                        }
 
-                        // Slider
-                        let mut slider_value = display_zoom;
-                        let slider = egui::Slider::new(&mut slider_value, 0.1..=max_zoom)
-                            .show_value(false)
-                            .clamping(egui::SliderClamping::Always);
-                        let slider_resp = ui.add_sized([110.0, 24.0], slider);
-
-                        if slider_resp.changed() && slider_resp.dragged() {
-                            let old_zoom = self.zoom.max(0.0001);
-                            let new_zoom = self.clamp_zoom(slider_value);
-
-                            if (new_zoom - old_zoom).abs() > 0.0001 {
-                                let zoom_ratio = new_zoom / old_zoom;
-
-                                if self.manga_mode {
-                                    // CRITICAL FIX: Use index-based anchoring for stable zooming with varying image sizes.
-                                    let center_anchor = self.manga_capture_center_anchor();
-
-                                    self.zoom = new_zoom;
-                                    self.zoom_target = new_zoom;
-                                    self.zoom_velocity = 0.0;
-                                    self.invalidate_manga_layout_cache_for_zoom();
-
-                                    if let Some(anchor) = center_anchor {
-                                        self.manga_apply_center_anchor(anchor);
+                            if minus_resp.is_pointer_button_down_on() {
+                                if !self.manga_zoom_minus_held {
+                                    self.manga_zoom_minus_held = true;
+                                    self.manga_zoom_plus_held = false;
+                                    self.manga_zoom_hold_start = Instant::now();
+                                    if self.manga_mode {
+                                        self.apply_manga_zoom_step(false);
+                                    } else {
+                                        self.apply_fullscreen_zoom_step(false);
                                     }
-
-                                    self.manga_update_preload_queue();
-                                } else {
-                                    self.zoom = new_zoom;
-                                    self.zoom_target = new_zoom;
-                                    self.zoom_velocity = 0.0;
-                                    self.offset = self.offset * zoom_ratio;
                                 }
+                                self.touch_bottom_overlays();
                             }
 
-                            self.manga_zoom_plus_held = false;
-                            self.manga_zoom_minus_held = false;
-                        }
+                            let mut slider_value = display_zoom;
+                            let slider = egui::Slider::new(&mut slider_value, 0.1..=max_zoom)
+                                .show_value(false)
+                                .clamping(egui::SliderClamping::Always);
+                            let slider_resp = ui.add_sized([92.0, 24.0], slider);
 
-                        let (plus_rect, plus_resp) =
-                            ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::click());
+                            if slider_resp.changed() && slider_resp.dragged() {
+                                let old_zoom = self.zoom.max(0.0001);
+                                let new_zoom = self.clamp_zoom(slider_value);
 
-                        if ui.is_rect_visible(plus_rect) {
-                            let plus_bg = if plus_resp.is_pointer_button_down_on() {
-                                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 36)
-                            } else if plus_resp.hovered() {
-                                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 20)
-                            } else {
-                                egui::Color32::TRANSPARENT
-                            };
-                            ui.painter().rect_filled(plus_rect, 4.0, plus_bg);
-                            ui.painter().text(
-                                plus_rect.center(),
-                                egui::Align2::CENTER_CENTER,
-                                "+",
-                                egui::FontId::proportional(16.0),
-                                egui::Color32::WHITE,
-                            );
-                        }
+                                if (new_zoom - old_zoom).abs() > 0.0001 {
+                                    let zoom_ratio = new_zoom / old_zoom;
 
-                        if plus_resp.is_pointer_button_down_on() {
-                            if !self.manga_zoom_plus_held {
-                                self.manga_zoom_plus_held = true;
+                                    if self.manga_mode {
+                                        // CRITICAL FIX: Use index-based anchoring for stable zooming with varying image sizes.
+                                        let center_anchor = self.manga_capture_center_anchor();
+
+                                        self.zoom = new_zoom;
+                                        self.zoom_target = new_zoom;
+                                        self.zoom_velocity = 0.0;
+                                        self.invalidate_manga_layout_cache_for_zoom();
+
+                                        if let Some(anchor) = center_anchor {
+                                            self.manga_apply_center_anchor(anchor);
+                                        }
+
+                                        self.manga_update_preload_queue();
+                                    } else {
+                                        self.zoom = new_zoom;
+                                        self.zoom_target = new_zoom;
+                                        self.zoom_velocity = 0.0;
+                                        self.offset = self.offset * zoom_ratio;
+                                    }
+                                }
+
+                                self.manga_zoom_plus_held = false;
                                 self.manga_zoom_minus_held = false;
-                                self.manga_zoom_hold_start = Instant::now();
-                                if self.manga_mode {
-                                    self.apply_manga_zoom_step(true);
-                                } else {
-                                    self.apply_fullscreen_zoom_step(true);
-                                }
                             }
-                            self.touch_bottom_overlays();
-                        }
 
-                        ui.add_space(4.0);
+                            let (plus_rect, plus_resp) =
+                                ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::click());
 
-                        let zoom_value = format!("{:.0}%", (display_zoom * 100.0).round());
-                        let (zoom_label_rect, _) =
-                            ui.allocate_exact_size(egui::vec2(46.0, 24.0), egui::Sense::hover());
-                        ui.painter().text(
-                            zoom_label_rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            zoom_value,
-                            egui::FontId::proportional(12.0),
-                            egui::Color32::from_rgb(200, 200, 200),
-                        );
-                    });
+                            if ui.is_rect_visible(plus_rect) {
+                                let plus_bg = if plus_resp.is_pointer_button_down_on() {
+                                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 36)
+                                } else if plus_resp.hovered() {
+                                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 20)
+                                } else {
+                                    egui::Color32::TRANSPARENT
+                                };
+                                ui.painter().rect_filled(plus_rect, 4.0, plus_bg);
+                                ui.painter().text(
+                                    plus_rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    "+",
+                                    egui::FontId::proportional(16.0),
+                                    egui::Color32::WHITE,
+                                );
+                            }
+
+                            if plus_resp.is_pointer_button_down_on() {
+                                if !self.manga_zoom_plus_held {
+                                    self.manga_zoom_plus_held = true;
+                                    self.manga_zoom_minus_held = false;
+                                    self.manga_zoom_hold_start = Instant::now();
+                                    if self.manga_mode {
+                                        self.apply_manga_zoom_step(true);
+                                    } else {
+                                        self.apply_fullscreen_zoom_step(true);
+                                    }
+                                }
+                                self.touch_bottom_overlays();
+                            }
+
+                            let zoom_value = format!("{:.0}%", (display_zoom * 100.0).round());
+                            let (zoom_label_rect, _) = ui.allocate_exact_size(
+                                egui::vec2(56.0, 24.0),
+                                egui::Sense::hover(),
+                            );
+                            ui.painter().text(
+                                zoom_label_rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                zoom_value,
+                                egui::FontId::proportional(12.0),
+                                egui::Color32::from_rgb(200, 200, 200),
+                            );
+                        },
+                    );
                 });
             });
     }
