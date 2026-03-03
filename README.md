@@ -170,10 +170,10 @@ rust-image-viewer.exe path\to\video.mp4
 
 ## Configuration
 
-This section mirrors the defaults in `assets/rust-image-viewer-config.ini`.
+This section mirrors the defaults in `assets/config.ini`.
 
-On first run, the viewer creates `rust-image-viewer-config.ini` in `%APPDATA%\rust-image-viewer\`.
-For backward compatibility and portable setups, legacy `config.ini` / `setting.ini` files in `%APPDATA%\rust-image-viewer\` or next to the executable are migrated automatically.
+On first run, the viewer creates `config.ini` in `%APPDATA%\rust-image-viewer\`.
+For backward compatibility and portable setups, legacy `rust-image-viewer-config.ini` / `setting.ini` files in `%APPDATA%\rust-image-viewer\` or next to the executable are migrated automatically.
 
 ### [Settings]
 

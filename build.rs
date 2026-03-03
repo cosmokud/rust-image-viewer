@@ -6,9 +6,9 @@ use std::env;
 use std::fs;
 use std::path::Path;
 
-const DEFAULT_CONFIG_TEMPLATE_PATH: &str = "assets/rust-image-viewer-config.ini";
-const RUNTIME_CONFIG_FILE_NAME: &str = "rust-image-viewer-config.ini";
-const LEGACY_CONFIG_FILE_NAME: &str = "config.ini";
+const DEFAULT_CONFIG_TEMPLATE_PATH: &str = "assets/config.ini";
+const RUNTIME_CONFIG_FILE_NAME: &str = "config.ini";
+const LEGACY_CONFIG_FILE_NAME: &str = "rust-image-viewer-config.ini";
 
 type IniValues = HashMap<String, HashMap<String, String>>;
 
@@ -163,11 +163,15 @@ fn sync_appdata_config(src_config: &Path) {
     };
 
     if !app_config.exists() && legacy_app_config.exists() {
-        if let Err(e) = fs::copy(&legacy_app_config, &app_config) {
-            println!(
-                "cargo:warning=Failed to migrate legacy AppData config.ini to {}: {}",
-                RUNTIME_CONFIG_FILE_NAME, e
-            );
+        if let Err(rename_err) = fs::rename(&legacy_app_config, &app_config) {
+            if let Err(copy_err) = fs::copy(&legacy_app_config, &app_config) {
+                println!(
+                    "cargo:warning=Failed to migrate legacy AppData {} to {} (rename: {}; copy: {})",
+                    LEGACY_CONFIG_FILE_NAME, RUNTIME_CONFIG_FILE_NAME, rename_err, copy_err
+                );
+            } else {
+                let _ = fs::remove_file(&legacy_app_config);
+            }
         }
     }
 

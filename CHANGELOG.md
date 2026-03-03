@@ -43,9 +43,9 @@ All notable changes to this project will be documented in this file.
 #### Configuration & Customization
 
 - Full INI-based customization for settings, shortcuts, video options, and image quality filters.
-- Runtime config stored in `%APPDATA%\rust-image-viewer\rust-image-viewer-config.ini`.
-- Legacy migration support for `config.ini` and `setting.ini`.
-- Bundled default template at `assets/rust-image-viewer-config.ini`.
+- Runtime config stored in `%APPDATA%\rust-image-viewer\config.ini`.
+- Legacy migration support for `rust-image-viewer-config.ini` and `setting.ini`.
+- Bundled default template at `assets/config.ini`.
 
 #### Format Support
 

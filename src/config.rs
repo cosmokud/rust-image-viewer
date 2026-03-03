@@ -5,9 +5,9 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
-const DEFAULT_CONFIG_INI: &str = include_str!("../assets/rust-image-viewer-config.ini");
-const CONFIG_FILE_NAME: &str = "rust-image-viewer-config.ini";
-const LEGACY_CONFIG_FILE_NAME: &str = "config.ini";
+const DEFAULT_CONFIG_INI: &str = include_str!("../assets/config.ini");
+const CONFIG_FILE_NAME: &str = "config.ini";
+const LEGACY_CONFIG_FILE_NAME: &str = "rust-image-viewer-config.ini";
 const LEGACY_SETTINGS_FILE_NAME: &str = "setting.ini";
 
 /// Image resampling filter types for scaling operations.
@@ -523,9 +523,9 @@ impl Config {
 
     /// Get settings file path.
     ///
-    /// Uses `rust-image-viewer-config.ini` in AppData/Roaming/rust-image-viewer/ on Windows.
+    /// Uses `config.ini` in AppData/Roaming/rust-image-viewer/ on Windows.
     ///
-    /// Migrates from legacy locations (`config.ini` / `setting.ini`) if needed.
+    /// Migrates from legacy locations (`rust-image-viewer-config.ini` / `setting.ini`) if needed.
     pub fn config_path() -> PathBuf {
         let config_dir = Self::config_dir();
         let config = config_dir.join(CONFIG_FILE_NAME);
@@ -534,7 +534,11 @@ impl Config {
         if !config.exists() {
             let legacy_appdata_config = config_dir.join(LEGACY_CONFIG_FILE_NAME);
             if legacy_appdata_config.exists() {
-                let _ = fs::copy(&legacy_appdata_config, &config);
+                if fs::rename(&legacy_appdata_config, &config).is_err() {
+                    if fs::copy(&legacy_appdata_config, &config).is_ok() {
+                        let _ = fs::remove_file(&legacy_appdata_config);
+                    }
+                }
             }
         }
 
