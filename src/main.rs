@@ -398,6 +398,9 @@ struct ImageViewer {
     /// One-shot placeholder to keep the currently visible strip item on screen
     /// while switching from strip mode back to solo mode.
     pending_mode_switch_placeholder: Option<ModeSwitchPlaceholder>,
+    /// Index allowed to reuse the pre-strip solo texture/video as a temporary fallback.
+    /// This prevents stale fullscreen frames from showing on unrelated items while scrolling.
+    strip_entry_placeholder_index: Option<usize>,
     /// Whether to show video controls bar
     show_video_controls: bool,
     /// Time when video controls were last shown
@@ -661,6 +664,7 @@ impl Default for ImageViewer {
             video_texture_dims: None,
             current_media_type: None,
             pending_mode_switch_placeholder: None,
+            strip_entry_placeholder_index: None,
             show_video_controls: false,
             video_controls_show_time: Instant::now(),
             mouse_over_video_controls: false,
@@ -2387,6 +2391,12 @@ impl ImageViewer {
             let current_image_is_animated =
                 self.image.as_ref().is_some_and(|img| img.is_animated());
 
+            self.strip_entry_placeholder_index = match current_media_type {
+                Some(MediaType::Image) if self.texture.is_some() => Some(self.current_index),
+                Some(MediaType::Video) if self.video_texture.is_some() => Some(self.current_index),
+                _ => None,
+            };
+
             self.manga_mode = true;
 
             // Close any playing fullscreen video when entering manga mode
@@ -2715,6 +2725,7 @@ impl ImageViewer {
     fn manga_clear_cache(&mut self) {
         // Clear the texture cache
         self.manga_texture_cache.clear();
+        self.strip_entry_placeholder_index = None;
 
         // Clear and reset the parallel loader
         if let Some(ref mut loader) = self.manga_loader {
@@ -4859,9 +4870,9 @@ impl ImageViewer {
                     egui::FontId::proportional(32.0),
                     egui::Color32::WHITE,
                 );
-            } else if idx == self.current_index {
+            } else if self.strip_entry_placeholder_index == Some(idx) {
                 // Immediate fallback when entering strip mode from solo-video fullscreen.
-                // Keeps the currently viewed frame visible until manga cache catches up.
+                // Keeps only the strip-entry frame visible until manga cache catches up.
                 if let Some(texture) = self.video_texture.as_ref() {
                     ui.painter().image(
                         texture.id(),
@@ -4914,9 +4925,9 @@ impl ImageViewer {
                     let time = ui.input(|i| i.time);
                     paint_loading_spinner(ui.painter(), image_rect, time);
                 }
-            } else if idx == self.current_index {
+            } else if self.strip_entry_placeholder_index == Some(idx) {
                 // Immediate fallback when entering strip mode from solo-image fullscreen.
-                // Keeps the current image visible while manga textures are still loading.
+                // Keeps only the strip-entry image visible while manga textures are still loading.
                 if let Some(texture) = self.texture.as_ref() {
                     ui.painter().image(
                         texture.id(),
