@@ -234,12 +234,22 @@ struct MasonryItemLayout {
 }
 
 impl MasonryItemLayout {
-    fn to_screen_rect(self, pan_x: f32, scroll_y: f32) -> egui::Rect {
+    fn to_screen_rect(self, zoom: f32, pan_x: f32, scroll_y: f32) -> egui::Rect {
+        let zoom = zoom.max(0.0001);
         egui::Rect::from_min_size(
-            egui::pos2(self.x + pan_x, self.y - scroll_y),
-            egui::vec2(self.width, self.height),
+            egui::pos2(self.x * zoom + pan_x, self.y * zoom - scroll_y),
+            egui::vec2(self.width * zoom, self.height * zoom),
         )
     }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct MasonryReturnState {
+    zoom: f32,
+    zoom_target: f32,
+    offset: egui::Vec2,
+    scroll_offset: f32,
+    scroll_target: f32,
 }
 
 /// Per-image view state for fullscreen mode memory.
@@ -461,6 +471,10 @@ struct ImageViewer {
     manga_layout_mode: MangaLayoutMode,
     /// Previous strip layout to restore when leaving solo fullscreen via middle click.
     strip_return_mode: Option<MangaLayoutMode>,
+    /// Saved masonry viewport state while temporarily opening a single item fullscreen.
+    strip_return_masonry_state: Option<MasonryReturnState>,
+    /// User-selected masonry density (items per row), controlled by slider.
+    masonry_items_per_row: usize,
     /// Whether the manga mode toggle button should be shown (on hover bottom-right)
     show_manga_toggle: bool,
     /// Time when manga toggle was last shown (for auto-hide)
@@ -507,9 +521,8 @@ struct ImageViewer {
     masonry_layout_items: Vec<MasonryItemLayout>,
     /// Cached total height for masonry mode.
     masonry_layout_total_height: f32,
-    masonry_layout_zoom: f32,
     masonry_layout_screen_x: f32,
-    masonry_layout_screen_y: f32,
+    masonry_layout_items_per_row: usize,
     masonry_layout_len: usize,
     masonry_layout_valid: bool,
 
@@ -685,6 +698,8 @@ impl Default for ImageViewer {
             manga_mode: false,
             manga_layout_mode: MangaLayoutMode::LongStrip,
             strip_return_mode: None,
+            strip_return_masonry_state: None,
+            masonry_items_per_row: 5,
             show_manga_toggle: false,
             manga_toggle_show_time: Instant::now(),
             show_manga_zoom_bar: false,
@@ -708,9 +723,8 @@ impl Default for ImageViewer {
 
             masonry_layout_items: Vec::new(),
             masonry_layout_total_height: 0.0,
-            masonry_layout_zoom: 1.0,
             masonry_layout_screen_x: 0.0,
-            masonry_layout_screen_y: 0.0,
+            masonry_layout_items_per_row: 0,
             masonry_layout_len: 0,
             masonry_layout_valid: false,
 
@@ -874,6 +888,11 @@ impl ImageViewer {
                 self.current_media_type,
                 Some(MediaType::Image | MediaType::Video)
             );
+        let masonry_rows_bar_height = if allow_zoom_bar && self.is_masonry_mode() {
+            48.0
+        } else {
+            0.0
+        };
 
         // One combined hover zone for the bottom-right overlays (zoom HUD + mode toggle stack).
         // IMPORTANT: this must be based on *potential* overlay layout, not the current visibility flags.
@@ -883,7 +902,11 @@ impl ImageViewer {
         let hover_zone_height = 80.0
             + mode_button_stack_height
             + if has_controllable_media { 64.0 } else { 0.0 }
-            + if allow_zoom_bar { 48.0 } else { 0.0 };
+            + if allow_zoom_bar {
+                48.0 + masonry_rows_bar_height
+            } else {
+                0.0
+            };
         let hover_bottom_right = mouse_pos
             .map(|p| {
                 let hover_zone = egui::Rect::from_min_size(
@@ -1000,13 +1023,27 @@ impl ImageViewer {
             if bar_rect.contains(pos) {
                 return true;
             }
+
+            if self.is_masonry_mode() {
+                let rows_bar_rect = egui::Rect::from_min_size(
+                    egui::pos2(bar_rect.min.x, bar_rect.min.y - 48.0),
+                    bar_size,
+                );
+                if rows_bar_rect.contains(pos) {
+                    return true;
+                }
+            }
         }
 
         if self.show_manga_toggle {
             let button_size = egui::Vec2::new(130.0, 32.0);
             let button_spacing = 8.0;
             let stack_height = button_size.y * 2.0 + button_spacing;
-            let y_offset = if self.show_manga_zoom_bar { 48.0 } else { 0.0 };
+            let y_offset = if self.show_manga_zoom_bar {
+                if self.is_masonry_mode() { 96.0 } else { 48.0 }
+            } else {
+                0.0
+            };
             let stack_pos = egui::pos2(
                 screen_rect.max.x - button_size.x - margin - scrollbar_padding,
                 screen_rect.max.y - stack_height - margin - y_offset - video_controls_offset,
@@ -1311,7 +1348,9 @@ impl ImageViewer {
             }
             Action::ZoomIn => {
                 let step = self.config.zoom_step;
-                if self.is_fullscreen {
+                if self.is_fullscreen && self.manga_mode {
+                    self.apply_manga_zoom_step(true);
+                } else if self.is_fullscreen {
                     self.zoom = (self.zoom * step).min(self.max_zoom_factor());
                     self.zoom_target = self.zoom;
                     self.zoom_velocity = 0.0;
@@ -1322,7 +1361,9 @@ impl ImageViewer {
             }
             Action::ZoomOut => {
                 let step = self.config.zoom_step;
-                if self.is_fullscreen {
+                if self.is_fullscreen && self.manga_mode {
+                    self.apply_manga_zoom_step(false);
+                } else if self.is_fullscreen {
                     self.zoom = (self.zoom / step).max(0.1);
                     self.zoom_target = self.zoom;
                     self.zoom_velocity = 0.0;
@@ -2037,10 +2078,23 @@ impl ImageViewer {
 
     fn clear_strip_return_context(&mut self) {
         self.strip_return_mode = None;
+        self.strip_return_masonry_state = None;
     }
 
     fn activate_strip_return_context(&mut self, layout_mode: MangaLayoutMode) {
         self.strip_return_mode = Some(layout_mode);
+        self.strip_return_masonry_state = if layout_mode == MangaLayoutMode::Masonry && self.manga_mode
+        {
+            Some(MasonryReturnState {
+                zoom: self.zoom,
+                zoom_target: self.zoom_target,
+                offset: self.offset,
+                scroll_offset: self.manga_scroll_offset,
+                scroll_target: self.manga_scroll_target,
+            })
+        } else {
+            None
+        };
     }
 
     fn return_to_strip_mode_from_middle_click(&mut self) {
@@ -2052,8 +2106,8 @@ impl ImageViewer {
             return;
         }
 
-        let center_index = if layout_mode == MangaLayoutMode::Masonry {
-            Some(self.current_index)
+        let restore_masonry_state = if layout_mode == MangaLayoutMode::Masonry {
+            self.strip_return_masonry_state
         } else {
             None
         };
@@ -2062,8 +2116,21 @@ impl ImageViewer {
         self.clear_strip_return_context();
         self.toggle_manga_mode();
 
-        if let Some(index) = center_index {
-            self.masonry_center_on_index(index);
+        if let Some(state) = restore_masonry_state {
+            if self.is_masonry_mode() {
+                self.zoom = self.clamp_zoom(state.zoom);
+                self.zoom_target = self.clamp_zoom(state.zoom_target);
+                self.zoom_velocity = 0.0;
+                self.offset = state.offset;
+
+                let max_scroll = (self.manga_total_height() - self.screen_size.y).max(0.0);
+                self.manga_scroll_offset = state.scroll_offset.clamp(0.0, max_scroll);
+                self.manga_scroll_target = state.scroll_target.clamp(0.0, max_scroll);
+                self.manga_scroll_velocity = 0.0;
+
+                self.manga_update_current_index();
+                self.manga_update_preload_queue();
+            }
         }
     }
 
@@ -2080,37 +2147,16 @@ impl ImageViewer {
         (30usize.saturating_mul(mul), 60usize.saturating_mul(mul))
     }
 
-    fn masonry_center_on_index(&mut self, index: usize) {
-        if !self.is_masonry_mode() || self.image_list.is_empty() {
-            return;
-        }
-
-        self.masonry_ensure_layout_cache();
-        let Some(item) = self.masonry_layout_items.get(index).copied() else {
-            return;
-        };
-
-        let viewport_center_x = self.screen_size.x * 0.5;
-        let viewport_center_y = self.screen_size.y * 0.5;
-        let item_center_x = item.x + item.width * 0.5;
-        let item_center_y = item.y + item.height * 0.5;
-
-        self.offset.x = viewport_center_x - item_center_x;
-
-        let total_height = self.manga_total_height();
-        let max_scroll = (total_height - self.screen_size.y).max(0.0);
-        let target_scroll = (item_center_y - viewport_center_y).clamp(0.0, max_scroll);
-        self.manga_scroll_offset = target_scroll;
-        self.manga_scroll_target = target_scroll;
-        self.manga_scroll_velocity = 0.0;
-        self.manga_update_current_index();
-        self.manga_update_preload_queue();
-    }
-
     fn invalidate_manga_layout_cache(&mut self) {
         self.manga_total_height_cache_valid = false;
         self.manga_layout_offsets.clear();
         self.masonry_layout_valid = false;
+    }
+
+    fn invalidate_manga_layout_cache_for_zoom(&mut self) {
+        if !self.is_masonry_mode() {
+            self.invalidate_manga_layout_cache();
+        }
     }
 
     fn toggle_long_strip_mode(&mut self) {
@@ -2119,6 +2165,28 @@ impl ImageViewer {
 
     fn toggle_masonry_mode(&mut self) {
         self.toggle_strip_mode(MangaLayoutMode::Masonry);
+    }
+
+    fn set_masonry_items_per_row(&mut self, items_per_row: usize) {
+        let items_per_row = items_per_row.clamp(2, 10);
+        if self.masonry_items_per_row == items_per_row {
+            return;
+        }
+
+        let center_anchor = if self.is_masonry_mode() {
+            self.manga_capture_center_anchor()
+        } else {
+            None
+        };
+
+        self.masonry_items_per_row = items_per_row;
+        self.invalidate_manga_layout_cache();
+
+        if let Some(anchor) = center_anchor {
+            self.manga_apply_center_anchor(anchor);
+            self.manga_update_current_index();
+            self.manga_update_preload_queue();
+        }
     }
 
     fn toggle_strip_mode(&mut self, layout_mode: MangaLayoutMode) {
@@ -2167,15 +2235,13 @@ impl ImageViewer {
             return;
         }
 
-        let zoom = (self.zoom * 10_000.0).round() / 10_000.0;
         let screen_x = self.screen_size.x.round();
-        let screen_y = self.screen_size.y.round();
         let len = self.image_list.len();
+        let items_per_row = self.masonry_items_per_row.clamp(2, 10);
 
         let needs_recompute = !self.masonry_layout_valid
-            || (self.masonry_layout_zoom - zoom).abs() > 1e-6
             || (self.masonry_layout_screen_x - screen_x).abs() > 1e-6
-            || (self.masonry_layout_screen_y - screen_y).abs() > 1e-6
+            || self.masonry_layout_items_per_row != items_per_row
             || self.masonry_layout_len != len;
 
         if !needs_recompute {
@@ -2187,16 +2253,10 @@ impl ImageViewer {
         const BOTTOM_PADDING: f32 = 10.0;
         const GUTTER: f32 = 12.0;
 
-        let available_width = (self.screen_size.x - SIDE_PADDING * 2.0).max(90.0);
-        let base_target_width = (self.screen_size.x * 0.28).clamp(180.0, 420.0);
-        let target_col_width =
-            (base_target_width * self.zoom.max(0.1)).clamp(90.0, available_width.max(90.0));
-
-        let columns = ((available_width + GUTTER) / (target_col_width + GUTTER))
-            .floor()
-            .max(1.0) as usize;
+        let available_width = (self.screen_size.x - SIDE_PADDING * 2.0).max(20.0);
+        let columns = items_per_row.max(1);
         let total_gutter = GUTTER * (columns.saturating_sub(1) as f32);
-        let column_width = ((available_width - total_gutter) / columns as f32).max(80.0);
+        let column_width = ((available_width - total_gutter) / columns as f32).max(1.0);
         let used_width = column_width * columns as f32 + total_gutter;
         let start_x = ((self.screen_size.x - used_width) * 0.5).max(0.0);
 
@@ -2217,7 +2277,7 @@ impl ImageViewer {
 
             let x = start_x + target_col as f32 * (column_width + GUTTER);
             let y = column_heights[target_col];
-            let height = (column_width * self.masonry_item_aspect_ratio(idx)).max(40.0);
+            let height = (column_width * self.masonry_item_aspect_ratio(idx)).max(20.0);
 
             self.masonry_layout_items[idx] = MasonryItemLayout {
                 x,
@@ -2240,9 +2300,8 @@ impl ImageViewer {
         }
 
         self.masonry_layout_total_height = (content_bottom + BOTTOM_PADDING).max(0.0);
-        self.masonry_layout_zoom = zoom;
         self.masonry_layout_screen_x = screen_x;
-        self.masonry_layout_screen_y = screen_y;
+        self.masonry_layout_items_per_row = items_per_row;
         self.masonry_layout_len = len;
         self.masonry_layout_valid = true;
     }
@@ -2251,7 +2310,7 @@ impl ImageViewer {
         self.masonry_layout_items
             .get(index)
             .copied()
-            .map(|item| item.to_screen_rect(self.offset.x, self.manga_scroll_offset))
+            .map(|item| item.to_screen_rect(self.zoom, self.offset.x, self.manga_scroll_offset))
     }
 
     fn manga_index_at_screen_pos(&mut self, pos: egui::Pos2) -> Option<usize> {
@@ -2431,7 +2490,7 @@ impl ImageViewer {
         if self.manga_layout_mode == MangaLayoutMode::Masonry {
             self.masonry_ensure_layout_cache();
             if let Some(item) = self.masonry_layout_items.get(target_index) {
-                return item.y.max(0.0);
+                return (item.y * self.zoom.max(0.0001)).max(0.0);
             }
             return 0.0;
         }
@@ -2684,6 +2743,8 @@ impl ImageViewer {
                 return self.current_index.min(len.saturating_sub(1));
             }
 
+            let zoom = self.zoom.max(0.0001);
+
             let viewport_top = self.manga_scroll_offset.max(0.0);
             let viewport_h = self.screen_size.y.max(1.0);
             let viewport_bottom = viewport_top + viewport_h;
@@ -2696,17 +2757,19 @@ impl ImageViewer {
             let mut best_score = f32::MAX;
 
             for (idx, item) in self.masonry_layout_items.iter().enumerate() {
-                let item_bottom = item.y + item.height;
-                let item_right = item.x + item.width;
-                if item.y >= viewport_bottom || item_bottom <= viewport_top {
+                let item_top = item.y * zoom;
+                let item_bottom = item_top + item.height * zoom;
+                let item_left = item.x * zoom;
+                let item_right = item_left + item.width * zoom;
+                if item_top >= viewport_bottom || item_bottom <= viewport_top {
                     continue;
                 }
-                if item.x >= viewport_right || item_right <= viewport_left {
+                if item_left >= viewport_right || item_right <= viewport_left {
                     continue;
                 }
 
-                let cx = item.x + item.width * 0.5;
-                let cy = item.y + item.height * 0.5;
+                let cx = item_left + item.width * zoom * 0.5;
+                let cy = item_top + item.height * zoom * 0.5;
                 let dx = cx - viewport_center_x;
                 let dy = cy - viewport_center_y;
                 let score = dx * dx * 0.25 + dy * dy;
@@ -2723,7 +2786,7 @@ impl ImageViewer {
             // Fallback when all items are panned out of horizontal viewport.
             let mut fallback_score = f32::MAX;
             for (idx, item) in self.masonry_layout_items.iter().enumerate() {
-                let cy = item.y + item.height * 0.5;
+                let cy = (item.y + item.height * 0.5) * zoom;
                 let score = (cy - viewport_center_y).abs();
                 if score < fallback_score {
                     fallback_score = score;
@@ -3390,12 +3453,14 @@ impl ImageViewer {
 
             let viewport_top = self.manga_scroll_offset.max(0.0);
             let viewport_bottom = viewport_top + self.screen_size.y;
+            let zoom = self.zoom.max(0.0001);
             let count = self
                 .masonry_layout_items
                 .iter()
                 .filter(|item| {
-                    let item_bottom = item.y + item.height;
-                    item.y < viewport_bottom && item_bottom > viewport_top
+                    let item_top = item.y * zoom;
+                    let item_bottom = item_top + item.height * zoom;
+                    item_top < viewport_bottom && item_bottom > viewport_top
                 })
                 .count();
 
@@ -3578,7 +3643,7 @@ impl ImageViewer {
 
         if self.is_masonry_mode() {
             self.masonry_ensure_layout_cache();
-            return self.masonry_layout_total_height;
+            return self.masonry_layout_total_height * self.zoom.max(0.0001);
         }
 
         // Quantize inputs used for cache invalidation.
@@ -3648,15 +3713,17 @@ impl ImageViewer {
                 return self.current_index.min(len.saturating_sub(1));
             }
 
+            let zoom = self.zoom.max(0.0001);
+
             let viewport_center_x = self.screen_size.x * 0.5 - self.offset.x;
 
             let mut best_row_idx = None;
             let mut best_row_score = f32::MAX;
             for (idx, item) in self.masonry_layout_items.iter().enumerate() {
-                let top = item.y;
-                let bottom = item.y + item.height;
+                let top = item.y * zoom;
+                let bottom = top + item.height * zoom;
                 if y >= top && y <= bottom {
-                    let center_x = item.x + item.width * 0.5;
+                    let center_x = (item.x + item.width * 0.5) * zoom;
                     let score = (center_x - viewport_center_x).abs();
                     if score < best_row_score {
                         best_row_score = score;
@@ -3671,7 +3738,7 @@ impl ImageViewer {
             let mut best_idx = self.current_index.min(len.saturating_sub(1));
             let mut best_score = f32::MAX;
             for (idx, item) in self.masonry_layout_items.iter().enumerate() {
-                let center_y = item.y + item.height * 0.5;
+                let center_y = (item.y + item.height * 0.5) * zoom;
                 let score = (center_y - y).abs();
                 if score < best_score {
                     best_score = score;
@@ -3712,7 +3779,7 @@ impl ImageViewer {
             return self
                 .masonry_layout_items
                 .get(index)
-                .map(|item| item.y)
+                .map(|item| item.y * self.zoom.max(0.0001))
                 .unwrap_or(0.0);
         }
 
@@ -3731,7 +3798,7 @@ impl ImageViewer {
             return self
                 .masonry_layout_items
                 .get(index)
-                .map(|item| item.height.max(0.0))
+                .map(|item| item.height.max(0.0) * self.zoom.max(0.0001))
                 .unwrap_or(0.0);
         }
 
@@ -4201,7 +4268,11 @@ impl ImageViewer {
         };
 
         // Position: bottom-right, above the zoom bar if it's visible, with scrollbar padding
-        let y_offset = if self.show_manga_zoom_bar { 48.0 } else { 0.0 };
+        let y_offset = if self.show_manga_zoom_bar {
+            if self.is_masonry_mode() { 96.0 } else { 48.0 }
+        } else {
+            0.0
+        };
         let button_pos = egui::pos2(
             screen_rect.max.x - button_size.x - margin - scrollbar_padding,
             screen_rect.max.y - stack_height - margin - y_offset - video_controls_offset,
@@ -4352,7 +4423,7 @@ impl ImageViewer {
                     self.zoom = new_zoom;
                     self.zoom_target = new_zoom;
                     self.zoom_velocity = 0.0;
-                    self.invalidate_manga_layout_cache();
+                    self.invalidate_manga_layout_cache_for_zoom();
 
                     // Re-apply the anchor to keep the same image position at the center
                     if let Some(anchor) = center_anchor {
@@ -4377,6 +4448,50 @@ impl ImageViewer {
             screen_rect.max.x - bar_size.x - margin - scrollbar_padding,
             screen_rect.max.y - bar_size.y - margin - video_controls_offset,
         );
+
+        if self.is_masonry_mode() {
+            let rows_bar_pos = egui::pos2(bar_pos.x, bar_pos.y - 48.0);
+            egui::Area::new(egui::Id::new("masonry_rows_bar"))
+                .fixed_pos(rows_bar_pos)
+                .order(egui::Order::Foreground)
+                .show(ctx, |ui| {
+                    let frame = egui::Frame::none()
+                        .fill(egui::Color32::from_rgba_unmultiplied(40, 40, 40, 180))
+                        .rounding(6.0)
+                        .inner_margin(egui::Margin::symmetric(8.0, 4.0));
+
+                    frame.show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("Rows")
+                                    .color(egui::Color32::from_rgb(220, 220, 220))
+                                    .size(12.0),
+                            );
+
+                            let mut slider_rows = self.masonry_items_per_row as i32;
+                            let rows_slider = egui::Slider::new(&mut slider_rows, 2..=10)
+                                .show_value(false)
+                                .clamping(egui::SliderClamping::Always);
+                            let rows_resp = ui.add_sized([108.0, 24.0], rows_slider);
+
+                            if rows_resp.changed() {
+                                self.set_masonry_items_per_row(slider_rows as usize);
+                            }
+
+                            if rows_resp.hovered() || rows_resp.dragged() {
+                                self.touch_bottom_overlays();
+                            }
+
+                            ui.add_space(4.0);
+                            ui.label(
+                                egui::RichText::new(format!("{} /row", self.masonry_items_per_row))
+                                    .color(egui::Color32::from_rgb(200, 200, 200))
+                                    .size(12.0),
+                            );
+                        });
+                    });
+                });
+        }
 
         egui::Area::new(egui::Id::new("manga_zoom_bar"))
             .fixed_pos(bar_pos)
@@ -4439,7 +4554,7 @@ impl ImageViewer {
                                     self.zoom = new_zoom;
                                     self.zoom_target = new_zoom;
                                     self.zoom_velocity = 0.0;
-                                    self.invalidate_manga_layout_cache();
+                                    self.invalidate_manga_layout_cache_for_zoom();
 
                                     if let Some(anchor) = center_anchor {
                                         self.manga_apply_center_anchor(anchor);
@@ -4515,7 +4630,7 @@ impl ImageViewer {
             self.zoom = new_zoom;
             self.zoom_target = new_zoom;
             self.zoom_velocity = 0.0;
-            self.invalidate_manga_layout_cache();
+            self.invalidate_manga_layout_cache_for_zoom();
 
             // Re-apply the anchor to keep the same image position at the center
             if let Some(anchor) = center_anchor {
@@ -5012,7 +5127,7 @@ impl ImageViewer {
                     self.zoom = new_zoom;
                     self.zoom_target = new_zoom;
                     self.zoom_velocity = 0.0;
-                    self.invalidate_manga_layout_cache();
+                    self.invalidate_manga_layout_cache_for_zoom();
 
                     // Re-apply the anchor to keep the same image position at the pointer/center
                     if let Some(a) = anchor {
@@ -5107,7 +5222,7 @@ impl ImageViewer {
                         self.zoom = new_zoom;
                         self.zoom_target = new_zoom;
                         self.zoom_velocity = 0.0;
-                        self.invalidate_manga_layout_cache();
+                        self.invalidate_manga_layout_cache_for_zoom();
                         did_reset = true;
 
                         // Re-apply the anchor to keep the same image position at the pointer/center
@@ -5246,15 +5361,18 @@ impl ImageViewer {
                     self.masonry_ensure_layout_cache();
                     let viewport_top = self.manga_scroll_offset.max(0.0);
                     let viewport_bottom = viewport_top + screen_height;
+                    let zoom = self.zoom.max(0.0001);
 
                     for idx in 0..self.masonry_layout_items.len() {
                         let item = self.masonry_layout_items[idx];
-                        let item_bottom = item.y + item.height;
-                        if item.y > viewport_bottom || item_bottom < viewport_top {
+                        let item_top = item.y * zoom;
+                        let item_bottom = item_top + item.height * zoom;
+                        if item_top > viewport_bottom || item_bottom < viewport_top {
                             continue;
                         }
 
-                        let image_rect = item.to_screen_rect(self.offset.x, self.manga_scroll_offset);
+                        let image_rect =
+                            item.to_screen_rect(zoom, self.offset.x, self.manga_scroll_offset);
                         self.draw_manga_item(ui, idx, image_rect);
                     }
                 } else {

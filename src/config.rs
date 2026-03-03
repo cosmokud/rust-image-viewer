@@ -162,6 +162,7 @@ impl Action {
         }
     }
 
+    #[allow(dead_code)]
     pub fn as_str(&self) -> &'static str {
         match self {
             Action::ToggleFullscreen => "toggle_fullscreen",
