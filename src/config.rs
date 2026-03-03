@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
-const DEFAULT_CONFIG_INI: &str = include_str!("../config.ini");
+const DEFAULT_CONFIG_INI: &str = include_str!("../assets/config.ini");
 
 /// Image resampling filter types for scaling operations.
 /// Listed from fastest (lowest quality) to slowest (highest quality).
@@ -431,10 +431,12 @@ impl Config {
 
         // Navigation
         self.add_binding(InputBinding::Key(egui::Key::ArrowRight), Action::NextImage);
+        self.add_binding(InputBinding::Key(egui::Key::PageDown), Action::NextImage);
         self.add_binding(
             InputBinding::Key(egui::Key::ArrowLeft),
             Action::PreviousImage,
         );
+        self.add_binding(InputBinding::Key(egui::Key::PageUp), Action::PreviousImage);
         self.add_binding(InputBinding::Mouse5, Action::NextImage);
         self.add_binding(InputBinding::Mouse4, Action::PreviousImage);
 

@@ -136,20 +136,22 @@ rust-image-viewer.exe path\to\video.mp4
 
 ### Default Keyboard Shortcuts
 
-| Action                   | Shortcut                         |
-| ------------------------ | -------------------------------- |
-| Toggle Fullscreen        | `F`, `F12`, or Middle-click      |
-| Next Image/Video         | `→` Right Arrow, or Mouse5       |
-| Previous Image/Video     | `←` Left Arrow, or Mouse4        |
-| Rotate Clockwise         | `↑` Up Arrow                     |
-| Rotate Counter-clockwise | `↓` Down Arrow                   |
-| Zoom In                  | Scroll Up (or `Ctrl` + Scroll)   |
-| Zoom Out                 | Scroll Down (or `Ctrl` + Scroll) |
-| Pan Image                | Hold Left Mouse Button + Drag    |
-| Play/Pause (Video/GIF)   | `Space`                          |
-| Mute/Unmute (Video)      | `M`                              |
-| Exit                     | `Esc` or `Ctrl+W`                |
-| Reset Zoom / Fit         | Double-click                     |
+| Action                   | Shortcut                               |
+| ------------------------ | -------------------------------------- |
+| Toggle Fullscreen        | `F`, `F12`, or Middle-click            |
+| Next Image/Video         | `→` Right Arrow, `PageDown`, or Mouse5 |
+| Previous Image/Video     | `←` Left Arrow, `PageUp`, or Mouse4    |
+| Jump to First File       | `Home`                                 |
+| Jump to Last File        | `End`                                  |
+| Rotate Clockwise         | `↑` Up Arrow                           |
+| Rotate Counter-clockwise | `↓` Down Arrow                         |
+| Zoom In                  | Scroll Up (or `Ctrl` + Scroll)         |
+| Zoom Out                 | Scroll Down (or `Ctrl` + Scroll)       |
+| Pan Image                | Hold Left Mouse Button + Drag          |
+| Play/Pause (Video/GIF)   | `Space`                                |
+| Mute/Unmute (Video)      | `M`                                    |
+| Exit                     | `Esc` or `Ctrl+W`                      |
+| Reset Zoom / Fit         | Double-click                           |
 
 ### Manga Mode Shortcuts
 
@@ -166,7 +168,7 @@ rust-image-viewer.exe path\to\video.mp4
 
 ## Configuration
 
-The viewer creates a `config.ini` file in `%APPDATA%\rust-image-viewer\` on first run. If a `config.ini` is placed next to the executable, it will be migrated on first launch for portable setups. All shortcuts and settings are fully customizable.
+The viewer creates a `config.ini` file in `%APPDATA%\rust-image-viewer\` on first run. If a `config.ini` is placed next to the executable, it will be migrated on first launch for portable setups. All shortcuts and settings are fully customizable. The repository default template is stored at `assets/config.ini`.
 
 ### Settings Section
 

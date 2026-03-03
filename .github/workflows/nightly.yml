@@ -56,9 +56,5 @@ jobs:
           tag_name: nightly
           name: Nightly Build
           prerelease: true
+          generate_release_notes: true
           files: target/release/rust-image-viewer.exe
-          body: |
-            Automated nightly build from the latest commit.
-
-            **Note:** This build requires GStreamer to be installed on your system.
-            Download GStreamer from: https://gstreamer.freedesktop.org/download/

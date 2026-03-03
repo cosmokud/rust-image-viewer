@@ -1541,6 +1541,55 @@ impl ImageViewer {
         self.load_image(&path);
     }
 
+    /// Load first image
+    fn first_image(&mut self) {
+        if self.image_list.is_empty() {
+            return;
+        }
+
+        // In manga mode, jump to start of strip
+        if self.manga_mode && self.is_fullscreen {
+            self.manga_go_to_start();
+            return;
+        }
+
+        if self.current_index == 0 {
+            return;
+        }
+
+        // Save current view state before navigating (fullscreen only)
+        self.save_current_fullscreen_view_state();
+
+        self.current_index = 0;
+        let path = self.image_list[self.current_index].clone();
+        self.load_image(&path);
+    }
+
+    /// Load last image
+    fn last_image(&mut self) {
+        if self.image_list.is_empty() {
+            return;
+        }
+
+        // In manga mode, jump to end of strip
+        if self.manga_mode && self.is_fullscreen {
+            self.manga_go_to_end();
+            return;
+        }
+
+        let last_index = self.image_list.len() - 1;
+        if self.current_index == last_index {
+            return;
+        }
+
+        // Save current view state before navigating (fullscreen only)
+        self.save_current_fullscreen_view_state();
+
+        self.current_index = last_index;
+        let path = self.image_list[self.current_index].clone();
+        self.load_image(&path);
+    }
+
     fn monitor_size_points(&self, ctx: &egui::Context) -> egui::Vec2 {
         ctx.input(|i| i.raw.viewport().monitor_size)
             .unwrap_or(self.screen_size)
@@ -5008,7 +5057,9 @@ impl ImageViewer {
             self.run_action(action);
         }
 
-        // Handle manga mode specific keys (arrows, Page Up/Down, Home/End)
+        // Handle mode-specific navigation keys.
+        // - Manga fullscreen: retain manga-specific paging behavior.
+        // - Floating/normal fullscreen: PageUp/PageDown/Home/End navigate files.
         if self.manga_mode && self.is_fullscreen {
             // Arrow keys in manga mode:
             // - Left/Right: PageUp/PageDown-style page navigation with smooth motion.
@@ -5086,6 +5137,41 @@ impl ImageViewer {
             }
             if end {
                 self.manga_go_to_end();
+            }
+        } else {
+            let page_up = ctx.input(|i| i.key_pressed(egui::Key::PageUp));
+            let page_down = ctx.input(|i| i.key_pressed(egui::Key::PageDown));
+            let home = ctx.input(|i| i.key_pressed(egui::Key::Home));
+            let end = ctx.input(|i| i.key_pressed(egui::Key::End));
+
+            let page_up_bound = self
+                .config
+                .bindings
+                .contains_key(&InputBinding::Key(egui::Key::PageUp));
+            let page_down_bound = self
+                .config
+                .bindings
+                .contains_key(&InputBinding::Key(egui::Key::PageDown));
+            let home_bound = self
+                .config
+                .bindings
+                .contains_key(&InputBinding::Key(egui::Key::Home));
+            let end_bound = self
+                .config
+                .bindings
+                .contains_key(&InputBinding::Key(egui::Key::End));
+
+            if page_up && !page_up_bound {
+                self.prev_image();
+            }
+            if page_down && !page_down_bound {
+                self.next_image();
+            }
+            if home && !home_bound {
+                self.first_image();
+            }
+            if end && !end_bound {
+                self.last_image();
             }
         }
     }

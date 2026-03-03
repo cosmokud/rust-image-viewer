@@ -43,7 +43,7 @@ parking_lot = "0.12"
 winapi = { version = "0.3", features = ["winuser", "dwmapi", "libloaderapi", "winreg", "processenv", "synchapi", "handleapi", "namedpipeapi", "fileapi", "winbase", "errhandlingapi", "winerror", "minwinbase"] }
 
 [build-dependencies]
-# For build script to copy config.ini and embed Windows icon (.ico)
+# For build script to copy default config template (assets/config.ini) and embed Windows icon (.ico)
 fs_extra = "1.3"
 winres = "0.1"
 
