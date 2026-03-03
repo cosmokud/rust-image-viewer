@@ -5,7 +5,10 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
-const DEFAULT_CONFIG_INI: &str = include_str!("../assets/config.ini");
+const DEFAULT_CONFIG_INI: &str = include_str!("../assets/rust-image-viewer-config.ini");
+const CONFIG_FILE_NAME: &str = "rust-image-viewer-config.ini";
+const LEGACY_CONFIG_FILE_NAME: &str = "config.ini";
+const LEGACY_SETTINGS_FILE_NAME: &str = "setting.ini";
 
 /// Image resampling filter types for scaling operations.
 /// Listed from fastest (lowest quality) to slowest (highest quality).
@@ -516,29 +519,37 @@ impl Config {
 
     /// Get settings file path.
     ///
-    /// Uses `config.ini` in AppData/Roaming/rust-image-viewer/ on Windows.
+    /// Uses `rust-image-viewer-config.ini` in AppData/Roaming/rust-image-viewer/ on Windows.
     ///
-    /// Migrates from legacy locations (exe directory, setting.ini) if needed.
+    /// Migrates from legacy locations (`config.ini` / `setting.ini`) if needed.
     pub fn config_path() -> PathBuf {
         let config_dir = Self::config_dir();
-        let config = config_dir.join("config.ini");
+        let config = config_dir.join(CONFIG_FILE_NAME);
 
-        // Migration from legacy locations
+        // Migration from legacy AppData filename
         if !config.exists() {
-            // Try to migrate from exe directory (old location)
+            let legacy_appdata_config = config_dir.join(LEGACY_CONFIG_FILE_NAME);
+            if legacy_appdata_config.exists() {
+                let _ = fs::copy(&legacy_appdata_config, &config);
+            }
+        }
+
+        // Migration from executable directory (portable / old locations)
+        if !config.exists() {
             if let Ok(exe_path) = std::env::current_exe() {
                 if let Some(exe_dir) = exe_path.parent() {
-                    // Check for config.ini in exe directory
-                    let legacy_config = exe_dir.join("config.ini");
-                    if legacy_config.exists() {
-                        let _ = fs::copy(&legacy_config, &config);
-                        // Don't delete - user might want to keep it
-                    }
-
-                    // Check for setting.ini (very old location)
-                    let legacy_setting = exe_dir.join("setting.ini");
-                    if legacy_setting.exists() && !config.exists() {
-                        let _ = fs::copy(&legacy_setting, &config);
+                    for legacy_name in [
+                        CONFIG_FILE_NAME,
+                        LEGACY_CONFIG_FILE_NAME,
+                        LEGACY_SETTINGS_FILE_NAME,
+                    ] {
+                        let legacy_config = exe_dir.join(legacy_name);
+                        if legacy_config.exists() {
+                            let _ = fs::copy(&legacy_config, &config);
+                            if config.exists() {
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -866,7 +877,7 @@ impl Config {
         let mut content = String::new();
 
         content.push_str("; Image Viewer Configuration\n");
-        content.push_str("; See config.ini in the application directory for examples\n\n");
+        content.push_str("; See rust-image-viewer-config.ini in the application directory for examples\n\n");
 
         // Write settings section
         content.push_str("[Settings]\n");

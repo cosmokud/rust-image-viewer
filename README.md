@@ -1,6 +1,8 @@
 # Rust Image & Video Viewer
 
-A high-performance, minimal, borderless, and feature-rich image and video viewer for Windows, built with Rust, egui, and GStreamer. Inspired by Google Picasa.
+A high-performance, minimal, borderless image and video viewer for Windows, built with Rust, egui, and GStreamer.
+
+This app is **not** intended to replace a full-featured image viewer or video player. It is a QuickLook-style preview tool focused on opening media instantly with minimal controls.
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Rust](https://img.shields.io/badge/rust-1.76%2B-orange.svg)
@@ -168,123 +170,80 @@ rust-image-viewer.exe path\to\video.mp4
 
 ## Configuration
 
-The viewer creates a `config.ini` file in `%APPDATA%\rust-image-viewer\` on first run. If a `config.ini` is placed next to the executable, it will be migrated on first launch for portable setups. All shortcuts and settings are fully customizable. The repository default template is stored at `assets/config.ini`.
+This section mirrors the defaults in `assets/rust-image-viewer-config.ini`.
 
-### Settings Section
+On first run, the viewer creates `rust-image-viewer-config.ini` in `%APPDATA%\rust-image-viewer\`.
+For backward compatibility and portable setups, legacy `config.ini` / `setting.ini` files in `%APPDATA%\rust-image-viewer\` or next to the executable are migrated automatically.
+
+### [Settings]
 
 ```ini
 [Settings]
-; Title bar auto-hide delay (seconds)
 controls_hide_delay = 0.5
-
-; Bottom overlays (video controls, Long Strip toggle) auto-hide delay (seconds)
 bottom_overlay_hide_delay = 0.5
-
-; Show FPS overlay for debugging (true/false)
 show_fps = false
-
-; Window resize border width in pixels
 resize_border_size = 6
-
-; Startup mode: floating or fullscreen
 startup_window_mode = floating
-
-; Single instance mode: reuse existing window when opening new files
 single_instance = true
-
-; Background color (RGB 0-255)
 background_rgb = 0, 0, 0
-
-; Zoom animation speed (0 = instant, 1-30 = animated)
-zoom_animation_speed = 20
-
-; Zoom step per scroll notch (1.02 = 2%, 1.10 = 10%)
-zoom_step = 1.02
-
-; Maximum zoom level in percent (1000 = 10x)
-max_zoom_percent = 1000
-
-; Reset view when entering fullscreen (true/false)
+background_r = 0
+background_g = 0
+background_b = 0
 fullscreen_reset_fit_on_enter = true
-```
-
-### Manga Mode Settings
-
-```ini
-[Settings]
-; Drag pan speed multiplier (1.0 = 1:1)
+zoom_animation_speed = 20
+zoom_step = 1.02
+max_zoom_percent = 1000
 manga_drag_pan_speed = 1.0
-
-; Mouse wheel scroll speed (pixels per step)
 manga_wheel_scroll_speed = 160
-
-; Inertial scrolling friction (lower = smoother glide)
 manga_inertial_friction = 0.33
-
-; Extra wheel multiplier for trackpad vs mouse
 manga_wheel_multiplier = 1.5
-
-; Arrow key scroll speed (pixels per press)
 manga_arrow_scroll_speed = 140
 ```
 
-### Video Settings
+### [Shortcuts]
+
+```ini
+[Shortcuts]
+toggle_fullscreen = mouse_middle, f, f12
+next_image = right, pagedown, mouse5
+previous_image = left, pageup, mouse4
+rotate_clockwise = up
+rotate_counterclockwise = down
+zoom_in = scroll_up, ctrl+scroll_up
+zoom_out = scroll_down, ctrl+scroll_down
+exit = ctrl+w, escape
+pan = mouse_left
+video_play_pause = space
+video_mute = m
+manga_zoom_in =
+manga_zoom_out =
+```
+
+`home` and `end` are built-in navigation fallbacks in floating/fullscreen mode even when not listed.
+
+### [Video]
 
 ```ini
 [Video]
-; Start videos muted (true/false)
 muted_by_default = true
-
-; Default volume level (0.0 to 1.0)
 default_volume = 0.0
-
-; Auto-loop videos (true/false)
 loop = true
 ```
 
-### Image Quality Settings
+### [Quality]
 
 ```ini
 [Quality]
-; Image scaling filters (from fastest to highest quality):
-; nearest, triangle, catmullrom, gaussian, lanczos3
-
-; Filter for enlarging images
 upscale_filter = catmullrom
-
-; Filter for shrinking images
 downscale_filter = lanczos3
-
-; Filter for GIF frame resizing
 gif_resize_filter = triangle
-
-; GPU texture filtering: nearest (sharp) or linear (smooth)
 texture_filter_static = linear
 texture_filter_animated = linear
 texture_filter_video = linear
 ```
 
-### Custom Shortcuts
-
-```ini
-[Shortcuts]
-; Multiple bindings separated by commas
-toggle_fullscreen = mouse_middle, f, f12
-next_image = right, mouse5
-previous_image = left, mouse4
-rotate_clockwise = up
-rotate_counterclockwise = down
-zoom_in = scroll_up
-zoom_out = scroll_down
-video_play_pause = space
-video_mute = m
-exit = ctrl+w, escape
-pan = mouse_left
-
-; Manga mode zoom
-manga_zoom_in = ctrl+scroll_up
-manga_zoom_out = ctrl+scroll_down
-```
+Available scaling filters: `nearest`, `triangle`, `catmullrom`, `gaussian`, `lanczos3`.
+Available texture filters: `nearest`, `linear`.
 
 ### Available Input Bindings
 

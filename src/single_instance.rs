@@ -5,7 +5,8 @@
 //! first instance via a temp file, then exits. The first instance receives the path
 //! and opens the file in its existing window.
 //!
-//! The behavior can be toggled via the `single_instance` setting in config.ini.
+//! The behavior can be toggled via the `single_instance` setting in
+//! rust-image-viewer-config.ini.
 
 use std::ffi::OsStr;
 use std::fs;

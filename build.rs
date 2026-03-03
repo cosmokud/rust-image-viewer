@@ -6,7 +6,9 @@ use std::env;
 use std::fs;
 use std::path::Path;
 
-const DEFAULT_CONFIG_TEMPLATE_PATH: &str = "assets/config.ini";
+const DEFAULT_CONFIG_TEMPLATE_PATH: &str = "assets/rust-image-viewer-config.ini";
+const RUNTIME_CONFIG_FILE_NAME: &str = "rust-image-viewer-config.ini";
+const LEGACY_CONFIG_FILE_NAME: &str = "config.ini";
 
 type IniValues = HashMap<String, HashMap<String, String>>;
 
@@ -105,7 +107,7 @@ fn copy_default_config_to_target(src_config: &Path) {
         .map(|p| p.to_path_buf());
 
     if let Some(target_dir) = target_dir {
-        let dst_config = target_dir.join("config.ini");
+        let dst_config = target_dir.join(RUNTIME_CONFIG_FILE_NAME);
 
         if src_config.exists() {
             let should_copy = if dst_config.exists() {
@@ -138,7 +140,8 @@ fn sync_appdata_config(src_config: &Path) {
     };
 
     let app_config_dir = Path::new(&appdata_dir).join("rust-image-viewer");
-    let app_config = app_config_dir.join("config.ini");
+    let app_config = app_config_dir.join(RUNTIME_CONFIG_FILE_NAME);
+    let legacy_app_config = app_config_dir.join(LEGACY_CONFIG_FILE_NAME);
 
     if let Err(e) = fs::create_dir_all(&app_config_dir) {
         println!(
@@ -159,11 +162,20 @@ fn sync_appdata_config(src_config: &Path) {
         }
     };
 
+    if !app_config.exists() && legacy_app_config.exists() {
+        if let Err(e) = fs::copy(&legacy_app_config, &app_config) {
+            println!(
+                "cargo:warning=Failed to migrate legacy AppData config.ini to {}: {}",
+                RUNTIME_CONFIG_FILE_NAME, e
+            );
+        }
+    }
+
     if !app_config.exists() {
         if let Err(e) = fs::write(&app_config, &default_template) {
             println!(
-                "cargo:warning=Failed to create AppData config.ini from default template: {}",
-                e
+                "cargo:warning=Failed to create AppData {} from default template: {}",
+                RUNTIME_CONFIG_FILE_NAME, e
             );
         }
         return;
@@ -175,21 +187,21 @@ fn sync_appdata_config(src_config: &Path) {
             if merged != current_content {
                 if let Err(e) = fs::write(&app_config, merged) {
                     println!(
-                        "cargo:warning=Failed to sync AppData config.ini with default template: {}",
-                        e
+                        "cargo:warning=Failed to sync AppData {} with default template: {}",
+                        RUNTIME_CONFIG_FILE_NAME, e
                     );
                 }
             }
         }
         Err(e) => {
             println!(
-                "cargo:warning=Failed to read AppData config.ini, replacing with default template: {}",
-                e
+                "cargo:warning=Failed to read AppData {}, replacing with default template: {}",
+                RUNTIME_CONFIG_FILE_NAME, e
             );
             if let Err(write_err) = fs::write(&app_config, &default_template) {
                 println!(
-                    "cargo:warning=Failed to replace unreadable AppData config.ini: {}",
-                    write_err
+                    "cargo:warning=Failed to replace unreadable AppData {}: {}",
+                    RUNTIME_CONFIG_FILE_NAME, write_err
                 );
             }
         }
