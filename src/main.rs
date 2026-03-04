@@ -628,6 +628,9 @@ struct ImageViewer {
 
 impl Default for ImageViewer {
     fn default() -> Self {
+        let config = Config::load();
+        let masonry_items_per_row = config.masonry_items_per_row.clamp(2, 10);
+
         Self {
             image: None,
             texture: None,
@@ -641,7 +644,7 @@ impl Default for ImageViewer {
             offset: egui::Vec2::ZERO,
             is_panning: false,
             last_mouse_pos: None,
-            config: Config::load(),
+            config,
             is_fullscreen: false,
             show_controls: false,
             controls_show_time: Instant::now(),
@@ -715,7 +718,7 @@ impl Default for ImageViewer {
             strip_return_mode: None,
             strip_return_masonry_state: None,
             strip_return_preserve_masonry_cache: false,
-            masonry_items_per_row: 5,
+            masonry_items_per_row,
             show_manga_toggle: false,
             manga_toggle_show_time: Instant::now(),
             show_manga_zoom_bar: false,
@@ -2465,6 +2468,8 @@ impl ImageViewer {
         };
 
         self.masonry_items_per_row = items_per_row;
+        self.config.masonry_items_per_row = items_per_row;
+        self.config.save();
         self.invalidate_manga_layout_cache();
 
         if let Some(anchor) = center_anchor {

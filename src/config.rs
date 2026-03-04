@@ -349,6 +349,8 @@ pub struct Config {
     pub manga_wheel_multiplier: f32,
     /// Manga mode: arrow-key scroll speed (pixels per key press)
     pub manga_arrow_scroll_speed: f32,
+    /// Masonry mode: number of items per row
+    pub masonry_items_per_row: usize,
     /// Manga mode: when true, consume wheel input with the same smooth cadence as arrow keys.
     pub manga_wheel_smooth_like_arrow_keys: bool,
     /// Manga mode autoscroll: dead zone radius around the anchor (px).
@@ -445,6 +447,7 @@ impl Config {
             manga_inertial_friction: 0.33,
             manga_wheel_multiplier: 1.5,
             manga_arrow_scroll_speed: 140.0,
+            masonry_items_per_row: 5,
             manga_wheel_smooth_like_arrow_keys: true,
             manga_autoscroll_dead_zone_px: 14.0,
             manga_autoscroll_base_speed_multiplier: 5.0,
@@ -807,6 +810,11 @@ impl Config {
                                 config.manga_arrow_scroll_speed = v.clamp(1.0, 5000.0);
                             }
                         }
+                        "masonry_items_per_row" | "manga_masonry_items_per_row" => {
+                            if let Ok(v) = value.parse::<usize>() {
+                                config.masonry_items_per_row = v.clamp(2, 10);
+                            }
+                        }
                         "manga_wheel_smooth_like_arrow_keys"
                         | "manga_wheel_smooth_match_arrow_keys"
                         | "manga_wheel_arrow_smooth_sync" => {
@@ -1098,6 +1106,10 @@ impl Config {
         values.insert(
             "manga_arrow_scroll_speed",
             format!("{}", self.manga_arrow_scroll_speed),
+        );
+        values.insert(
+            "masonry_items_per_row",
+            format!("{}", self.masonry_items_per_row),
         );
         values.insert(
             "manga_wheel_smooth_like_arrow_keys",
