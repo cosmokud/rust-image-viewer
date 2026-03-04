@@ -67,6 +67,10 @@ pub enum TextureFilter {
     Nearest,
     /// Linear (bilinear) - smooth interpolation between pixels (recommended for photos)
     Linear,
+    /// Trilinear - linear filtering with hardware mipmapping for smooth scaling at any zoom level.
+    /// Uses more VRAM (mipmap chain ~33% overhead) but prevents shimmer/aliasing when images
+    /// are displayed much smaller than their native resolution (e.g. masonry grids).
+    Trilinear,
 }
 
 impl TextureFilter {
@@ -74,6 +78,7 @@ impl TextureFilter {
         match s.trim().to_lowercase().as_str() {
             "nearest" | "point" | "nn" | "sharp" => Some(Self::Nearest),
             "linear" | "bilinear" | "smooth" => Some(Self::Linear),
+            "trilinear" | "mipmap" | "mipmapped" => Some(Self::Trilinear),
             _ => None,
         }
     }
@@ -82,6 +87,7 @@ impl TextureFilter {
         match self {
             Self::Nearest => "nearest",
             Self::Linear => "linear",
+            Self::Trilinear => "trilinear",
         }
     }
 
@@ -90,6 +96,12 @@ impl TextureFilter {
         match self {
             Self::Nearest => egui::TextureOptions::NEAREST,
             Self::Linear => egui::TextureOptions::LINEAR,
+            Self::Trilinear => egui::TextureOptions {
+                magnification: egui::TextureFilter::Linear,
+                minification: egui::TextureFilter::Linear,
+                wrap_mode: egui::TextureWrapMode::ClampToEdge,
+                mipmap_mode: Some(egui::TextureFilter::Linear),
+            },
         }
     }
 }
