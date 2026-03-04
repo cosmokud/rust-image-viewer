@@ -544,6 +544,11 @@ struct ImageViewer {
 
     /// Cached per-item layout for masonry mode (absolute strip coordinates).
     masonry_layout_items: Vec<MasonryItemLayout>,
+    /// Stable per-index masonry column assignment.
+    ///
+    /// This is intentionally preserved across dimension updates so late metadata
+    /// arrivals don't reshuffle tiles between columns during scrolling.
+    masonry_layout_columns: Vec<usize>,
     /// Cached total height for masonry mode.
     masonry_layout_total_height: f32,
     masonry_layout_screen_x: f32,
@@ -761,6 +766,7 @@ impl Default for ImageViewer {
             manga_layout_offsets: Vec::new(),
 
             masonry_layout_items: Vec::new(),
+            masonry_layout_columns: Vec::new(),
             masonry_layout_total_height: 0.0,
             masonry_layout_screen_x: 0.0,
             masonry_layout_items_per_row: 0,
@@ -2761,6 +2767,7 @@ impl ImageViewer {
     fn masonry_ensure_layout_cache(&mut self) {
         if !self.is_masonry_mode() || self.image_list.is_empty() {
             self.masonry_layout_items.clear();
+            self.masonry_layout_columns.clear();
             self.masonry_layout_total_height = 0.0;
             self.masonry_layout_valid = false;
             return;
@@ -2791,20 +2798,44 @@ impl ImageViewer {
         let used_width = column_width * columns as f32 + total_gutter;
         let start_x = ((self.screen_size.x - used_width) * 0.5).max(0.0);
 
+        // Keep column assignment stable across relayouts caused by async dimension updates.
+        // Re-seed only when the logical grid topology changes.
+        let should_reseed_columns =
+            self.masonry_layout_columns.len() != len || self.masonry_layout_items_per_row != items_per_row;
+
+        if should_reseed_columns {
+            let mut assignment_heights = vec![TOP_PADDING; columns];
+            self.masonry_layout_columns.clear();
+            self.masonry_layout_columns.resize(len, 0);
+
+            for idx in 0..len {
+                let mut target_col = 0usize;
+                let mut min_height = assignment_heights[0];
+                for col in 1..columns {
+                    if assignment_heights[col] < min_height {
+                        min_height = assignment_heights[col];
+                        target_col = col;
+                    }
+                }
+
+                self.masonry_layout_columns[idx] = target_col;
+                let height = (column_width * self.masonry_item_aspect_ratio(idx)).max(20.0);
+                assignment_heights[target_col] += height + GUTTER;
+            }
+        }
+
         let mut column_heights = vec![TOP_PADDING; columns];
         self.masonry_layout_items.clear();
         self.masonry_layout_items
             .resize(len, MasonryItemLayout::default());
 
         for idx in 0..len {
-            let mut target_col = 0usize;
-            let mut min_height = column_heights[0];
-            for col in 1..columns {
-                if column_heights[col] < min_height {
-                    min_height = column_heights[col];
-                    target_col = col;
-                }
-            }
+            let target_col = self
+                .masonry_layout_columns
+                .get(idx)
+                .copied()
+                .unwrap_or(0)
+                .min(columns.saturating_sub(1));
 
             let x = start_x + target_col as f32 * (column_width + GUTTER);
             let y = column_heights[target_col];
@@ -2851,44 +2882,11 @@ impl ImageViewer {
 
         if self.is_masonry_mode() {
             self.masonry_ensure_layout_cache();
-            let zoom = self.zoom.max(0.0001);
-            let items_per_row = self.masonry_items_per_row.clamp(2, 10);
-
-            // Convert screen pos to content Y for faster search
-            let content_y = (pos.y + self.manga_scroll_offset) / zoom;
-
-            // Binary search for approximate start index
             let item_count = self.masonry_layout_items.len();
-            let start_idx = if item_count > items_per_row * 3 {
-                let mut lo = 0usize;
-                let mut hi = item_count;
-                while lo < hi {
-                    let mid = lo + (hi - lo) / 2;
-                    let item = self.masonry_layout_items[mid];
-                    if item.y + item.height < content_y {
-                        lo = mid + 1;
-                    } else {
-                        hi = mid;
-                    }
-                }
-                lo.saturating_sub(items_per_row * 2)
-            } else {
-                0
-            };
-
-            let mut consecutive_below = 0usize;
-            for idx in start_idx..item_count {
+            for idx in 0..item_count {
                 if let Some(rect) = self.masonry_item_screen_rect(idx) {
                     if rect.contains(pos) {
                         return Some(idx);
-                    }
-                    if rect.min.y > pos.y {
-                        consecutive_below += 1;
-                        if consecutive_below >= items_per_row * 2 {
-                            break;
-                        }
-                    } else {
-                        consecutive_below = 0;
                     }
                 }
             }
@@ -3316,6 +3314,7 @@ impl ImageViewer {
 
         self.invalidate_manga_layout_cache();
         self.masonry_layout_items.clear();
+        self.masonry_layout_columns.clear();
         self.masonry_layout_total_height = 0.0;
     }
 
@@ -3336,7 +3335,6 @@ impl ImageViewer {
             }
 
             let zoom = self.zoom.max(0.0001);
-            let items_per_row = self.masonry_items_per_row.clamp(2, 10);
 
             let viewport_top = self.manga_scroll_offset.max(0.0);
             let viewport_h = self.screen_size.y.max(1.0);
@@ -3348,48 +3346,21 @@ impl ImageViewer {
 
             let mut best_idx = self.current_index.min(len.saturating_sub(1));
             let mut best_score = f32::MAX;
-
-            // Binary search for approximate start of visible range
-            let target_y = viewport_top / zoom;
             let item_count = self.masonry_layout_items.len();
-            let start_idx = if item_count > items_per_row * 3 {
-                let mut lo = 0usize;
-                let mut hi = item_count;
-                while lo < hi {
-                    let mid = lo + (hi - lo) / 2;
-                    let item = self.masonry_layout_items[mid];
-                    if item.y + item.height < target_y {
-                        lo = mid + 1;
-                    } else {
-                        hi = mid;
-                    }
-                }
-                lo.saturating_sub(items_per_row * 2)
-            } else {
-                0
-            };
 
-            let mut consecutive_below = 0usize;
-            let miss_budget = items_per_row * 2;
-
-            for idx in start_idx..item_count {
+            for idx in 0..item_count {
                 let item = self.masonry_layout_items[idx];
                 let item_top = item.y * zoom;
                 let item_bottom = item_top + item.height * zoom;
                 let item_left = item.x * zoom;
                 let item_right = item_left + item.width * zoom;
 
-                if item_top >= viewport_bottom {
-                    consecutive_below += 1;
-                    if consecutive_below >= miss_budget {
-                        break;
-                    }
-                    continue;
-                }
                 if item_bottom <= viewport_top {
                     continue;
                 }
-                consecutive_below = 0;
+                if item_top >= viewport_bottom {
+                    continue;
+                }
 
                 if item_left >= viewport_right || item_right <= viewport_left {
                     continue;
@@ -3411,14 +3382,9 @@ impl ImageViewer {
             }
 
             // Fallback when all items are panned out of horizontal viewport.
-            // Use same bounded scan instead of full linear scan.
             let mut fallback_score = f32::MAX;
-            for idx in start_idx..item_count {
+            for idx in 0..item_count {
                 let item = self.masonry_layout_items[idx];
-                let item_top = item.y * zoom;
-                if item_top >= viewport_bottom + viewport_h {
-                    break; // Far enough past viewport
-                }
                 let cy = (item.y + item.height * 0.5) * zoom;
                 let score = (cy - viewport_center_y).abs();
                 if score < fallback_score {
@@ -4091,45 +4057,16 @@ impl ImageViewer {
             let viewport_top = self.manga_scroll_offset.max(0.0);
             let viewport_bottom = viewport_top + self.screen_size.y;
             let zoom = self.zoom.max(0.0001);
-            let items_per_row = self.masonry_items_per_row.clamp(2, 10);
-
-            // Binary search for approximate start
-            let target_y = viewport_top / zoom;
-            let start_idx = if item_count > items_per_row * 3 {
-                let mut lo = 0usize;
-                let mut hi = item_count;
-                while lo < hi {
-                    let mid = lo + (hi - lo) / 2;
-                    let item = self.masonry_layout_items[mid];
-                    if item.y + item.height < target_y {
-                        lo = mid + 1;
-                    } else {
-                        hi = mid;
-                    }
-                }
-                lo.saturating_sub(items_per_row * 2)
-            } else {
-                0
-            };
 
             let mut count = 0usize;
-            let mut consecutive_below = 0usize;
-            for idx in start_idx..item_count {
+            for idx in 0..item_count {
                 let item = self.masonry_layout_items[idx];
                 let item_top = item.y * zoom;
                 let item_bottom = item_top + item.height * zoom;
 
-                if item_top > viewport_bottom {
-                    consecutive_below += 1;
-                    if consecutive_below >= items_per_row * 2 {
-                        break;
-                    }
+                if item_bottom < viewport_top || item_top > viewport_bottom {
                     continue;
                 }
-                if item_bottom < viewport_top {
-                    continue;
-                }
-                consecutive_below = 0;
                 count += 1;
             }
 
@@ -6453,62 +6390,16 @@ impl ImageViewer {
                     let viewport_top = self.manga_scroll_offset.max(0.0);
                     let viewport_bottom = viewport_top + screen_height;
                     let zoom = self.zoom.max(0.0001);
-                    let items_per_row = self.masonry_items_per_row.clamp(2, 10);
-
-                    // Optimized visibility culling: items are placed in roughly ascending Y
-                    // order by the shortest-column heuristic. Use binary search to find an
-                    // approximate start index, then scan forward. Once we've seen enough
-                    // consecutive items below the viewport, we stop (the "miss budget").
                     let item_count = self.masonry_layout_items.len();
 
-                    // Binary search for first item whose bottom edge might be in the viewport.
-                    // Items aren't perfectly sorted by Y, but they're monotonically increasing
-                    // on average, so binary search gives a good starting point.
-                    let start_idx = if item_count > items_per_row * 3 {
-                        // Search for first item where item_bottom >= viewport_top
-                        let target_y = viewport_top / zoom;
-                        let mut lo = 0usize;
-                        let mut hi = item_count;
-                        while lo < hi {
-                            let mid = lo + (hi - lo) / 2;
-                            let item = self.masonry_layout_items[mid];
-                            if item.y + item.height < target_y {
-                                lo = mid + 1;
-                            } else {
-                                hi = mid;
-                            }
-                        }
-                        // Back up by items_per_row to catch items in shorter columns
-                        // that may have started earlier but extend into the viewport.
-                        lo.saturating_sub(items_per_row * 2)
-                    } else {
-                        0
-                    };
-
-                    // Miss budget: after this many consecutive off-screen items past the
-                    // viewport bottom, we stop. Accounts for column height variance.
-                    let miss_budget_max = items_per_row * 2;
-                    let mut consecutive_below = 0usize;
-
-                    for idx in start_idx..item_count {
+                    for idx in 0..item_count {
                         let item = self.masonry_layout_items[idx];
                         let item_top = item.y * zoom;
                         let item_bottom = item_top + item.height * zoom;
 
-                        if item_top > viewport_bottom {
-                            consecutive_below += 1;
-                            if consecutive_below >= miss_budget_max {
-                                break; // All remaining items are below viewport
-                            }
-                            continue;
-                        }
-
-                        if item_bottom < viewport_top {
+                        if item_bottom < viewport_top || item_top > viewport_bottom {
                             continue; // Above viewport
                         }
-
-                        // Reset miss counter when we find a visible item
-                        consecutive_below = 0;
 
                         let image_rect =
                             item.to_screen_rect(zoom, self.offset.x, self.manga_scroll_offset);
