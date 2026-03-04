@@ -243,6 +243,7 @@ impl MasonryItemLayout {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Default)]
 struct MasonryReturnState {
     zoom: f32,
@@ -511,6 +512,10 @@ struct ImageViewer {
     manga_texture_cache: MangaTextureCache,
     /// Whether the scrollbar is being dragged
     manga_scrollbar_dragging: bool,
+    /// Browser-style autoscroll mode state for manga strip layouts.
+    manga_autoscroll_active: bool,
+    /// Anchor point where middle-click autoscroll was activated.
+    manga_autoscroll_anchor: Option<egui::Pos2>,
 
     /// Cached total height of all pages in manga mode for the current zoom/screen height.
     /// This avoids an O(n) scan on every scroll tick for large folders.
@@ -725,6 +730,8 @@ impl Default for ImageViewer {
             manga_loader: None,
             manga_texture_cache: MangaTextureCache::default(),
             manga_scrollbar_dragging: false,
+            manga_autoscroll_active: false,
+            manga_autoscroll_anchor: None,
 
             manga_total_height_cache: 0.0,
             manga_total_height_cache_zoom: 1.0,
@@ -1408,6 +1415,50 @@ impl ImageViewer {
             }
             _ => {}
         }
+    }
+
+    fn stop_manga_autoscroll(&mut self) {
+        self.manga_autoscroll_active = false;
+        self.manga_autoscroll_anchor = None;
+    }
+
+    fn strip_item_open_uses_right_click(&self) -> bool {
+        matches!(&self.config.strip_item_open_binding, InputBinding::MouseRight)
+    }
+
+    fn strip_item_open_binding_triggered(
+        &self,
+        input: &egui::InputState,
+        ctrl: bool,
+        shift: bool,
+        alt: bool,
+    ) -> bool {
+        match &self.config.strip_item_open_binding {
+            InputBinding::MouseRight => input.pointer.button_clicked(egui::PointerButton::Secondary),
+            InputBinding::MouseMiddle => input.pointer.button_pressed(egui::PointerButton::Middle),
+            InputBinding::Key(key) => !ctrl && !shift && !alt && input.key_pressed(*key),
+            InputBinding::KeyWithCtrl(key) => ctrl && !shift && !alt && input.key_pressed(*key),
+            InputBinding::KeyWithShift(key) => !ctrl && shift && !alt && input.key_pressed(*key),
+            InputBinding::KeyWithAlt(key) => !ctrl && !shift && alt && input.key_pressed(*key),
+            _ => false,
+        }
+    }
+
+    fn manga_autoscroll_axis_speed(delta: f32, base_speed: f32) -> f32 {
+        const DEAD_ZONE: f32 = 14.0;
+        const RAMP_DISTANCE: f32 = 300.0;
+
+        let magnitude = delta.abs();
+        if magnitude <= DEAD_ZONE {
+            return 0.0;
+        }
+
+        let t = ((magnitude - DEAD_ZONE) / (RAMP_DISTANCE - DEAD_ZONE)).clamp(0.0, 1.0);
+        let curved = t * t;
+        let min_speed = (base_speed * 0.6).clamp(80.0, 900.0);
+        let max_speed = (base_speed * 14.0).clamp(400.0, 7000.0);
+        let speed = min_speed + (max_speed - min_speed) * curved;
+        speed.copysign(delta)
     }
 
     /// Create new viewer with an image path
@@ -2162,6 +2213,7 @@ impl ImageViewer {
         items_per_row.saturating_mul(visible_rows.max(1))
     }
 
+    #[allow(dead_code)]
     fn circular_index_distance(&self, from: usize, to: usize) -> usize {
         let len = self.image_list.len();
         if len <= 1 {
@@ -2174,6 +2226,7 @@ impl ImageViewer {
         direct.min(len - direct)
     }
 
+    #[allow(dead_code)]
     fn should_reuse_masonry_cache_on_return(&self, state: MasonryReturnState) -> bool {
         if self.image_list.is_empty() {
             return false;
@@ -2198,6 +2251,7 @@ impl ImageViewer {
         self.manga_focused_anim_index = None;
     }
 
+    #[allow(dead_code)]
     fn enter_manga_mode_from_preserved_strip_cache(&mut self) {
         let current_media_dims = self.media_display_dimensions().or(self.video_texture_dims);
         let current_media_type = self.current_media_type;
@@ -2210,6 +2264,7 @@ impl ImageViewer {
         };
 
         self.manga_wheel_scroll_pending = 0.0;
+        self.stop_manga_autoscroll();
         self.manga_mode = true;
 
         // Close any playing fullscreen video when entering manga mode.
@@ -2252,6 +2307,7 @@ impl ImageViewer {
         }
     }
 
+    #[allow(dead_code)]
     fn return_to_strip_mode_from_middle_click(&mut self) {
         let Some(layout_mode) = self.strip_return_mode else {
             return;
@@ -2530,6 +2586,7 @@ impl ImageViewer {
 
         self.activate_strip_return_context(return_mode);
         self.manga_wheel_scroll_pending = 0.0;
+        self.stop_manga_autoscroll();
         self.manga_mode = false;
         if return_mode == MangaLayoutMode::Masonry {
             self.manga_suspend_runtime_for_solo_fullscreen();
@@ -2554,6 +2611,7 @@ impl ImageViewer {
             };
 
             self.manga_mode = true;
+            self.stop_manga_autoscroll();
 
             // Close any playing fullscreen video when entering manga mode
             // This prevents audio from the fullscreen video continuing to play
@@ -2656,6 +2714,7 @@ impl ImageViewer {
         self.prepare_mode_switch_placeholder_from_manga_index(visible_idx, target_media_type);
 
         self.manga_wheel_scroll_pending = 0.0;
+        self.stop_manga_autoscroll();
         self.manga_mode = false;
         self.manga_clear_cache();
 
@@ -5261,6 +5320,7 @@ impl ImageViewer {
         // We support both so Ctrl+wheel zoom works reliably across platforms/devices.
         let zoom_delta = ctx.input(|i| i.zoom_delta());
         let pointer_pos = ctx.input(|i| i.pointer.hover_pos());
+        let primary_clicked = ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Primary));
         let primary_down = ctx.input(|i| i.pointer.button_down(egui::PointerButton::Primary));
         let primary_pressed = ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary));
         let primary_released =
@@ -5269,6 +5329,7 @@ impl ImageViewer {
             i.pointer
                 .button_double_clicked(egui::PointerButton::Primary)
         });
+        let middle_clicked = ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Middle));
         let pointer_delta = ctx.input(|i| i.pointer.delta());
         let secondary_clicked =
             ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Secondary));
@@ -5339,13 +5400,46 @@ impl ImageViewer {
             });
         }
 
-        // Handle right-click to toggle play/pause for videos and GIFs in manga mode
-        // Skip if pointer is over the video controls bar at the bottom
         let controls_bar_height = 56.0;
         let over_controls =
             pointer_pos.map_or(false, |p| p.y > screen_height - controls_bar_height);
 
-        if secondary_clicked && !over_controls && !title_ui_blocking && !pointer_over_shortcut_ui {
+        let mut primary_consumed_for_autoscroll = false;
+        let mut secondary_consumed_for_autoscroll = false;
+
+        if middle_clicked && !over_controls && !title_ui_blocking && !pointer_over_shortcut_ui {
+            if self.manga_autoscroll_active {
+                self.stop_manga_autoscroll();
+            } else if let Some(anchor) = pointer_pos {
+                self.manga_autoscroll_active = true;
+                self.manga_autoscroll_anchor = Some(anchor);
+                self.is_panning = false;
+                self.last_mouse_pos = None;
+                self.manga_scroll_velocity = 0.0;
+                self.manga_wheel_scroll_pending = 0.0;
+            }
+            animation_active = true;
+        }
+
+        if self.manga_autoscroll_active && primary_clicked {
+            self.stop_manga_autoscroll();
+            primary_consumed_for_autoscroll = true;
+            animation_active = true;
+        }
+
+        if self.manga_autoscroll_active && secondary_clicked {
+            self.stop_manga_autoscroll();
+            secondary_consumed_for_autoscroll = true;
+            animation_active = true;
+        }
+
+        if secondary_clicked
+            && !self.strip_item_open_uses_right_click()
+            && !secondary_consumed_for_autoscroll
+            && !over_controls
+            && !title_ui_blocking
+            && !pointer_over_shortcut_ui
+        {
             // Check if we have a focused video
             if let Some(video_idx) = self.manga_focused_video_index {
                 if let Some(player) = self.manga_video_players.get_mut(&video_idx) {
@@ -5614,6 +5708,10 @@ impl ImageViewer {
             if self.last_mouse_pos.take().is_some() {
                 did_reset = true;
             }
+            if self.manga_autoscroll_active {
+                self.stop_manga_autoscroll();
+                did_reset = true;
+            }
 
             // Cancel any inertial scrolling (double-click is an explicit "reset" intent).
             if self.manga_scroll_velocity != 0.0 {
@@ -5713,6 +5811,8 @@ impl ImageViewer {
             && !self.manga_scrollbar_dragging
             && !over_scrollbar
             && !over_controls
+            && !self.manga_autoscroll_active
+            && !primary_consumed_for_autoscroll
             && !self.manga_video_seeking
             && !self.gif_seeking
             && !self.manga_video_volume_dragging;
@@ -5762,6 +5862,32 @@ impl ImageViewer {
             self.manga_scroll_target = self.manga_scroll_offset;
         }
 
+        let dt = ctx.input(|i| i.stable_dt).clamp(0.0, 0.033);
+
+        if self.manga_autoscroll_active {
+            if let (Some(anchor), Some(pos)) = (self.manga_autoscroll_anchor, pointer_pos) {
+                let speed_base = self.config.manga_arrow_scroll_speed.max(1.0);
+                let speed_x = Self::manga_autoscroll_axis_speed(pos.x - anchor.x, speed_base);
+                let speed_y = Self::manga_autoscroll_axis_speed(pos.y - anchor.y, speed_base);
+
+                if speed_x != 0.0 {
+                    self.offset.x += speed_x * dt;
+                    animation_active = true;
+                }
+
+                if self.manga_add_scroll_target_delta(speed_y * dt) {
+                    self.manga_update_preload_queue();
+                    animation_active = true;
+                }
+
+                if speed_x != 0.0 || speed_y != 0.0 {
+                    ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+                }
+            } else {
+                self.stop_manga_autoscroll();
+            }
+        }
+
         if self.config.manga_wheel_smooth_like_arrow_keys {
             // Smoothly consume queued wheel scroll using the same per-frame cadence as Arrow Up/Down.
             if self.manga_wheel_scroll_pending.abs() > 0.01 {
@@ -5792,7 +5918,6 @@ impl ImageViewer {
         }
 
         // Tick scroll animation
-        let dt = ctx.input(|i| i.stable_dt).min(0.033);
         if self.manga_tick_scroll_animation(dt) {
             animation_active = true;
             // Update preload queue during scroll (throttling is handled inside)
@@ -6014,6 +6139,71 @@ impl ImageViewer {
                         egui::FontId::proportional(14.0),
                         egui::Color32::WHITE,
                     );
+                }
+
+                if self.manga_autoscroll_active {
+                    if let Some(anchor) = self.manga_autoscroll_anchor {
+                        let painter = ui.painter();
+                        painter.circle_filled(
+                            anchor,
+                            18.0,
+                            egui::Color32::from_rgba_unmultiplied(35, 35, 35, 210),
+                        );
+                        painter.circle_stroke(
+                            anchor,
+                            18.0,
+                            egui::Stroke::new(
+                                1.6,
+                                egui::Color32::from_rgba_unmultiplied(210, 210, 210, 230),
+                            ),
+                        );
+                        painter.circle_filled(
+                            anchor,
+                            4.5,
+                            egui::Color32::from_rgba_unmultiplied(245, 245, 245, 240),
+                        );
+                        painter.line_segment(
+                            [
+                                egui::pos2(anchor.x - 7.0, anchor.y),
+                                egui::pos2(anchor.x + 7.0, anchor.y),
+                            ],
+                            egui::Stroke::new(
+                                1.2,
+                                egui::Color32::from_rgba_unmultiplied(210, 210, 210, 210),
+                            ),
+                        );
+                        painter.line_segment(
+                            [
+                                egui::pos2(anchor.x, anchor.y - 7.0),
+                                egui::pos2(anchor.x, anchor.y + 7.0),
+                            ],
+                            egui::Stroke::new(
+                                1.2,
+                                egui::Color32::from_rgba_unmultiplied(210, 210, 210, 210),
+                            ),
+                        );
+
+                        if let Some(cursor) = pointer_pos {
+                            let delta = cursor - anchor;
+                            let len = delta.length();
+                            if len > 2.0 {
+                                let direction = delta / len;
+                                let tip = anchor + direction * len.min(44.0);
+                                let perp = egui::vec2(-direction.y, direction.x);
+                                let stroke = egui::Stroke::new(
+                                    2.0,
+                                    egui::Color32::from_rgba_unmultiplied(140, 190, 255, 220),
+                                );
+
+                                painter.line_segment([anchor, tip], stroke);
+
+                                let head_a = tip - direction * 8.0 + perp * 5.0;
+                                let head_b = tip - direction * 8.0 - perp * 5.0;
+                                painter.line_segment([tip, head_a], stroke);
+                                painter.line_segment([tip, head_b], stroke);
+                            }
+                        }
+                    }
                 }
             });
 
@@ -6313,11 +6503,8 @@ impl ImageViewer {
 
         // Collect actions to run (we can't mutate self inside ctx.input closure)
         let mut actions_to_run: Vec<Action> = Vec::new();
-        // Special-case middle-click behavior:
-        // - In fullscreen strip mode (Masonry or Long Strip), middle click opens clicked item in solo fullscreen.
-        // - In solo fullscreen reached from strip-middle-click, middle click returns to that strip mode.
-        let mut middle_click_open_solo_from_strip = false;
-        let mut middle_click_return_to_strip = false;
+        let mut strip_item_open_from_strip = false;
+        let mut strip_item_open_pointer_pos: Option<egui::Pos2> = None;
         let mut right_click_navigated = false;
 
         ctx.input(|input| {
@@ -6326,10 +6513,35 @@ impl ImageViewer {
             let alt = input.modifiers.alt;
             let manga_fullscreen = self.manga_mode && self.is_fullscreen;
             let middle_pressed = input.pointer.button_pressed(egui::PointerButton::Middle);
+            let pointer_pos = input.pointer.interact_pos().or_else(|| input.pointer.hover_pos());
+            let pointer_over_shortcut_ui =
+                self.pointer_over_shortcut_blocking_ui(pointer_pos, input.screen_rect);
+
+            if manga_fullscreen && self.manga_autoscroll_active {
+                let primary_cancel = input.pointer.button_clicked(egui::PointerButton::Primary);
+                let secondary_cancel =
+                    input.pointer.button_clicked(egui::PointerButton::Secondary);
+                if primary_cancel || secondary_cancel {
+                    return;
+                }
+            }
+
+            if manga_fullscreen
+                && self.strip_item_open_binding_triggered(input, ctrl, shift, alt)
+                && !pointer_over_shortcut_ui
+            {
+                strip_item_open_from_strip = true;
+                strip_item_open_pointer_pos = pointer_pos;
+                return;
+            }
 
             // Check all keyboard bindings from config
             // We iterate through all configured bindings and check if the corresponding key was pressed
             for (binding, action) in &self.config.bindings {
+                if manga_fullscreen && binding == &self.config.strip_item_open_binding {
+                    continue;
+                }
+
                 match binding {
                     InputBinding::Key(key) => {
                         // In manga mode, repurpose arrow keys for navigation/scroll and disable their
@@ -6376,12 +6588,9 @@ impl ImageViewer {
                     InputBinding::MouseMiddle => {
                         if middle_pressed {
                             if manga_fullscreen {
-                                middle_click_open_solo_from_strip = true;
-                            } else if self.is_fullscreen && self.strip_return_mode.is_some() {
-                                middle_click_return_to_strip = true;
-                            } else {
-                                actions_to_run.push(*action);
+                                continue;
                             }
+                            actions_to_run.push(*action);
                         }
                     }
                     InputBinding::Mouse4 => {
@@ -6422,16 +6631,13 @@ impl ImageViewer {
                 }
             }
 
-            // Right-click navigation processed here (pre-draw) to avoid a one-frame flash.
-            // For videos: center region triggers play/pause, side zones trigger prev/next.
-            // Skip when pointer is over interactive overlay UI.
-            let pointer_pos = input.pointer.hover_pos();
-            let pointer_over_shortcut_ui =
-                self.pointer_over_shortcut_blocking_ui(pointer_pos, input.screen_rect);
-
             if input.pointer.button_clicked(egui::PointerButton::Secondary)
                 && !pointer_over_shortcut_ui
             {
+                if manga_fullscreen && self.strip_item_open_uses_right_click() {
+                    return;
+                }
+
                 if let Some(pos) = pointer_pos {
                     if !self.manga_mode {
                         if let Some(action) =
@@ -6458,18 +6664,12 @@ impl ImageViewer {
             }
         });
 
-        if middle_click_open_solo_from_strip {
-            let pointer_pos =
-                ctx.input(|i| i.pointer.interact_pos().or_else(|| i.pointer.hover_pos()));
-            let target_index = pointer_pos
+        if strip_item_open_from_strip {
+            self.stop_manga_autoscroll();
+            let target_index = strip_item_open_pointer_pos
                 .and_then(|pos| self.manga_index_at_screen_pos(pos))
                 .unwrap_or(self.current_index);
             self.open_strip_item_in_solo_fullscreen(target_index);
-            return;
-        }
-
-        if middle_click_return_to_strip {
-            self.return_to_strip_mode_from_middle_click();
             return;
         }
 
@@ -8685,6 +8885,7 @@ impl eframe::App for ImageViewer {
                 // If we're in fullscreen manga mode, exit it to show the new file normally
                 if self.manga_mode && self.is_fullscreen {
                     self.manga_wheel_scroll_pending = 0.0;
+                    self.stop_manga_autoscroll();
                     self.manga_mode = false;
                     self.manga_clear_cache();
 
@@ -8881,6 +9082,7 @@ impl eframe::App for ImageViewer {
                 // Exit manga mode when leaving fullscreen
                 if self.manga_mode {
                     self.manga_wheel_scroll_pending = 0.0;
+                    self.stop_manga_autoscroll();
                     self.manga_mode = false;
                     self.manga_clear_cache();
                 }

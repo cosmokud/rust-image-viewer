@@ -46,6 +46,8 @@ This app is **not** intended to replace a full-featured image viewer or video pl
 
 - **Vertical Strip View** — View all images in a folder as a continuous vertical strip
 - **Smooth Scrolling** — Inertial scrolling with momentum (configurable friction)
+- **Handsfree Autoscroll Ball** — Middle-click to start browser-style 8-direction autoscroll
+- **Quick Item Open** — Right-click an item to open it into solo fullscreen (configurable)
 - **High-performance Preloading** — Parallel background loading with priority-based queue
 - **Video Thumbnails** — Videos show first-frame thumbnails in manga strip
 - **Zoom Control** — Ctrl+Scroll to zoom in/out in manga mode
@@ -160,6 +162,8 @@ rust-image-viewer.exe path\to\video.mp4
 | Action            | Shortcut                               |
 | ----------------- | -------------------------------------- |
 | Scroll            | Mouse Wheel or Drag                    |
+| Open Item         | Right-click (configurable)             |
+| Handsfree Scroll  | Middle-click (toggle autoscroll ball)  |
 | Zoom In           | `Ctrl` + Scroll Up                     |
 | Zoom Out          | `Ctrl` + Scroll Down                   |
 | Page Up/Down      | `←`/`→` or `PageUp`/`PageDown`         |
@@ -199,6 +203,8 @@ manga_wheel_scroll_speed = 160
 manga_inertial_friction = 0.33
 manga_wheel_multiplier = 1.5
 manga_arrow_scroll_speed = 140
+manga_wheel_smooth_like_arrow_keys = true
+strip_item_open_binding = mouse_right
 ```
 
 ### [Shortcuts]

@@ -220,6 +220,18 @@ pub fn parse_input_binding(s: &str) -> Option<InputBinding> {
     parse_key(&s).map(InputBinding::Key)
 }
 
+fn is_strip_item_open_binding(binding: &InputBinding) -> bool {
+    matches!(
+        binding,
+        InputBinding::MouseRight
+            | InputBinding::MouseMiddle
+            | InputBinding::Key(_)
+            | InputBinding::KeyWithCtrl(_)
+            | InputBinding::KeyWithShift(_)
+            | InputBinding::KeyWithAlt(_)
+    )
+}
+
 /// Parse a single key from string
 fn parse_key(s: &str) -> Option<egui::Key> {
     match s.to_lowercase().as_str() {
@@ -339,6 +351,9 @@ pub struct Config {
     pub manga_arrow_scroll_speed: f32,
     /// Manga mode: when true, consume wheel input with the same smooth cadence as arrow keys.
     pub manga_wheel_smooth_like_arrow_keys: bool,
+    /// Binding used to open the hovered item into solo fullscreen from manga strip layouts.
+    /// Supports: mouse_right, mouse_middle, or keyboard bindings.
+    pub strip_item_open_binding: InputBinding,
 
     /// Whether videos start muted by default
     pub video_muted_by_default: bool,
@@ -413,6 +428,7 @@ impl Default for Config {
             manga_wheel_multiplier: 1.5,
             manga_arrow_scroll_speed: 140.0,
             manga_wheel_smooth_like_arrow_keys: true,
+            strip_item_open_binding: InputBinding::MouseRight,
             video_muted_by_default: true,
             video_default_volume: 0.0,
             video_loop: true,
@@ -624,6 +640,7 @@ impl Config {
             manga_wheel_multiplier: 1.5,
             manga_arrow_scroll_speed: 140.0,
             manga_wheel_smooth_like_arrow_keys: true,
+            strip_item_open_binding: InputBinding::MouseRight,
             video_muted_by_default: true,
             video_default_volume: 0.0,
             video_loop: true,
@@ -794,6 +811,16 @@ impl Config {
                         | "manga_wheel_arrow_smooth_sync" => {
                             if let Some(v) = parse_bool(value) {
                                 config.manga_wheel_smooth_like_arrow_keys = v;
+                            }
+                        }
+                        "strip_item_open_binding"
+                        | "strip_item_open_trigger"
+                        | "manga_item_open_binding"
+                        | "manga_item_open_trigger" => {
+                            if let Some(binding) = parse_input_binding(value) {
+                                if is_strip_item_open_binding(&binding) {
+                                    config.strip_item_open_binding = binding;
+                                }
                             }
                         }
                         "startup_window_mode" | "startup_mode" | "window_mode" => {
@@ -1014,6 +1041,10 @@ impl Config {
         values.insert(
             "manga_wheel_smooth_like_arrow_keys",
             bool_to_ini(self.manga_wheel_smooth_like_arrow_keys).to_string(),
+        );
+        values.insert(
+            "strip_item_open_binding",
+            binding_to_string(&self.strip_item_open_binding),
         );
 
         values.insert(
