@@ -6536,16 +6536,6 @@ impl ImageViewer {
                 return;
             }
 
-            if self.is_fullscreen
-                && !self.manga_mode
-                && self.strip_return_mode.is_some()
-                && input.pointer.button_clicked(egui::PointerButton::Secondary)
-                && !pointer_over_shortcut_ui
-            {
-                right_click_return_to_strip = true;
-                return;
-            }
-
             // Check all keyboard bindings from config
             // We iterate through all configured bindings and check if the corresponding key was pressed
             for (binding, action) in &self.config.bindings {
@@ -6667,6 +6657,11 @@ impl ImageViewer {
                     } else if pos.x > screen_width - side_zone {
                         actions_to_run.push(Action::NextImage);
                         right_click_navigated = true;
+                    } else if self.is_fullscreen && !self.manga_mode && self.strip_return_mode.is_some() {
+                        // Solo fullscreen opened from strip mode: center/right-click returns to strip.
+                        // Navigation hit-areas above (black bars or side zones) remain unchanged.
+                        right_click_return_to_strip = true;
+                        return;
                     } else {
                         // Center region: toggle play/pause for videos, do nothing for images
                         // We'll handle this outside the closure since we need &mut self
