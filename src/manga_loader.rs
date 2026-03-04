@@ -201,7 +201,8 @@ pub struct MangaLoader {
     /// Estimated number of pages visible on screen (for adaptive preloading)
     visible_page_count: usize,
     /// Runtime tuning settings (cache/probe/preload behavior).
-    settings: MangaLoaderSettings,
+    /// Shared with worker/coordinator threads so settings can be updated live.
+    settings: Arc<RwLock<MangaLoaderSettings>>,
 }
 
 /// Statistics for monitoring loader performance.
@@ -231,6 +232,7 @@ impl MangaLoader {
         let retry_state = Arc::new(RwLock::new(HashMap::new()));
         let shutdown = Arc::new(AtomicBool::new(false));
         let generation = Arc::new(AtomicUsize::new(0));
+        let settings_shared = Arc::new(RwLock::new(settings));
 
         // Spawn a coordinator thread that processes requests using Rayon
         let loading_clone = Arc::clone(&loading_indices);
@@ -238,7 +240,7 @@ impl MangaLoader {
         let retry_clone = Arc::clone(&retry_state);
         let shutdown_clone = Arc::clone(&shutdown);
         let generation_clone = Arc::clone(&generation);
-        let coordinator_settings = settings;
+        let coordinator_settings = Arc::clone(&settings_shared);
 
         std::thread::Builder::new()
             .name("manga-loader-coordinator".into())
@@ -259,7 +261,7 @@ impl MangaLoader {
         // Spawn a lightweight dimension probe worker.
         // This keeps file header reads (image::image_dimensions) off the UI thread.
         let shutdown_clone = Arc::clone(&shutdown);
-        let dim_worker_settings = settings;
+        let dim_worker_settings = Arc::clone(&settings_shared);
         std::thread::Builder::new()
             .name("manga-dimension-worker".into())
             .spawn(move || {
@@ -271,6 +273,8 @@ impl MangaLoader {
                         Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
                         Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
                     };
+
+                    let dim_worker_settings = *dim_worker_settings.read();
 
                     let mut out: Vec<(usize, u32, u32, MangaMediaType)> =
                         Vec::with_capacity(req.items.len());
@@ -344,8 +348,16 @@ impl MangaLoader {
             current_generation: 0,
             stats: LoaderStats::default(),
             visible_page_count: 1,
-            settings,
+            settings: settings_shared,
         }
+    }
+
+    /// Update loader tuning settings at runtime.
+    ///
+    /// Used by masonry mode to apply live row-scaled optimization values while
+    /// the user changes density via the rows slider.
+    pub fn update_settings(&mut self, settings: MangaLoaderSettings) {
+        *self.settings.write() = settings;
     }
 
     /// Number of indices currently being decoded on background workers.
@@ -375,6 +387,8 @@ impl MangaLoader {
             return;
         }
 
+        let settings = *self.settings.read();
+
         // Build a bounded batch of missing indices, prioritized around the current
         // visible center of this range so on-screen placeholders get real metadata first.
         let center = self.last_visible_index.clamp(start, end - 1);
@@ -399,7 +413,7 @@ impl MangaLoader {
         let mut video_items: Vec<(usize, PathBuf)> = Vec::new();
         let mut image_items: Vec<(usize, PathBuf)> = Vec::new();
         for idx in ordered_indices {
-            if video_items.len() + image_items.len() >= self.settings.dim_request_batch_size {
+            if video_items.len() + image_items.len() >= settings.dim_request_batch_size {
                 break;
             }
 
@@ -420,9 +434,9 @@ impl MangaLoader {
             }
         }
 
-        if video_items.len() + image_items.len() > self.settings.dim_request_batch_size {
+        if video_items.len() + image_items.len() > settings.dim_request_batch_size {
             image_items.truncate(
-                self.settings
+                settings
                     .dim_request_batch_size
                     .saturating_sub(video_items.len()),
             );
@@ -501,7 +515,7 @@ impl MangaLoader {
         retry_state: Arc<RwLock<HashMap<usize, RetryState>>>,
         shutdown: Arc<AtomicBool>,
         generation: Arc<AtomicUsize>,
-        settings: MangaLoaderSettings,
+        settings: Arc<RwLock<MangaLoaderSettings>>,
     ) {
         // Collect requests in batches for parallel processing
         let mut batch: Vec<LoadRequest> = Vec::with_capacity(16);
@@ -544,6 +558,7 @@ impl MangaLoader {
             // we prefer to drop the whole batch's outputs rather than clog the result channel
             // with stale work.
             let generation_changed = || generation.load(Ordering::Acquire) != current_gen;
+            let decode_settings = *settings.read();
 
             enum DecodeOutcome {
                 Skipped,
@@ -571,7 +586,7 @@ impl MangaLoader {
                 }
 
                 // Load the image
-                let decoded = Self::load_single_image(req, settings);
+                let decoded = Self::load_single_image(req, decode_settings);
 
                 let outcome = match decoded {
                     Some(decoded) => DecodeOutcome::Decoded(decoded),
@@ -1049,14 +1064,14 @@ impl MangaLoader {
     /// Returns (preload_ahead, preload_behind)
     fn calculate_preload_counts(&self) -> (usize, usize) {
         let visible_pages = self.visible_page_count.max(1);
+        let settings = *self.settings.read();
 
-        let min_preload = self.settings.min_preload.max(1);
-        let max_preload = self.settings.max_preload.max(min_preload);
+        let min_preload = settings.min_preload.max(1);
+        let max_preload = settings.max_preload.max(min_preload);
 
         // More buffer ahead (in scroll direction), less behind.
-        let ahead = (visible_pages + self.settings.preload_buffer_ahead).clamp(min_preload, max_preload);
-        let behind =
-            (visible_pages + self.settings.preload_buffer_behind).clamp(min_preload, max_preload);
+        let ahead = (visible_pages + settings.preload_buffer_ahead).clamp(min_preload, max_preload);
+        let behind = (visible_pages + settings.preload_buffer_behind).clamp(min_preload, max_preload);
 
         (ahead, behind)
     }
@@ -1403,6 +1418,7 @@ impl MangaLoader {
 
         // Clear existing cache
         self.dimension_cache.clear();
+        let settings = *self.settings.read();
 
         // Cache first batch synchronously for immediate layout
         let initial_batch: Vec<(usize, Option<(u32, u32, MangaMediaType)>)> = image_list
@@ -1415,8 +1431,7 @@ impl MangaLoader {
 
                 if is_video {
                     // For videos, probe dimensions
-                    let dims =
-                        Self::probe_video_dimensions(path, self.settings.video_probe_timeout_ms);
+                    let dims = Self::probe_video_dimensions(path, settings.video_probe_timeout_ms);
                     (idx, dims.map(|(w, h)| (w, h, MangaMediaType::Video)))
                 } else if is_image {
                     // For images, get from file header

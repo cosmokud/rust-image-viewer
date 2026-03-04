@@ -411,6 +411,12 @@ pub struct Config {
     pub manga_keep_headroom_rows: usize,
     /// Extra masonry rows to include in dimension probe windows.
     pub manga_probe_headroom_rows: usize,
+    /// Base metadata-only probe radius (in items) for masonry mode.
+    /// Effective runtime value scales with `masonry_items_per_row`.
+    pub manga_masonry_metadata_probe_radius: usize,
+    /// Base staged texture decode step (in items) for masonry mode.
+    /// Effective runtime value scales with `masonry_items_per_row`.
+    pub manga_masonry_texture_stage_step: usize,
     /// Base navigation preload window behind current index (used by arrow/Page style jumps).
     pub manga_navigation_preload_behind: usize,
     /// Base navigation preload window ahead of current index (used by arrow/Page style jumps).
@@ -546,6 +552,8 @@ impl Config {
             manga_cache_headroom_rows: 2,
             manga_keep_headroom_rows: 2,
             manga_probe_headroom_rows: 4,
+            manga_masonry_metadata_probe_radius: 30,
+            manga_masonry_texture_stage_step: 7,
             manga_navigation_preload_behind: 30,
             manga_navigation_preload_ahead: 60,
             manga_preload_buffer_ahead: 4,
@@ -953,6 +961,20 @@ impl Config {
                         | "manga_dimension_headroom_rows" => {
                             if let Ok(v) = value.parse::<usize>() {
                                 config.manga_probe_headroom_rows = v.clamp(0, 32);
+                            }
+                        }
+                        "manga_masonry_metadata_probe_radius"
+                        | "masonry_metadata_probe_radius"
+                        | "masonry_metadata_probe_items" => {
+                            if let Ok(v) = value.parse::<usize>() {
+                                config.manga_masonry_metadata_probe_radius = v.clamp(4, 5000);
+                            }
+                        }
+                        "manga_masonry_texture_stage_step"
+                        | "masonry_texture_stage_step"
+                        | "masonry_decode_stage_step" => {
+                            if let Ok(v) = value.parse::<usize>() {
+                                config.manga_masonry_texture_stage_step = v.clamp(1, 1024);
                             }
                         }
                         "manga_navigation_preload_behind" => {
@@ -1371,6 +1393,14 @@ impl Config {
         values.insert(
             "manga_probe_headroom_rows",
             format!("{}", self.manga_probe_headroom_rows),
+        );
+        values.insert(
+            "manga_masonry_metadata_probe_radius",
+            format!("{}", self.manga_masonry_metadata_probe_radius),
+        );
+        values.insert(
+            "manga_masonry_texture_stage_step",
+            format!("{}", self.manga_masonry_texture_stage_step),
         );
         values.insert(
             "manga_navigation_preload_behind",
