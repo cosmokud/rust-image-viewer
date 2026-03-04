@@ -5497,14 +5497,24 @@ impl ImageViewer {
                     animation_active = true;
                 }
             } else if wheel_steps != 0.0 {
-                // Queue wheel input and consume it at a stable per-frame rate.
-                // This makes wheel motion feel as smooth as keyboard up/down scrolling.
                 let scroll_speed = self.config.manga_wheel_scroll_speed;
                 let multiplier = self.config.manga_wheel_multiplier;
                 let delta = -wheel_steps * scroll_speed * multiplier;
-                let max_pending = self.screen_size.y.max(1.0) * 3.0;
-                self.manga_wheel_scroll_pending =
-                    (self.manga_wheel_scroll_pending + delta).clamp(-max_pending, max_pending);
+
+                if self.config.manga_wheel_smooth_like_arrow_keys {
+                    // Queue wheel input and consume it at a stable per-frame rate.
+                    // This makes wheel motion feel as smooth as keyboard up/down scrolling.
+                    let max_pending = self.screen_size.y.max(1.0) * 3.0;
+                    self.manga_wheel_scroll_pending =
+                        (self.manga_wheel_scroll_pending + delta).clamp(-max_pending, max_pending);
+                } else {
+                    // Legacy behavior: apply wheel deltas directly to the scroll target.
+                    self.manga_wheel_scroll_pending = 0.0;
+                    if self.manga_add_scroll_target_delta(delta) {
+                        self.manga_update_preload_queue();
+                    }
+                }
+
                 animation_active = true;
             }
         }
@@ -5678,28 +5688,33 @@ impl ImageViewer {
             self.manga_scroll_target = self.manga_scroll_offset;
         }
 
-        // Smoothly consume queued wheel scroll using the same per-frame cadence as Arrow Up/Down.
-        if self.manga_wheel_scroll_pending.abs() > 0.01 {
-            let per_frame_step = (self.config.manga_arrow_scroll_speed * 0.5).max(1.0);
-            let applied = self
-                .manga_wheel_scroll_pending
-                .clamp(-per_frame_step, per_frame_step);
+        if self.config.manga_wheel_smooth_like_arrow_keys {
+            // Smoothly consume queued wheel scroll using the same per-frame cadence as Arrow Up/Down.
+            if self.manga_wheel_scroll_pending.abs() > 0.01 {
+                let per_frame_step = (self.config.manga_arrow_scroll_speed * 0.5).max(1.0);
+                let applied = self
+                    .manga_wheel_scroll_pending
+                    .clamp(-per_frame_step, per_frame_step);
 
-            if self.manga_add_scroll_target_delta(applied) {
-                self.manga_update_preload_queue();
-                animation_active = true;
+                if self.manga_add_scroll_target_delta(applied) {
+                    self.manga_update_preload_queue();
+                    animation_active = true;
+                }
+
+                self.manga_wheel_scroll_pending -= applied;
+
+                // If we're at an edge, drop remaining queued motion that keeps pushing into it.
+                let total_height = self.manga_total_height();
+                let max_scroll = (total_height - self.screen_size.y).max(0.0);
+                if (self.manga_scroll_target <= 0.0 && self.manga_wheel_scroll_pending < 0.0)
+                    || (self.manga_scroll_target >= max_scroll
+                        && self.manga_wheel_scroll_pending > 0.0)
+                {
+                    self.manga_wheel_scroll_pending = 0.0;
+                }
             }
-
-            self.manga_wheel_scroll_pending -= applied;
-
-            // If we're at an edge, drop remaining queued motion that keeps pushing into it.
-            let total_height = self.manga_total_height();
-            let max_scroll = (total_height - self.screen_size.y).max(0.0);
-            if (self.manga_scroll_target <= 0.0 && self.manga_wheel_scroll_pending < 0.0)
-                || (self.manga_scroll_target >= max_scroll && self.manga_wheel_scroll_pending > 0.0)
-            {
-                self.manga_wheel_scroll_pending = 0.0;
-            }
+        } else if self.manga_wheel_scroll_pending.abs() > 0.01 {
+            self.manga_wheel_scroll_pending = 0.0;
         }
 
         // Tick scroll animation
@@ -8993,7 +9008,8 @@ impl eframe::App for ImageViewer {
         let manga_scroll_active = self.manga_mode
             && ((self.manga_scroll_target - self.manga_scroll_offset).abs() > 0.1
                 || self.manga_scroll_velocity.abs() > 0.5
-                || self.manga_wheel_scroll_pending.abs() > 0.1);
+                || (self.config.manga_wheel_smooth_like_arrow_keys
+                    && self.manga_wheel_scroll_pending.abs() > 0.1));
         // Check if arrow keys are held for continuous scrolling in manga mode
         let manga_arrow_held = self.manga_mode
             && self.is_fullscreen

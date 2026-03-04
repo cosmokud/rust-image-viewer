@@ -337,6 +337,8 @@ pub struct Config {
     pub manga_wheel_multiplier: f32,
     /// Manga mode: arrow-key scroll speed (pixels per key press)
     pub manga_arrow_scroll_speed: f32,
+    /// Manga mode: when true, consume wheel input with the same smooth cadence as arrow keys.
+    pub manga_wheel_smooth_like_arrow_keys: bool,
 
     /// Whether videos start muted by default
     pub video_muted_by_default: bool,
@@ -410,6 +412,7 @@ impl Default for Config {
             manga_inertial_friction: 0.33,
             manga_wheel_multiplier: 1.5,
             manga_arrow_scroll_speed: 140.0,
+            manga_wheel_smooth_like_arrow_keys: true,
             video_muted_by_default: true,
             video_default_volume: 0.0,
             video_loop: true,
@@ -620,6 +623,7 @@ impl Config {
             manga_inertial_friction: 0.33,
             manga_wheel_multiplier: 1.5,
             manga_arrow_scroll_speed: 140.0,
+            manga_wheel_smooth_like_arrow_keys: true,
             video_muted_by_default: true,
             video_default_volume: 0.0,
             video_loop: true,
@@ -783,6 +787,13 @@ impl Config {
                         "manga_arrow_scroll_speed" | "manga_arrow_key_scroll_speed" => {
                             if let Ok(v) = value.parse::<f32>() {
                                 config.manga_arrow_scroll_speed = v.clamp(1.0, 5000.0);
+                            }
+                        }
+                        "manga_wheel_smooth_like_arrow_keys"
+                        | "manga_wheel_smooth_match_arrow_keys"
+                        | "manga_wheel_arrow_smooth_sync" => {
+                            if let Some(v) = parse_bool(value) {
+                                config.manga_wheel_smooth_like_arrow_keys = v;
                             }
                         }
                         "startup_window_mode" | "startup_mode" | "window_mode" => {
@@ -999,6 +1010,10 @@ impl Config {
         values.insert(
             "manga_arrow_scroll_speed",
             format!("{}", self.manga_arrow_scroll_speed),
+        );
+        values.insert(
+            "manga_wheel_smooth_like_arrow_keys",
+            bool_to_ini(self.manga_wheel_smooth_like_arrow_keys).to_string(),
         );
 
         values.insert(
