@@ -40,7 +40,7 @@ const MAX_PENDING_UPLOADS: usize = 32;
 
 /// Maximum number of images to keep in the texture cache.
 /// Beyond this, the oldest entries are evicted to control VRAM usage.
-const MAX_CACHED_TEXTURES: usize = 64;
+const MAX_CACHED_TEXTURES: usize = 128;
 
 /// Fixed buffer to add AHEAD of visible pages (in scroll direction) for preloading.
 /// If 14 pages are visible and scrolling down, we preload 14 + 4 = 18 ahead.
@@ -1066,26 +1066,33 @@ impl MangaLoader {
         self.poll_decoded_images_limited(UPLOAD_BATCH_SIZE)
     }
 
-    /// Poll for decoded images ready for GPU upload with a caller-specified cap.
-    pub fn poll_decoded_images_limited(&mut self, max_images: usize) -> Vec<DecodedImage> {
+    /// Poll decoded images and also return indices whose dimension metadata changed.
+    pub fn poll_decoded_images_with_dimension_updates(
+        &mut self,
+        max_images: usize,
+    ) -> (Vec<DecodedImage>, Vec<usize>) {
         if max_images == 0 {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
 
         let mut results = Vec::with_capacity(max_images);
+        let mut dim_updates = Vec::new();
 
         for _ in 0..max_images {
             match self.result_rx.try_recv() {
                 Ok(decoded) => {
-                    // Cache dimensions and media type for stable layout
-                    self.dimension_cache.insert(
-                        decoded.index,
-                        (
-                            decoded.original_width,
-                            decoded.original_height,
-                            decoded.media_type,
-                        ),
+                    let new_meta = (
+                        decoded.original_width,
+                        decoded.original_height,
+                        decoded.media_type,
                     );
+                    let changed = self.dimension_cache.get(&decoded.index).copied() != Some(new_meta);
+
+                    self.dimension_cache.insert(decoded.index, new_meta);
+                    if changed {
+                        dim_updates.push(decoded.index);
+                    }
+
                     results.push(decoded);
                     self.stats.images_loaded += 1;
                 }
@@ -1093,7 +1100,12 @@ impl MangaLoader {
             }
         }
 
-        results
+        (results, dim_updates)
+    }
+
+    /// Poll for decoded images ready for GPU upload with a caller-specified cap.
+    pub fn poll_decoded_images_limited(&mut self, max_images: usize) -> Vec<DecodedImage> {
+        self.poll_decoded_images_with_dimension_updates(max_images).0
     }
 
     /// Start async dimension caching for all images in the list.
@@ -1357,6 +1369,38 @@ impl MangaTextureCache {
         }
     }
 
+    fn evict_oldest_entry(&mut self) -> Option<usize> {
+        let oldest = self
+            .entries
+            .iter()
+            .min_by_key(|(_, (_, _, _, _, frame))| *frame)
+            .map(|(&idx, _)| idx);
+
+        if let Some(oldest_idx) = oldest {
+            self.entries.remove(&oldest_idx);
+            Some(oldest_idx)
+        } else {
+            None
+        }
+    }
+
+    /// Update cache capacity at runtime.
+    /// Returns any indices evicted because of the new cap.
+    pub fn set_capacity(&mut self, max_entries: usize) -> Vec<usize> {
+        self.max_entries = max_entries.max(1);
+
+        let mut evicted = Vec::new();
+        while self.entries.len() > self.max_entries {
+            if let Some(idx) = self.evict_oldest_entry() {
+                evicted.push(idx);
+            } else {
+                break;
+            }
+        }
+
+        evicted
+    }
+
     /// Increment frame counter (call once per frame).
     pub fn tick(&mut self) {
         self.frame_counter += 1;
@@ -1461,15 +1505,7 @@ impl MangaTextureCache {
 
         // Evict oldest entries if at capacity
         while self.entries.len() >= self.max_entries {
-            // Find oldest entry
-            let oldest = self
-                .entries
-                .iter()
-                .min_by_key(|(_, (_, _, _, _, frame))| *frame)
-                .map(|(&idx, _)| idx);
-
-            if let Some(oldest_idx) = oldest {
-                self.entries.remove(&oldest_idx);
+            if let Some(oldest_idx) = self.evict_oldest_entry() {
                 evicted.push(oldest_idx);
             } else {
                 break;

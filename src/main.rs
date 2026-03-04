@@ -550,6 +550,9 @@ struct ImageViewer {
     masonry_layout_items_per_row: usize,
     masonry_layout_len: usize,
     masonry_layout_valid: bool,
+    /// True when masonry dimension updates were received during active scrolling.
+    /// Applied once motion settles to avoid viewport bounce.
+    masonry_layout_updates_deferred: bool,
 
     /// Prepared metadata for a future `egui_wgpu::CallbackFn` escape hatch.
     manga_wgpu_callback_plan: MangaWgpuCallbackPlan,
@@ -763,6 +766,7 @@ impl Default for ImageViewer {
             masonry_layout_items_per_row: 0,
             masonry_layout_len: 0,
             masonry_layout_valid: false,
+            masonry_layout_updates_deferred: false,
             manga_wgpu_callback_plan: MangaWgpuCallbackPlan::default(),
 
             manga_preload_cooldown: 0,
@@ -2531,6 +2535,80 @@ impl ImageViewer {
         self.manga_total_height_cache_valid = false;
         self.manga_layout_offsets.clear();
         self.masonry_layout_valid = false;
+        self.masonry_layout_updates_deferred = false;
+    }
+
+    fn manga_trilinear_texture_options() -> egui::TextureOptions {
+        egui::TextureOptions {
+            magnification: egui::TextureFilter::Linear,
+            minification: egui::TextureFilter::Linear,
+            wrap_mode: egui::TextureWrapMode::ClampToEdge,
+            mipmap_mode: Some(egui::TextureFilter::Linear),
+        }
+    }
+
+    fn manga_is_layout_motion_active(&self) -> bool {
+        self.manga_scrollbar_dragging
+            || self.manga_autoscroll_active
+            || self.manga_wheel_scroll_pending.abs() > 0.01
+            || (self.manga_scroll_target - self.manga_scroll_offset).abs() > 0.5
+            || self.manga_scroll_velocity.abs() > 1.0
+    }
+
+    fn manga_apply_masonry_scroll_stabilization_after_layout_change(&mut self) {
+        let prev_scroll = self.manga_scroll_offset;
+        let prev_target_delta = self.manga_scroll_target - self.manga_scroll_offset;
+        let prev_velocity = self.manga_scroll_velocity;
+
+        let max_scroll = (self.manga_total_height() - self.screen_size.y).max(0.0);
+        let new_offset = prev_scroll.clamp(0.0, max_scroll);
+
+        self.manga_scroll_offset = new_offset;
+        self.manga_scroll_target = (new_offset + prev_target_delta).clamp(0.0, max_scroll);
+        self.manga_scroll_velocity = prev_velocity;
+        self.manga_update_current_index();
+    }
+
+    fn manga_flush_deferred_masonry_layout_update(&mut self) -> bool {
+        if !self.is_masonry_mode() || !self.masonry_layout_updates_deferred {
+            return false;
+        }
+
+        if self.manga_is_layout_motion_active() {
+            return false;
+        }
+
+        self.masonry_layout_updates_deferred = false;
+        self.manga_total_height_cache_valid = false;
+        self.manga_layout_offsets.clear();
+        self.masonry_layout_valid = false;
+        self.manga_apply_masonry_scroll_stabilization_after_layout_change();
+        true
+    }
+
+    fn manga_update_texture_cache_budget(&mut self, visible_page_count: usize) {
+        if !self.manga_mode || visible_page_count == 0 {
+            return;
+        }
+
+        let target_capacity = if self.is_masonry_mode() {
+            let rows = self.masonry_items_per_row.clamp(2, 10);
+            let row_budget = rows.saturating_mul(48);
+            visible_page_count
+                .saturating_mul(3)
+                .max(row_budget)
+                .max(96)
+                .min(320)
+        } else {
+            visible_page_count.saturating_mul(2).max(64).min(160)
+        };
+
+        let evicted = self.manga_texture_cache.set_capacity(target_capacity);
+        if let Some(ref mut loader) = self.manga_loader {
+            for idx in evicted {
+                loader.mark_unloaded(idx);
+            }
+        }
     }
 
     fn invalidate_manga_layout_cache_for_zoom(&mut self) {
@@ -3650,7 +3728,7 @@ impl ImageViewer {
                     let texture = ctx.load_texture(
                         format!("manga_anim_{}", idx),
                         color_image,
-                        self.config.texture_filter_animated.to_egui_options(),
+                        Self::manga_trilinear_texture_options(),
                     );
 
                     self.manga_texture_cache.insert_with_type(
@@ -3729,7 +3807,7 @@ impl ImageViewer {
             let texture = ctx.load_texture(
                 format!("manga_anim_{}", idx),
                 color_image,
-                self.config.texture_filter_animated.to_egui_options(),
+                Self::manga_trilinear_texture_options(),
             );
             if self.manga_texture_cache.contains(idx) {
                 self.manga_texture_cache.update_texture(idx, texture, w, h);
@@ -3782,6 +3860,7 @@ impl ImageViewer {
         // Calculate how many pages are currently visible on screen
         // This determines preload count: visible_pages + 4 ahead and behind
         let visible_page_count = self.manga_calculate_visible_page_count();
+        self.manga_update_texture_cache_budget(visible_page_count);
         let is_masonry = self.is_masonry_mode();
         let masonry_rows = self.masonry_items_per_row.clamp(2, 10);
         let masonry_side_multiplier = (masonry_rows + 1) / 2;
@@ -4031,27 +4110,49 @@ impl ImageViewer {
 
         let is_masonry = self.is_masonry_mode();
         // Keep GPU upload burst bounded per frame, but never over-drain decoded results.
-        let max_uploads_per_frame: usize = if is_masonry { 4 } else { 8 };
+        let max_uploads_per_frame: usize = if is_masonry {
+            if self.masonry_items_per_row >= 5 {
+                2
+            } else {
+                4
+            }
+        } else {
+            8
+        };
+        let defer_masonry_layout_updates = is_masonry && self.manga_is_layout_motion_active();
 
         let Some(ref mut loader) = self.manga_loader else {
             return false;
         };
 
         // Poll for decoded images from the background threads
-        let decoded_images = loader.poll_decoded_images_limited(max_uploads_per_frame);
+        let (decoded_images, mut decoded_dim_updates) =
+            loader.poll_decoded_images_with_dimension_updates(max_uploads_per_frame);
 
         // Also poll async dimension probe results (header reads), applied incrementally.
         // Limiting messages per frame prevents layout updates from causing bursts of work.
-        let dim_updates = loader.poll_dimension_results(4);
-
-        // Dimension updates can change page heights; invalidate cached layout/prefix sums.
-        if !dim_updates.is_empty() {
-            self.manga_total_height_cache_valid = false;
-            self.manga_layout_offsets.clear();
-            self.masonry_layout_valid = false;
+        let mut dim_updates = loader.poll_dimension_results(4);
+        if !decoded_dim_updates.is_empty() {
+            dim_updates.append(&mut decoded_dim_updates);
+            dim_updates.sort_unstable();
+            dim_updates.dedup();
         }
 
-        let dims_updated = !decoded_images.is_empty() || !dim_updates.is_empty();
+        // Dimension updates can change page heights; invalidate cached layout/prefix sums.
+        // In masonry mode, defer this while actively scrolling to prevent viewport bounce.
+        let mut dims_updated = false;
+        if !dim_updates.is_empty() {
+            if defer_masonry_layout_updates {
+                self.masonry_layout_updates_deferred = true;
+                ctx.request_repaint_after(Duration::from_millis(16));
+            } else {
+                self.manga_total_height_cache_valid = false;
+                self.manga_layout_offsets.clear();
+                self.masonry_layout_valid = false;
+                self.masonry_layout_updates_deferred = false;
+                dims_updated = true;
+            }
+        }
 
         // Upload decoded images to GPU as textures.
         // All uploads use linear min/mag + trilinear mip filtering so dynamic scaling
@@ -4075,17 +4176,10 @@ impl ImageViewer {
                 &decoded.pixels,
             );
 
-            let texture_options = egui::TextureOptions {
-                magnification: egui::TextureFilter::Linear,
-                minification: egui::TextureFilter::Linear,
-                wrap_mode: egui::TextureWrapMode::ClampToEdge,
-                mipmap_mode: Some(egui::TextureFilter::Linear),
-            };
-
             let texture = ctx.load_texture(
                 format!("manga_{}", decoded.index),
                 color_image,
-                texture_options,
+                Self::manga_trilinear_texture_options(),
             );
 
             // Insert into cache with media type (this may evict old entries)
@@ -6182,6 +6276,10 @@ impl ImageViewer {
             self.manga_update_preload_queue();
         }
 
+        if self.manga_flush_deferred_masonry_layout_update() {
+            animation_active = true;
+        }
+
         // Process decoded images from background threads and upload to GPU.
         // This is now non-blocking - images are decoded in parallel on background threads.
         // We always call this to keep uploading decoded images even while scrolling.
@@ -6196,15 +6294,10 @@ impl ImageViewer {
         let dims_updated = self.manga_process_pending_loads(ctx);
         if dims_updated {
             if self.is_masonry_mode() {
-                // Masonry has non-linear row ordering; index/fraction anchors can oscillate when
-                // late dimension updates reshuffle column heights. Preserve absolute scroll instead.
-                let max_scroll = (self.manga_total_height() - self.screen_size.y).max(0.0);
-                let new_offset = masonry_prev_scroll.clamp(0.0, max_scroll);
-                self.manga_scroll_offset = new_offset;
-                self.manga_scroll_target =
-                    (new_offset + masonry_prev_target_delta).clamp(0.0, max_scroll);
+                self.manga_scroll_offset = masonry_prev_scroll;
+                self.manga_scroll_target = masonry_prev_scroll + masonry_prev_target_delta;
                 self.manga_scroll_velocity = masonry_prev_velocity;
-                self.manga_update_current_index();
+                self.manga_apply_masonry_scroll_stabilization_after_layout_change();
             } else if let Some(anchor) = load_anchor {
                 self.manga_apply_scroll_anchor(anchor);
                 self.manga_update_current_index();
@@ -6473,11 +6566,16 @@ impl ImageViewer {
             && self.manga_wgpu_callback_plan.visible_texture_count
                 == self.manga_wgpu_callback_plan.texture_ids.len();
 
+        if self.masonry_layout_updates_deferred {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        }
+
         animation_active
             || has_pending_loads
             || has_active_video
             || has_active_animation
             || requested_visible_retry
+            || self.masonry_layout_updates_deferred
             || callback_plan_active
     }
 
