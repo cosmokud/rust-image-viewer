@@ -250,6 +250,8 @@ struct MasonryReturnState {
     offset: egui::Vec2,
     scroll_offset: f32,
     scroll_target: f32,
+    opened_index: usize,
+    cache_reuse_radius: usize,
 }
 
 /// Per-image view state for fullscreen mode memory.
@@ -476,6 +478,8 @@ struct ImageViewer {
     strip_return_mode: Option<MangaLayoutMode>,
     /// Saved masonry viewport state while temporarily opening a single item fullscreen.
     strip_return_masonry_state: Option<MasonryReturnState>,
+    /// True while solo fullscreen is keeping masonry caches alive for potential middle-click return.
+    strip_return_preserve_masonry_cache: bool,
     /// User-selected masonry density (items per row), controlled by slider.
     masonry_items_per_row: usize,
     /// Whether the manga mode toggle button should be shown (on hover bottom-right)
@@ -703,6 +707,7 @@ impl Default for ImageViewer {
             manga_layout_mode: MangaLayoutMode::LongStrip,
             strip_return_mode: None,
             strip_return_masonry_state: None,
+            strip_return_preserve_masonry_cache: false,
             masonry_items_per_row: 5,
             show_manga_toggle: false,
             manga_toggle_show_time: Instant::now(),
@@ -2093,12 +2098,22 @@ impl ImageViewer {
     }
 
     fn clear_strip_return_context(&mut self) {
+        let should_clear_preserved_masonry_cache =
+            self.strip_return_preserve_masonry_cache && !self.manga_mode;
+
         self.strip_return_mode = None;
         self.strip_return_masonry_state = None;
+        self.strip_return_preserve_masonry_cache = false;
+
+        if should_clear_preserved_masonry_cache {
+            self.manga_clear_cache();
+        }
     }
 
     fn activate_strip_return_context(&mut self, layout_mode: MangaLayoutMode) {
         self.strip_return_mode = Some(layout_mode);
+        self.strip_return_preserve_masonry_cache =
+            layout_mode == MangaLayoutMode::Masonry && self.manga_mode;
         self.strip_return_masonry_state = if layout_mode == MangaLayoutMode::Masonry && self.manga_mode
         {
             Some(MasonryReturnState {
@@ -2107,10 +2122,130 @@ impl ImageViewer {
                 offset: self.offset,
                 scroll_offset: self.manga_scroll_offset,
                 scroll_target: self.manga_scroll_target,
+                opened_index: self.current_index,
+                cache_reuse_radius: self.masonry_cache_reuse_radius(),
             })
         } else {
             None
         };
+    }
+
+    fn masonry_cache_reuse_radius(&self) -> usize {
+        const SIDE_PADDING: f32 = 16.0;
+        const GUTTER: f32 = 12.0;
+
+        let items_per_row = self.masonry_items_per_row.clamp(2, 10);
+        let columns = items_per_row.max(1);
+
+        let estimated_item_height = if self.masonry_layout_valid && !self.masonry_layout_items.is_empty() {
+            let sample_count = self.masonry_layout_items.len().min(64);
+            let sample_sum: f32 = self
+                .masonry_layout_items
+                .iter()
+                .take(sample_count)
+                .map(|item| item.height.max(1.0))
+                .sum();
+            (sample_sum / sample_count as f32).max(1.0)
+        } else {
+            let available_width = (self.screen_size.x - SIDE_PADDING * 2.0).max(20.0);
+            let total_gutter = GUTTER * (columns.saturating_sub(1) as f32);
+            let column_width = ((available_width - total_gutter) / columns as f32).max(1.0);
+            (column_width * 1.4).max(1.0)
+        };
+
+        let row_height = (estimated_item_height + GUTTER) * self.zoom.max(0.0001);
+        let visible_rows = (self.screen_size.y.max(1.0) / row_height.max(1.0)).floor() as usize;
+
+        items_per_row.saturating_mul(visible_rows.max(1))
+    }
+
+    fn circular_index_distance(&self, from: usize, to: usize) -> usize {
+        let len = self.image_list.len();
+        if len <= 1 {
+            return 0;
+        }
+
+        let from = from.min(len - 1);
+        let to = to.min(len - 1);
+        let direct = from.abs_diff(to);
+        direct.min(len - direct)
+    }
+
+    fn should_reuse_masonry_cache_on_return(&self, state: MasonryReturnState) -> bool {
+        if self.image_list.is_empty() {
+            return false;
+        }
+
+        let current_index = self.current_index.min(self.image_list.len() - 1);
+        let traveled = self.circular_index_distance(state.opened_index, current_index);
+        traveled <= state.cache_reuse_radius.max(1)
+    }
+
+    fn manga_suspend_runtime_for_solo_fullscreen(&mut self) {
+        if let Some(ref mut loader) = self.manga_loader {
+            loader.cancel_pending_loads();
+        }
+
+        // Keep texture/dimension caches alive for fast strip restore,
+        // but stop active runtime workloads while in solo fullscreen.
+        self.manga_video_players.clear();
+        self.manga_focused_video_index = None;
+        self.manga_anim_streams.clear();
+        self.manga_anim_stream_done.clear();
+        self.manga_focused_anim_index = None;
+    }
+
+    fn enter_manga_mode_from_preserved_strip_cache(&mut self) {
+        let current_media_dims = self.media_display_dimensions().or(self.video_texture_dims);
+        let current_media_type = self.current_media_type;
+        let current_image_is_animated = self.image.as_ref().is_some_and(|img| img.is_animated());
+
+        self.strip_entry_placeholder_index = match current_media_type {
+            Some(MediaType::Image) if self.texture.is_some() => Some(self.current_index),
+            Some(MediaType::Video) if self.video_texture.is_some() => Some(self.current_index),
+            _ => None,
+        };
+
+        self.manga_mode = true;
+
+        // Close any playing fullscreen video when entering manga mode.
+        if let Some(player) = self.video_player.take() {
+            drop(player);
+        }
+        self.show_video_controls = false;
+
+        // Stop non-manga animation streaming while we render strip content.
+        self.anim_stream_rx = None;
+        self.anim_stream_path = None;
+        self.anim_stream_done = true;
+        self.anim_seekbar_total_frames = None;
+
+        self.manga_video_user_muted = None;
+        self.manga_video_user_volume = None;
+
+        if self.manga_loader.is_none() {
+            self.manga_loader = Some(MangaLoader::new());
+        }
+
+        if let (Some((w, h)), Some(media_type), Some(ref mut loader)) = (
+            current_media_dims,
+            current_media_type,
+            self.manga_loader.as_mut(),
+        ) {
+            let manga_media_type = match media_type {
+                MediaType::Video => MangaMediaType::Video,
+                MediaType::Image => {
+                    if current_image_is_animated {
+                        MangaMediaType::AnimatedImage
+                    } else {
+                        MangaMediaType::StaticImage
+                    }
+                }
+            };
+            loader
+                .dimension_cache
+                .insert(self.current_index, (w, h, manga_media_type));
+        }
     }
 
     fn return_to_strip_mode_from_middle_click(&mut self) {
@@ -2127,10 +2262,19 @@ impl ImageViewer {
         } else {
             None
         };
+        let reuse_masonry_cache = restore_masonry_state
+            .is_some_and(|state| self.should_reuse_masonry_cache_on_return(state));
 
         self.manga_layout_mode = layout_mode;
-        self.clear_strip_return_context();
-        self.toggle_manga_mode();
+
+        if reuse_masonry_cache {
+            self.enter_manga_mode_from_preserved_strip_cache();
+        } else {
+            if layout_mode == MangaLayoutMode::Masonry {
+                self.manga_clear_cache();
+            }
+            self.toggle_manga_mode();
+        }
 
         if let Some(state) = restore_masonry_state {
             if self.is_masonry_mode() {
@@ -2148,6 +2292,8 @@ impl ImageViewer {
                 self.manga_update_preload_queue();
             }
         }
+
+        self.clear_strip_return_context();
     }
 
     fn masonry_cache_multiplier(&self) -> usize {
@@ -2379,7 +2525,11 @@ impl ImageViewer {
 
         self.activate_strip_return_context(return_mode);
         self.manga_mode = false;
-        self.manga_clear_cache();
+        if return_mode == MangaLayoutMode::Masonry {
+            self.manga_suspend_runtime_for_solo_fullscreen();
+        } else {
+            self.manga_clear_cache();
+        }
         self.load_image(&path);
     }
 
