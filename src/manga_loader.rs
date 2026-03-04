@@ -1096,44 +1096,6 @@ impl MangaLoader {
         results
     }
 
-    /// Synchronously ensure header dimensions are present for a single media item.
-    ///
-    /// This is used by masonry layout reservation to guarantee stable rects
-    /// before full decode/upload is complete.
-    pub fn ensure_dimension_now(
-        &mut self,
-        index: usize,
-        path: &std::path::Path,
-    ) -> Option<(u32, u32, MangaMediaType)> {
-        if let Some((w, h, mt)) = self.dimension_cache.get(&index).copied() {
-            return Some((w, h, mt));
-        }
-
-        let is_video = is_supported_video(path);
-        let is_image = is_supported_image(path);
-        if !is_video && !is_image {
-            return None;
-        }
-
-        let dims = if is_video {
-            Self::probe_video_dimensions(path)
-        } else {
-            image::image_dimensions(path).ok()
-        }?;
-
-        let media_type = if is_video {
-            MangaMediaType::Video
-        } else {
-            MangaMediaType::StaticImage
-        };
-
-        self.dimension_cache
-            .insert(index, (dims.0, dims.1, media_type));
-        self.dim_pending.remove(&index);
-
-        Some((dims.0, dims.1, media_type))
-    }
-
     /// Start async dimension caching for all images in the list.
     /// This returns immediately and caches dimensions in the background.
     /// The first few visible images are prioritized.

@@ -2596,23 +2596,18 @@ impl ImageViewer {
     }
 
     fn manga_get_or_probe_dimensions(&mut self, index: usize) -> Option<(u32, u32)> {
-        if let Some((w, h)) = self
-            .manga_loader
+        // IMPORTANT: keep this path non-blocking.
+        //
+        // This helper is called inside O(n) layout/height rebuild loops for both
+        // Long Strip and Masonry. Performing synchronous header probes here can
+        // freeze mode entry and large scroll jumps on big folders.
+        //
+        // Dimensions are populated asynchronously by preload/dimension workers.
+        // Callers fall back to a stable estimate when cache is not ready yet.
+        self.manga_loader
             .as_ref()
             .and_then(|loader| loader.get_dimensions(index))
             .filter(|(w, h)| *w > 0 && *h > 0)
-        {
-            return Some((w, h));
-        }
-
-        let path = self.image_list.get(index).cloned()?;
-        let loader = self.manga_loader.as_mut()?;
-        let (w, h, _media_type) = loader.ensure_dimension_now(index, &path)?;
-        if w > 0 && h > 0 {
-            Some((w, h))
-        } else {
-            None
-        }
     }
 
     fn masonry_item_aspect_ratio(&mut self, index: usize) -> f32 {
