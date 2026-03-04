@@ -558,6 +558,9 @@ struct ImageViewer {
     /// True when masonry dimension updates were received during active scrolling.
     /// Applied once motion settles to avoid viewport bounce.
     masonry_layout_updates_deferred: bool,
+    /// Timestamp of the last detected masonry layout motion.
+    /// Used as a short settle window to avoid immediate relayout between wheel/drag events.
+    masonry_last_motion_at: Instant,
 
     /// Prepared metadata for a future `egui_wgpu::CallbackFn` escape hatch.
     manga_wgpu_callback_plan: MangaWgpuCallbackPlan,
@@ -773,6 +776,7 @@ impl Default for ImageViewer {
             masonry_layout_len: 0,
             masonry_layout_valid: false,
             masonry_layout_updates_deferred: false,
+            masonry_last_motion_at: Instant::now(),
             manga_wgpu_callback_plan: MangaWgpuCallbackPlan::default(),
 
             manga_preload_cooldown: 0,
@@ -2591,10 +2595,27 @@ impl ImageViewer {
 
     fn manga_is_layout_motion_active(&self) -> bool {
         self.manga_scrollbar_dragging
+            || self.is_panning
             || self.manga_autoscroll_active
+            || self.manga_zoom_plus_held
+            || self.manga_zoom_minus_held
             || self.manga_wheel_scroll_pending.abs() > 0.01
             || (self.manga_scroll_target - self.manga_scroll_offset).abs() > 0.5
             || self.manga_scroll_velocity.abs() > 1.0
+    }
+
+    fn manga_should_defer_masonry_layout_updates(&mut self) -> bool {
+        if !self.is_masonry_mode() {
+            return false;
+        }
+
+        if self.manga_is_layout_motion_active() {
+            self.masonry_last_motion_at = Instant::now();
+            return true;
+        }
+
+        const MASONRY_LAYOUT_SETTLE_DELAY: Duration = Duration::from_millis(120);
+        self.masonry_last_motion_at.elapsed() < MASONRY_LAYOUT_SETTLE_DELAY
     }
 
     fn manga_apply_masonry_scroll_stabilization_after_layout_change(
@@ -2630,7 +2651,7 @@ impl ImageViewer {
             return false;
         }
 
-        if self.manga_is_layout_motion_active() {
+        if self.manga_should_defer_masonry_layout_updates() {
             return false;
         }
 
@@ -4160,7 +4181,11 @@ impl ImageViewer {
         } else {
             8
         };
-        let defer_masonry_layout_updates = is_masonry && self.manga_is_layout_motion_active();
+        let defer_masonry_layout_updates = if is_masonry {
+            self.manga_should_defer_masonry_layout_updates()
+        } else {
+            false
+        };
         let probe_messages_per_frame = self
             .config
             .manga_dimension_probe_messages_per_frame
@@ -5573,7 +5598,7 @@ impl ImageViewer {
                     egui::FontId::proportional(32.0),
                     egui::Color32::WHITE,
                 );
-            } else if self.strip_entry_placeholder_index == Some(idx) {
+            } else if !self.is_masonry_mode() && self.strip_entry_placeholder_index == Some(idx) {
                 // Immediate fallback when entering strip mode from solo-video fullscreen.
                 // Keeps only the strip-entry frame visible until manga cache catches up.
                 if let Some(texture) = self.video_texture.as_ref() {
@@ -5632,7 +5657,7 @@ impl ImageViewer {
                     let time = ui.input(|i| i.time);
                     paint_loading_spinner(ui.painter(), image_rect, time);
                 }
-            } else if self.strip_entry_placeholder_index == Some(idx) {
+            } else if !self.is_masonry_mode() && self.strip_entry_placeholder_index == Some(idx) {
                 // Immediate fallback when entering strip mode from solo-image fullscreen.
                 // Keeps only the strip-entry image visible while manga textures are still loading.
                 if let Some(texture) = self.texture.as_ref() {
