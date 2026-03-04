@@ -63,6 +63,18 @@ const DEFAULT_DIM_RESULT_CHUNK_SIZE: usize = 96;
 const DEFAULT_VIDEO_PROBE_TIMEOUT_MS: u64 = 220;
 const DEFAULT_VIDEO_THUMBNAIL_TIMEOUT_MS: u64 = 650;
 
+fn fast_image_dimensions(path: &std::path::Path) -> Option<(u32, u32)> {
+    imagesize::size(path)
+        .ok()
+        .and_then(|dim| {
+            let w = u32::try_from(dim.width).ok()?;
+            let h = u32::try_from(dim.height).ok()?;
+            Some((w, h))
+        })
+        .or_else(|| image::image_dimensions(path).ok())
+        .filter(|(w, h)| *w > 0 && *h > 0)
+}
+
 /// Base backoff for decode retries after a failed/empty preload.
 const PRELOAD_RETRY_BASE_DELAY_MS: u64 = 250;
 /// Cap retry backoff so visible items recover quickly once they come into view.
@@ -272,7 +284,7 @@ impl MangaLoader {
                                 dim_worker_settings.video_probe_timeout_ms,
                             )
                         } else if is_image {
-                            image::image_dimensions(&path).ok()
+                            fast_image_dimensions(&path)
                         } else {
                             None
                         };
@@ -363,10 +375,30 @@ impl MangaLoader {
             return;
         }
 
-        // Build a bounded batch of missing indices.
+        // Build a bounded batch of missing indices, prioritized around the current
+        // visible center of this range so on-screen placeholders get real metadata first.
+        let center = self.last_visible_index.clamp(start, end - 1);
+        let mut ordered_indices: Vec<usize> = Vec::with_capacity(end - start);
+        ordered_indices.push(center);
+        let mut delta = 1usize;
+        while ordered_indices.len() < (end - start) {
+            if let Some(left) = center.checked_sub(delta) {
+                if left >= start {
+                    ordered_indices.push(left);
+                }
+            }
+
+            let right = center + delta;
+            if right < end {
+                ordered_indices.push(right);
+            }
+
+            delta += 1;
+        }
+
         let mut video_items: Vec<(usize, PathBuf)> = Vec::new();
         let mut image_items: Vec<(usize, PathBuf)> = Vec::new();
-        for idx in start..end {
+        for idx in ordered_indices {
             if video_items.len() + image_items.len() >= self.settings.dim_request_batch_size {
                 break;
             }
@@ -667,8 +699,7 @@ impl MangaLoader {
                 let probed_dims = Self::probe_video_dimensions(
                     &req.path,
                     settings.video_probe_timeout_ms,
-                )
-                .unwrap_or((1920, 1080));
+                );
 
                 // Then try to extract a first-frame thumbnail for visual preview.
                 match Self::extract_video_first_frame(
@@ -688,11 +719,9 @@ impl MangaLoader {
                         })
                     }
                     None => {
-                        // Fallback: dimensions-only payload, no thumbnail pixels yet.
-                        // UI still gets correct placeholder geometry from probed dims.
-                        let (original_width, original_height) = probed_dims;
-
-                        Some(DecodedImage {
+                        // Metadata-only fallback: only emit if real dimensions were extracted.
+                        // Avoid speculative placeholders that can later correct and cause relayout slingshot.
+                        probed_dims.map(|(original_width, original_height)| DecodedImage {
                             index: req.index,
                             pixels: Vec::new(),
                             width: 0,
@@ -706,7 +735,7 @@ impl MangaLoader {
             }
             MediaType::Image => {
                 // Get original dimensions from file header first (fast, no decode)
-                let (original_width, original_height) = image::image_dimensions(&req.path).ok()?;
+                let (original_width, original_height) = fast_image_dimensions(&req.path)?;
 
                 // For animated WebP files we only decode the first frame here so that
                 // the manga scroll view isn't blocked by a potentially very expensive
@@ -763,25 +792,6 @@ impl MangaLoader {
         use gstreamer as gst;
         static GST_INIT: std::sync::OnceLock<Result<(), ()>> = std::sync::OnceLock::new();
         GST_INIT.get_or_init(|| gst::init().map_err(|_| ())).is_ok()
-    }
-
-    fn probe_video_dimensions_from_filename(path: &std::path::Path) -> Option<(u32, u32)> {
-        let filename = path.file_name()?.to_string_lossy().to_lowercase();
-
-        if filename.contains("4k") || filename.contains("2160") {
-            Some((3840, 2160))
-        } else if filename.contains("1440") || filename.contains("2k") {
-            Some((2560, 1440))
-        } else if filename.contains("1080") || filename.contains("fhd") {
-            Some((1920, 1080))
-        } else if filename.contains("720") || filename.contains("hd") {
-            Some((1280, 720))
-        } else if filename.contains("480") || filename.contains("sd") {
-            Some((854, 480))
-        } else {
-            // Conservative fallback for unknown videos
-            Some((1920, 1080))
-        }
     }
 
     fn probe_video_dimensions_with_gstreamer(
@@ -868,10 +878,11 @@ impl MangaLoader {
     }
 
     /// Probe video dimensions using metadata-first strategy.
-    /// Falls back to filename heuristics if metadata probe is unavailable.
+    ///
+    /// Intentionally does not use filename heuristics to avoid speculative aspect ratios
+    /// that can later correct and disturb masonry layout.
     fn probe_video_dimensions(path: &std::path::Path, timeout_ms: u64) -> Option<(u32, u32)> {
         Self::probe_video_dimensions_with_gstreamer(path, timeout_ms)
-            .or_else(|| Self::probe_video_dimensions_from_filename(path))
     }
 
     /// Extract the first frame from a video file as a thumbnail.
@@ -1279,7 +1290,7 @@ impl MangaLoader {
                     (idx, dims.map(|(w, h)| (w, h, MangaMediaType::Video)))
                 } else if is_image {
                     // For images, get from file header
-                    let dims = image::image_dimensions(path).ok();
+                    let dims = fast_image_dimensions(path);
                     // We can't easily determine if an image is animated without loading it
                     // Default to static, will be updated when actually loaded
                     (idx, dims.map(|(w, h)| (w, h, MangaMediaType::StaticImage)))
@@ -1616,11 +1627,6 @@ impl MangaTextureCache {
     /// Check if an index is in the cache without updating access time.
     pub fn contains(&self, index: usize) -> bool {
         self.entries.contains_key(&index)
-    }
-
-    /// Peek texture ID without updating LRU access time.
-    pub fn peek_texture_id(&self, index: usize) -> Option<egui::TextureId> {
-        self.entries.get(&index).map(|entry| entry.0.id())
     }
 
     /// Insert a texture into the cache.

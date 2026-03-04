@@ -255,17 +255,6 @@ struct MasonryReturnState {
     cache_reuse_radius: usize,
 }
 
-/// Prepared state for a potential `egui_wgpu::CallbackFn` render path.
-///
-/// When `enabled` flips to true, the app can bypass standard egui image painting
-/// and submit the listed texture IDs through a dedicated wgpu callback pass.
-#[derive(Clone, Debug, Default)]
-struct MangaWgpuCallbackPlan {
-    enabled: bool,
-    visible_texture_count: usize,
-    texture_ids: Vec<egui::TextureId>,
-}
-
 /// Per-image view state for fullscreen mode memory.
 /// Stores zoom, pan, and transformation settings for each image path.
 #[derive(Clone, Debug)]
@@ -562,9 +551,6 @@ struct ImageViewer {
     /// Used as a short settle window to avoid immediate relayout between wheel/drag events.
     masonry_last_motion_at: Instant,
 
-    /// Prepared metadata for a future `egui_wgpu::CallbackFn` escape hatch.
-    manga_wgpu_callback_plan: MangaWgpuCallbackPlan,
-
     /// Cooldown frames before updating preload queue (prevents cache churn during rapid navigation)
     manga_preload_cooldown: u32,
     /// Last frame when preload queue was updated (throttle updates)
@@ -777,7 +763,6 @@ impl Default for ImageViewer {
             masonry_layout_valid: false,
             masonry_layout_updates_deferred: false,
             masonry_last_motion_at: Instant::now(),
-            manga_wgpu_callback_plan: MangaWgpuCallbackPlan::default(),
 
             manga_preload_cooldown: 0,
             manga_last_preload_update: Instant::now(),
@@ -832,7 +817,6 @@ impl ImageViewer {
     const MANGA_HUD_PANEL_INNER_WIDTH: f32 = 208.0;
     const MANGA_HUD_PANEL_INNER_HEIGHT: f32 = 24.0;
     const MANGA_HUD_PANEL_VERTICAL_STEP: f32 = 48.0;
-    const MANGA_WGPU_CALLBACK_THRESHOLD: usize = 30;
 
     fn update_fps_stats(&mut self) {
         let now = Instant::now();
@@ -3950,10 +3934,14 @@ impl ImageViewer {
             return;
         }
 
-        // Throttle updates to prevent cache churn during rapid scrolling
-        // Only update every 50ms minimum
-        const MIN_UPDATE_INTERVAL: Duration = Duration::from_millis(50);
-        if self.manga_last_preload_update.elapsed() < MIN_UPDATE_INTERVAL {
+        // Throttle updates to prevent cache churn during rapid scrolling.
+        // Masonry gets frame-rate cadence so visible metadata is requested immediately.
+        let min_update_interval = if self.is_masonry_mode() {
+            Duration::from_millis(16)
+        } else {
+            Duration::from_millis(50)
+        };
+        if self.manga_last_preload_update.elapsed() < min_update_interval {
             return;
         }
         let prev_scroll_pos = self.manga_last_scroll_position;
@@ -4005,6 +3993,26 @@ impl ImageViewer {
         let cache_start = current_visible_index.saturating_sub(behind);
         let cache_end = (current_visible_index + ahead).min(self.image_list.len());
         if let Some(ref mut loader) = self.manga_loader {
+            // Always prioritize the currently visible item first.
+            let focused_end = (current_visible_index + 1).min(self.image_list.len());
+            if current_visible_index < focused_end {
+                loader.request_dimensions_range(&self.image_list, current_visible_index, focused_end);
+            }
+
+            // In masonry, prioritize a tight visible neighborhood before broad headroom.
+            if is_masonry {
+                let urgent_span = visible_page_count
+                    .saturating_add(masonry_rows.saturating_mul(probe_headroom_rows.saturating_add(2)))
+                    .max(masonry_rows.saturating_mul(4))
+                    .min(400usize.saturating_mul(masonry_rows));
+
+                let urgent_start = current_visible_index.saturating_sub(urgent_span);
+                let urgent_end = (current_visible_index + urgent_span + 1).min(self.image_list.len());
+                if urgent_start < urgent_end {
+                    loader.request_dimensions_range(&self.image_list, urgent_start, urgent_end);
+                }
+            }
+
             loader.request_dimensions_range(&self.image_list, cache_start, cache_end);
         }
 
@@ -5501,22 +5509,17 @@ impl ImageViewer {
             .unwrap_or(false)
     }
 
-    /// Prepare metadata for a future `egui_wgpu::CallbackFn` fast-path.
-    ///
-    /// This does not switch renderers yet; it keeps persistent state so enabling
-    /// a direct wgpu callback pass is a localized follow-up change.
-    fn manga_update_wgpu_callback_plan(&mut self, visible_indices: &[usize]) {
-        let texture_ids: Vec<egui::TextureId> = visible_indices
-            .iter()
-            .filter_map(|&idx| self.manga_texture_cache.peek_texture_id(idx))
-            .collect();
+    fn manga_request_dimensions_for_visible_item(&mut self, index: usize) {
+        if !self.manga_mode || index >= self.image_list.len() {
+            return;
+        }
 
-        let visible_texture_count = texture_ids.len();
-        self.manga_wgpu_callback_plan = MangaWgpuCallbackPlan {
-            enabled: visible_texture_count >= Self::MANGA_WGPU_CALLBACK_THRESHOLD,
-            visible_texture_count,
-            texture_ids,
-        };
+        if let Some(ref mut loader) = self.manga_loader {
+            let end = (index + 1).min(self.image_list.len());
+            if index < end {
+                loader.request_dimensions_range(&self.image_list, index, end);
+            }
+        }
     }
 
     fn draw_manga_item(&mut self, ui: &mut egui::Ui, idx: usize, image_rect: egui::Rect) -> bool {
@@ -5620,6 +5623,7 @@ impl ImageViewer {
                     );
                 }
 
+                self.manga_request_dimensions_for_visible_item(idx);
                 requested_retry |= self.manga_request_retry_for_visible_item(idx);
             } else {
                 // Video not yet loaded - draw placeholder with video icon
@@ -5633,6 +5637,7 @@ impl ImageViewer {
                     egui::Color32::from_gray(100),
                 );
 
+                self.manga_request_dimensions_for_visible_item(idx);
                 requested_retry |= self.manga_request_retry_for_visible_item(idx);
             }
         } else {
@@ -5679,6 +5684,7 @@ impl ImageViewer {
                     );
                 }
 
+                self.manga_request_dimensions_for_visible_item(idx);
                 requested_retry |= self.manga_request_retry_for_visible_item(idx);
             } else {
                 // Image not loaded yet - draw a placeholder
@@ -5694,6 +5700,7 @@ impl ImageViewer {
                     egui::Color32::from_gray(80),
                 );
 
+                self.manga_request_dimensions_for_visible_item(idx);
                 requested_retry |= self.manga_request_retry_for_visible_item(idx);
             }
         }
@@ -6406,7 +6413,6 @@ impl ImageViewer {
 
         // Draw images in vertical strip
         let mut requested_visible_retry = false;
-        let mut visible_indices: Vec<usize> = Vec::new();
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(self.background_color32()))
             .show(ctx, |ui| {
@@ -6428,7 +6434,6 @@ impl ImageViewer {
 
                         let image_rect =
                             item.to_screen_rect(zoom, self.offset.x, self.manga_scroll_offset);
-                        visible_indices.push(idx);
                         if self.draw_manga_item(ui, idx, image_rect) {
                             requested_visible_retry = true;
                         }
@@ -6460,7 +6465,6 @@ impl ImageViewer {
                             egui::Vec2::new(display_width, display_height),
                         );
 
-                        visible_indices.push(idx);
                         if self.draw_manga_item(ui, idx, image_rect) {
                             requested_visible_retry = true;
                         }
@@ -6564,8 +6568,6 @@ impl ImageViewer {
                 }
             });
 
-        self.manga_update_wgpu_callback_plan(&visible_indices);
-
         if requested_visible_retry {
             animation_active = true;
         }
@@ -6576,10 +6578,6 @@ impl ImageViewer {
             self.manga_update_preload_queue();
         }
 
-        let callback_plan_active = self.manga_wgpu_callback_plan.enabled
-            && self.manga_wgpu_callback_plan.visible_texture_count
-                == self.manga_wgpu_callback_plan.texture_ids.len();
-
         if self.masonry_layout_updates_deferred {
             ctx.request_repaint_after(Duration::from_millis(16));
         }
@@ -6589,8 +6587,7 @@ impl ImageViewer {
             || has_active_video
             || has_active_animation
             || requested_visible_retry
-            || self.masonry_layout_updates_deferred
-            || callback_plan_active
+                || self.masonry_layout_updates_deferred
     }
 
     /// Get the current media display dimensions (works for both images and videos)
@@ -9904,6 +9901,18 @@ fn get_global_cursor_pos() -> Option<egui::Pos2> {
     None
 }
 
+fn fast_image_dimensions(path: &std::path::Path) -> Option<(u32, u32)> {
+    imagesize::size(path)
+        .ok()
+        .and_then(|dim| {
+            let w = u32::try_from(dim.width).ok()?;
+            let h = u32::try_from(dim.height).ok()?;
+            Some((w, h))
+        })
+        .or_else(|| image::image_dimensions(path).ok())
+        .filter(|(w, h)| *w > 0 && *h > 0)
+}
+
 fn main() -> eframe::Result<()> {
     #[cfg(target_os = "windows")]
     windows_env::refresh_process_path_from_registry();
@@ -9961,7 +9970,7 @@ fn main() -> eframe::Result<()> {
     let (initial_size, initial_pos, start_visible) = match media_type {
         Some(MediaType::Image) => {
             // Get image dimensions from file header (fast, no full decode)
-            let (img_w, img_h) = image::image_dimensions(&file_path).unwrap_or((800, 600));
+            let (img_w, img_h) = fast_image_dimensions(file_path.as_path()).unwrap_or((800, 600));
             let img_w = img_w as f32;
             let img_h = img_h as f32;
 

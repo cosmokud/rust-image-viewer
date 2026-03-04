@@ -12,12 +12,24 @@ use image::GenericImageView;
 // This prevents loading extremely large images that would consume too much RAM
 const DEFAULT_MAX_DECODE_ALLOC_BYTES: u64 = 512 * 1024 * 1024; // 512 MiB
 
+fn fast_image_dimensions(path: &Path) -> Option<(u32, u32)> {
+    imagesize::size(path)
+        .ok()
+        .and_then(|dim| {
+            let w = u32::try_from(dim.width).ok()?;
+            let h = u32::try_from(dim.height).ok()?;
+            Some((w, h))
+        })
+        .or_else(|| image::image_dimensions(path).ok())
+        .filter(|(w, h)| *w > 0 && *h > 0)
+}
+
 fn open_image_with_reasonable_limits(path: &Path) -> Result<image::DynamicImage, String> {
     // `image::open()` uses conservative decoder limits to protect against decompression bombs.
     // For a viewer, we want to allow legitimately large images while still keeping a hard cap.
     //
     // We size limits from the container header dimensions (fast, no full decode).
-    let (w, h) = image::image_dimensions(path).unwrap_or((0, 0));
+    let (w, h) = fast_image_dimensions(path).unwrap_or((0, 0));
 
     // Conservative upper bound: assume 4 bytes/pixel worst case.
     let estimated = (w as u64)
