@@ -351,6 +351,24 @@ pub struct Config {
     pub manga_arrow_scroll_speed: f32,
     /// Manga mode: when true, consume wheel input with the same smooth cadence as arrow keys.
     pub manga_wheel_smooth_like_arrow_keys: bool,
+    /// Manga mode autoscroll: dead zone radius around the anchor (px).
+    pub manga_autoscroll_dead_zone_px: f32,
+    /// Manga mode autoscroll: multiplier applied to base speed (`manga_arrow_scroll_speed`).
+    pub manga_autoscroll_base_speed_multiplier: f32,
+    /// Manga mode autoscroll: min speed as a multiple of base speed.
+    pub manga_autoscroll_min_speed_multiplier: f32,
+    /// Manga mode autoscroll: max speed as a multiple of base speed.
+    pub manga_autoscroll_max_speed_multiplier: f32,
+    /// Manga mode autoscroll: speed curve exponent (higher = slower near center, faster near edge).
+    pub manga_autoscroll_curve_power: f32,
+    /// Manga mode autoscroll: absolute minimum speed floor (px/s).
+    pub manga_autoscroll_min_speed_px_per_sec: f32,
+    /// Manga mode autoscroll: absolute maximum speed cap (px/s).
+    pub manga_autoscroll_max_speed_px_per_sec: f32,
+    /// Manga mode autoscroll: horizontal axis speed multiplier.
+    pub manga_autoscroll_horizontal_speed_multiplier: f32,
+    /// Manga mode autoscroll: vertical axis speed multiplier.
+    pub manga_autoscroll_vertical_speed_multiplier: f32,
     /// Binding used to open the hovered item into solo fullscreen from manga strip layouts.
     /// Supports: mouse_right, mouse_middle, or keyboard bindings.
     pub strip_item_open_binding: InputBinding,
@@ -428,6 +446,15 @@ impl Default for Config {
             manga_wheel_multiplier: 1.5,
             manga_arrow_scroll_speed: 140.0,
             manga_wheel_smooth_like_arrow_keys: true,
+            manga_autoscroll_dead_zone_px: 14.0,
+            manga_autoscroll_base_speed_multiplier: 1.0,
+            manga_autoscroll_min_speed_multiplier: 0.6,
+            manga_autoscroll_max_speed_multiplier: 14.0,
+            manga_autoscroll_curve_power: 2.0,
+            manga_autoscroll_min_speed_px_per_sec: 80.0,
+            manga_autoscroll_max_speed_px_per_sec: 7000.0,
+            manga_autoscroll_horizontal_speed_multiplier: 1.0,
+            manga_autoscroll_vertical_speed_multiplier: 1.0,
             strip_item_open_binding: InputBinding::MouseRight,
             video_muted_by_default: true,
             video_default_volume: 0.0,
@@ -640,6 +667,15 @@ impl Config {
             manga_wheel_multiplier: 1.5,
             manga_arrow_scroll_speed: 140.0,
             manga_wheel_smooth_like_arrow_keys: true,
+            manga_autoscroll_dead_zone_px: 14.0,
+            manga_autoscroll_base_speed_multiplier: 1.0,
+            manga_autoscroll_min_speed_multiplier: 0.6,
+            manga_autoscroll_max_speed_multiplier: 14.0,
+            manga_autoscroll_curve_power: 2.0,
+            manga_autoscroll_min_speed_px_per_sec: 80.0,
+            manga_autoscroll_max_speed_px_per_sec: 7000.0,
+            manga_autoscroll_horizontal_speed_multiplier: 1.0,
+            manga_autoscroll_vertical_speed_multiplier: 1.0,
             strip_item_open_binding: InputBinding::MouseRight,
             video_muted_by_default: true,
             video_default_volume: 0.0,
@@ -811,6 +847,66 @@ impl Config {
                         | "manga_wheel_arrow_smooth_sync" => {
                             if let Some(v) = parse_bool(value) {
                                 config.manga_wheel_smooth_like_arrow_keys = v;
+                            }
+                        }
+                        "manga_autoscroll_dead_zone_px"
+                        | "manga_autoscroll_deadzone_px"
+                        | "manga_autoscroll_dead_zone"
+                        | "manga_autoscroll_deadzone" => {
+                            if let Ok(v) = value.parse::<f32>() {
+                                config.manga_autoscroll_dead_zone_px = v.clamp(0.0, 400.0);
+                            }
+                        }
+                        "manga_autoscroll_base_speed_multiplier"
+                        | "manga_autoscroll_base_multiplier" => {
+                            if let Ok(v) = value.parse::<f32>() {
+                                config.manga_autoscroll_base_speed_multiplier = v.clamp(0.05, 20.0);
+                            }
+                        }
+                        "manga_autoscroll_min_speed_multiplier"
+                        | "manga_autoscroll_min_multiplier" => {
+                            if let Ok(v) = value.parse::<f32>() {
+                                config.manga_autoscroll_min_speed_multiplier = v.clamp(0.0, 20.0);
+                            }
+                        }
+                        "manga_autoscroll_max_speed_multiplier"
+                        | "manga_autoscroll_max_multiplier" => {
+                            if let Ok(v) = value.parse::<f32>() {
+                                config.manga_autoscroll_max_speed_multiplier = v.clamp(0.05, 100.0);
+                            }
+                        }
+                        "manga_autoscroll_curve_power"
+                        | "manga_autoscroll_speed_curve_power" => {
+                            if let Ok(v) = value.parse::<f32>() {
+                                config.manga_autoscroll_curve_power = v.clamp(0.5, 6.0);
+                            }
+                        }
+                        "manga_autoscroll_min_speed_px_per_sec"
+                        | "manga_autoscroll_min_speed"
+                        | "manga_autoscroll_min_px_per_sec" => {
+                            if let Ok(v) = value.parse::<f32>() {
+                                config.manga_autoscroll_min_speed_px_per_sec = v.clamp(0.0, 20000.0);
+                            }
+                        }
+                        "manga_autoscroll_max_speed_px_per_sec"
+                        | "manga_autoscroll_max_speed"
+                        | "manga_autoscroll_max_px_per_sec" => {
+                            if let Ok(v) = value.parse::<f32>() {
+                                config.manga_autoscroll_max_speed_px_per_sec = v.clamp(1.0, 50000.0);
+                            }
+                        }
+                        "manga_autoscroll_horizontal_speed_multiplier"
+                        | "manga_autoscroll_horizontal_multiplier"
+                        | "manga_autoscroll_x_speed_multiplier" => {
+                            if let Ok(v) = value.parse::<f32>() {
+                                config.manga_autoscroll_horizontal_speed_multiplier = v.clamp(0.05, 10.0);
+                            }
+                        }
+                        "manga_autoscroll_vertical_speed_multiplier"
+                        | "manga_autoscroll_vertical_multiplier"
+                        | "manga_autoscroll_y_speed_multiplier" => {
+                            if let Ok(v) = value.parse::<f32>() {
+                                config.manga_autoscroll_vertical_speed_multiplier = v.clamp(0.05, 10.0);
                             }
                         }
                         "strip_item_open_binding"
@@ -1041,6 +1137,42 @@ impl Config {
         values.insert(
             "manga_wheel_smooth_like_arrow_keys",
             bool_to_ini(self.manga_wheel_smooth_like_arrow_keys).to_string(),
+        );
+        values.insert(
+            "manga_autoscroll_dead_zone_px",
+            format_with_optional_trailing_zero_f32(self.manga_autoscroll_dead_zone_px),
+        );
+        values.insert(
+            "manga_autoscroll_base_speed_multiplier",
+            format_with_optional_trailing_zero_f32(self.manga_autoscroll_base_speed_multiplier),
+        );
+        values.insert(
+            "manga_autoscroll_min_speed_multiplier",
+            format_with_optional_trailing_zero_f32(self.manga_autoscroll_min_speed_multiplier),
+        );
+        values.insert(
+            "manga_autoscroll_max_speed_multiplier",
+            format_with_optional_trailing_zero_f32(self.manga_autoscroll_max_speed_multiplier),
+        );
+        values.insert(
+            "manga_autoscroll_curve_power",
+            format_with_optional_trailing_zero_f32(self.manga_autoscroll_curve_power),
+        );
+        values.insert(
+            "manga_autoscroll_min_speed_px_per_sec",
+            format_with_optional_trailing_zero_f32(self.manga_autoscroll_min_speed_px_per_sec),
+        );
+        values.insert(
+            "manga_autoscroll_max_speed_px_per_sec",
+            format_with_optional_trailing_zero_f32(self.manga_autoscroll_max_speed_px_per_sec),
+        );
+        values.insert(
+            "manga_autoscroll_horizontal_speed_multiplier",
+            format_with_optional_trailing_zero_f32(self.manga_autoscroll_horizontal_speed_multiplier),
+        );
+        values.insert(
+            "manga_autoscroll_vertical_speed_multiplier",
+            format_with_optional_trailing_zero_f32(self.manga_autoscroll_vertical_speed_multiplier),
         );
         values.insert(
             "strip_item_open_binding",

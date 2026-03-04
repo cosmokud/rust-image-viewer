@@ -1444,20 +1444,37 @@ impl ImageViewer {
         }
     }
 
-    fn manga_autoscroll_axis_speed(delta: f32, base_speed: f32) -> f32 {
-        const DEAD_ZONE: f32 = 14.0;
-        const RAMP_DISTANCE: f32 = 300.0;
-
+    fn manga_autoscroll_axis_speed(
+        &self,
+        delta: f32,
+        base_speed: f32,
+        max_axis_distance: f32,
+        axis_multiplier: f32,
+    ) -> f32 {
+        let dead_zone = self.config.manga_autoscroll_dead_zone_px.max(0.0);
         let magnitude = delta.abs();
-        if magnitude <= DEAD_ZONE {
+        if magnitude <= dead_zone {
             return 0.0;
         }
 
-        let t = ((magnitude - DEAD_ZONE) / (RAMP_DISTANCE - DEAD_ZONE)).clamp(0.0, 1.0);
-        let curved = t * t;
-        let min_speed = (base_speed * 0.6).clamp(80.0, 900.0);
-        let max_speed = (base_speed * 14.0).clamp(400.0, 7000.0);
-        let speed = min_speed + (max_speed - min_speed) * curved;
+        let base = (base_speed * self.config.manga_autoscroll_base_speed_multiplier).max(1.0);
+        let normalized_denominator = (max_axis_distance.max(1.0) - dead_zone).max(1.0);
+        let t = ((magnitude - dead_zone) / normalized_denominator).clamp(0.0, 1.0);
+        let curved = t.powf(self.config.manga_autoscroll_curve_power.clamp(0.5, 6.0));
+
+        let min_speed = (base * self.config.manga_autoscroll_min_speed_multiplier)
+            .max(self.config.manga_autoscroll_min_speed_px_per_sec)
+            .max(0.0);
+        let mut max_speed = (base * self.config.manga_autoscroll_max_speed_multiplier)
+            .min(self.config.manga_autoscroll_max_speed_px_per_sec)
+            .max(1.0);
+
+        if max_speed < min_speed {
+            max_speed = min_speed;
+        }
+
+        let axis_multiplier = axis_multiplier.max(0.05);
+        let speed = (min_speed + (max_speed - min_speed) * curved) * axis_multiplier;
         speed.copysign(delta)
     }
 
@@ -5867,8 +5884,32 @@ impl ImageViewer {
         if self.manga_autoscroll_active {
             if let (Some(anchor), Some(pos)) = (self.manga_autoscroll_anchor, pointer_pos) {
                 let speed_base = self.config.manga_arrow_scroll_speed.max(1.0);
-                let speed_x = Self::manga_autoscroll_axis_speed(pos.x - anchor.x, speed_base);
-                let speed_y = Self::manga_autoscroll_axis_speed(pos.y - anchor.y, speed_base);
+                let delta_x = pos.x - anchor.x;
+                let delta_y = pos.y - anchor.y;
+
+                let max_distance_x = if delta_x >= 0.0 {
+                    (screen_rect.max.x - anchor.x).max(1.0)
+                } else {
+                    (anchor.x - screen_rect.min.x).max(1.0)
+                };
+                let max_distance_y = if delta_y >= 0.0 {
+                    (screen_rect.max.y - anchor.y).max(1.0)
+                } else {
+                    (anchor.y - screen_rect.min.y).max(1.0)
+                };
+
+                let speed_x = self.manga_autoscroll_axis_speed(
+                    delta_x,
+                    speed_base,
+                    max_distance_x,
+                    self.config.manga_autoscroll_horizontal_speed_multiplier,
+                );
+                let speed_y = self.manga_autoscroll_axis_speed(
+                    delta_y,
+                    speed_base,
+                    max_distance_y,
+                    self.config.manga_autoscroll_vertical_speed_multiplier,
+                );
 
                 if speed_x != 0.0 {
                     self.offset.x -= speed_x * dt;
