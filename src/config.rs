@@ -371,6 +371,12 @@ pub struct Config {
     pub manga_autoscroll_horizontal_speed_multiplier: f32,
     /// Manga mode autoscroll: vertical axis speed multiplier.
     pub manga_autoscroll_vertical_speed_multiplier: f32,
+    /// Manga mode autoscroll indicator: circle fill alpha (0-255).
+    pub manga_autoscroll_circle_fill_alpha: u8,
+    /// Manga mode autoscroll indicator arrow color as RGB.
+    pub manga_autoscroll_arrow_rgb: [u8; 3],
+    /// Manga mode autoscroll indicator arrow alpha (0-255).
+    pub manga_autoscroll_arrow_alpha: u8,
     /// Binding used to open the hovered item into solo fullscreen from manga strip layouts.
     /// Supports: mouse_right, mouse_middle, or keyboard bindings.
     pub strip_item_open_binding: InputBinding,
@@ -458,6 +464,9 @@ impl Config {
             manga_autoscroll_max_speed_px_per_sec: 14000.0,
             manga_autoscroll_horizontal_speed_multiplier: 1.0,
             manga_autoscroll_vertical_speed_multiplier: 1.0,
+            manga_autoscroll_circle_fill_alpha: 110,
+            manga_autoscroll_arrow_rgb: [140, 190, 255],
+            manga_autoscroll_arrow_alpha: 150,
             strip_item_open_binding: InputBinding::MouseRight,
             video_muted_by_default: true,
             video_default_volume: 0.0,
@@ -882,6 +891,26 @@ impl Config {
                                 config.manga_autoscroll_vertical_speed_multiplier = v.clamp(0.05, 10.0);
                             }
                         }
+                        "manga_autoscroll_circle_fill_alpha"
+                        | "manga_autoscroll_ball_fill_alpha"
+                        | "manga_autoscroll_fill_alpha" => {
+                            if let Some(v) = parse_u8_clamped(value) {
+                                config.manga_autoscroll_circle_fill_alpha = v;
+                            }
+                        }
+                        "manga_autoscroll_arrow_rgb"
+                        | "manga_autoscroll_arrow_color"
+                        | "manga_autoscroll_arrow_color_rgb" => {
+                            if let Some(rgb) = parse_rgb_triplet(value) {
+                                config.manga_autoscroll_arrow_rgb = rgb;
+                            }
+                        }
+                        "manga_autoscroll_arrow_alpha"
+                        | "manga_autoscroll_arrow_opacity" => {
+                            if let Some(v) = parse_u8_clamped(value) {
+                                config.manga_autoscroll_arrow_alpha = v;
+                            }
+                        }
                         "strip_item_open_binding"
                         | "strip_item_open_trigger"
                         | "manga_item_open_binding"
@@ -1152,6 +1181,23 @@ impl Config {
             format_with_optional_trailing_zero_f32(self.manga_autoscroll_vertical_speed_multiplier),
         );
         values.insert(
+            "manga_autoscroll_circle_fill_alpha",
+            format!("{}", self.manga_autoscroll_circle_fill_alpha),
+        );
+        values.insert(
+            "manga_autoscroll_arrow_rgb",
+            format!(
+                "{}, {}, {}",
+                self.manga_autoscroll_arrow_rgb[0],
+                self.manga_autoscroll_arrow_rgb[1],
+                self.manga_autoscroll_arrow_rgb[2]
+            ),
+        );
+        values.insert(
+            "manga_autoscroll_arrow_alpha",
+            format!("{}", self.manga_autoscroll_arrow_alpha),
+        );
+        values.insert(
             "strip_item_open_binding",
             binding_to_string(&self.strip_item_open_binding),
         );
@@ -1325,4 +1371,18 @@ fn parse_rgb_triplet(value: &str) -> Option<[u8; 3]> {
     let g = parts[1].parse::<u8>().ok()?;
     let b = parts[2].parse::<u8>().ok()?;
     Some([r, g, b])
+}
+
+fn parse_u8_clamped(value: &str) -> Option<u8> {
+    if let Ok(v) = value.trim().parse::<i32>() {
+        return Some(v.clamp(0, 255) as u8);
+    }
+
+    if let Ok(v) = value.trim().parse::<f32>() {
+        if v.is_finite() {
+            return Some(v.round().clamp(0.0, 255.0) as u8);
+        }
+    }
+
+    None
 }

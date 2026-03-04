@@ -1431,10 +1431,14 @@ impl ImageViewer {
         anchor: egui::Pos2,
         pointer_pos: Option<egui::Pos2>,
     ) {
+        let fill_alpha = self.config.manga_autoscroll_circle_fill_alpha;
+        let [arrow_r, arrow_g, arrow_b] = self.config.manga_autoscroll_arrow_rgb;
+        let arrow_alpha = self.config.manga_autoscroll_arrow_alpha;
+
         painter.circle_filled(
             anchor,
             18.0,
-            egui::Color32::from_rgba_unmultiplied(35, 35, 35, 155),
+            egui::Color32::from_rgba_unmultiplied(35, 35, 35, fill_alpha),
         );
         painter.circle_stroke(
             anchor,
@@ -1479,7 +1483,12 @@ impl ImageViewer {
                 let perp = egui::vec2(-direction.y, direction.x);
                 let stroke = egui::Stroke::new(
                     2.0,
-                    egui::Color32::from_rgba_unmultiplied(140, 190, 255, 195),
+                    egui::Color32::from_rgba_unmultiplied(
+                        arrow_r,
+                        arrow_g,
+                        arrow_b,
+                        arrow_alpha,
+                    ),
                 );
 
                 painter.line_segment([anchor, tip], stroke);
@@ -6716,6 +6725,9 @@ impl ImageViewer {
 
         if right_click_toggle_fullscreen {
             self.stop_manga_autoscroll();
+            if self.is_fullscreen && !self.manga_mode && self.strip_return_mode.is_some() {
+                self.clear_strip_return_context();
+            }
             self.toggle_fullscreen = true;
             return;
         }
