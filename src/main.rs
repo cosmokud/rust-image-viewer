@@ -6551,6 +6551,7 @@ impl ImageViewer {
         let mut actions_to_run: Vec<Action> = Vec::new();
         let mut strip_item_open_from_strip = false;
         let mut strip_item_open_pointer_pos: Option<egui::Pos2> = None;
+        let mut right_click_return_to_strip = false;
         let mut right_click_toggle_fullscreen = false;
         let mut right_click_navigated = false;
 
@@ -6704,7 +6705,11 @@ impl ImageViewer {
                         actions_to_run.push(Action::NextImage);
                         right_click_navigated = true;
                     } else if !self.manga_mode {
-                        right_click_toggle_fullscreen = true;
+                        if self.is_fullscreen && self.strip_return_mode.is_some() {
+                            right_click_return_to_strip = true;
+                        } else {
+                            right_click_toggle_fullscreen = true;
+                        }
                         return;
                     } else {
                         // Center region: toggle play/pause for videos, do nothing for images
@@ -6723,11 +6728,14 @@ impl ImageViewer {
             return;
         }
 
+        if right_click_return_to_strip {
+            self.stop_manga_autoscroll();
+            self.return_to_strip_mode_from_middle_click();
+            return;
+        }
+
         if right_click_toggle_fullscreen {
             self.stop_manga_autoscroll();
-            if self.is_fullscreen && !self.manga_mode && self.strip_return_mode.is_some() {
-                self.clear_strip_return_context();
-            }
             self.toggle_fullscreen = true;
             return;
         }
