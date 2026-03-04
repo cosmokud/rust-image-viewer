@@ -474,7 +474,13 @@ impl MangaLoader {
             }
 
             for (idx, w, h, mt) in res.items {
-                let changed = self.dimension_cache.get(&idx).copied() != Some((w, h, mt));
+                // Layout-affecting change check: only width/height should trigger relayout.
+                // Media-type-only transitions (e.g. StaticImage -> AnimatedImage) should not
+                // invalidate masonry geometry and cause viewport jitter.
+                let changed = self
+                    .dimension_cache
+                    .get(&idx)
+                    .map_or(true, |(old_w, old_h, _)| *old_w != w || *old_h != h);
                 self.dimension_cache.insert(idx, (w, h, mt));
                 self.dim_pending.remove(&idx);
                 if changed {
@@ -1214,6 +1220,123 @@ impl MangaLoader {
         self.stats.images_pending = self.loading_indices.read().len();
     }
 
+    /// Request loading of media around an explicit symmetric/asymmetric window.
+    ///
+    /// This is used by masonry mode's staged texture loading strategy where
+    /// metadata probing and texture decoding are intentionally decoupled.
+    pub fn request_decode_range(
+        &mut self,
+        image_list: &[PathBuf],
+        visible_index: usize,
+        behind: usize,
+        ahead: usize,
+        max_texture_side: u32,
+        urgent_visible: bool,
+    ) {
+        if image_list.is_empty() {
+            return;
+        }
+
+        let visible_index = visible_index.min(image_list.len().saturating_sub(1));
+
+        // Keep jump-cancellation and direction tracking behavior consistent with
+        // `update_preload_queue`.
+        let prev_visible_index = self.last_visible_index;
+        let index_delta = visible_index.abs_diff(prev_visible_index);
+        let is_large_jump = index_delta > LARGE_JUMP_INDEX_THRESHOLD;
+        if is_large_jump {
+            self.cancel_pending_loads();
+        }
+
+        if visible_index > prev_visible_index {
+            self.scroll_direction = 1;
+        } else if visible_index < prev_visible_index {
+            self.scroll_direction = -1;
+        }
+        self.last_visible_index = visible_index;
+
+        let start_idx = visible_index.saturating_sub(behind);
+        let end_idx = (visible_index.saturating_add(ahead).saturating_add(1)).min(image_list.len());
+        if start_idx >= end_idx {
+            return;
+        }
+
+        let mut requests: Vec<LoadRequest> = Vec::new();
+        let generation = self.current_generation;
+        let now = Instant::now();
+
+        {
+            let loading = self.loading_indices.read();
+            let loaded = self.loaded_indices.read();
+            let retry = self.retry_state.read();
+
+            for idx in start_idx..end_idx {
+                let is_image = is_supported_image(&image_list[idx]);
+                let is_video = is_supported_video(&image_list[idx]);
+                if !is_image && !is_video {
+                    continue;
+                }
+
+                if loading.contains(&idx) || loaded.contains(&idx) {
+                    continue;
+                }
+
+                if let Some(retry_state) = retry.get(&idx) {
+                    let retry_due = now >= retry_state.next_retry_at;
+                    let can_retry_here = idx == visible_index;
+                    if !retry_due || !can_retry_here {
+                        continue;
+                    }
+                }
+
+                let distance = (idx as i32 - visible_index as i32).abs();
+                let direction_bonus = if self.scroll_direction > 0 {
+                    if idx > visible_index {
+                        0
+                    } else {
+                        10
+                    }
+                } else if idx < visible_index {
+                    0
+                } else {
+                    10
+                };
+
+                let priority = if idx == visible_index && (urgent_visible || is_large_jump) {
+                    -100_000
+                } else {
+                    distance + direction_bonus
+                };
+
+                requests.push(LoadRequest {
+                    generation,
+                    index: idx,
+                    path: image_list[idx].clone(),
+                    max_texture_side,
+                    priority,
+                });
+            }
+        }
+
+        requests.sort_by_key(|r| r.priority);
+        for req in requests {
+            let idx = req.index;
+            match self.request_tx.try_send(req) {
+                Ok(()) => {
+                    self.loading_indices.write().insert(idx);
+                }
+                Err(TrySendError::Full(_req)) => {
+                    break;
+                }
+                Err(TrySendError::Disconnected(_req)) => {
+                    break;
+                }
+            }
+        }
+
+        self.stats.images_pending = self.loading_indices.read().len();
+    }
+
     /// Poll for decoded images ready for GPU upload.
     /// Returns up to UPLOAD_BATCH_SIZE images per call to avoid frame drops.
     #[allow(dead_code)]
@@ -1241,7 +1364,14 @@ impl MangaLoader {
                         decoded.original_height,
                         decoded.media_type,
                     );
-                    let changed = self.dimension_cache.get(&decoded.index).copied() != Some(new_meta);
+                    // Layout-affecting change check: only width/height should trigger relayout.
+                    // Media-type-only transitions are expected and should remain geometry-stable.
+                    let changed = self
+                        .dimension_cache
+                        .get(&decoded.index)
+                        .map_or(true, |(old_w, old_h, _)| {
+                            *old_w != decoded.original_width || *old_h != decoded.original_height
+                        });
 
                     self.dimension_cache.insert(decoded.index, new_meta);
                     if changed {
