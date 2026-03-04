@@ -106,6 +106,45 @@ impl TextureFilter {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MasonryCacheProfile {
+    /// Adaptive baseline derived from current masonry density.
+    Dynamic,
+    /// 2x the adaptive baseline. Uses significantly more VRAM.
+    X2,
+    /// 3x the adaptive baseline. Uses maximum VRAM.
+    X3,
+}
+
+impl MasonryCacheProfile {
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "dynamic" | "auto" | "adaptive" | "default" | "1x" | "x1" => {
+                Some(Self::Dynamic)
+            }
+            "2x" | "x2" | "double" | "high" => Some(Self::X2),
+            "3x" | "x3" | "triple" | "max" | "maximum" => Some(Self::X3),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Dynamic => "dynamic",
+            Self::X2 => "2x",
+            Self::X3 => "3x",
+        }
+    }
+
+    pub fn multiplier(&self) -> usize {
+        match self {
+            Self::Dynamic => 1,
+            Self::X2 => 2,
+            Self::X3 => 3,
+        }
+    }
+}
+
 /// Represents all possible input types for shortcuts
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum InputBinding {
@@ -363,6 +402,43 @@ pub struct Config {
     pub manga_arrow_scroll_speed: f32,
     /// Masonry mode: number of items per row
     pub masonry_items_per_row: usize,
+    /// Masonry cache profile. `dynamic` scales with items-per-row.
+    /// `2x` and `3x` multiply dynamic cache windows and significantly increase VRAM usage.
+    pub masonry_cache_profile: MasonryCacheProfile,
+    /// Extra masonry rows to keep in the texture cache budget beyond visible content.
+    pub manga_cache_headroom_rows: usize,
+    /// Extra masonry rows to retain in the keep/eviction window.
+    pub manga_keep_headroom_rows: usize,
+    /// Extra masonry rows to include in dimension probe windows.
+    pub manga_probe_headroom_rows: usize,
+    /// Base navigation preload window behind current index (used by arrow/Page style jumps).
+    pub manga_navigation_preload_behind: usize,
+    /// Base navigation preload window ahead of current index (used by arrow/Page style jumps).
+    pub manga_navigation_preload_ahead: usize,
+    /// Loader adaptive preload buffer ahead (in addition to visible pages).
+    pub manga_preload_buffer_ahead: usize,
+    /// Loader adaptive preload buffer behind (in addition to visible pages).
+    pub manga_preload_buffer_behind: usize,
+    /// Loader minimum adaptive preload count.
+    pub manga_preload_min: usize,
+    /// Loader maximum adaptive preload count.
+    pub manga_preload_max: usize,
+    /// Max number of dimension probe items to enqueue per request.
+    pub manga_dimension_probe_batch_size: usize,
+    /// Max number of dimension probe results bundled per worker message.
+    pub manga_dimension_result_chunk_size: usize,
+    /// Max number of dimension-probe messages consumed per frame.
+    pub manga_dimension_probe_messages_per_frame: usize,
+    /// Timeout for metadata-first video dimension probing (milliseconds).
+    pub manga_video_probe_timeout_ms: u64,
+    /// Timeout for first-frame thumbnail extraction in manga mode (milliseconds).
+    pub manga_video_thumbnail_timeout_ms: u64,
+    /// Base texture-cache entries budget per masonry row.
+    pub manga_texture_cache_entries_per_row: usize,
+    /// Minimum texture cache entries in manga mode.
+    pub manga_texture_cache_min: usize,
+    /// Maximum texture cache entries in manga mode.
+    pub manga_texture_cache_max: usize,
     /// Manga mode: when true, consume wheel input with the same smooth cadence as arrow keys.
     pub manga_wheel_smooth_like_arrow_keys: bool,
     /// Manga mode autoscroll: dead zone radius around the anchor (px).
@@ -466,6 +542,24 @@ impl Config {
             manga_wheel_multiplier: 1.5,
             manga_arrow_scroll_speed: 140.0,
             masonry_items_per_row: 5,
+            masonry_cache_profile: MasonryCacheProfile::Dynamic,
+            manga_cache_headroom_rows: 2,
+            manga_keep_headroom_rows: 2,
+            manga_probe_headroom_rows: 4,
+            manga_navigation_preload_behind: 30,
+            manga_navigation_preload_ahead: 60,
+            manga_preload_buffer_ahead: 4,
+            manga_preload_buffer_behind: 2,
+            manga_preload_min: 4,
+            manga_preload_max: 96,
+            manga_dimension_probe_batch_size: 128,
+            manga_dimension_result_chunk_size: 96,
+            manga_dimension_probe_messages_per_frame: 8,
+            manga_video_probe_timeout_ms: 220,
+            manga_video_thumbnail_timeout_ms: 650,
+            manga_texture_cache_entries_per_row: 56,
+            manga_texture_cache_min: 96,
+            manga_texture_cache_max: 640,
             manga_wheel_smooth_like_arrow_keys: true,
             manga_autoscroll_dead_zone_px: 14.0,
             manga_autoscroll_base_speed_multiplier: 5.0,
@@ -836,6 +930,108 @@ impl Config {
                                 config.masonry_items_per_row = v.clamp(2, 10);
                             }
                         }
+                        "masonry_cache_profile"
+                        | "manga_masonry_cache_profile"
+                        | "masonry_cache_mode"
+                        | "manga_cache_profile" => {
+                            if let Some(profile) = MasonryCacheProfile::from_str(value) {
+                                config.masonry_cache_profile = profile;
+                            }
+                        }
+                        "manga_cache_headroom_rows" | "masonry_cache_headroom_rows" => {
+                            if let Ok(v) = value.parse::<usize>() {
+                                config.manga_cache_headroom_rows = v.clamp(0, 16);
+                            }
+                        }
+                        "manga_keep_headroom_rows" | "masonry_keep_headroom_rows" => {
+                            if let Ok(v) = value.parse::<usize>() {
+                                config.manga_keep_headroom_rows = v.clamp(0, 24);
+                            }
+                        }
+                        "manga_probe_headroom_rows"
+                        | "masonry_probe_headroom_rows"
+                        | "manga_dimension_headroom_rows" => {
+                            if let Ok(v) = value.parse::<usize>() {
+                                config.manga_probe_headroom_rows = v.clamp(0, 32);
+                            }
+                        }
+                        "manga_navigation_preload_behind" => {
+                            if let Ok(v) = value.parse::<usize>() {
+                                config.manga_navigation_preload_behind = v.clamp(4, 3000);
+                            }
+                        }
+                        "manga_navigation_preload_ahead" => {
+                            if let Ok(v) = value.parse::<usize>() {
+                                config.manga_navigation_preload_ahead = v.clamp(4, 3000);
+                            }
+                        }
+                        "manga_preload_buffer_ahead" | "manga_loader_preload_buffer_ahead" => {
+                            if let Ok(v) = value.parse::<usize>() {
+                                config.manga_preload_buffer_ahead = v.clamp(0, 512);
+                            }
+                        }
+                        "manga_preload_buffer_behind"
+                        | "manga_loader_preload_buffer_behind" => {
+                            if let Ok(v) = value.parse::<usize>() {
+                                config.manga_preload_buffer_behind = v.clamp(0, 512);
+                            }
+                        }
+                        "manga_preload_min" | "manga_loader_preload_min" => {
+                            if let Ok(v) = value.parse::<usize>() {
+                                config.manga_preload_min = v.clamp(1, 8192);
+                            }
+                        }
+                        "manga_preload_max" | "manga_loader_preload_max" => {
+                            if let Ok(v) = value.parse::<usize>() {
+                                config.manga_preload_max = v.clamp(1, 8192);
+                            }
+                        }
+                        "manga_dimension_probe_batch_size"
+                        | "manga_probe_batch_size"
+                        | "manga_dim_request_batch_size" => {
+                            if let Ok(v) = value.parse::<usize>() {
+                                config.manga_dimension_probe_batch_size = v.clamp(8, 1024);
+                            }
+                        }
+                        "manga_dimension_result_chunk_size"
+                        | "manga_probe_result_chunk_size"
+                        | "manga_dim_result_chunk_size" => {
+                            if let Ok(v) = value.parse::<usize>() {
+                                config.manga_dimension_result_chunk_size = v.clamp(8, 1024);
+                            }
+                        }
+                        "manga_dimension_probe_messages_per_frame"
+                        | "manga_probe_messages_per_frame" => {
+                            if let Ok(v) = value.parse::<usize>() {
+                                config.manga_dimension_probe_messages_per_frame = v.clamp(1, 64);
+                            }
+                        }
+                        "manga_video_probe_timeout_ms" | "video_probe_timeout_ms" => {
+                            if let Ok(v) = value.parse::<u64>() {
+                                config.manga_video_probe_timeout_ms = v.clamp(50, 10000);
+                            }
+                        }
+                        "manga_video_thumbnail_timeout_ms" | "video_thumbnail_timeout_ms" => {
+                            if let Ok(v) = value.parse::<u64>() {
+                                config.manga_video_thumbnail_timeout_ms = v.clamp(100, 10000);
+                            }
+                        }
+                        "manga_texture_cache_entries_per_row"
+                        | "masonry_texture_cache_entries_per_row" => {
+                            if let Ok(v) = value.parse::<usize>() {
+                                config.manga_texture_cache_entries_per_row = v.clamp(8, 256);
+                            }
+                        }
+                        "manga_texture_cache_min" | "masonry_texture_cache_min" => {
+                            if let Ok(v) = value.parse::<usize>() {
+                                config.manga_texture_cache_min = v.clamp(16, 8192);
+                            }
+                        }
+                        "manga_texture_cache_max" | "masonry_texture_cache_max" => {
+                            if let Ok(v) = value.parse::<usize>() {
+                                config.manga_texture_cache_max = v.clamp(16, 8192);
+                            }
+                        }
                         "manga_wheel_smooth_like_arrow_keys"
                         | "manga_wheel_smooth_match_arrow_keys"
                         | "manga_wheel_arrow_smooth_sync" => {
@@ -1024,6 +1220,14 @@ impl Config {
             }
         }
 
+        if config.manga_preload_max < config.manga_preload_min {
+            config.manga_preload_max = config.manga_preload_min;
+        }
+
+        if config.manga_texture_cache_max < config.manga_texture_cache_min {
+            config.manga_texture_cache_max = config.manga_texture_cache_min;
+        }
+
         // Fill in defaults for any missing actions
         let default_config = Config::default();
         for (action, default_bindings) in default_config.action_bindings.iter() {
@@ -1151,6 +1355,72 @@ impl Config {
         values.insert(
             "masonry_items_per_row",
             format!("{}", self.masonry_items_per_row),
+        );
+        values.insert(
+            "masonry_cache_profile",
+            self.masonry_cache_profile.as_str().to_string(),
+        );
+        values.insert(
+            "manga_cache_headroom_rows",
+            format!("{}", self.manga_cache_headroom_rows),
+        );
+        values.insert(
+            "manga_keep_headroom_rows",
+            format!("{}", self.manga_keep_headroom_rows),
+        );
+        values.insert(
+            "manga_probe_headroom_rows",
+            format!("{}", self.manga_probe_headroom_rows),
+        );
+        values.insert(
+            "manga_navigation_preload_behind",
+            format!("{}", self.manga_navigation_preload_behind),
+        );
+        values.insert(
+            "manga_navigation_preload_ahead",
+            format!("{}", self.manga_navigation_preload_ahead),
+        );
+        values.insert(
+            "manga_preload_buffer_ahead",
+            format!("{}", self.manga_preload_buffer_ahead),
+        );
+        values.insert(
+            "manga_preload_buffer_behind",
+            format!("{}", self.manga_preload_buffer_behind),
+        );
+        values.insert("manga_preload_min", format!("{}", self.manga_preload_min));
+        values.insert("manga_preload_max", format!("{}", self.manga_preload_max));
+        values.insert(
+            "manga_dimension_probe_batch_size",
+            format!("{}", self.manga_dimension_probe_batch_size),
+        );
+        values.insert(
+            "manga_dimension_result_chunk_size",
+            format!("{}", self.manga_dimension_result_chunk_size),
+        );
+        values.insert(
+            "manga_dimension_probe_messages_per_frame",
+            format!("{}", self.manga_dimension_probe_messages_per_frame),
+        );
+        values.insert(
+            "manga_video_probe_timeout_ms",
+            format!("{}", self.manga_video_probe_timeout_ms),
+        );
+        values.insert(
+            "manga_video_thumbnail_timeout_ms",
+            format!("{}", self.manga_video_thumbnail_timeout_ms),
+        );
+        values.insert(
+            "manga_texture_cache_entries_per_row",
+            format!("{}", self.manga_texture_cache_entries_per_row),
+        );
+        values.insert(
+            "manga_texture_cache_min",
+            format!("{}", self.manga_texture_cache_min),
+        );
+        values.insert(
+            "manga_texture_cache_max",
+            format!("{}", self.manga_texture_cache_max),
         );
         values.insert(
             "manga_wheel_smooth_like_arrow_keys",
