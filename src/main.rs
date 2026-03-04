@@ -4648,22 +4648,29 @@ impl ImageViewer {
                 let zoom_ratio = new_zoom / old_zoom;
 
                 if self.manga_mode {
-                    // CRITICAL FIX: Use index-based anchoring for stable zooming with varying image sizes.
-                    // Capture which image is at the center and the fractional position within it BEFORE zoom.
-                    let center_anchor = self.manga_capture_center_anchor();
+                    if self.is_masonry_mode() {
+                        let center_pos = egui::pos2(self.screen_size.x * 0.5, self.screen_size.y * 0.5);
+                        if self.apply_masonry_zoom_at_screen_pos(new_zoom, center_pos) {
+                            self.manga_update_preload_queue();
+                        }
+                    } else {
+                        // CRITICAL FIX: Use index-based anchoring for stable zooming with varying image sizes.
+                        // Capture which image is at the center and the fractional position within it BEFORE zoom.
+                        let center_anchor = self.manga_capture_center_anchor();
 
-                    // Apply the new zoom level
-                    self.zoom = new_zoom;
-                    self.zoom_target = new_zoom;
-                    self.zoom_velocity = 0.0;
-                    self.invalidate_manga_layout_cache_for_zoom();
+                        // Apply the new zoom level
+                        self.zoom = new_zoom;
+                        self.zoom_target = new_zoom;
+                        self.zoom_velocity = 0.0;
+                        self.invalidate_manga_layout_cache_for_zoom();
 
-                    // Re-apply the anchor to keep the same image position at the center
-                    if let Some(anchor) = center_anchor {
-                        self.manga_apply_center_anchor(anchor);
+                        // Re-apply the anchor to keep the same image position at the center
+                        if let Some(anchor) = center_anchor {
+                            self.manga_apply_center_anchor(anchor);
+                        }
+
+                        self.manga_update_preload_queue();
                     }
-
-                    self.manga_update_preload_queue();
                 } else {
                     // Non-manga mode: simple ratio-based offset adjustment
                     self.zoom = new_zoom;
@@ -4701,7 +4708,7 @@ impl ImageViewer {
                     ));
                     ui.allocate_new_ui(egui::UiBuilder::new().max_rect(inner_rect), |ui| {
                         ui.spacing_mut().item_spacing.x = 4.0;
-                        ui.spacing_mut().slider_width = 100.0;
+                        ui.spacing_mut().slider_width = 80.0;
                         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                             let (rows_label_rect, _) =
                                 ui.allocate_exact_size(egui::vec2(32.0, 24.0), egui::Sense::hover());
@@ -4713,23 +4720,75 @@ impl ImageViewer {
                                 egui::Color32::from_rgb(220, 220, 220),
                             );
 
+                            let (rows_minus_rect, rows_minus_resp) =
+                                ui.allocate_exact_size(egui::vec2(20.0, 24.0), egui::Sense::click());
+                            if ui.is_rect_visible(rows_minus_rect) {
+                                let minus_bg = if rows_minus_resp.is_pointer_button_down_on() {
+                                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 36)
+                                } else if rows_minus_resp.hovered() {
+                                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 20)
+                                } else {
+                                    egui::Color32::TRANSPARENT
+                                };
+                                ui.painter().rect_filled(rows_minus_rect, 4.0, minus_bg);
+                                ui.painter().text(
+                                    rows_minus_rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    "−",
+                                    egui::FontId::proportional(15.0),
+                                    egui::Color32::WHITE,
+                                );
+                            }
+                            if rows_minus_resp.clicked() {
+                                self.set_masonry_items_per_row(self.masonry_items_per_row.saturating_sub(1));
+                                self.touch_bottom_overlays();
+                            }
+
                             let mut slider_rows = self.masonry_items_per_row as i32;
                             let rows_slider = egui::Slider::new(&mut slider_rows, 2..=10)
                                 .show_value(false)
                                 .clamping(egui::SliderClamping::Always);
-                            let rows_resp = ui.add_sized([100.0, 24.0], rows_slider);
+                            let rows_resp = ui.add_sized([80.0, 24.0], rows_slider);
 
                             if rows_resp.changed() {
                                 self.set_masonry_items_per_row(slider_rows as usize);
+                            }
+
+                            let (rows_plus_rect, rows_plus_resp) =
+                                ui.allocate_exact_size(egui::vec2(20.0, 24.0), egui::Sense::click());
+                            if ui.is_rect_visible(rows_plus_rect) {
+                                let plus_bg = if rows_plus_resp.is_pointer_button_down_on() {
+                                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 36)
+                                } else if rows_plus_resp.hovered() {
+                                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 20)
+                                } else {
+                                    egui::Color32::TRANSPARENT
+                                };
+                                ui.painter().rect_filled(rows_plus_rect, 4.0, plus_bg);
+                                ui.painter().text(
+                                    rows_plus_rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    "+",
+                                    egui::FontId::proportional(15.0),
+                                    egui::Color32::WHITE,
+                                );
+                            }
+                            if rows_plus_resp.clicked() {
+                                self.set_masonry_items_per_row(self.masonry_items_per_row.saturating_add(1));
+                                self.touch_bottom_overlays();
                             }
 
                             if rows_resp.hovered() || rows_resp.dragged() {
                                 self.touch_bottom_overlays();
                             }
 
-                            let rows_value = format!("{} /row", self.masonry_items_per_row);
+                            if rows_minus_resp.hovered() || rows_plus_resp.hovered() {
+                                self.touch_bottom_overlays();
+                            }
+
+                            let rows_value = format!("{}", self.masonry_items_per_row);
                             let (rows_value_rect, _) =
-                                ui.allocate_exact_size(egui::vec2(68.0, 24.0), egui::Sense::hover());
+                                ui.allocate_exact_size(egui::vec2(40.0, 24.0), egui::Sense::hover());
                             ui.painter().text(
                                 rows_value_rect.center(),
                                 egui::Align2::CENTER_CENTER,
@@ -4813,19 +4872,27 @@ impl ImageViewer {
                                 let zoom_ratio = new_zoom / old_zoom;
 
                                 if self.manga_mode {
-                                    // CRITICAL FIX: Use index-based anchoring for stable zooming with varying image sizes.
-                                    let center_anchor = self.manga_capture_center_anchor();
+                                    if self.is_masonry_mode() {
+                                        let center_pos =
+                                            egui::pos2(self.screen_size.x * 0.5, self.screen_size.y * 0.5);
+                                        if self.apply_masonry_zoom_at_screen_pos(new_zoom, center_pos) {
+                                            self.manga_update_preload_queue();
+                                        }
+                                    } else {
+                                        // CRITICAL FIX: Use index-based anchoring for stable zooming with varying image sizes.
+                                        let center_anchor = self.manga_capture_center_anchor();
 
-                                    self.zoom = new_zoom;
-                                    self.zoom_target = new_zoom;
-                                    self.zoom_velocity = 0.0;
-                                    self.invalidate_manga_layout_cache_for_zoom();
+                                        self.zoom = new_zoom;
+                                        self.zoom_target = new_zoom;
+                                        self.zoom_velocity = 0.0;
+                                        self.invalidate_manga_layout_cache_for_zoom();
 
-                                    if let Some(anchor) = center_anchor {
-                                        self.manga_apply_center_anchor(anchor);
+                                        if let Some(anchor) = center_anchor {
+                                            self.manga_apply_center_anchor(anchor);
+                                        }
+
+                                        self.manga_update_preload_queue();
                                     }
-
-                                    self.manga_update_preload_queue();
                                 } else {
                                     self.zoom = new_zoom;
                                     self.zoom_target = new_zoom;
@@ -4899,22 +4966,29 @@ impl ImageViewer {
         };
 
         if (new_zoom - old_zoom).abs() > 0.0001 {
-            // CRITICAL FIX: Use index-based anchoring for stable zooming with varying image sizes.
-            // Capture which image is at the center and the fractional position within it BEFORE zoom.
-            let center_anchor = self.manga_capture_center_anchor();
+            if self.is_masonry_mode() {
+                let center_pos = egui::pos2(self.screen_size.x * 0.5, self.screen_size.y * 0.5);
+                if self.apply_masonry_zoom_at_screen_pos(new_zoom, center_pos) {
+                    self.manga_update_preload_queue();
+                }
+            } else {
+                // CRITICAL FIX: Use index-based anchoring for stable zooming with varying image sizes.
+                // Capture which image is at the center and the fractional position within it BEFORE zoom.
+                let center_anchor = self.manga_capture_center_anchor();
 
-            // Apply the new zoom level
-            self.zoom = new_zoom;
-            self.zoom_target = new_zoom;
-            self.zoom_velocity = 0.0;
-            self.invalidate_manga_layout_cache_for_zoom();
+                // Apply the new zoom level
+                self.zoom = new_zoom;
+                self.zoom_target = new_zoom;
+                self.zoom_velocity = 0.0;
+                self.invalidate_manga_layout_cache_for_zoom();
 
-            // Re-apply the anchor to keep the same image position at the center
-            if let Some(anchor) = center_anchor {
-                self.manga_apply_center_anchor(anchor);
+                // Re-apply the anchor to keep the same image position at the center
+                if let Some(anchor) = center_anchor {
+                    self.manga_apply_center_anchor(anchor);
+                }
+
+                self.manga_update_preload_queue();
             }
-
-            self.manga_update_preload_queue();
         }
     }
 
