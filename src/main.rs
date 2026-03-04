@@ -2586,22 +2586,44 @@ impl ImageViewer {
         true
     }
 
-    fn manga_update_texture_cache_budget(&mut self, visible_page_count: usize) {
+    fn manga_update_texture_cache_budget(
+        &mut self,
+        visible_page_count: usize,
+        keep_behind: usize,
+        keep_ahead: usize,
+    ) {
         if !self.manga_mode || visible_page_count == 0 {
             return;
         }
 
+        let len = self.image_list.len();
+        if len == 0 {
+            return;
+        }
+
+        let visible = visible_page_count.max(1);
+        let keep_window = keep_behind
+            .saturating_add(keep_ahead)
+            .saturating_add(1)
+            .max(visible);
+
         let target_capacity = if self.is_masonry_mode() {
-            let rows = self.masonry_items_per_row.clamp(2, 10);
-            let row_budget = rows.saturating_mul(48);
-            visible_page_count
-                .saturating_mul(3)
-                .max(row_budget)
-                .max(96)
-                .min(320)
+            // Aggressive VRAM use for dense grids, while still scaling to actual visibility.
+            // Example: if only ~9 items are visible, capacity stays well below 100.
+            keep_window
+                .saturating_add(keep_window / 2)
+                .saturating_add(visible)
+                .max(visible.saturating_mul(4))
         } else {
-            visible_page_count.saturating_mul(2).max(64).min(160)
+            keep_window
+                .saturating_add(keep_window / 3)
+                .saturating_add(visible)
+                .max(visible.saturating_mul(3))
         };
+
+        let hard_max = len.min(if self.is_masonry_mode() { 2048 } else { 1024 }).max(1);
+        let hard_min = hard_max.min(if self.is_masonry_mode() { 24 } else { 16 });
+        let target_capacity = target_capacity.clamp(hard_min, hard_max);
 
         let evicted = self.manga_texture_cache.set_capacity(target_capacity);
         if let Some(ref mut loader) = self.manga_loader {
@@ -3860,10 +3882,8 @@ impl ImageViewer {
         // Calculate how many pages are currently visible on screen
         // This determines preload count: visible_pages + 4 ahead and behind
         let visible_page_count = self.manga_calculate_visible_page_count();
-        self.manga_update_texture_cache_budget(visible_page_count);
         let is_masonry = self.is_masonry_mode();
         let masonry_rows = self.masonry_items_per_row.clamp(2, 10);
-        let masonry_side_multiplier = (masonry_rows + 1) / 2;
         let cache_multiplier = self.masonry_cache_multiplier();
 
         // Update the loader's visible page count for adaptive preloading
@@ -3876,40 +3896,29 @@ impl ImageViewer {
         // to avoid "unknown height -> real height" corrections from pushing the viewport around.
         // Scale the dimension cache window based on visible pages for better coverage
         let scrolling_up = self.manga_scroll_offset < prev_scroll_pos - 0.5;
-        let dim_scale = (visible_page_count as f32 / 2.0).max(1.0) as usize;
-        let max_behind = if is_masonry {
-            240usize.saturating_mul(masonry_rows)
-        } else {
-            200
-        };
-        let max_ahead = if is_masonry {
-            240usize.saturating_mul(masonry_rows)
-        } else {
-            100
-        };
-        let (base_behind, base_ahead) = if scrolling_up {
-            (
-                80usize.saturating_mul(dim_scale),
-                20usize.saturating_mul(dim_scale),
-            )
-        } else {
-            (
-                20usize.saturating_mul(dim_scale),
-                80usize.saturating_mul(dim_scale),
-            )
-        };
-        let behind_raw = base_behind.saturating_mul(cache_multiplier);
-        let ahead_raw = base_ahead.saturating_mul(cache_multiplier);
         let (behind, ahead) = if is_masonry {
-            // Masonry: keep preload symmetric (same forward/backward window), using the larger side,
-            // and scale with rows-per-row so denser layouts remain seamless.
-            let symmetric = behind_raw
-                .max(ahead_raw)
-                .saturating_mul(masonry_side_multiplier)
-                .max(80usize.saturating_mul(masonry_rows))
-                .min(max_behind.max(max_ahead));
+            // Masonry: keep a symmetric dimension probe window tied to visible content,
+            // not a large fixed multiplier. This prevents over-probing and relayout churn.
+            let visible = visible_page_count.max(masonry_rows.saturating_mul(2));
+            let symmetric = visible.saturating_mul(3).max(24).min(480);
             (symmetric, symmetric)
         } else {
+            let dim_scale = (visible_page_count as f32 / 2.0).max(1.0) as usize;
+            let max_behind = 200;
+            let max_ahead = 100;
+            let (base_behind, base_ahead) = if scrolling_up {
+                (
+                    80usize.saturating_mul(dim_scale),
+                    20usize.saturating_mul(dim_scale),
+                )
+            } else {
+                (
+                    20usize.saturating_mul(dim_scale),
+                    80usize.saturating_mul(dim_scale),
+                )
+            };
+            let behind_raw = base_behind.saturating_mul(cache_multiplier);
+            let ahead_raw = base_ahead.saturating_mul(cache_multiplier);
             (behind_raw.min(max_behind), ahead_raw.min(max_ahead))
         };
 
@@ -3944,17 +3953,26 @@ impl ImageViewer {
 
         // Apply eviction policy
         let (final_keep_behind, final_keep_ahead) = if is_masonry {
-            // Masonry: symmetric keep window from the larger side, scaled by rows-per-row.
+            // Masonry: symmetric keep window driven by visible count.
+            // Large when many items are visible, conservative when only a few are on-screen.
+            let visible = visible_page_count.max(masonry_rows.saturating_mul(2));
             let symmetric = keep_ahead
                 .max(keep_behind)
-                .saturating_mul(masonry_side_multiplier)
-                .max(12usize.saturating_mul(masonry_rows));
+                .max(visible.saturating_mul(2))
+                .max(16)
+                .min(384);
             (symmetric, symmetric)
         } else if scrolling_up {
             (keep_ahead, keep_behind) // Keep more behind when scrolling up
         } else {
             (keep_behind, keep_ahead) // Keep more ahead when scrolling down
         };
+
+        self.manga_update_texture_cache_budget(
+            visible_page_count,
+            final_keep_behind,
+            final_keep_ahead,
+        );
 
         let keep_start = current_visible_index.saturating_sub(final_keep_behind);
         let keep_end = (current_visible_index + final_keep_ahead + 1).min(self.image_list.len());
