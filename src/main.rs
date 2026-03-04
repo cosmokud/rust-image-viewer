@@ -2591,13 +2591,27 @@ impl ImageViewer {
             || self.manga_scroll_velocity.abs() > 1.0
     }
 
-    fn manga_apply_masonry_scroll_stabilization_after_layout_change(&mut self) {
+    fn manga_apply_masonry_scroll_stabilization_after_layout_change(
+        &mut self,
+        anchor: Option<(usize, f32)>,
+    ) {
         let prev_scroll = self.manga_scroll_offset;
         let prev_target_delta = self.manga_scroll_target - self.manga_scroll_offset;
         let prev_velocity = self.manga_scroll_velocity;
 
         let max_scroll = (self.manga_total_height() - self.screen_size.y).max(0.0);
-        let new_offset = prev_scroll.clamp(0.0, max_scroll);
+        let new_offset = if let Some((anchor_idx, anchor_fraction)) = anchor {
+            if anchor_idx < self.image_list.len() {
+                let start_y = self.manga_page_start_y(anchor_idx);
+                let anchor_h = self.manga_page_height_cached(anchor_idx).max(0.0001);
+                let within = anchor_fraction.clamp(0.0, 1.0) * anchor_h;
+                (start_y + within).clamp(0.0, max_scroll)
+            } else {
+                prev_scroll.clamp(0.0, max_scroll)
+            }
+        } else {
+            prev_scroll.clamp(0.0, max_scroll)
+        };
 
         self.manga_scroll_offset = new_offset;
         self.manga_scroll_target = (new_offset + prev_target_delta).clamp(0.0, max_scroll);
@@ -2614,11 +2628,13 @@ impl ImageViewer {
             return false;
         }
 
+        let anchor = self.manga_capture_scroll_anchor();
+
         self.masonry_layout_updates_deferred = false;
         self.manga_total_height_cache_valid = false;
         self.manga_layout_offsets.clear();
         self.masonry_layout_valid = false;
-        self.manga_apply_masonry_scroll_stabilization_after_layout_change();
+        self.manga_apply_masonry_scroll_stabilization_after_layout_change(anchor);
         true
     }
 
@@ -3039,6 +3055,60 @@ impl ImageViewer {
     fn manga_capture_scroll_anchor(&mut self) -> Option<(usize, f32)> {
         if !self.manga_mode || self.image_list.is_empty() {
             return None;
+        }
+
+        if self.is_masonry_mode() {
+            self.masonry_ensure_layout_cache();
+            if self.masonry_layout_items.is_empty() {
+                return None;
+            }
+
+            let scroll = self.manga_scroll_offset.max(0.0);
+            let viewport_bottom = scroll + self.screen_size.y.max(1.0);
+            let zoom = self.zoom.max(0.0001);
+            let viewport_center_x = self.screen_size.x * 0.5 - self.offset.x;
+
+            let mut best_idx = None;
+            let mut best_score = f32::MAX;
+
+            for (idx, item) in self.masonry_layout_items.iter().enumerate() {
+                let top = item.y * zoom;
+                let bottom = top + item.height * zoom;
+
+                if bottom < scroll || top > viewport_bottom {
+                    continue;
+                }
+
+                let vertical_gap = if scroll < top {
+                    top - scroll
+                } else if scroll > bottom {
+                    scroll - bottom
+                } else {
+                    0.0
+                };
+
+                let center_x = (item.x + item.width * 0.5) * zoom;
+                let x_gap = (center_x - viewport_center_x).abs();
+
+                // Strongly prefer items nearest to the viewport top, then nearest to center X.
+                let score = vertical_gap * 4.0 + x_gap * 0.25;
+                if score < best_score {
+                    best_score = score;
+                    best_idx = Some(idx);
+                }
+            }
+
+            let idx = best_idx.unwrap_or_else(|| {
+                self.current_index
+                    .min(self.masonry_layout_items.len().saturating_sub(1))
+            });
+
+            let item = self.masonry_layout_items[idx];
+            let start = item.y * zoom;
+            let h = (item.height * zoom).max(0.0001);
+            let within = (scroll - start).clamp(0.0, h);
+            let fraction = (within / h).clamp(0.0, 1.0);
+            return Some((idx, fraction));
         }
 
         let scroll = self.manga_scroll_offset.max(0.0);
@@ -6321,21 +6391,11 @@ impl ImageViewer {
         // Process decoded images from background threads and upload to GPU.
         // This is now non-blocking - images are decoded in parallel on background threads.
         // We always call this to keep uploading decoded images even while scrolling.
-        let masonry_prev_scroll = self.manga_scroll_offset;
-        let masonry_prev_target_delta = self.manga_scroll_target - self.manga_scroll_offset;
-        let masonry_prev_velocity = self.manga_scroll_velocity;
-        let load_anchor = if self.is_masonry_mode() {
-            None
-        } else {
-            self.manga_capture_scroll_anchor()
-        };
+        let load_anchor = self.manga_capture_scroll_anchor();
         let dims_updated = self.manga_process_pending_loads(ctx);
         if dims_updated {
             if self.is_masonry_mode() {
-                self.manga_scroll_offset = masonry_prev_scroll;
-                self.manga_scroll_target = masonry_prev_scroll + masonry_prev_target_delta;
-                self.manga_scroll_velocity = masonry_prev_velocity;
-                self.manga_apply_masonry_scroll_stabilization_after_layout_change();
+                self.manga_apply_masonry_scroll_stabilization_after_layout_change(load_anchor);
             } else if let Some(anchor) = load_anchor {
                 self.manga_apply_scroll_anchor(anchor);
                 self.manga_update_current_index();
