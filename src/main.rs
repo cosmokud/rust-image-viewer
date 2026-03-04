@@ -1478,6 +1478,110 @@ impl ImageViewer {
         speed.copysign(delta)
     }
 
+    fn stop_fullscreen_video_playback(&mut self) {
+        if let Some(player) = self.video_player.take() {
+            drop(player);
+        }
+        self.show_video_controls = false;
+    }
+
+    fn reset_fullscreen_anim_stream_state(&mut self) {
+        self.anim_stream_rx = None;
+        self.anim_stream_path = None;
+        self.anim_stream_done = true;
+        self.anim_seekbar_total_frames = None;
+    }
+
+    fn ensure_manga_loader(&mut self) {
+        if self.manga_loader.is_none() {
+            self.manga_loader = Some(MangaLoader::new());
+        }
+    }
+
+    fn reset_manga_video_user_preferences(&mut self) {
+        self.manga_video_user_muted = None;
+        self.manga_video_user_volume = None;
+    }
+
+    fn set_strip_entry_placeholder_from_current_media(
+        &mut self,
+        current_media_type: Option<MediaType>,
+    ) {
+        self.strip_entry_placeholder_index = match current_media_type {
+            Some(MediaType::Image) if self.texture.is_some() => Some(self.current_index),
+            Some(MediaType::Video) if self.video_texture.is_some() => Some(self.current_index),
+            _ => None,
+        };
+    }
+
+    fn manga_media_type_for_current_media(
+        media_type: MediaType,
+        current_image_is_animated: bool,
+    ) -> MangaMediaType {
+        match media_type {
+            MediaType::Video => MangaMediaType::Video,
+            MediaType::Image => {
+                if current_image_is_animated {
+                    MangaMediaType::AnimatedImage
+                } else {
+                    MangaMediaType::StaticImage
+                }
+            }
+        }
+    }
+
+    fn cache_current_media_dimensions_for_manga(
+        &mut self,
+        current_media_dims: Option<(u32, u32)>,
+        current_media_type: Option<MediaType>,
+        current_image_is_animated: bool,
+    ) {
+        let (Some((w, h)), Some(media_type)) = (current_media_dims, current_media_type) else {
+            return;
+        };
+
+        let manga_media_type =
+            Self::manga_media_type_for_current_media(media_type, current_image_is_animated);
+
+        if let Some(ref mut loader) = self.manga_loader {
+            loader
+                .dimension_cache
+                .insert(self.current_index, (w, h, manga_media_type));
+        }
+    }
+
+    fn prepare_enter_manga_mode_state(&mut self, current_media_type: Option<MediaType>) {
+        self.set_strip_entry_placeholder_from_current_media(current_media_type);
+        self.manga_wheel_scroll_pending = 0.0;
+        self.stop_manga_autoscroll();
+        self.manga_mode = true;
+        self.stop_fullscreen_video_playback();
+        self.reset_fullscreen_anim_stream_state();
+        self.reset_manga_video_user_preferences();
+        self.ensure_manga_loader();
+    }
+
+    fn clear_manga_runtime_workloads(&mut self) {
+        self.manga_video_players.clear();
+        self.manga_focused_video_index = None;
+        self.manga_anim_streams.clear();
+        self.manga_anim_stream_done.clear();
+        self.manga_focused_anim_index = None;
+    }
+
+    fn apply_video_audio_overrides(
+        player: &mut VideoPlayer,
+        muted_override: Option<bool>,
+        volume_override: Option<f64>,
+    ) {
+        if let Some(muted) = muted_override {
+            player.set_muted(muted);
+        }
+        if let Some(volume) = volume_override {
+            player.set_volume(volume);
+        }
+    }
+
     /// Create new viewer with an image path
     /// `start_visible`: true if window was created visible (images), false if hidden (videos)
     #[cfg(target_os = "windows")]
@@ -1588,10 +1692,7 @@ impl ImageViewer {
         // MEMORY OPTIMIZATION: Explicitly drop textures to release GPU memory immediately.
         // Setting to None allows Rust to drop the TextureHandle, which signals egui to
         // free the underlying GPU texture on the next frame.
-        if let Some(player) = self.video_player.take() {
-            // Drop the video player first - this stops GStreamer pipeline and frees its buffers
-            drop(player);
-        }
+        self.stop_fullscreen_video_playback();
         if !keep_video_placeholder {
             // Drop video texture to free VRAM
             if let Some(tex) = self.video_texture.take() {
@@ -1607,7 +1708,6 @@ impl ImageViewer {
             self.image_texture_dims = None;
         }
         self.image = None;
-        self.show_video_controls = false;
 
         if let Some(placeholder) = transition_placeholder {
             match placeholder.media_type {
@@ -1623,10 +1723,7 @@ impl ImageViewer {
         }
 
         // Cancel any in-flight background animation stream.
-        self.anim_stream_rx = None;
-        self.anim_stream_path = None;
-        self.anim_stream_done = true;
-        self.anim_seekbar_total_frames = None;
+        self.reset_fullscreen_anim_stream_state();
 
         // Reset GIF playback state for new media
         self.gif_paused = false;
@@ -1676,12 +1773,6 @@ impl ImageViewer {
                 }
             }
             Some(MediaType::Image) => {
-                // Cancel any in-flight background animation stream.
-                self.anim_stream_rx = None;
-                self.anim_stream_path = None;
-                self.anim_stream_done = true;
-                self.anim_seekbar_total_frames = None;
-
                 // Load as image with configured filters.
                 // For animated WebP we only decode the FIRST frame here so the
                 // window appears instantly, then start streaming remaining frames
@@ -2261,11 +2352,7 @@ impl ImageViewer {
 
         // Keep texture/dimension caches alive for fast strip restore,
         // but stop active runtime workloads while in solo fullscreen.
-        self.manga_video_players.clear();
-        self.manga_focused_video_index = None;
-        self.manga_anim_streams.clear();
-        self.manga_anim_stream_done.clear();
-        self.manga_focused_anim_index = None;
+        self.clear_manga_runtime_workloads();
     }
 
     #[allow(dead_code)]
@@ -2274,54 +2361,12 @@ impl ImageViewer {
         let current_media_type = self.current_media_type;
         let current_image_is_animated = self.image.as_ref().is_some_and(|img| img.is_animated());
 
-        self.strip_entry_placeholder_index = match current_media_type {
-            Some(MediaType::Image) if self.texture.is_some() => Some(self.current_index),
-            Some(MediaType::Video) if self.video_texture.is_some() => Some(self.current_index),
-            _ => None,
-        };
-
-        self.manga_wheel_scroll_pending = 0.0;
-        self.stop_manga_autoscroll();
-        self.manga_mode = true;
-
-        // Close any playing fullscreen video when entering manga mode.
-        if let Some(player) = self.video_player.take() {
-            drop(player);
-        }
-        self.show_video_controls = false;
-
-        // Stop non-manga animation streaming while we render strip content.
-        self.anim_stream_rx = None;
-        self.anim_stream_path = None;
-        self.anim_stream_done = true;
-        self.anim_seekbar_total_frames = None;
-
-        self.manga_video_user_muted = None;
-        self.manga_video_user_volume = None;
-
-        if self.manga_loader.is_none() {
-            self.manga_loader = Some(MangaLoader::new());
-        }
-
-        if let (Some((w, h)), Some(media_type), Some(ref mut loader)) = (
+        self.prepare_enter_manga_mode_state(current_media_type);
+        self.cache_current_media_dimensions_for_manga(
             current_media_dims,
             current_media_type,
-            self.manga_loader.as_mut(),
-        ) {
-            let manga_media_type = match media_type {
-                MediaType::Video => MangaMediaType::Video,
-                MediaType::Image => {
-                    if current_image_is_animated {
-                        MangaMediaType::AnimatedImage
-                    } else {
-                        MangaMediaType::StaticImage
-                    }
-                }
-            };
-            loader
-                .dimension_cache
-                .insert(self.current_index, (w, h, manga_media_type));
-        }
+            current_image_is_animated,
+        );
     }
 
     #[allow(dead_code)]
@@ -2621,64 +2666,24 @@ impl ImageViewer {
             let current_image_is_animated =
                 self.image.as_ref().is_some_and(|img| img.is_animated());
 
-            self.strip_entry_placeholder_index = match current_media_type {
-                Some(MediaType::Image) if self.texture.is_some() => Some(self.current_index),
-                Some(MediaType::Video) if self.video_texture.is_some() => Some(self.current_index),
-                _ => None,
-            };
-
-            self.manga_mode = true;
-            self.stop_manga_autoscroll();
-
-            // Close any playing fullscreen video when entering manga mode
-            // This prevents audio from the fullscreen video continuing to play
-            if let Some(player) = self.video_player.take() {
-                drop(player);
-            }
-            self.show_video_controls = false;
-
-            // Stop any non-manga animated WebP streaming; manga mode manages animation per item.
-            self.anim_stream_rx = None;
-            self.anim_stream_path = None;
-            self.anim_stream_done = true;
-            self.anim_seekbar_total_frames = None;
-
-            // Reset manga video user preferences when entering manga mode
-            // (they'll use config defaults initially)
-            self.manga_video_user_muted = None;
-            self.manga_video_user_volume = None;
+            self.prepare_enter_manga_mode_state(current_media_type);
 
             // Manga layout cache must be rebuilt for the new mode.
             self.invalidate_manga_layout_cache();
 
-            // Initialize the parallel manga loader if not already created
-            if self.manga_loader.is_none() {
-                self.manga_loader = Some(MangaLoader::new());
-            }
-
             // Pre-cache all image dimensions in parallel (reads file headers only - very fast)
             if let Some(ref mut loader) = self.manga_loader {
                 loader.cache_all_dimensions(&self.image_list);
-
-                // Ensure the currently viewed item has accurate dimensions immediately.
-                // This prevents stretched/overlap artifacts while entering strip mode,
-                // especially when the current index is outside the initial cached range.
-                if let (Some((w, h)), Some(media_type)) = (current_media_dims, current_media_type) {
-                    let manga_media_type = match media_type {
-                        MediaType::Video => MangaMediaType::Video,
-                        MediaType::Image => {
-                            if current_image_is_animated {
-                                MangaMediaType::AnimatedImage
-                            } else {
-                                MangaMediaType::StaticImage
-                            }
-                        }
-                    };
-                    loader
-                        .dimension_cache
-                        .insert(self.current_index, (w, h, manga_media_type));
-                }
             }
+
+            // Ensure the currently viewed item has accurate dimensions immediately.
+            // This prevents stretched/overlap artifacts while entering strip mode,
+            // especially when the current index is outside the initial cached range.
+            self.cache_current_media_dimensions_for_manga(
+                current_media_dims,
+                current_media_type,
+                current_image_is_animated,
+            );
 
             // Dimensions may have changed; rebuild height cache.
             self.invalidate_manga_layout_cache();
@@ -2967,15 +2972,11 @@ impl ImageViewer {
         }
 
         // Clear manga video players and textures
-        self.manga_video_players.clear();
+        self.clear_manga_runtime_workloads();
         self.manga_video_textures.clear();
-        self.manga_focused_video_index = None;
 
         // Clear animated images and streaming state
         self.manga_animated_images.clear();
-        self.manga_focused_anim_index = None;
-        self.manga_anim_streams.clear();
-        self.manga_anim_stream_done.clear();
         self.manga_anim_failed.clear();
         self.manga_anim_seekbar_total_frames.clear();
 
@@ -3132,6 +3133,11 @@ impl ImageViewer {
                 .get(focused_idx)
                 .map_or(false, |p| is_supported_video(p));
 
+        let muted_override = self.manga_video_user_muted;
+        let volume_override = self.manga_video_user_volume;
+        let muted = muted_override.unwrap_or(self.config.video_muted_by_default);
+        let volume = volume_override.unwrap_or(self.config.video_default_volume);
+
         if focused_is_video {
             // Focus changed to a video
             if self.manga_focused_video_index != Some(focused_idx) {
@@ -3148,25 +3154,12 @@ impl ImageViewer {
                         let _ = player.play();
                     }
                     // Apply user's persisted mute/volume settings to existing player
-                    if let Some(muted) = self.manga_video_user_muted {
-                        player.set_muted(muted);
-                    }
-                    if let Some(vol) = self.manga_video_user_volume {
-                        player.set_volume(vol);
-                    }
+                    Self::apply_video_audio_overrides(player, muted_override, volume_override);
                 } else {
                     // Create new video player for focused item
                     if let Some(path) = self.image_list.get(focused_idx) {
                         // Ensure GStreamer is initialized
                         self.gstreamer_initialized = true;
-
-                        // Use user's persisted settings, or config defaults if not set
-                        let muted = self
-                            .manga_video_user_muted
-                            .unwrap_or(self.config.video_muted_by_default);
-                        let volume = self
-                            .manga_video_user_volume
-                            .unwrap_or(self.config.video_default_volume);
 
                         match VideoPlayer::new(path, muted, volume) {
                             Ok(mut player) => {
@@ -3221,11 +3214,7 @@ impl ImageViewer {
             .manga_video_players
             .keys()
             .map(|&idx| {
-                let dist = if idx > focused_idx {
-                    idx - focused_idx
-                } else {
-                    focused_idx - idx
-                };
+                let dist = idx.abs_diff(focused_idx);
                 (idx, dist)
             })
             .collect();
@@ -6364,10 +6353,7 @@ impl ImageViewer {
         // In manga mode, animated WebPs are handled per-item; don't stream/play the
         // fullscreen animation pipeline.
         if self.manga_mode {
-            self.anim_stream_rx = None;
-            self.anim_stream_path = None;
-            self.anim_stream_done = true;
-            self.anim_seekbar_total_frames = None;
+            self.reset_fullscreen_anim_stream_state();
         }
 
         // ── Drain streamed animation frames (animated WebP) ──
@@ -6395,10 +6381,7 @@ impl ImageViewer {
                         }
                         Err(std::sync::mpsc::TryRecvError::Empty) => break,
                         Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                            self.anim_stream_done = true;
-                            self.anim_stream_rx = None;
-                            self.anim_stream_path = None;
-                            self.anim_seekbar_total_frames = None;
+                            self.reset_fullscreen_anim_stream_state();
                             break;
                         }
                     }
