@@ -425,9 +425,9 @@ impl StartupWindowMode {
     }
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        let mut config = Config {
+impl Config {
+    fn default_without_bindings() -> Self {
+        Self {
             bindings: HashMap::new(),
             action_bindings: HashMap::new(),
             controls_hide_delay: 0.5,
@@ -461,14 +461,20 @@ impl Default for Config {
             video_loop: true,
             startup_window_mode: StartupWindowMode::Floating,
             single_instance: true,
-            // Image quality defaults - use high quality filters
-            upscale_filter: ImageFilter::CatmullRom, // Good balance of quality and speed for upscaling
-            downscale_filter: ImageFilter::Lanczos3, // Highest quality for downscaling
-            gif_resize_filter: ImageFilter::Triangle, // Good quality, reasonable speed for animations
-            texture_filter_static: TextureFilter::Linear, // Smooth rendering for photos
-            texture_filter_animated: TextureFilter::Linear, // Smooth for animations
-            texture_filter_video: TextureFilter::Linear, // Smooth for video
-        };
+            // Image quality defaults
+            upscale_filter: ImageFilter::CatmullRom,
+            downscale_filter: ImageFilter::Lanczos3,
+            gif_resize_filter: ImageFilter::Triangle,
+            texture_filter_static: TextureFilter::Linear,
+            texture_filter_animated: TextureFilter::Linear,
+            texture_filter_video: TextureFilter::Linear,
+        }
+    }
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        let mut config = Self::default_without_bindings();
         config.set_defaults();
         config
     }
@@ -648,48 +654,7 @@ impl Config {
 
     /// Parse INI content into Config
     fn parse_ini(content: &str) -> Self {
-        let mut config = Config {
-            bindings: HashMap::new(),
-            action_bindings: HashMap::new(),
-            controls_hide_delay: 0.5,
-            bottom_overlay_hide_delay: 0.5,
-            double_click_grace_period: 0.35,
-            show_fps: false,
-            resize_border_size: 6.0,
-            background_rgb: [0, 0, 0],
-            fullscreen_reset_fit_on_enter: true,
-            zoom_animation_speed: 20.0,
-            zoom_step: 1.02,
-            max_zoom_percent: 1000.0,
-            manga_drag_pan_speed: 1.0,
-            manga_wheel_scroll_speed: 160.0,
-            manga_inertial_friction: 0.33,
-            manga_wheel_multiplier: 1.5,
-            manga_arrow_scroll_speed: 140.0,
-            manga_wheel_smooth_like_arrow_keys: true,
-            manga_autoscroll_dead_zone_px: 14.0,
-            manga_autoscroll_base_speed_multiplier: 5.0,
-            manga_autoscroll_min_speed_multiplier: 0.6,
-            manga_autoscroll_max_speed_multiplier: 14.0,
-            manga_autoscroll_curve_power: 2.0,
-            manga_autoscroll_min_speed_px_per_sec: 80.0,
-            manga_autoscroll_max_speed_px_per_sec: 14000.0,
-            manga_autoscroll_horizontal_speed_multiplier: 1.0,
-            manga_autoscroll_vertical_speed_multiplier: 1.0,
-            strip_item_open_binding: InputBinding::MouseRight,
-            video_muted_by_default: true,
-            video_default_volume: 0.0,
-            video_loop: true,
-            startup_window_mode: StartupWindowMode::Floating,
-            single_instance: true,
-            // Image quality defaults
-            upscale_filter: ImageFilter::CatmullRom,
-            downscale_filter: ImageFilter::Lanczos3,
-            gif_resize_filter: ImageFilter::Triangle,
-            texture_filter_static: TextureFilter::Linear,
-            texture_filter_animated: TextureFilter::Linear,
-            texture_filter_video: TextureFilter::Linear,
-        };
+        let mut config = Self::default_without_bindings();
 
         let mut in_shortcuts_section = false;
         let mut in_settings_section = false;
