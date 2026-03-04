@@ -4943,7 +4943,26 @@ impl ImageViewer {
         true
     }
 
-    fn draw_manga_item(&mut self, ui: &mut egui::Ui, idx: usize, image_rect: egui::Rect) {
+    fn manga_request_retry_for_visible_item(&mut self, index: usize) -> bool {
+        if !self.manga_mode {
+            return false;
+        }
+
+        if self.image_list.is_empty() {
+            return false;
+        }
+
+        self.manga_loader
+            .as_mut()
+            .map(|loader| {
+                loader.request_visible_retry(&self.image_list, index, self.max_texture_side)
+            })
+            .unwrap_or(false)
+    }
+
+    fn draw_manga_item(&mut self, ui: &mut egui::Ui, idx: usize, image_rect: egui::Rect) -> bool {
+        let mut requested_retry = false;
+
         // Check if this item is a video
         let is_video = self
             .manga_loader
@@ -5041,6 +5060,8 @@ impl ImageViewer {
                         egui::Color32::from_gray(100),
                     );
                 }
+
+                requested_retry |= self.manga_request_retry_for_visible_item(idx);
             } else {
                 // Video not yet loaded - draw placeholder with video icon
                 ui.painter()
@@ -5052,6 +5073,8 @@ impl ImageViewer {
                     egui::FontId::proportional(32.0),
                     egui::Color32::from_gray(100),
                 );
+
+                requested_retry |= self.manga_request_retry_for_visible_item(idx);
             }
         } else {
             // Image item: use regular texture cache
@@ -5096,6 +5119,8 @@ impl ImageViewer {
                         egui::Color32::from_gray(80),
                     );
                 }
+
+                requested_retry |= self.manga_request_retry_for_visible_item(idx);
             } else {
                 // Image not loaded yet - draw a placeholder
                 ui.painter()
@@ -5109,8 +5134,12 @@ impl ImageViewer {
                     egui::FontId::proportional(24.0),
                     egui::Color32::from_gray(80),
                 );
+
+                requested_retry |= self.manga_request_retry_for_visible_item(idx);
             }
         }
+
+        requested_retry
     }
 
     /// Draw images in manga (vertical strip) mode
@@ -5696,6 +5725,7 @@ impl ImageViewer {
         };
 
         // Draw images in vertical strip
+        let mut requested_visible_retry = false;
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(self.background_color32()))
             .show(ctx, |ui| {
@@ -5715,7 +5745,9 @@ impl ImageViewer {
 
                         let image_rect =
                             item.to_screen_rect(zoom, self.offset.x, self.manga_scroll_offset);
-                        self.draw_manga_item(ui, idx, image_rect);
+                        if self.draw_manga_item(ui, idx, image_rect) {
+                            requested_visible_retry = true;
+                        }
                     }
                 } else {
                     let mut y_offset: f32 = first_visible_y - self.manga_scroll_offset;
@@ -5744,7 +5776,9 @@ impl ImageViewer {
                             egui::Vec2::new(display_width, display_height),
                         );
 
-                        self.draw_manga_item(ui, idx, image_rect);
+                        if self.draw_manga_item(ui, idx, image_rect) {
+                            requested_visible_retry = true;
+                        }
                         y_offset += img_height;
                     }
                 }
@@ -5839,13 +5873,21 @@ impl ImageViewer {
                 }
             });
 
+        if requested_visible_retry {
+            animation_active = true;
+        }
+
         // Retry preload updates only while there is still background work in flight.
         // When fully idle, avoid periodic O(n) scans that keep CPU usage elevated.
         if has_pending_loads {
             self.manga_update_preload_queue();
         }
 
-        animation_active || has_pending_loads || has_active_video || has_active_animation
+        animation_active
+            || has_pending_loads
+            || has_active_video
+            || has_active_animation
+            || requested_visible_retry
     }
 
     /// Get the current media display dimensions (works for both images and videos)

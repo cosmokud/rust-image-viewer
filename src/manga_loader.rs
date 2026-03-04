@@ -23,7 +23,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, TrySendError};
 use image::imageops::FilterType;
@@ -71,6 +71,11 @@ const DIM_REQUEST_BATCH_SIZE: usize = 64;
 
 /// Maximum number of dimension results bundled into a single result message.
 const DIM_RESULT_CHUNK_SIZE: usize = 64;
+
+/// Base backoff for decode retries after a failed/empty preload.
+const PRELOAD_RETRY_BASE_DELAY_MS: u64 = 250;
+/// Cap retry backoff so visible items recover quickly once they come into view.
+const PRELOAD_RETRY_MAX_DELAY_MS: u64 = 4000;
 
 /// Media type for manga items (extended to include videos/animations)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -120,6 +125,12 @@ struct DimResult {
     items: Vec<(usize, u32, u32, MangaMediaType)>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct RetryState {
+    attempts: u8,
+    next_retry_at: Instant,
+}
+
 /// High-performance manga image loader with parallel decoding.
 pub struct MangaLoader {
     /// Channel to send load requests to worker threads
@@ -130,6 +141,9 @@ pub struct MangaLoader {
     loading_indices: Arc<RwLock<HashSet<usize>>>,
     /// Set of indices that have been loaded (to avoid re-requesting)
     loaded_indices: Arc<RwLock<HashSet<usize>>>,
+    /// Retry state for indices whose decode failed or produced no usable pixels.
+    /// Failed items are retried with backoff, and only aggressively retried when visible.
+    retry_state: Arc<RwLock<HashMap<usize, RetryState>>>,
     /// Cached original dimensions and media type (from file headers) for stable layout
     /// Maps index -> (width, height, media_type)
     pub dimension_cache: HashMap<usize, (u32, u32, MangaMediaType)>,
@@ -176,12 +190,14 @@ impl MangaLoader {
 
         let loading_indices = Arc::new(RwLock::new(HashSet::new()));
         let loaded_indices = Arc::new(RwLock::new(HashSet::new()));
+        let retry_state = Arc::new(RwLock::new(HashMap::new()));
         let shutdown = Arc::new(AtomicBool::new(false));
         let generation = Arc::new(AtomicUsize::new(0));
 
         // Spawn a coordinator thread that processes requests using Rayon
         let loading_clone = Arc::clone(&loading_indices);
         let loaded_clone = Arc::clone(&loaded_indices);
+        let retry_clone = Arc::clone(&retry_state);
         let shutdown_clone = Arc::clone(&shutdown);
         let generation_clone = Arc::clone(&generation);
 
@@ -193,6 +209,7 @@ impl MangaLoader {
                     result_tx,
                     loading_clone,
                     loaded_clone,
+                    retry_clone,
                     shutdown_clone,
                     generation_clone,
                 );
@@ -271,6 +288,7 @@ impl MangaLoader {
             result_rx,
             loading_indices,
             loaded_indices,
+            retry_state,
             dimension_cache: HashMap::new(),
             dim_request_tx,
             dim_result_rx,
@@ -394,6 +412,7 @@ impl MangaLoader {
         result_tx: Sender<DecodedImage>,
         loading_indices: Arc<RwLock<HashSet<usize>>>,
         loaded_indices: Arc<RwLock<HashSet<usize>>>,
+        retry_state: Arc<RwLock<HashMap<usize, RetryState>>>,
         shutdown: Arc<AtomicBool>,
         generation: Arc<AtomicUsize>,
     ) {
@@ -439,35 +458,46 @@ impl MangaLoader {
             // with stale work.
             let generation_changed = || generation.load(Ordering::Acquire) != current_gen;
 
-            let process_one = |req: &LoadRequest| -> (usize, Option<DecodedImage>) {
+            enum DecodeOutcome {
+                Skipped,
+                Failed,
+                Decoded(DecodedImage),
+            }
+
+            let process_one = |req: &LoadRequest| -> (usize, DecodeOutcome) {
                 // Skip if already loaded or if we've been shut down
                 if shutdown.load(Ordering::Relaxed) {
-                    return (req.index, None);
+                    return (req.index, DecodeOutcome::Skipped);
                 }
 
                 // Skip stale requests (e.g., after fast scrollbar jumps / cancel).
                 if req.generation != current_gen {
-                    return (req.index, None);
+                    return (req.index, DecodeOutcome::Skipped);
                 }
 
                 // Check if already in loaded set
                 {
                     let loaded = loaded_indices.read();
                     if loaded.contains(&req.index) {
-                        return (req.index, None);
+                        return (req.index, DecodeOutcome::Skipped);
                     }
                 }
 
                 // Load the image
                 let decoded = Self::load_single_image(req);
 
-                (req.index, decoded)
+                let outcome = match decoded {
+                    Some(decoded) => DecodeOutcome::Decoded(decoded),
+                    None => DecodeOutcome::Failed,
+                };
+
+                (req.index, outcome)
             };
 
             // IMPORTANT: for "urgent" requests (negative priority), decode the single highest
             // priority request first (serially) so it is not competing with neighbor prefetch.
             // This is the key to making far jumps feel instant.
-            let mut results: Vec<(usize, Option<DecodedImage>)> = Vec::with_capacity(batch.len());
+            let mut results: Vec<(usize, DecodeOutcome)> = Vec::with_capacity(batch.len());
 
             if batch.first().map_or(false, |r| r.priority < 0) {
                 if let Some(first) = batch.first() {
@@ -476,14 +506,14 @@ impl MangaLoader {
 
                 if generation_changed() {
                     // Drop everything from this batch (stale now).
-                    for (idx, _decoded_opt) in results.drain(..) {
+                    for (idx, _outcome) in results.drain(..) {
                         loading_indices.write().remove(&idx);
                     }
                     continue;
                 }
 
                 if batch.len() > 1 {
-                    let tail: Vec<(usize, Option<DecodedImage>)> =
+                    let tail: Vec<(usize, DecodeOutcome)> =
                         batch[1..].par_iter().map(process_one).collect();
                     results.extend(tail);
                 }
@@ -497,34 +527,82 @@ impl MangaLoader {
             // even though the main thread never received it, leaving placeholders stuck forever.
             if generation_changed() {
                 // Generation changed while decoding; treat all results as stale.
-                for (idx, _decoded_opt) in results {
+                for (idx, _outcome) in results {
                     loading_indices.write().remove(&idx);
                 }
                 continue;
             }
 
-            for (idx, decoded_opt) in results {
+            for (idx, outcome) in results {
                 // Request has finished one way or another; allow it to be re-requested if needed.
                 loading_indices.write().remove(&idx);
 
-                let Some(decoded) = decoded_opt else {
-                    continue;
-                };
+                match outcome {
+                    DecodeOutcome::Skipped => continue,
+                    DecodeOutcome::Failed => {
+                        Self::register_decode_failure(&loaded_indices, &retry_state, idx);
+                    }
+                    DecodeOutcome::Decoded(decoded) => {
+                        // A decoded payload with empty pixels/dimensions is still useful for metadata
+                        // (e.g., video dimension fallback), but does not satisfy texture preloading.
+                        let has_usable_pixels =
+                            !decoded.pixels.is_empty() && decoded.width > 0 && decoded.height > 0;
 
-                match result_tx.try_send(decoded) {
-                    Ok(_) => {
-                        loaded_indices.write().insert(idx);
-                    }
-                    Err(TrySendError::Full(_decoded)) => {
-                        // Channel full: drop decoded result.
-                        // We intentionally do NOT mark as loaded so the main thread can re-request.
-                    }
-                    Err(TrySendError::Disconnected(_decoded)) => {
-                        return; // Main thread gone, exit
+                        match result_tx.try_send(decoded) {
+                            Ok(_) => {
+                                if has_usable_pixels {
+                                    loaded_indices.write().insert(idx);
+                                    retry_state.write().remove(&idx);
+                                } else {
+                                    Self::register_decode_failure(&loaded_indices, &retry_state, idx);
+                                }
+                            }
+                            Err(TrySendError::Full(_decoded)) => {
+                                // Channel full: drop decoded result.
+                                // We intentionally do NOT mark as loaded so the main thread can re-request.
+                                loaded_indices.write().remove(&idx);
+                            }
+                            Err(TrySendError::Disconnected(_decoded)) => {
+                                return; // Main thread gone, exit
+                            }
+                        }
                     }
                 }
             }
         }
+    }
+
+    fn retry_backoff_for_attempt(attempts: u8) -> Duration {
+        let shift = attempts.saturating_sub(1).min(6) as u32;
+        let factor = 1u64 << shift;
+        let delay_ms = PRELOAD_RETRY_BASE_DELAY_MS
+            .saturating_mul(factor)
+            .min(PRELOAD_RETRY_MAX_DELAY_MS);
+        Duration::from_millis(delay_ms)
+    }
+
+    fn register_decode_failure(
+        loaded_indices: &Arc<RwLock<HashSet<usize>>>,
+        retry_state: &Arc<RwLock<HashMap<usize, RetryState>>>,
+        index: usize,
+    ) {
+        loaded_indices.write().remove(&index);
+
+        let now = Instant::now();
+        let mut retry = retry_state.write();
+        let attempts = retry
+            .get(&index)
+            .map(|state| state.attempts)
+            .unwrap_or(0)
+            .saturating_add(1);
+        let next_retry_at = now + Self::retry_backoff_for_attempt(attempts);
+        retry.insert(
+            index,
+            RetryState {
+                attempts,
+                next_retry_at,
+            },
+        );
     }
 
     /// Load a single image on a worker thread.
@@ -896,10 +974,12 @@ impl MangaLoader {
         // Collect indices that need loading
         let mut requests: Vec<LoadRequest> = Vec::new();
         let generation = self.current_generation;
+        let now = Instant::now();
 
         {
             let loading = self.loading_indices.read();
             let loaded = self.loaded_indices.read();
+            let retry = self.retry_state.read();
 
             for idx in start_idx..end_idx {
                 // Check if file is a supported media type (image or video)
@@ -912,6 +992,14 @@ impl MangaLoader {
                 // Skip if already loading or loaded
                 if loading.contains(&idx) || loaded.contains(&idx) {
                     continue;
+                }
+
+                if let Some(retry_state) = retry.get(&idx) {
+                    let retry_due = now >= retry_state.next_retry_at;
+                    let can_retry_here = idx == visible_index;
+                    if !retry_due || !can_retry_here {
+                        continue;
+                    }
                 }
 
                 // Calculate priority based on distance from visible index
@@ -1056,6 +1144,7 @@ impl MangaLoader {
         // Clear indices
         self.loading_indices.write().clear();
         self.loaded_indices.write().clear();
+        self.retry_state.write().clear();
 
         // Clear dimension cache
         self.dimension_cache.clear();
@@ -1079,6 +1168,58 @@ impl MangaLoader {
     /// Mark an index as needing reload (called when cache is evicted).
     pub fn mark_unloaded(&mut self, index: usize) {
         self.loaded_indices.write().remove(&index);
+        self.retry_state.write().remove(&index);
+    }
+
+    /// Force a high-priority retry for a visible item that is missing a texture.
+    ///
+    /// This is used as a self-healing path when UI detects an in-view placeholder
+    /// but loader bookkeeping says the item was already loaded.
+    pub fn request_visible_retry(
+        &mut self,
+        image_list: &[PathBuf],
+        index: usize,
+        max_texture_side: u32,
+    ) -> bool {
+        let Some(path) = image_list.get(index).cloned() else {
+            return false;
+        };
+
+        if !is_supported_image(&path) && !is_supported_video(&path) {
+            return false;
+        }
+
+        if self.loading_indices.read().contains(&index) {
+            return false;
+        }
+
+        let now = Instant::now();
+        if let Some(retry_state) = self.retry_state.read().get(&index).copied() {
+            if now < retry_state.next_retry_at {
+                return false;
+            }
+        }
+
+        // Visible placeholder takes precedence over stale loaded bookkeeping.
+        self.loaded_indices.write().remove(&index);
+
+        let req = LoadRequest {
+            generation: self.current_generation,
+            index,
+            path,
+            max_texture_side,
+            priority: -200_000,
+        };
+
+        match self.request_tx.try_send(req) {
+            Ok(()) => {
+                self.loading_indices.write().insert(index);
+                self.stats.images_pending = self.loading_indices.read().len();
+                true
+            }
+            Err(TrySendError::Full(_req)) => false,
+            Err(TrySendError::Disconnected(_req)) => false,
+        }
     }
 
     /// Cancel all pending load requests (called on large jumps like Home/End or fast scrollbar drag).
@@ -1093,8 +1234,21 @@ impl MangaLoader {
         // Clear loading indices (they'll be re-requested around the new position)
         self.loading_indices.write().clear();
 
-        // Drain result channel to clear stale decoded images
-        while self.result_rx.try_recv().is_ok() {}
+        // Drain result channel to clear stale decoded images.
+        // Any drained decoded index may have been marked as loaded by workers,
+        // so clear loaded bookkeeping for those entries.
+        let mut drained_indices: Vec<usize> = Vec::new();
+        while let Ok(decoded) = self.result_rx.try_recv() {
+            drained_indices.push(decoded.index);
+        }
+        if !drained_indices.is_empty() {
+            let mut loaded = self.loaded_indices.write();
+            let mut retry = self.retry_state.write();
+            for idx in drained_indices {
+                loaded.remove(&idx);
+                retry.remove(&idx);
+            }
+        }
 
         // Clear any queued dimension probes and drain stale results
         self.dim_pending.clear();
