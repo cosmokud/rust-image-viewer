@@ -63,6 +63,7 @@ const LARGE_JUMP_INDEX_THRESHOLD: usize = 32;
 
 /// Batch size for GPU texture uploads per frame.
 /// Uploading too many textures in one frame can cause stutters.
+#[allow(dead_code)]
 const UPLOAD_BATCH_SIZE: usize = 4;
 
 /// Maximum number of dimension probe items to include in a single request.
@@ -110,6 +111,8 @@ pub struct LoadRequest {
     pub generation: usize,
     pub index: usize,
     pub path: PathBuf,
+    /// Maximum texture side used for video thumbnail extraction fallback.
+    /// Static/animated image decode stays full-resolution for GPU-side scaling.
     pub max_texture_side: u32,
     pub priority: i32, // Lower = higher priority
 }
@@ -397,9 +400,12 @@ impl MangaLoader {
             }
 
             for (idx, w, h, mt) in res.items {
+                let changed = self.dimension_cache.get(&idx).copied() != Some((w, h, mt));
                 self.dimension_cache.insert(idx, (w, h, mt));
                 self.dim_pending.remove(&idx);
-                updated.push(idx);
+                if changed {
+                    updated.push(idx);
+                }
             }
         }
 
@@ -660,7 +666,7 @@ impl MangaLoader {
                 let img = if is_animated_webp {
                     LoadedImage::load_first_frame_only(
                         &req.path,
-                        Some(req.max_texture_side),
+                        None,
                         downscale_filter,
                         gif_filter,
                     )
@@ -668,7 +674,7 @@ impl MangaLoader {
                 } else {
                     LoadedImage::load_with_max_texture_side(
                         &req.path,
-                        Some(req.max_texture_side),
+                        None,
                         downscale_filter,
                         gif_filter,
                     )
@@ -686,20 +692,11 @@ impl MangaLoader {
 
                 let frame = img.current_frame_data();
 
-                // Downscale if needed (should already be done by loader, but safety check)
-                let (width, height, pixels) = downscale_rgba_if_needed(
-                    frame.width,
-                    frame.height,
-                    &frame.pixels,
-                    req.max_texture_side,
-                    downscale_filter,
-                );
-
                 Some(DecodedImage {
                     index: req.index,
-                    pixels: pixels.into_owned(),
-                    width,
-                    height,
+                    pixels: frame.pixels.clone(),
+                    width: frame.width,
+                    height: frame.height,
                     original_width,
                     original_height,
                     media_type: manga_media_type,
@@ -1064,10 +1061,20 @@ impl MangaLoader {
 
     /// Poll for decoded images ready for GPU upload.
     /// Returns up to UPLOAD_BATCH_SIZE images per call to avoid frame drops.
+    #[allow(dead_code)]
     pub fn poll_decoded_images(&mut self) -> Vec<DecodedImage> {
-        let mut results = Vec::with_capacity(UPLOAD_BATCH_SIZE);
+        self.poll_decoded_images_limited(UPLOAD_BATCH_SIZE)
+    }
 
-        for _ in 0..UPLOAD_BATCH_SIZE {
+    /// Poll for decoded images ready for GPU upload with a caller-specified cap.
+    pub fn poll_decoded_images_limited(&mut self, max_images: usize) -> Vec<DecodedImage> {
+        if max_images == 0 {
+            return Vec::new();
+        }
+
+        let mut results = Vec::with_capacity(max_images);
+
+        for _ in 0..max_images {
             match self.result_rx.try_recv() {
                 Ok(decoded) => {
                     // Cache dimensions and media type for stable layout
@@ -1087,6 +1094,44 @@ impl MangaLoader {
         }
 
         results
+    }
+
+    /// Synchronously ensure header dimensions are present for a single media item.
+    ///
+    /// This is used by masonry layout reservation to guarantee stable rects
+    /// before full decode/upload is complete.
+    pub fn ensure_dimension_now(
+        &mut self,
+        index: usize,
+        path: &std::path::Path,
+    ) -> Option<(u32, u32, MangaMediaType)> {
+        if let Some((w, h, mt)) = self.dimension_cache.get(&index).copied() {
+            return Some((w, h, mt));
+        }
+
+        let is_video = is_supported_video(path);
+        let is_image = is_supported_image(path);
+        if !is_video && !is_image {
+            return None;
+        }
+
+        let dims = if is_video {
+            Self::probe_video_dimensions(path)
+        } else {
+            image::image_dimensions(path).ok()
+        }?;
+
+        let media_type = if is_video {
+            MangaMediaType::Video
+        } else {
+            MangaMediaType::StaticImage
+        };
+
+        self.dimension_cache
+            .insert(index, (dims.0, dims.1, media_type));
+        self.dim_pending.remove(&index);
+
+        Some((dims.0, dims.1, media_type))
     }
 
     /// Start async dimension caching for all images in the list.
@@ -1420,6 +1465,11 @@ impl MangaTextureCache {
     /// Check if an index is in the cache without updating access time.
     pub fn contains(&self, index: usize) -> bool {
         self.entries.contains_key(&index)
+    }
+
+    /// Peek texture ID without updating LRU access time.
+    pub fn peek_texture_id(&self, index: usize) -> Option<egui::TextureId> {
+        self.entries.get(&index).map(|entry| entry.0.id())
     }
 
     /// Insert a texture into the cache.

@@ -255,6 +255,17 @@ struct MasonryReturnState {
     cache_reuse_radius: usize,
 }
 
+/// Prepared state for a potential `egui_wgpu::CallbackFn` render path.
+///
+/// When `enabled` flips to true, the app can bypass standard egui image painting
+/// and submit the listed texture IDs through a dedicated wgpu callback pass.
+#[derive(Clone, Debug, Default)]
+struct MangaWgpuCallbackPlan {
+    enabled: bool,
+    visible_texture_count: usize,
+    texture_ids: Vec<egui::TextureId>,
+}
+
 /// Per-image view state for fullscreen mode memory.
 /// Stores zoom, pan, and transformation settings for each image path.
 #[derive(Clone, Debug)]
@@ -540,6 +551,9 @@ struct ImageViewer {
     masonry_layout_len: usize,
     masonry_layout_valid: bool,
 
+    /// Prepared metadata for a future `egui_wgpu::CallbackFn` escape hatch.
+    manga_wgpu_callback_plan: MangaWgpuCallbackPlan,
+
     /// Cooldown frames before updating preload queue (prevents cache churn during rapid navigation)
     manga_preload_cooldown: u32,
     /// Last frame when preload queue was updated (throttle updates)
@@ -749,6 +763,7 @@ impl Default for ImageViewer {
             masonry_layout_items_per_row: 0,
             masonry_layout_len: 0,
             masonry_layout_valid: false,
+            manga_wgpu_callback_plan: MangaWgpuCallbackPlan::default(),
 
             manga_preload_cooldown: 0,
             manga_last_preload_update: Instant::now(),
@@ -803,6 +818,7 @@ impl ImageViewer {
     const MANGA_HUD_PANEL_INNER_WIDTH: f32 = 208.0;
     const MANGA_HUD_PANEL_INNER_HEIGHT: f32 = 24.0;
     const MANGA_HUD_PANEL_VERTICAL_STEP: f32 = 48.0;
+    const MANGA_WGPU_CALLBACK_THRESHOLD: usize = 30;
 
     fn update_fps_stats(&mut self) {
         let now = Instant::now();
@@ -2579,17 +2595,29 @@ impl ImageViewer {
         self.manga_update_preload_queue();
     }
 
-    fn masonry_item_aspect_ratio(&self, index: usize) -> f32 {
-        self.manga_loader
+    fn manga_get_or_probe_dimensions(&mut self, index: usize) -> Option<(u32, u32)> {
+        if let Some((w, h)) = self
+            .manga_loader
             .as_ref()
             .and_then(|loader| loader.get_dimensions(index))
-            .and_then(|(w, h)| {
-                if w > 0 && h > 0 {
-                    Some((h as f32 / w as f32).clamp(0.2, 5.0))
-                } else {
-                    None
-                }
-            })
+            .filter(|(w, h)| *w > 0 && *h > 0)
+        {
+            return Some((w, h));
+        }
+
+        let path = self.image_list.get(index).cloned()?;
+        let loader = self.manga_loader.as_mut()?;
+        let (w, h, _media_type) = loader.ensure_dimension_now(index, &path)?;
+        if w > 0 && h > 0 {
+            Some((w, h))
+        } else {
+            None
+        }
+    }
+
+    fn masonry_item_aspect_ratio(&mut self, index: usize) -> f32 {
+        self.manga_get_or_probe_dimensions(index)
+            .map(|(w, h)| (h as f32 / w as f32).clamp(0.2, 5.0))
             .unwrap_or(1.4)
     }
 
@@ -3961,17 +3989,9 @@ impl ImageViewer {
     }
 
     /// Get the display height of an image at a given index (scaled to fit screen height)
-    fn manga_get_image_display_height(&self, index: usize) -> f32 {
-        // IMPORTANT: for layout stability, prefer header dimensions from the manga loader.
-        // The texture we upload may be downscaled to fit GPU limits; using texture dimensions
-        // for layout would cause pages to "shrink" as they load, producing visible jitter.
-        let img_h = self
-            .manga_loader
-            .as_ref()
-            .and_then(|loader| loader.get_dimensions(index))
-            .map(|(_w, h)| h as f32);
-
-        if let Some(img_h) = img_h {
+    fn manga_get_image_display_height(&mut self, index: usize) -> f32 {
+        if let Some((_w, h)) = self.manga_get_or_probe_dimensions(index) {
+            let img_h = h as f32;
             if img_h > 0.0 {
                 let base_scale = if img_h > self.screen_size.y {
                     self.screen_size.y / img_h
@@ -3988,14 +4008,8 @@ impl ImageViewer {
     }
 
     /// Get the display width of an image at a given index (scaled to fit screen height)
-    fn manga_get_image_display_width(&self, index: usize) -> f32 {
-        // Prefer original/header dimensions for stable layout
-        let dims = self
-            .manga_loader
-            .as_ref()
-            .and_then(|loader| loader.get_dimensions(index));
-
-        if let Some((w, h)) = dims {
+    fn manga_get_image_display_width(&mut self, index: usize) -> f32 {
+        if let Some((w, h)) = self.manga_get_or_probe_dimensions(index) {
             let img_w = w as f32;
             let img_h = h as f32;
             if img_h > 0.0 {
@@ -4021,13 +4035,15 @@ impl ImageViewer {
         }
 
         let is_masonry = self.is_masonry_mode();
+        // Keep GPU upload burst bounded per frame, but never over-drain decoded results.
+        let max_uploads_per_frame: usize = if is_masonry { 4 } else { 8 };
 
         let Some(ref mut loader) = self.manga_loader else {
             return false;
         };
 
         // Poll for decoded images from the background threads
-        let decoded_images = loader.poll_decoded_images();
+        let decoded_images = loader.poll_decoded_images_limited(max_uploads_per_frame);
 
         // Also poll async dimension probe results (header reads), applied incrementally.
         // Limiting messages per frame prevents layout updates from causing bursts of work.
@@ -4043,12 +4059,8 @@ impl ImageViewer {
         let dims_updated = !decoded_images.is_empty() || !dim_updates.is_empty();
 
         // Upload decoded images to GPU as textures.
-        // Limit uploads per frame to prevent GPU stalls from bulk texture creation +
-        // mipmap generation. In masonry mode, many images can become visible at once
-        // (e.g. when scrolling fast), so we cap uploads to keep each frame's GPU
-        // submission lightweight. Remaining uploads happen on subsequent frames.
-        // In long-strip mode we allow more since fewer images are visible at once.
-        let max_uploads_per_frame: usize = if is_masonry { 3 } else { 6 };
+        // All uploads use linear min/mag + trilinear mip filtering so dynamic scaling
+        // and zooming are handled by GPU sampling, not CPU-side resize.
         let mut uploads_this_frame = 0usize;
 
         for decoded in decoded_images {
@@ -4062,43 +4074,17 @@ impl ImageViewer {
                 continue;
             }
 
-            // Defer remaining uploads to next frame to avoid GPU stalls
-            if uploads_this_frame >= max_uploads_per_frame {
-                // Re-send this image back to the loader so it will be re-polled next frame.
-                // The loader's channel will return it on the next poll_decoded_images() call.
-                // Since we can't easily re-queue, we just stop processing and let the channel
-                // buffer the remaining decoded results for next frame's poll.
-                break;
-            }
-
             // Create the texture
             let color_image = egui::ColorImage::from_rgba_unmultiplied(
                 [decoded.width as usize, decoded.height as usize],
                 &decoded.pixels,
             );
 
-            // Use appropriate texture filter based on media type.
-            // In masonry mode, images are displayed much smaller than native resolution,
-            // so trilinear mipmapping provides huge quality and GPU bandwidth savings.
-            // The hardware mipmap chain means the GPU reads from pre-scaled mip levels
-            // instead of the full-resolution texture, reducing memory bandwidth by ~90%.
-            let texture_options = if is_masonry
-                && decoded.media_type == MangaMediaType::StaticImage
-            {
-                // Force trilinear for masonry static images regardless of config.
-                // This is the single most important optimization for smooth masonry zooming.
-                egui::TextureOptions {
-                    magnification: egui::TextureFilter::Linear,
-                    minification: egui::TextureFilter::Linear,
-                    wrap_mode: egui::TextureWrapMode::ClampToEdge,
-                    mipmap_mode: Some(egui::TextureFilter::Linear),
-                }
-            } else if decoded.media_type == MangaMediaType::AnimatedImage
-                || decoded.media_type == MangaMediaType::Video
-            {
-                self.config.texture_filter_animated.to_egui_options()
-            } else {
-                self.config.texture_filter_static.to_egui_options()
+            let texture_options = egui::TextureOptions {
+                magnification: egui::TextureFilter::Linear,
+                minification: egui::TextureFilter::Linear,
+                wrap_mode: egui::TextureWrapMode::ClampToEdge,
+                mipmap_mode: Some(egui::TextureFilter::Linear),
             };
 
             let texture = ctx.load_texture(
@@ -4124,10 +4110,8 @@ impl ImageViewer {
             uploads_this_frame += 1;
         }
 
-        // If we hit the per-frame upload limit, request a repaint so the remaining
-        // decoded images (still buffered in the channel) get uploaded on the next frame.
-        // This spreads the GPU work across multiple frames for smooth animation.
-        if uploads_this_frame >= max_uploads_per_frame {
+        // If more decoded items are still pending, keep pumping uploads next frame.
+        if uploads_this_frame == max_uploads_per_frame && loader.pending_decoded_count() > 0 {
             ctx.request_repaint();
         }
 
@@ -5358,6 +5342,24 @@ impl ImageViewer {
             .unwrap_or(false)
     }
 
+    /// Prepare metadata for a future `egui_wgpu::CallbackFn` fast-path.
+    ///
+    /// This does not switch renderers yet; it keeps persistent state so enabling
+    /// a direct wgpu callback pass is a localized follow-up change.
+    fn manga_update_wgpu_callback_plan(&mut self, visible_indices: &[usize]) {
+        let texture_ids: Vec<egui::TextureId> = visible_indices
+            .iter()
+            .filter_map(|&idx| self.manga_texture_cache.peek_texture_id(idx))
+            .collect();
+
+        let visible_texture_count = texture_ids.len();
+        self.manga_wgpu_callback_plan = MangaWgpuCallbackPlan {
+            enabled: visible_texture_count >= Self::MANGA_WGPU_CALLBACK_THRESHOLD,
+            visible_texture_count,
+            texture_ids,
+        };
+    }
+
     fn draw_manga_item(&mut self, ui: &mut egui::Ui, idx: usize, image_rect: egui::Rect) -> bool {
         let mut requested_retry = false;
 
@@ -6256,6 +6258,7 @@ impl ImageViewer {
 
         // Draw images in vertical strip
         let mut requested_visible_retry = false;
+        let mut visible_indices: Vec<usize> = Vec::new();
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(self.background_color32()))
             .show(ctx, |ui| {
@@ -6323,6 +6326,7 @@ impl ImageViewer {
 
                         let image_rect =
                             item.to_screen_rect(zoom, self.offset.x, self.manga_scroll_offset);
+                        visible_indices.push(idx);
                         if self.draw_manga_item(ui, idx, image_rect) {
                             requested_visible_retry = true;
                         }
@@ -6354,6 +6358,7 @@ impl ImageViewer {
                             egui::Vec2::new(display_width, display_height),
                         );
 
+                        visible_indices.push(idx);
                         if self.draw_manga_item(ui, idx, image_rect) {
                             requested_visible_retry = true;
                         }
@@ -6457,6 +6462,8 @@ impl ImageViewer {
                 }
             });
 
+        self.manga_update_wgpu_callback_plan(&visible_indices);
+
         if requested_visible_retry {
             animation_active = true;
         }
@@ -6467,11 +6474,16 @@ impl ImageViewer {
             self.manga_update_preload_queue();
         }
 
+        let callback_plan_active = self.manga_wgpu_callback_plan.enabled
+            && self.manga_wgpu_callback_plan.visible_texture_count
+                == self.manga_wgpu_callback_plan.texture_ids.len();
+
         animation_active
             || has_pending_loads
             || has_active_video
             || has_active_animation
             || requested_visible_retry
+            || callback_plan_active
     }
 
     /// Get the current media display dimensions (works for both images and videos)
