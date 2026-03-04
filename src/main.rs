@@ -22,7 +22,6 @@ use single_instance::{FileReceiver, SingleInstanceResult};
 use video_player::{format_duration, VideoPlayer};
 
 use eframe::egui;
-use eframe::egui_wgpu;
 use image::imageops::FilterType;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -32,75 +31,6 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use eframe::glow::HasContext;
-
-const MANGA_WGPU_IMAGE_CALLBACK_SHADER: &str = r#"
-struct VsOut {
-    @builtin(position) position: vec4<f32>,
-    @location(0) uv: vec2<f32>,
-};
-
-@vertex
-fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VsOut {
-    var positions = array<vec2<f32>, 3>(
-        vec2<f32>(-1.0, -1.0),
-        vec2<f32>(3.0, -1.0),
-        vec2<f32>(-1.0, 3.0),
-    );
-    var uvs = array<vec2<f32>, 3>(
-        vec2<f32>(0.0, 0.0),
-        vec2<f32>(2.0, 0.0),
-        vec2<f32>(0.0, 2.0),
-    );
-
-    var out: VsOut;
-    out.position = vec4<f32>(positions[vertex_index], 0.0, 1.0);
-    out.uv = uvs[vertex_index];
-    return out;
-}
-
-@group(0) @binding(0)
-var image_tex: texture_2d<f32>;
-
-@group(0) @binding(1)
-var image_sampler: sampler;
-
-@fragment
-fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    return textureSample(image_tex, image_sampler, in.uv);
-}
-"#;
-
-struct MangaWgpuPaintResources {
-    pipeline: eframe::wgpu::RenderPipeline,
-}
-
-#[derive(Clone)]
-struct MangaWgpuImageCallback {
-    texture_id: egui::TextureId,
-    render_state: eframe::egui_wgpu::RenderState,
-}
-
-impl egui_wgpu::CallbackTrait for MangaWgpuImageCallback {
-    fn paint(
-        &self,
-        _info: egui::PaintCallbackInfo,
-        render_pass: &mut eframe::wgpu::RenderPass<'static>,
-        callback_resources: &egui_wgpu::CallbackResources,
-    ) {
-        let Some(resources) = callback_resources.get::<MangaWgpuPaintResources>() else {
-            return;
-        };
-
-        let renderer = self.render_state.renderer.read();
-        let Some(texture) = renderer.texture(&self.texture_id) else {
-            return;
-        };
-
-        render_pass.set_pipeline(&resources.pipeline);
-        render_pass.set_bind_group(0, &texture.bind_group, &[]);
-        render_pass.draw(0..3, 0..1);
-    }
-}
 
 /// Paint a smooth, semi-transparent loading spinner in the bottom-right corner
 /// of the given rectangle.  The spinner is a rotating arc that indicates
@@ -325,7 +255,7 @@ struct MasonryReturnState {
     cache_reuse_radius: usize,
 }
 
-/// Prepared state for a potential `egui_wgpu::CallbackTrait` render path.
+/// Prepared state for a potential `egui_wgpu::CallbackFn` render path.
 ///
 /// When `enabled` flips to true, the app can bypass standard egui image painting
 /// and submit the listed texture IDs through a dedicated wgpu callback pass.
@@ -430,12 +360,6 @@ struct ImageViewer {
     /// Maximum supported texture side for the active GPU backend.
     /// Used to prevent crashes when attempting to upload oversized images.
     max_texture_side: u32,
-
-    /// Active WGPU render state (present only when running with `Renderer::Wgpu`).
-    wgpu_render_state: Option<eframe::egui_wgpu::RenderState>,
-
-    /// True once callback pipeline resources are registered in egui_wgpu.
-    manga_wgpu_callback_resources_ready: bool,
 
     /// Apply startup window mode (floating/fullscreen) exactly once.
     startup_window_mode_applied: bool,
@@ -627,7 +551,7 @@ struct ImageViewer {
     masonry_layout_len: usize,
     masonry_layout_valid: bool,
 
-    /// Prepared metadata for a future `egui_wgpu::CallbackTrait` escape hatch.
+    /// Prepared metadata for a future `egui_wgpu::CallbackFn` escape hatch.
     manga_wgpu_callback_plan: MangaWgpuCallbackPlan,
 
     /// Cooldown frames before updating preload queue (prevents cache churn during rapid navigation)
@@ -746,8 +670,6 @@ impl Default for ImageViewer {
             toggle_fullscreen: false,
             request_minimize: false,
             max_texture_side: 4096,
-            wgpu_render_state: None,
-            manga_wgpu_callback_resources_ready: false,
             startup_window_mode_applied: false,
             pending_window_title: None,
             resize_direction: ResizeDirection::None,
@@ -1671,111 +1593,6 @@ impl ImageViewer {
         }
     }
 
-    fn refresh_wgpu_render_state(&mut self, frame: &eframe::Frame) {
-        if self.wgpu_render_state.is_none() {
-            self.wgpu_render_state = frame.wgpu_render_state().cloned();
-        }
-        self.ensure_manga_wgpu_callback_resources();
-    }
-
-    fn ensure_manga_wgpu_callback_resources(&mut self) {
-        if self.manga_wgpu_callback_resources_ready {
-            return;
-        }
-
-        let Some(render_state) = self.wgpu_render_state.clone() else {
-            return;
-        };
-
-        let device = &render_state.device;
-        let shader = device.create_shader_module(eframe::wgpu::ShaderModuleDescriptor {
-            label: Some("manga_wgpu_image_callback_shader"),
-            source: eframe::wgpu::ShaderSource::Wgsl(MANGA_WGPU_IMAGE_CALLBACK_SHADER.into()),
-        });
-
-        let texture_bind_group_layout =
-            device.create_bind_group_layout(&eframe::wgpu::BindGroupLayoutDescriptor {
-                label: Some("manga_wgpu_image_callback_layout"),
-                entries: &[
-                    eframe::wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: eframe::wgpu::ShaderStages::FRAGMENT,
-                        ty: eframe::wgpu::BindingType::Texture {
-                            multisampled: false,
-                            sample_type: eframe::wgpu::TextureSampleType::Float {
-                                filterable: true,
-                            },
-                            view_dimension: eframe::wgpu::TextureViewDimension::D2,
-                        },
-                        count: None,
-                    },
-                    eframe::wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: eframe::wgpu::ShaderStages::FRAGMENT,
-                        ty: eframe::wgpu::BindingType::Sampler(
-                            eframe::wgpu::SamplerBindingType::Filtering,
-                        ),
-                        count: None,
-                    },
-                ],
-            });
-
-        let pipeline_layout =
-            device.create_pipeline_layout(&eframe::wgpu::PipelineLayoutDescriptor {
-                label: Some("manga_wgpu_image_callback_pipeline_layout"),
-                bind_group_layouts: &[&texture_bind_group_layout],
-                push_constant_ranges: &[],
-            });
-
-        let pipeline = device.create_render_pipeline(&eframe::wgpu::RenderPipelineDescriptor {
-            label: Some("manga_wgpu_image_callback_pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: eframe::wgpu::VertexState {
-                module: &shader,
-                entry_point: "vs_main",
-                buffers: &[],
-                compilation_options: eframe::wgpu::PipelineCompilationOptions::default(),
-            },
-            primitive: eframe::wgpu::PrimitiveState {
-                topology: eframe::wgpu::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: eframe::wgpu::FrontFace::Ccw,
-                cull_mode: None,
-                unclipped_depth: false,
-                polygon_mode: eframe::wgpu::PolygonMode::Fill,
-                conservative: false,
-            },
-            depth_stencil: None,
-            multisample: eframe::wgpu::MultisampleState::default(),
-            fragment: Some(eframe::wgpu::FragmentState {
-                module: &shader,
-                entry_point: "fs_main",
-                targets: &[Some(eframe::wgpu::ColorTargetState {
-                    format: render_state.target_format,
-                    blend: Some(eframe::wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: eframe::wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: eframe::wgpu::PipelineCompilationOptions::default(),
-            }),
-            multiview: None,
-            cache: None,
-        });
-
-        render_state
-            .renderer
-            .write()
-            .callback_resources
-            .insert(MangaWgpuPaintResources { pipeline });
-
-        self.manga_wgpu_callback_resources_ready = true;
-    }
-
-    fn manga_wgpu_callback_fast_path_enabled(&self) -> bool {
-        self.manga_wgpu_callback_resources_ready
-            && self.wgpu_render_state.is_some()
-            && self.manga_wgpu_callback_plan.enabled
-    }
-
     fn reset_manga_video_user_preferences(&mut self) {
         self.manga_video_user_muted = None;
         self.manga_video_user_volume = None;
@@ -1898,27 +1715,17 @@ impl ImageViewer {
         viewer.startup_hide_started_at = Instant::now();
 
         // Determine the maximum texture size supported by the active backend.
-        // Oversized textures can crash or be rejected by backend validation.
-        let max_texture_side_gl = cc
+        // This viewer uses eframe's OpenGL (glow) integration; oversized textures can crash.
+        viewer.max_texture_side = cc
             .gl
             .as_ref()
             .and_then(|gl| unsafe {
                 gl.get_parameter_i32(eframe::glow::MAX_TEXTURE_SIZE)
                     .try_into()
                     .ok()
-            });
-
-        let max_texture_side_wgpu = cc
-            .wgpu_render_state
-            .as_ref()
-            .map(|state| state.device.limits().max_texture_dimension_2d);
-
-        viewer.wgpu_render_state = cc.wgpu_render_state.clone();
-        viewer.max_texture_side = max_texture_side_wgpu
-            .or(max_texture_side_gl)
+            })
             .unwrap_or(4096)
             .max(512);
-        viewer.ensure_manga_wgpu_callback_resources();
 
         // Configure visuals (background driven by config)
         let mut visuals = egui::Visuals::dark();
@@ -5535,7 +5342,7 @@ impl ImageViewer {
             .unwrap_or(false)
     }
 
-    /// Prepare metadata for a future `egui_wgpu::CallbackTrait` fast-path.
+    /// Prepare metadata for a future `egui_wgpu::CallbackFn` fast-path.
     ///
     /// This does not switch renderers yet; it keeps persistent state so enabling
     /// a direct wgpu callback pass is a localized follow-up change.
@@ -5569,12 +5376,6 @@ impl ImageViewer {
                 .image_list
                 .get(idx)
                 .map_or(false, |p| is_supported_video(p));
-
-        let is_animated_image = self
-            .manga_loader
-            .as_ref()
-            .and_then(|loader| loader.get_media_type(idx))
-            .map_or(false, |mt| mt == MangaMediaType::AnimatedImage);
 
         if is_video {
             // Video item: prioritize live video texture, fall back to first-frame thumbnail
@@ -5679,31 +5480,12 @@ impl ImageViewer {
             // Image item: use regular texture cache
             if let Some((texture_id, _tex_w, _tex_h)) = self.manga_texture_cache.get_texture_info(idx)
             {
-                if self.manga_wgpu_callback_fast_path_enabled() && !is_animated_image {
-                    if let Some(render_state) = self.wgpu_render_state.clone() {
-                        ui.painter().add(egui_wgpu::Callback::new_paint_callback(
-                            image_rect,
-                            MangaWgpuImageCallback {
-                                texture_id,
-                                render_state,
-                            },
-                        ));
-                    } else {
-                        ui.painter().image(
-                            texture_id,
-                            image_rect,
-                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                            egui::Color32::WHITE,
-                        );
-                    }
-                } else {
-                    ui.painter().image(
-                        texture_id,
-                        image_rect,
-                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                        egui::Color32::WHITE,
-                    );
-                }
+                ui.painter().image(
+                    texture_id,
+                    image_rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
 
                 // Show loading spinner only for the focused animated image.
                 let is_focused_anim = self.manga_focused_anim_index == Some(idx);
@@ -9447,10 +9229,9 @@ impl ImageViewer {
 }
 
 impl eframe::App for ImageViewer {
-    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Reset per-frame repaint tracking
         self.needs_repaint = false;
-        self.refresh_wgpu_render_state(frame);
 
         // ============ SINGLE INSTANCE: CHECK FOR INCOMING FILES ============
         // Check if another instance sent us a file path to open
@@ -10116,8 +9897,8 @@ fn main() -> eframe::Result<()> {
     // Configure native options
     //
     // IMPORTANT NOTE ON VRAM USAGE:
-    // This application uses WGPU (via eframe/egui_wgpu) for hardware-accelerated rendering.
-    // WGPU requires a GPU context which allocates a base amount of VRAM (~10-20MB) for:
+    // This application uses OpenGL (via eframe/glow) for hardware-accelerated rendering.
+    // OpenGL requires a GPU context which allocates a base amount of VRAM (~10-20MB) for:
     // - Framebuffers (front/back buffers for double-buffering)
     // - Default font texture atlas
     // - Shader programs
@@ -10142,7 +9923,7 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         // Keep the renderer lightweight at idle. This viewer renders 2D UI + a single image/video
         // texture; MSAA and a depth buffer are not required for perceptible quality.
-        renderer: eframe::Renderer::Wgpu,
+        renderer: eframe::Renderer::Glow,
         // CRITICAL: Enable VSync to eliminate screen tearing during scrolling/panning.
         // This synchronizes frame presentation with the display's refresh rate.
         vsync: true,
