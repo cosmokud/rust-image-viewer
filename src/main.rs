@@ -5871,7 +5871,7 @@ impl ImageViewer {
                 let speed_y = Self::manga_autoscroll_axis_speed(pos.y - anchor.y, speed_base);
 
                 if speed_x != 0.0 {
-                    self.offset.x += speed_x * dt;
+                    self.offset.x -= speed_x * dt;
                     animation_active = true;
                 }
 
@@ -6505,6 +6505,7 @@ impl ImageViewer {
         let mut actions_to_run: Vec<Action> = Vec::new();
         let mut strip_item_open_from_strip = false;
         let mut strip_item_open_pointer_pos: Option<egui::Pos2> = None;
+        let mut right_click_return_to_strip = false;
         let mut right_click_navigated = false;
 
         ctx.input(|input| {
@@ -6532,6 +6533,16 @@ impl ImageViewer {
             {
                 strip_item_open_from_strip = true;
                 strip_item_open_pointer_pos = pointer_pos;
+                return;
+            }
+
+            if self.is_fullscreen
+                && !self.manga_mode
+                && self.strip_return_mode.is_some()
+                && input.pointer.button_clicked(egui::PointerButton::Secondary)
+                && !pointer_over_shortcut_ui
+            {
+                right_click_return_to_strip = true;
                 return;
             }
 
@@ -6670,6 +6681,11 @@ impl ImageViewer {
                 .and_then(|pos| self.manga_index_at_screen_pos(pos))
                 .unwrap_or(self.current_index);
             self.open_strip_item_in_solo_fullscreen(target_index);
+            return;
+        }
+
+        if right_click_return_to_strip {
+            self.return_to_strip_mode_from_middle_click();
             return;
         }
 
