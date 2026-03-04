@@ -1425,6 +1425,73 @@ impl ImageViewer {
         self.manga_autoscroll_anchor = None;
     }
 
+    fn paint_manga_autoscroll_indicator(
+        &self,
+        painter: &egui::Painter,
+        anchor: egui::Pos2,
+        pointer_pos: Option<egui::Pos2>,
+    ) {
+        painter.circle_filled(
+            anchor,
+            18.0,
+            egui::Color32::from_rgba_unmultiplied(35, 35, 35, 155),
+        );
+        painter.circle_stroke(
+            anchor,
+            18.0,
+            egui::Stroke::new(
+                1.6,
+                egui::Color32::from_rgba_unmultiplied(210, 210, 210, 190),
+            ),
+        );
+        painter.circle_filled(
+            anchor,
+            4.5,
+            egui::Color32::from_rgba_unmultiplied(245, 245, 245, 205),
+        );
+        painter.line_segment(
+            [
+                egui::pos2(anchor.x - 7.0, anchor.y),
+                egui::pos2(anchor.x + 7.0, anchor.y),
+            ],
+            egui::Stroke::new(
+                1.2,
+                egui::Color32::from_rgba_unmultiplied(210, 210, 210, 180),
+            ),
+        );
+        painter.line_segment(
+            [
+                egui::pos2(anchor.x, anchor.y - 7.0),
+                egui::pos2(anchor.x, anchor.y + 7.0),
+            ],
+            egui::Stroke::new(
+                1.2,
+                egui::Color32::from_rgba_unmultiplied(210, 210, 210, 180),
+            ),
+        );
+
+        if let Some(cursor) = pointer_pos {
+            let delta = cursor - anchor;
+            let len = delta.length();
+            if len > 2.0 {
+                let direction = delta / len;
+                let tip = anchor + direction * len.min(44.0);
+                let perp = egui::vec2(-direction.y, direction.x);
+                let stroke = egui::Stroke::new(
+                    2.0,
+                    egui::Color32::from_rgba_unmultiplied(140, 190, 255, 195),
+                );
+
+                painter.line_segment([anchor, tip], stroke);
+
+                let head_a = tip - direction * 8.0 + perp * 5.0;
+                let head_b = tip - direction * 8.0 - perp * 5.0;
+                painter.line_segment([tip, head_a], stroke);
+                painter.line_segment([tip, head_b], stroke);
+            }
+        }
+    }
+
     fn strip_item_open_uses_right_click(&self) -> bool {
         matches!(&self.config.strip_item_open_binding, InputBinding::MouseRight)
     }
@@ -5340,7 +5407,7 @@ impl ImageViewer {
             i.pointer
                 .button_double_clicked(egui::PointerButton::Primary)
         });
-        let middle_clicked = ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Middle));
+        let middle_pressed = ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Middle));
         let pointer_delta = ctx.input(|i| i.pointer.delta());
         let secondary_clicked =
             ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Secondary));
@@ -5418,7 +5485,7 @@ impl ImageViewer {
         let mut primary_consumed_for_autoscroll = false;
         let mut secondary_consumed_for_autoscroll = false;
 
-        if middle_clicked && !over_controls && !title_ui_blocking && !pointer_over_shortcut_ui {
+        if middle_pressed && !over_controls && !title_ui_blocking && !pointer_over_shortcut_ui {
             if self.manga_autoscroll_active {
                 self.stop_manga_autoscroll();
             } else if let Some(anchor) = pointer_pos {
@@ -6178,66 +6245,7 @@ impl ImageViewer {
 
                 if self.manga_autoscroll_active {
                     if let Some(anchor) = self.manga_autoscroll_anchor {
-                        let painter = ui.painter();
-                        painter.circle_filled(
-                            anchor,
-                            18.0,
-                            egui::Color32::from_rgba_unmultiplied(35, 35, 35, 210),
-                        );
-                        painter.circle_stroke(
-                            anchor,
-                            18.0,
-                            egui::Stroke::new(
-                                1.6,
-                                egui::Color32::from_rgba_unmultiplied(210, 210, 210, 230),
-                            ),
-                        );
-                        painter.circle_filled(
-                            anchor,
-                            4.5,
-                            egui::Color32::from_rgba_unmultiplied(245, 245, 245, 240),
-                        );
-                        painter.line_segment(
-                            [
-                                egui::pos2(anchor.x - 7.0, anchor.y),
-                                egui::pos2(anchor.x + 7.0, anchor.y),
-                            ],
-                            egui::Stroke::new(
-                                1.2,
-                                egui::Color32::from_rgba_unmultiplied(210, 210, 210, 210),
-                            ),
-                        );
-                        painter.line_segment(
-                            [
-                                egui::pos2(anchor.x, anchor.y - 7.0),
-                                egui::pos2(anchor.x, anchor.y + 7.0),
-                            ],
-                            egui::Stroke::new(
-                                1.2,
-                                egui::Color32::from_rgba_unmultiplied(210, 210, 210, 210),
-                            ),
-                        );
-
-                        if let Some(cursor) = pointer_pos {
-                            let delta = cursor - anchor;
-                            let len = delta.length();
-                            if len > 2.0 {
-                                let direction = delta / len;
-                                let tip = anchor + direction * len.min(44.0);
-                                let perp = egui::vec2(-direction.y, direction.x);
-                                let stroke = egui::Stroke::new(
-                                    2.0,
-                                    egui::Color32::from_rgba_unmultiplied(140, 190, 255, 220),
-                                );
-
-                                painter.line_segment([anchor, tip], stroke);
-
-                                let head_a = tip - direction * 8.0 + perp * 5.0;
-                                let head_b = tip - direction * 8.0 - perp * 5.0;
-                                painter.line_segment([tip, head_a], stroke);
-                                painter.line_segment([tip, head_b], stroke);
-                            }
-                        }
+                        self.paint_manga_autoscroll_indicator(ui.painter(), anchor, pointer_pos);
                     }
                 }
             });
@@ -6534,7 +6542,7 @@ impl ImageViewer {
         let mut actions_to_run: Vec<Action> = Vec::new();
         let mut strip_item_open_from_strip = false;
         let mut strip_item_open_pointer_pos: Option<egui::Pos2> = None;
-        let mut right_click_return_to_strip = false;
+        let mut right_click_toggle_fullscreen = false;
         let mut right_click_navigated = false;
 
         ctx.input(|input| {
@@ -6547,7 +6555,7 @@ impl ImageViewer {
             let pointer_over_shortcut_ui =
                 self.pointer_over_shortcut_blocking_ui(pointer_pos, input.screen_rect);
 
-            if manga_fullscreen && self.manga_autoscroll_active {
+            if self.manga_autoscroll_active {
                 let primary_cancel = input.pointer.button_clicked(egui::PointerButton::Primary);
                 let secondary_cancel =
                     input.pointer.button_clicked(egui::PointerButton::Secondary);
@@ -6617,7 +6625,7 @@ impl ImageViewer {
                     }
                     InputBinding::MouseMiddle => {
                         if middle_pressed {
-                            if manga_fullscreen {
+                            if manga_fullscreen || !self.manga_mode {
                                 continue;
                             }
                             actions_to_run.push(*action);
@@ -6686,10 +6694,8 @@ impl ImageViewer {
                     } else if pos.x > screen_width - side_zone {
                         actions_to_run.push(Action::NextImage);
                         right_click_navigated = true;
-                    } else if self.is_fullscreen && !self.manga_mode && self.strip_return_mode.is_some() {
-                        // Solo fullscreen opened from strip mode: center/right-click returns to strip.
-                        // Navigation hit-areas above (black bars or side zones) remain unchanged.
-                        right_click_return_to_strip = true;
+                    } else if !self.manga_mode {
+                        right_click_toggle_fullscreen = true;
                         return;
                     } else {
                         // Center region: toggle play/pause for videos, do nothing for images
@@ -6708,8 +6714,9 @@ impl ImageViewer {
             return;
         }
 
-        if right_click_return_to_strip {
-            self.return_to_strip_mode_from_middle_click();
+        if right_click_toggle_fullscreen {
+            self.stop_manga_autoscroll();
+            self.toggle_fullscreen = true;
             return;
         }
 
@@ -8477,6 +8484,7 @@ impl ImageViewer {
             && !self.is_panning
             && !self.is_resizing
             && !self.is_seeking
+            && !self.manga_autoscroll_active
             && !floating_image_exceeds_window
             && self.offset.length() > 0.1
         {
@@ -8606,10 +8614,14 @@ impl ImageViewer {
 
         // Get pointer state
         let pointer_pos = ctx.input(|i| i.pointer.hover_pos());
+        let primary_clicked = ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Primary));
         let primary_down = ctx.input(|i| i.pointer.button_down(egui::PointerButton::Primary));
         let primary_pressed = ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary));
         let primary_released =
             ctx.input(|i| i.pointer.button_released(egui::PointerButton::Primary));
+        let middle_pressed = ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Middle));
+        let secondary_clicked =
+            ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Secondary));
 
         // Title bar gesture suppression:
         // Allow click-through on the empty title bar; only suppress when the pointer is on
@@ -8638,6 +8650,36 @@ impl ImageViewer {
             };
         let pointer_over_shortcut_ui =
             self.pointer_over_shortcut_blocking_ui(pointer_pos, screen_rect);
+
+        let mut primary_consumed_for_autoscroll = false;
+
+        if middle_pressed
+            && !title_ui_blocking
+            && !pointer_over_shortcut_ui
+            && !over_video_controls
+            && hover_resize_direction == ResizeDirection::None
+        {
+            if self.manga_autoscroll_active {
+                self.stop_manga_autoscroll();
+            } else if let Some(anchor) = pointer_pos {
+                self.manga_autoscroll_active = true;
+                self.manga_autoscroll_anchor = Some(anchor);
+                self.is_panning = false;
+                self.last_mouse_pos = None;
+            }
+            animation_active = true;
+        }
+
+        if self.manga_autoscroll_active && primary_clicked {
+            self.stop_manga_autoscroll();
+            primary_consumed_for_autoscroll = true;
+            animation_active = true;
+        }
+
+        if self.manga_autoscroll_active && secondary_clicked {
+            self.stop_manga_autoscroll();
+            animation_active = true;
+        }
 
         // Handle resize start (but not if over video controls)
         if primary_pressed
@@ -8695,6 +8737,8 @@ impl ImageViewer {
                 && !self.mouse_over_window_buttons
                 && !self.title_text_dragging
                 && !pointer_over_shortcut_ui
+                && !self.manga_autoscroll_active
+                && !primary_consumed_for_autoscroll
                 && !(over_title_bar && self.mouse_over_title_text)
             {
                 if let Some(pos) = pointer_pos {
@@ -8741,6 +8785,48 @@ impl ImageViewer {
                         ctx.set_cursor_icon(egui::CursorIcon::Default);
                     }
                 }
+            }
+        }
+
+        let dt = ctx.input(|i| i.stable_dt).clamp(0.0, 0.033);
+        if self.manga_autoscroll_active {
+            if let (Some(anchor), Some(pos)) = (self.manga_autoscroll_anchor, pointer_pos) {
+                let speed_base = self.config.manga_arrow_scroll_speed.max(1.0);
+                let delta_x = pos.x - anchor.x;
+                let delta_y = pos.y - anchor.y;
+
+                let max_distance_x = if delta_x >= 0.0 {
+                    (screen_rect.max.x - anchor.x).max(1.0)
+                } else {
+                    (anchor.x - screen_rect.min.x).max(1.0)
+                };
+                let max_distance_y = if delta_y >= 0.0 {
+                    (screen_rect.max.y - anchor.y).max(1.0)
+                } else {
+                    (anchor.y - screen_rect.min.y).max(1.0)
+                };
+
+                let speed_x = self.manga_autoscroll_axis_speed(
+                    delta_x,
+                    speed_base,
+                    max_distance_x,
+                    self.config.manga_autoscroll_horizontal_speed_multiplier,
+                );
+                let speed_y = self.manga_autoscroll_axis_speed(
+                    delta_y,
+                    speed_base,
+                    max_distance_y,
+                    self.config.manga_autoscroll_vertical_speed_multiplier,
+                );
+
+                if speed_x != 0.0 || speed_y != 0.0 {
+                    self.offset.x -= speed_x * dt;
+                    self.offset.y -= speed_y * dt;
+                    ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+                    animation_active = true;
+                }
+            } else {
+                self.stop_manga_autoscroll();
             }
         }
 
@@ -8898,6 +8984,12 @@ impl ImageViewer {
                                 .size(16.0),
                             );
                         });
+                    }
+                }
+
+                if self.manga_autoscroll_active {
+                    if let Some(anchor) = self.manga_autoscroll_anchor {
+                        self.paint_manga_autoscroll_indicator(ui.painter(), anchor, pointer_pos);
                     }
                 }
             });
@@ -9076,6 +9168,7 @@ impl eframe::App for ImageViewer {
         }
 
         if self.toggle_fullscreen {
+            self.stop_manga_autoscroll();
             let entering_fullscreen = !self.is_fullscreen;
             self.is_fullscreen = entering_fullscreen;
 
