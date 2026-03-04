@@ -503,6 +503,8 @@ struct ImageViewer {
     manga_scroll_target: f32,
     /// Scroll velocity for momentum scrolling
     manga_scroll_velocity: f32,
+    /// Pending wheel-driven scroll delta (pixels), consumed smoothly over frames.
+    manga_wheel_scroll_pending: f32,
     /// High-performance parallel image loader for manga mode
     manga_loader: Option<MangaLoader>,
     /// LRU texture cache for manga mode
@@ -719,6 +721,7 @@ impl Default for ImageViewer {
             manga_scroll_offset: 0.0,
             manga_scroll_target: 0.0,
             manga_scroll_velocity: 0.0,
+            manga_wheel_scroll_pending: 0.0,
             manga_loader: None,
             manga_texture_cache: MangaTextureCache::default(),
             manga_scrollbar_dragging: false,
@@ -2206,6 +2209,7 @@ impl ImageViewer {
             _ => None,
         };
 
+        self.manga_wheel_scroll_pending = 0.0;
         self.manga_mode = true;
 
         // Close any playing fullscreen video when entering manga mode.
@@ -2287,6 +2291,7 @@ impl ImageViewer {
                 self.manga_scroll_offset = state.scroll_offset.clamp(0.0, max_scroll);
                 self.manga_scroll_target = state.scroll_target.clamp(0.0, max_scroll);
                 self.manga_scroll_velocity = 0.0;
+                self.manga_wheel_scroll_pending = 0.0;
 
                 self.manga_update_current_index();
                 self.manga_update_preload_queue();
@@ -2524,6 +2529,7 @@ impl ImageViewer {
         self.prepare_mode_switch_placeholder_from_manga_index(index, target_media_type);
 
         self.activate_strip_return_context(return_mode);
+        self.manga_wheel_scroll_pending = 0.0;
         self.manga_mode = false;
         if return_mode == MangaLayoutMode::Masonry {
             self.manga_suspend_runtime_for_solo_fullscreen();
@@ -2635,6 +2641,7 @@ impl ImageViewer {
             self.manga_scroll_offset = scroll_to;
             self.manga_scroll_target = scroll_to;
             self.manga_scroll_velocity = 0.0;
+            self.manga_wheel_scroll_pending = 0.0;
             // Start preloading from current image
             self.manga_update_preload_queue();
             return;
@@ -2648,6 +2655,7 @@ impl ImageViewer {
 
         self.prepare_mode_switch_placeholder_from_manga_index(visible_idx, target_media_type);
 
+        self.manga_wheel_scroll_pending = 0.0;
         self.manga_mode = false;
         self.manga_clear_cache();
 
@@ -4323,6 +4331,7 @@ impl ImageViewer {
         self.manga_scroll_offset = 0.0;
         self.manga_scroll_target = 0.0;
         self.manga_scroll_velocity = 0.0;
+        self.manga_wheel_scroll_pending = 0.0;
         self.current_index = 0;
         // Invalidate height cache since we're at a new position
         self.invalidate_manga_layout_cache();
@@ -4357,11 +4366,30 @@ impl ImageViewer {
         self.manga_scroll_offset = target;
         self.manga_scroll_target = target;
         self.manga_scroll_velocity = 0.0;
+        self.manga_wheel_scroll_pending = 0.0;
         // Immediately trigger preload for new position (no cooldown)
         self.manga_preload_cooldown = 0;
         self.manga_last_preload_update = Instant::now() - Duration::from_millis(100);
         // Force immediate preload queue update
         self.manga_update_preload_queue();
+    }
+
+    /// Add a delta to the manga scroll target, clamped to valid scroll range.
+    /// Returns true if the target changed.
+    fn manga_add_scroll_target_delta(&mut self, delta: f32) -> bool {
+        if !self.manga_mode || !delta.is_finite() || delta == 0.0 {
+            return false;
+        }
+
+        let total_height = self.manga_total_height();
+        let visible_height = self.screen_size.y;
+        let max_scroll = (total_height - visible_height).max(0.0);
+
+        let prev_target = self.manga_scroll_target.clamp(0.0, max_scroll);
+        let next_target = (prev_target + delta).clamp(0.0, max_scroll);
+        self.manga_scroll_target = next_target;
+
+        (next_target - prev_target).abs() > f32::EPSILON
     }
 
     /// Update manga scroll animation (smooth scrolling)
@@ -5348,6 +5376,7 @@ impl ImageViewer {
 
                     self.manga_scroll_target = new_scroll;
                     self.manga_scroll_offset = new_scroll; // Instant scroll for responsiveness
+                    self.manga_wheel_scroll_pending = 0.0;
                     self.manga_last_scroll_position = new_scroll;
 
                     // Keep the page indicator in sync even for instant jumps.
@@ -5413,6 +5442,9 @@ impl ImageViewer {
                 && (zoom_delta != 1.0 || wheel_steps_ctrl != 0.0);
 
             if wants_ctrl_zoom {
+                // Ctrl+wheel intent is zoom, so cancel any queued wheel-scroll motion.
+                self.manga_wheel_scroll_pending = 0.0;
+
                 // Use the same step-based algorithm as normal wheel zoom.
                 // `zoom_delta` can be device/platform-dependent and may feel jumpy; only use it
                 // to determine direction when raw Ctrl-wheel steps aren't available.
@@ -5465,21 +5497,14 @@ impl ImageViewer {
                     animation_active = true;
                 }
             } else if wheel_steps != 0.0 {
-                // Regular wheel/trackpad scroll = inertial pan vertically.
-                // Input updates the TARGET; output (manga_tick_scroll_animation) eases the CURRENT toward it.
+                // Queue wheel input and consume it at a stable per-frame rate.
+                // This makes wheel motion feel as smooth as keyboard up/down scrolling.
                 let scroll_speed = self.config.manga_wheel_scroll_speed;
                 let multiplier = self.config.manga_wheel_multiplier;
                 let delta = -wheel_steps * scroll_speed * multiplier;
-
-                let total_height = self.manga_total_height();
-                let visible_height = self.screen_size.y;
-                let max_scroll = (total_height - visible_height).max(0.0);
-
-                self.manga_scroll_target =
-                    (self.manga_scroll_target + delta).clamp(0.0, max_scroll);
-
-                // Let the inertial loop do the motion; keep current velocity estimate derived from motion.
-                self.manga_update_preload_queue();
+                let max_pending = self.screen_size.y.max(1.0) * 3.0;
+                self.manga_wheel_scroll_pending =
+                    (self.manga_wheel_scroll_pending + delta).clamp(-max_pending, max_pending);
                 animation_active = true;
             }
         }
@@ -5509,6 +5534,10 @@ impl ImageViewer {
             // Cancel any inertial scrolling (double-click is an explicit "reset" intent).
             if self.manga_scroll_velocity != 0.0 {
                 self.manga_scroll_velocity = 0.0;
+                did_reset = true;
+            }
+            if self.manga_wheel_scroll_pending.abs() > 0.01 {
+                self.manga_wheel_scroll_pending = 0.0;
                 did_reset = true;
             }
             if (self.manga_scroll_target - self.manga_scroll_offset).abs() > 0.01 {
@@ -5611,6 +5640,7 @@ impl ImageViewer {
             if primary_pressed && !primary_double_clicked {
                 self.is_panning = true;
                 self.last_mouse_pos = pointer_pos;
+                self.manga_wheel_scroll_pending = 0.0;
                 ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
             }
 
@@ -5619,6 +5649,7 @@ impl ImageViewer {
 
                 // Stop any residual inertial scroll while the user is actively dragging.
                 self.manga_scroll_velocity = 0.0;
+                self.manga_wheel_scroll_pending = 0.0;
 
                 // Vertical drag = scroll the manga strip (1:1 feel).
                 let delta_y = -pointer_delta.y * drag_speed;
@@ -5645,6 +5676,30 @@ impl ImageViewer {
             self.last_mouse_pos = None;
             self.manga_scroll_velocity = 0.0;
             self.manga_scroll_target = self.manga_scroll_offset;
+        }
+
+        // Smoothly consume queued wheel scroll using the same per-frame cadence as Arrow Up/Down.
+        if self.manga_wheel_scroll_pending.abs() > 0.01 {
+            let per_frame_step = (self.config.manga_arrow_scroll_speed * 0.5).max(1.0);
+            let applied = self
+                .manga_wheel_scroll_pending
+                .clamp(-per_frame_step, per_frame_step);
+
+            if self.manga_add_scroll_target_delta(applied) {
+                self.manga_update_preload_queue();
+                animation_active = true;
+            }
+
+            self.manga_wheel_scroll_pending -= applied;
+
+            // If we're at an edge, drop remaining queued motion that keeps pushing into it.
+            let total_height = self.manga_total_height();
+            let max_scroll = (total_height - self.screen_size.y).max(0.0);
+            if (self.manga_scroll_target <= 0.0 && self.manga_wheel_scroll_pending < 0.0)
+                || (self.manga_scroll_target >= max_scroll && self.manga_wheel_scroll_pending > 0.0)
+            {
+                self.manga_wheel_scroll_pending = 0.0;
+            }
         }
 
         // Tick scroll animation
@@ -6431,16 +6486,15 @@ impl ImageViewer {
             // This provides a more natural feeling when holding Up/Down.
             if arrow_up {
                 let scroll_amount = scroll_speed * 0.5; // Per-frame amount
-                self.manga_scroll_target = (self.manga_scroll_target - scroll_amount).max(0.0);
-                self.manga_update_preload_queue();
+                if self.manga_add_scroll_target_delta(-scroll_amount) {
+                    self.manga_update_preload_queue();
+                }
             }
             if arrow_down {
-                let total_height = self.manga_total_height();
-                let max_scroll = (total_height - self.screen_size.y).max(0.0);
                 let scroll_amount = scroll_speed * 0.5;
-                self.manga_scroll_target =
-                    (self.manga_scroll_target + scroll_amount).min(max_scroll);
-                self.manga_update_preload_queue();
+                if self.manga_add_scroll_target_delta(scroll_amount) {
+                    self.manga_update_preload_queue();
+                }
             }
 
             // Check for manga-specific keys
@@ -8541,6 +8595,7 @@ impl eframe::App for ImageViewer {
 
                 // If we're in fullscreen manga mode, exit it to show the new file normally
                 if self.manga_mode && self.is_fullscreen {
+                    self.manga_wheel_scroll_pending = 0.0;
                     self.manga_mode = false;
                     self.manga_clear_cache();
 
@@ -8736,6 +8791,7 @@ impl eframe::App for ImageViewer {
 
                 // Exit manga mode when leaving fullscreen
                 if self.manga_mode {
+                    self.manga_wheel_scroll_pending = 0.0;
                     self.manga_mode = false;
                     self.manga_clear_cache();
                 }
@@ -8936,7 +8992,8 @@ impl eframe::App for ImageViewer {
                 .unwrap_or(false);
         let manga_scroll_active = self.manga_mode
             && ((self.manga_scroll_target - self.manga_scroll_offset).abs() > 0.1
-                || self.manga_scroll_velocity.abs() > 0.5);
+                || self.manga_scroll_velocity.abs() > 0.5
+                || self.manga_wheel_scroll_pending.abs() > 0.1);
         // Check if arrow keys are held for continuous scrolling in manga mode
         let manga_arrow_held = self.manga_mode
             && self.is_fullscreen
