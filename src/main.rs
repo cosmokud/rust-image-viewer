@@ -595,11 +595,6 @@ struct ImageViewer {
     /// Timestamp of the last detected masonry layout motion.
     /// Used as a short settle window to avoid immediate relayout between wheel/drag events.
     masonry_last_motion_at: Instant,
-    /// True once the one-time initial masonry layout settle has been performed.
-    /// After initial layout with possibly-default aspect ratios, one corrective relayout
-    /// is allowed when the metadata window first becomes fully ready. After that, the
-    /// layout is locked and dimension updates no longer trigger reflows.
-    masonry_initial_settle_done: bool,
 
     /// Cooldown frames before updating preload queue (prevents cache churn during rapid navigation)
     manga_preload_cooldown: u32,
@@ -814,7 +809,6 @@ impl Default for ImageViewer {
             masonry_layout_updates_deferred: false,
             masonry_metadata_window_ready: false,
             masonry_last_motion_at: Instant::now(),
-            masonry_initial_settle_done: false,
 
             manga_preload_cooldown: 0,
             manga_last_preload_update: Instant::now(),
@@ -2696,7 +2690,6 @@ impl ImageViewer {
         self.masonry_layout_valid = false;
         self.masonry_layout_updates_deferred = false;
         self.masonry_metadata_window_ready = false;
-        self.masonry_initial_settle_done = false;
     }
 
     fn manga_trilinear_texture_options() -> egui::TextureOptions {
@@ -2729,7 +2722,7 @@ impl ImageViewer {
             return true;
         }
 
-        const MASONRY_LAYOUT_SETTLE_DELAY: Duration = Duration::from_millis(120);
+        const MASONRY_LAYOUT_SETTLE_DELAY: Duration = Duration::from_millis(350);
         self.masonry_last_motion_at.elapsed() < MASONRY_LAYOUT_SETTLE_DELAY
     }
 
@@ -2777,45 +2770,6 @@ impl ImageViewer {
         self.manga_layout_offsets.clear();
         self.masonry_layout_valid = false;
         self.manga_apply_masonry_scroll_stabilization_after_layout_change(anchor);
-        true
-    }
-
-    /// Perform a ONE-TIME corrective relayout after the metadata probe window
-    /// first reports full coverage.
-    ///
-    /// Before this settle, the masonry layout may have been computed with the
-    /// default 1.4 aspect ratio for items whose dimensions had not arrived yet.
-    /// Once the metadata window is fully resolved, we recompute positions using
-    /// the real aspect ratios and stabilize the scroll position around the
-    /// current anchor.  After this single correction the layout is locked:
-    /// further dimension updates (from decoding or distant probes) no longer
-    /// trigger reflows.
-    fn masonry_try_initial_settle(&mut self) -> bool {
-        if !self.is_masonry_mode() || self.masonry_initial_settle_done {
-            return false;
-        }
-
-        // Only settle once the metadata window reports readiness AND
-        // we already have a valid layout to correct.
-        if !self.masonry_metadata_window_ready || !self.masonry_layout_valid {
-            return false;
-        }
-
-        // Don't settle while the user is actively interacting.
-        if self.manga_is_layout_motion_active() {
-            return false;
-        }
-
-        let anchor = self.manga_capture_scroll_anchor();
-
-        // Force a full recompute with the now-correct aspect ratios.
-        self.masonry_layout_valid = false;
-        self.masonry_ensure_layout_cache();
-
-        // Re-anchor the viewport so the user doesn't notice the shift.
-        self.manga_apply_masonry_scroll_stabilization_after_layout_change(anchor);
-
-        self.masonry_initial_settle_done = true;
         true
     }
 
@@ -2994,7 +2948,17 @@ impl ImageViewer {
                 continue;
             };
 
+            // Skip non-media files.
             if !is_supported_image(path) && !is_supported_video(path) {
+                continue;
+            }
+
+            // Videos are probed via GStreamer which is MUCH slower than image
+            // header reads.  Don't let a single unprobed video gate the
+            // entire metadata window.  Videos that are still pending will
+            // use the default 1.4 aspect ratio placeholder and get corrected
+            // via a deferred layout update once their probe completes.
+            if is_supported_video(path) {
                 continue;
             }
 
@@ -4284,9 +4248,15 @@ impl ImageViewer {
         let scrolling_up = self.manga_scroll_offset < prev_scroll_pos - 0.5;
         if is_masonry {
             // Masonry metadata-first pipeline:
-            // 1) Probe metadata only in a row-scaled ±N window around the viewport center.
-            // 2) Create stable placeholders from that metadata.
-            // 3) Decode textures in row-scaled staged ±K bands once metadata window is fully ready.
+            // 1) Probe metadata for a wide window around the viewport center.
+            // 2) Create stable placeholders from that metadata (real aspect ratios).
+            // 3) Decode textures in staged ±K bands.
+            //
+            // Metadata probing and texture decoding run in PARALLEL.  We don't
+            // wait for the full metadata window to be ready before starting
+            // texture loads — items that already have known dimensions can start
+            // decoding immediately.  This eliminates the stall where a single
+            // slow video probe would block all image texture loading.
             let (meta_start, meta_end) = self.masonry_metadata_window_bounds(preload_center_index);
             if let Some(ref mut loader) = self.manga_loader {
                 if meta_start < meta_end {
@@ -4297,19 +4267,21 @@ impl ImageViewer {
             let metadata_ready = self.masonry_metadata_ready_for_window(meta_start, meta_end);
             self.masonry_metadata_window_ready = metadata_ready;
 
-            if metadata_ready {
-                let stage_radius = self.masonry_next_texture_stage_radius(preload_center_index);
-                if stage_radius > 0 {
-                    if let Some(ref mut loader) = self.manga_loader {
-                        loader.request_decode_range(
-                            &self.image_list,
-                            preload_center_index,
-                            stage_radius,
-                            stage_radius,
-                            self.max_texture_side,
-                            true,
-                        );
-                    }
+            // Always request texture decodes regardless of metadata_ready.
+            // Items whose dimensions haven't arrived yet will be skipped by
+            // request_decode_range (the loader only decodes items it has paths
+            // for, and the actual decode uses the file itself).
+            let stage_radius = self.masonry_next_texture_stage_radius(preload_center_index);
+            if stage_radius > 0 {
+                if let Some(ref mut loader) = self.manga_loader {
+                    loader.request_decode_range(
+                        &self.image_list,
+                        preload_center_index,
+                        stage_radius,
+                        stage_radius,
+                        self.max_texture_side,
+                        true,
+                    );
                 }
             }
         } else {
@@ -4519,11 +4491,6 @@ impl ImageViewer {
         } else {
             8
         };
-        let _defer_masonry_layout_updates = if is_masonry {
-            self.manga_should_defer_masonry_layout_updates()
-        } else {
-            false
-        };
         let probe_messages_per_frame = if is_masonry {
             self.scale_for_masonry_rows(
                 self.config.manga_dimension_probe_messages_per_frame.max(1),
@@ -4555,27 +4522,25 @@ impl ImageViewer {
 
         // Dimension updates can change page heights; invalidate cached layout/prefix sums.
         //
-        // MASONRY MODE: Never invalidate the masonry layout from progressive dimension
-        // updates.  Doing so causes cascading Y-position shifts across all items in each
-        // column every time a batch of header probes completes, which makes the grid
-        // "dance" during scrolling and is extremely disorienting.  Instead, dimension
-        // updates are absorbed silently into the loader's dimension_cache; the masonry
-        // layout will pick them up during the one-time initial settle
-        // (masonry_try_initial_settle) or on the next topology-triggered recompute
-        // (screen resize, density change, item count change).  Images are rendered
-        // aspect-correct within their allocated cells, so even slightly-wrong cell
-        // heights produce clean results without stretching.
+        // MASONRY MODE: Always defer layout invalidation.  The layout recompute
+        // is applied once the user stops scrolling (via the flush mechanism in
+        // manga_flush_deferred_masonry_layout_update) with scroll-anchor
+        // stabilization so the viewport doesn't visibly jump.  This way,
+        // progressive dimension probe results flow into the layout smoothly
+        // during idle periods without disturbing the user during active scrolling.
         //
-        // LONG-STRIP MODE: Keeps the original invalidation behavior since each page
-        // occupies the full width and height changes are less visually disruptive.
+        // Images are also rendered aspect-correct within their allocated cells
+        // (cover-fit UV) so even slightly-wrong cell heights from default aspect
+        // ratios produce clean, unstreched results.
+        //
+        // LONG-STRIP MODE: Invalidate immediately (each page occupies the full
+        // width so height changes are isolated to their own row).
         let mut dims_updated = false;
         if !dim_updates.is_empty() {
             if is_masonry {
-                // Masonry: silently absorb — layout stays locked.
-                // Just request a repaint so the settle check runs next frame.
-                if !self.masonry_initial_settle_done {
-                    ctx.request_repaint();
-                }
+                // Masonry: defer until idle, then recompute with stabilization.
+                self.masonry_layout_updates_deferred = true;
+                ctx.request_repaint_after(Duration::from_millis(16));
             } else {
                 // Long-strip: invalidate as before.
                 self.manga_total_height_cache_valid = false;
@@ -6751,11 +6716,6 @@ impl ImageViewer {
         }
 
         if self.manga_flush_deferred_masonry_layout_update() {
-            animation_active = true;
-        }
-
-        // Masonry: one-time corrective relayout once metadata is fully resolved.
-        if self.masonry_try_initial_settle() {
             animation_active = true;
         }
 

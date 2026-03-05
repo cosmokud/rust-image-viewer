@@ -260,6 +260,12 @@ impl MangaLoader {
 
         // Spawn a lightweight dimension probe worker.
         // This keeps file header reads (image::image_dimensions) off the UI thread.
+        //
+        // IMPORTANT: The worker processes ALL images in a batch first, then videos.
+        // Image header reads are ~microseconds while video probes can take hundreds
+        // of milliseconds (GStreamer pipeline startup).  Processing images first and
+        // sending partial results immediately ensures the masonry layout gets real
+        // aspect ratios for images without waiting on slow video probes.
         let shutdown_clone = Arc::clone(&shutdown);
         let dim_worker_settings = Arc::clone(&settings_shared);
         std::thread::Builder::new()
@@ -275,56 +281,59 @@ impl MangaLoader {
                     };
 
                     let dim_worker_settings = *dim_worker_settings.read();
+                    let gen = req.generation;
 
-                    let mut out: Vec<(usize, u32, u32, MangaMediaType)> =
-                        Vec::with_capacity(req.items.len());
+                    // Partition into images and videos so images are probed first.
+                    let mut images: Vec<(usize, PathBuf)> = Vec::new();
+                    let mut videos: Vec<(usize, PathBuf)> = Vec::new();
                     for (idx, path) in req.items {
-                        let is_video = is_supported_video(&path);
-                        let is_image = is_supported_image(&path);
-
-                        let dims = if is_video {
-                            Self::probe_video_dimensions(
-                                &path,
-                                dim_worker_settings.video_probe_timeout_ms,
-                            )
-                        } else if is_image {
-                            fast_image_dimensions(&path)
-                        } else {
-                            None
-                        };
-
-                        if let Some((w, h)) = dims {
-                            let mt = if is_video {
-                                MangaMediaType::Video
-                            } else {
-                                MangaMediaType::StaticImage
-                            };
-                            out.push((idx, w, h, mt));
+                        if is_supported_video(&path) {
+                            videos.push((idx, path));
+                        } else if is_supported_image(&path) {
+                            images.push((idx, path));
                         }
+                    }
 
+                    // --- Phase 1: Probe all images (fast, ~microseconds each) ---
+                    let mut out: Vec<(usize, u32, u32, MangaMediaType)> =
+                        Vec::with_capacity(images.len());
+                    for (idx, path) in images {
+                        if shutdown_clone.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        if let Some((w, h)) = fast_image_dimensions(&path) {
+                            out.push((idx, w, h, MangaMediaType::StaticImage));
+                        }
                         if out.len() >= dim_worker_settings.dim_result_chunk_size {
                             let chunk = std::mem::take(&mut out);
-                            if dim_result_tx
-                                .send(DimResult {
-                                    generation: req.generation,
-                                    items: chunk,
-                                })
-                                .is_err()
-                            {
+                            if dim_result_tx.send(DimResult { generation: gen, items: chunk }).is_err() {
                                 return;
                             }
                         }
                     }
-
+                    // Flush remaining image results immediately so the UI gets them
+                    // before we start the slow video probes.
                     if !out.is_empty() {
-                        if dim_result_tx
-                            .send(DimResult {
-                                generation: req.generation,
-                                items: out,
-                            })
-                            .is_err()
-                        {
+                        if dim_result_tx.send(DimResult { generation: gen, items: std::mem::take(&mut out) }).is_err() {
                             return;
+                        }
+                    }
+
+                    // --- Phase 2: Probe videos (slow, ~100-220ms each) ---
+                    // Send each video result individually so one slow video doesn't
+                    // delay results for subsequent videos.
+                    for (idx, path) in videos {
+                        if shutdown_clone.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        if let Some((w, h)) = Self::probe_video_dimensions(
+                            &path,
+                            dim_worker_settings.video_probe_timeout_ms,
+                        ) {
+                            let item = vec![(idx, w, h, MangaMediaType::Video)];
+                            if dim_result_tx.send(DimResult { generation: gen, items: item }).is_err() {
+                                return;
+                            }
                         }
                     }
                 }
@@ -410,10 +419,10 @@ impl MangaLoader {
             delta += 1;
         }
 
-        let mut video_items: Vec<(usize, PathBuf)> = Vec::new();
         let mut image_items: Vec<(usize, PathBuf)> = Vec::new();
+        let mut video_items: Vec<(usize, PathBuf)> = Vec::new();
         for idx in ordered_indices {
-            if video_items.len() + image_items.len() >= settings.dim_request_batch_size {
+            if image_items.len() + video_items.len() >= settings.dim_request_batch_size {
                 break;
             }
 
@@ -426,7 +435,6 @@ impl MangaLoader {
                 None => continue,
             };
 
-            // Probe videos first so masonry placeholders get stable video aspect ratios early.
             if is_supported_video(&path) {
                 video_items.push((idx, path));
             } else if is_supported_image(&path) {
@@ -434,16 +442,12 @@ impl MangaLoader {
             }
         }
 
-        if video_items.len() + image_items.len() > settings.dim_request_batch_size {
-            image_items.truncate(
-                settings
-                    .dim_request_batch_size
-                    .saturating_sub(video_items.len()),
-            );
-        }
-
-        let mut items = video_items;
-        items.extend(image_items);
+        // Send images and videos together in one batch.
+        // The worker processes images first (fast), then videos (slow),
+        // sending partial results between phases so images are never
+        // blocked by slow video GStreamer probes.
+        let mut items = image_items;
+        items.extend(video_items);
 
         if items.is_empty() {
             return;
