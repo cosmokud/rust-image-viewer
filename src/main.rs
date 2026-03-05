@@ -4,11 +4,8 @@
 #![windows_subsystem = "windows"]
 
 mod config;
-mod gpu_masonry;
 mod image_loader;
-mod lod_cache;
 mod manga_loader;
-mod masonry_static;
 #[cfg(target_os = "windows")]
 mod single_instance;
 mod video_player;
@@ -16,19 +13,16 @@ mod video_player;
 mod windows_env;
 
 use config::{Action, Config, InputBinding, StartupWindowMode};
-use gpu_masonry::{GpuMasonryInputItem, GpuMasonryRenderer};
 use image_loader::{
     get_images_in_directory, get_media_type, is_supported_video, ImageFrame, LoadedImage, MediaType,
 };
-use manga_loader::{MangaL1PoolSlots, MangaLoader, MangaMediaType, MangaTextureCache};
-use masonry_static::{compute_static_masonry_layout, StaticMasonryLayoutConfig};
+use manga_loader::{MangaLoader, MangaMediaType, MangaTextureCache};
 #[cfg(target_os = "windows")]
 use single_instance::{FileReceiver, SingleInstanceResult};
 use video_player::{format_duration, VideoPlayer};
 
 use eframe::egui;
 use image::imageops::FilterType;
-use rayon::prelude::*;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 #[cfg(target_os = "windows")]
@@ -247,13 +241,6 @@ impl MasonryItemLayout {
             egui::vec2(self.width * zoom, self.height * zoom),
         )
     }
-}
-
-#[derive(Clone, Copy)]
-struct MangaDrawCommand {
-    index: usize,
-    image_rect: egui::Rect,
-    target_texture_side: u32,
 }
 
 #[allow(dead_code)]
@@ -488,8 +475,6 @@ struct ImageViewer {
     manga_mode: bool,
     /// Active strip layout when manga mode is enabled.
     manga_layout_mode: MangaLayoutMode,
-    /// Deferred strip layout toggle request applied at the start of a frame.
-    pending_strip_layout_toggle: Option<MangaLayoutMode>,
     /// Previous strip layout to restore when leaving solo fullscreen via middle click.
     strip_return_mode: Option<MangaLayoutMode>,
     /// Saved masonry viewport state while temporarily opening a single item fullscreen.
@@ -525,16 +510,6 @@ struct ImageViewer {
     manga_loader: Option<MangaLoader>,
     /// LRU texture cache for manga mode
     manga_texture_cache: MangaTextureCache,
-    /// Optional wgpu callback path for GPU culling and indirect draw staging in masonry mode.
-    manga_gpu_renderer: Option<GpuMasonryRenderer>,
-    /// Set when GPU masonry renderer initialization panicked/failed on this machine.
-    /// Prevents repeated init attempts from crashing the app.
-    manga_gpu_renderer_failed: bool,
-    /// Number of frames to force CPU-only masonry drawing after layout/fullscreen transitions.
-    /// This prevents callback/render-state overlap while mode switches settle.
-    manga_gpu_transition_cooldown_frames: u8,
-    /// Scratch buffer used to avoid per-frame allocations when preparing GPU callback inputs.
-    manga_gpu_items_scratch: Vec<GpuMasonryInputItem>,
     /// Whether the scrollbar is being dragged
     manga_scrollbar_dragging: bool,
     /// Browser-style autoscroll mode state for manga strip layouts.
@@ -577,8 +552,6 @@ struct ImageViewer {
     manga_target_texture_side: u32,
     /// Adaptive decoded-upload batch size used by manga texture uploads.
     manga_upload_batch_limit: usize,
-    /// Per-frame deduplicated missing/upgrade LOD requests (index -> desired target side).
-    manga_missing_lod_requests: HashMap<usize, u32>,
     /// First time a visible item was observed without an uploaded texture.
     manga_ttv_pending: HashMap<usize, Instant>,
     /// Recent time-to-visible samples for manga/masonry (milliseconds).
@@ -752,7 +725,6 @@ impl Default for ImageViewer {
             // Manga reading mode fields
             manga_mode: false,
             manga_layout_mode: MangaLayoutMode::LongStrip,
-            pending_strip_layout_toggle: None,
             strip_return_mode: None,
             strip_return_masonry_state: None,
             strip_return_preserve_masonry_cache: false,
@@ -770,10 +742,6 @@ impl Default for ImageViewer {
             manga_wheel_scroll_pending: 0.0,
             manga_loader: None,
             manga_texture_cache: MangaTextureCache::default(),
-            manga_gpu_renderer: None,
-            manga_gpu_renderer_failed: false,
-            manga_gpu_transition_cooldown_frames: 0,
-            manga_gpu_items_scratch: Vec::new(),
             manga_scrollbar_dragging: false,
             manga_autoscroll_active: false,
             manga_autoscroll_anchor: None,
@@ -798,7 +766,6 @@ impl Default for ImageViewer {
             manga_cache_target_capacity: 64,
             manga_target_texture_side: 4096,
             manga_upload_batch_limit: 4,
-            manga_missing_lod_requests: HashMap::new(),
             manga_ttv_pending: HashMap::new(),
             manga_ttv_samples_ms: VecDeque::new(),
             manga_arrow_left_was_down: false,
@@ -859,6 +826,8 @@ impl ImageViewer {
     const MANGA_DYNAMIC_TARGET_MIN_SIDE: u32 = 192;
     const MANGA_DYNAMIC_TARGET_OVERSCAN: f32 = 1.35;
     const MANGA_MASONRY_DYNAMIC_TARGET_MIN_SIDE: u32 = 96;
+    const MANGA_TEXTURE_UPGRADE_MIN_DELTA_SIDE: u32 = 64;
+    const MANGA_TEXTURE_UPGRADE_MIN_RATIO: f32 = 1.12;
     const MANGA_TTV_SAMPLE_CAP: usize = 240;
     const MANGA_TTV_PENDING_MAX_AGE: Duration = Duration::from_secs(30);
 
@@ -1730,10 +1699,7 @@ impl ImageViewer {
 
     fn ensure_manga_loader(&mut self) {
         if self.manga_loader.is_none() {
-            self.manga_loader = Some(MangaLoader::new_with_l2_cache(
-                self.config.l2_disk_cache_enabled,
-                self.config.l2_disk_cache_max_gb,
-            ));
+            self.manga_loader = Some(MangaLoader::new());
         }
     }
 
@@ -1808,36 +1774,6 @@ impl ImageViewer {
         self.manga_focused_anim_index = None;
     }
 
-    fn begin_manga_gpu_transition(&mut self) {
-        self.manga_gpu_transition_cooldown_frames =
-            self.manga_gpu_transition_cooldown_frames.max(2);
-    }
-
-    fn ensure_masonry_gpu_renderer(&mut self, frame: &eframe::Frame) {
-        if self.manga_gpu_renderer.is_some() || self.manga_gpu_renderer_failed {
-            return;
-        }
-
-        let Some(render_state) = frame.wgpu_render_state() else {
-            return;
-        };
-
-        let created = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            GpuMasonryRenderer::new(render_state)
-        }));
-
-        match created {
-            Ok(renderer) => {
-                self.manga_gpu_renderer = Some(renderer);
-                self.manga_gpu_renderer_failed = false;
-            }
-            Err(_) => {
-                self.manga_gpu_renderer = None;
-                self.manga_gpu_renderer_failed = true;
-            }
-        }
-    }
-
     fn apply_video_audio_overrides(
         player: &mut VideoPlayer,
         muted_override: Option<bool>,
@@ -1889,24 +1825,17 @@ impl ImageViewer {
         viewer.startup_hide_started_at = Instant::now();
 
         // Determine the maximum texture size supported by the active backend.
+        // This viewer uses eframe's OpenGL (glow) integration; oversized textures can crash.
         viewer.max_texture_side = cc
-            .wgpu_render_state
-            .as_ref()
-            .map(|state| state.device.limits().max_texture_dimension_2d)
-            .or_else(|| {
-                cc
             .gl
             .as_ref()
             .and_then(|gl| unsafe {
                 gl.get_parameter_i32(eframe::glow::MAX_TEXTURE_SIZE)
                     .try_into()
                     .ok()
-                })
             })
             .unwrap_or(4096)
             .max(512);
-
-        viewer.manga_gpu_renderer = None;
 
         // Configure visuals (background driven by config)
         let mut visuals = egui::Visuals::dark();
@@ -2535,16 +2464,6 @@ impl ImageViewer {
         self.manga_mode && self.manga_layout_mode == MangaLayoutMode::Masonry
     }
 
-    fn masonry_dimensions_ready(&self) -> bool {
-        if !self.is_masonry_mode() || self.image_list.is_empty() {
-            return true;
-        }
-
-        self.manga_loader
-            .as_ref()
-            .is_some_and(|loader| loader.has_dimensions_for_all(self.image_list.len()))
-    }
-
     fn clear_strip_return_context(&mut self) {
         let should_clear_preserved_masonry_cache =
             self.strip_return_preserve_masonry_cache && !self.manga_mode;
@@ -2744,31 +2663,6 @@ impl ImageViewer {
         }
     }
 
-    fn manga_quantize_lod_side(&self, desired_side: u32) -> u32 {
-        let max_side = self.max_texture_side.max(1);
-        if desired_side <= 256 {
-            256u32.min(max_side)
-        } else if desired_side <= 512 {
-            512u32.min(max_side)
-        } else if desired_side <= 1024 {
-            1024u32.min(max_side)
-        } else {
-            max_side
-        }
-    }
-
-    fn manga_lod_rank_for_side(side: u32) -> u8 {
-        if side <= 256 {
-            0
-        } else if side <= 512 {
-            1
-        } else if side <= 1024 {
-            2
-        } else {
-            3
-        }
-    }
-
     fn masonry_target_texture_side_from_screen_width(&self, item_screen_width: f32) -> u32 {
         let max_side = self.max_texture_side.max(1);
         let zoom = self.zoom.max(0.0001);
@@ -2805,14 +2699,19 @@ impl ImageViewer {
                 )
         };
 
-        let clamped_to_source = self
-            .manga_clamp_target_side_to_source(index, target_side)
-            .clamp(1, max_side);
-        self.manga_quantize_lod_side(clamped_to_source)
+        self.manga_clamp_target_side_to_source(index, target_side)
+            .clamp(1, max_side)
     }
 
     fn manga_texture_upgrade_needed(existing_side: u32, desired_side: u32) -> bool {
-        Self::manga_lod_rank_for_side(desired_side) > Self::manga_lod_rank_for_side(existing_side)
+        if desired_side <= existing_side {
+            return false;
+        }
+
+        let ratio_threshold =
+            (existing_side as f32 * Self::MANGA_TEXTURE_UPGRADE_MIN_RATIO).ceil() as u32;
+        let delta_threshold = existing_side.saturating_add(Self::MANGA_TEXTURE_UPGRADE_MIN_DELTA_SIDE);
+        desired_side >= ratio_threshold.max(delta_threshold)
     }
 
     fn manga_collect_visible_indices(&mut self) -> Vec<usize> {
@@ -2821,10 +2720,6 @@ impl ImageViewer {
         }
 
         if self.is_masonry_mode() {
-            if !self.masonry_dimensions_ready() {
-                return Vec::new();
-            }
-
             self.masonry_ensure_layout_cache();
             if self.masonry_layout_items.is_empty() {
                 return Vec::new();
@@ -2834,11 +2729,20 @@ impl ImageViewer {
             let viewport_bottom = viewport_top + self.screen_size.y.max(1.0);
             let zoom = self.zoom.max(0.0001);
 
-            return self.masonry_collect_visible_indices_for_viewport(
-                viewport_top,
-                viewport_bottom,
-                zoom,
-            );
+            return self
+                .masonry_layout_items
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, item)| {
+                    let item_top = item.y * zoom;
+                    let item_bottom = item_top + item.height * zoom;
+                    if item_top < viewport_bottom && item_bottom > viewport_top {
+                        Some(idx)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
         }
 
         let viewport_top = self.manga_scroll_offset.max(0.0);
@@ -2863,84 +2767,6 @@ impl ImageViewer {
         }
 
         visible_indices
-    }
-
-    fn masonry_collect_visible_indices_for_viewport(
-        &self,
-        viewport_top: f32,
-        viewport_bottom: f32,
-        zoom: f32,
-    ) -> Vec<usize> {
-        let mut visible: Vec<usize> = self
-            .masonry_layout_items
-            .par_iter()
-            .enumerate()
-            .filter_map(|(idx, item)| {
-                let item_top = item.y * zoom;
-                let item_bottom = item_top + item.height * zoom;
-                if item_top < viewport_bottom && item_bottom > viewport_top {
-                    Some(idx)
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        visible.sort_unstable();
-        visible
-    }
-
-    fn manga_build_masonry_draw_commands(
-        &self,
-        viewport_top: f32,
-        viewport_bottom: f32,
-        zoom: f32,
-    ) -> Vec<MangaDrawCommand> {
-        let max_side = self.max_texture_side.max(1);
-        let rows = self.masonry_items_per_row.clamp(2, 10) as f32;
-        let screen_width = self.screen_size.x.max(1.0);
-        let pan_x = self.offset.x;
-        let scroll_y = self.manga_scroll_offset;
-
-        let mut commands: Vec<MangaDrawCommand> = self
-            .masonry_layout_items
-            .par_iter()
-            .enumerate()
-            .filter_map(|(idx, item)| {
-                let item_top = item.y * zoom;
-                let item_bottom = item_top + item.height * zoom;
-                if item_top >= viewport_bottom || item_bottom <= viewport_top {
-                    return None;
-                }
-
-                let image_rect = item.to_screen_rect(zoom, pan_x, scroll_y);
-
-                let baseline_item_width = (screen_width / rows) * zoom;
-                let basis = image_rect.width().max(baseline_item_width).max(64.0);
-                let boosted = (basis * Self::masonry_zoom_quality_boost(zoom)).ceil() as u32;
-                let raw_target_side =
-                    boosted.clamp(Self::MANGA_MASONRY_DYNAMIC_TARGET_MIN_SIDE.min(max_side), max_side);
-
-                let target_texture_side = if raw_target_side <= 256 {
-                    256u32.min(max_side)
-                } else if raw_target_side <= 512 {
-                    512u32.min(max_side)
-                } else if raw_target_side <= 1024 {
-                    1024u32.min(max_side)
-                } else {
-                    max_side
-                };
-
-                Some(MangaDrawCommand {
-                    index: idx,
-                    image_rect,
-                    target_texture_side,
-                })
-            })
-            .collect();
-
-        commands.sort_unstable_by_key(|cmd| cmd.index);
-        commands
     }
 
     fn manga_compute_cache_capacity_target(
@@ -3005,8 +2831,7 @@ impl ImageViewer {
                 }
             }
 
-            let desired = self.masonry_target_texture_side_from_screen_width(visible_max_width);
-            return self.manga_quantize_lod_side(desired);
+            return self.masonry_target_texture_side_from_screen_width(visible_max_width);
         }
 
         if self.zoom >= 0.95 {
@@ -3027,7 +2852,7 @@ impl ImageViewer {
         }
 
         let scaled = (visible_max_side * 1.20).ceil() as u32;
-        self.manga_quantize_lod_side(scaled.clamp(256u32.min(max_side), max_side))
+        scaled.clamp(256u32.min(max_side), max_side)
     }
 
     fn navigation_preload_window(&self) -> (usize, usize) {
@@ -3047,19 +2872,12 @@ impl ImageViewer {
         }
     }
 
-    fn apply_pending_strip_layout_toggle(&mut self) {
-        let Some(layout_mode) = self.pending_strip_layout_toggle.take() else {
-            return;
-        };
+    fn toggle_long_strip_mode(&mut self) {
+        self.toggle_strip_mode(MangaLayoutMode::LongStrip);
+    }
 
-        // Drop stale deferred toggles during fullscreen transitions or after leaving fullscreen.
-        // Applying these can re-enter strip mode at unsafe times.
-        if self.toggle_fullscreen || !self.is_fullscreen {
-            return;
-        }
-
-        self.clear_strip_return_context();
-        self.toggle_strip_mode(layout_mode);
+    fn toggle_masonry_mode(&mut self) {
+        self.toggle_strip_mode(MangaLayoutMode::Masonry);
     }
 
     fn set_masonry_items_per_row(&mut self, items_per_row: usize) {
@@ -3087,8 +2905,6 @@ impl ImageViewer {
     }
 
     fn toggle_strip_mode(&mut self, layout_mode: MangaLayoutMode) {
-        self.begin_manga_gpu_transition();
-
         if !self.manga_mode {
             self.manga_layout_mode = layout_mode;
             self.toggle_manga_mode();
@@ -3134,18 +2950,12 @@ impl ImageViewer {
             return;
         }
 
-        if !self.masonry_dimensions_ready() {
-            self.masonry_layout_items.clear();
-            self.masonry_layout_total_height = 0.0;
-            self.masonry_layout_valid = false;
-            return;
-        }
-
         let screen_x = self.screen_size.x.round();
         let len = self.image_list.len();
         let items_per_row = self.masonry_items_per_row.clamp(2, 10);
 
         let needs_recompute = !self.masonry_layout_valid
+            || (self.masonry_layout_screen_x - screen_x).abs() > 1e-6
             || self.masonry_layout_items_per_row != items_per_row
             || self.masonry_layout_len != len;
 
@@ -3153,22 +2963,58 @@ impl ImageViewer {
             return;
         }
 
-        let layout = compute_static_masonry_layout(
-            len,
-            StaticMasonryLayoutConfig {
-                viewport_width: self.screen_size.x,
-                items_per_row,
-                side_padding: 16.0,
-                top_padding: 10.0,
-                bottom_padding: 10.0,
-                gutter: 12.0,
-                min_item_height: 20.0,
-            },
-            |idx| self.masonry_item_aspect_ratio(idx),
-        );
+        const SIDE_PADDING: f32 = 16.0;
+        const TOP_PADDING: f32 = 10.0;
+        const BOTTOM_PADDING: f32 = 10.0;
+        const GUTTER: f32 = 12.0;
 
-        self.masonry_layout_items = layout.items;
-        self.masonry_layout_total_height = layout.total_height;
+        let available_width = (self.screen_size.x - SIDE_PADDING * 2.0).max(20.0);
+        let columns = items_per_row.max(1);
+        let total_gutter = GUTTER * (columns.saturating_sub(1) as f32);
+        let column_width = ((available_width - total_gutter) / columns as f32).max(1.0);
+        let used_width = column_width * columns as f32 + total_gutter;
+        let start_x = ((self.screen_size.x - used_width) * 0.5).max(0.0);
+
+        let mut column_heights = vec![TOP_PADDING; columns];
+        self.masonry_layout_items.clear();
+        self.masonry_layout_items
+            .resize(len, MasonryItemLayout::default());
+
+        for idx in 0..len {
+            let mut target_col = 0usize;
+            let mut min_height = column_heights[0];
+            for col in 1..columns {
+                if column_heights[col] < min_height {
+                    min_height = column_heights[col];
+                    target_col = col;
+                }
+            }
+
+            let x = start_x + target_col as f32 * (column_width + GUTTER);
+            let y = column_heights[target_col];
+            let height = (column_width * self.masonry_item_aspect_ratio(idx)).max(20.0);
+
+            self.masonry_layout_items[idx] = MasonryItemLayout {
+                x,
+                y,
+                width: column_width,
+                height,
+            };
+
+            column_heights[target_col] = y + height + GUTTER;
+        }
+
+        let mut content_bottom = TOP_PADDING;
+        for h in column_heights {
+            if h > content_bottom {
+                content_bottom = h;
+            }
+        }
+        if len > 0 {
+            content_bottom = (content_bottom - GUTTER).max(TOP_PADDING);
+        }
+
+        self.masonry_layout_total_height = (content_bottom + BOTTOM_PADDING).max(0.0);
         self.masonry_layout_screen_x = screen_x;
         self.masonry_layout_items_per_row = items_per_row;
         self.masonry_layout_len = len;
@@ -3244,8 +3090,6 @@ impl ImageViewer {
 
     /// Toggle manga reading mode on/off
     fn toggle_manga_mode(&mut self) {
-        self.begin_manga_gpu_transition();
-
         if !self.manga_mode {
             let current_media_dims = self.media_display_dimensions().or(self.video_texture_dims);
             let current_media_type = self.current_media_type;
@@ -3554,16 +3398,12 @@ impl ImageViewer {
     fn manga_clear_cache(&mut self) {
         // Clear the texture cache
         self.manga_texture_cache.clear();
-        if let Some(renderer) = self.manga_gpu_renderer.as_ref() {
-            renderer.clear_textures();
-        }
         self.strip_entry_placeholder_index = None;
         self.manga_ttv_pending.clear();
         self.manga_ttv_samples_ms.clear();
         self.manga_upload_batch_limit = Self::MANGA_UPLOAD_BATCH_BASE;
         self.manga_cache_target_capacity = Self::MANGA_CACHE_MIN_ENTRIES;
         self.manga_target_texture_side = self.max_texture_side.max(1);
-        self.manga_missing_lod_requests.clear();
 
         // Clear and reset the parallel loader
         if let Some(ref mut loader) = self.manga_loader {
@@ -4214,13 +4054,6 @@ impl ImageViewer {
             return;
         }
 
-        if self.is_masonry_mode() && !self.masonry_dimensions_ready() {
-            if let Some(ref mut loader) = self.manga_loader {
-                loader.request_dimensions_range(&self.image_list, 0, self.image_list.len());
-            }
-            return;
-        }
-
         // Respect cooldown after large jumps (Home/End keys)
         if self.manga_preload_cooldown > 0 {
             return;
@@ -4257,16 +4090,9 @@ impl ImageViewer {
         self.manga_texture_cache
             .set_pinned_indices(visible_indices.iter().copied());
 
-        let mut evicted_for_capacity = self.manga_texture_cache.set_l1_pool_slots(MangaL1PoolSlots {
-            lod0_slots: self.config.l1_pool_lod0_slots,
-            lod1_slots: self.config.l1_pool_lod1_slots,
-            lod2_slots: self.config.l1_pool_lod2_slots,
-            lod3_slots: self.config.l1_pool_lod3_slots,
-        });
-        evicted_for_capacity.extend(
-            self.manga_texture_cache
-                .set_max_entries(self.manga_cache_target_capacity),
-        );
+        let mut evicted_for_capacity = self
+            .manga_texture_cache
+            .set_max_entries(self.manga_cache_target_capacity);
         if !evicted_for_capacity.is_empty() {
             if let Some(loader) = self.manga_loader.as_mut() {
                 for idx in evicted_for_capacity.drain(..) {
@@ -4598,9 +4424,8 @@ impl ImageViewer {
             (decoded_images, dim_updates)
         };
 
-        // In long-strip mode, dimension updates can change page heights and must invalidate layout.
-        // In masonry mode, layout is intentionally frozen after the first full metadata pass.
-        if !dim_updates.is_empty() && !self.is_masonry_mode() {
+        // Dimension updates can change page heights; invalidate cached layout/prefix sums.
+        if !dim_updates.is_empty() {
             self.manga_total_height_cache_valid = false;
             self.manga_layout_offsets.clear();
             self.masonry_layout_valid = false;
@@ -4612,81 +4437,56 @@ impl ImageViewer {
         self.manga_texture_cache
             .set_pinned_indices(visible_indices.iter().copied());
 
-        let mut evicted_to_mark_unloaded = self.manga_texture_cache.set_l1_pool_slots(
-            MangaL1PoolSlots {
-                lod0_slots: self.config.l1_pool_lod0_slots,
-                lod1_slots: self.config.l1_pool_lod1_slots,
-                lod2_slots: self.config.l1_pool_lod2_slots,
-                lod3_slots: self.config.l1_pool_lod3_slots,
-            },
-        );
-        evicted_to_mark_unloaded.extend(
-            self.manga_texture_cache
-                .set_max_entries(self.manga_cache_target_capacity),
-        );
+        let mut evicted_to_mark_unloaded = self
+            .manga_texture_cache
+            .set_max_entries(self.manga_cache_target_capacity);
 
         // Upload decoded images to GPU as textures
         for decoded in decoded_images {
-            let manga_loader::DecodedImage {
-                index,
-                pixels,
-                width,
-                height,
-                original_width: _,
-                original_height: _,
-                media_type,
-            } = decoded;
-
-            let incoming_side = width.max(height);
+            let incoming_side = decoded.width.max(decoded.height);
 
             // Keep current texture unless the decoded payload is a meaningful quality upgrade.
-            if let Some((_, existing_w, existing_h)) = self.manga_texture_cache.get_texture_info(index)
+            if let Some((_, existing_w, existing_h)) = self.manga_texture_cache.get_texture_info(decoded.index)
             {
                 let existing_side = existing_w.max(existing_h);
                 if !Self::manga_texture_upgrade_needed(existing_side, incoming_side) {
-                    self.manga_ttv_pending.remove(&index);
+                    self.manga_ttv_pending.remove(&decoded.index);
                     continue;
                 }
             }
 
             // Skip if no pixel data (failed to extract frame or empty placeholder)
-            if pixels.is_empty() {
+            if decoded.pixels.is_empty() {
                 continue;
-            }
-
-            if media_type == MangaMediaType::StaticImage {
-                if let Some(renderer) = self.manga_gpu_renderer.as_ref() {
-                    renderer.enqueue_texture_upload(index, width, height, incoming_side, pixels.clone());
-                }
             }
 
             // Create the texture
             let color_image = egui::ColorImage::from_rgba_unmultiplied(
-                [width as usize, height as usize],
-                &pixels,
+                [decoded.width as usize, decoded.height as usize],
+                &decoded.pixels,
             );
 
             // Static images + video thumbnails can use mipmaps for faster minification
             // in manga strip and masonry layouts.
             let texture_options =
-                self.manga_texture_options_for_upload(media_type, width, height);
+                self.manga_texture_options_for_upload(decoded.media_type, decoded.width, decoded.height);
 
             let texture = ctx.load_texture(
-                format!("manga_{}", index),
+                format!("manga_{}", decoded.index),
                 color_image,
                 texture_options,
             );
 
             // Insert into cache with media type (this may evict old entries)
             let evicted = self.manga_texture_cache.insert_with_type(
-                index,
+                decoded.index,
                 texture,
-                width,
-                height,
-                media_type,
+                decoded.width,
+                decoded.height,
+                decoded.media_type,
             );
 
-            if let Some(started_at) = self.manga_ttv_pending.remove(&index) {
+            if let Some(started_at) = self.manga_ttv_pending.remove(&decoded.index) {
                 self.manga_record_ttv_sample(started_at.elapsed());
             }
 
@@ -4694,12 +4494,6 @@ impl ImageViewer {
         }
 
         if !evicted_to_mark_unloaded.is_empty() {
-            if let Some(renderer) = self.manga_gpu_renderer.as_ref() {
-                for &evicted_idx in &evicted_to_mark_unloaded {
-                    renderer.remove_texture(evicted_idx);
-                }
-            }
-
             if let Some(loader) = self.manga_loader.as_mut() {
                 for evicted_idx in evicted_to_mark_unloaded {
                     loader.mark_unloaded(evicted_idx);
@@ -5449,12 +5243,12 @@ impl ImageViewer {
                     );
 
                     if response.clicked() {
-                        self.pending_strip_layout_toggle = Some(if *is_masonry {
-                            MangaLayoutMode::Masonry
+                        self.clear_strip_return_context();
+                        if *is_masonry {
+                            self.toggle_masonry_mode();
                         } else {
-                            MangaLayoutMode::LongStrip
-                        });
-                        self.begin_manga_gpu_transition();
+                            self.toggle_long_strip_mode();
+                        }
                         self.touch_bottom_overlays();
                     }
 
@@ -5963,68 +5757,28 @@ impl ImageViewer {
             .manga_clamp_target_side_to_source(index, display_target_side)
             .max(self.manga_target_texture_side.min(max_side))
             .clamp(Self::MANGA_DYNAMIC_TARGET_MIN_SIDE.min(max_side), max_side);
-        let target_texture_side = self.manga_quantize_lod_side(target_texture_side);
-        let new_target = match self.manga_missing_lod_requests.get_mut(&index) {
-            Some(existing) => {
-                if target_texture_side > *existing {
-                    *existing = target_texture_side;
-                }
-                false
-            }
-            None => {
-                self.manga_missing_lod_requests
-                    .insert(index, target_texture_side);
-                true
-            }
-        };
-
-        new_target
-    }
-
-    fn manga_flush_missing_lod_requests(&mut self) -> bool {
-        if self.manga_missing_lod_requests.is_empty() {
-            return false;
-        }
-
-        let mut requests: Vec<(usize, u32)> =
-            self.manga_missing_lod_requests.drain().collect();
-        requests.sort_by_key(|(idx, target_side)| {
-            (
-                idx.abs_diff(self.current_index),
-                std::cmp::Reverse(*target_side),
-            )
-        });
-
         let (downscale_filter, gif_filter) = self.manga_decode_filters_for_strip_mode();
         let force_triangle_filters = self.manga_should_force_triangle_filters();
-        let mut dispatched_any = false;
 
-        if let Some(loader) = self.manga_loader.as_mut() {
-            for (idx, target_side) in requests {
-                let dispatched = loader.request_visible_retry(
+        self.manga_loader
+            .as_mut()
+            .map(|loader| {
+                loader.request_visible_retry(
                     &self.image_list,
-                    idx,
+                    index,
                     self.max_texture_side,
-                    target_side,
+                    target_texture_side,
                     downscale_filter,
                     gif_filter,
                     force_triangle_filters,
-                );
-                dispatched_any |= dispatched;
-            }
-        }
-
-        dispatched_any
+                )
+            })
+            .unwrap_or(false)
     }
 
-    fn draw_manga_item(
-        &mut self,
-        ui: &mut egui::Ui,
-        idx: usize,
-        image_rect: egui::Rect,
-        retry_target_side: u32,
-    ) -> bool {
+    fn draw_manga_item(&mut self, ui: &mut egui::Ui, idx: usize, image_rect: egui::Rect) -> bool {
         let mut requested_retry = false;
+        let retry_target_side = self.manga_retry_target_side_for_rect(idx, image_rect);
 
         // Check if this item is a video
         let is_video = self
@@ -6229,30 +5983,6 @@ impl ImageViewer {
         let screen_width = screen_rect.width();
         let screen_height = screen_rect.height();
         let mut animation_active = false;
-
-        if self.is_masonry_mode() && !self.masonry_dimensions_ready() {
-            if let Some(loader) = self.manga_loader.as_mut() {
-                loader.request_dimensions_range(&self.image_list, 0, self.image_list.len());
-                let dim_updates = loader.poll_dimension_results(64);
-                if !dim_updates.is_empty() {
-                    self.masonry_layout_valid = false;
-                }
-            }
-
-            egui::CentralPanel::default()
-                .frame(egui::Frame::none().fill(self.background_color32()))
-                .show(ctx, |ui| {
-                    ui.painter().text(
-                        egui::pos2(screen_width * 0.5, screen_height * 0.5),
-                        egui::Align2::CENTER_CENTER,
-                        "Indexing image dimensions...",
-                        egui::FontId::proportional(18.0),
-                        egui::Color32::from_gray(200),
-                    );
-                });
-
-            return true;
-        }
 
         // Get input states
         let ctrl_held = ctx.input(|i| i.modifiers.ctrl);
@@ -6967,84 +6697,18 @@ impl ImageViewer {
                     let viewport_top = self.manga_scroll_offset.max(0.0);
                     let viewport_bottom = viewport_top + screen_height;
                     let zoom = self.zoom.max(0.0001);
-                    let allow_gpu_callback =
-                        !self.toggle_fullscreen
-                            && self.pending_strip_layout_toggle.is_none()
-                            && self.manga_gpu_transition_cooldown_frames == 0;
 
-                    let draw_commands = self.manga_build_masonry_draw_commands(
-                        viewport_top,
-                        viewport_bottom,
-                        zoom,
-                    );
-
-                    if allow_gpu_callback && self.manga_gpu_renderer.is_some() {
-                        self.manga_gpu_items_scratch.clear();
-                        self.manga_gpu_items_scratch.reserve(draw_commands.len());
-                        for command in draw_commands.iter() {
-                            let is_static_item = self
-                                .manga_loader
-                                .as_ref()
-                                .and_then(|loader| loader.get_media_type(command.index))
-                                .map(|media_type| media_type == MangaMediaType::StaticImage)
-                                .unwrap_or(false);
-
-                            if is_static_item {
-                                self.manga_gpu_items_scratch.push(GpuMasonryInputItem::from_rect(
-                                    command.index,
-                                    command.image_rect,
-                                    command.target_texture_side,
-                                ));
-                            }
-                        }
-                    }
-
-                    if allow_gpu_callback {
-                        if let Some(renderer) = self.manga_gpu_renderer.as_ref() {
-                        renderer.enqueue_callback(ui, &self.manga_gpu_items_scratch);
-                        }
-                    }
-
-                    for command in draw_commands {
-                        let is_static_item = self
-                            .manga_loader
-                            .as_ref()
-                            .and_then(|loader| loader.get_media_type(command.index))
-                            .map(|media_type| media_type == MangaMediaType::StaticImage)
-                            .unwrap_or(false);
-
-                        let (gpu_can_render, gpu_needs_upgrade) = if allow_gpu_callback && is_static_item {
-                            if let Some(renderer) = self.manga_gpu_renderer.as_ref() {
-                                (
-                                    renderer.can_render_index(command.index),
-                                    renderer.needs_lod_upgrade(
-                                        command.index,
-                                        command.target_texture_side,
-                                    ),
-                                )
-                            } else {
-                                (false, false)
-                            }
-                        } else {
-                            (false, false)
-                        };
-
-                        if gpu_can_render {
-                            if gpu_needs_upgrade {
-                                requested_visible_retry |= self.manga_request_retry_for_visible_item(
-                                    command.index,
-                                    command.target_texture_side,
-                                );
-                            }
+                    for idx in 0..self.masonry_layout_items.len() {
+                        let item = self.masonry_layout_items[idx];
+                        let item_top = item.y * zoom;
+                        let item_bottom = item_top + item.height * zoom;
+                        if item_top > viewport_bottom || item_bottom < viewport_top {
                             continue;
                         }
 
-                        if self.draw_manga_item(
-                            ui,
-                            command.index,
-                            command.image_rect,
-                            command.target_texture_side,
-                        ) {
+                        let image_rect =
+                            item.to_screen_rect(zoom, self.offset.x, self.manga_scroll_offset);
+                        if self.draw_manga_item(ui, idx, image_rect) {
                             requested_visible_retry = true;
                         }
                     }
@@ -7075,8 +6739,7 @@ impl ImageViewer {
                             egui::Vec2::new(display_width, display_height),
                         );
 
-                        let retry_target_side = self.manga_retry_target_side_for_rect(idx, image_rect);
-                        if self.draw_manga_item(ui, idx, image_rect, retry_target_side) {
+                        if self.draw_manga_item(ui, idx, image_rect) {
                             requested_visible_retry = true;
                         }
                         y_offset += img_height;
@@ -7181,11 +6844,6 @@ impl ImageViewer {
 
         if requested_visible_retry {
             animation_active = true;
-        }
-
-        if self.manga_flush_missing_lod_requests() {
-            animation_active = true;
-            requested_visible_retry = true;
         }
 
         // Retry preload updates only while there is still background work in flight.
@@ -9944,7 +9602,7 @@ impl ImageViewer {
 }
 
 impl eframe::App for ImageViewer {
-    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Reset per-frame repaint tracking
         self.needs_repaint = false;
 
@@ -10003,10 +9661,6 @@ impl eframe::App for ImageViewer {
         // Update FPS stats for the debug overlay (and for general diagnostics).
         self.update_fps_stats();
 
-        if self.manga_gpu_transition_cooldown_frames > 0 {
-            self.manga_gpu_transition_cooldown_frames -= 1;
-        }
-
         // Lazily install large CJK fonts only when we actually have a filename that needs them.
         self.ensure_windows_cjk_fonts_if_needed(ctx);
 
@@ -10043,10 +9697,6 @@ impl eframe::App for ImageViewer {
 
         // Input can switch media, which updates the title.
         self.apply_pending_window_title(ctx);
-
-        // Apply deferred strip layout toggles at frame start to avoid mutating
-        // manga/layout state in the middle of a frame after draw commands were queued.
-        self.apply_pending_strip_layout_toggle();
 
         // Input can switch media; update bottom overlay state again for this frame's drawing.
         let bottom_overlays_should_show = self.update_bottom_overlays_visibility(ctx);
@@ -10122,8 +9772,6 @@ impl eframe::App for ImageViewer {
 
         if self.toggle_fullscreen {
             self.stop_manga_autoscroll();
-            self.begin_manga_gpu_transition();
-            self.pending_strip_layout_toggle = None;
             let entering_fullscreen = !self.is_fullscreen;
             self.is_fullscreen = entering_fullscreen;
 
@@ -10333,9 +9981,6 @@ impl eframe::App for ImageViewer {
         let draw_animation_active = if skip_drawing {
             false
         } else {
-            if self.manga_mode && self.is_fullscreen && self.is_masonry_mode() {
-                self.ensure_masonry_gpu_renderer(frame);
-            }
             self.draw_image(ctx)
         };
 
@@ -10649,8 +10294,9 @@ fn main() -> eframe::Result<()> {
     //
     // Note: We don't set fullscreen in the viewport to avoid triggering NVIDIA GSYNC
     let options = eframe::NativeOptions {
-        // Use wgpu backend as the baseline for the modern GPU-driven masonry pipeline.
-        renderer: eframe::Renderer::Wgpu,
+        // Keep the renderer lightweight at idle. This viewer renders 2D UI + a single image/video
+        // texture; MSAA and a depth buffer are not required for perceptible quality.
+        renderer: eframe::Renderer::Glow,
         // CRITICAL: Enable VSync to eliminate screen tearing during scrolling/panning.
         // This synchronizes frame presentation with the display's refresh rate.
         vsync: true,
