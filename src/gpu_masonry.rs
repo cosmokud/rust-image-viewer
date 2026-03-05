@@ -10,6 +10,8 @@ const INITIAL_CAPACITY: usize = 1024;
 const CULL_WORKGROUP_SIZE: u32 = 64;
 const ATLAS_MAX_SIZE: u32 = 4096;
 const ATLAS_PADDING: u32 = 1;
+const ATLAS_UPLOAD_BATCH_ITEMS: usize = 8;
+const ATLAS_UPLOAD_BATCH_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GpuMasonryInputItem {
@@ -230,7 +232,24 @@ impl egui_wgpu::CallbackTrait for GpuMasonryCallback {
             let frame_items = shared.frame_data.items.clone();
             let viewport_min = shared.frame_data.viewport_min;
             let viewport_max = shared.frame_data.viewport_max;
-            let uploads: Vec<PendingTextureUpload> = shared.pending_uploads.drain(..).collect();
+            let mut uploads: Vec<PendingTextureUpload> = Vec::new();
+            let mut batch_bytes = 0usize;
+
+            while let Some(candidate) = shared.pending_uploads.pop_front() {
+                let candidate_bytes = candidate.pixels.len();
+                let over_item_limit = uploads.len() >= ATLAS_UPLOAD_BATCH_ITEMS;
+                let over_byte_limit = !uploads.is_empty()
+                    && batch_bytes.saturating_add(candidate_bytes) > ATLAS_UPLOAD_BATCH_BYTES;
+
+                if over_item_limit || over_byte_limit {
+                    shared.pending_uploads.push_front(candidate);
+                    break;
+                }
+
+                batch_bytes = batch_bytes.saturating_add(candidate_bytes);
+                uploads.push(candidate);
+            }
+
             let reset_requested = std::mem::take(&mut shared.atlas_reset_requested);
 
             (
@@ -450,7 +469,7 @@ impl GpuMasonryResources {
                     },
                     wgpu::BindGroupLayoutEntry {
                         binding: 1,
-                        visibility: wgpu::ShaderStages::COMPUTE | wgpu::ShaderStages::VERTEX,
+                        visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Storage { read_only: false },
                             has_dynamic_offset: false,
@@ -470,7 +489,7 @@ impl GpuMasonryResources {
                     },
                     wgpu::BindGroupLayoutEntry {
                         binding: 3,
-                        visibility: wgpu::ShaderStages::COMPUTE | wgpu::ShaderStages::VERTEX,
+                        visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Uniform,
                             has_dynamic_offset: false,
