@@ -43,6 +43,7 @@ rayon = "1.10"
 crossbeam-channel = "0.5"
 parking_lot = "0.12"
 lru = "0.12"
+hashbrown = "0.15"
 
 # Windows-specific
 [target.'cfg(windows)'.dependencies]

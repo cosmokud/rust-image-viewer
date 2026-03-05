@@ -19,7 +19,6 @@
 //!   while maximizing cache hit rate.
 
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -28,6 +27,7 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, TrySendError};
 use fast_image_resize as fir;
+use hashbrown::{HashMap, HashSet};
 use image::imageops::FilterType;
 use lru::LruCache;
 use parking_lot::RwLock;

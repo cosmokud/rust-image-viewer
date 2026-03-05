@@ -17,6 +17,7 @@ use image_loader::{
     get_images_in_directory, get_media_type, is_supported_video, probe_image_dimensions,
     ImageFrame, LoadedImage, MediaType,
 };
+use hashbrown::{HashMap, HashSet};
 use manga_loader::{MangaLoader, MangaMediaType, MangaTextureCache};
 #[cfg(target_os = "windows")]
 use single_instance::{FileReceiver, SingleInstanceResult};
@@ -25,7 +26,7 @@ use video_player::{format_duration, VideoPlayer};
 use eframe::egui;
 use image::imageops::FilterType;
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::VecDeque;
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
@@ -610,7 +611,7 @@ struct ImageViewer {
     /// Receiver that yields individual `ImageFrame`s as they are decoded on a
     /// background thread (non-manga mode).  Frames are appended to `self.image`
     /// progressively so the animation can start playing immediately.
-    anim_stream_rx: Option<std::sync::mpsc::Receiver<ImageFrame>>,
+    anim_stream_rx: Option<crossbeam_channel::Receiver<ImageFrame>>,
     /// Path of the image currently being streamed.
     anim_stream_path: Option<PathBuf>,
     /// `true` once the background decoder has finished (sender dropped).
@@ -620,7 +621,7 @@ struct ImageViewer {
 
     /// Per-index streaming receivers for manga mode animated WebPs.
     /// Multiple animations can stream in parallel (one per visible animated item).
-    manga_anim_streams: HashMap<usize, std::sync::mpsc::Receiver<ImageFrame>>,
+    manga_anim_streams: HashMap<usize, crossbeam_channel::Receiver<ImageFrame>>,
     /// Tracks which manga animated-image entries still have frames incoming.
     /// `true` = still streaming, `false` = done.
     manga_anim_stream_done: HashMap<usize, bool>,
@@ -4275,8 +4276,8 @@ impl ImageViewer {
                             }
                             needs_repaint = true;
                         }
-                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        Err(crossbeam_channel::TryRecvError::Empty) => break,
+                        Err(crossbeam_channel::TryRecvError::Disconnected) => {
                             disconnected = true;
                             break;
                         }
@@ -7509,8 +7510,8 @@ impl ImageViewer {
                                 }
                             }
                         }
-                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        Err(crossbeam_channel::TryRecvError::Empty) => break,
+                        Err(crossbeam_channel::TryRecvError::Disconnected) => {
                             self.reset_fullscreen_anim_stream_state();
                             break;
                         }

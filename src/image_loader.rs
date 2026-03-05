@@ -33,9 +33,20 @@ fn open_media_reader(path: &Path) -> Result<Box<dyn BufReadSeek>, String> {
 }
 
 fn should_decode_static_with_zune(path: &Path) -> bool {
+    extension_matches(path, ZUNE_STATIC_EXTENSIONS)
+}
+
+fn extension_matches(path: &Path, candidates: &[&str]) -> bool {
     path.extension()
-        .and_then(|e| e.to_str())
-        .map(|e| ZUNE_STATIC_EXTENSIONS.contains(&e.to_lowercase().as_str()))
+        .and_then(|ext| ext.to_str())
+        .map(|ext| candidates.iter().any(|candidate| ext.eq_ignore_ascii_case(candidate)))
+        .unwrap_or(false)
+}
+
+fn extension_is(path: &Path, candidate: &str) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case(candidate))
         .unwrap_or(false)
 }
 
@@ -190,26 +201,17 @@ pub enum MediaType {
 
 /// Check if a file is a supported image
 pub fn is_supported_image(path: &Path) -> bool {
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| SUPPORTED_IMAGE_EXTENSIONS.contains(&ext.to_lowercase().as_str()))
-        .unwrap_or(false)
+    extension_matches(path, SUPPORTED_IMAGE_EXTENSIONS)
 }
 
 /// Check if a file is a supported video
 pub fn is_supported_video(path: &Path) -> bool {
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| SUPPORTED_VIDEO_EXTENSIONS.contains(&ext.to_lowercase().as_str()))
-        .unwrap_or(false)
+    extension_matches(path, SUPPORTED_VIDEO_EXTENSIONS)
 }
 
 /// Check if a file is any supported media (image or video)
 pub fn is_supported_media(path: &Path) -> bool {
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| SUPPORTED_EXTENSIONS.contains(&ext.to_lowercase().as_str()))
-        .unwrap_or(false)
+    extension_matches(path, SUPPORTED_EXTENSIONS)
 }
 
 /// Get the media type for a file
@@ -293,15 +295,9 @@ impl LoadedImage {
         downscale_filter: FilterType,
         gif_filter: FilterType,
     ) -> Result<Self, String> {
-        let extension = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_lowercase())
-            .unwrap_or_default();
-
-        if extension == "gif" {
+        if extension_is(path, "gif") {
             Self::load_gif(path, max_texture_side, gif_filter)
-        } else if extension == "webp" {
+        } else if extension_is(path, "webp") {
             // Try loading as animated WEBP; fall back to static if decoding
             // fails or the file contains only a single frame.
             match Self::load_animated_webp(path, max_texture_side, gif_filter) {
@@ -324,13 +320,7 @@ impl LoadedImage {
         downscale_filter: FilterType,
         gif_filter: FilterType,
     ) -> Result<Self, String> {
-        let extension = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_lowercase())
-            .unwrap_or_default();
-
-        if extension == "webp" {
+        if extension_is(path, "webp") {
             // Try to decode just the first frame of an animated WebP.
             match Self::load_webp_first_frame(path, max_texture_side, gif_filter) {
                 Ok(img) => Ok(img),
@@ -357,14 +347,13 @@ impl LoadedImage {
         path: &Path,
         max_texture_side: Option<u32>,
         filter: FilterType,
-    ) -> Option<std::sync::mpsc::Receiver<ImageFrame>> {
-        use std::sync::mpsc;
+    ) -> Option<crossbeam_channel::Receiver<ImageFrame>> {
 
         if !Self::is_animated_webp(path) {
             return None;
         }
 
-        let (tx, rx) = mpsc::channel::<ImageFrame>();
+        let (tx, rx) = crossbeam_channel::unbounded::<ImageFrame>();
         let path = path.to_path_buf();
 
         std::thread::Builder::new()
@@ -384,7 +373,7 @@ impl LoadedImage {
         path: &Path,
         max_texture_side: Option<u32>,
         filter: FilterType,
-        tx: &std::sync::mpsc::Sender<ImageFrame>,
+        tx: &crossbeam_channel::Sender<ImageFrame>,
     ) {
         use image::codecs::webp::WebPDecoder;
         use image::AnimationDecoder;
@@ -481,13 +470,7 @@ impl LoadedImage {
     pub fn is_animated_webp(path: &Path) -> bool {
         use image::codecs::webp::WebPDecoder;
 
-        let extension = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_lowercase())
-            .unwrap_or_default();
-
-        if extension != "webp" {
+        if !extension_is(path, "webp") {
             return false;
         }
 

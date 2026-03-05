@@ -4,13 +4,14 @@
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::OnceLock;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 use gstreamer_video as gst_video;
+use parking_lot::Mutex;
 
 #[cfg(target_os = "windows")]
 fn configure_gstreamer_env_windows() {
@@ -447,8 +448,9 @@ Ensure your GStreamer installation includes the playback elements (usually from 
                         if let Ok(map) = buffer.map_readable() {
                             let mut data = map.as_slice().to_vec();
 
-                            if let Ok(mut state) = state.lock() {
-                                let should_expand = match state.needs_range_expand {
+                            let should_expand = {
+                                let mut state_guard = state.lock();
+                                match state_guard.needs_range_expand {
                                     Some(v) => v,
                                     None => {
                                         let by_caps = match video_info.colorimetry().range() {
@@ -460,24 +462,25 @@ Ensure your GStreamer installation includes the playback elements (usually from 
                                         // If caps don't clearly say, infer from first frame.
                                         let inferred = by_caps
                                             .unwrap_or_else(|| guess_limited_range_rgba(&data));
-                                        state.needs_range_expand = Some(inferred);
+                                        state_guard.needs_range_expand = Some(inferred);
                                         inferred
                                     }
-                                };
-
-                                if should_expand {
-                                    expand_limited_range_rgba_in_place(&mut data);
                                 }
+                            };
 
-                                state.video_width = width;
-                                state.video_height = height;
-                                state.current_frame = Some(VideoFrame {
-                                    pixels: data,
-                                    width,
-                                    height,
-                                });
-                                state.frame_updated = true;
+                            if should_expand {
+                                expand_limited_range_rgba_in_place(&mut data);
                             }
+
+                            let mut state_guard = state.lock();
+                            state_guard.video_width = width;
+                            state_guard.video_height = height;
+                            state_guard.current_frame = Some(VideoFrame {
+                                pixels: data,
+                                width,
+                                height,
+                            });
+                            state_guard.frame_updated = true;
                         }
                     }
                 }
@@ -701,19 +704,18 @@ Ensure your GStreamer installation includes the playback elements (usually from 
     /// Get the latest video frame if updated
     /// Takes ownership of the frame to avoid cloning (memory optimization)
     pub fn get_frame(&mut self) -> Option<VideoFrame> {
-        if let Ok(mut state) = self.state.lock() {
-            if state.frame_updated {
-                state.frame_updated = false;
+        let mut state = self.state.lock();
+        if state.frame_updated {
+            state.frame_updated = false;
 
-                // Update dimensions
-                if state.video_width > 0 && state.video_height > 0 {
-                    self.original_width = state.video_width;
-                    self.original_height = state.video_height;
-                }
-
-                // Take ownership instead of cloning to save memory
-                return state.current_frame.take();
+            // Update dimensions
+            if state.video_width > 0 && state.video_height > 0 {
+                self.original_width = state.video_width;
+                self.original_height = state.video_height;
             }
+
+            // Take ownership instead of cloning to save memory
+            return state.current_frame.take();
         }
         None
     }
@@ -721,21 +723,16 @@ Ensure your GStreamer installation includes the playback elements (usually from 
     /// Check if a new frame is available
     #[allow(dead_code)]
     pub fn has_new_frame(&self) -> bool {
-        if let Ok(state) = self.state.lock() {
-            state.frame_updated
-        } else {
-            false
-        }
+        self.state.lock().frame_updated
     }
 
     /// Get video dimensions
     pub fn dimensions(&self) -> (u32, u32) {
         if self.original_width > 0 && self.original_height > 0 {
             (self.original_width, self.original_height)
-        } else if let Ok(state) = self.state.lock() {
-            (state.video_width, state.video_height)
         } else {
-            (0, 0)
+            let state = self.state.lock();
+            (state.video_width, state.video_height)
         }
     }
 
