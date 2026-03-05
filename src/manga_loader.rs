@@ -139,8 +139,9 @@ pub struct MangaLoader {
     request_tx: Sender<LoadRequest>,
     /// Channel to receive decoded images from worker threads
     result_rx: Receiver<DecodedImage>,
-    /// Set of indices currently being loaded (to avoid duplicate requests)
-    loading_indices: Arc<RwLock<HashSet<usize>>>,
+    /// Indices currently being loaded for the active generation.
+    /// Maps index -> generation to prevent stale completions from clearing newer in-flight work.
+    loading_indices: Arc<RwLock<HashMap<usize, usize>>>,
     /// Set of indices that have been loaded (to avoid re-requesting)
     loaded_indices: Arc<RwLock<HashSet<usize>>>,
     /// Retry state for indices whose decode failed or produced no usable pixels.
@@ -190,7 +191,7 @@ impl MangaLoader {
         let (dim_request_tx, dim_request_rx) = crossbeam_channel::bounded::<DimRequest>(64);
         let (dim_result_tx, dim_result_rx) = crossbeam_channel::bounded::<DimResult>(64);
 
-        let loading_indices = Arc::new(RwLock::new(HashSet::new()));
+        let loading_indices = Arc::new(RwLock::new(HashMap::new()));
         let loaded_indices = Arc::new(RwLock::new(HashSet::new()));
         let retry_state = Arc::new(RwLock::new(HashMap::new()));
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -505,7 +506,7 @@ impl MangaLoader {
     fn coordinator_loop(
         request_rx: Receiver<LoadRequest>,
         result_tx: Sender<DecodedImage>,
-        loading_indices: Arc<RwLock<HashSet<usize>>>,
+        loading_indices: Arc<RwLock<HashMap<usize, usize>>>,
         loaded_indices: Arc<RwLock<HashSet<usize>>>,
         retry_state: Arc<RwLock<HashMap<usize, RetryState>>>,
         shutdown: Arc<AtomicBool>,
@@ -559,22 +560,24 @@ impl MangaLoader {
                 Decoded(DecodedImage),
             }
 
-            let process_one = |req: &LoadRequest| -> (usize, DecodeOutcome) {
+            let process_one = |req: &LoadRequest| -> (usize, usize, DecodeOutcome) {
+                let req_generation = req.generation;
+
                 // Skip if already loaded or if we've been shut down
                 if shutdown.load(Ordering::Relaxed) {
-                    return (req.index, DecodeOutcome::Skipped);
+                    return (req.index, req_generation, DecodeOutcome::Skipped);
                 }
 
                 // Skip stale requests (e.g., after fast scrollbar jumps / cancel).
-                if req.generation != current_gen {
-                    return (req.index, DecodeOutcome::Skipped);
+                if req_generation != current_gen {
+                    return (req.index, req_generation, DecodeOutcome::Skipped);
                 }
 
                 // Check if already in loaded set
                 {
                     let loaded = loaded_indices.read();
                     if loaded.contains(&req.index) {
-                        return (req.index, DecodeOutcome::Skipped);
+                        return (req.index, req_generation, DecodeOutcome::Skipped);
                     }
                 }
 
@@ -586,13 +589,13 @@ impl MangaLoader {
                     None => DecodeOutcome::Failed,
                 };
 
-                (req.index, outcome)
+                (req.index, req_generation, outcome)
             };
 
             // IMPORTANT: for "urgent" requests (negative priority), decode the single highest
             // priority request first (serially) so it is not competing with neighbor prefetch.
             // This is the key to making far jumps feel instant.
-            let mut results: Vec<(usize, DecodeOutcome)> = Vec::with_capacity(batch.len());
+            let mut results: Vec<(usize, usize, DecodeOutcome)> = Vec::with_capacity(batch.len());
 
             if batch.first().map_or(false, |r| r.priority < 0) {
                 if let Some(first) = batch.first() {
@@ -601,14 +604,14 @@ impl MangaLoader {
 
                 if generation_changed() {
                     // Drop everything from this batch (stale now).
-                    for (idx, _outcome) in results.drain(..) {
-                        loading_indices.write().remove(&idx);
+                    for (idx, req_generation, _outcome) in results.drain(..) {
+                        Self::clear_loading_if_generation(&loading_indices, idx, req_generation);
                     }
                     continue;
                 }
 
                 if batch.len() > 1 {
-                    let tail: Vec<(usize, DecodeOutcome)> =
+                    let tail: Vec<(usize, usize, DecodeOutcome)> =
                         batch[1..].par_iter().map(process_one).collect();
                     results.extend(tail);
                 }
@@ -622,15 +625,15 @@ impl MangaLoader {
             // even though the main thread never received it, leaving placeholders stuck forever.
             if generation_changed() {
                 // Generation changed while decoding; treat all results as stale.
-                for (idx, _outcome) in results {
-                    loading_indices.write().remove(&idx);
+                for (idx, req_generation, _outcome) in results {
+                    Self::clear_loading_if_generation(&loading_indices, idx, req_generation);
                 }
                 continue;
             }
 
-            for (idx, outcome) in results {
+            for (idx, req_generation, outcome) in results {
                 // Request has finished one way or another; allow it to be re-requested if needed.
-                loading_indices.write().remove(&idx);
+                Self::clear_loading_if_generation(&loading_indices, idx, req_generation);
 
                 match outcome {
                     DecodeOutcome::Skipped => continue,
@@ -664,6 +667,17 @@ impl MangaLoader {
                     }
                 }
             }
+        }
+    }
+
+    fn clear_loading_if_generation(
+        loading_indices: &Arc<RwLock<HashMap<usize, usize>>>,
+        index: usize,
+        generation: usize,
+    ) {
+        let mut loading = loading_indices.write();
+        if loading.get(&index).copied() == Some(generation) {
+            loading.remove(&index);
         }
     }
 
@@ -1112,7 +1126,7 @@ impl MangaLoader {
                 }
 
                 // Skip if already loading or loaded
-                if loading.contains(&idx) || loaded.contains(&idx) {
+                if loading.get(&idx).copied() == Some(generation) || loaded.contains(&idx) {
                     continue;
                 }
 
@@ -1171,7 +1185,7 @@ impl MangaLoader {
             let idx = req.index;
             match self.request_tx.try_send(req) {
                 Ok(()) => {
-                    self.loading_indices.write().insert(idx);
+                    self.loading_indices.write().insert(idx, generation);
                 }
                 Err(TrySendError::Full(_req)) => {
                     // Backpressure: stop here so already-enqueued high priority work runs first.
@@ -1320,7 +1334,13 @@ impl MangaLoader {
             return false;
         }
 
-        if self.loading_indices.read().contains(&index) {
+        if self
+            .loading_indices
+            .read()
+            .get(&index)
+            .copied()
+            == Some(self.current_generation)
+        {
             return false;
         }
 
@@ -1349,7 +1369,9 @@ impl MangaLoader {
 
         match self.request_tx.try_send(req) {
             Ok(()) => {
-                self.loading_indices.write().insert(index);
+                self.loading_indices
+                    .write()
+                    .insert(index, self.current_generation);
                 self.stats.images_pending = self.loading_indices.read().len();
                 true
             }
