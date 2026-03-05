@@ -36,6 +36,7 @@ use rayon::prelude::*;
 use crate::image_loader::{
     get_media_type, is_supported_image, is_supported_video, LoadedImage, MediaType,
 };
+use crate::lod_cache::{DiskLodCache, DiskLodCacheConfig, MangaLodLevel};
 
 /// Maximum number of decoded images to hold in memory awaiting GPU upload.
 /// This bounds memory usage even if the main thread is slow to consume results.
@@ -182,6 +183,11 @@ pub struct LoaderStats {
 impl MangaLoader {
     /// Create a new manga loader with background thread pool.
     pub fn new() -> Self {
+        Self::new_with_l2_cache(true, 50.0)
+    }
+
+    /// Create a new manga loader with explicit L2 disk-cache settings.
+    pub fn new_with_l2_cache(l2_enabled: bool, l2_max_gb: f32) -> Self {
         // Create bounded channels to prevent unbounded memory growth
         let (request_tx, request_rx) = crossbeam_channel::bounded::<LoadRequest>(256);
         let (result_tx, result_rx) =
@@ -196,12 +202,23 @@ impl MangaLoader {
         let shutdown = Arc::new(AtomicBool::new(false));
         let generation = Arc::new(AtomicUsize::new(0));
 
+        let l2_max_gb = if l2_max_gb.is_finite() {
+            l2_max_gb.clamp(1.0, 1000.0)
+        } else {
+            50.0
+        };
+        let mut l2_config = DiskLodCacheConfig::default();
+        l2_config.enabled = l2_enabled;
+        l2_config.max_bytes = (l2_max_gb * 1024.0 * 1024.0 * 1024.0) as u64;
+        let disk_lod_cache = Arc::new(DiskLodCache::new(l2_config));
+
         // Spawn a coordinator thread that processes requests using Rayon
         let loading_clone = Arc::clone(&loading_indices);
         let loaded_clone = Arc::clone(&loaded_indices);
         let retry_clone = Arc::clone(&retry_state);
         let shutdown_clone = Arc::clone(&shutdown);
         let generation_clone = Arc::clone(&generation);
+        let disk_lod_cache_clone = Arc::clone(&disk_lod_cache);
 
         std::thread::Builder::new()
             .name("manga-loader-coordinator".into())
@@ -214,6 +231,7 @@ impl MangaLoader {
                     retry_clone,
                     shutdown_clone,
                     generation_clone,
+                    disk_lod_cache_clone,
                 );
             })
             .expect("Failed to spawn manga loader coordinator thread");
@@ -417,6 +435,7 @@ impl MangaLoader {
         retry_state: Arc<RwLock<HashMap<usize, RetryState>>>,
         shutdown: Arc<AtomicBool>,
         generation: Arc<AtomicUsize>,
+        disk_lod_cache: Arc<DiskLodCache>,
     ) {
         // Collect requests in batches for parallel processing
         let mut batch: Vec<LoadRequest> = Vec::with_capacity(16);
@@ -486,7 +505,7 @@ impl MangaLoader {
                 }
 
                 // Load the image
-                let decoded = Self::load_single_image(req);
+                let decoded = Self::load_single_image(req, &disk_lod_cache);
 
                 let outcome = match decoded {
                     Some(decoded) => DecodeOutcome::Decoded(decoded),
@@ -609,11 +628,13 @@ impl MangaLoader {
 
     /// Load a single image on a worker thread.
     /// For video files, this extracts the first frame as a thumbnail placeholder.
-    fn load_single_image(req: &LoadRequest) -> Option<DecodedImage> {
-        let effective_texture_side = req
-            .target_texture_side
-            .max(1)
-            .min(req.max_texture_side.max(1));
+    fn load_single_image(req: &LoadRequest, disk_lod_cache: &DiskLodCache) -> Option<DecodedImage> {
+        let requested_lod = MangaLodLevel::from_target_side(req.target_texture_side.max(1));
+        let effective_texture_side = requested_lod
+            .max_side()
+            .unwrap_or(req.max_texture_side.max(1))
+            .min(req.max_texture_side.max(1))
+            .max(1);
 
         // Determine media type
         let media_type = get_media_type(&req.path)?;
@@ -663,6 +684,21 @@ impl MangaLoader {
                 // Get original dimensions from file header first (fast, no decode)
                 let (original_width, original_height) = image::image_dimensions(&req.path).ok()?;
 
+                // L2 cache lookup for explicit static LOD tiers.
+                if let Some((cached_pixels, cached_width, cached_height)) =
+                    disk_lod_cache.load_rgba(&req.path, requested_lod)
+                {
+                    return Some(DecodedImage {
+                        index: req.index,
+                        pixels: cached_pixels,
+                        width: cached_width,
+                        height: cached_height,
+                        original_width,
+                        original_height,
+                        media_type: MangaMediaType::StaticImage,
+                    });
+                }
+
                 // For animated WebP files we only decode the first frame here so that
                 // the manga scroll view isn't blocked by a potentially very expensive
                 // full-animation decode.  The full animation will be loaded lazily by
@@ -709,6 +745,18 @@ impl MangaLoader {
                     effective_texture_side,
                     downscale_filter,
                 );
+
+                if manga_media_type == MangaMediaType::StaticImage
+                    && requested_lod != MangaLodLevel::Lod0Original
+                {
+                    disk_lod_cache.store_rgba(
+                        &req.path,
+                        requested_lod,
+                        width,
+                        height,
+                        pixels.as_ref(),
+                    );
+                }
 
                 Some(DecodedImage {
                     index: req.index,
@@ -955,8 +1003,11 @@ impl MangaLoader {
             return;
         }
 
-        let target_texture_side = target_texture_side
-            .max(1)
+        // Quantize to explicit LOD hierarchy:
+        // LOD3=256, LOD2=512, LOD1=1024, LOD0=original/max texture side.
+        let target_texture_side = MangaLodLevel::from_target_side(target_texture_side.max(1))
+            .max_side()
+            .unwrap_or(max_texture_side.max(1))
             .min(max_texture_side.max(1));
         let (request_downscale_filter, request_gif_filter) = if force_triangle_filters {
             (FilterType::Triangle, FilterType::Triangle)

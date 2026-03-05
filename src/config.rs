@@ -369,6 +369,10 @@ pub struct Config {
     pub manga_arrow_scroll_speed: f32,
     /// Masonry mode: number of items per row
     pub masonry_items_per_row: usize,
+    /// Enable persistent L2 disk cache for preprocessed static-image LOD tiers.
+    pub l2_disk_cache_enabled: bool,
+    /// Maximum L2 disk cache size in GiB.
+    pub l2_disk_cache_max_gb: f32,
     /// Manga mode: when true, consume wheel input with the same smooth cadence as arrow keys.
     pub manga_wheel_smooth_like_arrow_keys: bool,
     /// Manga mode autoscroll: dead zone radius around the anchor (px).
@@ -478,6 +482,8 @@ impl Config {
             manga_wheel_multiplier: 1.5,
             manga_arrow_scroll_speed: 140.0,
             masonry_items_per_row: 5,
+            l2_disk_cache_enabled: true,
+            l2_disk_cache_max_gb: 50.0,
             manga_wheel_smooth_like_arrow_keys: true,
             manga_autoscroll_dead_zone_px: 14.0,
             manga_autoscroll_base_speed_multiplier: 5.0,
@@ -851,6 +857,20 @@ impl Config {
                                 config.masonry_items_per_row = v.clamp(2, 10);
                             }
                         }
+                        "l2_disk_cache_enabled"
+                        | "lod_disk_cache_enabled"
+                        | "manga_l2_disk_cache_enabled" => {
+                            if let Some(v) = parse_bool(value) {
+                                config.l2_disk_cache_enabled = v;
+                            }
+                        }
+                        "l2_disk_cache_max_gb"
+                        | "lod_disk_cache_max_gb"
+                        | "manga_l2_disk_cache_max_gb" => {
+                            if let Ok(v) = value.parse::<f32>() {
+                                config.l2_disk_cache_max_gb = v.clamp(1.0, 1000.0);
+                            }
+                        }
                         "manga_wheel_smooth_like_arrow_keys"
                         | "manga_wheel_smooth_match_arrow_keys"
                         | "manga_wheel_arrow_smooth_sync" => {
@@ -1183,6 +1203,14 @@ impl Config {
         values.insert(
             "masonry_items_per_row",
             format!("{}", self.masonry_items_per_row),
+        );
+        values.insert(
+            "l2_disk_cache_enabled",
+            bool_to_ini(self.l2_disk_cache_enabled).to_string(),
+        );
+        values.insert(
+            "l2_disk_cache_max_gb",
+            format_with_optional_trailing_zero_f32(self.l2_disk_cache_max_gb),
         );
         values.insert(
             "manga_wheel_smooth_like_arrow_keys",
