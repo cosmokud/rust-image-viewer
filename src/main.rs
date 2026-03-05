@@ -3505,6 +3505,9 @@ impl ImageViewer {
     fn manga_clear_cache(&mut self) {
         // Clear the texture cache
         self.manga_texture_cache.clear();
+        if let Some(renderer) = self.manga_gpu_renderer.as_ref() {
+            renderer.clear_textures();
+        }
         self.strip_entry_placeholder_index = None;
         self.manga_ttv_pending.clear();
         self.manga_ttv_samples_ms.clear();
@@ -4575,50 +4578,66 @@ impl ImageViewer {
 
         // Upload decoded images to GPU as textures
         for decoded in decoded_images {
-            let incoming_side = decoded.width.max(decoded.height);
+            let manga_loader::DecodedImage {
+                index,
+                pixels,
+                width,
+                height,
+                original_width: _,
+                original_height: _,
+                media_type,
+            } = decoded;
+
+            let incoming_side = width.max(height);
 
             // Keep current texture unless the decoded payload is a meaningful quality upgrade.
-            if let Some((_, existing_w, existing_h)) = self.manga_texture_cache.get_texture_info(decoded.index)
+            if let Some((_, existing_w, existing_h)) = self.manga_texture_cache.get_texture_info(index)
             {
                 let existing_side = existing_w.max(existing_h);
                 if !Self::manga_texture_upgrade_needed(existing_side, incoming_side) {
-                    self.manga_ttv_pending.remove(&decoded.index);
+                    self.manga_ttv_pending.remove(&index);
                     continue;
                 }
             }
 
             // Skip if no pixel data (failed to extract frame or empty placeholder)
-            if decoded.pixels.is_empty() {
+            if pixels.is_empty() {
                 continue;
+            }
+
+            if media_type == MangaMediaType::StaticImage {
+                if let Some(renderer) = self.manga_gpu_renderer.as_ref() {
+                    renderer.enqueue_texture_upload(index, width, height, incoming_side, pixels.clone());
+                }
             }
 
             // Create the texture
             let color_image = egui::ColorImage::from_rgba_unmultiplied(
-                [decoded.width as usize, decoded.height as usize],
-                &decoded.pixels,
+                [width as usize, height as usize],
+                &pixels,
             );
 
             // Static images + video thumbnails can use mipmaps for faster minification
             // in manga strip and masonry layouts.
             let texture_options =
-                self.manga_texture_options_for_upload(decoded.media_type, decoded.width, decoded.height);
+                self.manga_texture_options_for_upload(media_type, width, height);
 
             let texture = ctx.load_texture(
-                format!("manga_{}", decoded.index),
+                format!("manga_{}", index),
                 color_image,
                 texture_options,
             );
 
             // Insert into cache with media type (this may evict old entries)
             let evicted = self.manga_texture_cache.insert_with_type(
-                decoded.index,
+                index,
                 texture,
-                decoded.width,
-                decoded.height,
-                decoded.media_type,
+                width,
+                height,
+                media_type,
             );
 
-            if let Some(started_at) = self.manga_ttv_pending.remove(&decoded.index) {
+            if let Some(started_at) = self.manga_ttv_pending.remove(&index) {
                 self.manga_record_ttv_sample(started_at.elapsed());
             }
 
@@ -4626,6 +4645,12 @@ impl ImageViewer {
         }
 
         if !evicted_to_mark_unloaded.is_empty() {
+            if let Some(renderer) = self.manga_gpu_renderer.as_ref() {
+                for &evicted_idx in &evicted_to_mark_unloaded {
+                    renderer.remove_texture(evicted_idx);
+                }
+            }
+
             if let Some(loader) = self.manga_loader.as_mut() {
                 for evicted_idx in evicted_to_mark_unloaded {
                     loader.mark_unloaded(evicted_idx);
@@ -6903,12 +6928,22 @@ impl ImageViewer {
                     if self.manga_gpu_renderer.is_some() {
                         self.manga_gpu_items_scratch.clear();
                         self.manga_gpu_items_scratch.reserve(draw_commands.len());
-                        self.manga_gpu_items_scratch.extend(draw_commands.iter().map(|command| {
-                            GpuMasonryInputItem::from_rect(
-                                command.image_rect,
-                                command.target_texture_side,
-                            )
-                        }));
+                        for command in draw_commands.iter() {
+                            let is_static_item = self
+                                .manga_loader
+                                .as_ref()
+                                .and_then(|loader| loader.get_media_type(command.index))
+                                .map(|media_type| media_type == MangaMediaType::StaticImage)
+                                .unwrap_or(false);
+
+                            if is_static_item {
+                                self.manga_gpu_items_scratch.push(GpuMasonryInputItem::from_rect(
+                                    command.index,
+                                    command.image_rect,
+                                    command.target_texture_side,
+                                ));
+                            }
+                        }
                     }
 
                     if let Some(renderer) = self.manga_gpu_renderer.as_ref() {
@@ -6916,6 +6951,39 @@ impl ImageViewer {
                     }
 
                     for command in draw_commands {
+                        let is_static_item = self
+                            .manga_loader
+                            .as_ref()
+                            .and_then(|loader| loader.get_media_type(command.index))
+                            .map(|media_type| media_type == MangaMediaType::StaticImage)
+                            .unwrap_or(false);
+
+                        let (gpu_can_render, gpu_needs_upgrade) = if is_static_item {
+                            if let Some(renderer) = self.manga_gpu_renderer.as_ref() {
+                                (
+                                    renderer.can_render_index(command.index),
+                                    renderer.needs_lod_upgrade(
+                                        command.index,
+                                        command.target_texture_side,
+                                    ),
+                                )
+                            } else {
+                                (false, false)
+                            }
+                        } else {
+                            (false, false)
+                        };
+
+                        if gpu_can_render {
+                            if gpu_needs_upgrade {
+                                requested_visible_retry |= self.manga_request_retry_for_visible_item(
+                                    command.index,
+                                    command.target_texture_side,
+                                );
+                            }
+                            continue;
+                        }
+
                         if self.draw_manga_item(
                             ui,
                             command.index,
