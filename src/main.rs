@@ -814,9 +814,7 @@ impl ImageViewer {
     const MANGA_HUD_PANEL_VERTICAL_STEP: f32 = 48.0;
     const MANGA_UPLOAD_BATCH_BASE: usize = 4;
     const MANGA_UPLOAD_BATCH_MIN: usize = 2;
-    const MANGA_UPLOAD_BATCH_MAX: usize = 14;
-    const MANGA_UPLOAD_BATCH_RAMP_UP: usize = 2;
-    const MANGA_UPLOAD_BATCH_RAMP_DOWN: usize = 1;
+    const MANGA_UPLOAD_BATCH_MAX: usize = 12;
     const MANGA_TTV_SAMPLE_CAP: usize = 240;
     const MANGA_TTV_PENDING_MAX_AGE: Duration = Duration::from_secs(30);
 
@@ -864,13 +862,6 @@ impl ImageViewer {
             .retain(|_, started_at| started_at.elapsed() <= Self::MANGA_TTV_PENDING_MAX_AGE);
     }
 
-    fn manga_oldest_pending_ttv_ms(&self) -> f32 {
-        self.manga_ttv_pending
-            .values()
-            .map(|started_at| started_at.elapsed().as_secs_f32() * 1000.0)
-            .fold(0.0f32, f32::max)
-    }
-
     fn manga_ttv_percentiles_ms(&self) -> Option<(f32, f32, usize)> {
         if self.manga_ttv_samples_ms.is_empty() {
             return None;
@@ -896,87 +887,32 @@ impl ImageViewer {
     fn manga_compute_upload_batch_limit(&self, pending_loads: usize, pending_decoded: usize) -> usize {
         let mut limit = Self::MANGA_UPLOAD_BATCH_BASE;
 
-        let zoom = self.zoom.max(0.05);
-        let pending_visible = self.manga_ttv_pending.len();
-        let oldest_pending_ms = self.manga_oldest_pending_ttv_ms();
-
         if self.is_masonry_mode() {
-            let density = self.masonry_items_per_row.clamp(2, 10);
             limit += 2;
-            if density >= 6 {
-                limit += 1;
-            }
-            if density >= 8 {
-                limit += 1;
-            }
+        }
 
-            if zoom <= 0.75 {
-                limit += 1;
-            }
-            if zoom <= 0.55 {
-                limit += 1;
-            }
-        } else {
-            // Long strip: low zoom can expose many stacked pages.
-            if zoom <= 0.85 {
-                limit += 1;
-            }
-            if zoom <= 0.65 {
-                limit += 2;
-            }
-            if zoom <= 0.45 {
-                limit += 2;
-            }
+        // Lower zoom usually means many more items are visible; prioritize fast fill.
+        if self.zoom <= 0.75 {
+            limit += 2;
+        }
+        if self.zoom <= 0.50 {
+            limit += 2;
         }
 
         // Increase throughput when decode backlog is building.
-        if pending_decoded >= 6 {
-            limit += 1;
-        }
         if pending_decoded >= 8 {
-            limit += 1;
-        }
-        if pending_decoded >= 12 {
             limit += 2;
         }
-        if pending_decoded >= 20 {
+        if pending_decoded >= 16 {
             limit += 2;
         }
-
         if pending_loads >= 24 {
-            limit += 1;
-        }
-        if pending_loads >= 48 {
             limit += 1;
         }
 
         // If many visible placeholders are waiting, bias toward lower latency.
-        if pending_visible >= 4 {
-            limit += 1;
-        }
-        if pending_visible >= 8 {
-            limit += 1;
-        }
-        if pending_visible >= 12 {
+        if self.manga_ttv_pending.len() >= 8 {
             limit += 2;
-        }
-
-        if oldest_pending_ms >= 250.0 {
-            limit += 1;
-        }
-        if oldest_pending_ms >= 500.0 {
-            limit += 1;
-        }
-        if oldest_pending_ms >= 900.0 {
-            limit += 1;
-        }
-
-        // If frame time is already under pressure and backlog is light, back off slightly.
-        // This keeps scrolling fluid while still allowing aggressive fill when queues build.
-        if self.fps_last_dt_s > 0.028 && pending_decoded <= 4 && pending_visible <= 2 {
-            limit = limit.saturating_sub(2);
-        } else if self.fps_last_dt_s > 0.022 && pending_decoded <= 2 && pending_visible <= 1 {
-            limit = limit.saturating_sub(1);
         }
 
         limit.clamp(Self::MANGA_UPLOAD_BATCH_MIN, Self::MANGA_UPLOAD_BATCH_MAX)
@@ -1002,22 +938,15 @@ impl ImageViewer {
                 ));
             }
 
-            let pending_visible = self.manga_ttv_pending.len();
-            let oldest_pending_ms = self.manga_oldest_pending_ttv_ms();
-
             if let Some(loader) = self.manga_loader.as_ref() {
                 text.push_str(&format!(
-                    " | U{} L{} D{} P{}@{oldest_pending_ms:.0}",
+                    " | U{} L{} D{}",
                     self.manga_upload_batch_limit,
                     loader.pending_load_count(),
-                    loader.pending_decoded_count(),
-                    pending_visible,
+                    loader.pending_decoded_count()
                 ));
             } else {
-                text.push_str(&format!(
-                    " | U{} P{}@{oldest_pending_ms:.0}",
-                    self.manga_upload_batch_limit, pending_visible,
-                ));
+                text.push_str(&format!(" | U{}", self.manga_upload_batch_limit));
             }
         }
 
@@ -4140,22 +4069,8 @@ impl ImageViewer {
             .as_ref()
             .map(|loader| (loader.pending_load_count(), loader.pending_decoded_count()))
             .unwrap_or((0, 0));
-        let desired_upload_batch_limit =
+        let upload_batch_limit =
             self.manga_compute_upload_batch_limit(pending_loads, pending_decoded);
-        let current_upload_batch_limit = self
-            .manga_upload_batch_limit
-            .clamp(Self::MANGA_UPLOAD_BATCH_MIN, Self::MANGA_UPLOAD_BATCH_MAX);
-        let upload_batch_limit = if desired_upload_batch_limit > current_upload_batch_limit {
-            current_upload_batch_limit
-                .saturating_add(Self::MANGA_UPLOAD_BATCH_RAMP_UP)
-                .min(desired_upload_batch_limit)
-        } else if desired_upload_batch_limit < current_upload_batch_limit {
-            current_upload_batch_limit
-                .saturating_sub(Self::MANGA_UPLOAD_BATCH_RAMP_DOWN)
-                .max(desired_upload_batch_limit)
-        } else {
-            current_upload_batch_limit
-        };
         self.manga_upload_batch_limit = upload_batch_limit;
 
         let (decoded_images, dim_updates) = {
