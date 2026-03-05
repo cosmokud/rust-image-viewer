@@ -581,6 +581,9 @@ struct ImageViewer {
     /// Hovered media index in masonry mode, updated from pointer position.
     /// Used for hover-driven video autoplay selection.
     manga_hovered_media_index: Option<usize>,
+    /// Earliest time when masonry hover-autoplay is allowed to resume.
+    /// Extended while user is actively scrolling/panning/zooming/autoscrolling.
+    manga_hover_autoplay_resume_at: Instant,
     /// Maximum number of video players to keep alive in manga mode.
     /// Beyond this, the furthest-from-view players are disposed.
     manga_max_video_players: usize,
@@ -790,6 +793,7 @@ impl Default for ImageViewer {
             manga_video_textures: HashMap::new(),
             manga_focused_video_index: None,
             manga_hovered_media_index: None,
+            manga_hover_autoplay_resume_at: Instant::now(),
             manga_max_video_players: 3, // Keep at most 3 video players alive
             manga_animated_images: HashMap::new(),
             manga_focused_anim_index: None,
@@ -1931,6 +1935,7 @@ impl ImageViewer {
         self.manga_video_players.clear();
         self.manga_focused_video_index = None;
         self.manga_hovered_media_index = None;
+        self.manga_hover_autoplay_resume_at = Instant::now();
         self.manga_anim_streams.clear();
         self.manga_anim_stream_done.clear();
         self.manga_focused_anim_index = None;
@@ -3738,6 +3743,18 @@ impl ImageViewer {
     /// Ensures only one video plays at a time (the focused one).
     fn manga_update_video_focus(&mut self) {
         if !self.manga_mode || self.image_list.is_empty() {
+            return;
+        }
+
+        if self.is_masonry_mode() && Instant::now() < self.manga_hover_autoplay_resume_at {
+            if self.manga_focused_video_index.is_some() {
+                for player in self.manga_video_players.values_mut() {
+                    if player.is_playing() {
+                        let _ = player.pause();
+                    }
+                }
+                self.manga_focused_video_index = None;
+            }
             return;
         }
 
@@ -6899,6 +6916,31 @@ impl ImageViewer {
             } else if let Some(anchor) = load_anchor {
                 self.manga_apply_scroll_anchor(anchor);
                 self.manga_update_current_index();
+            }
+        }
+
+        if self.is_masonry_mode() {
+            let navigation_active = self.manga_scrollbar_dragging
+                || self.is_panning
+                || self.manga_autoscroll_active
+                || self.manga_zoom_plus_held
+                || self.manga_zoom_minus_held
+                || self.manga_wheel_scroll_pending.abs() > 0.01
+                || (self.manga_scroll_target - self.manga_scroll_offset).abs() > 0.25
+                || self.manga_scroll_velocity.abs() > 0.25
+                || self.manga_video_seeking
+                || self.manga_video_volume_dragging
+                || self.gif_seeking
+                || primary_down
+                || wheel_steps != 0.0
+                || wheel_steps_ctrl != 0.0
+                || (ctrl_held
+                    && manga_ctrl_scroll_zoom_bound
+                    && (zoom_delta != 1.0 || wheel_steps_ctrl != 0.0));
+
+            if navigation_active {
+                self.manga_hover_autoplay_resume_at =
+                    Instant::now() + Duration::from_millis(220);
             }
         }
 
