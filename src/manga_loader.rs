@@ -111,6 +111,8 @@ pub struct LoadRequest {
     pub path: PathBuf,
     pub max_texture_side: u32,
     pub target_texture_side: u32,
+    pub downscale_filter: FilterType,
+    pub gif_filter: FilterType,
     pub priority: i32, // Lower = higher priority
 }
 
@@ -627,7 +629,7 @@ impl MangaLoader {
                             height,
                             &pixels,
                             effective_texture_side,
-                            FilterType::Triangle,
+                            req.downscale_filter,
                         );
 
                         Some(DecodedImage {
@@ -667,8 +669,8 @@ impl MangaLoader {
                 // `manga_update_animated_textures` when the user actually focuses on it.
                 let is_animated_webp = LoadedImage::is_animated_webp(&req.path);
 
-                let downscale_filter = FilterType::Triangle; // Fast filter for manga
-                let gif_filter = FilterType::Triangle;
+                let downscale_filter = req.downscale_filter;
+                let gif_filter = req.gif_filter;
 
                 let img = if is_animated_webp {
                     LoadedImage::load_first_frame_only(
@@ -945,6 +947,9 @@ impl MangaLoader {
         _screen_height: f32,
         max_texture_side: u32,
         target_texture_side: u32,
+        downscale_filter: FilterType,
+        gif_filter: FilterType,
+        force_triangle_filters: bool,
     ) {
         if image_list.is_empty() {
             return;
@@ -953,6 +958,11 @@ impl MangaLoader {
         let target_texture_side = target_texture_side
             .max(1)
             .min(max_texture_side.max(1));
+        let (request_downscale_filter, request_gif_filter) = if force_triangle_filters {
+            (FilterType::Triangle, FilterType::Triangle)
+        } else {
+            (downscale_filter, gif_filter)
+        };
 
         // Detect a far jump (e.g., dragging the scrollbar, Home/End, or any other big reposition).
         // On a far jump we cancel older work and make the target page the only "urgent" item.
@@ -1052,6 +1062,8 @@ impl MangaLoader {
                     path: image_list[idx].clone(),
                     max_texture_side,
                     target_texture_side,
+                    downscale_filter: request_downscale_filter,
+                    gif_filter: request_gif_filter,
                     priority,
                 });
             }
@@ -1203,6 +1215,9 @@ impl MangaLoader {
         index: usize,
         max_texture_side: u32,
         target_texture_side: u32,
+        downscale_filter: FilterType,
+        gif_filter: FilterType,
+        force_triangle_filters: bool,
     ) -> bool {
         let Some(path) = image_list.get(index).cloned() else {
             return false;
@@ -1222,6 +1237,11 @@ impl MangaLoader {
         let target_texture_side = target_texture_side
             .max(1)
             .min(max_texture_side.max(1));
+        let (request_downscale_filter, request_gif_filter) = if force_triangle_filters {
+            (FilterType::Triangle, FilterType::Triangle)
+        } else {
+            (downscale_filter, gif_filter)
+        };
 
         let req = LoadRequest {
             generation: self.current_generation,
@@ -1229,6 +1249,8 @@ impl MangaLoader {
             path,
             max_texture_side,
             target_texture_side,
+            downscale_filter: request_downscale_filter,
+            gif_filter: request_gif_filter,
             priority: -200_000,
         };
 
