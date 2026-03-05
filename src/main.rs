@@ -4,6 +4,7 @@
 #![windows_subsystem = "windows"]
 
 mod config;
+mod gpu_masonry;
 mod image_loader;
 mod lod_cache;
 mod manga_loader;
@@ -15,6 +16,7 @@ mod video_player;
 mod windows_env;
 
 use config::{Action, Config, InputBinding, StartupWindowMode};
+use gpu_masonry::{GpuMasonryInputItem, GpuMasonryRenderer};
 use image_loader::{
     get_images_in_directory, get_media_type, is_supported_video, ImageFrame, LoadedImage, MediaType,
 };
@@ -521,6 +523,10 @@ struct ImageViewer {
     manga_loader: Option<MangaLoader>,
     /// LRU texture cache for manga mode
     manga_texture_cache: MangaTextureCache,
+    /// Optional wgpu callback path for GPU culling and indirect draw staging in masonry mode.
+    manga_gpu_renderer: Option<GpuMasonryRenderer>,
+    /// Scratch buffer used to avoid per-frame allocations when preparing GPU callback inputs.
+    manga_gpu_items_scratch: Vec<GpuMasonryInputItem>,
     /// Whether the scrollbar is being dragged
     manga_scrollbar_dragging: bool,
     /// Browser-style autoscroll mode state for manga strip layouts.
@@ -755,6 +761,8 @@ impl Default for ImageViewer {
             manga_wheel_scroll_pending: 0.0,
             manga_loader: None,
             manga_texture_cache: MangaTextureCache::default(),
+            manga_gpu_renderer: None,
+            manga_gpu_items_scratch: Vec::new(),
             manga_scrollbar_dragging: false,
             manga_autoscroll_active: false,
             manga_autoscroll_anchor: None,
@@ -1856,6 +1864,11 @@ impl ImageViewer {
             })
             .unwrap_or(4096)
             .max(512);
+
+        viewer.manga_gpu_renderer = cc
+            .wgpu_render_state
+            .as_ref()
+            .map(GpuMasonryRenderer::new);
 
         // Configure visuals (background driven by config)
         let mut visuals = egui::Visuals::dark();
@@ -6887,6 +6900,21 @@ impl ImageViewer {
                         viewport_bottom,
                         zoom,
                     );
+
+                    if self.manga_gpu_renderer.is_some() {
+                        self.manga_gpu_items_scratch.clear();
+                        self.manga_gpu_items_scratch.reserve(draw_commands.len());
+                        self.manga_gpu_items_scratch.extend(draw_commands.iter().map(|command| {
+                            GpuMasonryInputItem::from_rect(
+                                command.image_rect,
+                                command.target_texture_side,
+                            )
+                        }));
+                    }
+
+                    if let Some(renderer) = self.manga_gpu_renderer.as_ref() {
+                        renderer.enqueue_callback(ui, &self.manga_gpu_items_scratch);
+                    }
 
                     for command in draw_commands {
                         if self.draw_manga_item(
