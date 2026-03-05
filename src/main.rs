@@ -1373,6 +1373,29 @@ impl ImageViewer {
         }
     }
 
+    fn format_file_size(bytes: u64) -> String {
+        const KB: f64 = 1024.0;
+        const MB: f64 = KB * 1024.0;
+        const GB: f64 = MB * 1024.0;
+
+        let bytes_f = bytes as f64;
+        if bytes_f >= GB {
+            format!("{:.2} GB", bytes_f / GB)
+        } else if bytes_f >= MB {
+            format!("{:.2} MB", bytes_f / MB)
+        } else if bytes_f >= KB {
+            format!("{:.1} KB", bytes_f / KB)
+        } else {
+            format!("{} B", bytes)
+        }
+    }
+
+    fn file_size_label_for_path(path: &PathBuf) -> Option<String> {
+        std::fs::metadata(path)
+            .ok()
+            .map(|metadata| Self::format_file_size(metadata.len()))
+    }
+
     fn animated_image_label_for_path(path: Option<&PathBuf>) -> &'static str {
         if let Some(path) = path {
             let is_webp = path
@@ -1864,7 +1887,7 @@ impl ImageViewer {
         let total = self.masonry_metadata_preload_total.max(1);
         let loaded = self.masonry_metadata_preload_loaded.min(total);
         let progress_ratio = (loaded as f32 / total as f32).clamp(0.0, 1.0);
-        let progress_text = format!("{} / {} images loaded", loaded, total);
+        let progress_text = format!("{} / {} files loaded", loaded, total);
 
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(self.background_color32()))
@@ -2709,14 +2732,8 @@ impl ImageViewer {
     }
 
     #[allow(dead_code)]
-    fn should_reuse_masonry_cache_on_return(&self, state: MasonryReturnState) -> bool {
-        if self.image_list.is_empty() {
-            return false;
-        }
-
-        let current_index = self.current_index.min(self.image_list.len() - 1);
-        let traveled = self.circular_index_distance(state.opened_index, current_index);
-        traveled <= state.cache_reuse_radius.max(1)
+    fn should_reuse_masonry_cache_on_return(&self, _state: MasonryReturnState) -> bool {
+        !self.image_list.is_empty() && self.strip_return_preserve_masonry_cache && self.manga_loader.is_some()
     }
 
     fn manga_suspend_runtime_for_solo_fullscreen(&mut self) {
@@ -7971,6 +7988,20 @@ impl ImageViewer {
                                         let resp = ui.add(
                                             egui::Label::new(
                                                 egui::RichText::new(format!("{}x{}", w, h))
+                                                    .color(egui::Color32::GRAY),
+                                            )
+                                            .selectable(true),
+                                        );
+                                        over_title_text |= resp.contains_pointer();
+                                        started_title_text_drag |=
+                                            resp.drag_started() || resp.dragged();
+                                    }
+
+                                    if let Some(file_size_label) = Self::file_size_label_for_path(&path)
+                                    {
+                                        let resp = ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(file_size_label)
                                                     .color(egui::Color32::GRAY),
                                             )
                                             .selectable(true),
