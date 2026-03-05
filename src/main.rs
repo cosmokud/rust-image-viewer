@@ -826,6 +826,7 @@ impl ImageViewer {
     const MANGA_DYNAMIC_TARGET_MIN_SIDE: u32 = 192;
     const MANGA_DYNAMIC_TARGET_OVERSCAN: f32 = 1.35;
     const MANGA_MASONRY_DYNAMIC_TARGET_MIN_SIDE: u32 = 96;
+    const MANGA_MASONRY_ZOOM_QUALITY_BASELINE_SCALE: f32 = 1024.0 / 688.0;
     const MANGA_TEXTURE_UPGRADE_MIN_DELTA_SIDE: u32 = 64;
     const MANGA_TEXTURE_UPGRADE_MIN_RATIO: f32 = 1.12;
     const MANGA_TTV_SAMPLE_CAP: usize = 240;
@@ -2668,9 +2669,10 @@ impl ImageViewer {
         let zoom = self.zoom.max(0.0001);
         let rows = self.masonry_items_per_row.clamp(2, 10) as f32;
 
-        // Baseline uses viewport width split by rows, so at 3440px / 5 rows / 100% zoom
-        // the target is ~688px before quality boost.
-        let baseline_item_width = (self.screen_size.x.max(1.0) / rows) * zoom;
+        // Baseline uses viewport width split by rows and is normalized to a 1024px
+        // reference at 3440px / 5 rows / 100% zoom before quality boost.
+        let baseline_item_width =
+            (self.screen_size.x.max(1.0) / rows) * zoom * Self::MANGA_MASONRY_ZOOM_QUALITY_BASELINE_SCALE;
         let basis = item_screen_width.max(baseline_item_width).max(64.0);
         let scaled = (basis * Self::masonry_zoom_quality_boost(zoom)).ceil() as u32;
 
