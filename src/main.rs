@@ -18,7 +18,7 @@ use config::{Action, Config, InputBinding, StartupWindowMode};
 use image_loader::{
     get_images_in_directory, get_media_type, is_supported_video, ImageFrame, LoadedImage, MediaType,
 };
-use manga_loader::{MangaLoader, MangaMediaType, MangaTextureCache};
+use manga_loader::{MangaL1PoolSlots, MangaLoader, MangaMediaType, MangaTextureCache};
 use masonry_static::{compute_static_masonry_layout, StaticMasonryLayoutConfig};
 #[cfg(target_os = "windows")]
 use single_instance::{FileReceiver, SingleInstanceResult};
@@ -26,6 +26,7 @@ use video_player::{format_duration, VideoPlayer};
 
 use eframe::egui;
 use image::imageops::FilterType;
+use rayon::prelude::*;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 #[cfg(target_os = "windows")]
@@ -244,6 +245,13 @@ impl MasonryItemLayout {
             egui::vec2(self.width * zoom, self.height * zoom),
         )
     }
+}
+
+#[derive(Clone, Copy)]
+struct MangaDrawCommand {
+    index: usize,
+    image_rect: egui::Rect,
+    target_texture_side: u32,
 }
 
 #[allow(dead_code)]
@@ -555,6 +563,8 @@ struct ImageViewer {
     manga_target_texture_side: u32,
     /// Adaptive decoded-upload batch size used by manga texture uploads.
     manga_upload_batch_limit: usize,
+    /// Per-frame deduplicated missing/upgrade LOD requests (index -> desired target side).
+    manga_missing_lod_requests: HashMap<usize, u32>,
     /// First time a visible item was observed without an uploaded texture.
     manga_ttv_pending: HashMap<usize, Instant>,
     /// Recent time-to-visible samples for manga/masonry (milliseconds).
@@ -769,6 +779,7 @@ impl Default for ImageViewer {
             manga_cache_target_capacity: 64,
             manga_target_texture_side: 4096,
             manga_upload_batch_limit: 4,
+            manga_missing_lod_requests: HashMap::new(),
             manga_ttv_pending: HashMap::new(),
             manga_ttv_samples_ms: VecDeque::new(),
             manga_arrow_left_was_down: false,
@@ -829,8 +840,6 @@ impl ImageViewer {
     const MANGA_DYNAMIC_TARGET_MIN_SIDE: u32 = 192;
     const MANGA_DYNAMIC_TARGET_OVERSCAN: f32 = 1.35;
     const MANGA_MASONRY_DYNAMIC_TARGET_MIN_SIDE: u32 = 96;
-    const MANGA_TEXTURE_UPGRADE_MIN_DELTA_SIDE: u32 = 64;
-    const MANGA_TEXTURE_UPGRADE_MIN_RATIO: f32 = 1.12;
     const MANGA_TTV_SAMPLE_CAP: usize = 240;
     const MANGA_TTV_PENDING_MAX_AGE: Duration = Duration::from_secs(30);
 
@@ -1831,14 +1840,19 @@ impl ImageViewer {
         viewer.startup_hide_started_at = Instant::now();
 
         // Determine the maximum texture size supported by the active backend.
-        // This viewer uses eframe's OpenGL (glow) integration; oversized textures can crash.
         viewer.max_texture_side = cc
+            .wgpu_render_state
+            .as_ref()
+            .map(|state| state.device.limits().max_texture_dimension_2d)
+            .or_else(|| {
+                cc
             .gl
             .as_ref()
             .and_then(|gl| unsafe {
                 gl.get_parameter_i32(eframe::glow::MAX_TEXTURE_SIZE)
                     .try_into()
                     .ok()
+                })
             })
             .unwrap_or(4096)
             .max(512);
@@ -2679,6 +2693,31 @@ impl ImageViewer {
         }
     }
 
+    fn manga_quantize_lod_side(&self, desired_side: u32) -> u32 {
+        let max_side = self.max_texture_side.max(1);
+        if desired_side <= 256 {
+            256u32.min(max_side)
+        } else if desired_side <= 512 {
+            512u32.min(max_side)
+        } else if desired_side <= 1024 {
+            1024u32.min(max_side)
+        } else {
+            max_side
+        }
+    }
+
+    fn manga_lod_rank_for_side(side: u32) -> u8 {
+        if side <= 256 {
+            0
+        } else if side <= 512 {
+            1
+        } else if side <= 1024 {
+            2
+        } else {
+            3
+        }
+    }
+
     fn masonry_target_texture_side_from_screen_width(&self, item_screen_width: f32) -> u32 {
         let max_side = self.max_texture_side.max(1);
         let zoom = self.zoom.max(0.0001);
@@ -2715,19 +2754,14 @@ impl ImageViewer {
                 )
         };
 
-        self.manga_clamp_target_side_to_source(index, target_side)
-            .clamp(1, max_side)
+        let clamped_to_source = self
+            .manga_clamp_target_side_to_source(index, target_side)
+            .clamp(1, max_side);
+        self.manga_quantize_lod_side(clamped_to_source)
     }
 
     fn manga_texture_upgrade_needed(existing_side: u32, desired_side: u32) -> bool {
-        if desired_side <= existing_side {
-            return false;
-        }
-
-        let ratio_threshold =
-            (existing_side as f32 * Self::MANGA_TEXTURE_UPGRADE_MIN_RATIO).ceil() as u32;
-        let delta_threshold = existing_side.saturating_add(Self::MANGA_TEXTURE_UPGRADE_MIN_DELTA_SIDE);
-        desired_side >= ratio_threshold.max(delta_threshold)
+        Self::manga_lod_rank_for_side(desired_side) > Self::manga_lod_rank_for_side(existing_side)
     }
 
     fn manga_collect_visible_indices(&mut self) -> Vec<usize> {
@@ -2749,20 +2783,11 @@ impl ImageViewer {
             let viewport_bottom = viewport_top + self.screen_size.y.max(1.0);
             let zoom = self.zoom.max(0.0001);
 
-            return self
-                .masonry_layout_items
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, item)| {
-                    let item_top = item.y * zoom;
-                    let item_bottom = item_top + item.height * zoom;
-                    if item_top < viewport_bottom && item_bottom > viewport_top {
-                        Some(idx)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
+            return self.masonry_collect_visible_indices_for_viewport(
+                viewport_top,
+                viewport_bottom,
+                zoom,
+            );
         }
 
         let viewport_top = self.manga_scroll_offset.max(0.0);
@@ -2787,6 +2812,84 @@ impl ImageViewer {
         }
 
         visible_indices
+    }
+
+    fn masonry_collect_visible_indices_for_viewport(
+        &self,
+        viewport_top: f32,
+        viewport_bottom: f32,
+        zoom: f32,
+    ) -> Vec<usize> {
+        let mut visible: Vec<usize> = self
+            .masonry_layout_items
+            .par_iter()
+            .enumerate()
+            .filter_map(|(idx, item)| {
+                let item_top = item.y * zoom;
+                let item_bottom = item_top + item.height * zoom;
+                if item_top < viewport_bottom && item_bottom > viewport_top {
+                    Some(idx)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        visible.sort_unstable();
+        visible
+    }
+
+    fn manga_build_masonry_draw_commands(
+        &self,
+        viewport_top: f32,
+        viewport_bottom: f32,
+        zoom: f32,
+    ) -> Vec<MangaDrawCommand> {
+        let max_side = self.max_texture_side.max(1);
+        let rows = self.masonry_items_per_row.clamp(2, 10) as f32;
+        let screen_width = self.screen_size.x.max(1.0);
+        let pan_x = self.offset.x;
+        let scroll_y = self.manga_scroll_offset;
+
+        let mut commands: Vec<MangaDrawCommand> = self
+            .masonry_layout_items
+            .par_iter()
+            .enumerate()
+            .filter_map(|(idx, item)| {
+                let item_top = item.y * zoom;
+                let item_bottom = item_top + item.height * zoom;
+                if item_top >= viewport_bottom || item_bottom <= viewport_top {
+                    return None;
+                }
+
+                let image_rect = item.to_screen_rect(zoom, pan_x, scroll_y);
+
+                let baseline_item_width = (screen_width / rows) * zoom;
+                let basis = image_rect.width().max(baseline_item_width).max(64.0);
+                let boosted = (basis * Self::masonry_zoom_quality_boost(zoom)).ceil() as u32;
+                let raw_target_side =
+                    boosted.clamp(Self::MANGA_MASONRY_DYNAMIC_TARGET_MIN_SIDE.min(max_side), max_side);
+
+                let target_texture_side = if raw_target_side <= 256 {
+                    256u32.min(max_side)
+                } else if raw_target_side <= 512 {
+                    512u32.min(max_side)
+                } else if raw_target_side <= 1024 {
+                    1024u32.min(max_side)
+                } else {
+                    max_side
+                };
+
+                Some(MangaDrawCommand {
+                    index: idx,
+                    image_rect,
+                    target_texture_side,
+                })
+            })
+            .collect();
+
+        commands.sort_unstable_by_key(|cmd| cmd.index);
+        commands
     }
 
     fn manga_compute_cache_capacity_target(
@@ -2851,7 +2954,8 @@ impl ImageViewer {
                 }
             }
 
-            return self.masonry_target_texture_side_from_screen_width(visible_max_width);
+            let desired = self.masonry_target_texture_side_from_screen_width(visible_max_width);
+            return self.manga_quantize_lod_side(desired);
         }
 
         if self.zoom >= 0.95 {
@@ -2872,7 +2976,7 @@ impl ImageViewer {
         }
 
         let scaled = (visible_max_side * 1.20).ceil() as u32;
-        scaled.clamp(256u32.min(max_side), max_side)
+        self.manga_quantize_lod_side(scaled.clamp(256u32.min(max_side), max_side))
     }
 
     fn navigation_preload_window(&self) -> (usize, usize) {
@@ -3394,6 +3498,7 @@ impl ImageViewer {
         self.manga_upload_batch_limit = Self::MANGA_UPLOAD_BATCH_BASE;
         self.manga_cache_target_capacity = Self::MANGA_CACHE_MIN_ENTRIES;
         self.manga_target_texture_side = self.max_texture_side.max(1);
+        self.manga_missing_lod_requests.clear();
 
         // Clear and reset the parallel loader
         if let Some(ref mut loader) = self.manga_loader {
@@ -4087,9 +4192,16 @@ impl ImageViewer {
         self.manga_texture_cache
             .set_pinned_indices(visible_indices.iter().copied());
 
-        let mut evicted_for_capacity = self
-            .manga_texture_cache
-            .set_max_entries(self.manga_cache_target_capacity);
+        let mut evicted_for_capacity = self.manga_texture_cache.set_l1_pool_slots(MangaL1PoolSlots {
+            lod0_slots: self.config.l1_pool_lod0_slots,
+            lod1_slots: self.config.l1_pool_lod1_slots,
+            lod2_slots: self.config.l1_pool_lod2_slots,
+            lod3_slots: self.config.l1_pool_lod3_slots,
+        });
+        evicted_for_capacity.extend(
+            self.manga_texture_cache
+                .set_max_entries(self.manga_cache_target_capacity),
+        );
         if !evicted_for_capacity.is_empty() {
             if let Some(loader) = self.manga_loader.as_mut() {
                 for idx in evicted_for_capacity.drain(..) {
@@ -4435,9 +4547,18 @@ impl ImageViewer {
         self.manga_texture_cache
             .set_pinned_indices(visible_indices.iter().copied());
 
-        let mut evicted_to_mark_unloaded = self
-            .manga_texture_cache
-            .set_max_entries(self.manga_cache_target_capacity);
+        let mut evicted_to_mark_unloaded = self.manga_texture_cache.set_l1_pool_slots(
+            MangaL1PoolSlots {
+                lod0_slots: self.config.l1_pool_lod0_slots,
+                lod1_slots: self.config.l1_pool_lod1_slots,
+                lod2_slots: self.config.l1_pool_lod2_slots,
+                lod3_slots: self.config.l1_pool_lod3_slots,
+            },
+        );
+        evicted_to_mark_unloaded.extend(
+            self.manga_texture_cache
+                .set_max_entries(self.manga_cache_target_capacity),
+        );
 
         // Upload decoded images to GPU as textures
         for decoded in decoded_images {
@@ -5755,28 +5876,68 @@ impl ImageViewer {
             .manga_clamp_target_side_to_source(index, display_target_side)
             .max(self.manga_target_texture_side.min(max_side))
             .clamp(Self::MANGA_DYNAMIC_TARGET_MIN_SIDE.min(max_side), max_side);
+        let target_texture_side = self.manga_quantize_lod_side(target_texture_side);
+        let new_target = match self.manga_missing_lod_requests.get_mut(&index) {
+            Some(existing) => {
+                if target_texture_side > *existing {
+                    *existing = target_texture_side;
+                }
+                false
+            }
+            None => {
+                self.manga_missing_lod_requests
+                    .insert(index, target_texture_side);
+                true
+            }
+        };
+
+        new_target
+    }
+
+    fn manga_flush_missing_lod_requests(&mut self) -> bool {
+        if self.manga_missing_lod_requests.is_empty() {
+            return false;
+        }
+
+        let mut requests: Vec<(usize, u32)> =
+            self.manga_missing_lod_requests.drain().collect();
+        requests.sort_by_key(|(idx, target_side)| {
+            (
+                idx.abs_diff(self.current_index),
+                std::cmp::Reverse(*target_side),
+            )
+        });
+
         let (downscale_filter, gif_filter) = self.manga_decode_filters_for_strip_mode();
         let force_triangle_filters = self.manga_should_force_triangle_filters();
+        let mut dispatched_any = false;
 
-        self.manga_loader
-            .as_mut()
-            .map(|loader| {
-                loader.request_visible_retry(
+        if let Some(loader) = self.manga_loader.as_mut() {
+            for (idx, target_side) in requests {
+                let dispatched = loader.request_visible_retry(
                     &self.image_list,
-                    index,
+                    idx,
                     self.max_texture_side,
-                    target_texture_side,
+                    target_side,
                     downscale_filter,
                     gif_filter,
                     force_triangle_filters,
-                )
-            })
-            .unwrap_or(false)
+                );
+                dispatched_any |= dispatched;
+            }
+        }
+
+        dispatched_any
     }
 
-    fn draw_manga_item(&mut self, ui: &mut egui::Ui, idx: usize, image_rect: egui::Rect) -> bool {
+    fn draw_manga_item(
+        &mut self,
+        ui: &mut egui::Ui,
+        idx: usize,
+        image_rect: egui::Rect,
+        retry_target_side: u32,
+    ) -> bool {
         let mut requested_retry = false;
-        let retry_target_side = self.manga_retry_target_side_for_rect(idx, image_rect);
 
         // Check if this item is a video
         let is_video = self
@@ -6720,17 +6881,19 @@ impl ImageViewer {
                     let viewport_bottom = viewport_top + screen_height;
                     let zoom = self.zoom.max(0.0001);
 
-                    for idx in 0..self.masonry_layout_items.len() {
-                        let item = self.masonry_layout_items[idx];
-                        let item_top = item.y * zoom;
-                        let item_bottom = item_top + item.height * zoom;
-                        if item_top > viewport_bottom || item_bottom < viewport_top {
-                            continue;
-                        }
+                    let draw_commands = self.manga_build_masonry_draw_commands(
+                        viewport_top,
+                        viewport_bottom,
+                        zoom,
+                    );
 
-                        let image_rect =
-                            item.to_screen_rect(zoom, self.offset.x, self.manga_scroll_offset);
-                        if self.draw_manga_item(ui, idx, image_rect) {
+                    for command in draw_commands {
+                        if self.draw_manga_item(
+                            ui,
+                            command.index,
+                            command.image_rect,
+                            command.target_texture_side,
+                        ) {
                             requested_visible_retry = true;
                         }
                     }
@@ -6761,7 +6924,8 @@ impl ImageViewer {
                             egui::Vec2::new(display_width, display_height),
                         );
 
-                        if self.draw_manga_item(ui, idx, image_rect) {
+                        let retry_target_side = self.manga_retry_target_side_for_rect(idx, image_rect);
+                        if self.draw_manga_item(ui, idx, image_rect, retry_target_side) {
                             requested_visible_retry = true;
                         }
                         y_offset += img_height;
@@ -6866,6 +7030,11 @@ impl ImageViewer {
 
         if requested_visible_retry {
             animation_active = true;
+        }
+
+        if self.manga_flush_missing_lod_requests() {
+            animation_active = true;
+            requested_visible_retry = true;
         }
 
         // Retry preload updates only while there is still background work in flight.
@@ -10316,9 +10485,8 @@ fn main() -> eframe::Result<()> {
     //
     // Note: We don't set fullscreen in the viewport to avoid triggering NVIDIA GSYNC
     let options = eframe::NativeOptions {
-        // Keep the renderer lightweight at idle. This viewer renders 2D UI + a single image/video
-        // texture; MSAA and a depth buffer are not required for perceptible quality.
-        renderer: eframe::Renderer::Glow,
+        // Use wgpu backend as the baseline for the modern GPU-driven masonry pipeline.
+        renderer: eframe::Renderer::Wgpu,
         // CRITICAL: Enable VSync to eliminate screen tearing during scrolling/panning.
         // This synchronizes frame presentation with the display's refresh rate.
         vsync: true,

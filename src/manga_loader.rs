@@ -1485,6 +1485,10 @@ pub struct MangaTextureCache {
     max_entries: usize,
     /// Indices that should not be evicted while still visible.
     pinned_indices: HashSet<usize>,
+    /// Hard per-LOD slot limits (LOD0..LOD3).
+    l1_pool_limits: [usize; 4],
+    /// Effective per-LOD slot limits after scaling to `max_entries`.
+    effective_l1_pool_limits: [usize; 4],
 }
 
 #[derive(Clone)]
@@ -1493,17 +1497,159 @@ struct MangaTextureEntry {
     width: u32,
     height: u32,
     media_type: MangaMediaType,
+    lod_level: MangaLodLevel,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct MangaL1PoolSlots {
+    pub lod0_slots: usize,
+    pub lod1_slots: usize,
+    pub lod2_slots: usize,
+    pub lod3_slots: usize,
+}
+
+impl Default for MangaL1PoolSlots {
+    fn default() -> Self {
+        Self {
+            lod0_slots: 128,
+            lod1_slots: 500,
+            lod2_slots: 1500,
+            lod3_slots: 5000,
+        }
+    }
+}
+
+impl MangaL1PoolSlots {
+    fn as_array(self) -> [usize; 4] {
+        [
+            self.lod0_slots,
+            self.lod1_slots,
+            self.lod2_slots,
+            self.lod3_slots,
+        ]
+    }
 }
 
 impl MangaTextureCache {
     pub fn new(max_entries: usize) -> Self {
         let capacity = NonZeroUsize::new(max_entries.max(1)).expect("cache capacity is non-zero");
-        Self {
+        let l1_pool_limits = MangaL1PoolSlots::default().as_array();
+        let mut cache = Self {
             pinned_entries: HashMap::with_capacity(max_entries),
             unpinned_entries: LruCache::new(capacity),
             max_entries: max_entries.max(1),
             pinned_indices: HashSet::new(),
+            l1_pool_limits,
+            effective_l1_pool_limits: [1, 1, 1, 1],
+        };
+        cache.recompute_effective_l1_pool_limits();
+        cache
+    }
+
+    fn lod_index(lod_level: MangaLodLevel) -> usize {
+        match lod_level {
+            MangaLodLevel::Lod0Original => 0,
+            MangaLodLevel::Lod1_1024 => 1,
+            MangaLodLevel::Lod2_512 => 2,
+            MangaLodLevel::Lod3_256 => 3,
         }
+    }
+
+    fn texture_lod_level(width: u32, height: u32) -> MangaLodLevel {
+        MangaLodLevel::from_target_side(width.max(height).max(1))
+    }
+
+    fn recompute_effective_l1_pool_limits(&mut self) {
+        let mut limits = self.l1_pool_limits;
+        if limits.iter().all(|&v| v == 0) {
+            limits = MangaL1PoolSlots::default().as_array();
+            self.l1_pool_limits = limits;
+        }
+
+        let base_total: usize = limits.iter().sum();
+        if base_total == 0 {
+            self.effective_l1_pool_limits = [1, 1, 1, 1];
+            return;
+        }
+
+        if self.max_entries >= base_total {
+            let mut effective = limits;
+            effective[3] = effective[3].saturating_add(self.max_entries - base_total);
+            self.effective_l1_pool_limits = effective;
+            return;
+        }
+
+        let ratio = self.max_entries as f64 / base_total as f64;
+        let mut effective = [0usize; 4];
+
+        for idx in 0..4 {
+            let base = limits[idx];
+            if base == 0 {
+                effective[idx] = 0;
+                continue;
+            }
+
+            let mut scaled = ((base as f64) * ratio).floor() as usize;
+            if scaled == 0 {
+                scaled = 1;
+            }
+            effective[idx] = scaled;
+        }
+
+        let mut total: usize = effective.iter().sum();
+        while total > self.max_entries {
+            let mut reduced = false;
+            for tier in [3usize, 2, 1, 0] {
+                if effective[tier] > 1 {
+                    effective[tier] -= 1;
+                    total -= 1;
+                    reduced = true;
+                    if total <= self.max_entries {
+                        break;
+                    }
+                }
+            }
+
+            if !reduced {
+                break;
+            }
+        }
+
+        while total < self.max_entries {
+            effective[3] = effective[3].saturating_add(1);
+            total += 1;
+        }
+
+        self.effective_l1_pool_limits = effective;
+    }
+
+    fn count_entries_by_lod(&self) -> [usize; 4] {
+        let mut counts = [0usize; 4];
+
+        for entry in self.pinned_entries.values() {
+            counts[Self::lod_index(entry.lod_level)] += 1;
+        }
+        for (_, entry) in self.unpinned_entries.iter() {
+            counts[Self::lod_index(entry.lod_level)] += 1;
+        }
+
+        counts
+    }
+
+    fn least_recent_unpinned_in_lod(&self, lod_index: usize) -> Option<usize> {
+        let mut candidate = None;
+        for (idx, entry) in self.unpinned_entries.iter() {
+            if Self::lod_index(entry.lod_level) == lod_index {
+                candidate = Some(*idx);
+            }
+        }
+        candidate
+    }
+
+    pub fn set_l1_pool_slots(&mut self, slots: MangaL1PoolSlots) -> Vec<usize> {
+        self.l1_pool_limits = slots.as_array();
+        self.recompute_effective_l1_pool_limits();
+        self.evict_to_capacity()
     }
 
     fn total_entries(&self) -> usize {
@@ -1513,9 +1659,41 @@ impl MangaTextureCache {
     fn evict_to_capacity(&mut self) -> Vec<usize> {
         let mut evicted = Vec::new();
 
-        while self.total_entries() > self.max_entries {
-            let Some((idx, _)) = self.unpinned_entries.pop_lru() else {
-                // All remaining entries are pinned; cannot evict further.
+        loop {
+            let lod_counts = self.count_entries_by_lod();
+
+            let mut over_limit_lod: Option<usize> = None;
+            let mut overflow = 0usize;
+            for lod_idx in 0..4 {
+                let limit = self.effective_l1_pool_limits[lod_idx];
+                if lod_counts[lod_idx] > limit {
+                    let current_overflow = lod_counts[lod_idx] - limit;
+                    if current_overflow > overflow {
+                        overflow = current_overflow;
+                        over_limit_lod = Some(lod_idx);
+                    }
+                }
+            }
+
+            let over_total = self.total_entries() > self.max_entries;
+            if over_limit_lod.is_none() && !over_total {
+                break;
+            }
+
+            let removed = if let Some(lod_idx) = over_limit_lod {
+                if let Some(candidate_idx) = self.least_recent_unpinned_in_lod(lod_idx) {
+                    self.unpinned_entries
+                        .pop(&candidate_idx)
+                        .map(|entry| (candidate_idx, entry))
+                } else {
+                    self.unpinned_entries.pop_lru()
+                }
+            } else {
+                self.unpinned_entries.pop_lru()
+            };
+
+            let Some((idx, _entry)) = removed else {
+                // All remaining items are pinned, cannot evict further.
                 break;
             };
 
@@ -1531,6 +1709,7 @@ impl MangaTextureCache {
         let capacity =
             NonZeroUsize::new(self.max_entries).expect("cache capacity is non-zero");
         self.unpinned_entries.resize(capacity);
+        self.recompute_effective_l1_pool_limits();
         self.evict_to_capacity()
     }
 
@@ -1687,6 +1866,7 @@ impl MangaTextureCache {
             width,
             height,
             media_type,
+            lod_level: Self::texture_lod_level(width, height),
         };
 
         if self.pinned_indices.contains(&index) {
@@ -1714,6 +1894,7 @@ impl MangaTextureCache {
             entry.texture = texture;
             entry.width = width;
             entry.height = height;
+            entry.lod_level = Self::texture_lod_level(width, height);
             return;
         }
 
@@ -1721,6 +1902,7 @@ impl MangaTextureCache {
             entry.texture = texture;
             entry.width = width;
             entry.height = height;
+            entry.lod_level = Self::texture_lod_level(width, height);
         }
     }
 
