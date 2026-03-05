@@ -26,6 +26,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, TrySendError};
+use fast_image_resize as fir;
 use image::imageops::FilterType;
 use parking_lot::RwLock;
 use rayon::prelude::*;
@@ -40,7 +41,7 @@ const MAX_PENDING_UPLOADS: usize = 32;
 
 /// Maximum number of images to keep in the texture cache.
 /// Beyond this, the oldest entries are evicted to control VRAM usage.
-const MAX_CACHED_TEXTURES: usize = 64;
+const DEFAULT_CACHED_TEXTURES: usize = 64;
 
 /// Fixed buffer to add AHEAD of visible pages (in scroll direction) for preloading.
 /// If 14 pages are visible and scrolling down, we preload 14 + 4 = 18 ahead.
@@ -107,6 +108,7 @@ pub struct LoadRequest {
     pub index: usize,
     pub path: PathBuf,
     pub max_texture_side: u32,
+    pub target_texture_side: u32,
     pub priority: i32, // Lower = higher priority
 }
 
@@ -604,6 +606,11 @@ impl MangaLoader {
     /// Load a single image on a worker thread.
     /// For video files, this extracts the first frame as a thumbnail placeholder.
     fn load_single_image(req: &LoadRequest) -> Option<DecodedImage> {
+        let effective_texture_side = req
+            .target_texture_side
+            .max(1)
+            .min(req.max_texture_side.max(1));
+
         // Determine media type
         let media_type = get_media_type(&req.path)?;
 
@@ -613,9 +620,17 @@ impl MangaLoader {
                 // This provides a visual preview instead of a gray placeholder
                 match Self::extract_video_first_frame(&req.path, req.max_texture_side) {
                     Some((pixels, width, height, original_width, original_height)) => {
+                        let (width, height, pixels) = downscale_rgba_if_needed(
+                            width,
+                            height,
+                            &pixels,
+                            effective_texture_side,
+                            FilterType::Triangle,
+                        );
+
                         Some(DecodedImage {
                             index: req.index,
-                            pixels,
+                            pixels: pixels.into_owned(),
                             width,
                             height,
                             original_width,
@@ -687,7 +702,7 @@ impl MangaLoader {
                     frame.width,
                     frame.height,
                     &frame.pixels,
-                    req.max_texture_side,
+                    effective_texture_side,
                     downscale_filter,
                 );
 
@@ -927,10 +942,15 @@ impl MangaLoader {
         visible_index: usize,
         _screen_height: f32,
         max_texture_side: u32,
+        target_texture_side: u32,
     ) {
         if image_list.is_empty() {
             return;
         }
+
+        let target_texture_side = target_texture_side
+            .max(1)
+            .min(max_texture_side.max(1));
 
         // Detect a far jump (e.g., dragging the scrollbar, Home/End, or any other big reposition).
         // On a far jump we cancel older work and make the target page the only "urgent" item.
@@ -971,6 +991,7 @@ impl MangaLoader {
         let mut requests: Vec<LoadRequest> = Vec::new();
         let generation = self.current_generation;
         let now = Instant::now();
+        let visible_retry_radius = self.visible_page_count.saturating_sub(1).min(6);
 
         {
             let loading = self.loading_indices.read();
@@ -992,8 +1013,8 @@ impl MangaLoader {
 
                 if let Some(retry_state) = retry.get(&idx) {
                     let retry_due = now >= retry_state.next_retry_at;
-                    let can_retry_here = idx == visible_index;
-                    if !retry_due || !can_retry_here {
+                    let can_retry_here = idx.abs_diff(visible_index) <= visible_retry_radius;
+                    if !retry_due && !can_retry_here {
                         continue;
                     }
                 }
@@ -1028,6 +1049,7 @@ impl MangaLoader {
                     index: idx,
                     path: image_list[idx].clone(),
                     max_texture_side,
+                    target_texture_side,
                     priority,
                 });
             }
@@ -1178,6 +1200,7 @@ impl MangaLoader {
         image_list: &[PathBuf],
         index: usize,
         max_texture_side: u32,
+        target_texture_side: u32,
     ) -> bool {
         let Some(path) = image_list.get(index).cloned() else {
             return false;
@@ -1191,21 +1214,19 @@ impl MangaLoader {
             return false;
         }
 
-        let now = Instant::now();
-        if let Some(retry_state) = self.retry_state.read().get(&index).copied() {
-            if now < retry_state.next_retry_at {
-                return false;
-            }
-        }
-
         // Visible placeholder takes precedence over stale loaded bookkeeping.
         self.loaded_indices.write().remove(&index);
+
+        let target_texture_side = target_texture_side
+            .max(1)
+            .min(max_texture_side.max(1));
 
         let req = LoadRequest {
             generation: self.current_generation,
             index,
             path,
             max_texture_side,
+            target_texture_side,
             priority: -200_000,
         };
 
@@ -1298,6 +1319,38 @@ impl Drop for MangaLoader {
 
 /// Downscale RGBA pixel data if it exceeds the maximum texture size.
 /// Uses Cow to avoid unnecessary allocations when no downscaling is needed.
+fn image_filter_to_fir(filter: FilterType) -> fir::FilterType {
+    match filter {
+        FilterType::Nearest => fir::FilterType::Box,
+        FilterType::Triangle => fir::FilterType::Bilinear,
+        FilterType::CatmullRom => fir::FilterType::CatmullRom,
+        FilterType::Gaussian => fir::FilterType::Gaussian,
+        FilterType::Lanczos3 => fir::FilterType::Lanczos3,
+    }
+}
+
+fn resize_rgba_with_fir(
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+    new_w: u32,
+    new_h: u32,
+    filter: FilterType,
+) -> Option<Vec<u8>> {
+    let src = fir::images::Image::from_vec_u8(width, height, pixels.to_vec(), fir::PixelType::U8x4)
+        .ok()?;
+    let mut dst = fir::images::Image::new(new_w, new_h, fir::PixelType::U8x4);
+
+    let options = fir::ResizeOptions::new().resize_alg(fir::ResizeAlg::Convolution(
+        image_filter_to_fir(filter),
+    ));
+
+    let mut resizer = fir::Resizer::new();
+    resizer.resize(&src, &mut dst, Some(&options)).ok()?;
+
+    Some(dst.into_vec())
+}
+
 fn downscale_rgba_if_needed<'a>(
     width: u32,
     height: u32,
@@ -1319,6 +1372,10 @@ fn downscale_rgba_if_needed<'a>(
     let new_w = ((width as f64) * scale).round().max(1.0) as u32;
     let new_h = ((height as f64) * scale).round().max(1.0) as u32;
 
+    if let Some(resized) = resize_rgba_with_fir(width, height, pixels, new_w, new_h, filter) {
+        return (new_w, new_h, Cow::Owned(resized));
+    }
+
     // Convert to an owned buffer for resizing.
     let Some(img) = image::RgbaImage::from_raw(width, height, pixels.to_vec()) else {
         return (width, height, Cow::Borrowed(pixels));
@@ -1337,6 +1394,8 @@ pub struct MangaTextureCache {
     frame_counter: u64,
     /// Maximum number of entries to cache
     max_entries: usize,
+    /// Indices that should not be evicted while still visible.
+    pinned_indices: HashSet<usize>,
 }
 
 impl MangaTextureCache {
@@ -1344,8 +1403,42 @@ impl MangaTextureCache {
         Self {
             entries: HashMap::with_capacity(max_entries),
             frame_counter: 0,
-            max_entries,
+            max_entries: max_entries.max(1),
+            pinned_indices: HashSet::new(),
         }
+    }
+
+    fn oldest_evictable_index(&self) -> Option<usize> {
+        self.entries
+            .iter()
+            .filter(|(idx, _)| !self.pinned_indices.contains(*idx))
+            .min_by_key(|(_, (_, _, _, _, frame))| *frame)
+            .map(|(&idx, _)| idx)
+    }
+
+    pub fn set_max_entries(&mut self, max_entries: usize) -> Vec<usize> {
+        self.max_entries = max_entries.max(1);
+
+        let mut evicted = Vec::new();
+        while self.entries.len() > self.max_entries {
+            if let Some(oldest_idx) = self.oldest_evictable_index() {
+                self.entries.remove(&oldest_idx);
+                self.pinned_indices.remove(&oldest_idx);
+                evicted.push(oldest_idx);
+            } else {
+                break;
+            }
+        }
+
+        evicted
+    }
+
+    pub fn set_pinned_indices<I>(&mut self, pinned: I)
+    where
+        I: IntoIterator<Item = usize>,
+    {
+        self.pinned_indices.clear();
+        self.pinned_indices.extend(pinned);
     }
 
     /// Increment frame counter (call once per frame).
@@ -1445,17 +1538,16 @@ impl MangaTextureCache {
     ) -> Vec<usize> {
         let mut evicted = Vec::new();
 
+        if let Some(entry) = self.entries.get_mut(&index) {
+            *entry = (texture, width, height, media_type, self.frame_counter);
+            return evicted;
+        }
+
         // Evict oldest entries if at capacity
         while self.entries.len() >= self.max_entries {
-            // Find oldest entry
-            let oldest = self
-                .entries
-                .iter()
-                .min_by_key(|(_, (_, _, _, _, frame))| *frame)
-                .map(|(&idx, _)| idx);
-
-            if let Some(oldest_idx) = oldest {
+            if let Some(oldest_idx) = self.oldest_evictable_index() {
                 self.entries.remove(&oldest_idx);
+                self.pinned_indices.remove(&oldest_idx);
                 evicted.push(oldest_idx);
             } else {
                 break;
@@ -1491,11 +1583,13 @@ impl MangaTextureCache {
     /// Remove an entry from the cache.
     pub fn remove(&mut self, index: usize) {
         self.entries.remove(&index);
+        self.pinned_indices.remove(&index);
     }
 
     /// Clear the entire cache.
     pub fn clear(&mut self) {
         self.entries.clear();
+        self.pinned_indices.clear();
     }
 
     /// Get the number of cached textures.
@@ -1518,6 +1612,6 @@ impl MangaTextureCache {
 
 impl Default for MangaTextureCache {
     fn default() -> Self {
-        Self::new(MAX_CACHED_TEXTURES)
+        Self::new(DEFAULT_CACHED_TEXTURES)
     }
 }

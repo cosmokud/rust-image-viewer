@@ -546,6 +546,10 @@ struct ImageViewer {
     manga_last_preload_update: std::time::Instant,
     /// Last scroll position for detecting large jumps
     manga_last_scroll_position: f32,
+    /// Adaptive target cache capacity for manga/masonry textures.
+    manga_cache_target_capacity: usize,
+    /// Dynamic target texture side used for preload/retry requests.
+    manga_target_texture_side: u32,
     /// Adaptive decoded-upload batch size used by manga texture uploads.
     manga_upload_batch_limit: usize,
     /// First time a visible item was observed without an uploaded texture.
@@ -759,6 +763,8 @@ impl Default for ImageViewer {
             manga_preload_cooldown: 0,
             manga_last_preload_update: Instant::now(),
             manga_last_scroll_position: 0.0,
+            manga_cache_target_capacity: 64,
+            manga_target_texture_side: 4096,
             manga_upload_batch_limit: 4,
             manga_ttv_pending: HashMap::new(),
             manga_ttv_samples_ms: VecDeque::new(),
@@ -815,6 +821,10 @@ impl ImageViewer {
     const MANGA_UPLOAD_BATCH_BASE: usize = 4;
     const MANGA_UPLOAD_BATCH_MIN: usize = 2;
     const MANGA_UPLOAD_BATCH_MAX: usize = 12;
+    const MANGA_CACHE_MIN_ENTRIES: usize = 64;
+    const MANGA_CACHE_MAX_ENTRIES: usize = 512;
+    const MANGA_DYNAMIC_TARGET_MIN_SIDE: u32 = 192;
+    const MANGA_DYNAMIC_TARGET_OVERSCAN: f32 = 1.35;
     const MANGA_TTV_SAMPLE_CAP: usize = 240;
     const MANGA_TTV_PENDING_MAX_AGE: Duration = Duration::from_secs(30);
 
@@ -2619,6 +2629,153 @@ impl ImageViewer {
         }
     }
 
+    fn manga_collect_visible_indices(&mut self) -> Vec<usize> {
+        if !self.manga_mode || self.image_list.is_empty() {
+            return Vec::new();
+        }
+
+        if self.is_masonry_mode() {
+            self.masonry_ensure_layout_cache();
+            if self.masonry_layout_items.is_empty() {
+                return Vec::new();
+            }
+
+            let viewport_top = self.manga_scroll_offset.max(0.0);
+            let viewport_bottom = viewport_top + self.screen_size.y.max(1.0);
+            let zoom = self.zoom.max(0.0001);
+
+            return self
+                .masonry_layout_items
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, item)| {
+                    let item_top = item.y * zoom;
+                    let item_bottom = item_top + item.height * zoom;
+                    if item_top < viewport_bottom && item_bottom > viewport_top {
+                        Some(idx)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+        }
+
+        let viewport_top = self.manga_scroll_offset.max(0.0);
+        let viewport_bottom = viewport_top + self.screen_size.y.max(1.0);
+        let first_idx = self.manga_index_at_y(viewport_top);
+
+        let mut visible_indices = Vec::new();
+        let mut y = self.manga_page_start_y(first_idx);
+        for idx in first_idx..self.image_list.len() {
+            let page_h = self.manga_page_height_cached(idx).max(1.0);
+            let page_bottom = y + page_h;
+
+            if y < viewport_bottom && page_bottom > viewport_top {
+                visible_indices.push(idx);
+            }
+
+            if y > viewport_bottom {
+                break;
+            }
+
+            y = page_bottom;
+        }
+
+        visible_indices
+    }
+
+    fn manga_compute_cache_capacity_target(
+        &self,
+        visible_page_count: usize,
+        visible_indices_count: usize,
+    ) -> usize {
+        let visible = visible_page_count.max(1).max(visible_indices_count.max(1));
+
+        if self.is_masonry_mode() {
+            let rows = self.masonry_items_per_row.clamp(2, 10);
+            let zoom_factor = if self.zoom <= 0.35 {
+                4
+            } else if self.zoom <= 0.55 {
+                3
+            } else if self.zoom <= 0.80 {
+                2
+            } else {
+                1
+            };
+            let density_factor = 2 + rows / 2;
+
+            visible
+                .saturating_mul(density_factor)
+                .saturating_mul(zoom_factor)
+                .clamp(Self::MANGA_CACHE_MIN_ENTRIES, Self::MANGA_CACHE_MAX_ENTRIES)
+        } else {
+            let zoom_factor = if self.zoom <= 0.45 {
+                3
+            } else if self.zoom <= 0.75 {
+                2
+            } else {
+                1
+            };
+
+            visible
+                .saturating_mul(4)
+                .saturating_mul(zoom_factor)
+                .clamp(Self::MANGA_CACHE_MIN_ENTRIES, 320)
+        }
+    }
+
+    fn manga_target_texture_side_for_preload(
+        &mut self,
+        anchor_index: usize,
+        visible_indices: &[usize],
+    ) -> u32 {
+        let max_side = self.max_texture_side.max(1);
+
+        if !self.manga_mode || self.image_list.is_empty() {
+            return max_side;
+        }
+
+        if self.is_masonry_mode() {
+            self.masonry_ensure_layout_cache();
+            let zoom = self.zoom.max(0.0001);
+            let mut visible_max_side = 0.0f32;
+
+            for &idx in visible_indices.iter().take(96) {
+                if let Some(item) = self.masonry_layout_items.get(idx) {
+                    visible_max_side = visible_max_side.max((item.width * zoom).max(item.height * zoom));
+                }
+            }
+
+            if visible_max_side <= 0.0 {
+                let rows = self.masonry_items_per_row.clamp(2, 10) as f32;
+                visible_max_side = (self.screen_size.x.max(1.0) / rows).max(64.0);
+            }
+
+            let scaled = (visible_max_side * Self::MANGA_DYNAMIC_TARGET_OVERSCAN).ceil() as u32;
+            return scaled.clamp(Self::MANGA_DYNAMIC_TARGET_MIN_SIDE.min(max_side), max_side);
+        }
+
+        if self.zoom >= 0.95 {
+            return max_side;
+        }
+
+        let mut visible_max_side = 0.0f32;
+        for &idx in visible_indices.iter().take(6) {
+            let display_w = self.manga_get_image_display_width(idx);
+            let display_h = self.manga_get_image_display_height(idx);
+            visible_max_side = visible_max_side.max(display_w.max(display_h));
+        }
+
+        if visible_max_side <= 0.0 && anchor_index < self.image_list.len() {
+            let display_w = self.manga_get_image_display_width(anchor_index);
+            let display_h = self.manga_get_image_display_height(anchor_index);
+            visible_max_side = display_w.max(display_h);
+        }
+
+        let scaled = (visible_max_side * 1.20).ceil() as u32;
+        scaled.clamp(256u32.min(max_side), max_side)
+    }
+
     fn navigation_preload_window(&self) -> (usize, usize) {
         let mul = self.masonry_cache_multiplier();
         (30usize.saturating_mul(mul), 60usize.saturating_mul(mul))
@@ -3166,6 +3323,8 @@ impl ImageViewer {
         self.manga_ttv_pending.clear();
         self.manga_ttv_samples_ms.clear();
         self.manga_upload_batch_limit = Self::MANGA_UPLOAD_BATCH_BASE;
+        self.manga_cache_target_capacity = Self::MANGA_CACHE_MIN_ENTRIES;
+        self.manga_target_texture_side = self.max_texture_side.max(1);
 
         // Clear and reset the parallel loader
         if let Some(ref mut loader) = self.manga_loader {
@@ -3675,13 +3834,20 @@ impl ImageViewer {
                         self.config.texture_filter_animated.to_egui_options(),
                     );
 
-                    self.manga_texture_cache.insert_with_type(
+                    let evicted = self.manga_texture_cache.insert_with_type(
                         idx,
                         texture,
                         w,
                         h,
                         MangaMediaType::AnimatedImage,
                     );
+                    if !evicted.is_empty() {
+                        if let Some(loader) = self.manga_loader.as_mut() {
+                            for evicted_idx in evicted {
+                                loader.mark_unloaded(evicted_idx);
+                            }
+                        }
+                    }
 
                     needs_repaint = true;
                 }
@@ -3756,13 +3922,20 @@ impl ImageViewer {
             if self.manga_texture_cache.contains(idx) {
                 self.manga_texture_cache.update_texture(idx, texture, w, h);
             } else {
-                self.manga_texture_cache.insert_with_type(
+                let evicted = self.manga_texture_cache.insert_with_type(
                     idx,
                     texture,
                     w,
                     h,
                     MangaMediaType::AnimatedImage,
                 );
+                if !evicted.is_empty() {
+                    if let Some(loader) = self.manga_loader.as_mut() {
+                        for evicted_idx in evicted {
+                            loader.mark_unloaded(evicted_idx);
+                        }
+                    }
+                }
             }
         }
     }
@@ -3804,14 +3977,40 @@ impl ImageViewer {
         // Calculate how many pages are currently visible on screen
         // This determines preload count: visible_pages + 4 ahead and behind
         let visible_page_count = self.manga_calculate_visible_page_count();
+        let visible_indices = self.manga_collect_visible_indices();
+        let visible_indices_count = visible_indices.len().max(1);
+        let visible_set: HashSet<usize> = visible_indices.iter().copied().collect();
+
         let is_masonry = self.is_masonry_mode();
         let masonry_rows = self.masonry_items_per_row.clamp(2, 10);
         let masonry_side_multiplier = (masonry_rows + 1) / 2;
+        let target_cache_capacity =
+            self.manga_compute_cache_capacity_target(visible_page_count, visible_indices_count);
+        self.manga_cache_target_capacity = target_cache_capacity;
+        self.manga_target_texture_side =
+            self.manga_target_texture_side_for_preload(current_visible_index, &visible_indices);
+
+        self.manga_texture_cache
+            .set_pinned_indices(visible_indices.iter().copied());
+
+        let mut evicted_for_capacity = self
+            .manga_texture_cache
+            .set_max_entries(self.manga_cache_target_capacity);
+        if !evicted_for_capacity.is_empty() {
+            if let Some(loader) = self.manga_loader.as_mut() {
+                for idx in evicted_for_capacity.drain(..) {
+                    loader.mark_unloaded(idx);
+                }
+            }
+        }
+
         let cache_multiplier = self.masonry_cache_multiplier();
 
         // Update the loader's visible page count for adaptive preloading
         if let Some(ref mut loader) = self.manga_loader {
-            loader.update_visible_page_count(visible_page_count.saturating_mul(cache_multiplier));
+            let visible_for_loader = visible_page_count.saturating_mul(cache_multiplier);
+            let cache_limited_visible = visible_for_loader.min(self.manga_cache_target_capacity.max(1));
+            loader.update_visible_page_count(cache_limited_visible.max(1));
         }
 
         // Cache dimensions for a window around the visible range.
@@ -3872,6 +4071,7 @@ impl ImageViewer {
                 current_visible_index,
                 self.screen_size.y,
                 self.max_texture_side,
+                self.manga_target_texture_side,
             );
         }
 
@@ -3886,7 +4086,7 @@ impl ImageViewer {
         };
 
         // Apply eviction policy
-        let (final_keep_behind, final_keep_ahead) = if is_masonry {
+        let (mut final_keep_behind, mut final_keep_ahead) = if is_masonry {
             // Masonry: symmetric keep window from the larger side, scaled by rows-per-row.
             let symmetric = keep_ahead
                 .max(keep_behind)
@@ -3899,14 +4099,48 @@ impl ImageViewer {
             (keep_behind, keep_ahead) // Keep more ahead when scrolling down
         };
 
+        let visible_budget = visible_indices_count.min(self.manga_cache_target_capacity.max(1));
+        let keep_budget_total = self.manga_cache_target_capacity.saturating_sub(visible_budget);
+        if keep_budget_total == 0 {
+            final_keep_behind = 0;
+            final_keep_ahead = 0;
+        } else {
+            let requested_total = final_keep_behind.saturating_add(final_keep_ahead);
+            if requested_total > keep_budget_total {
+                let mut scaled_behind =
+                    final_keep_behind.saturating_mul(keep_budget_total) / requested_total.max(1);
+                let mut scaled_ahead = keep_budget_total.saturating_sub(scaled_behind);
+
+                if final_keep_behind > 0 && scaled_behind == 0 {
+                    scaled_behind = 1.min(keep_budget_total);
+                    scaled_ahead = keep_budget_total.saturating_sub(scaled_behind);
+                }
+                if final_keep_ahead > 0 && scaled_ahead == 0 && keep_budget_total > 1 {
+                    scaled_ahead = 1;
+                    scaled_behind = keep_budget_total.saturating_sub(scaled_ahead);
+                }
+
+                final_keep_behind = scaled_behind;
+                final_keep_ahead = scaled_ahead;
+            }
+        }
+
         let keep_start = current_visible_index.saturating_sub(final_keep_behind);
         let keep_end = (current_visible_index + final_keep_ahead + 1).min(self.image_list.len());
 
+        let mut evicted_by_window = Vec::new();
         let cached_indices = self.manga_texture_cache.cached_indices();
         for idx in cached_indices {
-            if idx < keep_start || idx >= keep_end {
+            let outside_keep_window = idx < keep_start || idx >= keep_end;
+            if outside_keep_window && !visible_set.contains(&idx) {
                 self.manga_texture_cache.remove(idx);
-                if let Some(ref mut loader) = self.manga_loader {
+                evicted_by_window.push(idx);
+            }
+        }
+
+        if !evicted_by_window.is_empty() {
+            if let Some(loader) = self.manga_loader.as_mut() {
+                for idx in evicted_by_window {
                     loader.mark_unloaded(idx);
                 }
             }
@@ -4096,7 +4330,14 @@ impl ImageViewer {
         }
 
         let dims_updated = !decoded_images.is_empty() || !dim_updates.is_empty();
-        let mut evicted_to_mark_unloaded = Vec::new();
+
+        let visible_indices = self.manga_collect_visible_indices();
+        self.manga_texture_cache
+            .set_pinned_indices(visible_indices.iter().copied());
+
+        let mut evicted_to_mark_unloaded = self
+            .manga_texture_cache
+            .set_max_entries(self.manga_cache_target_capacity);
 
         // Upload decoded images to GPU as textures
         for decoded in decoded_images {
@@ -4435,6 +4676,7 @@ impl ImageViewer {
 
         // Prime the loader around the destination so the transition stays smooth.
         let (preload_behind, preload_ahead) = self.navigation_preload_window();
+        let target_texture_side = self.manga_target_texture_side_for_preload(target, &[]);
         if let Some(ref mut loader) = self.manga_loader {
             let len = self.image_list.len();
             if len > 0 {
@@ -4446,6 +4688,7 @@ impl ImageViewer {
                     target,
                     self.screen_size.y,
                     self.max_texture_side,
+                    target_texture_side,
                 );
             }
         }
@@ -4535,6 +4778,7 @@ impl ImageViewer {
 
         // Prime the loader around the destination so the transition stays smooth.
         let (preload_behind, preload_ahead) = self.navigation_preload_window();
+        let target_texture_side = self.manga_target_texture_side_for_preload(target, &[]);
         if let Some(ref mut loader) = self.manga_loader {
             let len = self.image_list.len();
             let start = target.saturating_sub(preload_behind);
@@ -4545,6 +4789,7 @@ impl ImageViewer {
                 target,
                 self.screen_size.y,
                 self.max_texture_side,
+                target_texture_side,
             );
         }
 
@@ -4572,6 +4817,7 @@ impl ImageViewer {
 
         // Prime the loader around the destination so the transition stays smooth.
         let (preload_behind, preload_ahead) = self.navigation_preload_window();
+        let target_texture_side = self.manga_target_texture_side_for_preload(target, &[]);
         if let Some(ref mut loader) = self.manga_loader {
             let len = self.image_list.len();
             if len > 0 {
@@ -4583,6 +4829,7 @@ impl ImageViewer {
                     target,
                     self.screen_size.y,
                     self.max_texture_side,
+                    target_texture_side,
                 );
             }
         }
@@ -4615,6 +4862,7 @@ impl ImageViewer {
 
         // Prime the loader around the destination so the transition stays smooth.
         let (preload_behind, preload_ahead) = self.navigation_preload_window();
+        let target_texture_side = self.manga_target_texture_side_for_preload(target, &[]);
         if let Some(ref mut loader) = self.manga_loader {
             let len = self.image_list.len();
             let start = target.saturating_sub(preload_behind);
@@ -4625,6 +4873,7 @@ impl ImageViewer {
                 target,
                 self.screen_size.y,
                 self.max_texture_side,
+                target_texture_side,
             );
         }
 
@@ -5362,7 +5611,11 @@ impl ImageViewer {
         true
     }
 
-    fn manga_request_retry_for_visible_item(&mut self, index: usize) -> bool {
+    fn manga_request_retry_for_visible_item(
+        &mut self,
+        index: usize,
+        display_target_side: u32,
+    ) -> bool {
         if !self.manga_mode {
             return false;
         }
@@ -5371,16 +5624,33 @@ impl ImageViewer {
             return false;
         }
 
+        let max_side = self.max_texture_side.max(1);
+        let target_texture_side = display_target_side
+            .max(self.manga_target_texture_side.min(max_side))
+            .clamp(Self::MANGA_DYNAMIC_TARGET_MIN_SIDE.min(max_side), max_side);
+
         self.manga_loader
             .as_mut()
             .map(|loader| {
-                loader.request_visible_retry(&self.image_list, index, self.max_texture_side)
+                loader.request_visible_retry(
+                    &self.image_list,
+                    index,
+                    self.max_texture_side,
+                    target_texture_side,
+                )
             })
             .unwrap_or(false)
     }
 
     fn draw_manga_item(&mut self, ui: &mut egui::Ui, idx: usize, image_rect: egui::Rect) -> bool {
         let mut requested_retry = false;
+        let retry_target_side = ((image_rect.width().max(image_rect.height())
+            * Self::MANGA_DYNAMIC_TARGET_OVERSCAN)
+            .ceil() as u32)
+            .clamp(
+                Self::MANGA_DYNAMIC_TARGET_MIN_SIDE.min(self.max_texture_side.max(1)),
+                self.max_texture_side.max(1),
+            );
 
         // Check if this item is a video
         let is_video = self
@@ -5480,7 +5750,7 @@ impl ImageViewer {
                     );
                 }
 
-                requested_retry |= self.manga_request_retry_for_visible_item(idx);
+                requested_retry |= self.manga_request_retry_for_visible_item(idx, retry_target_side);
             } else {
                 // Video not yet loaded - draw placeholder with video icon
                 ui.painter()
@@ -5495,7 +5765,7 @@ impl ImageViewer {
 
                 self.manga_mark_placeholder_visible(idx);
 
-                requested_retry |= self.manga_request_retry_for_visible_item(idx);
+                requested_retry |= self.manga_request_retry_for_visible_item(idx, retry_target_side);
             }
         } else {
             // Image item: use regular texture cache
@@ -5541,7 +5811,7 @@ impl ImageViewer {
                     );
                 }
 
-                requested_retry |= self.manga_request_retry_for_visible_item(idx);
+                requested_retry |= self.manga_request_retry_for_visible_item(idx, retry_target_side);
             } else {
                 // Image not loaded yet - draw a placeholder
                 ui.painter()
@@ -5558,7 +5828,7 @@ impl ImageViewer {
 
                 self.manga_mark_placeholder_visible(idx);
 
-                requested_retry |= self.manga_request_retry_for_visible_item(idx);
+                requested_retry |= self.manga_request_retry_for_visible_item(idx, retry_target_side);
             }
         }
 

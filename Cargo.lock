@@ -1307,6 +1307,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "fast_image_resize"
+version = "6.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "12dd43e5011e8d8411a3215a0d57a2ec5c68282fb90eb5d7221fab0113442174"
+dependencies = [
+ "cfg-if",
+ "document-features",
+ "num-traits",
+ "thiserror 2.0.17",
+]
+
+[[package]]
 name = "fastrand"
 version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3388,6 +3400,7 @@ dependencies = [
  "eframe",
  "egui",
  "egui_extras",
+ "fast_image_resize",
  "fs_extra",
  "gif 0.13.3",
  "gstreamer",
