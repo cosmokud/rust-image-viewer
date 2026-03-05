@@ -540,6 +540,13 @@ struct ImageViewer {
     masonry_layout_len: usize,
     masonry_layout_valid: bool,
 
+    /// Whether startup metadata pre-scan is active for masonry mode.
+    masonry_metadata_preload_active: bool,
+    /// Total number of items to scan for metadata.
+    masonry_metadata_preload_total: usize,
+    /// Number of items with dimensions already resolved.
+    masonry_metadata_preload_loaded: usize,
+
     /// Cooldown frames before updating preload queue (prevents cache churn during rapid navigation)
     manga_preload_cooldown: u32,
     /// Last frame when preload queue was updated (throttle updates)
@@ -759,6 +766,10 @@ impl Default for ImageViewer {
             masonry_layout_items_per_row: 0,
             masonry_layout_len: 0,
             masonry_layout_valid: false,
+
+            masonry_metadata_preload_active: false,
+            masonry_metadata_preload_total: 0,
+            masonry_metadata_preload_loaded: 0,
 
             manga_preload_cooldown: 0,
             manga_last_preload_update: Instant::now(),
@@ -1759,11 +1770,157 @@ impl ImageViewer {
         self.set_strip_entry_placeholder_from_current_media(current_media_type);
         self.manga_wheel_scroll_pending = 0.0;
         self.stop_manga_autoscroll();
+        self.reset_masonry_metadata_preload();
         self.manga_mode = true;
         self.stop_fullscreen_video_playback();
         self.reset_fullscreen_anim_stream_state();
         self.reset_manga_video_user_preferences();
         self.ensure_manga_loader();
+    }
+
+    fn reset_masonry_metadata_preload(&mut self) {
+        self.masonry_metadata_preload_active = false;
+        self.masonry_metadata_preload_total = 0;
+        self.masonry_metadata_preload_loaded = 0;
+    }
+
+    fn begin_masonry_metadata_preload(&mut self) {
+        self.masonry_metadata_preload_total = self.image_list.len();
+        self.masonry_metadata_preload_loaded = 0;
+        self.masonry_metadata_preload_active = self.manga_mode
+            && self.is_masonry_mode()
+            && self.masonry_metadata_preload_total > 0
+            && self.manga_loader.is_some();
+
+        if !self.masonry_metadata_preload_active {
+            return;
+        }
+
+        self.tick_masonry_metadata_preload();
+    }
+
+    fn tick_masonry_metadata_preload(&mut self) {
+        if !self.masonry_metadata_preload_active {
+            return;
+        }
+
+        if !self.manga_mode || !self.is_masonry_mode() {
+            self.reset_masonry_metadata_preload();
+            return;
+        }
+
+        let total = self.masonry_metadata_preload_total.min(self.image_list.len());
+        if total == 0 {
+            self.reset_masonry_metadata_preload();
+            return;
+        }
+
+        let Some(loader) = self.manga_loader.as_mut() else {
+            self.reset_masonry_metadata_preload();
+            return;
+        };
+
+        let (dim_updates, loaded_count, pending_probe_count, pending_result_count) = {
+            loader.request_all_missing_dimensions(&self.image_list);
+            let dim_updates = loader.poll_dimension_results(512);
+            let loaded_count = loader.cached_dimensions_count(total).min(total);
+            let pending_probe_count = loader.pending_dimension_probe_count();
+            let pending_result_count = loader.pending_dimension_results_count();
+            (
+                dim_updates,
+                loaded_count,
+                pending_probe_count,
+                pending_result_count,
+            )
+        };
+
+        if !dim_updates.is_empty() {
+            self.invalidate_manga_layout_cache();
+        }
+
+        self.masonry_metadata_preload_loaded = loaded_count;
+
+        let scan_complete = self.masonry_metadata_preload_loaded >= total
+            && pending_probe_count == 0
+            && pending_result_count == 0;
+
+        if scan_complete {
+            self.masonry_metadata_preload_loaded = total;
+            self.masonry_metadata_preload_active = false;
+            self.invalidate_manga_layout_cache();
+            self.manga_update_preload_queue();
+        }
+    }
+
+    fn draw_masonry_metadata_loading_overlay(&self, ctx: &egui::Context) {
+        let total = self.masonry_metadata_preload_total.max(1);
+        let loaded = self.masonry_metadata_preload_loaded.min(total);
+        let progress_ratio = (loaded as f32 / total as f32).clamp(0.0, 1.0);
+        let progress_text = format!("{} / {} images loaded", loaded, total);
+
+        egui::CentralPanel::default()
+            .frame(egui::Frame::none().fill(self.background_color32()))
+            .show(ctx, |ui| {
+                let rect = ui.max_rect();
+                ui.painter().rect_filled(
+                    rect,
+                    0.0,
+                    egui::Color32::from_rgba_unmultiplied(0, 0, 0, 120),
+                );
+
+                let panel_rect =
+                    egui::Rect::from_center_size(rect.center(), egui::vec2(440.0, 220.0));
+                ui.painter().rect_filled(
+                    panel_rect,
+                    14.0,
+                    egui::Color32::from_rgba_unmultiplied(16, 16, 16, 230),
+                );
+
+                let spinner_center = egui::pos2(panel_rect.center().x, panel_rect.top() + 66.0);
+                let spinner_rect = egui::Rect::from_min_max(
+                    egui::pos2(spinner_center.x - 26.0, spinner_center.y - 26.0),
+                    egui::pos2(spinner_center.x + 26.0, spinner_center.y + 26.0),
+                );
+                let time = ui.input(|i| i.time);
+                paint_loading_spinner(ui.painter(), spinner_rect, time);
+
+                ui.painter().text(
+                    egui::pos2(panel_rect.center().x, panel_rect.top() + 122.0),
+                    egui::Align2::CENTER_CENTER,
+                    "Preparing masonry layout",
+                    egui::FontId::proportional(23.0),
+                    egui::Color32::WHITE,
+                );
+
+                ui.painter().text(
+                    egui::pos2(panel_rect.center().x, panel_rect.top() + 156.0),
+                    egui::Align2::CENTER_CENTER,
+                    progress_text,
+                    egui::FontId::proportional(18.0),
+                    egui::Color32::from_gray(220),
+                );
+
+                let bar_rect = egui::Rect::from_center_size(
+                    egui::pos2(panel_rect.center().x, panel_rect.bottom() - 34.0),
+                    egui::vec2(panel_rect.width() - 64.0, 10.0),
+                );
+                ui.painter().rect_filled(
+                    bar_rect,
+                    5.0,
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 45),
+                );
+
+                let fill_width = bar_rect.width() * progress_ratio;
+                let fill_rect = egui::Rect::from_min_max(
+                    bar_rect.min,
+                    egui::pos2(bar_rect.min.x + fill_width, bar_rect.max.y),
+                );
+                ui.painter().rect_filled(
+                    fill_rect,
+                    5.0,
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 195),
+                );
+            });
     }
 
     fn clear_manga_runtime_workloads(&mut self) {
@@ -1867,6 +2024,8 @@ impl ImageViewer {
 
     /// Load any media (image or video) from path
     fn load_media(&mut self, path: &PathBuf) {
+        self.reset_masonry_metadata_preload();
+
         // Update the native window title (taskbar title) using Unicode-safe conversion.
         self.pending_window_title = Some(self.compute_window_title_for_path(path));
 
@@ -2926,7 +3085,16 @@ impl ImageViewer {
         self.manga_scroll_target = scroll_to;
         self.manga_scroll_velocity = 0.0;
         self.manga_update_current_index();
-        self.manga_update_preload_queue();
+
+        if self.manga_layout_mode == MangaLayoutMode::Masonry {
+            self.begin_masonry_metadata_preload();
+        } else {
+            self.reset_masonry_metadata_preload();
+        }
+
+        if !self.masonry_metadata_preload_active {
+            self.manga_update_preload_queue();
+        }
     }
 
     fn masonry_item_aspect_ratio(&self, index: usize) -> f32 {
@@ -3080,6 +3248,7 @@ impl ImageViewer {
         self.activate_strip_return_context(return_mode);
         self.manga_wheel_scroll_pending = 0.0;
         self.stop_manga_autoscroll();
+        self.reset_masonry_metadata_preload();
         self.manga_mode = false;
         if return_mode == MangaLayoutMode::Masonry {
             self.manga_suspend_runtime_for_solo_fullscreen();
@@ -3157,8 +3326,17 @@ impl ImageViewer {
             self.manga_scroll_target = scroll_to;
             self.manga_scroll_velocity = 0.0;
             self.manga_wheel_scroll_pending = 0.0;
-            // Start preloading from current image
-            self.manga_update_preload_queue();
+
+            if self.manga_layout_mode == MangaLayoutMode::Masonry {
+                self.begin_masonry_metadata_preload();
+            } else {
+                self.reset_masonry_metadata_preload();
+            }
+
+            // Start preloading from current image once metadata is ready.
+            if !self.masonry_metadata_preload_active {
+                self.manga_update_preload_queue();
+            }
             return;
         }
 
@@ -3423,6 +3601,7 @@ impl ImageViewer {
         self.invalidate_manga_layout_cache();
         self.masonry_layout_items.clear();
         self.masonry_layout_total_height = 0.0;
+        self.reset_masonry_metadata_preload();
     }
 
     /// Determine the focused media index in manga mode.
@@ -4052,6 +4231,10 @@ impl ImageViewer {
     /// Update the preload queue based on current scroll position
     fn manga_update_preload_queue(&mut self) {
         if !self.manga_mode || self.image_list.is_empty() {
+            return;
+        }
+
+        if self.masonry_metadata_preload_active {
             return;
         }
 
@@ -5979,6 +6162,14 @@ impl ImageViewer {
         }
 
         self.manga_prune_ttv_pending();
+
+        if self.is_masonry_mode() && self.masonry_metadata_preload_active {
+            self.tick_masonry_metadata_preload();
+            if self.masonry_metadata_preload_active {
+                self.draw_masonry_metadata_loading_overlay(ctx);
+                return true;
+            }
+        }
 
         let screen_rect = ctx.screen_rect();
         let screen_width = screen_rect.width();
