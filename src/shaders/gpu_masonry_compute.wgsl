@@ -3,10 +3,14 @@ struct Item {
     min_y: f32,
     max_x: f32,
     max_y: f32,
-    target_texture_side: u32,
+    uv_min_x: f32,
+    uv_min_y: f32,
+    uv_max_x: f32,
+    uv_max_y: f32,
+    lod_side: u32,
+    ready: u32,
     _pad0: u32,
     _pad1: u32,
-    _pad2: u32,
 };
 
 struct CullMeta {
@@ -34,15 +38,12 @@ var<storage, read> items: array<Item>;
 var<storage, read_write> visible_indices: array<u32>;
 
 @group(0) @binding(2)
-var<storage, read_write> visible_lod: array<u32>;
-
-@group(0) @binding(3)
 var<storage, read_write> indirect_args: array<u32>;
 
-@group(0) @binding(4)
+@group(0) @binding(3)
 var<uniform> meta: CullMeta;
 
-@group(0) @binding(5)
+@group(0) @binding(4)
 var<storage, read_write> counter: Counter;
 
 @compute @workgroup_size(64)
@@ -53,6 +54,10 @@ fn cull_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     let item = items[index];
+    if (item.ready == 0u) {
+        return;
+    }
+
     let intersects = item.max_x > meta.viewport_min.x && item.min_x < meta.viewport_max.x &&
         item.max_y > meta.viewport_min.y && item.min_y < meta.viewport_max.y;
 
@@ -60,7 +65,6 @@ fn cull_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let out_index = atomicAdd(&counter.visible_count, 1u);
         if (out_index < meta.item_count) {
             visible_indices[out_index] = index;
-            visible_lod[out_index] = item.target_texture_side;
         }
     }
 }
