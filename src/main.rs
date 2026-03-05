@@ -3141,14 +3141,23 @@ impl ImageViewer {
             return;
         }
 
+        // Preserve the visual center while switching layouts so repeated
+        // long-strip <-> masonry toggles do not drift away from the same file.
+        let center_anchor = self.manga_capture_center_anchor();
+
         self.manga_layout_mode = layout_mode;
         self.invalidate_manga_layout_cache();
         self.offset = egui::Vec2::ZERO;
 
-        let scroll_to = self.manga_get_scroll_offset_for_index(self.current_index);
-        self.manga_scroll_offset = scroll_to;
-        self.manga_scroll_target = scroll_to;
-        self.manga_scroll_velocity = 0.0;
+        if let Some(anchor) = center_anchor {
+            self.manga_apply_center_anchor(anchor);
+        } else {
+            let scroll_to = self.manga_get_scroll_offset_for_index(self.current_index);
+            self.manga_scroll_offset = scroll_to;
+            self.manga_scroll_target = scroll_to;
+            self.manga_scroll_velocity = 0.0;
+        }
+        self.manga_wheel_scroll_pending = 0.0;
         self.manga_update_current_index();
 
         if self.manga_layout_mode == MangaLayoutMode::Masonry {
@@ -5569,6 +5578,12 @@ impl ImageViewer {
                         if self.is_fullscreen && !self.manga_mode && self.strip_return_mode.is_some() {
                             self.strip_return_mode = Some(target_layout);
                             self.return_to_strip_mode_from_middle_click();
+                        } else if self.manga_mode && *is_on {
+                            // Toggling OFF the currently active strip layout should preserve
+                            // exact strip position for immediate ON re-entry (no cumulative drift).
+                            self.stop_manga_autoscroll();
+                            let target_index = self.manga_visible_index();
+                            self.open_strip_item_in_solo_fullscreen(target_index);
                         } else {
                             self.clear_strip_return_context();
                             if target_layout == MangaLayoutMode::Masonry {
