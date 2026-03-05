@@ -830,15 +830,139 @@ impl MangaLoader {
         }
     }
 
-    /// Probe video dimensions without full decode (using file metadata if available)
+    /// Probe video dimensions for stable layout sizing.
+    ///
+    /// Uses a lightweight GStreamer preroll and reads width/height from negotiated caps.
+    /// Falls back to filename-based heuristics when probing fails.
     fn probe_video_dimensions(path: &std::path::Path) -> Option<(u32, u32)> {
-        // For now, we use a simple heuristic based on common video resolutions
-        // In a production system, you'd use GStreamer's discoverer or ffprobe
-        // But since GStreamer init is expensive and should happen on main thread,
-        // we return a reasonable default and update dimensions when video is played
+        use gstreamer as gst;
+        use gstreamer::prelude::*;
+        use gstreamer_app as gst_app;
+        use gstreamer_video as gst_video;
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
 
-        // Try to infer from filename patterns (e.g., "video_1080p.mp4")
+        static GST_INIT: std::sync::OnceLock<Result<(), ()>> = std::sync::OnceLock::new();
+        let init_result = GST_INIT.get_or_init(|| gst::init().map_err(|_| ()));
+        if init_result.is_err() {
+            return Self::fallback_video_dimensions(path);
+        }
+
+        let uri = match gst::glib::filename_to_uri(path, None) {
+            Ok(uri) => uri.to_string(),
+            Err(_) => return Self::fallback_video_dimensions(path),
+        };
+
+        let pipeline_str = format!(
+            "uridecodebin uri=\"{}\" name=dec ! videoconvert ! videoscale ! \
+             video/x-raw,format=RGBA ! appsink name=sink max-buffers=1 drop=true",
+            uri.replace("\"", "\\\"")
+        );
+
+        let pipeline = match gst::parse::launch(&pipeline_str)
+            .ok()
+            .and_then(|p| p.downcast::<gst::Pipeline>().ok())
+        {
+            Some(p) => p,
+            None => return Self::fallback_video_dimensions(path),
+        };
+
+        let appsink = match pipeline
+            .by_name("sink")
+            .and_then(|e| e.dynamic_cast::<gst_app::AppSink>().ok())
+        {
+            Some(sink) => sink,
+            None => {
+                let _ = pipeline.set_state(gst::State::Null);
+                return Self::fallback_video_dimensions(path);
+            }
+        };
+
+        let probed_dims: Arc<Mutex<Option<(u32, u32)>>> = Arc::new(Mutex::new(None));
+        let dims_clone = Arc::clone(&probed_dims);
+
+        appsink.set_callbacks(
+            gst_app::AppSinkCallbacks::builder()
+                .new_preroll(move |sink| {
+                    if let Ok(sample) = sink.pull_preroll() {
+                        if let Some(caps) = sample.caps() {
+                            if let Ok(video_info) = gst_video::VideoInfo::from_caps(caps) {
+                                let width = video_info.width();
+                                let height = video_info.height();
+                                if width > 0 && height > 0 {
+                                    if let Ok(mut dims) = dims_clone.lock() {
+                                        *dims = Some((width, height));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Ok(gst::FlowSuccess::Ok)
+                })
+                .build(),
+        );
+
+        if pipeline.set_state(gst::State::Paused).is_err() {
+            let _ = pipeline.set_state(gst::State::Null);
+            return Self::fallback_video_dimensions(path);
+        }
+
+        if let Some(bus) = pipeline.bus() {
+            let deadline = std::time::Instant::now() + Duration::from_millis(900);
+            while std::time::Instant::now() < deadline {
+                if let Some(msg) = bus.timed_pop(gst::ClockTime::from_mseconds(50)) {
+                    match msg.view() {
+                        gst::MessageView::Error(_) | gst::MessageView::Eos(_) => {
+                            break;
+                        }
+                        gst::MessageView::AsyncDone(_) => {
+                            if probed_dims
+                                .lock()
+                                .ok()
+                                .and_then(|dims| *dims)
+                                .is_some()
+                            {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
+                if probed_dims
+                    .lock()
+                    .ok()
+                    .and_then(|dims| *dims)
+                    .is_some()
+                {
+                    break;
+                }
+            }
+        }
+
+        let probed = probed_dims.lock().ok().and_then(|dims| *dims);
+        let _ = pipeline.set_state(gst::State::Null);
+
+        if let Some((w, h)) = probed {
+            if w > 0 && h > 0 {
+                return Some((w, h));
+            }
+        }
+
+        Self::fallback_video_dimensions(path)
+    }
+
+    fn fallback_video_dimensions(path: &std::path::Path) -> Option<(u32, u32)> {
         let filename = path.file_name()?.to_string_lossy().to_lowercase();
+
+        if filename.contains("vertical")
+            || filename.contains("portrait")
+            || filename.contains("9x16")
+            || filename.contains("1080x1920")
+            || filename.contains("720x1280")
+        {
+            return Some((1080, 1920));
+        }
 
         if filename.contains("4k") || filename.contains("2160") {
             Some((3840, 2160))
@@ -851,7 +975,6 @@ impl MangaLoader {
         } else if filename.contains("480") || filename.contains("sd") {
             Some((854, 480))
         } else {
-            // Default to 1080p for unknown videos
             Some((1920, 1080))
         }
     }
