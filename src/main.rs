@@ -4609,8 +4609,12 @@ impl ImageViewer {
             (decoded_images, dim_updates)
         };
 
+        let has_decoded_video_dims = decoded_images
+            .iter()
+            .any(|decoded| decoded.media_type == MangaMediaType::Video);
+
         // Dimension updates can change page heights; invalidate cached layout/prefix sums.
-        if !dim_updates.is_empty() {
+        if !dim_updates.is_empty() || has_decoded_video_dims {
             self.manga_total_height_cache_valid = false;
             self.manga_layout_offsets.clear();
             self.masonry_layout_valid = false;
@@ -5965,12 +5969,16 @@ impl ImageViewer {
         let mut requested_retry = false;
         let retry_target_side = self.manga_retry_target_side_for_rect(idx, image_rect);
 
-        // Check if this item is a video
-        let is_video = self
+        let cached_media_type = self
             .manga_loader
             .as_ref()
-            .and_then(|loader| loader.get_media_type(idx))
-            .map_or(false, |mt| mt == MangaMediaType::Video);
+            .and_then(|loader| loader.get_media_type(idx));
+
+        // Check if this item is a video
+        let is_video = cached_media_type.map_or(false, |mt| mt == MangaMediaType::Video);
+
+        let is_animated_image =
+            cached_media_type.map_or(false, |mt| mt == MangaMediaType::AnimatedImage);
 
         // Also check by file extension as a fallback
         let is_video = is_video
@@ -6105,6 +6113,23 @@ impl ImageViewer {
                 if is_focused_anim && (still_streaming || has_active_stream) {
                     let time = ui.input(|i| i.time);
                     paint_loading_spinner(ui.painter(), image_rect, time);
+                }
+
+                if is_animated_image {
+                    let icon_bg_rect =
+                        egui::Rect::from_center_size(image_rect.center(), egui::Vec2::splat(60.0));
+                    ui.painter().rect_filled(
+                        icon_bg_rect,
+                        30.0,
+                        egui::Color32::from_rgba_unmultiplied(0, 0, 0, 160),
+                    );
+                    ui.painter().text(
+                        image_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "▶",
+                        egui::FontId::proportional(32.0),
+                        egui::Color32::WHITE,
+                    );
                 }
 
                 if Self::manga_texture_upgrade_needed(tex_w.max(tex_h), retry_target_side) {
