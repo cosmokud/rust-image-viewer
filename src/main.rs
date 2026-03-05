@@ -525,6 +525,9 @@ struct ImageViewer {
     manga_texture_cache: MangaTextureCache,
     /// Optional wgpu callback path for GPU culling and indirect draw staging in masonry mode.
     manga_gpu_renderer: Option<GpuMasonryRenderer>,
+    /// Set when GPU masonry renderer initialization panicked/failed on this machine.
+    /// Prevents repeated init attempts from crashing the app.
+    manga_gpu_renderer_failed: bool,
     /// Scratch buffer used to avoid per-frame allocations when preparing GPU callback inputs.
     manga_gpu_items_scratch: Vec<GpuMasonryInputItem>,
     /// Whether the scrollbar is being dragged
@@ -762,6 +765,7 @@ impl Default for ImageViewer {
             manga_loader: None,
             manga_texture_cache: MangaTextureCache::default(),
             manga_gpu_renderer: None,
+            manga_gpu_renderer_failed: false,
             manga_gpu_items_scratch: Vec::new(),
             manga_scrollbar_dragging: false,
             manga_autoscroll_active: false,
@@ -1797,6 +1801,31 @@ impl ImageViewer {
         self.manga_focused_anim_index = None;
     }
 
+    fn ensure_masonry_gpu_renderer(&mut self, frame: &eframe::Frame) {
+        if self.manga_gpu_renderer.is_some() || self.manga_gpu_renderer_failed {
+            return;
+        }
+
+        let Some(render_state) = frame.wgpu_render_state() else {
+            return;
+        };
+
+        let created = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            GpuMasonryRenderer::new(render_state)
+        }));
+
+        match created {
+            Ok(renderer) => {
+                self.manga_gpu_renderer = Some(renderer);
+                self.manga_gpu_renderer_failed = false;
+            }
+            Err(_) => {
+                self.manga_gpu_renderer = None;
+                self.manga_gpu_renderer_failed = true;
+            }
+        }
+    }
+
     fn apply_video_audio_overrides(
         player: &mut VideoPlayer,
         muted_override: Option<bool>,
@@ -1865,10 +1894,7 @@ impl ImageViewer {
             .unwrap_or(4096)
             .max(512);
 
-        viewer.manga_gpu_renderer = cc
-            .wgpu_render_state
-            .as_ref()
-            .map(GpuMasonryRenderer::new);
+        viewer.manga_gpu_renderer = None;
 
         // Configure visuals (background driven by config)
         let mut visuals = egui::Visuals::dark();
@@ -9889,7 +9915,7 @@ impl ImageViewer {
 }
 
 impl eframe::App for ImageViewer {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         // Reset per-frame repaint tracking
         self.needs_repaint = false;
 
@@ -10268,6 +10294,9 @@ impl eframe::App for ImageViewer {
         let draw_animation_active = if skip_drawing {
             false
         } else {
+            if self.manga_mode && self.is_fullscreen && self.is_masonry_mode() {
+                self.ensure_masonry_gpu_renderer(frame);
+            }
             self.draw_image(ctx)
         };
 
