@@ -488,6 +488,8 @@ struct ImageViewer {
     manga_mode: bool,
     /// Active strip layout when manga mode is enabled.
     manga_layout_mode: MangaLayoutMode,
+    /// Deferred strip layout toggle request applied at the start of a frame.
+    pending_strip_layout_toggle: Option<MangaLayoutMode>,
     /// Previous strip layout to restore when leaving solo fullscreen via middle click.
     strip_return_mode: Option<MangaLayoutMode>,
     /// Saved masonry viewport state while temporarily opening a single item fullscreen.
@@ -747,6 +749,7 @@ impl Default for ImageViewer {
             // Manga reading mode fields
             manga_mode: false,
             manga_layout_mode: MangaLayoutMode::LongStrip,
+            pending_strip_layout_toggle: None,
             strip_return_mode: None,
             strip_return_masonry_state: None,
             strip_return_preserve_masonry_cache: false,
@@ -3036,12 +3039,13 @@ impl ImageViewer {
         }
     }
 
-    fn toggle_long_strip_mode(&mut self) {
-        self.toggle_strip_mode(MangaLayoutMode::LongStrip);
-    }
+    fn apply_pending_strip_layout_toggle(&mut self) {
+        let Some(layout_mode) = self.pending_strip_layout_toggle.take() else {
+            return;
+        };
 
-    fn toggle_masonry_mode(&mut self) {
-        self.toggle_strip_mode(MangaLayoutMode::Masonry);
+        self.clear_strip_return_context();
+        self.toggle_strip_mode(layout_mode);
     }
 
     fn set_masonry_items_per_row(&mut self, items_per_row: usize) {
@@ -5427,12 +5431,11 @@ impl ImageViewer {
                     );
 
                     if response.clicked() {
-                        self.clear_strip_return_context();
-                        if *is_masonry {
-                            self.toggle_masonry_mode();
+                        self.pending_strip_layout_toggle = Some(if *is_masonry {
+                            MangaLayoutMode::Masonry
                         } else {
-                            self.toggle_long_strip_mode();
-                        }
+                            MangaLayoutMode::LongStrip
+                        });
                         self.touch_bottom_overlays();
                     }
 
@@ -6945,6 +6948,8 @@ impl ImageViewer {
                     let viewport_top = self.manga_scroll_offset.max(0.0);
                     let viewport_bottom = viewport_top + screen_height;
                     let zoom = self.zoom.max(0.0001);
+                    let allow_gpu_callback =
+                        !self.toggle_fullscreen && self.pending_strip_layout_toggle.is_none();
 
                     let draw_commands = self.manga_build_masonry_draw_commands(
                         viewport_top,
@@ -6952,7 +6957,7 @@ impl ImageViewer {
                         zoom,
                     );
 
-                    if self.manga_gpu_renderer.is_some() {
+                    if allow_gpu_callback && self.manga_gpu_renderer.is_some() {
                         self.manga_gpu_items_scratch.clear();
                         self.manga_gpu_items_scratch.reserve(draw_commands.len());
                         for command in draw_commands.iter() {
@@ -6973,8 +6978,10 @@ impl ImageViewer {
                         }
                     }
 
-                    if let Some(renderer) = self.manga_gpu_renderer.as_ref() {
+                    if allow_gpu_callback {
+                        if let Some(renderer) = self.manga_gpu_renderer.as_ref() {
                         renderer.enqueue_callback(ui, &self.manga_gpu_items_scratch);
+                        }
                     }
 
                     for command in draw_commands {
@@ -6985,7 +6992,7 @@ impl ImageViewer {
                             .map(|media_type| media_type == MangaMediaType::StaticImage)
                             .unwrap_or(false);
 
-                        let (gpu_can_render, gpu_needs_upgrade) = if is_static_item {
+                        let (gpu_can_render, gpu_needs_upgrade) = if allow_gpu_callback && is_static_item {
                             if let Some(renderer) = self.manga_gpu_renderer.as_ref() {
                                 (
                                     renderer.can_render_index(command.index),
@@ -10011,6 +10018,10 @@ impl eframe::App for ImageViewer {
 
         // Input can switch media, which updates the title.
         self.apply_pending_window_title(ctx);
+
+        // Apply deferred strip layout toggles at frame start to avoid mutating
+        // manga/layout state in the middle of a frame after draw commands were queued.
+        self.apply_pending_strip_layout_toggle();
 
         // Input can switch media; update bottom overlay state again for this frame's drawing.
         let bottom_overlays_should_show = self.update_bottom_overlays_visibility(ctx);
