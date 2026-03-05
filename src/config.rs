@@ -552,7 +552,7 @@ impl Config {
             manga_cache_headroom_rows: 2,
             manga_keep_headroom_rows: 2,
             manga_probe_headroom_rows: 4,
-            manga_masonry_metadata_probe_radius: 60,
+            manga_masonry_metadata_probe_radius: 30,
             manga_masonry_texture_stage_step: 7,
             manga_navigation_preload_behind: 30,
             manga_navigation_preload_ahead: 60,

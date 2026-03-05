@@ -396,8 +396,6 @@ impl MangaLoader {
             return;
         }
 
-        let settings = *self.settings.read();
-
         // Build a bounded batch of missing indices, prioritized around the current
         // visible center of this range so on-screen placeholders get real metadata first.
         let center = self.last_visible_index.clamp(start, end - 1);
@@ -419,11 +417,59 @@ impl MangaLoader {
             delta += 1;
         }
 
+        self.request_dimensions_indices(image_list, &ordered_indices);
+    }
+
+    fn enqueue_dimension_probe_items(&mut self, items: Vec<(usize, PathBuf)>) {
+        if items.is_empty() {
+            return;
+        }
+
+        let indices: Vec<usize> = items.iter().map(|(i, _)| *i).collect();
+        match self.dim_request_tx.try_send(DimRequest {
+            generation: self.current_generation,
+            items,
+        }) {
+            Ok(()) => {
+                for idx in indices {
+                    self.dim_pending.insert(idx);
+                }
+            }
+            Err(TrySendError::Full(_)) => {
+                // Backpressure: try again next frame/update.
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                // Worker gone; ignore.
+            }
+        }
+    }
+
+    /// Queue async dimension probes for explicit indices in caller-defined priority order.
+    ///
+    /// Indices outside bounds, duplicates, unsupported media, cached entries, and
+    /// already-pending entries are skipped.
+    pub fn request_dimensions_indices(
+        &mut self,
+        image_list: &[PathBuf],
+        ordered_indices: &[usize],
+    ) {
+        if image_list.is_empty() || ordered_indices.is_empty() {
+            return;
+        }
+
+        let settings = *self.settings.read();
+
         let mut image_items: Vec<(usize, PathBuf)> = Vec::new();
         let mut video_items: Vec<(usize, PathBuf)> = Vec::new();
-        for idx in ordered_indices {
+        let mut seen_indices: HashSet<usize> = HashSet::new();
+
+        for &idx in ordered_indices {
             if image_items.len() + video_items.len() >= settings.dim_request_batch_size {
                 break;
+            }
+
+            if idx >= image_list.len() || !seen_indices.insert(idx) {
+                continue;
             }
 
             if self.dimension_cache.contains_key(&idx) || self.dim_pending.contains(&idx) {
@@ -448,28 +494,7 @@ impl MangaLoader {
         // blocked by slow video GStreamer probes.
         let mut items = image_items;
         items.extend(video_items);
-
-        if items.is_empty() {
-            return;
-        }
-
-        let indices: Vec<usize> = items.iter().map(|(i, _)| *i).collect();
-        match self.dim_request_tx.try_send(DimRequest {
-            generation: self.current_generation,
-            items,
-        }) {
-            Ok(()) => {
-                for idx in indices {
-                    self.dim_pending.insert(idx);
-                }
-            }
-            Err(TrySendError::Full(_)) => {
-                // Backpressure: try again next frame/update.
-            }
-            Err(TrySendError::Disconnected(_)) => {
-                // Worker gone; ignore.
-            }
-        }
+        self.enqueue_dimension_probe_items(items);
     }
 
     /// Drain async dimension results and apply them to `dimension_cache`.

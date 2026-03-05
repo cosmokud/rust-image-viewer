@@ -592,6 +592,12 @@ struct ImageViewer {
     /// True once the active masonry metadata probe window has complete dimensions.
     /// Used to gate texture decode retries so placeholders stabilize first.
     masonry_metadata_window_ready: bool,
+    /// Current viewport-driven masonry metadata probe window [start, end).
+    /// Updated by masonry preload scheduling and used to scope relayout updates.
+    masonry_active_probe_start: usize,
+    masonry_active_probe_end: usize,
+    /// Earliest index whose masonry item height changed and still needs layout recompute.
+    masonry_layout_dirty_from: Option<usize>,
     /// Timestamp of the last detected masonry layout motion.
     /// Used as a short settle window to avoid immediate relayout between wheel/drag events.
     masonry_last_motion_at: Instant,
@@ -808,6 +814,9 @@ impl Default for ImageViewer {
             masonry_layout_valid: false,
             masonry_layout_updates_deferred: false,
             masonry_metadata_window_ready: false,
+            masonry_active_probe_start: 0,
+            masonry_active_probe_end: 0,
+            masonry_layout_dirty_from: None,
             masonry_last_motion_at: Instant::now(),
 
             manga_preload_cooldown: 0,
@@ -2690,6 +2699,9 @@ impl ImageViewer {
         self.masonry_layout_valid = false;
         self.masonry_layout_updates_deferred = false;
         self.masonry_metadata_window_ready = false;
+        self.masonry_active_probe_start = 0;
+        self.masonry_active_probe_end = 0;
+        self.masonry_layout_dirty_from = None;
     }
 
     fn manga_trilinear_texture_options() -> egui::TextureOptions {
@@ -2766,9 +2778,13 @@ impl ImageViewer {
         let anchor = self.manga_capture_scroll_anchor();
 
         self.masonry_layout_updates_deferred = false;
+
+        if self.masonry_layout_dirty_from.is_none() {
+            return false;
+        }
+
         self.manga_total_height_cache_valid = false;
         self.manga_layout_offsets.clear();
-        self.masonry_layout_valid = false;
         self.manga_apply_masonry_scroll_stabilization_after_layout_change(anchor);
         true
     }
@@ -2933,8 +2949,94 @@ impl ImageViewer {
         (start, end)
     }
 
-    fn masonry_metadata_ready_for_window(&self, start: usize, end: usize) -> bool {
-        if self.image_list.is_empty() || start >= end {
+    fn masonry_collect_active_probe_indices(&mut self) -> Vec<usize> {
+        let len = self.image_list.len();
+        if len == 0 {
+            return Vec::new();
+        }
+
+        self.masonry_ensure_layout_cache();
+        if self.masonry_layout_items.len() != len {
+            let fallback = self.current_index.min(len.saturating_sub(1));
+            return vec![fallback];
+        }
+
+        let zoom = self.zoom.max(0.0001);
+        let viewport_top = self.manga_scroll_offset.max(0.0);
+        let viewport_bottom = viewport_top + self.screen_size.y.max(1.0);
+
+        let sample_count = self.masonry_layout_items.len().min(64).max(1);
+        let avg_item_height = self
+            .masonry_layout_items
+            .iter()
+            .take(sample_count)
+            .map(|item| item.height.max(1.0))
+            .sum::<f32>()
+            / sample_count as f32;
+
+        let probe_rows = self.config.manga_probe_headroom_rows.saturating_add(1).max(1) as f32;
+        let probe_margin = (avg_item_height * probe_rows * zoom).max(self.screen_size.y * 0.5);
+        let probe_top = (viewport_top - probe_margin).max(0.0);
+        let probe_bottom = viewport_bottom + probe_margin;
+
+        let mut indices = Vec::new();
+        for (idx, item) in self.masonry_layout_items.iter().enumerate() {
+            let top = item.y * zoom;
+            let bottom = top + item.height * zoom;
+
+            if bottom < probe_top || top > probe_bottom {
+                continue;
+            }
+            indices.push(idx);
+        }
+
+        if indices.is_empty() {
+            let fallback = self.current_index.min(len.saturating_sub(1));
+            indices.push(fallback);
+        }
+
+        let center = self.current_index.min(len.saturating_sub(1));
+        indices.sort_unstable_by_key(|idx| idx.abs_diff(center));
+        indices
+    }
+
+    fn masonry_set_active_probe_window(&mut self, indices: &[usize]) -> (usize, usize) {
+        let len = self.image_list.len();
+        if len == 0 || indices.is_empty() {
+            self.masonry_active_probe_start = 0;
+            self.masonry_active_probe_end = 0;
+            return (0, 0);
+        }
+
+        let mut min_idx = usize::MAX;
+        let mut max_idx = 0usize;
+        for &idx in indices {
+            if idx >= len {
+                continue;
+            }
+            min_idx = min_idx.min(idx);
+            max_idx = max_idx.max(idx);
+        }
+
+        if min_idx == usize::MAX {
+            self.masonry_active_probe_start = 0;
+            self.masonry_active_probe_end = 0;
+            return (0, 0);
+        }
+
+        // Add a small symmetric index cushion so tiny drags don't immediately
+        // move updates out of the active window.
+        let cushion = self.masonry_rows().saturating_mul(2);
+        let start = min_idx.saturating_sub(cushion);
+        let end = max_idx.saturating_add(cushion).saturating_add(1).min(len);
+
+        self.masonry_active_probe_start = start;
+        self.masonry_active_probe_end = end;
+        (start, end)
+    }
+
+    fn masonry_metadata_ready_for_indices(&self, indices: &[usize]) -> bool {
+        if self.image_list.is_empty() || indices.is_empty() {
             return false;
         }
 
@@ -2942,22 +3044,15 @@ impl ImageViewer {
             return false;
         };
 
-        let end = end.min(self.image_list.len());
-        for idx in start..end {
+        for &idx in indices {
             let Some(path) = self.image_list.get(idx) else {
                 continue;
             };
 
-            // Skip non-media files.
             if !is_supported_image(path) && !is_supported_video(path) {
                 continue;
             }
 
-            // Videos are probed via GStreamer which is MUCH slower than image
-            // header reads.  Don't let a single unprobed video gate the
-            // entire metadata window.  Videos that are still pending will
-            // use the default 1.4 aspect ratio placeholder and get corrected
-            // via a deferred layout update once their probe completes.
             if is_supported_video(path) {
                 continue;
             }
@@ -3034,6 +3129,7 @@ impl ImageViewer {
             self.masonry_layout_columns.clear();
             self.masonry_layout_total_height = 0.0;
             self.masonry_layout_valid = false;
+            self.masonry_layout_dirty_from = None;
             return;
         }
 
@@ -3041,10 +3137,12 @@ impl ImageViewer {
         let len = self.image_list.len();
         let items_per_row = self.masonry_items_per_row.clamp(2, 10);
 
-        let needs_recompute = !self.masonry_layout_valid
-            || (self.masonry_layout_screen_x - screen_x).abs() > 1e-6
+        let topology_changed = (self.masonry_layout_screen_x - screen_x).abs() > 1e-6
             || self.masonry_layout_items_per_row != items_per_row
             || self.masonry_layout_len != len;
+        let needs_recompute = !self.masonry_layout_valid
+            || topology_changed
+            || self.masonry_layout_dirty_from.is_some();
 
         if !needs_recompute {
             return;
@@ -3064,6 +3162,12 @@ impl ImageViewer {
 
         // Keep column assignment stable across relayouts caused by async dimension updates.
         // Re-seed only when the logical grid topology changes.
+        let mut recompute_start = if !self.masonry_layout_valid || topology_changed {
+            0
+        } else {
+            self.masonry_layout_dirty_from.unwrap_or(0).min(len)
+        };
+
         let should_reseed_columns =
             self.masonry_layout_columns.len() != len || self.masonry_layout_items_per_row != items_per_row;
 
@@ -3086,14 +3190,37 @@ impl ImageViewer {
                 let height = (column_width * self.masonry_item_aspect_ratio(idx)).max(20.0);
                 assignment_heights[target_col] += height + GUTTER;
             }
+
+            recompute_start = 0;
         }
 
         let mut column_heights = vec![TOP_PADDING; columns];
-        self.masonry_layout_items.clear();
-        self.masonry_layout_items
-            .resize(len, MasonryItemLayout::default());
 
-        for idx in 0..len {
+        if self.masonry_layout_items.len() != len {
+            self.masonry_layout_items
+                .resize(len, MasonryItemLayout::default());
+            recompute_start = 0;
+        }
+
+        if recompute_start > 0 {
+            for idx in 0..recompute_start {
+                let target_col = self
+                    .masonry_layout_columns
+                    .get(idx)
+                    .copied()
+                    .unwrap_or(0)
+                    .min(columns.saturating_sub(1));
+
+                if let Some(item) = self.masonry_layout_items.get(idx) {
+                    let bottom = item.y + item.height + GUTTER;
+                    if bottom > column_heights[target_col] {
+                        column_heights[target_col] = bottom;
+                    }
+                }
+            }
+        }
+
+        for idx in recompute_start..len {
             let target_col = self
                 .masonry_layout_columns
                 .get(idx)
@@ -3130,6 +3257,7 @@ impl ImageViewer {
         self.masonry_layout_items_per_row = items_per_row;
         self.masonry_layout_len = len;
         self.masonry_layout_valid = true;
+        self.masonry_layout_dirty_from = None;
     }
 
     fn masonry_item_screen_rect(&self, index: usize) -> Option<egui::Rect> {
@@ -4248,7 +4376,7 @@ impl ImageViewer {
         let scrolling_up = self.manga_scroll_offset < prev_scroll_pos - 0.5;
         if is_masonry {
             // Masonry metadata-first pipeline:
-            // 1) Probe metadata for a wide window around the viewport center.
+            // 1) Probe metadata for a viewport-driven active band.
             // 2) Create stable placeholders from that metadata (real aspect ratios).
             // 3) Decode textures in staged ±K bands.
             //
@@ -4257,26 +4385,32 @@ impl ImageViewer {
             // texture loads — items that already have known dimensions can start
             // decoding immediately.  This eliminates the stall where a single
             // slow video probe would block all image texture loading.
-            let (meta_start, meta_end) = self.masonry_metadata_window_bounds(preload_center_index);
+            let probe_indices = self.masonry_collect_active_probe_indices();
+            self.masonry_set_active_probe_window(&probe_indices);
+
             if let Some(ref mut loader) = self.manga_loader {
-                if meta_start < meta_end {
-                    loader.request_dimensions_range(&self.image_list, meta_start, meta_end);
+                if !probe_indices.is_empty() {
+                    loader.request_dimensions_indices(&self.image_list, &probe_indices);
                 }
             }
 
-            let metadata_ready = self.masonry_metadata_ready_for_window(meta_start, meta_end);
+            let metadata_ready = self.masonry_metadata_ready_for_indices(&probe_indices);
             self.masonry_metadata_window_ready = metadata_ready;
 
             // Always request texture decodes regardless of metadata_ready.
             // Items whose dimensions haven't arrived yet will be skipped by
             // request_decode_range (the loader only decodes items it has paths
             // for, and the actual decode uses the file itself).
-            let stage_radius = self.masonry_next_texture_stage_radius(preload_center_index);
+            let stage_center_index = probe_indices
+                .first()
+                .copied()
+                .unwrap_or(preload_center_index);
+            let stage_radius = self.masonry_next_texture_stage_radius(stage_center_index);
             if stage_radius > 0 {
                 if let Some(ref mut loader) = self.manga_loader {
                     loader.request_decode_range(
                         &self.image_list,
-                        preload_center_index,
+                        stage_center_index,
                         stage_radius,
                         stage_radius,
                         self.max_texture_side,
@@ -4502,6 +4636,8 @@ impl ImageViewer {
                 .manga_dimension_probe_messages_per_frame
                 .clamp(1, 64)
         };
+        let active_probe_start = self.masonry_active_probe_start;
+        let active_probe_end = self.masonry_active_probe_end;
 
         let Some(ref mut loader) = self.manga_loader else {
             return false;
@@ -4538,9 +4674,26 @@ impl ImageViewer {
         let mut dims_updated = false;
         if !dim_updates.is_empty() {
             if is_masonry {
-                // Masonry: defer until idle, then recompute with stabilization.
-                self.masonry_layout_updates_deferred = true;
-                ctx.request_repaint_after(Duration::from_millis(16));
+                // Masonry: only updates intersecting the active probe window
+                // should invalidate layout near the viewport.
+                let min_idx = if active_probe_start >= active_probe_end {
+                    dim_updates.iter().copied().min()
+                } else {
+                    dim_updates
+                        .iter()
+                        .copied()
+                        .filter(|idx| *idx >= active_probe_start && *idx < active_probe_end)
+                        .min()
+                };
+
+                if let Some(min_idx) = min_idx {
+                    self.masonry_layout_dirty_from = Some(
+                        self.masonry_layout_dirty_from
+                            .map_or(min_idx, |existing| existing.min(min_idx)),
+                    );
+                    self.masonry_layout_updates_deferred = true;
+                    ctx.request_repaint_after(Duration::from_millis(16));
+                }
             } else {
                 // Long-strip: invalidate as before.
                 self.manga_total_height_cache_valid = false;
