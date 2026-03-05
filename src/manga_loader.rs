@@ -1410,13 +1410,10 @@ struct MangaTextureEntry {
 
 impl MangaTextureCache {
     pub fn new(max_entries: usize) -> Self {
+        let capacity = NonZeroUsize::new(max_entries.max(1)).expect("cache capacity is non-zero");
         Self {
             pinned_entries: HashMap::with_capacity(max_entries),
-            // Use a very large internal capacity and control eviction ourselves so we can
-            // preserve pinning behavior and return all evicted indices to the caller.
-            unpinned_entries: LruCache::new(
-                NonZeroUsize::new(usize::MAX).expect("usize::MAX is non-zero"),
-            ),
+            unpinned_entries: LruCache::new(capacity),
             max_entries: max_entries.max(1),
             pinned_indices: HashSet::new(),
         }
@@ -1444,6 +1441,9 @@ impl MangaTextureCache {
 
     pub fn set_max_entries(&mut self, max_entries: usize) -> Vec<usize> {
         self.max_entries = max_entries.max(1);
+        let capacity =
+            NonZeroUsize::new(self.max_entries).expect("cache capacity is non-zero");
+        self.unpinned_entries.resize(capacity);
         self.evict_to_capacity()
     }
 
