@@ -34,7 +34,8 @@ use parking_lot::RwLock;
 use rayon::prelude::*;
 
 use crate::image_loader::{
-    get_media_type, is_supported_image, is_supported_video, LoadedImage, MediaType,
+    get_media_type, is_supported_image, is_supported_video, probe_image_dimensions, LoadedImage,
+    MediaType,
 };
 
 /// Maximum number of decoded images to hold in memory awaiting GPU upload.
@@ -220,7 +221,7 @@ impl MangaLoader {
             .expect("Failed to spawn manga loader coordinator thread");
 
         // Spawn a lightweight dimension probe worker.
-        // This keeps file header reads (image::image_dimensions) off the UI thread.
+        // This keeps header-based size probes off the UI thread.
         let shutdown_clone = Arc::clone(&shutdown);
         std::thread::Builder::new()
             .name("manga-dimension-worker".into())
@@ -253,7 +254,7 @@ impl MangaLoader {
                         let dims = if is_video {
                             Self::probe_video_dimensions(&path)
                         } else if is_image {
-                            image::image_dimensions(&path).ok()
+                            probe_image_dimensions(&path)
                         } else {
                             None
                         };
@@ -768,7 +769,7 @@ impl MangaLoader {
             }
             MediaType::Image => {
                 // Get original dimensions from file header first (fast, no decode)
-                let (original_width, original_height) = image::image_dimensions(&req.path).ok()?;
+                let (original_width, original_height) = probe_image_dimensions(&req.path)?;
 
                 // For animated WebP files we only decode the first frame here so that
                 // the manga scroll view isn't blocked by a potentially very expensive
@@ -1379,7 +1380,7 @@ impl MangaLoader {
                     (idx, dims.map(|(w, h)| (w, h, MangaMediaType::Video)))
                 } else if is_image {
                     // For images, get from file header
-                    let dims = image::image_dimensions(path).ok();
+                    let dims = probe_image_dimensions(path);
                     // We can't easily determine if an image is animated without loading it
                     // Default to static, will be updated when actually loaded
                     (idx, dims.map(|(w, h)| (w, h, MangaMediaType::StaticImage)))

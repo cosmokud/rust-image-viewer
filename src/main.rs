@@ -14,7 +14,8 @@ mod windows_env;
 
 use config::{Action, Config, InputBinding, StartupWindowMode};
 use image_loader::{
-    get_images_in_directory, get_media_type, is_supported_video, ImageFrame, LoadedImage, MediaType,
+    get_images_in_directory, get_media_type, is_supported_video, probe_image_dimensions,
+    ImageFrame, LoadedImage, MediaType,
 };
 use manga_loader::{MangaLoader, MangaMediaType, MangaTextureCache};
 #[cfg(target_os = "windows")]
@@ -10779,7 +10780,7 @@ fn main() -> eframe::Result<()> {
     let (initial_size, initial_pos, start_visible) = match media_type {
         Some(MediaType::Image) => {
             // Get image dimensions from file header (fast, no full decode)
-            let (img_w, img_h) = image::image_dimensions(&file_path).unwrap_or((800, 600));
+            let (img_w, img_h) = probe_image_dimensions(&file_path).unwrap_or((800, 600));
             let img_w = img_w as f32;
             let img_h = img_h as f32;
 

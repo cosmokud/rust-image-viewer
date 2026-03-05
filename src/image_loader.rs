@@ -29,12 +29,26 @@ fn open_media_reader(path: &Path) -> Result<Box<dyn BufReadSeek>, String> {
     }
 }
 
+/// Fast image dimension probe using header-only parsing.
+/// Returns `None` when dimensions are unavailable or cannot fit in `u32`.
+pub fn probe_image_dimensions(path: &Path) -> Option<(u32, u32)> {
+    let size = imagesize::size(path).ok()?;
+    let width = u32::try_from(size.width).ok()?;
+    let height = u32::try_from(size.height).ok()?;
+
+    if width == 0 || height == 0 {
+        return None;
+    }
+
+    Some((width, height))
+}
+
 fn open_image_with_reasonable_limits(path: &Path) -> Result<image::DynamicImage, String> {
     // `image::open()` uses conservative decoder limits to protect against decompression bombs.
     // For a viewer, we want to allow legitimately large images while still keeping a hard cap.
     //
     // We size limits from the container header dimensions (fast, no full decode).
-    let (w, h) = image::image_dimensions(path).unwrap_or((0, 0));
+    let (w, h) = probe_image_dimensions(path).unwrap_or((0, 0));
 
     // Conservative upper bound: assume 4 bytes/pixel worst case.
     let estimated = (w as u64)
