@@ -86,6 +86,47 @@ fn paint_loading_spinner(painter: &egui::Painter, rect: egui::Rect, time: f64) {
 /// Downscale RGBA pixel data if it exceeds the maximum texture size.
 /// Uses Cow to avoid unnecessary allocations when no downscaling is needed.
 /// Uses Triangle filter (faster than Lanczos3) for better performance.
+
+/// Compute a UV rectangle that "covers" the cell while preserving the texture's
+/// aspect ratio (like CSS `object-fit: cover`).
+///
+/// When the cell and the texture have the same aspect ratio, the full UV
+/// `(0,0)-(1,1)` is returned.  Otherwise the UV is narrowed along one axis
+/// so that the texture fills the cell completely, center-cropped.
+///
+/// This is used in masonry mode so that small aspect-ratio mismatches (from
+/// placeholder-based layout or late metadata corrections) never produce
+/// visible stretching or letter-boxing.
+fn masonry_cover_uv(cell_w: f32, cell_h: f32, tex_w: u32, tex_h: u32) -> egui::Rect {
+    let tw = tex_w as f32;
+    let th = tex_h as f32;
+
+    if tw <= 0.0 || th <= 0.0 || cell_w <= 0.0 || cell_h <= 0.0 {
+        return egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+    }
+
+    // Width/height ratios — comparing proportions, not absolute sizes.
+    let cell_ratio = cell_w / cell_h;
+    let tex_ratio = tw / th;
+
+    // Threshold: if ratios are very close, skip cropping to avoid sub-pixel artifacts.
+    if (cell_ratio - tex_ratio).abs() < 0.005 {
+        return egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+    }
+
+    if cell_ratio > tex_ratio {
+        // Cell is wider proportionally → crop texture top/bottom.
+        let visible = (tex_ratio / cell_ratio).clamp(0.0, 1.0);
+        let margin = (1.0 - visible) * 0.5;
+        egui::Rect::from_min_max(egui::pos2(0.0, margin), egui::pos2(1.0, 1.0 - margin))
+    } else {
+        // Cell is taller proportionally → crop texture left/right.
+        let visible = (cell_ratio / tex_ratio).clamp(0.0, 1.0);
+        let margin = (1.0 - visible) * 0.5;
+        egui::Rect::from_min_max(egui::pos2(margin, 0.0), egui::pos2(1.0 - margin, 1.0))
+    }
+}
+
 fn downscale_rgba_if_needed<'a>(
     width: u32,
     height: u32,
@@ -554,6 +595,11 @@ struct ImageViewer {
     /// Timestamp of the last detected masonry layout motion.
     /// Used as a short settle window to avoid immediate relayout between wheel/drag events.
     masonry_last_motion_at: Instant,
+    /// True once the one-time initial masonry layout settle has been performed.
+    /// After initial layout with possibly-default aspect ratios, one corrective relayout
+    /// is allowed when the metadata window first becomes fully ready. After that, the
+    /// layout is locked and dimension updates no longer trigger reflows.
+    masonry_initial_settle_done: bool,
 
     /// Cooldown frames before updating preload queue (prevents cache churn during rapid navigation)
     manga_preload_cooldown: u32,
@@ -768,6 +814,7 @@ impl Default for ImageViewer {
             masonry_layout_updates_deferred: false,
             masonry_metadata_window_ready: false,
             masonry_last_motion_at: Instant::now(),
+            masonry_initial_settle_done: false,
 
             manga_preload_cooldown: 0,
             manga_last_preload_update: Instant::now(),
@@ -2649,6 +2696,7 @@ impl ImageViewer {
         self.masonry_layout_valid = false;
         self.masonry_layout_updates_deferred = false;
         self.masonry_metadata_window_ready = false;
+        self.masonry_initial_settle_done = false;
     }
 
     fn manga_trilinear_texture_options() -> egui::TextureOptions {
@@ -2729,6 +2777,45 @@ impl ImageViewer {
         self.manga_layout_offsets.clear();
         self.masonry_layout_valid = false;
         self.manga_apply_masonry_scroll_stabilization_after_layout_change(anchor);
+        true
+    }
+
+    /// Perform a ONE-TIME corrective relayout after the metadata probe window
+    /// first reports full coverage.
+    ///
+    /// Before this settle, the masonry layout may have been computed with the
+    /// default 1.4 aspect ratio for items whose dimensions had not arrived yet.
+    /// Once the metadata window is fully resolved, we recompute positions using
+    /// the real aspect ratios and stabilize the scroll position around the
+    /// current anchor.  After this single correction the layout is locked:
+    /// further dimension updates (from decoding or distant probes) no longer
+    /// trigger reflows.
+    fn masonry_try_initial_settle(&mut self) -> bool {
+        if !self.is_masonry_mode() || self.masonry_initial_settle_done {
+            return false;
+        }
+
+        // Only settle once the metadata window reports readiness AND
+        // we already have a valid layout to correct.
+        if !self.masonry_metadata_window_ready || !self.masonry_layout_valid {
+            return false;
+        }
+
+        // Don't settle while the user is actively interacting.
+        if self.manga_is_layout_motion_active() {
+            return false;
+        }
+
+        let anchor = self.manga_capture_scroll_anchor();
+
+        // Force a full recompute with the now-correct aspect ratios.
+        self.masonry_layout_valid = false;
+        self.masonry_ensure_layout_cache();
+
+        // Re-anchor the viewport so the user doesn't notice the shift.
+        self.manga_apply_masonry_scroll_stabilization_after_layout_change(anchor);
+
+        self.masonry_initial_settle_done = true;
         true
     }
 
@@ -4432,7 +4519,7 @@ impl ImageViewer {
         } else {
             8
         };
-        let defer_masonry_layout_updates = if is_masonry {
+        let _defer_masonry_layout_updates = if is_masonry {
             self.manga_should_defer_masonry_layout_updates()
         } else {
             false
@@ -4467,17 +4554,32 @@ impl ImageViewer {
         }
 
         // Dimension updates can change page heights; invalidate cached layout/prefix sums.
-        // In masonry mode, defer this while actively scrolling to prevent viewport bounce.
+        //
+        // MASONRY MODE: Never invalidate the masonry layout from progressive dimension
+        // updates.  Doing so causes cascading Y-position shifts across all items in each
+        // column every time a batch of header probes completes, which makes the grid
+        // "dance" during scrolling and is extremely disorienting.  Instead, dimension
+        // updates are absorbed silently into the loader's dimension_cache; the masonry
+        // layout will pick them up during the one-time initial settle
+        // (masonry_try_initial_settle) or on the next topology-triggered recompute
+        // (screen resize, density change, item count change).  Images are rendered
+        // aspect-correct within their allocated cells, so even slightly-wrong cell
+        // heights produce clean results without stretching.
+        //
+        // LONG-STRIP MODE: Keeps the original invalidation behavior since each page
+        // occupies the full width and height changes are less visually disruptive.
         let mut dims_updated = false;
         if !dim_updates.is_empty() {
-            if defer_masonry_layout_updates {
-                self.masonry_layout_updates_deferred = true;
-                ctx.request_repaint_after(Duration::from_millis(16));
+            if is_masonry {
+                // Masonry: silently absorb — layout stays locked.
+                // Just request a repaint so the settle check runs next frame.
+                if !self.masonry_initial_settle_done {
+                    ctx.request_repaint();
+                }
             } else {
+                // Long-strip: invalidate as before.
                 self.manga_total_height_cache_valid = false;
                 self.manga_layout_offsets.clear();
-                self.masonry_layout_valid = false;
-                self.masonry_layout_updates_deferred = false;
                 dims_updated = true;
             }
         }
@@ -5787,6 +5889,15 @@ impl ImageViewer {
     fn draw_manga_item(&mut self, ui: &mut egui::Ui, idx: usize, image_rect: egui::Rect) -> bool {
         let mut requested_retry = false;
         let allow_texture_retry = !self.is_masonry_mode() || self.masonry_metadata_window_ready;
+        let is_masonry = self.is_masonry_mode();
+
+        // In masonry mode, compute a UV rect that preserves the texture's native
+        // aspect ratio while filling the cell (object-fit: cover).  This prevents
+        // any visible stretching when the cell height differs slightly from the
+        // image's true aspect ratio (e.g. before the metadata settle).
+        let full_uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+        let cell_w = image_rect.width();
+        let cell_h = image_rect.height();
 
         // Check if this item is a video
         let is_video = self
@@ -5804,12 +5915,17 @@ impl ImageViewer {
 
         if is_video {
             // Video item: prioritize live video texture, fall back to first-frame thumbnail
-            if let Some((texture, _tex_w, _tex_h)) = self.manga_video_textures.get(&idx) {
+            if let Some((texture, tex_w, tex_h)) = self.manga_video_textures.get(&idx) {
                 // Live video frame available - use it
+                let uv = if is_masonry {
+                    masonry_cover_uv(cell_w, cell_h, *tex_w, *tex_h)
+                } else {
+                    full_uv
+                };
                 ui.painter().image(
                     texture.id(),
                     image_rect,
-                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    uv,
                     egui::Color32::WHITE,
                 );
 
@@ -5838,14 +5954,19 @@ impl ImageViewer {
                         egui::Color32::WHITE,
                     );
                 }
-            } else if let Some((texture_id, _tex_w, _tex_h)) =
+            } else if let Some((texture_id, tex_w, tex_h)) =
                 self.manga_texture_cache.get_texture_info(idx)
             {
                 // First-frame thumbnail from texture cache - use it as a preview
+                let uv = if is_masonry {
+                    masonry_cover_uv(cell_w, cell_h, tex_w, tex_h)
+                } else {
+                    full_uv
+                };
                 ui.painter().image(
                     texture_id,
                     image_rect,
-                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    uv,
                     egui::Color32::WHITE,
                 );
 
@@ -5909,12 +6030,17 @@ impl ImageViewer {
             }
         } else {
             // Image item: use regular texture cache
-            if let Some((texture_id, _tex_w, _tex_h)) = self.manga_texture_cache.get_texture_info(idx)
+            if let Some((texture_id, tex_w, tex_h)) = self.manga_texture_cache.get_texture_info(idx)
             {
+                let uv = if is_masonry {
+                    masonry_cover_uv(cell_w, cell_h, tex_w, tex_h)
+                } else {
+                    full_uv
+                };
                 ui.painter().image(
                     texture_id,
                     image_rect,
-                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    uv,
                     egui::Color32::WHITE,
                 );
 
@@ -6625,6 +6751,11 @@ impl ImageViewer {
         }
 
         if self.manga_flush_deferred_masonry_layout_update() {
+            animation_active = true;
+        }
+
+        // Masonry: one-time corrective relayout once metadata is fully resolved.
+        if self.masonry_try_initial_settle() {
             animation_active = true;
         }
 
