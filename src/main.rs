@@ -5557,11 +5557,24 @@ impl ImageViewer {
                     );
 
                     if response.clicked() {
-                        self.clear_strip_return_context();
-                        if *is_masonry {
-                            self.toggle_masonry_mode();
+                        let target_layout = if *is_masonry {
+                            MangaLayoutMode::Masonry
                         } else {
-                            self.toggle_long_strip_mode();
+                            MangaLayoutMode::LongStrip
+                        };
+
+                        // When solo fullscreen was opened from strip mode, route button-based
+                        // returns through the same strip-return path as center right-click.
+                        if self.is_fullscreen && !self.manga_mode && self.strip_return_mode.is_some() {
+                            self.strip_return_mode = Some(target_layout);
+                            self.return_to_strip_mode_from_middle_click();
+                        } else {
+                            self.clear_strip_return_context();
+                            if target_layout == MangaLayoutMode::Masonry {
+                                self.toggle_masonry_mode();
+                            } else {
+                                self.toggle_long_strip_mode();
+                            }
                         }
                         self.touch_bottom_overlays();
                     }
