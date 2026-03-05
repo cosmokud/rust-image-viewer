@@ -6,6 +6,7 @@
 mod config;
 mod image_loader;
 mod manga_loader;
+mod masonry_static;
 #[cfg(target_os = "windows")]
 mod single_instance;
 mod video_player;
@@ -17,6 +18,7 @@ use image_loader::{
     get_images_in_directory, get_media_type, is_supported_video, ImageFrame, LoadedImage, MediaType,
 };
 use manga_loader::{MangaLoader, MangaMediaType, MangaTextureCache};
+use masonry_static::{compute_static_masonry_layout, StaticMasonryLayoutConfig};
 #[cfg(target_os = "windows")]
 use single_instance::{FileReceiver, SingleInstanceResult};
 use video_player::{format_duration, VideoPlayer};
@@ -2465,6 +2467,16 @@ impl ImageViewer {
         self.manga_mode && self.manga_layout_mode == MangaLayoutMode::Masonry
     }
 
+    fn masonry_dimensions_ready(&self) -> bool {
+        if !self.is_masonry_mode() || self.image_list.is_empty() {
+            return true;
+        }
+
+        self.manga_loader
+            .as_ref()
+            .is_some_and(|loader| loader.has_dimensions_for_all(self.image_list.len()))
+    }
+
     fn clear_strip_return_context(&mut self) {
         let should_clear_preserved_masonry_cache =
             self.strip_return_preserve_masonry_cache && !self.manga_mode;
@@ -2722,6 +2734,10 @@ impl ImageViewer {
         }
 
         if self.is_masonry_mode() {
+            if !self.masonry_dimensions_ready() {
+                return Vec::new();
+            }
+
             self.masonry_ensure_layout_cache();
             if self.masonry_layout_items.is_empty() {
                 return Vec::new();
@@ -2952,12 +2968,18 @@ impl ImageViewer {
             return;
         }
 
+        if !self.masonry_dimensions_ready() {
+            self.masonry_layout_items.clear();
+            self.masonry_layout_total_height = 0.0;
+            self.masonry_layout_valid = false;
+            return;
+        }
+
         let screen_x = self.screen_size.x.round();
         let len = self.image_list.len();
         let items_per_row = self.masonry_items_per_row.clamp(2, 10);
 
         let needs_recompute = !self.masonry_layout_valid
-            || (self.masonry_layout_screen_x - screen_x).abs() > 1e-6
             || self.masonry_layout_items_per_row != items_per_row
             || self.masonry_layout_len != len;
 
@@ -2965,58 +2987,22 @@ impl ImageViewer {
             return;
         }
 
-        const SIDE_PADDING: f32 = 16.0;
-        const TOP_PADDING: f32 = 10.0;
-        const BOTTOM_PADDING: f32 = 10.0;
-        const GUTTER: f32 = 12.0;
+        let layout = compute_static_masonry_layout(
+            len,
+            StaticMasonryLayoutConfig {
+                viewport_width: self.screen_size.x,
+                items_per_row,
+                side_padding: 16.0,
+                top_padding: 10.0,
+                bottom_padding: 10.0,
+                gutter: 12.0,
+                min_item_height: 20.0,
+            },
+            |idx| self.masonry_item_aspect_ratio(idx),
+        );
 
-        let available_width = (self.screen_size.x - SIDE_PADDING * 2.0).max(20.0);
-        let columns = items_per_row.max(1);
-        let total_gutter = GUTTER * (columns.saturating_sub(1) as f32);
-        let column_width = ((available_width - total_gutter) / columns as f32).max(1.0);
-        let used_width = column_width * columns as f32 + total_gutter;
-        let start_x = ((self.screen_size.x - used_width) * 0.5).max(0.0);
-
-        let mut column_heights = vec![TOP_PADDING; columns];
-        self.masonry_layout_items.clear();
-        self.masonry_layout_items
-            .resize(len, MasonryItemLayout::default());
-
-        for idx in 0..len {
-            let mut target_col = 0usize;
-            let mut min_height = column_heights[0];
-            for col in 1..columns {
-                if column_heights[col] < min_height {
-                    min_height = column_heights[col];
-                    target_col = col;
-                }
-            }
-
-            let x = start_x + target_col as f32 * (column_width + GUTTER);
-            let y = column_heights[target_col];
-            let height = (column_width * self.masonry_item_aspect_ratio(idx)).max(20.0);
-
-            self.masonry_layout_items[idx] = MasonryItemLayout {
-                x,
-                y,
-                width: column_width,
-                height,
-            };
-
-            column_heights[target_col] = y + height + GUTTER;
-        }
-
-        let mut content_bottom = TOP_PADDING;
-        for h in column_heights {
-            if h > content_bottom {
-                content_bottom = h;
-            }
-        }
-        if len > 0 {
-            content_bottom = (content_bottom - GUTTER).max(TOP_PADDING);
-        }
-
-        self.masonry_layout_total_height = (content_bottom + BOTTOM_PADDING).max(0.0);
+        self.masonry_layout_items = layout.items;
+        self.masonry_layout_total_height = layout.total_height;
         self.masonry_layout_screen_x = screen_x;
         self.masonry_layout_items_per_row = items_per_row;
         self.masonry_layout_len = len;
@@ -4056,6 +4042,13 @@ impl ImageViewer {
             return;
         }
 
+        if self.is_masonry_mode() && !self.masonry_dimensions_ready() {
+            if let Some(ref mut loader) = self.manga_loader {
+                loader.request_dimensions_range(&self.image_list, 0, self.image_list.len());
+            }
+            return;
+        }
+
         // Respect cooldown after large jumps (Home/End keys)
         if self.manga_preload_cooldown > 0 {
             return;
@@ -4426,8 +4419,9 @@ impl ImageViewer {
             (decoded_images, dim_updates)
         };
 
-        // Dimension updates can change page heights; invalidate cached layout/prefix sums.
-        if !dim_updates.is_empty() {
+        // In long-strip mode, dimension updates can change page heights and must invalidate layout.
+        // In masonry mode, layout is intentionally frozen after the first full metadata pass.
+        if !dim_updates.is_empty() && !self.is_masonry_mode() {
             self.manga_total_height_cache_valid = false;
             self.manga_layout_offsets.clear();
             self.masonry_layout_valid = false;
@@ -5985,6 +5979,30 @@ impl ImageViewer {
         let screen_width = screen_rect.width();
         let screen_height = screen_rect.height();
         let mut animation_active = false;
+
+        if self.is_masonry_mode() && !self.masonry_dimensions_ready() {
+            if let Some(loader) = self.manga_loader.as_mut() {
+                loader.request_dimensions_range(&self.image_list, 0, self.image_list.len());
+                let dim_updates = loader.poll_dimension_results(64);
+                if !dim_updates.is_empty() {
+                    self.masonry_layout_valid = false;
+                }
+            }
+
+            egui::CentralPanel::default()
+                .frame(egui::Frame::none().fill(self.background_color32()))
+                .show(ctx, |ui| {
+                    ui.painter().text(
+                        egui::pos2(screen_width * 0.5, screen_height * 0.5),
+                        egui::Align2::CENTER_CENTER,
+                        "Indexing image dimensions...",
+                        egui::FontId::proportional(18.0),
+                        egui::Color32::from_gray(200),
+                    );
+                });
+
+            return true;
+        }
 
         // Get input states
         let ctrl_held = ctx.input(|i| i.modifiers.ctrl);

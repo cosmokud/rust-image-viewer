@@ -1123,49 +1123,63 @@ impl MangaLoader {
         results
     }
 
-    /// Start async dimension caching for all images in the list.
-    /// This returns immediately and caches dimensions in the background.
-    /// The first few visible images are prioritized.
+    /// Cache dimensions for the full dataset in one CPU pass.
+    ///
+    /// This is used by static masonry initialization to guarantee a stable,
+    /// no-reflow layout once the folder is opened.
     pub fn cache_all_dimensions(&mut self, image_list: &[PathBuf]) {
-        // For fast startup, only cache the first batch of visible media synchronously.
-        // The rest will be cached on-demand or when media is loaded.
-        const INITIAL_CACHE_COUNT: usize = 30;
+        const FALLBACK_STATIC_WIDTH: u32 = 1000;
+        const FALLBACK_STATIC_HEIGHT: u32 = 1400;
+        const FALLBACK_VIDEO_WIDTH: u32 = 1920;
+        const FALLBACK_VIDEO_HEIGHT: u32 = 1080;
 
-        // Clear existing cache
+        // Reset existing metadata state.
         self.dimension_cache.clear();
+        self.dim_pending.clear();
 
-        // Cache first batch synchronously for immediate layout
-        let initial_batch: Vec<(usize, Option<(u32, u32, MangaMediaType)>)> = image_list
+        // Drain stale async dimension results from previous ranges/generations.
+        while self.dim_result_rx.try_recv().is_ok() {}
+
+        let all_dims: Vec<(usize, (u32, u32, MangaMediaType))> = image_list
             .par_iter()
-            .take(INITIAL_CACHE_COUNT)
             .enumerate()
             .map(|(idx, path)| {
                 let is_video = is_supported_video(path);
                 let is_image = is_supported_image(path);
 
                 if is_video {
-                    // For videos, probe dimensions
                     let dims = Self::probe_video_dimensions(path);
-                    (idx, dims.map(|(w, h)| (w, h, MangaMediaType::Video)))
+                    let (w, h) = dims.unwrap_or((FALLBACK_VIDEO_WIDTH, FALLBACK_VIDEO_HEIGHT));
+                    (idx, (w.max(1), h.max(1), MangaMediaType::Video))
                 } else if is_image {
-                    // For images, get from file header
                     let dims = image::image_dimensions(path).ok();
-                    // We can't easily determine if an image is animated without loading it
-                    // Default to static, will be updated when actually loaded
-                    (idx, dims.map(|(w, h)| (w, h, MangaMediaType::StaticImage)))
+                    let (w, h) = dims.unwrap_or((FALLBACK_STATIC_WIDTH, FALLBACK_STATIC_HEIGHT));
+                    (idx, (w.max(1), h.max(1), MangaMediaType::StaticImage))
                 } else {
-                    (idx, None)
+                    (
+                        idx,
+                        (
+                            FALLBACK_STATIC_WIDTH,
+                            FALLBACK_STATIC_HEIGHT,
+                            MangaMediaType::StaticImage,
+                        ),
+                    )
                 }
             })
             .collect();
-        for (idx, opt_dims) in initial_batch {
-            if let Some((w, h, media_type)) = opt_dims {
-                self.dimension_cache.insert(idx, (w, h, media_type));
-            }
+
+        for (idx, dims) in all_dims {
+            self.dimension_cache.insert(idx, dims);
+        }
+    }
+
+    /// Returns true when dimensions are known for all items in `image_count`.
+    pub fn has_dimensions_for_all(&self, image_count: usize) -> bool {
+        if image_count == 0 {
+            return true;
         }
 
-        // The rest will be cached on-demand when media is loaded
-        // or when manga_get_image_display_height is called
+        self.dimension_cache.len() >= image_count
     }
 
     /// Clear all caches and reset state (called when exiting manga mode).
