@@ -3140,9 +3140,13 @@ impl ImageViewer {
         let topology_changed = (self.masonry_layout_screen_x - screen_x).abs() > 1e-6
             || self.masonry_layout_items_per_row != items_per_row
             || self.masonry_layout_len != len;
+        let deferred_dirty_layout = self.masonry_layout_updates_deferred
+            && self.masonry_layout_dirty_from.is_some()
+            && self.masonry_layout_valid
+            && !topology_changed;
         let needs_recompute = !self.masonry_layout_valid
             || topology_changed
-            || self.masonry_layout_dirty_from.is_some();
+            || (self.masonry_layout_dirty_from.is_some() && !deferred_dirty_layout);
 
         if !needs_recompute {
             return;
