@@ -310,9 +310,6 @@ struct ImageViewer {
     image_list: Vec<PathBuf>,
     /// Current image index in the list
     current_index: usize,
-    /// Global last-viewed file index shared across all modes/transitions.
-    /// This is the single source of truth for cross-mode return targeting.
-    last_viewed_index: usize,
     /// Current zoom level (1.0 = 100%)
     zoom: f32,
     /// Target zoom for smooth animation in floating mode
@@ -664,7 +661,6 @@ impl Default for ImageViewer {
             texture_frame: 0,
             image_list: Vec::new(),
             current_index: 0,
-            last_viewed_index: 0,
             zoom: 1.0,
             zoom_target: 1.0,
             zoom_velocity: 0.0,
@@ -854,25 +850,14 @@ impl ImageViewer {
     const MANGA_TTV_SAMPLE_CAP: usize = 240;
     const MANGA_TTV_PENDING_MAX_AGE: Duration = Duration::from_secs(30);
 
-    fn tracked_viewed_index(&self) -> usize {
-        if self.image_list.is_empty() {
-            0
-        } else {
-            self.last_viewed_index
-                .min(self.image_list.len().saturating_sub(1))
-        }
-    }
-
-    fn set_current_index_tracked(&mut self, index: usize) {
+    fn set_current_index_clamped(&mut self, index: usize) {
         if self.image_list.is_empty() {
             self.current_index = 0;
-            self.last_viewed_index = 0;
             return;
         }
 
         let clamped = index.min(self.image_list.len().saturating_sub(1));
         self.current_index = clamped;
-        self.last_viewed_index = clamped;
     }
 
     fn update_fps_stats(&mut self) {
@@ -2162,7 +2147,7 @@ impl ImageViewer {
 
         // Get media in directory
         self.image_list = get_images_in_directory(path);
-        self.set_current_index_tracked(self.image_list.iter().position(|p| p == path).unwrap_or(0));
+        self.set_current_index_clamped(self.image_list.iter().position(|p| p == path).unwrap_or(0));
 
         match media_type {
             Some(MediaType::Video) => {
@@ -2349,7 +2334,7 @@ impl ImageViewer {
             } else {
                 self.current_index + 1
             };
-            self.set_current_index_tracked(next_index);
+            self.set_current_index_clamped(next_index);
             let scroll_to = self.manga_get_scroll_offset_for_index(next_index);
             self.manga_scroll_target = scroll_to;
             self.manga_update_preload_queue();
@@ -2359,7 +2344,7 @@ impl ImageViewer {
         // Save current view state before navigating (fullscreen only)
         self.save_current_fullscreen_view_state();
 
-        self.set_current_index_tracked(if self.current_index + 1 >= self.image_list.len() {
+        self.set_current_index_clamped(if self.current_index + 1 >= self.image_list.len() {
             0
         } else {
             self.current_index + 1
@@ -2381,7 +2366,7 @@ impl ImageViewer {
             } else {
                 self.current_index - 1
             };
-            self.set_current_index_tracked(prev_index);
+            self.set_current_index_clamped(prev_index);
             let scroll_to = self.manga_get_scroll_offset_for_index(prev_index);
             self.manga_scroll_target = scroll_to;
             self.manga_update_preload_queue();
@@ -2391,7 +2376,7 @@ impl ImageViewer {
         // Save current view state before navigating (fullscreen only)
         self.save_current_fullscreen_view_state();
 
-        self.set_current_index_tracked(if self.current_index == 0 {
+        self.set_current_index_clamped(if self.current_index == 0 {
             self.image_list.len() - 1
         } else {
             self.current_index - 1
@@ -2419,7 +2404,7 @@ impl ImageViewer {
         // Save current view state before navigating (fullscreen only)
         self.save_current_fullscreen_view_state();
 
-        self.set_current_index_tracked(0);
+        self.set_current_index_clamped(0);
         let path = self.image_list[self.current_index].clone();
         self.load_image(&path);
     }
@@ -2444,7 +2429,7 @@ impl ImageViewer {
         // Save current view state before navigating (fullscreen only)
         self.save_current_fullscreen_view_state();
 
-        self.set_current_index_tracked(last_index);
+        self.set_current_index_clamped(last_index);
         let path = self.image_list[self.current_index].clone();
         self.load_image(&path);
     }
@@ -2768,8 +2753,8 @@ impl ImageViewer {
             return;
         }
 
-        let target_index = self.tracked_viewed_index();
-        self.set_current_index_tracked(target_index);
+        let target_index = self.current_index.min(self.image_list.len().saturating_sub(1));
+        self.set_current_index_clamped(target_index);
         let max_scroll = (self.manga_total_height() - self.screen_size.y).max(0.0);
         let target_scroll = if self.is_masonry_mode() {
             self.masonry_scroll_offset_for_index_centered(target_index)
@@ -2831,8 +2816,8 @@ impl ImageViewer {
         } else {
             None
         };
-        let current_viewed_index = self.tracked_viewed_index();
-        self.set_current_index_tracked(current_viewed_index);
+        let current_viewed_index = self.current_index.min(self.image_list.len().saturating_sub(1));
+        self.set_current_index_clamped(current_viewed_index);
         let traversed_during_fullscreen = restore_masonry_state
             .is_some_and(|state| state.opened_index != current_viewed_index);
         let reuse_masonry_cache = restore_masonry_state
@@ -2857,7 +2842,7 @@ impl ImageViewer {
                 self.offset = state.offset;
 
                 if traversed_during_fullscreen {
-                    // Follow the last file viewed in solo fullscreen.
+                    // Follow the currently viewed file in solo fullscreen.
                     self.scroll_strip_to_current_index();
                 } else {
                     let max_scroll = (self.manga_total_height() - self.screen_size.y).max(0.0);
@@ -2872,7 +2857,7 @@ impl ImageViewer {
             }
         } else if self.manga_mode {
             // Long-strip return and non-preserved masonry fall back here.
-            // Ensure strip position follows the last file viewed in solo fullscreen.
+            // Ensure strip position follows the currently viewed file in solo fullscreen.
             self.scroll_strip_to_current_index();
             self.manga_update_current_index();
             self.manga_update_preload_queue();
@@ -3174,24 +3159,32 @@ impl ImageViewer {
             return;
         }
 
-        // Preserve the visual center while switching layouts so repeated
-        // long-strip <-> masonry toggles do not drift away from the same file.
-        let center_anchor = self.manga_capture_center_anchor();
+        // Use the currently viewed file as the single source of truth when switching layouts.
+        let target_index = self
+            .manga_visible_index()
+            .min(self.image_list.len().saturating_sub(1));
+        self.set_current_index_clamped(target_index);
 
         self.manga_layout_mode = layout_mode;
         self.invalidate_manga_layout_cache();
         self.offset = egui::Vec2::ZERO;
 
-        if let Some(anchor) = center_anchor {
-            self.manga_apply_center_anchor(anchor);
+        let max_scroll = (self.manga_total_height() - self.screen_size.y).max(0.0);
+        let scroll_to = if layout_mode == MangaLayoutMode::Masonry {
+            self.masonry_scroll_offset_for_index_centered(target_index)
+                .unwrap_or_else(|| {
+                    self.manga_get_scroll_offset_for_index(target_index)
+                        .clamp(0.0, max_scroll)
+                })
         } else {
-            let scroll_to = self.manga_get_scroll_offset_for_index(self.current_index);
-            self.manga_scroll_offset = scroll_to;
-            self.manga_scroll_target = scroll_to;
-            self.manga_scroll_velocity = 0.0;
-        }
+            self.manga_get_scroll_offset_for_index(target_index)
+                .clamp(0.0, max_scroll)
+        };
+
+        self.manga_scroll_offset = scroll_to;
+        self.manga_scroll_target = scroll_to;
+        self.manga_scroll_velocity = 0.0;
         self.manga_wheel_scroll_pending = 0.0;
-        self.manga_update_current_index();
 
         if self.manga_layout_mode == MangaLayoutMode::Masonry {
             self.begin_masonry_metadata_preload();
@@ -3344,7 +3337,7 @@ impl ImageViewer {
         }
 
         let return_mode = self.manga_layout_mode;
-        self.set_current_index_tracked(index);
+        self.set_current_index_clamped(index);
         let Some(path) = self.image_list.get(index).cloned() else {
             return;
         };
@@ -3428,9 +3421,19 @@ impl ImageViewer {
 
             // Reset offset (horizontal pan) and scroll to current image position
             self.offset = egui::Vec2::ZERO;
-            let tracked_index = self.tracked_viewed_index();
-            self.set_current_index_tracked(tracked_index);
-            let scroll_to = self.manga_get_scroll_offset_for_index(tracked_index);
+            let target_index = self.current_index.min(self.image_list.len().saturating_sub(1));
+            self.set_current_index_clamped(target_index);
+            let max_scroll = (self.manga_total_height() - self.screen_size.y).max(0.0);
+            let scroll_to = if self.manga_layout_mode == MangaLayoutMode::Masonry {
+                self.masonry_scroll_offset_for_index_centered(target_index)
+                    .unwrap_or_else(|| {
+                        self.manga_get_scroll_offset_for_index(target_index)
+                            .clamp(0.0, max_scroll)
+                    })
+            } else {
+                self.manga_get_scroll_offset_for_index(target_index)
+                    .clamp(0.0, max_scroll)
+            };
             self.manga_scroll_offset = scroll_to;
             self.manga_scroll_target = scroll_to;
             self.manga_scroll_velocity = 0.0;
@@ -3451,7 +3454,7 @@ impl ImageViewer {
 
         // Exiting manga mode: switch fullscreen view to the currently visible page.
         let visible_idx = self.manga_visible_index();
-        self.set_current_index_tracked(visible_idx);
+        self.set_current_index_clamped(visible_idx);
         let target_path = self.image_list.get(visible_idx).cloned();
         let target_media_type = target_path.as_ref().and_then(|path| get_media_type(path));
 
@@ -5101,7 +5104,7 @@ impl ImageViewer {
             return;
         }
         let target = current - 1;
-        self.set_current_index_tracked(target);
+        self.set_current_index_clamped(target);
         let scroll_to = self.manga_get_scroll_offset_for_index(target);
         self.manga_scroll_target = scroll_to;
         self.manga_scroll_offset = scroll_to;
@@ -5149,7 +5152,7 @@ impl ImageViewer {
             return;
         }
         let target = current - 1;
-        self.set_current_index_tracked(target);
+        self.set_current_index_clamped(target);
         let scroll_to = self.manga_get_scroll_offset_for_index(target);
         self.manga_scroll_target = scroll_to;
         self.manga_scroll_velocity = 0.0;
@@ -5196,7 +5199,7 @@ impl ImageViewer {
         if target == current {
             return;
         }
-        self.set_current_index_tracked(target);
+        self.set_current_index_clamped(target);
         let scroll_to = self.manga_get_scroll_offset_for_index(target);
         self.manga_scroll_target = scroll_to;
         self.manga_scroll_offset = scroll_to;
@@ -5256,7 +5259,7 @@ impl ImageViewer {
             return;
         }
 
-        self.set_current_index_tracked(target);
+        self.set_current_index_clamped(target);
         let scroll_to = self.manga_get_scroll_offset_for_index(target);
         self.manga_scroll_target = scroll_to;
         self.manga_scroll_velocity = 0.0;
@@ -5300,7 +5303,7 @@ impl ImageViewer {
             return;
         }
         let target = current - 1;
-        self.set_current_index_tracked(target);
+        self.set_current_index_clamped(target);
         let scroll_to = self.manga_get_scroll_offset_for_index(target);
         self.manga_scroll_target = scroll_to;
         self.manga_scroll_velocity = 0.0;
@@ -5350,7 +5353,7 @@ impl ImageViewer {
             return;
         }
 
-        self.set_current_index_tracked(target);
+        self.set_current_index_clamped(target);
         let scroll_to = self.manga_get_scroll_offset_for_index(target);
         self.manga_scroll_target = scroll_to;
         self.manga_scroll_velocity = 0.0;
@@ -5398,7 +5401,7 @@ impl ImageViewer {
         self.manga_scroll_target = 0.0;
         self.manga_scroll_velocity = 0.0;
         self.manga_wheel_scroll_pending = 0.0;
-        self.set_current_index_tracked(0);
+        self.set_current_index_clamped(0);
         // Invalidate height cache since we're at a new position
         self.invalidate_manga_layout_cache();
         // Immediately trigger preload for new position (no cooldown)
@@ -5422,7 +5425,7 @@ impl ImageViewer {
             let start = last_index.saturating_sub(preload_behind);
             loader.request_dimensions_range(&self.image_list, start, self.image_list.len());
         }
-        self.set_current_index_tracked(last_index);
+        self.set_current_index_clamped(last_index);
         // Invalidate height cache since we're at a new position
         self.invalidate_manga_layout_cache();
         let total_height = self.manga_total_height();
@@ -5529,11 +5532,15 @@ impl ImageViewer {
             return;
         }
 
-        let viewport_h = self.screen_size.y.max(1.0);
-        let y_center = self.manga_scroll_offset.max(0.0) + viewport_h * 0.5;
-        let idx = self.manga_index_at_y(y_center);
+        let idx = if self.is_masonry_mode() {
+            self.manga_get_focused_media_index()
+        } else {
+            let viewport_h = self.screen_size.y.max(1.0);
+            let y_center = self.manga_scroll_offset.max(0.0) + viewport_h * 0.5;
+            self.manga_index_at_y(y_center)
+        };
         if self.current_index != idx {
-            self.set_current_index_tracked(idx);
+            self.set_current_index_clamped(idx);
         }
     }
 
