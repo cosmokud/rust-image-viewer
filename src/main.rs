@@ -2734,7 +2734,26 @@ impl ImageViewer {
 
     #[allow(dead_code)]
     fn should_reuse_masonry_cache_on_return(&self, _state: MasonryReturnState) -> bool {
-        !self.image_list.is_empty() && self.strip_return_preserve_masonry_cache && self.manga_loader.is_some()
+        !self.image_list.is_empty()
+            && self.strip_return_preserve_masonry_cache
+            && self.manga_loader.is_some()
+    }
+
+    fn scroll_strip_to_current_index(&mut self) {
+        if !self.manga_mode || self.image_list.is_empty() {
+            return;
+        }
+
+        let target_index = self.current_index.min(self.image_list.len().saturating_sub(1));
+        let max_scroll = (self.manga_total_height() - self.screen_size.y).max(0.0);
+        let target_scroll = self
+            .manga_get_scroll_offset_for_index(target_index)
+            .clamp(0.0, max_scroll);
+
+        self.manga_scroll_offset = target_scroll;
+        self.manga_scroll_target = target_scroll;
+        self.manga_scroll_velocity = 0.0;
+        self.manga_wheel_scroll_pending = 0.0;
     }
 
     fn manga_suspend_runtime_for_solo_fullscreen(&mut self) {
@@ -2759,6 +2778,10 @@ impl ImageViewer {
             current_media_type,
             current_image_is_animated,
         );
+
+        // The fullscreen traversal may have discovered new dimensions for the currently viewed file.
+        // Rebuild strip layout with the latest metadata before restoring viewport position.
+        self.invalidate_manga_layout_cache();
     }
 
     #[allow(dead_code)]
@@ -2776,6 +2799,9 @@ impl ImageViewer {
         } else {
             None
         };
+        let current_viewed_index = self.current_index;
+        let traversed_during_fullscreen = restore_masonry_state
+            .is_some_and(|state| state.opened_index != current_viewed_index);
         let reuse_masonry_cache = restore_masonry_state
             .is_some_and(|state| self.should_reuse_masonry_cache_on_return(state));
 
@@ -2797,15 +2823,26 @@ impl ImageViewer {
                 self.zoom_velocity = 0.0;
                 self.offset = state.offset;
 
-                let max_scroll = (self.manga_total_height() - self.screen_size.y).max(0.0);
-                self.manga_scroll_offset = state.scroll_offset.clamp(0.0, max_scroll);
-                self.manga_scroll_target = state.scroll_target.clamp(0.0, max_scroll);
-                self.manga_scroll_velocity = 0.0;
-                self.manga_wheel_scroll_pending = 0.0;
+                if traversed_during_fullscreen {
+                    // Follow the last file viewed in solo fullscreen.
+                    self.scroll_strip_to_current_index();
+                } else {
+                    let max_scroll = (self.manga_total_height() - self.screen_size.y).max(0.0);
+                    self.manga_scroll_offset = state.scroll_offset.clamp(0.0, max_scroll);
+                    self.manga_scroll_target = state.scroll_target.clamp(0.0, max_scroll);
+                    self.manga_scroll_velocity = 0.0;
+                    self.manga_wheel_scroll_pending = 0.0;
+                }
 
                 self.manga_update_current_index();
                 self.manga_update_preload_queue();
             }
+        } else if self.manga_mode {
+            // Long-strip return and non-preserved masonry fall back here.
+            // Ensure strip position follows the last file viewed in solo fullscreen.
+            self.scroll_strip_to_current_index();
+            self.manga_update_current_index();
+            self.manga_update_preload_queue();
         }
 
         self.clear_strip_return_context();
@@ -10146,9 +10183,16 @@ impl eframe::App for ImageViewer {
         if self.toggle_fullscreen {
             self.stop_manga_autoscroll();
             let entering_fullscreen = !self.is_fullscreen;
-            self.is_fullscreen = entering_fullscreen;
 
-            if entering_fullscreen {
+            // When solo fullscreen was opened from strip mode, all fullscreen-exit triggers
+            // (keyboard, title-bar button, menu actions) should return back to that strip mode,
+            // not leave fullscreen to floating mode.
+            if !entering_fullscreen && !self.manga_mode && self.strip_return_mode.is_some() {
+                self.return_to_strip_mode_from_middle_click();
+            } else {
+                self.is_fullscreen = entering_fullscreen;
+
+                if entering_fullscreen {
                 // Save current floating state before entering fullscreen
                 let inner_size = ctx
                     .input(|i| i.raw.viewport().inner_rect)
@@ -10182,7 +10226,7 @@ impl eframe::App for ImageViewer {
                 ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::Pos2::ZERO));
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(monitor));
                 self.last_requested_inner_size = Some(monitor);
-            } else {
+                } else {
                 // Exiting fullscreen - use delayed resize to prevent flash
                 self.fullscreen_transition = 0.0;
                 self.fullscreen_transition_target = 0.0;
@@ -10305,6 +10349,7 @@ impl eframe::App for ImageViewer {
                         self.pending_media_layout =
                             matches!(self.current_media_type, Some(MediaType::Video));
                     }
+                }
                 }
             }
             self.toggle_fullscreen = false;
