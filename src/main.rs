@@ -5,6 +5,7 @@
 
 mod config;
 mod image_loader;
+mod lod_cache;
 mod manga_loader;
 mod masonry_static;
 #[cfg(target_os = "windows")]
@@ -1702,7 +1703,10 @@ impl ImageViewer {
 
     fn ensure_manga_loader(&mut self) {
         if self.manga_loader.is_none() {
-            self.manga_loader = Some(MangaLoader::new());
+            self.manga_loader = Some(MangaLoader::new_with_l2_cache(
+                self.config.l2_disk_cache_enabled,
+                self.config.l2_disk_cache_max_gb,
+            ));
         }
     }
 
