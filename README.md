@@ -66,6 +66,7 @@ This app is **not** intended to replace a full-featured image viewer or video pl
 | WebP   | `.webp`                     |
 | GIF    | `.gif` (including animated) |
 | BMP    | `.bmp`                      |
+| PSD    | `.psd`                      |
 | ICO    | `.ico`                      |
 | TIFF   | `.tiff`, `.tif`             |
 

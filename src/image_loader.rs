@@ -1,5 +1,5 @@
 //! Image and video loading and management module.
-//! Supports JPG, PNG, WEBP (including animated), animated GIF files, and video formats.
+//! Supports JPG, PNG, WEBP, BMP, PSD (zune-image), animated GIF files, and video formats.
 //! Optimized for low memory usage while maintaining functionality.
 
 use std::fs::File;
@@ -8,12 +8,15 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use image::imageops::FilterType;
-use image::GenericImageView;
 use memmap2::MmapOptions;
+use zune_core::colorspace::ColorSpace;
+use zune_core::options::DecoderOptions;
+use zune_image::image::Image as ZuneImage;
 
 // Reduced from 4 GiB to 512 MiB for more reasonable memory limits
 // This prevents loading extremely large images that would consume too much RAM
 const DEFAULT_MAX_DECODE_ALLOC_BYTES: u64 = 512 * 1024 * 1024; // 512 MiB
+const ZUNE_STATIC_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "bmp", "psd"];
 
 trait BufReadSeek: BufRead + Seek {}
 impl<T: BufRead + Seek> BufReadSeek for T {}
@@ -27,6 +30,13 @@ fn open_media_reader(path: &Path) -> Result<Box<dyn BufReadSeek>, String> {
         Ok(mapped) => Ok(Box::new(Cursor::new(mapped))),
         Err(_) => Ok(Box::new(BufReader::new(file))),
     }
+}
+
+fn should_decode_static_with_zune(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| ZUNE_STATIC_EXTENSIONS.contains(&e.to_lowercase().as_str()))
+        .unwrap_or(false)
 }
 
 /// Fast image dimension probe using header-only parsing.
@@ -43,11 +53,9 @@ pub fn probe_image_dimensions(path: &Path) -> Option<(u32, u32)> {
     Some((width, height))
 }
 
-fn open_image_with_reasonable_limits(path: &Path) -> Result<image::DynamicImage, String> {
-    // `image::open()` uses conservative decoder limits to protect against decompression bombs.
-    // For a viewer, we want to allow legitimately large images while still keeping a hard cap.
-    //
-    // We size limits from the container header dimensions (fast, no full decode).
+fn decode_static_with_zune_limits(path: &Path) -> Result<(u32, u32, Vec<u8>), String> {
+    // Size decode limits from the container header (fast, no full decode) to keep
+    // throughput high while still bounding decode memory.
     let (w, h) = probe_image_dimensions(path).unwrap_or((0, 0));
 
     // Conservative upper bound: assume 4 bytes/pixel worst case.
@@ -57,7 +65,68 @@ fn open_image_with_reasonable_limits(path: &Path) -> Result<image::DynamicImage,
         .saturating_add(16 * 1024 * 1024);
 
     let max_alloc = estimated.clamp(256 * 1024 * 1024, DEFAULT_MAX_DECODE_ALLOC_BYTES);
-    let max_alloc_u64 = max_alloc;
+    let max_alloc_usize = usize::try_from(max_alloc).unwrap_or(usize::MAX);
+
+    let mut options = DecoderOptions::new_fast()
+        .inflate_set_limit(max_alloc_usize)
+        // For static loading we only need the first frame (if any).
+        .png_set_decode_animated(false);
+
+    if w > 0 {
+        options = options.set_max_width(w as usize);
+    }
+    if h > 0 {
+        options = options.set_max_height(h as usize);
+    }
+
+    let reader = open_media_reader(path)?;
+    let mut img = ZuneImage::read(reader, options)
+        .map_err(|e| format!("Failed to load image with zune-image: {}", e))?;
+
+    img.convert_color(ColorSpace::RGBA)
+        .map_err(|e| format!("Failed to convert decoded image to RGBA: {}", e))?;
+
+    let (w, h) = img.dimensions();
+    if w == 0 || h == 0 {
+        return Err("Decoded image has invalid dimensions".to_string());
+    }
+
+    let width = u32::try_from(w).map_err(|_| "Decoded image width too large".to_string())?;
+    let height = u32::try_from(h).map_err(|_| "Decoded image height too large".to_string())?;
+
+    let pixels = img
+        .flatten_to_u8()
+        .into_iter()
+        .next()
+        .ok_or_else(|| "Decoded image had no pixel data".to_string())?;
+
+    let expected_len = w
+        .checked_mul(h)
+        .and_then(|px| px.checked_mul(4))
+        .ok_or_else(|| "Decoded image size overflow".to_string())?;
+
+    if pixels.len() != expected_len {
+        return Err(format!(
+            "Decoded pixel buffer size mismatch: expected {}, got {}",
+            expected_len,
+            pixels.len()
+        ));
+    }
+
+    Ok((width, height, pixels))
+}
+
+fn decode_static_with_image_reader_limits(path: &Path) -> Result<(u32, u32, Vec<u8>), String> {
+    // Legacy fallback for static formats not currently routed to zune-image.
+    // We keep this for formats like ICO/TIFF while fast-pathing common formats via zune.
+    let (w, h) = probe_image_dimensions(path).unwrap_or((0, 0));
+
+    let estimated = (w as u64)
+        .saturating_mul(h as u64)
+        .saturating_mul(4)
+        .saturating_add(16 * 1024 * 1024);
+
+    let max_alloc = estimated.clamp(256 * 1024 * 1024, DEFAULT_MAX_DECODE_ALLOC_BYTES);
 
     let mut reader = image::ImageReader::new(open_media_reader(path)?);
 
@@ -67,7 +136,7 @@ fn open_image_with_reasonable_limits(path: &Path) -> Result<image::DynamicImage,
         .map_err(|e| format!("Failed to guess image format: {}", e))?;
 
     let mut limits = image::Limits::default();
-    limits.max_alloc = Some(max_alloc_u64);
+    limits.max_alloc = Some(max_alloc);
 
     // Also relax dimension limits (still bounded by whatever the header claims).
     if w > 0 {
@@ -78,14 +147,26 @@ fn open_image_with_reasonable_limits(path: &Path) -> Result<image::DynamicImage,
     }
 
     reader.limits(limits);
-    reader
+    let decoded = reader
         .decode()
-        .map_err(|e| format!("Failed to load image: {}", e))
+        .map_err(|e| format!("Failed to load image: {}", e))?;
+
+    let rgba = decoded.to_rgba8();
+    let (width, height) = rgba.dimensions();
+    Ok((width, height, rgba.into_raw()))
+}
+
+fn open_image_with_reasonable_limits(path: &Path) -> Result<(u32, u32, Vec<u8>), String> {
+    if should_decode_static_with_zune(path) {
+        decode_static_with_zune_limits(path)
+    } else {
+        decode_static_with_image_reader_limits(path)
+    }
 }
 
 /// Supported image extensions
 pub const SUPPORTED_IMAGE_EXTENSIONS: &[&str] = &[
-    "jpg", "jpeg", "png", "webp", "gif", "bmp", "ico", "tiff", "tif",
+    "jpg", "jpeg", "png", "webp", "gif", "bmp", "psd", "ico", "tiff", "tif",
 ];
 
 /// Supported video extensions
@@ -96,7 +177,7 @@ pub const SUPPORTED_VIDEO_EXTENSIONS: &[&str] = &[
 /// All supported media extensions (images + videos)
 pub const SUPPORTED_EXTENSIONS: &[&str] = &[
     // Images
-    "jpg", "jpeg", "png", "webp", "gif", "bmp", "ico", "tiff", "tif", // Videos
+    "jpg", "jpeg", "png", "webp", "gif", "bmp", "psd", "ico", "tiff", "tif", // Videos
     "mp4", "mkv", "webm", "avi", "mov", "wmv", "flv", "m4v", "3gp", "ogv",
 ];
 
@@ -492,28 +573,32 @@ impl LoadedImage {
         max_texture_side: Option<u32>,
         downscale_filter: FilterType,
     ) -> Result<Self, String> {
-        let img = open_image_with_reasonable_limits(path)?;
-        let img = if let Some(max_side) = max_texture_side {
-            if max_side > 0 {
-                let (w, h) = img.dimensions();
-                if w > max_side || h > max_side {
-                    // Preserve aspect ratio; `resize` interprets (max_width, max_height).
-                    img.resize(max_side, max_side, downscale_filter)
-                } else {
-                    img
-                }
-            } else {
-                img
-            }
-        } else {
-            img
-        };
+        let (mut width, mut height, mut pixels) = open_image_with_reasonable_limits(path)?;
 
-        let rgba = img.to_rgba8();
-        let (width, height) = rgba.dimensions();
+        if let Some(max_side) = max_texture_side {
+            if max_side > 0 && (width > max_side || height > max_side) {
+                let scale = (max_side as f64 / width as f64).min(max_side as f64 / height as f64);
+                let target_width = ((width as f64) * scale).round().max(1.0) as u32;
+                let target_height = ((height as f64) * scale).round().max(1.0) as u32;
+
+                let Some(img) = image::RgbaImage::from_raw(width, height, pixels) else {
+                    return Err("Failed to build RGBA image for static resizing".to_string());
+                };
+
+                let resized = image::imageops::resize(
+                    &img,
+                    target_width,
+                    target_height,
+                    downscale_filter,
+                );
+                pixels = resized.into_raw();
+                width = target_width;
+                height = target_height;
+            }
+        }
 
         let frame = ImageFrame {
-            pixels: rgba.into_raw(),
+            pixels,
             width,
             height,
             delay_ms: 0,
