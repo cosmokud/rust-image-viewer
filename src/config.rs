@@ -369,6 +369,8 @@ pub struct Config {
     pub manga_arrow_scroll_speed: f32,
     /// Masonry mode: number of items per row
     pub masonry_items_per_row: usize,
+    /// Masonry mode: delay before hover autoplay resumes after interaction stops (milliseconds)
+    pub manga_hover_autoplay_resume_delay_ms: u64,
     /// Manga mode: when true, consume wheel input with the same smooth cadence as arrow keys.
     pub manga_wheel_smooth_like_arrow_keys: bool,
     /// Manga mode autoscroll: dead zone radius around the anchor (px).
@@ -478,6 +480,7 @@ impl Config {
             manga_wheel_multiplier: 1.5,
             manga_arrow_scroll_speed: 140.0,
             masonry_items_per_row: 5,
+            manga_hover_autoplay_resume_delay_ms: 220,
             manga_wheel_smooth_like_arrow_keys: true,
             manga_autoscroll_dead_zone_px: 14.0,
             manga_autoscroll_base_speed_multiplier: 5.0,
@@ -851,6 +854,16 @@ impl Config {
                                 config.masonry_items_per_row = v.clamp(2, 10);
                             }
                         }
+                        "manga_hover_autoplay_resume_delay_ms"
+                        | "masonry_hover_autoplay_resume_delay_ms"
+                        | "hover_autoplay_resume_delay_ms" => {
+                            if let Ok(v) = value.parse::<f32>() {
+                                if v.is_finite() {
+                                    config.manga_hover_autoplay_resume_delay_ms =
+                                        v.round().clamp(0.0, 5000.0) as u64;
+                                }
+                            }
+                        }
                         "manga_wheel_smooth_like_arrow_keys"
                         | "manga_wheel_smooth_match_arrow_keys"
                         | "manga_wheel_arrow_smooth_sync" => {
@@ -1183,6 +1196,10 @@ impl Config {
         values.insert(
             "masonry_items_per_row",
             format!("{}", self.masonry_items_per_row),
+        );
+        values.insert(
+            "manga_hover_autoplay_resume_delay_ms",
+            format!("{}", self.manga_hover_autoplay_resume_delay_ms),
         );
         values.insert(
             "manga_wheel_smooth_like_arrow_keys",

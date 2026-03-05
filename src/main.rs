@@ -3725,7 +3725,19 @@ impl ImageViewer {
             return None;
         }
 
-        let focused_idx = self.manga_get_focused_media_index();
+        let focused_idx = if self.is_masonry_mode() {
+            if Instant::now() < self.manga_hover_autoplay_resume_at {
+                return None;
+            }
+
+            let Some(hovered_idx) = self.manga_hovered_media_index else {
+                return None;
+            };
+            hovered_idx
+        } else {
+            self.manga_get_focused_media_index()
+        };
+
         let focused_is_animated = self
             .manga_loader
             .as_ref()
@@ -4020,7 +4032,7 @@ impl ImageViewer {
         let viewport_bottom = viewport_top + viewport_h;
         let vis_start = self.manga_index_at_y(viewport_top);
         let vis_end = self.manga_index_at_y(viewport_bottom);
-        // ── Start streaming for the focused animated item only ──
+        // ── Start/prepare animation source for the focused animated item only ──
         if let Some(idx) = focused_anim_idx {
             // Already have the full animation?
             if !(self.manga_animated_images.contains_key(&idx)
@@ -4037,34 +4049,54 @@ impl ImageViewer {
                 if let Some(path) = self.image_list.get(idx).cloned() {
                     let max_tex = self.max_texture_side;
 
-                    if let Some(rx) =
-                        LoadedImage::start_streaming_webp(&path, Some(max_tex), active_gif_filter)
-                    {
-                        self.manga_anim_streams.insert(idx, rx);
-                        self.manga_anim_stream_done.insert(idx, false);
+                    if LoadedImage::is_animated_webp(&path) {
+                        if let Some(rx) =
+                            LoadedImage::start_streaming_webp(&path, Some(max_tex), active_gif_filter)
+                        {
+                            self.manga_anim_streams.insert(idx, rx);
+                            self.manga_anim_stream_done.insert(idx, false);
 
-                        // Ensure there's a LoadedImage entry with at least the first frame.
-                        if !self.manga_animated_images.contains_key(&idx) {
-                            if let Ok(img) = LoadedImage::load_first_frame_only(
-                                &path,
-                                Some(max_tex),
-                                active_downscale_filter,
-                                active_gif_filter,
-                            ) {
+                            // Ensure there's a LoadedImage entry with at least the first frame.
+                            if !self.manga_animated_images.contains_key(&idx) {
+                                if let Ok(img) = LoadedImage::load_first_frame_only(
+                                    &path,
+                                    Some(max_tex),
+                                    active_downscale_filter,
+                                    active_gif_filter,
+                                ) {
+                                    self.manga_animated_images.insert(idx, img);
+                                }
+                            }
+                            let base_frames = self
+                                .manga_animated_images
+                                .get(&idx)
+                                .map(|img| img.frame_count())
+                                .unwrap_or(1);
+                            self.manga_anim_seekbar_total_frames
+                                .entry(idx)
+                                .or_insert(base_frames);
+                        } else {
+                            self.manga_anim_failed.insert(idx);
+                        }
+                    } else {
+                        // GIF (and any other non-WebP animated image): load the full animation directly.
+                        match LoadedImage::load_with_max_texture_side(
+                            &path,
+                            Some(max_tex),
+                            active_downscale_filter,
+                            active_gif_filter,
+                        ) {
+                            Ok(img) if img.is_animated() => {
+                                let total_frames = img.frame_count();
                                 self.manga_animated_images.insert(idx, img);
+                                self.manga_anim_stream_done.insert(idx, true);
+                                self.manga_anim_seekbar_total_frames
+                                    .insert(idx, total_frames.max(1));
+                            }
+                            _ => {
+                                self.manga_anim_failed.insert(idx);
                             }
                         }
-                        let base_frames = self
-                            .manga_animated_images
-                            .get(&idx)
-                            .map(|img| img.frame_count())
-                            .unwrap_or(1);
-                        self.manga_anim_seekbar_total_frames
-                            .entry(idx)
-                            .or_insert(base_frames);
-                    } else {
-                        // Not actually an animated WebP — mark as failed so we don't retry.
-                        self.manga_anim_failed.insert(idx);
                     }
                 }
             }
@@ -6159,20 +6191,31 @@ impl ImageViewer {
                 }
 
                 if is_animated_image {
-                    let icon_bg_rect =
-                        egui::Rect::from_center_size(image_rect.center(), egui::Vec2::splat(60.0));
-                    ui.painter().rect_filled(
-                        icon_bg_rect,
-                        30.0,
-                        egui::Color32::from_rgba_unmultiplied(0, 0, 0, 160),
-                    );
-                    ui.painter().text(
-                        image_rect.center(),
-                        egui::Align2::CENTER_CENTER,
-                        "▶",
-                        egui::FontId::proportional(32.0),
-                        egui::Color32::WHITE,
-                    );
+                    let is_actively_animating = self.manga_focused_anim_index == Some(idx)
+                        && !self.gif_paused
+                        && self
+                            .manga_animated_images
+                            .get(&idx)
+                            .is_some_and(|img| img.is_animated());
+
+                    if !is_actively_animating {
+                        let icon_bg_rect = egui::Rect::from_center_size(
+                            image_rect.center(),
+                            egui::Vec2::splat(60.0),
+                        );
+                        ui.painter().rect_filled(
+                            icon_bg_rect,
+                            30.0,
+                            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 160),
+                        );
+                        ui.painter().text(
+                            image_rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            "▶",
+                            egui::FontId::proportional(32.0),
+                            egui::Color32::WHITE,
+                        );
+                    }
                 }
 
                 if Self::manga_texture_upgrade_needed(tex_w.max(tex_h), retry_target_side) {
@@ -6940,7 +6983,8 @@ impl ImageViewer {
 
             if navigation_active {
                 self.manga_hover_autoplay_resume_at =
-                    Instant::now() + Duration::from_millis(220);
+                    Instant::now()
+                        + Duration::from_millis(self.config.manga_hover_autoplay_resume_delay_ms);
             }
         }
 
