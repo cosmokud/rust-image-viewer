@@ -40,12 +40,21 @@ const MAX_PENDING_UPLOADS: usize = 32;
 
 /// Maximum number of images to keep in the texture cache.
 /// Beyond this, the oldest entries are evicted to control VRAM usage.
-const MAX_CACHED_TEXTURES: usize = 128;
+const MAX_CACHED_TEXTURES: usize = 64;
 
-const DEFAULT_PRELOAD_BUFFER_AHEAD: usize = 4;
-const DEFAULT_PRELOAD_BUFFER_BEHIND: usize = 2;
-const DEFAULT_MIN_PRELOAD: usize = 4;
-const DEFAULT_MAX_PRELOAD: usize = 96;
+/// Fixed buffer to add AHEAD of visible pages (in scroll direction) for preloading.
+/// If 14 pages are visible and scrolling down, we preload 14 + 4 = 18 ahead.
+const PRELOAD_BUFFER_AHEAD: usize = 4;
+
+/// Fixed buffer to add BEHIND visible pages (opposite scroll direction) for preloading.
+/// If 14 pages are visible and scrolling down, we preload 14 + 2 = 16 behind.
+const PRELOAD_BUFFER_BEHIND: usize = 2;
+
+/// Minimum preload counts (even when only 1 page is visible)
+const MIN_PRELOAD: usize = 4;
+
+/// Maximum preload counts (to prevent excessive memory usage)
+const MAX_PRELOAD: usize = 48;
 
 /// If the visible index jumps by more than this many pages, treat it as a "large jump".
 ///
@@ -54,26 +63,14 @@ const LARGE_JUMP_INDEX_THRESHOLD: usize = 32;
 
 /// Batch size for GPU texture uploads per frame.
 /// Uploading too many textures in one frame can cause stutters.
-#[allow(dead_code)]
 const UPLOAD_BATCH_SIZE: usize = 4;
 
-const DEFAULT_DIM_REQUEST_BATCH_SIZE: usize = 128;
-const DEFAULT_DIM_RESULT_CHUNK_SIZE: usize = 96;
+/// Maximum number of dimension probe items to include in a single request.
+/// Larger values increase background throughput but can increase burstiness.
+const DIM_REQUEST_BATCH_SIZE: usize = 64;
 
-const DEFAULT_VIDEO_PROBE_TIMEOUT_MS: u64 = 220;
-const DEFAULT_VIDEO_THUMBNAIL_TIMEOUT_MS: u64 = 650;
-
-fn fast_image_dimensions(path: &std::path::Path) -> Option<(u32, u32)> {
-    imagesize::size(path)
-        .ok()
-        .and_then(|dim| {
-            let w = u32::try_from(dim.width).ok()?;
-            let h = u32::try_from(dim.height).ok()?;
-            Some((w, h))
-        })
-        .or_else(|| image::image_dimensions(path).ok())
-        .filter(|(w, h)| *w > 0 && *h > 0)
-}
+/// Maximum number of dimension results bundled into a single result message.
+const DIM_RESULT_CHUNK_SIZE: usize = 64;
 
 /// Base backoff for decode retries after a failed/empty preload.
 const PRELOAD_RETRY_BASE_DELAY_MS: u64 = 250;
@@ -113,8 +110,6 @@ pub struct LoadRequest {
     pub generation: usize,
     pub index: usize,
     pub path: PathBuf,
-    /// Maximum texture side used for video thumbnail extraction fallback.
-    /// Static/animated image decode stays full-resolution for GPU-side scaling.
     pub max_texture_side: u32,
     pub priority: i32, // Lower = higher priority
 }
@@ -134,33 +129,6 @@ struct DimResult {
 struct RetryState {
     attempts: u8,
     next_retry_at: Instant,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct MangaLoaderSettings {
-    pub preload_buffer_ahead: usize,
-    pub preload_buffer_behind: usize,
-    pub min_preload: usize,
-    pub max_preload: usize,
-    pub dim_request_batch_size: usize,
-    pub dim_result_chunk_size: usize,
-    pub video_probe_timeout_ms: u64,
-    pub video_thumbnail_timeout_ms: u64,
-}
-
-impl Default for MangaLoaderSettings {
-    fn default() -> Self {
-        Self {
-            preload_buffer_ahead: DEFAULT_PRELOAD_BUFFER_AHEAD,
-            preload_buffer_behind: DEFAULT_PRELOAD_BUFFER_BEHIND,
-            min_preload: DEFAULT_MIN_PRELOAD,
-            max_preload: DEFAULT_MAX_PRELOAD,
-            dim_request_batch_size: DEFAULT_DIM_REQUEST_BATCH_SIZE,
-            dim_result_chunk_size: DEFAULT_DIM_RESULT_CHUNK_SIZE,
-            video_probe_timeout_ms: DEFAULT_VIDEO_PROBE_TIMEOUT_MS,
-            video_thumbnail_timeout_ms: DEFAULT_VIDEO_THUMBNAIL_TIMEOUT_MS,
-        }
-    }
 }
 
 /// High-performance manga image loader with parallel decoding.
@@ -200,9 +168,6 @@ pub struct MangaLoader {
     pub stats: LoaderStats,
     /// Estimated number of pages visible on screen (for adaptive preloading)
     visible_page_count: usize,
-    /// Runtime tuning settings (cache/probe/preload behavior).
-    /// Shared with worker/coordinator threads so settings can be updated live.
-    settings: Arc<RwLock<MangaLoaderSettings>>,
 }
 
 /// Statistics for monitoring loader performance.
@@ -215,10 +180,6 @@ pub struct LoaderStats {
 impl MangaLoader {
     /// Create a new manga loader with background thread pool.
     pub fn new() -> Self {
-        Self::new_with_settings(MangaLoaderSettings::default())
-    }
-
-    pub fn new_with_settings(settings: MangaLoaderSettings) -> Self {
         // Create bounded channels to prevent unbounded memory growth
         let (request_tx, request_rx) = crossbeam_channel::bounded::<LoadRequest>(256);
         let (result_tx, result_rx) =
@@ -232,7 +193,6 @@ impl MangaLoader {
         let retry_state = Arc::new(RwLock::new(HashMap::new()));
         let shutdown = Arc::new(AtomicBool::new(false));
         let generation = Arc::new(AtomicUsize::new(0));
-        let settings_shared = Arc::new(RwLock::new(settings));
 
         // Spawn a coordinator thread that processes requests using Rayon
         let loading_clone = Arc::clone(&loading_indices);
@@ -240,7 +200,6 @@ impl MangaLoader {
         let retry_clone = Arc::clone(&retry_state);
         let shutdown_clone = Arc::clone(&shutdown);
         let generation_clone = Arc::clone(&generation);
-        let coordinator_settings = Arc::clone(&settings_shared);
 
         std::thread::Builder::new()
             .name("manga-loader-coordinator".into())
@@ -253,21 +212,13 @@ impl MangaLoader {
                     retry_clone,
                     shutdown_clone,
                     generation_clone,
-                    coordinator_settings,
                 );
             })
             .expect("Failed to spawn manga loader coordinator thread");
 
         // Spawn a lightweight dimension probe worker.
         // This keeps file header reads (image::image_dimensions) off the UI thread.
-        //
-        // IMPORTANT: The worker processes ALL images in a batch first, then videos.
-        // Image header reads are ~microseconds while video probes can take hundreds
-        // of milliseconds (GStreamer pipeline startup).  Processing images first and
-        // sending partial results immediately ensures the masonry layout gets real
-        // aspect ratios for images without waiting on slow video probes.
         let shutdown_clone = Arc::clone(&shutdown);
-        let dim_worker_settings = Arc::clone(&settings_shared);
         std::thread::Builder::new()
             .name("manga-dimension-worker".into())
             .spawn(move || {
@@ -280,60 +231,52 @@ impl MangaLoader {
                         Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
                     };
 
-                    let dim_worker_settings = *dim_worker_settings.read();
-                    let gen = req.generation;
-
-                    // Partition into images and videos so images are probed first.
-                    let mut images: Vec<(usize, PathBuf)> = Vec::new();
-                    let mut videos: Vec<(usize, PathBuf)> = Vec::new();
-                    for (idx, path) in req.items {
-                        if is_supported_video(&path) {
-                            videos.push((idx, path));
-                        } else if is_supported_image(&path) {
-                            images.push((idx, path));
-                        }
-                    }
-
-                    // --- Phase 1: Probe all images (fast, ~microseconds each) ---
                     let mut out: Vec<(usize, u32, u32, MangaMediaType)> =
-                        Vec::with_capacity(images.len());
-                    for (idx, path) in images {
-                        if shutdown_clone.load(Ordering::Relaxed) {
-                            return;
+                        Vec::with_capacity(req.items.len());
+                    for (idx, path) in req.items {
+                        let is_video = is_supported_video(&path);
+                        let is_image = is_supported_image(&path);
+
+                        let dims = if is_video {
+                            Self::probe_video_dimensions(&path)
+                        } else if is_image {
+                            image::image_dimensions(&path).ok()
+                        } else {
+                            None
+                        };
+
+                        if let Some((w, h)) = dims {
+                            let mt = if is_video {
+                                MangaMediaType::Video
+                            } else {
+                                MangaMediaType::StaticImage
+                            };
+                            out.push((idx, w, h, mt));
                         }
-                        if let Some((w, h)) = fast_image_dimensions(&path) {
-                            out.push((idx, w, h, MangaMediaType::StaticImage));
-                        }
-                        if out.len() >= dim_worker_settings.dim_result_chunk_size {
+
+                        if out.len() >= DIM_RESULT_CHUNK_SIZE {
                             let chunk = std::mem::take(&mut out);
-                            if dim_result_tx.send(DimResult { generation: gen, items: chunk }).is_err() {
+                            if dim_result_tx
+                                .send(DimResult {
+                                    generation: req.generation,
+                                    items: chunk,
+                                })
+                                .is_err()
+                            {
                                 return;
                             }
-                        }
-                    }
-                    // Flush remaining image results immediately so the UI gets them
-                    // before we start the slow video probes.
-                    if !out.is_empty() {
-                        if dim_result_tx.send(DimResult { generation: gen, items: std::mem::take(&mut out) }).is_err() {
-                            return;
                         }
                     }
 
-                    // --- Phase 2: Probe videos (slow, ~100-220ms each) ---
-                    // Send each video result individually so one slow video doesn't
-                    // delay results for subsequent videos.
-                    for (idx, path) in videos {
-                        if shutdown_clone.load(Ordering::Relaxed) {
+                    if !out.is_empty() {
+                        if dim_result_tx
+                            .send(DimResult {
+                                generation: req.generation,
+                                items: out,
+                            })
+                            .is_err()
+                        {
                             return;
-                        }
-                        if let Some((w, h)) = Self::probe_video_dimensions(
-                            &path,
-                            dim_worker_settings.video_probe_timeout_ms,
-                        ) {
-                            let item = vec![(idx, w, h, MangaMediaType::Video)];
-                            if dim_result_tx.send(DimResult { generation: gen, items: item }).is_err() {
-                                return;
-                            }
                         }
                     }
                 }
@@ -357,16 +300,7 @@ impl MangaLoader {
             current_generation: 0,
             stats: LoaderStats::default(),
             visible_page_count: 1,
-            settings: settings_shared,
         }
-    }
-
-    /// Update loader tuning settings at runtime.
-    ///
-    /// Used by masonry mode to apply live row-scaled optimization values while
-    /// the user changes density via the rows slider.
-    pub fn update_settings(&mut self, settings: MangaLoaderSettings) {
-        *self.settings.write() = settings;
     }
 
     /// Number of indices currently being decoded on background workers.
@@ -396,31 +330,30 @@ impl MangaLoader {
             return;
         }
 
-        // Build a bounded batch of missing indices, prioritized around the current
-        // visible center of this range so on-screen placeholders get real metadata first.
-        let center = self.last_visible_index.clamp(start, end - 1);
-        let mut ordered_indices: Vec<usize> = Vec::with_capacity(end - start);
-        ordered_indices.push(center);
-        let mut delta = 1usize;
-        while ordered_indices.len() < (end - start) {
-            if let Some(left) = center.checked_sub(delta) {
-                if left >= start {
-                    ordered_indices.push(left);
-                }
+        // Build a bounded batch of missing indices.
+        let mut items: Vec<(usize, PathBuf)> = Vec::new();
+        for idx in start..end {
+            if items.len() >= DIM_REQUEST_BATCH_SIZE {
+                break;
             }
 
-            let right = center + delta;
-            if right < end {
-                ordered_indices.push(right);
+            if self.dimension_cache.contains_key(&idx) || self.dim_pending.contains(&idx) {
+                continue;
             }
 
-            delta += 1;
+            let path = match image_list.get(idx) {
+                Some(p) => p.clone(),
+                None => continue,
+            };
+
+            // Only request for supported media.
+            if !is_supported_image(&path) && !is_supported_video(&path) {
+                continue;
+            }
+
+            items.push((idx, path));
         }
 
-        self.request_dimensions_indices(image_list, &ordered_indices);
-    }
-
-    fn enqueue_dimension_probe_items(&mut self, items: Vec<(usize, PathBuf)>) {
         if items.is_empty() {
             return;
         }
@@ -444,59 +377,6 @@ impl MangaLoader {
         }
     }
 
-    /// Queue async dimension probes for explicit indices in caller-defined priority order.
-    ///
-    /// Indices outside bounds, duplicates, unsupported media, cached entries, and
-    /// already-pending entries are skipped.
-    pub fn request_dimensions_indices(
-        &mut self,
-        image_list: &[PathBuf],
-        ordered_indices: &[usize],
-    ) {
-        if image_list.is_empty() || ordered_indices.is_empty() {
-            return;
-        }
-
-        let settings = *self.settings.read();
-
-        let mut image_items: Vec<(usize, PathBuf)> = Vec::new();
-        let mut video_items: Vec<(usize, PathBuf)> = Vec::new();
-        let mut seen_indices: HashSet<usize> = HashSet::new();
-
-        for &idx in ordered_indices {
-            if image_items.len() + video_items.len() >= settings.dim_request_batch_size {
-                break;
-            }
-
-            if idx >= image_list.len() || !seen_indices.insert(idx) {
-                continue;
-            }
-
-            if self.dimension_cache.contains_key(&idx) || self.dim_pending.contains(&idx) {
-                continue;
-            }
-
-            let path = match image_list.get(idx) {
-                Some(p) => p.clone(),
-                None => continue,
-            };
-
-            if is_supported_video(&path) {
-                video_items.push((idx, path));
-            } else if is_supported_image(&path) {
-                image_items.push((idx, path));
-            }
-        }
-
-        // Send images and videos together in one batch.
-        // The worker processes images first (fast), then videos (slow),
-        // sending partial results between phases so images are never
-        // blocked by slow video GStreamer probes.
-        let mut items = image_items;
-        items.extend(video_items);
-        self.enqueue_dimension_probe_items(items);
-    }
-
     /// Drain async dimension results and apply them to `dimension_cache`.
     /// Returns indices whose dimensions were updated.
     pub fn poll_dimension_results(&mut self, max_messages: usize) -> Vec<usize> {
@@ -517,18 +397,9 @@ impl MangaLoader {
             }
 
             for (idx, w, h, mt) in res.items {
-                // Layout-affecting change check: only width/height should trigger relayout.
-                // Media-type-only transitions (e.g. StaticImage -> AnimatedImage) should not
-                // invalidate masonry geometry and cause viewport jitter.
-                let changed = self
-                    .dimension_cache
-                    .get(&idx)
-                    .map_or(true, |(old_w, old_h, _)| *old_w != w || *old_h != h);
                 self.dimension_cache.insert(idx, (w, h, mt));
                 self.dim_pending.remove(&idx);
-                if changed {
-                    updated.push(idx);
-                }
+                updated.push(idx);
             }
         }
 
@@ -544,7 +415,6 @@ impl MangaLoader {
         retry_state: Arc<RwLock<HashMap<usize, RetryState>>>,
         shutdown: Arc<AtomicBool>,
         generation: Arc<AtomicUsize>,
-        settings: Arc<RwLock<MangaLoaderSettings>>,
     ) {
         // Collect requests in batches for parallel processing
         let mut batch: Vec<LoadRequest> = Vec::with_capacity(16);
@@ -587,7 +457,6 @@ impl MangaLoader {
             // we prefer to drop the whole batch's outputs rather than clog the result channel
             // with stale work.
             let generation_changed = || generation.load(Ordering::Acquire) != current_gen;
-            let decode_settings = *settings.read();
 
             enum DecodeOutcome {
                 Skipped,
@@ -615,7 +484,7 @@ impl MangaLoader {
                 }
 
                 // Load the image
-                let decoded = Self::load_single_image(req, decode_settings);
+                let decoded = Self::load_single_image(req);
 
                 let outcome = match decoded {
                     Some(decoded) => DecodeOutcome::Decoded(decoded),
@@ -738,25 +607,15 @@ impl MangaLoader {
 
     /// Load a single image on a worker thread.
     /// For video files, this extracts the first frame as a thumbnail placeholder.
-    fn load_single_image(req: &LoadRequest, settings: MangaLoaderSettings) -> Option<DecodedImage> {
+    fn load_single_image(req: &LoadRequest) -> Option<DecodedImage> {
         // Determine media type
         let media_type = get_media_type(&req.path)?;
 
         match media_type {
             MediaType::Video => {
-                // Always resolve dimensions first so placeholders can use stable aspect ratio,
-                // even if first-frame extraction is slow or unavailable.
-                let probed_dims = Self::probe_video_dimensions(
-                    &req.path,
-                    settings.video_probe_timeout_ms,
-                );
-
-                // Then try to extract a first-frame thumbnail for visual preview.
-                match Self::extract_video_first_frame(
-                    &req.path,
-                    req.max_texture_side,
-                    settings.video_thumbnail_timeout_ms,
-                ) {
+                // For videos, try to extract the first frame as a thumbnail
+                // This provides a visual preview instead of a gray placeholder
+                match Self::extract_video_first_frame(&req.path, req.max_texture_side) {
                     Some((pixels, width, height, original_width, original_height)) => {
                         Some(DecodedImage {
                             index: req.index,
@@ -769,9 +628,11 @@ impl MangaLoader {
                         })
                     }
                     None => {
-                        // Metadata-only fallback: only emit if real dimensions were extracted.
-                        // Avoid speculative placeholders that can later correct and cause relayout slingshot.
-                        probed_dims.map(|(original_width, original_height)| DecodedImage {
+                        // Fallback: probe dimensions only, no thumbnail
+                        let (original_width, original_height) =
+                            Self::probe_video_dimensions(&req.path).unwrap_or((1920, 1080)); // Fallback to 1080p
+
+                        Some(DecodedImage {
                             index: req.index,
                             pixels: Vec::new(),
                             width: 0,
@@ -785,7 +646,7 @@ impl MangaLoader {
             }
             MediaType::Image => {
                 // Get original dimensions from file header first (fast, no decode)
-                let (original_width, original_height) = fast_image_dimensions(&req.path)?;
+                let (original_width, original_height) = image::image_dimensions(&req.path).ok()?;
 
                 // For animated WebP files we only decode the first frame here so that
                 // the manga scroll view isn't blocked by a potentially very expensive
@@ -799,7 +660,7 @@ impl MangaLoader {
                 let img = if is_animated_webp {
                     LoadedImage::load_first_frame_only(
                         &req.path,
-                        None,
+                        Some(req.max_texture_side),
                         downscale_filter,
                         gif_filter,
                     )
@@ -807,7 +668,7 @@ impl MangaLoader {
                 } else {
                     LoadedImage::load_with_max_texture_side(
                         &req.path,
-                        None,
+                        Some(req.max_texture_side),
                         downscale_filter,
                         gif_filter,
                     )
@@ -825,11 +686,20 @@ impl MangaLoader {
 
                 let frame = img.current_frame_data();
 
+                // Downscale if needed (should already be done by loader, but safety check)
+                let (width, height, pixels) = downscale_rgba_if_needed(
+                    frame.width,
+                    frame.height,
+                    &frame.pixels,
+                    req.max_texture_side,
+                    downscale_filter,
+                );
+
                 Some(DecodedImage {
                     index: req.index,
-                    pixels: frame.pixels.clone(),
-                    width: frame.width,
-                    height: frame.height,
+                    pixels: pixels.into_owned(),
+                    width,
+                    height,
                     original_width,
                     original_height,
                     media_type: manga_media_type,
@@ -838,101 +708,30 @@ impl MangaLoader {
         }
     }
 
-    fn ensure_gstreamer_initialized() -> bool {
-        use gstreamer as gst;
-        static GST_INIT: std::sync::OnceLock<Result<(), ()>> = std::sync::OnceLock::new();
-        GST_INIT.get_or_init(|| gst::init().map_err(|_| ())).is_ok()
-    }
+    /// Probe video dimensions without full decode (using file metadata if available)
+    fn probe_video_dimensions(path: &std::path::Path) -> Option<(u32, u32)> {
+        // For now, we use a simple heuristic based on common video resolutions
+        // In a production system, you'd use GStreamer's discoverer or ffprobe
+        // But since GStreamer init is expensive and should happen on main thread,
+        // we return a reasonable default and update dimensions when video is played
 
-    fn probe_video_dimensions_with_gstreamer(
-        path: &std::path::Path,
-        timeout_ms: u64,
-    ) -> Option<(u32, u32)> {
-        use gstreamer as gst;
-        use gstreamer::prelude::*;
-        use gstreamer_app as gst_app;
-        use gstreamer_video as gst_video;
-        use std::sync::{Arc, Mutex};
+        // Try to infer from filename patterns (e.g., "video_1080p.mp4")
+        let filename = path.file_name()?.to_string_lossy().to_lowercase();
 
-        if !Self::ensure_gstreamer_initialized() {
-            return None;
+        if filename.contains("4k") || filename.contains("2160") {
+            Some((3840, 2160))
+        } else if filename.contains("1440") || filename.contains("2k") {
+            Some((2560, 1440))
+        } else if filename.contains("1080") || filename.contains("fhd") {
+            Some((1920, 1080))
+        } else if filename.contains("720") || filename.contains("hd") {
+            Some((1280, 720))
+        } else if filename.contains("480") || filename.contains("sd") {
+            Some((854, 480))
+        } else {
+            // Default to 1080p for unknown videos
+            Some((1920, 1080))
         }
-
-        let uri = gst::glib::filename_to_uri(path, None).ok()?.to_string();
-        let pipeline_str = format!(
-            "uridecodebin uri=\"{}\" name=dec ! videoconvert ! videoscale ! \
-             video/x-raw,format=RGBA ! appsink name=sink max-buffers=1 drop=true",
-            uri.replace("\"", "\\\"")
-        );
-
-        let pipeline = gst::parse::launch(&pipeline_str).ok()?;
-        let pipeline = pipeline.downcast::<gst::Pipeline>().ok()?;
-
-        let appsink = pipeline
-            .by_name("sink")?
-            .dynamic_cast::<gst_app::AppSink>()
-            .ok()?;
-
-        let dims: Arc<Mutex<Option<(u32, u32)>>> = Arc::new(Mutex::new(None));
-        let dims_clone = Arc::clone(&dims);
-
-        appsink.set_callbacks(
-            gst_app::AppSinkCallbacks::builder()
-                .new_preroll(move |sink| {
-                    if let Ok(sample) = sink.pull_preroll() {
-                        if let Some(caps) = sample.caps() {
-                            if let Ok(video_info) = gst_video::VideoInfo::from_caps(caps) {
-                                if let Ok(mut slot) = dims_clone.lock() {
-                                    *slot = Some((video_info.width(), video_info.height()));
-                                }
-                            }
-                        }
-                    }
-                    Ok(gst::FlowSuccess::Ok)
-                })
-                .build(),
-        );
-
-        if pipeline.set_state(gst::State::Paused).is_err() {
-            let _ = pipeline.set_state(gst::State::Null);
-            return None;
-        }
-
-        let bus = pipeline.bus()?;
-        let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms.max(50));
-
-        while std::time::Instant::now() < deadline {
-            if let Ok(current) = dims.lock() {
-                if let Some((w, h)) = *current {
-                    if w > 0 && h > 0 {
-                        let _ = pipeline.set_state(gst::State::Null);
-                        return Some((w, h));
-                    }
-                }
-            }
-
-            if let Some(msg) = bus.timed_pop(gst::ClockTime::from_mseconds(30)) {
-                match msg.view() {
-                    gst::MessageView::Error(_) | gst::MessageView::Eos(_) => break,
-                    _ => {}
-                }
-            }
-        }
-
-        let _ = pipeline.set_state(gst::State::Null);
-
-        dims.lock()
-            .ok()
-            .and_then(|current| *current)
-            .filter(|(w, h)| *w > 0 && *h > 0)
-    }
-
-    /// Probe video dimensions using metadata-first strategy.
-    ///
-    /// Intentionally does not use filename heuristics to avoid speculative aspect ratios
-    /// that can later correct and disturb masonry layout.
-    fn probe_video_dimensions(path: &std::path::Path, timeout_ms: u64) -> Option<(u32, u32)> {
-        Self::probe_video_dimensions_with_gstreamer(path, timeout_ms)
     }
 
     /// Extract the first frame from a video file as a thumbnail.
@@ -945,15 +744,18 @@ impl MangaLoader {
     fn extract_video_first_frame(
         path: &std::path::Path,
         max_texture_side: u32,
-        timeout_ms: u64,
     ) -> Option<(Vec<u8>, u32, u32, u32, u32)> {
         use gstreamer as gst;
         use gstreamer::prelude::*;
         use gstreamer_app as gst_app;
         use gstreamer_video as gst_video;
         use std::sync::{Arc, Mutex};
+        use std::time::Duration;
 
-        if !Self::ensure_gstreamer_initialized() {
+        // Initialize GStreamer if needed (static check to avoid repeated init)
+        static GST_INIT: std::sync::OnceLock<Result<(), ()>> = std::sync::OnceLock::new();
+        let init_result = GST_INIT.get_or_init(|| gst::init().map_err(|_| ()));
+        if init_result.is_err() {
             return None;
         }
 
@@ -1010,12 +812,12 @@ impl MangaLoader {
             return None;
         }
 
-        // Wait for state change or timeout.
+        // Wait for state change or timeout (500ms max for responsiveness)
         let bus = pipeline.bus()?;
         let mut got_frame = false;
 
         // Wait for ASYNC_DONE or ERROR, with timeout
-        let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms.max(100));
+        let deadline = std::time::Instant::now() + Duration::from_millis(500);
         while std::time::Instant::now() < deadline {
             if let Some(msg) = bus.timed_pop(gst::ClockTime::from_mseconds(50)) {
                 match msg.view() {
@@ -1093,14 +895,10 @@ impl MangaLoader {
     /// Returns (preload_ahead, preload_behind)
     fn calculate_preload_counts(&self) -> (usize, usize) {
         let visible_pages = self.visible_page_count.max(1);
-        let settings = *self.settings.read();
 
-        let min_preload = settings.min_preload.max(1);
-        let max_preload = settings.max_preload.max(min_preload);
-
-        // More buffer ahead (in scroll direction), less behind.
-        let ahead = (visible_pages + settings.preload_buffer_ahead).clamp(min_preload, max_preload);
-        let behind = (visible_pages + settings.preload_buffer_behind).clamp(min_preload, max_preload);
+        // More buffer ahead (in scroll direction), less behind
+        let ahead = (visible_pages + PRELOAD_BUFFER_AHEAD).clamp(MIN_PRELOAD, MAX_PRELOAD);
+        let behind = (visible_pages + PRELOAD_BUFFER_BEHIND).clamp(MIN_PRELOAD, MAX_PRELOAD);
 
         (ahead, behind)
     }
@@ -1264,164 +1062,23 @@ impl MangaLoader {
         self.stats.images_pending = self.loading_indices.read().len();
     }
 
-    /// Request loading of media around an explicit symmetric/asymmetric window.
-    ///
-    /// This is used by masonry mode's staged texture loading strategy where
-    /// metadata probing and texture decoding are intentionally decoupled.
-    pub fn request_decode_range(
-        &mut self,
-        image_list: &[PathBuf],
-        visible_index: usize,
-        behind: usize,
-        ahead: usize,
-        max_texture_side: u32,
-        urgent_visible: bool,
-    ) {
-        if image_list.is_empty() {
-            return;
-        }
-
-        let visible_index = visible_index.min(image_list.len().saturating_sub(1));
-
-        // Keep jump-cancellation and direction tracking behavior consistent with
-        // `update_preload_queue`.
-        let prev_visible_index = self.last_visible_index;
-        let index_delta = visible_index.abs_diff(prev_visible_index);
-        let is_large_jump = index_delta > LARGE_JUMP_INDEX_THRESHOLD;
-        if is_large_jump {
-            self.cancel_pending_loads();
-        }
-
-        if visible_index > prev_visible_index {
-            self.scroll_direction = 1;
-        } else if visible_index < prev_visible_index {
-            self.scroll_direction = -1;
-        }
-        self.last_visible_index = visible_index;
-
-        let start_idx = visible_index.saturating_sub(behind);
-        let end_idx = (visible_index.saturating_add(ahead).saturating_add(1)).min(image_list.len());
-        if start_idx >= end_idx {
-            return;
-        }
-
-        let mut requests: Vec<LoadRequest> = Vec::new();
-        let generation = self.current_generation;
-        let now = Instant::now();
-
-        {
-            let loading = self.loading_indices.read();
-            let loaded = self.loaded_indices.read();
-            let retry = self.retry_state.read();
-
-            for idx in start_idx..end_idx {
-                let is_image = is_supported_image(&image_list[idx]);
-                let is_video = is_supported_video(&image_list[idx]);
-                if !is_image && !is_video {
-                    continue;
-                }
-
-                if loading.contains(&idx) || loaded.contains(&idx) {
-                    continue;
-                }
-
-                if let Some(retry_state) = retry.get(&idx) {
-                    let retry_due = now >= retry_state.next_retry_at;
-                    let can_retry_here = idx == visible_index;
-                    if !retry_due || !can_retry_here {
-                        continue;
-                    }
-                }
-
-                let distance = (idx as i32 - visible_index as i32).abs();
-                let direction_bonus = if self.scroll_direction > 0 {
-                    if idx > visible_index {
-                        0
-                    } else {
-                        10
-                    }
-                } else if idx < visible_index {
-                    0
-                } else {
-                    10
-                };
-
-                let priority = if idx == visible_index && (urgent_visible || is_large_jump) {
-                    -100_000
-                } else {
-                    distance + direction_bonus
-                };
-
-                requests.push(LoadRequest {
-                    generation,
-                    index: idx,
-                    path: image_list[idx].clone(),
-                    max_texture_side,
-                    priority,
-                });
-            }
-        }
-
-        requests.sort_by_key(|r| r.priority);
-        for req in requests {
-            let idx = req.index;
-            match self.request_tx.try_send(req) {
-                Ok(()) => {
-                    self.loading_indices.write().insert(idx);
-                }
-                Err(TrySendError::Full(_req)) => {
-                    break;
-                }
-                Err(TrySendError::Disconnected(_req)) => {
-                    break;
-                }
-            }
-        }
-
-        self.stats.images_pending = self.loading_indices.read().len();
-    }
-
     /// Poll for decoded images ready for GPU upload.
     /// Returns up to UPLOAD_BATCH_SIZE images per call to avoid frame drops.
-    #[allow(dead_code)]
     pub fn poll_decoded_images(&mut self) -> Vec<DecodedImage> {
-        self.poll_decoded_images_limited(UPLOAD_BATCH_SIZE)
-    }
+        let mut results = Vec::with_capacity(UPLOAD_BATCH_SIZE);
 
-    /// Poll decoded images and also return indices whose dimension metadata changed.
-    pub fn poll_decoded_images_with_dimension_updates(
-        &mut self,
-        max_images: usize,
-    ) -> (Vec<DecodedImage>, Vec<usize>) {
-        if max_images == 0 {
-            return (Vec::new(), Vec::new());
-        }
-
-        let mut results = Vec::with_capacity(max_images);
-        let mut dim_updates = Vec::new();
-
-        for _ in 0..max_images {
+        for _ in 0..UPLOAD_BATCH_SIZE {
             match self.result_rx.try_recv() {
                 Ok(decoded) => {
-                    let new_meta = (
-                        decoded.original_width,
-                        decoded.original_height,
-                        decoded.media_type,
+                    // Cache dimensions and media type for stable layout
+                    self.dimension_cache.insert(
+                        decoded.index,
+                        (
+                            decoded.original_width,
+                            decoded.original_height,
+                            decoded.media_type,
+                        ),
                     );
-                    // Layout-affecting change check: only width/height should trigger relayout.
-                    // Media-type-only transitions are expected and should remain geometry-stable.
-                    let changed = self
-                        .dimension_cache
-                        .get(&decoded.index)
-                        .map_or(true, |(old_w, old_h, _)| {
-                            *old_w != decoded.original_width || *old_h != decoded.original_height
-                        });
-
-                    self.dimension_cache.insert(decoded.index, new_meta);
-                    if changed {
-                        dim_updates.push(decoded.index);
-                    }
-
                     results.push(decoded);
                     self.stats.images_loaded += 1;
                 }
@@ -1429,12 +1086,7 @@ impl MangaLoader {
             }
         }
 
-        (results, dim_updates)
-    }
-
-    /// Poll for decoded images ready for GPU upload with a caller-specified cap.
-    pub fn poll_decoded_images_limited(&mut self, max_images: usize) -> Vec<DecodedImage> {
-        self.poll_decoded_images_with_dimension_updates(max_images).0
+        results
     }
 
     /// Start async dimension caching for all images in the list.
@@ -1447,7 +1099,6 @@ impl MangaLoader {
 
         // Clear existing cache
         self.dimension_cache.clear();
-        let settings = *self.settings.read();
 
         // Cache first batch synchronously for immediate layout
         let initial_batch: Vec<(usize, Option<(u32, u32, MangaMediaType)>)> = image_list
@@ -1460,11 +1111,11 @@ impl MangaLoader {
 
                 if is_video {
                     // For videos, probe dimensions
-                    let dims = Self::probe_video_dimensions(path, settings.video_probe_timeout_ms);
+                    let dims = Self::probe_video_dimensions(path);
                     (idx, dims.map(|(w, h)| (w, h, MangaMediaType::Video)))
                 } else if is_image {
                     // For images, get from file header
-                    let dims = fast_image_dimensions(path);
+                    let dims = image::image_dimensions(path).ok();
                     // We can't easily determine if an image is animated without loading it
                     // Default to static, will be updated when actually loaded
                     (idx, dims.map(|(w, h)| (w, h, MangaMediaType::StaticImage)))
@@ -1699,38 +1350,6 @@ impl MangaTextureCache {
         }
     }
 
-    fn evict_oldest_entry(&mut self) -> Option<usize> {
-        let oldest = self
-            .entries
-            .iter()
-            .min_by_key(|(_, (_, _, _, _, frame))| *frame)
-            .map(|(&idx, _)| idx);
-
-        if let Some(oldest_idx) = oldest {
-            self.entries.remove(&oldest_idx);
-            Some(oldest_idx)
-        } else {
-            None
-        }
-    }
-
-    /// Update cache capacity at runtime.
-    /// Returns any indices evicted because of the new cap.
-    pub fn set_capacity(&mut self, max_entries: usize) -> Vec<usize> {
-        self.max_entries = max_entries.max(1);
-
-        let mut evicted = Vec::new();
-        while self.entries.len() > self.max_entries {
-            if let Some(idx) = self.evict_oldest_entry() {
-                evicted.push(idx);
-            } else {
-                break;
-            }
-        }
-
-        evicted
-    }
-
     /// Increment frame counter (call once per frame).
     pub fn tick(&mut self) {
         self.frame_counter += 1;
@@ -1830,7 +1449,15 @@ impl MangaTextureCache {
 
         // Evict oldest entries if at capacity
         while self.entries.len() >= self.max_entries {
-            if let Some(oldest_idx) = self.evict_oldest_entry() {
+            // Find oldest entry
+            let oldest = self
+                .entries
+                .iter()
+                .min_by_key(|(_, (_, _, _, _, frame))| *frame)
+                .map(|(&idx, _)| idx);
+
+            if let Some(oldest_idx) = oldest {
+                self.entries.remove(&oldest_idx);
                 evicted.push(oldest_idx);
             } else {
                 break;
