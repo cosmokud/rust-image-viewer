@@ -539,6 +539,9 @@ struct ImageViewer {
     masonry_layout_items_per_row: usize,
     masonry_layout_len: usize,
     masonry_layout_valid: bool,
+    /// Dimension/layout updates received while masonry navigation is active.
+    /// These are applied once motion settles to avoid repeated expensive relayouts.
+    masonry_layout_invalidation_deferred: bool,
 
     /// Whether startup metadata pre-scan is active for masonry mode.
     masonry_metadata_preload_active: bool,
@@ -772,6 +775,7 @@ impl Default for ImageViewer {
             masonry_layout_items_per_row: 0,
             masonry_layout_len: 0,
             masonry_layout_valid: false,
+            masonry_layout_invalidation_deferred: false,
 
             masonry_metadata_preload_active: false,
             masonry_metadata_preload_total: 0,
@@ -958,7 +962,33 @@ impl ImageViewer {
             limit += 2;
         }
 
+        // During active masonry navigation, prioritize frame-time consistency over fill rate.
+        // Keeping upload batches tiny avoids UI-thread upload bursts that cause micro-stutter.
+        if self.masonry_navigation_active_for_heavy_work() {
+            let hard_cap = if self.manga_scrollbar_dragging || self.is_panning {
+                2
+            } else {
+                3
+            };
+            return limit.clamp(Self::MANGA_UPLOAD_BATCH_MIN, hard_cap);
+        }
+
         limit.clamp(Self::MANGA_UPLOAD_BATCH_MIN, Self::MANGA_UPLOAD_BATCH_MAX)
+    }
+
+    fn masonry_navigation_active_for_heavy_work(&self) -> bool {
+        self.is_masonry_mode()
+            && (self.manga_scrollbar_dragging
+                || self.is_panning
+                || self.manga_autoscroll_active
+                || self.manga_zoom_plus_held
+                || self.manga_zoom_minus_held
+                || self.manga_wheel_scroll_pending.abs() > 0.01
+                || (self.manga_scroll_target - self.manga_scroll_offset).abs() > 0.25
+                || self.manga_scroll_velocity.abs() > 0.25
+                || self.manga_video_seeking
+                || self.manga_video_volume_dragging
+                || self.gif_seeking)
     }
 
     fn draw_fps_overlay(&self, ctx: &egui::Context) {
@@ -3120,6 +3150,7 @@ impl ImageViewer {
         self.manga_total_height_cache_valid = false;
         self.manga_layout_offsets.clear();
         self.masonry_layout_valid = false;
+        self.masonry_layout_invalidation_deferred = false;
     }
 
     fn invalidate_manga_layout_cache_for_zoom(&mut self) {
@@ -4784,6 +4815,8 @@ impl ImageViewer {
             return false;
         }
 
+        let defer_masonry_layout_work = self.masonry_navigation_active_for_heavy_work();
+
         let (pending_loads, pending_decoded) = self
             .manga_loader
             .as_ref()
@@ -4803,7 +4836,8 @@ impl ImageViewer {
 
             // Also poll async dimension probe results (header reads), applied incrementally.
             // Limiting messages per frame prevents layout updates from causing bursts of work.
-            let dim_updates = loader.poll_dimension_results(4);
+            let dim_poll_limit = if defer_masonry_layout_work { 1 } else { 4 };
+            let dim_updates = loader.poll_dimension_results(dim_poll_limit);
 
             (decoded_images, dim_updates)
         };
@@ -4814,9 +4848,11 @@ impl ImageViewer {
 
         // Dimension updates can change page heights; invalidate cached layout/prefix sums.
         if !dim_updates.is_empty() || has_decoded_video_dims {
-            self.manga_total_height_cache_valid = false;
-            self.manga_layout_offsets.clear();
-            self.masonry_layout_valid = false;
+            if defer_masonry_layout_work {
+                self.masonry_layout_invalidation_deferred = true;
+            } else {
+                self.invalidate_manga_layout_cache();
+            }
         }
 
         let dims_updated = !decoded_images.is_empty() || !dim_updates.is_empty();
@@ -6426,6 +6462,12 @@ impl ImageViewer {
 
         self.manga_prune_ttv_pending();
 
+        if self.masonry_layout_invalidation_deferred
+            && !self.masonry_navigation_active_for_heavy_work()
+        {
+            self.invalidate_manga_layout_cache();
+        }
+
         if self.is_masonry_mode() && self.masonry_metadata_preload_active {
             self.tick_masonry_metadata_preload();
             if self.masonry_metadata_preload_active {
@@ -7114,17 +7156,7 @@ impl ImageViewer {
         }
 
         if self.is_masonry_mode() {
-            let navigation_active = self.manga_scrollbar_dragging
-                || self.is_panning
-                || self.manga_autoscroll_active
-                || self.manga_zoom_plus_held
-                || self.manga_zoom_minus_held
-                || self.manga_wheel_scroll_pending.abs() > 0.01
-                || (self.manga_scroll_target - self.manga_scroll_offset).abs() > 0.25
-                || self.manga_scroll_velocity.abs() > 0.25
-                || self.manga_video_seeking
-                || self.manga_video_volume_dragging
-                || self.gif_seeking
+            let navigation_active = self.masonry_navigation_active_for_heavy_work()
                 || primary_down
                 || wheel_steps != 0.0
                 || wheel_steps_ctrl != 0.0
@@ -10576,7 +10608,13 @@ impl eframe::App for ImageViewer {
         // - Time-based auto-hide UI: repaint once at its deadline
         // - Fully idle: push repaint far into the future (event loop will still wake on input)
         if any_animation_active {
-            ctx.request_repaint();
+            if self.masonry_navigation_active_for_heavy_work() {
+                // Pace active masonry redraws near high-refresh cadence instead of spinning
+                // the UI thread as fast as possible under load.
+                ctx.request_repaint_after(Duration::from_millis(7));
+            } else {
+                ctx.request_repaint();
+            }
         } else if self.pending_media_layout {
             ctx.request_repaint_after(Duration::from_millis(16));
         } else if let Some(ref player) = self.video_player {
