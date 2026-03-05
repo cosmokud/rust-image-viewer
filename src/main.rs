@@ -1877,6 +1877,12 @@ impl ImageViewer {
 
         if !dim_updates.is_empty() {
             self.invalidate_manga_layout_cache();
+
+            // While masonry metadata is still being discovered, keep the selected file
+            // locked in view so late dimension updates don't drift to a different file.
+            if self.is_masonry_mode() {
+                self.scroll_strip_to_current_index();
+            }
         }
 
         self.masonry_metadata_preload_loaded = loaded_count;
@@ -1889,6 +1895,12 @@ impl ImageViewer {
             self.masonry_metadata_preload_loaded = total;
             self.masonry_metadata_preload_active = false;
             self.invalidate_manga_layout_cache();
+
+            // Final snap after full metadata resolves to guarantee exact targeting.
+            if self.is_masonry_mode() {
+                self.scroll_strip_to_current_index();
+            }
+
             self.manga_update_preload_queue();
         }
     }
