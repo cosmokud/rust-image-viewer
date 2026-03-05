@@ -530,6 +530,9 @@ struct ImageViewer {
     /// Set when GPU masonry renderer initialization panicked/failed on this machine.
     /// Prevents repeated init attempts from crashing the app.
     manga_gpu_renderer_failed: bool,
+    /// Number of frames to force CPU-only masonry drawing after layout/fullscreen transitions.
+    /// This prevents callback/render-state overlap while mode switches settle.
+    manga_gpu_transition_cooldown_frames: u8,
     /// Scratch buffer used to avoid per-frame allocations when preparing GPU callback inputs.
     manga_gpu_items_scratch: Vec<GpuMasonryInputItem>,
     /// Whether the scrollbar is being dragged
@@ -769,6 +772,7 @@ impl Default for ImageViewer {
             manga_texture_cache: MangaTextureCache::default(),
             manga_gpu_renderer: None,
             manga_gpu_renderer_failed: false,
+            manga_gpu_transition_cooldown_frames: 0,
             manga_gpu_items_scratch: Vec::new(),
             manga_scrollbar_dragging: false,
             manga_autoscroll_active: false,
@@ -1802,6 +1806,11 @@ impl ImageViewer {
         self.manga_anim_streams.clear();
         self.manga_anim_stream_done.clear();
         self.manga_focused_anim_index = None;
+    }
+
+    fn begin_manga_gpu_transition(&mut self) {
+        self.manga_gpu_transition_cooldown_frames =
+            self.manga_gpu_transition_cooldown_frames.max(2);
     }
 
     fn ensure_masonry_gpu_renderer(&mut self, frame: &eframe::Frame) {
@@ -3043,6 +3052,12 @@ impl ImageViewer {
             return;
         };
 
+        // Drop stale deferred toggles during fullscreen transitions or after leaving fullscreen.
+        // Applying these can re-enter strip mode at unsafe times.
+        if self.toggle_fullscreen || !self.is_fullscreen {
+            return;
+        }
+
         self.clear_strip_return_context();
         self.toggle_strip_mode(layout_mode);
     }
@@ -3072,6 +3087,8 @@ impl ImageViewer {
     }
 
     fn toggle_strip_mode(&mut self, layout_mode: MangaLayoutMode) {
+        self.begin_manga_gpu_transition();
+
         if !self.manga_mode {
             self.manga_layout_mode = layout_mode;
             self.toggle_manga_mode();
@@ -3227,6 +3244,8 @@ impl ImageViewer {
 
     /// Toggle manga reading mode on/off
     fn toggle_manga_mode(&mut self) {
+        self.begin_manga_gpu_transition();
+
         if !self.manga_mode {
             let current_media_dims = self.media_display_dimensions().or(self.video_texture_dims);
             let current_media_type = self.current_media_type;
@@ -5435,6 +5454,7 @@ impl ImageViewer {
                         } else {
                             MangaLayoutMode::LongStrip
                         });
+                        self.begin_manga_gpu_transition();
                         self.touch_bottom_overlays();
                     }
 
@@ -6948,7 +6968,9 @@ impl ImageViewer {
                     let viewport_bottom = viewport_top + screen_height;
                     let zoom = self.zoom.max(0.0001);
                     let allow_gpu_callback =
-                        !self.toggle_fullscreen && self.pending_strip_layout_toggle.is_none();
+                        !self.toggle_fullscreen
+                            && self.pending_strip_layout_toggle.is_none()
+                            && self.manga_gpu_transition_cooldown_frames == 0;
 
                     let draw_commands = self.manga_build_masonry_draw_commands(
                         viewport_top,
@@ -9981,6 +10003,10 @@ impl eframe::App for ImageViewer {
         // Update FPS stats for the debug overlay (and for general diagnostics).
         self.update_fps_stats();
 
+        if self.manga_gpu_transition_cooldown_frames > 0 {
+            self.manga_gpu_transition_cooldown_frames -= 1;
+        }
+
         // Lazily install large CJK fonts only when we actually have a filename that needs them.
         self.ensure_windows_cjk_fonts_if_needed(ctx);
 
@@ -10096,6 +10122,8 @@ impl eframe::App for ImageViewer {
 
         if self.toggle_fullscreen {
             self.stop_manga_autoscroll();
+            self.begin_manga_gpu_transition();
+            self.pending_strip_layout_toggle = None;
             let entering_fullscreen = !self.is_fullscreen;
             self.is_fullscreen = entering_fullscreen;
 
