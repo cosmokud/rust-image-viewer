@@ -283,7 +283,8 @@ Available texture filters: `nearest`, `linear`.
 
 - **Delay-loaded DLLs** — GStreamer DLLs are loaded on-demand, keeping memory low when viewing images only
 - **Parallel Image Decoding** — Manga mode uses Rayon thread pool for parallel loading
-- **LRU Texture Cache** — Efficient GPU memory management for large image collections
+- **Pinned + LRU Texture Cache (`lru`)** — Visible pages stay pinned while off-screen textures are evicted by recency
+- **Memory-mapped Media I/O (`memmap2`)** — Static/GIF/WebP decode paths use OS-backed mapping with buffered fallback
 - **Lock-free Communication** — Crossbeam channels for zero-contention multi-threading
 - **Adaptive Preloading** — Priority-based prefetching based on scroll direction
 

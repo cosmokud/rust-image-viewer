@@ -2,15 +2,32 @@
 //! Supports JPG, PNG, WEBP (including animated), animated GIF files, and video formats.
 //! Optimized for low memory usage while maintaining functionality.
 
+use std::fs::File;
+use std::io::{BufRead, BufReader, Cursor, Seek};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use image::imageops::FilterType;
 use image::GenericImageView;
+use memmap2::MmapOptions;
 
 // Reduced from 4 GiB to 512 MiB for more reasonable memory limits
 // This prevents loading extremely large images that would consume too much RAM
 const DEFAULT_MAX_DECODE_ALLOC_BYTES: u64 = 512 * 1024 * 1024; // 512 MiB
+
+trait BufReadSeek: BufRead + Seek {}
+impl<T: BufRead + Seek> BufReadSeek for T {}
+
+fn open_media_reader(path: &Path) -> Result<Box<dyn BufReadSeek>, String> {
+    let file = File::open(path).map_err(|e| format!("Failed to open file: {}", e))?;
+
+    // SAFETY: We keep the mapping owned inside `Cursor<Mmap>` and never mutate through it.
+    // If memory mapping fails (e.g. permission/platform constraints), we fall back to buffered I/O.
+    match unsafe { MmapOptions::new().map(&file) } {
+        Ok(mapped) => Ok(Box::new(Cursor::new(mapped))),
+        Err(_) => Ok(Box::new(BufReader::new(file))),
+    }
+}
 
 fn open_image_with_reasonable_limits(path: &Path) -> Result<image::DynamicImage, String> {
     // `image::open()` uses conservative decoder limits to protect against decompression bombs.
@@ -28,8 +45,7 @@ fn open_image_with_reasonable_limits(path: &Path) -> Result<image::DynamicImage,
     let max_alloc = estimated.clamp(256 * 1024 * 1024, DEFAULT_MAX_DECODE_ALLOC_BYTES);
     let max_alloc_u64 = max_alloc;
 
-    let mut reader =
-        image::ImageReader::open(path).map_err(|e| format!("Failed to open image: {}", e))?;
+    let mut reader = image::ImageReader::new(open_media_reader(path)?);
 
     // Best-effort format detection for cases where extensions are unusual.
     reader = reader
@@ -277,14 +293,11 @@ impl LoadedImage {
     ) {
         use image::codecs::webp::WebPDecoder;
         use image::AnimationDecoder;
-        use std::fs::File;
-        use std::io::BufReader;
 
-        let file = match File::open(path) {
-            Ok(f) => f,
+        let reader = match open_media_reader(path) {
+            Ok(r) => r,
             Err(_) => return,
         };
-        let reader = BufReader::new(file);
         let decoder = match WebPDecoder::new(reader) {
             Ok(d) => d,
             Err(_) => return,
@@ -372,8 +385,6 @@ impl LoadedImage {
     /// This is cheap — it only reads the file header, not any frame data.
     pub fn is_animated_webp(path: &Path) -> bool {
         use image::codecs::webp::WebPDecoder;
-        use std::fs::File;
-        use std::io::BufReader;
 
         let extension = path
             .extension()
@@ -385,11 +396,10 @@ impl LoadedImage {
             return false;
         }
 
-        let file = match File::open(path) {
-            Ok(f) => f,
+        let reader = match open_media_reader(path) {
+            Ok(r) => r,
             Err(_) => return false,
         };
-        let reader = BufReader::new(file);
         match WebPDecoder::new(reader) {
             Ok(dec) => dec.has_animation(),
             Err(_) => false,
@@ -405,11 +415,8 @@ impl LoadedImage {
     ) -> Result<Self, String> {
         use image::codecs::webp::WebPDecoder;
         use image::AnimationDecoder;
-        use std::fs::File;
-        use std::io::BufReader;
 
-        let file = File::open(path).map_err(|e| format!("Failed to open file: {}", e))?;
-        let reader = BufReader::new(file);
+        let reader = open_media_reader(path)?;
         let decoder =
             WebPDecoder::new(reader).map_err(|e| format!("Failed to decode WEBP: {}", e))?;
 
@@ -516,14 +523,13 @@ impl LoadedImage {
         gif_filter: FilterType,
     ) -> Result<Self, String> {
         use gif::DecodeOptions;
-        use std::fs::File;
 
-        let file = File::open(path).map_err(|e| format!("Failed to open file: {}", e))?;
+        let reader = open_media_reader(path)?;
         let mut decoder = DecodeOptions::new();
         decoder.set_color_output(gif::ColorOutput::RGBA);
 
         let mut decoder = decoder
-            .read_info(file)
+            .read_info(reader)
             .map_err(|e| format!("Failed to read GIF: {}", e))?;
 
         let mut frames = Vec::new();
@@ -664,11 +670,8 @@ impl LoadedImage {
     ) -> Result<Self, String> {
         use image::codecs::webp::WebPDecoder;
         use image::AnimationDecoder;
-        use std::fs::File;
-        use std::io::BufReader;
 
-        let file = File::open(path).map_err(|e| format!("Failed to open file: {}", e))?;
-        let reader = BufReader::new(file);
+        let reader = open_media_reader(path)?;
         let decoder =
             WebPDecoder::new(reader).map_err(|e| format!("Failed to decode WEBP: {}", e))?;
 

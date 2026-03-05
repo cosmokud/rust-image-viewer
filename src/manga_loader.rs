@@ -20,6 +20,7 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -28,6 +29,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, Sender, TrySendError};
 use fast_image_resize as fir;
 use image::imageops::FilterType;
+use lru::LruCache;
 use parking_lot::RwLock;
 use rayon::prelude::*;
 
@@ -1388,84 +1390,118 @@ fn downscale_rgba_if_needed<'a>(
 /// LRU-style texture cache for manga mode.
 /// Keeps track of usage order for eviction.
 pub struct MangaTextureCache {
-    /// Maps index to (texture_handle, width, height, media_type, last_access_frame)
-    entries: HashMap<usize, (egui::TextureHandle, u32, u32, MangaMediaType, u64)>,
-    /// Current frame counter for LRU tracking
-    frame_counter: u64,
+    /// Non-evictable entries for currently visible indices.
+    pinned_entries: HashMap<usize, MangaTextureEntry>,
+    /// Evictable entries, ordered by recency.
+    unpinned_entries: LruCache<usize, MangaTextureEntry>,
     /// Maximum number of entries to cache
     max_entries: usize,
     /// Indices that should not be evicted while still visible.
     pinned_indices: HashSet<usize>,
 }
 
+#[derive(Clone)]
+struct MangaTextureEntry {
+    texture: egui::TextureHandle,
+    width: u32,
+    height: u32,
+    media_type: MangaMediaType,
+}
+
 impl MangaTextureCache {
     pub fn new(max_entries: usize) -> Self {
         Self {
-            entries: HashMap::with_capacity(max_entries),
-            frame_counter: 0,
+            pinned_entries: HashMap::with_capacity(max_entries),
+            // Use a very large internal capacity and control eviction ourselves so we can
+            // preserve pinning behavior and return all evicted indices to the caller.
+            unpinned_entries: LruCache::new(
+                NonZeroUsize::new(usize::MAX).expect("usize::MAX is non-zero"),
+            ),
             max_entries: max_entries.max(1),
             pinned_indices: HashSet::new(),
         }
     }
 
-    fn oldest_evictable_index(&self) -> Option<usize> {
-        self.entries
-            .iter()
-            .filter(|(idx, _)| !self.pinned_indices.contains(*idx))
-            .min_by_key(|(_, (_, _, _, _, frame))| *frame)
-            .map(|(&idx, _)| idx)
+    fn total_entries(&self) -> usize {
+        self.pinned_entries.len() + self.unpinned_entries.len()
+    }
+
+    fn evict_to_capacity(&mut self) -> Vec<usize> {
+        let mut evicted = Vec::new();
+
+        while self.total_entries() > self.max_entries {
+            let Some((idx, _)) = self.unpinned_entries.pop_lru() else {
+                // All remaining entries are pinned; cannot evict further.
+                break;
+            };
+
+            self.pinned_indices.remove(&idx);
+            evicted.push(idx);
+        }
+
+        evicted
     }
 
     pub fn set_max_entries(&mut self, max_entries: usize) -> Vec<usize> {
         self.max_entries = max_entries.max(1);
-
-        let mut evicted = Vec::new();
-        while self.entries.len() > self.max_entries {
-            if let Some(oldest_idx) = self.oldest_evictable_index() {
-                self.entries.remove(&oldest_idx);
-                self.pinned_indices.remove(&oldest_idx);
-                evicted.push(oldest_idx);
-            } else {
-                break;
-            }
-        }
-
-        evicted
+        self.evict_to_capacity()
     }
 
     pub fn set_pinned_indices<I>(&mut self, pinned: I)
     where
         I: IntoIterator<Item = usize>,
     {
-        self.pinned_indices.clear();
-        self.pinned_indices.extend(pinned);
+        let new_pinned: HashSet<usize> = pinned.into_iter().collect();
+
+        let to_unpin: Vec<usize> = self
+            .pinned_indices
+            .difference(&new_pinned)
+            .copied()
+            .collect();
+        for idx in to_unpin {
+            if let Some(entry) = self.pinned_entries.remove(&idx) {
+                self.unpinned_entries.put(idx, entry);
+            }
+        }
+
+        let to_pin: Vec<usize> = new_pinned
+            .difference(&self.pinned_indices)
+            .copied()
+            .collect();
+        for idx in to_pin {
+            if let Some(entry) = self.unpinned_entries.pop(&idx) {
+                self.pinned_entries.insert(idx, entry);
+            }
+        }
+
+        self.pinned_indices = new_pinned;
     }
 
     /// Increment frame counter (call once per frame).
     pub fn tick(&mut self) {
-        self.frame_counter += 1;
+        // LruCache updates recency on access, so no per-frame bookkeeping is needed.
     }
 
     /// Get a texture from cache, updating its access time.
     #[allow(dead_code)]
     pub fn get(&mut self, index: usize) -> Option<&egui::TextureHandle> {
-        if let Some(entry) = self.entries.get_mut(&index) {
-            entry.4 = self.frame_counter;
-            Some(&entry.0)
-        } else {
-            None
+        if let Some(entry) = self.pinned_entries.get(&index) {
+            return Some(&entry.texture);
         }
+
+        self.unpinned_entries.get(&index).map(|entry| &entry.texture)
     }
 
     /// Get texture ID and dimensions from cache (avoids borrow issues).
     /// Returns (texture_id, width, height) if found.
     pub fn get_texture_info(&mut self, index: usize) -> Option<(egui::TextureId, u32, u32)> {
-        if let Some(entry) = self.entries.get_mut(&index) {
-            entry.4 = self.frame_counter;
-            Some((entry.0.id(), entry.1, entry.2))
-        } else {
-            None
+        if let Some(entry) = self.pinned_entries.get(&index) {
+            return Some((entry.texture.id(), entry.width, entry.height));
         }
+
+        self.unpinned_entries
+            .get(&index)
+            .map(|entry| (entry.texture.id(), entry.width, entry.height))
     }
 
     /// Get a cloned texture handle, dimensions, and media type from cache.
@@ -1474,12 +1510,23 @@ impl MangaTextureCache {
         &mut self,
         index: usize,
     ) -> Option<(egui::TextureHandle, u32, u32, MangaMediaType)> {
-        if let Some(entry) = self.entries.get_mut(&index) {
-            entry.4 = self.frame_counter;
-            Some((entry.0.clone(), entry.1, entry.2, entry.3))
-        } else {
-            None
+        if let Some(entry) = self.pinned_entries.get(&index) {
+            return Some((
+                entry.texture.clone(),
+                entry.width,
+                entry.height,
+                entry.media_type,
+            ));
         }
+
+        self.unpinned_entries.get(&index).map(|entry| {
+            (
+                entry.texture.clone(),
+                entry.width,
+                entry.height,
+                entry.media_type,
+            )
+        })
     }
 
     /// Get texture ID, dimensions, and media type from cache.
@@ -1489,28 +1536,40 @@ impl MangaTextureCache {
         &mut self,
         index: usize,
     ) -> Option<(egui::TextureId, u32, u32, MangaMediaType)> {
-        if let Some(entry) = self.entries.get_mut(&index) {
-            entry.4 = self.frame_counter;
-            Some((entry.0.id(), entry.1, entry.2, entry.3))
-        } else {
-            None
+        if let Some(entry) = self.pinned_entries.get(&index) {
+            return Some((
+                entry.texture.id(),
+                entry.width,
+                entry.height,
+                entry.media_type,
+            ));
         }
+
+        self.unpinned_entries.get(&index).map(|entry| {
+            (
+                entry.texture.id(),
+                entry.width,
+                entry.height,
+                entry.media_type,
+            )
+        })
     }
 
     /// Get texture and dimensions from cache.
     #[allow(dead_code)]
     pub fn get_with_dims(&mut self, index: usize) -> Option<(&egui::TextureHandle, u32, u32)> {
-        if let Some(entry) = self.entries.get_mut(&index) {
-            entry.4 = self.frame_counter;
-            Some((&entry.0, entry.1, entry.2))
-        } else {
-            None
+        if let Some(entry) = self.pinned_entries.get(&index) {
+            return Some((&entry.texture, entry.width, entry.height));
         }
+
+        self.unpinned_entries
+            .get(&index)
+            .map(|entry| (&entry.texture, entry.width, entry.height))
     }
 
     /// Check if an index is in the cache without updating access time.
     pub fn contains(&self, index: usize) -> bool {
-        self.entries.contains_key(&index)
+        self.pinned_entries.contains_key(&index) || self.unpinned_entries.contains(&index)
     }
 
     /// Insert a texture into the cache.
@@ -1536,30 +1595,22 @@ impl MangaTextureCache {
         height: u32,
         media_type: MangaMediaType,
     ) -> Vec<usize> {
-        let mut evicted = Vec::new();
+        let entry = MangaTextureEntry {
+            texture,
+            width,
+            height,
+            media_type,
+        };
 
-        if let Some(entry) = self.entries.get_mut(&index) {
-            *entry = (texture, width, height, media_type, self.frame_counter);
-            return evicted;
+        if self.pinned_indices.contains(&index) {
+            self.unpinned_entries.pop(&index);
+            self.pinned_entries.insert(index, entry);
+        } else {
+            self.pinned_entries.remove(&index);
+            self.unpinned_entries.put(index, entry);
         }
 
-        // Evict oldest entries if at capacity
-        while self.entries.len() >= self.max_entries {
-            if let Some(oldest_idx) = self.oldest_evictable_index() {
-                self.entries.remove(&oldest_idx);
-                self.pinned_indices.remove(&oldest_idx);
-                evicted.push(oldest_idx);
-            } else {
-                break;
-            }
-        }
-
-        self.entries.insert(
-            index,
-            (texture, width, height, media_type, self.frame_counter),
-        );
-
-        evicted
+        self.evict_to_capacity()
     }
 
     /// Update an existing texture in the cache (for video frame updates).
@@ -1572,41 +1623,52 @@ impl MangaTextureCache {
         width: u32,
         height: u32,
     ) {
-        if let Some(entry) = self.entries.get_mut(&index) {
-            entry.0 = texture;
-            entry.1 = width;
-            entry.2 = height;
-            entry.4 = self.frame_counter;
+        if let Some(entry) = self.pinned_entries.get_mut(&index) {
+            entry.texture = texture;
+            entry.width = width;
+            entry.height = height;
+            return;
+        }
+
+        if let Some(entry) = self.unpinned_entries.get_mut(&index) {
+            entry.texture = texture;
+            entry.width = width;
+            entry.height = height;
         }
     }
 
     /// Remove an entry from the cache.
     pub fn remove(&mut self, index: usize) {
-        self.entries.remove(&index);
+        self.pinned_entries.remove(&index);
+        self.unpinned_entries.pop(&index);
         self.pinned_indices.remove(&index);
     }
 
     /// Clear the entire cache.
     pub fn clear(&mut self) {
-        self.entries.clear();
+        self.pinned_entries.clear();
+        self.unpinned_entries.clear();
         self.pinned_indices.clear();
     }
 
     /// Get the number of cached textures.
     #[allow(dead_code)]
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.total_entries()
     }
 
     /// Check if cache is empty.
     #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.total_entries() == 0
     }
 
     /// Get indices of all cached textures.
     pub fn cached_indices(&self) -> Vec<usize> {
-        self.entries.keys().copied().collect()
+        let mut indices = Vec::with_capacity(self.total_entries());
+        indices.extend(self.pinned_entries.keys().copied());
+        indices.extend(self.unpinned_entries.iter().map(|(idx, _)| *idx));
+        indices
     }
 }
 
