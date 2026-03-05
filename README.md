@@ -4,7 +4,7 @@
 ![Rust](https://img.shields.io/badge/rust-1.76%2B-orange.svg)
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-lightgrey.svg)
 
-A high-performance, minimal, borderless image and video viewer for Windows, built with Rust, egui, wgpu, and GStreamer.
+A high-performance, minimal, borderless image and video viewer for Windows, built with Rust, egui, and GStreamer.
 
 This app is **not** intended to replace a full-featured image viewer or video player. It is a QuickLook-style preview tool focused on opening media instantly with minimal controls.
 
@@ -203,12 +203,6 @@ manga_wheel_scroll_speed = 160
 manga_inertial_friction = 0.33
 manga_wheel_multiplier = 1.5
 manga_arrow_scroll_speed = 140
-l2_disk_cache_enabled = true
-l2_disk_cache_max_gb = 50.0
-l1_pool_lod0_slots = 128
-l1_pool_lod1_slots = 500
-l1_pool_lod2_slots = 1500
-l1_pool_lod3_slots = 5000
 manga_wheel_smooth_like_arrow_keys = true
 manga_autoscroll_dead_zone_px = 14.0
 manga_autoscroll_base_speed_multiplier = 5.0
@@ -289,9 +283,7 @@ Available texture filters: `nearest`, `linear`.
 
 - **Delay-loaded DLLs** — GStreamer DLLs are loaded on-demand, keeping memory low when viewing images only
 - **Parallel Image Decoding** — Manga mode uses Rayon thread pool for parallel loading
-- **Tier-aware L1 Texture Cache (`lru`)** — Visible pages stay pinned while per-LOD pools evict off-screen textures by recency
-- **Persistent L2 Disk LOD Cache** — Preprocessed 256/512/1024 image tiers are reused across sessions
-- **Parallel Masonry Culling + Draw Commands** — Per-frame visibility is culled in parallel and consumed as a command list
+- **Pinned + LRU Texture Cache (`lru`)** — Visible pages stay pinned while off-screen textures are evicted by recency
 - **Memory-mapped Media I/O (`memmap2`)** — Static/GIF/WebP decode paths use OS-backed mapping with buffered fallback
 - **Lock-free Communication** — Crossbeam channels for zero-contention multi-threading
 - **Adaptive Preloading** — Priority-based prefetching based on scroll direction
