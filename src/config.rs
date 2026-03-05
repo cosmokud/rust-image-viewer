@@ -85,12 +85,30 @@ impl TextureFilter {
         }
     }
 
+    /// Convert to egui's texture filter enum.
+    pub fn to_egui_filter(&self) -> egui::TextureFilter {
+        match self {
+            Self::Nearest => egui::TextureFilter::Nearest,
+            Self::Linear => egui::TextureFilter::Linear,
+        }
+    }
+
     /// Convert to egui TextureOptions
     pub fn to_egui_options(&self) -> egui::TextureOptions {
         match self {
             Self::Nearest => egui::TextureOptions::NEAREST,
             Self::Linear => egui::TextureOptions::LINEAR,
         }
+    }
+
+    /// Convert to egui TextureOptions, optionally enabling mipmapping.
+    pub fn to_egui_options_with_mipmap(&self, mipmap: bool) -> egui::TextureOptions {
+        let mipmap_mode = if mipmap {
+            Some(self.to_egui_filter())
+        } else {
+            None
+        };
+        self.to_egui_options().with_mipmap_mode(mipmap_mode)
     }
 }
 
@@ -408,6 +426,12 @@ pub struct Config {
     pub texture_filter_animated: TextureFilter,
     /// GPU texture filtering for video frames
     pub texture_filter_video: TextureFilter,
+    /// Enable mipmaps for manga/masonry static-image textures.
+    pub manga_mipmap_static: bool,
+    /// Enable mipmaps for manga/masonry video thumbnails (first-frame previews).
+    pub manga_mipmap_video_thumbnails: bool,
+    /// Minimum texture side length required before mipmaps are enabled.
+    pub manga_mipmap_min_side: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -480,6 +504,9 @@ impl Config {
             texture_filter_static: TextureFilter::Linear,
             texture_filter_animated: TextureFilter::Linear,
             texture_filter_video: TextureFilter::Linear,
+            manga_mipmap_static: true,
+            manga_mipmap_video_thumbnails: true,
+            manga_mipmap_min_side: 128,
         }
     }
 }
@@ -1006,6 +1033,23 @@ impl Config {
                                 config.texture_filter_video = f;
                             }
                         }
+                        "manga_mipmap_static" | "mipmap_static" => {
+                            if let Some(v) = parse_bool(value) {
+                                config.manga_mipmap_static = v;
+                            }
+                        }
+                        "manga_mipmap_video_thumbnails"
+                        | "manga_mipmap_video_thumbnail"
+                        | "mipmap_video_thumbnails" => {
+                            if let Some(v) = parse_bool(value) {
+                                config.manga_mipmap_video_thumbnails = v;
+                            }
+                        }
+                        "manga_mipmap_min_side" | "manga_mipmap_min_size" => {
+                            if let Ok(v) = value.parse::<u32>() {
+                                config.manga_mipmap_min_side = v.clamp(1, 4096);
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -1226,6 +1270,18 @@ impl Config {
         values.insert(
             "texture_filter_video",
             self.texture_filter_video.as_str().to_string(),
+        );
+        values.insert(
+            "manga_mipmap_static",
+            bool_to_ini(self.manga_mipmap_static).to_string(),
+        );
+        values.insert(
+            "manga_mipmap_video_thumbnails",
+            bool_to_ini(self.manga_mipmap_video_thumbnails).to_string(),
+        );
+        values.insert(
+            "manga_mipmap_min_side",
+            format!("{}", self.manga_mipmap_min_side),
         );
 
         values.insert(

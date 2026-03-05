@@ -61,10 +61,6 @@ const MAX_PRELOAD: usize = 48;
 /// For large jumps we want latency (load the target page ASAP) over throughput (prefetch neighbors).
 const LARGE_JUMP_INDEX_THRESHOLD: usize = 32;
 
-/// Batch size for GPU texture uploads per frame.
-/// Uploading too many textures in one frame can cause stutters.
-const UPLOAD_BATCH_SIZE: usize = 4;
-
 /// Maximum number of dimension probe items to include in a single request.
 /// Larger values increase background throughput but can increase burstiness.
 const DIM_REQUEST_BATCH_SIZE: usize = 64;
@@ -1062,12 +1058,14 @@ impl MangaLoader {
         self.stats.images_pending = self.loading_indices.read().len();
     }
 
-    /// Poll for decoded images ready for GPU upload.
-    /// Returns up to UPLOAD_BATCH_SIZE images per call to avoid frame drops.
-    pub fn poll_decoded_images(&mut self) -> Vec<DecodedImage> {
-        let mut results = Vec::with_capacity(UPLOAD_BATCH_SIZE);
+    /// Poll for decoded images ready for GPU upload with a caller-provided limit.
+    ///
+    /// `max_items` is clamped to `1..=MAX_PENDING_UPLOADS`.
+    pub fn poll_decoded_images_with_limit(&mut self, max_items: usize) -> Vec<DecodedImage> {
+        let max_items = max_items.clamp(1, MAX_PENDING_UPLOADS);
+        let mut results = Vec::with_capacity(max_items);
 
-        for _ in 0..UPLOAD_BATCH_SIZE {
+        for _ in 0..max_items {
             match self.result_rx.try_recv() {
                 Ok(decoded) => {
                     // Cache dimensions and media type for stable layout

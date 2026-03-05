@@ -24,7 +24,7 @@ use video_player::{format_duration, VideoPlayer};
 use eframe::egui;
 use image::imageops::FilterType;
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
@@ -546,6 +546,12 @@ struct ImageViewer {
     manga_last_preload_update: std::time::Instant,
     /// Last scroll position for detecting large jumps
     manga_last_scroll_position: f32,
+    /// Adaptive decoded-upload batch size used by manga texture uploads.
+    manga_upload_batch_limit: usize,
+    /// First time a visible item was observed without an uploaded texture.
+    manga_ttv_pending: HashMap<usize, Instant>,
+    /// Recent time-to-visible samples for manga/masonry (milliseconds).
+    manga_ttv_samples_ms: VecDeque<f32>,
     /// Track if left arrow was down last frame (to detect hold vs single tap)
     manga_arrow_left_was_down: bool,
     /// Track if right arrow was down last frame (to detect hold vs single tap)
@@ -753,6 +759,9 @@ impl Default for ImageViewer {
             manga_preload_cooldown: 0,
             manga_last_preload_update: Instant::now(),
             manga_last_scroll_position: 0.0,
+            manga_upload_batch_limit: 4,
+            manga_ttv_pending: HashMap::new(),
+            manga_ttv_samples_ms: VecDeque::new(),
             manga_arrow_left_was_down: false,
             manga_arrow_right_was_down: false,
 
@@ -803,6 +812,11 @@ impl ImageViewer {
     const MANGA_HUD_PANEL_INNER_WIDTH: f32 = 208.0;
     const MANGA_HUD_PANEL_INNER_HEIGHT: f32 = 24.0;
     const MANGA_HUD_PANEL_VERTICAL_STEP: f32 = 48.0;
+    const MANGA_UPLOAD_BATCH_BASE: usize = 4;
+    const MANGA_UPLOAD_BATCH_MIN: usize = 2;
+    const MANGA_UPLOAD_BATCH_MAX: usize = 12;
+    const MANGA_TTV_SAMPLE_CAP: usize = 240;
+    const MANGA_TTV_PENDING_MAX_AGE: Duration = Duration::from_secs(30);
 
     fn update_fps_stats(&mut self) {
         let now = Instant::now();
@@ -824,6 +838,86 @@ impl ImageViewer {
         }
     }
 
+    fn manga_mark_placeholder_visible(&mut self, index: usize) {
+        if !self.manga_mode {
+            return;
+        }
+        self.manga_ttv_pending.entry(index).or_insert_with(Instant::now);
+    }
+
+    fn manga_record_ttv_sample(&mut self, elapsed: Duration) {
+        let ms = elapsed.as_secs_f32() * 1000.0;
+        if !ms.is_finite() || ms <= 0.0 {
+            return;
+        }
+
+        if self.manga_ttv_samples_ms.len() >= Self::MANGA_TTV_SAMPLE_CAP {
+            self.manga_ttv_samples_ms.pop_front();
+        }
+        self.manga_ttv_samples_ms.push_back(ms);
+    }
+
+    fn manga_prune_ttv_pending(&mut self) {
+        self.manga_ttv_pending
+            .retain(|_, started_at| started_at.elapsed() <= Self::MANGA_TTV_PENDING_MAX_AGE);
+    }
+
+    fn manga_ttv_percentiles_ms(&self) -> Option<(f32, f32, usize)> {
+        if self.manga_ttv_samples_ms.is_empty() {
+            return None;
+        }
+
+        let mut sorted: Vec<f32> = self
+            .manga_ttv_samples_ms
+            .iter()
+            .copied()
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .collect();
+        if sorted.is_empty() {
+            return None;
+        }
+
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let n = sorted.len();
+        let p50_idx = ((n - 1) as f32 * 0.50).round() as usize;
+        let p95_idx = ((n - 1) as f32 * 0.95).round() as usize;
+        Some((sorted[p50_idx], sorted[p95_idx], n))
+    }
+
+    fn manga_compute_upload_batch_limit(&self, pending_loads: usize, pending_decoded: usize) -> usize {
+        let mut limit = Self::MANGA_UPLOAD_BATCH_BASE;
+
+        if self.is_masonry_mode() {
+            limit += 2;
+        }
+
+        // Lower zoom usually means many more items are visible; prioritize fast fill.
+        if self.zoom <= 0.75 {
+            limit += 2;
+        }
+        if self.zoom <= 0.50 {
+            limit += 2;
+        }
+
+        // Increase throughput when decode backlog is building.
+        if pending_decoded >= 8 {
+            limit += 2;
+        }
+        if pending_decoded >= 16 {
+            limit += 2;
+        }
+        if pending_loads >= 24 {
+            limit += 1;
+        }
+
+        // If many visible placeholders are waiting, bias toward lower latency.
+        if self.manga_ttv_pending.len() >= 8 {
+            limit += 2;
+        }
+
+        limit.clamp(Self::MANGA_UPLOAD_BATCH_MIN, Self::MANGA_UPLOAD_BATCH_MAX)
+    }
+
     fn draw_fps_overlay(&self, ctx: &egui::Context) {
         if !self.config.show_fps {
             return;
@@ -835,7 +929,26 @@ impl ImageViewer {
             0.0
         };
         let ms = (self.fps_last_dt_s * 1000.0).max(0.0);
-        let text = format!("{fps:.0} FPS  ({ms:.1} ms)");
+        let mut text = format!("{fps:.0} FPS  ({ms:.1} ms)");
+
+        if self.manga_mode {
+            if let Some((p50, p95, samples)) = self.manga_ttv_percentiles_ms() {
+                text.push_str(&format!(
+                    " | TTV p50/p95 {p50:.0}/{p95:.0} ms (n={samples})"
+                ));
+            }
+
+            if let Some(loader) = self.manga_loader.as_ref() {
+                text.push_str(&format!(
+                    " | U{} L{} D{}",
+                    self.manga_upload_batch_limit,
+                    loader.pending_load_count(),
+                    loader.pending_decoded_count()
+                ));
+            } else {
+                text.push_str(&format!(" | U{}", self.manga_upload_batch_limit));
+            }
+        }
 
         // Keep it below the title bar buttons when the bar is visible.
         let y_offset = if self.show_controls { 40.0 } else { 8.0 };
@@ -2747,6 +2860,10 @@ impl ImageViewer {
             let current_image_is_animated =
                 self.image.as_ref().is_some_and(|img| img.is_animated());
 
+            self.manga_ttv_pending.clear();
+            self.manga_ttv_samples_ms.clear();
+            self.manga_upload_batch_limit = Self::MANGA_UPLOAD_BATCH_BASE;
+
             self.prepare_enter_manga_mode_state(current_media_type);
 
             // Manga layout cache must be rebuilt for the new mode.
@@ -3046,6 +3163,9 @@ impl ImageViewer {
         // Clear the texture cache
         self.manga_texture_cache.clear();
         self.strip_entry_placeholder_index = None;
+        self.manga_ttv_pending.clear();
+        self.manga_ttv_samples_ms.clear();
+        self.manga_upload_batch_limit = Self::MANGA_UPLOAD_BATCH_BASE;
 
         // Clear and reset the parallel loader
         if let Some(ref mut loader) = self.manga_loader {
@@ -3905,6 +4025,38 @@ impl ImageViewer {
         self.screen_size.y * 0.67 * self.zoom
     }
 
+    /// Select texture options for manga/masonry preload uploads.
+    ///
+    /// Mipmaps are only enabled for static pages and video thumbnails.
+    /// Animated textures are frequently updated and stay non-mipmapped to avoid
+    /// repeated mipmap generation costs.
+    fn manga_texture_options_for_upload(
+        &self,
+        media_type: MangaMediaType,
+        width: u32,
+        height: u32,
+    ) -> egui::TextureOptions {
+        let min_side = width.min(height);
+        let mipmap_allowed_by_size = min_side >= self.config.manga_mipmap_min_side.max(1);
+
+        match media_type {
+            MangaMediaType::StaticImage => {
+                let enable_mipmap = self.config.manga_mipmap_static && mipmap_allowed_by_size;
+                self.config
+                    .texture_filter_static
+                    .to_egui_options_with_mipmap(enable_mipmap)
+            }
+            MangaMediaType::Video => {
+                let enable_mipmap =
+                    self.config.manga_mipmap_video_thumbnails && mipmap_allowed_by_size;
+                self.config
+                    .texture_filter_video
+                    .to_egui_options_with_mipmap(enable_mipmap)
+            }
+            MangaMediaType::AnimatedImage => self.config.texture_filter_animated.to_egui_options(),
+        }
+    }
+
     /// Process decoded images from the parallel loader and upload them as GPU textures.
     /// This is called every frame and uploads a limited batch to prevent stutters.
     fn manga_process_pending_loads(&mut self, ctx: &egui::Context) -> bool {
@@ -3912,16 +4064,29 @@ impl ImageViewer {
             return false;
         }
 
-        let Some(ref mut loader) = self.manga_loader else {
-            return false;
+        let (pending_loads, pending_decoded) = self
+            .manga_loader
+            .as_ref()
+            .map(|loader| (loader.pending_load_count(), loader.pending_decoded_count()))
+            .unwrap_or((0, 0));
+        let upload_batch_limit =
+            self.manga_compute_upload_batch_limit(pending_loads, pending_decoded);
+        self.manga_upload_batch_limit = upload_batch_limit;
+
+        let (decoded_images, dim_updates) = {
+            let Some(loader) = self.manga_loader.as_mut() else {
+                return false;
+            };
+
+            // Poll for decoded images from the background threads
+            let decoded_images = loader.poll_decoded_images_with_limit(upload_batch_limit);
+
+            // Also poll async dimension probe results (header reads), applied incrementally.
+            // Limiting messages per frame prevents layout updates from causing bursts of work.
+            let dim_updates = loader.poll_dimension_results(4);
+
+            (decoded_images, dim_updates)
         };
-
-        // Poll for decoded images from the background threads
-        let decoded_images = loader.poll_decoded_images();
-
-        // Also poll async dimension probe results (header reads), applied incrementally.
-        // Limiting messages per frame prevents layout updates from causing bursts of work.
-        let dim_updates = loader.poll_dimension_results(4);
 
         // Dimension updates can change page heights; invalidate cached layout/prefix sums.
         if !dim_updates.is_empty() {
@@ -3931,11 +4096,13 @@ impl ImageViewer {
         }
 
         let dims_updated = !decoded_images.is_empty() || !dim_updates.is_empty();
+        let mut evicted_to_mark_unloaded = Vec::new();
 
         // Upload decoded images to GPU as textures
         for decoded in decoded_images {
             // Skip if already in texture cache
             if self.manga_texture_cache.contains(decoded.index) {
+                self.manga_ttv_pending.remove(&decoded.index);
                 continue;
             }
 
@@ -3950,15 +4117,10 @@ impl ImageViewer {
                 &decoded.pixels,
             );
 
-            // Use appropriate texture filter based on media type
-            // Videos and animated images use the animated filter for smoother playback
-            let texture_options = if decoded.media_type == MangaMediaType::AnimatedImage
-                || decoded.media_type == MangaMediaType::Video
-            {
-                self.config.texture_filter_animated.to_egui_options()
-            } else {
-                self.config.texture_filter_static.to_egui_options()
-            };
+            // Static images + video thumbnails can use mipmaps for faster minification
+            // in manga strip and masonry layouts.
+            let texture_options =
+                self.manga_texture_options_for_upload(decoded.media_type, decoded.width, decoded.height);
 
             let texture = ctx.load_texture(
                 format!("manga_{}", decoded.index),
@@ -3975,9 +4137,18 @@ impl ImageViewer {
                 decoded.media_type,
             );
 
-            // Mark evicted textures as unloaded so they can be re-requested
-            for evicted_idx in evicted {
-                loader.mark_unloaded(evicted_idx);
+            if let Some(started_at) = self.manga_ttv_pending.remove(&decoded.index) {
+                self.manga_record_ttv_sample(started_at.elapsed());
+            }
+
+            evicted_to_mark_unloaded.extend(evicted);
+        }
+
+        if !evicted_to_mark_unloaded.is_empty() {
+            if let Some(loader) = self.manga_loader.as_mut() {
+                for evicted_idx in evicted_to_mark_unloaded {
+                    loader.mark_unloaded(evicted_idx);
+                }
             }
         }
 
@@ -5322,6 +5493,8 @@ impl ImageViewer {
                     egui::Color32::from_gray(100),
                 );
 
+                self.manga_mark_placeholder_visible(idx);
+
                 requested_retry |= self.manga_request_retry_for_visible_item(idx);
             }
         } else {
@@ -5383,6 +5556,8 @@ impl ImageViewer {
                     egui::Color32::from_gray(80),
                 );
 
+                self.manga_mark_placeholder_visible(idx);
+
                 requested_retry |= self.manga_request_retry_for_visible_item(idx);
             }
         }
@@ -5395,6 +5570,8 @@ impl ImageViewer {
         if !self.manga_mode || !self.is_fullscreen {
             return false;
         }
+
+        self.manga_prune_ttv_pending();
 
         let screen_rect = ctx.screen_rect();
         let screen_width = screen_rect.width();

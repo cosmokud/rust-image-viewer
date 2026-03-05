@@ -256,6 +256,9 @@ gif_resize_filter = triangle
 texture_filter_static = linear
 texture_filter_animated = linear
 texture_filter_video = linear
+manga_mipmap_static = true
+manga_mipmap_video_thumbnails = true
+manga_mipmap_min_side = 128
 ```
 
 Available scaling filters: `nearest`, `triangle`, `catmullrom`, `gaussian`, `lanczos3`.
