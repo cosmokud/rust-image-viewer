@@ -578,6 +578,9 @@ struct ImageViewer {
     /// Index of the currently focused (playing) video in manga mode.
     /// Only one video plays at a time; all others are paused.
     manga_focused_video_index: Option<usize>,
+    /// Hovered media index in masonry mode, updated from pointer position.
+    /// Used for hover-driven video autoplay selection.
+    manga_hovered_media_index: Option<usize>,
     /// Maximum number of video players to keep alive in manga mode.
     /// Beyond this, the furthest-from-view players are disposed.
     manga_max_video_players: usize,
@@ -786,6 +789,7 @@ impl Default for ImageViewer {
             manga_video_players: HashMap::new(),
             manga_video_textures: HashMap::new(),
             manga_focused_video_index: None,
+            manga_hovered_media_index: None,
             manga_max_video_players: 3, // Keep at most 3 video players alive
             manga_animated_images: HashMap::new(),
             manga_focused_anim_index: None,
@@ -1927,6 +1931,7 @@ impl ImageViewer {
     fn clear_manga_runtime_workloads(&mut self) {
         self.manga_video_players.clear();
         self.manga_focused_video_index = None;
+        self.manga_hovered_media_index = None;
         self.manga_anim_streams.clear();
         self.manga_anim_stream_done.clear();
         self.manga_focused_anim_index = None;
@@ -3737,7 +3742,25 @@ impl ImageViewer {
             return;
         }
 
-        let focused_idx = self.manga_get_focused_media_index();
+        let focused_idx = if self.is_masonry_mode() {
+            if let Some(hovered_idx) = self.manga_hovered_media_index {
+                hovered_idx
+            } else {
+                // In masonry mode, autoplay follows hover only.
+                // If nothing is hovered, pause any active video.
+                if self.manga_focused_video_index.is_some() {
+                    for player in self.manga_video_players.values_mut() {
+                        if player.is_playing() {
+                            let _ = player.pause();
+                        }
+                    }
+                    self.manga_focused_video_index = None;
+                }
+                return;
+            }
+        } else {
+            self.manga_get_focused_media_index()
+        };
 
         // Check if the focused item is a video
         let focused_is_video = self
@@ -5998,16 +6021,13 @@ impl ImageViewer {
                     egui::Color32::WHITE,
                 );
 
-                // Draw play/pause indicator for video
-                let is_focused = self.manga_focused_video_index == Some(idx);
+                // Draw play indicator only when not actively playing.
                 let is_playing = self
                     .manga_video_players
                     .get(&idx)
                     .map_or(false, |p| p.is_playing());
 
-                // Draw a subtle play icon overlay for non-focused videos
-                if !is_focused || !is_playing {
-                    let icon = if is_playing { "▶" } else { "⏸" };
+                if !is_playing {
                     let icon_bg_rect =
                         egui::Rect::from_center_size(image_rect.center(), egui::Vec2::splat(50.0));
                     ui.painter().rect_filled(
@@ -6018,7 +6038,7 @@ impl ImageViewer {
                     ui.painter().text(
                         image_rect.center(),
                         egui::Align2::CENTER_CENTER,
-                        icon,
+                        "▶",
                         egui::FontId::proportional(28.0),
                         egui::Color32::WHITE,
                     );
@@ -6034,21 +6054,28 @@ impl ImageViewer {
                     egui::Color32::WHITE,
                 );
 
-                // Draw a play icon overlay to indicate it's a video
-                let icon_bg_rect =
-                    egui::Rect::from_center_size(image_rect.center(), egui::Vec2::splat(60.0));
-                ui.painter().rect_filled(
-                    icon_bg_rect,
-                    30.0,
-                    egui::Color32::from_rgba_unmultiplied(0, 0, 0, 160),
-                );
-                ui.painter().text(
-                    image_rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    "▶",
-                    egui::FontId::proportional(32.0),
-                    egui::Color32::WHITE,
-                );
+                let is_playing = self
+                    .manga_video_players
+                    .get(&idx)
+                    .map_or(false, |p| p.is_playing());
+
+                if !is_playing {
+                    // Draw a play icon overlay to indicate it's a video
+                    let icon_bg_rect =
+                        egui::Rect::from_center_size(image_rect.center(), egui::Vec2::splat(60.0));
+                    ui.painter().rect_filled(
+                        icon_bg_rect,
+                        30.0,
+                        egui::Color32::from_rgba_unmultiplied(0, 0, 0, 160),
+                    );
+                    ui.painter().text(
+                        image_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "▶",
+                        egui::FontId::proportional(32.0),
+                        egui::Color32::WHITE,
+                    );
+                }
 
                 if Self::manga_texture_upgrade_needed(tex_w.max(tex_h), retry_target_side) {
                     requested_retry |= self.manga_request_retry_for_visible_item(idx, retry_target_side);
@@ -6291,6 +6318,17 @@ impl ImageViewer {
         let controls_bar_height = 56.0;
         let over_controls =
             pointer_pos.map_or(false, |p| p.y > screen_height - controls_bar_height);
+
+        if self.is_masonry_mode() {
+            self.manga_hovered_media_index = if !title_ui_blocking && !pointer_over_shortcut_ui && !over_controls
+            {
+                pointer_pos.and_then(|pos| self.manga_index_at_screen_pos(pos))
+            } else {
+                None
+            };
+        } else {
+            self.manga_hovered_media_index = None;
+        }
 
         let mut primary_consumed_for_autoscroll = false;
         let mut secondary_consumed_for_autoscroll = false;
