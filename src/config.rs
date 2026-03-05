@@ -415,6 +415,9 @@ pub struct Config {
     /// instead of creating a new one
     pub single_instance: bool,
 
+    /// Enable VSync for swapchain presentation to reduce screen tearing.
+    pub vsync: bool,
+
     // ============ IMAGE QUALITY SETTINGS ============
     /// Filter for upscaling images (making them larger)
     pub upscale_filter: ImageFilter,
@@ -500,6 +503,7 @@ impl Config {
             video_loop: true,
             startup_window_mode: StartupWindowMode::Floating,
             single_instance: true,
+            vsync: true,
             // Image quality defaults
             upscale_filter: ImageFilter::CatmullRom,
             downscale_filter: ImageFilter::Lanczos3,
@@ -971,6 +975,11 @@ impl Config {
                                 config.single_instance = v;
                             }
                         }
+                        "vsync" | "v_sync" | "enable_vsync" => {
+                            if let Some(v) = parse_bool(value) {
+                                config.vsync = v;
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -1153,6 +1162,7 @@ impl Config {
             "single_instance",
             bool_to_ini(self.single_instance).to_string(),
         );
+        values.insert("vsync", bool_to_ini(self.vsync).to_string());
         values.insert(
             "background_rgb",
             format!(

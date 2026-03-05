@@ -10811,9 +10811,9 @@ fn main() -> eframe::Result<()> {
         // Keep the renderer lightweight at idle. This viewer renders 2D UI + a single image/video
         // texture; MSAA and a depth buffer are not required for perceptible quality.
         renderer: eframe::Renderer::Glow,
-        // CRITICAL: Enable VSync to eliminate screen tearing during scrolling/panning.
-        // This synchronizes frame presentation with the display's refresh rate.
-        vsync: true,
+        // Configurable via [Settings].vsync in config.ini (default: true).
+        // Keep enabled by default for smoother presentation and no tearing.
+        vsync: config.vsync,
         // VRAM/GPU optimization: Disable MSAA and depth buffer (not needed for 2D image viewer)
         // This reduces GPU memory allocation significantly
         multisampling: 0,
