@@ -825,6 +825,9 @@ impl ImageViewer {
     const MANGA_CACHE_MAX_ENTRIES: usize = 512;
     const MANGA_DYNAMIC_TARGET_MIN_SIDE: u32 = 192;
     const MANGA_DYNAMIC_TARGET_OVERSCAN: f32 = 1.35;
+    const MANGA_MASONRY_DYNAMIC_TARGET_MIN_SIDE: u32 = 96;
+    const MANGA_TEXTURE_UPGRADE_MIN_DELTA_SIDE: u32 = 64;
+    const MANGA_TEXTURE_UPGRADE_MIN_RATIO: f32 = 1.12;
     const MANGA_TTV_SAMPLE_CAP: usize = 240;
     const MANGA_TTV_PENDING_MAX_AGE: Duration = Duration::from_secs(30);
 
@@ -2629,6 +2632,88 @@ impl ImageViewer {
         }
     }
 
+    fn manga_should_force_triangle_filters(&self) -> bool {
+        self.is_masonry_mode()
+    }
+
+    fn manga_decode_filters_for_strip_mode(&self) -> (FilterType, FilterType) {
+        if self.manga_should_force_triangle_filters() {
+            (FilterType::Triangle, FilterType::Triangle)
+        } else {
+            (
+                self.config.downscale_filter.to_image_filter(),
+                self.config.gif_resize_filter.to_image_filter(),
+            )
+        }
+    }
+
+    fn masonry_zoom_quality_boost(zoom: f32) -> f32 {
+        if zoom <= 0.35 {
+            0.85
+        } else if zoom <= 0.60 {
+            0.90
+        } else if zoom <= 1.00 {
+            1.00
+        } else if zoom <= 1.50 {
+            1.08
+        } else if zoom <= 2.00 {
+            1.16
+        } else {
+            1.24
+        }
+    }
+
+    fn masonry_target_texture_side_from_screen_width(&self, item_screen_width: f32) -> u32 {
+        let max_side = self.max_texture_side.max(1);
+        let zoom = self.zoom.max(0.0001);
+        let rows = self.masonry_items_per_row.clamp(2, 10) as f32;
+
+        // Baseline uses viewport width split by rows, so at 3440px / 5 rows / 100% zoom
+        // the target is ~688px before quality boost.
+        let baseline_item_width = (self.screen_size.x.max(1.0) / rows) * zoom;
+        let basis = item_screen_width.max(baseline_item_width).max(64.0);
+        let scaled = (basis * Self::masonry_zoom_quality_boost(zoom)).ceil() as u32;
+
+        scaled.clamp(Self::MANGA_MASONRY_DYNAMIC_TARGET_MIN_SIDE.min(max_side), max_side)
+    }
+
+    fn manga_clamp_target_side_to_source(&self, index: usize, target_side: u32) -> u32 {
+        self.manga_loader
+            .as_ref()
+            .and_then(|loader| loader.get_dimensions(index))
+            .map(|(w, h)| target_side.min(w.max(h).max(1)))
+            .unwrap_or(target_side)
+    }
+
+    fn manga_retry_target_side_for_rect(&self, index: usize, image_rect: egui::Rect) -> u32 {
+        let max_side = self.max_texture_side.max(1);
+
+        let target_side = if self.is_masonry_mode() {
+            self.masonry_target_texture_side_from_screen_width(image_rect.width().max(1.0))
+        } else {
+            ((image_rect.width().max(image_rect.height()) * Self::MANGA_DYNAMIC_TARGET_OVERSCAN)
+                .ceil() as u32)
+                .clamp(
+                    Self::MANGA_DYNAMIC_TARGET_MIN_SIDE.min(max_side),
+                    max_side,
+                )
+        };
+
+        self.manga_clamp_target_side_to_source(index, target_side)
+            .clamp(1, max_side)
+    }
+
+    fn manga_texture_upgrade_needed(existing_side: u32, desired_side: u32) -> bool {
+        if desired_side <= existing_side {
+            return false;
+        }
+
+        let ratio_threshold =
+            (existing_side as f32 * Self::MANGA_TEXTURE_UPGRADE_MIN_RATIO).ceil() as u32;
+        let delta_threshold = existing_side.saturating_add(Self::MANGA_TEXTURE_UPGRADE_MIN_DELTA_SIDE);
+        desired_side >= ratio_threshold.max(delta_threshold)
+    }
+
     fn manga_collect_visible_indices(&mut self) -> Vec<usize> {
         if !self.manga_mode || self.image_list.is_empty() {
             return Vec::new();
@@ -2738,21 +2823,15 @@ impl ImageViewer {
         if self.is_masonry_mode() {
             self.masonry_ensure_layout_cache();
             let zoom = self.zoom.max(0.0001);
-            let mut visible_max_side = 0.0f32;
+            let mut visible_max_width = 0.0f32;
 
             for &idx in visible_indices.iter().take(96) {
                 if let Some(item) = self.masonry_layout_items.get(idx) {
-                    visible_max_side = visible_max_side.max((item.width * zoom).max(item.height * zoom));
+                    visible_max_width = visible_max_width.max(item.width * zoom);
                 }
             }
 
-            if visible_max_side <= 0.0 {
-                let rows = self.masonry_items_per_row.clamp(2, 10) as f32;
-                visible_max_side = (self.screen_size.x.max(1.0) / rows).max(64.0);
-            }
-
-            let scaled = (visible_max_side * Self::MANGA_DYNAMIC_TARGET_OVERSCAN).ceil() as u32;
-            return scaled.clamp(Self::MANGA_DYNAMIC_TARGET_MIN_SIDE.min(max_side), max_side);
+            return self.masonry_target_texture_side_from_screen_width(visible_max_width);
         }
 
         if self.zoom >= 0.95 {
@@ -3627,7 +3706,11 @@ impl ImageViewer {
                         frame.height,
                         &frame.pixels,
                         self.max_texture_side,
-                        self.config.downscale_filter.to_image_filter(),
+                        if self.manga_should_force_triangle_filters() {
+                            FilterType::Triangle
+                        } else {
+                            self.config.downscale_filter.to_image_filter()
+                        },
                     );
                     let color_image = egui::ColorImage::from_rgba_unmultiplied(
                         [w as usize, h as usize],
@@ -3658,6 +3741,16 @@ impl ImageViewer {
         }
 
         let mut needs_repaint = false;
+        let active_gif_filter = if self.manga_should_force_triangle_filters() {
+            FilterType::Triangle
+        } else {
+            self.config.gif_resize_filter.to_image_filter()
+        };
+        let active_downscale_filter = if self.manga_should_force_triangle_filters() {
+            FilterType::Triangle
+        } else {
+            self.config.downscale_filter.to_image_filter()
+        };
 
         let prev_focused = self.manga_focused_anim_index;
         // Determine which animated image should be active (center of viewport).
@@ -3722,23 +3815,21 @@ impl ImageViewer {
                 && !self.manga_anim_failed.contains(&idx)
             {
                 if let Some(path) = self.image_list.get(idx).cloned() {
-                    let gif_filter = self.config.gif_resize_filter.to_image_filter();
                     let max_tex = self.max_texture_side;
 
                     if let Some(rx) =
-                        LoadedImage::start_streaming_webp(&path, Some(max_tex), gif_filter)
+                        LoadedImage::start_streaming_webp(&path, Some(max_tex), active_gif_filter)
                     {
                         self.manga_anim_streams.insert(idx, rx);
                         self.manga_anim_stream_done.insert(idx, false);
 
                         // Ensure there's a LoadedImage entry with at least the first frame.
                         if !self.manga_animated_images.contains_key(&idx) {
-                            let downscale_f = FilterType::Triangle;
                             if let Ok(img) = LoadedImage::load_first_frame_only(
                                 &path,
                                 Some(max_tex),
-                                downscale_f,
-                                gif_filter,
+                                active_downscale_filter,
+                                active_gif_filter,
                             ) {
                                 self.manga_animated_images.insert(idx, img);
                             }
@@ -3820,7 +3911,7 @@ impl ImageViewer {
                         frame.height,
                         &frame.pixels,
                         self.max_texture_side,
-                        self.config.gif_resize_filter.to_image_filter(),
+                        active_gif_filter,
                     );
 
                     let color_image = egui::ColorImage::from_rgba_unmultiplied(
@@ -3896,6 +3987,12 @@ impl ImageViewer {
         idx: usize,
         stream_done: bool,
     ) {
+        let reset_filter = if self.manga_should_force_triangle_filters() {
+            FilterType::Triangle
+        } else {
+            self.config.gif_resize_filter.to_image_filter()
+        };
+
         if let Some(img) = self.manga_animated_images.get_mut(&idx) {
             if !stream_done && img.frames.len() > 1 {
                 img.frames.truncate(1);
@@ -3910,7 +4007,7 @@ impl ImageViewer {
                 frame.height,
                 &frame.pixels,
                 self.max_texture_side,
-                self.config.gif_resize_filter.to_image_filter(),
+                reset_filter,
             );
             let color_image =
                 egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], pixels.as_ref());
@@ -4065,6 +4162,8 @@ impl ImageViewer {
         self.manga_last_scroll_position = self.manga_scroll_offset;
 
         // Update the parallel loader's preload queue
+        let (downscale_filter, gif_filter) = self.manga_decode_filters_for_strip_mode();
+        let force_triangle_filters = self.manga_should_force_triangle_filters();
         if let Some(ref mut loader) = self.manga_loader {
             loader.update_preload_queue(
                 &self.image_list,
@@ -4072,6 +4171,9 @@ impl ImageViewer {
                 self.screen_size.y,
                 self.max_texture_side,
                 self.manga_target_texture_side,
+                downscale_filter,
+                gif_filter,
+                force_triangle_filters,
             );
         }
 
@@ -4341,10 +4443,16 @@ impl ImageViewer {
 
         // Upload decoded images to GPU as textures
         for decoded in decoded_images {
-            // Skip if already in texture cache
-            if self.manga_texture_cache.contains(decoded.index) {
-                self.manga_ttv_pending.remove(&decoded.index);
-                continue;
+            let incoming_side = decoded.width.max(decoded.height);
+
+            // Keep current texture unless the decoded payload is a meaningful quality upgrade.
+            if let Some((_, existing_w, existing_h)) = self.manga_texture_cache.get_texture_info(decoded.index)
+            {
+                let existing_side = existing_w.max(existing_h);
+                if !Self::manga_texture_upgrade_needed(existing_side, incoming_side) {
+                    self.manga_ttv_pending.remove(&decoded.index);
+                    continue;
+                }
             }
 
             // Skip if no pixel data (failed to extract frame or empty placeholder)
@@ -4677,6 +4785,8 @@ impl ImageViewer {
         // Prime the loader around the destination so the transition stays smooth.
         let (preload_behind, preload_ahead) = self.navigation_preload_window();
         let target_texture_side = self.manga_target_texture_side_for_preload(target, &[]);
+        let (downscale_filter, gif_filter) = self.manga_decode_filters_for_strip_mode();
+        let force_triangle_filters = self.manga_should_force_triangle_filters();
         if let Some(ref mut loader) = self.manga_loader {
             let len = self.image_list.len();
             if len > 0 {
@@ -4689,6 +4799,9 @@ impl ImageViewer {
                     self.screen_size.y,
                     self.max_texture_side,
                     target_texture_side,
+                    downscale_filter,
+                    gif_filter,
+                    force_triangle_filters,
                 );
             }
         }
@@ -4779,6 +4892,8 @@ impl ImageViewer {
         // Prime the loader around the destination so the transition stays smooth.
         let (preload_behind, preload_ahead) = self.navigation_preload_window();
         let target_texture_side = self.manga_target_texture_side_for_preload(target, &[]);
+        let (downscale_filter, gif_filter) = self.manga_decode_filters_for_strip_mode();
+        let force_triangle_filters = self.manga_should_force_triangle_filters();
         if let Some(ref mut loader) = self.manga_loader {
             let len = self.image_list.len();
             let start = target.saturating_sub(preload_behind);
@@ -4790,6 +4905,9 @@ impl ImageViewer {
                 self.screen_size.y,
                 self.max_texture_side,
                 target_texture_side,
+                downscale_filter,
+                gif_filter,
+                force_triangle_filters,
             );
         }
 
@@ -4818,6 +4936,8 @@ impl ImageViewer {
         // Prime the loader around the destination so the transition stays smooth.
         let (preload_behind, preload_ahead) = self.navigation_preload_window();
         let target_texture_side = self.manga_target_texture_side_for_preload(target, &[]);
+        let (downscale_filter, gif_filter) = self.manga_decode_filters_for_strip_mode();
+        let force_triangle_filters = self.manga_should_force_triangle_filters();
         if let Some(ref mut loader) = self.manga_loader {
             let len = self.image_list.len();
             if len > 0 {
@@ -4830,6 +4950,9 @@ impl ImageViewer {
                     self.screen_size.y,
                     self.max_texture_side,
                     target_texture_side,
+                    downscale_filter,
+                    gif_filter,
+                    force_triangle_filters,
                 );
             }
         }
@@ -4863,6 +4986,8 @@ impl ImageViewer {
         // Prime the loader around the destination so the transition stays smooth.
         let (preload_behind, preload_ahead) = self.navigation_preload_window();
         let target_texture_side = self.manga_target_texture_side_for_preload(target, &[]);
+        let (downscale_filter, gif_filter) = self.manga_decode_filters_for_strip_mode();
+        let force_triangle_filters = self.manga_should_force_triangle_filters();
         if let Some(ref mut loader) = self.manga_loader {
             let len = self.image_list.len();
             let start = target.saturating_sub(preload_behind);
@@ -4874,6 +4999,9 @@ impl ImageViewer {
                 self.screen_size.y,
                 self.max_texture_side,
                 target_texture_side,
+                downscale_filter,
+                gif_filter,
+                force_triangle_filters,
             );
         }
 
@@ -5625,9 +5753,12 @@ impl ImageViewer {
         }
 
         let max_side = self.max_texture_side.max(1);
-        let target_texture_side = display_target_side
+        let target_texture_side = self
+            .manga_clamp_target_side_to_source(index, display_target_side)
             .max(self.manga_target_texture_side.min(max_side))
             .clamp(Self::MANGA_DYNAMIC_TARGET_MIN_SIDE.min(max_side), max_side);
+        let (downscale_filter, gif_filter) = self.manga_decode_filters_for_strip_mode();
+        let force_triangle_filters = self.manga_should_force_triangle_filters();
 
         self.manga_loader
             .as_mut()
@@ -5637,6 +5768,9 @@ impl ImageViewer {
                     index,
                     self.max_texture_side,
                     target_texture_side,
+                    downscale_filter,
+                    gif_filter,
+                    force_triangle_filters,
                 )
             })
             .unwrap_or(false)
@@ -5644,13 +5778,7 @@ impl ImageViewer {
 
     fn draw_manga_item(&mut self, ui: &mut egui::Ui, idx: usize, image_rect: egui::Rect) -> bool {
         let mut requested_retry = false;
-        let retry_target_side = ((image_rect.width().max(image_rect.height())
-            * Self::MANGA_DYNAMIC_TARGET_OVERSCAN)
-            .ceil() as u32)
-            .clamp(
-                Self::MANGA_DYNAMIC_TARGET_MIN_SIDE.min(self.max_texture_side.max(1)),
-                self.max_texture_side.max(1),
-            );
+        let retry_target_side = self.manga_retry_target_side_for_rect(idx, image_rect);
 
         // Check if this item is a video
         let is_video = self
@@ -5702,7 +5830,7 @@ impl ImageViewer {
                         egui::Color32::WHITE,
                     );
                 }
-            } else if let Some((texture_id, _tex_w, _tex_h)) =
+            } else if let Some((texture_id, tex_w, tex_h)) =
                 self.manga_texture_cache.get_texture_info(idx)
             {
                 // First-frame thumbnail from texture cache - use it as a preview
@@ -5728,6 +5856,10 @@ impl ImageViewer {
                     egui::FontId::proportional(32.0),
                     egui::Color32::WHITE,
                 );
+
+                if Self::manga_texture_upgrade_needed(tex_w.max(tex_h), retry_target_side) {
+                    requested_retry |= self.manga_request_retry_for_visible_item(idx, retry_target_side);
+                }
             } else if self.strip_entry_placeholder_index == Some(idx) {
                 // Immediate fallback when entering strip mode from solo-video fullscreen.
                 // Keeps only the strip-entry frame visible until manga cache catches up.
@@ -5769,7 +5901,7 @@ impl ImageViewer {
             }
         } else {
             // Image item: use regular texture cache
-            if let Some((texture_id, _tex_w, _tex_h)) = self.manga_texture_cache.get_texture_info(idx)
+            if let Some((texture_id, tex_w, tex_h)) = self.manga_texture_cache.get_texture_info(idx)
             {
                 ui.painter().image(
                     texture_id,
@@ -5788,6 +5920,10 @@ impl ImageViewer {
                 if is_focused_anim && (still_streaming || has_active_stream) {
                     let time = ui.input(|i| i.time);
                     paint_loading_spinner(ui.painter(), image_rect, time);
+                }
+
+                if Self::manga_texture_upgrade_needed(tex_w.max(tex_h), retry_target_side) {
+                    requested_retry |= self.manga_request_retry_for_visible_item(idx, retry_target_side);
                 }
             } else if self.strip_entry_placeholder_index == Some(idx) {
                 // Immediate fallback when entering strip mode from solo-image fullscreen.
