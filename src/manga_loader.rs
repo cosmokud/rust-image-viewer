@@ -239,6 +239,16 @@ impl MangaLoader {
                         let is_video = is_supported_video(&path);
                         let is_image = is_supported_image(&path);
 
+                        if !is_video && !is_image {
+                            continue;
+                        }
+
+                        let media_type = if is_video {
+                            MangaMediaType::Video
+                        } else {
+                            MangaMediaType::StaticImage
+                        };
+
                         let dims = if is_video {
                             Self::probe_video_dimensions(&path)
                         } else if is_image {
@@ -247,14 +257,15 @@ impl MangaLoader {
                             None
                         };
 
-                        if let Some((w, h)) = dims {
-                            let mt = if is_video {
-                                MangaMediaType::Video
-                            } else {
-                                MangaMediaType::StaticImage
-                            };
-                            out.push((idx, w, h, mt));
-                        }
+                        let (w, h) = if let Some((w, h)) = dims {
+                            (w, h)
+                        } else if is_video {
+                            (1920, 1080)
+                        } else {
+                            (1200, 1600)
+                        };
+
+                        out.push((idx, w, h, media_type));
 
                         if out.len() >= DIM_RESULT_CHUNK_SIZE {
                             let chunk = std::mem::take(&mut out);
@@ -323,6 +334,23 @@ impl MangaLoader {
         self.dim_result_rx.len()
     }
 
+    /// Number of indices currently waiting for dimension probe completion.
+    pub fn pending_dimension_probe_count(&self) -> usize {
+        self.dim_pending.len()
+    }
+
+    /// Number of cached dimensions for indices in `[0, total_len)`.
+    pub fn cached_dimensions_count(&self, total_len: usize) -> usize {
+        if total_len == 0 {
+            return 0;
+        }
+
+        self.dimension_cache
+            .keys()
+            .filter(|&&idx| idx < total_len)
+            .count()
+    }
+
     /// Queue async dimension probes for a range of indices.
     ///
     /// This does not block the UI thread. Results are applied when `poll_dimension_results` is called.
@@ -377,6 +405,71 @@ impl MangaLoader {
                 // Worker gone; ignore.
             }
         }
+    }
+
+    /// Queue async dimension probes for all uncached indices.
+    ///
+    /// This is non-blocking and respects channel backpressure.
+    /// Returns the number of indices successfully enqueued in this call.
+    pub fn request_all_missing_dimensions(&mut self, image_list: &[PathBuf]) -> usize {
+        if image_list.is_empty() {
+            return 0;
+        }
+
+        let mut enqueued = 0usize;
+        let mut batch: Vec<(usize, PathBuf)> = Vec::with_capacity(DIM_REQUEST_BATCH_SIZE);
+
+        for (idx, path) in image_list.iter().enumerate() {
+            if self.dimension_cache.contains_key(&idx) || self.dim_pending.contains(&idx) {
+                continue;
+            }
+
+            if !is_supported_image(path) && !is_supported_video(path) {
+                continue;
+            }
+
+            batch.push((idx, path.clone()));
+
+            if batch.len() >= DIM_REQUEST_BATCH_SIZE {
+                let indices: Vec<usize> = batch.iter().map(|(i, _)| *i).collect();
+                let items = std::mem::take(&mut batch);
+                match self.dim_request_tx.try_send(DimRequest {
+                    generation: self.current_generation,
+                    items,
+                }) {
+                    Ok(()) => {
+                        for idx in indices {
+                            self.dim_pending.insert(idx);
+                        }
+                        enqueued += DIM_REQUEST_BATCH_SIZE;
+                    }
+                    Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
+                        return enqueued;
+                    }
+                }
+            }
+        }
+
+        if !batch.is_empty() {
+            let indices: Vec<usize> = batch.iter().map(|(i, _)| *i).collect();
+            let items = std::mem::take(&mut batch);
+            match self.dim_request_tx.try_send(DimRequest {
+                generation: self.current_generation,
+                items,
+            }) {
+                Ok(()) => {
+                    for idx in &indices {
+                        self.dim_pending.insert(*idx);
+                    }
+                    enqueued += indices.len();
+                }
+                Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
+                    return enqueued;
+                }
+            }
+        }
+
+        enqueued
     }
 
     /// Drain async dimension results and apply them to `dimension_cache`.
