@@ -4881,20 +4881,43 @@ impl ImageViewer {
         scaled.clamp(self.masonry_dynamic_target_min_side(), max_side)
     }
 
+    fn masonry_item_current_display_size(&mut self, index: usize) -> Option<egui::Vec2> {
+        if !self.is_masonry_mode() {
+            return None;
+        }
+
+        if let Some(rect) = self.masonry_item_screen_rect(index) {
+            return Some(rect.size());
+        }
+
+        self.masonry_ensure_layout_cache();
+        self.masonry_layout_items.get(index).map(|item| {
+            let slot_size = egui::vec2(
+                item.width * self.zoom.max(0.0001),
+                item.height * self.zoom.max(0.0001),
+            );
+            self.masonry_item_display_size(index, slot_size)
+        })
+    }
+
+    fn masonry_target_texture_side_for_index(&mut self, index: usize) -> u32 {
+        let max_side = self.max_texture_side.max(1);
+        let display_max_side = self
+            .masonry_item_current_display_size(index)
+            .map(|size| size.x.max(size.y).max(1.0))
+            .unwrap_or_else(|| self.screen_size.x.min(self.screen_size.y).max(1.0));
+
+        self.manga_clamp_target_side_to_source(
+            index,
+            self.masonry_target_texture_side_from_display_side(display_max_side),
+        )
+        .clamp(1, max_side)
+    }
+
     fn manga_screen_max_side_for_index(&mut self, index: usize) -> f32 {
         if self.is_masonry_mode() {
-            if let Some(rect) = self.masonry_item_screen_rect(index) {
-                return rect.width().max(rect.height()).max(1.0);
-            }
-
-            self.masonry_ensure_layout_cache();
-            if let Some(item) = self.masonry_layout_items.get(index) {
-                let slot_size = egui::vec2(
-                    item.width * self.zoom.max(0.0001),
-                    item.height * self.zoom.max(0.0001),
-                );
-                let display_size = self.masonry_item_display_size(index, slot_size);
-                return display_size.x.max(display_size.y).max(1.0);
+            if let Some(size) = self.masonry_item_current_display_size(index) {
+                return size.x.max(size.y).max(1.0);
             }
 
             return self.screen_size.x.min(self.screen_size.y).max(1.0);
@@ -4965,14 +4988,12 @@ impl ImageViewer {
             .unwrap_or(target_side)
     }
 
-    fn manga_retry_target_side_for_rect(&self, index: usize, image_rect: egui::Rect) -> u32 {
+    fn manga_retry_target_side_for_rect(&mut self, index: usize, image_rect: egui::Rect) -> u32 {
         let max_side = self.max_texture_side.max(1);
         let target_scale = self.manga_lod_target_scale_factor();
 
         let target_side = if self.is_masonry_mode() {
-            self.masonry_target_texture_side_from_display_side(
-                image_rect.width().max(image_rect.height()).max(1.0),
-            )
+            self.masonry_target_texture_side_for_index(index)
         } else {
             ((image_rect.width().max(image_rect.height())
                 * Self::MANGA_DYNAMIC_TARGET_OVERSCAN
@@ -4981,11 +5002,8 @@ impl ImageViewer {
                 .clamp(Self::MANGA_DYNAMIC_TARGET_MIN_SIDE.min(max_side), max_side)
         };
 
-        let clamped_target = self
-            .manga_clamp_target_side_to_source(index, target_side)
-            .clamp(1, max_side);
-
-        MangaLoader::quantize_requested_texture_side(clamped_target, max_side).clamp(1, max_side)
+        self.manga_clamp_target_side_to_source(index, target_side)
+            .clamp(1, max_side)
     }
 
     fn manga_texture_upgrade_needed(
@@ -4996,6 +5014,10 @@ impl ImageViewer {
     ) -> bool {
         if desired_side <= existing_side {
             return false;
+        }
+
+        if self.is_masonry_mode() && media_type == MangaMediaType::StaticImage {
+            return true;
         }
 
         let (ratio, delta) = if self.is_masonry_mode() {
@@ -7270,6 +7292,49 @@ impl ImageViewer {
         }
     }
 
+    fn manga_texture_options_for_cached_upload(
+        &mut self,
+        index: usize,
+        media_type: MangaMediaType,
+        width: u32,
+        height: u32,
+    ) -> egui::TextureOptions {
+        if !self.is_masonry_mode() || media_type == MangaMediaType::AnimatedImage {
+            return self.manga_texture_options_for_upload(media_type, width, height);
+        }
+
+        let min_side = width.min(height);
+        let mipmap_allowed_by_size = min_side >= self.config.manga_mipmap_min_side.max(1);
+        let navigation_blocks_mipmaps = self.masonry_navigation_active_for_heavy_work();
+        let display_min_side = self
+            .masonry_item_current_display_size(index)
+            .map(|size| size.x.min(size.y).max(1.0))
+            .unwrap_or(min_side.max(1) as f32);
+        let meaningfully_minified = (min_side as f32) >= display_min_side * 1.15;
+
+        match media_type {
+            MangaMediaType::StaticImage => {
+                let enable_mipmap = self.config.manga_mipmap_static
+                    && mipmap_allowed_by_size
+                    && meaningfully_minified
+                    && !navigation_blocks_mipmaps;
+                self.config
+                    .texture_filter_static
+                    .to_egui_options_with_mipmap(enable_mipmap)
+            }
+            MangaMediaType::Video => {
+                let enable_mipmap = self.config.manga_mipmap_video_thumbnails
+                    && mipmap_allowed_by_size
+                    && meaningfully_minified
+                    && !navigation_blocks_mipmaps;
+                self.config
+                    .texture_filter_video
+                    .to_egui_options_with_mipmap(enable_mipmap)
+            }
+            MangaMediaType::AnimatedImage => self.config.texture_filter_animated.to_egui_options(),
+        }
+    }
+
     /// Process decoded images from the parallel loader and upload them as GPU textures.
     /// This is called every frame and uploads a limited batch to prevent stutters.
     fn manga_process_pending_loads(&mut self, ctx: &egui::Context) -> bool {
@@ -7441,7 +7506,8 @@ impl ImageViewer {
 
             // Static images + video thumbnails can use mipmaps for faster minification
             // in manga strip and masonry layouts.
-            let texture_options = self.manga_texture_options_for_upload(
+            let texture_options = self.manga_texture_options_for_cached_upload(
+                decoded.index,
                 decoded.media_type,
                 decoded.width,
                 decoded.height,

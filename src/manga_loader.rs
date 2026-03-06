@@ -718,10 +718,7 @@ impl MangaLoader {
                         let has_usable_pixels =
                             !decoded.pixels.is_empty() && decoded.width > 0 && decoded.height > 0;
 
-                        let loaded_side = decoded
-                            .width
-                            .max(decoded.height)
-                            .max(decoded.requested_side);
+                        let loaded_side = decoded.width.max(decoded.height);
 
                         match result_tx.try_send(decoded) {
                             Ok(_) => {
@@ -1001,12 +998,18 @@ impl MangaLoader {
         max_side
     }
 
-    /// Quantize a requested texture side to the loader's shared LOD buckets.
-    pub fn quantize_requested_texture_side(
+    fn limit_target_texture_side_for_index(
+        &self,
+        index: usize,
         target_texture_side: u32,
         max_texture_side: u32,
     ) -> u32 {
-        Self::quantize_target_texture_side(target_texture_side, max_texture_side)
+        let quantized = Self::quantize_target_texture_side(target_texture_side, max_texture_side);
+
+        self.dimension_cache
+            .get(&index)
+            .map(|(width, height, _)| quantized.min((*width).max(*height).max(1)))
+            .unwrap_or(quantized)
     }
 
     /// Probe video dimensions for stable layout sizing.
@@ -1400,6 +1403,12 @@ impl MangaLoader {
             let retry = self.retry_state.read();
 
             for idx in start_idx..end_idx {
+                let request_target_texture_side = self.limit_target_texture_side_for_index(
+                    idx,
+                    target_texture_side,
+                    max_texture_side,
+                );
+
                 // Check if file is a supported media type (image or video)
                 let is_image = is_supported_image(&image_list[idx]);
                 let is_video = is_supported_video(&image_list[idx]);
@@ -1411,7 +1420,7 @@ impl MangaLoader {
                 if loading.get(&idx).copied() == Some(generation)
                     || loaded
                         .get(&idx)
-                        .is_some_and(|side| *side >= target_texture_side)
+                        .is_some_and(|side| *side >= request_target_texture_side)
                 {
                     continue;
                 }
@@ -1454,7 +1463,7 @@ impl MangaLoader {
                     index: idx,
                     path: image_list[idx].clone(),
                     max_texture_side,
-                    target_texture_side,
+                    target_texture_side: request_target_texture_side,
                     downscale_filter: request_downscale_filter,
                     gif_filter: request_gif_filter,
                     priority,
@@ -1626,7 +1635,7 @@ impl MangaLoader {
         }
 
         let target_texture_side =
-            Self::quantize_target_texture_side(target_texture_side, max_texture_side);
+            self.limit_target_texture_side_for_index(index, target_texture_side, max_texture_side);
 
         if self
             .loaded_levels

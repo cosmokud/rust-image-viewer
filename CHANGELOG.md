@@ -21,6 +21,7 @@ All notable changes to this project will be documented in this file.
 - Masonry navigation now suppresses more unnecessary quality upgrades and mipmap work for transient textures, keeping the draw thread focused on fast visible fills before settling to higher detail.
 - Metadata-cache fingerprint validation now uses a short-lived in-memory stamp cache, which cuts repeated `std::fs::metadata` probes during dense browsing and reduces HDD-sensitive thumbnail and dimension lookup stalls.
 - Visible strip and masonry items no longer get stuck in the blurry fill state, because sharpness upgrades now use the loader's real LOD buckets and can force a self-healing retry when stale bookkeeping gets in the way.
+- Masonry visible sharpening and mipmap decisions now follow each tile's current fitted on-screen size in the active row layout, and loader bookkeeping no longer overstates quality past the source image's real dimensions.
 
 ### Added
 
