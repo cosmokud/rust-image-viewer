@@ -1996,6 +1996,38 @@ impl MangaTextureCache {
         }
     }
 
+    /// Update an existing texture's pixel data in-place.
+    ///
+    /// Returns `true` if the cache entry existed and was updated.
+    pub fn set_existing_texture_image(
+        &mut self,
+        index: usize,
+        image: Arc<egui::ColorImage>,
+        options: egui::TextureOptions,
+        media_type: MangaMediaType,
+    ) -> bool {
+        let width = image.size[0] as u32;
+        let height = image.size[1] as u32;
+
+        if let Some(entry) = self.pinned_entries.get_mut(&index) {
+            entry.texture.set(image.clone(), options);
+            entry.width = width;
+            entry.height = height;
+            entry.media_type = media_type;
+            return true;
+        }
+
+        if let Some(entry) = self.unpinned_entries.get_mut(&index) {
+            entry.texture.set(image, options);
+            entry.width = width;
+            entry.height = height;
+            entry.media_type = media_type;
+            return true;
+        }
+
+        false
+    }
+
     /// Remove an entry from the cache.
     pub fn remove(&mut self, index: usize) {
         self.pinned_entries.remove(&index);
