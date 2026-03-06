@@ -2,6 +2,10 @@
 #[path = "../src/image_loader.rs"]
 mod image_loader;
 
+#[allow(dead_code)]
+#[path = "../src/media_index.rs"]
+mod media_index;
+
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -74,6 +78,38 @@ fn bench_directory_scan(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_directory_index_cache(c: &mut Criterion) {
+    let mut group = c.benchmark_group("directory_index_cache");
+
+    for &size in &[1_000usize, 10_000usize] {
+        let (_dir, anchor) = create_scan_dataset(size);
+
+        group.bench_with_input(BenchmarkId::new("cache_hit", size), &anchor, |b, p| {
+            let mut index = media_index::MediaDirectoryIndex::new(64);
+            let _ = index.media_in_directory_for_path(p);
+
+            b.iter(|| {
+                let files = index.media_in_directory_for_path(black_box(p));
+                black_box(files.len());
+            });
+        });
+
+        group.bench_with_input(BenchmarkId::new("cache_miss", size), &anchor, |b, p| {
+            let mut index = media_index::MediaDirectoryIndex::new(64);
+
+            b.iter(|| {
+                if let Some(parent) = p.parent() {
+                    index.invalidate_directory(parent);
+                }
+                let files = index.media_in_directory_for_path(black_box(p));
+                black_box(files.len());
+            });
+        });
+    }
+
+    group.finish();
+}
+
 fn bench_gif_decode(c: &mut Criterion) {
     let dir = tempfile::tempdir().expect("failed to create gif tempdir");
     let gif_path = dir.path().join("animated_bench.gif");
@@ -93,5 +129,10 @@ fn bench_gif_decode(c: &mut Criterion) {
     });
 }
 
-criterion_group!(perf_baseline, bench_directory_scan, bench_gif_decode);
+criterion_group!(
+    perf_baseline,
+    bench_directory_scan,
+    bench_directory_index_cache,
+    bench_gif_decode
+);
 criterion_main!(perf_baseline);

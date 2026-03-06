@@ -5,7 +5,9 @@
 
 mod config;
 mod image_loader;
+mod media_index;
 mod manga_loader;
+mod perf_metrics;
 #[cfg(target_os = "windows")]
 mod single_instance;
 mod video_player;
@@ -18,11 +20,13 @@ static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use config::{Action, Config, InputBinding, StartupWindowMode};
 use image_loader::{
-    get_images_in_directory, get_media_type, is_supported_video, probe_image_dimensions,
-    ImageFrame, LoadedImage, MediaType,
+    get_media_type, is_supported_video, probe_image_dimensions, ImageFrame, LoadedImage,
+    MediaType,
 };
 use hashbrown::{HashMap, HashSet};
+use media_index::MediaDirectoryIndex;
 use manga_loader::{MangaLoader, MangaMediaType, MangaTextureCache};
+use perf_metrics::PerfMetrics;
 #[cfg(target_os = "windows")]
 use single_instance::{FileReceiver, SingleInstanceResult};
 use video_player::{format_duration, VideoPlayer};
@@ -353,6 +357,8 @@ struct ImageViewer {
     texture_frame: usize,
     /// List of images in the current directory
     image_list: Vec<PathBuf>,
+    /// Cached directory index used to avoid rescanning unchanged folders on every navigation step.
+    media_directory_index: MediaDirectoryIndex,
     /// Current image index in the list
     current_index: usize,
     /// Current zoom level (1.0 = 100%)
@@ -493,6 +499,9 @@ struct ImageViewer {
     is_idle: bool,
     /// Idle repaint interval counter - skip unnecessary repaints when truly idle
     idle_frame_skip_counter: u32,
+
+    /// Rolling runtime metrics used for perf diagnostics.
+    perf_metrics: PerfMetrics,
 
     // ============ FPS DEBUG OVERLAY ============
     /// Last time we recorded a frame (for FPS calculation)
@@ -712,6 +721,7 @@ impl Default for ImageViewer {
             image_texture_dims: None,
             texture_frame: 0,
             image_list: Vec::new(),
+            media_directory_index: MediaDirectoryIndex::default(),
             current_index: 0,
             zoom: 1.0,
             zoom_target: 1.0,
@@ -776,6 +786,7 @@ impl Default for ImageViewer {
             last_activity_time: Instant::now(),
             is_idle: true,
             idle_frame_skip_counter: 0,
+            perf_metrics: PerfMetrics::default(),
 
             fps_last_frame_at: Instant::now(),
             fps_last_active_frame_at: Instant::now(),
@@ -1091,6 +1102,27 @@ impl ImageViewer {
                 ));
             } else {
                 text.push_str(&format!(" | U{}", self.manga_upload_batch_limit));
+            }
+        }
+
+        let index_stats = self.media_directory_index.stats();
+        text.push_str(&format!(
+            " | IDX H{} M{}",
+            index_stats.hits, index_stats.misses
+        ));
+
+        if let Some(p95) = self.perf_metrics.percentile_ms("media_index_lookup_ms", 0.95) {
+            text.push_str(&format!(" p95:{p95:.2}ms"));
+        }
+
+        if self.manga_mode {
+            if let Some(p95) = self.perf_metrics.percentile_ms("manga_upload_pass_ms", 0.95) {
+                text.push_str(&format!(" | UP p95:{p95:.2}ms"));
+            }
+
+            let uploaded_total = self.perf_metrics.counter("manga_uploaded_textures");
+            if uploaded_total > 0 {
+                text.push_str(&format!(" | UTot {}", uploaded_total));
             }
         }
 
@@ -2189,6 +2221,8 @@ impl ImageViewer {
 
     /// Load any media (image or video) from path
     fn load_media(&mut self, path: &PathBuf) {
+        let load_media_start = Instant::now();
+
         self.reset_masonry_metadata_preload();
 
         // Update the native window title (taskbar title) using Unicode-safe conversion.
@@ -2267,8 +2301,25 @@ impl ImageViewer {
         self.zoom_target = 1.0;
         self.pending_media_layout = false;
 
-        // Get media in directory
-        self.image_list = get_images_in_directory(path);
+        // Reuse cached directory listing when the parent folder is unchanged.
+        let index_stats_before = self.media_directory_index.stats();
+        let index_lookup_start = Instant::now();
+        self.image_list = self.media_directory_index.media_in_directory_for_path(path);
+        self.perf_metrics
+            .record_duration("media_index_lookup_ms", index_lookup_start.elapsed());
+        let index_stats_after = self.media_directory_index.stats();
+        if index_stats_after.hits > index_stats_before.hits {
+            self.perf_metrics.increment_counter(
+                "media_index_hits",
+                index_stats_after.hits - index_stats_before.hits,
+            );
+        }
+        if index_stats_after.misses > index_stats_before.misses {
+            self.perf_metrics.increment_counter(
+                "media_index_misses",
+                index_stats_after.misses - index_stats_before.misses,
+            );
+        }
         self.set_current_index_clamped(self.image_list.iter().position(|p| p == path).unwrap_or(0));
 
         match media_type {
@@ -2286,6 +2337,8 @@ impl ImageViewer {
                         // Start playback
                         if let Err(e) = player.play() {
                             self.error_message = Some(format!("Failed to play video: {}", e));
+                            self.perf_metrics
+                                .record_duration("load_media_sync_ms", load_media_start.elapsed());
                             return;
                         }
                         self.video_player = Some(player);
@@ -2346,6 +2399,9 @@ impl ImageViewer {
                 self.error_message = Some(format!("Unsupported file format: {:?}", path));
             }
         }
+
+        self.perf_metrics
+            .record_duration("load_media_sync_ms", load_media_start.elapsed());
     }
 
     /// Save the current view state for the current image (fullscreen only).
@@ -4894,6 +4950,8 @@ impl ImageViewer {
             return false;
         }
 
+        let upload_pass_started = Instant::now();
+
         let defer_masonry_layout_work = self.masonry_navigation_active_for_heavy_work();
 
         let (pending_loads, pending_decoded) = self
@@ -4943,6 +5001,7 @@ impl ImageViewer {
         let mut evicted_to_mark_unloaded = self
             .manga_texture_cache
             .set_max_entries(self.manga_cache_target_capacity);
+        let mut uploaded_textures = 0u64;
 
         // Upload decoded images to GPU as textures
         for decoded in decoded_images {
@@ -4988,6 +5047,7 @@ impl ImageViewer {
                 decoded.height,
                 decoded.media_type,
             );
+            uploaded_textures = uploaded_textures.saturating_add(1);
 
             if let Some(started_at) = self.manga_ttv_pending.remove(&decoded.index) {
                 self.manga_record_ttv_sample(started_at.elapsed());
@@ -5006,6 +5066,13 @@ impl ImageViewer {
 
         // Tick the cache's frame counter for LRU tracking
         self.manga_texture_cache.tick();
+
+        self.perf_metrics
+            .record_duration("manga_upload_pass_ms", upload_pass_started.elapsed());
+        if uploaded_textures > 0 {
+            self.perf_metrics
+                .increment_counter("manga_uploaded_textures", uploaded_textures);
+        }
 
         dims_updated
     }

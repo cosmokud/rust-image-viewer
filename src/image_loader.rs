@@ -304,6 +304,7 @@ pub fn get_media_in_directory(path: &Path) -> Vec<PathBuf> {
 }
 
 /// Get all images in the same directory as the given path (legacy function for compatibility)
+#[allow(dead_code)]
 pub fn get_images_in_directory(path: &Path) -> Vec<PathBuf> {
     get_media_in_directory(path)
 }
