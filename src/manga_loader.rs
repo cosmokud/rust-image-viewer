@@ -730,7 +730,7 @@ impl MangaLoader {
             MediaType::Video => {
                 // For videos, try to extract the first frame as a thumbnail
                 // This provides a visual preview instead of a gray placeholder
-                match Self::extract_video_first_frame(&req.path, req.max_texture_side) {
+                match Self::extract_video_first_frame(&req.path, effective_texture_side) {
                     Some((pixels, width, height, original_width, original_height)) => {
                         let (width, height, pixels) = downscale_rgba_if_needed(
                             width,
@@ -784,7 +784,7 @@ impl MangaLoader {
                 let img = if is_animated_webp {
                     LoadedImage::load_first_frame_only(
                         &req.path,
-                        Some(req.max_texture_side),
+                        Some(effective_texture_side),
                         downscale_filter,
                         gif_filter,
                     )
@@ -792,7 +792,7 @@ impl MangaLoader {
                 } else {
                     LoadedImage::load_with_max_texture_side(
                         &req.path,
-                        Some(req.max_texture_side),
+                        Some(effective_texture_side),
                         downscale_filter,
                         gif_filter,
                     )

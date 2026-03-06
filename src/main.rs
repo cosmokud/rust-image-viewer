@@ -1727,6 +1727,12 @@ impl ImageViewer {
             if uploaded_total > 0 {
                 text.push_str(&format!(" | UTot {}", uploaded_total));
             }
+
+            let deferred_nav = self.perf_metrics.counter("manga_upgrade_deferred_nav");
+            let low_lod_nav = self.perf_metrics.counter("manga_retry_low_lod_nav");
+            if deferred_nav > 0 || low_lod_nav > 0 {
+                text.push_str(&format!(" | NavDQ {} NavLL {}", deferred_nav, low_lod_nav));
+            }
         }
 
         // Keep it below the title bar buttons when the bar is visible.
@@ -7628,6 +7634,7 @@ impl ImageViewer {
         &mut self,
         index: usize,
         display_target_side: u32,
+        quality_upgrade: bool,
     ) -> bool {
         if !self.manga_mode {
             return false;
@@ -7638,10 +7645,41 @@ impl ImageViewer {
         }
 
         let max_side = self.max_texture_side.max(1);
-        let target_texture_side = self
+        let is_masonry = self.is_masonry_mode();
+        let min_target_side = if is_masonry {
+            Self::MANGA_MASONRY_DYNAMIC_TARGET_MIN_SIDE
+        } else {
+            Self::MANGA_DYNAMIC_TARGET_MIN_SIDE
+        }
+        .min(max_side);
+
+        if quality_upgrade && self.masonry_navigation_active_for_heavy_work() {
+            self.perf_metrics
+                .increment_counter("manga_upgrade_deferred_nav", 1);
+            return false;
+        }
+
+        let desired_target_side = self
             .manga_clamp_target_side_to_source(index, display_target_side)
-            .max(self.manga_target_texture_side.min(max_side))
-            .clamp(Self::MANGA_DYNAMIC_TARGET_MIN_SIDE.min(max_side), max_side);
+            .clamp(1, max_side);
+
+        // During active masonry navigation, prioritize fast placeholder fill over texture quality.
+        let target_texture_side = if is_masonry
+            && self.masonry_navigation_active_for_heavy_work()
+            && !quality_upgrade
+        {
+            let nav_cap = self.manga_target_texture_side.min(256).max(min_target_side);
+            let side = desired_target_side.min(nav_cap).max(min_target_side);
+            if side < desired_target_side {
+                self.perf_metrics
+                    .increment_counter("manga_retry_low_lod_nav", 1);
+            }
+            side
+        } else {
+            desired_target_side
+                .max(self.manga_target_texture_side.min(max_side))
+                .clamp(min_target_side, max_side)
+        };
         let (downscale_filter, gif_filter) = self.manga_decode_filters_for_strip_mode();
         let force_triangle_filters = self.manga_should_force_triangle_filters();
 
@@ -7753,7 +7791,8 @@ impl ImageViewer {
                 }
 
                 if Self::manga_texture_upgrade_needed(tex_w.max(tex_h), retry_target_side) {
-                    requested_retry |= self.manga_request_retry_for_visible_item(idx, retry_target_side);
+                    requested_retry |=
+                        self.manga_request_retry_for_visible_item(idx, retry_target_side, true);
                 }
             } else if self.strip_entry_placeholder_index == Some(idx) {
                 // Immediate fallback when entering strip mode from solo-video fullscreen.
@@ -7777,7 +7816,8 @@ impl ImageViewer {
                     );
                 }
 
-                requested_retry |= self.manga_request_retry_for_visible_item(idx, retry_target_side);
+                requested_retry |=
+                    self.manga_request_retry_for_visible_item(idx, retry_target_side, false);
             } else {
                 // Video not yet loaded - draw placeholder with video icon
                 ui.painter()
@@ -7792,7 +7832,8 @@ impl ImageViewer {
 
                 self.manga_mark_placeholder_visible(idx);
 
-                requested_retry |= self.manga_request_retry_for_visible_item(idx, retry_target_side);
+                requested_retry |=
+                    self.manga_request_retry_for_visible_item(idx, retry_target_side, false);
             }
 
             if video_load_pending
@@ -7854,7 +7895,8 @@ impl ImageViewer {
                 }
 
                 if Self::manga_texture_upgrade_needed(tex_w.max(tex_h), retry_target_side) {
-                    requested_retry |= self.manga_request_retry_for_visible_item(idx, retry_target_side);
+                    requested_retry |=
+                        self.manga_request_retry_for_visible_item(idx, retry_target_side, true);
                 }
             } else if self.strip_entry_placeholder_index == Some(idx) {
                 // Immediate fallback when entering strip mode from solo-image fullscreen.
@@ -7878,7 +7920,8 @@ impl ImageViewer {
                     );
                 }
 
-                requested_retry |= self.manga_request_retry_for_visible_item(idx, retry_target_side);
+                requested_retry |=
+                    self.manga_request_retry_for_visible_item(idx, retry_target_side, false);
             } else {
                 // Image not loaded yet - draw a placeholder
                 ui.painter()
@@ -7895,7 +7938,8 @@ impl ImageViewer {
 
                 self.manga_mark_placeholder_visible(idx);
 
-                requested_retry |= self.manga_request_retry_for_visible_item(idx, retry_target_side);
+                requested_retry |=
+                    self.manga_request_retry_for_visible_item(idx, retry_target_side, false);
             }
         }
 
