@@ -1,15 +1,12 @@
 //! Single-instance application support for Windows.
 //!
-//! This module provides functionality to ensure only one instance of the application
-//! runs at a time. When a second instance is launched, it sends its file path to the
-//! first instance via a temp file, then exits. The first instance receives the path
-//! and opens the file in its existing window.
+//! This module ensures only one instance of the application runs at a time.
+//! Secondary instances forward their file path to the primary instance over a
+//! named pipe and then exit.
 //!
-//! The behavior can be toggled via the `single_instance` setting in
-//! config.ini.
+//! The behavior can be toggled via the `single_instance` setting in config.ini.
 
 use std::ffi::OsStr;
-use std::fs;
 use std::os::windows::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,20 +14,26 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use winapi::shared::minwindef::FALSE;
-use winapi::shared::winerror::ERROR_ALREADY_EXISTS;
+use winapi::shared::minwindef::{DWORD, FALSE};
+use winapi::shared::winerror::{ERROR_ALREADY_EXISTS, ERROR_PIPE_CONNECTED};
 use winapi::um::errhandlingapi::GetLastError;
-use winapi::um::handleapi::CloseHandle;
+use winapi::um::fileapi::{CreateFileW, ReadFile, WriteFile, OPEN_EXISTING};
+use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
+use winapi::um::namedpipeapi::{ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe};
 use winapi::um::synchapi::CreateMutexW;
-use winapi::um::winnt::HANDLE;
+use winapi::um::winbase::{
+    PIPE_ACCESS_INBOUND, PIPE_READMODE_MESSAGE, PIPE_TYPE_MESSAGE, PIPE_UNLIMITED_INSTANCES,
+    PIPE_WAIT,
+};
+use winapi::um::winnt::{GENERIC_WRITE, HANDLE};
 
 /// Unique name for the application mutex (prevents multiple instances).
 const MUTEX_NAME: &str = "Global\\RustImageViewer_SingleInstance_A7F3B2C1";
 
-/// Get the path to the IPC file used for communication between instances.
-fn get_ipc_file_path() -> PathBuf {
-    std::env::temp_dir().join("rust_image_viewer_ipc.txt")
-}
+/// Named pipe used to forward open-file requests from secondary instances.
+const IPC_PIPE_NAME: &str = r"\\.\pipe\RustImageViewer_SingleInstance_A7F3B2C1";
+const IPC_BUFFER_SIZE: usize = 4096;
+const IPC_WAKE_MESSAGE: &str = "WAKE";
 
 /// Result of attempting to acquire the single-instance lock.
 pub enum SingleInstanceResult {
@@ -55,23 +58,21 @@ unsafe impl Send for SingleInstanceLock {}
 
 impl Drop for SingleInstanceLock {
     fn drop(&mut self) {
-        // Signal the listener thread to stop
+        // Signal listener shutdown and wake blocked ConnectNamedPipe.
         self.shutdown_flag.store(true, Ordering::SeqCst);
+        wake_pipe_listener();
 
-        // Wait for listener thread to finish
+        // Wait for listener thread to finish.
         if let Some(handle) = self.listener_thread.take() {
             let _ = handle.join();
         }
 
-        // Release the mutex
+        // Release the mutex.
         if !self.mutex_handle.is_null() {
             unsafe {
                 CloseHandle(self.mutex_handle);
             }
         }
-
-        // Clean up IPC file
-        let _ = fs::remove_file(get_ipc_file_path());
     }
 }
 
@@ -81,6 +82,72 @@ fn to_wide_null(s: &str) -> Vec<u16> {
         .encode_wide()
         .chain(std::iter::once(0))
         .collect()
+}
+
+fn create_server_pipe() -> HANDLE {
+    let pipe_name = to_wide_null(IPC_PIPE_NAME);
+    unsafe {
+        CreateNamedPipeW(
+            pipe_name.as_ptr(),
+            PIPE_ACCESS_INBOUND,
+            PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
+            PIPE_UNLIMITED_INSTANCES,
+            0,
+            IPC_BUFFER_SIZE as u32,
+            0,
+            std::ptr::null_mut(),
+        )
+    }
+}
+
+fn send_message_to_primary(message: &str) -> bool {
+    let pipe_name = to_wide_null(IPC_PIPE_NAME);
+    let handle = unsafe {
+        CreateFileW(
+            pipe_name.as_ptr(),
+            GENERIC_WRITE,
+            0,
+            std::ptr::null_mut(),
+            OPEN_EXISTING,
+            0,
+            std::ptr::null_mut(),
+        )
+    };
+
+    if handle == INVALID_HANDLE_VALUE {
+        return false;
+    }
+
+    let bytes = message.as_bytes();
+    let mut written: DWORD = 0;
+    let ok = unsafe {
+        WriteFile(
+            handle,
+            bytes.as_ptr() as *const _,
+            bytes.len() as u32,
+            &mut written,
+            std::ptr::null_mut(),
+        ) != 0
+    };
+
+    unsafe {
+        CloseHandle(handle);
+    }
+
+    ok && written > 0
+}
+
+fn send_file_path_to_primary(path: &PathBuf) -> bool {
+    let payload = format!("OPEN:{}", path.to_string_lossy());
+    let sent = send_message_to_primary(&payload);
+    if sent {
+        tracing::debug!(target: "single_instance", path = %path.display(), "forwarded file path to primary");
+    }
+    sent
+}
+
+fn wake_pipe_listener() {
+    let _ = send_message_to_primary(IPC_WAKE_MESSAGE);
 }
 
 /// Attempt to acquire the single-instance lock.
@@ -97,7 +164,7 @@ pub fn try_acquire_lock(
         return SingleInstanceResult::Disabled;
     }
 
-    // Try to create/acquire the mutex
+    // Try to create/acquire the mutex.
     let mutex_name_wide = to_wide_null(MUTEX_NAME);
     let mutex_handle =
         unsafe { CreateMutexW(std::ptr::null_mut(), FALSE, mutex_name_wide.as_ptr()) };
@@ -109,32 +176,25 @@ pub fn try_acquire_lock(
     let last_error = unsafe { GetLastError() };
 
     if last_error == ERROR_ALREADY_EXISTS {
-        // Another instance already has the mutex - we are secondary
+        // Another instance already has the mutex - we are secondary.
         unsafe {
             CloseHandle(mutex_handle);
         }
 
-        // Send our file path to the primary instance via temp file
         if let Some(path) = file_path {
-            let ipc_path = get_ipc_file_path();
-            // Write with a unique marker to avoid partial reads
-            let content = format!("OPEN:{}", path.to_string_lossy());
-            let _ = fs::write(&ipc_path, content);
+            let _ = send_file_path_to_primary(path);
         }
 
         return SingleInstanceResult::Secondary;
     }
 
-    // We are the primary instance
-    // Clean up any stale IPC file from a previous crash
-    let _ = fs::remove_file(get_ipc_file_path());
-
-    // Start the file watcher thread
+    // We are the primary instance.
+    tracing::debug!(target: "single_instance", "primary instance listener starting");
     let shutdown_flag = Arc::new(AtomicBool::new(false));
     let shutdown_flag_clone = Arc::clone(&shutdown_flag);
 
     let listener_thread = thread::spawn(move || {
-        run_file_watcher(shutdown_flag_clone, on_file_received);
+        run_pipe_listener(shutdown_flag_clone, on_file_received);
     });
 
     SingleInstanceResult::Primary(SingleInstanceLock {
@@ -144,37 +204,69 @@ pub fn try_acquire_lock(
     })
 }
 
-/// Watch for IPC file and call callback when a file path is received.
-fn run_file_watcher(
+/// Listen for pipe messages and call callback when a file path is received.
+fn run_pipe_listener(
     shutdown_flag: Arc<AtomicBool>,
     on_file_received: impl Fn(PathBuf) + Send + 'static,
 ) {
-    let ipc_path = get_ipc_file_path();
-
     loop {
         if shutdown_flag.load(Ordering::SeqCst) {
             break;
         }
 
-        // Check if IPC file exists
-        if ipc_path.exists() {
-            // Read and process the file
-            if let Ok(content) = fs::read_to_string(&ipc_path) {
-                // Delete the file immediately to avoid double-processing
-                let _ = fs::remove_file(&ipc_path);
+        let pipe = create_server_pipe();
+        if pipe == INVALID_HANDLE_VALUE {
+            thread::sleep(Duration::from_millis(10));
+            continue;
+        }
 
-                // Parse the content
-                if let Some(path_str) = content.strip_prefix("OPEN:") {
-                    let path = PathBuf::from(path_str);
-                    if path.exists() {
-                        on_file_received(path);
+        let connected = unsafe {
+            let ok = ConnectNamedPipe(pipe, std::ptr::null_mut());
+            if ok != 0 {
+                true
+            } else {
+                GetLastError() == ERROR_PIPE_CONNECTED
+            }
+        };
+
+        if connected {
+            let mut buffer = vec![0u8; IPC_BUFFER_SIZE];
+            let mut bytes_read: DWORD = 0;
+
+            let read_ok = unsafe {
+                ReadFile(
+                    pipe,
+                    buffer.as_mut_ptr() as *mut _,
+                    buffer.len() as u32,
+                    &mut bytes_read,
+                    std::ptr::null_mut(),
+                ) != 0
+            };
+
+            if read_ok && bytes_read > 0 {
+                buffer.truncate(bytes_read as usize);
+
+                if let Ok(message) = String::from_utf8(buffer) {
+                    if message == IPC_WAKE_MESSAGE {
+                        // Internal wake-up to break blocking ConnectNamedPipe during shutdown.
+                    } else if let Some(path_str) = message.strip_prefix("OPEN:") {
+                        let path = PathBuf::from(path_str.trim());
+                        if path.exists() {
+                            tracing::debug!(target: "single_instance", path = %path.display(), "received open request from secondary instance");
+                            on_file_received(path);
+                        }
                     }
                 }
             }
+
+            unsafe {
+                DisconnectNamedPipe(pipe);
+            }
         }
 
-        // Poll every 50ms
-        thread::sleep(Duration::from_millis(50));
+        unsafe {
+            CloseHandle(pipe);
+        }
     }
 }
 

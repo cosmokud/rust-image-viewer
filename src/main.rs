@@ -12,6 +12,10 @@ mod video_player;
 #[cfg(target_os = "windows")]
 mod windows_env;
 
+#[cfg(all(target_os = "windows", feature = "mimalloc-allocator"))]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use config::{Action, Config, InputBinding, StartupWindowMode};
 use image_loader::{
     get_images_in_directory, get_media_type, is_supported_video, probe_image_dimensions,
@@ -24,12 +28,15 @@ use single_instance::{FileReceiver, SingleInstanceResult};
 use video_player::{format_duration, VideoPlayer};
 
 use eframe::egui;
+use fast_image_resize as fir;
 use image::imageops::FilterType;
+use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::collections::VecDeque;
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use eframe::glow::HasContext;
@@ -70,7 +77,7 @@ fn paint_loading_spinner(painter: &egui::Painter, rect: egui::Rect, time: f64) {
     let start_angle = (time * 4.0) as f32; // ~4 rad/s ≈ 0.64 rev/s
     let sweep = std::f32::consts::PI * 1.4; // ~250°
     let segments = 28;
-    let points: Vec<egui::Pos2> = (0..=segments)
+    let points: SmallVec<[egui::Pos2; 32]> = (0..=segments)
         .map(|i| {
             let t = i as f32 / segments as f32;
             let angle = start_angle + sweep * t;
@@ -81,12 +88,42 @@ fn paint_loading_spinner(painter: &egui::Painter, rect: egui::Rect, time: f64) {
         2.5,
         egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200),
     );
-    painter.add(egui::Shape::line(points, stroke));
+    painter.add(egui::Shape::line(points.to_vec(), stroke));
 }
 
 /// Downscale RGBA pixel data if it exceeds the maximum texture size.
 /// Uses Cow to avoid unnecessary allocations when no downscaling is needed.
 /// Uses Triangle filter (faster than Lanczos3) for better performance.
+fn image_filter_to_fir(filter: FilterType) -> fir::FilterType {
+    match filter {
+        FilterType::Nearest => fir::FilterType::Box,
+        FilterType::Triangle => fir::FilterType::Bilinear,
+        FilterType::CatmullRom => fir::FilterType::CatmullRom,
+        FilterType::Gaussian => fir::FilterType::Gaussian,
+        FilterType::Lanczos3 => fir::FilterType::Lanczos3,
+    }
+}
+
+fn resize_rgba_with_fir(
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+    new_w: u32,
+    new_h: u32,
+    filter: FilterType,
+) -> Option<Vec<u8>> {
+    let src = fir::images::ImageRef::new(width, height, pixels, fir::PixelType::U8x4).ok()?;
+    let mut dst = fir::images::Image::new(new_w, new_h, fir::PixelType::U8x4);
+
+    let options = fir::ResizeOptions::new().resize_alg(fir::ResizeAlg::Convolution(
+        image_filter_to_fir(filter),
+    ));
+
+    let mut resizer = fir::Resizer::new();
+    resizer.resize(&src, &mut dst, Some(&options)).ok()?;
+    Some(dst.into_vec())
+}
+
 fn downscale_rgba_if_needed<'a>(
     width: u32,
     height: u32,
@@ -110,10 +147,6 @@ fn downscale_rgba_if_needed<'a>(
     let new_w = ((width as f64) * scale).round().max(1.0) as u32;
     let new_h = ((height as f64) * scale).round().max(1.0) as u32;
 
-    // Convert to an owned buffer for resizing.
-    let Some(img) = image::RgbaImage::from_raw(width, height, pixels.to_vec()) else {
-        return (width, height, Cow::Borrowed(pixels));
-    };
     let filter = match filter {
         // Be defensive: always downscaling here, so avoid an accidental "upscale"-only filter.
         // (All current variants are valid for both directions, but keep this guard for future changes.)
@@ -123,6 +156,16 @@ fn downscale_rgba_if_needed<'a>(
         | FilterType::Gaussian
         | FilterType::Lanczos3 => filter,
     };
+
+    if let Some(resized) = resize_rgba_with_fir(width, height, pixels, new_w, new_h, filter) {
+        return (new_w, new_h, Cow::Owned(resized));
+    }
+
+    // Convert to an owned buffer only for the fallback resize path.
+    let Some(img) = image::RgbaImage::from_raw(width, height, pixels.to_vec()) else {
+        return (width, height, Cow::Borrowed(pixels));
+    };
+
     let resized = image::imageops::resize(&img, new_w, new_h, filter);
     (new_w, new_h, Cow::Owned(resized.into_raw()))
 }
@@ -10724,7 +10767,32 @@ fn get_global_cursor_pos() -> Option<egui::Pos2> {
     None
 }
 
+fn init_runtime_diagnostics() {
+    static INIT: OnceLock<()> = OnceLock::new();
+
+    INIT.get_or_init(|| {
+        let filter = std::env::var("RIV_LOG")
+            .or_else(|_| std::env::var("RUST_LOG"))
+            .unwrap_or_else(|_| "warn".to_string());
+
+        let env_filter = tracing_subscriber::EnvFilter::try_new(filter)
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_target(false)
+            .compact()
+            .try_init();
+
+        if std::env::var_os("RIV_PUFFIN").is_some() {
+            puffin::set_scopes_on(true);
+        }
+    });
+}
+
 fn main() -> eframe::Result<()> {
+    init_runtime_diagnostics();
+
     #[cfg(target_os = "windows")]
     windows_env::refresh_process_path_from_registry();
 
@@ -10742,6 +10810,8 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     };
 
+    tracing::info!(target: "startup", file = %file_path.display(), "launch request received");
+
     // Load config early to check single_instance setting
     let config = Config::load();
 
@@ -10753,15 +10823,18 @@ fn main() -> eframe::Result<()> {
         match single_instance::try_acquire_lock(config.single_instance, Some(&file_path), callback)
         {
             SingleInstanceResult::Primary(lock) => {
+                tracing::debug!(target: "single_instance", "acquired primary instance lock");
                 // We are the primary instance - proceed with window creation
                 (Some(receiver), Some(lock))
             }
             SingleInstanceResult::Secondary => {
+                tracing::debug!(target: "single_instance", "secondary instance forwarded request");
                 // Another instance is running and we sent our file path to it
                 // Exit this instance
                 return Ok(());
             }
             SingleInstanceResult::Disabled => {
+                tracing::debug!(target: "single_instance", "single-instance mode disabled or unavailable");
                 // Single instance mode is disabled, proceed normally
                 (None, None)
             }

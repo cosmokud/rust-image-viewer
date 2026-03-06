@@ -833,15 +833,11 @@ impl MangaLoader {
 
     /// Probe video dimensions for stable layout sizing.
     ///
-    /// Uses a lightweight GStreamer preroll and reads width/height from negotiated caps.
+    /// Uses GStreamer Discoverer metadata probe instead of spinning up a decode pipeline.
     /// Falls back to filename-based heuristics when probing fails.
     fn probe_video_dimensions(path: &std::path::Path) -> Option<(u32, u32)> {
         use gstreamer as gst;
-        use gstreamer::prelude::*;
-        use gstreamer_app as gst_app;
-        use gstreamer_video as gst_video;
-        use std::sync::{Arc, Mutex};
-        use std::time::Duration;
+        use gstreamer_pbutils as gst_pbutils;
 
         static GST_INIT: std::sync::OnceLock<Result<(), ()>> = std::sync::OnceLock::new();
         let init_result = GST_INIT.get_or_init(|| gst::init().map_err(|_| ()));
@@ -854,95 +850,25 @@ impl MangaLoader {
             Err(_) => return Self::fallback_video_dimensions(path),
         };
 
-        let pipeline_str = format!(
-            "uridecodebin uri=\"{}\" name=dec ! videoconvert ! videoscale ! \
-             video/x-raw,format=RGBA ! appsink name=sink max-buffers=1 drop=true",
-            uri.replace("\"", "\\\"")
-        );
-
-        let pipeline = match gst::parse::launch(&pipeline_str)
-            .ok()
-            .and_then(|p| p.downcast::<gst::Pipeline>().ok())
-        {
-            Some(p) => p,
-            None => return Self::fallback_video_dimensions(path),
+        let discoverer = match gst_pbutils::Discoverer::new(gst::ClockTime::from_mseconds(900)) {
+            Ok(d) => d,
+            Err(_) => return Self::fallback_video_dimensions(path),
         };
 
-        let appsink = match pipeline
-            .by_name("sink")
-            .and_then(|e| e.dynamic_cast::<gst_app::AppSink>().ok())
-        {
-            Some(sink) => sink,
-            None => {
-                let _ = pipeline.set_state(gst::State::Null);
-                return Self::fallback_video_dimensions(path);
-            }
+        let info = match discoverer.discover_uri(&uri) {
+            Ok(i) => i,
+            Err(_) => return Self::fallback_video_dimensions(path),
         };
 
-        let probed_dims: Arc<Mutex<Option<(u32, u32)>>> = Arc::new(Mutex::new(None));
-        let dims_clone = Arc::clone(&probed_dims);
-
-        appsink.set_callbacks(
-            gst_app::AppSinkCallbacks::builder()
-                .new_preroll(move |sink| {
-                    if let Ok(sample) = sink.pull_preroll() {
-                        if let Some(caps) = sample.caps() {
-                            if let Ok(video_info) = gst_video::VideoInfo::from_caps(caps) {
-                                let width = video_info.width();
-                                let height = video_info.height();
-                                if width > 0 && height > 0 {
-                                    if let Ok(mut dims) = dims_clone.lock() {
-                                        *dims = Some((width, height));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Ok(gst::FlowSuccess::Ok)
-                })
-                .build(),
-        );
-
-        if pipeline.set_state(gst::State::Paused).is_err() {
-            let _ = pipeline.set_state(gst::State::Null);
-            return Self::fallback_video_dimensions(path);
-        }
-
-        if let Some(bus) = pipeline.bus() {
-            let deadline = std::time::Instant::now() + Duration::from_millis(900);
-            while std::time::Instant::now() < deadline {
-                if let Some(msg) = bus.timed_pop(gst::ClockTime::from_mseconds(50)) {
-                    match msg.view() {
-                        gst::MessageView::Error(_) | gst::MessageView::Eos(_) => {
-                            break;
-                        }
-                        gst::MessageView::AsyncDone(_) => {
-                            if probed_dims
-                                .lock()
-                                .ok()
-                                .and_then(|dims| *dims)
-                                .is_some()
-                            {
-                                break;
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-
-                if probed_dims
-                    .lock()
-                    .ok()
-                    .and_then(|dims| *dims)
-                    .is_some()
-                {
-                    break;
-                }
+        let probed = info.video_streams().into_iter().find_map(|video| {
+            let w = video.width();
+            let h = video.height();
+            if w > 0 && h > 0 {
+                Some((w, h))
+            } else {
+                None
             }
-        }
-
-        let probed = probed_dims.lock().ok().and_then(|dims| *dims);
-        let _ = pipeline.set_state(gst::State::Null);
+        });
 
         if let Some((w, h)) = probed {
             if w > 0 && h > 0 {
@@ -995,7 +921,8 @@ impl MangaLoader {
         use gstreamer::prelude::*;
         use gstreamer_app as gst_app;
         use gstreamer_video as gst_video;
-        use std::sync::{Arc, Mutex};
+        use parking_lot::Mutex;
+        use std::sync::Arc;
         use std::time::Duration;
 
         // Initialize GStreamer if needed (static check to avoid repeated init)
@@ -1040,9 +967,8 @@ impl MangaLoader {
                                 let height = video_info.height();
                                 if let Ok(map) = buffer.map_readable() {
                                     let pixels = map.as_slice().to_vec();
-                                    if let Ok(mut data) = frame_data_clone.lock() {
-                                        *data = Some((pixels, width, height));
-                                    }
+                                    let mut data = frame_data_clone.lock();
+                                    *data = Some((pixels, width, height));
                                 }
                             }
                         }
@@ -1082,11 +1008,9 @@ impl MangaLoader {
             }
 
             // Check if we already got frame data
-            if let Ok(data) = frame_data.lock() {
-                if data.is_some() {
-                    got_frame = true;
-                    break;
-                }
+            if frame_data.lock().is_some() {
+                got_frame = true;
+                break;
             }
         }
 
@@ -1099,7 +1023,7 @@ impl MangaLoader {
 
         // Extract the frame data
         let (pixels, width, height) = {
-            let data = frame_data.lock().ok()?;
+            let data = frame_data.lock();
             data.clone()?
         };
 
@@ -1600,8 +1524,7 @@ fn resize_rgba_with_fir(
     new_h: u32,
     filter: FilterType,
 ) -> Option<Vec<u8>> {
-    let src = fir::images::Image::from_vec_u8(width, height, pixels.to_vec(), fir::PixelType::U8x4)
-        .ok()?;
+    let src = fir::images::ImageRef::new(width, height, pixels, fir::PixelType::U8x4).ok()?;
     let mut dst = fir::images::Image::new(new_w, new_h, fir::PixelType::U8x4);
 
     let options = fir::ResizeOptions::new().resize_alg(fir::ResizeAlg::Convolution(

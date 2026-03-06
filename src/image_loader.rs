@@ -7,7 +7,9 @@ use std::io::{BufRead, BufReader, Cursor, Seek};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use fast_image_resize as fir;
 use image::imageops::FilterType;
+use jwalk::WalkDir;
 use memmap2::MmapOptions;
 use zune_core::colorspace::ColorSpace;
 use zune_core::options::DecoderOptions;
@@ -48,6 +50,56 @@ fn extension_is(path: &Path, candidate: &str) -> bool {
         .and_then(|ext| ext.to_str())
         .map(|ext| ext.eq_ignore_ascii_case(candidate))
         .unwrap_or(false)
+}
+
+fn image_filter_to_fir(filter: FilterType) -> fir::FilterType {
+    match filter {
+        FilterType::Nearest => fir::FilterType::Box,
+        FilterType::Triangle => fir::FilterType::Bilinear,
+        FilterType::CatmullRom => fir::FilterType::CatmullRom,
+        FilterType::Gaussian => fir::FilterType::Gaussian,
+        FilterType::Lanczos3 => fir::FilterType::Lanczos3,
+    }
+}
+
+fn resize_rgba_with_fir(
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+    new_w: u32,
+    new_h: u32,
+    filter: FilterType,
+) -> Option<Vec<u8>> {
+    let src = fir::images::ImageRef::new(width, height, pixels, fir::PixelType::U8x4).ok()?;
+    let mut dst = fir::images::Image::new(new_w, new_h, fir::PixelType::U8x4);
+
+    let options = fir::ResizeOptions::new().resize_alg(fir::ResizeAlg::Convolution(
+        image_filter_to_fir(filter),
+    ));
+
+    let mut resizer = fir::Resizer::new();
+    resizer.resize(&src, &mut dst, Some(&options)).ok()?;
+    Some(dst.into_vec())
+}
+
+fn resize_rgba(
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+    new_w: u32,
+    new_h: u32,
+    filter: FilterType,
+) -> Result<Vec<u8>, String> {
+    if let Some(resized) = resize_rgba_with_fir(width, height, pixels, new_w, new_h, filter) {
+        return Ok(resized);
+    }
+
+    // Fallback path when FIR cannot handle the provided buffer alignment/layout.
+    let Some(img) = image::RgbaImage::from_raw(width, height, pixels.to_vec()) else {
+        return Err("Failed to build RGBA image for resizing".to_string());
+    };
+
+    Ok(image::imageops::resize(&img, new_w, new_h, filter).into_raw())
 }
 
 /// Fast image dimension probe using header-only parsing.
@@ -232,9 +284,10 @@ pub fn get_media_in_directory(path: &Path) -> Vec<PathBuf> {
         None => return vec![path.to_path_buf()],
     };
 
-    let mut media: Vec<PathBuf> = std::fs::read_dir(parent)
+    let mut media: Vec<PathBuf> = WalkDir::new(parent)
+        .max_depth(1)
+        .min_depth(1)
         .into_iter()
-        .flatten()
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.path())
         .filter(|p| p.is_file() && is_supported_media(p))
@@ -438,8 +491,10 @@ impl LoadedImage {
             let th = target_height.unwrap_or(height);
 
             let (final_w, final_h, pixels) = if tw != width || th != height {
-                let resized = image::imageops::resize(&rgba, tw, th, filter);
-                (tw, th, resized.into_raw())
+                match resize_rgba(width, height, rgba.as_raw(), tw, th, filter) {
+                    Ok(resized) => (tw, th, resized),
+                    Err(_) => (width, height, rgba.into_raw()),
+                }
             } else {
                 (width, height, rgba.into_raw())
             };
@@ -529,8 +584,9 @@ impl LoadedImage {
         };
 
         let (final_w, final_h, pixels) = if tw != width || th != height {
-            let resized = image::imageops::resize(&rgba, tw, th, filter);
-            (tw, th, resized.into_raw())
+            let resized = resize_rgba(width, height, rgba.as_raw(), tw, th, filter)
+                .map_err(|e| format!("Failed to resize WEBP first frame: {}", e))?;
+            (tw, th, resized)
         } else {
             (width, height, rgba.into_raw())
         };
@@ -568,13 +624,15 @@ impl LoadedImage {
                     return Err("Failed to build RGBA image for static resizing".to_string());
                 };
 
-                let resized = image::imageops::resize(
-                    &img,
+                pixels = resize_rgba(
+                    width,
+                    height,
+                    img.as_raw(),
                     target_width,
                     target_height,
                     downscale_filter,
-                );
-                pixels = resized.into_raw();
+                )
+                .map_err(|e| format!("Failed to resize static image: {}", e))?;
                 width = target_width;
                 height = target_height;
             }
@@ -644,16 +702,6 @@ impl LoadedImage {
         // Create a canvas to composite frames onto (at original size for decoding)
         let mut canvas = vec![0u8; (width * height * 4) as usize];
 
-        // Pre-allocate reusable buffer for downscaling if needed
-        #[allow(unused_mut)]
-        let mut downscale_buffer: Option<Vec<u8>> = if needs_downscale {
-            Some(Vec::with_capacity(
-                (target_width * target_height * 4) as usize,
-            ))
-        } else {
-            None
-        };
-
         let mut frame_count = 0;
         while let Some(frame) = decoder
             .read_next_frame()
@@ -692,14 +740,8 @@ impl LoadedImage {
 
             // Store either downscaled or original frame
             let frame_pixels = if needs_downscale {
-                // Downscale immediately to save memory
-                let Some(img) = image::RgbaImage::from_raw(width, height, canvas.clone()) else {
-                    return Err("Failed to build RGBA image for GIF resizing".to_string());
-                };
-                // Use configurable filter for animated GIFs
-                let resized =
-                    image::imageops::resize(&img, target_width, target_height, gif_filter);
-                resized.into_raw()
+                resize_rgba(width, height, &canvas, target_width, target_height, gif_filter)
+                    .map_err(|e| format!("Failed to resize GIF frame: {}", e))?
             } else {
                 canvas.clone()
             };
@@ -720,9 +762,6 @@ impl LoadedImage {
                 break;
             }
         }
-
-        // Clean up the downscale buffer
-        drop(downscale_buffer);
 
         if frames.is_empty() {
             return Err("No frames in GIF".to_string());
@@ -815,8 +854,9 @@ impl LoadedImage {
             let th = target_height.unwrap_or(height);
 
             let (final_w, final_h, pixels) = if tw != width || th != height {
-                let resized = image::imageops::resize(&rgba, tw, th, filter);
-                (tw, th, resized.into_raw())
+                let resized = resize_rgba(width, height, rgba.as_raw(), tw, th, filter)
+                    .map_err(|e| format!("Failed to resize animated WEBP frame: {}", e))?;
+                (tw, th, resized)
             } else {
                 (width, height, rgba.into_raw())
             };
@@ -1042,8 +1082,8 @@ pub mod natord {
                             other => return other,
                         }
                     } else {
-                        let ac_lower = ac.to_lowercase().next().unwrap_or(ac);
-                        let bc_lower = bc.to_lowercase().next().unwrap_or(bc);
+                        let ac_lower = ac.to_ascii_lowercase();
+                        let bc_lower = bc.to_ascii_lowercase();
                         match ac_lower.cmp(&bc_lower) {
                             std::cmp::Ordering::Equal => {
                                 a_chars.next();
