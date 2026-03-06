@@ -850,6 +850,8 @@ struct ImageViewer {
     /// True while a previous solo-media texture is intentionally kept visible
     /// until a replacement load finishes.
     retained_media_placeholder_visible: bool,
+    /// Defers zoom/pan reset while a retained solo-media placeholder is still visible.
+    defer_media_view_reset: bool,
     /// Index allowed to reuse the pre-strip solo texture/video as a temporary fallback.
     /// This prevents stale fullscreen frames from showing on unrelated items while scrolling.
     strip_entry_placeholder_index: Option<usize>,
@@ -1205,6 +1207,7 @@ impl Default for ImageViewer {
             current_media_type: None,
             pending_mode_switch_placeholder: None,
             retained_media_placeholder_visible: false,
+            defer_media_view_reset: false,
             strip_entry_placeholder_index: None,
             show_video_controls: false,
             video_controls_show_time: Instant::now(),
@@ -1425,6 +1428,7 @@ impl ImageViewer {
 
     fn drop_retained_media_placeholder(&mut self) {
         self.retained_media_placeholder_visible = false;
+        self.defer_media_view_reset = false;
 
         if self.image.is_none() {
             if let Some(texture) = self.texture.take() {
@@ -1438,6 +1442,27 @@ impl ImageViewer {
                 drop(texture);
             }
             self.video_texture_dims = None;
+        }
+    }
+
+    fn freeze_current_media_view(&mut self) {
+        self.zoom_target = self.zoom;
+        self.zoom_velocity = 0.0;
+        self.pending_media_layout = false;
+    }
+
+    fn reset_media_view_for_swap(&mut self) {
+        self.offset = egui::Vec2::ZERO;
+        self.zoom_velocity = 0.0;
+        self.zoom = 1.0;
+        self.zoom_target = 1.0;
+        self.pending_media_layout = false;
+    }
+
+    fn consume_deferred_media_view_reset(&mut self) {
+        if self.defer_media_view_reset {
+            self.reset_media_view_for_swap();
+            self.defer_media_view_reset = false;
         }
     }
 
@@ -1484,6 +1509,8 @@ impl ImageViewer {
 
         self.perf_metrics
             .increment_counter("decoded_image_cache_hit", 1);
+
+        self.consume_deferred_media_view_reset();
 
         self.image = Some(LoadedImage::from_single_frame(
             path.clone(),
@@ -3141,6 +3168,7 @@ impl ImageViewer {
     fn clear_pending_media_load(&mut self) {
         self.pending_media_load = None;
         self.retained_media_placeholder_visible = false;
+        self.defer_media_view_reset = false;
     }
 
     fn clear_pending_manga_video_load(&mut self) {
@@ -3414,6 +3442,7 @@ impl ImageViewer {
             match result {
                 MediaLoadResult::Image { path, result, .. } => match result {
                     Ok(loaded) => {
+                        self.consume_deferred_media_view_reset();
                         self.retained_media_placeholder_visible = false;
                         let (display_w, display_h) = loaded.image.display_dimensions();
                         if display_w > 0 && display_h > 0 {
@@ -3462,18 +3491,23 @@ impl ImageViewer {
                 },
                 MediaLoadResult::Video { path, result, .. } => match result {
                     Ok(player) => {
-                        self.retained_media_placeholder_visible = false;
                         let dims = player.dimensions();
                         if dims.0 > 0 && dims.1 > 0 {
                             store_cached_dimensions(&path, CachedMediaKind::Video, dims.0, dims.1);
                         }
 
                         self.video_player = Some(player);
-                        self.image_changed = true;
-                        self.pending_media_layout = true;
                         self.error_message = None;
                         self.show_video_controls = true;
                         self.touch_bottom_overlays();
+
+                        if self.defer_media_view_reset {
+                            self.pending_media_layout = false;
+                        } else {
+                            self.retained_media_placeholder_visible = false;
+                            self.image_changed = true;
+                            self.pending_media_layout = true;
+                        }
                     }
                     Err(err) => {
                         self.drop_retained_media_placeholder();
@@ -3534,6 +3568,8 @@ impl ImageViewer {
                     None
                 }
             });
+        let keep_current_view_until_swap =
+            retain_visible_media_until_ready && transition_placeholder.is_some();
 
         // Clear previous media state.
         // When a placeholder was captured above we immediately restore it after clearing
@@ -3574,13 +3610,13 @@ impl ImageViewer {
         self.gif_seeking = false;
         self.gif_seek_preview_frame = None;
 
-        // Reset view state so we don't carry zoom/offset across media switches.
-        // (The correct layout will be applied once we have dimensions.)
-        self.offset = egui::Vec2::ZERO;
-        self.zoom_velocity = 0.0;
-        self.zoom = 1.0;
-        self.zoom_target = 1.0;
-        self.pending_media_layout = false;
+        if keep_current_view_until_swap {
+            self.freeze_current_media_view();
+            self.defer_media_view_reset = true;
+        } else {
+            self.reset_media_view_for_swap();
+            self.defer_media_view_reset = false;
+        }
         self.error_message = None;
 
         // Reuse cached directory listing when the parent folder is unchanged.
@@ -9336,7 +9372,11 @@ impl ImageViewer {
     }
 
     fn request_floating_autosize(&mut self, ctx: &egui::Context) {
-        if self.is_fullscreen || self.is_resizing || self.pending_window_resize.is_some() {
+        if self.is_fullscreen
+            || self.is_resizing
+            || self.pending_window_resize.is_some()
+            || self.defer_media_view_reset
+        {
             return;
         }
 
@@ -9370,6 +9410,7 @@ impl ImageViewer {
     /// Returns true if a repaint is needed for animations
     fn update_texture(&mut self, ctx: &egui::Context) -> bool {
         let mut needs_repaint = false;
+        let mut activate_deferred_video_swap = false;
 
         // In manga mode, animated WebPs are handled per-item; don't stream/play the
         // fullscreen animation pipeline.
@@ -9504,6 +9545,8 @@ impl ImageViewer {
 
             // Get new frame if available
             if let Some(frame) = player.get_frame() {
+                activate_deferred_video_swap = self.defer_media_view_reset;
+
                 let (w, h, pixels) = downscale_rgba_if_needed(
                     frame.width,
                     frame.height,
@@ -9533,6 +9576,13 @@ impl ImageViewer {
             } else if self.is_seeking {
                 needs_repaint = true;
             }
+        }
+
+        if activate_deferred_video_swap {
+            self.consume_deferred_media_view_reset();
+            self.retained_media_placeholder_visible = false;
+            self.image_changed = true;
+            self.pending_media_layout = true;
         }
 
         // If we are waiting on video dimensions (e.g. right after switching videos),
