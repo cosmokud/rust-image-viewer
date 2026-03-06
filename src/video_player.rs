@@ -3,15 +3,16 @@
 
 use std::path::Path;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicI8, AtomicU32, Ordering};
 use std::sync::OnceLock;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crossbeam_queue::ArrayQueue;
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 use gstreamer_video as gst_video;
-use parking_lot::Mutex;
 
 #[cfg(target_os = "windows")]
 fn configure_gstreamer_env_windows() {
@@ -185,12 +186,17 @@ pub struct VideoFrame {
 
 /// Shared state between GStreamer callbacks and the main application
 struct VideoState {
-    current_frame: Option<VideoFrame>,
-    video_width: u32,
-    video_height: u32,
-    frame_updated: bool,
-    needs_range_expand: Option<bool>,
+    // Small bounded queue keeps the freshest frames and drops stale ones under load.
+    frame_queue: ArrayQueue<VideoFrame>,
+    video_width: AtomicU32,
+    video_height: AtomicU32,
+    // -1 unknown, 0 full-range (no expand), 1 limited-range (expand)
+    needs_range_expand: AtomicI8,
 }
+
+const RANGE_EXPAND_UNKNOWN: i8 = -1;
+const RANGE_EXPAND_FALSE: i8 = 0;
+const RANGE_EXPAND_TRUE: i8 = 1;
 
 fn guess_limited_range_rgba(pixels: &[u8]) -> bool {
     // Heuristic for cases where upstream fails to signal limited range.
@@ -267,7 +273,7 @@ fn expand_limited_range_rgba_in_place(pixels: &mut [u8]) {
 /// Video player using GStreamer
 pub struct VideoPlayer {
     pipeline: gst::Pipeline,
-    state: Arc<Mutex<VideoState>>,
+    state: Arc<VideoState>,
     volume_element: Option<gst::Element>,
     duration: Option<Duration>,
     is_playing: bool,
@@ -425,20 +431,19 @@ Ensure your GStreamer installation includes the playback elements (usually from 
             pipeline.set_property("audio-sink", &audio_bin);
         }
 
-        let state = Arc::new(Mutex::new(VideoState {
-            current_frame: None,
-            video_width: 0,
-            video_height: 0,
-            frame_updated: false,
-            needs_range_expand: None,
-        }));
+        let state = Arc::new(VideoState {
+            frame_queue: ArrayQueue::new(3),
+            video_width: AtomicU32::new(0),
+            video_height: AtomicU32::new(0),
+            needs_range_expand: AtomicI8::new(RANGE_EXPAND_UNKNOWN),
+        });
 
         // Set up appsink callbacks.
         // NOTE: In PAUSED state (e.g. when the user pauses or when seeking while paused),
         // playbin/appsink typically delivers the next frame as a *preroll* buffer, not a
         // regular sample. To show the exact frame when seeking while paused, handle BOTH.
 
-        fn process_sample(sample: gst::Sample, state: &Arc<Mutex<VideoState>>) {
+        fn process_sample(sample: gst::Sample, state: &Arc<VideoState>) {
             if let Some(buffer) = sample.buffer() {
                 if let Some(caps) = sample.caps() {
                     if let Ok(video_info) = gst_video::VideoInfo::from_caps(caps) {
@@ -448,23 +453,29 @@ Ensure your GStreamer installation includes the playback elements (usually from 
                         if let Ok(map) = buffer.map_readable() {
                             let mut data = map.as_slice().to_vec();
 
-                            let should_expand = {
-                                let mut state_guard = state.lock();
-                                match state_guard.needs_range_expand {
-                                    Some(v) => v,
-                                    None => {
-                                        let by_caps = match video_info.colorimetry().range() {
-                                            gst_video::VideoColorRange::Range16_235 => Some(true),
-                                            gst_video::VideoColorRange::Range0_255 => Some(false),
-                                            _ => None,
-                                        };
+                            let should_expand = match state.needs_range_expand.load(Ordering::Acquire)
+                            {
+                                RANGE_EXPAND_TRUE => true,
+                                RANGE_EXPAND_FALSE => false,
+                                _ => {
+                                    let by_caps = match video_info.colorimetry().range() {
+                                        gst_video::VideoColorRange::Range16_235 => Some(true),
+                                        gst_video::VideoColorRange::Range0_255 => Some(false),
+                                        _ => None,
+                                    };
 
-                                        // If caps don't clearly say, infer from first frame.
-                                        let inferred = by_caps
-                                            .unwrap_or_else(|| guess_limited_range_rgba(&data));
-                                        state_guard.needs_range_expand = Some(inferred);
-                                        inferred
-                                    }
+                                    // If caps don't clearly say, infer from first frame.
+                                    let inferred =
+                                        by_caps.unwrap_or_else(|| guess_limited_range_rgba(&data));
+                                    state.needs_range_expand.store(
+                                        if inferred {
+                                            RANGE_EXPAND_TRUE
+                                        } else {
+                                            RANGE_EXPAND_FALSE
+                                        },
+                                        Ordering::Release,
+                                    );
+                                    inferred
                                 }
                             };
 
@@ -472,15 +483,20 @@ Ensure your GStreamer installation includes the playback elements (usually from 
                                 expand_limited_range_rgba_in_place(&mut data);
                             }
 
-                            let mut state_guard = state.lock();
-                            state_guard.video_width = width;
-                            state_guard.video_height = height;
-                            state_guard.current_frame = Some(VideoFrame {
+                            state.video_width.store(width, Ordering::Release);
+                            state.video_height.store(height, Ordering::Release);
+
+                            let frame = VideoFrame {
                                 pixels: data,
                                 width,
                                 height,
-                            });
-                            state_guard.frame_updated = true;
+                            };
+
+                            // Keep only the freshest frames to avoid callback backpressure.
+                            if let Err(frame) = state.frame_queue.push(frame) {
+                                let _ = state.frame_queue.pop();
+                                let _ = state.frame_queue.push(frame);
+                            }
                         }
                     }
                 }
@@ -702,28 +718,28 @@ Ensure your GStreamer installation includes the playback elements (usually from 
     }
 
     /// Get the latest video frame if updated
-    /// Takes ownership of the frame to avoid cloning (memory optimization)
+    /// Takes ownership of the freshest frame and drops stale queued frames.
     pub fn get_frame(&mut self) -> Option<VideoFrame> {
-        let mut state = self.state.lock();
-        if state.frame_updated {
-            state.frame_updated = false;
-
-            // Update dimensions
-            if state.video_width > 0 && state.video_height > 0 {
-                self.original_width = state.video_width;
-                self.original_height = state.video_height;
-            }
-
-            // Take ownership instead of cloning to save memory
-            return state.current_frame.take();
+        let mut latest = None;
+        while let Some(frame) = self.state.frame_queue.pop() {
+            latest = Some(frame);
         }
+
+        if let Some(frame) = latest {
+            if frame.width > 0 && frame.height > 0 {
+                self.original_width = frame.width;
+                self.original_height = frame.height;
+            }
+            return Some(frame);
+        }
+
         None
     }
 
     /// Check if a new frame is available
     #[allow(dead_code)]
     pub fn has_new_frame(&self) -> bool {
-        self.state.lock().frame_updated
+        !self.state.frame_queue.is_empty()
     }
 
     /// Get video dimensions
@@ -731,8 +747,10 @@ Ensure your GStreamer installation includes the playback elements (usually from 
         if self.original_width > 0 && self.original_height > 0 {
             (self.original_width, self.original_height)
         } else {
-            let state = self.state.lock();
-            (state.video_width, state.video_height)
+            (
+                self.state.video_width.load(Ordering::Acquire),
+                self.state.video_height.load(Ordering::Acquire),
+            )
         }
     }
 

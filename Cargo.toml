@@ -41,6 +41,7 @@ gstreamer-audio = "0.23"
 # Concurrency & parallelism for high-performance manga mode
 rayon = "1.10"
 crossbeam-channel = "0.5"
+crossbeam-queue = "0.3"
 parking_lot = "0.12"
 lru = "0.12"
 hashbrown = "0.15"
