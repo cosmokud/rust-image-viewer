@@ -11,6 +11,7 @@ use fast_image_resize as fir;
 use image::imageops::FilterType;
 use jwalk::WalkDir;
 use memmap2::MmapOptions;
+use rayon::slice::ParallelSliceMut;
 use zune_core::colorspace::ColorSpace;
 use zune_core::options::DecoderOptions;
 use zune_image::image::Image as ZuneImage;
@@ -296,7 +297,7 @@ pub fn get_media_in_directory(path: &Path) -> Vec<PathBuf> {
         .filter(|p| p.is_file() && is_supported_media(p))
         .collect();
 
-    media.sort_by(|a, b| {
+    media.par_sort_unstable_by(|a, b| {
         natord::compare(
             a.file_name().unwrap_or_default().to_str().unwrap_or(""),
             b.file_name().unwrap_or_default().to_str().unwrap_or(""),
@@ -447,7 +448,6 @@ impl LoadedImage {
         max_texture_side: Option<u32>,
         filter: FilterType,
     ) -> Option<crossbeam_channel::Receiver<ImageFrame>> {
-
         if !Self::is_animated_webp(path) {
             return None;
         }
@@ -455,12 +455,9 @@ impl LoadedImage {
         let (tx, rx) = crossbeam_channel::bounded::<ImageFrame>(WEBP_STREAM_CHANNEL_CAPACITY);
         let path = path.to_path_buf();
 
-        std::thread::Builder::new()
-            .name("webp-stream".into())
-            .spawn(move || {
-                Self::stream_webp_frames(&path, max_texture_side, filter, &tx);
-            })
-            .ok();
+        crate::async_runtime::spawn_blocking_or_thread("webp-stream", move || {
+            Self::stream_webp_frames(&path, max_texture_side, filter, &tx);
+        });
 
         Some(rx)
     }

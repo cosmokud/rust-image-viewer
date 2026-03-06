@@ -3,6 +3,10 @@
 mod image_loader;
 
 #[allow(dead_code)]
+#[path = "../src/async_runtime.rs"]
+mod async_runtime;
+
+#[allow(dead_code)]
 #[path = "../src/media_index.rs"]
 mod media_index;
 

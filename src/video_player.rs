@@ -16,6 +16,7 @@ use gstreamer_app as gst_app;
 use gstreamer_video as gst_video;
 use image_simd::u16x8;
 use parking_lot::Mutex;
+use rayon::prelude::*;
 use std::collections::VecDeque;
 
 #[cfg(target_os = "windows")]
@@ -321,39 +322,34 @@ fn guess_limited_range_rgba(pixels: &[u8]) -> bool {
     let target_samples: usize = 20_000;
     let step = (pixel_count / target_samples).max(1);
 
-    let mut min_rgb = [255u8; 3];
-    let mut max_rgb = [0u8; 3];
+    let sampled_positions: Vec<usize> = (0..pixel_count).step_by(step).take(target_samples).collect();
 
-    let mut saw_near_black = false;
-    let mut saw_near_white = false;
+    let (min_rgb, max_rgb, saw_near_black, saw_near_white) = sampled_positions
+        .par_iter()
+        .map(|&p| {
+            let i = p * 4;
+            let r = pixels[i];
+            let g = pixels[i + 1];
+            let b = pixels[i + 2];
 
-    let mut samples = 0usize;
-    for p in (0..pixel_count).step_by(step) {
-        let i = p * 4;
-        let r = pixels[i];
-        let g = pixels[i + 1];
-        let b = pixels[i + 2];
-
-        min_rgb[0] = min_rgb[0].min(r);
-        min_rgb[1] = min_rgb[1].min(g);
-        min_rgb[2] = min_rgb[2].min(b);
-        max_rgb[0] = max_rgb[0].max(r);
-        max_rgb[1] = max_rgb[1].max(g);
-        max_rgb[2] = max_rgb[2].max(b);
-
-        // "Near" in limited-range space.
-        if r <= 20 || g <= 20 || b <= 20 {
-            saw_near_black = true;
-        }
-        if r >= 235 || g >= 235 || b >= 235 {
-            saw_near_white = true;
-        }
-
-        samples += 1;
-        if samples >= target_samples {
-            break;
-        }
-    }
+            (
+                [r, g, b],
+                [r, g, b],
+                r <= 20 || g <= 20 || b <= 20,
+                r >= 235 || g >= 235 || b >= 235,
+            )
+        })
+        .reduce(
+            || ([255u8; 3], [0u8; 3], false, false),
+            |a, b| {
+                (
+                    [a.0[0].min(b.0[0]), a.0[1].min(b.0[1]), a.0[2].min(b.0[2])],
+                    [a.1[0].max(b.1[0]), a.1[1].max(b.1[1]), a.1[2].max(b.1[2])],
+                    a.2 || b.2,
+                    a.3 || b.3,
+                )
+            },
+        );
 
     let min_all = *min_rgb.iter().min().unwrap_or(&0);
     let max_all = *max_rgb.iter().max().unwrap_or(&255);
@@ -392,8 +388,10 @@ fn expand_limited_range_rgba_in_place(pixels: &mut [u8]) {
     const PIXELS_PER_BATCH: usize = 8;
     const BATCH_BYTES: usize = PIXELS_PER_BATCH * 4;
 
-    let mut chunks = pixels.chunks_exact_mut(BATCH_BYTES);
-    for chunk in &mut chunks {
+    let aligned_len = (pixels.len() / BATCH_BYTES) * BATCH_BYTES;
+    let (full_batches, remainder) = pixels.split_at_mut(aligned_len);
+
+    full_batches.par_chunks_mut(BATCH_BYTES).for_each(|chunk| {
         let mut r = [0u16; PIXELS_PER_BATCH];
         let mut g = [0u16; PIXELS_PER_BATCH];
         let mut b = [0u16; PIXELS_PER_BATCH];
@@ -415,13 +413,13 @@ fn expand_limited_range_rgba_in_place(pixels: &mut [u8]) {
             chunk[base + 1] = g_mapped[lane];
             chunk[base + 2] = b_mapped[lane];
         }
-    }
+    });
 
     const OFFSET: i32 = 16;
     const SCALE_NUM: i32 = 255;
     const SCALE_DEN: i32 = 219;
 
-    for px in chunks.into_remainder().chunks_exact_mut(4) {
+    for px in remainder.chunks_exact_mut(4) {
         for c in &mut px[0..3] {
             let v = *c as i32;
             let scaled = ((v - OFFSET) * SCALE_NUM + (SCALE_DEN / 2)) / SCALE_DEN;

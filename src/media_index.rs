@@ -18,6 +18,13 @@ struct DirectoryCacheEntry {
     scanned_at: Instant,
 }
 
+#[derive(Clone)]
+pub struct DirectoryScanResult {
+    pub directory: PathBuf,
+    pub files: Vec<PathBuf>,
+    pub modified_at: Option<SystemTime>,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MediaDirectoryIndexStats {
     pub hits: u64,
@@ -58,35 +65,79 @@ impl MediaDirectoryIndex {
         self.cache.pop(directory);
     }
 
-    pub fn media_in_directory_for_path(&mut self, path: &Path) -> Vec<PathBuf> {
+    pub fn try_cached_media_for_path(&mut self, path: &Path) -> Option<Vec<PathBuf>> {
         let parent = match path.parent() {
             Some(parent) => parent.to_path_buf(),
-            None => return vec![path.to_path_buf()],
+            None => return Some(vec![path.to_path_buf()]),
         };
 
         let modified_at = directory_modified_time(&parent);
-
         if let Some(entry) = self.cache.get(&parent) {
             if is_entry_fresh(entry, &modified_at) {
                 self.stats.hits = self.stats.hits.saturating_add(1);
-                return entry.files.clone();
+                return Some(entry.files.clone());
             }
+        }
+
+        None
+    }
+
+    pub fn request_media_scan_for_path(
+        &mut self,
+        path: &Path,
+    ) -> Option<crossbeam_channel::Receiver<DirectoryScanResult>> {
+        let directory = match path.parent() {
+            Some(parent) => parent.to_path_buf(),
+            None => return None,
+        };
+
+        self.stats.misses = self.stats.misses.saturating_add(1);
+        self.stats.scans = self.stats.scans.saturating_add(1);
+
+        let anchor = path.to_path_buf();
+        let (tx, rx) = crossbeam_channel::bounded::<DirectoryScanResult>(1);
+
+        crate::async_runtime::spawn_blocking_or_thread("media-directory-scan", move || {
+            let files = get_media_in_directory(&anchor);
+            let modified_at = directory_modified_time(&directory);
+            let _ = tx.send(DirectoryScanResult {
+                directory,
+                files,
+                modified_at,
+            });
+        });
+
+        Some(rx)
+    }
+
+    pub fn apply_directory_scan_result(&mut self, result: DirectoryScanResult) -> Vec<PathBuf> {
+        self.cache.put(
+            result.directory,
+            DirectoryCacheEntry {
+                files: result.files.clone(),
+                modified_at: result.modified_at,
+                scanned_at: Instant::now(),
+            },
+        );
+
+        result.files
+    }
+
+    #[allow(dead_code)]
+    pub fn media_in_directory_for_path(&mut self, path: &Path) -> Vec<PathBuf> {
+        if let Some(files) = self.try_cached_media_for_path(path) {
+            return files;
         }
 
         self.stats.misses = self.stats.misses.saturating_add(1);
         self.stats.scans = self.stats.scans.saturating_add(1);
 
         let files = get_media_in_directory(path);
-        self.cache.put(
-            parent,
-            DirectoryCacheEntry {
-                files: files.clone(),
-                modified_at,
-                scanned_at: Instant::now(),
-            },
-        );
-
-        files
+        self.apply_directory_scan_result(DirectoryScanResult {
+            directory: path.parent().unwrap_or(path).to_path_buf(),
+            files,
+            modified_at: path.parent().and_then(directory_modified_time),
+        })
     }
 }
 

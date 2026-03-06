@@ -209,44 +209,40 @@ impl MangaLoader {
         let shutdown_clone = Arc::clone(&shutdown);
         let generation_clone = Arc::clone(&generation);
 
-        std::thread::Builder::new()
-            .name("manga-loader-coordinator".into())
-            .spawn(move || {
-                Self::coordinator_loop(
-                    request_rx,
-                    result_tx,
-                    loading_clone,
-                    loaded_clone,
-                    retry_clone,
-                    shutdown_clone,
-                    generation_clone,
-                );
-            })
-            .expect("Failed to spawn manga loader coordinator thread");
+        crate::async_runtime::spawn_blocking_or_thread("manga-loader-coordinator", move || {
+            Self::coordinator_loop(
+                request_rx,
+                result_tx,
+                loading_clone,
+                loaded_clone,
+                retry_clone,
+                shutdown_clone,
+                generation_clone,
+            );
+        });
 
         // Spawn a lightweight dimension probe worker.
         // This keeps header-based size probes off the UI thread.
         let shutdown_clone = Arc::clone(&shutdown);
-        std::thread::Builder::new()
-            .name("manga-dimension-worker".into())
-            .spawn(move || {
-                while !shutdown_clone.load(Ordering::Acquire) {
-                    // Use a long timeout (500ms) to minimize CPU usage when idle.
-                    // The channel will wake immediately when a real request arrives.
-                    let req = match dim_request_rx.recv_timeout(Duration::from_millis(500)) {
-                        Ok(r) => r,
-                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
-                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
-                    };
+        crate::async_runtime::spawn_blocking_or_thread("manga-dimension-worker", move || {
+            while !shutdown_clone.load(Ordering::Acquire) {
+                // Use a long timeout (500ms) to minimize CPU usage when idle.
+                // The channel will wake immediately when a real request arrives.
+                let req = match dim_request_rx.recv_timeout(Duration::from_millis(500)) {
+                    Ok(r) => r,
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                };
 
-                    let mut out: Vec<(usize, u32, u32, MangaMediaType)> =
-                        Vec::with_capacity(req.items.len());
-                    for (idx, path) in req.items {
+                let mut out: Vec<(usize, u32, u32, MangaMediaType)> = req
+                    .items
+                    .into_par_iter()
+                    .filter_map(|(idx, path)| {
                         let is_video = is_supported_video(&path);
                         let is_image = is_supported_image(&path);
 
                         if !is_video && !is_image {
-                            continue;
+                            return None;
                         }
 
                         let media_type = if is_video {
@@ -257,10 +253,8 @@ impl MangaLoader {
 
                         let dims = if is_video {
                             Self::probe_video_dimensions(&path)
-                        } else if is_image {
-                            Self::probe_image_dimensions_cached(&path)
                         } else {
-                            None
+                            Self::probe_image_dimensions_cached(&path)
                         };
 
                         let (w, h) = if let Some((w, h)) = dims {
@@ -271,36 +265,25 @@ impl MangaLoader {
                             (1200, 1600)
                         };
 
-                        out.push((idx, w, h, media_type));
+                        Some((idx, w, h, media_type))
+                    })
+                    .collect();
 
-                        if out.len() >= DIM_RESULT_CHUNK_SIZE {
-                            let chunk = std::mem::take(&mut out);
-                            if dim_result_tx
-                                .send(DimResult {
-                                    generation: req.generation,
-                                    items: chunk,
-                                })
-                                .is_err()
-                            {
-                                return;
-                            }
-                        }
-                    }
+                out.par_sort_unstable_by_key(|(idx, _, _, _)| *idx);
 
-                    if !out.is_empty() {
-                        if dim_result_tx
-                            .send(DimResult {
-                                generation: req.generation,
-                                items: out,
-                            })
-                            .is_err()
-                        {
-                            return;
-                        }
+                for chunk in out.chunks(DIM_RESULT_CHUNK_SIZE) {
+                    if dim_result_tx
+                        .send(DimResult {
+                            generation: req.generation,
+                            items: chunk.to_vec(),
+                        })
+                        .is_err()
+                    {
+                        return;
                     }
                 }
-            })
-            .expect("Failed to spawn manga dimension worker thread");
+            }
+        });
 
         Self {
             request_tx,

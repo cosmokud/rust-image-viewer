@@ -20,6 +20,7 @@ const THUMBNAIL_CACHE_TTL_SECS: u64 = 60 * 60 * 24 * 14;
 const DIMENSION_CACHE_MAX_ENTRIES: usize = 80_000;
 const THUMBNAIL_CACHE_MAX_ENTRIES: usize = 4_000;
 const PRUNE_INTERVAL_SECS: u64 = 60;
+const CACHE_WRITE_QUEUE_CAPACITY: usize = 512;
 
 static DIMENSION_HITS: AtomicU64 = AtomicU64::new(0);
 static DIMENSION_MISSES: AtomicU64 = AtomicU64::new(0);
@@ -89,6 +90,20 @@ pub struct CachedVideoThumbnail {
     pub height: u32,
     pub original_width: u32,
     pub original_height: u32,
+}
+
+enum CacheWriteOp {
+    Dimensions {
+        path: PathBuf,
+        media_kind: CachedMediaKind,
+        width: u32,
+        height: u32,
+    },
+    VideoThumbnail {
+        path: PathBuf,
+        max_texture_side: u32,
+        thumbnail: CachedVideoThumbnail,
+    },
 }
 
 pub struct MetadataCache {
@@ -406,15 +421,65 @@ impl MetadataCache {
 }
 
 static GLOBAL_CACHE: OnceLock<Option<Arc<Mutex<MetadataCache>>>> = OnceLock::new();
+static CACHE_WRITE_TX: OnceLock<Option<crossbeam_channel::Sender<CacheWriteOp>>> = OnceLock::new();
+
+fn global_cache_handle() -> Option<&'static Arc<Mutex<MetadataCache>>> {
+    GLOBAL_CACHE
+        .get_or_init(|| MetadataCache::open_default().map(|cache| Arc::new(Mutex::new(cache))))
+        .as_ref()
+}
+
+fn cache_write_tx() -> Option<&'static crossbeam_channel::Sender<CacheWriteOp>> {
+    CACHE_WRITE_TX
+        .get_or_init(|| {
+            let cache = global_cache_handle()?.clone();
+            let (tx, rx) = crossbeam_channel::bounded::<CacheWriteOp>(CACHE_WRITE_QUEUE_CAPACITY);
+
+            crate::async_runtime::spawn_blocking_or_thread("metadata-cache-writer", move || {
+                cache_write_loop(cache, rx);
+            });
+
+            Some(tx)
+        })
+        .as_ref()
+}
+
+fn cache_write_loop(cache: Arc<Mutex<MetadataCache>>, rx: crossbeam_channel::Receiver<CacheWriteOp>) {
+    while let Ok(first_op) = rx.recv() {
+        let mut pending: Vec<CacheWriteOp> = Vec::with_capacity(32);
+        pending.push(first_op);
+
+        while pending.len() < 64 {
+            match rx.try_recv() {
+                Ok(op) => pending.push(op),
+                Err(_) => break,
+            }
+        }
+
+        let cache = cache.lock();
+        for op in pending {
+            match op {
+                CacheWriteOp::Dimensions {
+                    path,
+                    media_kind,
+                    width,
+                    height,
+                } => cache.store_dimensions(path.as_path(), media_kind, width, height),
+                CacheWriteOp::VideoThumbnail {
+                    path,
+                    max_texture_side,
+                    thumbnail,
+                } => cache.store_video_thumbnail(path.as_path(), max_texture_side, &thumbnail),
+            }
+        }
+    }
+}
 
 pub fn lookup_cached_dimensions(
     path: &Path,
     expected_kind: CachedMediaKind,
 ) -> Option<(u32, u32)> {
-    let Some(cache) = GLOBAL_CACHE
-        .get_or_init(|| MetadataCache::open_default().map(|cache| Arc::new(Mutex::new(cache))))
-        .as_ref()
-    else {
+    let Some(cache) = global_cache_handle() else {
         DIMENSION_MISSES.fetch_add(1, Ordering::Relaxed);
         return None;
     };
@@ -430,26 +495,30 @@ pub fn lookup_cached_dimensions(
 }
 
 pub fn store_cached_dimensions(path: &Path, media_kind: CachedMediaKind, width: u32, height: u32) {
-    let Some(cache) = GLOBAL_CACHE
-        .get_or_init(|| MetadataCache::open_default().map(|cache| Arc::new(Mutex::new(cache))))
-        .as_ref()
-    else {
-        return;
-    };
+    if let Some(tx) = cache_write_tx() {
+        let op = CacheWriteOp::Dimensions {
+            path: path.to_path_buf(),
+            media_kind,
+            width,
+            height,
+        };
+        if tx.try_send(op).is_ok() {
+            return;
+        }
+    }
 
-    cache
-        .lock()
-        .store_dimensions(path, media_kind, width, height);
+    if let Some(cache) = global_cache_handle() {
+        cache
+            .lock()
+            .store_dimensions(path, media_kind, width, height);
+    }
 }
 
 pub fn lookup_cached_video_thumbnail(
     path: &Path,
     max_texture_side: u32,
 ) -> Option<CachedVideoThumbnail> {
-    let Some(cache) = GLOBAL_CACHE
-        .get_or_init(|| MetadataCache::open_default().map(|cache| Arc::new(Mutex::new(cache))))
-        .as_ref()
-    else {
+    let Some(cache) = global_cache_handle() else {
         THUMBNAIL_MISSES.fetch_add(1, Ordering::Relaxed);
         return None;
     };
@@ -471,16 +540,22 @@ pub fn store_cached_video_thumbnail(
     max_texture_side: u32,
     thumbnail: &CachedVideoThumbnail,
 ) {
-    let Some(cache) = GLOBAL_CACHE
-        .get_or_init(|| MetadataCache::open_default().map(|cache| Arc::new(Mutex::new(cache))))
-        .as_ref()
-    else {
-        return;
-    };
+    if let Some(tx) = cache_write_tx() {
+        let op = CacheWriteOp::VideoThumbnail {
+            path: path.to_path_buf(),
+            max_texture_side,
+            thumbnail: thumbnail.clone(),
+        };
+        if tx.try_send(op).is_ok() {
+            return;
+        }
+    }
 
-    cache
-        .lock()
-        .store_video_thumbnail(path, max_texture_side, thumbnail);
+    if let Some(cache) = global_cache_handle() {
+        cache
+            .lock()
+            .store_video_thumbnail(path, max_texture_side, thumbnail);
+    }
 }
 
 pub fn metadata_cache_stats() -> MetadataCacheStats {

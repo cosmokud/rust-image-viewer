@@ -4,6 +4,7 @@
 #![windows_subsystem = "windows"]
 
 mod config;
+mod async_runtime;
 mod image_loader;
 mod media_index;
 mod metadata_cache;
@@ -28,7 +29,7 @@ use image_loader::{
     MediaType,
 };
 use hashbrown::{HashMap, HashSet};
-use media_index::MediaDirectoryIndex;
+use media_index::{DirectoryScanResult, MediaDirectoryIndex};
 use metadata_cache::metadata_cache_stats;
 use manga_loader::{MangaLoader, MangaMediaType, MangaTextureCache};
 use manga_spatial::{MangaSpatialIndex, SpatialRect, STRIP_QUERY_HALF_WIDTH};
@@ -423,6 +424,12 @@ struct ImageViewer {
     decoded_image_cache: moka::sync::Cache<String, Arc<CachedDecodedImage>>,
     /// Cached directory index used to avoid rescanning unchanged folders on every navigation step.
     media_directory_index: MediaDirectoryIndex,
+    /// Pending async directory scan for the currently loaded media path.
+    pending_media_directory_scan: Option<crossbeam_channel::Receiver<DirectoryScanResult>>,
+    /// Path associated with `pending_media_directory_scan`.
+    pending_media_directory_target: Option<PathBuf>,
+    /// Start time for the in-flight async directory scan.
+    pending_media_directory_started_at: Option<Instant>,
     /// Current image index in the list
     current_index: usize,
     /// Current zoom level (1.0 = 100%)
@@ -803,6 +810,9 @@ impl Default for ImageViewer {
                 })
                 .build(),
             media_directory_index: MediaDirectoryIndex::default(),
+            pending_media_directory_scan: None,
+            pending_media_directory_target: None,
+            pending_media_directory_started_at: None,
             current_index: 0,
             zoom: 1.0,
             zoom_target: 1.0,
@@ -2468,6 +2478,53 @@ impl ImageViewer {
         }
     }
 
+    fn poll_pending_media_directory_scan(&mut self, ctx: &egui::Context) {
+        let Some(rx) = self.pending_media_directory_scan.as_ref() else {
+            return;
+        };
+
+        let result = match rx.try_recv() {
+            Ok(result) => result,
+            Err(crossbeam_channel::TryRecvError::Empty) => return,
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                self.pending_media_directory_scan = None;
+                self.pending_media_directory_target = None;
+                self.pending_media_directory_started_at = None;
+                return;
+            }
+        };
+
+        self.pending_media_directory_scan = None;
+        let Some(target_path) = self.pending_media_directory_target.take() else {
+            self.pending_media_directory_started_at = None;
+            return;
+        };
+
+        if let Some(started_at) = self.pending_media_directory_started_at.take() {
+            self.perf_metrics
+                .record_duration("media_index_async_scan_ms", started_at.elapsed());
+        }
+
+        let mut files = self.media_directory_index.apply_directory_scan_result(result);
+        if files.is_empty() {
+            files.push(target_path.clone());
+        }
+
+        let current_path = self.image_list.get(self.current_index).cloned();
+        if current_path.as_ref() != Some(&target_path) {
+            return;
+        }
+
+        self.image_list = files;
+        let resolved_index = self
+            .image_list
+            .iter()
+            .position(|candidate| candidate == &target_path)
+            .unwrap_or(0);
+        self.set_current_index_clamped(resolved_index);
+        ctx.request_repaint();
+    }
+
     /// Load an image from path
     fn load_image(&mut self, path: &PathBuf) {
         self.load_media(path);
@@ -2558,7 +2615,27 @@ impl ImageViewer {
         // Reuse cached directory listing when the parent folder is unchanged.
         let index_stats_before = self.media_directory_index.stats();
         let index_lookup_start = Instant::now();
-        self.image_list = self.media_directory_index.media_in_directory_for_path(path);
+
+        self.pending_media_directory_scan = None;
+        self.pending_media_directory_target = None;
+        self.pending_media_directory_started_at = None;
+
+        if let Some(files) = self.media_directory_index.try_cached_media_for_path(path) {
+            self.image_list = files;
+        } else {
+            // Keep current media navigable immediately while the full directory scan runs in background.
+            self.image_list = vec![path.clone()];
+            if let Some(rx) = self.media_directory_index.request_media_scan_for_path(path) {
+                self.pending_media_directory_scan = Some(rx);
+                self.pending_media_directory_target = Some(path.clone());
+                self.pending_media_directory_started_at = Some(Instant::now());
+            }
+        }
+
+        if self.image_list.is_empty() {
+            self.image_list.push(path.clone());
+        }
+
         self.perf_metrics
             .record_duration("media_index_lookup_ms", index_lookup_start.elapsed());
         let index_stats_after = self.media_directory_index.stats();
@@ -2574,7 +2651,12 @@ impl ImageViewer {
                 index_stats_after.misses - index_stats_before.misses,
             );
         }
-        self.set_current_index_clamped(self.image_list.iter().position(|p| p == path).unwrap_or(0));
+        self.set_current_index_clamped(
+            self.image_list
+                .iter()
+                .position(|candidate| candidate == path)
+                .unwrap_or(0),
+        );
 
         match media_type {
             Some(MediaType::Video) => {
@@ -10888,6 +10970,8 @@ impl eframe::App for ImageViewer {
             }
         }
 
+        self.poll_pending_media_directory_scan(ctx);
+
         // Keep our cached screen size in sync with the real viewport.
         // Manga mode uses this for layout/scroll math; if it drifts from `ctx.screen_rect()`,
         // you can get clamping oscillations and visible jitter.
@@ -11534,6 +11618,7 @@ fn init_runtime_diagnostics() {
 
 fn main() -> eframe::Result<()> {
     init_runtime_diagnostics();
+    let _ = async_runtime::init_runtime();
 
     #[cfg(target_os = "windows")]
     windows_env::refresh_process_path_from_registry();
