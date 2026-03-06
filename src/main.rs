@@ -378,28 +378,6 @@ struct ModeSwitchPlaceholder {
     media_type: MediaType,
 }
 
-#[derive(Clone, Copy)]
-struct FloatingViewLayout {
-    zoom: f32,
-    zoom_target: f32,
-    offset: egui::Vec2,
-    floating_max_inner_size: Option<egui::Vec2>,
-    last_requested_inner_size: Option<egui::Vec2>,
-}
-
-#[derive(Clone, Copy)]
-enum DeferredWindowModeLayout {
-    Fullscreen,
-    Floating(FloatingViewLayout),
-}
-
-#[derive(Clone, Copy)]
-struct PendingWindowModeLayout {
-    target_inner_size: egui::Vec2,
-    layout: DeferredWindowModeLayout,
-    waited_frames: u8,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PendingMediaLoadKind {
     Image,
@@ -843,8 +821,6 @@ struct ImageViewer {
     image_rotated: bool,
     /// Pending window resize to apply after a frame delay (to prevent flash on fullscreen exit)
     pending_window_resize: Option<(egui::Vec2, egui::Pos2, u8)>,
-    /// Layout to apply once a window-mode resize reaches its requested inner size.
-    pending_window_mode_layout: Option<PendingWindowModeLayout>,
 
     /// Per-image view state cache for fullscreen mode.
     /// Maps image paths to their saved view states (zoom, pan, rotation, flip).
@@ -1220,7 +1196,6 @@ impl Default for ImageViewer {
             fullscreen_transition_target: 0.0,
             image_rotated: false,
             pending_window_resize: None,
-            pending_window_mode_layout: None,
             fullscreen_view_states: HashMap::new(),
             last_known_outer_pos: None,
             floating_user_moved_window: false,
@@ -3568,7 +3543,6 @@ impl ImageViewer {
 
         self.reset_masonry_metadata_preload();
         self.clear_pending_media_load();
-        self.pending_window_mode_layout = None;
 
         self.current_file_size_label = None;
         self.current_file_size_label_path = None;
@@ -3985,73 +3959,6 @@ impl ImageViewer {
         self.send_outer_position(ctx, egui::pos2(x.max(0.0), y.max(0.0)));
     }
 
-    fn current_viewport_inner_size(&self, ctx: &egui::Context) -> egui::Vec2 {
-        ctx.input(|i| i.raw.viewport().inner_rect)
-            .map(|r| r.size())
-            .unwrap_or_else(|| ctx.screen_rect().size())
-    }
-
-    fn window_mode_layout_matches_target(current: egui::Vec2, target: egui::Vec2) -> bool {
-        const SIZE_TOLERANCE: f32 = 2.0;
-
-        (current.x - target.x).abs() <= SIZE_TOLERANCE
-            && (current.y - target.y).abs() <= SIZE_TOLERANCE
-    }
-
-    fn schedule_window_mode_layout(
-        &mut self,
-        target_inner_size: egui::Vec2,
-        layout: DeferredWindowModeLayout,
-    ) {
-        self.pending_window_mode_layout = Some(PendingWindowModeLayout {
-            target_inner_size,
-            layout,
-            waited_frames: 0,
-        });
-    }
-
-    fn apply_floating_view_layout(&mut self, layout: FloatingViewLayout) {
-        self.zoom = layout.zoom;
-        self.zoom_target = layout.zoom_target;
-        self.zoom_velocity = 0.0;
-        self.offset = layout.offset;
-        self.floating_max_inner_size = layout.floating_max_inner_size;
-        self.last_requested_inner_size = layout.last_requested_inner_size;
-    }
-
-    fn poll_pending_window_mode_layout(&mut self, ctx: &egui::Context) {
-        let Some(mut pending) = self.pending_window_mode_layout.take() else {
-            return;
-        };
-
-        let current_inner_size = self.current_viewport_inner_size(ctx);
-        let ready =
-            Self::window_mode_layout_matches_target(current_inner_size, pending.target_inner_size)
-                || pending.waited_frames >= 30;
-
-        if !ready {
-            pending.waited_frames = pending.waited_frames.saturating_add(1);
-            self.pending_window_mode_layout = Some(pending);
-            ctx.request_repaint_after(Duration::from_millis(16));
-            return;
-        }
-
-        match pending.layout {
-            DeferredWindowModeLayout::Fullscreen => {
-                if self.media_display_dimensions().is_some() {
-                    self.apply_fullscreen_layout_for_current_image(ctx);
-                } else if matches!(self.current_media_type, Some(MediaType::Video)) {
-                    self.pending_media_layout = true;
-                }
-            }
-            DeferredWindowModeLayout::Floating(layout) => {
-                self.apply_floating_view_layout(layout);
-            }
-        }
-
-        ctx.request_repaint();
-    }
-
     fn apply_floating_layout_for_current_image(&mut self, ctx: &egui::Context) {
         self.offset = egui::Vec2::ZERO;
 
@@ -4141,12 +4048,6 @@ impl ImageViewer {
 
     fn tick_floating_zoom_animation(&mut self, ctx: &egui::Context) -> bool {
         if self.is_fullscreen {
-            self.zoom_target = self.zoom;
-            self.zoom_velocity = 0.0;
-            return false;
-        }
-
-        if self.pending_window_mode_layout.is_some() {
             self.zoom_target = self.zoom;
             self.zoom_velocity = 0.0;
             return false;
@@ -9542,7 +9443,6 @@ impl ImageViewer {
         if self.is_fullscreen
             || self.is_resizing
             || self.pending_window_resize.is_some()
-            || self.pending_window_mode_layout.is_some()
             || self.defer_media_view_reset
         {
             return;
@@ -11786,7 +11686,6 @@ impl ImageViewer {
         if !self.is_fullscreen
             && !self.is_panning
             && !self.is_resizing
-            && self.pending_window_mode_layout.is_none()
             && !self.is_seeking
             && !self.manga_autoscroll_active
             && !floating_image_exceeds_window
@@ -12441,7 +12340,7 @@ impl eframe::App for ImageViewer {
         let texture_animation_active = self.update_texture(ctx);
 
         // Apply layout changes after image changes.
-        if self.image_changed && self.pending_window_mode_layout.is_none() {
+        if self.image_changed {
             // If we're about to enter fullscreen (startup or user toggle), skip applying
             // a floating layout first to avoid a one-frame flash.
             if !self.is_fullscreen && self.toggle_fullscreen {
@@ -12460,7 +12359,7 @@ impl eframe::App for ImageViewer {
         }
 
         // Apply layout changes after image rotation (resize window to match new dimensions)
-        if self.image_rotated && self.pending_window_mode_layout.is_none() {
+        if self.image_rotated {
             if self.is_fullscreen {
                 // Fullscreen: fit vertically to screen, centered.
                 // Don't call apply_fullscreen_layout_for_current_image here because it would
@@ -12487,7 +12386,7 @@ impl eframe::App for ImageViewer {
 
         // For videos, the first frame (and therefore dimensions) may arrive after the initial load.
         // Retry layout once we have dimensions so next/prev video switches obey the sizing rules.
-        if self.pending_media_layout && self.pending_window_mode_layout.is_none() {
+        if self.pending_media_layout {
             if self.media_display_dimensions().is_some() {
                 if self.is_fullscreen {
                     self.apply_fullscreen_layout_for_current_image(ctx);
@@ -12505,8 +12404,6 @@ impl eframe::App for ImageViewer {
 
         if self.toggle_fullscreen {
             self.stop_manga_autoscroll();
-            self.pending_window_resize = None;
-            self.pending_window_mode_layout = None;
             let entering_fullscreen = !self.is_fullscreen;
             let toggled_from_titlebar = self.toggle_fullscreen_from_titlebar;
 
@@ -12549,12 +12446,13 @@ impl eframe::App for ImageViewer {
                     // No fullscreen transition animation: switch instantly.
                     self.fullscreen_transition = 1.0;
                     self.fullscreen_transition_target = 1.0;
-                    self.freeze_current_media_view();
+
+                    // Requirement: when moving from floating -> fullscreen, always fit vertically and center.
+                    self.apply_fullscreen_layout_for_current_image(ctx);
 
                     // Use borderless "pseudo-fullscreen" instead of OS fullscreen.
                     // This avoids a brief desktop flash on Windows caused by toggling window styles/swapchain.
                     let monitor = self.monitor_size_points(ctx);
-                    self.schedule_window_mode_layout(monitor, DeferredWindowModeLayout::Fullscreen);
                     self.suppress_outer_pos_tracking_frames =
                         self.suppress_outer_pos_tracking_frames.max(2);
                     ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::Pos2::ZERO));
@@ -12617,8 +12515,6 @@ impl eframe::App for ImageViewer {
                         self.saved_fullscreen_entry_index = None;
                     }
 
-                    self.freeze_current_media_view();
-
                     if !image_changed_while_fullscreen {
                         if let Some((
                             saved_zoom,
@@ -12628,39 +12524,31 @@ impl eframe::App for ImageViewer {
                             saved_pos,
                         )) = self.saved_floating_state.take()
                         {
-                            self.schedule_window_mode_layout(
-                                saved_size,
-                                DeferredWindowModeLayout::Floating(FloatingViewLayout {
-                                    zoom: saved_zoom,
-                                    zoom_target: saved_zoom_target,
-                                    offset: saved_offset,
-                                    floating_max_inner_size: Some(saved_size),
-                                    last_requested_inner_size: Some(saved_size),
-                                }),
-                            );
+                            self.zoom = saved_zoom;
+                            self.zoom_target = saved_zoom_target;
+                            self.offset = saved_offset;
+                            self.floating_max_inner_size = Some(saved_size);
+                            self.last_requested_inner_size = Some(saved_size);
                             // Delay window resize by 2 frames to prevent flash
                             self.pending_window_resize = Some((saved_size, saved_pos, 2));
                         } else {
                             // Fallback: reset to centered at 100% and resize to 100% image size (capped by fit-to-screen)
-                            if let Some((w, h)) = self.media_display_dimensions() {
+                            self.offset = egui::Vec2::ZERO;
+                            self.zoom = 1.0;
+                            self.zoom_target = 1.0;
+
+                            if let Some(img) = self.image.as_ref() {
+                                let (w, h) = img.display_dimensions();
                                 let mut desired = egui::Vec2::new(w as f32, h as f32);
                                 let available = self.floating_available_size(ctx);
                                 let cap = self.initial_window_size_for_available(available);
+                                self.floating_max_inner_size = Some(cap);
                                 if desired.x > cap.x || desired.y > cap.y {
                                     desired = cap;
                                 }
                                 desired.x = desired.x.max(200.0);
                                 desired.y = desired.y.max(150.0);
-                                self.schedule_window_mode_layout(
-                                    desired,
-                                    DeferredWindowModeLayout::Floating(FloatingViewLayout {
-                                        zoom: 1.0,
-                                        zoom_target: 1.0,
-                                        offset: egui::Vec2::ZERO,
-                                        floating_max_inner_size: Some(cap),
-                                        last_requested_inner_size: Some(desired),
-                                    }),
-                                );
+                                self.last_requested_inner_size = Some(desired);
                                 // Calculate center position
                                 let monitor = self.monitor_size_points(ctx);
                                 let x = (monitor.x - desired.x) * 0.5;
@@ -12699,20 +12587,17 @@ impl eframe::App for ImageViewer {
                                     1.0
                                 };
 
+                                self.zoom = z;
+                                self.zoom_target = z;
+                                self.offset = egui::Vec2::ZERO;
+                                self.zoom_velocity = 0.0;
+
                                 let mut size = egui::Vec2::new(img_w * z, img_h * z);
                                 size.x = size.x.max(200.0);
                                 size.y = size.y.max(150.0);
 
-                                self.schedule_window_mode_layout(
-                                    size,
-                                    DeferredWindowModeLayout::Floating(FloatingViewLayout {
-                                        zoom: z,
-                                        zoom_target: z,
-                                        offset: egui::Vec2::ZERO,
-                                        floating_max_inner_size: Some(size),
-                                        last_requested_inner_size: Some(size),
-                                    }),
-                                );
+                                self.floating_max_inner_size = Some(size);
+                                self.last_requested_inner_size = Some(size);
 
                                 let x = (monitor.x - size.x) * 0.5;
                                 let y = (monitor.y - size.y) * 0.5;
@@ -12754,8 +12639,6 @@ impl eframe::App for ImageViewer {
             } else {
                 false
             };
-
-        self.poll_pending_window_mode_layout(ctx);
 
         if self.request_minimize {
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
