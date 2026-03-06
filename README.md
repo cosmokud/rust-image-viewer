@@ -6,7 +6,7 @@
 
 A high-performance, minimal, borderless image and video viewer for Windows, built with Rust, egui, and GStreamer.
 
-This app is **not** intended to replace a full-featured image viewer or video player. It is a QuickLook-style preview tool focused on opening media instantly with minimal controls.
+**Scope & Purpose:** This app is highly optimized strictly for **quickly viewing and looking up images and videos only**. It is **not** intended to be a replacement for a full-fledged image management app, an image editor, or a comprehensive video player. Think of it as a QuickLook-style preview tool focused on opening media instantly with minimal controls.
 
 ## Features
 

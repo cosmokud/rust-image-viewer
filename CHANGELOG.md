@@ -2,6 +2,35 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.2.0] - 2026-03-06
+
+### Highlights
+
+- **New masonry mode for quick image discovery.** Added a tile/grid-style layout with stable column placement, pointer-anchored zoom behavior, preserved visual focus during layout switches, and smoother scrolling in dense folders.
+- Introduced async media loading with a Tokio-backed runtime and dedicated load coordinators for images and videos.
+- Added metadata and directory indexing systems to reduce repeated probing and improve navigation responsiveness.
+
+### Added
+
+- Masonry mode capabilities optimized for quick folder scanning and image discovery, including configurable row density/zoom behavior, hover-driven video autoplay, autoplay resume delay, and metadata preloading.
+- Spatial indexing and viewport virtualization improvements (including the `rtree` backend) for faster visible-item queries.
+- New modules for async/runtime and performance infrastructure: `src/async_runtime.rs`, `src/media_index.rs`, `src/metadata_cache.rs`, `src/perf_metrics.rs`, and `src/manga_spatial.rs`.
+- Baseline benchmarking scaffold at `benches/perf_baseline.rs` for performance regression checks.
+
+### Changed
+
+- Manga loading/caching pipeline was reworked for higher throughput, with staged decode behavior, thumbnail caching, and better cache reuse/eviction behavior.
+- GIF playback and video handling were refined with improved frame queueing, seek policy controls, and more robust dimension probing.
+- The default config template location is now `assets/config.ini`, and migration behavior for legacy config paths was updated.
+- The default manga virtualization backend is now `rtree`.
+- Single-instance file handoff and wake-notification behavior were improved for faster open-to-display latency.
+
+### Fixed
+
+- Multiple masonry stability issues during rapid navigation/zoom/layout changes (stale completion handling, settling logic, and dirty-state churn).
+- Fullscreen/navigation edge cases, including title-bar integration behavior and keybinding consistency updates.
+- Documentation/workflow polish for performance comparison and release automation.
+
 ## [v0.1.0] - 2026-02-02
 
 ### Added
