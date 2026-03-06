@@ -19,6 +19,7 @@ All notable changes to this project will be documented in this file.
 - Opening a page from masonry mode or manga long-strip mode into solo fullscreen now applies the fullscreen fit immediately to the retained placeholder, avoiding the brief zoomed-in flash before the final image appears.
 - Masonry mode now fits extreme panoramas and long-strip images inside each masonry slot using the source aspect ratio, even when that leaves extra padding around the media.
 - Masonry texture retry and preload quality now track the actual fitted on-screen draw size instead of the slot width alone, which reduces blur on very tall and very wide thumbnails.
+- Corrected mouse-scroll handling so wheel movements are now consistent across views and respect user-configured acceleration settings.
 
 ## [v0.2.0] - 2026-03-06
 
