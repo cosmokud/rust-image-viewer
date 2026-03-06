@@ -10830,8 +10830,28 @@ impl eframe::App for ImageViewer {
                 if self.manga_mode {
                     self.manga_wheel_scroll_pending = 0.0;
                     self.stop_manga_autoscroll();
+
+                    // Keep floating mode in sync with the strip item currently centered
+                    // in the viewport (the same item reflected by the status/title bars).
+                    self.manga_update_current_index();
+                    let visible_idx = self
+                        .current_index
+                        .min(self.image_list.len().saturating_sub(1));
+                    let target_path = self.image_list.get(visible_idx).cloned();
+                    let target_media_type =
+                        target_path.as_ref().and_then(|path| get_media_type(path));
+
+                    self.prepare_mode_switch_placeholder_from_manga_index(
+                        visible_idx,
+                        target_media_type,
+                    );
+
                     self.manga_mode = false;
                     self.manga_clear_cache();
+
+                    if let Some(path) = target_path {
+                        self.load_image(&path);
+                    }
                 }
 
                 // Clear the per-image fullscreen view state cache when exiting fullscreen
