@@ -409,21 +409,22 @@ pub struct Config {
 
     /// Manga mode: drag pan speed multiplier (1.0 = 1:1 pointer delta)
     pub manga_drag_pan_speed: f32,
-    /// Manga mode: mouse wheel scroll speed (pixels per normalized scroll unit)
-    pub manga_wheel_scroll_speed: f32,
-    /// Manga mode: inertial scroll friction (0.0-1.0). Lower = heavier/smoother.
-    /// Sweet spot for manga is ~0.08-0.15.
+    /// Manga mode: wheel momentum injected per normalized scroll step (px/s).
+    pub manga_wheel_impulse_per_step: f32,
+    /// Manga mode: exponential decay rate for free wheel momentum (1/s).
+    pub manga_wheel_decay_rate: f32,
+    /// Manga mode: cap for accumulated wheel momentum (px/s).
+    pub manga_wheel_max_velocity: f32,
+    /// Manga mode: critically-damped edge spring frequency for wheel overscroll (Hz).
+    pub manga_wheel_edge_spring_hz: f32,
+    /// Manga mode: inertial target friction for keyboard/page/autoscroll scrolling (0.0-1.0).
     pub manga_inertial_friction: f32,
-    /// Manga mode: mouse wheel multiplier applied after normalization.
-    pub manga_wheel_multiplier: f32,
     /// Manga mode: arrow-key scroll speed (pixels per key press)
     pub manga_arrow_scroll_speed: f32,
     /// Masonry mode: number of items per row
     pub masonry_items_per_row: usize,
     /// Masonry mode: delay before hover autoplay resumes after interaction stops (milliseconds)
     pub manga_hover_autoplay_resume_delay_ms: u64,
-    /// Manga mode: when true, consume wheel input with the same smooth cadence as arrow keys.
-    pub manga_wheel_smooth_like_arrow_keys: bool,
     /// Manga mode viewport virtualization backend.
     /// Default is `rtree`; users can switch to `linear` or `auto` in config.ini.
     pub manga_virtualization_backend: MangaVirtualizationBackend,
@@ -542,13 +543,14 @@ impl Config {
             zoom_step: 1.02,
             max_zoom_percent: 1000.0,
             manga_drag_pan_speed: 1.0,
-            manga_wheel_scroll_speed: 160.0,
+            manga_wheel_impulse_per_step: 2400.0,
+            manga_wheel_decay_rate: 11.0,
+            manga_wheel_max_velocity: 9000.0,
+            manga_wheel_edge_spring_hz: 4.5,
             manga_inertial_friction: 0.33,
-            manga_wheel_multiplier: 1.5,
             manga_arrow_scroll_speed: 140.0,
             masonry_items_per_row: 5,
             manga_hover_autoplay_resume_delay_ms: 220,
-            manga_wheel_smooth_like_arrow_keys: true,
             manga_virtualization_backend: MangaVirtualizationBackend::RTree,
             manga_autoscroll_dead_zone_px: 14.0,
             manga_autoscroll_base_speed_multiplier: 5.0,
@@ -901,9 +903,29 @@ impl Config {
                                 config.manga_drag_pan_speed = v.clamp(0.1, 20.0);
                             }
                         }
-                        "manga_wheel_scroll_speed" | "manga_scroll_wheel_speed" => {
+                        "manga_wheel_impulse_per_step"
+                        | "manga_wheel_velocity_per_step"
+                        | "manga_wheel_momentum_per_step" => {
                             if let Ok(v) = value.parse::<f32>() {
-                                config.manga_wheel_scroll_speed = v.clamp(1.0, 2000.0);
+                                config.manga_wheel_impulse_per_step = v.clamp(50.0, 20000.0);
+                            }
+                        }
+                        "manga_wheel_decay_rate"
+                        | "manga_wheel_decay"
+                        | "manga_wheel_momentum_decay" => {
+                            if let Ok(v) = value.parse::<f32>() {
+                                config.manga_wheel_decay_rate = v.clamp(0.5, 40.0);
+                            }
+                        }
+                        "manga_wheel_max_velocity" | "manga_wheel_velocity_cap" => {
+                            if let Ok(v) = value.parse::<f32>() {
+                                config.manga_wheel_max_velocity = v.clamp(200.0, 30000.0);
+                            }
+                        }
+                        "manga_wheel_edge_spring_hz"
+                        | "manga_wheel_edge_spring_frequency" => {
+                            if let Ok(v) = value.parse::<f32>() {
+                                config.manga_wheel_edge_spring_hz = v.clamp(0.5, 20.0);
                             }
                         }
                         "manga_inertial_friction"
@@ -913,11 +935,6 @@ impl Config {
                                 // Keep within a practical range to avoid "teleport" (too high)
                                 // or excessively sluggish motion (too low).
                                 config.manga_inertial_friction = v.clamp(0.01, 0.5);
-                            }
-                        }
-                        "manga_wheel_multiplier" | "manga_scroll_wheel_multiplier" => {
-                            if let Ok(v) = value.parse::<f32>() {
-                                config.manga_wheel_multiplier = v.clamp(0.1, 10.0);
                             }
                         }
                         "manga_arrow_scroll_speed" | "manga_arrow_key_scroll_speed" => {
@@ -938,13 +955,6 @@ impl Config {
                                     config.manga_hover_autoplay_resume_delay_ms =
                                         v.round().clamp(0.0, 5000.0) as u64;
                                 }
-                            }
-                        }
-                        "manga_wheel_smooth_like_arrow_keys"
-                        | "manga_wheel_smooth_match_arrow_keys"
-                        | "manga_wheel_arrow_smooth_sync" => {
-                            if let Some(v) = parse_bool(value) {
-                                config.manga_wheel_smooth_like_arrow_keys = v;
                             }
                         }
                         "manga_virtualization_backend"
@@ -1301,16 +1311,24 @@ impl Config {
             format_with_optional_trailing_zero_f32(self.manga_drag_pan_speed),
         );
         values.insert(
-            "manga_wheel_scroll_speed",
-            format!("{}", self.manga_wheel_scroll_speed),
+            "manga_wheel_impulse_per_step",
+            format_with_optional_trailing_zero_f32(self.manga_wheel_impulse_per_step),
+        );
+        values.insert(
+            "manga_wheel_decay_rate",
+            format_with_optional_trailing_zero_f32(self.manga_wheel_decay_rate),
+        );
+        values.insert(
+            "manga_wheel_max_velocity",
+            format_with_optional_trailing_zero_f32(self.manga_wheel_max_velocity),
+        );
+        values.insert(
+            "manga_wheel_edge_spring_hz",
+            format_with_optional_trailing_zero_f32(self.manga_wheel_edge_spring_hz),
         );
         values.insert(
             "manga_inertial_friction",
             format!("{}", self.manga_inertial_friction),
-        );
-        values.insert(
-            "manga_wheel_multiplier",
-            format!("{}", self.manga_wheel_multiplier),
         );
         values.insert(
             "manga_arrow_scroll_speed",
@@ -1323,10 +1341,6 @@ impl Config {
         values.insert(
             "manga_hover_autoplay_resume_delay_ms",
             format!("{}", self.manga_hover_autoplay_resume_delay_ms),
-        );
-        values.insert(
-            "manga_wheel_smooth_like_arrow_keys",
-            bool_to_ini(self.manga_wheel_smooth_like_arrow_keys).to_string(),
         );
         values.insert(
             "manga_virtualization_backend",
