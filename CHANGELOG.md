@@ -20,6 +20,11 @@ All notable changes to this project will be documented in this file.
 - Masonry retries, focused video frames, and focused animated-image frames now target a more aggressive display-aware LOD, which reduces oversized uploads and quality-churn stutter in dense zoomed-out views.
 - Masonry navigation now suppresses more unnecessary quality upgrades and mipmap work for transient textures, keeping the draw thread focused on fast visible fills before settling to higher detail.
 - Metadata-cache fingerprint validation now uses a short-lived in-memory stamp cache, which cuts repeated `std::fs::metadata` probes during dense browsing and reduces HDD-sensitive thumbnail and dimension lookup stalls.
+- Visible strip and masonry items no longer get stuck in the blurry fill state, because sharpness upgrades now use the loader's real LOD buckets and can force a self-healing retry when stale bookkeeping gets in the way.
+
+### Added
+
+- Added `manga_lod_profile`, `manga_lod_target_scale`, and `manga_lod_upgrade_hysteresis` to `config.ini` so strip and masonry rendering can be biased toward performance or clarity.
 
 ### Added
 

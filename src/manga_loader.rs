@@ -1001,6 +1001,14 @@ impl MangaLoader {
         max_side
     }
 
+    /// Quantize a requested texture side to the loader's shared LOD buckets.
+    pub fn quantize_requested_texture_side(
+        target_texture_side: u32,
+        max_texture_side: u32,
+    ) -> u32 {
+        Self::quantize_target_texture_side(target_texture_side, max_texture_side)
+    }
+
     /// Probe video dimensions for stable layout sizing.
     ///
     /// Uses GStreamer Discoverer metadata probe instead of spinning up a decode pipeline.

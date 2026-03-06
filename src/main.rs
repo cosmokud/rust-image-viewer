@@ -22,7 +22,8 @@ mod windows_env;
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use config::{
-    Action, Config, InputBinding, MangaVirtualizationBackend, StartupWindowMode, VideoSeekPolicy,
+    Action, Config, InputBinding, MangaLodProfile, MangaVirtualizationBackend,
+    StartupWindowMode, VideoSeekPolicy,
 };
 use hashbrown::{HashMap, HashSet};
 use image_loader::{get_media_type, is_supported_video, ImageFrame, LoadedImage, MediaType};
@@ -4834,6 +4835,26 @@ impl ImageViewer {
         (base * density_scale * navigation_scale).clamp(0.72f32, 1.12f32)
     }
 
+    fn manga_lod_target_scale_factor(&self) -> f32 {
+        let profile_scale = match self.config.manga_lod_profile {
+            MangaLodProfile::Performance => 0.86,
+            MangaLodProfile::Balanced => 1.0,
+            MangaLodProfile::Clarity => 1.14,
+        };
+
+        (profile_scale * self.config.manga_lod_target_scale).clamp(0.60, 1.60)
+    }
+
+    fn manga_lod_upgrade_hysteresis_factor(&self) -> f32 {
+        let profile_scale = match self.config.manga_lod_profile {
+            MangaLodProfile::Performance => 1.10,
+            MangaLodProfile::Balanced => 1.0,
+            MangaLodProfile::Clarity => 0.94,
+        };
+
+        (profile_scale * self.config.manga_lod_upgrade_hysteresis).clamp(0.70, 1.35)
+    }
+
     fn masonry_target_texture_side_from_display_side(&self, item_screen_max_side: f32) -> u32 {
         let max_side = self.max_texture_side.max(1);
         let zoom = self.zoom.max(0.0001);
@@ -4847,7 +4868,10 @@ impl ImageViewer {
         let basis = item_screen_max_side
             .max(baseline_item_width.min(item_screen_max_side.max(1.0) * 1.08))
             .max(48.0);
-        let scaled = (basis * self.masonry_zoom_quality_boost(zoom)).ceil() as u32;
+        let scaled = (basis
+            * self.masonry_zoom_quality_boost(zoom)
+            * self.manga_lod_target_scale_factor())
+            .ceil() as u32;
         let scaled = if self.masonry_navigation_active_for_heavy_work() {
             scaled.min(self.masonry_navigation_target_side_cap())
         } else {
@@ -4888,6 +4912,7 @@ impl ImageViewer {
     ) -> u32 {
         let max_side = self.max_texture_side.max(1);
         let display_side = self.manga_screen_max_side_for_index(index);
+        let target_scale = self.manga_lod_target_scale_factor();
         let overscan = match media_type {
             MangaMediaType::Video => {
                 if self.is_masonry_mode() {
@@ -4916,7 +4941,8 @@ impl ImageViewer {
             Self::MANGA_DYNAMIC_TARGET_MIN_SIDE.min(max_side)
         };
 
-        let mut target_side = ((display_side * overscan).ceil() as u32).clamp(min_side, max_side);
+        let mut target_side = ((display_side * overscan * target_scale).ceil() as u32)
+            .clamp(min_side, max_side);
         target_side = self.manga_clamp_target_side_to_source(index, target_side).clamp(1, max_side);
 
         if self.is_masonry_mode() {
@@ -4941,19 +4967,25 @@ impl ImageViewer {
 
     fn manga_retry_target_side_for_rect(&self, index: usize, image_rect: egui::Rect) -> u32 {
         let max_side = self.max_texture_side.max(1);
+        let target_scale = self.manga_lod_target_scale_factor();
 
         let target_side = if self.is_masonry_mode() {
             self.masonry_target_texture_side_from_display_side(
                 image_rect.width().max(image_rect.height()).max(1.0),
             )
         } else {
-            ((image_rect.width().max(image_rect.height()) * Self::MANGA_DYNAMIC_TARGET_OVERSCAN)
+            ((image_rect.width().max(image_rect.height())
+                * Self::MANGA_DYNAMIC_TARGET_OVERSCAN
+                * target_scale)
                 .ceil() as u32)
                 .clamp(Self::MANGA_DYNAMIC_TARGET_MIN_SIDE.min(max_side), max_side)
         };
 
-        self.manga_clamp_target_side_to_source(index, target_side)
-            .clamp(1, max_side)
+        let clamped_target = self
+            .manga_clamp_target_side_to_source(index, target_side)
+            .clamp(1, max_side);
+
+        MangaLoader::quantize_requested_texture_side(clamped_target, max_side).clamp(1, max_side)
     }
 
     fn manga_texture_upgrade_needed(
@@ -4984,6 +5016,10 @@ impl ImageViewer {
                 Self::MANGA_TEXTURE_UPGRADE_MIN_DELTA_SIDE,
             )
         };
+
+        let hysteresis = self.manga_lod_upgrade_hysteresis_factor();
+        let ratio = (ratio * hysteresis).clamp(1.05, 2.0);
+        let delta = ((delta as f32) * hysteresis).round().max(16.0) as u32;
 
         let ratio_threshold = (existing_side as f32 * ratio).ceil() as u32;
         let delta_threshold = existing_side.saturating_add(delta);
@@ -5253,6 +5289,8 @@ impl ImageViewer {
             return max_side;
         }
 
+        let target_scale = self.manga_lod_target_scale_factor();
+
         let mut visible_max_side = 0.0f32;
         for &idx in visible_indices.iter().take(6) {
             let display_w = self.manga_get_image_display_width(idx);
@@ -5266,7 +5304,7 @@ impl ImageViewer {
             visible_max_side = display_w.max(display_h);
         }
 
-        let scaled = (visible_max_side * 1.20).ceil() as u32;
+        let scaled = (visible_max_side * 1.20 * target_scale).ceil() as u32;
         scaled.clamp(256u32.min(max_side), max_side)
     }
 
@@ -8924,8 +8962,13 @@ impl ImageViewer {
             };
         let (downscale_filter, gif_filter) = self.manga_decode_filters_for_strip_mode();
         let force_triangle_filters = self.manga_should_force_triangle_filters();
+        let current_texture_side = self
+            .manga_texture_cache
+            .get_texture_info(index)
+            .map(|(_, tex_w, tex_h)| tex_w.max(tex_h))
+            .unwrap_or(0);
 
-        let requested = self
+        let mut requested = self
             .manga_loader
             .as_mut()
             .map(|loader| {
@@ -8940,6 +8983,30 @@ impl ImageViewer {
                 )
             })
             .unwrap_or(false);
+
+        if !requested
+            && quality_upgrade
+            && current_texture_side > 0
+            && current_texture_side < target_texture_side
+        {
+            if let Some(loader) = self.manga_loader.as_mut() {
+                loader.mark_unloaded(index);
+                requested = loader.request_visible_retry(
+                    &self.image_list,
+                    index,
+                    self.max_texture_side,
+                    target_texture_side,
+                    downscale_filter,
+                    gif_filter,
+                    force_triangle_filters,
+                );
+            }
+
+            if requested {
+                self.perf_metrics
+                    .increment_counter("manga_retry_forced_requeue", 1);
+            }
+        }
 
         if requested {
             self.perf_metrics
