@@ -83,7 +83,9 @@ const PRELOAD_RETRY_BASE_DELAY_MS: u64 = 250;
 const PRELOAD_RETRY_MAX_DELAY_MS: u64 = 4000;
 /// Texture-side buckets used for masonry/strip LOD requests.
 /// Requests are rounded up to the next bucket to avoid churn from tiny deltas.
-const LOD_SIDE_BUCKETS: &[u32] = &[96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096];
+const LOD_SIDE_BUCKETS: &[u32] = &[
+    96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096,
+];
 
 /// Media type for manga items (extended to include videos/animations)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -658,7 +660,10 @@ impl MangaLoader {
                         let has_usable_pixels =
                             !decoded.pixels.is_empty() && decoded.width > 0 && decoded.height > 0;
 
-                        let loaded_side = decoded.width.max(decoded.height).max(decoded.requested_side);
+                        let loaded_side = decoded
+                            .width
+                            .max(decoded.height)
+                            .max(decoded.requested_side);
 
                         match result_tx.try_send(decoded) {
                             Ok(_) => {
@@ -670,7 +675,11 @@ impl MangaLoader {
                                         .or_insert(loaded_side);
                                     retry_state.write().remove(&idx);
                                 } else {
-                                    Self::register_decode_failure(&loaded_levels, &retry_state, idx);
+                                    Self::register_decode_failure(
+                                        &loaded_levels,
+                                        &retry_state,
+                                        idx,
+                                    );
                                 }
                             }
                             Err(TrySendError::Full(_decoded)) => {
@@ -821,7 +830,8 @@ impl MangaLoader {
                     .map(|ext| matches!(ext.to_ascii_lowercase().as_str(), "gif" | "webp"))
                     .unwrap_or(false);
                 if !may_be_animated_by_ext {
-                    if let Some(cached) = lookup_cached_static_thumbnail(&req.path, effective_texture_side)
+                    if let Some(cached) =
+                        lookup_cached_static_thumbnail(&req.path, effective_texture_side)
                     {
                         return Some(DecodedImage {
                             index: req.index,
@@ -1267,7 +1277,8 @@ impl MangaLoader {
             return;
         }
 
-        let target_texture_side = Self::quantize_target_texture_side(target_texture_side, max_texture_side);
+        let target_texture_side =
+            Self::quantize_target_texture_side(target_texture_side, max_texture_side);
         let (request_downscale_filter, request_gif_filter) = if force_triangle_filters {
             (FilterType::Triangle, FilterType::Triangle)
         } else {
@@ -1542,13 +1553,7 @@ impl MangaLoader {
             return false;
         }
 
-        if self
-            .loading_indices
-            .read()
-            .get(&index)
-            .copied()
-            == Some(self.current_generation)
-        {
+        if self.loading_indices.read().get(&index).copied() == Some(self.current_generation) {
             return false;
         }
 
@@ -1697,9 +1702,8 @@ fn resize_rgba_with_fir(
     let src = fir::images::ImageRef::new(width, height, pixels, fir::PixelType::U8x4).ok()?;
     let mut dst = fir::images::Image::new(new_w, new_h, fir::PixelType::U8x4);
 
-    let options = fir::ResizeOptions::new().resize_alg(fir::ResizeAlg::Convolution(
-        image_filter_to_fir(filter),
-    ));
+    let options = fir::ResizeOptions::new()
+        .resize_alg(fir::ResizeAlg::Convolution(image_filter_to_fir(filter)));
 
     let mut resizer = fir::Resizer::new();
     resizer.resize(&src, &mut dst, Some(&options)).ok()?;
@@ -1795,8 +1799,7 @@ impl MangaTextureCache {
 
     pub fn set_max_entries(&mut self, max_entries: usize) -> Vec<usize> {
         self.max_entries = max_entries.max(1);
-        let capacity =
-            NonZeroUsize::new(self.max_entries).expect("cache capacity is non-zero");
+        let capacity = NonZeroUsize::new(self.max_entries).expect("cache capacity is non-zero");
         self.unpinned_entries.resize(capacity);
         self.evict_to_capacity()
     }
@@ -1843,7 +1846,9 @@ impl MangaTextureCache {
             return Some(&entry.texture);
         }
 
-        self.unpinned_entries.get(&index).map(|entry| &entry.texture)
+        self.unpinned_entries
+            .get(&index)
+            .map(|entry| &entry.texture)
     }
 
     /// Get texture ID and dimensions from cache (avoids borrow issues).

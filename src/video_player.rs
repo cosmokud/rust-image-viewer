@@ -4,8 +4,8 @@
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicI8, AtomicU32, AtomicUsize, Ordering};
-use std::sync::OnceLock;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
@@ -199,7 +199,8 @@ fn apply_decoder_preference_windows(prefer_hardware_decode: bool, disable_hardwa
 }
 
 #[cfg(not(target_os = "windows"))]
-fn apply_decoder_preference_windows(_prefer_hardware_decode: bool, _disable_hardware_decode: bool) {}
+fn apply_decoder_preference_windows(_prefer_hardware_decode: bool, _disable_hardware_decode: bool) {
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VideoSeekMode {
@@ -322,7 +323,10 @@ fn guess_limited_range_rgba(pixels: &[u8]) -> bool {
     let target_samples: usize = 20_000;
     let step = (pixel_count / target_samples).max(1);
 
-    let sampled_positions: Vec<usize> = (0..pixel_count).step_by(step).take(target_samples).collect();
+    let sampled_positions: Vec<usize> = (0..pixel_count)
+        .step_by(step)
+        .take(target_samples)
+        .collect();
 
     let (min_rgb, max_rgb, saw_near_black, saw_near_white) = sampled_positions
         .par_iter()
@@ -623,31 +627,31 @@ Ensure your GStreamer installation includes the playback elements (usually from 
                             data.resize(mapped.len(), 0);
                             data.copy_from_slice(mapped);
 
-                            let should_expand = match state.needs_range_expand.load(Ordering::Acquire)
-                            {
-                                RANGE_EXPAND_TRUE => true,
-                                RANGE_EXPAND_FALSE => false,
-                                _ => {
-                                    let by_caps = match video_info.colorimetry().range() {
-                                        gst_video::VideoColorRange::Range16_235 => Some(true),
-                                        gst_video::VideoColorRange::Range0_255 => Some(false),
-                                        _ => None,
-                                    };
+                            let should_expand =
+                                match state.needs_range_expand.load(Ordering::Acquire) {
+                                    RANGE_EXPAND_TRUE => true,
+                                    RANGE_EXPAND_FALSE => false,
+                                    _ => {
+                                        let by_caps = match video_info.colorimetry().range() {
+                                            gst_video::VideoColorRange::Range16_235 => Some(true),
+                                            gst_video::VideoColorRange::Range0_255 => Some(false),
+                                            _ => None,
+                                        };
 
-                                    // If caps don't clearly say, infer from first frame.
-                                    let inferred =
-                                        by_caps.unwrap_or_else(|| guess_limited_range_rgba(&data));
-                                    state.needs_range_expand.store(
-                                        if inferred {
-                                            RANGE_EXPAND_TRUE
-                                        } else {
-                                            RANGE_EXPAND_FALSE
-                                        },
-                                        Ordering::Release,
-                                    );
-                                    inferred
-                                }
-                            };
+                                        // If caps don't clearly say, infer from first frame.
+                                        let inferred = by_caps
+                                            .unwrap_or_else(|| guess_limited_range_rgba(&data));
+                                        state.needs_range_expand.store(
+                                            if inferred {
+                                                RANGE_EXPAND_TRUE
+                                            } else {
+                                                RANGE_EXPAND_FALSE
+                                            },
+                                            Ordering::Release,
+                                        );
+                                        inferred
+                                    }
+                                };
 
                             if should_expand {
                                 expand_limited_range_rgba_in_place(data.as_mut());
@@ -818,7 +822,11 @@ Ensure your GStreamer installation includes the playback elements (usually from 
     }
 
     /// Seek to a specific time in seconds using the provided mode.
-    pub fn seek_to_time_with_mode(&mut self, seconds: f64, mode: VideoSeekMode) -> Result<(), String> {
+    pub fn seek_to_time_with_mode(
+        &mut self,
+        seconds: f64,
+        mode: VideoSeekMode,
+    ) -> Result<(), String> {
         let seek_pos_ns = (seconds * 1_000_000_000.0) as u64;
 
         self.pipeline

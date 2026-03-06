@@ -45,7 +45,11 @@ fn should_decode_static_with_zune(path: &Path) -> bool {
 fn extension_matches(path: &Path, candidates: &[&str]) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
-        .map(|ext| candidates.iter().any(|candidate| ext.eq_ignore_ascii_case(candidate)))
+        .map(|ext| {
+            candidates
+                .iter()
+                .any(|candidate| ext.eq_ignore_ascii_case(candidate))
+        })
         .unwrap_or(false)
 }
 
@@ -77,9 +81,8 @@ fn resize_rgba_with_fir(
     let src = fir::images::ImageRef::new(width, height, pixels, fir::PixelType::U8x4).ok()?;
     let mut dst = fir::images::Image::new(new_w, new_h, fir::PixelType::U8x4);
 
-    let options = fir::ResizeOptions::new().resize_alg(fir::ResizeAlg::Convolution(
-        image_filter_to_fir(filter),
-    ));
+    let options = fir::ResizeOptions::new()
+        .resize_alg(fir::ResizeAlg::Convolution(image_filter_to_fir(filter)));
 
     let mut resizer = fir::Resizer::new();
     resizer.resize(&src, &mut dst, Some(&options)).ok()?;
@@ -881,22 +884,21 @@ impl LoadedImage {
 
                 let src_w_u32 = src_w as u32;
                 let src_h_u32 = src_h as u32;
-                let (final_w, final_h, final_pixels) = if src_w_u32 != target_width
-                    || src_h_u32 != target_height
-                {
-                    let resized = resize_rgba(
-                        src_w_u32,
-                        src_h_u32,
-                        &pixels,
-                        target_width,
-                        target_height,
-                        gif_filter,
-                    )
-                    .map_err(|e| format!("Failed to resize GIF frame: {}", e))?;
-                    (target_width, target_height, resized)
-                } else {
-                    (src_w_u32, src_h_u32, pixels)
-                };
+                let (final_w, final_h, final_pixels) =
+                    if src_w_u32 != target_width || src_h_u32 != target_height {
+                        let resized = resize_rgba(
+                            src_w_u32,
+                            src_h_u32,
+                            &pixels,
+                            target_width,
+                            target_height,
+                            gif_filter,
+                        )
+                        .map_err(|e| format!("Failed to resize GIF frame: {}", e))?;
+                        (target_width, target_height, resized)
+                    } else {
+                        (src_w_u32, src_h_u32, pixels)
+                    };
 
                 out.push(ImageFrame {
                     pixels: final_pixels,

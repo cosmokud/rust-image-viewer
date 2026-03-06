@@ -1,12 +1,15 @@
 //! Persistent metadata cache for media dimensions and video thumbnails.
 
+use std::fs::OpenOptions;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::UNIX_EPOCH;
 
 use parking_lot::Mutex;
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::backends::FileBackend;
+use redb::{Database, DatabaseError, ReadableTable, StorageBackend, TableDefinition};
 
 const METADATA_TABLE: TableDefinition<&str, &str> = TableDefinition::new("media_dimensions");
 const VIDEO_THUMBNAIL_TABLE: TableDefinition<&str, &[u8]> =
@@ -25,6 +28,8 @@ const THUMBNAIL_CACHE_MAX_ENTRIES: usize = 4_000;
 const STATIC_THUMBNAIL_CACHE_MAX_ENTRIES: usize = 12_000;
 const PRUNE_INTERVAL_SECS: u64 = 60;
 const CACHE_WRITE_QUEUE_CAPACITY: usize = 512;
+const METADATA_CACHE_DEFAULT_MAX_SIZE_BYTES: u64 = 1024 * 1024 * 1024;
+const BYTES_PER_MIB: u64 = 1024 * 1024;
 
 static DIMENSION_HITS: AtomicU64 = AtomicU64::new(0);
 static DIMENSION_MISSES: AtomicU64 = AtomicU64::new(0);
@@ -39,6 +44,8 @@ static STATIC_THUMBNAIL_MISSES: AtomicU64 = AtomicU64::new(0);
 static STATIC_THUMBNAIL_EXPIRED: AtomicU64 = AtomicU64::new(0);
 static STATIC_THUMBNAIL_EVICTED: AtomicU64 = AtomicU64::new(0);
 static LAST_PRUNE_SECS: AtomicU64 = AtomicU64::new(0);
+static METADATA_CACHE_MAX_SIZE_BYTES: AtomicU64 =
+    AtomicU64::new(METADATA_CACHE_DEFAULT_MAX_SIZE_BYTES);
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MetadataCacheStats {
@@ -134,18 +141,20 @@ enum CacheWriteOp {
 
 pub struct MetadataCache {
     db: Database,
+    cache_path: PathBuf,
 }
 
 impl MetadataCache {
     pub fn open_default() -> Option<Self> {
         let path = default_cache_path()?;
-        let db = if path.exists() {
-            Database::open(&path).ok().or_else(|| Database::create(&path).ok())?
-        } else {
-            Database::create(&path).ok()?
-        };
+        let max_size_bytes = metadata_cache_max_size_bytes();
 
-        Some(Self { db })
+        let db = open_database_with_size_limit(path.as_path(), max_size_bytes)?;
+
+        Some(Self {
+            db,
+            cache_path: path,
+        })
     }
 
     pub fn lookup_dimensions(
@@ -187,7 +196,13 @@ impl MetadataCache {
         Some((record.width, record.height))
     }
 
-    pub fn store_dimensions(&self, path: &Path, media_kind: CachedMediaKind, width: u32, height: u32) {
+    pub fn store_dimensions(
+        &mut self,
+        path: &Path,
+        media_kind: CachedMediaKind,
+        width: u32,
+        height: u32,
+    ) {
         if width == 0 || height == 0 {
             return;
         }
@@ -204,6 +219,14 @@ impl MetadataCache {
             media_kind,
             cached_at_secs: unix_now_secs(),
         });
+
+        let estimated_write_bytes = key.len().saturating_add(encoded.len()).saturating_add(512);
+        if self.should_skip_write_due_to_size_limit(estimated_write_bytes) {
+            self.maybe_prune_tables();
+            if self.should_skip_write_due_to_size_limit(estimated_write_bytes) {
+                return;
+            }
+        }
 
         let Ok(write_txn) = self.db.begin_write() else {
             return;
@@ -237,7 +260,8 @@ impl MetadataCache {
         let (cached_fingerprint, cached_at_secs, thumbnail) = decode_thumbnail_record(raw.value())?;
 
         let now_secs = unix_now_secs();
-        if cached_at_secs > 0 && now_secs.saturating_sub(cached_at_secs) > THUMBNAIL_CACHE_TTL_SECS {
+        if cached_at_secs > 0 && now_secs.saturating_sub(cached_at_secs) > THUMBNAIL_CACHE_TTL_SECS
+        {
             THUMBNAIL_EXPIRED.fetch_add(1, Ordering::Relaxed);
             return None;
         }
@@ -260,7 +284,7 @@ impl MetadataCache {
     }
 
     pub fn store_video_thumbnail(
-        &self,
+        &mut self,
         path: &Path,
         max_texture_side: u32,
         thumbnail: &CachedVideoThumbnail,
@@ -286,6 +310,14 @@ impl MetadataCache {
         };
 
         let encoded = encode_thumbnail_record(file_fingerprint, unix_now_secs(), thumbnail);
+
+        let estimated_write_bytes = key.len().saturating_add(encoded.len()).saturating_add(1024);
+        if self.should_skip_write_due_to_size_limit(estimated_write_bytes) {
+            self.maybe_prune_tables();
+            if self.should_skip_write_due_to_size_limit(estimated_write_bytes) {
+                return;
+            }
+        }
 
         let Ok(write_txn) = self.db.begin_write() else {
             return;
@@ -350,7 +382,7 @@ impl MetadataCache {
     }
 
     pub fn store_static_thumbnail(
-        &self,
+        &mut self,
         path: &Path,
         max_texture_side: u32,
         thumbnail: &CachedImageThumbnail,
@@ -387,6 +419,14 @@ impl MetadataCache {
             },
         );
 
+        let estimated_write_bytes = key.len().saturating_add(encoded.len()).saturating_add(1024);
+        if self.should_skip_write_due_to_size_limit(estimated_write_bytes) {
+            self.maybe_prune_tables();
+            if self.should_skip_write_due_to_size_limit(estimated_write_bytes) {
+                return;
+            }
+        }
+
         let Ok(write_txn) = self.db.begin_write() else {
             return;
         };
@@ -405,23 +445,25 @@ impl MetadataCache {
         self.maybe_prune_tables();
     }
 
-    fn maybe_prune_tables(&self) {
+    fn maybe_prune_tables(&mut self) {
         let now_secs = unix_now_secs();
-        let last_prune = LAST_PRUNE_SECS.load(Ordering::Relaxed);
-        if now_secs.saturating_sub(last_prune) < PRUNE_INTERVAL_SECS {
+        let last_prune_secs = LAST_PRUNE_SECS.load(Ordering::Relaxed);
+        let prune_due_to_interval = now_secs.saturating_sub(last_prune_secs) >= PRUNE_INTERVAL_SECS;
+        let prune_due_to_size = self.cache_needs_size_prune();
+
+        if !prune_due_to_interval && !prune_due_to_size {
             return;
         }
 
-        if LAST_PRUNE_SECS
-            .compare_exchange(last_prune, now_secs, Ordering::AcqRel, Ordering::Relaxed)
-            .is_err()
-        {
-            return;
-        }
+        LAST_PRUNE_SECS.store(now_secs, Ordering::Relaxed);
 
         self.prune_dimension_table(now_secs);
         self.prune_thumbnail_table(now_secs);
         self.prune_static_thumbnail_table(now_secs);
+
+        if prune_due_to_size {
+            self.prune_to_size_limit();
+        }
     }
 
     fn prune_dimension_table(&self, now_secs: u64) {
@@ -454,7 +496,8 @@ impl MetadataCache {
                     };
 
                     let is_expired = record.cached_at_secs > 0
-                        && now_secs.saturating_sub(record.cached_at_secs) > DIMENSION_CACHE_TTL_SECS;
+                        && now_secs.saturating_sub(record.cached_at_secs)
+                            > DIMENSION_CACHE_TTL_SECS;
                     if is_expired {
                         expired.push(key_owned);
                     } else {
@@ -509,7 +552,8 @@ impl MetadataCache {
                     };
 
                     let key_owned = key.value().to_string();
-                    let Some((_, cached_at_secs, _)) = decode_thumbnail_record(value.value()) else {
+                    let Some((_, cached_at_secs, _)) = decode_thumbnail_record(value.value())
+                    else {
                         expired.push(key_owned);
                         continue;
                     };
@@ -570,7 +614,8 @@ impl MetadataCache {
                     };
 
                     let key_owned = key.value().to_string();
-                    let Some((_, cached_at_secs, _)) = decode_thumbnail_record(value.value()) else {
+                    let Some((_, cached_at_secs, _)) = decode_thumbnail_record(value.value())
+                    else {
                         expired.push(key_owned);
                         continue;
                     };
@@ -607,6 +652,48 @@ impl MetadataCache {
 
         let _ = write_txn.commit();
     }
+
+    fn cache_file_len(&self) -> Option<u64> {
+        std::fs::metadata(&self.cache_path)
+            .ok()
+            .map(|metadata| metadata.len())
+    }
+
+    fn should_skip_write_due_to_size_limit(&self, estimated_write_bytes: usize) -> bool {
+        let max_size_bytes = metadata_cache_max_size_bytes();
+        if max_size_bytes == 0 {
+            return false;
+        }
+
+        let Some(current_len) = self.cache_file_len() else {
+            return false;
+        };
+
+        current_len.saturating_add(estimated_write_bytes as u64) > max_size_bytes
+    }
+
+    fn cache_needs_size_prune(&self) -> bool {
+        let max_size_bytes = metadata_cache_max_size_bytes();
+        if max_size_bytes == 0 {
+            return false;
+        }
+
+        self.cache_file_len()
+            .is_some_and(|len| len > max_size_bytes)
+    }
+
+    fn prune_to_size_limit(&mut self) {
+        let max_size_bytes = metadata_cache_max_size_bytes();
+        if max_size_bytes == 0 {
+            return;
+        }
+
+        if !self.cache_needs_size_prune() {
+            return;
+        }
+
+        let _ = self.db.compact();
+    }
 }
 
 static GLOBAL_CACHE: OnceLock<Option<Arc<Mutex<MetadataCache>>>> = OnceLock::new();
@@ -633,7 +720,10 @@ fn cache_write_tx() -> Option<&'static crossbeam_channel::Sender<CacheWriteOp>> 
         .as_ref()
 }
 
-fn cache_write_loop(cache: Arc<Mutex<MetadataCache>>, rx: crossbeam_channel::Receiver<CacheWriteOp>) {
+fn cache_write_loop(
+    cache: Arc<Mutex<MetadataCache>>,
+    rx: crossbeam_channel::Receiver<CacheWriteOp>,
+) {
     while let Ok(first_op) = rx.recv() {
         let mut pending: Vec<CacheWriteOp> = Vec::with_capacity(32);
         pending.push(first_op);
@@ -645,7 +735,7 @@ fn cache_write_loop(cache: Arc<Mutex<MetadataCache>>, rx: crossbeam_channel::Rec
             }
         }
 
-        let cache = cache.lock();
+        let mut cache = cache.lock();
         for op in pending {
             match op {
                 CacheWriteOp::Dimensions {
@@ -669,10 +759,7 @@ fn cache_write_loop(cache: Arc<Mutex<MetadataCache>>, rx: crossbeam_channel::Rec
     }
 }
 
-pub fn lookup_cached_dimensions(
-    path: &Path,
-    expected_kind: CachedMediaKind,
-) -> Option<(u32, u32)> {
+pub fn lookup_cached_dimensions(path: &Path, expected_kind: CachedMediaKind) -> Option<(u32, u32)> {
     let Some(cache) = global_cache_handle() else {
         DIMENSION_MISSES.fetch_add(1, Ordering::Relaxed);
         return None;
@@ -717,9 +804,7 @@ pub fn lookup_cached_video_thumbnail(
         return None;
     };
 
-    let result = cache
-        .lock()
-        .lookup_video_thumbnail(path, max_texture_side);
+    let result = cache.lock().lookup_video_thumbnail(path, max_texture_side);
     if result.is_some() {
         THUMBNAIL_HITS.fetch_add(1, Ordering::Relaxed);
     } else {
@@ -761,9 +846,7 @@ pub fn lookup_cached_static_thumbnail(
         return None;
     };
 
-    let result = cache
-        .lock()
-        .lookup_static_thumbnail(path, max_texture_side);
+    let result = cache.lock().lookup_static_thumbnail(path, max_texture_side);
     if result.is_some() {
         STATIC_THUMBNAIL_HITS.fetch_add(1, Ordering::Relaxed);
     } else {
@@ -830,6 +913,128 @@ fn default_cache_path() -> Option<PathBuf> {
     }
 
     None
+}
+
+fn metadata_cache_max_size_bytes() -> u64 {
+    METADATA_CACHE_MAX_SIZE_BYTES.load(Ordering::Relaxed)
+}
+
+fn io_other_error(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::Other, message)
+}
+
+#[derive(Debug)]
+struct SizeLimitedFileBackend {
+    inner: FileBackend,
+    max_size_bytes: u64,
+    current_len: AtomicU64,
+}
+
+impl SizeLimitedFileBackend {
+    fn new(inner: FileBackend, max_size_bytes: u64, current_len: u64) -> Self {
+        Self {
+            inner,
+            max_size_bytes,
+            current_len: AtomicU64::new(current_len),
+        }
+    }
+
+    fn exceeds_limit(&self, required_len: u64) -> bool {
+        self.max_size_bytes > 0 && required_len > self.max_size_bytes
+    }
+}
+
+impl StorageBackend for SizeLimitedFileBackend {
+    fn len(&self) -> std::result::Result<u64, io::Error> {
+        let actual_len = self.inner.len()?;
+        self.current_len.store(actual_len, Ordering::Relaxed);
+        Ok(actual_len)
+    }
+
+    fn read(&self, offset: u64, len: usize) -> std::result::Result<Vec<u8>, io::Error> {
+        self.inner.read(offset, len)
+    }
+
+    fn set_len(&self, len: u64) -> std::result::Result<(), io::Error> {
+        if self.exceeds_limit(len) {
+            return Err(io_other_error("metadata cache size limit reached"));
+        }
+
+        self.inner.set_len(len)?;
+        self.current_len.store(len, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn sync_data(&self, eventual: bool) -> std::result::Result<(), io::Error> {
+        self.inner.sync_data(eventual)
+    }
+
+    fn write(&self, offset: u64, data: &[u8]) -> std::result::Result<(), io::Error> {
+        let write_end = offset
+            .checked_add(data.len() as u64)
+            .ok_or_else(|| io_other_error("metadata cache size overflow"))?;
+        let tracked_len = self.current_len.load(Ordering::Relaxed);
+        let required_len = tracked_len.max(write_end);
+
+        if self.exceeds_limit(required_len) {
+            return Err(io_other_error("metadata cache size limit reached"));
+        }
+
+        self.inner.write(offset, data)?;
+        if required_len > tracked_len {
+            self.current_len.store(required_len, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+}
+
+fn open_database_with_size_limit(path: &Path, max_size_bytes: u64) -> Option<Database> {
+    if max_size_bytes > 0 {
+        if let Ok(metadata) = std::fs::metadata(path) {
+            if metadata.len() > max_size_bytes {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .ok()?;
+    let current_len = file.metadata().ok().map(|m| m.len()).unwrap_or(0);
+
+    let base_backend = FileBackend::new(file).ok()?;
+    let limited_backend = SizeLimitedFileBackend::new(base_backend, max_size_bytes, current_len);
+
+    match Database::builder().create_with_backend(limited_backend) {
+        Ok(db) => Some(db),
+        Err(DatabaseError::Storage(redb::StorageError::Corrupted(_))) if path.exists() => {
+            let _ = std::fs::remove_file(path);
+            let recreated_file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(path)
+                .ok()?;
+            let recreated_len = recreated_file.metadata().ok().map(|m| m.len()).unwrap_or(0);
+            let recreated_backend = FileBackend::new(recreated_file).ok()?;
+            let limited_backend =
+                SizeLimitedFileBackend::new(recreated_backend, max_size_bytes, recreated_len);
+            Database::builder()
+                .create_with_backend(limited_backend)
+                .ok()
+        }
+        Err(_) => None,
+    }
+}
+
+pub fn configure_metadata_cache_size_limit(max_size_mb: u64) {
+    let max_size_bytes = max_size_mb.saturating_mul(BYTES_PER_MIB);
+    METADATA_CACHE_MAX_SIZE_BYTES.store(max_size_bytes, Ordering::Relaxed);
 }
 
 fn cache_key(path: &Path) -> String {
@@ -981,8 +1186,7 @@ fn parse_thumbnail_payload(raw: &[u8], start: usize) -> Option<(CachedVideoThumb
     let width = u32::from_le_bytes(raw.get(start..start + 4)?.try_into().ok()?);
     let height = u32::from_le_bytes(raw.get(start + 4..start + 8)?.try_into().ok()?);
     let original_width = u32::from_le_bytes(raw.get(start + 8..start + 12)?.try_into().ok()?);
-    let original_height =
-        u32::from_le_bytes(raw.get(start + 12..start + 16)?.try_into().ok()?);
+    let original_height = u32::from_le_bytes(raw.get(start + 12..start + 16)?.try_into().ok()?);
     let pixel_len = u32::from_le_bytes(raw.get(start + 16..start + 20)?.try_into().ok()?) as usize;
 
     let pixel_start = start + 20;

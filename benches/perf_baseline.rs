@@ -14,9 +14,7 @@ mod media_index;
 #[path = "../src/manga_spatial.rs"]
 mod manga_spatial;
 
-use criterion::{
-    black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion,
-};
+use criterion::{black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
 use manga_spatial::{MangaSpatialIndex, SpatialRect, STRIP_QUERY_HALF_WIDTH};
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -78,12 +76,16 @@ fn bench_directory_scan(c: &mut Criterion) {
 
     for &size in &[1_000usize, 10_000usize] {
         let (_dir, anchor) = create_scan_dataset(size);
-        group.bench_with_input(BenchmarkId::new("get_media_in_directory", size), &anchor, |b, p| {
-            b.iter(|| {
-                let files = image_loader::get_media_in_directory(black_box(p));
-                black_box(files.len());
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::new("get_media_in_directory", size),
+            &anchor,
+            |b, p| {
+                b.iter(|| {
+                    let files = image_loader::get_media_in_directory(black_box(p));
+                    black_box(files.len());
+                });
+            },
+        );
     }
 
     group.finish();
@@ -351,16 +353,20 @@ fn bench_rtree_rebuild(c: &mut Criterion) {
             );
         });
 
-        group.bench_with_input(BenchmarkId::new("masonry_bulk_load", size), &size, |b, _| {
-            b.iter_batched(
-                || masonry_rects_template.clone(),
-                |rects| {
-                    let index = MangaSpatialIndex::from_rects(rects);
-                    black_box(index.len());
-                },
-                BatchSize::LargeInput,
-            );
-        });
+        group.bench_with_input(
+            BenchmarkId::new("masonry_bulk_load", size),
+            &size,
+            |b, _| {
+                b.iter_batched(
+                    || masonry_rects_template.clone(),
+                    |rects| {
+                        let index = MangaSpatialIndex::from_rects(rects);
+                        black_box(index.len());
+                    },
+                    BatchSize::LargeInput,
+                );
+            },
+        );
     }
 
     group.finish();

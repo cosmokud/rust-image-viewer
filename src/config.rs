@@ -250,7 +250,6 @@ fn is_strip_item_open_binding(binding: &InputBinding) -> bool {
     )
 }
 
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VideoSeekPolicy {
     Adaptive,
@@ -479,6 +478,10 @@ pub struct Config {
     /// Enable VSync for swapchain presentation to reduce screen tearing.
     pub vsync: bool,
 
+    /// Maximum size for metadata_cache.redb in MiB.
+    /// 0 disables the size limit.
+    pub metadata_cache_max_size_mb: u64,
+
     // ============ IMAGE QUALITY SETTINGS ============
     /// Filter for upscaling images (making them larger)
     pub upscale_filter: ImageFilter,
@@ -569,6 +572,7 @@ impl Config {
             startup_window_mode: StartupWindowMode::Floating,
             single_instance: true,
             vsync: true,
+            metadata_cache_max_size_mb: 1024,
             // Image quality defaults
             upscale_filter: ImageFilter::CatmullRom,
             downscale_filter: ImageFilter::Lanczos3,
@@ -598,7 +602,10 @@ impl Config {
         self.add_binding(InputBinding::MouseMiddle, Action::ToggleFullscreen);
         self.add_binding(InputBinding::Key(egui::Key::F), Action::ToggleFullscreen);
         self.add_binding(InputBinding::Key(egui::Key::F12), Action::ToggleFullscreen);
-        self.add_binding(InputBinding::Key(egui::Key::Enter), Action::ToggleFullscreen);
+        self.add_binding(
+            InputBinding::Key(egui::Key::Enter),
+            Action::ToggleFullscreen,
+        );
 
         // Navigation
         self.add_binding(InputBinding::Key(egui::Key::ArrowRight), Action::NextImage);
@@ -974,8 +981,7 @@ impl Config {
                                 config.manga_autoscroll_max_speed_multiplier = v.clamp(0.05, 100.0);
                             }
                         }
-                        "manga_autoscroll_curve_power"
-                        | "manga_autoscroll_speed_curve_power" => {
+                        "manga_autoscroll_curve_power" | "manga_autoscroll_speed_curve_power" => {
                             if let Ok(v) = value.parse::<f32>() {
                                 config.manga_autoscroll_curve_power = v.clamp(0.5, 6.0);
                             }
@@ -984,28 +990,32 @@ impl Config {
                         | "manga_autoscroll_min_speed"
                         | "manga_autoscroll_min_px_per_sec" => {
                             if let Ok(v) = value.parse::<f32>() {
-                                config.manga_autoscroll_min_speed_px_per_sec = v.clamp(0.0, 20000.0);
+                                config.manga_autoscroll_min_speed_px_per_sec =
+                                    v.clamp(0.0, 20000.0);
                             }
                         }
                         "manga_autoscroll_max_speed_px_per_sec"
                         | "manga_autoscroll_max_speed"
                         | "manga_autoscroll_max_px_per_sec" => {
                             if let Ok(v) = value.parse::<f32>() {
-                                config.manga_autoscroll_max_speed_px_per_sec = v.clamp(1.0, 50000.0);
+                                config.manga_autoscroll_max_speed_px_per_sec =
+                                    v.clamp(1.0, 50000.0);
                             }
                         }
                         "manga_autoscroll_horizontal_speed_multiplier"
                         | "manga_autoscroll_horizontal_multiplier"
                         | "manga_autoscroll_x_speed_multiplier" => {
                             if let Ok(v) = value.parse::<f32>() {
-                                config.manga_autoscroll_horizontal_speed_multiplier = v.clamp(0.05, 10.0);
+                                config.manga_autoscroll_horizontal_speed_multiplier =
+                                    v.clamp(0.05, 10.0);
                             }
                         }
                         "manga_autoscroll_vertical_speed_multiplier"
                         | "manga_autoscroll_vertical_multiplier"
                         | "manga_autoscroll_y_speed_multiplier" => {
                             if let Ok(v) = value.parse::<f32>() {
-                                config.manga_autoscroll_vertical_speed_multiplier = v.clamp(0.05, 10.0);
+                                config.manga_autoscroll_vertical_speed_multiplier =
+                                    v.clamp(0.05, 10.0);
                             }
                         }
                         "manga_autoscroll_circle_fill_alpha"
@@ -1022,8 +1032,7 @@ impl Config {
                                 config.manga_autoscroll_arrow_rgb = rgb;
                             }
                         }
-                        "manga_autoscroll_arrow_alpha"
-                        | "manga_autoscroll_arrow_opacity" => {
+                        "manga_autoscroll_arrow_alpha" | "manga_autoscroll_arrow_opacity" => {
                             if let Some(v) = parse_u8_clamped(value) {
                                 config.manga_autoscroll_arrow_alpha = v;
                             }
@@ -1051,6 +1060,13 @@ impl Config {
                         "vsync" | "v_sync" | "enable_vsync" => {
                             if let Some(v) = parse_bool(value) {
                                 config.vsync = v;
+                            }
+                        }
+                        "metadata_cache_max_size_mb"
+                        | "metadata_cache_limit_mb"
+                        | "metadata_cache_max_mb" => {
+                            if let Ok(v) = value.parse::<u64>() {
+                                config.metadata_cache_max_size_mb = v.min(1_048_576);
                             }
                         }
                         _ => {}
@@ -1092,9 +1108,7 @@ impl Config {
                                 config.video_prefer_hardware_decode = v;
                             }
                         }
-                        "disable_hardware_decode"
-                        | "force_software_decode"
-                        | "force_sw_decode" => {
+                        "disable_hardware_decode" | "force_software_decode" | "force_sw_decode" => {
                             if let Some(v) = parse_bool(value) {
                                 config.video_disable_hardware_decode = v;
                             }
@@ -1235,7 +1249,10 @@ impl Config {
     fn ini_value_replacements(&self) -> HashMap<&'static str, String> {
         let mut values = HashMap::new();
 
-        values.insert("controls_hide_delay", format!("{}", self.controls_hide_delay));
+        values.insert(
+            "controls_hide_delay",
+            format!("{}", self.controls_hide_delay),
+        );
         values.insert(
             "bottom_overlay_hide_delay",
             format!("{}", self.bottom_overlay_hide_delay),
@@ -1255,6 +1272,10 @@ impl Config {
             bool_to_ini(self.single_instance).to_string(),
         );
         values.insert("vsync", bool_to_ini(self.vsync).to_string());
+        values.insert(
+            "metadata_cache_max_size_mb",
+            format!("{}", self.metadata_cache_max_size_mb),
+        );
         values.insert(
             "background_rgb",
             format!(
@@ -1341,7 +1362,9 @@ impl Config {
         );
         values.insert(
             "manga_autoscroll_horizontal_speed_multiplier",
-            format_with_optional_trailing_zero_f32(self.manga_autoscroll_horizontal_speed_multiplier),
+            format_with_optional_trailing_zero_f32(
+                self.manga_autoscroll_horizontal_speed_multiplier,
+            ),
         );
         values.insert(
             "manga_autoscroll_vertical_speed_multiplier",
@@ -1378,10 +1401,7 @@ impl Config {
             format_with_optional_trailing_zero_f64(self.video_default_volume),
         );
         values.insert("loop", bool_to_ini(self.video_loop).to_string());
-        values.insert(
-            "seek_policy",
-            self.video_seek_policy.as_str().to_string(),
-        );
+        values.insert("seek_policy", self.video_seek_policy.as_str().to_string());
         values.insert(
             "prefer_hardware_decode",
             bool_to_ini(self.video_prefer_hardware_decode).to_string(),
@@ -1392,8 +1412,14 @@ impl Config {
         );
 
         values.insert("upscale_filter", self.upscale_filter.as_str().to_string());
-        values.insert("downscale_filter", self.downscale_filter.as_str().to_string());
-        values.insert("gif_resize_filter", self.gif_resize_filter.as_str().to_string());
+        values.insert(
+            "downscale_filter",
+            self.downscale_filter.as_str().to_string(),
+        );
+        values.insert(
+            "gif_resize_filter",
+            self.gif_resize_filter.as_str().to_string(),
+        );
         values.insert(
             "texture_filter_static",
             self.texture_filter_static.as_str().to_string(),
@@ -1424,7 +1450,10 @@ impl Config {
             self.action_bindings_csv(Action::ToggleFullscreen),
         );
         values.insert("next_image", self.action_bindings_csv(Action::NextImage));
-        values.insert("previous_image", self.action_bindings_csv(Action::PreviousImage));
+        values.insert(
+            "previous_image",
+            self.action_bindings_csv(Action::PreviousImage),
+        );
         values.insert(
             "rotate_clockwise",
             self.action_bindings_csv(Action::RotateClockwise),
@@ -1442,7 +1471,10 @@ impl Config {
             self.action_bindings_csv(Action::VideoPlayPause),
         );
         values.insert("video_mute", self.action_bindings_csv(Action::VideoMute));
-        values.insert("manga_zoom_in", self.action_bindings_csv(Action::MangaZoomIn));
+        values.insert(
+            "manga_zoom_in",
+            self.action_bindings_csv(Action::MangaZoomIn),
+        );
         values.insert(
             "manga_zoom_out",
             self.action_bindings_csv(Action::MangaZoomOut),

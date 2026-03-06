@@ -3,13 +3,13 @@
 
 #![windows_subsystem = "windows"]
 
-mod config;
 mod async_runtime;
+mod config;
 mod image_loader;
-mod media_index;
-mod metadata_cache;
 mod manga_loader;
 mod manga_spatial;
+mod media_index;
+mod metadata_cache;
 mod perf_metrics;
 #[cfg(target_os = "windows")]
 mod single_instance;
@@ -24,16 +24,15 @@ static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use config::{
     Action, Config, InputBinding, MangaVirtualizationBackend, StartupWindowMode, VideoSeekPolicy,
 };
-use image_loader::{
-    get_media_type, is_supported_video, ImageFrame, LoadedImage, MediaType,
-};
 use hashbrown::{HashMap, HashSet};
-use media_index::{DirectoryScanResult, MediaDirectoryIndex};
-use metadata_cache::{
-    lookup_cached_dimensions, metadata_cache_stats, store_cached_dimensions, CachedMediaKind,
-};
+use image_loader::{get_media_type, is_supported_video, ImageFrame, LoadedImage, MediaType};
 use manga_loader::{MangaLoader, MangaMediaType, MangaTextureCache};
 use manga_spatial::{MangaSpatialIndex, SpatialRect, STRIP_QUERY_HALF_WIDTH};
+use media_index::{DirectoryScanResult, MediaDirectoryIndex};
+use metadata_cache::{
+    configure_metadata_cache_size_limit, lookup_cached_dimensions, metadata_cache_stats,
+    store_cached_dimensions, CachedMediaKind,
+};
 use perf_metrics::PerfMetrics;
 #[cfg(target_os = "windows")]
 use single_instance::{FileReceiver, SingleInstanceResult};
@@ -128,9 +127,8 @@ fn resize_rgba_with_fir(
     let src = fir::images::ImageRef::new(width, height, pixels, fir::PixelType::U8x4).ok()?;
     let mut dst = fir::images::Image::new(new_w, new_h, fir::PixelType::U8x4);
 
-    let options = fir::ResizeOptions::new().resize_alg(fir::ResizeAlg::Convolution(
-        image_filter_to_fir(filter),
-    ));
+    let options = fir::ResizeOptions::new()
+        .resize_alg(fir::ResizeAlg::Convolution(image_filter_to_fir(filter)));
 
     let mut resizer = fir::Resizer::new();
     resizer.resize(&src, &mut dst, Some(&options)).ok()?;
@@ -1442,7 +1440,8 @@ impl ImageViewer {
         self.error_message = None;
 
         if cached.is_animated_webp {
-            if let Some(rx) = LoadedImage::start_streaming_webp(path, Some(max_texture_side), gif_filter)
+            if let Some(rx) =
+                LoadedImage::start_streaming_webp(path, Some(max_texture_side), gif_filter)
             {
                 self.anim_stream_rx = Some(rx);
                 self.anim_stream_path = Some(path.clone());
@@ -1526,7 +1525,9 @@ impl ImageViewer {
         if !self.manga_mode {
             return;
         }
-        self.manga_ttv_pending.entry(index).or_insert_with(Instant::now);
+        self.manga_ttv_pending
+            .entry(index)
+            .or_insert_with(Instant::now);
     }
 
     fn manga_record_ttv_sample(&mut self, elapsed: Duration) {
@@ -1584,7 +1585,11 @@ impl ImageViewer {
         Some((sorted[p50_idx], sorted[p95_idx], n))
     }
 
-    fn manga_compute_upload_batch_limit(&self, pending_loads: usize, pending_decoded: usize) -> usize {
+    fn manga_compute_upload_batch_limit(
+        &self,
+        pending_loads: usize,
+        pending_decoded: usize,
+    ) -> usize {
         let mut limit = Self::MANGA_UPLOAD_BATCH_BASE;
 
         if self.is_masonry_mode() {
@@ -1754,12 +1759,18 @@ impl ImageViewer {
             ));
         }
 
-        if let Some(p95) = self.perf_metrics.percentile_ms("media_index_lookup_ms", 0.95) {
+        if let Some(p95) = self
+            .perf_metrics
+            .percentile_ms("media_index_lookup_ms", 0.95)
+        {
             text.push_str(&format!(" p95:{p95:.2}ms"));
         }
 
         if self.manga_mode {
-            if let Some(p95) = self.perf_metrics.percentile_ms("manga_upload_pass_ms", 0.95) {
+            if let Some(p95) = self
+                .perf_metrics
+                .percentile_ms("manga_upload_pass_ms", 0.95)
+            {
                 text.push_str(&format!(" | UP p95:{p95:.2}ms"));
             }
 
@@ -1769,13 +1780,22 @@ impl ImageViewer {
             {
                 text.push_str(&format!(" | QW p95:{p95:.2}ms"));
             }
-            if let Some(p95) = self.perf_metrics.percentile_ms("manga_decode_worker_ms", 0.95) {
+            if let Some(p95) = self
+                .perf_metrics
+                .percentile_ms("manga_decode_worker_ms", 0.95)
+            {
                 text.push_str(&format!(" | DEC p95:{p95:.2}ms"));
             }
-            if let Some(p95) = self.perf_metrics.percentile_ms("manga_decode_resize_ms", 0.95) {
+            if let Some(p95) = self
+                .perf_metrics
+                .percentile_ms("manga_decode_resize_ms", 0.95)
+            {
                 text.push_str(&format!(" | RSZ p95:{p95:.2}ms"));
             }
-            if let Some(p95) = self.perf_metrics.percentile_ms("manga_upload_texture_ms", 0.95) {
+            if let Some(p95) = self
+                .perf_metrics
+                .percentile_ms("manga_upload_texture_ms", 0.95)
+            {
                 text.push_str(&format!(" | UTX p95:{p95:.2}ms"));
             }
 
@@ -1794,7 +1814,10 @@ impl ImageViewer {
             let side_mid = self.perf_metrics.counter("manga_target_side_mid");
             let side_high = self.perf_metrics.counter("manga_target_side_high");
             if side_low > 0 || side_mid > 0 || side_high > 0 {
-                text.push_str(&format!(" | TS L/M/H {}/{}/{}", side_low, side_mid, side_high));
+                text.push_str(&format!(
+                    " | TS L/M/H {}/{}/{}",
+                    side_low, side_mid, side_high
+                ));
             }
 
             let deferred_nav = self.perf_metrics.counter("manga_upgrade_deferred_nav");
@@ -1895,7 +1918,11 @@ impl ImageViewer {
         // IMPORTANT: this must be based on *potential* overlay layout, not the current visibility flags.
         // Otherwise, videos can get stuck where the manga button is drawn higher (above the video controls)
         // but the hover zone is still computed as if the controls are hidden, preventing activation.
-        let mode_button_stack_height = if self.is_fullscreen { 32.0 * 2.0 + 8.0 } else { 0.0 };
+        let mode_button_stack_height = if self.is_fullscreen {
+            32.0 * 2.0 + 8.0
+        } else {
+            0.0
+        };
         let hover_zone_height = 80.0
             + mode_button_stack_height
             + if has_controllable_media { 64.0 } else { 0.0 }
@@ -2009,7 +2036,8 @@ impl ImageViewer {
         };
 
         if self.show_manga_zoom_bar {
-            let bar_size = egui::Vec2::new(Self::MANGA_HUD_PANEL_WIDTH, Self::MANGA_HUD_PANEL_HEIGHT);
+            let bar_size =
+                egui::Vec2::new(Self::MANGA_HUD_PANEL_WIDTH, Self::MANGA_HUD_PANEL_HEIGHT);
             let bar_rect = egui::Rect::from_min_size(
                 egui::pos2(
                     screen_rect.max.x - bar_size.x - margin - scrollbar_padding,
@@ -2023,7 +2051,10 @@ impl ImageViewer {
 
             if self.is_masonry_mode() {
                 let rows_bar_rect = egui::Rect::from_min_size(
-                    egui::pos2(bar_rect.min.x, bar_rect.min.y - Self::MANGA_HUD_PANEL_VERTICAL_STEP),
+                    egui::pos2(
+                        bar_rect.min.x,
+                        bar_rect.min.y - Self::MANGA_HUD_PANEL_VERTICAL_STEP,
+                    ),
                     bar_size,
                 );
                 if rows_bar_rect.contains(pos) {
@@ -2199,9 +2230,12 @@ impl ImageViewer {
             if Self::filename_needs_cjk_fonts(&filename) {
                 let (tx, rx) = crossbeam_channel::bounded::<Vec<(String, Vec<u8>)>>(1);
                 self.pending_windows_cjk_font_load = Some(rx);
-                crate::async_runtime::spawn_blocking_or_thread("windows-cjk-font-load", move || {
-                    let _ = tx.send(load_windows_cjk_font_data());
-                });
+                crate::async_runtime::spawn_blocking_or_thread(
+                    "windows-cjk-font-load",
+                    move || {
+                        let _ = tx.send(load_windows_cjk_font_data());
+                    },
+                );
             }
         }
     }
@@ -2569,12 +2603,7 @@ impl ImageViewer {
                 let perp = egui::vec2(-direction.y, direction.x);
                 let stroke = egui::Stroke::new(
                     2.0,
-                    egui::Color32::from_rgba_unmultiplied(
-                        arrow_r,
-                        arrow_g,
-                        arrow_b,
-                        arrow_alpha,
-                    ),
+                    egui::Color32::from_rgba_unmultiplied(arrow_r, arrow_g, arrow_b, arrow_alpha),
                 );
 
                 painter.line_segment([anchor, tip], stroke);
@@ -2588,7 +2617,10 @@ impl ImageViewer {
     }
 
     fn strip_item_open_uses_right_click(&self) -> bool {
-        matches!(&self.config.strip_item_open_binding, InputBinding::MouseRight)
+        matches!(
+            &self.config.strip_item_open_binding,
+            InputBinding::MouseRight
+        )
     }
 
     fn strip_item_open_binding_triggered(
@@ -2599,7 +2631,9 @@ impl ImageViewer {
         alt: bool,
     ) -> bool {
         match &self.config.strip_item_open_binding {
-            InputBinding::MouseRight => input.pointer.button_clicked(egui::PointerButton::Secondary),
+            InputBinding::MouseRight => {
+                input.pointer.button_clicked(egui::PointerButton::Secondary)
+            }
             InputBinding::MouseMiddle => input.pointer.button_pressed(egui::PointerButton::Middle),
             InputBinding::Key(key) => !ctrl && !shift && !alt && input.key_pressed(*key),
             InputBinding::KeyWithCtrl(key) => ctrl && !shift && !alt && input.key_pressed(*key),
@@ -2764,7 +2798,9 @@ impl ImageViewer {
             return;
         }
 
-        let total = self.masonry_metadata_preload_total.min(self.image_list.len());
+        let total = self
+            .masonry_metadata_preload_total
+            .min(self.image_list.len());
         if total == 0 {
             self.reset_masonry_metadata_preload();
             return;
@@ -3022,7 +3058,9 @@ impl ImageViewer {
                 .record_duration("media_index_async_scan_ms", started_at.elapsed());
         }
 
-        let mut files = self.media_directory_index.apply_directory_scan_result(result);
+        let mut files = self
+            .media_directory_index
+            .apply_directory_scan_result(result);
         if files.is_empty() {
             files.push(target_path.clone());
         }
@@ -3122,7 +3160,8 @@ impl ImageViewer {
                 || result_index != pending.index
                 || result_path != &pending.path
             {
-                self.perf_metrics.increment_counter("manga_video_async_stale", 1);
+                self.perf_metrics
+                    .increment_counter("manga_video_async_stale", 1);
                 continue;
             }
 
@@ -3148,7 +3187,8 @@ impl ImageViewer {
                     .is_some_and(|current_path| current_path == result_path);
 
             if !still_targeted {
-                self.perf_metrics.increment_counter("manga_video_async_stale", 1);
+                self.perf_metrics
+                    .increment_counter("manga_video_async_stale", 1);
                 continue;
             }
 
@@ -3292,7 +3332,8 @@ impl ImageViewer {
             };
 
             if result_request_id != pending.request_id || result_path != &pending.path {
-                self.perf_metrics.increment_counter("load_media_async_stale", 1);
+                self.perf_metrics
+                    .increment_counter("load_media_async_stale", 1);
                 continue;
             }
 
@@ -3548,12 +3589,7 @@ impl ImageViewer {
                     return;
                 }
 
-                self.start_async_image_load(
-                    path.clone(),
-                    max_tex,
-                    downscale_filter,
-                    gif_filter,
-                );
+                self.start_async_image_load(path.clone(), max_tex, downscale_filter, gif_filter);
             }
             None => {
                 self.error_message = Some(format!("Unsupported file format: {:?}", path));
@@ -4021,20 +4057,20 @@ impl ImageViewer {
         self.strip_return_mode = Some(layout_mode);
         self.strip_return_preserve_masonry_cache =
             layout_mode == MangaLayoutMode::Masonry && self.manga_mode;
-        self.strip_return_masonry_state = if layout_mode == MangaLayoutMode::Masonry && self.manga_mode
-        {
-            Some(MasonryReturnState {
-                zoom: self.zoom,
-                zoom_target: self.zoom_target,
-                offset: self.offset,
-                scroll_offset: self.manga_scroll_offset,
-                scroll_target: self.manga_scroll_target,
-                opened_index: self.current_index,
-                cache_reuse_radius: self.masonry_cache_reuse_radius(),
-            })
-        } else {
-            None
-        };
+        self.strip_return_masonry_state =
+            if layout_mode == MangaLayoutMode::Masonry && self.manga_mode {
+                Some(MasonryReturnState {
+                    zoom: self.zoom,
+                    zoom_target: self.zoom_target,
+                    offset: self.offset,
+                    scroll_offset: self.manga_scroll_offset,
+                    scroll_target: self.manga_scroll_target,
+                    opened_index: self.current_index,
+                    cache_reuse_radius: self.masonry_cache_reuse_radius(),
+                })
+            } else {
+                None
+            };
     }
 
     fn masonry_cache_reuse_radius(&self) -> usize {
@@ -4044,21 +4080,22 @@ impl ImageViewer {
         let items_per_row = self.masonry_items_per_row.clamp(2, 10);
         let columns = items_per_row.max(1);
 
-        let estimated_item_height = if self.masonry_layout_valid && !self.masonry_layout_items.is_empty() {
-            let sample_count = self.masonry_layout_items.len().min(64);
-            let sample_sum: f32 = self
-                .masonry_layout_items
-                .iter()
-                .take(sample_count)
-                .map(|item| item.height.max(1.0))
-                .sum();
-            (sample_sum / sample_count as f32).max(1.0)
-        } else {
-            let available_width = (self.screen_size.x - SIDE_PADDING * 2.0).max(20.0);
-            let total_gutter = GUTTER * (columns.saturating_sub(1) as f32);
-            let column_width = ((available_width - total_gutter) / columns as f32).max(1.0);
-            (column_width * 1.4).max(1.0)
-        };
+        let estimated_item_height =
+            if self.masonry_layout_valid && !self.masonry_layout_items.is_empty() {
+                let sample_count = self.masonry_layout_items.len().min(64);
+                let sample_sum: f32 = self
+                    .masonry_layout_items
+                    .iter()
+                    .take(sample_count)
+                    .map(|item| item.height.max(1.0))
+                    .sum();
+                (sample_sum / sample_count as f32).max(1.0)
+            } else {
+                let available_width = (self.screen_size.x - SIDE_PADDING * 2.0).max(20.0);
+                let total_gutter = GUTTER * (columns.saturating_sub(1) as f32);
+                let column_width = ((available_width - total_gutter) / columns as f32).max(1.0);
+                (column_width * 1.4).max(1.0)
+            };
 
         let row_height = (estimated_item_height + GUTTER) * self.zoom.max(0.0001);
         let visible_rows = (self.screen_size.y.max(1.0) / row_height.max(1.0)).floor() as usize;
@@ -4091,7 +4128,9 @@ impl ImageViewer {
             return;
         }
 
-        let target_index = self.current_index.min(self.image_list.len().saturating_sub(1));
+        let target_index = self
+            .current_index
+            .min(self.image_list.len().saturating_sub(1));
         self.set_current_index_clamped(target_index);
         let max_scroll = (self.manga_total_height() - self.screen_size.y).max(0.0);
         let target_scroll = if self.is_masonry_mode() {
@@ -4156,10 +4195,12 @@ impl ImageViewer {
         } else {
             None
         };
-        let current_viewed_index = self.current_index.min(self.image_list.len().saturating_sub(1));
+        let current_viewed_index = self
+            .current_index
+            .min(self.image_list.len().saturating_sub(1));
         self.set_current_index_clamped(current_viewed_index);
-        let traversed_during_fullscreen = restore_masonry_state
-            .is_some_and(|state| state.opened_index != current_viewed_index);
+        let traversed_during_fullscreen =
+            restore_masonry_state.is_some_and(|state| state.opened_index != current_viewed_index);
         let reuse_masonry_cache = restore_masonry_state
             .is_some_and(|state| self.should_reuse_masonry_cache_on_return(state));
 
@@ -4252,12 +4293,16 @@ impl ImageViewer {
 
         // Baseline uses viewport width split by rows and is normalized to a 1024px
         // reference at 3440px / 5 rows / 100% zoom before quality boost.
-        let baseline_item_width =
-            (self.screen_size.x.max(1.0) / rows) * zoom * Self::MANGA_MASONRY_ZOOM_QUALITY_BASELINE_SCALE;
+        let baseline_item_width = (self.screen_size.x.max(1.0) / rows)
+            * zoom
+            * Self::MANGA_MASONRY_ZOOM_QUALITY_BASELINE_SCALE;
         let basis = item_screen_width.max(baseline_item_width).max(64.0);
         let scaled = (basis * Self::masonry_zoom_quality_boost(zoom)).ceil() as u32;
 
-        scaled.clamp(Self::MANGA_MASONRY_DYNAMIC_TARGET_MIN_SIDE.min(max_side), max_side)
+        scaled.clamp(
+            Self::MANGA_MASONRY_DYNAMIC_TARGET_MIN_SIDE.min(max_side),
+            max_side,
+        )
     }
 
     fn manga_clamp_target_side_to_source(&self, index: usize, target_side: u32) -> u32 {
@@ -4276,10 +4321,7 @@ impl ImageViewer {
         } else {
             ((image_rect.width().max(image_rect.height()) * Self::MANGA_DYNAMIC_TARGET_OVERSCAN)
                 .ceil() as u32)
-                .clamp(
-                    Self::MANGA_DYNAMIC_TARGET_MIN_SIDE.min(max_side),
-                    max_side,
-                )
+                .clamp(Self::MANGA_DYNAMIC_TARGET_MIN_SIDE.min(max_side), max_side)
         };
 
         self.manga_clamp_target_side_to_source(index, target_side)
@@ -4293,7 +4335,8 @@ impl ImageViewer {
 
         let ratio_threshold =
             (existing_side as f32 * Self::MANGA_TEXTURE_UPGRADE_MIN_RATIO).ceil() as u32;
-        let delta_threshold = existing_side.saturating_add(Self::MANGA_TEXTURE_UPGRADE_MIN_DELTA_SIDE);
+        let delta_threshold =
+            existing_side.saturating_add(Self::MANGA_TEXTURE_UPGRADE_MIN_DELTA_SIDE);
         desired_side >= ratio_threshold.max(delta_threshold)
     }
 
@@ -4458,7 +4501,9 @@ impl ImageViewer {
         let viewport_bottom = viewport_top + self.screen_size.y.max(1.0);
 
         if self.manga_use_rtree_backend() {
-            if let Some(indices) = self.manga_query_visible_indices_rtree(viewport_top, viewport_bottom) {
+            if let Some(indices) =
+                self.manga_query_visible_indices_rtree(viewport_top, viewport_bottom)
+            {
                 return indices;
             }
         }
@@ -4915,7 +4960,9 @@ impl ImageViewer {
 
             // Reset offset (horizontal pan) and scroll to current image position
             self.offset = egui::Vec2::ZERO;
-            let target_index = self.current_index.min(self.image_list.len().saturating_sub(1));
+            let target_index = self
+                .current_index
+                .min(self.image_list.len().saturating_sub(1));
             self.set_current_index_clamped(target_index);
             let max_scroll = (self.manga_total_height() - self.screen_size.y).max(0.0);
             let scroll_to = if self.manga_layout_mode == MangaLayoutMode::Masonry {
@@ -5692,9 +5739,11 @@ impl ImageViewer {
                     let max_tex = self.max_texture_side;
 
                     if LoadedImage::is_animated_webp(&path) {
-                        if let Some(rx) =
-                            LoadedImage::start_streaming_webp(&path, Some(max_tex), active_gif_filter)
-                        {
+                        if let Some(rx) = LoadedImage::start_streaming_webp(
+                            &path,
+                            Some(max_tex),
+                            active_gif_filter,
+                        ) {
                             self.manga_anim_streams.insert(idx, rx);
                             self.manga_anim_stream_done.insert(idx, false);
 
@@ -5984,7 +6033,8 @@ impl ImageViewer {
             self.manga_target_texture_side_for_preload(current_visible_index, &visible_indices);
         self.manga_record_target_side_sample(self.manga_target_texture_side);
         self.manga_visible_indices_last = visible_indices_count;
-        self.manga_visible_indices_peak = self.manga_visible_indices_peak.max(visible_indices_count);
+        self.manga_visible_indices_peak =
+            self.manga_visible_indices_peak.max(visible_indices_count);
 
         if is_masonry {
             // Byte-aware clamp to avoid oversized entry-count targets when textures are large.
@@ -6005,7 +6055,8 @@ impl ImageViewer {
             let byte_limited_capacity = (budget_bytes / est_bytes_per_texture.max(1))
                 .clamp(Self::MANGA_CACHE_MIN_ENTRIES, Self::MANGA_CACHE_MAX_ENTRIES);
             let keep_floor = visible_indices_count.max(masonry_rows.saturating_mul(2));
-            target_cache_capacity = target_cache_capacity.min(byte_limited_capacity.max(keep_floor));
+            target_cache_capacity =
+                target_cache_capacity.min(byte_limited_capacity.max(keep_floor));
         }
 
         self.manga_cache_target_capacity = target_cache_capacity;
@@ -6036,7 +6087,8 @@ impl ImageViewer {
                 let directional_cap = visible_indices_count.saturating_mul(2).max(1);
                 visible_for_loader = visible_for_loader.min(directional_cap);
             }
-            let cache_limited_visible = visible_for_loader.min(self.manga_cache_target_capacity.max(1));
+            let cache_limited_visible =
+                visible_for_loader.min(self.manga_cache_target_capacity.max(1));
             loader.update_visible_page_count(cache_limited_visible.max(1));
         }
 
@@ -6151,7 +6203,9 @@ impl ImageViewer {
         };
 
         let visible_budget = visible_indices_count.min(self.manga_cache_target_capacity.max(1));
-        let keep_budget_total = self.manga_cache_target_capacity.saturating_sub(visible_budget);
+        let keep_budget_total = self
+            .manga_cache_target_capacity
+            .saturating_sub(visible_budget);
         if keep_budget_total == 0 {
             final_keep_behind = 0;
             final_keep_ahead = 0;
@@ -6425,7 +6479,8 @@ impl ImageViewer {
             let incoming_side = decoded.width.max(decoded.height);
 
             // Keep current texture unless the decoded payload is a meaningful quality upgrade.
-            if let Some((_, existing_w, existing_h)) = self.manga_texture_cache.get_texture_info(decoded.index)
+            if let Some((_, existing_w, existing_h)) =
+                self.manga_texture_cache.get_texture_info(decoded.index)
             {
                 let existing_side = existing_w.max(existing_h);
                 if !Self::manga_texture_upgrade_needed(existing_side, incoming_side) {
@@ -6447,8 +6502,11 @@ impl ImageViewer {
 
             // Static images + video thumbnails can use mipmaps for faster minification
             // in manga strip and masonry layouts.
-            let texture_options =
-                self.manga_texture_options_for_upload(decoded.media_type, decoded.width, decoded.height);
+            let texture_options = self.manga_texture_options_for_upload(
+                decoded.media_type,
+                decoded.width,
+                decoded.height,
+            );
 
             let upload_texture_started = Instant::now();
             let texture = ctx.load_texture(
@@ -7224,8 +7282,7 @@ impl ImageViewer {
         );
 
         let masonry_on = self.manga_mode && self.manga_layout_mode == MangaLayoutMode::Masonry;
-        let long_strip_on =
-            self.manga_mode && self.manga_layout_mode == MangaLayoutMode::LongStrip;
+        let long_strip_on = self.manga_mode && self.manga_layout_mode == MangaLayoutMode::LongStrip;
 
         egui::Area::new(egui::Id::new("manga_toggle_button"))
             .fixed_pos(button_pos)
@@ -7269,7 +7326,10 @@ impl ImageViewer {
 
                         // When solo fullscreen was opened from strip mode, route button-based
                         // returns through the same strip-return path as center right-click.
-                        if self.is_fullscreen && !self.manga_mode && self.strip_return_mode.is_some() {
+                        if self.is_fullscreen
+                            && !self.manga_mode
+                            && self.strip_return_mode.is_some()
+                        {
                             self.strip_return_mode = Some(target_layout);
                             self.return_to_strip_mode_from_middle_click();
                         } else if self.manga_mode && *is_on {
@@ -7380,7 +7440,8 @@ impl ImageViewer {
 
                 if self.manga_mode {
                     if self.is_masonry_mode() {
-                        let center_pos = egui::pos2(self.screen_size.x * 0.5, self.screen_size.y * 0.5);
+                        let center_pos =
+                            egui::pos2(self.screen_size.x * 0.5, self.screen_size.y * 0.5);
                         if self.apply_masonry_zoom_at_screen_pos(new_zoom, center_pos) {
                             self.manga_update_preload_queue();
                         }
@@ -7421,7 +7482,8 @@ impl ImageViewer {
         );
 
         if self.is_masonry_mode() {
-            let rows_bar_pos = egui::pos2(bar_pos.x, bar_pos.y - Self::MANGA_HUD_PANEL_VERTICAL_STEP);
+            let rows_bar_pos =
+                egui::pos2(bar_pos.x, bar_pos.y - Self::MANGA_HUD_PANEL_VERTICAL_STEP);
             egui::Area::new(egui::Id::new("masonry_rows_bar"))
                 .fixed_pos(rows_bar_pos)
                 .order(egui::Order::Foreground)
@@ -7441,8 +7503,8 @@ impl ImageViewer {
                         ui.spacing_mut().item_spacing.x = 4.0;
                         ui.spacing_mut().slider_width = 80.0;
                         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                            let (rows_label_rect, _) =
-                                ui.allocate_exact_size(egui::vec2(32.0, 24.0), egui::Sense::hover());
+                            let (rows_label_rect, _) = ui
+                                .allocate_exact_size(egui::vec2(32.0, 24.0), egui::Sense::hover());
                             ui.painter().text(
                                 rows_label_rect.center(),
                                 egui::Align2::CENTER_CENTER,
@@ -7451,8 +7513,8 @@ impl ImageViewer {
                                 egui::Color32::from_rgb(220, 220, 220),
                             );
 
-                            let (rows_minus_rect, rows_minus_resp) =
-                                ui.allocate_exact_size(egui::vec2(20.0, 24.0), egui::Sense::click());
+                            let (rows_minus_rect, rows_minus_resp) = ui
+                                .allocate_exact_size(egui::vec2(20.0, 24.0), egui::Sense::click());
                             if ui.is_rect_visible(rows_minus_rect) {
                                 let minus_bg = if rows_minus_resp.is_pointer_button_down_on() {
                                     egui::Color32::from_rgba_unmultiplied(255, 255, 255, 36)
@@ -7471,7 +7533,9 @@ impl ImageViewer {
                                 );
                             }
                             if rows_minus_resp.clicked() {
-                                self.set_masonry_items_per_row(self.masonry_items_per_row.saturating_sub(1));
+                                self.set_masonry_items_per_row(
+                                    self.masonry_items_per_row.saturating_sub(1),
+                                );
                                 self.touch_bottom_overlays();
                             }
 
@@ -7485,8 +7549,8 @@ impl ImageViewer {
                                 self.set_masonry_items_per_row(slider_rows as usize);
                             }
 
-                            let (rows_plus_rect, rows_plus_resp) =
-                                ui.allocate_exact_size(egui::vec2(20.0, 24.0), egui::Sense::click());
+                            let (rows_plus_rect, rows_plus_resp) = ui
+                                .allocate_exact_size(egui::vec2(20.0, 24.0), egui::Sense::click());
                             if ui.is_rect_visible(rows_plus_rect) {
                                 let plus_bg = if rows_plus_resp.is_pointer_button_down_on() {
                                     egui::Color32::from_rgba_unmultiplied(255, 255, 255, 36)
@@ -7505,7 +7569,9 @@ impl ImageViewer {
                                 );
                             }
                             if rows_plus_resp.clicked() {
-                                self.set_masonry_items_per_row(self.masonry_items_per_row.saturating_add(1));
+                                self.set_masonry_items_per_row(
+                                    self.masonry_items_per_row.saturating_add(1),
+                                );
                                 self.touch_bottom_overlays();
                             }
 
@@ -7518,8 +7584,8 @@ impl ImageViewer {
                             }
 
                             let rows_value = format!("{}", self.masonry_items_per_row);
-                            let (rows_value_rect, _) =
-                                ui.allocate_exact_size(egui::vec2(40.0, 24.0), egui::Sense::hover());
+                            let (rows_value_rect, _) = ui
+                                .allocate_exact_size(egui::vec2(40.0, 24.0), egui::Sense::hover());
                             ui.painter().text(
                                 rows_value_rect.center(),
                                 egui::Align2::CENTER_CENTER,
@@ -7604,9 +7670,13 @@ impl ImageViewer {
 
                                 if self.manga_mode {
                                     if self.is_masonry_mode() {
-                                        let center_pos =
-                                            egui::pos2(self.screen_size.x * 0.5, self.screen_size.y * 0.5);
-                                        if self.apply_masonry_zoom_at_screen_pos(new_zoom, center_pos) {
+                                        let center_pos = egui::pos2(
+                                            self.screen_size.x * 0.5,
+                                            self.screen_size.y * 0.5,
+                                        );
+                                        if self
+                                            .apply_masonry_zoom_at_screen_pos(new_zoom, center_pos)
+                                        {
                                             self.manga_update_preload_queue();
                                         }
                                     } else {
@@ -7744,7 +7814,11 @@ impl ImageViewer {
 
     /// Apply pointer-anchored zoom for masonry mode using screen-space cursor position.
     /// Keeps the content point under the cursor stable while zooming.
-    fn apply_masonry_zoom_at_screen_pos(&mut self, new_zoom: f32, anchor_screen: egui::Pos2) -> bool {
+    fn apply_masonry_zoom_at_screen_pos(
+        &mut self,
+        new_zoom: f32,
+        anchor_screen: egui::Pos2,
+    ) -> bool {
         if !self.is_masonry_mode() {
             return false;
         }
@@ -7810,22 +7884,20 @@ impl ImageViewer {
             .clamp(1, max_side);
 
         // During active masonry navigation, prioritize fast placeholder fill over texture quality.
-        let target_texture_side = if is_masonry
-            && self.masonry_navigation_active_for_heavy_work()
-            && !quality_upgrade
-        {
-            let nav_cap = self.manga_target_texture_side.min(256).max(min_target_side);
-            let side = desired_target_side.min(nav_cap).max(min_target_side);
-            if side < desired_target_side {
-                self.perf_metrics
-                    .increment_counter("manga_retry_low_lod_nav", 1);
-            }
-            side
-        } else {
-            desired_target_side
-                .max(self.manga_target_texture_side.min(max_side))
-                .clamp(min_target_side, max_side)
-        };
+        let target_texture_side =
+            if is_masonry && self.masonry_navigation_active_for_heavy_work() && !quality_upgrade {
+                let nav_cap = self.manga_target_texture_side.min(256).max(min_target_side);
+                let side = desired_target_side.min(nav_cap).max(min_target_side);
+                if side < desired_target_side {
+                    self.perf_metrics
+                        .increment_counter("manga_retry_low_lod_nav", 1);
+                }
+                side
+            } else {
+                desired_target_side
+                    .max(self.manga_target_texture_side.min(max_side))
+                    .clamp(min_target_side, max_side)
+            };
         let (downscale_filter, gif_filter) = self.manga_decode_filters_for_strip_mode();
         let force_triangle_filters = self.manga_should_force_triangle_filters();
 
@@ -7846,10 +7918,12 @@ impl ImageViewer {
             .unwrap_or(false);
 
         if requested {
-            self.perf_metrics.increment_counter("manga_retry_enqueued", 1);
+            self.perf_metrics
+                .increment_counter("manga_retry_enqueued", 1);
             self.manga_record_target_side_sample(target_texture_side);
         } else {
-            self.perf_metrics.increment_counter("manga_retry_rejected", 1);
+            self.perf_metrics
+                .increment_counter("manga_retry_rejected", 1);
         }
 
         requested
@@ -8220,12 +8294,12 @@ impl ImageViewer {
             pointer_pos.map_or(false, |p| p.y > screen_height - controls_bar_height);
 
         if self.is_masonry_mode() {
-            self.manga_hovered_media_index = if !title_ui_blocking && !pointer_over_shortcut_ui && !over_controls
-            {
-                pointer_pos.and_then(|pos| self.manga_index_at_screen_pos(pos))
-            } else {
-                None
-            };
+            self.manga_hovered_media_index =
+                if !title_ui_blocking && !pointer_over_shortcut_ui && !over_controls {
+                    pointer_pos.and_then(|pos| self.manga_index_at_screen_pos(pos))
+                } else {
+                    None
+                };
         } else {
             self.manga_hovered_media_index = None;
         }
@@ -8813,9 +8887,8 @@ impl ImageViewer {
                     && (zoom_delta != 1.0 || wheel_steps_ctrl != 0.0));
 
             if navigation_active {
-                self.manga_hover_autoplay_resume_at =
-                    Instant::now()
-                        + Duration::from_millis(self.config.manga_hover_autoplay_resume_delay_ms);
+                self.manga_hover_autoplay_resume_at = Instant::now()
+                    + Duration::from_millis(self.config.manga_hover_autoplay_resume_delay_ms);
             }
         }
 
@@ -9376,14 +9449,16 @@ impl ImageViewer {
             let alt = input.modifiers.alt;
             let manga_fullscreen = self.manga_mode && self.is_fullscreen;
             let middle_pressed = input.pointer.button_pressed(egui::PointerButton::Middle);
-            let pointer_pos = input.pointer.interact_pos().or_else(|| input.pointer.hover_pos());
+            let pointer_pos = input
+                .pointer
+                .interact_pos()
+                .or_else(|| input.pointer.hover_pos());
             let pointer_over_shortcut_ui =
                 self.pointer_over_shortcut_blocking_ui(pointer_pos, input.screen_rect);
 
             if self.manga_autoscroll_active {
                 let primary_cancel = input.pointer.button_clicked(egui::PointerButton::Primary);
-                let secondary_cancel =
-                    input.pointer.button_clicked(egui::PointerButton::Secondary);
+                let secondary_cancel = input.pointer.button_clicked(egui::PointerButton::Secondary);
                 if primary_cancel || secondary_cancel {
                     return;
                 }
@@ -11539,9 +11614,8 @@ impl ImageViewer {
 
         // Check if pointer is over the video controls bar area (bottom of screen when visible)
         // Important: give resize edges priority over the overlay so bottom/bottom-corner resizing works.
-        let over_video_controls = self.show_video_controls
-            && hover_resize_direction == ResizeDirection::None
-            && {
+        let over_video_controls =
+            self.show_video_controls && hover_resize_direction == ResizeDirection::None && {
                 let bar_height = 56.0;
                 pointer_pos.map_or(false, |pos| pos.y > screen_rect.height() - bar_height)
             };
@@ -12118,193 +12192,193 @@ impl eframe::App for ImageViewer {
                 self.is_fullscreen = entering_fullscreen;
 
                 if entering_fullscreen {
-                // Save current floating state before entering fullscreen
-                let inner_size = ctx
-                    .input(|i| i.raw.viewport().inner_rect)
-                    .map(|r| r.size())
-                    .unwrap_or(egui::Vec2::new(800.0, 600.0));
-                let outer_pos = ctx
-                    .input(|i| i.raw.viewport().outer_rect)
-                    .map(|r| r.min)
-                    .unwrap_or(egui::Pos2::ZERO);
-                self.saved_floating_state = Some((
-                    self.zoom,
-                    self.zoom_target,
-                    self.offset,
-                    inner_size,
-                    outer_pos,
-                ));
-                self.saved_fullscreen_entry_index = Some(self.current_index);
+                    // Save current floating state before entering fullscreen
+                    let inner_size = ctx
+                        .input(|i| i.raw.viewport().inner_rect)
+                        .map(|r| r.size())
+                        .unwrap_or(egui::Vec2::new(800.0, 600.0));
+                    let outer_pos = ctx
+                        .input(|i| i.raw.viewport().outer_rect)
+                        .map(|r| r.min)
+                        .unwrap_or(egui::Pos2::ZERO);
+                    self.saved_floating_state = Some((
+                        self.zoom,
+                        self.zoom_target,
+                        self.offset,
+                        inner_size,
+                        outer_pos,
+                    ));
+                    self.saved_fullscreen_entry_index = Some(self.current_index);
 
-                // No fullscreen transition animation: switch instantly.
-                self.fullscreen_transition = 1.0;
-                self.fullscreen_transition_target = 1.0;
+                    // No fullscreen transition animation: switch instantly.
+                    self.fullscreen_transition = 1.0;
+                    self.fullscreen_transition_target = 1.0;
 
-                // Requirement: when moving from floating -> fullscreen, always fit vertically and center.
-                self.apply_fullscreen_layout_for_current_image(ctx);
+                    // Requirement: when moving from floating -> fullscreen, always fit vertically and center.
+                    self.apply_fullscreen_layout_for_current_image(ctx);
 
-                // Use borderless "pseudo-fullscreen" instead of OS fullscreen.
-                // This avoids a brief desktop flash on Windows caused by toggling window styles/swapchain.
-                let monitor = self.monitor_size_points(ctx);
-                self.suppress_outer_pos_tracking_frames =
-                    self.suppress_outer_pos_tracking_frames.max(2);
-                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::Pos2::ZERO));
-                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(monitor));
-                self.last_requested_inner_size = Some(monitor);
+                    // Use borderless "pseudo-fullscreen" instead of OS fullscreen.
+                    // This avoids a brief desktop flash on Windows caused by toggling window styles/swapchain.
+                    let monitor = self.monitor_size_points(ctx);
+                    self.suppress_outer_pos_tracking_frames =
+                        self.suppress_outer_pos_tracking_frames.max(2);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::Pos2::ZERO));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(monitor));
+                    self.last_requested_inner_size = Some(monitor);
 
-                if toggled_from_titlebar {
-                    if let Some(layout_mode) = self.titlebar_pending_restore_layout.take() {
-                        self.clear_strip_return_context();
-                        self.manga_layout_mode = layout_mode;
-                        if !self.manga_mode {
-                            self.toggle_manga_mode();
-                        }
-                    }
-                }
-                } else {
-                // Exiting fullscreen - use delayed resize to prevent flash
-                self.fullscreen_transition = 0.0;
-                self.fullscreen_transition_target = 0.0;
-                self.clear_strip_return_context();
-
-                // Exit manga mode when leaving fullscreen
-                if self.manga_mode {
-                    self.manga_wheel_scroll_pending = 0.0;
-                    self.stop_manga_autoscroll();
-
-                    // Keep floating mode in sync with the strip item currently centered
-                    // in the viewport (the same item reflected by the status/title bars).
-                    self.manga_update_current_index();
-                    let visible_idx = self
-                        .current_index
-                        .min(self.image_list.len().saturating_sub(1));
-                    let target_path = self.image_list.get(visible_idx).cloned();
-                    let target_media_type =
-                        target_path.as_ref().and_then(|path| get_media_type(path));
-
-                    self.prepare_mode_switch_placeholder_from_manga_index(
-                        visible_idx,
-                        target_media_type,
-                    );
-
-                    self.manga_mode = false;
-                    self.manga_clear_cache();
-
-                    if let Some(path) = target_path {
-                        self.load_image(&path);
-                    }
-                }
-
-                // Clear the per-image fullscreen view state cache when exiting fullscreen
-                // (since it's only meant for fullscreen mode comparisons within a session)
-                self.fullscreen_view_states.clear();
-
-                let image_changed_while_fullscreen = self
-                    .saved_fullscreen_entry_index
-                    .is_some_and(|idx| idx != self.current_index);
-
-                // Restore previous floating state if available
-                if !image_changed_while_fullscreen {
-                    self.saved_fullscreen_entry_index = None;
-                }
-
-                if !image_changed_while_fullscreen {
-                    if let Some((
-                        saved_zoom,
-                        saved_zoom_target,
-                        saved_offset,
-                        saved_size,
-                        saved_pos,
-                    )) = self.saved_floating_state.take()
-                    {
-                        self.zoom = saved_zoom;
-                        self.zoom_target = saved_zoom_target;
-                        self.offset = saved_offset;
-                        self.floating_max_inner_size = Some(saved_size);
-                        self.last_requested_inner_size = Some(saved_size);
-                        // Delay window resize by 2 frames to prevent flash
-                        self.pending_window_resize = Some((saved_size, saved_pos, 2));
-                    } else {
-                        // Fallback: reset to centered at 100% and resize to 100% image size (capped by fit-to-screen)
-                        self.offset = egui::Vec2::ZERO;
-                        self.zoom = 1.0;
-                        self.zoom_target = 1.0;
-
-                        if let Some(img) = self.image.as_ref() {
-                            let (w, h) = img.display_dimensions();
-                            let mut desired = egui::Vec2::new(w as f32, h as f32);
-                            let available = self.floating_available_size(ctx);
-                            let cap = self.initial_window_size_for_available(available);
-                            self.floating_max_inner_size = Some(cap);
-                            if desired.x > cap.x || desired.y > cap.y {
-                                desired = cap;
+                    if toggled_from_titlebar {
+                        if let Some(layout_mode) = self.titlebar_pending_restore_layout.take() {
+                            self.clear_strip_return_context();
+                            self.manga_layout_mode = layout_mode;
+                            if !self.manga_mode {
+                                self.toggle_manga_mode();
                             }
-                            desired.x = desired.x.max(200.0);
-                            desired.y = desired.y.max(150.0);
-                            self.last_requested_inner_size = Some(desired);
-                            // Calculate center position
-                            let monitor = self.monitor_size_points(ctx);
-                            let x = (monitor.x - desired.x) * 0.5;
-                            let y = (monitor.y - desired.y) * 0.5;
-                            let pos = egui::pos2(x.max(0.0), y.max(0.0));
-                            // Delay window resize by 2 frames to prevent flash
-                            self.pending_window_resize = Some((desired, pos, 2));
                         }
                     }
                 } else {
-                    // If the user navigated to a different image while fullscreen,
-                    // don't restore the previous floating zoom/position; apply normal floating sizing.
-                    self.saved_fullscreen_entry_index = None;
-                    self.saved_floating_state = None;
-                    // Calculate the new size for the current image
-                    if let Some((img_w_u, img_h_u)) = self.media_display_dimensions() {
-                        if img_w_u > 0 && img_h_u > 0 {
-                            let img_w = img_w_u as f32;
-                            let img_h = img_h_u as f32;
-                            let monitor = self.monitor_size_points(ctx);
+                    // Exiting fullscreen - use delayed resize to prevent flash
+                    self.fullscreen_transition = 0.0;
+                    self.fullscreen_transition_target = 0.0;
+                    self.clear_strip_return_context();
 
-                            // Floating sizing when leaving fullscreen after navigation:
-                            // - Videos: fit vertically only if taller than the screen, else 100%.
-                            // - Images: keep existing behavior for this branch (fit vertically if taller).
-                            let is_video =
-                                matches!(self.current_media_type, Some(MediaType::Video));
-                            let z = if is_video {
-                                if img_h > monitor.y {
+                    // Exit manga mode when leaving fullscreen
+                    if self.manga_mode {
+                        self.manga_wheel_scroll_pending = 0.0;
+                        self.stop_manga_autoscroll();
+
+                        // Keep floating mode in sync with the strip item currently centered
+                        // in the viewport (the same item reflected by the status/title bars).
+                        self.manga_update_current_index();
+                        let visible_idx = self
+                            .current_index
+                            .min(self.image_list.len().saturating_sub(1));
+                        let target_path = self.image_list.get(visible_idx).cloned();
+                        let target_media_type =
+                            target_path.as_ref().and_then(|path| get_media_type(path));
+
+                        self.prepare_mode_switch_placeholder_from_manga_index(
+                            visible_idx,
+                            target_media_type,
+                        );
+
+                        self.manga_mode = false;
+                        self.manga_clear_cache();
+
+                        if let Some(path) = target_path {
+                            self.load_image(&path);
+                        }
+                    }
+
+                    // Clear the per-image fullscreen view state cache when exiting fullscreen
+                    // (since it's only meant for fullscreen mode comparisons within a session)
+                    self.fullscreen_view_states.clear();
+
+                    let image_changed_while_fullscreen = self
+                        .saved_fullscreen_entry_index
+                        .is_some_and(|idx| idx != self.current_index);
+
+                    // Restore previous floating state if available
+                    if !image_changed_while_fullscreen {
+                        self.saved_fullscreen_entry_index = None;
+                    }
+
+                    if !image_changed_while_fullscreen {
+                        if let Some((
+                            saved_zoom,
+                            saved_zoom_target,
+                            saved_offset,
+                            saved_size,
+                            saved_pos,
+                        )) = self.saved_floating_state.take()
+                        {
+                            self.zoom = saved_zoom;
+                            self.zoom_target = saved_zoom_target;
+                            self.offset = saved_offset;
+                            self.floating_max_inner_size = Some(saved_size);
+                            self.last_requested_inner_size = Some(saved_size);
+                            // Delay window resize by 2 frames to prevent flash
+                            self.pending_window_resize = Some((saved_size, saved_pos, 2));
+                        } else {
+                            // Fallback: reset to centered at 100% and resize to 100% image size (capped by fit-to-screen)
+                            self.offset = egui::Vec2::ZERO;
+                            self.zoom = 1.0;
+                            self.zoom_target = 1.0;
+
+                            if let Some(img) = self.image.as_ref() {
+                                let (w, h) = img.display_dimensions();
+                                let mut desired = egui::Vec2::new(w as f32, h as f32);
+                                let available = self.floating_available_size(ctx);
+                                let cap = self.initial_window_size_for_available(available);
+                                self.floating_max_inner_size = Some(cap);
+                                if desired.x > cap.x || desired.y > cap.y {
+                                    desired = cap;
+                                }
+                                desired.x = desired.x.max(200.0);
+                                desired.y = desired.y.max(150.0);
+                                self.last_requested_inner_size = Some(desired);
+                                // Calculate center position
+                                let monitor = self.monitor_size_points(ctx);
+                                let x = (monitor.x - desired.x) * 0.5;
+                                let y = (monitor.y - desired.y) * 0.5;
+                                let pos = egui::pos2(x.max(0.0), y.max(0.0));
+                                // Delay window resize by 2 frames to prevent flash
+                                self.pending_window_resize = Some((desired, pos, 2));
+                            }
+                        }
+                    } else {
+                        // If the user navigated to a different image while fullscreen,
+                        // don't restore the previous floating zoom/position; apply normal floating sizing.
+                        self.saved_fullscreen_entry_index = None;
+                        self.saved_floating_state = None;
+                        // Calculate the new size for the current image
+                        if let Some((img_w_u, img_h_u)) = self.media_display_dimensions() {
+                            if img_w_u > 0 && img_h_u > 0 {
+                                let img_w = img_w_u as f32;
+                                let img_h = img_h_u as f32;
+                                let monitor = self.monitor_size_points(ctx);
+
+                                // Floating sizing when leaving fullscreen after navigation:
+                                // - Videos: fit vertically only if taller than the screen, else 100%.
+                                // - Images: keep existing behavior for this branch (fit vertically if taller).
+                                let is_video =
+                                    matches!(self.current_media_type, Some(MediaType::Video));
+                                let z = if is_video {
+                                    if img_h > monitor.y {
+                                        (monitor.y / img_h).clamp(0.1, self.max_zoom_factor())
+                                    } else {
+                                        1.0
+                                    }
+                                } else if img_h > monitor.y {
                                     (monitor.y / img_h).clamp(0.1, self.max_zoom_factor())
                                 } else {
                                     1.0
-                                }
-                            } else if img_h > monitor.y {
-                                (monitor.y / img_h).clamp(0.1, self.max_zoom_factor())
-                            } else {
-                                1.0
-                            };
+                                };
 
-                            self.zoom = z;
-                            self.zoom_target = z;
-                            self.offset = egui::Vec2::ZERO;
-                            self.zoom_velocity = 0.0;
+                                self.zoom = z;
+                                self.zoom_target = z;
+                                self.offset = egui::Vec2::ZERO;
+                                self.zoom_velocity = 0.0;
 
-                            let mut size = egui::Vec2::new(img_w * z, img_h * z);
-                            size.x = size.x.max(200.0);
-                            size.y = size.y.max(150.0);
+                                let mut size = egui::Vec2::new(img_w * z, img_h * z);
+                                size.x = size.x.max(200.0);
+                                size.y = size.y.max(150.0);
 
-                            self.floating_max_inner_size = Some(size);
-                            self.last_requested_inner_size = Some(size);
+                                self.floating_max_inner_size = Some(size);
+                                self.last_requested_inner_size = Some(size);
 
-                            let x = (monitor.x - size.x) * 0.5;
-                            let y = (monitor.y - size.y) * 0.5;
-                            let pos = egui::pos2(x.max(0.0), y.max(0.0));
-                            // Delay window resize by 2 frames to prevent flash
-                            self.pending_window_resize = Some((size, pos, 2));
+                                let x = (monitor.x - size.x) * 0.5;
+                                let y = (monitor.y - size.y) * 0.5;
+                                let pos = egui::pos2(x.max(0.0), y.max(0.0));
+                                // Delay window resize by 2 frames to prevent flash
+                                self.pending_window_resize = Some((size, pos, 2));
+                            }
+                        } else {
+                            // If we don't have dimensions yet (possible for videos right after switching),
+                            // schedule a retry once dimensions become available.
+                            self.pending_media_layout =
+                                matches!(self.current_media_type, Some(MediaType::Video));
                         }
-                    } else {
-                        // If we don't have dimensions yet (possible for videos right after switching),
-                        // schedule a retry once dimensions become available.
-                        self.pending_media_layout =
-                            matches!(self.current_media_type, Some(MediaType::Video));
                     }
-                }
                 }
             }
             self.toggle_fullscreen = false;
@@ -12636,6 +12710,7 @@ fn main() -> eframe::Result<()> {
 
     // Load config early to check single_instance setting
     let config = Config::load();
+    configure_metadata_cache_size_limit(config.metadata_cache_max_size_mb);
 
     // ============ SINGLE INSTANCE MODE ============
     // Try to become the primary instance or send the file to an existing instance

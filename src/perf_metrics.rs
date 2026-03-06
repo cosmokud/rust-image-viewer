@@ -2,8 +2,8 @@
 
 use std::time::Duration;
 
-use hdrhistogram::Histogram;
 use hashbrown::HashMap;
+use hdrhistogram::Histogram;
 
 const DEFAULT_WINDOW_CAP: usize = 240;
 const HISTOGRAM_MAX_US: u64 = 60 * 1_000_000;

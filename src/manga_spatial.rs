@@ -1,6 +1,6 @@
 //! Spatial indexing helpers for manga/masonry viewport virtualization.
 
-use rstar::{AABB, RTree, RTreeObject};
+use rstar::{RTree, RTreeObject, AABB};
 
 /// Wide X range used when querying strip-like layouts where visibility is Y-driven.
 pub const STRIP_QUERY_HALF_WIDTH: f32 = 1_000_000_000.0;
@@ -63,10 +63,7 @@ impl MangaSpatialIndex {
         let query_min_y = min_y.min(max_y);
         let query_max_y = min_y.max(max_y);
 
-        let envelope = AABB::from_corners(
-            [query_min_x, query_min_y],
-            [query_max_x, query_max_y],
-        );
+        let envelope = AABB::from_corners([query_min_x, query_min_y], [query_max_x, query_max_y]);
 
         let mut indices: Vec<usize> = self
             .tree
