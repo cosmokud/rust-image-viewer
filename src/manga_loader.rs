@@ -416,6 +416,7 @@ impl MangaLoader {
     ///
     /// This is non-blocking and respects channel backpressure.
     /// Returns the number of indices successfully enqueued in this call.
+    #[allow(dead_code)]
     pub fn request_all_missing_dimensions(&mut self, image_list: &[PathBuf]) -> usize {
         if image_list.is_empty() {
             return 0;
@@ -976,7 +977,9 @@ impl MangaLoader {
             }
         };
 
-        let discoverer = match gst_pbutils::Discoverer::new(gst::ClockTime::from_mseconds(900)) {
+        // Keep discovery bounded so slow video metadata probes do not monopolize
+        // worker capacity while masonry is trying to stay responsive.
+        let discoverer = match gst_pbutils::Discoverer::new(gst::ClockTime::from_mseconds(250)) {
             Ok(d) => d,
             Err(_) => {
                 let fallback = Self::fallback_video_dimensions(path);

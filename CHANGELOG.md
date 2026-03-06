@@ -11,6 +11,9 @@ All notable changes to this project will be documented in this file.
 - Leaving masonry mode or manga long-strip mode through the title-bar maximize or restore button now uses the same native maximize or restore-down animation as the solo viewer.
 - Restoring down from masonry or long-strip and maximizing back now restores the remembered fullscreen strip mode only after the window transition has landed, fixing the broken fit-to-screen state and the missing bottom-right hover HUD after the round-trip.
 - Returning from solo fullscreen to masonry now remembers the last solo item for one untouched strip re-entry, so immediately toggling back opens the last viewed file instead of the centered masonry tile.
+- Masonry mode no longer blocks first paint behind a full-screen metadata preload overlay; layout dimensions now warm progressively in the background while the visible canvas keeps rendering.
+- Masonry scrolling now defers off-screen relayout churn and dynamic video or animated texture refresh while navigation is active, reducing frame-time spikes from late metadata, upload work, and moving-media updates.
+- Slow video-dimension probes in the masonry loader now use a tighter discovery timeout so background metadata work is less likely to compete with visible scrolling and preload requests.
 
 ### Added
 

@@ -308,12 +308,27 @@ enum TitlebarToggleReturnMode {
     Manga(MangaLayoutMode),
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 struct MasonryItemLayout {
     x: f32,
     y: f32,
     width: f32,
     height: f32,
+    source_width: u32,
+    source_height: u32,
+}
+
+impl Default for MasonryItemLayout {
+    fn default() -> Self {
+        Self {
+            x: 0.0,
+            y: 0.0,
+            width: 0.0,
+            height: 0.0,
+            source_width: 0,
+            source_height: 0,
+        }
+    }
 }
 
 impl MasonryItemLayout {
@@ -323,6 +338,17 @@ impl MasonryItemLayout {
             egui::pos2(self.x * zoom + pan_x, self.y * zoom - scroll_y),
             egui::vec2(self.width * zoom, self.height * zoom),
         )
+    }
+
+    fn source_size(self) -> Option<egui::Vec2> {
+        if self.source_width > 0 && self.source_height > 0 {
+            Some(egui::vec2(
+                self.source_width as f32,
+                self.source_height as f32,
+            ))
+        } else {
+            None
+        }
     }
 }
 
@@ -1046,6 +1072,8 @@ struct ImageViewer {
     masonry_metadata_preload_total: usize,
     /// Number of items with dimensions already resolved.
     masonry_metadata_preload_loaded: usize,
+    /// Cursor used to warm remaining masonry dimensions progressively in the background.
+    masonry_metadata_preload_cursor: usize,
 
     /// Cooldown frames before updating preload queue (prevents cache churn during rapid navigation)
     manga_preload_cooldown: u32,
@@ -1322,6 +1350,7 @@ impl Default for ImageViewer {
             masonry_metadata_preload_active: false,
             masonry_metadata_preload_total: 0,
             masonry_metadata_preload_loaded: 0,
+            masonry_metadata_preload_cursor: 0,
 
             manga_preload_cooldown: 0,
             manga_last_preload_update: Instant::now(),
@@ -2882,11 +2911,15 @@ impl ImageViewer {
         self.masonry_metadata_preload_active = false;
         self.masonry_metadata_preload_total = 0;
         self.masonry_metadata_preload_loaded = 0;
+        self.masonry_metadata_preload_cursor = 0;
     }
 
     fn begin_masonry_metadata_preload(&mut self) {
         self.masonry_metadata_preload_total = self.image_list.len();
         self.masonry_metadata_preload_loaded = 0;
+        self.masonry_metadata_preload_cursor = self
+            .current_index
+            .min(self.masonry_metadata_preload_total.saturating_sub(1));
         self.masonry_metadata_preload_active = self.manga_mode
             && self.is_masonry_mode()
             && self.masonry_metadata_preload_total > 0
@@ -2909,131 +2942,111 @@ impl ImageViewer {
             return;
         }
 
-        let total = self
-            .masonry_metadata_preload_total
-            .min(self.image_list.len());
+        let total = self.masonry_metadata_preload_total.min(self.image_list.len());
         if total == 0 {
             self.reset_masonry_metadata_preload();
             return;
         }
 
-        let Some(loader) = self.manga_loader.as_mut() else {
-            self.reset_masonry_metadata_preload();
-            return;
-        };
+        let navigation_active = self.masonry_navigation_active_for_heavy_work();
+        let preload_cursor = self.masonry_metadata_preload_cursor.min(total.saturating_sub(1));
+        let preload_window = 96usize.max(self.masonry_items_per_row.clamp(2, 10) * 48);
+        let preload_end = (preload_cursor + preload_window).min(total);
 
-        let (dim_updates, loaded_count, pending_probe_count, pending_result_count) = {
-            loader.request_all_missing_dimensions(&self.image_list);
-            let dim_updates = loader.poll_dimension_results(512);
-            let loaded_count = loader.cached_dimensions_count(total).min(total);
-            let pending_probe_count = loader.pending_dimension_probe_count();
-            let pending_result_count = loader.pending_dimension_results_count();
+        let (loaded_count, pending_probe_count, pending_result_count) = {
+            let Some(loader) = self.manga_loader.as_mut() else {
+                self.reset_masonry_metadata_preload();
+                return;
+            };
+
+            if !navigation_active {
+                loader.request_dimensions_range(&self.image_list, preload_cursor, preload_end);
+            }
+
             (
-                dim_updates,
-                loaded_count,
-                pending_probe_count,
-                pending_result_count,
+                loader.cached_dimensions_count(total).min(total),
+                loader.pending_dimension_probe_count(),
+                loader.pending_dimension_results_count(),
             )
         };
 
-        if !dim_updates.is_empty() {
-            self.invalidate_manga_layout_cache();
-
-            // While masonry metadata is still being discovered, keep the selected file
-            // locked in view so late dimension updates don't drift to a different file.
-            if self.is_masonry_mode() {
-                self.scroll_strip_to_current_index();
-            }
+        if !navigation_active {
+            self.masonry_metadata_preload_cursor = if preload_end >= total { 0 } else { preload_end };
         }
 
         self.masonry_metadata_preload_loaded = loaded_count;
 
-        let scan_complete = self.masonry_metadata_preload_loaded >= total
+        let scan_complete = loaded_count >= total
             && pending_probe_count == 0
             && pending_result_count == 0;
 
         if scan_complete {
             self.masonry_metadata_preload_loaded = total;
             self.masonry_metadata_preload_active = false;
-            self.invalidate_manga_layout_cache();
-
-            // Final snap after full metadata resolves to guarantee exact targeting.
-            if self.is_masonry_mode() {
-                self.scroll_strip_to_current_index();
-            }
-
             self.manga_update_preload_queue();
         }
     }
 
     fn draw_masonry_metadata_loading_overlay(&self, ctx: &egui::Context) {
+        if !self.masonry_metadata_preload_active {
+            return;
+        }
+
         let total = self.masonry_metadata_preload_total.max(1);
         let loaded = self.masonry_metadata_preload_loaded.min(total);
         let progress_ratio = (loaded as f32 / total as f32).clamp(0.0, 1.0);
-        let progress_text = format!("{} / {} files loaded", loaded, total);
+        let progress_text = format!("Warming layout  {} / {}", loaded, total);
+        let y_offset = if self.show_controls { 40.0 } else { 10.0 };
 
-        egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(self.background_color32()))
+        egui::Area::new(egui::Id::new("masonry_metadata_loading_overlay"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-16.0, y_offset))
             .show(ctx, |ui| {
-                let rect = ui.max_rect();
-                ui.painter().rect_filled(
-                    rect,
-                    0.0,
-                    egui::Color32::from_rgba_unmultiplied(0, 0, 0, 120),
-                );
-
-                let panel_rect =
-                    egui::Rect::from_center_size(rect.center(), egui::vec2(440.0, 220.0));
+                let panel_size = egui::vec2(220.0, 54.0);
+                let (panel_rect, _) = ui.allocate_exact_size(panel_size, egui::Sense::hover());
                 ui.painter().rect_filled(
                     panel_rect,
-                    14.0,
-                    egui::Color32::from_rgba_unmultiplied(16, 16, 16, 230),
+                    10.0,
+                    egui::Color32::from_rgba_unmultiplied(16, 16, 16, 220),
                 );
-
-                let spinner_center = egui::pos2(panel_rect.center().x, panel_rect.top() + 66.0);
-                let spinner_rect = egui::Rect::from_min_max(
-                    egui::pos2(spinner_center.x - 26.0, spinner_center.y - 26.0),
-                    egui::pos2(spinner_center.x + 26.0, spinner_center.y + 26.0),
-                );
-                let time = ui.input(|i| i.time);
-                paint_loading_spinner(ui.painter(), spinner_rect, time);
-
                 ui.painter().text(
-                    egui::pos2(panel_rect.center().x, panel_rect.top() + 122.0),
-                    egui::Align2::CENTER_CENTER,
+                    egui::pos2(panel_rect.min.x + 12.0, panel_rect.min.y + 14.0),
+                    egui::Align2::LEFT_CENTER,
                     "Preparing masonry layout",
-                    egui::FontId::proportional(23.0),
+                    egui::FontId::proportional(13.0),
                     egui::Color32::WHITE,
                 );
-
                 ui.painter().text(
-                    egui::pos2(panel_rect.center().x, panel_rect.top() + 156.0),
-                    egui::Align2::CENTER_CENTER,
+                    egui::pos2(panel_rect.min.x + 12.0, panel_rect.min.y + 32.0),
+                    egui::Align2::LEFT_CENTER,
                     progress_text,
-                    egui::FontId::proportional(18.0),
-                    egui::Color32::from_gray(220),
+                    egui::FontId::proportional(12.0),
+                    egui::Color32::from_gray(205),
                 );
 
-                let bar_rect = egui::Rect::from_center_size(
-                    egui::pos2(panel_rect.center().x, panel_rect.bottom() - 34.0),
-                    egui::vec2(panel_rect.width() - 64.0, 10.0),
+                let bar_rect = egui::Rect::from_min_size(
+                    egui::pos2(panel_rect.min.x + 12.0, panel_rect.max.y - 14.0),
+                    egui::vec2(panel_rect.width() - 24.0, 6.0),
                 );
                 ui.painter().rect_filled(
                     bar_rect,
-                    5.0,
-                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 45),
+                    3.0,
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 40),
                 );
-
-                let fill_width = bar_rect.width() * progress_ratio;
-                let fill_rect = egui::Rect::from_min_max(
-                    bar_rect.min,
-                    egui::pos2(bar_rect.min.x + fill_width, bar_rect.max.y),
-                );
-                ui.painter().rect_filled(
-                    fill_rect,
-                    5.0,
-                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 195),
-                );
+                if progress_ratio > 0.0 {
+                    let fill_rect = egui::Rect::from_min_max(
+                        bar_rect.min,
+                        egui::pos2(
+                            bar_rect.min.x + bar_rect.width() * progress_ratio,
+                            bar_rect.max.y,
+                        ),
+                    );
+                    ui.painter().rect_filled(
+                        fill_rect,
+                        3.0,
+                        egui::Color32::from_rgb(120, 196, 108),
+                    );
+                }
             });
     }
 
@@ -5000,35 +5013,29 @@ impl ImageViewer {
             self.reset_masonry_metadata_preload();
         }
 
-        if !self.masonry_metadata_preload_active {
-            self.manga_update_preload_queue();
-        }
+        self.manga_update_preload_queue();
     }
 
-    fn masonry_slot_aspect_ratio(&self, index: usize) -> f32 {
+    fn masonry_slot_source_dimensions(&self, index: usize) -> Option<(u32, u32)> {
         self.manga_loader
             .as_ref()
             .and_then(|loader| loader.get_dimensions(index))
-            .and_then(|(w, h)| {
-                if w > 0 && h > 0 {
-                    Some((h as f32 / w as f32).clamp(0.2, 5.0))
-                } else {
-                    None
-                }
-            })
+            .and_then(|(w, h)| if w > 0 && h > 0 { Some((w, h)) } else { None })
+    }
+
+    fn masonry_slot_aspect_ratio(&self, index: usize) -> f32 {
+        self.masonry_slot_source_dimensions(index)
+            .map(|(w, h)| (h as f32 / w as f32).clamp(0.2, 5.0))
             .unwrap_or(1.4)
     }
 
     fn masonry_item_source_size(&self, index: usize) -> Option<egui::Vec2> {
-        self.manga_loader
-            .as_ref()
-            .and_then(|loader| loader.get_dimensions(index))
-            .and_then(|(w, h)| {
-                if w > 0 && h > 0 {
-                    Some(egui::vec2(w as f32, h as f32))
-                } else {
-                    None
-                }
+        self.masonry_layout_items
+            .get(index)
+            .and_then(|item| item.source_size())
+            .or_else(|| {
+                self.masonry_slot_source_dimensions(index)
+                    .map(|(w, h)| egui::vec2(w as f32, h as f32))
             })
     }
 
@@ -5110,13 +5117,18 @@ impl ImageViewer {
 
             let x = start_x + target_col as f32 * (column_width + GUTTER);
             let y = column_heights[target_col];
-            let height = (column_width * self.masonry_slot_aspect_ratio(idx)).max(20.0);
+            let (source_width, source_height) =
+                self.masonry_slot_source_dimensions(idx).unwrap_or((0, 0));
+            let aspect_ratio = self.masonry_slot_aspect_ratio(idx);
+            let height = (column_width * aspect_ratio).max(20.0);
 
             self.masonry_layout_items[idx] = MasonryItemLayout {
                 x,
                 y,
                 width: column_width,
                 height,
+                source_width,
+                source_height,
             };
 
             column_heights[target_col] = y + height + GUTTER;
@@ -5146,6 +5158,33 @@ impl ImageViewer {
             .copied()
             .map(|item| item.to_screen_rect(self.zoom, self.offset.x, self.manga_scroll_offset))
             .map(|slot_rect| self.masonry_item_display_rect(index, slot_rect))
+    }
+
+    fn masonry_should_apply_dimension_updates_now(&mut self, updated_indices: &[usize]) -> bool {
+        if updated_indices.is_empty() || !self.is_masonry_mode() || !self.manga_mode {
+            return !updated_indices.is_empty();
+        }
+
+        if !self.masonry_layout_valid || self.masonry_layout_items.is_empty() {
+            return true;
+        }
+
+        let visible_indices = self.manga_collect_visible_indices();
+        if visible_indices.is_empty() {
+            return true;
+        }
+
+        let first_visible = *visible_indices.first().unwrap_or(&0);
+        let last_visible = *visible_indices.last().unwrap_or(&first_visible);
+        let buffer = self.masonry_items_per_row.clamp(2, 10).saturating_mul(4);
+        let start = first_visible.saturating_sub(buffer);
+        let end = last_visible
+            .saturating_add(buffer)
+            .min(self.image_list.len().saturating_sub(1));
+
+        updated_indices
+            .iter()
+            .any(|idx| *idx >= start && *idx <= end)
     }
 
     fn manga_index_at_screen_pos(&mut self, pos: egui::Pos2) -> Option<usize> {
@@ -5337,10 +5376,7 @@ impl ImageViewer {
                 self.reset_masonry_metadata_preload();
             }
 
-            // Start preloading from current image once metadata is ready.
-            if !self.masonry_metadata_preload_active {
-                self.manga_update_preload_queue();
-            }
+            self.manga_update_preload_queue();
             return;
         }
 
@@ -5951,6 +5987,9 @@ impl ImageViewer {
             return;
         }
 
+        let defer_texture_refresh =
+            self.is_masonry_mode() && self.masonry_navigation_active_for_heavy_work();
+
         // Only update the focused video's texture (to save resources)
         if let Some(focused_idx) = self.manga_focused_video_index {
             if let Some(player) = self.manga_video_players.get_mut(&focused_idx) {
@@ -5962,6 +6001,10 @@ impl ImageViewer {
                     if self.config.video_loop {
                         let _ = player.restart();
                     }
+                }
+
+                if defer_texture_refresh {
+                    return;
                 }
 
                 // Get new frame if available
@@ -6009,6 +6052,12 @@ impl ImageViewer {
     /// thumbnail from the normal manga loader pipeline.
     fn manga_update_animated_textures(&mut self, ctx: &egui::Context) -> bool {
         if !self.manga_mode {
+            return false;
+        }
+
+        if self.is_masonry_mode() && self.masonry_navigation_active_for_heavy_work() {
+            self.manga_anim_streams.clear();
+            self.manga_focused_anim_index = None;
             return false;
         }
 
@@ -6344,10 +6393,6 @@ impl ImageViewer {
     /// Update the preload queue based on current scroll position
     fn manga_update_preload_queue(&mut self) {
         if !self.manga_mode || self.image_list.is_empty() {
-            return;
-        }
-
-        if self.masonry_metadata_preload_active {
             return;
         }
 
@@ -6789,13 +6834,27 @@ impl ImageViewer {
             (decoded_images, dim_updates)
         };
 
-        let has_decoded_video_dims = decoded_images
+        let video_dim_indices: Vec<usize> = decoded_images
             .iter()
-            .any(|decoded| decoded.media_type == MangaMediaType::Video);
+            .filter(|decoded| decoded.media_type == MangaMediaType::Video)
+            .map(|decoded| decoded.index)
+            .collect();
+        let has_decoded_video_dims = !video_dim_indices.is_empty();
 
         // Dimension updates can change page heights; invalidate cached layout/prefix sums.
         if !dim_updates.is_empty() || has_decoded_video_dims {
-            if defer_masonry_layout_work {
+            if self.is_masonry_mode() {
+                let mut layout_update_indices = dim_updates.clone();
+                layout_update_indices.extend(video_dim_indices.iter().copied());
+
+                if !defer_masonry_layout_work
+                    && self.masonry_should_apply_dimension_updates_now(&layout_update_indices)
+                {
+                    self.invalidate_manga_layout_cache();
+                } else {
+                    self.masonry_layout_invalidation_deferred = true;
+                }
+            } else if defer_masonry_layout_work {
                 self.masonry_layout_invalidation_deferred = true;
             } else {
                 self.invalidate_manga_layout_cache();
@@ -8649,16 +8708,13 @@ impl ImageViewer {
 
         if self.masonry_layout_invalidation_deferred
             && !self.masonry_navigation_active_for_heavy_work()
+            && !self.masonry_metadata_preload_active
         {
             self.invalidate_manga_layout_cache();
         }
 
         if self.is_masonry_mode() && self.masonry_metadata_preload_active {
             self.tick_masonry_metadata_preload();
-            if self.masonry_metadata_preload_active {
-                self.draw_masonry_metadata_loading_overlay(ctx);
-                return true;
-            }
         }
 
         let screen_rect = ctx.screen_rect();
@@ -9558,6 +9614,10 @@ impl ImageViewer {
                     }
                 }
             });
+
+        if self.is_masonry_mode() && self.masonry_metadata_preload_active {
+            self.draw_masonry_metadata_loading_overlay(ctx);
+        }
 
         if requested_visible_retry {
             animation_active = true;
