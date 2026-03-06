@@ -26,7 +26,7 @@ use config::{
 };
 use hashbrown::{HashMap, HashSet};
 use image_loader::{get_media_type, is_supported_video, ImageFrame, LoadedImage, MediaType};
-use manga_loader::{MangaLoader, MangaMediaType, MangaTextureCache};
+use manga_loader::{DecodedImage, MangaLoader, MangaMediaType, MangaTextureCache};
 use manga_spatial::{MangaSpatialIndex, SpatialRect, STRIP_QUERY_HALF_WIDTH};
 use media_index::{DirectoryScanResult, MediaDirectoryIndex};
 use metadata_cache::{
@@ -1029,6 +1029,8 @@ struct ImageViewer {
     manga_loader: Option<MangaLoader>,
     /// LRU texture cache for manga mode
     manga_texture_cache: MangaTextureCache,
+    /// Decoded-image mailbox drained on the UI thread so visible uploads can win over speculative ones.
+    manga_decoded_mailbox: Vec<DecodedImage>,
     /// Whether the scrollbar is being dragged
     manga_scrollbar_dragging: bool,
     /// Browser-style autoscroll mode state for manga strip layouts.
@@ -1065,6 +1067,8 @@ struct ImageViewer {
     /// Dimension/layout updates received while masonry navigation is active.
     /// These are applied once motion settles to avoid repeated expensive relayouts.
     masonry_layout_invalidation_deferred: bool,
+    /// Pending masonry dimension updates waiting to be committed into layout.
+    masonry_pending_dimension_updates: HashSet<usize>,
 
     /// Whether startup metadata pre-scan is active for masonry mode.
     masonry_metadata_preload_active: bool,
@@ -1326,6 +1330,7 @@ impl Default for ImageViewer {
             manga_wheel_scroll_active: false,
             manga_loader: None,
             manga_texture_cache: MangaTextureCache::default(),
+            manga_decoded_mailbox: Vec::new(),
             manga_scrollbar_dragging: false,
             manga_autoscroll_active: false,
             manga_autoscroll_anchor: None,
@@ -1346,6 +1351,7 @@ impl Default for ImageViewer {
             masonry_layout_len: 0,
             masonry_layout_valid: false,
             masonry_layout_invalidation_deferred: false,
+            masonry_pending_dimension_updates: HashSet::new(),
 
             masonry_metadata_preload_active: false,
             masonry_metadata_preload_total: 0,
@@ -1419,6 +1425,7 @@ impl ImageViewer {
     const MANGA_UPLOAD_BATCH_BASE: usize = 4;
     const MANGA_UPLOAD_BATCH_MIN: usize = 2;
     const MANGA_UPLOAD_BATCH_MAX: usize = 12;
+    const MANGA_DECODED_MAILBOX_MAX_ITEMS: usize = 16;
     const MANGA_UPLOAD_P95_SOFT_BUDGET_MS: f32 = 4.5;
     const MANGA_UPLOAD_P95_HARD_BUDGET_MS: f32 = 7.5;
     const MANGA_VIRTUALIZATION_AUTO_RTREE_MIN_ITEMS: usize = 2048;
@@ -1790,15 +1797,95 @@ impl ImageViewer {
         // During active masonry navigation, prioritize frame-time consistency over fill rate.
         // Keeping upload batches tiny avoids UI-thread upload bursts that cause micro-stutter.
         if self.masonry_navigation_active_for_heavy_work() {
-            let hard_cap = if self.manga_scrollbar_dragging || self.is_panning {
-                2
-            } else {
-                3
-            };
-            return limit.clamp(Self::MANGA_UPLOAD_BATCH_MIN, hard_cap);
+            return Self::MANGA_UPLOAD_BATCH_MIN;
         }
 
         limit.clamp(Self::MANGA_UPLOAD_BATCH_MIN, Self::MANGA_UPLOAD_BATCH_MAX)
+    }
+
+    fn manga_decoded_mailbox_band(
+        index: usize,
+        visible_set: &HashSet<usize>,
+        anchor_index: usize,
+        near_radius: usize,
+    ) -> u8 {
+        if visible_set.contains(&index) {
+            0
+        } else if index.abs_diff(anchor_index) <= near_radius {
+            1
+        } else {
+            2
+        }
+    }
+
+    fn manga_sort_decoded_mailbox_for_upload(
+        &mut self,
+        visible_set: &HashSet<usize>,
+        anchor_index: usize,
+        navigation_active: bool,
+    ) -> usize {
+        let near_radius = if self.is_masonry_mode() {
+            self.masonry_items_per_row.clamp(2, 10).saturating_mul(3)
+        } else {
+            visible_set.len().max(2)
+        };
+
+        self.manga_decoded_mailbox.sort_by_key(|decoded| {
+            let band = Self::manga_decoded_mailbox_band(
+                decoded.index,
+                visible_set,
+                anchor_index,
+                near_radius,
+            );
+            let distance = decoded.index.abs_diff(anchor_index);
+            let media_penalty = if navigation_active && decoded.media_type == MangaMediaType::Video {
+                1u8
+            } else {
+                0u8
+            };
+            let lod_penalty = if navigation_active {
+                decoded.requested_side
+            } else {
+                0
+            };
+
+            (band, distance, media_penalty, lod_penalty)
+        });
+
+        near_radius
+    }
+
+    fn manga_prune_decoded_mailbox(
+        &mut self,
+        visible_set: &HashSet<usize>,
+        anchor_index: usize,
+        navigation_active: bool,
+    ) -> usize {
+        let near_radius =
+            self.manga_sort_decoded_mailbox_for_upload(visible_set, anchor_index, navigation_active);
+
+        if self.manga_decoded_mailbox.len() <= Self::MANGA_DECODED_MAILBOX_MAX_ITEMS {
+            return near_radius;
+        }
+
+        let dropped: Vec<DecodedImage> = self
+            .manga_decoded_mailbox
+            .drain(Self::MANGA_DECODED_MAILBOX_MAX_ITEMS..)
+            .collect();
+        let dropped_count = dropped.len() as u64;
+
+        if let Some(loader) = self.manga_loader.as_mut() {
+            for decoded in dropped {
+                loader.mark_unloaded(decoded.index);
+            }
+        }
+
+        if dropped_count > 0 {
+            self.perf_metrics
+                .increment_counter("manga_decoded_mailbox_drop", dropped_count);
+        }
+
+        near_radius
     }
 
     fn masonry_navigation_active_for_heavy_work(&self) -> bool {
@@ -1938,10 +2025,63 @@ impl ImageViewer {
             {
                 text.push_str(&format!(" | UTX p95:{p95:.2}ms"));
             }
+            if let Some(p95) = self
+                .perf_metrics
+                .percentile_ms("masonry_layout_rebuild_ms", 0.95)
+            {
+                text.push_str(&format!(" | LY p95:{p95:.2}ms"));
+            }
+            if let Some(p95) = self
+                .perf_metrics
+                .percentile_ms("masonry_spatial_rebuild_ms", 0.95)
+            {
+                text.push_str(&format!(" | SI p95:{p95:.2}ms"));
+            }
+            if let Some(p95) = self
+                .perf_metrics
+                .percentile_ms("manga_visible_query_ms", 0.95)
+            {
+                text.push_str(&format!(" | VQ p95:{p95:.2}ms"));
+            }
 
             let uploaded_total = self.perf_metrics.counter("manga_uploaded_textures");
             if uploaded_total > 0 {
                 text.push_str(&format!(" | UTot {}", uploaded_total));
+            }
+
+            let visible_query_rtree = self.perf_metrics.counter("manga_visible_query_rtree");
+            let visible_query_linear = self.perf_metrics.counter("manga_visible_query_linear");
+            if visible_query_rtree > 0 || visible_query_linear > 0 {
+                text.push_str(&format!(
+                    " | VQ R/L {}/{}",
+                    visible_query_rtree, visible_query_linear
+                ));
+            }
+
+            if self.is_masonry_mode() {
+                text.push_str(&format!(
+                    " | DQ {}",
+                    self.masonry_pending_dimension_updates.len()
+                ));
+
+                text.push_str(&format!(" | DM {}", self.manga_decoded_mailbox.len()));
+
+                let dim_commit_visible = self.perf_metrics.counter("masonry_dim_commit_visible");
+                let dim_commit_idle = self.perf_metrics.counter("masonry_dim_commit_idle");
+                let dim_commit_deferred =
+                    self.perf_metrics.counter("masonry_dim_commit_deferred");
+                if dim_commit_visible > 0 || dim_commit_idle > 0 || dim_commit_deferred > 0 {
+                    text.push_str(&format!(
+                        " | DQ V/I/D {}/{}/{}",
+                        dim_commit_visible, dim_commit_idle, dim_commit_deferred
+                    ));
+                }
+
+                let decoded_mailbox_drop =
+                    self.perf_metrics.counter("manga_decoded_mailbox_drop");
+                if decoded_mailbox_drop > 0 {
+                    text.push_str(&format!(" | DMdrop {}", decoded_mailbox_drop));
+                }
             }
 
             let retry_enqueued = self.perf_metrics.counter("manga_retry_enqueued");
@@ -2917,9 +3057,11 @@ impl ImageViewer {
     fn begin_masonry_metadata_preload(&mut self) {
         self.masonry_metadata_preload_total = self.image_list.len();
         self.masonry_metadata_preload_loaded = 0;
+        let preload_window = 96usize.max(self.masonry_items_per_row.clamp(2, 10) * 48);
         self.masonry_metadata_preload_cursor = self
             .current_index
-            .min(self.masonry_metadata_preload_total.saturating_sub(1));
+            .min(self.masonry_metadata_preload_total.saturating_sub(1))
+            .saturating_sub(preload_window / 2);
         self.masonry_metadata_preload_active = self.manga_mode
             && self.is_masonry_mode()
             && self.masonry_metadata_preload_total > 0
@@ -2960,7 +3102,11 @@ impl ImageViewer {
             };
 
             if !navigation_active {
-                loader.request_dimensions_range(&self.image_list, preload_cursor, preload_end);
+                loader.request_dimensions_range_background(
+                    &self.image_list,
+                    preload_cursor,
+                    preload_end,
+                );
             }
 
             (
@@ -3052,6 +3198,7 @@ impl ImageViewer {
 
     fn clear_manga_runtime_workloads(&mut self) {
         self.clear_pending_manga_video_load();
+        self.manga_decoded_mailbox.clear();
         self.manga_video_players.clear();
         self.manga_focused_video_index = None;
         self.manga_hovered_media_index = None;
@@ -3260,6 +3407,7 @@ impl ImageViewer {
 
     fn poll_pending_manga_video_load(&mut self, ctx: &egui::Context) {
         let mut applied_any = false;
+        let mut pending_dimension_updates = Vec::new();
 
         loop {
             let result = match self.manga_video_load_coordinator.try_recv() {
@@ -3337,7 +3485,11 @@ impl ImageViewer {
                     let dims = player.dimensions();
                     if dims.0 > 0 && dims.1 > 0 {
                         if let Some(ref mut loader) = self.manga_loader {
+                            let previous_dims = loader.get_dimensions(index);
                             loader.update_video_dimensions(index, dims.0, dims.1);
+                            if previous_dims != Some((dims.0, dims.1)) {
+                                pending_dimension_updates.push(index);
+                            }
                         }
                     }
 
@@ -3365,6 +3517,14 @@ impl ImageViewer {
                         self.manga_focused_video_index = None;
                     }
                 }
+            }
+        }
+
+        if self.is_masonry_mode() && !pending_dimension_updates.is_empty() {
+            self.masonry_queue_dimension_updates(pending_dimension_updates);
+            if !self.masonry_navigation_active_for_heavy_work() {
+                let force_flush = !self.masonry_metadata_preload_active;
+                self.masonry_flush_pending_dimension_updates(force_flush);
             }
         }
 
@@ -4684,6 +4844,7 @@ impl ImageViewer {
             .unwrap_or(true);
 
         if needs_rebuild {
+            let rebuild_started = Instant::now();
             let mut rects = Vec::with_capacity(self.masonry_layout_items.len());
             for (idx, item) in self.masonry_layout_items.iter().enumerate() {
                 rects.push(SpatialRect::new(
@@ -4695,6 +4856,10 @@ impl ImageViewer {
                 ));
             }
             self.masonry_spatial_index = Some(MangaSpatialIndex::from_rects(rects));
+            self.perf_metrics.record_duration(
+                "masonry_spatial_rebuild_ms",
+                rebuild_started.elapsed(),
+            );
         }
 
         self.masonry_spatial_index.as_ref()
@@ -4812,6 +4977,8 @@ impl ImageViewer {
             return Vec::new();
         }
 
+        let query_started = Instant::now();
+
         let viewport_top = self.manga_scroll_offset.max(0.0);
         let viewport_bottom = viewport_top + self.screen_size.y.max(1.0);
 
@@ -4819,11 +4986,20 @@ impl ImageViewer {
             if let Some(indices) =
                 self.manga_query_visible_indices_rtree(viewport_top, viewport_bottom)
             {
+                self.perf_metrics
+                    .record_duration("manga_visible_query_ms", query_started.elapsed());
+                self.perf_metrics
+                    .increment_counter("manga_visible_query_rtree", 1);
                 return indices;
             }
         }
 
-        self.manga_collect_visible_indices_linear()
+        let indices = self.manga_collect_visible_indices_linear();
+        self.perf_metrics
+            .record_duration("manga_visible_query_ms", query_started.elapsed());
+        self.perf_metrics
+            .increment_counter("manga_visible_query_linear", 1);
+        indices
     }
 
     fn manga_compute_cache_capacity_target(
@@ -4926,6 +5102,7 @@ impl ImageViewer {
         self.masonry_spatial_index = None;
         self.masonry_layout_valid = false;
         self.masonry_layout_invalidation_deferred = false;
+        self.masonry_pending_dimension_updates.clear();
     }
 
     fn invalidate_manga_layout_cache_for_zoom(&mut self) {
@@ -5088,6 +5265,8 @@ impl ImageViewer {
             return;
         }
 
+        let rebuild_started = Instant::now();
+
         const SIDE_PADDING: f32 = 16.0;
         const TOP_PADDING: f32 = 10.0;
         const BOTTOM_PADDING: f32 = 10.0;
@@ -5150,6 +5329,8 @@ impl ImageViewer {
         self.masonry_layout_len = len;
         self.masonry_layout_valid = true;
         self.masonry_spatial_index = None;
+        self.perf_metrics
+            .record_duration("masonry_layout_rebuild_ms", rebuild_started.elapsed());
     }
 
     fn masonry_item_screen_rect(&self, index: usize) -> Option<egui::Rect> {
@@ -5182,9 +5363,56 @@ impl ImageViewer {
             .saturating_add(buffer)
             .min(self.image_list.len().saturating_sub(1));
 
-        updated_indices
+        updated_indices.iter().any(|idx| *idx >= start && *idx <= end)
+    }
+
+    fn masonry_queue_dimension_updates<I>(&mut self, updated_indices: I)
+    where
+        I: IntoIterator<Item = usize>,
+    {
+        for idx in updated_indices {
+            self.masonry_pending_dimension_updates.insert(idx);
+        }
+
+        if !self.masonry_pending_dimension_updates.is_empty() {
+            self.masonry_layout_invalidation_deferred = true;
+        }
+    }
+
+    fn masonry_flush_pending_dimension_updates(&mut self, force: bool) -> bool {
+        if self.masonry_pending_dimension_updates.is_empty() {
+            self.masonry_layout_invalidation_deferred = false;
+            return false;
+        }
+
+        let pending_indices: Vec<usize> = self
+            .masonry_pending_dimension_updates
             .iter()
-            .any(|idx| *idx >= start && *idx <= end)
+            .copied()
+            .collect();
+        let should_apply = force || self.masonry_should_apply_dimension_updates_now(&pending_indices);
+        if !should_apply {
+            self.perf_metrics
+                .increment_counter("masonry_dim_commit_deferred", 1);
+            self.masonry_layout_invalidation_deferred = true;
+            return false;
+        }
+
+        let pending_count = self.masonry_pending_dimension_updates.len() as u64;
+        self.masonry_pending_dimension_updates.clear();
+        self.masonry_layout_invalidation_deferred = false;
+        self.invalidate_manga_layout_cache();
+        self.perf_metrics.increment_counter(
+            if force {
+                "masonry_dim_commit_idle"
+            } else {
+                "masonry_dim_commit_visible"
+            },
+            1,
+        );
+        self.perf_metrics
+            .increment_counter("masonry_dim_commit_items", pending_count);
+        true
     }
 
     fn manga_index_at_screen_pos(&mut self, pos: egui::Pos2) -> Option<usize> {
@@ -5640,6 +5868,7 @@ impl ImageViewer {
         self.manga_visible_indices_peak = 0;
         self.manga_pending_loads_peak = 0;
         self.manga_pending_decoded_peak = 0;
+        self.manga_decoded_mailbox.clear();
 
         // Clear and reset the parallel loader
         if let Some(ref mut loader) = self.manga_loader {
@@ -5992,6 +6221,7 @@ impl ImageViewer {
 
         // Only update the focused video's texture (to save resources)
         if let Some(focused_idx) = self.manga_focused_video_index {
+            let mut video_dimensions_changed = false;
             if let Some(player) = self.manga_video_players.get_mut(&focused_idx) {
                 // Update duration cache
                 player.update_duration();
@@ -6012,7 +6242,10 @@ impl ImageViewer {
                     // Update dimensions in loader if changed
                     if frame.width > 0 && frame.height > 0 {
                         if let Some(ref mut loader) = self.manga_loader {
+                            let previous_dims = loader.get_dimensions(focused_idx);
                             loader.update_video_dimensions(focused_idx, frame.width, frame.height);
+                            video_dimensions_changed =
+                                previous_dims != Some((frame.width, frame.height));
                         }
                     }
 
@@ -6040,6 +6273,14 @@ impl ImageViewer {
 
                     self.manga_video_textures
                         .insert(focused_idx, (texture, w, h));
+                }
+            }
+
+            if self.is_masonry_mode() && video_dimensions_changed {
+                self.masonry_queue_dimension_updates(std::iter::once(focused_idx));
+                if !self.masonry_navigation_active_for_heavy_work() {
+                    let force_flush = !self.masonry_metadata_preload_active;
+                    self.masonry_flush_pending_dimension_updates(force_flush);
                 }
             }
         }
@@ -6812,29 +7053,45 @@ impl ImageViewer {
             .as_ref()
             .map(|loader| (loader.pending_load_count(), loader.pending_decoded_count()))
             .unwrap_or((0, 0));
+        let decoded_backlog_total = pending_decoded.saturating_add(self.manga_decoded_mailbox.len());
         self.manga_pending_loads_peak = self.manga_pending_loads_peak.max(pending_loads);
-        self.manga_pending_decoded_peak = self.manga_pending_decoded_peak.max(pending_decoded);
+        self.manga_pending_decoded_peak = self
+            .manga_pending_decoded_peak
+            .max(decoded_backlog_total);
         let upload_batch_limit =
-            self.manga_compute_upload_batch_limit(pending_loads, pending_decoded);
+            self.manga_compute_upload_batch_limit(pending_loads, decoded_backlog_total);
         self.manga_upload_batch_limit = upload_batch_limit;
 
-        let (decoded_images, dim_updates) = {
+        let (new_decoded_images, dim_updates) = {
             let Some(loader) = self.manga_loader.as_mut() else {
                 return false;
             };
 
             // Poll for decoded images from the background threads
-            let decoded_images = loader.poll_decoded_images_with_limit(upload_batch_limit);
+            let mailbox_headroom = Self::MANGA_DECODED_MAILBOX_MAX_ITEMS
+                .saturating_sub(self.manga_decoded_mailbox.len());
+            let decoded_images = if mailbox_headroom == 0 {
+                Vec::new()
+            } else {
+                loader.poll_decoded_images_with_limit(
+                    mailbox_headroom.min(upload_batch_limit.saturating_mul(2).max(1)),
+                )
+            };
 
             // Also poll async dimension probe results (header reads), applied incrementally.
             // Limiting messages per frame prevents layout updates from causing bursts of work.
-            let dim_poll_limit = if defer_masonry_layout_work { 1 } else { 4 };
+            let dim_poll_limit = if defer_masonry_layout_work || self.masonry_metadata_preload_active
+            {
+                1
+            } else {
+                4
+            };
             let dim_updates = loader.poll_dimension_results(dim_poll_limit);
 
             (decoded_images, dim_updates)
         };
 
-        let video_dim_indices: Vec<usize> = decoded_images
+        let video_dim_indices: Vec<usize> = new_decoded_images
             .iter()
             .filter(|decoded| decoded.media_type == MangaMediaType::Video)
             .map(|decoded| decoded.index)
@@ -6847,12 +7104,10 @@ impl ImageViewer {
                 let mut layout_update_indices = dim_updates.clone();
                 layout_update_indices.extend(video_dim_indices.iter().copied());
 
-                if !defer_masonry_layout_work
-                    && self.masonry_should_apply_dimension_updates_now(&layout_update_indices)
-                {
-                    self.invalidate_manga_layout_cache();
-                } else {
-                    self.masonry_layout_invalidation_deferred = true;
+                self.masonry_queue_dimension_updates(layout_update_indices);
+                if !defer_masonry_layout_work {
+                    let force_flush = !self.masonry_metadata_preload_active;
+                    self.masonry_flush_pending_dimension_updates(force_flush);
                 }
             } else if defer_masonry_layout_work {
                 self.masonry_layout_invalidation_deferred = true;
@@ -6861,15 +7116,52 @@ impl ImageViewer {
             }
         }
 
-        let dims_updated = !decoded_images.is_empty() || !dim_updates.is_empty();
+        let mailbox_received = !new_decoded_images.is_empty();
+        if mailbox_received {
+            self.manga_decoded_mailbox.extend(new_decoded_images);
+        }
+
+        let dims_updated = mailbox_received || !dim_updates.is_empty();
 
         let visible_indices = self.manga_collect_visible_indices();
+        let visible_set: HashSet<usize> = visible_indices.iter().copied().collect();
         self.manga_visible_indices_last = visible_indices.len();
         self.manga_visible_indices_peak = self
             .manga_visible_indices_peak
             .max(self.manga_visible_indices_last);
         self.manga_texture_cache
             .set_pinned_indices(visible_indices.iter().copied());
+
+        let upload_anchor_index = visible_indices
+            .first()
+            .copied()
+            .unwrap_or(self.current_index.min(self.image_list.len().saturating_sub(1)));
+        let near_radius = self.manga_prune_decoded_mailbox(
+            &visible_set,
+            upload_anchor_index,
+            defer_masonry_layout_work,
+        );
+        let eligible_uploads = if defer_masonry_layout_work {
+            self.manga_decoded_mailbox
+                .iter()
+                .take_while(|decoded| {
+                    Self::manga_decoded_mailbox_band(
+                        decoded.index,
+                        &visible_set,
+                        upload_anchor_index,
+                        near_radius,
+                    ) <= 1
+                })
+                .count()
+        } else {
+            self.manga_decoded_mailbox.len()
+        };
+        let upload_count = upload_batch_limit.min(eligible_uploads);
+        let decoded_images: Vec<DecodedImage> = if upload_count == 0 {
+            Vec::new()
+        } else {
+            self.manga_decoded_mailbox.drain(0..upload_count).collect()
+        };
 
         let mut evicted_to_mark_unloaded = self
             .manga_texture_cache
@@ -8708,9 +9000,9 @@ impl ImageViewer {
 
         if self.masonry_layout_invalidation_deferred
             && !self.masonry_navigation_active_for_heavy_work()
-            && !self.masonry_metadata_preload_active
         {
-            self.invalidate_manga_layout_cache();
+            let force_flush = !self.masonry_metadata_preload_active;
+            self.masonry_flush_pending_dimension_updates(force_flush);
         }
 
         if self.is_masonry_mode() && self.masonry_metadata_preload_active {

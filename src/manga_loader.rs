@@ -174,6 +174,8 @@ pub struct MangaLoader {
 
     /// Async dimension-probe request channel (main thread -> worker).
     dim_request_tx: Sender<DimRequest>,
+    /// Low-priority async dimension-probe request channel for background warm-up work.
+    dim_background_request_tx: Sender<DimRequest>,
     /// Async dimension-probe result channel (worker -> main thread).
     dim_result_rx: Receiver<DimResult>,
     /// Indices currently queued for async dimension probing (main thread only).
@@ -210,6 +212,8 @@ impl MangaLoader {
             crossbeam_channel::bounded::<DecodedImage>(MAX_PENDING_UPLOADS);
 
         let (dim_request_tx, dim_request_rx) = crossbeam_channel::bounded::<DimRequest>(64);
+        let (dim_background_request_tx, dim_background_request_rx) =
+            crossbeam_channel::bounded::<DimRequest>(64);
         let (dim_result_tx, dim_result_rx) = crossbeam_channel::bounded::<DimResult>(64);
 
         let loading_indices = Arc::new(RwLock::new(HashMap::new()));
@@ -242,12 +246,36 @@ impl MangaLoader {
         let shutdown_clone = Arc::clone(&shutdown);
         crate::async_runtime::spawn_blocking_or_thread("manga-dimension-worker", move || {
             while !shutdown_clone.load(Ordering::Acquire) {
-                // Use a long timeout (500ms) to minimize CPU usage when idle.
-                // The channel will wake immediately when a real request arrives.
-                let req = match dim_request_rx.recv_timeout(Duration::from_millis(500)) {
-                    Ok(r) => r,
-                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
-                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                let req = loop {
+                    if let Ok(request) = dim_request_rx.try_recv() {
+                        break Some(request);
+                    }
+
+                    if let Ok(request) = dim_background_request_rx.try_recv() {
+                        break Some(request);
+                    }
+
+                    crossbeam_channel::select! {
+                        recv(dim_request_rx) -> request => {
+                            if let Ok(request) = request {
+                                break Some(request);
+                            }
+                        }
+                        recv(dim_background_request_rx) -> request => {
+                            if let Ok(request) = request {
+                                break Some(request);
+                            }
+                        }
+                        default(Duration::from_millis(500)) => {
+                            if shutdown_clone.load(Ordering::Acquire) {
+                                break None;
+                            }
+                        }
+                    }
+                };
+
+                let Some(req) = req else {
+                    break;
                 };
 
                 let mut out: Vec<(usize, u32, u32, MangaMediaType)> = req
@@ -309,6 +337,7 @@ impl MangaLoader {
             retry_state,
             dimension_cache: HashMap::new(),
             dim_request_tx,
+            dim_background_request_tx,
             dim_result_rx,
             dim_pending: HashSet::new(),
             shutdown,
@@ -360,6 +389,34 @@ impl MangaLoader {
     ///
     /// This does not block the UI thread. Results are applied when `poll_dimension_results` is called.
     pub fn request_dimensions_range(&mut self, image_list: &[PathBuf], start: usize, end: usize) {
+        self.enqueue_dimension_range(image_list, start, end, self.dim_request_tx.clone());
+    }
+
+    /// Queue async background dimension probes for a range of indices.
+    ///
+    /// This is intended for non-interactive masonry warm-up and should not compete with
+    /// immediately visible media.
+    pub fn request_dimensions_range_background(
+        &mut self,
+        image_list: &[PathBuf],
+        start: usize,
+        end: usize,
+    ) {
+        self.enqueue_dimension_range(
+            image_list,
+            start,
+            end,
+            self.dim_background_request_tx.clone(),
+        );
+    }
+
+    fn enqueue_dimension_range(
+        &mut self,
+        image_list: &[PathBuf],
+        start: usize,
+        end: usize,
+        request_tx: Sender<DimRequest>,
+    ) {
         let end = end.min(image_list.len());
         if start >= end {
             return;
@@ -394,7 +451,7 @@ impl MangaLoader {
         }
 
         let indices: Vec<usize> = items.iter().map(|(i, _)| *i).collect();
-        match self.dim_request_tx.try_send(DimRequest {
+        match request_tx.try_send(DimRequest {
             generation: self.current_generation,
             items,
         }) {
@@ -439,7 +496,7 @@ impl MangaLoader {
             if batch.len() >= DIM_REQUEST_BATCH_SIZE {
                 let indices: Vec<usize> = batch.iter().map(|(i, _)| *i).collect();
                 let items = std::mem::take(&mut batch);
-                match self.dim_request_tx.try_send(DimRequest {
+                match self.dim_background_request_tx.try_send(DimRequest {
                     generation: self.current_generation,
                     items,
                 }) {
@@ -459,7 +516,7 @@ impl MangaLoader {
         if !batch.is_empty() {
             let indices: Vec<usize> = batch.iter().map(|(i, _)| *i).collect();
             let items = std::mem::take(&mut batch);
-            match self.dim_request_tx.try_send(DimRequest {
+            match self.dim_background_request_tx.try_send(DimRequest {
                 generation: self.current_generation,
                 items,
             }) {

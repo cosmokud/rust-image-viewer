@@ -14,6 +14,9 @@ All notable changes to this project will be documented in this file.
 - Masonry mode no longer blocks first paint behind a full-screen metadata preload overlay; layout dimensions now warm progressively in the background while the visible canvas keeps rendering.
 - Masonry scrolling now defers off-screen relayout churn and dynamic video or animated texture refresh while navigation is active, reducing frame-time spikes from late metadata, upload work, and moving-media updates.
 - Slow video-dimension probes in the masonry loader now use a tighter discovery timeout so background metadata work is less likely to compete with visible scrolling and preload requests.
+- Visible masonry dimension requests now use a higher-priority worker lane than background warm-up probes, so viewport-critical layout data can preempt whole-folder metadata refinement.
+- Decoded masonry images now pass through a small visible-first mailbox before GPU upload, which keeps active scrolling focused on visible or near-visible textures and sheds stale speculative uploads sooner when the UI falls behind.
+- Added masonry layout, spatial-index, and visible-query timing metrics to the performance overlay so remaining frame spikes can be correlated to concrete hot paths instead of guessed heuristics.
 
 ### Added
 
