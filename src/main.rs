@@ -181,39 +181,6 @@ fn downscale_rgba_if_needed<'a>(
     (new_w, new_h, Cow::Owned(resized.into_raw()))
 }
 
-fn detect_max_texture_side(cc: &eframe::CreationContext<'_>) -> u32 {
-    // Prefer the active wgpu device limit when available.
-    // This is the authoritative cap for `Renderer::Wgpu` and keeps uploads within backend limits.
-    let wgpu_limit = cc
-        .wgpu_render_state
-        .as_ref()
-        .map(|render_state| render_state.device.limits().max_texture_dimension_2d);
-
-    // Fallback for glow contexts (or mixed builds where glow is active).
-    let glow_limit = cc.gl.as_ref().and_then(|gl| unsafe {
-        gl.get_parameter_i32(eframe::glow::MAX_TEXTURE_SIZE)
-            .try_into()
-            .ok()
-    });
-
-    wgpu_limit.or(glow_limit).unwrap_or(4096).max(512)
-}
-
-fn update_or_create_texture(
-    slot: &mut Option<egui::TextureHandle>,
-    ctx: &egui::Context,
-    name: impl Into<String>,
-    image: egui::ColorImage,
-    options: egui::TextureOptions,
-) {
-    if let Some(texture) = slot.as_mut() {
-        texture.set(image, options);
-    } else {
-        let texture = ctx.load_texture(name, image, options);
-        *slot = Some(texture);
-    }
-}
-
 #[cfg(target_os = "windows")]
 fn windows_cjk_font_candidates() -> [(&'static str, &'static str); 6] {
     [
@@ -3028,9 +2995,18 @@ impl ImageViewer {
         // Mark the start of the hidden startup period.
         viewer.startup_hide_started_at = Instant::now();
 
-        // Determine the maximum texture size supported by the active renderer backend.
-        // Oversized uploads can fail validation or crash on some drivers.
-        viewer.max_texture_side = detect_max_texture_side(cc);
+        // Determine the maximum texture size supported by the active backend.
+        // This viewer uses eframe's OpenGL (glow) integration; oversized textures can crash.
+        viewer.max_texture_side = cc
+            .gl
+            .as_ref()
+            .and_then(|gl| unsafe {
+                gl.get_parameter_i32(eframe::glow::MAX_TEXTURE_SIZE)
+                    .try_into()
+                    .ok()
+            })
+            .unwrap_or(4096)
+            .max(512);
 
         // Configure visuals (background driven by config)
         let mut visuals = egui::Visuals::dark();
@@ -5661,24 +5637,15 @@ impl ImageViewer {
                         [w as usize, h as usize],
                         pixels.as_ref(),
                     );
-                    let texture_options = self.config.texture_filter_video.to_egui_options();
 
-                    if let Some((texture, tex_w, tex_h)) =
-                        self.manga_video_textures.get_mut(&focused_idx)
-                    {
-                        texture.set(color_image, texture_options);
-                        *tex_w = w;
-                        *tex_h = h;
-                    } else {
-                        let texture = ctx.load_texture(
-                            format!("manga_video_{}", focused_idx),
-                            color_image,
-                            texture_options,
-                        );
+                    let texture = ctx.load_texture(
+                        format!("manga_video_{}", focused_idx),
+                        color_image,
+                        self.config.texture_filter_video.to_egui_options(),
+                    );
 
-                        self.manga_video_textures
-                            .insert(focused_idx, (texture, w, h));
-                    }
+                    self.manga_video_textures
+                        .insert(focused_idx, (texture, w, h));
                 }
             }
         }
@@ -5895,34 +5862,23 @@ impl ImageViewer {
                         pixels.as_ref(),
                     );
 
-                    let texture_options = self.config.texture_filter_animated.to_egui_options();
-                    let color_image = std::sync::Arc::new(color_image);
-                    let updated = self.manga_texture_cache.set_existing_texture_image(
-                        idx,
-                        color_image.clone(),
-                        texture_options,
-                        MangaMediaType::AnimatedImage,
+                    let texture = ctx.load_texture(
+                        format!("manga_anim_{}", idx),
+                        color_image,
+                        self.config.texture_filter_animated.to_egui_options(),
                     );
 
-                    if !updated {
-                        let texture = ctx.load_texture(
-                            format!("manga_anim_{}", idx),
-                            color_image,
-                            texture_options,
-                        );
-
-                        let evicted = self.manga_texture_cache.insert_with_type(
-                            idx,
-                            texture,
-                            w,
-                            h,
-                            MangaMediaType::AnimatedImage,
-                        );
-                        if !evicted.is_empty() {
-                            if let Some(loader) = self.manga_loader.as_mut() {
-                                for evicted_idx in evicted {
-                                    loader.mark_unloaded(evicted_idx);
-                                }
+                    let evicted = self.manga_texture_cache.insert_with_type(
+                        idx,
+                        texture,
+                        w,
+                        h,
+                        MangaMediaType::AnimatedImage,
+                    );
+                    if !evicted.is_empty() {
+                        if let Some(loader) = self.manga_loader.as_mut() {
+                            for evicted_idx in evicted {
+                                loader.mark_unloaded(evicted_idx);
                             }
                         }
                     }
@@ -5997,16 +5953,14 @@ impl ImageViewer {
             );
             let color_image =
                 egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], pixels.as_ref());
-            let texture_options = self.config.texture_filter_animated.to_egui_options();
-            let color_image = std::sync::Arc::new(color_image);
-            if !self.manga_texture_cache.set_existing_texture_image(
-                idx,
-                color_image.clone(),
-                texture_options,
-                MangaMediaType::AnimatedImage,
-            ) {
-                let texture =
-                    ctx.load_texture(format!("manga_anim_{}", idx), color_image, texture_options);
+            let texture = ctx.load_texture(
+                format!("manga_anim_{}", idx),
+                color_image,
+                self.config.texture_filter_animated.to_egui_options(),
+            );
+            if self.manga_texture_cache.contains(idx) {
+                self.manga_texture_cache.update_texture(idx, texture, w, h);
+            } else {
                 let evicted = self.manga_texture_cache.insert_with_type(
                     idx,
                     texture,
@@ -6553,38 +6507,24 @@ impl ImageViewer {
                 decoded.width,
                 decoded.height,
             );
-            let color_image = std::sync::Arc::new(color_image);
 
             let upload_texture_started = Instant::now();
-            let texture = if self.manga_texture_cache.set_existing_texture_image(
-                decoded.index,
-                color_image.clone(),
+            let texture = ctx.load_texture(
+                format!("manga_{}", decoded.index),
+                color_image,
                 texture_options,
-                decoded.media_type,
-            ) {
-                None
-            } else {
-                Some(ctx.load_texture(
-                    format!("manga_{}", decoded.index),
-                    color_image,
-                    texture_options,
-                ))
-            };
+            );
             self.perf_metrics
                 .record_duration("manga_upload_texture_ms", upload_texture_started.elapsed());
 
             // Insert into cache with media type (this may evict old entries)
-            let evicted = if let Some(texture) = texture {
-                self.manga_texture_cache.insert_with_type(
-                    decoded.index,
-                    texture,
-                    decoded.width,
-                    decoded.height,
-                    decoded.media_type,
-                )
-            } else {
-                Vec::new()
-            };
+            let evicted = self.manga_texture_cache.insert_with_type(
+                decoded.index,
+                texture,
+                decoded.width,
+                decoded.height,
+                decoded.media_type,
+            );
             uploaded_textures = uploaded_textures.saturating_add(1);
 
             if let Some(started_at) = self.manga_ttv_pending.remove(&decoded.index) {
@@ -9416,13 +9356,7 @@ impl ImageViewer {
                     self.config.texture_filter_static.to_egui_options()
                 };
 
-                update_or_create_texture(
-                    &mut self.texture,
-                    ctx,
-                    "image",
-                    color_image,
-                    texture_options,
-                );
+                self.texture = Some(ctx.load_texture("image", color_image, texture_options));
                 self.image_texture_dims = Some((w, h));
                 self.texture_frame = img.current_frame_index();
             }
@@ -9470,13 +9404,11 @@ impl ImageViewer {
                 );
 
                 // Use configured texture filter for video
-                update_or_create_texture(
-                    &mut self.video_texture,
-                    ctx,
+                self.video_texture = Some(ctx.load_texture(
                     "video",
                     color_image,
                     self.config.texture_filter_video.to_egui_options(),
-                );
+                ));
                 self.video_texture_dims = Some((w, h));
                 needs_repaint = true;
             }
@@ -12863,8 +12795,8 @@ fn main() -> eframe::Result<()> {
     // Configure native options
     //
     // IMPORTANT NOTE ON VRAM USAGE:
-    // This application uses GPU-accelerated rendering (wgpu via eframe by default).
-    // GPU backends require a graphics context which allocates a base amount of VRAM (~10-20MB) for:
+    // This application uses OpenGL (via eframe/glow) for hardware-accelerated rendering.
+    // OpenGL requires a GPU context which allocates a base amount of VRAM (~10-20MB) for:
     // - Framebuffers (front/back buffers for double-buffering)
     // - Default font texture atlas
     // - Shader programs
@@ -12889,7 +12821,7 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         // Keep the renderer lightweight at idle. This viewer renders 2D UI + a single image/video
         // texture; MSAA and a depth buffer are not required for perceptible quality.
-        renderer: eframe::Renderer::Wgpu,
+        renderer: eframe::Renderer::Glow,
         // Configurable via [Settings].vsync in config.ini (default: true).
         // Keep enabled by default for smoother presentation and no tearing.
         vsync: config.vsync,
