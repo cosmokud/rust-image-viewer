@@ -25,12 +25,13 @@ use config::{
     Action, Config, InputBinding, MangaVirtualizationBackend, StartupWindowMode, VideoSeekPolicy,
 };
 use image_loader::{
-    get_media_type, is_supported_video, probe_image_dimensions, ImageFrame, LoadedImage,
-    MediaType,
+    get_media_type, is_supported_video, ImageFrame, LoadedImage, MediaType,
 };
 use hashbrown::{HashMap, HashSet};
 use media_index::{DirectoryScanResult, MediaDirectoryIndex};
-use metadata_cache::metadata_cache_stats;
+use metadata_cache::{
+    lookup_cached_dimensions, metadata_cache_stats, store_cached_dimensions, CachedMediaKind,
+};
 use manga_loader::{MangaLoader, MangaMediaType, MangaTextureCache};
 use manga_spatial::{MangaSpatialIndex, SpatialRect, STRIP_QUERY_HALF_WIDTH};
 use perf_metrics::PerfMetrics;
@@ -183,12 +184,8 @@ fn downscale_rgba_if_needed<'a>(
 }
 
 #[cfg(target_os = "windows")]
-fn install_windows_cjk_fonts(ctx: &egui::Context) {
-    // egui's default font set is Latin-focused; without adding a font that contains
-    // CJK glyphs, filenames will show as tofu boxes in our custom title bar.
-    let mut fonts = egui::FontDefinitions::default();
-
-    let candidates: [(&str, &str); 6] = [
+fn windows_cjk_font_candidates() -> [(&'static str, &'static str); 6] {
+    [
         // Japanese
         ("cjk_meiryo", r"C:\Windows\Fonts\meiryo.ttc"),
         ("cjk_msgothic", r"C:\Windows\Fonts\msgothic.ttc"),
@@ -200,38 +197,63 @@ fn install_windows_cjk_fonts(ctx: &egui::Context) {
         ("cjk_malgun", r"C:\Windows\Fonts\malgun.ttf"),
         // Broad fallback (varies by Windows install)
         ("cjk_segoeui", r"C:\Windows\Fonts\segoeui.ttf"),
-    ];
+    ]
+}
+
+#[cfg(target_os = "windows")]
+fn load_windows_cjk_font_data() -> Vec<(String, Vec<u8>)> {
+    let mut loaded = Vec::new();
+    for (name, path) in windows_cjk_font_candidates() {
+        if let Ok(bytes) = std::fs::read(path) {
+            loaded.push((name.to_owned(), bytes));
+        }
+    }
+    loaded
+}
+
+#[cfg(target_os = "windows")]
+fn apply_windows_cjk_fonts(ctx: &egui::Context, font_data: Vec<(String, Vec<u8>)>) -> bool {
+    // egui's default font set is Latin-focused; without adding a font that contains
+    // CJK glyphs, filenames will show as tofu boxes in our custom title bar.
+    let mut fonts = egui::FontDefinitions::default();
 
     let mut loaded_any = false;
-    for (name, path) in candidates {
-        if let Ok(bytes) = std::fs::read(path) {
-            fonts
-                .font_data
-                .insert(name.to_owned(), egui::FontData::from_owned(bytes));
+    for (name, bytes) in font_data {
+        fonts
+            .font_data
+            .insert(name.clone(), egui::FontData::from_owned(bytes));
 
-            // Put CJK fonts first so they are preferred for matching glyphs.
-            if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
-                if !family.iter().any(|f| f == name) {
-                    family.insert(0, name.to_owned());
-                }
+        // Put CJK fonts first so they are preferred for matching glyphs.
+        if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+            if !family.iter().any(|f| f == &name) {
+                family.insert(0, name.clone());
             }
-            if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
-                if !family.iter().any(|f| f == name) {
-                    family.push(name.to_owned());
-                }
-            }
-
-            loaded_any = true;
         }
+        if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
+            if !family.iter().any(|f| f == &name) {
+                family.push(name.clone());
+            }
+        }
+
+        loaded_any = true;
     }
 
     if loaded_any {
         ctx.set_fonts(fonts);
     }
+
+    loaded_any
 }
 
 #[cfg(not(target_os = "windows"))]
-fn install_windows_cjk_fonts(_ctx: &egui::Context) {}
+fn load_windows_cjk_font_data() -> Vec<(String, Vec<u8>)> {
+    Vec::new()
+}
+
+#[cfg(not(target_os = "windows"))]
+fn apply_windows_cjk_fonts(_ctx: &egui::Context, _font_data: Vec<(String, Vec<u8>)>) -> bool {
+    false
+}
 
 fn open_path_in_default_app(path: &std::path::Path) -> std::io::Result<()> {
     #[cfg(target_os = "windows")]
@@ -676,12 +698,15 @@ fn file_stamp_for_path(path: &Path) -> Option<FileStamp> {
 }
 
 fn decoded_image_cache_key(path: &Path, max_texture_side: u32) -> String {
-    let key = path
-        .canonicalize()
-        .ok()
-        .unwrap_or_else(|| path.to_path_buf())
-        .to_string_lossy()
-        .to_string();
+    let normalized_path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        path.canonicalize()
+            .ok()
+            .unwrap_or_else(|| path.to_path_buf())
+    };
+
+    let key = normalized_path.to_string_lossy().to_string();
 
     #[cfg(target_os = "windows")]
     {
@@ -890,6 +915,16 @@ struct ImageViewer {
     /// Whether we've installed extra Windows fonts for CJK filename rendering.
     /// These font files can be quite large, so we install them lazily only when needed.
     windows_cjk_fonts_installed: bool,
+    /// Pending background load for Windows CJK font bytes.
+    pending_windows_cjk_font_load: Option<crossbeam_channel::Receiver<Vec<(String, Vec<u8>)>>>,
+    /// Pending background metadata probe for title-bar file size text.
+    pending_file_size_probe: Option<crossbeam_channel::Receiver<(PathBuf, Option<String>)>>,
+    /// Path associated with `pending_file_size_probe`.
+    pending_file_size_probe_path: Option<PathBuf>,
+    /// Cached file-size label for the currently displayed path.
+    current_file_size_label: Option<String>,
+    /// Path associated with `current_file_size_label`.
+    current_file_size_label_path: Option<PathBuf>,
 
     /// Whether GStreamer has been initialized (deferred until first video load)
     gstreamer_initialized: bool,
@@ -1192,6 +1227,11 @@ impl Default for ImageViewer {
             fps_last_dt_s: 0.0,
 
             windows_cjk_fonts_installed: false,
+            pending_windows_cjk_font_load: None,
+            pending_file_size_probe: None,
+            pending_file_size_probe_path: None,
+            current_file_size_label: None,
+            current_file_size_label_path: None,
             gstreamer_initialized: false,
 
             startup_window_shown: false,
@@ -2050,6 +2090,24 @@ impl ImageViewer {
                 return;
             }
 
+            if let Some(rx) = self.pending_windows_cjk_font_load.as_ref() {
+                match rx.try_recv() {
+                    Ok(font_data) => {
+                        self.pending_windows_cjk_font_load = None;
+                        let _ = apply_windows_cjk_fonts(ctx, font_data);
+                        self.windows_cjk_fonts_installed = true;
+                        self.needs_repaint = true;
+                        return;
+                    }
+                    Err(crossbeam_channel::TryRecvError::Empty) => return,
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                        self.pending_windows_cjk_font_load = None;
+                        self.windows_cjk_fonts_installed = true;
+                        return;
+                    }
+                }
+            }
+
             let Some(path) = self.image_list.get(self.current_index) else {
                 return;
             };
@@ -2064,9 +2122,11 @@ impl ImageViewer {
             }
 
             if Self::filename_needs_cjk_fonts(&filename) {
-                install_windows_cjk_fonts(ctx);
-                self.windows_cjk_fonts_installed = true;
-                self.needs_repaint = true;
+                let (tx, rx) = crossbeam_channel::bounded::<Vec<(String, Vec<u8>)>>(1);
+                self.pending_windows_cjk_font_load = Some(rx);
+                crate::async_runtime::spawn_blocking_or_thread("windows-cjk-font-load", move || {
+                    let _ = tx.send(load_windows_cjk_font_data());
+                });
             }
         }
     }
@@ -2097,10 +2157,86 @@ impl ImageViewer {
         }
     }
 
-    fn file_size_label_for_path(path: &PathBuf) -> Option<String> {
+    fn file_size_label_for_path(path: &Path) -> Option<String> {
         std::fs::metadata(path)
             .ok()
             .map(|metadata| Self::format_file_size(metadata.len()))
+    }
+
+    fn start_async_file_size_probe(&mut self, path: PathBuf) {
+        let (tx, rx) = crossbeam_channel::bounded::<(PathBuf, Option<String>)>(1);
+        self.pending_file_size_probe = Some(rx);
+        self.pending_file_size_probe_path = Some(path.clone());
+
+        crate::async_runtime::spawn_blocking_or_thread("file-size-probe", move || {
+            let label = Self::file_size_label_for_path(path.as_path());
+            let _ = tx.send((path, label));
+        });
+    }
+
+    fn poll_pending_file_size_probe(&mut self, ctx: &egui::Context) {
+        let Some(rx) = self.pending_file_size_probe.as_ref() else {
+            return;
+        };
+
+        match rx.try_recv() {
+            Ok((path, label)) => {
+                let matches_pending = self
+                    .pending_file_size_probe_path
+                    .as_ref()
+                    .is_some_and(|pending_path| pending_path == &path);
+                self.pending_file_size_probe = None;
+                self.pending_file_size_probe_path = None;
+
+                if !matches_pending {
+                    return;
+                }
+
+                if self
+                    .image_list
+                    .get(self.current_index)
+                    .is_some_and(|current| current == &path)
+                {
+                    self.current_file_size_label_path = Some(path.clone());
+                    self.current_file_size_label = label;
+                    ctx.request_repaint();
+                }
+            }
+            Err(crossbeam_channel::TryRecvError::Empty) => {}
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                self.pending_file_size_probe = None;
+                self.pending_file_size_probe_path = None;
+            }
+        }
+    }
+
+    fn ensure_current_file_size_label(&mut self) {
+        let Some(path) = self.image_list.get(self.current_index).cloned() else {
+            self.current_file_size_label = None;
+            self.current_file_size_label_path = None;
+            return;
+        };
+
+        if self
+            .current_file_size_label_path
+            .as_ref()
+            .is_some_and(|current| current == &path)
+        {
+            return;
+        }
+
+        if self.pending_file_size_probe.is_some()
+            || self
+                .pending_file_size_probe_path
+                .as_ref()
+                .is_some_and(|pending| pending == &path)
+        {
+            return;
+        }
+
+        self.current_file_size_label = None;
+        self.current_file_size_label_path = None;
+        self.start_async_file_size_probe(path);
     }
 
     fn animated_image_label_for_path(path: Option<&PathBuf>) -> &'static str {
@@ -3102,6 +3238,16 @@ impl ImageViewer {
             match result {
                 MediaLoadResult::Image { path, result, .. } => match result {
                     Ok(loaded) => {
+                        let (display_w, display_h) = loaded.image.display_dimensions();
+                        if display_w > 0 && display_h > 0 {
+                            store_cached_dimensions(
+                                &path,
+                                CachedMediaKind::Image,
+                                display_w,
+                                display_h,
+                            );
+                        }
+
                         self.cache_loaded_image_first_frame(
                             &path,
                             loaded.max_texture_side,
@@ -3136,8 +3282,13 @@ impl ImageViewer {
                         self.error_message = Some(err);
                     }
                 },
-                MediaLoadResult::Video { result, .. } => match result {
+                MediaLoadResult::Video { path, result, .. } => match result {
                     Ok(player) => {
+                        let dims = player.dimensions();
+                        if dims.0 > 0 && dims.1 > 0 {
+                            store_cached_dimensions(&path, CachedMediaKind::Video, dims.0, dims.1);
+                        }
+
                         self.video_player = Some(player);
                         self.image_changed = true;
                         self.pending_media_layout = true;
@@ -3170,6 +3321,12 @@ impl ImageViewer {
 
         self.reset_masonry_metadata_preload();
         self.clear_pending_media_load();
+
+        self.current_file_size_label = None;
+        self.current_file_size_label_path = None;
+        self.pending_file_size_probe = None;
+        self.pending_file_size_probe_path = None;
+        self.start_async_file_size_probe(path.clone());
 
         // Update the native window title (taskbar title) using Unicode-safe conversion.
         self.pending_window_title = Some(self.compute_window_title_for_path(path));
@@ -9514,18 +9671,25 @@ impl ImageViewer {
                                             resp.drag_started() || resp.dragged();
                                     }
 
-                                    if let Some(file_size_label) = Self::file_size_label_for_path(&path)
+                                    if self
+                                        .current_file_size_label_path
+                                        .as_ref()
+                                        .is_some_and(|label_path| label_path == &path)
                                     {
-                                        let resp = ui.add(
-                                            egui::Label::new(
-                                                egui::RichText::new(file_size_label)
-                                                    .color(egui::Color32::GRAY),
-                                            )
-                                            .selectable(true),
-                                        );
-                                        over_title_text |= resp.contains_pointer();
-                                        started_title_text_drag |=
-                                            resp.drag_started() || resp.dragged();
+                                        if let Some(file_size_label) =
+                                            self.current_file_size_label.as_ref()
+                                        {
+                                            let resp = ui.add(
+                                                egui::Label::new(
+                                                    egui::RichText::new(file_size_label)
+                                                        .color(egui::Color32::GRAY),
+                                                )
+                                                .selectable(true),
+                                            );
+                                            over_title_text |= resp.contains_pointer();
+                                            started_title_text_drag |=
+                                                resp.drag_started() || resp.dragged();
+                                        }
                                     }
 
                                     let resp = ui.add(
@@ -11594,6 +11758,8 @@ impl eframe::App for ImageViewer {
         if !(self.manga_mode && self.is_fullscreen) {
             self.poll_pending_manga_video_load(ctx);
         }
+        self.poll_pending_file_size_probe(ctx);
+        self.ensure_current_file_size_label();
 
         // Keep our cached screen size in sync with the real viewport.
         // Manga mode uses this for layout/scroll math; if it drifts from `ctx.screen_rect()`,
@@ -12309,8 +12475,9 @@ fn main() -> eframe::Result<()> {
     // For videos, we start hidden and show once GStreamer decodes the first frame.
     let (initial_size, initial_pos, start_visible) = match media_type {
         Some(MediaType::Image) => {
-            // Get image dimensions from file header (fast, no full decode)
-            let (img_w, img_h) = probe_image_dimensions(&file_path).unwrap_or((800, 600));
+            // Prefer cached dimensions to avoid touching the media file on every startup.
+            let (img_w, img_h) =
+                lookup_cached_dimensions(&file_path, CachedMediaKind::Image).unwrap_or((800, 600));
             let img_w = img_w as f32;
             let img_h = img_h as f32;
 

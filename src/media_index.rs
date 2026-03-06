@@ -10,6 +10,7 @@ use crate::image_loader::get_media_in_directory;
 
 const DEFAULT_CACHED_DIRECTORIES: usize = 64;
 const UNKNOWN_MTIME_RESCAN_INTERVAL: Duration = Duration::from_secs(2);
+const KNOWN_MTIME_REVALIDATE_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Clone)]
 struct DirectoryCacheEntry {
@@ -71,9 +72,23 @@ impl MediaDirectoryIndex {
             None => return Some(vec![path.to_path_buf()]),
         };
 
-        let modified_at = directory_modified_time(&parent);
+        // Fast path for rapid navigation in the same directory: avoid a filesystem
+        // metadata syscall on every single next/prev action.
         if let Some(entry) = self.cache.get(&parent) {
+            if entry.modified_at.is_some()
+                && entry.scanned_at.elapsed() < KNOWN_MTIME_REVALIDATE_INTERVAL
+            {
+                self.stats.hits = self.stats.hits.saturating_add(1);
+                return Some(entry.files.clone());
+            }
+        }
+
+        let modified_at = directory_modified_time(&parent);
+        if let Some(entry) = self.cache.get_mut(&parent) {
             if is_entry_fresh(entry, &modified_at) {
+                if entry.modified_at.is_some() {
+                    entry.scanned_at = Instant::now();
+                }
                 self.stats.hits = self.stats.hits.saturating_add(1);
                 return Some(entry.files.clone());
             }

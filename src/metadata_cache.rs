@@ -591,12 +591,15 @@ fn default_cache_path() -> Option<PathBuf> {
 }
 
 fn cache_key(path: &Path) -> String {
-    let key = path
-        .canonicalize()
-        .ok()
-        .unwrap_or_else(|| path.to_path_buf())
-        .to_string_lossy()
-        .to_string();
+    let normalized_path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        path.canonicalize()
+            .ok()
+            .unwrap_or_else(|| path.to_path_buf())
+    };
+
+    let key = normalized_path.to_string_lossy().to_string();
 
     #[cfg(target_os = "windows")]
     {
