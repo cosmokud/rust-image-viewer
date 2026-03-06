@@ -2,13 +2,6 @@
 
 All notable changes to this project will be documented in this file.
 
-## [v0.2.2] - 2026-03-07
-
-### Fixed
-
-- Fullscreen entry and exit now use egui's native borderless fullscreen command, with floating window restore only forced as a fallback after Windows has had a chance to restore the prior placement itself.
-- Switching between floating and fullscreen now waits to apply the new zoom/layout until the window reaches its requested size, removing the transient oversized-image flash during the mode swap.
-
 ## [v0.2.1] - 2026-03-06
 
 ### Highlights

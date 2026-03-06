@@ -3991,39 +3991,11 @@ impl ImageViewer {
             .unwrap_or_else(|| ctx.screen_rect().size())
     }
 
-    fn current_viewport_outer_pos(&self, ctx: &egui::Context) -> Option<egui::Pos2> {
-        ctx.input(|i| i.raw.viewport().outer_rect).map(|r| r.min)
-    }
-
     fn window_mode_layout_matches_target(current: egui::Vec2, target: egui::Vec2) -> bool {
         const SIZE_TOLERANCE: f32 = 2.0;
 
         (current.x - target.x).abs() <= SIZE_TOLERANCE
             && (current.y - target.y).abs() <= SIZE_TOLERANCE
-    }
-
-    fn outer_position_matches_target(current: egui::Pos2, target: egui::Pos2) -> bool {
-        const POSITION_TOLERANCE: f32 = 2.0;
-
-        (current.x - target.x).abs() <= POSITION_TOLERANCE
-            && (current.y - target.y).abs() <= POSITION_TOLERANCE
-    }
-
-    fn viewport_restore_matches_target(
-        &self,
-        ctx: &egui::Context,
-        target_inner_size: egui::Vec2,
-        target_outer_pos: egui::Pos2,
-    ) -> bool {
-        let size_matches = Self::window_mode_layout_matches_target(
-            self.current_viewport_inner_size(ctx),
-            target_inner_size,
-        );
-        let pos_matches = self
-            .current_viewport_outer_pos(ctx)
-            .is_some_and(|current| Self::outer_position_matches_target(current, target_outer_pos));
-
-        size_matches && pos_matches
     }
 
     fn schedule_window_mode_layout(
@@ -12579,12 +12551,14 @@ impl eframe::App for ImageViewer {
                     self.fullscreen_transition_target = 1.0;
                     self.freeze_current_media_view();
 
-                    // Use the backend's native borderless fullscreen command instead of a
-                    // manual move+resize. Windows can apply the manual commands in separate
-                    // compositor steps, which is what causes the left-edge/background flash.
+                    // Use borderless "pseudo-fullscreen" instead of OS fullscreen.
+                    // This avoids a brief desktop flash on Windows caused by toggling window styles/swapchain.
                     let monitor = self.monitor_size_points(ctx);
                     self.schedule_window_mode_layout(monitor, DeferredWindowModeLayout::Fullscreen);
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+                    self.suppress_outer_pos_tracking_frames =
+                        self.suppress_outer_pos_tracking_frames.max(2);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::Pos2::ZERO));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(monitor));
                     self.last_requested_inner_size = Some(monitor);
 
                     if toggled_from_titlebar {
@@ -12600,7 +12574,6 @@ impl eframe::App for ImageViewer {
                     // Exiting fullscreen - use delayed resize to prevent flash
                     self.fullscreen_transition = 0.0;
                     self.fullscreen_transition_target = 0.0;
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
                     self.clear_strip_return_context();
 
                     // Exit manga mode when leaving fullscreen
@@ -12665,9 +12638,8 @@ impl eframe::App for ImageViewer {
                                     last_requested_inner_size: Some(saved_size),
                                 }),
                             );
-                            // Let Windows restore its remembered window placement first.
-                            // If it does not, we fall back to the saved floating size/position.
-                            self.pending_window_resize = Some((saved_size, saved_pos, 6));
+                            // Delay window resize by 2 frames to prevent flash
+                            self.pending_window_resize = Some((saved_size, saved_pos, 2));
                         } else {
                             // Fallback: reset to centered at 100% and resize to 100% image size (capped by fit-to-screen)
                             if let Some((w, h)) = self.media_display_dimensions() {
@@ -12694,7 +12666,8 @@ impl eframe::App for ImageViewer {
                                 let x = (monitor.x - desired.x) * 0.5;
                                 let y = (monitor.y - desired.y) * 0.5;
                                 let pos = egui::pos2(x.max(0.0), y.max(0.0));
-                                self.pending_window_resize = Some((desired, pos, 6));
+                                // Delay window resize by 2 frames to prevent flash
+                                self.pending_window_resize = Some((desired, pos, 2));
                             }
                         }
                     } else {
@@ -12744,7 +12717,8 @@ impl eframe::App for ImageViewer {
                                 let x = (monitor.x - size.x) * 0.5;
                                 let y = (monitor.y - size.y) * 0.5;
                                 let pos = egui::pos2(x.max(0.0), y.max(0.0));
-                                self.pending_window_resize = Some((size, pos, 6));
+                                // Delay window resize by 2 frames to prevent flash
+                                self.pending_window_resize = Some((size, pos, 2));
                             }
                         } else {
                             // If we don't have dimensions yet (possible for videos right after switching),
@@ -12765,15 +12739,12 @@ impl eframe::App for ImageViewer {
         let pending_resize_active =
             if let Some((size, pos, frames_remaining)) = self.pending_window_resize.take() {
                 if frames_remaining <= 1 {
-                    if !self.viewport_restore_matches_target(ctx, size, pos) {
-                        // Apply the saved floating placement only if leaving fullscreen did not
-                        // already restore it for us.
-                        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
-                        self.suppress_outer_pos_tracking_frames =
-                            self.suppress_outer_pos_tracking_frames.max(2);
-                        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
-                        self.last_known_outer_pos = Some(pos);
-                    }
+                    // Apply the resize now
+                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+                    self.suppress_outer_pos_tracking_frames =
+                        self.suppress_outer_pos_tracking_frames.max(2);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+                    self.last_known_outer_pos = Some(pos);
                     false
                 } else {
                     // Wait another frame
