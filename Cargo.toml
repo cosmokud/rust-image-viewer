@@ -46,11 +46,15 @@ gstreamer-audio = "0.23"
 rayon = "1.10"
 crossbeam-channel = "0.5"
 crossbeam-queue = "0.3"
+interprocess = "2.4"
 parking_lot = "0.12"
 lru = "0.12"
 hashbrown = "0.15"
 jwalk = "0.8"
 smallvec = "1.13"
+# crates.io does not currently expose a crate literally named `image-simd`.
+# We alias `wide` under this name for SIMD pixel math in hot paths.
+image-simd = { package = "wide", version = "0.7" }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 puffin = "0.19"

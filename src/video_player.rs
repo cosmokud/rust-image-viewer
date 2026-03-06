@@ -13,6 +13,7 @@ use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 use gstreamer_video as gst_video;
+use image_simd::u16x8;
 
 #[cfg(target_os = "windows")]
 fn configure_gstreamer_env_windows() {
@@ -254,14 +255,62 @@ fn guess_limited_range_rgba(pixels: &[u8]) -> bool {
     confined && touched_edges
 }
 
+fn expand_limited_range_channel_simd_8(values: [u16; 8]) -> [u8; 8] {
+    // Integer mapping from limited-range [16..235] to full-range [0..255].
+    // Keep this math equivalent to the scalar formula used in fallback path.
+    const OFFSET: u16 = 16;
+    const SCALE_NUM: u16 = 255;
+    const SCALE_DEN: u16 = 219;
+    const ROUND: u16 = SCALE_DEN / 2;
+
+    let v = u16x8::new(values);
+    let mapped = (v.max(u16x8::splat(OFFSET)) - u16x8::splat(OFFSET)) * u16x8::splat(SCALE_NUM)
+        + u16x8::splat(ROUND);
+
+    let mapped_arr = mapped.to_array();
+    let mut out = [0u8; 8];
+    for (idx, value) in mapped_arr.iter().enumerate() {
+        out[idx] = (value / SCALE_DEN).min(255) as u8;
+    }
+    out
+}
+
 fn expand_limited_range_rgba_in_place(pixels: &mut [u8]) {
     // Map limited-range (TV) RGB [16..235] to full-range [0..255].
-    // This fixes the classic "washed out" look when limited-range RGB is displayed as full-range.
+    // Process 8 pixels per batch with SIMD lane math, then finish remainder scalar.
+    const PIXELS_PER_BATCH: usize = 8;
+    const BATCH_BYTES: usize = PIXELS_PER_BATCH * 4;
+
+    let mut chunks = pixels.chunks_exact_mut(BATCH_BYTES);
+    for chunk in &mut chunks {
+        let mut r = [0u16; PIXELS_PER_BATCH];
+        let mut g = [0u16; PIXELS_PER_BATCH];
+        let mut b = [0u16; PIXELS_PER_BATCH];
+
+        for lane in 0..PIXELS_PER_BATCH {
+            let base = lane * 4;
+            r[lane] = chunk[base] as u16;
+            g[lane] = chunk[base + 1] as u16;
+            b[lane] = chunk[base + 2] as u16;
+        }
+
+        let r_mapped = expand_limited_range_channel_simd_8(r);
+        let g_mapped = expand_limited_range_channel_simd_8(g);
+        let b_mapped = expand_limited_range_channel_simd_8(b);
+
+        for lane in 0..PIXELS_PER_BATCH {
+            let base = lane * 4;
+            chunk[base] = r_mapped[lane];
+            chunk[base + 1] = g_mapped[lane];
+            chunk[base + 2] = b_mapped[lane];
+        }
+    }
+
     const OFFSET: i32 = 16;
     const SCALE_NUM: i32 = 255;
     const SCALE_DEN: i32 = 219;
 
-    for px in pixels.chunks_exact_mut(4) {
+    for px in chunks.into_remainder().chunks_exact_mut(4) {
         for c in &mut px[0..3] {
             let v = *c as i32;
             let scaled = ((v - OFFSET) * SCALE_NUM + (SCALE_DEN / 2)) / SCALE_DEN;

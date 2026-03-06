@@ -7,32 +7,28 @@
 //! The behavior can be toggled via the `single_instance` setting in config.ini.
 
 use std::ffi::OsStr;
+use std::io::{BufRead, BufReader, Write};
 use std::os::windows::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
 
-use winapi::shared::minwindef::{DWORD, FALSE};
-use winapi::shared::winerror::{ERROR_ALREADY_EXISTS, ERROR_PIPE_CONNECTED};
+use interprocess::local_socket::{prelude::*, GenericNamespaced, ListenerOptions, Stream};
+
+use winapi::shared::minwindef::FALSE;
+use winapi::shared::winerror::ERROR_ALREADY_EXISTS;
 use winapi::um::errhandlingapi::GetLastError;
-use winapi::um::fileapi::{CreateFileW, ReadFile, WriteFile, OPEN_EXISTING};
-use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
-use winapi::um::namedpipeapi::{ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe};
+use winapi::um::handleapi::CloseHandle;
 use winapi::um::synchapi::CreateMutexW;
-use winapi::um::winbase::{
-    PIPE_ACCESS_INBOUND, PIPE_READMODE_MESSAGE, PIPE_TYPE_MESSAGE, PIPE_UNLIMITED_INSTANCES,
-    PIPE_WAIT,
-};
-use winapi::um::winnt::{GENERIC_WRITE, HANDLE};
+use winapi::um::winnt::HANDLE;
 
 /// Unique name for the application mutex (prevents multiple instances).
 const MUTEX_NAME: &str = "Global\\RustImageViewer_SingleInstance_A7F3B2C1";
 
-/// Named pipe used to forward open-file requests from secondary instances.
-const IPC_PIPE_NAME: &str = r"\\.\pipe\RustImageViewer_SingleInstance_A7F3B2C1";
-const IPC_BUFFER_SIZE: usize = 4096;
+/// Interprocess local socket name used to forward open-file requests.
+/// On Windows this maps to a namespaced transport backed by named pipes.
+const IPC_SOCKET_NAME: &str = "RustImageViewer_SingleInstance_A7F3B2C1.sock";
 const IPC_WAKE_MESSAGE: &str = "WAKE";
 
 /// Result of attempting to acquire the single-instance lock.
@@ -58,7 +54,7 @@ unsafe impl Send for SingleInstanceLock {}
 
 impl Drop for SingleInstanceLock {
     fn drop(&mut self) {
-        // Signal listener shutdown and wake blocked ConnectNamedPipe.
+        // Signal listener shutdown and wake blocked socket accept.
         self.shutdown_flag.store(true, Ordering::SeqCst);
         wake_pipe_listener();
 
@@ -84,57 +80,26 @@ fn to_wide_null(s: &str) -> Vec<u16> {
         .collect()
 }
 
-fn create_server_pipe() -> HANDLE {
-    let pipe_name = to_wide_null(IPC_PIPE_NAME);
-    unsafe {
-        CreateNamedPipeW(
-            pipe_name.as_ptr(),
-            PIPE_ACCESS_INBOUND,
-            PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
-            PIPE_UNLIMITED_INSTANCES,
-            0,
-            IPC_BUFFER_SIZE as u32,
-            0,
-            std::ptr::null_mut(),
-        )
-    }
-}
-
 fn send_message_to_primary(message: &str) -> bool {
-    let pipe_name = to_wide_null(IPC_PIPE_NAME);
-    let handle = unsafe {
-        CreateFileW(
-            pipe_name.as_ptr(),
-            GENERIC_WRITE,
-            0,
-            std::ptr::null_mut(),
-            OPEN_EXISTING,
-            0,
-            std::ptr::null_mut(),
-        )
+    let name = match IPC_SOCKET_NAME.to_ns_name::<GenericNamespaced>() {
+        Ok(name) => name,
+        Err(_) => return false,
     };
 
-    if handle == INVALID_HANDLE_VALUE {
+    let mut stream = match Stream::connect(name) {
+        Ok(stream) => stream,
+        Err(_) => return false,
+    };
+
+    let mut payload = String::with_capacity(message.len() + 1);
+    payload.push_str(message);
+    payload.push('\n');
+
+    if stream.write_all(payload.as_bytes()).is_err() {
         return false;
     }
 
-    let bytes = message.as_bytes();
-    let mut written: DWORD = 0;
-    let ok = unsafe {
-        WriteFile(
-            handle,
-            bytes.as_ptr() as *const _,
-            bytes.len() as u32,
-            &mut written,
-            std::ptr::null_mut(),
-        ) != 0
-    };
-
-    unsafe {
-        CloseHandle(handle);
-    }
-
-    ok && written > 0
+    stream.flush().is_ok()
 }
 
 fn send_file_path_to_primary(path: &PathBuf) -> bool {
@@ -194,7 +159,7 @@ pub fn try_acquire_lock(
     let shutdown_flag_clone = Arc::clone(&shutdown_flag);
 
     let listener_thread = thread::spawn(move || {
-        run_pipe_listener(shutdown_flag_clone, on_file_received);
+        run_socket_listener(shutdown_flag_clone, on_file_received);
     });
 
     SingleInstanceResult::Primary(SingleInstanceLock {
@@ -204,68 +169,48 @@ pub fn try_acquire_lock(
     })
 }
 
-/// Listen for pipe messages and call callback when a file path is received.
-fn run_pipe_listener(
+/// Listen for local-socket messages and call callback when a file path is received.
+fn run_socket_listener(
     shutdown_flag: Arc<AtomicBool>,
     on_file_received: impl Fn(PathBuf) + Send + 'static,
 ) {
-    loop {
+    let name = match IPC_SOCKET_NAME.to_ns_name::<GenericNamespaced>() {
+        Ok(name) => name,
+        Err(_) => return,
+    };
+
+    let listener = match ListenerOptions::new().name(name).create_sync() {
+        Ok(listener) => listener,
+        Err(_) => return,
+    };
+
+    for conn_result in listener.incoming() {
         if shutdown_flag.load(Ordering::SeqCst) {
             break;
         }
 
-        let pipe = create_server_pipe();
-        if pipe == INVALID_HANDLE_VALUE {
-            thread::sleep(Duration::from_millis(10));
+        let conn = match conn_result {
+            Ok(conn) => conn,
+            Err(_) => continue,
+        };
+
+        let mut reader = BufReader::new(conn);
+        let mut message = String::new();
+        if reader.read_line(&mut message).is_err() {
             continue;
         }
 
-        let connected = unsafe {
-            let ok = ConnectNamedPipe(pipe, std::ptr::null_mut());
-            if ok != 0 {
-                true
-            } else {
-                GetLastError() == ERROR_PIPE_CONNECTED
+        let message = message.trim_end_matches(&['\r', '\n'][..]);
+        if message == IPC_WAKE_MESSAGE {
+            if shutdown_flag.load(Ordering::SeqCst) {
+                break;
             }
-        };
-
-        if connected {
-            let mut buffer = vec![0u8; IPC_BUFFER_SIZE];
-            let mut bytes_read: DWORD = 0;
-
-            let read_ok = unsafe {
-                ReadFile(
-                    pipe,
-                    buffer.as_mut_ptr() as *mut _,
-                    buffer.len() as u32,
-                    &mut bytes_read,
-                    std::ptr::null_mut(),
-                ) != 0
-            };
-
-            if read_ok && bytes_read > 0 {
-                buffer.truncate(bytes_read as usize);
-
-                if let Ok(message) = String::from_utf8(buffer) {
-                    if message == IPC_WAKE_MESSAGE {
-                        // Internal wake-up to break blocking ConnectNamedPipe during shutdown.
-                    } else if let Some(path_str) = message.strip_prefix("OPEN:") {
-                        let path = PathBuf::from(path_str.trim());
-                        if path.exists() {
-                            tracing::debug!(target: "single_instance", path = %path.display(), "received open request from secondary instance");
-                            on_file_received(path);
-                        }
-                    }
-                }
+        } else if let Some(path_str) = message.strip_prefix("OPEN:") {
+            let path = PathBuf::from(path_str.trim());
+            if path.exists() {
+                tracing::debug!(target: "single_instance", path = %path.display(), "received open request from secondary instance");
+                on_file_received(path);
             }
-
-            unsafe {
-                DisconnectNamedPipe(pipe);
-            }
-        }
-
-        unsafe {
-            CloseHandle(pipe);
         }
     }
 }
