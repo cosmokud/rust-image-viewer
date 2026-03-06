@@ -19,6 +19,7 @@ use zune_image::image::Image as ZuneImage;
 // This prevents loading extremely large images that would consume too much RAM
 const DEFAULT_MAX_DECODE_ALLOC_BYTES: u64 = 512 * 1024 * 1024; // 512 MiB
 const ZUNE_STATIC_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "bmp", "psd"];
+const WEBP_STREAM_CHANNEL_CAPACITY: usize = 96;
 
 trait BufReadSeek: BufRead + Seek {}
 impl<T: BufRead + Seek> BufReadSeek for T {}
@@ -407,7 +408,7 @@ impl LoadedImage {
             return None;
         }
 
-        let (tx, rx) = crossbeam_channel::unbounded::<ImageFrame>();
+        let (tx, rx) = crossbeam_channel::bounded::<ImageFrame>(WEBP_STREAM_CHANNEL_CAPACITY);
         let path = path.to_path_buf();
 
         std::thread::Builder::new()

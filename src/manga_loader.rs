@@ -37,6 +37,9 @@ use crate::image_loader::{
     get_media_type, is_supported_image, is_supported_video, probe_image_dimensions, LoadedImage,
     MediaType,
 };
+use crate::metadata_cache::{
+    lookup_cached_dimensions, store_cached_dimensions, CachedMediaKind,
+};
 
 /// Maximum number of decoded images to hold in memory awaiting GPU upload.
 /// This bounds memory usage even if the main thread is slow to consume results.
@@ -254,7 +257,7 @@ impl MangaLoader {
                         let dims = if is_video {
                             Self::probe_video_dimensions(&path)
                         } else if is_image {
-                            probe_image_dimensions(&path)
+                            Self::probe_image_dimensions_cached(&path)
                         } else {
                             None
                         };
@@ -715,6 +718,19 @@ impl MangaLoader {
         );
     }
 
+    fn probe_image_dimensions_cached(path: &std::path::Path) -> Option<(u32, u32)> {
+        if let Some((w, h)) = lookup_cached_dimensions(path, CachedMediaKind::Image) {
+            return Some((w, h));
+        }
+
+        let dims = probe_image_dimensions(path);
+        if let Some((w, h)) = dims {
+            store_cached_dimensions(path, CachedMediaKind::Image, w, h);
+        }
+
+        dims
+    }
+
     /// Load a single image on a worker thread.
     /// For video files, this extracts the first frame as a thumbnail placeholder.
     fn load_single_image(req: &LoadRequest) -> Option<DecodedImage> {
@@ -769,7 +785,8 @@ impl MangaLoader {
             }
             MediaType::Image => {
                 // Get original dimensions from file header first (fast, no decode)
-                let (original_width, original_height) = probe_image_dimensions(&req.path)?;
+                let (original_width, original_height) =
+                    Self::probe_image_dimensions_cached(&req.path)?;
 
                 // For animated WebP files we only decode the first frame here so that
                 // the manga scroll view isn't blocked by a potentially very expensive
@@ -836,28 +853,54 @@ impl MangaLoader {
     /// Uses GStreamer Discoverer metadata probe instead of spinning up a decode pipeline.
     /// Falls back to filename-based heuristics when probing fails.
     fn probe_video_dimensions(path: &std::path::Path) -> Option<(u32, u32)> {
+        if let Some((w, h)) = lookup_cached_dimensions(path, CachedMediaKind::Video) {
+            return Some((w, h));
+        }
+
         use gstreamer as gst;
         use gstreamer_pbutils as gst_pbutils;
 
         static GST_INIT: std::sync::OnceLock<Result<(), ()>> = std::sync::OnceLock::new();
         let init_result = GST_INIT.get_or_init(|| gst::init().map_err(|_| ()));
         if init_result.is_err() {
-            return Self::fallback_video_dimensions(path);
+            let fallback = Self::fallback_video_dimensions(path);
+            if let Some((w, h)) = fallback {
+                store_cached_dimensions(path, CachedMediaKind::Video, w, h);
+            }
+            return fallback;
         }
 
         let uri = match gst::glib::filename_to_uri(path, None) {
             Ok(uri) => uri.to_string(),
-            Err(_) => return Self::fallback_video_dimensions(path),
+            Err(_) => {
+                let fallback = Self::fallback_video_dimensions(path);
+                if let Some((w, h)) = fallback {
+                    store_cached_dimensions(path, CachedMediaKind::Video, w, h);
+                }
+                return fallback;
+            }
         };
 
         let discoverer = match gst_pbutils::Discoverer::new(gst::ClockTime::from_mseconds(900)) {
             Ok(d) => d,
-            Err(_) => return Self::fallback_video_dimensions(path),
+            Err(_) => {
+                let fallback = Self::fallback_video_dimensions(path);
+                if let Some((w, h)) = fallback {
+                    store_cached_dimensions(path, CachedMediaKind::Video, w, h);
+                }
+                return fallback;
+            }
         };
 
         let info = match discoverer.discover_uri(&uri) {
             Ok(i) => i,
-            Err(_) => return Self::fallback_video_dimensions(path),
+            Err(_) => {
+                let fallback = Self::fallback_video_dimensions(path);
+                if let Some((w, h)) = fallback {
+                    store_cached_dimensions(path, CachedMediaKind::Video, w, h);
+                }
+                return fallback;
+            }
         };
 
         let probed = info.video_streams().into_iter().find_map(|video| {
@@ -872,11 +915,17 @@ impl MangaLoader {
 
         if let Some((w, h)) = probed {
             if w > 0 && h > 0 {
+                store_cached_dimensions(path, CachedMediaKind::Video, w, h);
                 return Some((w, h));
             }
         }
 
-        Self::fallback_video_dimensions(path)
+        let fallback = Self::fallback_video_dimensions(path);
+        if let Some((w, h)) = fallback {
+            store_cached_dimensions(path, CachedMediaKind::Video, w, h);
+        }
+
+        fallback
     }
 
     fn fallback_video_dimensions(path: &std::path::Path) -> Option<(u32, u32)> {
@@ -1304,7 +1353,7 @@ impl MangaLoader {
                     (idx, dims.map(|(w, h)| (w, h, MangaMediaType::Video)))
                 } else if is_image {
                     // For images, get from file header
-                    let dims = probe_image_dimensions(path);
+                    let dims = Self::probe_image_dimensions_cached(path);
                     // We can't easily determine if an image is animated without loading it
                     // Default to static, will be updated when actually loaded
                     (idx, dims.map(|(w, h)| (w, h, MangaMediaType::StaticImage)))

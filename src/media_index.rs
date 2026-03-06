@@ -48,6 +48,7 @@ impl MediaDirectoryIndex {
         }
     }
 
+    #[allow(dead_code)]
     pub fn stats(&self) -> MediaDirectoryIndexStats {
         self.stats
     }

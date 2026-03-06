@@ -6,6 +6,7 @@
 mod config;
 mod image_loader;
 mod media_index;
+mod metadata_cache;
 mod manga_loader;
 mod perf_metrics;
 #[cfg(target_os = "windows")]
@@ -906,6 +907,8 @@ impl ImageViewer {
     const MANGA_UPLOAD_BATCH_BASE: usize = 4;
     const MANGA_UPLOAD_BATCH_MIN: usize = 2;
     const MANGA_UPLOAD_BATCH_MAX: usize = 12;
+    const MANGA_UPLOAD_P95_SOFT_BUDGET_MS: f32 = 4.5;
+    const MANGA_UPLOAD_P95_HARD_BUDGET_MS: f32 = 7.5;
     const MANGA_CACHE_MIN_ENTRIES: usize = 64;
     const MANGA_CACHE_MAX_ENTRIES: usize = 512;
     const MANGA_DYNAMIC_TARGET_MIN_SIDE: u32 = 192;
@@ -1038,6 +1041,33 @@ impl ImageViewer {
         // If many visible placeholders are waiting, bias toward lower latency.
         if self.manga_ttv_pending.len() >= 8 {
             limit += 2;
+        }
+
+        // Adapt upload budget to measured upload pass latency.
+        if let Some(upload_p95_ms) = self
+            .perf_metrics
+            .percentile_ms("manga_upload_pass_ms", 0.95)
+        {
+            if upload_p95_ms >= Self::MANGA_UPLOAD_P95_HARD_BUDGET_MS {
+                limit = limit.saturating_sub(4);
+            } else if upload_p95_ms >= Self::MANGA_UPLOAD_P95_SOFT_BUDGET_MS {
+                limit = limit.saturating_sub(2);
+            } else if upload_p95_ms <= 1.5 && pending_decoded >= 6 {
+                limit += 1;
+            }
+        }
+
+        // Guard UI smoothness by reacting to recent frame time.
+        // `fps_last_dt_s` is updated from active render frames only.
+        if self.fps_last_dt_s.is_finite() && self.fps_last_dt_s > 0.0 {
+            let frame_ms = self.fps_last_dt_s * 1000.0;
+            if frame_ms >= 22.0 {
+                limit = limit.saturating_sub(2);
+            } else if frame_ms >= 18.0 {
+                limit = limit.saturating_sub(1);
+            } else if frame_ms <= 12.5 && pending_decoded >= 10 {
+                limit += 1;
+            }
         }
 
         // During active masonry navigation, prioritize frame-time consistency over fill rate.
