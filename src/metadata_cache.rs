@@ -1,11 +1,12 @@
 //! Persistent metadata cache for media dimensions and video thumbnails.
 
+use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use parking_lot::Mutex;
 use redb::backends::FileBackend;
@@ -30,6 +31,8 @@ const PRUNE_INTERVAL_SECS: u64 = 60;
 const CACHE_WRITE_QUEUE_CAPACITY: usize = 512;
 const METADATA_CACHE_DEFAULT_MAX_SIZE_BYTES: u64 = 1024 * 1024 * 1024;
 const BYTES_PER_MIB: u64 = 1024 * 1024;
+const FINGERPRINT_CACHE_TTL: Duration = Duration::from_millis(750);
+const FINGERPRINT_CACHE_MAX_ENTRIES: usize = 4096;
 
 static DIMENSION_HITS: AtomicU64 = AtomicU64::new(0);
 static DIMENSION_MISSES: AtomicU64 = AtomicU64::new(0);
@@ -91,6 +94,12 @@ struct FileFingerprint {
     size_bytes: u64,
     modified_secs: u64,
     modified_nanos: u32,
+}
+
+#[derive(Clone, Copy)]
+struct CachedFingerprintEntry {
+    fingerprint: FileFingerprint,
+    cached_at: Instant,
 }
 
 #[derive(Clone, Copy)]
@@ -1067,16 +1076,58 @@ fn static_thumbnail_key(path: &Path, max_texture_side: u32) -> String {
     format!("{}#imgts{}", cache_key(path), max_texture_side.max(1))
 }
 
+fn fingerprint_cache() -> &'static Mutex<HashMap<PathBuf, CachedFingerprintEntry>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, CachedFingerprintEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn fingerprint_cache_prune(
+    cache: &mut HashMap<PathBuf, CachedFingerprintEntry>,
+    now: Instant,
+) {
+    cache.retain(|_, entry| now.duration_since(entry.cached_at) <= FINGERPRINT_CACHE_TTL);
+
+    while cache.len() >= FINGERPRINT_CACHE_MAX_ENTRIES {
+        let Some(oldest_key) = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.cached_at)
+            .map(|(path, _)| path.clone())
+        else {
+            break;
+        };
+        cache.remove(&oldest_key);
+    }
+}
+
 fn fingerprint(path: &Path) -> Option<FileFingerprint> {
+    let now = Instant::now();
+    if let Some(entry) = fingerprint_cache().lock().get(path).copied() {
+        if now.duration_since(entry.cached_at) <= FINGERPRINT_CACHE_TTL {
+            return Some(entry.fingerprint);
+        }
+    }
+
     let metadata = std::fs::metadata(path).ok()?;
     let modified = metadata.modified().ok()?;
     let duration = modified.duration_since(UNIX_EPOCH).ok()?;
 
-    Some(FileFingerprint {
+    let fingerprint = FileFingerprint {
         size_bytes: metadata.len(),
         modified_secs: duration.as_secs(),
         modified_nanos: duration.subsec_nanos(),
-    })
+    };
+
+    let mut cache = fingerprint_cache().lock();
+    fingerprint_cache_prune(&mut cache, now);
+    cache.insert(
+        path.to_path_buf(),
+        CachedFingerprintEntry {
+            fingerprint,
+            cached_at: now,
+        },
+    );
+
+    Some(fingerprint)
 }
 
 fn unix_now_secs() -> u64 {

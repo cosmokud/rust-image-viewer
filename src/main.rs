@@ -1433,10 +1433,13 @@ impl ImageViewer {
     const MANGA_CACHE_MAX_ENTRIES: usize = 512;
     const MANGA_DYNAMIC_TARGET_MIN_SIDE: u32 = 192;
     const MANGA_DYNAMIC_TARGET_OVERSCAN: f32 = 1.35;
+    const MANGA_MASONRY_DYNAMIC_TARGET_DENSE_MIN_SIDE: u32 = 64;
     const MANGA_MASONRY_DYNAMIC_TARGET_MIN_SIDE: u32 = 96;
-    const MANGA_MASONRY_ZOOM_QUALITY_BASELINE_SCALE: f32 = 1024.0 / 688.0;
+    const MANGA_MASONRY_ZOOM_QUALITY_BASELINE_SCALE: f32 = 1.08;
     const MANGA_TEXTURE_UPGRADE_MIN_DELTA_SIDE: u32 = 64;
     const MANGA_TEXTURE_UPGRADE_MIN_RATIO: f32 = 1.12;
+    const MANGA_TEXTURE_UPGRADE_MASONRY_MIN_DELTA_SIDE: u32 = 96;
+    const MANGA_TEXTURE_UPGRADE_MASONRY_MIN_RATIO: f32 = 1.24;
     const MANGA_TTV_SAMPLE_CAP: usize = 240;
     const MANGA_TTV_PENDING_MAX_AGE: Duration = Duration::from_secs(30);
     const FPS_OVERLAY_IDLE_POLL_MS: u64 = 500;
@@ -4743,20 +4746,92 @@ impl ImageViewer {
         }
     }
 
-    fn masonry_zoom_quality_boost(zoom: f32) -> f32 {
-        if zoom <= 0.35 {
-            0.85
-        } else if zoom <= 0.60 {
-            0.90
-        } else if zoom <= 1.00 {
+    fn masonry_visible_density_hint(&self) -> usize {
+        self.manga_visible_indices_last.max(1)
+    }
+
+    fn masonry_dynamic_target_min_side(&self) -> u32 {
+        let max_side = self.max_texture_side.max(1);
+        let visible_hint = self.masonry_visible_density_hint();
+
+        let min_side = if visible_hint >= 48 || self.zoom <= 0.55 {
+            Self::MANGA_MASONRY_DYNAMIC_TARGET_DENSE_MIN_SIDE
+        } else {
+            Self::MANGA_MASONRY_DYNAMIC_TARGET_MIN_SIDE
+        };
+
+        min_side.min(max_side)
+    }
+
+    fn masonry_fill_target_side_cap(&self) -> u32 {
+        let max_side = self.max_texture_side.max(1);
+        let visible_hint = self.masonry_visible_density_hint();
+
+        let cap = if visible_hint >= 120 {
+            128
+        } else if visible_hint >= 72 {
+            160
+        } else if visible_hint >= 36 {
+            224
+        } else if visible_hint >= 18 {
+            320
+        } else {
+            max_side
+        };
+
+        cap.min(max_side)
+    }
+
+    fn masonry_navigation_target_side_cap(&self) -> u32 {
+        let max_side = self.max_texture_side.max(1);
+        let visible_hint = self.masonry_visible_density_hint();
+
+        let cap = if visible_hint >= 120 {
+            96
+        } else if visible_hint >= 72 {
+            128
+        } else if visible_hint >= 36 {
+            160
+        } else {
+            224
+        };
+
+        cap.min(max_side)
+    }
+
+    fn masonry_zoom_quality_boost(&self, zoom: f32) -> f32 {
+        let base: f32 = if zoom <= 0.35 {
             1.00
+        } else if zoom <= 0.60 {
+            1.02
+        } else if zoom <= 1.00 {
+            1.04
         } else if zoom <= 1.50 {
             1.08
         } else if zoom <= 2.00 {
-            1.16
+            1.12
         } else {
-            1.24
-        }
+            1.16
+        };
+
+        let visible_hint = self.masonry_visible_density_hint();
+        let density_scale: f32 = if visible_hint >= 120 {
+            0.72
+        } else if visible_hint >= 72 {
+            0.82
+        } else if visible_hint >= 36 {
+            0.92
+        } else {
+            1.0
+        };
+
+        let navigation_scale: f32 = if self.masonry_navigation_active_for_heavy_work() {
+            0.90
+        } else {
+            1.0
+        };
+
+        (base * density_scale * navigation_scale).clamp(0.72f32, 1.12f32)
     }
 
     fn masonry_target_texture_side_from_display_side(&self, item_screen_max_side: f32) -> u32 {
@@ -4769,13 +4844,91 @@ impl ImageViewer {
         let baseline_item_width = (self.screen_size.x.max(1.0) / rows)
             * zoom
             * Self::MANGA_MASONRY_ZOOM_QUALITY_BASELINE_SCALE;
-        let basis = item_screen_max_side.max(baseline_item_width).max(64.0);
-        let scaled = (basis * Self::masonry_zoom_quality_boost(zoom)).ceil() as u32;
+        let basis = item_screen_max_side
+            .max(baseline_item_width.min(item_screen_max_side.max(1.0) * 1.08))
+            .max(48.0);
+        let scaled = (basis * self.masonry_zoom_quality_boost(zoom)).ceil() as u32;
+        let scaled = if self.masonry_navigation_active_for_heavy_work() {
+            scaled.min(self.masonry_navigation_target_side_cap())
+        } else {
+            scaled.min(self.masonry_fill_target_side_cap())
+        };
 
-        scaled.clamp(
-            Self::MANGA_MASONRY_DYNAMIC_TARGET_MIN_SIDE.min(max_side),
-            max_side,
-        )
+        scaled.clamp(self.masonry_dynamic_target_min_side(), max_side)
+    }
+
+    fn manga_screen_max_side_for_index(&mut self, index: usize) -> f32 {
+        if self.is_masonry_mode() {
+            if let Some(rect) = self.masonry_item_screen_rect(index) {
+                return rect.width().max(rect.height()).max(1.0);
+            }
+
+            self.masonry_ensure_layout_cache();
+            if let Some(item) = self.masonry_layout_items.get(index) {
+                let slot_size = egui::vec2(
+                    item.width * self.zoom.max(0.0001),
+                    item.height * self.zoom.max(0.0001),
+                );
+                let display_size = self.masonry_item_display_size(index, slot_size);
+                return display_size.x.max(display_size.y).max(1.0);
+            }
+
+            return self.screen_size.x.min(self.screen_size.y).max(1.0);
+        }
+
+        self.manga_get_image_display_width(index)
+            .max(self.manga_get_image_display_height(index))
+            .max(1.0)
+    }
+
+    fn manga_target_texture_side_for_dynamic_media(
+        &mut self,
+        index: usize,
+        media_type: MangaMediaType,
+    ) -> u32 {
+        let max_side = self.max_texture_side.max(1);
+        let display_side = self.manga_screen_max_side_for_index(index);
+        let overscan = match media_type {
+            MangaMediaType::Video => {
+                if self.is_masonry_mode() {
+                    1.05
+                } else {
+                    1.10
+                }
+            }
+            MangaMediaType::AnimatedImage => {
+                if self.is_masonry_mode() {
+                    1.08
+                } else {
+                    1.12
+                }
+            }
+            MangaMediaType::StaticImage => Self::MANGA_DYNAMIC_TARGET_OVERSCAN,
+        };
+
+        let min_side = if self.is_masonry_mode() {
+            self.masonry_dynamic_target_min_side().max(match media_type {
+                MangaMediaType::Video => 96,
+                MangaMediaType::AnimatedImage => 96,
+                MangaMediaType::StaticImage => self.masonry_dynamic_target_min_side(),
+            })
+        } else {
+            Self::MANGA_DYNAMIC_TARGET_MIN_SIDE.min(max_side)
+        };
+
+        let mut target_side = ((display_side * overscan).ceil() as u32).clamp(min_side, max_side);
+        target_side = self.manga_clamp_target_side_to_source(index, target_side).clamp(1, max_side);
+
+        if self.is_masonry_mode() {
+            let fill_cap = if self.masonry_navigation_active_for_heavy_work() {
+                self.masonry_navigation_target_side_cap()
+            } else {
+                self.masonry_fill_target_side_cap()
+            };
+            target_side = target_side.min(fill_cap.max(min_side));
+        }
+
+        target_side
     }
 
     fn manga_clamp_target_side_to_source(&self, index: usize, target_side: u32) -> u32 {
@@ -4803,15 +4956,37 @@ impl ImageViewer {
             .clamp(1, max_side)
     }
 
-    fn manga_texture_upgrade_needed(existing_side: u32, desired_side: u32) -> bool {
+    fn manga_texture_upgrade_needed(
+        &self,
+        existing_side: u32,
+        desired_side: u32,
+        media_type: MangaMediaType,
+    ) -> bool {
         if desired_side <= existing_side {
             return false;
         }
 
-        let ratio_threshold =
-            (existing_side as f32 * Self::MANGA_TEXTURE_UPGRADE_MIN_RATIO).ceil() as u32;
-        let delta_threshold =
-            existing_side.saturating_add(Self::MANGA_TEXTURE_UPGRADE_MIN_DELTA_SIDE);
+        let (ratio, delta) = if self.is_masonry_mode() {
+            let dense_view = self.masonry_visible_density_hint() >= 48;
+            let moving_media = matches!(media_type, MangaMediaType::Video | MangaMediaType::AnimatedImage);
+
+            if dense_view || moving_media {
+                (1.32f32, 128u32)
+            } else {
+                (
+                    Self::MANGA_TEXTURE_UPGRADE_MASONRY_MIN_RATIO,
+                    Self::MANGA_TEXTURE_UPGRADE_MASONRY_MIN_DELTA_SIDE,
+                )
+            }
+        } else {
+            (
+                Self::MANGA_TEXTURE_UPGRADE_MIN_RATIO,
+                Self::MANGA_TEXTURE_UPGRADE_MIN_DELTA_SIDE,
+            )
+        };
+
+        let ratio_threshold = (existing_side as f32 * ratio).ceil() as u32;
+        let delta_threshold = existing_side.saturating_add(delta);
         desired_side >= ratio_threshold.max(delta_threshold)
     }
 
@@ -5066,7 +5241,12 @@ impl ImageViewer {
                 }
             }
 
-            return self.masonry_target_texture_side_from_display_side(visible_max_side.max(1.0));
+            let mut target_side =
+                self.masonry_target_texture_side_from_display_side(visible_max_side.max(1.0));
+            if self.masonry_navigation_active_for_heavy_work() {
+                target_side = target_side.min(self.masonry_navigation_target_side_cap());
+            }
+            return target_side;
         }
 
         if self.zoom >= 0.95 {
@@ -6221,6 +6401,8 @@ impl ImageViewer {
 
         // Only update the focused video's texture (to save resources)
         if let Some(focused_idx) = self.manga_focused_video_index {
+            let target_side =
+                self.manga_target_texture_side_for_dynamic_media(focused_idx, MangaMediaType::Video);
             let mut video_dimensions_changed = false;
             if let Some(player) = self.manga_video_players.get_mut(&focused_idx) {
                 // Update duration cache
@@ -6253,7 +6435,7 @@ impl ImageViewer {
                         frame.width,
                         frame.height,
                         &frame.pixels,
-                        self.max_texture_side,
+                        target_side,
                         if self.manga_should_force_triangle_filters() {
                             FilterType::Triangle
                         } else {
@@ -6268,7 +6450,7 @@ impl ImageViewer {
                     let texture = ctx.load_texture(
                         format!("manga_video_{}", focused_idx),
                         color_image,
-                        self.config.texture_filter_video.to_egui_options(),
+                        self.manga_texture_options_for_upload(MangaMediaType::Video, w, h),
                     );
 
                     self.manga_video_textures
@@ -6377,12 +6559,15 @@ impl ImageViewer {
                 && !self.manga_anim_failed.contains(&idx)
             {
                 if let Some(path) = self.image_list.get(idx).cloned() {
-                    let max_tex = self.max_texture_side;
+                    let target_side = self.manga_target_texture_side_for_dynamic_media(
+                        idx,
+                        MangaMediaType::AnimatedImage,
+                    );
 
                     if LoadedImage::is_animated_webp(&path) {
                         if let Some(rx) = LoadedImage::start_streaming_webp(
                             &path,
-                            Some(max_tex),
+                            Some(target_side),
                             active_gif_filter,
                         ) {
                             self.manga_anim_streams.insert(idx, rx);
@@ -6392,7 +6577,7 @@ impl ImageViewer {
                             if !self.manga_animated_images.contains_key(&idx) {
                                 if let Ok(img) = LoadedImage::load_first_frame_only(
                                     &path,
-                                    Some(max_tex),
+                                    Some(target_side),
                                     active_downscale_filter,
                                     active_gif_filter,
                                 ) {
@@ -6414,7 +6599,7 @@ impl ImageViewer {
                         // GIF (and any other non-WebP animated image): load the full animation directly.
                         match LoadedImage::load_with_max_texture_side(
                             &path,
-                            Some(max_tex),
+                            Some(target_side),
                             active_downscale_filter,
                             active_gif_filter,
                         ) {
@@ -6469,6 +6654,8 @@ impl ImageViewer {
 
         // ── Update animation frames for the focused animated image only ──
         for &idx in focused_anim_idx.iter() {
+            let target_side =
+                self.manga_target_texture_side_for_dynamic_media(idx, MangaMediaType::AnimatedImage);
             let stream_done = self
                 .manga_anim_stream_done
                 .get(&idx)
@@ -6494,7 +6681,7 @@ impl ImageViewer {
                         frame.width,
                         frame.height,
                         &frame.pixels,
-                        self.max_texture_side,
+                        target_side,
                         active_gif_filter,
                     );
 
@@ -6570,6 +6757,8 @@ impl ImageViewer {
         idx: usize,
         stream_done: bool,
     ) {
+        let target_side =
+            self.manga_target_texture_side_for_dynamic_media(idx, MangaMediaType::AnimatedImage);
         let reset_filter = if self.manga_should_force_triangle_filters() {
             FilterType::Triangle
         } else {
@@ -6589,7 +6778,7 @@ impl ImageViewer {
                 frame.width,
                 frame.height,
                 &frame.pixels,
-                self.max_texture_side,
+                target_side,
                 reset_filter,
             );
             let color_image =
@@ -7018,17 +7207,23 @@ impl ImageViewer {
     ) -> egui::TextureOptions {
         let min_side = width.min(height);
         let mipmap_allowed_by_size = min_side >= self.config.manga_mipmap_min_side.max(1);
+        let navigation_blocks_mipmaps =
+            self.is_masonry_mode() && self.masonry_navigation_active_for_heavy_work();
 
         match media_type {
             MangaMediaType::StaticImage => {
-                let enable_mipmap = self.config.manga_mipmap_static && mipmap_allowed_by_size;
+                let enable_mipmap = self.config.manga_mipmap_static
+                    && mipmap_allowed_by_size
+                    && !navigation_blocks_mipmaps;
                 self.config
                     .texture_filter_static
                     .to_egui_options_with_mipmap(enable_mipmap)
             }
             MangaMediaType::Video => {
                 let enable_mipmap =
-                    self.config.manga_mipmap_video_thumbnails && mipmap_allowed_by_size;
+                    self.config.manga_mipmap_video_thumbnails
+                        && mipmap_allowed_by_size
+                        && !navigation_blocks_mipmaps;
                 self.config
                     .texture_filter_video
                     .to_egui_options_with_mipmap(enable_mipmap)
@@ -7185,7 +7380,11 @@ impl ImageViewer {
                 self.manga_texture_cache.get_texture_info(decoded.index)
             {
                 let existing_side = existing_w.max(existing_h);
-                if !Self::manga_texture_upgrade_needed(existing_side, incoming_side) {
+                if !self.manga_texture_upgrade_needed(
+                    existing_side,
+                    incoming_side,
+                    decoded.media_type,
+                ) {
                     self.manga_ttv_pending.remove(&decoded.index);
                     continue;
                 }
@@ -8691,15 +8890,31 @@ impl ImageViewer {
         let desired_target_side = self
             .manga_clamp_target_side_to_source(index, display_target_side)
             .clamp(1, max_side);
+        let masonry_fill_cap = if is_masonry {
+            if self.masonry_navigation_active_for_heavy_work() {
+                self.masonry_navigation_target_side_cap()
+            } else {
+                self.masonry_fill_target_side_cap()
+            }
+        } else {
+            max_side
+        };
 
         // During active masonry navigation, prioritize fast placeholder fill over texture quality.
-        let target_texture_side =
-            if is_masonry && self.masonry_navigation_active_for_heavy_work() && !quality_upgrade {
-                let nav_cap = self.manga_target_texture_side.min(256).max(min_target_side);
-                let side = desired_target_side.min(nav_cap).max(min_target_side);
+        let target_texture_side = if is_masonry && !quality_upgrade {
+                let fill_cap = masonry_fill_cap
+                    .min(self.manga_target_texture_side.max(min_target_side))
+                    .max(min_target_side);
+                let side = desired_target_side.min(fill_cap).max(min_target_side);
                 if side < desired_target_side {
-                    self.perf_metrics
-                        .increment_counter("manga_retry_low_lod_nav", 1);
+                    self.perf_metrics.increment_counter(
+                        if self.masonry_navigation_active_for_heavy_work() {
+                            "manga_retry_low_lod_nav"
+                        } else {
+                            "manga_retry_low_lod_fill"
+                        },
+                        1,
+                    );
                 }
                 side
             } else {
@@ -8764,6 +8979,14 @@ impl ImageViewer {
                 .image_list
                 .get(idx)
                 .map_or(false, |p| is_supported_video(p));
+
+        let retry_media_type = if is_video {
+            MangaMediaType::Video
+        } else if is_animated_image {
+            MangaMediaType::AnimatedImage
+        } else {
+            MangaMediaType::StaticImage
+        };
 
         let video_load_pending = is_video && self.manga_video_load_pending_for_index(idx);
 
@@ -8834,7 +9057,11 @@ impl ImageViewer {
                     );
                 }
 
-                if Self::manga_texture_upgrade_needed(tex_w.max(tex_h), retry_target_side) {
+                if self.manga_texture_upgrade_needed(
+                    tex_w.max(tex_h),
+                    retry_target_side,
+                    retry_media_type,
+                ) {
                     requested_retry |=
                         self.manga_request_retry_for_visible_item(idx, retry_target_side, true);
                 }
@@ -8938,7 +9165,11 @@ impl ImageViewer {
                     }
                 }
 
-                if Self::manga_texture_upgrade_needed(tex_w.max(tex_h), retry_target_side) {
+                if self.manga_texture_upgrade_needed(
+                    tex_w.max(tex_h),
+                    retry_target_side,
+                    retry_media_type,
+                ) {
                     requested_retry |=
                         self.manga_request_retry_for_visible_item(idx, retry_target_side, true);
                 }

@@ -17,6 +17,9 @@ All notable changes to this project will be documented in this file.
 - Visible masonry dimension requests now use a higher-priority worker lane than background warm-up probes, so viewport-critical layout data can preempt whole-folder metadata refinement.
 - Decoded masonry images now pass through a small visible-first mailbox before GPU upload, which keeps active scrolling focused on visible or near-visible textures and sheds stale speculative uploads sooner when the UI falls behind.
 - Added masonry layout, spatial-index, and visible-query timing metrics to the performance overlay so remaining frame spikes can be correlated to concrete hot paths instead of guessed heuristics.
+- Masonry retries, focused video frames, and focused animated-image frames now target a more aggressive display-aware LOD, which reduces oversized uploads and quality-churn stutter in dense zoomed-out views.
+- Masonry navigation now suppresses more unnecessary quality upgrades and mipmap work for transient textures, keeping the draw thread focused on fast visible fills before settling to higher detail.
+- Metadata-cache fingerprint validation now uses a short-lived in-memory stamp cache, which cuts repeated `std::fs::metadata` probes during dense browsing and reduces HDD-sensitive thumbnail and dimension lookup stalls.
 
 ### Added
 
