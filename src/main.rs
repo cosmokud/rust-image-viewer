@@ -4414,11 +4414,21 @@ impl ImageViewer {
         let viewport_bottom = viewport_top + viewport_h;
         let viewport_center = viewport_top + viewport_h * 0.5;
 
-        // Only consider items intersecting the viewport.
-        let start_idx = self.manga_index_at_y(viewport_top);
-        let mut end_idx = self.manga_index_at_y(viewport_bottom);
-        if end_idx < start_idx {
-            end_idx = start_idx;
+        let mut candidate_indices = if self.manga_use_rtree_backend() {
+            self.manga_query_visible_indices_rtree(viewport_top, viewport_bottom)
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        if candidate_indices.is_empty() {
+            // Only consider items intersecting the viewport.
+            let start_idx = self.manga_index_at_y(viewport_top);
+            let mut end_idx = self.manga_index_at_y(viewport_bottom);
+            if end_idx < start_idx {
+                end_idx = start_idx;
+            }
+            candidate_indices.extend(start_idx..=end_idx.min(len.saturating_sub(1)));
         }
 
         self.manga_ensure_layout_cache();
@@ -4430,7 +4440,10 @@ impl ImageViewer {
         let mut best_center_distance = f32::MAX;
 
         // Use prefix sums directly for speed.
-        for idx in start_idx..=end_idx.min(len.saturating_sub(1)) {
+        for idx in candidate_indices {
+            if idx >= len || idx + 1 >= self.manga_layout_offsets.len() {
+                continue;
+            }
             let start = self.manga_layout_offsets[idx];
             let end = self.manga_layout_offsets[idx + 1];
             let center = (start + end) * 0.5;
@@ -7815,14 +7828,20 @@ impl ImageViewer {
             None
         };
 
+        let strip_visible_indices = if !self.is_masonry_mode() && self.manga_use_rtree_backend() {
+            Some(self.manga_collect_visible_indices())
+        } else {
+            None
+        };
+
         // Long-strip fast-path: start drawing from the first visible index.
         // Masonry mode uses its own per-item visibility checks below.
-        let first_visible_idx = if self.is_masonry_mode() {
+        let first_visible_idx = if self.is_masonry_mode() || strip_visible_indices.is_some() {
             0
         } else {
             self.manga_index_at_y(self.manga_scroll_offset.max(0.0))
         };
-        let first_visible_y = if self.is_masonry_mode() {
+        let first_visible_y = if self.is_masonry_mode() || strip_visible_indices.is_some() {
             0.0
         } else {
             self.manga_page_start_y(first_visible_idx)
@@ -7868,36 +7887,60 @@ impl ImageViewer {
                         }
                     }
                 } else {
-                    let mut y_offset: f32 = first_visible_y - self.manga_scroll_offset;
+                    if let Some(visible_indices) = strip_visible_indices.as_ref() {
+                        for idx in visible_indices {
+                            let idx = *idx;
+                            let display_height = self.manga_page_height_cached(idx).max(1.0);
+                            let y_offset = self.manga_page_start_y(idx) - self.manga_scroll_offset;
 
-                    for idx in first_visible_idx..self.image_list.len() {
-                        let img_height = self.manga_get_image_display_height(idx);
+                            if y_offset + display_height < 0.0 || y_offset > screen_height {
+                                continue;
+                            }
 
-                        // Skip images that are completely above the viewport
-                        if y_offset + img_height < 0.0 {
+                            let display_width = self.manga_get_image_display_width(idx);
+                            let x = (screen_width - display_width) / 2.0 + self.offset.x;
+
+                            let image_rect = egui::Rect::from_min_size(
+                                egui::pos2(x, y_offset),
+                                egui::Vec2::new(display_width, display_height),
+                            );
+
+                            if self.draw_manga_item(ui, idx, image_rect) {
+                                requested_visible_retry = true;
+                            }
+                        }
+                    } else {
+                        let mut y_offset: f32 = first_visible_y - self.manga_scroll_offset;
+
+                        for idx in first_visible_idx..self.image_list.len() {
+                            let img_height = self.manga_get_image_display_height(idx);
+
+                            // Skip images that are completely above the viewport
+                            if y_offset + img_height < 0.0 {
+                                y_offset += img_height;
+                                continue;
+                            }
+
+                            // Stop drawing if we're past the viewport
+                            if y_offset > screen_height {
+                                break;
+                            }
+
+                            // Get display dimensions first (uses manga_loader, not texture cache)
+                            let display_height = img_height;
+                            let display_width = self.manga_get_image_display_width(idx);
+                            let x = (screen_width - display_width) / 2.0 + self.offset.x;
+
+                            let image_rect = egui::Rect::from_min_size(
+                                egui::pos2(x, y_offset),
+                                egui::Vec2::new(display_width, display_height),
+                            );
+
+                            if self.draw_manga_item(ui, idx, image_rect) {
+                                requested_visible_retry = true;
+                            }
                             y_offset += img_height;
-                            continue;
                         }
-
-                        // Stop drawing if we're past the viewport
-                        if y_offset > screen_height {
-                            break;
-                        }
-
-                        // Get display dimensions first (uses manga_loader, not texture cache)
-                        let display_height = img_height;
-                        let display_width = self.manga_get_image_display_width(idx);
-                        let x = (screen_width - display_width) / 2.0 + self.offset.x;
-
-                        let image_rect = egui::Rect::from_min_size(
-                            egui::pos2(x, y_offset),
-                            egui::Vec2::new(display_width, display_height),
-                        );
-
-                        if self.draw_manga_item(ui, idx, image_rect) {
-                            requested_visible_retry = true;
-                        }
-                        y_offset += img_height;
                     }
                 }
 
