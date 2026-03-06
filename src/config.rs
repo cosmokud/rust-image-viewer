@@ -276,6 +276,32 @@ impl VideoSeekPolicy {
         }
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MangaVirtualizationBackend {
+    Auto,
+    Linear,
+    RTree,
+}
+
+impl MangaVirtualizationBackend {
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "auto" | "default" => Some(Self::Auto),
+            "linear" | "scan" => Some(Self::Linear),
+            "rtree" | "r-tree" | "spatial" | "spatial_index" => Some(Self::RTree),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Linear => "linear",
+            Self::RTree => "rtree",
+        }
+    }
+}
 /// Parse a single key from string
 fn parse_key(s: &str) -> Option<egui::Key> {
     match s.to_lowercase().as_str() {
@@ -399,6 +425,9 @@ pub struct Config {
     pub manga_hover_autoplay_resume_delay_ms: u64,
     /// Manga mode: when true, consume wheel input with the same smooth cadence as arrow keys.
     pub manga_wheel_smooth_like_arrow_keys: bool,
+    /// Manga mode viewport virtualization backend.
+    /// `auto` enables r-tree for large folders while preserving linear scans for small sets.
+    pub manga_virtualization_backend: MangaVirtualizationBackend,
     /// Manga mode autoscroll: dead zone radius around the anchor (px).
     pub manga_autoscroll_dead_zone_px: f32,
     /// Manga mode autoscroll: multiplier applied to base speed (`manga_arrow_scroll_speed`).
@@ -517,6 +546,7 @@ impl Config {
             masonry_items_per_row: 5,
             manga_hover_autoplay_resume_delay_ms: 220,
             manga_wheel_smooth_like_arrow_keys: true,
+            manga_virtualization_backend: MangaVirtualizationBackend::Auto,
             manga_autoscroll_dead_zone_px: 14.0,
             manga_autoscroll_base_speed_multiplier: 5.0,
             manga_autoscroll_min_speed_multiplier: 0.6,
@@ -910,6 +940,14 @@ impl Config {
                                 config.manga_wheel_smooth_like_arrow_keys = v;
                             }
                         }
+                        "manga_virtualization_backend"
+                        | "manga_viewport_backend"
+                        | "manga_spatial_backend"
+                        | "manga_virtualization_mode" => {
+                            if let Some(mode) = MangaVirtualizationBackend::from_str(value) {
+                                config.manga_virtualization_backend = mode;
+                            }
+                        }
                         "manga_autoscroll_dead_zone_px"
                         | "manga_autoscroll_deadzone_px"
                         | "manga_autoscroll_dead_zone"
@@ -1268,6 +1306,10 @@ impl Config {
         values.insert(
             "manga_wheel_smooth_like_arrow_keys",
             bool_to_ini(self.manga_wheel_smooth_like_arrow_keys).to_string(),
+        );
+        values.insert(
+            "manga_virtualization_backend",
+            self.manga_virtualization_backend.as_str().to_string(),
         );
         values.insert(
             "manga_autoscroll_dead_zone_px",

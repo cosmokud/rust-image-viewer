@@ -8,6 +8,7 @@ mod image_loader;
 mod media_index;
 mod metadata_cache;
 mod manga_loader;
+mod manga_spatial;
 mod perf_metrics;
 #[cfg(target_os = "windows")]
 mod single_instance;
@@ -19,7 +20,9 @@ mod windows_env;
 #[global_allocator]
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use config::{Action, Config, InputBinding, StartupWindowMode, VideoSeekPolicy};
+use config::{
+    Action, Config, InputBinding, MangaVirtualizationBackend, StartupWindowMode, VideoSeekPolicy,
+};
 use image_loader::{
     get_media_type, is_supported_video, probe_image_dimensions, ImageFrame, LoadedImage,
     MediaType,
@@ -28,6 +31,7 @@ use hashbrown::{HashMap, HashSet};
 use media_index::MediaDirectoryIndex;
 use metadata_cache::metadata_cache_stats;
 use manga_loader::{MangaLoader, MangaMediaType, MangaTextureCache};
+use manga_spatial::{MangaSpatialIndex, SpatialRect, STRIP_QUERY_HALF_WIDTH};
 use perf_metrics::PerfMetrics;
 #[cfg(target_os = "windows")]
 use single_instance::{FileReceiver, SingleInstanceResult};
@@ -654,9 +658,13 @@ struct ImageViewer {
     /// When valid: `manga_layout_offsets.len() == image_list.len() + 1` and
     /// page `i` spans `offsets[i]..offsets[i+1]` in absolute strip coordinates.
     manga_layout_offsets: Vec<f32>,
+    /// Spatial index for long-strip page bounds.
+    manga_strip_spatial_index: Option<MangaSpatialIndex>,
 
     /// Cached per-item layout for masonry mode (absolute strip coordinates).
     masonry_layout_items: Vec<MasonryItemLayout>,
+    /// Spatial index for masonry item bounds.
+    masonry_spatial_index: Option<MangaSpatialIndex>,
     /// Cached total height for masonry mode.
     masonry_layout_total_height: f32,
     masonry_layout_screen_x: f32,
@@ -906,8 +914,10 @@ impl Default for ImageViewer {
             manga_total_height_cache_len: 0,
             manga_total_height_cache_valid: false,
             manga_layout_offsets: Vec::new(),
+            manga_strip_spatial_index: None,
 
             masonry_layout_items: Vec::new(),
+            masonry_spatial_index: None,
             masonry_layout_total_height: 0.0,
             masonry_layout_screen_x: 0.0,
             masonry_layout_items_per_row: 0,
@@ -984,6 +994,7 @@ impl ImageViewer {
     const MANGA_UPLOAD_BATCH_MAX: usize = 12;
     const MANGA_UPLOAD_P95_SOFT_BUDGET_MS: f32 = 4.5;
     const MANGA_UPLOAD_P95_HARD_BUDGET_MS: f32 = 7.5;
+    const MANGA_VIRTUALIZATION_AUTO_RTREE_MIN_ITEMS: usize = 2048;
     const MANGA_CACHE_MIN_ENTRIES: usize = 64;
     const MANGA_CACHE_MAX_ENTRIES: usize = 512;
     const MANGA_DYNAMIC_TARGET_MIN_SIDE: u32 = 192;
@@ -3389,11 +3400,108 @@ impl ImageViewer {
         desired_side >= ratio_threshold.max(delta_threshold)
     }
 
-    fn manga_collect_visible_indices(&mut self) -> Vec<usize> {
-        if !self.manga_mode || self.image_list.is_empty() {
-            return Vec::new();
+    fn manga_use_rtree_backend(&self) -> bool {
+        match self.config.manga_virtualization_backend {
+            MangaVirtualizationBackend::Linear => false,
+            MangaVirtualizationBackend::RTree => true,
+            MangaVirtualizationBackend::Auto => {
+                self.image_list.len() >= Self::MANGA_VIRTUALIZATION_AUTO_RTREE_MIN_ITEMS
+            }
+        }
+    }
+
+    fn manga_ensure_masonry_spatial_index(&mut self) -> Option<&MangaSpatialIndex> {
+        if !self.is_masonry_mode() || self.image_list.is_empty() {
+            self.masonry_spatial_index = None;
+            return None;
         }
 
+        self.masonry_ensure_layout_cache();
+        if self.masonry_layout_items.is_empty() {
+            self.masonry_spatial_index = None;
+            return None;
+        }
+
+        let needs_rebuild = self
+            .masonry_spatial_index
+            .as_ref()
+            .map(|index| index.len() != self.masonry_layout_items.len())
+            .unwrap_or(true);
+
+        if needs_rebuild {
+            let mut rects = Vec::with_capacity(self.masonry_layout_items.len());
+            for (idx, item) in self.masonry_layout_items.iter().enumerate() {
+                rects.push(SpatialRect::new(
+                    idx,
+                    item.x,
+                    item.y,
+                    item.x + item.width.max(0.0),
+                    item.y + item.height.max(0.0),
+                ));
+            }
+            self.masonry_spatial_index = Some(MangaSpatialIndex::from_rects(rects));
+        }
+
+        self.masonry_spatial_index.as_ref()
+    }
+
+    fn manga_ensure_strip_spatial_index(&mut self) -> Option<&MangaSpatialIndex> {
+        if self.is_masonry_mode() || !self.manga_mode || self.image_list.is_empty() {
+            self.manga_strip_spatial_index = None;
+            return None;
+        }
+
+        self.manga_ensure_layout_cache();
+        let len = self.image_list.len();
+        if self.manga_layout_offsets.len() != len.saturating_add(1) {
+            self.manga_strip_spatial_index = None;
+            return None;
+        }
+
+        let needs_rebuild = self
+            .manga_strip_spatial_index
+            .as_ref()
+            .map(|index| index.len() != len)
+            .unwrap_or(true);
+
+        if needs_rebuild {
+            let mut rects = Vec::with_capacity(len);
+            for idx in 0..len {
+                let start_y = self.manga_layout_offsets[idx];
+                let end_y = self.manga_layout_offsets[idx + 1].max(start_y + 0.0001);
+                rects.push(SpatialRect::new(
+                    idx,
+                    -STRIP_QUERY_HALF_WIDTH,
+                    start_y,
+                    STRIP_QUERY_HALF_WIDTH,
+                    end_y,
+                ));
+            }
+            self.manga_strip_spatial_index = Some(MangaSpatialIndex::from_rects(rects));
+        }
+
+        self.manga_strip_spatial_index.as_ref()
+    }
+
+    fn manga_query_visible_indices_rtree(
+        &mut self,
+        viewport_top: f32,
+        viewport_bottom: f32,
+    ) -> Option<Vec<usize>> {
+        if self.is_masonry_mode() {
+            let zoom = self.zoom.max(0.0001);
+            let min_y = viewport_top / zoom;
+            let max_y = viewport_bottom / zoom;
+            return self
+                .manga_ensure_masonry_spatial_index()
+                .map(|index| index.query_vertical_band(min_y, max_y));
+        }
+
+        self.manga_ensure_strip_spatial_index()
+            .map(|index| index.query_vertical_band(viewport_top, viewport_bottom))
+    }
+
+    fn manga_collect_visible_indices_linear(&mut self) -> Vec<usize> {
         if self.is_masonry_mode() {
             self.masonry_ensure_layout_cache();
             if self.masonry_layout_items.is_empty() {
@@ -3442,6 +3550,23 @@ impl ImageViewer {
         }
 
         visible_indices
+    }
+
+    fn manga_collect_visible_indices(&mut self) -> Vec<usize> {
+        if !self.manga_mode || self.image_list.is_empty() {
+            return Vec::new();
+        }
+
+        let viewport_top = self.manga_scroll_offset.max(0.0);
+        let viewport_bottom = viewport_top + self.screen_size.y.max(1.0);
+
+        if self.manga_use_rtree_backend() {
+            if let Some(indices) = self.manga_query_visible_indices_rtree(viewport_top, viewport_bottom) {
+                return indices;
+            }
+        }
+
+        self.manga_collect_visible_indices_linear()
     }
 
     fn manga_compute_cache_capacity_target(
@@ -3538,6 +3663,8 @@ impl ImageViewer {
     fn invalidate_manga_layout_cache(&mut self) {
         self.manga_total_height_cache_valid = false;
         self.manga_layout_offsets.clear();
+        self.manga_strip_spatial_index = None;
+        self.masonry_spatial_index = None;
         self.masonry_layout_valid = false;
         self.masonry_layout_invalidation_deferred = false;
     }
@@ -3647,6 +3774,7 @@ impl ImageViewer {
     fn masonry_ensure_layout_cache(&mut self) {
         if !self.is_masonry_mode() || self.image_list.is_empty() {
             self.masonry_layout_items.clear();
+            self.masonry_spatial_index = None;
             self.masonry_layout_total_height = 0.0;
             self.masonry_layout_valid = false;
             return;
@@ -3721,6 +3849,7 @@ impl ImageViewer {
         self.masonry_layout_items_per_row = items_per_row;
         self.masonry_layout_len = len;
         self.masonry_layout_valid = true;
+        self.masonry_spatial_index = None;
     }
 
     fn masonry_item_screen_rect(&self, index: usize) -> Option<egui::Rect> {
@@ -3737,6 +3866,36 @@ impl ImageViewer {
 
         if self.is_masonry_mode() {
             self.masonry_ensure_layout_cache();
+
+            if self.manga_use_rtree_backend() {
+                let zoom = self.zoom.max(0.0001);
+                let layout_x = (pos.x - self.offset.x) / zoom;
+                let layout_y = (self.manga_scroll_offset.max(0.0) + pos.y) / zoom;
+                let eps = 0.0001;
+
+                let candidates = self
+                    .manga_ensure_masonry_spatial_index()
+                    .map(|index| {
+                        index.query_indices(
+                            layout_x - eps,
+                            layout_y - eps,
+                            layout_x + eps,
+                            layout_y + eps,
+                        )
+                    })
+                    .unwrap_or_default();
+
+                for idx in candidates {
+                    if let Some(rect) = self.masonry_item_screen_rect(idx) {
+                        if rect.contains(pos) {
+                            return Some(idx);
+                        }
+                    }
+                }
+
+                return None;
+            }
+
             for (idx, _) in self.image_list.iter().enumerate() {
                 if let Some(rect) = self.masonry_item_screen_rect(idx) {
                     if rect.contains(pos) {
@@ -4189,10 +4348,28 @@ impl ImageViewer {
             let viewport_center_x = viewport_left + self.screen_size.x * 0.5;
             let viewport_center_y = viewport_top + viewport_h * 0.5;
 
+            let candidate_indices: Vec<usize> = if self.manga_use_rtree_backend() {
+                let layout_left = viewport_left / zoom;
+                let layout_right = viewport_right / zoom;
+                let layout_top = viewport_top / zoom;
+                let layout_bottom = viewport_bottom / zoom;
+                self.manga_ensure_masonry_spatial_index()
+                    .map(|index| {
+                        index.query_indices(layout_left, layout_top, layout_right, layout_bottom)
+                    })
+                    .unwrap_or_default()
+            } else {
+                (0..self.masonry_layout_items.len()).collect()
+            };
+
             let mut best_idx = self.current_index.min(len.saturating_sub(1));
             let mut best_score = f32::MAX;
 
-            for (idx, item) in self.masonry_layout_items.iter().enumerate() {
+            for idx in candidate_indices {
+                let Some(item) = self.masonry_layout_items.get(idx) else {
+                    continue;
+                };
+
                 let item_top = item.y * zoom;
                 let item_bottom = item_top + item.height * zoom;
                 let item_left = item.x * zoom;
@@ -5066,6 +5243,10 @@ impl ImageViewer {
             return 1;
         }
 
+        if self.manga_use_rtree_backend() {
+            return self.manga_collect_visible_indices().len().max(1);
+        }
+
         if self.is_masonry_mode() {
             self.masonry_ensure_layout_cache();
             if self.masonry_layout_items.is_empty() {
@@ -5367,6 +5548,7 @@ impl ImageViewer {
         if needs_recompute {
             let mut total = 0.0;
             self.manga_layout_offsets.clear();
+            self.manga_strip_spatial_index = None;
             self.manga_layout_offsets.reserve(len + 1);
             self.manga_layout_offsets.push(0.0);
             for idx in 0..len {
@@ -5422,17 +5604,40 @@ impl ImageViewer {
 
             let viewport_center_x = self.screen_size.x * 0.5 - self.offset.x;
 
+            let row_candidates: Option<Vec<usize>> = if self.manga_use_rtree_backend() {
+                let query_y = y / zoom;
+                self.manga_ensure_masonry_spatial_index()
+                    .map(|index| index.query_vertical_band(query_y, query_y))
+            } else {
+                None
+            };
+
             let mut best_row_idx = None;
             let mut best_row_score = f32::MAX;
-            for (idx, item) in self.masonry_layout_items.iter().enumerate() {
-                let top = item.y * zoom;
-                let bottom = top + item.height * zoom;
-                if y >= top && y <= bottom {
+
+            if let Some(candidates) = row_candidates {
+                for idx in candidates {
+                    let Some(item) = self.masonry_layout_items.get(idx) else {
+                        continue;
+                    };
                     let center_x = (item.x + item.width * 0.5) * zoom;
                     let score = (center_x - viewport_center_x).abs();
                     if score < best_row_score {
                         best_row_score = score;
                         best_row_idx = Some(idx);
+                    }
+                }
+            } else {
+                for (idx, item) in self.masonry_layout_items.iter().enumerate() {
+                    let top = item.y * zoom;
+                    let bottom = top + item.height * zoom;
+                    if y >= top && y <= bottom {
+                        let center_x = (item.x + item.width * 0.5) * zoom;
+                        let score = (center_x - viewport_center_x).abs();
+                        if score < best_row_score {
+                            best_row_score = score;
+                            best_row_idx = Some(idx);
+                        }
                     }
                 }
             }
@@ -7604,6 +7809,12 @@ impl ImageViewer {
             .and_then(|idx| self.manga_video_players.get(&idx))
             .map_or(false, |p| p.is_playing());
 
+        let masonry_visible_indices = if self.is_masonry_mode() && self.manga_use_rtree_backend() {
+            Some(self.manga_collect_visible_indices())
+        } else {
+            None
+        };
+
         // Long-strip fast-path: start drawing from the first visible index.
         // Masonry mode uses its own per-item visibility checks below.
         let first_visible_idx = if self.is_masonry_mode() {
@@ -7628,18 +7839,32 @@ impl ImageViewer {
                     let viewport_bottom = viewport_top + screen_height;
                     let zoom = self.zoom.max(0.0001);
 
-                    for idx in 0..self.masonry_layout_items.len() {
-                        let item = self.masonry_layout_items[idx];
-                        let item_top = item.y * zoom;
-                        let item_bottom = item_top + item.height * zoom;
-                        if item_top > viewport_bottom || item_bottom < viewport_top {
-                            continue;
-                        }
+                    if let Some(visible_indices) = masonry_visible_indices.as_ref() {
+                        for idx in visible_indices {
+                            let Some(item) = self.masonry_layout_items.get(*idx).copied() else {
+                                continue;
+                            };
 
-                        let image_rect =
-                            item.to_screen_rect(zoom, self.offset.x, self.manga_scroll_offset);
-                        if self.draw_manga_item(ui, idx, image_rect) {
-                            requested_visible_retry = true;
+                            let image_rect =
+                                item.to_screen_rect(zoom, self.offset.x, self.manga_scroll_offset);
+                            if self.draw_manga_item(ui, *idx, image_rect) {
+                                requested_visible_retry = true;
+                            }
+                        }
+                    } else {
+                        for idx in 0..self.masonry_layout_items.len() {
+                            let item = self.masonry_layout_items[idx];
+                            let item_top = item.y * zoom;
+                            let item_bottom = item_top + item.height * zoom;
+                            if item_top > viewport_bottom || item_bottom < viewport_top {
+                                continue;
+                            }
+
+                            let image_rect =
+                                item.to_screen_rect(zoom, self.offset.x, self.manga_scroll_offset);
+                            if self.draw_manga_item(ui, idx, image_rect) {
+                                requested_visible_retry = true;
+                            }
                         }
                     }
                 } else {
