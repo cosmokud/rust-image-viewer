@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.2.2] - 2026-03-07
+
+### Fixed
+
+- The title-bar maximize or restore button now uses native Win32 maximize and restore behavior instead of routing through the viewer's custom fullscreen toggle path.
+
 ## [v0.2.1] - 2026-03-06
 
 ### Highlights

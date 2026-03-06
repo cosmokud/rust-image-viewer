@@ -791,6 +791,8 @@ struct ImageViewer {
     toggle_fullscreen_from_titlebar: bool,
     /// Request minimize
     request_minimize: bool,
+    /// Request native maximize (`Some(true)`) or restore (`Some(false)`) for the root window.
+    request_native_maximize: Option<bool>,
 
     /// Maximum supported texture side for the active GPU backend.
     /// Used to prevent crashes when attempting to upload oversized images.
@@ -821,6 +823,8 @@ struct ImageViewer {
     image_rotated: bool,
     /// Pending window resize to apply after a frame delay (to prevent flash on fullscreen exit)
     pending_window_resize: Option<(egui::Vec2, egui::Pos2, u8)>,
+    /// Apply a fit-to-window layout once a native maximize request has landed.
+    pending_maximized_layout: bool,
 
     /// Per-image view state cache for fullscreen mode.
     /// Maps image paths to their saved view states (zoom, pan, rotation, flip).
@@ -1183,6 +1187,7 @@ impl Default for ImageViewer {
             toggle_fullscreen: false,
             toggle_fullscreen_from_titlebar: false,
             request_minimize: false,
+            request_native_maximize: None,
             max_texture_side: 4096,
             startup_window_mode_applied: false,
             pending_window_title: None,
@@ -1196,6 +1201,7 @@ impl Default for ImageViewer {
             fullscreen_transition_target: 0.0,
             image_rotated: false,
             pending_window_resize: None,
+            pending_maximized_layout: false,
             fullscreen_view_states: HashMap::new(),
             last_known_outer_pos: None,
             floating_user_moved_window: false,
@@ -3959,6 +3965,22 @@ impl ImageViewer {
         self.send_outer_position(ctx, egui::pos2(x.max(0.0), y.max(0.0)));
     }
 
+    fn current_window_is_maximized(&self, ctx: &egui::Context) -> bool {
+        let viewport_maximized = ctx.input(|i| i.raw.viewport().maximized);
+
+        #[cfg(target_os = "windows")]
+        {
+            viewport_maximized
+                .or_else(crate::windows_env::active_window_is_maximized)
+                .unwrap_or(false)
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            viewport_maximized.unwrap_or(false)
+        }
+    }
+
     fn apply_floating_layout_for_current_image(&mut self, ctx: &egui::Context) {
         self.offset = egui::Vec2::ZERO;
 
@@ -4018,6 +4040,39 @@ impl ImageViewer {
                 self.center_window_on_monitor(ctx, size);
             }
         }
+    }
+
+    fn apply_maximized_layout_for_current_image(&mut self, ctx: &egui::Context) {
+        self.offset = egui::Vec2::ZERO;
+        self.zoom_velocity = 0.0;
+
+        let Some((img_w_u, img_h_u)) = self.media_display_dimensions() else {
+            return;
+        };
+
+        let img_w = img_w_u as f32;
+        let img_h = img_h_u as f32;
+        if img_w <= 0.0 || img_h <= 0.0 {
+            return;
+        }
+
+        let available = ctx.screen_rect().size();
+        let is_video = matches!(self.current_media_type, Some(MediaType::Video));
+
+        let fit_zoom = if is_video {
+            if img_h > available.y {
+                (available.y / img_h).clamp(0.1, self.max_zoom_factor())
+            } else {
+                1.0
+            }
+        } else if img_h > available.y || img_w > available.x {
+            (available.y / img_h).min(available.x / img_w).min(1.0)
+        } else {
+            1.0
+        };
+
+        self.zoom = fit_zoom;
+        self.zoom_target = fit_zoom;
     }
 
     fn apply_fullscreen_layout_for_current_image(&mut self, ctx: &egui::Context) {
@@ -9441,6 +9496,7 @@ impl ImageViewer {
 
     fn request_floating_autosize(&mut self, ctx: &egui::Context) {
         if self.is_fullscreen
+            || self.current_window_is_maximized(ctx)
             || self.is_resizing
             || self.pending_window_resize.is_some()
             || self.defer_media_view_reset
@@ -10348,15 +10404,16 @@ impl ImageViewer {
                             }
 
                             // Maximize/Restore button
-                            let button = if self.is_fullscreen {
+                            let window_is_maximized = self.current_window_is_maximized(ctx);
+                            let button = if self.is_fullscreen || window_is_maximized {
                                 WindowButton::Restore
                             } else {
                                 WindowButton::Maximize
                             };
                             if window_icon_button(ui, button).clicked() {
-                                self.toggle_fullscreen_from_titlebar = true;
-
                                 if self.is_fullscreen {
+                                    self.toggle_fullscreen_from_titlebar = true;
+
                                     // Remember where maximize/restore should return from floating mode.
                                     self.titlebar_previous_mode = Some(if self.manga_mode {
                                         TitlebarToggleReturnMode::Manga(self.manga_layout_mode)
@@ -10365,17 +10422,11 @@ impl ImageViewer {
                                     } else {
                                         TitlebarToggleReturnMode::Fullscreen
                                     });
+                                    self.toggle_fullscreen = true;
                                 } else {
-                                    self.titlebar_pending_restore_layout =
-                                        match self.titlebar_previous_mode {
-                                            Some(TitlebarToggleReturnMode::Manga(layout_mode)) => {
-                                                Some(layout_mode)
-                                            }
-                                            _ => None,
-                                        };
+                                    self.request_native_maximize = Some(!window_is_maximized);
+                                    self.pending_maximized_layout = !window_is_maximized;
                                 }
-
-                                self.toggle_fullscreen = true;
                             }
 
                             // Minimize button
@@ -12338,6 +12389,7 @@ impl eframe::App for ImageViewer {
         // We must decode frames first so that pending_media_layout and show_window_if_ready
         // can see the correct dimensions and apply layout before showing the window.
         let texture_animation_active = self.update_texture(ctx);
+        let window_is_maximized = self.current_window_is_maximized(ctx);
 
         // Apply layout changes after image changes.
         if self.image_changed {
@@ -12350,6 +12402,8 @@ impl eframe::App for ImageViewer {
                 if self.is_fullscreen {
                     // Fullscreen: keep fullscreen and fit vertically, centered.
                     self.apply_fullscreen_layout_for_current_image(ctx);
+                } else if window_is_maximized {
+                    self.apply_maximized_layout_for_current_image(ctx);
                 } else {
                     // Floating: size exactly to image (fit-to-screen if needed) and center window.
                     self.apply_floating_layout_for_current_image(ctx);
@@ -12377,6 +12431,8 @@ impl eframe::App for ImageViewer {
                         self.zoom_target = z;
                     }
                 }
+            } else if window_is_maximized {
+                self.apply_maximized_layout_for_current_image(ctx);
             } else {
                 // Floating: resize window to match new image dimensions (swapped after rotation)
                 self.apply_floating_layout_for_current_image(ctx);
@@ -12390,6 +12446,8 @@ impl eframe::App for ImageViewer {
             if self.media_display_dimensions().is_some() {
                 if self.is_fullscreen {
                     self.apply_fullscreen_layout_for_current_image(ctx);
+                } else if window_is_maximized {
+                    self.apply_maximized_layout_for_current_image(ctx);
                 } else {
                     self.apply_floating_layout_for_current_image(ctx);
                 }
@@ -12639,6 +12697,31 @@ impl eframe::App for ImageViewer {
             } else {
                 false
             };
+
+        if let Some(maximize) = self.request_native_maximize.take() {
+            #[cfg(target_os = "windows")]
+            {
+                let _ = crate::windows_env::set_active_window_maximized(maximize);
+            }
+
+            #[cfg(not(target_os = "windows"))]
+            {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(maximize));
+            }
+
+            if maximize {
+                ctx.request_repaint_after(Duration::from_millis(16));
+            }
+        }
+
+        if self.pending_maximized_layout {
+            if self.current_window_is_maximized(ctx) {
+                self.apply_maximized_layout_for_current_image(ctx);
+                self.pending_maximized_layout = false;
+            } else {
+                ctx.request_repaint_after(Duration::from_millis(16));
+            }
+        }
 
         if self.request_minimize {
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));

@@ -147,6 +147,45 @@ fn registry_effective_path() -> Option<String> {
     }
 }
 
+fn active_or_foreground_window() -> winapi::shared::windef::HWND {
+    use winapi::um::winuser::{GetActiveWindow, GetForegroundWindow};
+
+    unsafe {
+        let active = GetActiveWindow();
+        if !active.is_null() {
+            active
+        } else {
+            GetForegroundWindow()
+        }
+    }
+}
+
+pub fn active_window_is_maximized() -> Option<bool> {
+    use winapi::um::winuser::IsZoomed;
+
+    let hwnd = active_or_foreground_window();
+    if hwnd.is_null() {
+        return None;
+    }
+
+    unsafe { Some(IsZoomed(hwnd) != 0) }
+}
+
+pub fn set_active_window_maximized(maximize: bool) -> bool {
+    use winapi::um::winuser::{ShowWindow, SW_MAXIMIZE, SW_RESTORE};
+
+    let hwnd = active_or_foreground_window();
+    if hwnd.is_null() {
+        return false;
+    }
+
+    let cmd = if maximize { SW_MAXIMIZE } else { SW_RESTORE };
+    unsafe {
+        ShowWindow(hwnd, cmd);
+    }
+    true
+}
+
 /// Refreshes the process `PATH` from the registry (HKLM + HKCU), merging with the current
 /// process PATH. This makes DLL/plugin discovery resilient when the process is launched from
 /// a parent process with a stale/sanitized environment (e.g., some browsers).
