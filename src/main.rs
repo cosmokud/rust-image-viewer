@@ -372,6 +372,14 @@ struct PendingMediaLoad {
     started_at: Instant,
 }
 
+#[derive(Clone, Debug)]
+struct PendingMangaFocusedVideoLoad {
+    request_id: u64,
+    index: usize,
+    path: PathBuf,
+    started_at: Instant,
+}
+
 struct AsyncImageLoad {
     image: LoadedImage,
     is_animated_webp: bool,
@@ -532,6 +540,110 @@ fn process_media_load_request(request: MediaLoadRequest) -> MediaLoadResult {
     }
 }
 
+struct MangaFocusedVideoLoadRequest {
+    request_id: u64,
+    index: usize,
+    path: PathBuf,
+    muted: bool,
+    initial_volume: f64,
+    prefer_hardware_decode: bool,
+    disable_hardware_decode: bool,
+}
+
+struct MangaFocusedVideoLoadResult {
+    request_id: u64,
+    index: usize,
+    path: PathBuf,
+    result: Result<VideoPlayer, String>,
+    worker_elapsed: Duration,
+}
+
+struct MangaFocusedVideoLoadCoordinator {
+    latest_request: Arc<Mutex<Option<MangaFocusedVideoLoadRequest>>>,
+    wake_tx: crossbeam_channel::Sender<()>,
+    result_rx: crossbeam_channel::Receiver<MangaFocusedVideoLoadResult>,
+}
+
+impl MangaFocusedVideoLoadCoordinator {
+    fn new() -> Self {
+        let latest_request: Arc<Mutex<Option<MangaFocusedVideoLoadRequest>>> =
+            Arc::new(Mutex::new(None));
+        let (wake_tx, wake_rx) = crossbeam_channel::bounded::<()>(1);
+        let (result_tx, result_rx) = crossbeam_channel::bounded::<MangaFocusedVideoLoadResult>(8);
+
+        let latest_request_worker = Arc::clone(&latest_request);
+        crate::async_runtime::spawn_blocking_or_thread("manga-video-load-coordinator", move || {
+            run_manga_focused_video_load_coordinator(latest_request_worker, wake_rx, result_tx);
+        });
+
+        Self {
+            latest_request,
+            wake_tx,
+            result_rx,
+        }
+    }
+
+    fn submit(&self, request: MangaFocusedVideoLoadRequest) {
+        *self.latest_request.lock() = Some(request);
+        let _ = self.wake_tx.try_send(());
+    }
+
+    fn try_recv(&self) -> Result<MangaFocusedVideoLoadResult, crossbeam_channel::TryRecvError> {
+        self.result_rx.try_recv()
+    }
+}
+
+fn run_manga_focused_video_load_coordinator(
+    latest_request: Arc<Mutex<Option<MangaFocusedVideoLoadRequest>>>,
+    wake_rx: crossbeam_channel::Receiver<()>,
+    result_tx: crossbeam_channel::Sender<MangaFocusedVideoLoadResult>,
+) {
+    while wake_rx.recv().is_ok() {
+        loop {
+            while wake_rx.try_recv().is_ok() {}
+
+            let Some(request) = latest_request.lock().take() else {
+                break;
+            };
+
+            let result = process_manga_focused_video_load_request(request);
+            if result_tx.send(result).is_err() {
+                return;
+            }
+
+            if latest_request.lock().is_none() {
+                break;
+            }
+        }
+    }
+}
+
+fn process_manga_focused_video_load_request(
+    request: MangaFocusedVideoLoadRequest,
+) -> MangaFocusedVideoLoadResult {
+    let started_at = Instant::now();
+
+    let result = VideoPlayer::new(
+        &request.path,
+        request.muted,
+        request.initial_volume,
+        request.prefer_hardware_decode,
+        request.disable_hardware_decode,
+    )
+    .and_then(|mut player| {
+        player.play()?;
+        Ok(player)
+    });
+
+    MangaFocusedVideoLoadResult {
+        request_id: request.request_id,
+        index: request.index,
+        path: request.path,
+        result,
+        worker_elapsed: started_at.elapsed(),
+    }
+}
+
 const DECODED_IMAGE_CACHE_MAX_BYTES: u64 = 192 * 1024 * 1024;
 const DECODED_IMAGE_CACHE_SKIP_ENTRY_BYTES: usize = 24 * 1024 * 1024;
 
@@ -611,6 +723,12 @@ struct ImageViewer {
     media_load_coordinator: MediaLoadCoordinator,
     /// Active non-blocking media load (if any).
     pending_media_load: Option<PendingMediaLoad>,
+    /// Monotonic request id for async manga-focused video startup.
+    next_manga_video_load_request_id: u64,
+    /// Latest-only coordinator for async manga-focused video startup.
+    manga_video_load_coordinator: MangaFocusedVideoLoadCoordinator,
+    /// Active async manga-focused video startup request.
+    pending_manga_video_load: Option<PendingMangaFocusedVideoLoad>,
     /// Current image index in the list
     current_index: usize,
     /// Current zoom level (1.0 = 100%)
@@ -997,6 +1115,9 @@ impl Default for ImageViewer {
             next_media_load_request_id: 1,
             media_load_coordinator: MediaLoadCoordinator::new(),
             pending_media_load: None,
+            next_manga_video_load_request_id: 1,
+            manga_video_load_coordinator: MangaFocusedVideoLoadCoordinator::new(),
+            pending_manga_video_load: None,
             current_index: 0,
             zoom: 1.0,
             zoom_target: 1.0,
@@ -2559,6 +2680,7 @@ impl ImageViewer {
     }
 
     fn clear_manga_runtime_workloads(&mut self) {
+        self.clear_pending_manga_video_load();
         self.manga_video_players.clear();
         self.manga_focused_video_index = None;
         self.manga_hovered_media_index = None;
@@ -2711,6 +2833,167 @@ impl ImageViewer {
 
     fn clear_pending_media_load(&mut self) {
         self.pending_media_load = None;
+    }
+
+    fn clear_pending_manga_video_load(&mut self) {
+        self.pending_manga_video_load = None;
+    }
+
+    fn manga_video_load_pending_for_index(&self, index: usize) -> bool {
+        self.pending_manga_video_load
+            .as_ref()
+            .is_some_and(|pending| {
+                pending.index == index
+                    && self
+                        .image_list
+                        .get(index)
+                        .is_some_and(|current_path| current_path == &pending.path)
+            })
+    }
+
+    fn start_async_manga_focused_video_load(
+        &mut self,
+        index: usize,
+        path: PathBuf,
+        muted: bool,
+        initial_volume: f64,
+    ) {
+        let request_id = self.next_manga_video_load_request_id;
+        self.next_manga_video_load_request_id = self
+            .next_manga_video_load_request_id
+            .saturating_add(1)
+            .max(1);
+
+        self.pending_manga_video_load = Some(PendingMangaFocusedVideoLoad {
+            request_id,
+            index,
+            path: path.clone(),
+            started_at: Instant::now(),
+        });
+
+        self.manga_video_load_coordinator
+            .submit(MangaFocusedVideoLoadRequest {
+                request_id,
+                index,
+                path,
+                muted,
+                initial_volume,
+                prefer_hardware_decode: self.config.video_prefer_hardware_decode,
+                disable_hardware_decode: self.config.video_disable_hardware_decode,
+            });
+    }
+
+    fn poll_pending_manga_video_load(&mut self, ctx: &egui::Context) {
+        let mut applied_any = false;
+
+        loop {
+            let result = match self.manga_video_load_coordinator.try_recv() {
+                Ok(result) => result,
+                Err(crossbeam_channel::TryRecvError::Empty) => break,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    self.clear_pending_manga_video_load();
+                    break;
+                }
+            };
+
+            let (result_request_id, result_index, result_path, worker_elapsed) = (
+                result.request_id,
+                result.index,
+                &result.path,
+                result.worker_elapsed,
+            );
+
+            let Some(pending) = self.pending_manga_video_load.as_ref() else {
+                continue;
+            };
+
+            if result_request_id != pending.request_id
+                || result_index != pending.index
+                || result_path != &pending.path
+            {
+                self.perf_metrics.increment_counter("manga_video_async_stale", 1);
+                continue;
+            }
+
+            let Some(pending) = self.pending_manga_video_load.take() else {
+                continue;
+            };
+
+            let total_elapsed = pending.started_at.elapsed();
+            self.perf_metrics
+                .record_duration("manga_video_async_ms", total_elapsed);
+            self.perf_metrics
+                .record_duration("manga_video_async_worker_ms", worker_elapsed);
+            self.perf_metrics.record_duration(
+                "manga_video_async_queue_ms",
+                total_elapsed.saturating_sub(worker_elapsed),
+            );
+
+            let still_targeted = self.manga_mode
+                && self.manga_focused_video_index == Some(result_index)
+                && self
+                    .image_list
+                    .get(result_index)
+                    .is_some_and(|current_path| current_path == result_path);
+
+            if !still_targeted {
+                self.perf_metrics.increment_counter("manga_video_async_stale", 1);
+                continue;
+            }
+
+            match result {
+                MangaFocusedVideoLoadResult {
+                    index,
+                    result: Ok(mut player),
+                    ..
+                } => {
+                    Self::apply_video_audio_overrides(
+                        &mut player,
+                        self.manga_video_user_muted,
+                        self.manga_video_user_volume,
+                    );
+
+                    if !player.is_playing() {
+                        let _ = player.play();
+                    }
+
+                    let dims = player.dimensions();
+                    if dims.0 > 0 && dims.1 > 0 {
+                        if let Some(ref mut loader) = self.manga_loader {
+                            loader.update_video_dimensions(index, dims.0, dims.1);
+                        }
+                    }
+
+                    self.manga_video_players.insert(index, player);
+                    self.error_message = None;
+                    self.manga_evict_distant_video_players(index);
+                    applied_any = true;
+                }
+                MangaFocusedVideoLoadResult {
+                    index,
+                    path,
+                    result: Err(err),
+                    ..
+                } => {
+                    eprintln!(
+                        "Failed to create video player for manga index {} ({}): {}",
+                        index,
+                        path.display(),
+                        err
+                    );
+
+                    if self.manga_focused_video_index == Some(index)
+                        && !self.manga_video_players.contains_key(&index)
+                    {
+                        self.manga_focused_video_index = None;
+                    }
+                }
+            }
+        }
+
+        if applied_any {
+            ctx.request_repaint();
+        }
     }
 
     fn start_async_image_load(
@@ -4876,6 +5159,7 @@ impl ImageViewer {
     /// Ensures only one video plays at a time (the focused one).
     fn manga_update_video_focus(&mut self) {
         if !self.manga_mode || self.image_list.is_empty() {
+            self.clear_pending_manga_video_load();
             return;
         }
 
@@ -4888,6 +5172,7 @@ impl ImageViewer {
                 }
                 self.manga_focused_video_index = None;
             }
+            self.clear_pending_manga_video_load();
             return;
         }
 
@@ -4905,6 +5190,7 @@ impl ImageViewer {
                     }
                     self.manga_focused_video_index = None;
                 }
+                self.clear_pending_manga_video_load();
                 return;
             }
         } else {
@@ -4931,63 +5217,50 @@ impl ImageViewer {
         let volume = volume_override.unwrap_or(self.config.video_default_volume);
 
         if focused_is_video {
-            // Focus changed to a video
-            if self.manga_focused_video_index != Some(focused_idx) {
+            let focus_changed = self.manga_focused_video_index != Some(focused_idx);
+
+            if focus_changed {
                 // Pause all other videos
                 for (&idx, player) in self.manga_video_players.iter_mut() {
                     if idx != focused_idx && player.is_playing() {
                         let _ = player.pause();
                     }
                 }
+            }
 
-                // Create or resume the focused video player
-                if let Some(player) = self.manga_video_players.get_mut(&focused_idx) {
-                    if !player.is_playing() {
-                        let _ = player.play();
-                    }
-                    // Apply user's persisted mute/volume settings to existing player
+            if let Some(player) = self.manga_video_players.get_mut(&focused_idx) {
+                if focus_changed && !player.is_playing() {
+                    let _ = player.play();
+                }
+
+                if focus_changed {
+                    // Apply user's persisted mute/volume settings when switching focus.
                     Self::apply_video_audio_overrides(player, muted_override, volume_override);
-                } else {
-                    // Create new video player for focused item
-                    if let Some(path) = self.image_list.get(focused_idx) {
-                        // Ensure GStreamer is initialized
-                        self.gstreamer_initialized = true;
-
-                        match VideoPlayer::new(
-                            path,
-                            muted,
-                            volume,
-                            self.config.video_prefer_hardware_decode,
-                            self.config.video_disable_hardware_decode,
-                        ) {
-                            Ok(mut player) => {
-                                let _ = player.play();
-
-                                // Update dimensions from video if available
-                                let dims = player.dimensions();
-                                if dims.0 > 0 && dims.1 > 0 {
-                                    if let Some(ref mut loader) = self.manga_loader {
-                                        loader.update_video_dimensions(focused_idx, dims.0, dims.1);
-                                    }
-                                }
-
-                                self.manga_video_players.insert(focused_idx, player);
-                            }
-                            Err(e) => {
-                                eprintln!(
-                                    "Failed to create video player for manga index {}: {}",
-                                    focused_idx, e
-                                );
-                            }
-                        }
-                    }
                 }
 
                 self.manga_focused_video_index = Some(focused_idx);
+                self.clear_pending_manga_video_load();
 
-                // Evict video players that are far from view
+                // Evict video players that are far from view.
                 self.manga_evict_distant_video_players(focused_idx);
+                return;
             }
+
+            self.manga_focused_video_index = Some(focused_idx);
+
+            let Some(path) = self.image_list.get(focused_idx).cloned() else {
+                self.manga_focused_video_index = None;
+                self.clear_pending_manga_video_load();
+                return;
+            };
+
+            if !self.manga_video_load_pending_for_index(focused_idx) {
+                // Ensure GStreamer is initialized before background startup work.
+                self.gstreamer_initialized = true;
+                self.start_async_manga_focused_video_load(focused_idx, path, muted, volume);
+            }
+
+            return;
         } else {
             // Focused item is not a video - pause all videos
             if self.manga_focused_video_index.is_some() {
@@ -4998,6 +5271,8 @@ impl ImageViewer {
                 }
                 self.manga_focused_video_index = None;
             }
+
+            self.clear_pending_manga_video_load();
         }
     }
 
@@ -7251,6 +7526,8 @@ impl ImageViewer {
                 .get(idx)
                 .map_or(false, |p| is_supported_video(p));
 
+        let video_load_pending = is_video && self.manga_video_load_pending_for_index(idx);
+
         if is_video {
             // Video item: prioritize live video texture, fall back to first-frame thumbnail
             if let Some((texture, _tex_w, _tex_h)) = self.manga_video_textures.get(&idx) {
@@ -7359,6 +7636,14 @@ impl ImageViewer {
                 self.manga_mark_placeholder_visible(idx);
 
                 requested_retry |= self.manga_request_retry_for_visible_item(idx, retry_target_side);
+            }
+
+            if video_load_pending
+                && self.manga_focused_video_index == Some(idx)
+                && !self.manga_video_textures.contains_key(&idx)
+            {
+                let time = ui.input(|i| i.time);
+                paint_loading_spinner(ui.painter(), image_rect, time);
             }
         } else {
             // Image item: use regular texture cache
@@ -8180,6 +8465,9 @@ impl ImageViewer {
         // Update video focus - ensures only one video plays at a time (the focused one)
         self.manga_update_video_focus();
 
+        // Apply any completed focused-video startup before texture polling.
+        self.poll_pending_manga_video_load(ctx);
+
         // Update video textures for the focused video
         self.manga_update_video_textures(ctx);
 
@@ -8203,6 +8491,11 @@ impl ImageViewer {
             .manga_focused_video_index
             .and_then(|idx| self.manga_video_players.get(&idx))
             .map_or(false, |p| p.is_playing());
+
+        let has_pending_focused_video_load = self
+            .pending_manga_video_load
+            .as_ref()
+            .is_some_and(|pending| self.manga_focused_video_index == Some(pending.index));
 
         let masonry_visible_indices = if self.is_masonry_mode() && self.manga_use_rtree_backend() {
             Some(self.manga_collect_visible_indices())
@@ -8435,6 +8728,7 @@ impl ImageViewer {
         animation_active
             || has_active_video
             || has_active_animation
+            || has_pending_focused_video_load
             || requested_visible_retry
     }
 
@@ -11297,6 +11591,9 @@ impl eframe::App for ImageViewer {
 
         self.poll_pending_media_directory_scan(ctx);
         self.poll_pending_media_load(ctx);
+        if !(self.manga_mode && self.is_fullscreen) {
+            self.poll_pending_manga_video_load(ctx);
+        }
 
         // Keep our cached screen size in sync with the real viewport.
         // Manga mode uses this for layout/scroll math; if it drifts from `ctx.screen_rect()`,
@@ -11769,8 +12066,10 @@ impl eframe::App for ImageViewer {
             .as_ref()
             .map_or(false, |player| player.is_playing());
         let media_load_pending = self.pending_media_load.is_some();
+        let manga_video_load_pending = self.pending_manga_video_load.is_some();
         self.fps_last_frame_was_active = any_animation_active
             || media_load_pending
+            || manga_video_load_pending
             || self.pending_media_layout
             || manga_needs_fast_background_poll
             || manga_background_work_pending
@@ -11803,7 +12102,7 @@ impl eframe::App for ImageViewer {
             } else {
                 ctx.request_repaint();
             }
-        } else if media_load_pending {
+        } else if media_load_pending || manga_video_load_pending {
             ctx.request_repaint_after(Duration::from_millis(16));
         } else if self.pending_media_layout {
             ctx.request_repaint_after(Duration::from_millis(16));
