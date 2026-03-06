@@ -847,6 +847,9 @@ struct ImageViewer {
     /// One-shot placeholder to keep the currently visible strip item on screen
     /// while switching from strip mode back to solo mode.
     pending_mode_switch_placeholder: Option<ModeSwitchPlaceholder>,
+    /// True while a previous solo-media texture is intentionally kept visible
+    /// until a replacement load finishes.
+    retained_media_placeholder_visible: bool,
     /// Index allowed to reuse the pre-strip solo texture/video as a temporary fallback.
     /// This prevents stale fullscreen frames from showing on unrelated items while scrolling.
     strip_entry_placeholder_index: Option<usize>,
@@ -1201,6 +1204,7 @@ impl Default for ImageViewer {
             video_texture_dims: None,
             current_media_type: None,
             pending_mode_switch_placeholder: None,
+            retained_media_placeholder_visible: false,
             strip_entry_placeholder_index: None,
             show_video_controls: false,
             video_controls_show_time: Instant::now(),
@@ -1384,6 +1388,59 @@ impl ImageViewer {
         self.current_index = clamped;
     }
 
+    fn capture_current_media_placeholder(
+        &self,
+        target_media_type: Option<MediaType>,
+    ) -> Option<ModeSwitchPlaceholder> {
+        match target_media_type? {
+            MediaType::Image => {
+                let texture = self.texture.as_ref()?.clone();
+                let dims = self
+                    .image_texture_dims
+                    .or_else(|| self.image.as_ref().map(|img| img.display_dimensions()))?;
+
+                Some(ModeSwitchPlaceholder {
+                    texture,
+                    dims,
+                    media_type: MediaType::Image,
+                })
+            }
+            MediaType::Video => {
+                let texture = self.video_texture.as_ref()?.clone();
+                let dims = self.video_texture_dims.or_else(|| {
+                    self.video_player.as_ref().and_then(|player| {
+                        let dims = player.dimensions();
+                        (dims.0 > 0 && dims.1 > 0).then_some(dims)
+                    })
+                })?;
+
+                Some(ModeSwitchPlaceholder {
+                    texture,
+                    dims,
+                    media_type: MediaType::Video,
+                })
+            }
+        }
+    }
+
+    fn drop_retained_media_placeholder(&mut self) {
+        self.retained_media_placeholder_visible = false;
+
+        if self.image.is_none() {
+            if let Some(texture) = self.texture.take() {
+                drop(texture);
+            }
+            self.image_texture_dims = None;
+        }
+
+        if self.video_player.is_none() {
+            if let Some(texture) = self.video_texture.take() {
+                drop(texture);
+            }
+            self.video_texture_dims = None;
+        }
+    }
+
     fn try_load_image_from_decoded_cache(
         &mut self,
         path: &PathBuf,
@@ -1434,6 +1491,7 @@ impl ImageViewer {
             cached.original_width,
             cached.original_height,
         ));
+        self.retained_media_placeholder_visible = false;
         self.texture_frame = usize::MAX;
         self.image_changed = true;
         self.pending_media_layout = false;
@@ -3082,6 +3140,7 @@ impl ImageViewer {
 
     fn clear_pending_media_load(&mut self) {
         self.pending_media_load = None;
+        self.retained_media_placeholder_visible = false;
     }
 
     fn clear_pending_manga_video_load(&mut self) {
@@ -3307,6 +3366,7 @@ impl ImageViewer {
                 Ok(result) => result,
                 Err(crossbeam_channel::TryRecvError::Empty) => break,
                 Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    self.drop_retained_media_placeholder();
                     self.clear_pending_media_load();
                     break;
                 }
@@ -3354,6 +3414,7 @@ impl ImageViewer {
             match result {
                 MediaLoadResult::Image { path, result, .. } => match result {
                     Ok(loaded) => {
+                        self.retained_media_placeholder_visible = false;
                         let (display_w, display_h) = loaded.image.display_dimensions();
                         if display_w > 0 && display_h > 0 {
                             store_cached_dimensions(
@@ -3395,11 +3456,13 @@ impl ImageViewer {
                         }
                     }
                     Err(err) => {
+                        self.drop_retained_media_placeholder();
                         self.error_message = Some(err);
                     }
                 },
                 MediaLoadResult::Video { path, result, .. } => match result {
                     Ok(player) => {
+                        self.retained_media_placeholder_visible = false;
                         let dims = player.dimensions();
                         if dims.0 > 0 && dims.1 > 0 {
                             store_cached_dimensions(&path, CachedMediaKind::Video, dims.0, dims.1);
@@ -3413,6 +3476,7 @@ impl ImageViewer {
                         self.touch_bottom_overlays();
                     }
                     Err(err) => {
+                        self.drop_retained_media_placeholder();
                         self.error_message = Some(format!("Failed to load video: {}", err));
                     }
                 },
@@ -3426,13 +3490,21 @@ impl ImageViewer {
         }
     }
 
+    fn load_image_retaining_visible_media(&mut self, path: &PathBuf) {
+        self.load_media_internal(path, true);
+    }
+
     /// Load an image from path
     fn load_image(&mut self, path: &PathBuf) {
-        self.load_media(path);
+        self.load_media_internal(path, false);
     }
 
     /// Load any media (image or video) from path
     fn load_media(&mut self, path: &PathBuf) {
+        self.load_media_internal(path, false);
+    }
+
+    fn load_media_internal(&mut self, path: &PathBuf, retain_visible_media_until_ready: bool) {
         let load_media_start = Instant::now();
 
         self.reset_masonry_metadata_preload();
@@ -3448,48 +3520,38 @@ impl ImageViewer {
         self.pending_window_title = Some(self.compute_window_title_for_path(path));
 
         // Determine media type up-front so we can decide whether to keep a placeholder frame.
-        let previous_media_type = self.current_media_type;
         let media_type = get_media_type(path);
         self.current_media_type = media_type;
 
         let transition_placeholder = self
             .pending_mode_switch_placeholder
             .take()
-            .filter(|placeholder| Some(placeholder.media_type) == media_type);
-
-        let keep_video_placeholder = matches!(previous_media_type, Some(MediaType::Video))
-            && matches!(media_type, Some(MediaType::Video))
-            || transition_placeholder
-                .as_ref()
-                .is_some_and(|placeholder| placeholder.media_type == MediaType::Video);
-
-        let keep_image_placeholder = transition_placeholder
-            .as_ref()
-            .is_some_and(|placeholder| placeholder.media_type == MediaType::Image);
+            .filter(|placeholder| Some(placeholder.media_type) == media_type)
+            .or_else(|| {
+                if retain_visible_media_until_ready {
+                    self.capture_current_media_placeholder(media_type)
+                } else {
+                    None
+                }
+            });
 
         // Clear previous media state.
-        // For video-to-video navigation we keep the previous video texture as a placeholder
-        // until the first decoded frame of the new video arrives.
-        //
+        // When a placeholder was captured above we immediately restore it after clearing
+        // the current decode state so the visible frame stays on screen during navigation.
         // MEMORY OPTIMIZATION: Explicitly drop textures to release GPU memory immediately.
         // Setting to None allows Rust to drop the TextureHandle, which signals egui to
         // free the underlying GPU texture on the next frame.
         self.stop_fullscreen_video_playback();
-        if !keep_video_placeholder {
-            // Drop video texture to free VRAM
-            if let Some(tex) = self.video_texture.take() {
-                drop(tex);
-            }
-            self.video_texture_dims = None;
+        if let Some(texture) = self.video_texture.take() {
+            drop(texture);
         }
-        if !keep_image_placeholder {
-            // Drop image texture to free VRAM
-            if let Some(tex) = self.texture.take() {
-                drop(tex);
-            }
-            self.image_texture_dims = None;
+        self.video_texture_dims = None;
+        if let Some(texture) = self.texture.take() {
+            drop(texture);
         }
+        self.image_texture_dims = None;
         self.image = None;
+        self.retained_media_placeholder_visible = transition_placeholder.is_some();
 
         if let Some(placeholder) = transition_placeholder {
             match placeholder.media_type {
@@ -3592,6 +3654,7 @@ impl ImageViewer {
                 self.start_async_image_load(path.clone(), max_tex, downscale_filter, gif_filter);
             }
             None => {
+                self.drop_retained_media_placeholder();
                 self.error_message = Some(format!("Unsupported file format: {:?}", path));
             }
         }
@@ -3724,7 +3787,7 @@ impl ImageViewer {
             self.current_index + 1
         });
         let path = self.image_list[self.current_index].clone();
-        self.load_image(&path);
+        self.load_image_retaining_visible_media(&path);
     }
 
     /// Load previous image
@@ -3756,7 +3819,7 @@ impl ImageViewer {
             self.current_index - 1
         });
         let path = self.image_list[self.current_index].clone();
-        self.load_image(&path);
+        self.load_image_retaining_visible_media(&path);
     }
 
     /// Load first image
@@ -3780,7 +3843,7 @@ impl ImageViewer {
 
         self.set_current_index_clamped(0);
         let path = self.image_list[self.current_index].clone();
-        self.load_image(&path);
+        self.load_image_retaining_visible_media(&path);
     }
 
     /// Load last image
@@ -3805,7 +3868,7 @@ impl ImageViewer {
 
         self.set_current_index_clamped(last_index);
         let path = self.image_list[self.current_index].clone();
-        self.load_image(&path);
+        self.load_image_retaining_visible_media(&path);
     }
 
     fn monitor_size_points(&self, ctx: &egui::Context) -> egui::Vec2 {
@@ -11934,7 +11997,9 @@ impl ImageViewer {
                         ctx.request_repaint();
                     }
 
-                    if self.pending_media_load.is_some() {
+                    if self.pending_media_load.is_some()
+                        && !self.retained_media_placeholder_visible
+                    {
                         let time = ui.input(|i| i.time);
                         paint_loading_spinner(ui.painter(), final_rect, time);
                         ctx.request_repaint_after(Duration::from_millis(16));
