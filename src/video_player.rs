@@ -177,6 +177,32 @@ fn configure_gstreamer_env_windows() {
     }
 }
 
+#[cfg(target_os = "windows")]
+fn apply_decoder_preference_windows(prefer_hardware_decode: bool, disable_hardware_decode: bool) {
+    const HW_DECODE_RANKS: &str =
+        "d3d11h264dec:300,d3d11h265dec:300,d3d11vp9dec:300,d3d11av1dec:300";
+    const DISABLE_HW_DECODE_RANKS: &str =
+        "d3d11h264dec:0,d3d11h265dec:0,d3d11vp9dec:0,d3d11av1dec:0";
+
+    if disable_hardware_decode {
+        std::env::set_var("GST_PLUGIN_FEATURE_RANK", DISABLE_HW_DECODE_RANKS);
+        return;
+    }
+
+    if prefer_hardware_decode && std::env::var_os("GST_PLUGIN_FEATURE_RANK").is_none() {
+        std::env::set_var("GST_PLUGIN_FEATURE_RANK", HW_DECODE_RANKS);
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn apply_decoder_preference_windows(_prefer_hardware_decode: bool, _disable_hardware_decode: bool) {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoSeekMode {
+    Accurate,
+    Keyframe,
+}
+
 /// Video frame data extracted from GStreamer
 #[derive(Clone)]
 pub struct VideoFrame {
@@ -358,7 +384,14 @@ impl VideoPlayer {
     }
 
     /// Create a new video player for the given file
-    pub fn new(path: &Path, muted: bool, initial_volume: f64) -> Result<Self, String> {
+    pub fn new(
+        path: &Path,
+        muted: bool,
+        initial_volume: f64,
+        prefer_hardware_decode: bool,
+        disable_hardware_decode: bool,
+    ) -> Result<Self, String> {
+        apply_decoder_preference_windows(prefer_hardware_decode, disable_hardware_decode);
         Self::ensure_init()?;
 
         // Build a correct file:// URI (including percent-encoding for spaces, etc.).
@@ -662,20 +695,30 @@ Ensure your GStreamer installation includes the playback elements (usually from 
         self.is_playing
     }
 
-    /// Seek to a position (0.0 to 1.0)
-    /// Uses frame-accurate seeking for precise positioning
+    fn seek_flags_for_mode(mode: VideoSeekMode) -> gst::SeekFlags {
+        match mode {
+            VideoSeekMode::Accurate => gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
+            VideoSeekMode::Keyframe => gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT,
+        }
+    }
+
+    /// Seek to a position (0.0 to 1.0) using frame-accurate mode.
+    #[allow(dead_code)]
     pub fn seek(&mut self, position: f64) -> Result<(), String> {
+        self.seek_with_mode(position, VideoSeekMode::Accurate)
+    }
+
+    /// Seek to a position (0.0 to 1.0) using the provided mode.
+    pub fn seek_with_mode(&mut self, position: f64, mode: VideoSeekMode) -> Result<(), String> {
         let position = position.clamp(0.0, 1.0);
 
         if let Some(duration) = self.duration {
             let seek_pos = Duration::from_secs_f64(duration.as_secs_f64() * position);
             let seek_pos_ns = seek_pos.as_nanos() as i64;
 
-            // Use ACCURATE flag for frame-precise seeking instead of KEY_UNIT
-            // This may be slower but provides exact frame positioning
             self.pipeline
                 .seek_simple(
-                    gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
+                    Self::seek_flags_for_mode(mode),
                     gst::ClockTime::from_nseconds(seek_pos_ns as u64),
                 )
                 .map_err(|e| format!("Failed to seek: {}", e))?;
@@ -684,15 +727,18 @@ Ensure your GStreamer installation includes the playback elements (usually from 
         Ok(())
     }
 
-    /// Seek to a specific time in seconds
-    /// Uses frame-accurate seeking for precise positioning
+    /// Seek to a specific time in seconds using frame-accurate mode.
     pub fn seek_to_time(&mut self, seconds: f64) -> Result<(), String> {
+        self.seek_to_time_with_mode(seconds, VideoSeekMode::Accurate)
+    }
+
+    /// Seek to a specific time in seconds using the provided mode.
+    pub fn seek_to_time_with_mode(&mut self, seconds: f64, mode: VideoSeekMode) -> Result<(), String> {
         let seek_pos_ns = (seconds * 1_000_000_000.0) as u64;
 
-        // Use ACCURATE flag for frame-precise seeking instead of KEY_UNIT
         self.pipeline
             .seek_simple(
-                gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
+                Self::seek_flags_for_mode(mode),
                 gst::ClockTime::from_nseconds(seek_pos_ns),
             )
             .map_err(|e| format!("Failed to seek: {}", e))?;

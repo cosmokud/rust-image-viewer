@@ -19,7 +19,7 @@ mod windows_env;
 #[global_allocator]
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use config::{Action, Config, InputBinding, StartupWindowMode};
+use config::{Action, Config, InputBinding, StartupWindowMode, VideoSeekPolicy};
 use image_loader::{
     get_media_type, is_supported_video, probe_image_dimensions, ImageFrame, LoadedImage,
     MediaType,
@@ -31,7 +31,7 @@ use manga_loader::{MangaLoader, MangaMediaType, MangaTextureCache};
 use perf_metrics::PerfMetrics;
 #[cfg(target_os = "windows")]
 use single_instance::{FileReceiver, SingleInstanceResult};
-use video_player::{format_duration, VideoPlayer};
+use video_player::{format_duration, VideoPlayer, VideoSeekMode};
 
 use eframe::egui;
 use fast_image_resize as fir;
@@ -1296,13 +1296,21 @@ impl ImageViewer {
             || metadata_stats.dimension_misses > 0
             || metadata_stats.thumbnail_hits > 0
             || metadata_stats.thumbnail_misses > 0
+            || metadata_stats.dimension_expired > 0
+            || metadata_stats.thumbnail_expired > 0
+            || metadata_stats.dimension_evicted > 0
+            || metadata_stats.thumbnail_evicted > 0
         {
             text.push_str(&format!(
-                " | MC D{}/{} T{}/{}",
+                " | MC D{}/{} T{}/{} E{}/{} V{}/{}",
                 metadata_stats.dimension_hits,
                 metadata_stats.dimension_misses,
                 metadata_stats.thumbnail_hits,
-                metadata_stats.thumbnail_misses
+                metadata_stats.thumbnail_misses,
+                metadata_stats.dimension_expired,
+                metadata_stats.thumbnail_expired,
+                metadata_stats.dimension_evicted,
+                metadata_stats.thumbnail_evicted
             ));
         }
 
@@ -2527,6 +2535,8 @@ impl ImageViewer {
                     path,
                     self.config.video_muted_by_default,
                     self.config.video_default_volume,
+                    self.config.video_prefer_hardware_decode,
+                    self.config.video_disable_hardware_decode,
                 ) {
                     Ok(mut player) => {
                         // Start playback
@@ -4328,7 +4338,13 @@ impl ImageViewer {
                         // Ensure GStreamer is initialized
                         self.gstreamer_initialized = true;
 
-                        match VideoPlayer::new(path, muted, volume) {
+                        match VideoPlayer::new(
+                            path,
+                            muted,
+                            volume,
+                            self.config.video_prefer_hardware_decode,
+                            self.config.video_disable_hardware_decode,
+                        ) {
                             Ok(mut player) => {
                                 let _ = player.play();
 
@@ -8793,8 +8809,25 @@ impl ImageViewer {
             });
     }
 
+    fn drag_video_seek_mode(&self) -> VideoSeekMode {
+        match self.config.video_seek_policy {
+            VideoSeekPolicy::Adaptive | VideoSeekPolicy::Keyframe => VideoSeekMode::Keyframe,
+            VideoSeekPolicy::Accurate => VideoSeekMode::Accurate,
+        }
+    }
+
+    fn commit_video_seek_mode(&self) -> VideoSeekMode {
+        match self.config.video_seek_policy {
+            VideoSeekPolicy::Adaptive | VideoSeekPolicy::Accurate => VideoSeekMode::Accurate,
+            VideoSeekPolicy::Keyframe => VideoSeekMode::Keyframe,
+        }
+    }
+
     /// Draw video seekbar and controls (called from draw_video_controls)
     fn draw_video_seekbar_inner(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let drag_seek_mode = self.drag_video_seek_mode();
+        let commit_seek_mode = self.commit_video_seek_mode();
+
         ui.vertical(|ui| {
             // === Seek bar (top row) ===
             let Some(player) = self.video_player.as_mut() else {
@@ -8887,7 +8920,7 @@ impl ImageViewer {
                     if fraction_changed
                         && self.last_seek_sent_at.elapsed() >= Duration::from_millis(50)
                     {
-                        let _ = player.seek(seek_fraction as f64);
+                        let _ = player.seek_with_mode(seek_fraction as f64, drag_seek_mode);
                         self.last_seek_sent_at = Instant::now();
                     }
                 }
@@ -8899,7 +8932,7 @@ impl ImageViewer {
                 if let Some(pos) = seek_response.interact_pointer_pos() {
                     let seek_fraction =
                         ((pos.x - bar_inner.min.x) / bar_inner.width()).clamp(0.0, 1.0);
-                    let _ = player.seek(seek_fraction as f64);
+                    let _ = player.seek_with_mode(seek_fraction as f64, commit_seek_mode);
                     ctx.request_repaint();
                 }
             }
@@ -8907,7 +8940,7 @@ impl ImageViewer {
             // On mouse release, finalize seek and restore prior play state.
             if self.is_seeking && primary_released {
                 if let Some(final_fraction) = self.seek_preview_fraction.take() {
-                    let _ = player.seek(final_fraction as f64);
+                    let _ = player.seek_with_mode(final_fraction as f64, commit_seek_mode);
                 }
                 self.is_seeking = false;
                 self.last_seek_sent_at = Instant::now();
@@ -9285,6 +9318,9 @@ impl ImageViewer {
         ctx: &egui::Context,
         video_idx: usize,
     ) {
+        let drag_seek_mode = self.drag_video_seek_mode();
+        let commit_seek_mode = self.commit_video_seek_mode();
+
         let Some(player) = self.manga_video_players.get_mut(&video_idx) else {
             return;
         };
@@ -9377,7 +9413,7 @@ impl ImageViewer {
                         && self.manga_video_last_seek_sent.elapsed() >= Duration::from_millis(50)
                     {
                         if let Some(player) = self.manga_video_players.get_mut(&video_idx) {
-                            let _ = player.seek(seek_fraction as f64);
+                            let _ = player.seek_with_mode(seek_fraction as f64, drag_seek_mode);
                         }
                         self.manga_video_last_seek_sent = Instant::now();
                     }
@@ -9390,7 +9426,7 @@ impl ImageViewer {
                     let seek_fraction =
                         ((pos.x - bar_inner.min.x) / bar_inner.width()).clamp(0.0, 1.0);
                     if let Some(player) = self.manga_video_players.get_mut(&video_idx) {
-                        let _ = player.seek(seek_fraction as f64);
+                        let _ = player.seek_with_mode(seek_fraction as f64, commit_seek_mode);
                     }
                     ctx.request_repaint();
                 }
@@ -9399,7 +9435,7 @@ impl ImageViewer {
             if self.manga_video_seeking && primary_released {
                 if let Some(final_fraction) = self.manga_video_seek_preview_fraction.take() {
                     if let Some(player) = self.manga_video_players.get_mut(&video_idx) {
-                        let _ = player.seek(final_fraction as f64);
+                        let _ = player.seek_with_mode(final_fraction as f64, commit_seek_mode);
                     }
                 }
                 self.manga_video_seeking = false;

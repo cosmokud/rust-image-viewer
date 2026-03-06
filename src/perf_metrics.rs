@@ -1,58 +1,64 @@
 //! Lightweight rolling runtime metrics used for in-app performance diagnostics.
 
-use std::collections::VecDeque;
 use std::time::Duration;
 
+use hdrhistogram::Histogram;
 use hashbrown::HashMap;
 
 const DEFAULT_WINDOW_CAP: usize = 240;
+const HISTOGRAM_MAX_US: u64 = 60 * 1_000_000;
+const HISTOGRAM_SIG_FIGS: u8 = 3;
+const HISTOGRAM_DECAY_MULTIPLIER: usize = 4;
 
-#[derive(Default)]
 struct MetricWindow {
-    samples_ms: VecDeque<f32>,
+    histogram_us: Histogram<u64>,
+    recorded_samples: usize,
     max_samples: usize,
 }
 
 impl MetricWindow {
     fn with_capacity(max_samples: usize) -> Self {
         Self {
-            samples_ms: VecDeque::with_capacity(max_samples.max(1)),
+            histogram_us: Histogram::<u64>::new_with_bounds(
+                1,
+                HISTOGRAM_MAX_US,
+                HISTOGRAM_SIG_FIGS,
+            )
+            .expect("valid histogram bounds"),
+            recorded_samples: 0,
             max_samples: max_samples.max(1),
         }
     }
 
     fn push_duration(&mut self, duration: Duration) {
-        let ms = duration.as_secs_f32() * 1000.0;
-        if !ms.is_finite() || ms < 0.0 {
-            return;
+        let raw_micros = duration.as_micros();
+        let clamped_micros = raw_micros.max(1).min(HISTOGRAM_MAX_US as u128) as u64;
+
+        // Keep the structure fast by periodically decaying old samples.
+        if self.recorded_samples >= self.max_samples.saturating_mul(HISTOGRAM_DECAY_MULTIPLIER) {
+            self.histogram_us.reset();
+            self.recorded_samples = 0;
         }
 
-        if self.samples_ms.len() >= self.max_samples {
-            self.samples_ms.pop_front();
+        if self.histogram_us.record(clamped_micros).is_ok() {
+            self.recorded_samples = self.recorded_samples.saturating_add(1);
         }
-        self.samples_ms.push_back(ms);
     }
 
     fn percentile_ms(&self, percentile: f32) -> Option<f32> {
-        if self.samples_ms.is_empty() {
+        if self.recorded_samples == 0 {
             return None;
         }
 
-        let mut sorted: Vec<f32> = self
-            .samples_ms
-            .iter()
-            .copied()
-            .filter(|v| v.is_finite())
-            .collect();
+        let quantile = percentile.clamp(0.0, 1.0) as f64;
+        let micros = self.histogram_us.value_at_quantile(quantile);
+        Some((micros as f32) / 1000.0)
+    }
+}
 
-        if sorted.is_empty() {
-            return None;
-        }
-
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let p = percentile.clamp(0.0, 1.0);
-        let idx = ((sorted.len() - 1) as f32 * p).round() as usize;
-        sorted.get(idx).copied()
+impl Default for MetricWindow {
+    fn default() -> Self {
+        Self::with_capacity(DEFAULT_WINDOW_CAP)
     }
 }
 

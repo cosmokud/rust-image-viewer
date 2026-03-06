@@ -250,6 +250,32 @@ fn is_strip_item_open_binding(binding: &InputBinding) -> bool {
     )
 }
 
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoSeekPolicy {
+    Adaptive,
+    Accurate,
+    Keyframe,
+}
+
+impl VideoSeekPolicy {
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "adaptive" | "auto" => Some(Self::Adaptive),
+            "accurate" | "precise" | "frame" => Some(Self::Accurate),
+            "keyframe" | "key" | "fast" | "key_unit" => Some(Self::Keyframe),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Adaptive => "adaptive",
+            Self::Accurate => "accurate",
+            Self::Keyframe => "keyframe",
+        }
+    }
+}
 /// Parse a single key from string
 fn parse_key(s: &str) -> Option<egui::Key> {
     match s.to_lowercase().as_str() {
@@ -407,6 +433,12 @@ pub struct Config {
     pub video_default_volume: f64,
     /// Whether videos loop by default
     pub video_loop: bool,
+    /// Seek policy for scrub interactions: adaptive, accurate, or keyframe.
+    pub video_seek_policy: VideoSeekPolicy,
+    /// Prefer hardware decoders on Windows when available.
+    pub video_prefer_hardware_decode: bool,
+    /// Disable hardware decoders and force software decode path.
+    pub video_disable_hardware_decode: bool,
 
     /// Startup window mode: `floating` (default) or `fullscreen`
     pub startup_window_mode: StartupWindowMode,
@@ -501,6 +533,9 @@ impl Config {
             video_muted_by_default: true,
             video_default_volume: 0.0,
             video_loop: true,
+            video_seek_policy: VideoSeekPolicy::Adaptive,
+            video_prefer_hardware_decode: true,
+            video_disable_hardware_decode: false,
             startup_window_mode: StartupWindowMode::Floating,
             single_instance: true,
             vsync: true,
@@ -1007,6 +1042,25 @@ impl Config {
                                 config.video_loop = v;
                             }
                         }
+                        "seek_policy" | "seek_mode" | "seek_behavior" => {
+                            if let Some(policy) = VideoSeekPolicy::from_str(value) {
+                                config.video_seek_policy = policy;
+                            }
+                        }
+                        "prefer_hardware_decode"
+                        | "prefer_hw_decode"
+                        | "hardware_decode_preference" => {
+                            if let Some(v) = parse_bool(value) {
+                                config.video_prefer_hardware_decode = v;
+                            }
+                        }
+                        "disable_hardware_decode"
+                        | "force_software_decode"
+                        | "force_sw_decode" => {
+                            if let Some(v) = parse_bool(value) {
+                                config.video_disable_hardware_decode = v;
+                            }
+                        }
                         // Backwards-compat: legacy per-video hide delay now maps to the unified bottom overlay delay.
                         "controls_hide_delay" | "video_controls_hide_delay" => {
                             if let Ok(v) = value.parse::<f32>() {
@@ -1282,6 +1336,18 @@ impl Config {
             format_with_optional_trailing_zero_f64(self.video_default_volume),
         );
         values.insert("loop", bool_to_ini(self.video_loop).to_string());
+        values.insert(
+            "seek_policy",
+            self.video_seek_policy.as_str().to_string(),
+        );
+        values.insert(
+            "prefer_hardware_decode",
+            bool_to_ini(self.video_prefer_hardware_decode).to_string(),
+        );
+        values.insert(
+            "disable_hardware_decode",
+            bool_to_ini(self.video_disable_hardware_decode).to_string(),
+        );
 
         values.insert("upscale_filter", self.upscale_filter.as_str().to_string());
         values.insert("downscale_filter", self.downscale_filter.as_str().to_string());
