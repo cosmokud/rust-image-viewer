@@ -41,6 +41,7 @@ use video_player::{format_duration, VideoPlayer, VideoSeekMode};
 use eframe::egui;
 use fast_image_resize as fir;
 use image::imageops::FilterType;
+use parking_lot::Mutex;
 use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::collections::VecDeque;
@@ -378,17 +379,157 @@ struct AsyncImageLoad {
     gif_filter: FilterType,
 }
 
+enum MediaLoadRequest {
+    Image {
+        request_id: u64,
+        path: PathBuf,
+        max_texture_side: u32,
+        downscale_filter: FilterType,
+        gif_filter: FilterType,
+    },
+    Video {
+        request_id: u64,
+        path: PathBuf,
+        muted: bool,
+        initial_volume: f64,
+        prefer_hardware_decode: bool,
+        disable_hardware_decode: bool,
+    },
+}
+
 enum MediaLoadResult {
     Image {
         request_id: u64,
         path: PathBuf,
         result: Result<AsyncImageLoad, String>,
+        worker_elapsed: Duration,
     },
     Video {
         request_id: u64,
         path: PathBuf,
         result: Result<VideoPlayer, String>,
+        worker_elapsed: Duration,
     },
+}
+
+struct MediaLoadCoordinator {
+    latest_request: Arc<Mutex<Option<MediaLoadRequest>>>,
+    wake_tx: crossbeam_channel::Sender<()>,
+    result_rx: crossbeam_channel::Receiver<MediaLoadResult>,
+}
+
+impl MediaLoadCoordinator {
+    fn new() -> Self {
+        let latest_request: Arc<Mutex<Option<MediaLoadRequest>>> = Arc::new(Mutex::new(None));
+        let (wake_tx, wake_rx) = crossbeam_channel::bounded::<()>(1);
+        let (result_tx, result_rx) = crossbeam_channel::bounded::<MediaLoadResult>(8);
+
+        let latest_request_worker = Arc::clone(&latest_request);
+        crate::async_runtime::spawn_blocking_or_thread("media-load-coordinator", move || {
+            run_media_load_coordinator(latest_request_worker, wake_rx, result_tx);
+        });
+
+        Self {
+            latest_request,
+            wake_tx,
+            result_rx,
+        }
+    }
+
+    fn submit(&self, request: MediaLoadRequest) {
+        *self.latest_request.lock() = Some(request);
+        let _ = self.wake_tx.try_send(());
+    }
+
+    fn try_recv(&self) -> Result<MediaLoadResult, crossbeam_channel::TryRecvError> {
+        self.result_rx.try_recv()
+    }
+}
+
+fn run_media_load_coordinator(
+    latest_request: Arc<Mutex<Option<MediaLoadRequest>>>,
+    wake_rx: crossbeam_channel::Receiver<()>,
+    result_tx: crossbeam_channel::Sender<MediaLoadResult>,
+) {
+    while wake_rx.recv().is_ok() {
+        loop {
+            while wake_rx.try_recv().is_ok() {}
+
+            let Some(request) = latest_request.lock().take() else {
+                break;
+            };
+
+            let result = process_media_load_request(request);
+            if result_tx.send(result).is_err() {
+                return;
+            }
+
+            if latest_request.lock().is_none() {
+                break;
+            }
+        }
+    }
+}
+
+fn process_media_load_request(request: MediaLoadRequest) -> MediaLoadResult {
+    let started_at = Instant::now();
+
+    match request {
+        MediaLoadRequest::Image {
+            request_id,
+            path,
+            max_texture_side,
+            downscale_filter,
+            gif_filter,
+        } => {
+            let result = LoadedImage::load_first_frame_only(
+                &path,
+                Some(max_texture_side),
+                downscale_filter,
+                gif_filter,
+            )
+            .map(|image| AsyncImageLoad {
+                image,
+                is_animated_webp: LoadedImage::is_animated_webp(&path),
+                max_texture_side,
+                gif_filter,
+            });
+
+            MediaLoadResult::Image {
+                request_id,
+                path,
+                result,
+                worker_elapsed: started_at.elapsed(),
+            }
+        }
+        MediaLoadRequest::Video {
+            request_id,
+            path,
+            muted,
+            initial_volume,
+            prefer_hardware_decode,
+            disable_hardware_decode,
+        } => {
+            let result = VideoPlayer::new(
+                &path,
+                muted,
+                initial_volume,
+                prefer_hardware_decode,
+                disable_hardware_decode,
+            )
+            .and_then(|mut player| {
+                player.play()?;
+                Ok(player)
+            });
+
+            MediaLoadResult::Video {
+                request_id,
+                path,
+                result,
+                worker_elapsed: started_at.elapsed(),
+            }
+        }
+    }
 }
 
 const DECODED_IMAGE_CACHE_MAX_BYTES: u64 = 192 * 1024 * 1024;
@@ -466,10 +607,10 @@ struct ImageViewer {
     pending_media_directory_started_at: Option<Instant>,
     /// Monotonic request id for non-blocking solo media loads.
     next_media_load_request_id: u64,
+    /// Latest-only non-blocking solo media load coordinator.
+    media_load_coordinator: MediaLoadCoordinator,
     /// Active non-blocking media load (if any).
     pending_media_load: Option<PendingMediaLoad>,
-    /// Completion channel for `pending_media_load`.
-    pending_media_load_rx: Option<crossbeam_channel::Receiver<MediaLoadResult>>,
     /// Current image index in the list
     current_index: usize,
     /// Current zoom level (1.0 = 100%)
@@ -854,8 +995,8 @@ impl Default for ImageViewer {
             pending_media_directory_target: None,
             pending_media_directory_started_at: None,
             next_media_load_request_id: 1,
+            media_load_coordinator: MediaLoadCoordinator::new(),
             pending_media_load: None,
-            pending_media_load_rx: None,
             current_index: 0,
             zoom: 1.0,
             zoom_target: 1.0,
@@ -2570,7 +2711,6 @@ impl ImageViewer {
 
     fn clear_pending_media_load(&mut self) {
         self.pending_media_load = None;
-        self.pending_media_load_rx = None;
     }
 
     fn start_async_image_load(
@@ -2583,34 +2723,19 @@ impl ImageViewer {
         let request_id = self.next_media_load_request_id;
         self.next_media_load_request_id = self.next_media_load_request_id.saturating_add(1).max(1);
 
-        let (tx, rx) = crossbeam_channel::bounded::<MediaLoadResult>(1);
         self.pending_media_load = Some(PendingMediaLoad {
             request_id,
             path: path.clone(),
             kind: PendingMediaLoadKind::Image,
             started_at: Instant::now(),
         });
-        self.pending_media_load_rx = Some(rx);
 
-        crate::async_runtime::spawn_blocking_or_thread("solo-image-load", move || {
-            let result = LoadedImage::load_first_frame_only(
-                &path,
-                Some(max_texture_side),
-                downscale_filter,
-                gif_filter,
-            )
-            .map(|image| AsyncImageLoad {
-                image,
-                is_animated_webp: LoadedImage::is_animated_webp(&path),
-                max_texture_side,
-                gif_filter,
-            });
-
-            let _ = tx.send(MediaLoadResult::Image {
-                request_id,
-                path,
-                result,
-            });
+        self.media_load_coordinator.submit(MediaLoadRequest::Image {
+            request_id,
+            path,
+            max_texture_side,
+            downscale_filter,
+            gif_filter,
         });
     }
 
@@ -2623,128 +2748,132 @@ impl ImageViewer {
         let prefer_hardware_decode = self.config.video_prefer_hardware_decode;
         let disable_hardware_decode = self.config.video_disable_hardware_decode;
 
-        let (tx, rx) = crossbeam_channel::bounded::<MediaLoadResult>(1);
         self.pending_media_load = Some(PendingMediaLoad {
             request_id,
             path: path.clone(),
             kind: PendingMediaLoadKind::Video,
             started_at: Instant::now(),
         });
-        self.pending_media_load_rx = Some(rx);
 
-        crate::async_runtime::spawn_blocking_or_thread("solo-video-load", move || {
-            let result = VideoPlayer::new(
-                &path,
-                muted,
-                initial_volume,
-                prefer_hardware_decode,
-                disable_hardware_decode,
-            )
-            .and_then(|mut player| {
-                player.play()?;
-                Ok(player)
-            });
-
-            let _ = tx.send(MediaLoadResult::Video {
-                request_id,
-                path,
-                result,
-            });
+        self.media_load_coordinator.submit(MediaLoadRequest::Video {
+            request_id,
+            path,
+            muted,
+            initial_volume,
+            prefer_hardware_decode,
+            disable_hardware_decode,
         });
     }
 
     fn poll_pending_media_load(&mut self, ctx: &egui::Context) {
-        let result = {
-            let Some(rx) = self.pending_media_load_rx.as_ref() else {
-                return;
-            };
+        let mut applied_any = false;
 
-            match rx.try_recv() {
+        loop {
+            let result = match self.media_load_coordinator.try_recv() {
                 Ok(result) => result,
-                Err(crossbeam_channel::TryRecvError::Empty) => return,
+                Err(crossbeam_channel::TryRecvError::Empty) => break,
                 Err(crossbeam_channel::TryRecvError::Disconnected) => {
                     self.clear_pending_media_load();
-                    return;
+                    break;
                 }
+            };
+
+            let (result_request_id, result_path, worker_elapsed) = match &result {
+                MediaLoadResult::Image {
+                    request_id,
+                    path,
+                    worker_elapsed,
+                    ..
+                } => (*request_id, path, *worker_elapsed),
+                MediaLoadResult::Video {
+                    request_id,
+                    path,
+                    worker_elapsed,
+                    ..
+                } => (*request_id, path, *worker_elapsed),
+            };
+
+            let Some(pending) = self.pending_media_load.as_ref() else {
+                continue;
+            };
+
+            if result_request_id != pending.request_id || result_path != &pending.path {
+                self.perf_metrics.increment_counter("load_media_async_stale", 1);
+                continue;
             }
-        };
 
-        let pending = self.pending_media_load.take();
-        self.pending_media_load_rx = None;
+            let Some(pending) = self.pending_media_load.take() else {
+                continue;
+            };
 
-        let Some(pending) = pending else {
-            return;
-        };
+            let total_elapsed = pending.started_at.elapsed();
+            self.perf_metrics
+                .record_duration("load_media_async_ms", total_elapsed);
+            self.perf_metrics
+                .record_duration("load_media_async_worker_ms", worker_elapsed);
+            self.perf_metrics.record_duration(
+                "load_media_async_queue_ms",
+                total_elapsed.saturating_sub(worker_elapsed),
+            );
 
-        let (result_request_id, result_path) = match &result {
-            MediaLoadResult::Image {
-                request_id, path, ..
-            } => (*request_id, path),
-            MediaLoadResult::Video {
-                request_id, path, ..
-            } => (*request_id, path),
-        };
-
-        if result_request_id != pending.request_id || result_path != &pending.path {
-            return;
-        }
-
-        self.perf_metrics
-            .record_duration("load_media_async_ms", pending.started_at.elapsed());
-
-        match result {
-            MediaLoadResult::Image { path, result, .. } => match result {
-                Ok(loaded) => {
-                    self.cache_loaded_image_first_frame(
-                        &path,
-                        loaded.max_texture_side,
-                        &loaded.image,
-                        loaded.is_animated_webp,
-                    );
-                    self.image = Some(loaded.image);
-                    self.texture_frame = usize::MAX;
-                    self.image_changed = true;
-                    self.pending_media_layout = false;
-                    self.error_message = None;
-
-                    if loaded.is_animated_webp {
-                        if let Some(rx) = LoadedImage::start_streaming_webp(
+            match result {
+                MediaLoadResult::Image { path, result, .. } => match result {
+                    Ok(loaded) => {
+                        self.cache_loaded_image_first_frame(
                             &path,
-                            Some(loaded.max_texture_side),
-                            loaded.gif_filter,
-                        ) {
-                            self.anim_stream_rx = Some(rx);
-                            self.anim_stream_path = Some(path);
-                            self.anim_stream_done = false;
-                            self.anim_seekbar_total_frames = Some(
-                                self.image
-                                    .as_ref()
-                                    .map(|image| image.frame_count())
-                                    .unwrap_or(1),
-                            );
+                            loaded.max_texture_side,
+                            &loaded.image,
+                            loaded.is_animated_webp,
+                        );
+                        self.image = Some(loaded.image);
+                        self.texture_frame = usize::MAX;
+                        self.image_changed = true;
+                        self.pending_media_layout = false;
+                        self.error_message = None;
+
+                        if loaded.is_animated_webp {
+                            if let Some(rx) = LoadedImage::start_streaming_webp(
+                                &path,
+                                Some(loaded.max_texture_side),
+                                loaded.gif_filter,
+                            ) {
+                                self.anim_stream_rx = Some(rx);
+                                self.anim_stream_path = Some(path);
+                                self.anim_stream_done = false;
+                                self.anim_seekbar_total_frames = Some(
+                                    self.image
+                                        .as_ref()
+                                        .map(|image| image.frame_count())
+                                        .unwrap_or(1),
+                                );
+                            }
                         }
                     }
-                }
-                Err(err) => {
-                    self.error_message = Some(err);
-                }
-            },
-            MediaLoadResult::Video { result, .. } => match result {
-                Ok(player) => {
-                    self.video_player = Some(player);
-                    self.image_changed = true;
-                    self.pending_media_layout = true;
-                    self.error_message = None;
-                    self.show_video_controls = true;
-                    self.touch_bottom_overlays();
-                }
-                Err(err) => {
-                    self.error_message = Some(format!("Failed to load video: {}", err));
-                }
-            },
+                    Err(err) => {
+                        self.error_message = Some(err);
+                    }
+                },
+                MediaLoadResult::Video { result, .. } => match result {
+                    Ok(player) => {
+                        self.video_player = Some(player);
+                        self.image_changed = true;
+                        self.pending_media_layout = true;
+                        self.error_message = None;
+                        self.show_video_controls = true;
+                        self.touch_bottom_overlays();
+                    }
+                    Err(err) => {
+                        self.error_message = Some(format!("Failed to load video: {}", err));
+                    }
+                },
+            }
+
+            applied_any = true;
         }
 
-        ctx.request_repaint();
+        if applied_any {
+            ctx.request_repaint();
+        }
     }
 
     /// Load an image from path
