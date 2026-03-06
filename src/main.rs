@@ -497,6 +497,10 @@ struct ImageViewer {
     // ============ FPS DEBUG OVERLAY ============
     /// Last time we recorded a frame (for FPS calculation)
     fps_last_frame_at: Instant,
+    /// Last time the app rendered an actively-updating frame.
+    fps_last_active_frame_at: Instant,
+    /// Whether the previous frame represented active rendering work.
+    fps_last_frame_was_active: bool,
     /// Exponentially-smoothed FPS value
     fps_smoothed: f32,
     /// Most recent frame delta time in seconds
@@ -774,6 +778,8 @@ impl Default for ImageViewer {
             idle_frame_skip_counter: 0,
 
             fps_last_frame_at: Instant::now(),
+            fps_last_active_frame_at: Instant::now(),
+            fps_last_frame_was_active: false,
             fps_smoothed: 0.0,
             fps_last_dt_s: 0.0,
 
@@ -901,6 +907,7 @@ impl ImageViewer {
     const MANGA_TTV_PENDING_MAX_AGE: Duration = Duration::from_secs(30);
     const FPS_OVERLAY_IDLE_POLL_MS: u64 = 500;
     const FPS_OVERLAY_ACTIVE_POLL_MS: u64 = 120;
+    const FPS_IDLE_RESET_AFTER_MS: u64 = 350;
 
     fn set_current_index_clamped(&mut self, index: usize) {
         if self.image_list.is_empty() {
@@ -912,23 +919,36 @@ impl ImageViewer {
         self.current_index = clamped;
     }
 
-    fn update_fps_stats(&mut self) {
+    fn update_fps_stats(&mut self, frame_was_active: bool) {
         let now = Instant::now();
         let dt = now.saturating_duration_since(self.fps_last_frame_at);
         self.fps_last_frame_at = now;
 
-        let dt_s = dt.as_secs_f32();
-        // Guard against huge dt (e.g., debugging breakpoints / system sleep)
-        if dt_s.is_finite() && dt_s > 0.0 && dt_s < 1.0 {
-            self.fps_last_dt_s = dt_s;
-            let fps = 1.0 / dt_s;
-            if self.fps_smoothed <= 0.0 {
-                self.fps_smoothed = fps;
-            } else {
-                // Simple EMA smoothing to avoid jitter
-                let alpha = 0.10;
-                self.fps_smoothed = (1.0 - alpha) * self.fps_smoothed + alpha * fps;
+        if frame_was_active {
+            self.fps_last_active_frame_at = now;
+
+            let dt_s = dt.as_secs_f32();
+            // Guard against huge dt (e.g., debugging breakpoints / system sleep)
+            if dt_s.is_finite() && dt_s > 0.0 && dt_s < 1.0 {
+                self.fps_last_dt_s = dt_s;
+                let fps = 1.0 / dt_s;
+                if self.fps_smoothed <= 0.0 {
+                    self.fps_smoothed = fps;
+                } else {
+                    // Simple EMA smoothing to avoid jitter
+                    let alpha = 0.10;
+                    self.fps_smoothed = (1.0 - alpha) * self.fps_smoothed + alpha * fps;
+                }
             }
+            return;
+        }
+
+        // Overlay-only wakeups should not masquerade as low FPS rendering.
+        if now.saturating_duration_since(self.fps_last_active_frame_at)
+            >= Duration::from_millis(Self::FPS_IDLE_RESET_AFTER_MS)
+        {
+            self.fps_smoothed = 0.0;
+            self.fps_last_dt_s = 0.0;
         }
     }
 
@@ -1044,12 +1064,16 @@ impl ImageViewer {
         }
 
         let fps = if self.fps_smoothed.is_finite() {
-            self.fps_smoothed
+            self.fps_smoothed.max(0.0)
         } else {
             0.0
         };
-        let ms = (self.fps_last_dt_s * 1000.0).max(0.0);
-        let mut text = format!("{fps:.0} FPS  ({ms:.1} ms)");
+        let mut text = if fps > 0.0 && self.fps_last_dt_s > 0.0 {
+            let ms = (self.fps_last_dt_s * 1000.0).max(0.0);
+            format!("{fps:.0} FPS  ({ms:.1} ms)")
+        } else {
+            "0 FPS  (idle)".to_string()
+        };
 
         if self.manga_mode {
             if let Some((p50, p95, samples)) = self.manga_ttv_percentiles_ms() {
@@ -10247,7 +10271,9 @@ impl eframe::App for ImageViewer {
         }
 
         // Update FPS stats for the debug overlay (and for general diagnostics).
-        self.update_fps_stats();
+        // Use the previous frame's activity classification so low-rate overlay polls
+        // do not skew FPS downward.
+        self.update_fps_stats(self.fps_last_frame_was_active);
 
         // Lazily install large CJK fonts only when we actually have a filename that needs them.
         self.ensure_windows_cjk_fonts_if_needed(ctx);
@@ -10649,6 +10675,15 @@ impl eframe::App for ImageViewer {
             || self.is_volume_dragging
             || manga_scroll_active
             || manga_arrow_held;
+        let video_playing = self
+            .video_player
+            .as_ref()
+            .map_or(false, |player| player.is_playing());
+        self.fps_last_frame_was_active = any_animation_active
+            || self.pending_media_layout
+            || manga_needs_fast_background_poll
+            || manga_background_work_pending
+            || video_playing;
 
         // Update idle state and optimize repaint scheduling
         if any_animation_active {
@@ -10683,13 +10718,11 @@ impl eframe::App for ImageViewer {
             ctx.request_repaint_after(Duration::from_millis(16));
         } else if manga_background_work_pending {
             ctx.request_repaint_after(Duration::from_millis(66));
-        } else if let Some(ref player) = self.video_player {
-            if player.is_playing() {
-                ctx.request_repaint_after(Duration::from_millis(16));
-            } else {
-                // Paused video: no repaint needed.
-                // Any input will trigger an event-driven repaint.
-            }
+        } else if video_playing {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        } else if self.video_player.is_some() {
+            // Paused video: no repaint needed.
+            // Any input will trigger an event-driven repaint.
         } else {
             let mut next_repaint: Option<Duration> = None;
 
