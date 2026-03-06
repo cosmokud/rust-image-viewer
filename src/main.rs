@@ -338,6 +338,17 @@ struct MasonryReturnState {
     cache_reuse_radius: usize,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct PendingMasonrySoloReentry {
+    index: usize,
+    scroll_offset: f32,
+    scroll_target: f32,
+    zoom: f32,
+    zoom_target: f32,
+    offset: egui::Vec2,
+    items_per_row: usize,
+}
+
 /// Per-image view state for fullscreen mode memory.
 /// Stores zoom, pan, and transformation settings for each image path.
 #[derive(Clone, Debug)]
@@ -957,6 +968,8 @@ struct ImageViewer {
     titlebar_previous_mode: Option<TitlebarToggleReturnMode>,
     /// Manga layout to restore when the title-bar button re-enters from floating mode.
     titlebar_pending_restore_layout: Option<MangaLayoutMode>,
+    /// Re-open the last solo item when returning immediately from masonry without touching the strip.
+    pending_masonry_solo_reentry: Option<PendingMasonrySoloReentry>,
     /// Saved masonry viewport state while temporarily opening a single item fullscreen.
     strip_return_masonry_state: Option<MasonryReturnState>,
     /// True while solo fullscreen is keeping masonry caches alive for potential middle-click return.
@@ -1268,6 +1281,7 @@ impl Default for ImageViewer {
             strip_return_mode: None,
             titlebar_previous_mode: None,
             titlebar_pending_restore_layout: None,
+            pending_masonry_solo_reentry: None,
             strip_return_masonry_state: None,
             strip_return_preserve_masonry_cache: false,
             masonry_items_per_row,
@@ -3987,6 +4001,117 @@ impl ImageViewer {
         }
     }
 
+    fn use_native_fullscreen_window_transition(&self) -> bool {
+        #[cfg(target_os = "windows")]
+        {
+            self.config.fullscreen_native_window_transition
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            false
+        }
+    }
+
+    fn current_titlebar_return_mode(&self) -> TitlebarToggleReturnMode {
+        if self.manga_mode {
+            TitlebarToggleReturnMode::Manga(self.manga_layout_mode)
+        } else if let Some(layout_mode) = self.strip_return_mode {
+            TitlebarToggleReturnMode::Manga(layout_mode)
+        } else {
+            TitlebarToggleReturnMode::Fullscreen
+        }
+    }
+
+    fn request_titlebar_fullscreen_reentry(
+        &mut self,
+        return_mode: Option<TitlebarToggleReturnMode>,
+    ) {
+        self.toggle_fullscreen_from_titlebar = true;
+        self.titlebar_pending_restore_layout = match return_mode {
+            Some(TitlebarToggleReturnMode::Manga(layout_mode)) => Some(layout_mode),
+            _ => None,
+        };
+        self.titlebar_previous_mode = None;
+        self.toggle_fullscreen = true;
+    }
+
+    fn capture_pending_masonry_solo_reentry(&mut self, index: usize) {
+        if self.manga_layout_mode != MangaLayoutMode::Masonry {
+            self.pending_masonry_solo_reentry = None;
+            return;
+        }
+
+        self.pending_masonry_solo_reentry = Some(PendingMasonrySoloReentry {
+            index,
+            scroll_offset: self.manga_scroll_offset,
+            scroll_target: self.manga_scroll_target,
+            zoom: self.zoom,
+            zoom_target: self.zoom_target,
+            offset: self.offset,
+            items_per_row: self.masonry_items_per_row,
+        });
+    }
+
+    fn pending_masonry_solo_reentry_index(&self) -> Option<usize> {
+        let state = self.pending_masonry_solo_reentry?;
+        if !self.is_masonry_mode() || self.masonry_items_per_row != state.items_per_row {
+            return None;
+        }
+
+        const SCROLL_EPSILON: f32 = 0.5;
+        const ZOOM_EPSILON: f32 = 0.0005;
+        const OFFSET_EPSILON: f32 = 0.5;
+
+        let scroll_unchanged = (self.manga_scroll_offset - state.scroll_offset).abs() <= SCROLL_EPSILON
+            && (self.manga_scroll_target - state.scroll_target).abs() <= SCROLL_EPSILON;
+        let zoom_unchanged = (self.zoom - state.zoom).abs() <= ZOOM_EPSILON
+            && (self.zoom_target - state.zoom_target).abs() <= ZOOM_EPSILON;
+        let offset_unchanged = (self.offset - state.offset).length() <= OFFSET_EPSILON;
+
+        if scroll_unchanged && zoom_unchanged && offset_unchanged {
+            Some(state.index)
+        } else {
+            None
+        }
+    }
+
+    fn apply_pending_titlebar_restore_layout(&mut self, ctx: &egui::Context) -> bool {
+        let Some(layout_mode) = self.titlebar_pending_restore_layout else {
+            return false;
+        };
+
+        if !self.is_fullscreen {
+            self.titlebar_pending_restore_layout = None;
+            return false;
+        }
+
+        if self.manga_mode {
+            self.titlebar_pending_restore_layout = None;
+            return false;
+        }
+
+        let ready = if self.use_native_fullscreen_window_transition() {
+            self.current_window_is_maximized(ctx)
+        } else {
+            let monitor = self.monitor_size_points(ctx);
+            let viewport = ctx.screen_rect().size();
+            (viewport.x - monitor.x).abs() <= 2.0 && (viewport.y - monitor.y).abs() <= 2.0
+        };
+
+        if !ready {
+            ctx.request_repaint_after(Duration::from_millis(16));
+            return true;
+        }
+
+        self.titlebar_pending_restore_layout = None;
+        self.clear_strip_return_context();
+        self.manga_layout_mode = layout_mode;
+        self.toggle_manga_mode();
+        self.touch_bottom_overlays();
+        true
+    }
+
     fn apply_floating_layout_for_current_image(&mut self, ctx: &egui::Context) {
         self.offset = egui::Vec2::ZERO;
 
@@ -4408,6 +4533,7 @@ impl ImageViewer {
 
                 self.manga_update_current_index();
                 self.manga_update_preload_queue();
+                self.capture_pending_masonry_solo_reentry(current_viewed_index);
             }
         } else if self.manga_mode {
             // Long-strip return and non-preserved masonry fall back here.
@@ -4415,6 +4541,7 @@ impl ImageViewer {
             self.scroll_strip_to_current_index();
             self.manga_update_current_index();
             self.manga_update_preload_queue();
+            self.pending_masonry_solo_reentry = None;
         }
 
         self.clear_strip_return_context();
@@ -4827,6 +4954,8 @@ impl ImageViewer {
     }
 
     fn toggle_strip_mode(&mut self, layout_mode: MangaLayoutMode) {
+        self.pending_masonry_solo_reentry = None;
+
         if !self.manga_mode {
             self.manga_layout_mode = layout_mode;
             self.toggle_manga_mode();
@@ -5088,6 +5217,8 @@ impl ImageViewer {
             return;
         }
 
+        self.pending_masonry_solo_reentry = None;
+
         let return_mode = self.manga_layout_mode;
         self.set_current_index_clamped(index);
         let Some(path) = self.image_list.get(index).cloned() else {
@@ -5114,6 +5245,8 @@ impl ImageViewer {
     /// Toggle manga reading mode on/off
     fn toggle_manga_mode(&mut self) {
         if !self.manga_mode {
+            self.pending_masonry_solo_reentry = None;
+
             let current_media_dims = self.media_display_dimensions().or(self.video_texture_dims);
             let current_media_type = self.current_media_type;
             let current_image_is_animated =
@@ -7656,7 +7789,12 @@ impl ImageViewer {
                             // Toggling OFF the currently active strip layout should preserve
                             // exact strip position for immediate ON re-entry (no cumulative drift).
                             self.stop_manga_autoscroll();
-                            let target_index = self.manga_visible_index();
+                            let target_index = if target_layout == MangaLayoutMode::Masonry {
+                                self.pending_masonry_solo_reentry_index()
+                                    .unwrap_or_else(|| self.manga_visible_index())
+                            } else {
+                                self.manga_visible_index()
+                            };
                             self.open_strip_item_in_solo_fullscreen(target_index);
                         } else {
                             self.clear_strip_return_context();
@@ -10413,27 +10551,30 @@ impl ImageViewer {
 
                             // Maximize/Restore button
                             let window_is_maximized = self.current_window_is_maximized(ctx);
-                            let button = if self.is_fullscreen || window_is_maximized {
+                            let use_native_transition = self.use_native_fullscreen_window_transition();
+                            let button = if self.is_fullscreen
+                                || (use_native_transition && window_is_maximized)
+                            {
                                 WindowButton::Restore
                             } else {
                                 WindowButton::Maximize
                             };
                             if window_icon_button(ui, button).clicked() {
                                 if self.is_fullscreen {
+                                    self.titlebar_previous_mode =
+                                        Some(self.current_titlebar_return_mode());
                                     self.toggle_fullscreen_from_titlebar = true;
-
-                                    // Remember where maximize/restore should return from floating mode.
-                                    self.titlebar_previous_mode = Some(if self.manga_mode {
-                                        TitlebarToggleReturnMode::Manga(self.manga_layout_mode)
-                                    } else if let Some(layout_mode) = self.strip_return_mode {
-                                        TitlebarToggleReturnMode::Manga(layout_mode)
-                                    } else {
-                                        TitlebarToggleReturnMode::Fullscreen
-                                    });
                                     self.toggle_fullscreen = true;
-                                } else {
+                                } else if self.titlebar_previous_mode.is_some() {
+                                    let previous_mode = self.titlebar_previous_mode.take();
+                                    self.request_titlebar_fullscreen_reentry(previous_mode);
+                                } else if use_native_transition {
                                     self.request_native_maximize = Some(!window_is_maximized);
                                     self.pending_maximized_layout = !window_is_maximized;
+                                } else {
+                                    self.request_titlebar_fullscreen_reentry(Some(
+                                        TitlebarToggleReturnMode::Fullscreen,
+                                    ));
                                 }
                             }
 
@@ -12473,9 +12614,13 @@ impl eframe::App for ImageViewer {
             let entering_fullscreen = !self.is_fullscreen;
             let toggled_from_titlebar = self.toggle_fullscreen_from_titlebar;
             let window_was_maximized = self.current_window_is_maximized(ctx);
+            let use_native_transition = self.use_native_fullscreen_window_transition();
+            let entering_titlebar_strip =
+                toggled_from_titlebar && self.titlebar_pending_restore_layout.is_some();
 
             if !toggled_from_titlebar {
                 self.titlebar_pending_restore_layout = None;
+                self.titlebar_previous_mode = None;
             }
 
             // When solo fullscreen was opened from strip mode, all fullscreen-exit triggers
@@ -12508,7 +12653,7 @@ impl eframe::App for ImageViewer {
                         inner_size,
                         outer_pos,
                     ));
-                    self.saved_floating_was_maximized = window_was_maximized;
+                    self.saved_floating_was_maximized = use_native_transition && window_was_maximized;
                     self.saved_fullscreen_entry_index = Some(self.current_index);
                     self.pending_window_resize = None;
                     self.pending_maximized_layout = false;
@@ -12517,23 +12662,23 @@ impl eframe::App for ImageViewer {
                     self.fullscreen_transition = 1.0;
                     self.fullscreen_transition_target = 1.0;
 
-                    #[cfg(target_os = "windows")]
-                    {
+                    if use_native_transition {
                         if window_was_maximized {
                             self.pending_fullscreen_layout = false;
-                            self.apply_fullscreen_layout_for_current_image(ctx);
+                            if !entering_titlebar_strip {
+                                self.apply_fullscreen_layout_for_current_image(ctx);
+                            }
                         } else {
-                            self.pending_fullscreen_layout = true;
+                            self.pending_fullscreen_layout = !entering_titlebar_strip;
                             self.request_native_maximize = Some(true);
                         }
-                    }
-
-                    #[cfg(not(target_os = "windows"))]
-                    {
+                    } else {
                         self.pending_fullscreen_layout = false;
 
-                        // Requirement: when moving from floating -> fullscreen, always fit vertically and center.
-                        self.apply_fullscreen_layout_for_current_image(ctx);
+                        if !entering_titlebar_strip {
+                            // Requirement: when moving from floating -> fullscreen, always fit vertically and center.
+                            self.apply_fullscreen_layout_for_current_image(ctx);
+                        }
 
                         // Use borderless "pseudo-fullscreen" instead of OS fullscreen.
                         // This avoids a brief desktop flash on Windows caused by toggling window styles/swapchain.
@@ -12543,16 +12688,6 @@ impl eframe::App for ImageViewer {
                         ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::Pos2::ZERO));
                         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(monitor));
                         self.last_requested_inner_size = Some(monitor);
-                    }
-
-                    if toggled_from_titlebar {
-                        if let Some(layout_mode) = self.titlebar_pending_restore_layout.take() {
-                            self.clear_strip_return_context();
-                            self.manga_layout_mode = layout_mode;
-                            if !self.manga_mode {
-                                self.toggle_manga_mode();
-                            }
-                        }
                     }
                 } else {
                     // Exiting fullscreen - use delayed resize to prevent flash
@@ -12596,8 +12731,9 @@ impl eframe::App for ImageViewer {
                     let image_changed_while_fullscreen = self
                         .saved_fullscreen_entry_index
                         .is_some_and(|idx| idx != self.current_index);
-                    let restore_to_maximized = self.saved_floating_was_maximized;
-                    let should_native_restore = window_was_maximized && !restore_to_maximized;
+                    let restore_to_maximized = use_native_transition && self.saved_floating_was_maximized;
+                    let should_native_restore =
+                        use_native_transition && window_was_maximized && !restore_to_maximized;
                     self.saved_floating_was_maximized = false;
 
                     // Restore previous floating state if available
@@ -12780,6 +12916,8 @@ impl eframe::App for ImageViewer {
                 ctx.request_repaint_after(Duration::from_millis(16));
             }
         }
+
+        self.apply_pending_titlebar_restore_layout(ctx);
 
         if self.pending_maximized_layout {
             if self.current_window_is_maximized(ctx) {

@@ -399,6 +399,8 @@ pub struct Config {
     pub background_rgb: [u8; 3],
     /// When entering fullscreen, reset image to center and fit-to-screen.
     pub fullscreen_reset_fit_on_enter: bool,
+    /// On Windows, use native maximize/restore-down animation for fullscreen transitions.
+    pub fullscreen_native_window_transition: bool,
     /// Floating-mode zoom animation speed. Higher = faster. 0 = instant snap.
     pub zoom_animation_speed: f32,
     /// Zoom step per scroll wheel notch (1.05 = 5% per step, 1.25 = 25% per step)
@@ -539,6 +541,7 @@ impl Config {
             resize_border_size: 6.0,
             background_rgb: [0, 0, 0],
             fullscreen_reset_fit_on_enter: true,
+            fullscreen_native_window_transition: true,
             zoom_animation_speed: 20.0,
             zoom_step: 1.02,
             max_zoom_percent: 1000.0,
@@ -877,6 +880,14 @@ impl Config {
                         "fullscreen_reset_fit_on_enter" => {
                             if let Some(v) = parse_bool(value) {
                                 config.fullscreen_reset_fit_on_enter = v;
+                            }
+                        }
+                        "fullscreen_native_window_transition"
+                        | "fullscreen_native_transition"
+                        | "fullscreen_animated_window_transition"
+                        | "animate_fullscreen_with_maximize_restore" => {
+                            if let Some(v) = parse_bool(value) {
+                                config.fullscreen_native_window_transition = v;
                             }
                         }
                         "zoom_animation_speed" => {
@@ -1299,6 +1310,10 @@ impl Config {
         values.insert(
             "fullscreen_reset_fit_on_enter",
             bool_to_ini(self.fullscreen_reset_fit_on_enter).to_string(),
+        );
+        values.insert(
+            "fullscreen_native_window_transition",
+            bool_to_ini(self.fullscreen_native_window_transition).to_string(),
         );
         values.insert(
             "zoom_animation_speed",

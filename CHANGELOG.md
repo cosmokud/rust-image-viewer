@@ -9,6 +9,12 @@ All notable changes to this project will be documented in this file.
 - The title-bar maximize or restore button now uses native Win32 maximize and restore behavior instead of routing through the viewer's custom fullscreen toggle path.
 - Fullscreen toggles on Windows now reuse the native maximize or restore transition, so center right-click in solo mode follows the same animated path without changing masonry or long-strip right-click behavior.
 - Leaving masonry mode or manga long-strip mode through the title-bar maximize or restore button now uses the same native maximize or restore-down animation as the solo viewer.
+- Restoring down from masonry or long-strip and maximizing back now restores the remembered fullscreen strip mode only after the window transition has landed, fixing the broken fit-to-screen state and the missing bottom-right hover HUD after the round-trip.
+- Returning from solo fullscreen to masonry now remembers the last solo item for one untouched strip re-entry, so immediately toggling back opens the last viewed file instead of the centered masonry tile.
+
+### Added
+
+- Added `fullscreen_native_window_transition` to the settings INI so users can switch between the native animated maximize or restore-down fullscreen path and the old instant fullscreen snap.
 
 ## [v0.2.1] - 2026-03-06
 
