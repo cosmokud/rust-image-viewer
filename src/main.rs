@@ -813,6 +813,8 @@ struct ImageViewer {
     last_requested_inner_size: Option<egui::Vec2>,
     /// Saved floating state before entering fullscreen (zoom, zoom_target, offset, window_size, window_pos)
     saved_floating_state: Option<(f32, f32, egui::Vec2, egui::Vec2, egui::Pos2)>,
+    /// Whether the floating window was already maximized before entering fullscreen.
+    saved_floating_was_maximized: bool,
     /// Image index at the moment we entered fullscreen (used to detect next/prev navigation)
     saved_fullscreen_entry_index: Option<usize>,
     /// Fullscreen transition animation progress (0.0 = floating, 1.0 = fullscreen)
@@ -823,6 +825,8 @@ struct ImageViewer {
     image_rotated: bool,
     /// Pending window resize to apply after a frame delay (to prevent flash on fullscreen exit)
     pending_window_resize: Option<(egui::Vec2, egui::Pos2, u8)>,
+    /// Apply fullscreen layout once a native maximize request has landed.
+    pending_fullscreen_layout: bool,
     /// Apply a fit-to-window layout once a native maximize request has landed.
     pending_maximized_layout: bool,
 
@@ -1196,11 +1200,13 @@ impl Default for ImageViewer {
             floating_max_inner_size: None,
             last_requested_inner_size: None,
             saved_floating_state: None,
+            saved_floating_was_maximized: false,
             saved_fullscreen_entry_index: None,
             fullscreen_transition: 0.0,
             fullscreen_transition_target: 0.0,
             image_rotated: false,
             pending_window_resize: None,
+            pending_fullscreen_layout: false,
             pending_maximized_layout: false,
             fullscreen_view_states: HashMap::new(),
             last_known_outer_pos: None,
@@ -4090,10 +4096,12 @@ impl ImageViewer {
         // Get dimensions from either image or video
         if let Some((_, img_h)) = self.media_display_dimensions() {
             if img_h > 0 {
-                let target_h = self
-                    .monitor_size_points(ctx)
-                    .y
-                    .max(ctx.screen_rect().height());
+                let viewport_height = ctx.screen_rect().height().max(1.0);
+                let target_h = if self.current_window_is_maximized(ctx) {
+                    viewport_height
+                } else {
+                    self.monitor_size_points(ctx).y.max(viewport_height)
+                };
                 let z = (target_h / img_h as f32).clamp(0.1, self.max_zoom_factor());
                 self.zoom = z;
                 self.zoom_target = z;
@@ -12464,6 +12472,7 @@ impl eframe::App for ImageViewer {
             self.stop_manga_autoscroll();
             let entering_fullscreen = !self.is_fullscreen;
             let toggled_from_titlebar = self.toggle_fullscreen_from_titlebar;
+            let window_was_maximized = self.current_window_is_maximized(ctx);
 
             if !toggled_from_titlebar {
                 self.titlebar_pending_restore_layout = None;
@@ -12499,23 +12508,42 @@ impl eframe::App for ImageViewer {
                         inner_size,
                         outer_pos,
                     ));
+                    self.saved_floating_was_maximized = window_was_maximized;
                     self.saved_fullscreen_entry_index = Some(self.current_index);
+                    self.pending_window_resize = None;
+                    self.pending_maximized_layout = false;
 
                     // No fullscreen transition animation: switch instantly.
                     self.fullscreen_transition = 1.0;
                     self.fullscreen_transition_target = 1.0;
 
-                    // Requirement: when moving from floating -> fullscreen, always fit vertically and center.
-                    self.apply_fullscreen_layout_for_current_image(ctx);
+                    #[cfg(target_os = "windows")]
+                    {
+                        if window_was_maximized {
+                            self.pending_fullscreen_layout = false;
+                            self.apply_fullscreen_layout_for_current_image(ctx);
+                        } else {
+                            self.pending_fullscreen_layout = true;
+                            self.request_native_maximize = Some(true);
+                        }
+                    }
 
-                    // Use borderless "pseudo-fullscreen" instead of OS fullscreen.
-                    // This avoids a brief desktop flash on Windows caused by toggling window styles/swapchain.
-                    let monitor = self.monitor_size_points(ctx);
-                    self.suppress_outer_pos_tracking_frames =
-                        self.suppress_outer_pos_tracking_frames.max(2);
-                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::Pos2::ZERO));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(monitor));
-                    self.last_requested_inner_size = Some(monitor);
+                    #[cfg(not(target_os = "windows"))]
+                    {
+                        self.pending_fullscreen_layout = false;
+
+                        // Requirement: when moving from floating -> fullscreen, always fit vertically and center.
+                        self.apply_fullscreen_layout_for_current_image(ctx);
+
+                        // Use borderless "pseudo-fullscreen" instead of OS fullscreen.
+                        // This avoids a brief desktop flash on Windows caused by toggling window styles/swapchain.
+                        let monitor = self.monitor_size_points(ctx);
+                        self.suppress_outer_pos_tracking_frames =
+                            self.suppress_outer_pos_tracking_frames.max(2);
+                        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::Pos2::ZERO));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(monitor));
+                        self.last_requested_inner_size = Some(monitor);
+                    }
 
                     if toggled_from_titlebar {
                         if let Some(layout_mode) = self.titlebar_pending_restore_layout.take() {
@@ -12530,6 +12558,7 @@ impl eframe::App for ImageViewer {
                     // Exiting fullscreen - use delayed resize to prevent flash
                     self.fullscreen_transition = 0.0;
                     self.fullscreen_transition_target = 0.0;
+                    self.pending_fullscreen_layout = false;
                     self.clear_strip_return_context();
 
                     // Exit manga mode when leaving fullscreen
@@ -12567,6 +12596,9 @@ impl eframe::App for ImageViewer {
                     let image_changed_while_fullscreen = self
                         .saved_fullscreen_entry_index
                         .is_some_and(|idx| idx != self.current_index);
+                    let restore_to_maximized = self.saved_floating_was_maximized;
+                    let should_native_restore = window_was_maximized && !restore_to_maximized;
+                    self.saved_floating_was_maximized = false;
 
                     // Restore previous floating state if available
                     if !image_changed_while_fullscreen {
@@ -12585,17 +12617,26 @@ impl eframe::App for ImageViewer {
                             self.zoom = saved_zoom;
                             self.zoom_target = saved_zoom_target;
                             self.offset = saved_offset;
+                            self.zoom_velocity = 0.0;
                             self.floating_max_inner_size = Some(saved_size);
                             self.last_requested_inner_size = Some(saved_size);
-                            // Delay window resize by 2 frames to prevent flash
-                            self.pending_window_resize = Some((saved_size, saved_pos, 2));
+                            if should_native_restore {
+                                self.request_native_maximize = Some(false);
+                                self.last_known_outer_pos = Some(saved_pos);
+                            } else if !restore_to_maximized {
+                                // Delay window resize by 2 frames to prevent flash
+                                self.pending_window_resize = Some((saved_size, saved_pos, 2));
+                            }
                         } else {
                             // Fallback: reset to centered at 100% and resize to 100% image size (capped by fit-to-screen)
                             self.offset = egui::Vec2::ZERO;
                             self.zoom = 1.0;
                             self.zoom_target = 1.0;
+                            self.zoom_velocity = 0.0;
 
-                            if let Some(img) = self.image.as_ref() {
+                            if restore_to_maximized {
+                                self.pending_maximized_layout = true;
+                            } else if let Some(img) = self.image.as_ref() {
                                 let (w, h) = img.display_dimensions();
                                 let mut desired = egui::Vec2::new(w as f32, h as f32);
                                 let available = self.floating_available_size(ctx);
@@ -12614,6 +12655,9 @@ impl eframe::App for ImageViewer {
                                 let pos = egui::pos2(x.max(0.0), y.max(0.0));
                                 // Delay window resize by 2 frames to prevent flash
                                 self.pending_window_resize = Some((desired, pos, 2));
+                                if should_native_restore {
+                                    self.request_native_maximize = Some(false);
+                                }
                             }
                         }
                     } else {
@@ -12621,8 +12665,16 @@ impl eframe::App for ImageViewer {
                         // don't restore the previous floating zoom/position; apply normal floating sizing.
                         self.saved_fullscreen_entry_index = None;
                         self.saved_floating_state = None;
-                        // Calculate the new size for the current image
-                        if let Some((img_w_u, img_h_u)) = self.media_display_dimensions() {
+                        if restore_to_maximized {
+                            // Returning to a previously maximized floating window should keep
+                            // the window maximized and only recompute the fit for the new media.
+                            if self.media_display_dimensions().is_some() {
+                                self.apply_maximized_layout_for_current_image(ctx);
+                            } else {
+                                self.pending_media_layout =
+                                    matches!(self.current_media_type, Some(MediaType::Video));
+                            }
+                        } else if let Some((img_w_u, img_h_u)) = self.media_display_dimensions() {
                             if img_w_u > 0 && img_h_u > 0 {
                                 let img_w = img_w_u as f32;
                                 let img_h = img_h_u as f32;
@@ -12662,12 +12714,18 @@ impl eframe::App for ImageViewer {
                                 let pos = egui::pos2(x.max(0.0), y.max(0.0));
                                 // Delay window resize by 2 frames to prevent flash
                                 self.pending_window_resize = Some((size, pos, 2));
+                                if should_native_restore {
+                                    self.request_native_maximize = Some(false);
+                                }
                             }
                         } else {
                             // If we don't have dimensions yet (possible for videos right after switching),
                             // schedule a retry once dimensions become available.
                             self.pending_media_layout =
                                 matches!(self.current_media_type, Some(MediaType::Video));
+                            if should_native_restore {
+                                self.request_native_maximize = Some(false);
+                            }
                         }
                     }
                 }
@@ -12710,6 +12768,15 @@ impl eframe::App for ImageViewer {
             }
 
             if maximize {
+                ctx.request_repaint_after(Duration::from_millis(16));
+            }
+        }
+
+        if self.pending_fullscreen_layout {
+            if self.current_window_is_maximized(ctx) {
+                self.apply_fullscreen_layout_for_current_image(ctx);
+                self.pending_fullscreen_layout = false;
+            } else {
                 ctx.request_repaint_after(Duration::from_millis(16));
             }
         }

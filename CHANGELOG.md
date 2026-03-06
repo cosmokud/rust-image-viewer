@@ -7,6 +7,8 @@ All notable changes to this project will be documented in this file.
 ### Fixed
 
 - The title-bar maximize or restore button now uses native Win32 maximize and restore behavior instead of routing through the viewer's custom fullscreen toggle path.
+- Fullscreen toggles on Windows now reuse the native maximize or restore transition, so center right-click in solo mode follows the same animated path without changing masonry or long-strip right-click behavior.
+- Leaving masonry mode or manga long-strip mode through the title-bar maximize or restore button now uses the same native maximize or restore-down animation as the solo viewer.
 
 ## [v0.2.1] - 2026-03-06
 
