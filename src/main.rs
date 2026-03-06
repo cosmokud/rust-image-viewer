@@ -2106,6 +2106,14 @@ impl ImageViewer {
         path: Option<PathBuf>,
         start_visible: bool,
     ) {
+        #[cfg(target_os = "windows")]
+        if let Some(receiver) = viewer.file_receiver.as_ref() {
+            let egui_ctx = cc.egui_ctx.clone();
+            receiver.set_wake_callback(move || {
+                egui_ctx.request_repaint();
+            });
+        }
+
         // If window started visible, mark it as shown already
         viewer.startup_window_shown = start_visible;
 
@@ -7422,7 +7430,6 @@ impl ImageViewer {
         }
 
         animation_active
-            || has_pending_loads
             || has_active_video
             || has_active_animation
             || requested_visible_retry
@@ -10214,10 +10221,6 @@ impl eframe::App for ImageViewer {
 
                 // Request repaint to show the new content
                 ctx.request_repaint();
-            } else {
-                // Schedule a periodic check for incoming files (every 100ms)
-                // This is necessary because the app runs in reactive mode
-                ctx.request_repaint_after(Duration::from_millis(100));
             }
         }
 
@@ -10597,17 +10600,28 @@ impl eframe::App for ImageViewer {
         // This avoids the brief flash of the default empty window on Explorer-open.
         self.show_window_if_ready(ctx);
 
-        // Determine if we need continuous repainting
-        let manga_loading_active = self.manga_mode
-            && self
-                .manga_loader
-                .as_ref()
-                .map(|loader| {
-                    loader.pending_load_count() > 0
-                        || loader.pending_decoded_count() > 0
-                        || loader.pending_dimension_results_count() > 0
-                })
-                .unwrap_or(false);
+        // Determine if we need continuous repainting.
+        // Keep visual animations separate from background loader work so idle
+        // masonry does not run at full frame rate while decoding off-screen items.
+        let (manga_pending_loads, manga_pending_decoded, manga_pending_dimensions) = self
+            .manga_loader
+            .as_ref()
+            .map(|loader| {
+                (
+                    loader.pending_load_count(),
+                    loader.pending_decoded_count(),
+                    loader.pending_dimension_results_count(),
+                )
+            })
+            .unwrap_or((0, 0, 0));
+        let manga_background_work_pending = self.manga_mode
+            && (manga_pending_loads > 0
+                || manga_pending_decoded > 0
+                || manga_pending_dimensions > 0);
+        let manga_needs_fast_background_poll = self.manga_mode
+            && (!self.manga_ttv_pending.is_empty()
+                || manga_pending_decoded > 0
+                || manga_pending_dimensions > 0);
         let manga_scroll_active = self.manga_mode
             && ((self.manga_scroll_target - self.manga_scroll_offset).abs() > 0.1
                 || self.manga_scroll_velocity.abs() > 0.5
@@ -10631,7 +10645,6 @@ impl eframe::App for ImageViewer {
             || self.is_resizing
             || self.is_seeking
             || self.is_volume_dragging
-            || manga_loading_active
             || manga_scroll_active
             || manga_arrow_held;
 
@@ -10648,6 +10661,8 @@ impl eframe::App for ImageViewer {
 
         // Smart repaint scheduling for CPU efficiency:
         // - Active animations: immediate repaint
+        // - Visible manga placeholders / queued uploads: poll near 60fps
+        // - Off-screen/background manga decode only: poll slowly
         // - Waiting for video dims: poll at 60fps
         // - Idle with video playing: poll at video framerate
         // - Time-based auto-hide UI: repaint once at its deadline
@@ -10662,6 +10677,10 @@ impl eframe::App for ImageViewer {
             }
         } else if self.pending_media_layout {
             ctx.request_repaint_after(Duration::from_millis(16));
+        } else if manga_needs_fast_background_poll {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        } else if manga_background_work_pending {
+            ctx.request_repaint_after(Duration::from_millis(66));
         } else if let Some(ref player) = self.video_player {
             if player.is_playing() {
                 ctx.request_repaint_after(Duration::from_millis(16));

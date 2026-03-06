@@ -11,7 +11,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::windows::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use interprocess::local_socket::{prelude::*, GenericNamespaced, ListenerOptions, Stream};
@@ -216,22 +216,49 @@ fn run_socket_listener(
 }
 
 /// Channel-based file receiver for use with egui's event loop.
+type WakeCallback = Arc<dyn Fn() + Send + Sync>;
+
 pub struct FileReceiver {
     receiver: crossbeam_channel::Receiver<PathBuf>,
+    wake_callback: Arc<Mutex<Option<WakeCallback>>>,
 }
 
 impl FileReceiver {
     /// Create a new file receiver and return the sender callback.
     pub fn new() -> (Self, impl Fn(PathBuf) + Send + 'static) {
         let (sender, receiver) = crossbeam_channel::unbounded();
+        let wake_callback: Arc<Mutex<Option<WakeCallback>>> = Arc::new(Mutex::new(None));
+        let wake_for_callback = Arc::clone(&wake_callback);
+
         let callback = move |path: PathBuf| {
-            let _ = sender.send(path);
+            if sender.send(path).is_ok() {
+                let wake = wake_for_callback
+                    .lock()
+                    .ok()
+                    .and_then(|slot| slot.as_ref().cloned());
+                if let Some(wake) = wake {
+                    wake();
+                }
+            }
         };
-        (FileReceiver { receiver }, callback)
+        (
+            FileReceiver {
+                receiver,
+                wake_callback,
+            },
+            callback,
+        )
     }
 
     /// Try to receive a file path without blocking.
     pub fn try_recv(&self) -> Option<PathBuf> {
         self.receiver.try_recv().ok()
+    }
+
+    /// Register a wake callback used to notify the UI thread about new files.
+    pub fn set_wake_callback(&self, wake: impl Fn() + Send + Sync + 'static) {
+        if let Ok(mut slot) = self.wake_callback.lock() {
+            *slot = Some(Arc::new(wake));
+        }
     }
 }
