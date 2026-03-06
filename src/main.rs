@@ -3557,10 +3557,17 @@ impl ImageViewer {
         let media_type = get_media_type(path);
         self.current_media_type = media_type;
 
+        let mut used_mode_switch_placeholder = false;
         let transition_placeholder = self
             .pending_mode_switch_placeholder
             .take()
-            .filter(|placeholder| Some(placeholder.media_type) == media_type)
+            .filter(|placeholder| {
+                let matches_target = Some(placeholder.media_type) == media_type;
+                if matches_target {
+                    used_mode_switch_placeholder = true;
+                }
+                matches_target
+            })
             .or_else(|| {
                 if retain_visible_media_until_ready {
                     self.capture_current_media_placeholder(media_type)
@@ -3616,6 +3623,10 @@ impl ImageViewer {
         } else {
             self.reset_media_view_for_swap();
             self.defer_media_view_reset = false;
+
+            if used_mode_switch_placeholder {
+                self.image_changed = true;
+            }
         }
         self.error_message = None;
 
@@ -9322,6 +9333,10 @@ impl ImageViewer {
             } else {
                 None
             }
+        } else if matches!(self.current_media_type, Some(MediaType::Image)) {
+            self.image_texture_dims
+        } else if matches!(self.current_media_type, Some(MediaType::Video)) {
+            self.video_texture_dims
         } else {
             None
         }
