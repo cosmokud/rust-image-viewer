@@ -1677,12 +1677,23 @@ dependencies = [
 
 [[package]]
 name = "gif"
-version = "0.13.3"
+version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4ae047235e33e2829703574b54fdec96bfbad892062d97fed2f76022287de61b"
+checksum = "f5df2ba84018d80c213569363bdcd0c64e6933c67fe4c1d60ecf822971a3c35e"
 dependencies = [
  "color_quant",
  "weezl",
+]
+
+[[package]]
+name = "gif-dispose"
+version = "6.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8286d15964fdb9c181187f910412c964f62ce91306d890fd93e36b3c909e0de2"
+dependencies = [
+ "gif",
+ "imgref",
+ "rgb",
 ]
 
 [[package]]
@@ -2314,6 +2325,12 @@ name = "imagesize"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "edcd27d72f2f071c64249075f42e205ff93c9a4c5f6c6da53e79ed9f9832c285"
+
+[[package]]
+name = "imgref"
+version = "1.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e7c5cedc30da3a610cac6b4ba17597bdf7152cf974e8aab3afb3d54455e371c8"
 
 [[package]]
 name = "immutable-chunkmap"
@@ -3892,6 +3909,7 @@ dependencies = [
 name = "rust-image-viewer"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "criterion",
  "crossbeam-channel",
  "crossbeam-queue",
@@ -3901,6 +3919,7 @@ dependencies = [
  "fast_image_resize",
  "fs_extra",
  "gif",
+ "gif-dispose",
  "gstreamer",
  "gstreamer-app",
  "gstreamer-audio",

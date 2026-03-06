@@ -34,7 +34,8 @@ fast_image_resize = "6.0"
 memmap2 = "0.9"
 
 # GIF animation support
-gif = "0.13"
+gif = "0.14"
+gif-dispose = "6.0"
 
 # GStreamer for video playback
 gstreamer = "0.23"
@@ -46,6 +47,7 @@ gstreamer-audio = "0.23"
 rayon = "1.10"
 crossbeam-channel = "0.5"
 crossbeam-queue = "0.3"
+bytes = "1.7"
 interprocess = "2.4"
 parking_lot = "0.12"
 lru = "0.12"

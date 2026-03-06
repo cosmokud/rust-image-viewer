@@ -1022,14 +1022,12 @@ impl ImageViewer {
         self.perf_metrics
             .increment_counter("decoded_image_cache_hit", 1);
 
-        self.image = Some(LoadedImage {
-            path: path.clone(),
-            frames: vec![cached.first_frame.clone()],
-            current_frame: 0,
-            last_frame_time: Instant::now(),
-            original_width: cached.original_width,
-            original_height: cached.original_height,
-        });
+        self.image = Some(LoadedImage::from_single_frame(
+            path.clone(),
+            cached.first_frame.clone(),
+            cached.original_width,
+            cached.original_height,
+        ));
         self.texture_frame = usize::MAX;
         self.image_changed = true;
         self.pending_media_layout = false;
@@ -4656,9 +4654,9 @@ impl ImageViewer {
                 .unwrap_or(true);
 
             if let Some(img) = self.manga_animated_images.get_mut(&idx) {
-                let frame_changed = if !self.gif_paused && img.frames.len() > 1 {
+                let frame_changed = if !self.gif_paused && img.frame_count() > 1 {
                     // If still streaming and on the last frame, hold rather than wrap.
-                    if !stream_done && img.current_frame == img.frames.len() - 1 {
+                    if !stream_done && img.current_frame_index() + 1 >= img.frame_count() {
                         false
                     } else {
                         img.update_animation()
@@ -4708,9 +4706,8 @@ impl ImageViewer {
                 }
 
                 // Schedule next repaint for animation.
-                if img.frames.len() > 1 && !self.gif_paused {
-                    let current_delay =
-                        Duration::from_millis(img.frames[img.current_frame].delay_ms as u64);
+                if img.frame_count() > 1 && !self.gif_paused {
+                    let current_delay = Duration::from_millis(img.current_delay_ms() as u64);
                     let elapsed = img.last_frame_time.elapsed();
                     if elapsed < current_delay {
                         ctx.request_repaint_after(current_delay - elapsed);
@@ -4758,10 +4755,10 @@ impl ImageViewer {
         };
 
         if let Some(img) = self.manga_animated_images.get_mut(&idx) {
-            if !stream_done && img.frames.len() > 1 {
-                img.frames.truncate(1);
+            if !stream_done && img.frame_count() > 1 {
+                img.trim_streamed_frames_to_first();
             }
-            img.current_frame = 0;
+            img.reset_animation_to_first_frame();
             img.last_frame_time = Instant::now();
 
             // Force the texture back to the first frame so off-focus items stay static.
@@ -7899,7 +7896,7 @@ impl ImageViewer {
                 // available one, hold it until the next frame arrives instead of
                 // wrapping back to frame 0. Once streaming is done, normal
                 // looping resumes.
-                if !self.anim_stream_done && img.current_frame == img.frames.len() - 1 {
+                if !self.anim_stream_done && img.current_frame_index() + 1 >= img.frame_count() {
                     false // wait for more frames
                 } else {
                     img.update_animation()
@@ -7908,7 +7905,10 @@ impl ImageViewer {
                 false
             };
 
-            if self.texture.is_none() || frame_changed || self.texture_frame != img.current_frame {
+            if self.texture.is_none()
+                || frame_changed
+                || self.texture_frame != img.current_frame_index()
+            {
                 let frame = img.current_frame_data();
                 // This should already be constrained in the loader, but keep this guard to
                 // avoid backend crashes if a frame slips through.
@@ -7939,14 +7939,13 @@ impl ImageViewer {
 
                 self.texture = Some(ctx.load_texture("image", color_image, texture_options));
                 self.image_texture_dims = Some((w, h));
-                self.texture_frame = img.current_frame;
+                self.texture_frame = img.current_frame_index();
             }
 
             // Only request repaint for animated images that are not paused
             if allow_animation && img.is_animated() && !self.gif_paused {
                 // Calculate time until next frame to avoid unnecessary repaints
-                let current_delay =
-                    Duration::from_millis(img.frames[img.current_frame].delay_ms as u64);
+                let current_delay = Duration::from_millis(img.current_delay_ms() as u64);
                 let elapsed = img.last_frame_time.elapsed();
                 if elapsed < current_delay {
                     // Schedule repaint for when the next frame is due

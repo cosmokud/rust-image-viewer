@@ -20,6 +20,8 @@ use zune_image::image::Image as ZuneImage;
 const DEFAULT_MAX_DECODE_ALLOC_BYTES: u64 = 512 * 1024 * 1024; // 512 MiB
 const ZUNE_STATIC_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "bmp", "psd"];
 const WEBP_STREAM_CHANNEL_CAPACITY: usize = 96;
+const GIF_FRAME_WINDOW_SIZE: usize = 72;
+const GIF_WINDOW_MODE_THRESHOLD_BYTES: usize = 96 * 1024 * 1024;
 
 trait BufReadSeek: BufRead + Seek {}
 impl<T: BufRead + Seek> BufReadSeek for T {}
@@ -319,6 +321,30 @@ pub struct ImageFrame {
     pub delay_ms: u32,
 }
 
+enum AnimationStorage {
+    FullyDecoded,
+    GifWindow(GifWindowState),
+}
+
+struct GifWindowState {
+    path: PathBuf,
+    gif_filter: FilterType,
+    target_width: u32,
+    target_height: u32,
+    total_frames: usize,
+    frame_delays_ms: Vec<u32>,
+    window_start: usize,
+    window_size: usize,
+    global_frame: usize,
+}
+
+struct GifScanInfo {
+    target_width: u32,
+    target_height: u32,
+    total_frames: usize,
+    frame_delays_ms: Vec<u32>,
+}
+
 /// Loaded image data
 pub struct LoadedImage {
     #[allow(dead_code)]
@@ -328,9 +354,27 @@ pub struct LoadedImage {
     pub last_frame_time: Instant,
     pub original_width: u32,
     pub original_height: u32,
+    animation_storage: AnimationStorage,
 }
 
 impl LoadedImage {
+    pub fn from_single_frame(
+        path: PathBuf,
+        frame: ImageFrame,
+        original_width: u32,
+        original_height: u32,
+    ) -> Self {
+        Self {
+            path,
+            frames: vec![frame],
+            current_frame: 0,
+            last_frame_time: Instant::now(),
+            original_width,
+            original_height,
+            animation_storage: AnimationStorage::FullyDecoded,
+        }
+    }
+
     /// Load an image from path
     #[allow(dead_code)]
     pub fn load(path: &Path) -> Result<Self, String> {
@@ -356,7 +400,7 @@ impl LoadedImage {
             // Try loading as animated WEBP; fall back to static if decoding
             // fails or the file contains only a single frame.
             match Self::load_animated_webp(path, max_texture_side, gif_filter) {
-                Ok(img) if img.frames.len() > 1 => Ok(img),
+                Ok(img) if img.frame_count() > 1 => Ok(img),
                 _ => Self::load_static(path, max_texture_side, downscale_filter),
             }
         } else {
@@ -605,6 +649,7 @@ impl LoadedImage {
             last_frame_time: Instant::now(),
             original_width: final_w,
             original_height: final_h,
+            animation_storage: AnimationStorage::FullyDecoded,
         })
     }
 
@@ -654,6 +699,7 @@ impl LoadedImage {
             last_frame_time: Instant::now(),
             original_width: width,
             original_height: height,
+            animation_storage: AnimationStorage::FullyDecoded,
         })
     }
 
@@ -664,112 +710,53 @@ impl LoadedImage {
         max_texture_side: Option<u32>,
         gif_filter: FilterType,
     ) -> Result<Self, String> {
-        use gif::DecodeOptions;
-
-        let reader = open_media_reader(path)?;
-        let mut decoder = DecodeOptions::new();
-        decoder.set_color_output(gif::ColorOutput::RGBA);
-
-        let mut decoder = decoder
-            .read_info(reader)
-            .map_err(|e| format!("Failed to read GIF: {}", e))?;
-
-        let mut frames = Vec::new();
-        let width = decoder.width() as u32;
-        let height = decoder.height() as u32;
-
-        // Use a memory budget instead of a hard frame-count cap so that
-        // long animations can play fully without being truncated.
-        const MAX_ANIMATION_MEMORY: usize = 512 * 1024 * 1024; // 512 MiB
-        const MAX_FRAMES_SAFETY: usize = 1000; // generous hard cap
-        let mut total_decoded_bytes: usize = 0;
-
-        // Determine if we need to downscale upfront based on memory constraints
-        // For large GIFs, downscale immediately to reduce per-frame memory
-        let (target_width, target_height, needs_downscale) = if let Some(max_side) =
-            max_texture_side
-        {
-            if max_side > 0 && (width > max_side || height > max_side) {
-                let scale = (max_side as f64 / width as f64).min(max_side as f64 / height as f64);
-                let new_w = ((width as f64) * scale).round().max(1.0) as u32;
-                let new_h = ((height as f64) * scale).round().max(1.0) as u32;
-                (new_w, new_h, true)
-            } else {
-                (width, height, false)
-            }
-        } else {
-            (width, height, false)
-        };
-
-        // Create a canvas to composite frames onto (at original size for decoding)
-        let mut canvas = vec![0u8; (width * height * 4) as usize];
-
-        let mut frame_count = 0;
-        while let Some(frame) = decoder
-            .read_next_frame()
-            .map_err(|e| format!("GIF frame error: {}", e))?
-        {
-            // Stop when we exceed the memory budget or the safety cap.
-            if frame_count >= MAX_FRAMES_SAFETY {
-                break;
-            }
-
-            let delay_ms = (frame.delay as u32) * 10; // GIF delay is in centiseconds
-            let delay_ms = if delay_ms == 0 { 100 } else { delay_ms }; // Default to 100ms if 0
-
-            // Handle different disposal methods
-            let frame_x = frame.left as usize;
-            let frame_y = frame.top as usize;
-            let frame_width = frame.width as usize;
-            let frame_height = frame.height as usize;
-
-            // Copy frame buffer to canvas
-            for y in 0..frame_height {
-                for x in 0..frame_width {
-                    let src_idx = (y * frame_width + x) * 4;
-                    let dst_x = frame_x + x;
-                    let dst_y = frame_y + y;
-                    if dst_x < width as usize && dst_y < height as usize {
-                        let dst_idx = (dst_y * width as usize + dst_x) * 4;
-                        // Only copy if not fully transparent
-                        if frame.buffer.len() > src_idx + 3 && frame.buffer[src_idx + 3] > 0 {
-                            canvas[dst_idx..dst_idx + 4]
-                                .copy_from_slice(&frame.buffer[src_idx..src_idx + 4]);
-                        }
-                    }
-                }
-            }
-
-            // Store either downscaled or original frame
-            let frame_pixels = if needs_downscale {
-                resize_rgba(width, height, &canvas, target_width, target_height, gif_filter)
-                    .map_err(|e| format!("Failed to resize GIF frame: {}", e))?
-            } else {
-                canvas.clone()
-            };
-
-            total_decoded_bytes += frame_pixels.len();
-
-            frames.push(ImageFrame {
-                pixels: frame_pixels,
-                width: target_width,
-                height: target_height,
-                delay_ms,
-            });
-
-            frame_count += 1;
-
-            // Stop if we have exceeded the memory budget.
-            if total_decoded_bytes >= MAX_ANIMATION_MEMORY {
-                break;
-            }
-        }
-
-        if frames.is_empty() {
+        let scan = Self::scan_gif_info(path, max_texture_side)?;
+        if scan.total_frames == 0 {
             return Err("No frames in GIF".to_string());
         }
 
-        // Shrink frames vector to exact size to free unused capacity
+        let estimated_total_bytes = (scan.target_width as usize)
+            .saturating_mul(scan.target_height as usize)
+            .saturating_mul(4)
+            .saturating_mul(scan.total_frames);
+
+        let use_window_mode = estimated_total_bytes >= GIF_WINDOW_MODE_THRESHOLD_BYTES
+            || scan.total_frames > GIF_FRAME_WINDOW_SIZE.saturating_mul(2);
+
+        if !use_window_mode {
+            let mut frames = Self::decode_gif_disposal_range(
+                path,
+                scan.target_width,
+                scan.target_height,
+                gif_filter,
+                0,
+                scan.total_frames,
+            )?;
+            frames.shrink_to_fit();
+
+            return Ok(LoadedImage {
+                path: path.to_path_buf(),
+                frames,
+                current_frame: 0,
+                last_frame_time: Instant::now(),
+                original_width: scan.target_width,
+                original_height: scan.target_height,
+                animation_storage: AnimationStorage::FullyDecoded,
+            });
+        }
+
+        let window_size = GIF_FRAME_WINDOW_SIZE.min(scan.total_frames.max(1));
+        let mut frames = Self::decode_gif_disposal_range(
+            path,
+            scan.target_width,
+            scan.target_height,
+            gif_filter,
+            0,
+            window_size,
+        )?;
+        if frames.is_empty() {
+            return Err("Failed to decode GIF frame window".to_string());
+        }
         frames.shrink_to_fit();
 
         Ok(LoadedImage {
@@ -777,9 +764,164 @@ impl LoadedImage {
             frames,
             current_frame: 0,
             last_frame_time: Instant::now(),
-            original_width: target_width,
-            original_height: target_height,
+            original_width: scan.target_width,
+            original_height: scan.target_height,
+            animation_storage: AnimationStorage::GifWindow(GifWindowState {
+                path: path.to_path_buf(),
+                gif_filter,
+                target_width: scan.target_width,
+                target_height: scan.target_height,
+                total_frames: scan.total_frames,
+                frame_delays_ms: scan.frame_delays_ms,
+                window_start: 0,
+                window_size,
+                global_frame: 0,
+            }),
         })
+    }
+
+    fn scan_gif_info(path: &Path, max_texture_side: Option<u32>) -> Result<GifScanInfo, String> {
+        use gif::DecodeOptions;
+
+        let reader = open_media_reader(path)?;
+        let mut decoder = DecodeOptions::new();
+        decoder.set_color_output(gif::ColorOutput::Indexed);
+
+        let mut decoder = decoder
+            .read_info(reader)
+            .map_err(|e| format!("Failed to read GIF: {}", e))?;
+
+        let width = decoder.width() as u32;
+        let height = decoder.height() as u32;
+
+        let (target_width, target_height) = if let Some(max_side) = max_texture_side {
+            if max_side > 0 && (width > max_side || height > max_side) {
+                let scale = (max_side as f64 / width as f64).min(max_side as f64 / height as f64);
+                (
+                    ((width as f64) * scale).round().max(1.0) as u32,
+                    ((height as f64) * scale).round().max(1.0) as u32,
+                )
+            } else {
+                (width, height)
+            }
+        } else {
+            (width, height)
+        };
+
+        const MAX_FRAMES_SAFETY: usize = 4000;
+        let mut frame_delays_ms = Vec::new();
+        while let Some(frame) = decoder
+            .read_next_frame()
+            .map_err(|e| format!("GIF frame error: {}", e))?
+        {
+            if frame_delays_ms.len() >= MAX_FRAMES_SAFETY {
+                break;
+            }
+            frame_delays_ms.push(Self::gif_delay_ms(frame.delay));
+        }
+
+        Ok(GifScanInfo {
+            target_width,
+            target_height,
+            total_frames: frame_delays_ms.len(),
+            frame_delays_ms,
+        })
+    }
+
+    fn decode_gif_disposal_range(
+        path: &Path,
+        target_width: u32,
+        target_height: u32,
+        gif_filter: FilterType,
+        start_frame: usize,
+        frame_count: usize,
+    ) -> Result<Vec<ImageFrame>, String> {
+        use gif::DecodeOptions;
+        use gif_dispose::Screen;
+
+        if frame_count == 0 {
+            return Ok(Vec::new());
+        }
+
+        let reader = open_media_reader(path)?;
+        let mut decoder = DecodeOptions::new();
+        decoder.set_color_output(gif::ColorOutput::Indexed);
+
+        let mut decoder = decoder
+            .read_info(reader)
+            .map_err(|e| format!("Failed to read GIF: {}", e))?;
+
+        let mut screen = Screen::new_decoder(&decoder);
+        let end_frame = start_frame.saturating_add(frame_count);
+
+        let mut frame_index = 0usize;
+        let mut out = Vec::with_capacity(frame_count.min(96));
+
+        while let Some(frame) = decoder
+            .read_next_frame()
+            .map_err(|e| format!("GIF frame error: {}", e))?
+        {
+            if frame_index >= end_frame {
+                break;
+            }
+
+            let delay_ms = Self::gif_delay_ms(frame.delay);
+            screen
+                .blit_frame(frame)
+                .map_err(|e| format!("Failed to composite GIF frame: {}", e))?;
+
+            if frame_index >= start_frame {
+                let rgba = screen.pixels_rgba();
+                let (contiguous, src_w, src_h) = rgba.to_contiguous_buf();
+
+                let mut pixels = Vec::with_capacity(src_w.saturating_mul(src_h).saturating_mul(4));
+                for px in contiguous.iter() {
+                    pixels.push(px.r);
+                    pixels.push(px.g);
+                    pixels.push(px.b);
+                    pixels.push(px.a);
+                }
+
+                let src_w_u32 = src_w as u32;
+                let src_h_u32 = src_h as u32;
+                let (final_w, final_h, final_pixels) = if src_w_u32 != target_width
+                    || src_h_u32 != target_height
+                {
+                    let resized = resize_rgba(
+                        src_w_u32,
+                        src_h_u32,
+                        &pixels,
+                        target_width,
+                        target_height,
+                        gif_filter,
+                    )
+                    .map_err(|e| format!("Failed to resize GIF frame: {}", e))?;
+                    (target_width, target_height, resized)
+                } else {
+                    (src_w_u32, src_h_u32, pixels)
+                };
+
+                out.push(ImageFrame {
+                    pixels: final_pixels,
+                    width: final_w,
+                    height: final_h,
+                    delay_ms,
+                });
+            }
+
+            frame_index = frame_index.saturating_add(1);
+        }
+
+        Ok(out)
+    }
+
+    fn gif_delay_ms(delay_cs: u16) -> u32 {
+        let delay_ms = (delay_cs as u32).saturating_mul(10);
+        if delay_ms == 0 {
+            100
+        } else {
+            delay_ms
+        }
     }
 
     /// Load an animated WEBP file.
@@ -894,54 +1036,142 @@ impl LoadedImage {
             last_frame_time: Instant::now(),
             original_width: out_w,
             original_height: out_h,
+            animation_storage: AnimationStorage::FullyDecoded,
         })
     }
 
     /// Check if this is an animated image
     pub fn is_animated(&self) -> bool {
-        self.frames.len() > 1
+        self.frame_count() > 1
     }
 
     /// Get total number of frames
     pub fn frame_count(&self) -> usize {
-        self.frames.len()
+        match &self.animation_storage {
+            AnimationStorage::FullyDecoded => self.frames.len(),
+            AnimationStorage::GifWindow(state) => state.total_frames,
+        }
     }
 
     /// Get total duration of the animation in milliseconds
     pub fn total_duration_ms(&self) -> u32 {
-        self.frames.iter().map(|f| f.delay_ms).sum()
+        match &self.animation_storage {
+            AnimationStorage::FullyDecoded => self.frames.iter().map(|f| f.delay_ms).sum(),
+            AnimationStorage::GifWindow(state) => state.frame_delays_ms.iter().copied().sum(),
+        }
     }
 
     /// Get current frame index
     pub fn current_frame_index(&self) -> usize {
-        self.current_frame
+        match &self.animation_storage {
+            AnimationStorage::FullyDecoded => self.current_frame,
+            AnimationStorage::GifWindow(state) => state.global_frame,
+        }
     }
 
     /// Set current frame index directly (for seeking)
     pub fn set_frame(&mut self, frame_index: usize) {
-        if !self.frames.is_empty() {
-            self.current_frame = frame_index.min(self.frames.len() - 1);
-            self.last_frame_time = Instant::now();
+        match &mut self.animation_storage {
+            AnimationStorage::FullyDecoded => {
+                if !self.frames.is_empty() {
+                    self.current_frame = frame_index.min(self.frames.len() - 1);
+                    self.last_frame_time = Instant::now();
+                }
+            }
+            AnimationStorage::GifWindow(state) => {
+                if state.total_frames == 0 {
+                    return;
+                }
+
+                let target_global = frame_index.min(state.total_frames - 1);
+                let window_end = state.window_start.saturating_add(self.frames.len());
+                if target_global < state.window_start || target_global >= window_end {
+                    let desired_start = target_global.saturating_sub(state.window_size / 2);
+                    let max_start = state.total_frames.saturating_sub(state.window_size);
+                    let new_window_start = desired_start.min(max_start);
+
+                    if let Ok(mut decoded) = Self::decode_gif_disposal_range(
+                        &state.path,
+                        state.target_width,
+                        state.target_height,
+                        state.gif_filter,
+                        new_window_start,
+                        state.window_size,
+                    ) {
+                        decoded.shrink_to_fit();
+                        self.frames = decoded;
+                        state.window_start = new_window_start;
+                    }
+                }
+
+                if !self.frames.is_empty() {
+                    let relative = target_global.saturating_sub(state.window_start);
+                    self.current_frame = relative.min(self.frames.len() - 1);
+                    state.global_frame = target_global;
+                    self.last_frame_time = Instant::now();
+                }
+            }
         }
     }
 
     /// Get current position as a fraction (0.0 to 1.0) based on frame index
     pub fn position_fraction(&self) -> f64 {
-        if self.frames.len() <= 1 {
+        if self.frame_count() <= 1 {
             return 0.0;
         }
 
         // Calculate position based on cumulative time of frames before current
         let total_duration = self.total_duration_ms() as f64;
         if total_duration <= 0.0 {
-            return self.current_frame as f64 / (self.frames.len() - 1) as f64;
+            return self.current_frame_index() as f64 / (self.frame_count() - 1) as f64;
         }
 
         let mut cumulative_time: f64 = 0.0;
-        for i in 0..self.current_frame {
-            cumulative_time += self.frames[i].delay_ms as f64;
+        let current = self.current_frame_index();
+        match &self.animation_storage {
+            AnimationStorage::FullyDecoded => {
+                for i in 0..current {
+                    cumulative_time += self.frames[i].delay_ms as f64;
+                }
+            }
+            AnimationStorage::GifWindow(state) => {
+                for i in 0..current {
+                    cumulative_time += state.frame_delays_ms[i] as f64;
+                }
+            }
         }
         cumulative_time / total_duration
+    }
+
+    pub fn current_delay_ms(&self) -> u32 {
+        match &self.animation_storage {
+            AnimationStorage::FullyDecoded => self
+                .frames
+                .get(self.current_frame)
+                .map(|frame| frame.delay_ms)
+                .unwrap_or(100),
+            AnimationStorage::GifWindow(state) => state
+                .frame_delays_ms
+                .get(state.global_frame)
+                .copied()
+                .unwrap_or(100),
+        }
+    }
+
+    pub fn reset_animation_to_first_frame(&mut self) {
+        self.set_frame(0);
+    }
+
+    pub fn trim_streamed_frames_to_first(&mut self) {
+        if self.frames.len() > 1 {
+            self.frames.truncate(1);
+            self.current_frame = 0;
+        }
+
+        if let AnimationStorage::GifWindow(state) = &mut self.animation_storage {
+            state.window_start = 0;
+            state.global_frame = 0;
+        }
     }
 
     /// Update animation frame if needed, returns true if frame changed
@@ -950,10 +1180,10 @@ impl LoadedImage {
             return false;
         }
 
-        let current_delay = Duration::from_millis(self.frames[self.current_frame].delay_ms as u64);
+        let current_delay = Duration::from_millis(self.current_delay_ms() as u64);
         if self.last_frame_time.elapsed() >= current_delay {
-            self.current_frame = (self.current_frame + 1) % self.frames.len();
-            self.last_frame_time = Instant::now();
+            let next = (self.current_frame_index() + 1) % self.frame_count();
+            self.set_frame(next);
             true
         } else {
             false

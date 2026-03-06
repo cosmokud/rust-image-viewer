@@ -3,17 +3,20 @@
 
 use std::path::Path;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicI8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicI8, AtomicU32, AtomicUsize, Ordering};
 use std::sync::OnceLock;
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::{Bytes, BytesMut};
 use crossbeam_queue::ArrayQueue;
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 use gstreamer_video as gst_video;
 use image_simd::u16x8;
+use parking_lot::Mutex;
+use std::collections::VecDeque;
 
 #[cfg(target_os = "windows")]
 fn configure_gstreamer_env_windows() {
@@ -206,15 +209,17 @@ pub enum VideoSeekMode {
 /// Video frame data extracted from GStreamer
 #[derive(Clone)]
 pub struct VideoFrame {
-    pub pixels: Vec<u8>,
+    pub pixels: Bytes,
     pub width: u32,
     pub height: u32,
 }
 
 /// Shared state between GStreamer callbacks and the main application
 struct VideoState {
-    // Small bounded queue keeps the freshest frames and drops stale ones under load.
-    frame_queue: ArrayQueue<VideoFrame>,
+    // Adaptive bounded queue keeps freshest frames and avoids hard-coding one depth.
+    frame_queue: Mutex<VecDeque<VideoFrame>>,
+    frame_queue_capacity: AtomicUsize,
+    buffer_pool: ArrayQueue<BytesMut>,
     video_width: AtomicU32,
     video_height: AtomicU32,
     // -1 unknown, 0 full-range (no expand), 1 limited-range (expand)
@@ -224,6 +229,86 @@ struct VideoState {
 const RANGE_EXPAND_UNKNOWN: i8 = -1;
 const RANGE_EXPAND_FALSE: i8 = 0;
 const RANGE_EXPAND_TRUE: i8 = 1;
+const DEFAULT_FRAME_QUEUE_CAPACITY: usize = 3;
+const MAX_FRAME_QUEUE_CAPACITY: usize = 6;
+const FRAME_BUFFER_POOL_CAPACITY: usize = 16;
+
+impl VideoState {
+    fn adaptive_capacity_for_dims(width: u32, height: u32) -> usize {
+        let pixels = (width as u64).saturating_mul(height as u64);
+
+        if pixels >= (3840u64 * 2160u64) {
+            2
+        } else if pixels >= (2560u64 * 1440u64) {
+            3
+        } else if pixels >= (1920u64 * 1080u64) {
+            4
+        } else {
+            5
+        }
+    }
+
+    fn update_queue_capacity(&self, width: u32, height: u32) {
+        let target = Self::adaptive_capacity_for_dims(width, height)
+            .clamp(2, MAX_FRAME_QUEUE_CAPACITY.max(2));
+        let previous = self.frame_queue_capacity.swap(target, Ordering::Release);
+        if previous == target {
+            return;
+        }
+
+        let mut queue = self.frame_queue.lock();
+        while queue.len() > target {
+            if let Some(stale) = queue.pop_front() {
+                self.recycle_buffer(stale.pixels);
+            }
+        }
+    }
+
+    fn take_buffer(&self, len: usize) -> BytesMut {
+        let mut buffer = self
+            .buffer_pool
+            .pop()
+            .unwrap_or_else(|| BytesMut::with_capacity(len.max(1)));
+        buffer.clear();
+        if buffer.capacity() < len {
+            buffer.reserve(len - buffer.capacity());
+        }
+        buffer
+    }
+
+    fn recycle_buffer(&self, bytes: Bytes) {
+        if let Ok(mut reusable) = bytes.try_into_mut() {
+            reusable.clear();
+            let _ = self.buffer_pool.push(reusable);
+        }
+    }
+
+    fn push_frame(&self, frame: VideoFrame) {
+        let target = self.frame_queue_capacity.load(Ordering::Acquire).max(2);
+
+        let mut queue = self.frame_queue.lock();
+        while queue.len() >= target {
+            if let Some(stale) = queue.pop_front() {
+                self.recycle_buffer(stale.pixels);
+            }
+        }
+        queue.push_back(frame);
+    }
+
+    fn pop_latest_frame(&self) -> Option<VideoFrame> {
+        let mut queue = self.frame_queue.lock();
+        while queue.len() > 1 {
+            if let Some(stale) = queue.pop_front() {
+                self.recycle_buffer(stale.pixels);
+            }
+        }
+        queue.pop_front()
+    }
+
+    fn has_queued_frame(&self) -> bool {
+        !self.frame_queue.lock().is_empty()
+    }
+}
 
 fn guess_limited_range_rgba(pixels: &[u8]) -> bool {
     // Heuristic for cases where upstream fails to signal limited range.
@@ -514,7 +599,9 @@ Ensure your GStreamer installation includes the playback elements (usually from 
         }
 
         let state = Arc::new(VideoState {
-            frame_queue: ArrayQueue::new(3),
+            frame_queue: Mutex::new(VecDeque::with_capacity(DEFAULT_FRAME_QUEUE_CAPACITY)),
+            frame_queue_capacity: AtomicUsize::new(DEFAULT_FRAME_QUEUE_CAPACITY),
+            buffer_pool: ArrayQueue::new(FRAME_BUFFER_POOL_CAPACITY),
             video_width: AtomicU32::new(0),
             video_height: AtomicU32::new(0),
             needs_range_expand: AtomicI8::new(RANGE_EXPAND_UNKNOWN),
@@ -533,7 +620,10 @@ Ensure your GStreamer installation includes the playback elements (usually from 
                         let height = video_info.height();
 
                         if let Ok(map) = buffer.map_readable() {
-                            let mut data = map.as_slice().to_vec();
+                            let mapped = map.as_slice();
+                            let mut data = state.take_buffer(mapped.len());
+                            data.resize(mapped.len(), 0);
+                            data.copy_from_slice(mapped);
 
                             let should_expand = match state.needs_range_expand.load(Ordering::Acquire)
                             {
@@ -562,23 +652,20 @@ Ensure your GStreamer installation includes the playback elements (usually from 
                             };
 
                             if should_expand {
-                                expand_limited_range_rgba_in_place(&mut data);
+                                expand_limited_range_rgba_in_place(data.as_mut());
                             }
 
                             state.video_width.store(width, Ordering::Release);
                             state.video_height.store(height, Ordering::Release);
+                            state.update_queue_capacity(width, height);
 
                             let frame = VideoFrame {
-                                pixels: data,
+                                pixels: data.freeze(),
                                 width,
                                 height,
                             };
 
-                            // Keep only the freshest frames to avoid callback backpressure.
-                            if let Err(frame) = state.frame_queue.push(frame) {
-                                let _ = state.frame_queue.pop();
-                                let _ = state.frame_queue.push(frame);
-                            }
+                            state.push_frame(frame);
                         }
                     }
                 }
@@ -815,10 +902,7 @@ Ensure your GStreamer installation includes the playback elements (usually from 
     /// Get the latest video frame if updated
     /// Takes ownership of the freshest frame and drops stale queued frames.
     pub fn get_frame(&mut self) -> Option<VideoFrame> {
-        let mut latest = None;
-        while let Some(frame) = self.state.frame_queue.pop() {
-            latest = Some(frame);
-        }
+        let latest = self.state.pop_latest_frame();
 
         if let Some(frame) = latest {
             if frame.width > 0 && frame.height > 0 {
@@ -834,7 +918,7 @@ Ensure your GStreamer installation includes the playback elements (usually from 
     /// Check if a new frame is available
     #[allow(dead_code)]
     pub fn has_new_frame(&self) -> bool {
-        !self.state.frame_queue.is_empty()
+        self.state.has_queued_frame()
     }
 
     /// Get video dimensions
