@@ -205,7 +205,7 @@ manga_inertial_friction = 0.33
 manga_wheel_multiplier = 1.5
 manga_arrow_scroll_speed = 140
 manga_wheel_smooth_like_arrow_keys = true
-manga_virtualization_backend = auto
+manga_virtualization_backend = rtree
 manga_autoscroll_dead_zone_px = 14.0
 manga_autoscroll_base_speed_multiplier = 5.0
 manga_autoscroll_min_speed_multiplier = 0.6
@@ -218,7 +218,7 @@ manga_autoscroll_vertical_speed_multiplier = 1.0
 strip_item_open_binding = mouse_right
 ```
 
-`manga_virtualization_backend` accepts `auto`, `linear`, or `rtree`.
+`manga_virtualization_backend` accepts `auto`, `linear`, or `rtree` (default: `rtree`).
 
 ### [Shortcuts]
 

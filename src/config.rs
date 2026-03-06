@@ -426,7 +426,7 @@ pub struct Config {
     /// Manga mode: when true, consume wheel input with the same smooth cadence as arrow keys.
     pub manga_wheel_smooth_like_arrow_keys: bool,
     /// Manga mode viewport virtualization backend.
-    /// `auto` enables r-tree for large folders while preserving linear scans for small sets.
+    /// Default is `rtree`; users can switch to `linear` or `auto` in config.ini.
     pub manga_virtualization_backend: MangaVirtualizationBackend,
     /// Manga mode autoscroll: dead zone radius around the anchor (px).
     pub manga_autoscroll_dead_zone_px: f32,
@@ -546,7 +546,7 @@ impl Config {
             masonry_items_per_row: 5,
             manga_hover_autoplay_resume_delay_ms: 220,
             manga_wheel_smooth_like_arrow_keys: true,
-            manga_virtualization_backend: MangaVirtualizationBackend::Auto,
+            manga_virtualization_backend: MangaVirtualizationBackend::RTree,
             manga_autoscroll_dead_zone_px: 14.0,
             manga_autoscroll_base_speed_multiplier: 5.0,
             manga_autoscroll_min_speed_multiplier: 0.6,
