@@ -26,6 +26,7 @@ use image_loader::{
 };
 use hashbrown::{HashMap, HashSet};
 use media_index::MediaDirectoryIndex;
+use metadata_cache::metadata_cache_stats;
 use manga_loader::{MangaLoader, MangaMediaType, MangaTextureCache};
 use perf_metrics::PerfMetrics;
 #[cfg(target_os = "windows")]
@@ -40,9 +41,9 @@ use std::borrow::Cow;
 use std::collections::VecDeque;
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
-use std::path::PathBuf;
-use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use eframe::glow::HasContext;
 
@@ -345,6 +346,56 @@ struct ModeSwitchPlaceholder {
     media_type: MediaType,
 }
 
+const DECODED_IMAGE_CACHE_MAX_BYTES: u64 = 192 * 1024 * 1024;
+const DECODED_IMAGE_CACHE_SKIP_ENTRY_BYTES: usize = 24 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FileStamp {
+    size_bytes: u64,
+    modified_secs: u64,
+    modified_nanos: u32,
+}
+
+#[derive(Clone)]
+struct CachedDecodedImage {
+    stamp: FileStamp,
+    first_frame: ImageFrame,
+    original_width: u32,
+    original_height: u32,
+    is_animated_webp: bool,
+}
+
+fn file_stamp_for_path(path: &Path) -> Option<FileStamp> {
+    let metadata = std::fs::metadata(path).ok()?;
+    let modified = metadata.modified().ok()?;
+    let duration = modified.duration_since(UNIX_EPOCH).ok()?;
+
+    Some(FileStamp {
+        size_bytes: metadata.len(),
+        modified_secs: duration.as_secs(),
+        modified_nanos: duration.subsec_nanos(),
+    })
+}
+
+fn decoded_image_cache_key(path: &Path, max_texture_side: u32) -> String {
+    let key = path
+        .canonicalize()
+        .ok()
+        .unwrap_or_else(|| path.to_path_buf())
+        .to_string_lossy()
+        .to_string();
+
+    #[cfg(target_os = "windows")]
+    {
+        return format!("{}#ts{}", key.to_lowercase(), max_texture_side.max(1));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        format!("{}#ts{}", key, max_texture_side.max(1))
+    }
+}
+
 /// Application state
 struct ImageViewer {
     /// Current loaded image
@@ -358,6 +409,8 @@ struct ImageViewer {
     texture_frame: usize,
     /// List of images in the current directory
     image_list: Vec<PathBuf>,
+    /// Decoded-image cache for fast back/forward navigation in image mode.
+    decoded_image_cache: moka::sync::Cache<String, Arc<CachedDecodedImage>>,
     /// Cached directory index used to avoid rescanning unchanged folders on every navigation step.
     media_directory_index: MediaDirectoryIndex,
     /// Current image index in the list
@@ -722,6 +775,13 @@ impl Default for ImageViewer {
             image_texture_dims: None,
             texture_frame: 0,
             image_list: Vec::new(),
+            decoded_image_cache: moka::sync::Cache::builder()
+                .max_capacity(DECODED_IMAGE_CACHE_MAX_BYTES)
+                .weigher(|_, value: &Arc<CachedDecodedImage>| {
+                    let frame_bytes = value.first_frame.pixels.len().min(u32::MAX as usize) as u32;
+                    frame_bytes.saturating_add(256)
+                })
+                .build(),
             media_directory_index: MediaDirectoryIndex::default(),
             current_index: 0,
             zoom: 1.0,
@@ -933,6 +993,90 @@ impl ImageViewer {
         self.current_index = clamped;
     }
 
+    fn try_load_image_from_decoded_cache(
+        &mut self,
+        path: &PathBuf,
+        max_texture_side: u32,
+        gif_filter: FilterType,
+    ) -> bool {
+        let key = decoded_image_cache_key(path, max_texture_side);
+        let Some(current_stamp) = file_stamp_for_path(path) else {
+            self.perf_metrics
+                .increment_counter("decoded_image_cache_miss", 1);
+            return false;
+        };
+
+        let Some(cached) = self.decoded_image_cache.get(&key) else {
+            self.perf_metrics
+                .increment_counter("decoded_image_cache_miss", 1);
+            return false;
+        };
+
+        if cached.stamp != current_stamp {
+            self.decoded_image_cache.invalidate(&key);
+            self.perf_metrics
+                .increment_counter("decoded_image_cache_miss", 1);
+            return false;
+        }
+
+        self.perf_metrics
+            .increment_counter("decoded_image_cache_hit", 1);
+
+        self.image = Some(LoadedImage {
+            path: path.clone(),
+            frames: vec![cached.first_frame.clone()],
+            current_frame: 0,
+            last_frame_time: Instant::now(),
+            original_width: cached.original_width,
+            original_height: cached.original_height,
+        });
+        self.texture_frame = usize::MAX;
+        self.image_changed = true;
+        self.pending_media_layout = false;
+        self.error_message = None;
+
+        if cached.is_animated_webp {
+            if let Some(rx) = LoadedImage::start_streaming_webp(path, Some(max_texture_side), gif_filter)
+            {
+                self.anim_stream_rx = Some(rx);
+                self.anim_stream_path = Some(path.clone());
+                self.anim_stream_done = false;
+                self.anim_seekbar_total_frames =
+                    Some(self.image.as_ref().map(|i| i.frame_count()).unwrap_or(1));
+            }
+        }
+
+        true
+    }
+
+    fn cache_loaded_image_first_frame(
+        &mut self,
+        path: &PathBuf,
+        max_texture_side: u32,
+        image: &LoadedImage,
+        is_animated_webp: bool,
+    ) {
+        let Some(stamp) = file_stamp_for_path(path) else {
+            return;
+        };
+
+        let frame = image.current_frame_data();
+        if frame.pixels.len() > DECODED_IMAGE_CACHE_SKIP_ENTRY_BYTES {
+            return;
+        }
+
+        self.decoded_image_cache.insert(
+            decoded_image_cache_key(path, max_texture_side),
+            Arc::new(CachedDecodedImage {
+                stamp,
+                first_frame: frame.clone(),
+                original_width: image.original_width,
+                original_height: image.original_height,
+                is_animated_webp,
+            }),
+        );
+    }
+
     fn update_fps_stats(&mut self, frame_was_active: bool) {
         let now = Instant::now();
         let dt = now.saturating_duration_since(self.fps_last_frame_at);
@@ -1140,6 +1284,27 @@ impl ImageViewer {
             " | IDX H{} M{}",
             index_stats.hits, index_stats.misses
         ));
+
+        let decoded_hits = self.perf_metrics.counter("decoded_image_cache_hit");
+        let decoded_misses = self.perf_metrics.counter("decoded_image_cache_miss");
+        if decoded_hits > 0 || decoded_misses > 0 {
+            text.push_str(&format!(" | DC H{} M{}", decoded_hits, decoded_misses));
+        }
+
+        let metadata_stats = metadata_cache_stats();
+        if metadata_stats.dimension_hits > 0
+            || metadata_stats.dimension_misses > 0
+            || metadata_stats.thumbnail_hits > 0
+            || metadata_stats.thumbnail_misses > 0
+        {
+            text.push_str(&format!(
+                " | MC D{}/{} T{}/{}",
+                metadata_stats.dimension_hits,
+                metadata_stats.dimension_misses,
+                metadata_stats.thumbnail_hits,
+                metadata_stats.thumbnail_misses
+            ));
+        }
 
         if let Some(p95) = self.perf_metrics.percentile_ms("media_index_lookup_ms", 0.95) {
             text.push_str(&format!(" p95:{p95:.2}ms"));
@@ -2393,6 +2558,12 @@ impl ImageViewer {
                 let gif_filter = self.config.gif_resize_filter.to_image_filter();
                 let max_tex = self.max_texture_side;
 
+                if self.try_load_image_from_decoded_cache(path, max_tex, gif_filter) {
+                    self.perf_metrics
+                        .record_duration("load_media_sync_ms", load_media_start.elapsed());
+                    return;
+                }
+
                 match LoadedImage::load_first_frame_only(
                     path,
                     Some(max_tex),
@@ -2401,6 +2572,7 @@ impl ImageViewer {
                 ) {
                     Ok(img) => {
                         let is_animated_webp = LoadedImage::is_animated_webp(path);
+                        self.cache_loaded_image_first_frame(path, max_tex, &img, is_animated_webp);
                         self.image = Some(img);
                         self.texture_frame = usize::MAX;
                         self.image_changed = true;

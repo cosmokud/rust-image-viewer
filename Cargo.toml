@@ -53,6 +53,7 @@ hashbrown = "0.15"
 jwalk = "0.8"
 smallvec = "1.13"
 redb = "2.6"
+moka = { version = "0.12", features = ["sync"] }
 # crates.io does not currently expose a crate literally named `image-simd`.
 # We alias `wide` under this name for SIMD pixel math in hot paths.
 image-simd = { package = "wide", version = "0.7" }

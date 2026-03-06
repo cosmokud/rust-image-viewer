@@ -38,7 +38,8 @@ use crate::image_loader::{
     MediaType,
 };
 use crate::metadata_cache::{
-    lookup_cached_dimensions, store_cached_dimensions, CachedMediaKind,
+    lookup_cached_dimensions, lookup_cached_video_thumbnail, store_cached_dimensions,
+    store_cached_video_thumbnail, CachedMediaKind, CachedVideoThumbnail,
 };
 
 /// Maximum number of decoded images to hold in memory awaiting GPU upload.
@@ -966,6 +967,16 @@ impl MangaLoader {
         path: &std::path::Path,
         max_texture_side: u32,
     ) -> Option<(Vec<u8>, u32, u32, u32, u32)> {
+        if let Some(cached) = lookup_cached_video_thumbnail(path, max_texture_side) {
+            return Some((
+                cached.pixels,
+                cached.width,
+                cached.height,
+                cached.original_width,
+                cached.original_height,
+            ));
+        }
+
         use gstreamer as gst;
         use gstreamer::prelude::*;
         use gstreamer_app as gst_app;
@@ -1092,8 +1103,21 @@ impl MangaLoader {
             FilterType::Triangle,
         );
 
+        let final_pixels = final_pixels.into_owned();
+        store_cached_video_thumbnail(
+            path,
+            max_texture_side,
+            &CachedVideoThumbnail {
+                pixels: final_pixels.clone(),
+                width: final_width,
+                height: final_height,
+                original_width,
+                original_height,
+            },
+        );
+
         Some((
-            final_pixels.into_owned(),
+            final_pixels,
             final_width,
             final_height,
             original_width,
