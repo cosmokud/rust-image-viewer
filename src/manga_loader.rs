@@ -38,8 +38,9 @@ use crate::image_loader::{
     MediaType,
 };
 use crate::metadata_cache::{
-    lookup_cached_dimensions, lookup_cached_video_thumbnail, store_cached_dimensions,
-    store_cached_video_thumbnail, CachedMediaKind, CachedVideoThumbnail,
+    lookup_cached_dimensions, lookup_cached_static_thumbnail, lookup_cached_video_thumbnail,
+    store_cached_dimensions, store_cached_static_thumbnail, store_cached_video_thumbnail,
+    CachedImageThumbnail, CachedMediaKind, CachedVideoThumbnail,
 };
 
 /// Maximum number of decoded images to hold in memory awaiting GPU upload.
@@ -80,6 +81,9 @@ const DIM_RESULT_CHUNK_SIZE: usize = 64;
 const PRELOAD_RETRY_BASE_DELAY_MS: u64 = 250;
 /// Cap retry backoff so visible items recover quickly once they come into view.
 const PRELOAD_RETRY_MAX_DELAY_MS: u64 = 4000;
+/// Texture-side buckets used for masonry/strip LOD requests.
+/// Requests are rounded up to the next bucket to avoid churn from tiny deltas.
+const LOD_SIDE_BUCKETS: &[u32] = &[96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096];
 
 /// Media type for manga items (extended to include videos/animations)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -104,6 +108,14 @@ pub struct DecodedImage {
     pub original_height: u32,
     /// Media type of this item
     pub media_type: MangaMediaType,
+    /// Requested target side (LOD bucket) for this decode request.
+    pub requested_side: u32,
+    /// Time spent waiting in the decode queue before a worker started this request.
+    pub queue_wait: Duration,
+    /// Total worker decode time for this request.
+    pub decode_time: Duration,
+    /// Time spent in the final resize/downscale step after decode.
+    pub resize_time: Duration,
 }
 
 /// Request sent to the loader thread pool.
@@ -119,6 +131,7 @@ pub struct LoadRequest {
     pub downscale_filter: FilterType,
     pub gif_filter: FilterType,
     pub priority: i32, // Lower = higher priority
+    pub queued_at: Instant,
 }
 
 #[derive(Clone)]
@@ -147,8 +160,9 @@ pub struct MangaLoader {
     /// Indices currently being loaded for the active generation.
     /// Maps index -> generation to prevent stale completions from clearing newer in-flight work.
     loading_indices: Arc<RwLock<HashMap<usize, usize>>>,
-    /// Set of indices that have been loaded (to avoid re-requesting)
-    loaded_indices: Arc<RwLock<HashSet<usize>>>,
+    /// Highest loaded texture side per index for the active generation.
+    /// Used for LOD-aware skip logic to avoid redundant reload churn.
+    loaded_levels: Arc<RwLock<HashMap<usize, u32>>>,
     /// Retry state for indices whose decode failed or produced no usable pixels.
     /// Failed items are retried with backoff, and only aggressively retried when visible.
     retry_state: Arc<RwLock<HashMap<usize, RetryState>>>,
@@ -197,14 +211,14 @@ impl MangaLoader {
         let (dim_result_tx, dim_result_rx) = crossbeam_channel::bounded::<DimResult>(64);
 
         let loading_indices = Arc::new(RwLock::new(HashMap::new()));
-        let loaded_indices = Arc::new(RwLock::new(HashSet::new()));
+        let loaded_levels = Arc::new(RwLock::new(HashMap::new()));
         let retry_state = Arc::new(RwLock::new(HashMap::new()));
         let shutdown = Arc::new(AtomicBool::new(false));
         let generation = Arc::new(AtomicUsize::new(0));
 
         // Spawn a coordinator thread that processes requests using Rayon
         let loading_clone = Arc::clone(&loading_indices);
-        let loaded_clone = Arc::clone(&loaded_indices);
+        let loaded_clone = Arc::clone(&loaded_levels);
         let retry_clone = Arc::clone(&retry_state);
         let shutdown_clone = Arc::clone(&shutdown);
         let generation_clone = Arc::clone(&generation);
@@ -289,7 +303,7 @@ impl MangaLoader {
             request_tx,
             result_rx,
             loading_indices,
-            loaded_indices,
+            loaded_levels,
             retry_state,
             dimension_cache: HashMap::new(),
             dim_request_tx,
@@ -495,7 +509,7 @@ impl MangaLoader {
         request_rx: Receiver<LoadRequest>,
         result_tx: Sender<DecodedImage>,
         loading_indices: Arc<RwLock<HashMap<usize, usize>>>,
-        loaded_indices: Arc<RwLock<HashSet<usize>>>,
+        loaded_levels: Arc<RwLock<HashMap<usize, u32>>>,
         retry_state: Arc<RwLock<HashMap<usize, RetryState>>>,
         shutdown: Arc<AtomicBool>,
         generation: Arc<AtomicUsize>,
@@ -563,17 +577,27 @@ impl MangaLoader {
 
                 // Check if already in loaded set
                 {
-                    let loaded = loaded_indices.read();
-                    if loaded.contains(&req.index) {
+                    let loaded = loaded_levels.read();
+                    if loaded
+                        .get(&req.index)
+                        .is_some_and(|side| *side >= req.target_texture_side)
+                    {
                         return (req.index, req_generation, DecodeOutcome::Skipped);
                     }
                 }
 
                 // Load the image
+                let queue_wait = req.queued_at.elapsed();
+                let decode_started = Instant::now();
                 let decoded = Self::load_single_image(req);
+                let decode_time = decode_started.elapsed();
 
                 let outcome = match decoded {
-                    Some(decoded) => DecodeOutcome::Decoded(decoded),
+                    Some(mut decoded) => {
+                        decoded.queue_wait = queue_wait;
+                        decoded.decode_time = decode_time;
+                        DecodeOutcome::Decoded(decoded)
+                    }
                     None => DecodeOutcome::Failed,
                 };
 
@@ -626,7 +650,7 @@ impl MangaLoader {
                 match outcome {
                     DecodeOutcome::Skipped => continue,
                     DecodeOutcome::Failed => {
-                        Self::register_decode_failure(&loaded_indices, &retry_state, idx);
+                        Self::register_decode_failure(&loaded_levels, &retry_state, idx);
                     }
                     DecodeOutcome::Decoded(decoded) => {
                         // A decoded payload with empty pixels/dimensions is still useful for metadata
@@ -634,19 +658,25 @@ impl MangaLoader {
                         let has_usable_pixels =
                             !decoded.pixels.is_empty() && decoded.width > 0 && decoded.height > 0;
 
+                        let loaded_side = decoded.width.max(decoded.height).max(decoded.requested_side);
+
                         match result_tx.try_send(decoded) {
                             Ok(_) => {
                                 if has_usable_pixels {
-                                    loaded_indices.write().insert(idx);
+                                    let mut loaded = loaded_levels.write();
+                                    loaded
+                                        .entry(idx)
+                                        .and_modify(|side| *side = (*side).max(loaded_side))
+                                        .or_insert(loaded_side);
                                     retry_state.write().remove(&idx);
                                 } else {
-                                    Self::register_decode_failure(&loaded_indices, &retry_state, idx);
+                                    Self::register_decode_failure(&loaded_levels, &retry_state, idx);
                                 }
                             }
                             Err(TrySendError::Full(_decoded)) => {
                                 // Channel full: drop decoded result.
                                 // We intentionally do NOT mark as loaded so the main thread can re-request.
-                                loaded_indices.write().remove(&idx);
+                                loaded_levels.write().remove(&idx);
                             }
                             Err(TrySendError::Disconnected(_decoded)) => {
                                 return; // Main thread gone, exit
@@ -679,11 +709,11 @@ impl MangaLoader {
     }
 
     fn register_decode_failure(
-        loaded_indices: &Arc<RwLock<HashSet<usize>>>,
+        loaded_levels: &Arc<RwLock<HashMap<usize, u32>>>,
         retry_state: &Arc<RwLock<HashMap<usize, RetryState>>>,
         index: usize,
     ) {
-        loaded_indices.write().remove(&index);
+        loaded_levels.write().remove(&index);
 
         let now = Instant::now();
         let mut retry = retry_state.write();
@@ -732,6 +762,7 @@ impl MangaLoader {
                 // This provides a visual preview instead of a gray placeholder
                 match Self::extract_video_first_frame(&req.path, effective_texture_side) {
                     Some((pixels, width, height, original_width, original_height)) => {
+                        let resize_started = Instant::now();
                         let (width, height, pixels) = downscale_rgba_if_needed(
                             width,
                             height,
@@ -739,6 +770,7 @@ impl MangaLoader {
                             effective_texture_side,
                             req.downscale_filter,
                         );
+                        let resize_time = resize_started.elapsed();
 
                         Some(DecodedImage {
                             index: req.index,
@@ -748,6 +780,10 @@ impl MangaLoader {
                             original_width,
                             original_height,
                             media_type: MangaMediaType::Video,
+                            requested_side: effective_texture_side,
+                            queue_wait: Duration::ZERO,
+                            decode_time: Duration::ZERO,
+                            resize_time,
                         })
                     }
                     None => {
@@ -763,6 +799,10 @@ impl MangaLoader {
                             original_width,
                             original_height,
                             media_type: MangaMediaType::Video,
+                            requested_side: effective_texture_side,
+                            queue_wait: Duration::ZERO,
+                            decode_time: Duration::ZERO,
+                            resize_time: Duration::ZERO,
                         })
                     }
                 }
@@ -771,6 +811,33 @@ impl MangaLoader {
                 // Get original dimensions from file header first (fast, no decode)
                 let (original_width, original_height) =
                     Self::probe_image_dimensions_cached(&req.path)?;
+
+                // For definitely-static formats, prefer persistent thumbnail pyramid cache.
+                // This avoids repeat decode+resize work across sessions and dense masonry runs.
+                let may_be_animated_by_ext = req
+                    .path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .map(|ext| matches!(ext.to_ascii_lowercase().as_str(), "gif" | "webp"))
+                    .unwrap_or(false);
+                if !may_be_animated_by_ext {
+                    if let Some(cached) = lookup_cached_static_thumbnail(&req.path, effective_texture_side)
+                    {
+                        return Some(DecodedImage {
+                            index: req.index,
+                            pixels: cached.pixels,
+                            width: cached.width,
+                            height: cached.height,
+                            original_width: cached.original_width,
+                            original_height: cached.original_height,
+                            media_type: MangaMediaType::StaticImage,
+                            requested_side: effective_texture_side,
+                            queue_wait: Duration::ZERO,
+                            decode_time: Duration::ZERO,
+                            resize_time: Duration::ZERO,
+                        });
+                    }
+                }
 
                 // For animated WebP files we only decode the first frame here so that
                 // the manga scroll view isn't blocked by a potentially very expensive
@@ -811,6 +878,7 @@ impl MangaLoader {
                 let frame = img.current_frame_data();
 
                 // Downscale if needed (should already be done by loader, but safety check)
+                let resize_started = Instant::now();
                 let (width, height, pixels) = downscale_rgba_if_needed(
                     frame.width,
                     frame.height,
@@ -818,18 +886,51 @@ impl MangaLoader {
                     effective_texture_side,
                     downscale_filter,
                 );
+                let resize_time = resize_started.elapsed();
+                let pixels = pixels.into_owned();
+
+                if manga_media_type == MangaMediaType::StaticImage {
+                    store_cached_static_thumbnail(
+                        &req.path,
+                        effective_texture_side,
+                        &CachedImageThumbnail {
+                            pixels: pixels.clone(),
+                            width,
+                            height,
+                            original_width,
+                            original_height,
+                        },
+                    );
+                }
 
                 Some(DecodedImage {
                     index: req.index,
-                    pixels: pixels.into_owned(),
+                    pixels,
                     width,
                     height,
                     original_width,
                     original_height,
                     media_type: manga_media_type,
+                    requested_side: effective_texture_side,
+                    queue_wait: Duration::ZERO,
+                    decode_time: Duration::ZERO,
+                    resize_time,
                 })
             }
         }
+    }
+
+    fn quantize_target_texture_side(target_texture_side: u32, max_texture_side: u32) -> u32 {
+        let max_side = max_texture_side.max(1);
+        let target = target_texture_side.max(1).min(max_side);
+
+        for &bucket in LOD_SIDE_BUCKETS {
+            if bucket >= target && bucket <= max_side {
+                return bucket;
+            }
+        }
+
+        max_side
     }
 
     /// Probe video dimensions for stable layout sizing.
@@ -1166,9 +1267,7 @@ impl MangaLoader {
             return;
         }
 
-        let target_texture_side = target_texture_side
-            .max(1)
-            .min(max_texture_side.max(1));
+        let target_texture_side = Self::quantize_target_texture_side(target_texture_side, max_texture_side);
         let (request_downscale_filter, request_gif_filter) = if force_triangle_filters {
             (FilterType::Triangle, FilterType::Triangle)
         } else {
@@ -1218,7 +1317,7 @@ impl MangaLoader {
 
         {
             let loading = self.loading_indices.read();
-            let loaded = self.loaded_indices.read();
+            let loaded = self.loaded_levels.read();
             let retry = self.retry_state.read();
 
             for idx in start_idx..end_idx {
@@ -1229,8 +1328,12 @@ impl MangaLoader {
                     continue;
                 }
 
-                // Skip if already loading or loaded
-                if loading.get(&idx).copied() == Some(generation) || loaded.contains(&idx) {
+                // Skip if already loading or loaded at sufficient LOD.
+                if loading.get(&idx).copied() == Some(generation)
+                    || loaded
+                        .get(&idx)
+                        .is_some_and(|side| *side >= target_texture_side)
+                {
                     continue;
                 }
 
@@ -1276,6 +1379,7 @@ impl MangaLoader {
                     downscale_filter: request_downscale_filter,
                     gif_filter: request_gif_filter,
                     priority,
+                    queued_at: Instant::now(),
                 });
             }
         }
@@ -1388,7 +1492,7 @@ impl MangaLoader {
 
         // Clear indices
         self.loading_indices.write().clear();
-        self.loaded_indices.write().clear();
+        self.loaded_levels.write().clear();
         self.retry_state.write().clear();
 
         // Clear dimension cache
@@ -1412,7 +1516,7 @@ impl MangaLoader {
 
     /// Mark an index as needing reload (called when cache is evicted).
     pub fn mark_unloaded(&mut self, index: usize) {
-        self.loaded_indices.write().remove(&index);
+        self.loaded_levels.write().remove(&index);
         self.retry_state.write().remove(&index);
     }
 
@@ -1448,12 +1552,21 @@ impl MangaLoader {
             return false;
         }
 
-        // Visible placeholder takes precedence over stale loaded bookkeeping.
-        self.loaded_indices.write().remove(&index);
+        let target_texture_side =
+            Self::quantize_target_texture_side(target_texture_side, max_texture_side);
 
-        let target_texture_side = target_texture_side
-            .max(1)
-            .min(max_texture_side.max(1));
+        if self
+            .loaded_levels
+            .read()
+            .get(&index)
+            .is_some_and(|side| *side >= target_texture_side)
+        {
+            return false;
+        }
+
+        // Visible placeholder takes precedence over potentially stale loaded bookkeeping.
+        self.loaded_levels.write().remove(&index);
+
         let (request_downscale_filter, request_gif_filter) = if force_triangle_filters {
             (FilterType::Triangle, FilterType::Triangle)
         } else {
@@ -1469,6 +1582,7 @@ impl MangaLoader {
             downscale_filter: request_downscale_filter,
             gif_filter: request_gif_filter,
             priority: -200_000,
+            queued_at: Instant::now(),
         };
 
         match self.request_tx.try_send(req) {
@@ -1504,7 +1618,7 @@ impl MangaLoader {
             drained_indices.push(decoded.index);
         }
         if !drained_indices.is_empty() {
-            let mut loaded = self.loaded_indices.write();
+            let mut loaded = self.loaded_levels.write();
             let mut retry = self.retry_state.write();
             for idx in drained_indices {
                 loaded.remove(&idx);

@@ -292,6 +292,28 @@ Available texture filters: `nearest`, `linear`.
 - **Lock-free Communication** — Crossbeam channels for zero-contention multi-threading
 - **Adaptive Preloading** — Priority-based prefetching based on scroll direction
 
+### Reproducible Masonry Profiling
+
+Use this checklist when comparing performance changes in dense folders:
+
+1. Build release: `cargo build --release`
+2. Enable in `config.ini`: `show_fps = true`
+3. Open the same mixed media folder (4K-heavy images/videos) for every run
+4. In manga mode, test the same matrix:
+	- `masonry_items_per_row = 3`, `5`, `10`
+	- zoom near `1.0` and minimum zoom
+5. Use the same gesture sequence each run:
+	- 3 seconds slow wheel scroll
+	- 3 seconds fast wheel scroll
+	- 3 seconds scrollbar drag
+6. Record overlay values after warm-up:
+	- frame time / FPS
+	- `UP p95`, `QW p95`, `DEC p95`, `RSZ p95`, `UTX p95`
+	- `L`, `D`, visible-count (`V`) and their peaks
+	- retry counters (`RR`) and target-side distribution (`TS L/M/H`)
+
+This keeps regressions and improvements comparable across branches and machines.
+
 ### Build Optimizations
 
 The release profile includes:

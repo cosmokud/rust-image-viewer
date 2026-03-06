@@ -11,14 +11,18 @@ use redb::{Database, ReadableTable, TableDefinition};
 const METADATA_TABLE: TableDefinition<&str, &str> = TableDefinition::new("media_dimensions");
 const VIDEO_THUMBNAIL_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("video_first_frame_rgba");
+const STATIC_THUMBNAIL_TABLE: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("image_thumbnail_rgba");
 const LEGACY_THUMBNAIL_HEADER_BYTES: usize = 40;
 const THUMBNAIL_HEADER_BYTES: usize = 48;
 const THUMBNAIL_SCHEMA_TAG: u64 = 0x4341_4348_5454_4c31;
 
 const DIMENSION_CACHE_TTL_SECS: u64 = 60 * 60 * 24 * 30;
 const THUMBNAIL_CACHE_TTL_SECS: u64 = 60 * 60 * 24 * 14;
+const STATIC_THUMBNAIL_CACHE_TTL_SECS: u64 = 60 * 60 * 24 * 30;
 const DIMENSION_CACHE_MAX_ENTRIES: usize = 80_000;
 const THUMBNAIL_CACHE_MAX_ENTRIES: usize = 4_000;
+const STATIC_THUMBNAIL_CACHE_MAX_ENTRIES: usize = 12_000;
 const PRUNE_INTERVAL_SECS: u64 = 60;
 const CACHE_WRITE_QUEUE_CAPACITY: usize = 512;
 
@@ -30,6 +34,10 @@ static DIMENSION_EXPIRED: AtomicU64 = AtomicU64::new(0);
 static THUMBNAIL_EXPIRED: AtomicU64 = AtomicU64::new(0);
 static DIMENSION_EVICTED: AtomicU64 = AtomicU64::new(0);
 static THUMBNAIL_EVICTED: AtomicU64 = AtomicU64::new(0);
+static STATIC_THUMBNAIL_HITS: AtomicU64 = AtomicU64::new(0);
+static STATIC_THUMBNAIL_MISSES: AtomicU64 = AtomicU64::new(0);
+static STATIC_THUMBNAIL_EXPIRED: AtomicU64 = AtomicU64::new(0);
+static STATIC_THUMBNAIL_EVICTED: AtomicU64 = AtomicU64::new(0);
 static LAST_PRUNE_SECS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -42,6 +50,10 @@ pub struct MetadataCacheStats {
     pub thumbnail_expired: u64,
     pub dimension_evicted: u64,
     pub thumbnail_evicted: u64,
+    pub static_thumbnail_hits: u64,
+    pub static_thumbnail_misses: u64,
+    pub static_thumbnail_expired: u64,
+    pub static_thumbnail_evicted: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -92,6 +104,15 @@ pub struct CachedVideoThumbnail {
     pub original_height: u32,
 }
 
+#[derive(Clone)]
+pub struct CachedImageThumbnail {
+    pub pixels: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+    pub original_width: u32,
+    pub original_height: u32,
+}
+
 enum CacheWriteOp {
     Dimensions {
         path: PathBuf,
@@ -103,6 +124,11 @@ enum CacheWriteOp {
         path: PathBuf,
         max_texture_side: u32,
         thumbnail: CachedVideoThumbnail,
+    },
+    StaticThumbnail {
+        path: PathBuf,
+        max_texture_side: u32,
+        thumbnail: CachedImageThumbnail,
     },
 }
 
@@ -279,6 +305,106 @@ impl MetadataCache {
         self.maybe_prune_tables();
     }
 
+    pub fn lookup_static_thumbnail(
+        &self,
+        path: &Path,
+        max_texture_side: u32,
+    ) -> Option<CachedImageThumbnail> {
+        let key = static_thumbnail_key(path, max_texture_side);
+        let fingerprint = fingerprint(path)?;
+
+        let read_txn = self.db.begin_read().ok()?;
+        let table = read_txn.open_table(STATIC_THUMBNAIL_TABLE).ok()?;
+        let raw = table.get(key.as_str()).ok()??;
+        let (cached_fingerprint, cached_at_secs, thumbnail) = decode_thumbnail_record(raw.value())?;
+
+        let now_secs = unix_now_secs();
+        if cached_at_secs > 0
+            && now_secs.saturating_sub(cached_at_secs) > STATIC_THUMBNAIL_CACHE_TTL_SECS
+        {
+            STATIC_THUMBNAIL_EXPIRED.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+
+        if cached_fingerprint.size_bytes != fingerprint.size_bytes
+            || cached_fingerprint.modified_secs != fingerprint.modified_secs
+            || cached_fingerprint.modified_nanos != fingerprint.modified_nanos
+        {
+            return None;
+        }
+
+        let expected_len = (thumbnail.width as usize)
+            .saturating_mul(thumbnail.height as usize)
+            .saturating_mul(4);
+        if thumbnail.pixels.len() != expected_len {
+            return None;
+        }
+
+        Some(CachedImageThumbnail {
+            pixels: thumbnail.pixels,
+            width: thumbnail.width,
+            height: thumbnail.height,
+            original_width: thumbnail.original_width,
+            original_height: thumbnail.original_height,
+        })
+    }
+
+    pub fn store_static_thumbnail(
+        &self,
+        path: &Path,
+        max_texture_side: u32,
+        thumbnail: &CachedImageThumbnail,
+    ) {
+        if thumbnail.width == 0
+            || thumbnail.height == 0
+            || thumbnail.original_width == 0
+            || thumbnail.original_height == 0
+        {
+            return;
+        }
+
+        let expected_len = (thumbnail.width as usize)
+            .saturating_mul(thumbnail.height as usize)
+            .saturating_mul(4);
+        if thumbnail.pixels.len() != expected_len {
+            return;
+        }
+
+        let key = static_thumbnail_key(path, max_texture_side);
+        let Some(file_fingerprint) = fingerprint(path) else {
+            return;
+        };
+
+        let encoded = encode_thumbnail_record(
+            file_fingerprint,
+            unix_now_secs(),
+            &CachedVideoThumbnail {
+                pixels: thumbnail.pixels.clone(),
+                width: thumbnail.width,
+                height: thumbnail.height,
+                original_width: thumbnail.original_width,
+                original_height: thumbnail.original_height,
+            },
+        );
+
+        let Ok(write_txn) = self.db.begin_write() else {
+            return;
+        };
+
+        {
+            let Ok(mut table) = write_txn.open_table(STATIC_THUMBNAIL_TABLE) else {
+                return;
+            };
+
+            if table.insert(key.as_str(), encoded.as_slice()).is_err() {
+                return;
+            }
+        }
+
+        let _ = write_txn.commit();
+        self.maybe_prune_tables();
+    }
+
     fn maybe_prune_tables(&self) {
         let now_secs = unix_now_secs();
         let last_prune = LAST_PRUNE_SECS.load(Ordering::Relaxed);
@@ -295,6 +421,7 @@ impl MetadataCache {
 
         self.prune_dimension_table(now_secs);
         self.prune_thumbnail_table(now_secs);
+        self.prune_static_thumbnail_table(now_secs);
     }
 
     fn prune_dimension_table(&self, now_secs: u64) {
@@ -418,6 +545,68 @@ impl MetadataCache {
 
         let _ = write_txn.commit();
     }
+
+    fn prune_static_thumbnail_table(&self, now_secs: u64) {
+        let Ok(write_txn) = self.db.begin_write() else {
+            return;
+        };
+
+        {
+            let Ok(mut table) = write_txn.open_table(STATIC_THUMBNAIL_TABLE) else {
+                return;
+            };
+
+            let (expired_keys, mut retained_entries) = {
+                let mut expired = Vec::new();
+                let mut retained = Vec::new();
+
+                let Ok(iter) = table.iter() else {
+                    return;
+                };
+
+                for item in iter {
+                    let Ok((key, value)) = item else {
+                        continue;
+                    };
+
+                    let key_owned = key.value().to_string();
+                    let Some((_, cached_at_secs, _)) = decode_thumbnail_record(value.value()) else {
+                        expired.push(key_owned);
+                        continue;
+                    };
+
+                    let is_expired = cached_at_secs > 0
+                        && now_secs.saturating_sub(cached_at_secs)
+                            > STATIC_THUMBNAIL_CACHE_TTL_SECS;
+                    if is_expired {
+                        expired.push(key_owned);
+                    } else {
+                        retained.push((cached_at_secs, key_owned));
+                    }
+                }
+
+                (expired, retained)
+            };
+
+            if !expired_keys.is_empty() {
+                STATIC_THUMBNAIL_EXPIRED.fetch_add(expired_keys.len() as u64, Ordering::Relaxed);
+                for key in &expired_keys {
+                    let _ = table.remove(key.as_str());
+                }
+            }
+
+            if retained_entries.len() > STATIC_THUMBNAIL_CACHE_MAX_ENTRIES {
+                retained_entries.sort_unstable_by_key(|(cached_at_secs, _)| *cached_at_secs);
+                let remove_count = retained_entries.len() - STATIC_THUMBNAIL_CACHE_MAX_ENTRIES;
+                for (_, key) in retained_entries.into_iter().take(remove_count) {
+                    let _ = table.remove(key.as_str());
+                }
+                STATIC_THUMBNAIL_EVICTED.fetch_add(remove_count as u64, Ordering::Relaxed);
+            }
+        }
+
+        let _ = write_txn.commit();
+    }
 }
 
 static GLOBAL_CACHE: OnceLock<Option<Arc<Mutex<MetadataCache>>>> = OnceLock::new();
@@ -470,6 +659,11 @@ fn cache_write_loop(cache: Arc<Mutex<MetadataCache>>, rx: crossbeam_channel::Rec
                     max_texture_side,
                     thumbnail,
                 } => cache.store_video_thumbnail(path.as_path(), max_texture_side, &thumbnail),
+                CacheWriteOp::StaticThumbnail {
+                    path,
+                    max_texture_side,
+                    thumbnail,
+                } => cache.store_static_thumbnail(path.as_path(), max_texture_side, &thumbnail),
             }
         }
     }
@@ -558,6 +752,50 @@ pub fn store_cached_video_thumbnail(
     }
 }
 
+pub fn lookup_cached_static_thumbnail(
+    path: &Path,
+    max_texture_side: u32,
+) -> Option<CachedImageThumbnail> {
+    let Some(cache) = global_cache_handle() else {
+        STATIC_THUMBNAIL_MISSES.fetch_add(1, Ordering::Relaxed);
+        return None;
+    };
+
+    let result = cache
+        .lock()
+        .lookup_static_thumbnail(path, max_texture_side);
+    if result.is_some() {
+        STATIC_THUMBNAIL_HITS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        STATIC_THUMBNAIL_MISSES.fetch_add(1, Ordering::Relaxed);
+    }
+
+    result
+}
+
+pub fn store_cached_static_thumbnail(
+    path: &Path,
+    max_texture_side: u32,
+    thumbnail: &CachedImageThumbnail,
+) {
+    if let Some(tx) = cache_write_tx() {
+        let op = CacheWriteOp::StaticThumbnail {
+            path: path.to_path_buf(),
+            max_texture_side,
+            thumbnail: thumbnail.clone(),
+        };
+        if tx.try_send(op).is_ok() {
+            return;
+        }
+    }
+
+    if let Some(cache) = global_cache_handle() {
+        cache
+            .lock()
+            .store_static_thumbnail(path, max_texture_side, thumbnail);
+    }
+}
+
 pub fn metadata_cache_stats() -> MetadataCacheStats {
     MetadataCacheStats {
         dimension_hits: DIMENSION_HITS.load(Ordering::Relaxed),
@@ -568,6 +806,10 @@ pub fn metadata_cache_stats() -> MetadataCacheStats {
         thumbnail_expired: THUMBNAIL_EXPIRED.load(Ordering::Relaxed),
         dimension_evicted: DIMENSION_EVICTED.load(Ordering::Relaxed),
         thumbnail_evicted: THUMBNAIL_EVICTED.load(Ordering::Relaxed),
+        static_thumbnail_hits: STATIC_THUMBNAIL_HITS.load(Ordering::Relaxed),
+        static_thumbnail_misses: STATIC_THUMBNAIL_MISSES.load(Ordering::Relaxed),
+        static_thumbnail_expired: STATIC_THUMBNAIL_EXPIRED.load(Ordering::Relaxed),
+        static_thumbnail_evicted: STATIC_THUMBNAIL_EVICTED.load(Ordering::Relaxed),
     }
 }
 
@@ -614,6 +856,10 @@ fn cache_key(path: &Path) -> String {
 
 fn thumbnail_key(path: &Path, max_texture_side: u32) -> String {
     format!("{}#ts{}", cache_key(path), max_texture_side.max(1))
+}
+
+fn static_thumbnail_key(path: &Path, max_texture_side: u32) -> String {
+    format!("{}#imgts{}", cache_key(path), max_texture_side.max(1))
 }
 
 fn fingerprint(path: &Path) -> Option<FileFingerprint> {

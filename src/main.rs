@@ -1035,6 +1035,14 @@ struct ImageViewer {
     manga_target_texture_side: u32,
     /// Adaptive decoded-upload batch size used by manga texture uploads.
     manga_upload_batch_limit: usize,
+    /// Last sampled number of visible media tiles in manga mode.
+    manga_visible_indices_last: usize,
+    /// Peak sampled number of visible media tiles in manga mode.
+    manga_visible_indices_peak: usize,
+    /// Peak background request queue depth while in manga mode.
+    manga_pending_loads_peak: usize,
+    /// Peak decoded-result queue depth while in manga mode.
+    manga_pending_decoded_peak: usize,
     /// First time a visible item was observed without an uploaded texture.
     manga_ttv_pending: HashMap<usize, Instant>,
     /// Recent time-to-visible samples for manga/masonry (milliseconds).
@@ -1290,6 +1298,10 @@ impl Default for ImageViewer {
             manga_cache_target_capacity: 64,
             manga_target_texture_side: 4096,
             manga_upload_batch_limit: 4,
+            manga_visible_indices_last: 0,
+            manga_visible_indices_peak: 0,
+            manga_pending_loads_peak: 0,
+            manga_pending_decoded_peak: 0,
             manga_ttv_pending: HashMap::new(),
             manga_ttv_samples_ms: VecDeque::new(),
             manga_arrow_left_was_down: false,
@@ -1534,6 +1546,22 @@ impl ImageViewer {
             .retain(|_, started_at| started_at.elapsed() <= Self::MANGA_TTV_PENDING_MAX_AGE);
     }
 
+    fn manga_record_target_side_sample(&mut self, side: u32) {
+        self.perf_metrics
+            .increment_counter("manga_target_side_samples", 1);
+
+        if side <= 192 {
+            self.perf_metrics
+                .increment_counter("manga_target_side_low", 1);
+        } else if side <= 512 {
+            self.perf_metrics
+                .increment_counter("manga_target_side_mid", 1);
+        } else {
+            self.perf_metrics
+                .increment_counter("manga_target_side_high", 1);
+        }
+    }
+
     fn manga_ttv_percentiles_ms(&self) -> Option<(f32, f32, usize)> {
         if self.manga_ttv_samples_ms.is_empty() {
             return None;
@@ -1669,10 +1697,14 @@ impl ImageViewer {
 
             if let Some(loader) = self.manga_loader.as_ref() {
                 text.push_str(&format!(
-                    " | U{} L{} D{}",
+                    " | U{} L{}/{} D{}/{} V{}/{}",
                     self.manga_upload_batch_limit,
                     loader.pending_load_count(),
-                    loader.pending_decoded_count()
+                    self.manga_pending_loads_peak,
+                    loader.pending_decoded_count(),
+                    self.manga_pending_decoded_peak,
+                    self.manga_visible_indices_last,
+                    self.manga_visible_indices_peak
                 ));
             } else {
                 text.push_str(&format!(" | U{}", self.manga_upload_batch_limit));
@@ -1696,21 +1728,29 @@ impl ImageViewer {
             || metadata_stats.dimension_misses > 0
             || metadata_stats.thumbnail_hits > 0
             || metadata_stats.thumbnail_misses > 0
+            || metadata_stats.static_thumbnail_hits > 0
+            || metadata_stats.static_thumbnail_misses > 0
             || metadata_stats.dimension_expired > 0
             || metadata_stats.thumbnail_expired > 0
+            || metadata_stats.static_thumbnail_expired > 0
             || metadata_stats.dimension_evicted > 0
             || metadata_stats.thumbnail_evicted > 0
+            || metadata_stats.static_thumbnail_evicted > 0
         {
             text.push_str(&format!(
-                " | MC D{}/{} T{}/{} E{}/{} V{}/{}",
+                " | MC D{}/{} TV{}/{} TS{}/{} E{}/{}/{} V{}/{}/{}",
                 metadata_stats.dimension_hits,
                 metadata_stats.dimension_misses,
                 metadata_stats.thumbnail_hits,
                 metadata_stats.thumbnail_misses,
+                metadata_stats.static_thumbnail_hits,
+                metadata_stats.static_thumbnail_misses,
                 metadata_stats.dimension_expired,
                 metadata_stats.thumbnail_expired,
+                metadata_stats.static_thumbnail_expired,
                 metadata_stats.dimension_evicted,
-                metadata_stats.thumbnail_evicted
+                metadata_stats.thumbnail_evicted,
+                metadata_stats.static_thumbnail_evicted,
             ));
         }
 
@@ -1723,9 +1763,38 @@ impl ImageViewer {
                 text.push_str(&format!(" | UP p95:{p95:.2}ms"));
             }
 
+            if let Some(p95) = self
+                .perf_metrics
+                .percentile_ms("manga_decode_queue_wait_ms", 0.95)
+            {
+                text.push_str(&format!(" | QW p95:{p95:.2}ms"));
+            }
+            if let Some(p95) = self.perf_metrics.percentile_ms("manga_decode_worker_ms", 0.95) {
+                text.push_str(&format!(" | DEC p95:{p95:.2}ms"));
+            }
+            if let Some(p95) = self.perf_metrics.percentile_ms("manga_decode_resize_ms", 0.95) {
+                text.push_str(&format!(" | RSZ p95:{p95:.2}ms"));
+            }
+            if let Some(p95) = self.perf_metrics.percentile_ms("manga_upload_texture_ms", 0.95) {
+                text.push_str(&format!(" | UTX p95:{p95:.2}ms"));
+            }
+
             let uploaded_total = self.perf_metrics.counter("manga_uploaded_textures");
             if uploaded_total > 0 {
                 text.push_str(&format!(" | UTot {}", uploaded_total));
+            }
+
+            let retry_enqueued = self.perf_metrics.counter("manga_retry_enqueued");
+            let retry_rejected = self.perf_metrics.counter("manga_retry_rejected");
+            if retry_enqueued > 0 || retry_rejected > 0 {
+                text.push_str(&format!(" | RR {}/{}", retry_enqueued, retry_rejected));
+            }
+
+            let side_low = self.perf_metrics.counter("manga_target_side_low");
+            let side_mid = self.perf_metrics.counter("manga_target_side_mid");
+            let side_high = self.perf_metrics.counter("manga_target_side_high");
+            if side_low > 0 || side_mid > 0 || side_high > 0 {
+                text.push_str(&format!(" | TS L/M/H {}/{}/{}", side_low, side_mid, side_high));
             }
 
             let deferred_nav = self.perf_metrics.counter("manga_upgrade_deferred_nav");
@@ -4790,6 +4859,10 @@ impl ImageViewer {
             self.manga_ttv_pending.clear();
             self.manga_ttv_samples_ms.clear();
             self.manga_upload_batch_limit = Self::MANGA_UPLOAD_BATCH_BASE;
+            self.manga_visible_indices_last = 0;
+            self.manga_visible_indices_peak = 0;
+            self.manga_pending_loads_peak = 0;
+            self.manga_pending_decoded_peak = 0;
 
             self.prepare_enter_manga_mode_state(current_media_type);
 
@@ -5129,6 +5202,10 @@ impl ImageViewer {
         self.manga_upload_batch_limit = Self::MANGA_UPLOAD_BATCH_BASE;
         self.manga_cache_target_capacity = Self::MANGA_CACHE_MIN_ENTRIES;
         self.manga_target_texture_side = self.max_texture_side.max(1);
+        self.manga_visible_indices_last = 0;
+        self.manga_visible_indices_peak = 0;
+        self.manga_pending_loads_peak = 0;
+        self.manga_pending_decoded_peak = 0;
 
         // Clear and reset the parallel loader
         if let Some(ref mut loader) = self.manga_loader {
@@ -5901,11 +5978,37 @@ impl ImageViewer {
         let is_masonry = self.is_masonry_mode();
         let masonry_rows = self.masonry_items_per_row.clamp(2, 10);
         let masonry_side_multiplier = (masonry_rows + 1) / 2;
-        let target_cache_capacity =
+        let mut target_cache_capacity =
             self.manga_compute_cache_capacity_target(visible_page_count, visible_indices_count);
-        self.manga_cache_target_capacity = target_cache_capacity;
         self.manga_target_texture_side =
             self.manga_target_texture_side_for_preload(current_visible_index, &visible_indices);
+        self.manga_record_target_side_sample(self.manga_target_texture_side);
+        self.manga_visible_indices_last = visible_indices_count;
+        self.manga_visible_indices_peak = self.manga_visible_indices_peak.max(visible_indices_count);
+
+        if is_masonry {
+            // Byte-aware clamp to avoid oversized entry-count targets when textures are large.
+            const MASONRY_CACHE_BUDGET_BYTES_IDLE: usize = 256 * 1024 * 1024;
+            const MASONRY_CACHE_BUDGET_BYTES_NAV: usize = 160 * 1024 * 1024;
+
+            let est_side = self.manga_target_texture_side.max(1) as usize;
+            let est_bytes_per_texture = est_side
+                .saturating_mul(est_side)
+                .saturating_mul(4)
+                .saturating_mul(3)
+                / 2;
+            let budget_bytes = if self.masonry_navigation_active_for_heavy_work() {
+                MASONRY_CACHE_BUDGET_BYTES_NAV
+            } else {
+                MASONRY_CACHE_BUDGET_BYTES_IDLE
+            };
+            let byte_limited_capacity = (budget_bytes / est_bytes_per_texture.max(1))
+                .clamp(Self::MANGA_CACHE_MIN_ENTRIES, Self::MANGA_CACHE_MAX_ENTRIES);
+            let keep_floor = visible_indices_count.max(masonry_rows.saturating_mul(2));
+            target_cache_capacity = target_cache_capacity.min(byte_limited_capacity.max(keep_floor));
+        }
+
+        self.manga_cache_target_capacity = target_cache_capacity;
 
         self.manga_texture_cache
             .set_pinned_indices(visible_indices.iter().copied());
@@ -5922,10 +6025,17 @@ impl ImageViewer {
         }
 
         let cache_multiplier = self.masonry_cache_multiplier();
+        let navigation_active_for_loader =
+            is_masonry && self.masonry_navigation_active_for_heavy_work();
 
         // Update the loader's visible page count for adaptive preloading
         if let Some(ref mut loader) = self.manga_loader {
-            let visible_for_loader = visible_page_count.saturating_mul(cache_multiplier);
+            let mut visible_for_loader = visible_page_count.saturating_mul(cache_multiplier);
+            if navigation_active_for_loader {
+                // While actively navigating dense masonry layouts, keep speculative preload tighter.
+                let directional_cap = visible_indices_count.saturating_mul(2).max(1);
+                visible_for_loader = visible_for_loader.min(directional_cap);
+            }
             let cache_limited_visible = visible_for_loader.min(self.manga_cache_target_capacity.max(1));
             loader.update_visible_page_count(cache_limited_visible.max(1));
         }
@@ -5960,14 +6070,33 @@ impl ImageViewer {
         let behind_raw = base_behind.saturating_mul(cache_multiplier);
         let ahead_raw = base_ahead.saturating_mul(cache_multiplier);
         let (behind, ahead) = if is_masonry {
-            // Masonry: keep preload symmetric (same forward/backward window), using the larger side,
-            // and scale with rows-per-row so denser layouts remain seamless.
+            // Masonry baseline: symmetric window scaled with rows-per-row.
             let symmetric = behind_raw
                 .max(ahead_raw)
                 .saturating_mul(masonry_side_multiplier)
                 .max(80usize.saturating_mul(masonry_rows))
                 .min(max_behind.max(max_ahead));
-            (symmetric, symmetric)
+
+            let fast_directional = self.manga_scrollbar_dragging
+                || self.is_panning
+                || self.manga_wheel_scroll_pending.abs() > 2.0
+                || self.manga_scroll_velocity.abs() > 1.2;
+            if fast_directional {
+                let leading = symmetric.saturating_mul(3) / 2;
+                let trailing = (symmetric / 2).max(24usize.saturating_mul(masonry_rows));
+                let moving_up = scrolling_up || self.manga_scroll_velocity < -0.5;
+
+                self.perf_metrics
+                    .increment_counter("manga_preload_directional_nav", 1);
+
+                if moving_up {
+                    (leading.min(max_behind), trailing.min(max_ahead))
+                } else {
+                    (trailing.min(max_behind), leading.min(max_ahead))
+                }
+            } else {
+                (symmetric, symmetric)
+            }
         } else {
             (behind_raw.min(max_behind), ahead_raw.min(max_ahead))
         };
@@ -6233,6 +6362,8 @@ impl ImageViewer {
             .as_ref()
             .map(|loader| (loader.pending_load_count(), loader.pending_decoded_count()))
             .unwrap_or((0, 0));
+        self.manga_pending_loads_peak = self.manga_pending_loads_peak.max(pending_loads);
+        self.manga_pending_decoded_peak = self.manga_pending_decoded_peak.max(pending_decoded);
         let upload_batch_limit =
             self.manga_compute_upload_batch_limit(pending_loads, pending_decoded);
         self.manga_upload_batch_limit = upload_batch_limit;
@@ -6269,6 +6400,10 @@ impl ImageViewer {
         let dims_updated = !decoded_images.is_empty() || !dim_updates.is_empty();
 
         let visible_indices = self.manga_collect_visible_indices();
+        self.manga_visible_indices_last = visible_indices.len();
+        self.manga_visible_indices_peak = self
+            .manga_visible_indices_peak
+            .max(self.manga_visible_indices_last);
         self.manga_texture_cache
             .set_pinned_indices(visible_indices.iter().copied());
 
@@ -6279,6 +6414,14 @@ impl ImageViewer {
 
         // Upload decoded images to GPU as textures
         for decoded in decoded_images {
+            self.perf_metrics
+                .record_duration("manga_decode_queue_wait_ms", decoded.queue_wait);
+            self.perf_metrics
+                .record_duration("manga_decode_worker_ms", decoded.decode_time);
+            self.perf_metrics
+                .record_duration("manga_decode_resize_ms", decoded.resize_time);
+            self.manga_record_target_side_sample(decoded.requested_side);
+
             let incoming_side = decoded.width.max(decoded.height);
 
             // Keep current texture unless the decoded payload is a meaningful quality upgrade.
@@ -6307,11 +6450,14 @@ impl ImageViewer {
             let texture_options =
                 self.manga_texture_options_for_upload(decoded.media_type, decoded.width, decoded.height);
 
+            let upload_texture_started = Instant::now();
             let texture = ctx.load_texture(
                 format!("manga_{}", decoded.index),
                 color_image,
                 texture_options,
             );
+            self.perf_metrics
+                .record_duration("manga_upload_texture_ms", upload_texture_started.elapsed());
 
             // Insert into cache with media type (this may evict old entries)
             let evicted = self.manga_texture_cache.insert_with_type(
@@ -7683,7 +7829,8 @@ impl ImageViewer {
         let (downscale_filter, gif_filter) = self.manga_decode_filters_for_strip_mode();
         let force_triangle_filters = self.manga_should_force_triangle_filters();
 
-        self.manga_loader
+        let requested = self
+            .manga_loader
             .as_mut()
             .map(|loader| {
                 loader.request_visible_retry(
@@ -7696,7 +7843,16 @@ impl ImageViewer {
                     force_triangle_filters,
                 )
             })
-            .unwrap_or(false)
+            .unwrap_or(false);
+
+        if requested {
+            self.perf_metrics.increment_counter("manga_retry_enqueued", 1);
+            self.manga_record_target_side_sample(target_texture_side);
+        } else {
+            self.perf_metrics.increment_counter("manga_retry_rejected", 1);
+        }
+
+        requested
     }
 
     fn draw_manga_item(&mut self, ui: &mut egui::Ui, idx: usize, image_rect: egui::Rect) -> bool {
