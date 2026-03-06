@@ -4349,7 +4349,7 @@ impl ImageViewer {
         }
     }
 
-    fn masonry_target_texture_side_from_screen_width(&self, item_screen_width: f32) -> u32 {
+    fn masonry_target_texture_side_from_display_side(&self, item_screen_max_side: f32) -> u32 {
         let max_side = self.max_texture_side.max(1);
         let zoom = self.zoom.max(0.0001);
         let rows = self.masonry_items_per_row.clamp(2, 10) as f32;
@@ -4359,7 +4359,7 @@ impl ImageViewer {
         let baseline_item_width = (self.screen_size.x.max(1.0) / rows)
             * zoom
             * Self::MANGA_MASONRY_ZOOM_QUALITY_BASELINE_SCALE;
-        let basis = item_screen_width.max(baseline_item_width).max(64.0);
+        let basis = item_screen_max_side.max(baseline_item_width).max(64.0);
         let scaled = (basis * Self::masonry_zoom_quality_boost(zoom)).ceil() as u32;
 
         scaled.clamp(
@@ -4380,7 +4380,9 @@ impl ImageViewer {
         let max_side = self.max_texture_side.max(1);
 
         let target_side = if self.is_masonry_mode() {
-            self.masonry_target_texture_side_from_screen_width(image_rect.width().max(1.0))
+            self.masonry_target_texture_side_from_display_side(
+                image_rect.width().max(image_rect.height()).max(1.0),
+            )
         } else {
             ((image_rect.width().max(image_rect.height()) * Self::MANGA_DYNAMIC_TARGET_OVERSCAN)
                 .ceil() as u32)
@@ -4628,15 +4630,17 @@ impl ImageViewer {
         if self.is_masonry_mode() {
             self.masonry_ensure_layout_cache();
             let zoom = self.zoom.max(0.0001);
-            let mut visible_max_width = 0.0f32;
+            let mut visible_max_side = 0.0f32;
 
             for &idx in visible_indices.iter().take(96) {
                 if let Some(item) = self.masonry_layout_items.get(idx) {
-                    visible_max_width = visible_max_width.max(item.width * zoom);
+                    let slot_size = egui::vec2(item.width * zoom, item.height * zoom);
+                    let display_size = self.masonry_item_display_size(idx, slot_size);
+                    visible_max_side = visible_max_side.max(display_size.x.max(display_size.y));
                 }
             }
 
-            return self.masonry_target_texture_side_from_screen_width(visible_max_width);
+            return self.masonry_target_texture_side_from_display_side(visible_max_side.max(1.0));
         }
 
         if self.zoom >= 0.95 {
@@ -4762,7 +4766,7 @@ impl ImageViewer {
         }
     }
 
-    fn masonry_item_aspect_ratio(&self, index: usize) -> f32 {
+    fn masonry_slot_aspect_ratio(&self, index: usize) -> f32 {
         self.manga_loader
             .as_ref()
             .and_then(|loader| loader.get_dimensions(index))
@@ -4774,6 +4778,46 @@ impl ImageViewer {
                 }
             })
             .unwrap_or(1.4)
+    }
+
+    fn masonry_item_source_size(&self, index: usize) -> Option<egui::Vec2> {
+        self.manga_loader
+            .as_ref()
+            .and_then(|loader| loader.get_dimensions(index))
+            .and_then(|(w, h)| {
+                if w > 0 && h > 0 {
+                    Some(egui::vec2(w as f32, h as f32))
+                } else {
+                    None
+                }
+            })
+    }
+
+    fn fit_size_preserving_aspect(source_size: egui::Vec2, bounds_size: egui::Vec2) -> egui::Vec2 {
+        if source_size.x <= 0.0
+            || source_size.y <= 0.0
+            || bounds_size.x <= 0.0
+            || bounds_size.y <= 0.0
+        {
+            return bounds_size;
+        }
+
+        let scale = (bounds_size.x / source_size.x).min(bounds_size.y / source_size.y);
+        egui::vec2(
+            (source_size.x * scale).min(bounds_size.x),
+            (source_size.y * scale).min(bounds_size.y),
+        )
+    }
+
+    fn masonry_item_display_size(&self, index: usize, slot_size: egui::Vec2) -> egui::Vec2 {
+        self.masonry_item_source_size(index)
+            .map(|source_size| Self::fit_size_preserving_aspect(source_size, slot_size))
+            .unwrap_or(slot_size)
+    }
+
+    fn masonry_item_display_rect(&self, index: usize, slot_rect: egui::Rect) -> egui::Rect {
+        let display_size = self.masonry_item_display_size(index, slot_rect.size());
+        egui::Rect::from_center_size(slot_rect.center(), display_size)
     }
 
     fn masonry_ensure_layout_cache(&mut self) {
@@ -4827,7 +4871,7 @@ impl ImageViewer {
 
             let x = start_x + target_col as f32 * (column_width + GUTTER);
             let y = column_heights[target_col];
-            let height = (column_width * self.masonry_item_aspect_ratio(idx)).max(20.0);
+            let height = (column_width * self.masonry_slot_aspect_ratio(idx)).max(20.0);
 
             self.masonry_layout_items[idx] = MasonryItemLayout {
                 x,
@@ -4862,6 +4906,7 @@ impl ImageViewer {
             .get(index)
             .copied()
             .map(|item| item.to_screen_rect(self.zoom, self.offset.x, self.manga_scroll_offset))
+            .map(|slot_rect| self.masonry_item_display_rect(index, slot_rect))
     }
 
     fn manga_index_at_screen_pos(&mut self, pos: egui::Pos2) -> Option<usize> {
@@ -7993,6 +8038,11 @@ impl ImageViewer {
     }
 
     fn draw_manga_item(&mut self, ui: &mut egui::Ui, idx: usize, image_rect: egui::Rect) -> bool {
+        let image_rect = if self.is_masonry_mode() {
+            self.masonry_item_display_rect(idx, image_rect)
+        } else {
+            image_rect
+        };
         let mut requested_retry = false;
         let retry_target_side = self.manga_retry_target_side_for_rect(idx, image_rect);
 

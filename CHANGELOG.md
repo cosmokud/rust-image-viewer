@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.2.1] - 2026-03-06
+
+### Highlights
+
+- Added retained media placeholders so the current image or video frame can stay visible while replacement media or layout-target textures are still loading.
+- Fixed masonry rendering for extreme aspect-ratio images so very tall and very wide media keeps its original proportions instead of stretching to fill capped masonry slots.
+
+### Added
+
+- Retained placeholder management for solo-view navigation and strip or masonry transitions, including entry placeholders that keep the currently focused media visible while the destination view warms its textures.
+
+### Fixed
+
+- Masonry mode now fits extreme panoramas and long-strip images inside each masonry slot using the source aspect ratio, even when that leaves extra padding around the media.
+- Masonry texture retry and preload quality now track the actual fitted on-screen draw size instead of the slot width alone, which reduces blur on very tall and very wide thumbnails.
+
 ## [v0.2.0] - 2026-03-06
 
 ### Highlights
