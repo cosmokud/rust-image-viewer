@@ -899,6 +899,8 @@ impl ImageViewer {
     const MANGA_TEXTURE_UPGRADE_MIN_RATIO: f32 = 1.12;
     const MANGA_TTV_SAMPLE_CAP: usize = 240;
     const MANGA_TTV_PENDING_MAX_AGE: Duration = Duration::from_secs(30);
+    const FPS_OVERLAY_IDLE_POLL_MS: u64 = 500;
+    const FPS_OVERLAY_ACTIVE_POLL_MS: u64 = 120;
 
     fn set_current_index_clamped(&mut self, index: usize) {
         if self.image_list.is_empty() {
@@ -10688,8 +10690,6 @@ impl eframe::App for ImageViewer {
                 // Paused video: no repaint needed.
                 // Any input will trigger an event-driven repaint.
             }
-        } else if self.config.show_fps {
-            ctx.request_repaint_after(Duration::from_millis(16));
         } else {
             let mut next_repaint: Option<Duration> = None;
 
@@ -10699,6 +10699,17 @@ impl eframe::App for ImageViewer {
                     None => d,
                 });
             };
+
+            if self.config.show_fps {
+                // Keep FPS/debug stats visible without turning idle mode into
+                // a continuous 60 FPS redraw loop.
+                let fps_overlay_poll_ms = if self.is_idle {
+                    Self::FPS_OVERLAY_IDLE_POLL_MS
+                } else {
+                    Self::FPS_OVERLAY_ACTIVE_POLL_MS
+                };
+                schedule_min(Duration::from_millis(fps_overlay_poll_ms));
+            }
 
             // Top control bar auto-hide: schedule a single repaint right when it should disappear.
             if self.show_controls {
