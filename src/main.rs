@@ -276,6 +276,12 @@ enum MangaLayoutMode {
     Masonry,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TitlebarToggleReturnMode {
+    Fullscreen,
+    Manga(MangaLayoutMode),
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct MasonryItemLayout {
     x: f32,
@@ -448,6 +454,8 @@ struct ImageViewer {
     should_exit: bool,
     /// Request fullscreen toggle
     toggle_fullscreen: bool,
+    /// True when fullscreen toggle was requested by the title-bar maximize/restore button.
+    toggle_fullscreen_from_titlebar: bool,
     /// Request minimize
     request_minimize: bool,
 
@@ -589,6 +597,10 @@ struct ImageViewer {
     manga_layout_mode: MangaLayoutMode,
     /// Previous strip layout to restore when leaving solo fullscreen via middle click.
     strip_return_mode: Option<MangaLayoutMode>,
+    /// Last non-floating mode captured when title-bar maximize/restore exited to floating.
+    titlebar_previous_mode: Option<TitlebarToggleReturnMode>,
+    /// Manga layout to restore when the title-bar button re-enters from floating mode.
+    titlebar_pending_restore_layout: Option<MangaLayoutMode>,
     /// Saved masonry viewport state while temporarily opening a single item fullscreen.
     strip_return_masonry_state: Option<MasonryReturnState>,
     /// True while solo fullscreen is keeping masonry caches alive for potential middle-click return.
@@ -800,6 +812,7 @@ impl Default for ImageViewer {
             screen_size: egui::Vec2::new(1920.0, 1080.0),
             should_exit: false,
             toggle_fullscreen: false,
+            toggle_fullscreen_from_titlebar: false,
             request_minimize: false,
             max_texture_side: 4096,
             startup_window_mode_applied: false,
@@ -865,6 +878,8 @@ impl Default for ImageViewer {
             manga_mode: false,
             manga_layout_mode: MangaLayoutMode::LongStrip,
             strip_return_mode: None,
+            titlebar_previous_mode: None,
+            titlebar_pending_restore_layout: None,
             strip_return_masonry_state: None,
             strip_return_preserve_masonry_cache: false,
             masonry_items_per_row,
@@ -1000,6 +1015,21 @@ impl ImageViewer {
         gif_filter: FilterType,
     ) -> bool {
         let key = decoded_image_cache_key(path, max_texture_side);
+
+        // Animated GIFs cannot be reconstructed from a single cached frame.
+        // If we restore them from this cache they appear as static images.
+        let path_is_gif = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("gif"))
+            .unwrap_or(false);
+        if path_is_gif {
+            self.decoded_image_cache.invalidate(&key);
+            self.perf_metrics
+                .increment_counter("decoded_image_cache_miss", 1);
+            return false;
+        }
+
         let Some(current_stamp) = file_stamp_for_path(path) else {
             self.perf_metrics
                 .increment_counter("decoded_image_cache_miss", 1);
@@ -1057,6 +1087,12 @@ impl ImageViewer {
         let Some(stamp) = file_stamp_for_path(path) else {
             return;
         };
+
+        // Keep single-frame cache entries for static images and animated WebP.
+        // Animated GIFs need their full frame source to stay playable.
+        if image.is_animated() && !is_animated_webp {
+            return;
+        }
 
         let frame = image.current_frame_data();
         if frame.pixels.len() > DECODED_IMAGE_CACHE_SKIP_ENTRY_BYTES {
@@ -2084,6 +2120,11 @@ impl ImageViewer {
         self.anim_seekbar_total_frames = None;
     }
 
+    fn reset_gif_seek_interaction_state(&mut self) {
+        self.gif_seeking = false;
+        self.gif_seek_preview_frame = None;
+    }
+
     fn ensure_manga_loader(&mut self) {
         if self.manga_loader.is_none() {
             self.manga_loader = Some(MangaLoader::new());
@@ -2146,6 +2187,7 @@ impl ImageViewer {
         self.set_strip_entry_placeholder_from_current_media(current_media_type);
         self.manga_wheel_scroll_pending = 0.0;
         self.stop_manga_autoscroll();
+        self.reset_gif_seek_interaction_state();
         self.reset_masonry_metadata_preload();
         self.manga_mode = true;
         self.stop_fullscreen_video_playback();
@@ -3199,6 +3241,8 @@ impl ImageViewer {
             return;
         }
 
+        self.reset_gif_seek_interaction_state();
+
         let restore_masonry_state = if layout_mode == MangaLayoutMode::Masonry {
             self.strip_return_masonry_state
         } else {
@@ -3737,6 +3781,7 @@ impl ImageViewer {
         self.activate_strip_return_context(return_mode);
         self.manga_wheel_scroll_pending = 0.0;
         self.stop_manga_autoscroll();
+        self.reset_gif_seek_interaction_state();
         self.reset_masonry_metadata_preload();
         self.manga_mode = false;
         if return_mode == MangaLayoutMode::Masonry {
@@ -8695,6 +8740,27 @@ impl ImageViewer {
                                 WindowButton::Maximize
                             };
                             if window_icon_button(ui, button).clicked() {
+                                self.toggle_fullscreen_from_titlebar = true;
+
+                                if self.is_fullscreen {
+                                    // Remember where maximize/restore should return from floating mode.
+                                    self.titlebar_previous_mode = Some(if self.manga_mode {
+                                        TitlebarToggleReturnMode::Manga(self.manga_layout_mode)
+                                    } else if let Some(layout_mode) = self.strip_return_mode {
+                                        TitlebarToggleReturnMode::Manga(layout_mode)
+                                    } else {
+                                        TitlebarToggleReturnMode::Fullscreen
+                                    });
+                                } else {
+                                    self.titlebar_pending_restore_layout =
+                                        match self.titlebar_previous_mode {
+                                            Some(TitlebarToggleReturnMode::Manga(layout_mode)) => {
+                                                Some(layout_mode)
+                                            }
+                                            _ => None,
+                                        };
+                                }
+
                                 self.toggle_fullscreen = true;
                             }
 
@@ -10691,11 +10757,21 @@ impl eframe::App for ImageViewer {
         if self.toggle_fullscreen {
             self.stop_manga_autoscroll();
             let entering_fullscreen = !self.is_fullscreen;
+            let toggled_from_titlebar = self.toggle_fullscreen_from_titlebar;
+
+            if !toggled_from_titlebar {
+                self.titlebar_pending_restore_layout = None;
+            }
 
             // When solo fullscreen was opened from strip mode, all fullscreen-exit triggers
             // (keyboard, title-bar button, menu actions) should return back to that strip mode,
-            // not leave fullscreen to floating mode.
-            if !entering_fullscreen && !self.manga_mode && self.strip_return_mode.is_some() {
+            // not leave fullscreen to floating mode. The title-bar maximize/restore button is
+            // intentionally different: it always exits to floating mode.
+            if !entering_fullscreen
+                && !self.manga_mode
+                && self.strip_return_mode.is_some()
+                && !toggled_from_titlebar
+            {
                 self.return_to_strip_mode_from_middle_click();
             } else {
                 self.is_fullscreen = entering_fullscreen;
@@ -10734,6 +10810,16 @@ impl eframe::App for ImageViewer {
                 ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::Pos2::ZERO));
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(monitor));
                 self.last_requested_inner_size = Some(monitor);
+
+                if toggled_from_titlebar {
+                    if let Some(layout_mode) = self.titlebar_pending_restore_layout.take() {
+                        self.clear_strip_return_context();
+                        self.manga_layout_mode = layout_mode;
+                        if !self.manga_mode {
+                            self.toggle_manga_mode();
+                        }
+                    }
+                }
                 } else {
                 // Exiting fullscreen - use delayed resize to prevent flash
                 self.fullscreen_transition = 0.0;
@@ -10861,6 +10947,7 @@ impl eframe::App for ImageViewer {
                 }
             }
             self.toggle_fullscreen = false;
+            self.toggle_fullscreen_from_titlebar = false;
         }
 
         let fullscreen_animation_active = false;
