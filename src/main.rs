@@ -357,6 +357,40 @@ struct ModeSwitchPlaceholder {
     media_type: MediaType,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingMediaLoadKind {
+    Image,
+    Video,
+}
+
+#[derive(Clone, Debug)]
+struct PendingMediaLoad {
+    request_id: u64,
+    path: PathBuf,
+    kind: PendingMediaLoadKind,
+    started_at: Instant,
+}
+
+struct AsyncImageLoad {
+    image: LoadedImage,
+    is_animated_webp: bool,
+    max_texture_side: u32,
+    gif_filter: FilterType,
+}
+
+enum MediaLoadResult {
+    Image {
+        request_id: u64,
+        path: PathBuf,
+        result: Result<AsyncImageLoad, String>,
+    },
+    Video {
+        request_id: u64,
+        path: PathBuf,
+        result: Result<VideoPlayer, String>,
+    },
+}
+
 const DECODED_IMAGE_CACHE_MAX_BYTES: u64 = 192 * 1024 * 1024;
 const DECODED_IMAGE_CACHE_SKIP_ENTRY_BYTES: usize = 24 * 1024 * 1024;
 
@@ -430,6 +464,12 @@ struct ImageViewer {
     pending_media_directory_target: Option<PathBuf>,
     /// Start time for the in-flight async directory scan.
     pending_media_directory_started_at: Option<Instant>,
+    /// Monotonic request id for non-blocking solo media loads.
+    next_media_load_request_id: u64,
+    /// Active non-blocking media load (if any).
+    pending_media_load: Option<PendingMediaLoad>,
+    /// Completion channel for `pending_media_load`.
+    pending_media_load_rx: Option<crossbeam_channel::Receiver<MediaLoadResult>>,
     /// Current image index in the list
     current_index: usize,
     /// Current zoom level (1.0 = 100%)
@@ -813,6 +853,9 @@ impl Default for ImageViewer {
             pending_media_directory_scan: None,
             pending_media_directory_target: None,
             pending_media_directory_started_at: None,
+            next_media_load_request_id: 1,
+            pending_media_load: None,
+            pending_media_load_rx: None,
             current_index: 0,
             zoom: 1.0,
             zoom_target: 1.0,
@@ -2525,6 +2568,185 @@ impl ImageViewer {
         ctx.request_repaint();
     }
 
+    fn clear_pending_media_load(&mut self) {
+        self.pending_media_load = None;
+        self.pending_media_load_rx = None;
+    }
+
+    fn start_async_image_load(
+        &mut self,
+        path: PathBuf,
+        max_texture_side: u32,
+        downscale_filter: FilterType,
+        gif_filter: FilterType,
+    ) {
+        let request_id = self.next_media_load_request_id;
+        self.next_media_load_request_id = self.next_media_load_request_id.saturating_add(1).max(1);
+
+        let (tx, rx) = crossbeam_channel::bounded::<MediaLoadResult>(1);
+        self.pending_media_load = Some(PendingMediaLoad {
+            request_id,
+            path: path.clone(),
+            kind: PendingMediaLoadKind::Image,
+            started_at: Instant::now(),
+        });
+        self.pending_media_load_rx = Some(rx);
+
+        crate::async_runtime::spawn_blocking_or_thread("solo-image-load", move || {
+            let result = LoadedImage::load_first_frame_only(
+                &path,
+                Some(max_texture_side),
+                downscale_filter,
+                gif_filter,
+            )
+            .map(|image| AsyncImageLoad {
+                image,
+                is_animated_webp: LoadedImage::is_animated_webp(&path),
+                max_texture_side,
+                gif_filter,
+            });
+
+            let _ = tx.send(MediaLoadResult::Image {
+                request_id,
+                path,
+                result,
+            });
+        });
+    }
+
+    fn start_async_video_load(&mut self, path: PathBuf) {
+        let request_id = self.next_media_load_request_id;
+        self.next_media_load_request_id = self.next_media_load_request_id.saturating_add(1).max(1);
+
+        let muted = self.config.video_muted_by_default;
+        let initial_volume = self.config.video_default_volume;
+        let prefer_hardware_decode = self.config.video_prefer_hardware_decode;
+        let disable_hardware_decode = self.config.video_disable_hardware_decode;
+
+        let (tx, rx) = crossbeam_channel::bounded::<MediaLoadResult>(1);
+        self.pending_media_load = Some(PendingMediaLoad {
+            request_id,
+            path: path.clone(),
+            kind: PendingMediaLoadKind::Video,
+            started_at: Instant::now(),
+        });
+        self.pending_media_load_rx = Some(rx);
+
+        crate::async_runtime::spawn_blocking_or_thread("solo-video-load", move || {
+            let result = VideoPlayer::new(
+                &path,
+                muted,
+                initial_volume,
+                prefer_hardware_decode,
+                disable_hardware_decode,
+            )
+            .and_then(|mut player| {
+                player.play()?;
+                Ok(player)
+            });
+
+            let _ = tx.send(MediaLoadResult::Video {
+                request_id,
+                path,
+                result,
+            });
+        });
+    }
+
+    fn poll_pending_media_load(&mut self, ctx: &egui::Context) {
+        let result = {
+            let Some(rx) = self.pending_media_load_rx.as_ref() else {
+                return;
+            };
+
+            match rx.try_recv() {
+                Ok(result) => result,
+                Err(crossbeam_channel::TryRecvError::Empty) => return,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    self.clear_pending_media_load();
+                    return;
+                }
+            }
+        };
+
+        let pending = self.pending_media_load.take();
+        self.pending_media_load_rx = None;
+
+        let Some(pending) = pending else {
+            return;
+        };
+
+        let (result_request_id, result_path) = match &result {
+            MediaLoadResult::Image {
+                request_id, path, ..
+            } => (*request_id, path),
+            MediaLoadResult::Video {
+                request_id, path, ..
+            } => (*request_id, path),
+        };
+
+        if result_request_id != pending.request_id || result_path != &pending.path {
+            return;
+        }
+
+        self.perf_metrics
+            .record_duration("load_media_async_ms", pending.started_at.elapsed());
+
+        match result {
+            MediaLoadResult::Image { path, result, .. } => match result {
+                Ok(loaded) => {
+                    self.cache_loaded_image_first_frame(
+                        &path,
+                        loaded.max_texture_side,
+                        &loaded.image,
+                        loaded.is_animated_webp,
+                    );
+                    self.image = Some(loaded.image);
+                    self.texture_frame = usize::MAX;
+                    self.image_changed = true;
+                    self.pending_media_layout = false;
+                    self.error_message = None;
+
+                    if loaded.is_animated_webp {
+                        if let Some(rx) = LoadedImage::start_streaming_webp(
+                            &path,
+                            Some(loaded.max_texture_side),
+                            loaded.gif_filter,
+                        ) {
+                            self.anim_stream_rx = Some(rx);
+                            self.anim_stream_path = Some(path);
+                            self.anim_stream_done = false;
+                            self.anim_seekbar_total_frames = Some(
+                                self.image
+                                    .as_ref()
+                                    .map(|image| image.frame_count())
+                                    .unwrap_or(1),
+                            );
+                        }
+                    }
+                }
+                Err(err) => {
+                    self.error_message = Some(err);
+                }
+            },
+            MediaLoadResult::Video { result, .. } => match result {
+                Ok(player) => {
+                    self.video_player = Some(player);
+                    self.image_changed = true;
+                    self.pending_media_layout = true;
+                    self.error_message = None;
+                    self.show_video_controls = true;
+                    self.touch_bottom_overlays();
+                }
+                Err(err) => {
+                    self.error_message = Some(format!("Failed to load video: {}", err));
+                }
+            },
+        }
+
+        ctx.request_repaint();
+    }
+
     /// Load an image from path
     fn load_image(&mut self, path: &PathBuf) {
         self.load_media(path);
@@ -2535,6 +2757,7 @@ impl ImageViewer {
         let load_media_start = Instant::now();
 
         self.reset_masonry_metadata_preload();
+        self.clear_pending_media_load();
 
         // Update the native window title (taskbar title) using Unicode-safe conversion.
         self.pending_window_title = Some(self.compute_window_title_for_path(path));
@@ -2611,6 +2834,7 @@ impl ImageViewer {
         self.zoom = 1.0;
         self.zoom_target = 1.0;
         self.pending_media_layout = false;
+        self.error_message = None;
 
         // Reuse cached directory listing when the parent folder is unchanged.
         let index_stats_before = self.media_directory_index.stats();
@@ -2663,34 +2887,7 @@ impl ImageViewer {
                 // Mark GStreamer as initialized (it will be lazily initialized on first use)
                 self.gstreamer_initialized = true;
 
-                // Load as video
-                match VideoPlayer::new(
-                    path,
-                    self.config.video_muted_by_default,
-                    self.config.video_default_volume,
-                    self.config.video_prefer_hardware_decode,
-                    self.config.video_disable_hardware_decode,
-                ) {
-                    Ok(mut player) => {
-                        // Start playback
-                        if let Err(e) = player.play() {
-                            self.error_message = Some(format!("Failed to play video: {}", e));
-                            self.perf_metrics
-                                .record_duration("load_media_sync_ms", load_media_start.elapsed());
-                            return;
-                        }
-                        self.video_player = Some(player);
-                        self.image_changed = true;
-                        // Video dimensions may not be known until the first decoded frame.
-                        self.pending_media_layout = true;
-                        self.error_message = None;
-                        self.show_video_controls = true;
-                        self.touch_bottom_overlays();
-                    }
-                    Err(e) => {
-                        self.error_message = Some(format!("Failed to load video: {}", e));
-                    }
-                }
+                self.start_async_video_load(path.clone());
             }
             Some(MediaType::Image) => {
                 // Load as image with configured filters.
@@ -2703,42 +2900,16 @@ impl ImageViewer {
 
                 if self.try_load_image_from_decoded_cache(path, max_tex, gif_filter) {
                     self.perf_metrics
-                        .record_duration("load_media_sync_ms", load_media_start.elapsed());
+                        .record_duration("load_media_prepare_ms", load_media_start.elapsed());
                     return;
                 }
 
-                match LoadedImage::load_first_frame_only(
-                    path,
-                    Some(max_tex),
+                self.start_async_image_load(
+                    path.clone(),
+                    max_tex,
                     downscale_filter,
                     gif_filter,
-                ) {
-                    Ok(img) => {
-                        let is_animated_webp = LoadedImage::is_animated_webp(path);
-                        self.cache_loaded_image_first_frame(path, max_tex, &img, is_animated_webp);
-                        self.image = Some(img);
-                        self.texture_frame = usize::MAX;
-                        self.image_changed = true;
-                        self.pending_media_layout = false;
-                        self.error_message = None;
-
-                        if is_animated_webp {
-                            // Start streaming frames one-by-one from a background thread.
-                            if let Some(rx) =
-                                LoadedImage::start_streaming_webp(path, Some(max_tex), gif_filter)
-                            {
-                                self.anim_stream_rx = Some(rx);
-                                self.anim_stream_path = Some(path.to_path_buf());
-                                self.anim_stream_done = false;
-                                self.anim_seekbar_total_frames =
-                                    Some(self.image.as_ref().map(|i| i.frame_count()).unwrap_or(1));
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        self.error_message = Some(e);
-                    }
-                }
+                );
             }
             None => {
                 self.error_message = Some(format!("Unsupported file format: {:?}", path));
@@ -2746,7 +2917,7 @@ impl ImageViewer {
         }
 
         self.perf_metrics
-            .record_duration("load_media_sync_ms", load_media_start.elapsed());
+            .record_duration("load_media_prepare_ms", load_media_start.elapsed());
     }
 
     /// Save the current view state for the current image (fullscreen only).
@@ -10901,6 +11072,12 @@ impl ImageViewer {
                         // Keep repainting so the spinner animates smoothly.
                         ctx.request_repaint();
                     }
+
+                    if self.pending_media_load.is_some() {
+                        let time = ui.input(|i| i.time);
+                        paint_loading_spinner(ui.painter(), final_rect, time);
+                        ctx.request_repaint_after(Duration::from_millis(16));
+                    }
                 } else if let Some(ref error) = self.error_message {
                     ui.centered_and_justified(|ui| {
                         ui.label(
@@ -10910,10 +11087,29 @@ impl ImageViewer {
                         );
                     });
                 } else {
-                    // Only show the empty-state hint when nothing is loaded.
-                    // When switching videos, we can have a player but not yet have the first decoded frame,
-                    // so avoid flashing this message.
-                    if self.image.is_none() && self.video_player.is_none() {
+                    if let Some(pending) = self.pending_media_load.as_ref() {
+                        let rect = ui.max_rect();
+                        let spinner_rect = egui::Rect::from_center_size(
+                            rect.center() + egui::vec2(0.0, -18.0),
+                            egui::vec2(64.0, 64.0),
+                        );
+                        let time = ui.input(|i| i.time);
+                        paint_loading_spinner(ui.painter(), spinner_rect, time);
+
+                        let loading_text = match pending.kind {
+                            PendingMediaLoadKind::Image => "Loading image...",
+                            PendingMediaLoadKind::Video => "Loading video...",
+                        };
+
+                        ui.painter().text(
+                            rect.center() + egui::vec2(0.0, 28.0),
+                            egui::Align2::CENTER_CENTER,
+                            loading_text,
+                            egui::FontId::proportional(16.0),
+                            egui::Color32::LIGHT_GRAY,
+                        );
+                        ctx.request_repaint_after(Duration::from_millis(16));
+                    } else if self.image.is_none() && self.video_player.is_none() {
                         ui.centered_and_justified(|ui| {
                             ui.label(
                                 egui::RichText::new(
@@ -10971,6 +11167,7 @@ impl eframe::App for ImageViewer {
         }
 
         self.poll_pending_media_directory_scan(ctx);
+        self.poll_pending_media_load(ctx);
 
         // Keep our cached screen size in sync with the real viewport.
         // Manga mode uses this for layout/scroll math; if it drifts from `ctx.screen_rect()`,
@@ -11442,7 +11639,9 @@ impl eframe::App for ImageViewer {
             .video_player
             .as_ref()
             .map_or(false, |player| player.is_playing());
+        let media_load_pending = self.pending_media_load.is_some();
         self.fps_last_frame_was_active = any_animation_active
+            || media_load_pending
             || self.pending_media_layout
             || manga_needs_fast_background_poll
             || manga_background_work_pending
@@ -11475,6 +11674,8 @@ impl eframe::App for ImageViewer {
             } else {
                 ctx.request_repaint();
             }
+        } else if media_load_pending {
+            ctx.request_repaint_after(Duration::from_millis(16));
         } else if self.pending_media_layout {
             ctx.request_repaint_after(Duration::from_millis(16));
         } else if manga_needs_fast_background_poll {
