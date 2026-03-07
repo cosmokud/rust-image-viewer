@@ -32,6 +32,7 @@ All notable changes to this project will be documented in this file.
 ### Added
 
 - Added `fullscreen_native_window_transition` to the settings INI so users can switch between the native animated maximize or restore-down fullscreen path and the old instant fullscreen snap.
+- Added pass-1 masonry smoothness diagnostics for frame pacing, UI update cost, decoded-mailbox depth, and visible texture transition timing, plus optional puffin scopes around the main update loop and manga texture uploads.
 
 ## [v0.2.1] - 2026-03-06
 
