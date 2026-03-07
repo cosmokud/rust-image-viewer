@@ -1432,10 +1432,10 @@ impl ImageViewer {
     const MANGA_HUD_PANEL_INNER_WIDTH: f32 = 208.0;
     const MANGA_HUD_PANEL_INNER_HEIGHT: f32 = 24.0;
     const MANGA_HUD_PANEL_VERTICAL_STEP: f32 = 48.0;
-    const MANGA_UPLOAD_BATCH_BASE: usize = 4;
-    const MANGA_UPLOAD_BATCH_MIN: usize = 2;
-    const MANGA_UPLOAD_BATCH_MAX: usize = 12;
-    const MANGA_DECODED_MAILBOX_MAX_ITEMS: usize = 16;
+    const MANGA_UPLOAD_BATCH_BASE: usize = 6;
+    const MANGA_UPLOAD_BATCH_MIN: usize = 3;
+    const MANGA_UPLOAD_BATCH_MAX: usize = 20;
+    const MANGA_DECODED_MAILBOX_MAX_ITEMS: usize = 64;
     const MANGA_UPLOAD_P95_SOFT_BUDGET_MS: f32 = 4.5;
     const MANGA_UPLOAD_P95_HARD_BUDGET_MS: f32 = 7.5;
     const MANGA_VIRTUALIZATION_AUTO_RTREE_MIN_ITEMS: usize = 2048;
@@ -4735,14 +4735,6 @@ impl ImageViewer {
         self.clear_strip_return_context();
     }
 
-    fn masonry_cache_multiplier(&self) -> usize {
-        if self.is_masonry_mode() {
-            2
-        } else {
-            1
-        }
-    }
-
     fn manga_should_force_triangle_filters(&self) -> bool {
         self.is_masonry_mode()
     }
@@ -5410,8 +5402,22 @@ impl ImageViewer {
     }
 
     fn navigation_preload_window(&self) -> (usize, usize) {
-        let mul = self.masonry_cache_multiplier();
-        (30usize.saturating_mul(mul), 60usize.saturating_mul(mul))
+        let visible = self.manga_visible_indices_last.max(1);
+        let min_behind = if self.is_masonry_mode() {
+            self.masonry_items_per_row.clamp(2, 10).saturating_mul(4)
+        } else {
+            8
+        };
+        let min_ahead = if self.is_masonry_mode() {
+            self.masonry_items_per_row.clamp(2, 10).saturating_mul(8)
+        } else {
+            16
+        };
+
+        (
+            visible.max(min_behind),
+            visible.saturating_mul(2).max(min_ahead),
+        )
     }
 
     fn invalidate_manga_layout_cache(&mut self) {
@@ -7140,82 +7146,47 @@ impl ImageViewer {
             }
         }
 
-        let cache_multiplier = self.masonry_cache_multiplier();
-        let navigation_active_for_loader =
-            is_masonry && self.masonry_navigation_active_for_heavy_work();
-
-        // Update the loader's visible page count for adaptive preloading
+        // Update the loader's visible item count using the actual visible set. When the R-tree
+        // backend is active, `visible_indices` already reflects the current on-screen tile count.
         if let Some(ref mut loader) = self.manga_loader {
-            let mut visible_for_loader = visible_page_count.saturating_mul(cache_multiplier);
-            if navigation_active_for_loader {
-                // While actively navigating dense masonry layouts, keep speculative preload tighter.
-                let directional_cap = visible_indices_count.saturating_mul(2).max(1);
-                visible_for_loader = visible_for_loader.min(directional_cap);
-            }
-            let cache_limited_visible =
-                visible_for_loader.min(self.manga_cache_target_capacity.max(1));
+            let visible_for_loader = visible_indices_count.max(1);
+            let cache_limited_visible = visible_for_loader.min(self.manga_cache_target_capacity.max(1));
             loader.update_visible_page_count(cache_limited_visible.max(1));
         }
 
-        // Cache dimensions for a window around the visible range.
-        // Bias the window by scroll direction: when scrolling UP we need much more behind cached
-        // to avoid "unknown height -> real height" corrections from pushing the viewport around.
-        // Scale the dimension cache window based on visible pages for better coverage
+        // Cache dimensions for a directional window around the visible range.
+        // Use the actual visible item count so backend probe work scales with what is truly on screen.
         let scrolling_up = self.manga_scroll_offset < prev_scroll_pos - 0.5;
-        let dim_scale = (visible_page_count as f32 / 2.0).max(1.0) as usize;
-        let max_behind = if is_masonry {
-            240usize.saturating_mul(masonry_rows)
+        let moving_up = scrolling_up || self.manga_scroll_velocity < -0.5;
+        let directional_visible = visible_indices_count.max(1);
+        let look_forward = directional_visible.saturating_mul(2);
+        let look_backward = directional_visible;
+        let min_forward = if is_masonry {
+            masonry_rows.saturating_mul(8)
         } else {
-            200
+            16
+        };
+        let min_backward = if is_masonry {
+            masonry_rows.saturating_mul(4)
+        } else {
+            8
+        };
+        let max_behind = if is_masonry {
+            384usize.saturating_mul(masonry_rows)
+        } else {
+            384
         };
         let max_ahead = if is_masonry {
-            240usize.saturating_mul(masonry_rows)
+            768usize.saturating_mul(masonry_rows)
         } else {
-            100
+            768
         };
-        let (base_behind, base_ahead) = if scrolling_up {
-            (
-                80usize.saturating_mul(dim_scale),
-                20usize.saturating_mul(dim_scale),
-            )
+        let forward = look_forward.max(min_forward);
+        let backward = look_backward.max(min_backward);
+        let (behind, ahead) = if moving_up {
+            (forward.min(max_behind), backward.min(max_ahead))
         } else {
-            (
-                20usize.saturating_mul(dim_scale),
-                80usize.saturating_mul(dim_scale),
-            )
-        };
-        let behind_raw = base_behind.saturating_mul(cache_multiplier);
-        let ahead_raw = base_ahead.saturating_mul(cache_multiplier);
-        let (behind, ahead) = if is_masonry {
-            // Masonry baseline: symmetric window scaled with rows-per-row.
-            let symmetric = behind_raw
-                .max(ahead_raw)
-                .saturating_mul(masonry_side_multiplier)
-                .max(80usize.saturating_mul(masonry_rows))
-                .min(max_behind.max(max_ahead));
-
-            let fast_directional = self.manga_scrollbar_dragging
-                || self.is_panning
-                || self.manga_wheel_scroll_active
-                || self.manga_scroll_velocity.abs() > 1.2;
-            if fast_directional {
-                let leading = symmetric.saturating_mul(3) / 2;
-                let trailing = (symmetric / 2).max(24usize.saturating_mul(masonry_rows));
-                let moving_up = scrolling_up || self.manga_scroll_velocity < -0.5;
-
-                self.perf_metrics
-                    .increment_counter("manga_preload_directional_nav", 1);
-
-                if moving_up {
-                    (leading.min(max_behind), trailing.min(max_ahead))
-                } else {
-                    (trailing.min(max_behind), leading.min(max_ahead))
-                }
-            } else {
-                (symmetric, symmetric)
-            }
-        } else {
-            (behind_raw.min(max_behind), ahead_raw.min(max_ahead))
+            (backward.min(max_behind), forward.min(max_ahead))
         };
 
         let cache_start = current_visible_index.saturating_sub(behind);
@@ -7250,7 +7221,7 @@ impl ImageViewer {
         let (keep_ahead, keep_behind) = if let Some(ref loader) = self.manga_loader {
             (loader.get_preload_ahead(), loader.get_preload_behind())
         } else {
-            (16, 8)
+            (32, 16)
         };
 
         // Apply eviction policy
@@ -7551,7 +7522,7 @@ impl ImageViewer {
                 Vec::new()
             } else {
                 loader.poll_decoded_images_with_limit(
-                    mailbox_headroom.min(upload_batch_limit.saturating_mul(2).max(1)),
+                    mailbox_headroom.min(upload_batch_limit.saturating_mul(4).max(1)),
                 )
             };
 

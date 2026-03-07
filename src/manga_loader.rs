@@ -45,28 +45,25 @@ use crate::metadata_cache::{
 
 /// Maximum number of decoded images to hold in memory awaiting GPU upload.
 /// This bounds memory usage even if the main thread is slow to consume results.
-const MAX_PENDING_UPLOADS: usize = 32;
+const MAX_PENDING_UPLOADS: usize = 128;
 
 /// Maximum number of images to keep in the texture cache.
 /// Beyond this, the oldest entries are evicted to control VRAM usage.
 const DEFAULT_CACHED_TEXTURES: usize = 128;
 
 /// Small dedicated queue for visible-item retries that should not wait behind preload churn.
-const URGENT_REQUEST_QUEUE_CAPACITY: usize = 64;
+const URGENT_REQUEST_QUEUE_CAPACITY: usize = 128;
 
-/// Fixed buffer to add AHEAD of visible pages (in scroll direction) for preloading.
-/// If 14 pages are visible and scrolling down, we preload 14 + 4 = 18 ahead.
-const PRELOAD_BUFFER_AHEAD: usize = 4;
+/// Directional preload window multipliers derived from the actual number of visible items.
+/// The scroll direction gets 2x visible items ahead; the reverse direction gets 1x behind.
+const PRELOAD_LOOK_AHEAD_MULTIPLIER: usize = 2;
+const PRELOAD_LOOK_BEHIND_MULTIPLIER: usize = 1;
 
-/// Fixed buffer to add BEHIND visible pages (opposite scroll direction) for preloading.
-/// If 14 pages are visible and scrolling down, we preload 14 + 2 = 16 behind.
-const PRELOAD_BUFFER_BEHIND: usize = 2;
-
-/// Minimum preload counts (even when only 1 page is visible)
-const MIN_PRELOAD: usize = 4;
-
-/// Maximum preload counts (to prevent excessive memory usage)
-const MAX_PRELOAD: usize = 48;
+/// Clamp the directional preload windows to keep memory usage bounded.
+const MIN_PRELOAD_AHEAD: usize = 12;
+const MIN_PRELOAD_BEHIND: usize = 6;
+const MAX_PRELOAD_AHEAD: usize = 256;
+const MAX_PRELOAD_BEHIND: usize = 128;
 
 /// If the visible index jumps by more than this many pages, treat it as a "large jump".
 ///
@@ -197,7 +194,7 @@ pub struct MangaLoader {
     current_generation: usize,
     /// Statistics for debugging
     pub stats: LoaderStats,
-    /// Estimated number of pages visible on screen (for adaptive preloading)
+    /// Estimated number of visible items on screen (for adaptive preloading)
     visible_page_count: usize,
 }
 
@@ -1326,23 +1323,25 @@ impl MangaLoader {
     /// - AHEAD (scroll direction): visible_pages + 4
     /// - BEHIND (opposite direction): visible_pages + 2
     ///
-    /// For example, if 14 pages are visible:
-    /// - Scrolling down: 18 ahead, 16 behind
-    /// - Scrolling up: 18 behind, 16 ahead
+    /// For example, if 14 items are visible:
+    /// - Scrolling down: 28 ahead, 14 behind
+    /// - Scrolling up: 28 behind, 14 ahead
     ///
     /// Returns (preload_ahead, preload_behind)
     fn calculate_preload_counts(&self) -> (usize, usize) {
-        let visible_pages = self.visible_page_count.max(1);
-
-        // More buffer ahead (in scroll direction), less behind
-        let ahead = (visible_pages + PRELOAD_BUFFER_AHEAD).clamp(MIN_PRELOAD, MAX_PRELOAD);
-        let behind = (visible_pages + PRELOAD_BUFFER_BEHIND).clamp(MIN_PRELOAD, MAX_PRELOAD);
+        let visible_items = self.visible_page_count.max(1);
+        let ahead = visible_items
+            .saturating_mul(PRELOAD_LOOK_AHEAD_MULTIPLIER)
+            .clamp(MIN_PRELOAD_AHEAD, MAX_PRELOAD_AHEAD);
+        let behind = visible_items
+            .saturating_mul(PRELOAD_LOOK_BEHIND_MULTIPLIER)
+            .clamp(MIN_PRELOAD_BEHIND, MAX_PRELOAD_BEHIND);
 
         (ahead, behind)
     }
 
-    /// Update the visible page count for adaptive preloading.
-    /// Call this after calculating how many pages are visible on screen.
+    /// Update the visible item count for adaptive preloading.
+    /// Call this after calculating how many items are visible on screen.
     pub fn update_visible_page_count(&mut self, visible_page_count: usize) {
         self.visible_page_count = visible_page_count.max(1);
     }
@@ -1360,9 +1359,7 @@ impl MangaLoader {
     /// Request loading of images around the visible range.
     /// Uses priority-based loading with scroll direction and visibility awareness.
     ///
-    /// The algorithm adapts to visible pages:
-    /// - 1 page visible: preload 1 + 4 = 5 ahead and behind
-    /// - 14 pages visible: preload 14 + 4 = 18 ahead and behind
+    /// The algorithm adapts to the number of currently visible items.
     pub fn update_preload_queue(
         &mut self,
         image_list: &[PathBuf],
@@ -1425,7 +1422,7 @@ impl MangaLoader {
         let mut requests: Vec<LoadRequest> = Vec::new();
         let generation = self.current_generation;
         let now = Instant::now();
-        let visible_retry_radius = self.visible_page_count.saturating_sub(1).min(6);
+        let visible_retry_radius = self.visible_page_count.clamp(6, 24);
 
         {
             let loading = self.loading_indices.read();
