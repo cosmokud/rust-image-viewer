@@ -4231,6 +4231,27 @@ impl ImageViewer {
         }
     }
 
+    fn sync_current_index_to_visible_media(&mut self) {
+        let visible_path = self
+            .image
+            .as_ref()
+            .map(|img| &img.path)
+            .or(self.pending_file_size_probe_path.as_ref())
+            .or(self.current_file_size_label_path.as_ref());
+
+        let Some(visible_path) = visible_path else {
+            return;
+        };
+
+        if let Some(index) = self
+            .image_list
+            .iter()
+            .position(|candidate| candidate == visible_path)
+        {
+            self.set_current_index_clamped(index);
+        }
+    }
+
     fn current_titlebar_return_mode(&self) -> TitlebarToggleReturnMode {
         if self.manga_mode {
             TitlebarToggleReturnMode::Manga(self.manga_layout_mode)
@@ -4245,6 +4266,7 @@ impl ImageViewer {
         &mut self,
         return_mode: Option<TitlebarToggleReturnMode>,
     ) {
+        self.sync_current_index_to_visible_media();
         self.toggle_fullscreen_from_titlebar = true;
         if self.config.maximize_to_borderless_fullscreen {
             self.toggle_fullscreen_force_borderless = true;
@@ -4320,7 +4342,15 @@ impl ImageViewer {
         }
 
         self.titlebar_pending_restore_layout = None;
+
+        if self.strip_return_mode_for_fullscreen_toggle() == Some(layout_mode) {
+            self.return_to_strip_mode_from_middle_click();
+            self.touch_bottom_overlays();
+            return true;
+        }
+
         self.clear_strip_return_context();
+        self.sync_current_index_to_visible_media();
         self.manga_layout_mode = layout_mode;
         self.toggle_manga_mode();
         self.touch_bottom_overlays();
@@ -4690,6 +4720,7 @@ impl ImageViewer {
             return;
         }
 
+        self.sync_current_index_to_visible_media();
         self.reset_gif_seek_interaction_state();
 
         let restore_masonry_state = if layout_mode == MangaLayoutMode::Masonry {
@@ -11201,6 +11232,12 @@ impl ImageViewer {
 
         if right_click_toggle_fullscreen {
             self.stop_manga_autoscroll();
+            if !self.is_fullscreen {
+                if let Some(previous_mode) = self.titlebar_previous_mode.take() {
+                    self.request_titlebar_fullscreen_reentry(Some(previous_mode));
+                    return;
+                }
+            }
             if self.config.maximize_to_borderless_fullscreen && !self.is_fullscreen {
                 self.toggle_fullscreen_force_borderless = true;
             }
@@ -13768,6 +13805,13 @@ impl eframe::App for ImageViewer {
                 && !self.toggle_fullscreen_force_borderless;
             let entering_titlebar_strip =
                 toggled_from_titlebar && self.titlebar_pending_restore_layout.is_some();
+            let preserve_strip_return_context = !entering_fullscreen
+                && toggled_from_titlebar
+                && self.strip_return_mode_for_fullscreen_toggle().is_some()
+                && matches!(
+                    self.titlebar_previous_mode,
+                    Some(TitlebarToggleReturnMode::Manga(_))
+                );
 
             if !toggled_from_titlebar {
                 self.titlebar_pending_restore_layout = None;
@@ -13845,7 +13889,9 @@ impl eframe::App for ImageViewer {
                     self.fullscreen_transition = 0.0;
                     self.fullscreen_transition_target = 0.0;
                     self.pending_fullscreen_layout = false;
-                    self.clear_strip_return_context();
+                    if !preserve_strip_return_context {
+                        self.clear_strip_return_context();
+                    }
 
                     // Exit manga mode when leaving fullscreen
                     if self.manga_mode {
