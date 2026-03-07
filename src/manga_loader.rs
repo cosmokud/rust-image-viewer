@@ -38,9 +38,9 @@ use crate::image_loader::{
     MediaType,
 };
 use crate::metadata_cache::{
-    lookup_cached_dimensions, lookup_cached_static_thumbnail, lookup_cached_video_thumbnail,
-    store_cached_dimensions, store_cached_static_thumbnail, store_cached_video_thumbnail,
-    CachedImageThumbnail, CachedMediaKind, CachedVideoThumbnail,
+    lookup_cached_dimensions, lookup_cached_dimensions_batch, lookup_cached_static_thumbnail,
+    lookup_cached_video_thumbnail, store_cached_dimensions, store_cached_static_thumbnail,
+    store_cached_video_thumbnail, CachedImageThumbnail, CachedMediaKind, CachedVideoThumbnail,
 };
 
 /// Maximum number of decoded images to hold in memory awaiting GPU upload.
@@ -1574,7 +1574,7 @@ impl MangaLoader {
     /// Start async dimension caching for all images in the list.
     /// This returns immediately and caches dimensions in the background.
     /// The first few visible images are prioritized.
-    pub fn cache_all_dimensions(&mut self, image_list: &[PathBuf]) {
+    pub fn cache_all_dimensions(&mut self, image_list: &[PathBuf]) -> usize {
         // For fast startup, only cache the first batch of visible media synchronously.
         // The rest will be cached on-demand or when media is loaded.
         const INITIAL_CACHE_COUNT: usize = 30;
@@ -1582,11 +1582,56 @@ impl MangaLoader {
         // Clear existing cache
         self.dimension_cache.clear();
 
-        // Cache first batch synchronously for immediate layout
-        let initial_batch: Vec<(usize, Option<(u32, u32, MangaMediaType)>)> = image_list
-            .par_iter()
-            .take(INITIAL_CACHE_COUNT)
+        if image_list.is_empty() {
+            return 0;
+        }
+
+        let cached_lookup_items: Vec<(usize, CachedMediaKind, PathBuf)> = image_list
+            .iter()
             .enumerate()
+            .filter_map(|(idx, path)| {
+                if is_supported_video(path) {
+                    Some((idx, CachedMediaKind::Video, path.clone()))
+                } else if is_supported_image(path) {
+                    Some((idx, CachedMediaKind::Image, path.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if !cached_lookup_items.is_empty() {
+            let batch_items: Vec<(PathBuf, CachedMediaKind)> = cached_lookup_items
+                .iter()
+                .map(|(_, kind, path)| (path.clone(), *kind))
+                .collect();
+            let cached_results = lookup_cached_dimensions_batch(&batch_items);
+
+            for ((idx, kind, _), cached) in cached_lookup_items.iter().zip(cached_results.into_iter())
+            {
+                if let Some((w, h)) = cached {
+                    let media_type = match kind {
+                        CachedMediaKind::Image => MangaMediaType::StaticImage,
+                        CachedMediaKind::Video => MangaMediaType::Video,
+                    };
+                    self.dimension_cache.insert(*idx, (w, h, media_type));
+                }
+            }
+        }
+
+        // Cache first batch synchronously for immediate layout
+        let initial_probe_items: Vec<(usize, PathBuf)> = image_list
+            .iter()
+            .enumerate()
+            .filter(|(idx, path)| {
+                !self.dimension_cache.contains_key(idx)
+                    && (is_supported_video(path) || is_supported_image(path))
+            })
+            .take(INITIAL_CACHE_COUNT)
+            .map(|(idx, path)| (idx, path.clone()))
+            .collect();
+        let initial_batch: Vec<(usize, Option<(u32, u32, MangaMediaType)>)> = initial_probe_items
+            .par_iter()
             .map(|(idx, path)| {
                 let is_video = is_supported_video(path);
                 let is_image = is_supported_image(path);
@@ -1594,15 +1639,15 @@ impl MangaLoader {
                 if is_video {
                     // For videos, probe dimensions
                     let dims = Self::probe_video_dimensions(path);
-                    (idx, dims.map(|(w, h)| (w, h, MangaMediaType::Video)))
+                    (*idx, dims.map(|(w, h)| (w, h, MangaMediaType::Video)))
                 } else if is_image {
                     // For images, get from file header
                     let dims = Self::probe_image_dimensions_cached(path);
                     // We can't easily determine if an image is animated without loading it
                     // Default to static, will be updated when actually loaded
-                    (idx, dims.map(|(w, h)| (w, h, MangaMediaType::StaticImage)))
+                    (*idx, dims.map(|(w, h)| (w, h, MangaMediaType::StaticImage)))
                 } else {
-                    (idx, None)
+                    (*idx, None)
                 }
             })
             .collect();
@@ -1614,10 +1659,10 @@ impl MangaLoader {
 
         // The rest will be cached on-demand when media is loaded
         // or when manga_get_image_display_height is called
+        self.cached_dimensions_count(image_list.len())
     }
 
-    /// Clear all caches and reset state (called when exiting manga mode).
-    pub fn clear(&mut self) {
+    fn clear_with_dimension_policy(&mut self, preserve_dimensions: bool) {
         // Increment generation to invalidate pending requests
         self.current_generation += 1;
         self.generation
@@ -1629,7 +1674,9 @@ impl MangaLoader {
         self.retry_state.write().clear();
 
         // Clear dimension cache
-        self.dimension_cache.clear();
+        if !preserve_dimensions {
+            self.dimension_cache.clear();
+        }
 
         // Clear any queued dimension probes
         self.dim_pending.clear();
@@ -1642,9 +1689,17 @@ impl MangaLoader {
 
         // Note: we can't directly drain the request channel from here because we only own
         // the Sender; cancellation is handled via generation checks in the coordinator.
-
-        // Reset stats
         self.stats = LoaderStats::default();
+    }
+
+    /// Clear all caches and reset state (called when exiting manga mode).
+    pub fn clear(&mut self) {
+        self.clear_with_dimension_policy(false);
+    }
+
+    /// Clear runtime state but keep the current list's cached dimensions warm.
+    pub fn clear_preserving_dimensions(&mut self) {
+        self.clear_with_dimension_policy(true);
     }
 
     /// Mark an index as needing reload (called when cache is evicted).

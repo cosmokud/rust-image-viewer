@@ -205,6 +205,64 @@ impl MetadataCache {
         Some((record.width, record.height))
     }
 
+    pub fn lookup_dimensions_batch(
+        &self,
+        items: &[(PathBuf, CachedMediaKind)],
+    ) -> Vec<Option<(u32, u32)>> {
+        let Ok(read_txn) = self.db.begin_read() else {
+            return vec![None; items.len()];
+        };
+        let Ok(table) = read_txn.open_table(METADATA_TABLE) else {
+            return vec![None; items.len()];
+        };
+
+        let now_secs = unix_now_secs();
+        let mut results = Vec::with_capacity(items.len());
+
+        for (path, expected_kind) in items {
+            let Some(fingerprint) = fingerprint(path.as_path()) else {
+                results.push(None);
+                continue;
+            };
+
+            let key = cache_key(path.as_path());
+            let raw = match table.get(key.as_str()) {
+                Ok(Some(raw)) => raw,
+                _ => {
+                    results.push(None);
+                    continue;
+                }
+            };
+            let Some(record) = decode_record(raw.value()) else {
+                results.push(None);
+                continue;
+            };
+
+            if record.cached_at_secs > 0
+                && now_secs.saturating_sub(record.cached_at_secs) > DIMENSION_CACHE_TTL_SECS
+            {
+                DIMENSION_EXPIRED.fetch_add(1, Ordering::Relaxed);
+                results.push(None);
+                continue;
+            }
+
+            if &record.media_kind != expected_kind
+                || record.fingerprint.size_bytes != fingerprint.size_bytes
+                || record.fingerprint.modified_secs != fingerprint.modified_secs
+                || record.fingerprint.modified_nanos != fingerprint.modified_nanos
+                || record.width == 0
+                || record.height == 0
+            {
+                results.push(None);
+                continue;
+            }
+
+            results.push(Some((record.width, record.height)));
+        }
+
+        results
+    }
+
     pub fn store_dimensions(
         &mut self,
         path: &Path,
@@ -782,6 +840,31 @@ pub fn lookup_cached_dimensions(path: &Path, expected_kind: CachedMediaKind) -> 
     }
 
     result
+}
+
+pub fn lookup_cached_dimensions_batch(
+    items: &[(PathBuf, CachedMediaKind)],
+) -> Vec<Option<(u32, u32)>> {
+    if items.is_empty() {
+        return Vec::new();
+    }
+
+    let Some(cache) = global_cache_handle() else {
+        DIMENSION_MISSES.fetch_add(items.len() as u64, Ordering::Relaxed);
+        return vec![None; items.len()];
+    };
+
+    let results = cache.lock().lookup_dimensions_batch(items);
+    let hits = results.iter().filter(|result| result.is_some()).count() as u64;
+    let misses = items.len() as u64 - hits;
+    if hits > 0 {
+        DIMENSION_HITS.fetch_add(hits, Ordering::Relaxed);
+    }
+    if misses > 0 {
+        DIMENSION_MISSES.fetch_add(misses, Ordering::Relaxed);
+    }
+
+    results
 }
 
 pub fn store_cached_dimensions(path: &Path, media_kind: CachedMediaKind, width: u32, height: u32) {

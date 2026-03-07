@@ -45,7 +45,8 @@ use image::imageops::FilterType;
 use parking_lot::Mutex;
 use smallvec::SmallVec;
 use std::borrow::Cow;
-use std::collections::VecDeque;
+use std::collections::{hash_map::DefaultHasher, VecDeque};
+use std::hash::{Hash, Hasher};
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -768,6 +769,8 @@ struct ImageViewer {
     texture_frame: usize,
     /// List of images in the current directory
     image_list: Vec<PathBuf>,
+    /// Stable signature for the current `image_list` contents.
+    image_list_signature: u64,
     /// Decoded-image cache for fast back/forward navigation in image mode.
     decoded_image_cache: moka::sync::Cache<String, Arc<CachedDecodedImage>>,
     /// Cached directory index used to avoid rescanning unchanged folders on every navigation step.
@@ -1034,6 +1037,8 @@ struct ImageViewer {
     manga_wheel_scroll_active: bool,
     /// High-performance parallel image loader for manga mode
     manga_loader: Option<MangaLoader>,
+    /// Signature of the image list currently represented by `manga_loader.dimension_cache`.
+    manga_dimension_cache_list_signature: u64,
     /// LRU texture cache for manga mode
     manga_texture_cache: MangaTextureCache,
     /// Decoded-image mailbox drained on the UI thread so visible uploads can win over speculative ones.
@@ -1070,6 +1075,7 @@ struct ImageViewer {
     masonry_layout_screen_x: f32,
     masonry_layout_items_per_row: usize,
     masonry_layout_len: usize,
+    masonry_layout_list_signature: u64,
     masonry_layout_valid: bool,
     /// Dimension/layout updates received while masonry navigation is active.
     /// These are applied once motion settles to avoid repeated expensive relayouts.
@@ -1215,6 +1221,7 @@ impl Default for ImageViewer {
             image_texture_dims: None,
             texture_frame: 0,
             image_list: Vec::new(),
+            image_list_signature: 0,
             decoded_image_cache: moka::sync::Cache::builder()
                 .max_capacity(DECODED_IMAGE_CACHE_MAX_BYTES)
                 .weigher(|_, value: &Arc<CachedDecodedImage>| {
@@ -1346,6 +1353,7 @@ impl Default for ImageViewer {
             manga_scroll_velocity: 0.0,
             manga_wheel_scroll_active: false,
             manga_loader: None,
+            manga_dimension_cache_list_signature: 0,
             manga_texture_cache: MangaTextureCache::default(),
             manga_decoded_mailbox: Vec::new(),
             manga_scrollbar_dragging: false,
@@ -1366,6 +1374,7 @@ impl Default for ImageViewer {
             masonry_layout_screen_x: 0.0,
             masonry_layout_items_per_row: 0,
             masonry_layout_len: 0,
+            masonry_layout_list_signature: 0,
             masonry_layout_valid: false,
             masonry_layout_invalidation_deferred: false,
             masonry_pending_dimension_updates: HashSet::new(),
@@ -1478,6 +1487,28 @@ impl ImageViewer {
 
         let clamped = index.min(self.image_list.len().saturating_sub(1));
         self.current_index = clamped;
+    }
+
+    fn compute_image_list_signature(files: &[PathBuf]) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        files.len().hash(&mut hasher);
+        for path in files {
+            path.hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
+    fn set_image_list(&mut self, files: Vec<PathBuf>) {
+        self.image_list = files;
+        self.image_list_signature = Self::compute_image_list_signature(&self.image_list);
+    }
+
+    fn can_reuse_preserved_masonry_layout(&self) -> bool {
+        self.manga_layout_mode == MangaLayoutMode::Masonry
+            && self.masonry_layout_valid
+            && !self.masonry_layout_items.is_empty()
+            && self.masonry_layout_list_signature == self.image_list_signature
+            && self.manga_dimension_cache_list_signature == self.image_list_signature
     }
 
     fn capture_current_media_placeholder(
@@ -3052,19 +3083,22 @@ impl ImageViewer {
         current_media_dims: Option<(u32, u32)>,
         current_media_type: Option<MediaType>,
         current_image_is_animated: bool,
-    ) {
+    ) -> bool {
         let (Some((w, h)), Some(media_type)) = (current_media_dims, current_media_type) else {
-            return;
+            return false;
         };
 
         let manga_media_type =
             Self::manga_media_type_for_current_media(media_type, current_image_is_animated);
 
         if let Some(ref mut loader) = self.manga_loader {
-            loader
-                .dimension_cache
-                .insert(self.current_index, (w, h, manga_media_type));
+            let new_entry = (w, h, manga_media_type);
+            let changed = loader.dimension_cache.get(&self.current_index).copied() != Some(new_entry);
+            loader.dimension_cache.insert(self.current_index, new_entry);
+            return changed;
         }
+
+        false
     }
 
     fn prepare_enter_manga_mode_state(&mut self, current_media_type: Option<MediaType>) {
@@ -3119,6 +3153,26 @@ impl ImageViewer {
         self.stop_manga_autoscroll();
 
         self.tick_masonry_metadata_preload();
+    }
+
+    fn maybe_begin_masonry_metadata_preload(&mut self) {
+        if self.manga_layout_mode != MangaLayoutMode::Masonry || self.image_list.is_empty() {
+            self.reset_masonry_metadata_preload();
+            return;
+        }
+
+        let total = self.image_list.len();
+        let fully_warm = self.manga_loader.as_ref().is_some_and(|loader| {
+            loader.cached_dimensions_count(total) >= total
+                && loader.pending_dimension_probe_count() == 0
+                && loader.pending_dimension_results_count() == 0
+        });
+
+        if fully_warm {
+            self.reset_masonry_metadata_preload();
+        } else {
+            self.begin_masonry_metadata_preload();
+        }
     }
 
     fn restore_masonry_scroll_after_metadata_preload(&mut self) {
@@ -3446,7 +3500,7 @@ impl ImageViewer {
             return;
         }
 
-        self.image_list = files;
+        self.set_image_list(files);
         let resolved_index = self
             .image_list
             .iter()
@@ -3943,10 +3997,10 @@ impl ImageViewer {
         self.pending_media_directory_started_at = None;
 
         if let Some(files) = self.media_directory_index.try_cached_media_for_path(path) {
-            self.image_list = files;
+            self.set_image_list(files);
         } else {
             // Keep current media navigable immediately while the full directory scan runs in background.
-            self.image_list = vec![path.clone()];
+            self.set_image_list(vec![path.clone()]);
             if let Some(rx) = self.media_directory_index.request_media_scan_for_path(path) {
                 self.pending_media_directory_scan = Some(rx);
                 self.pending_media_directory_target = Some(path.clone());
@@ -3955,7 +4009,7 @@ impl ImageViewer {
         }
 
         if self.image_list.is_empty() {
-            self.image_list.push(path.clone());
+            self.set_image_list(vec![path.clone()]);
         }
 
         self.perf_metrics
@@ -4655,7 +4709,7 @@ impl ImageViewer {
         self.strip_return_preserve_masonry_cache = false;
 
         if should_clear_preserved_masonry_cache {
-            self.manga_clear_cache();
+            self.clear_manga_runtime_cache(true);
         }
     }
 
@@ -4774,7 +4828,7 @@ impl ImageViewer {
         let current_image_is_animated = self.image.as_ref().is_some_and(|img| img.is_animated());
 
         self.prepare_enter_manga_mode_state(current_media_type);
-        self.cache_current_media_dimensions_for_manga(
+        let current_dims_changed = self.cache_current_media_dimensions_for_manga(
             current_media_dims,
             current_media_type,
             current_image_is_animated,
@@ -4782,7 +4836,9 @@ impl ImageViewer {
 
         // The fullscreen traversal may have discovered new dimensions for the currently viewed file.
         // Rebuild strip layout with the latest metadata before restoring viewport position.
-        self.invalidate_manga_layout_cache();
+        if current_dims_changed {
+            self.invalidate_manga_layout_cache();
+        }
     }
 
     #[allow(dead_code)]
@@ -4818,7 +4874,7 @@ impl ImageViewer {
             self.enter_manga_mode_from_preserved_strip_cache();
         } else {
             if layout_mode == MangaLayoutMode::Masonry {
-                self.manga_clear_cache();
+                self.clear_manga_runtime_cache(true);
             }
             self.toggle_manga_mode();
         }
@@ -5694,6 +5750,7 @@ impl ImageViewer {
         self.manga_layout_offsets.clear();
         self.manga_strip_spatial_index = None;
         self.masonry_spatial_index = None;
+        self.masonry_layout_list_signature = 0;
         self.masonry_layout_valid = false;
         self.masonry_layout_invalidation_deferred = false;
         self.masonry_pending_dimension_updates.clear();
@@ -5778,11 +5835,7 @@ impl ImageViewer {
         self.manga_scroll_velocity = 0.0;
         self.stop_manga_wheel_scroll();
 
-        if self.manga_layout_mode == MangaLayoutMode::Masonry {
-            self.begin_masonry_metadata_preload();
-        } else {
-            self.reset_masonry_metadata_preload();
-        }
+        self.maybe_begin_masonry_metadata_preload();
 
         self.manga_update_preload_queue();
     }
@@ -5838,11 +5891,16 @@ impl ImageViewer {
     }
 
     fn masonry_ensure_layout_cache(&mut self) {
-        if !self.is_masonry_mode() || self.image_list.is_empty() {
+        if self.image_list.is_empty() {
             self.masonry_layout_items.clear();
             self.masonry_spatial_index = None;
             self.masonry_layout_total_height = 0.0;
+            self.masonry_layout_list_signature = 0;
             self.masonry_layout_valid = false;
+            return;
+        }
+
+        if !self.is_masonry_mode() {
             return;
         }
 
@@ -5853,7 +5911,8 @@ impl ImageViewer {
         let needs_recompute = !self.masonry_layout_valid
             || (self.masonry_layout_screen_x - screen_x).abs() > 1e-6
             || self.masonry_layout_items_per_row != items_per_row
-            || self.masonry_layout_len != len;
+            || self.masonry_layout_len != len
+            || self.masonry_layout_list_signature != self.image_list_signature;
 
         if !needs_recompute {
             return;
@@ -5921,6 +5980,7 @@ impl ImageViewer {
         self.masonry_layout_screen_x = screen_x;
         self.masonry_layout_items_per_row = items_per_row;
         self.masonry_layout_len = len;
+        self.masonry_layout_list_signature = self.image_list_signature;
         self.masonry_layout_valid = true;
         self.masonry_spatial_index = None;
         self.perf_metrics
@@ -6114,6 +6174,7 @@ impl ImageViewer {
         if !self.manga_mode {
             self.pending_masonry_solo_reentry = None;
             self.sync_current_index_to_visible_media();
+            let reuse_preserved_masonry_layout = self.can_reuse_preserved_masonry_layout();
 
             let current_media_dims = self.media_display_dimensions().or(self.video_texture_dims);
             let current_media_type = self.current_media_type;
@@ -6131,24 +6192,34 @@ impl ImageViewer {
             self.prepare_enter_manga_mode_state(current_media_type);
 
             // Manga layout cache must be rebuilt for the new mode.
-            self.invalidate_manga_layout_cache();
+            if !reuse_preserved_masonry_layout {
+                self.invalidate_manga_layout_cache();
+            }
 
-            // Pre-cache all image dimensions in parallel (reads file headers only - very fast)
+            // Warm the active list from in-memory state or persistent metadata cache before
+            // falling back to background probes for the remaining misses.
             if let Some(ref mut loader) = self.manga_loader {
-                loader.cache_all_dimensions(&self.image_list);
+                if !reuse_preserved_masonry_layout {
+                    loader.cache_all_dimensions(&self.image_list);
+                }
+            }
+            if !self.image_list.is_empty() {
+                self.manga_dimension_cache_list_signature = self.image_list_signature;
             }
 
             // Ensure the currently viewed item has accurate dimensions immediately.
             // This prevents stretched/overlap artifacts while entering strip mode,
             // especially when the current index is outside the initial cached range.
-            self.cache_current_media_dimensions_for_manga(
+            let current_dims_changed = self.cache_current_media_dimensions_for_manga(
                 current_media_dims,
                 current_media_type,
                 current_image_is_animated,
             );
 
             // Dimensions may have changed; rebuild height cache.
-            self.invalidate_manga_layout_cache();
+            if !reuse_preserved_masonry_layout || current_dims_changed {
+                self.invalidate_manga_layout_cache();
+            }
 
             if self.manga_layout_mode == MangaLayoutMode::Masonry {
                 let new_zoom = self.clamp_zoom(1.0);
@@ -6199,11 +6270,7 @@ impl ImageViewer {
             self.manga_scroll_velocity = 0.0;
             self.stop_manga_wheel_scroll();
 
-            if self.manga_layout_mode == MangaLayoutMode::Masonry {
-                self.begin_masonry_metadata_preload();
-            } else {
-                self.reset_masonry_metadata_preload();
-            }
+            self.maybe_begin_masonry_metadata_preload();
 
             self.manga_update_preload_queue();
             return;
@@ -6220,7 +6287,7 @@ impl ImageViewer {
         self.stop_manga_wheel_scroll();
         self.stop_manga_autoscroll();
         self.manga_mode = false;
-        self.manga_clear_cache();
+        self.clear_manga_runtime_cache(self.manga_layout_mode == MangaLayoutMode::Masonry);
 
         if let Some(path) = target_path {
             // Load the selected page into normal fullscreen mode.
@@ -6530,8 +6597,7 @@ impl ImageViewer {
         }
     }
 
-    /// Clear the manga image cache to free GPU memory
-    fn manga_clear_cache(&mut self) {
+    fn clear_manga_runtime_cache(&mut self, preserve_dimensions: bool) {
         // Clear the texture cache
         self.manga_texture_cache.clear();
         self.strip_entry_placeholder_index = None;
@@ -6551,7 +6617,14 @@ impl ImageViewer {
 
         // Clear and reset the parallel loader
         if let Some(ref mut loader) = self.manga_loader {
-            loader.clear();
+            if preserve_dimensions {
+                loader.clear_preserving_dimensions();
+            } else {
+                loader.clear();
+            }
+        }
+        if !preserve_dimensions {
+            self.manga_dimension_cache_list_signature = 0;
         }
 
         // Clear manga video players and textures
@@ -6563,10 +6636,16 @@ impl ImageViewer {
         self.manga_anim_failed.clear();
         self.manga_anim_seekbar_total_frames.clear();
 
+        self.reset_masonry_metadata_preload();
+    }
+
+    /// Clear the manga image cache to free GPU memory
+    fn manga_clear_cache(&mut self) {
+        self.clear_manga_runtime_cache(false);
+
         self.invalidate_manga_layout_cache();
         self.masonry_layout_items.clear();
         self.masonry_layout_total_height = 0.0;
-        self.reset_masonry_metadata_preload();
     }
 
     /// Determine the focused media index in manga mode.
@@ -14019,7 +14098,9 @@ impl eframe::App for ImageViewer {
                         );
 
                         self.manga_mode = false;
-                        self.manga_clear_cache();
+                        self.clear_manga_runtime_cache(
+                            self.manga_layout_mode == MangaLayoutMode::Masonry,
+                        );
 
                         if let Some(path) = target_path {
                             self.load_image(&path);
