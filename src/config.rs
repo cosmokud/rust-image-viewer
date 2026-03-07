@@ -402,9 +402,9 @@ pub struct Config {
     pub fullscreen_reset_fit_on_enter: bool,
     /// On Windows, use native maximize/restore-down animation for fullscreen transitions.
     pub fullscreen_native_window_transition: bool,
-    /// When true, title-bar maximize actions use borderless fullscreen instead of a separate
-    /// maximized floating-window state. This also forces center right-click fullscreen toggles
-    /// through the borderless path.
+    /// When true, title-bar maximize actions and center right-click fullscreen toggles animate
+    /// through native maximize/restore first, then switch to borderless fullscreen instead of
+    /// staying in a separate maximized floating-window state.
     pub maximize_to_borderless_fullscreen: bool,
     /// Floating-mode zoom animation speed. Higher = faster. 0 = instant snap.
     pub zoom_animation_speed: f32,

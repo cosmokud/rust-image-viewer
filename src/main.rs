@@ -828,6 +828,9 @@ struct ImageViewer {
     should_exit: bool,
     /// Request fullscreen toggle
     toggle_fullscreen: bool,
+    /// Route the next fullscreen entry through native maximize first, then switch to
+    /// OS-managed borderless fullscreen.
+    toggle_fullscreen_native_borderless_handoff: bool,
     /// Force the next fullscreen toggle to use the manual borderless path even when
     /// native maximize/restore transitions are enabled.
     toggle_fullscreen_force_borderless: bool,
@@ -873,6 +876,16 @@ struct ImageViewer {
     pending_fullscreen_layout: bool,
     /// Apply a fit-to-window layout once a native maximize request has landed.
     pending_maximized_layout: bool,
+    /// Wait for native maximize animation to settle before switching to OS borderless fullscreen.
+    pending_native_borderless_fullscreen: bool,
+    /// Fullscreen currently uses OS-managed borderless fullscreen entered after native maximize.
+    fullscreen_uses_native_borderless: bool,
+    /// Wait for OS borderless fullscreen to drop back to maximized before restoring down.
+    pending_native_borderless_restore: bool,
+    /// Last observed viewport size while waiting for a native maximize animation to finish.
+    native_borderless_transition_last_size: Option<egui::Vec2>,
+    /// Consecutive frames for which the native maximize target size stayed stable.
+    native_borderless_transition_stable_frames: u8,
 
     /// Per-image view state cache for fullscreen mode.
     /// Maps image paths to their saved view states (zoom, pan, rotation, flip).
@@ -1256,6 +1269,7 @@ impl Default for ImageViewer {
             screen_size: egui::Vec2::new(1920.0, 1080.0),
             should_exit: false,
             toggle_fullscreen: false,
+            toggle_fullscreen_native_borderless_handoff: false,
             toggle_fullscreen_force_borderless: false,
             toggle_fullscreen_from_titlebar: false,
             request_minimize: false,
@@ -1276,6 +1290,11 @@ impl Default for ImageViewer {
             pending_window_resize: None,
             pending_fullscreen_layout: false,
             pending_maximized_layout: false,
+            pending_native_borderless_fullscreen: false,
+            fullscreen_uses_native_borderless: false,
+            pending_native_borderless_restore: false,
+            native_borderless_transition_last_size: None,
+            native_borderless_transition_stable_frames: 0,
             fullscreen_view_states: HashMap::new(),
             last_known_outer_pos: None,
             floating_user_moved_window: false,
@@ -4333,6 +4352,17 @@ impl ImageViewer {
         }
     }
 
+    fn current_viewport_inner_size(&self, ctx: &egui::Context) -> egui::Vec2 {
+        ctx.input(|i| i.raw.viewport().inner_rect)
+            .map(|r| r.size())
+            .unwrap_or_else(|| ctx.screen_rect().size())
+    }
+
+    fn viewport_is_os_fullscreen(&self, ctx: &egui::Context) -> bool {
+        ctx.input(|i| i.raw.viewport().fullscreen)
+            .unwrap_or(false)
+    }
+
     fn use_native_fullscreen_window_transition(&self) -> bool {
         #[cfg(target_os = "windows")]
         {
@@ -4345,9 +4375,42 @@ impl ImageViewer {
         }
     }
 
+    fn reset_native_borderless_transition_tracking(&mut self) {
+        self.native_borderless_transition_last_size = None;
+        self.native_borderless_transition_stable_frames = 0;
+    }
+
+    fn begin_native_borderless_fullscreen_handoff(&mut self) {
+        self.pending_native_borderless_fullscreen = true;
+        self.reset_native_borderless_transition_tracking();
+    }
+
+    fn native_maximize_animation_complete(&mut self, ctx: &egui::Context) -> bool {
+        if !self.current_window_is_maximized(ctx) {
+            self.reset_native_borderless_transition_tracking();
+            return false;
+        }
+
+        let viewport_size = self.current_viewport_inner_size(ctx);
+        let size_stable = self.native_borderless_transition_last_size.is_some_and(|prev| {
+            (prev.x - viewport_size.x).abs() <= 1.0 && (prev.y - viewport_size.y).abs() <= 1.0
+        });
+
+        self.native_borderless_transition_last_size = Some(viewport_size);
+        if size_stable {
+            self.native_borderless_transition_stable_frames = self
+                .native_borderless_transition_stable_frames
+                .saturating_add(1);
+        } else {
+            self.native_borderless_transition_stable_frames = 0;
+        }
+
+        self.native_borderless_transition_stable_frames >= 1
+    }
+
     fn fullscreen_layout_ready(&self, ctx: &egui::Context) -> bool {
         let monitor = self.monitor_size_points(ctx);
-        let viewport = ctx.screen_rect().size();
+        let viewport = self.current_viewport_inner_size(ctx);
 
         (viewport.x - monitor.x).abs() <= 2.0 && (viewport.y - monitor.y).abs() <= 2.0
     }
@@ -4398,7 +4461,7 @@ impl ImageViewer {
         self.sync_current_index_to_visible_media();
         self.toggle_fullscreen_from_titlebar = true;
         if self.config.maximize_to_borderless_fullscreen {
-            self.toggle_fullscreen_force_borderless = true;
+            self.toggle_fullscreen_native_borderless_handoff = true;
         }
         self.titlebar_pending_restore_layout = match return_mode {
             Some(TitlebarToggleReturnMode::Manga(layout_mode)) => Some(layout_mode),
@@ -11423,7 +11486,7 @@ impl ImageViewer {
                 }
             }
             if self.config.maximize_to_borderless_fullscreen && !self.is_fullscreen {
-                self.toggle_fullscreen_force_borderless = true;
+                self.toggle_fullscreen_native_borderless_handoff = true;
             }
             self.toggle_fullscreen = true;
             return;
@@ -13987,6 +14050,9 @@ impl eframe::App for ImageViewer {
             let window_was_maximized = self.current_window_is_maximized(ctx);
             let use_native_transition = self.use_native_fullscreen_window_transition()
                 && !self.toggle_fullscreen_force_borderless;
+            let use_native_borderless_handoff = entering_fullscreen
+                && self.toggle_fullscreen_native_borderless_handoff
+                && use_native_transition;
             let entering_titlebar_strip =
                 toggled_from_titlebar && self.titlebar_pending_restore_layout.is_some();
             let preserve_strip_return_context = !entering_fullscreen
@@ -14036,13 +14102,23 @@ impl eframe::App for ImageViewer {
                     self.saved_fullscreen_entry_index = Some(self.current_index);
                     self.pending_window_resize = None;
                     self.pending_maximized_layout = false;
+                    self.pending_native_borderless_restore = false;
+                    self.pending_native_borderless_fullscreen = false;
+                    self.fullscreen_uses_native_borderless = false;
+                    self.reset_native_borderless_transition_tracking();
 
                     // No fullscreen transition animation: switch instantly.
                     self.fullscreen_transition = 1.0;
                     self.fullscreen_transition_target = 1.0;
 
                     if use_native_transition {
-                        if window_was_maximized {
+                        if use_native_borderless_handoff {
+                            self.pending_fullscreen_layout = !entering_titlebar_strip;
+                            self.begin_native_borderless_fullscreen_handoff();
+                            if !window_was_maximized {
+                                self.request_native_maximize = Some(true);
+                            }
+                        } else if window_was_maximized {
                             self.pending_fullscreen_layout = false;
                             if !entering_titlebar_strip {
                                 self.apply_fullscreen_layout_for_current_image(ctx);
@@ -14114,10 +14190,24 @@ impl eframe::App for ImageViewer {
                     let image_changed_while_fullscreen = self
                         .saved_fullscreen_entry_index
                         .is_some_and(|idx| idx != self.current_index);
+                    let using_native_borderless_fullscreen = self.fullscreen_uses_native_borderless;
                     let restore_to_maximized = use_native_transition && self.saved_floating_was_maximized;
-                    let should_native_restore =
-                        use_native_transition && window_was_maximized && !restore_to_maximized;
+                    let should_native_restore = use_native_transition
+                        && (window_was_maximized || using_native_borderless_fullscreen)
+                        && !restore_to_maximized;
+                    let defer_native_restore =
+                        using_native_borderless_fullscreen && should_native_restore;
                     self.saved_floating_was_maximized = false;
+
+                    if using_native_borderless_fullscreen {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+                        self.fullscreen_uses_native_borderless = false;
+                        self.pending_native_borderless_restore = should_native_restore;
+                        self.pending_native_borderless_fullscreen = false;
+                        self.reset_native_borderless_transition_tracking();
+                    } else {
+                        self.pending_native_borderless_restore = false;
+                    }
 
                     // Restore previous floating state if available
                     if !image_changed_while_fullscreen {
@@ -14140,8 +14230,10 @@ impl eframe::App for ImageViewer {
                             self.floating_max_inner_size = Some(saved_size);
                             self.last_requested_inner_size = Some(saved_size);
                             if should_native_restore {
-                                self.request_native_maximize = Some(false);
                                 self.last_known_outer_pos = Some(saved_pos);
+                                if !defer_native_restore {
+                                    self.request_native_maximize = Some(false);
+                                }
                             } else if !restore_to_maximized {
                                 // Delay window resize by 2 frames to prevent flash
                                 self.pending_window_resize = Some((saved_size, saved_pos, 2));
@@ -14174,7 +14266,7 @@ impl eframe::App for ImageViewer {
                                 let pos = egui::pos2(x.max(0.0), y.max(0.0));
                                 // Delay window resize by 2 frames to prevent flash
                                 self.pending_window_resize = Some((desired, pos, 2));
-                                if should_native_restore {
+                                if should_native_restore && !defer_native_restore {
                                     self.request_native_maximize = Some(false);
                                 }
                             }
@@ -14233,7 +14325,7 @@ impl eframe::App for ImageViewer {
                                 let pos = egui::pos2(x.max(0.0), y.max(0.0));
                                 // Delay window resize by 2 frames to prevent flash
                                 self.pending_window_resize = Some((size, pos, 2));
-                                if should_native_restore {
+                                if should_native_restore && !defer_native_restore {
                                     self.request_native_maximize = Some(false);
                                 }
                             }
@@ -14242,7 +14334,7 @@ impl eframe::App for ImageViewer {
                             // schedule a retry once dimensions become available.
                             self.pending_media_layout =
                                 matches!(self.current_media_type, Some(MediaType::Video));
-                            if should_native_restore {
+                            if should_native_restore && !defer_native_restore {
                                 self.request_native_maximize = Some(false);
                             }
                         }
@@ -14250,6 +14342,7 @@ impl eframe::App for ImageViewer {
                 }
             }
             self.toggle_fullscreen = false;
+            self.toggle_fullscreen_native_borderless_handoff = false;
             self.toggle_fullscreen_force_borderless = false;
             self.toggle_fullscreen_from_titlebar = false;
         }
@@ -14275,6 +14368,29 @@ impl eframe::App for ImageViewer {
             } else {
                 false
             };
+
+        if self.pending_native_borderless_fullscreen {
+            if self.native_maximize_animation_complete(ctx) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+                self.pending_native_borderless_fullscreen = false;
+                self.fullscreen_uses_native_borderless = true;
+                self.reset_native_borderless_transition_tracking();
+                ctx.request_repaint_after(Duration::from_millis(16));
+            } else {
+                ctx.request_repaint_after(Duration::from_millis(16));
+            }
+        }
+
+        if self.pending_native_borderless_restore {
+            if self.viewport_is_os_fullscreen(ctx) {
+                ctx.request_repaint_after(Duration::from_millis(16));
+            } else if self.current_window_is_maximized(ctx) {
+                self.pending_native_borderless_restore = false;
+                self.request_native_maximize = Some(false);
+            } else {
+                self.pending_native_borderless_restore = false;
+            }
+        }
 
         if let Some(maximize) = self.request_native_maximize.take() {
             self.suppress_programmatic_native_window_transition_tracking();

@@ -220,7 +220,7 @@ manga_autoscroll_vertical_speed_multiplier = 1.0
 strip_item_open_binding = mouse_right
 ```
 
-`maximize_to_borderless_fullscreen` makes the custom title-bar maximize button and center right-click use borderless fullscreen by default instead of a separate maximized floating window state.
+`maximize_to_borderless_fullscreen` makes the custom title-bar maximize button and center right-click animate through native maximize/restore first, then hand off to borderless fullscreen instead of staying in a separate maximized floating window state.
 
 `manga_virtualization_backend` accepts `auto`, `linear`, or `rtree` (default: `rtree`).
 
