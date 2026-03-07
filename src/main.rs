@@ -1085,6 +1085,8 @@ struct ImageViewer {
     masonry_metadata_preload_loaded: usize,
     /// Cursor used to warm remaining masonry dimensions progressively in the background.
     masonry_metadata_preload_cursor: usize,
+    /// Item to restore once startup metadata warmup finishes rebuilding the masonry layout.
+    masonry_metadata_preload_restore_index: Option<usize>,
     /// True if masonry was actively scrolling/panning/zooming on the previous frame.
     masonry_navigation_was_active: bool,
     /// Earliest time when a post-navigation visible-quality refinement pass may begin.
@@ -1372,6 +1374,7 @@ impl Default for ImageViewer {
             masonry_metadata_preload_total: 0,
             masonry_metadata_preload_loaded: 0,
             masonry_metadata_preload_cursor: 0,
+            masonry_metadata_preload_restore_index: None,
             masonry_navigation_was_active: false,
             masonry_quality_refine_due_at: None,
             masonry_quality_refine_frames_remaining: 0,
@@ -3082,11 +3085,17 @@ impl ImageViewer {
         self.masonry_metadata_preload_total = 0;
         self.masonry_metadata_preload_loaded = 0;
         self.masonry_metadata_preload_cursor = 0;
+        self.masonry_metadata_preload_restore_index = None;
     }
 
     fn begin_masonry_metadata_preload(&mut self) {
         self.masonry_metadata_preload_total = self.image_list.len();
         self.masonry_metadata_preload_loaded = 0;
+        self.masonry_metadata_preload_restore_index = if self.image_list.is_empty() {
+            None
+        } else {
+            Some(self.current_index.min(self.image_list.len().saturating_sub(1)))
+        };
         let preload_window = 96usize.max(self.masonry_items_per_row.clamp(2, 10) * 48);
         self.masonry_metadata_preload_cursor = self
             .current_index
@@ -3098,10 +3107,48 @@ impl ImageViewer {
             && self.manga_loader.is_some();
 
         if !self.masonry_metadata_preload_active {
+            self.masonry_metadata_preload_restore_index = None;
             return;
         }
 
+        self.manga_scrollbar_dragging = false;
+        self.is_panning = false;
+        self.last_mouse_pos = None;
+        self.manga_hovered_media_index = None;
+        self.stop_manga_wheel_scroll();
+        self.stop_manga_autoscroll();
+
         self.tick_masonry_metadata_preload();
+    }
+
+    fn restore_masonry_scroll_after_metadata_preload(&mut self) {
+        let Some(target_index) = self.masonry_metadata_preload_restore_index.take() else {
+            return;
+        };
+
+        if !self.manga_mode || !self.is_masonry_mode() || self.image_list.is_empty() {
+            return;
+        }
+
+        let target_index = target_index.min(self.image_list.len().saturating_sub(1));
+        self.set_current_index_clamped(target_index);
+
+        let max_scroll = (self.manga_total_height() - self.screen_size.y).max(0.0);
+        let scroll_to = self
+            .masonry_scroll_offset_for_index_centered(target_index)
+            .unwrap_or_else(|| {
+                self.manga_get_scroll_offset_for_index(target_index)
+                    .clamp(0.0, max_scroll)
+            });
+
+        self.manga_scroll_offset = scroll_to;
+        self.manga_scroll_target = scroll_to;
+        self.manga_scroll_velocity = 0.0;
+        self.manga_scrollbar_dragging = false;
+        self.is_panning = false;
+        self.last_mouse_pos = None;
+        self.manga_hovered_media_index = None;
+        self.stop_manga_wheel_scroll();
     }
 
     fn tick_masonry_metadata_preload(&mut self) {
@@ -3160,6 +3207,9 @@ impl ImageViewer {
             self.masonry_metadata_preload_loaded = total;
             self.masonry_metadata_preload_active = false;
             self.manga_update_preload_queue();
+            if self.masonry_pending_dimension_updates.is_empty() {
+                self.restore_masonry_scroll_after_metadata_preload();
+            }
         }
     }
 
@@ -3172,42 +3222,67 @@ impl ImageViewer {
         let loaded = self.masonry_metadata_preload_loaded.min(total);
         let progress_ratio = (loaded as f32 / total as f32).clamp(0.0, 1.0);
         let progress_text = format!("Warming layout  {} / {}", loaded, total);
-        let y_offset = if self.show_controls { 40.0 } else { 10.0 };
+        let screen_rect = ctx.screen_rect();
+        let panel_width = (screen_rect.width() - 48.0).clamp(280.0, 420.0);
+        let panel_size = egui::vec2(panel_width, 144.0);
 
         egui::Area::new(egui::Id::new("masonry_metadata_loading_overlay"))
             .order(egui::Order::Foreground)
-            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-16.0, y_offset))
+            .fixed_pos(screen_rect.min)
             .show(ctx, |ui| {
-                let panel_size = egui::vec2(220.0, 54.0);
-                let (panel_rect, _) = ui.allocate_exact_size(panel_size, egui::Sense::hover());
+                let overlay_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, screen_rect.size());
+                let _ = ui.allocate_rect(overlay_rect, egui::Sense::click_and_drag());
+                ui.painter().rect_filled(
+                    overlay_rect,
+                    0.0,
+                    egui::Color32::from_rgba_unmultiplied(5, 8, 12, 150),
+                );
+
+                let panel_rect = egui::Rect::from_center_size(overlay_rect.center(), panel_size);
                 ui.painter().rect_filled(
                     panel_rect,
-                    10.0,
-                    egui::Color32::from_rgba_unmultiplied(16, 16, 16, 220),
+                    18.0,
+                    egui::Color32::from_rgba_unmultiplied(18, 22, 28, 240),
                 );
+                ui.painter().rect_stroke(
+                    panel_rect,
+                    18.0,
+                    egui::Stroke::new(
+                        1.0,
+                        egui::Color32::from_rgba_unmultiplied(130, 188, 255, 72),
+                    ),
+                );
+
                 ui.painter().text(
-                    egui::pos2(panel_rect.min.x + 12.0, panel_rect.min.y + 14.0),
-                    egui::Align2::LEFT_CENTER,
+                    egui::pos2(panel_rect.center().x, panel_rect.min.y + 34.0),
+                    egui::Align2::CENTER_CENTER,
                     "Preparing masonry layout",
-                    egui::FontId::proportional(13.0),
+                    egui::FontId::proportional(20.0),
                     egui::Color32::WHITE,
                 );
                 ui.painter().text(
-                    egui::pos2(panel_rect.min.x + 12.0, panel_rect.min.y + 32.0),
-                    egui::Align2::LEFT_CENTER,
+                    egui::pos2(panel_rect.center().x, panel_rect.min.y + 64.0),
+                    egui::Align2::CENTER_CENTER,
                     progress_text,
+                    egui::FontId::proportional(14.0),
+                    egui::Color32::from_gray(214),
+                );
+                ui.painter().text(
+                    egui::pos2(panel_rect.center().x, panel_rect.min.y + 88.0),
+                    egui::Align2::CENTER_CENTER,
+                    "Navigation is paused until the layout stabilizes.",
                     egui::FontId::proportional(12.0),
-                    egui::Color32::from_gray(205),
+                    egui::Color32::from_gray(170),
                 );
 
                 let bar_rect = egui::Rect::from_min_size(
-                    egui::pos2(panel_rect.min.x + 12.0, panel_rect.max.y - 14.0),
-                    egui::vec2(panel_rect.width() - 24.0, 6.0),
+                    egui::pos2(panel_rect.min.x + 24.0, panel_rect.max.y - 30.0),
+                    egui::vec2(panel_rect.width() - 48.0, 10.0),
                 );
                 ui.painter().rect_filled(
                     bar_rect,
-                    3.0,
-                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 40),
+                    5.0,
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 30),
                 );
                 if progress_ratio > 0.0 {
                     let fill_rect = egui::Rect::from_min_max(
@@ -3219,8 +3294,8 @@ impl ImageViewer {
                     );
                     ui.painter().rect_filled(
                         fill_rect,
-                        3.0,
-                        egui::Color32::from_rgb(120, 196, 108),
+                        5.0,
+                        egui::Color32::from_rgb(104, 184, 255),
                     );
                 }
             });
@@ -5931,6 +6006,11 @@ impl ImageViewer {
         );
         self.perf_metrics
             .increment_counter("masonry_dim_commit_items", pending_count);
+
+        if force && !self.masonry_metadata_preload_active {
+            self.restore_masonry_scroll_after_metadata_preload();
+        }
+
         true
     }
 
@@ -6033,6 +6113,7 @@ impl ImageViewer {
     fn toggle_manga_mode(&mut self) {
         if !self.manga_mode {
             self.pending_masonry_solo_reentry = None;
+            self.sync_current_index_to_visible_media();
 
             let current_media_dims = self.media_display_dimensions().or(self.video_texture_dims);
             let current_media_type = self.current_media_type;
@@ -9796,26 +9877,45 @@ impl ImageViewer {
         let screen_width = screen_rect.width();
         let screen_height = screen_rect.height();
         let mut animation_active = false;
+        let masonry_preload_input_blocked =
+            self.is_masonry_mode() && self.masonry_metadata_preload_active;
 
         // Get input states
         let ctrl_held = ctx.input(|i| i.modifiers.ctrl);
         // NOTE: In egui/eframe, Ctrl+mouse-wheel is commonly routed into `zoom_delta` (not `scroll_delta`).
         // We support both so Ctrl+wheel zoom works reliably across platforms/devices.
-        let zoom_delta = ctx.input(|i| i.zoom_delta());
-        let pointer_pos = ctx.input(|i| i.pointer.hover_pos());
-        let primary_clicked = ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Primary));
-        let primary_down = ctx.input(|i| i.pointer.button_down(egui::PointerButton::Primary));
-        let primary_pressed = ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary));
-        let primary_released =
-            ctx.input(|i| i.pointer.button_released(egui::PointerButton::Primary));
-        let primary_double_clicked = ctx.input(|i| {
-            i.pointer
-                .button_double_clicked(egui::PointerButton::Primary)
-        });
-        let middle_pressed = ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Middle));
-        let pointer_delta = ctx.input(|i| i.pointer.delta());
-        let secondary_clicked =
-            ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Secondary));
+        let zoom_delta = if masonry_preload_input_blocked {
+            1.0
+        } else {
+            ctx.input(|i| i.zoom_delta())
+        };
+        let pointer_pos = if masonry_preload_input_blocked {
+            None
+        } else {
+            ctx.input(|i| i.pointer.hover_pos())
+        };
+        let primary_clicked = !masonry_preload_input_blocked
+            && ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Primary));
+        let primary_down = !masonry_preload_input_blocked
+            && ctx.input(|i| i.pointer.button_down(egui::PointerButton::Primary));
+        let primary_pressed = !masonry_preload_input_blocked
+            && ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary));
+        let primary_released = !masonry_preload_input_blocked
+            && ctx.input(|i| i.pointer.button_released(egui::PointerButton::Primary));
+        let primary_double_clicked = !masonry_preload_input_blocked
+            && ctx.input(|i| {
+                i.pointer
+                    .button_double_clicked(egui::PointerButton::Primary)
+            });
+        let middle_pressed = !masonry_preload_input_blocked
+            && ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Middle));
+        let pointer_delta = if masonry_preload_input_blocked {
+            egui::Vec2::ZERO
+        } else {
+            ctx.input(|i| i.pointer.delta())
+        };
+        let secondary_clicked = !masonry_preload_input_blocked
+            && ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Secondary));
 
         // Avoid triggering manga interactions while selecting/copying title-bar text.
         // IMPORTANT: allow click-through on the empty title bar area.
@@ -9831,7 +9931,7 @@ impl ImageViewer {
         // We normalize both into "wheel steps" so wheel momentum tuning stays consistent.
         const MANGA_WHEEL_POINTS_PER_LINE: f32 = 50.0;
         const MANGA_WHEEL_MAX_STEPS_PER_EVENT: f32 = 6.0;
-        let (wheel_steps, wheel_steps_ctrl) = ctx.input(|i| {
+        let (raw_wheel_steps, raw_wheel_steps_ctrl) = ctx.input(|i| {
             let mut normal = 0.0f32;
             let mut ctrl = 0.0f32;
 
@@ -9872,10 +9972,15 @@ impl ImageViewer {
 
             (normal, ctrl)
         });
+        let (wheel_steps, wheel_steps_ctrl) = if masonry_preload_input_blocked {
+            (0.0, 0.0)
+        } else {
+            (raw_wheel_steps, raw_wheel_steps_ctrl)
+        };
 
         // In manga fullscreen mode, the wheel is owned by our custom inertial scroller.
         // Remove wheel events so other widgets don't accidentally react to them in the same frame.
-        if wheel_steps != 0.0 || wheel_steps_ctrl != 0.0 {
+        if raw_wheel_steps != 0.0 || raw_wheel_steps_ctrl != 0.0 {
             ctx.input_mut(|i| {
                 i.raw
                     .events
