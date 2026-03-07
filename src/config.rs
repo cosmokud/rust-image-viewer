@@ -402,6 +402,10 @@ pub struct Config {
     pub fullscreen_reset_fit_on_enter: bool,
     /// On Windows, use native maximize/restore-down animation for fullscreen transitions.
     pub fullscreen_native_window_transition: bool,
+    /// When true, title-bar maximize actions use borderless fullscreen instead of a separate
+    /// maximized floating-window state. This also forces center right-click fullscreen toggles
+    /// through the borderless path.
+    pub maximize_to_borderless_fullscreen: bool,
     /// Floating-mode zoom animation speed. Higher = faster. 0 = instant snap.
     pub zoom_animation_speed: f32,
     /// Zoom step per scroll wheel notch (1.05 = 5% per step, 1.25 = 25% per step)
@@ -543,6 +547,7 @@ impl Config {
             background_rgb: [0, 0, 0],
             fullscreen_reset_fit_on_enter: true,
             fullscreen_native_window_transition: true,
+            maximize_to_borderless_fullscreen: true,
             zoom_animation_speed: 20.0,
             zoom_step: 1.02,
             max_zoom_percent: 1000.0,
@@ -889,6 +894,13 @@ impl Config {
                         | "animate_fullscreen_with_maximize_restore" => {
                             if let Some(v) = parse_bool(value) {
                                 config.fullscreen_native_window_transition = v;
+                            }
+                        }
+                        "maximize_to_borderless_fullscreen"
+                        | "maximize_to_fullscreen"
+                        | "titlebar_maximize_to_fullscreen" => {
+                            if let Some(v) = parse_bool(value) {
+                                config.maximize_to_borderless_fullscreen = v;
                             }
                         }
                         "zoom_animation_speed" => {
@@ -1315,6 +1327,10 @@ impl Config {
         values.insert(
             "fullscreen_native_window_transition",
             bool_to_ini(self.fullscreen_native_window_transition).to_string(),
+        );
+        values.insert(
+            "maximize_to_borderless_fullscreen",
+            bool_to_ini(self.maximize_to_borderless_fullscreen).to_string(),
         );
         values.insert(
             "zoom_animation_speed",

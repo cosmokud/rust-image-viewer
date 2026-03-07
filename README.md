@@ -196,6 +196,8 @@ background_r = 0
 background_g = 0
 background_b = 0
 fullscreen_reset_fit_on_enter = true
+fullscreen_native_window_transition = true
+maximize_to_borderless_fullscreen = true
 zoom_animation_speed = 20
 zoom_step = 1.02
 max_zoom_percent = 1000
@@ -217,6 +219,8 @@ manga_autoscroll_horizontal_speed_multiplier = 1.0
 manga_autoscroll_vertical_speed_multiplier = 1.0
 strip_item_open_binding = mouse_right
 ```
+
+`maximize_to_borderless_fullscreen` makes the custom title-bar maximize button and center right-click use borderless fullscreen by default instead of a separate maximized floating window state.
 
 `manga_virtualization_backend` accepts `auto`, `linear`, or `rtree` (default: `rtree`).
 

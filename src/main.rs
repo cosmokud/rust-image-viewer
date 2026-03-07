@@ -825,6 +825,9 @@ struct ImageViewer {
     should_exit: bool,
     /// Request fullscreen toggle
     toggle_fullscreen: bool,
+    /// Force the next fullscreen toggle to use the manual borderless path even when
+    /// native maximize/restore transitions are enabled.
+    toggle_fullscreen_force_borderless: bool,
     /// True when fullscreen toggle was requested by the title-bar maximize/restore button.
     toggle_fullscreen_from_titlebar: bool,
     /// Request minimize
@@ -1244,6 +1247,7 @@ impl Default for ImageViewer {
             screen_size: egui::Vec2::new(1920.0, 1080.0),
             should_exit: false,
             toggle_fullscreen: false,
+            toggle_fullscreen_force_borderless: false,
             toggle_fullscreen_from_titlebar: false,
             request_minimize: false,
             request_native_maximize: None,
@@ -4242,6 +4246,9 @@ impl ImageViewer {
         return_mode: Option<TitlebarToggleReturnMode>,
     ) {
         self.toggle_fullscreen_from_titlebar = true;
+        if self.config.maximize_to_borderless_fullscreen {
+            self.toggle_fullscreen_force_borderless = true;
+        }
         self.titlebar_pending_restore_layout = match return_mode {
             Some(TitlebarToggleReturnMode::Manga(layout_mode)) => Some(layout_mode),
             _ => None,
@@ -11194,6 +11201,9 @@ impl ImageViewer {
 
         if right_click_toggle_fullscreen {
             self.stop_manga_autoscroll();
+            if self.config.maximize_to_borderless_fullscreen && !self.is_fullscreen {
+                self.toggle_fullscreen_force_borderless = true;
+            }
             self.toggle_fullscreen = true;
             return;
         }
@@ -11687,9 +11697,7 @@ impl ImageViewer {
                             // Maximize/Restore button
                             let window_is_maximized = self.current_window_is_maximized(ctx);
                             let use_native_transition = self.use_native_fullscreen_window_transition();
-                            let button = if self.is_fullscreen
-                                || (use_native_transition && window_is_maximized)
-                            {
+                            let button = if self.is_fullscreen || window_is_maximized {
                                 WindowButton::Restore
                             } else {
                                 WindowButton::Maximize
@@ -11703,6 +11711,13 @@ impl ImageViewer {
                                 } else if self.titlebar_previous_mode.is_some() {
                                     let previous_mode = self.titlebar_previous_mode.take();
                                     self.request_titlebar_fullscreen_reentry(previous_mode);
+                                } else if window_is_maximized {
+                                    self.request_native_maximize = Some(false);
+                                    self.pending_maximized_layout = false;
+                                } else if self.config.maximize_to_borderless_fullscreen {
+                                    self.request_titlebar_fullscreen_reentry(Some(
+                                        TitlebarToggleReturnMode::Fullscreen,
+                                    ));
                                 } else if use_native_transition {
                                     self.request_native_maximize = Some(!window_is_maximized);
                                     self.pending_maximized_layout = !window_is_maximized;
@@ -13749,7 +13764,8 @@ impl eframe::App for ImageViewer {
             let entering_fullscreen = !self.is_fullscreen;
             let toggled_from_titlebar = self.toggle_fullscreen_from_titlebar;
             let window_was_maximized = self.current_window_is_maximized(ctx);
-            let use_native_transition = self.use_native_fullscreen_window_transition();
+            let use_native_transition = self.use_native_fullscreen_window_transition()
+                && !self.toggle_fullscreen_force_borderless;
             let entering_titlebar_strip =
                 toggled_from_titlebar && self.titlebar_pending_restore_layout.is_some();
 
@@ -14002,6 +14018,7 @@ impl eframe::App for ImageViewer {
                 }
             }
             self.toggle_fullscreen = false;
+            self.toggle_fullscreen_force_borderless = false;
             self.toggle_fullscreen_from_titlebar = false;
         }
 
