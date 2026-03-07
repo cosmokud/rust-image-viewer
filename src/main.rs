@@ -13786,24 +13786,6 @@ impl eframe::App for ImageViewer {
                     self.fullscreen_transition = 1.0;
                     self.fullscreen_transition_target = 1.0;
 
-                    #[cfg(target_os = "windows")]
-                    {
-                        self.pending_fullscreen_layout = false;
-
-                        if !entering_titlebar_strip {
-                            self.apply_fullscreen_layout_for_current_image(ctx);
-                        }
-
-                        let monitor = self.monitor_size_points(ctx);
-                        self.suppress_outer_pos_tracking_frames =
-                            self.suppress_outer_pos_tracking_frames.max(2);
-                        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::Pos2::ZERO));
-                        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(monitor));
-                        self.last_requested_inner_size = Some(monitor);
-                        let _ = crate::windows_env::set_active_window_topmost(true);
-                    }
-
-                    #[cfg(not(target_os = "windows"))]
                     if use_native_transition {
                         if window_was_maximized {
                             self.pending_fullscreen_layout = false;
@@ -13837,11 +13819,6 @@ impl eframe::App for ImageViewer {
                     self.fullscreen_transition_target = 0.0;
                     self.pending_fullscreen_layout = false;
                     self.clear_strip_return_context();
-
-                    #[cfg(target_os = "windows")]
-                    {
-                        let _ = crate::windows_env::set_active_window_topmost(false);
-                    }
 
                     // Exit manga mode when leaving fullscreen
                     if self.manga_mode {

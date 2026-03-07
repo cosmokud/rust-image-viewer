@@ -186,31 +186,6 @@ pub fn set_active_window_maximized(maximize: bool) -> bool {
     true
 }
 
-pub fn set_active_window_topmost(topmost: bool) -> bool {
-    use winapi::um::winuser::{
-        SetWindowPos, HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    };
-
-    let hwnd = active_or_foreground_window();
-    if hwnd.is_null() {
-        return false;
-    }
-
-    let insert_after = if topmost { HWND_TOPMOST } else { HWND_NOTOPMOST };
-    unsafe {
-        SetWindowPos(
-            hwnd,
-            insert_after,
-            0,
-            0,
-            0,
-            0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-        );
-    }
-    true
-}
-
 /// Refreshes the process `PATH` from the registry (HKLM + HKCU), merging with the current
 /// process PATH. This makes DLL/plugin discovery resilient when the process is launched from
 /// a parent process with a stale/sanitized environment (e.g., some browsers).
