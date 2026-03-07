@@ -4930,6 +4930,7 @@ impl ImageViewer {
 
         self.masonry_quality_refine_due_at = None;
         self.masonry_quality_refine_frames_remaining = Self::MASONRY_QUALITY_REFINE_MAX_FRAMES;
+        self.manga_last_preload_update = Instant::now() - Duration::from_millis(100);
         true
     }
 
@@ -6142,6 +6143,38 @@ impl ImageViewer {
         Some((idx, fraction, screen_y))
     }
 
+    fn manga_capture_anchor_at_screen_pos(
+        &mut self,
+        screen_pos: egui::Pos2,
+    ) -> Option<(usize, f32, f32, f32, f32)> {
+        if !self.manga_mode || self.is_masonry_mode() || self.image_list.is_empty() {
+            return None;
+        }
+
+        let screen_y = screen_pos.y.clamp(0.0, self.screen_size.y.max(1.0));
+        let target_y = self.manga_scroll_offset.max(0.0) + screen_y;
+        let idx = self.manga_index_at_y(target_y);
+        if idx >= self.image_list.len() {
+            return None;
+        }
+
+        let start_y = self.manga_page_start_y(idx);
+        let page_height = self.manga_page_height_cached(idx).max(0.0001);
+        let y_fraction = ((target_y - start_y) / page_height).clamp(0.0, 1.0);
+
+        let page_width = self.manga_get_image_display_width(idx).max(0.0001);
+        let page_left = (self.screen_size.x - page_width) * 0.5 + self.offset.x;
+        let x_fraction = (screen_pos.x - page_left) / page_width;
+
+        Some((
+            idx,
+            y_fraction,
+            screen_y,
+            x_fraction,
+            screen_pos.x.clamp(0.0, self.screen_size.x.max(1.0)),
+        ))
+    }
+
     /// Re-apply a previously captured anchor at a specific screen Y position after zoom.
     ///
     /// Places the same fractional position of the same image at the same screen Y position.
@@ -6170,6 +6203,49 @@ impl ImageViewer {
         self.manga_scroll_offset = new_offset;
         self.manga_scroll_target = new_offset;
         self.manga_scroll_velocity = 0.0;
+    }
+
+    fn manga_apply_anchor_at_screen_pos(&mut self, anchor: (usize, f32, f32, f32, f32)) {
+        if !self.manga_mode || self.is_masonry_mode() || self.image_list.is_empty() {
+            return;
+        }
+
+        let (anchor_idx, anchor_y_fraction, screen_y, anchor_x_fraction, screen_x) = anchor;
+        if anchor_idx >= self.image_list.len() {
+            return;
+        }
+
+        let total_height = self.manga_total_height();
+        let start_y = self.manga_page_start_y(anchor_idx);
+        let page_height = self.manga_page_height_cached(anchor_idx).max(0.0001);
+        let anchor_abs_y = start_y + anchor_y_fraction.clamp(0.0, 1.0) * page_height;
+
+        let max_scroll = (total_height - self.screen_size.y).max(0.0);
+        let new_offset_y = (anchor_abs_y - screen_y).clamp(0.0, max_scroll);
+
+        let page_width = self.manga_get_image_display_width(anchor_idx).max(0.0001);
+        let centered_left = (self.screen_size.x - page_width) * 0.5;
+        let new_offset_x = screen_x - centered_left - anchor_x_fraction * page_width;
+
+        self.offset.x = new_offset_x;
+        self.manga_scroll_offset = new_offset_y;
+        self.manga_scroll_target = new_offset_y;
+        self.manga_scroll_velocity = 0.0;
+    }
+
+    fn masonry_note_zoom_interaction(&mut self) {
+        self.masonry_navigation_was_active = true;
+        self.masonry_quality_refine_due_at = None;
+        self.masonry_quality_refine_frames_remaining = 0;
+    }
+
+    fn manga_finish_direct_zoom_change(&mut self) {
+        self.manga_update_current_index();
+        if self.is_masonry_mode() {
+            self.masonry_note_zoom_interaction();
+        } else {
+            self.manga_update_preload_queue();
+        }
     }
 
     /// Clear the manga image cache to free GPU memory
@@ -8636,7 +8712,7 @@ impl ImageViewer {
                         let center_pos =
                             egui::pos2(self.screen_size.x * 0.5, self.screen_size.y * 0.5);
                         if self.apply_masonry_zoom_at_screen_pos(new_zoom, center_pos) {
-                            self.manga_update_preload_queue();
+                            self.manga_finish_direct_zoom_change();
                         }
                     } else {
                         // CRITICAL FIX: Use index-based anchoring for stable zooming with varying image sizes.
@@ -8654,7 +8730,7 @@ impl ImageViewer {
                             self.manga_apply_center_anchor(anchor);
                         }
 
-                        self.manga_update_preload_queue();
+                        self.manga_finish_direct_zoom_change();
                     }
                 } else {
                     // Non-manga mode: simple ratio-based offset adjustment
@@ -8870,7 +8946,7 @@ impl ImageViewer {
                                         if self
                                             .apply_masonry_zoom_at_screen_pos(new_zoom, center_pos)
                                         {
-                                            self.manga_update_preload_queue();
+                                            self.manga_finish_direct_zoom_change();
                                         }
                                     } else {
                                         // CRITICAL FIX: Use index-based anchoring for stable zooming with varying image sizes.
@@ -8885,7 +8961,7 @@ impl ImageViewer {
                                             self.manga_apply_center_anchor(anchor);
                                         }
 
-                                        self.manga_update_preload_queue();
+                                        self.manga_finish_direct_zoom_change();
                                     }
                                 } else {
                                     self.zoom = new_zoom;
@@ -8963,7 +9039,7 @@ impl ImageViewer {
             if self.is_masonry_mode() {
                 let center_pos = egui::pos2(self.screen_size.x * 0.5, self.screen_size.y * 0.5);
                 if self.apply_masonry_zoom_at_screen_pos(new_zoom, center_pos) {
-                    self.manga_update_preload_queue();
+                    self.manga_finish_direct_zoom_change();
                 }
             } else {
                 // CRITICAL FIX: Use index-based anchoring for stable zooming with varying image sizes.
@@ -8981,7 +9057,7 @@ impl ImageViewer {
                     self.manga_apply_center_anchor(anchor);
                 }
 
-                self.manga_update_preload_queue();
+                self.manga_finish_direct_zoom_change();
             }
         }
     }
@@ -9758,8 +9834,9 @@ impl ImageViewer {
                             .any(|b| matches!(b, InputBinding::CtrlScrollDown))
                     });
 
-        // Handle scroll/zoom (only when not over scrollbar)
-        if !over_scrollbar && !title_ui_blocking {
+        // Handle scroll/zoom. Ctrl+wheel zoom should still work over the scrollbar track unless
+        // the user is actively dragging the scrollbar itself.
+        if !title_ui_blocking && !self.manga_scrollbar_dragging {
             let wants_ctrl_zoom = ctrl_held
                 && manga_ctrl_scroll_zoom_bound
                 && (zoom_delta != 1.0 || wheel_steps_ctrl != 0.0);
@@ -9795,29 +9872,33 @@ impl ImageViewer {
                             })
                             .unwrap_or(egui::pos2(screen_width * 0.5, screen_height * 0.5));
 
-                        let _ = self.apply_masonry_zoom_at_screen_pos(new_zoom, anchor);
+                        if self.apply_masonry_zoom_at_screen_pos(new_zoom, anchor) {
+                            self.manga_finish_direct_zoom_change();
+                        }
                     } else {
-                        // Long strip: keep existing Y-anchor behavior.
-                        let anchor_screen_y = pointer_pos
-                            .map(|p| (p.y - screen_rect.min.y).clamp(0.0, screen_height))
-                            .unwrap_or(screen_height * 0.5);
-
-                        let anchor = self.manga_capture_anchor_at_screen_y(anchor_screen_y);
+                        let anchor_pos = pointer_pos
+                            .map(|p| {
+                                egui::pos2(
+                                    (p.x - screen_rect.min.x).clamp(0.0, screen_width),
+                                    (p.y - screen_rect.min.y).clamp(0.0, screen_height),
+                                )
+                            })
+                            .unwrap_or(egui::pos2(screen_width * 0.5, screen_height * 0.5));
+                        let anchor = self.manga_capture_anchor_at_screen_pos(anchor_pos);
 
                         self.zoom = new_zoom;
                         self.zoom_target = new_zoom;
                         self.zoom_velocity = 0.0;
                         self.invalidate_manga_layout_cache_for_zoom();
 
-                        // Re-apply the anchor to keep the same image position at the pointer/center
+                        // Re-apply the anchor to keep the same content point under the cursor.
                         if let Some(a) = anchor {
-                            self.manga_apply_anchor_at_screen_y(a);
+                            self.manga_apply_anchor_at_screen_pos(a);
                         }
+
+                        self.manga_finish_direct_zoom_change();
                     }
 
-                    // Scroll offset moved; update page index immediately.
-                    self.manga_update_current_index();
-                    self.manga_update_preload_queue();
                     animation_active = true;
                 }
             } else if wheel_steps != 0.0 {

@@ -23,6 +23,7 @@ All notable changes to this project will be documented in this file.
 - Visible strip and masonry items no longer get stuck in the blurry fill state, because sharpness upgrades now use the loader's real LOD buckets and can force a self-healing retry when stale bookkeeping gets in the way.
 - Masonry visible sharpening and mipmap decisions now follow each tile's current fitted on-screen size in the active row layout, and loader bookkeeping no longer overstates quality past the source image's real dimensions.
 - Masonry now schedules its own short post-navigation quality-refinement pass after scrolling, panning, or zooming settles, so visible tiles sharpen automatically without needing a manual zoom nudge.
+- Masonry Ctrl+wheel zoom no longer stalls when the pointer crosses the scrollbar track, active zoom stops forcing a full preload refresh every tick, and manga long-strip zoom now keeps the exact cursor position anchored in both axes instead of only following vertical position.
 
 ### Changed
 
