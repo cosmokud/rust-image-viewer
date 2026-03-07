@@ -2717,6 +2717,12 @@ impl ImageViewer {
         self.last_known_outer_pos = Some(pos);
     }
 
+    fn suppress_programmatic_native_window_transition_tracking(&mut self) {
+        // Native maximize/restore animations can emit several intermediate outer-position updates.
+        // Treat them like programmatic moves so floating media changes keep their normal centering behavior.
+        self.suppress_outer_pos_tracking_frames = self.suppress_outer_pos_tracking_frames.max(12);
+    }
+
     #[allow(dead_code)]
     fn apply_floating_layout_exit_fullscreen_current_image(&mut self, ctx: &egui::Context) {
         self.offset = egui::Vec2::ZERO;
@@ -4379,30 +4385,17 @@ impl ImageViewer {
         self.offset = egui::Vec2::ZERO;
         self.zoom_velocity = 0.0;
 
-        let Some((img_w_u, img_h_u)) = self.media_display_dimensions() else {
+        let Some((_, img_h_u)) = self.media_display_dimensions() else {
             return;
         };
 
-        let img_w = img_w_u as f32;
         let img_h = img_h_u as f32;
-        if img_w <= 0.0 || img_h <= 0.0 {
+        if img_h <= 0.0 {
             return;
         }
 
         let available = ctx.screen_rect().size();
-        let is_video = matches!(self.current_media_type, Some(MediaType::Video));
-
-        let fit_zoom = if is_video {
-            if img_h > available.y {
-                (available.y / img_h).clamp(0.1, self.max_zoom_factor())
-            } else {
-                1.0
-            }
-        } else if img_h > available.y || img_w > available.x {
-            (available.y / img_h).min(available.x / img_w).min(1.0)
-        } else {
-            1.0
-        };
+        let fit_zoom = (available.y.max(1.0) / img_h).clamp(0.1, self.max_zoom_factor());
 
         self.zoom = fit_zoom;
         self.zoom_target = fit_zoom;
@@ -14035,6 +14028,8 @@ impl eframe::App for ImageViewer {
             };
 
         if let Some(maximize) = self.request_native_maximize.take() {
+            self.suppress_programmatic_native_window_transition_tracking();
+
             #[cfg(target_os = "windows")]
             {
                 let _ = crate::windows_env::set_active_window_maximized(maximize);
@@ -14045,9 +14040,7 @@ impl eframe::App for ImageViewer {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(maximize));
             }
 
-            if maximize {
-                ctx.request_repaint_after(Duration::from_millis(16));
-            }
+            ctx.request_repaint_after(Duration::from_millis(16));
         }
 
         if self.pending_fullscreen_layout {
@@ -14062,7 +14055,7 @@ impl eframe::App for ImageViewer {
         self.apply_pending_titlebar_restore_layout(ctx);
 
         if self.pending_maximized_layout {
-            if self.current_window_is_maximized(ctx) {
+            if self.fullscreen_layout_ready(ctx) {
                 self.apply_maximized_layout_for_current_image(ctx);
                 self.pending_maximized_layout = false;
             } else {
