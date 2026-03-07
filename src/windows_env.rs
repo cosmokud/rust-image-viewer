@@ -186,6 +186,62 @@ pub fn set_active_window_maximized(maximize: bool) -> bool {
     true
 }
 
+pub fn clear_active_window_maximized_preserve_bounds() -> bool {
+    use std::ptr;
+    use winapi::um::winuser::{
+        GetMonitorInfoW, GetWindowPlacement, MonitorFromWindow, SetWindowPlacement, SetWindowPos,
+        MONITORINFO, MONITOR_DEFAULTTONEAREST, SW_SHOWNORMAL, SWP_ASYNCWINDOWPOS,
+        SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOZORDER, WINDOWPLACEMENT,
+    };
+
+    let hwnd = active_or_foreground_window();
+    if hwnd.is_null() {
+        return false;
+    }
+
+    unsafe {
+        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        if monitor.is_null() {
+            return false;
+        }
+
+        let mut monitor_info: MONITORINFO = std::mem::zeroed();
+        monitor_info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(monitor, &mut monitor_info as *mut _ as *mut _) == 0 {
+            return false;
+        }
+
+        let mut placement: WINDOWPLACEMENT = std::mem::zeroed();
+        placement.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
+        if GetWindowPlacement(hwnd, &mut placement) == 0 {
+            return false;
+        }
+
+        if placement.showCmd != winapi::um::winuser::SW_MAXIMIZE as u32 {
+            return true;
+        }
+
+        let monitor_rect = monitor_info.rcMonitor;
+        placement.showCmd = SW_SHOWNORMAL as u32;
+        placement.rcNormalPosition = monitor_rect;
+        if SetWindowPlacement(hwnd, &placement) == 0 {
+            return false;
+        }
+
+        SetWindowPos(
+            hwnd,
+            ptr::null_mut(),
+            monitor_rect.left,
+            monitor_rect.top,
+            monitor_rect.right - monitor_rect.left,
+            monitor_rect.bottom - monitor_rect.top,
+            SWP_ASYNCWINDOWPOS | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        );
+    }
+
+    true
+}
+
 /// Refreshes the process `PATH` from the registry (HKLM + HKCU), merging with the current
 /// process PATH. This makes DLL/plugin discovery resilient when the process is launched from
 /// a parent process with a stale/sanitized environment (e.g., some browsers).

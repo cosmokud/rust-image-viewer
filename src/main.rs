@@ -878,8 +878,12 @@ struct ImageViewer {
     pending_maximized_layout: bool,
     /// Wait for native maximize animation to settle before switching to OS borderless fullscreen.
     pending_native_borderless_fullscreen: bool,
+    /// Wait for the OS borderless fullscreen request to actually land.
+    pending_native_borderless_fullscreen_ack: bool,
     /// Fullscreen currently uses OS-managed borderless fullscreen entered after native maximize.
     fullscreen_uses_native_borderless: bool,
+    /// Clear the lingering maximized work-area clamp if Windows keeps fullscreen undersized.
+    native_borderless_unmaximize_requested: bool,
     /// Wait for OS borderless fullscreen to drop back to maximized before restoring down.
     pending_native_borderless_restore: bool,
     /// Last observed viewport size while waiting for a native maximize animation to finish.
@@ -1291,7 +1295,9 @@ impl Default for ImageViewer {
             pending_fullscreen_layout: false,
             pending_maximized_layout: false,
             pending_native_borderless_fullscreen: false,
+            pending_native_borderless_fullscreen_ack: false,
             fullscreen_uses_native_borderless: false,
+            native_borderless_unmaximize_requested: false,
             pending_native_borderless_restore: false,
             native_borderless_transition_last_size: None,
             native_borderless_transition_stable_frames: 0,
@@ -2230,7 +2236,7 @@ impl ImageViewer {
     }
 
     fn update_bottom_overlays_visibility(&mut self, ctx: &egui::Context) -> bool {
-        let screen_rect = ctx.screen_rect();
+        let screen_rect = self.current_layout_screen_rect(ctx);
         let mouse_pos = ctx.input(|i| i.pointer.hover_pos());
 
         let hover_bottom = mouse_pos
@@ -4358,6 +4364,21 @@ impl ImageViewer {
             .unwrap_or_else(|| ctx.screen_rect().size())
     }
 
+    fn current_layout_screen_rect(&self, ctx: &egui::Context) -> egui::Rect {
+        let screen_rect = ctx.screen_rect();
+
+        if self.is_fullscreen
+            || self.pending_native_borderless_fullscreen
+            || self.pending_native_borderless_fullscreen_ack
+            || self.fullscreen_uses_native_borderless
+            || self.viewport_is_os_fullscreen(ctx)
+        {
+            egui::Rect::from_min_size(screen_rect.min, self.current_viewport_inner_size(ctx))
+        } else {
+            screen_rect
+        }
+    }
+
     fn viewport_is_os_fullscreen(&self, ctx: &egui::Context) -> bool {
         ctx.input(|i| i.raw.viewport().fullscreen)
             .unwrap_or(false)
@@ -4382,6 +4403,8 @@ impl ImageViewer {
 
     fn begin_native_borderless_fullscreen_handoff(&mut self) {
         self.pending_native_borderless_fullscreen = true;
+        self.pending_native_borderless_fullscreen_ack = false;
+        self.native_borderless_unmaximize_requested = false;
         self.reset_native_borderless_transition_tracking();
     }
 
@@ -4623,7 +4646,7 @@ impl ImageViewer {
             return;
         }
 
-        let available = ctx.screen_rect().size();
+        let available = self.current_layout_screen_rect(ctx).size();
         let fit_zoom = (available.y.max(1.0) / img_h).clamp(0.1, self.max_zoom_factor());
 
         self.zoom = fit_zoom;
@@ -4645,7 +4668,7 @@ impl ImageViewer {
         // Get dimensions from either image or video
         if let Some((_, img_h)) = self.media_display_dimensions() {
             if img_h > 0 {
-                let viewport_height = ctx.screen_rect().height().max(1.0);
+                let viewport_height = self.current_layout_screen_rect(ctx).height().max(1.0);
                 let target_h = if self.fullscreen_layout_ready(ctx) {
                     viewport_height
                 } else {
@@ -8926,7 +8949,7 @@ impl ImageViewer {
             return;
         }
 
-        let screen_rect = ctx.screen_rect();
+        let screen_rect = self.current_layout_screen_rect(ctx);
         let button_size = egui::Vec2::new(130.0, 32.0);
         let button_spacing = 8.0;
         let stack_height = button_size.y * 2.0 + button_spacing;
@@ -9059,7 +9082,7 @@ impl ImageViewer {
             return;
         }
 
-        let screen_rect = ctx.screen_rect();
+        let screen_rect = self.current_layout_screen_rect(ctx);
         let scrollbar_padding = Self::BOTTOM_RIGHT_OVERLAY_SCROLLBAR_PADDING; // Padding to avoid scrollbar
         let margin = Self::BOTTOM_RIGHT_OVERLAY_MARGIN;
 
@@ -10015,7 +10038,7 @@ impl ImageViewer {
             self.tick_masonry_metadata_preload();
         }
 
-        let screen_rect = ctx.screen_rect();
+        let screen_rect = self.current_layout_screen_rect(ctx);
         let screen_width = screen_rect.width();
         let screen_height = screen_rect.height();
         let mut animation_active = false;
@@ -11284,7 +11307,7 @@ impl ImageViewer {
 
     /// Handle keyboard and mouse input
     fn handle_input(&mut self, ctx: &egui::Context) {
-        let screen_width = ctx.screen_rect().width();
+        let screen_width = self.current_layout_screen_rect(ctx).width();
 
         // Collect actions to run (we can't mutate self inside ctx.input closure)
         let mut actions_to_run: Vec<Action> = Vec::new();
@@ -11663,7 +11686,7 @@ impl ImageViewer {
 
     /// Draw the control bar
     fn draw_controls(&mut self, ctx: &egui::Context) {
-        let screen_rect = ctx.screen_rect();
+        let screen_rect = self.current_layout_screen_rect(ctx);
 
         // Default to false each frame; updated below when the bar is visible.
         self.mouse_over_window_buttons = false;
@@ -12078,7 +12101,7 @@ impl ImageViewer {
             return;
         }
 
-        let screen_rect = ctx.screen_rect();
+        let screen_rect = self.current_layout_screen_rect(ctx);
         let bar_height = 56.0; // Increased height for bottom padding
         let bottom_padding = 8.0; // Gap at the bottom so buttons don't look cramped
 
@@ -12582,7 +12605,7 @@ impl ImageViewer {
             return;
         }
 
-        let screen_rect = ctx.screen_rect();
+        let screen_rect = self.current_layout_screen_rect(ctx);
         let bar_height = 56.0;
         let bottom_padding = 8.0;
 
@@ -13293,7 +13316,7 @@ impl ImageViewer {
             return self.draw_manga_mode(ctx);
         }
 
-        let screen_rect = ctx.screen_rect();
+        let screen_rect = self.current_layout_screen_rect(ctx);
         let mut animation_active = false;
         let title_bar_height = 32.0;
         let title_ui_blocking = self.mouse_over_window_buttons
@@ -13905,7 +13928,7 @@ impl eframe::App for ImageViewer {
         // Keep our cached screen size in sync with the real viewport.
         // Manga mode uses this for layout/scroll math; if it drifts from `ctx.screen_rect()`,
         // you can get clamping oscillations and visible jitter.
-        self.screen_size = ctx.screen_rect().size();
+        self.screen_size = self.current_layout_screen_rect(ctx).size();
 
         // PERFORMANCE: Check if window is minimized to reduce resource usage
         let is_minimized = ctx.input(|i| i.raw.viewport().minimized.unwrap_or(false));
@@ -14008,7 +14031,7 @@ impl eframe::App for ImageViewer {
                         let target_h = self
                             .monitor_size_points(ctx)
                             .y
-                            .max(ctx.screen_rect().height());
+                            .max(self.current_layout_screen_rect(ctx).height());
                         let z = (target_h / img_h as f32).clamp(0.1, self.max_zoom_factor());
                         self.zoom = z;
                         self.zoom_target = z;
@@ -14104,7 +14127,9 @@ impl eframe::App for ImageViewer {
                     self.pending_maximized_layout = false;
                     self.pending_native_borderless_restore = false;
                     self.pending_native_borderless_fullscreen = false;
+                    self.pending_native_borderless_fullscreen_ack = false;
                     self.fullscreen_uses_native_borderless = false;
+                    self.native_borderless_unmaximize_requested = false;
                     self.reset_native_borderless_transition_tracking();
 
                     // No fullscreen transition animation: switch instantly.
@@ -14190,7 +14215,9 @@ impl eframe::App for ImageViewer {
                     let image_changed_while_fullscreen = self
                         .saved_fullscreen_entry_index
                         .is_some_and(|idx| idx != self.current_index);
-                    let using_native_borderless_fullscreen = self.fullscreen_uses_native_borderless;
+                    let using_native_borderless_fullscreen = self.fullscreen_uses_native_borderless
+                        || self.pending_native_borderless_fullscreen_ack
+                        || self.viewport_is_os_fullscreen(ctx);
                     let restore_to_maximized = use_native_transition && self.saved_floating_was_maximized;
                     let should_native_restore = use_native_transition
                         && (window_was_maximized || using_native_borderless_fullscreen)
@@ -14204,6 +14231,8 @@ impl eframe::App for ImageViewer {
                         self.fullscreen_uses_native_borderless = false;
                         self.pending_native_borderless_restore = should_native_restore;
                         self.pending_native_borderless_fullscreen = false;
+                        self.pending_native_borderless_fullscreen_ack = false;
+                        self.native_borderless_unmaximize_requested = false;
                         self.reset_native_borderless_transition_tracking();
                     } else {
                         self.pending_native_borderless_restore = false;
@@ -14373,10 +14402,32 @@ impl eframe::App for ImageViewer {
             if self.native_maximize_animation_complete(ctx) {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
                 self.pending_native_borderless_fullscreen = false;
-                self.fullscreen_uses_native_borderless = true;
-                self.reset_native_borderless_transition_tracking();
+                self.pending_native_borderless_fullscreen_ack = true;
                 ctx.request_repaint_after(Duration::from_millis(16));
             } else {
+                ctx.request_repaint_after(Duration::from_millis(16));
+            }
+        }
+
+        if self.pending_native_borderless_fullscreen_ack {
+            if self.fullscreen_layout_ready(ctx) {
+                self.pending_native_borderless_fullscreen_ack = false;
+                self.fullscreen_uses_native_borderless = true;
+                self.native_borderless_unmaximize_requested = false;
+                self.reset_native_borderless_transition_tracking();
+            } else {
+                if self.viewport_is_os_fullscreen(ctx)
+                    && self.current_window_is_maximized(ctx)
+                    && !self.native_borderless_unmaximize_requested
+                {
+                    #[cfg(target_os = "windows")]
+                    {
+                        if crate::windows_env::clear_active_window_maximized_preserve_bounds() {
+                            self.native_borderless_unmaximize_requested = true;
+                        }
+                    }
+                }
+
                 ctx.request_repaint_after(Duration::from_millis(16));
             }
         }
