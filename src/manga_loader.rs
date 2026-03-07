@@ -51,6 +51,9 @@ const MAX_PENDING_UPLOADS: usize = 32;
 /// Beyond this, the oldest entries are evicted to control VRAM usage.
 const DEFAULT_CACHED_TEXTURES: usize = 64;
 
+/// Small dedicated queue for visible-item retries that should not wait behind preload churn.
+const URGENT_REQUEST_QUEUE_CAPACITY: usize = 64;
+
 /// Fixed buffer to add AHEAD of visible pages (in scroll direction) for preloading.
 /// If 14 pages are visible and scrolling down, we preload 14 + 4 = 18 ahead.
 const PRELOAD_BUFFER_AHEAD: usize = 4;
@@ -157,6 +160,8 @@ struct RetryState {
 pub struct MangaLoader {
     /// Channel to send load requests to worker threads
     request_tx: Sender<LoadRequest>,
+    /// Channel for visible-item retries that should bypass normal preload backlog.
+    urgent_request_tx: Sender<LoadRequest>,
     /// Channel to receive decoded images from worker threads
     result_rx: Receiver<DecodedImage>,
     /// Indices currently being loaded for the active generation.
@@ -208,6 +213,8 @@ impl MangaLoader {
     pub fn new() -> Self {
         // Create bounded channels to prevent unbounded memory growth
         let (request_tx, request_rx) = crossbeam_channel::bounded::<LoadRequest>(256);
+        let (urgent_request_tx, urgent_request_rx) =
+            crossbeam_channel::bounded::<LoadRequest>(URGENT_REQUEST_QUEUE_CAPACITY);
         let (result_tx, result_rx) =
             crossbeam_channel::bounded::<DecodedImage>(MAX_PENDING_UPLOADS);
 
@@ -232,6 +239,7 @@ impl MangaLoader {
         crate::async_runtime::spawn_blocking_or_thread("manga-loader-coordinator", move || {
             Self::coordinator_loop(
                 request_rx,
+                urgent_request_rx,
                 result_tx,
                 loading_clone,
                 loaded_clone,
@@ -331,6 +339,7 @@ impl MangaLoader {
 
         Self {
             request_tx,
+            urgent_request_tx,
             result_rx,
             loading_indices,
             loaded_levels,
@@ -567,6 +576,7 @@ impl MangaLoader {
     /// Coordinator loop that processes requests in parallel using Rayon.
     fn coordinator_loop(
         request_rx: Receiver<LoadRequest>,
+        urgent_request_rx: Receiver<LoadRequest>,
         result_tx: Sender<DecodedImage>,
         loading_indices: Arc<RwLock<HashMap<usize, usize>>>,
         loaded_levels: Arc<RwLock<HashMap<usize, u32>>>,
@@ -585,19 +595,39 @@ impl MangaLoader {
             // Collect available requests (non-blocking after first)
             batch.clear();
 
-            // Block on first request with a long timeout (500ms) to minimize CPU usage when idle.
-            // The channel will wake immediately when a real request arrives.
-            match request_rx.recv_timeout(std::time::Duration::from_millis(500)) {
-                Ok(req) => batch.push(req),
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
-                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+            // Prefer urgent visible retries so sharpening upgrades do not wait behind preload work.
+            crossbeam_channel::select! {
+                recv(urgent_request_rx) -> req => {
+                    if let Ok(req) = req {
+                        batch.push(req);
+                    } else {
+                        continue;
+                    }
+                }
+                recv(request_rx) -> req => {
+                    if let Ok(req) = req {
+                        batch.push(req);
+                    } else {
+                        continue;
+                    }
+                }
+                default(std::time::Duration::from_millis(500)) => continue,
+            }
+
+            while batch.len() < 32 {
+                match urgent_request_rx.try_recv() {
+                    Ok(req) => batch.push(req),
+                    Err(crossbeam_channel::TryRecvError::Empty) => break,
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+                }
             }
 
             // Drain any additional pending requests (non-blocking)
-            while let Ok(req) = request_rx.try_recv() {
-                batch.push(req);
-                if batch.len() >= 32 {
-                    break;
+            while batch.len() < 32 {
+                match request_rx.try_recv() {
+                    Ok(req) => batch.push(req),
+                    Err(crossbeam_channel::TryRecvError::Empty) => break,
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => break,
                 }
             }
 
@@ -1667,11 +1697,19 @@ impl MangaLoader {
             queued_at: Instant::now(),
         };
 
-        match self.request_tx.try_send(req) {
+        let send_result = match self.urgent_request_tx.try_send(req.clone()) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(req)) | Err(TrySendError::Disconnected(req)) => {
+                self.request_tx.try_send(req)
+            }
+        };
+
+        match send_result {
             Ok(()) => {
                 self.loading_indices
                     .write()
                     .insert(index, self.current_generation);
+                self.retry_state.write().remove(&index);
                 self.stats.images_pending = self.loading_indices.read().len();
                 true
             }

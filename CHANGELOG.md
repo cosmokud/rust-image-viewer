@@ -24,6 +24,7 @@ All notable changes to this project will be documented in this file.
 - Masonry visible sharpening and mipmap decisions now follow each tile's current fitted on-screen size in the active row layout, and loader bookkeeping no longer overstates quality past the source image's real dimensions.
 - Masonry now schedules its own short post-navigation quality-refinement pass after scrolling, panning, or zooming settles, so visible tiles sharpen automatically without needing a manual zoom nudge.
 - Masonry Ctrl+wheel zoom no longer stalls when the pointer crosses the scrollbar track, active zoom stops forcing a full preload refresh every tick, and manga long-strip zoom now keeps the exact cursor position anchored in both axes instead of only following vertical position.
+- Visible sharpening retries now go through a dedicated urgent loader lane instead of waiting behind speculative preload work, and masonry starts its post-navigation quality-refine pass sooner so blurry tiles snap to their sharp version faster after they enter view.
 
 ### Changed
 
