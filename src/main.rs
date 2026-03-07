@@ -1112,6 +1112,8 @@ struct ImageViewer {
     manga_ttv_samples_ms: VecDeque<f32>,
     /// First time a visible item received an initial texture and started waiting for a sharper one.
     manga_sharp_pending: HashMap<usize, Instant>,
+    /// Number of placeholders actually rendered in the most recent manga frame.
+    manga_visible_placeholder_count: usize,
     /// Track if left arrow was down last frame (to detect hold vs single tap)
     manga_arrow_left_was_down: bool,
     /// Track if right arrow was down last frame (to detect hold vs single tap)
@@ -1383,6 +1385,7 @@ impl Default for ImageViewer {
             manga_ttv_pending: HashMap::new(),
             manga_ttv_samples_ms: VecDeque::new(),
             manga_sharp_pending: HashMap::new(),
+            manga_visible_placeholder_count: 0,
             manga_arrow_left_was_down: false,
             manga_arrow_right_was_down: false,
 
@@ -1694,6 +1697,8 @@ impl ImageViewer {
             return;
         }
         self.manga_sharp_pending.remove(&index);
+        self.manga_visible_placeholder_count =
+            self.manga_visible_placeholder_count.saturating_add(1);
         self.manga_ttv_pending
             .entry(index)
             .or_insert_with(Instant::now);
@@ -1819,7 +1824,7 @@ impl ImageViewer {
         }
 
         // If many visible placeholders are waiting, bias toward lower latency.
-        if self.manga_ttv_pending.len() >= 8 {
+        if self.manga_visible_placeholder_count >= 8 {
             limit += 2;
         }
 
@@ -1887,10 +1892,10 @@ impl ImageViewer {
         let soft_backlog = base_batch.saturating_mul(2).max(4);
         let hard_backlog = base_batch.saturating_mul(3).max(8);
 
-        if !self.manga_ttv_pending.is_empty() {
+        if self.manga_visible_placeholder_count > 0 {
             level = level.max(1);
         }
-        if self.manga_ttv_pending.len() >= 6 {
+        if self.manga_visible_placeholder_count >= 6 {
             level = level.max(2);
         }
 
@@ -1931,7 +1936,7 @@ impl ImageViewer {
         pending_decoded_total: usize,
         upload_batch_limit: usize,
     ) -> usize {
-        if upload_batch_limit <= 1 || !self.manga_ttv_pending.is_empty() {
+        if upload_batch_limit <= 1 || self.manga_visible_placeholder_count > 0 {
             return 0;
         }
 
@@ -2139,18 +2144,22 @@ impl ImageViewer {
                 push_segment(
                     &mut manga_line,
                     format!(
-                        "U{} L{}/{} D{}/{} V{}/{}",
+                        "U{} L{}/{} D{}/{} V{}/{} P{}",
                         self.manga_upload_batch_limit,
                         loader.pending_load_count(),
                         self.manga_pending_loads_peak,
                         loader.pending_decoded_count(),
                         self.manga_pending_decoded_peak,
                         self.manga_visible_indices_last,
-                        self.manga_visible_indices_peak
+                        self.manga_visible_indices_peak,
+                        self.manga_visible_placeholder_count
                     ),
                 );
             } else {
-                push_segment(&mut manga_line, format!("U{}", self.manga_upload_batch_limit));
+                push_segment(
+                    &mut manga_line,
+                    format!("U{} P{}", self.manga_upload_batch_limit, self.manga_visible_placeholder_count),
+                );
             }
             if let Some(p95) = self
                 .perf_metrics
@@ -3427,6 +3436,7 @@ impl ImageViewer {
         self.clear_pending_manga_video_load();
         self.manga_decoded_mailbox.clear();
         self.manga_sharp_pending.clear();
+        self.manga_visible_placeholder_count = 0;
         self.manga_video_players.clear();
         self.manga_focused_video_index = None;
         self.manga_hovered_media_index = None;
@@ -6080,6 +6090,7 @@ impl ImageViewer {
             self.manga_ttv_pending.clear();
             self.manga_ttv_samples_ms.clear();
             self.manga_sharp_pending.clear();
+            self.manga_visible_placeholder_count = 0;
             self.manga_upload_batch_limit = Self::MANGA_UPLOAD_BATCH_BASE;
             self.manga_visible_indices_last = 0;
             self.manga_visible_indices_peak = 0;
@@ -6496,6 +6507,7 @@ impl ImageViewer {
         self.manga_ttv_pending.clear();
         self.manga_ttv_samples_ms.clear();
         self.manga_sharp_pending.clear();
+        self.manga_visible_placeholder_count = 0;
         self.manga_upload_batch_limit = Self::MANGA_UPLOAD_BATCH_BASE;
         self.manga_cache_target_capacity = Self::MANGA_CACHE_MIN_ENTRIES;
         self.manga_target_texture_side = self.max_texture_side.max(1);
@@ -9492,7 +9504,7 @@ impl ImageViewer {
             let pending_decoded_total =
                 pending_decoded.saturating_add(self.manga_decoded_mailbox.len());
 
-            if !self.manga_ttv_pending.is_empty() {
+            if self.manga_visible_placeholder_count > 0 {
                 self.perf_metrics
                     .increment_counter("manga_upgrade_deferred_fill", 1);
                 return false;
@@ -9563,6 +9575,26 @@ impl ImageViewer {
                 )
             })
             .unwrap_or(false);
+
+        if !requested && current_texture_side == 0 {
+            if let Some(loader) = self.manga_loader.as_mut() {
+                loader.mark_unloaded(index);
+                requested = loader.request_visible_retry(
+                    &self.image_list,
+                    index,
+                    self.max_texture_side,
+                    target_texture_side,
+                    downscale_filter,
+                    gif_filter,
+                    force_triangle_filters,
+                );
+            }
+
+            if requested {
+                self.perf_metrics
+                    .increment_counter("manga_retry_forced_placeholder_requeue", 1);
+            }
+        }
 
         if !requested
             && quality_upgrade
@@ -9889,6 +9921,7 @@ impl ImageViewer {
             return false;
         }
 
+        self.manga_visible_placeholder_count = 0;
         self.manga_prune_ttv_pending();
         self.manga_prune_sharp_pending();
 
@@ -14279,7 +14312,8 @@ impl eframe::App for ImageViewer {
                 || manga_pending_decoded > 0
                 || manga_pending_dimensions > 0);
         let manga_needs_fast_background_poll = self.manga_mode
-            && (!self.manga_ttv_pending.is_empty()
+            && (self.manga_visible_placeholder_count > 0
+                || !self.manga_sharp_pending.is_empty()
                 || manga_pending_decoded > 0
                 || manga_pending_dimensions > 0);
         let manga_scroll_active = self.manga_mode
