@@ -302,32 +302,6 @@ impl MangaVirtualizationBackend {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MangaLodProfile {
-    Performance,
-    Balanced,
-    Clarity,
-}
-
-impl MangaLodProfile {
-    pub fn from_str(s: &str) -> Option<Self> {
-        match s.trim().to_lowercase().as_str() {
-            "performance" | "perf" | "speed" | "fast" => Some(Self::Performance),
-            "balanced" | "balance" | "default" => Some(Self::Balanced),
-            "clarity" | "quality" | "sharp" | "sharpness" => Some(Self::Clarity),
-            _ => None,
-        }
-    }
-
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Performance => "performance",
-            Self::Balanced => "balanced",
-            Self::Clarity => "clarity",
-        }
-    }
-}
-
 /// Parse a single key from string
 fn parse_key(s: &str) -> Option<egui::Key> {
     match s.to_lowercase().as_str() {
@@ -513,12 +487,6 @@ pub struct Config {
     pub metadata_cache_max_size_mb: u64,
 
     // ============ IMAGE QUALITY SETTINGS ============
-    /// High-level LOD bias preset for manga/masonry texture targets.
-    pub manga_lod_profile: MangaLodProfile,
-    /// Multiplier applied to manga/masonry target texture sizes.
-    pub manga_lod_target_scale: f32,
-    /// Multiplier applied to the quality-upgrade hysteresis.
-    pub manga_lod_upgrade_hysteresis: f32,
     /// Filter for upscaling images (making them larger)
     pub upscale_filter: ImageFilter,
     /// Filter for downscaling images (making them smaller)
@@ -612,9 +580,6 @@ impl Config {
             vsync: true,
             metadata_cache_max_size_mb: 1024,
             // Image quality defaults
-            manga_lod_profile: MangaLodProfile::Balanced,
-            manga_lod_target_scale: 1.0,
-            manga_lod_upgrade_hysteresis: 1.0,
             upscale_filter: ImageFilter::CatmullRom,
             downscale_filter: ImageFilter::Lanczos3,
             gif_resize_filter: ImageFilter::Triangle,
@@ -1188,31 +1153,6 @@ impl Config {
                     let value = value.trim();
 
                     match key.as_str() {
-                        "manga_lod_profile"
-                        | "manga_quality_profile"
-                        | "manga_texture_lod_profile" => {
-                            if let Some(profile) = MangaLodProfile::from_str(value) {
-                                config.manga_lod_profile = profile;
-                            }
-                        }
-                        "manga_lod_target_scale"
-                        | "manga_texture_target_scale"
-                        | "manga_texture_quality_scale" => {
-                            if let Ok(v) = value.parse::<f32>() {
-                                if v.is_finite() {
-                                    config.manga_lod_target_scale = v.clamp(0.60, 1.60);
-                                }
-                            }
-                        }
-                        "manga_lod_upgrade_hysteresis"
-                        | "manga_texture_upgrade_hysteresis"
-                        | "manga_upgrade_hysteresis" => {
-                            if let Ok(v) = value.parse::<f32>() {
-                                if v.is_finite() {
-                                    config.manga_lod_upgrade_hysteresis = v.clamp(0.70, 1.35);
-                                }
-                            }
-                        }
                         "upscale_filter" => {
                             if let Some(f) = ImageFilter::from_str(value) {
                                 config.upscale_filter = f;
@@ -1501,18 +1441,6 @@ impl Config {
             bool_to_ini(self.video_disable_hardware_decode).to_string(),
         );
 
-        values.insert(
-            "manga_lod_profile",
-            self.manga_lod_profile.as_str().to_string(),
-        );
-        values.insert(
-            "manga_lod_target_scale",
-            format_with_optional_trailing_zero_f32(self.manga_lod_target_scale),
-        );
-        values.insert(
-            "manga_lod_upgrade_hysteresis",
-            format_with_optional_trailing_zero_f32(self.manga_lod_upgrade_hysteresis),
-        );
         values.insert("upscale_filter", self.upscale_filter.as_str().to_string());
         values.insert(
             "downscale_filter",

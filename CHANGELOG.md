@@ -22,10 +22,11 @@ All notable changes to this project will be documented in this file.
 - Metadata-cache fingerprint validation now uses a short-lived in-memory stamp cache, which cuts repeated `std::fs::metadata` probes during dense browsing and reduces HDD-sensitive thumbnail and dimension lookup stalls.
 - Visible strip and masonry items no longer get stuck in the blurry fill state, because sharpness upgrades now use the loader's real LOD buckets and can force a self-healing retry when stale bookkeeping gets in the way.
 - Masonry visible sharpening and mipmap decisions now follow each tile's current fitted on-screen size in the active row layout, and loader bookkeeping no longer overstates quality past the source image's real dimensions.
+- Masonry now schedules its own short post-navigation quality-refinement pass after scrolling, panning, or zooming settles, so visible tiles sharpen automatically without needing a manual zoom nudge.
 
-### Added
+### Changed
 
-- Added `manga_lod_profile`, `manga_lod_target_scale`, and `manga_lod_upgrade_hysteresis` to `config.ini` so strip and masonry rendering can be biased toward performance or clarity.
+- Manga and masonry LOD selection is now automatic again and adapts to current tile fit, row density, visible workload, and screen size instead of exposing manual quality knobs in `config.ini`.
 
 ### Added
 

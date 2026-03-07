@@ -22,8 +22,8 @@ mod windows_env;
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use config::{
-    Action, Config, InputBinding, MangaLodProfile, MangaVirtualizationBackend,
-    StartupWindowMode, VideoSeekPolicy,
+    Action, Config, InputBinding, MangaVirtualizationBackend, StartupWindowMode,
+    VideoSeekPolicy,
 };
 use hashbrown::{HashMap, HashSet};
 use image_loader::{get_media_type, is_supported_video, ImageFrame, LoadedImage, MediaType};
@@ -1079,6 +1079,12 @@ struct ImageViewer {
     masonry_metadata_preload_loaded: usize,
     /// Cursor used to warm remaining masonry dimensions progressively in the background.
     masonry_metadata_preload_cursor: usize,
+    /// True if masonry was actively scrolling/panning/zooming on the previous frame.
+    masonry_navigation_was_active: bool,
+    /// Earliest time when a post-navigation visible-quality refinement pass may begin.
+    masonry_quality_refine_due_at: Option<Instant>,
+    /// Remaining frames for the post-navigation visible-quality refinement pass.
+    masonry_quality_refine_frames_remaining: u8,
 
     /// Cooldown frames before updating preload queue (prevents cache churn during rapid navigation)
     manga_preload_cooldown: u32,
@@ -1358,6 +1364,9 @@ impl Default for ImageViewer {
             masonry_metadata_preload_total: 0,
             masonry_metadata_preload_loaded: 0,
             masonry_metadata_preload_cursor: 0,
+            masonry_navigation_was_active: false,
+            masonry_quality_refine_due_at: None,
+            masonry_quality_refine_frames_remaining: 0,
 
             manga_preload_cooldown: 0,
             manga_last_preload_update: Instant::now(),
@@ -1441,6 +1450,8 @@ impl ImageViewer {
     const MANGA_TEXTURE_UPGRADE_MIN_RATIO: f32 = 1.12;
     const MANGA_TEXTURE_UPGRADE_MASONRY_MIN_DELTA_SIDE: u32 = 96;
     const MANGA_TEXTURE_UPGRADE_MASONRY_MIN_RATIO: f32 = 1.24;
+    const MASONRY_QUALITY_REFINE_SETTLE_MS: u64 = 90;
+    const MASONRY_QUALITY_REFINE_MAX_FRAMES: u8 = 12;
     const MANGA_TTV_SAMPLE_CAP: usize = 240;
     const MANGA_TTV_PENDING_MAX_AGE: Duration = Duration::from_secs(30);
     const FPS_OVERLAY_IDLE_POLL_MS: u64 = 500;
@@ -4836,23 +4847,90 @@ impl ImageViewer {
     }
 
     fn manga_lod_target_scale_factor(&self) -> f32 {
-        let profile_scale = match self.config.manga_lod_profile {
-            MangaLodProfile::Performance => 0.86,
-            MangaLodProfile::Balanced => 1.0,
-            MangaLodProfile::Clarity => 1.14,
-        };
+        if !self.is_masonry_mode() {
+            if self.screen_size.x >= 3200.0 {
+                1.06
+            } else if self.screen_size.x >= 2560.0 {
+                1.03
+            } else {
+                1.0
+            }
+        } else {
+            let visible_hint = self.masonry_visible_density_hint();
+            let row_scale: f32 = match self.masonry_items_per_row.clamp(2, 10) {
+                2 | 3 => 1.10,
+                4 => 1.06,
+                5 => 1.02,
+                6 => 0.98,
+                7 => 0.95,
+                _ => 0.92,
+            };
+            let density_scale: f32 = if visible_hint >= 120 {
+                0.90
+            } else if visible_hint >= 72 {
+                0.95
+            } else if visible_hint >= 36 {
+                1.0
+            } else {
+                1.06
+            };
+            let screen_scale: f32 = if self.screen_size.x >= 3200.0 {
+                1.06
+            } else if self.screen_size.x >= 2560.0 {
+                1.03
+            } else {
+                1.0
+            };
 
-        (profile_scale * self.config.manga_lod_target_scale).clamp(0.60, 1.60)
+            (row_scale * density_scale * screen_scale).clamp(0.88f32, 1.18f32)
+        }
     }
 
     fn manga_lod_upgrade_hysteresis_factor(&self) -> f32 {
-        let profile_scale = match self.config.manga_lod_profile {
-            MangaLodProfile::Performance => 1.10,
-            MangaLodProfile::Balanced => 1.0,
-            MangaLodProfile::Clarity => 0.94,
+        if !self.is_masonry_mode() {
+            1.0
+        } else if self.masonry_quality_refine_frames_remaining > 0 {
+            0.80
+        } else {
+            let visible_hint = self.masonry_visible_density_hint();
+            if visible_hint >= 120 {
+                0.98
+            } else if visible_hint >= 72 {
+                0.94
+            } else if visible_hint >= 36 {
+                0.90
+            } else {
+                0.86
+            }
+        }
+    }
+
+    fn masonry_schedule_quality_refine(&mut self) {
+        self.masonry_quality_refine_due_at = Some(
+            Instant::now() + Duration::from_millis(Self::MASONRY_QUALITY_REFINE_SETTLE_MS),
+        );
+        self.masonry_quality_refine_frames_remaining = 0;
+    }
+
+    fn masonry_begin_quality_refine_if_due(&mut self) -> bool {
+        if !self.is_masonry_mode()
+            || !self.manga_mode
+            || self.masonry_navigation_active_for_heavy_work()
+        {
+            return false;
+        }
+
+        let Some(due_at) = self.masonry_quality_refine_due_at else {
+            return false;
         };
 
-        (profile_scale * self.config.manga_lod_upgrade_hysteresis).clamp(0.70, 1.35)
+        if Instant::now() < due_at {
+            return false;
+        }
+
+        self.masonry_quality_refine_due_at = None;
+        self.masonry_quality_refine_frames_remaining = Self::MASONRY_QUALITY_REFINE_MAX_FRAMES;
+        true
     }
 
     fn masonry_target_texture_side_from_display_side(&self, item_screen_max_side: f32) -> u32 {
@@ -6109,6 +6187,9 @@ impl ImageViewer {
         self.manga_pending_loads_peak = 0;
         self.manga_pending_decoded_peak = 0;
         self.manga_decoded_mailbox.clear();
+        self.masonry_navigation_was_active = false;
+        self.masonry_quality_refine_due_at = None;
+        self.masonry_quality_refine_frames_remaining = 0;
 
         // Clear and reset the parallel loader
         if let Some(ref mut loader) = self.manga_loader {
@@ -10015,6 +10096,21 @@ impl ImageViewer {
             if navigation_active {
                 self.manga_hover_autoplay_resume_at = Instant::now()
                     + Duration::from_millis(self.config.manga_hover_autoplay_resume_delay_ms);
+                self.masonry_navigation_was_active = true;
+                self.masonry_quality_refine_due_at = None;
+                self.masonry_quality_refine_frames_remaining = 0;
+            } else {
+                if self.masonry_navigation_was_active {
+                    self.masonry_navigation_was_active = false;
+                    self.masonry_schedule_quality_refine();
+                    ctx.request_repaint_after(Duration::from_millis(
+                        Self::MASONRY_QUALITY_REFINE_SETTLE_MS,
+                    ));
+                } else if self.masonry_begin_quality_refine_if_due() {
+                    self.manga_preload_cooldown = 0;
+                    self.manga_update_preload_queue();
+                    animation_active = true;
+                }
             }
         }
 
@@ -10283,6 +10379,22 @@ impl ImageViewer {
         // When fully idle, avoid periodic O(n) scans that keep CPU usage elevated.
         if has_pending_loads {
             self.manga_update_preload_queue();
+        }
+
+        if self.is_masonry_mode() && !self.masonry_navigation_active_for_heavy_work() {
+            if let Some(due_at) = self.masonry_quality_refine_due_at {
+                let now = Instant::now();
+                if now < due_at {
+                    ctx.request_repaint_after(due_at.saturating_duration_since(now));
+                }
+            }
+
+            if self.masonry_quality_refine_frames_remaining > 0 {
+                self.masonry_quality_refine_frames_remaining -= 1;
+                self.manga_preload_cooldown = 0;
+                self.manga_update_preload_queue();
+                animation_active = true;
+            }
         }
 
         animation_active
