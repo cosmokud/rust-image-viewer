@@ -1441,6 +1441,8 @@ impl ImageViewer {
     const MANGA_DECODED_MAILBOX_MAX_ITEMS: usize = 16;
     const MANGA_UPLOAD_P95_SOFT_BUDGET_MS: f32 = 4.5;
     const MANGA_UPLOAD_P95_HARD_BUDGET_MS: f32 = 7.5;
+    const MANGA_FRAME_P95_SOFT_BUDGET_MS: f32 = 8.25;
+    const MANGA_FRAME_P95_HARD_BUDGET_MS: f32 = 10.5;
     const MANGA_VIRTUALIZATION_AUTO_RTREE_MIN_ITEMS: usize = 2048;
     const MANGA_CACHE_MIN_ENTRIES: usize = 64;
     const MANGA_CACHE_MAX_ENTRIES: usize = 512;
@@ -1780,7 +1782,7 @@ impl ImageViewer {
         media_type: MangaMediaType,
     ) -> u32 {
         if self.is_masonry_mode() && media_type == MangaMediaType::StaticImage {
-            self.masonry_target_texture_side_for_index(index)
+            self.masonry_quality_target_texture_side_for_index(index)
         } else {
             self.manga_target_texture_side_for_dynamic_media(index, media_type)
         }
@@ -1835,15 +1837,25 @@ impl ImageViewer {
             }
         }
 
+        if let Some(frame_p95_ms) = self.perf_metrics.percentile_ms("frame_dt_ms", 0.95) {
+            if frame_p95_ms >= Self::MANGA_FRAME_P95_HARD_BUDGET_MS {
+                limit = limit.saturating_sub(3);
+            } else if frame_p95_ms >= Self::MANGA_FRAME_P95_SOFT_BUDGET_MS {
+                limit = limit.saturating_sub(2);
+            } else if frame_p95_ms <= 7.0 && pending_decoded >= 10 {
+                limit += 1;
+            }
+        }
+
         // Guard UI smoothness by reacting to recent frame time.
         // `fps_last_dt_s` is updated from active render frames only.
         if self.fps_last_dt_s.is_finite() && self.fps_last_dt_s > 0.0 {
             let frame_ms = self.fps_last_dt_s * 1000.0;
-            if frame_ms >= 22.0 {
+            if frame_ms >= 14.0 {
                 limit = limit.saturating_sub(2);
-            } else if frame_ms >= 18.0 {
+            } else if frame_ms >= 10.5 {
                 limit = limit.saturating_sub(1);
-            } else if frame_ms <= 12.5 && pending_decoded >= 10 {
+            } else if frame_ms <= 8.0 && pending_decoded >= 10 {
                 limit += 1;
             }
         }
@@ -1855,6 +1867,85 @@ impl ImageViewer {
         }
 
         limit.clamp(Self::MANGA_UPLOAD_BATCH_MIN, Self::MANGA_UPLOAD_BATCH_MAX)
+    }
+
+    fn manga_quality_refine_pressure_level(
+        &self,
+        pending_loads: usize,
+        pending_decoded_total: usize,
+    ) -> u8 {
+        if self.masonry_navigation_active_for_heavy_work() {
+            return 2;
+        }
+
+        let mut level = 0u8;
+        let base_batch = self
+            .manga_upload_batch_limit
+            .max(Self::MANGA_UPLOAD_BATCH_MIN)
+            .max(1);
+        let mailbox_len = self.manga_decoded_mailbox.len();
+        let soft_backlog = base_batch.saturating_mul(2).max(4);
+        let hard_backlog = base_batch.saturating_mul(3).max(8);
+
+        if !self.manga_ttv_pending.is_empty() {
+            level = level.max(1);
+        }
+        if self.manga_ttv_pending.len() >= 6 {
+            level = level.max(2);
+        }
+
+        if mailbox_len >= hard_backlog || pending_decoded_total >= hard_backlog {
+            level = level.max(2);
+        } else if mailbox_len >= soft_backlog
+            || pending_decoded_total >= soft_backlog
+            || pending_loads >= 28
+        {
+            level = level.max(1);
+        }
+
+        if let Some(upload_p95_ms) = self
+            .perf_metrics
+            .percentile_ms("manga_upload_pass_ms", 0.95)
+        {
+            if upload_p95_ms >= Self::MANGA_UPLOAD_P95_HARD_BUDGET_MS {
+                level = level.max(2);
+            } else if upload_p95_ms >= Self::MANGA_UPLOAD_P95_SOFT_BUDGET_MS {
+                level = level.max(1);
+            }
+        }
+
+        if let Some(frame_p95_ms) = self.perf_metrics.percentile_ms("frame_dt_ms", 0.95) {
+            if frame_p95_ms >= Self::MANGA_FRAME_P95_HARD_BUDGET_MS {
+                level = level.max(2);
+            } else if frame_p95_ms >= Self::MANGA_FRAME_P95_SOFT_BUDGET_MS {
+                level = level.max(1);
+            }
+        }
+
+        level
+    }
+
+    fn manga_quality_refine_upload_budget(
+        &self,
+        pending_loads: usize,
+        pending_decoded_total: usize,
+        upload_batch_limit: usize,
+    ) -> usize {
+        if upload_batch_limit <= 1 || !self.manga_ttv_pending.is_empty() {
+            return 0;
+        }
+
+        if self.manga_quality_refine_pressure_level(pending_loads, pending_decoded_total) > 0 {
+            return 0;
+        }
+
+        let max_refine = if self.masonry_quality_refine_frames_remaining > 0 {
+            2
+        } else {
+            1
+        };
+
+        upload_batch_limit.saturating_sub(1).min(max_refine)
     }
 
     fn manga_decoded_mailbox_band(
@@ -1884,6 +1975,13 @@ impl ImageViewer {
             visible_set.len().max(2)
         };
 
+        if self.manga_decoded_mailbox.len() <= 1 {
+            return near_radius;
+        }
+
+        puffin::profile_scope!("manga_mailbox_sort");
+        let sort_started = Instant::now();
+
         self.manga_decoded_mailbox.sort_by_key(|decoded| {
             let band = Self::manga_decoded_mailbox_band(
                 decoded.index,
@@ -1891,6 +1989,11 @@ impl ImageViewer {
                 anchor_index,
                 near_radius,
             );
+            let existing_texture_penalty = if self.manga_texture_cache.contains(decoded.index) {
+                1u8
+            } else {
+                0u8
+            };
             let distance = decoded.index.abs_diff(anchor_index);
             let media_penalty = if navigation_active && decoded.media_type == MangaMediaType::Video {
                 1u8
@@ -1903,8 +2006,17 @@ impl ImageViewer {
                 0
             };
 
-            (band, distance, media_penalty, lod_penalty)
+            (
+                band,
+                existing_texture_penalty,
+                distance,
+                media_penalty,
+                lod_penalty,
+            )
         });
+
+        self.perf_metrics
+            .record_duration("manga_mailbox_sort_ms", sort_started.elapsed());
 
         near_radius
     }
@@ -2082,6 +2194,12 @@ impl ImageViewer {
             {
                 push_segment(&mut manga_line, format!("VQ p95:{p95:.2}ms"));
             }
+            if let Some(p95) = self
+                .perf_metrics
+                .percentile_ms("manga_mailbox_sort_ms", 0.95)
+            {
+                push_segment(&mut manga_line, format!("MS p95:{p95:.2}ms"));
+            }
             let uploaded_total = self.perf_metrics.counter("manga_uploaded_textures");
             if uploaded_total > 0 {
                 push_segment(&mut manga_line, format!("UTot {}", uploaded_total));
@@ -2141,9 +2259,27 @@ impl ImageViewer {
             }
 
             let deferred_nav = self.perf_metrics.counter("manga_upgrade_deferred_nav");
+            let deferred_fill = self.perf_metrics.counter("manga_upgrade_deferred_fill");
+            let deferred_pressure = self.perf_metrics.counter("manga_upgrade_deferred_pressure");
             let low_lod_nav = self.perf_metrics.counter("manga_retry_low_lod_nav");
-            if deferred_nav > 0 || low_lod_nav > 0 {
-                push_segment(&mut manga_line, format!("NavDQ {} NavLL {}", deferred_nav, low_lod_nav));
+            let upload_refine_deferred = self.perf_metrics.counter("manga_upload_refine_deferred");
+            if deferred_nav > 0
+                || deferred_fill > 0
+                || deferred_pressure > 0
+                || low_lod_nav > 0
+                || upload_refine_deferred > 0
+            {
+                push_segment(
+                    &mut manga_line,
+                    format!(
+                        "DQ N/F/P/U {}/{}/{}/{} NavLL {}",
+                        deferred_nav,
+                        deferred_fill,
+                        deferred_pressure,
+                        upload_refine_deferred,
+                        low_lod_nav
+                    ),
+                );
             }
 
             if !manga_line.is_empty() {
@@ -5011,7 +5147,7 @@ impl ImageViewer {
         true
     }
 
-    fn masonry_target_texture_side_from_display_side(&self, item_screen_max_side: f32) -> u32 {
+    fn masonry_quality_target_texture_side_from_display_side(&self, item_screen_max_side: f32) -> u32 {
         let max_side = self.max_texture_side.max(1);
         let zoom = self.zoom.max(0.0001);
         let rows = self.masonry_items_per_row.clamp(2, 10) as f32;
@@ -5028,6 +5164,18 @@ impl ImageViewer {
             * self.masonry_zoom_quality_boost(zoom)
             * self.manga_lod_target_scale_factor())
             .ceil() as u32;
+        let scaled = if self.masonry_navigation_active_for_heavy_work() {
+            scaled.min(self.masonry_navigation_target_side_cap())
+        } else {
+            scaled
+        };
+
+        scaled.clamp(self.masonry_dynamic_target_min_side(), max_side)
+    }
+
+    fn masonry_target_texture_side_from_display_side(&self, item_screen_max_side: f32) -> u32 {
+        let max_side = self.max_texture_side.max(1);
+        let scaled = self.masonry_quality_target_texture_side_from_display_side(item_screen_max_side);
         let scaled = if self.masonry_navigation_active_for_heavy_work() {
             scaled.min(self.masonry_navigation_target_side_cap())
         } else {
@@ -5066,6 +5214,20 @@ impl ImageViewer {
         self.manga_clamp_target_side_to_source(
             index,
             self.masonry_target_texture_side_from_display_side(display_max_side),
+        )
+        .clamp(1, max_side)
+    }
+
+    fn masonry_quality_target_texture_side_for_index(&mut self, index: usize) -> u32 {
+        let max_side = self.max_texture_side.max(1);
+        let display_max_side = self
+            .masonry_item_current_display_size(index)
+            .map(|size| size.x.max(size.y).max(1.0))
+            .unwrap_or_else(|| self.screen_size.x.min(self.screen_size.y).max(1.0));
+
+        self.manga_clamp_target_side_to_source(
+            index,
+            self.masonry_quality_target_texture_side_from_display_side(display_max_side),
         )
         .clamp(1, max_side)
     }
@@ -7186,9 +7348,14 @@ impl ImageViewer {
         self.manga_texture_cache
             .set_pinned_indices(visible_indices.iter().copied());
 
-        let mut evicted_for_capacity = self
-            .manga_texture_cache
-            .set_max_entries(self.manga_cache_target_capacity);
+        let mut evicted_for_capacity = if self.manga_texture_cache.max_entries()
+            != self.manga_cache_target_capacity
+        {
+            self.manga_texture_cache
+                .set_max_entries(self.manga_cache_target_capacity)
+        } else {
+            Vec::new()
+        };
         if !evicted_for_capacity.is_empty() {
             if let Some(loader) = self.manga_loader.as_mut() {
                 for idx in evicted_for_capacity.drain(..) {
@@ -7534,6 +7701,7 @@ impl ImageViewer {
         media_type: MangaMediaType,
         width: u32,
         height: u32,
+        is_quality_upgrade: bool,
     ) -> egui::TextureOptions {
         if !self.is_masonry_mode() || media_type == MangaMediaType::AnimatedImage {
             return self.manga_texture_options_for_upload(media_type, width, height);
@@ -7553,6 +7721,7 @@ impl ImageViewer {
                 let enable_mipmap = self.config.manga_mipmap_static
                     && mipmap_allowed_by_size
                     && meaningfully_minified
+                    && is_quality_upgrade
                     && !navigation_blocks_mipmaps;
                 self.config
                     .texture_filter_static
@@ -7562,6 +7731,7 @@ impl ImageViewer {
                 let enable_mipmap = self.config.manga_mipmap_video_thumbnails
                     && mipmap_allowed_by_size
                     && meaningfully_minified
+                    && is_quality_upgrade
                     && !navigation_blocks_mipmaps;
                 self.config
                     .texture_filter_video
@@ -7695,19 +7865,65 @@ impl ImageViewer {
             self.manga_decoded_mailbox.len()
         };
         let upload_count = upload_batch_limit.min(eligible_uploads);
-        let decoded_images: Vec<DecodedImage> = if upload_count == 0 {
-            Vec::new()
-        } else {
-            self.manga_decoded_mailbox.drain(0..upload_count).collect()
-        };
+        let refine_upload_budget = self.manga_quality_refine_upload_budget(
+            pending_loads,
+            decoded_backlog_total,
+            upload_count,
+        );
+        let mut remaining_refine_uploads = refine_upload_budget;
+        let mut deferred_refine_uploads = 0u64;
+        let mut decoded_images: Vec<DecodedImage> = Vec::with_capacity(upload_count);
+        let mut retained_mailbox: Vec<DecodedImage> =
+            Vec::with_capacity(self.manga_decoded_mailbox.len());
+
+        for decoded in std::mem::take(&mut self.manga_decoded_mailbox) {
+            let band = Self::manga_decoded_mailbox_band(
+                decoded.index,
+                &visible_set,
+                upload_anchor_index,
+                near_radius,
+            );
+            let eligible_band = !defer_masonry_layout_work || band <= 1;
+            let is_quality_upgrade = self.manga_texture_cache.contains(decoded.index);
+
+            let take_decoded = eligible_band
+                && decoded_images.len() < upload_count
+                && (!is_quality_upgrade || {
+                    if remaining_refine_uploads > 0 {
+                        remaining_refine_uploads -= 1;
+                        true
+                    } else {
+                        false
+                    }
+                });
+
+            if take_decoded {
+                decoded_images.push(decoded);
+            } else {
+                if eligible_band && is_quality_upgrade && decoded_images.len() < upload_count {
+                    deferred_refine_uploads = deferred_refine_uploads.saturating_add(1);
+                }
+                retained_mailbox.push(decoded);
+            }
+        }
+        self.manga_decoded_mailbox = retained_mailbox;
+        if deferred_refine_uploads > 0 {
+            self.perf_metrics
+                .increment_counter("manga_upload_refine_deferred", deferred_refine_uploads);
+        }
         self.perf_metrics.record_value(
             "manga_decoded_mailbox_depth",
             self.manga_decoded_mailbox.len() as u64,
         );
 
-        let mut evicted_to_mark_unloaded = self
-            .manga_texture_cache
-            .set_max_entries(self.manga_cache_target_capacity);
+        let mut evicted_to_mark_unloaded = if self.manga_texture_cache.max_entries()
+            != self.manga_cache_target_capacity
+        {
+            self.manga_texture_cache
+                .set_max_entries(self.manga_cache_target_capacity)
+        } else {
+            Vec::new()
+        };
         let mut uploaded_textures = 0u64;
 
         // Upload decoded images to GPU as textures
@@ -7760,6 +7976,7 @@ impl ImageViewer {
                 decoded.media_type,
                 decoded.width,
                 decoded.height,
+                existing_texture_info.is_some(),
             );
 
             puffin::profile_scope!("manga_texture_upload");
@@ -9260,10 +9477,32 @@ impl ImageViewer {
         }
         .min(max_side);
 
-        if quality_upgrade && self.masonry_navigation_active_for_heavy_work() {
-            self.perf_metrics
-                .increment_counter("manga_upgrade_deferred_nav", 1);
-            return false;
+        if quality_upgrade {
+            if self.masonry_navigation_active_for_heavy_work() {
+                self.perf_metrics
+                    .increment_counter("manga_upgrade_deferred_nav", 1);
+                return false;
+            }
+
+            let (pending_loads, pending_decoded) = self
+                .manga_loader
+                .as_ref()
+                .map(|loader| (loader.pending_load_count(), loader.pending_decoded_count()))
+                .unwrap_or((0, 0));
+            let pending_decoded_total =
+                pending_decoded.saturating_add(self.manga_decoded_mailbox.len());
+
+            if !self.manga_ttv_pending.is_empty() {
+                self.perf_metrics
+                    .increment_counter("manga_upgrade_deferred_fill", 1);
+                return false;
+            }
+
+            if self.manga_quality_refine_pressure_level(pending_loads, pending_decoded_total) > 0 {
+                self.perf_metrics
+                    .increment_counter("manga_upgrade_deferred_pressure", 1);
+                return false;
+            }
         }
 
         let desired_target_side = self
@@ -9395,6 +9634,13 @@ impl ImageViewer {
         } else {
             MangaMediaType::StaticImage
         };
+        let quality_retry_target_side = if self.is_masonry_mode()
+            && retry_media_type == MangaMediaType::StaticImage
+        {
+            self.manga_visible_target_side_for_upload(idx, retry_media_type)
+        } else {
+            retry_target_side
+        };
 
         let video_load_pending = is_video && self.manga_video_load_pending_for_index(idx);
 
@@ -9467,11 +9713,15 @@ impl ImageViewer {
 
                 if self.manga_texture_upgrade_needed(
                     tex_w.max(tex_h),
-                    retry_target_side,
+                    quality_retry_target_side,
                     retry_media_type,
                 ) {
                     requested_retry |=
-                        self.manga_request_retry_for_visible_item(idx, retry_target_side, true);
+                        self.manga_request_retry_for_visible_item(
+                            idx,
+                            quality_retry_target_side,
+                            true,
+                        );
                 }
             } else if self.strip_entry_placeholder_index == Some(idx) {
                 // Immediate fallback when entering strip mode from solo-video fullscreen.
@@ -9575,11 +9825,15 @@ impl ImageViewer {
 
                 if self.manga_texture_upgrade_needed(
                     tex_w.max(tex_h),
-                    retry_target_side,
+                    quality_retry_target_side,
                     retry_media_type,
                 ) {
                     requested_retry |=
-                        self.manga_request_retry_for_visible_item(idx, retry_target_side, true);
+                        self.manga_request_retry_for_visible_item(
+                            idx,
+                            quality_retry_target_side,
+                            true,
+                        );
                 }
             } else if self.strip_entry_placeholder_index == Some(idx) {
                 // Immediate fallback when entering strip mode from solo-image fullscreen.

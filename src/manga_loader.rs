@@ -84,7 +84,8 @@ const PRELOAD_RETRY_MAX_DELAY_MS: u64 = 4000;
 /// Texture-side buckets used for masonry/strip LOD requests.
 /// Requests are rounded up to the next bucket to avoid churn from tiny deltas.
 const LOD_SIDE_BUCKETS: &[u32] = &[
-    96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096,
+    96, 128, 160, 192, 224, 256, 320, 384, 448, 512, 640, 768, 896, 1024, 1280, 1536,
+    1792, 2048, 2560, 3072, 4096,
 ];
 
 /// Media type for manga items (extended to include videos/animations)
@@ -1879,6 +1880,10 @@ impl MangaTextureCache {
         let capacity = NonZeroUsize::new(self.max_entries).expect("cache capacity is non-zero");
         self.unpinned_entries.resize(capacity);
         self.evict_to_capacity()
+    }
+
+    pub fn max_entries(&self) -> usize {
+        self.max_entries
     }
 
     pub fn set_pinned_indices<I>(&mut self, pinned: I)
