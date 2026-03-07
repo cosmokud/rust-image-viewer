@@ -25,6 +25,7 @@ All notable changes to this project will be documented in this file.
 - Masonry now schedules its own short post-navigation quality-refinement pass after scrolling, panning, or zooming settles, so visible tiles sharpen automatically without needing a manual zoom nudge.
 - Masonry Ctrl+wheel zoom no longer stalls when the pointer crosses the scrollbar track, active zoom stops forcing a full preload refresh every tick, and manga long-strip zoom now keeps the exact cursor position anchored in both axes instead of only following vertical position.
 - Visible sharpening retries now go through a dedicated urgent loader lane instead of waiting behind speculative preload work, and masonry starts its post-navigation quality-refine pass sooner so blurry tiles snap to their sharp version faster after they enter view.
+- Manga and masonry now keep a much larger recent texture working set in VRAM and avoid shrinking the cache aggressively during active navigation, which reduces needless texture reloads when you reverse direction and revisit images that were just on screen.
 
 ### Changed
 

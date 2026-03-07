@@ -1440,7 +1440,7 @@ impl ImageViewer {
     const MANGA_UPLOAD_P95_HARD_BUDGET_MS: f32 = 7.5;
     const MANGA_VIRTUALIZATION_AUTO_RTREE_MIN_ITEMS: usize = 2048;
     const MANGA_CACHE_MIN_ENTRIES: usize = 64;
-    const MANGA_CACHE_MAX_ENTRIES: usize = 512;
+    const MANGA_CACHE_MAX_ENTRIES: usize = 1024;
     const MANGA_DYNAMIC_TARGET_MIN_SIDE: u32 = 192;
     const MANGA_DYNAMIC_TARGET_OVERSCAN: f32 = 1.35;
     const MANGA_MASONRY_DYNAMIC_TARGET_DENSE_MIN_SIDE: u32 = 64;
@@ -5332,7 +5332,7 @@ impl ImageViewer {
             } else {
                 1
             };
-            let density_factor = 2 + rows / 2;
+            let density_factor = 3 + rows;
 
             visible
                 .saturating_mul(density_factor)
@@ -5348,9 +5348,9 @@ impl ImageViewer {
             };
 
             visible
-                .saturating_mul(4)
+                .saturating_mul(5)
                 .saturating_mul(zoom_factor)
-                .clamp(Self::MANGA_CACHE_MIN_ENTRIES, 320)
+                .clamp(Self::MANGA_CACHE_MIN_ENTRIES, 512)
         }
     }
 
@@ -7066,6 +7066,9 @@ impl ImageViewer {
         let visible_indices = self.manga_collect_visible_indices();
         let visible_indices_count = visible_indices.len().max(1);
         let visible_set: HashSet<usize> = visible_indices.iter().copied().collect();
+        let previous_cache_capacity = self
+            .manga_cache_target_capacity
+            .max(Self::MANGA_CACHE_MIN_ENTRIES);
 
         let is_masonry = self.is_masonry_mode();
         let masonry_rows = self.masonry_items_per_row.clamp(2, 10);
@@ -7081,8 +7084,8 @@ impl ImageViewer {
 
         if is_masonry {
             // Byte-aware clamp to avoid oversized entry-count targets when textures are large.
-            const MASONRY_CACHE_BUDGET_BYTES_IDLE: usize = 256 * 1024 * 1024;
-            const MASONRY_CACHE_BUDGET_BYTES_NAV: usize = 160 * 1024 * 1024;
+            const MASONRY_CACHE_BUDGET_BYTES_IDLE: usize = 768 * 1024 * 1024;
+            const MASONRY_CACHE_BUDGET_BYTES_NAV: usize = 512 * 1024 * 1024;
 
             let est_side = self.manga_target_texture_side.max(1) as usize;
             let est_bytes_per_texture = est_side
@@ -7097,9 +7100,28 @@ impl ImageViewer {
             };
             let byte_limited_capacity = (budget_bytes / est_bytes_per_texture.max(1))
                 .clamp(Self::MANGA_CACHE_MIN_ENTRIES, Self::MANGA_CACHE_MAX_ENTRIES);
-            let keep_floor = visible_indices_count.max(masonry_rows.saturating_mul(2));
+            let keep_floor = visible_indices_count.max(masonry_rows.saturating_mul(4));
             target_cache_capacity =
                 target_cache_capacity.min(byte_limited_capacity.max(keep_floor));
+        }
+
+        let preserve_recent_cache = if is_masonry {
+            self.masonry_navigation_active_for_heavy_work()
+                || self.masonry_navigation_was_active
+                || self.masonry_quality_refine_due_at.is_some()
+                || self.masonry_quality_refine_frames_remaining > 0
+        } else {
+            self.manga_wheel_scroll_active
+                || self.is_panning
+                || self.manga_scroll_velocity.abs() > 0.5
+        };
+
+        if preserve_recent_cache {
+            let retain_floor = previous_cache_capacity
+                .saturating_mul(7)
+                .saturating_div(8)
+                .max(visible_indices_count);
+            target_cache_capacity = target_cache_capacity.max(retain_floor);
         }
 
         self.manga_cache_target_capacity = target_cache_capacity;

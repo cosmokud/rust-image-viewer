@@ -49,7 +49,7 @@ const MAX_PENDING_UPLOADS: usize = 32;
 
 /// Maximum number of images to keep in the texture cache.
 /// Beyond this, the oldest entries are evicted to control VRAM usage.
-const DEFAULT_CACHED_TEXTURES: usize = 64;
+const DEFAULT_CACHED_TEXTURES: usize = 128;
 
 /// Small dedicated queue for visible-item retries that should not wait behind preload churn.
 const URGENT_REQUEST_QUEUE_CAPACITY: usize = 64;
