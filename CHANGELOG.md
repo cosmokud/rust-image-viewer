@@ -32,12 +32,6 @@ All notable changes to this project will be documented in this file.
 ### Added
 
 - Added `fullscreen_native_window_transition` to the settings INI so users can switch between the native animated maximize or restore-down fullscreen path and the old instant fullscreen snap.
-- Added pass-1 masonry smoothness diagnostics for frame pacing, UI update cost, decoded-mailbox depth, and visible texture transition timing, plus optional puffin scopes around the main update loop and manga texture uploads.
-- Tightened masonry upload admission so visible first-fill textures always beat sharpness-refine uploads, while frame-time and upload-pressure guards now suppress visible quality retries before they can turn into UI-thread upload bursts.
-- Densified the static-image LOD buckets around masonry fill caps and common display sizes, and split visible static-image sharpness targets from low-LOD first-fill targets so settled tiles can sharpen without forcing expensive first paints.
-- Static-image and video-thumbnail first fills now skip mipmap generation until a later quality-upgrade upload, and the manga frame loop now avoids redundant texture-cache capacity resets while exposing mailbox-sort timing for secondary stutter hunting.
-- The staged masonry texture pipeline now explicitly favors smooth first-fill uploads over immediate high-LOD replacement, so visible placeholders resolve quickly and sharpening only spends upload budget when frame pacing has headroom.
-- Visible placeholder retries now forcibly clear stale loader bookkeeping when the UI still has no texture, and sharpness gating now keys off placeholders that are actually on screen, fixing cases where images could stay blurry too long or remain stuck unloaded.
 
 ## [v0.2.1] - 2026-03-06
 
