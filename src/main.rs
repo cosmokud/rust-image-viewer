@@ -991,6 +991,9 @@ struct ImageViewer {
     manga_layout_mode: MangaLayoutMode,
     /// Previous strip layout to restore when leaving solo fullscreen via middle click.
     strip_return_mode: Option<MangaLayoutMode>,
+    /// True when solo fullscreen came from explicitly turning a strip layout off.
+    /// Generic fullscreen toggles should stay in solo fullscreen; the layout button can re-enable it.
+    strip_return_button_only: bool,
     /// Last non-floating mode captured when title-bar maximize/restore exited to floating.
     titlebar_previous_mode: Option<TitlebarToggleReturnMode>,
     /// Manga layout to restore when the title-bar button re-enters from floating mode.
@@ -1318,6 +1321,7 @@ impl Default for ImageViewer {
             manga_mode: false,
             manga_layout_mode: MangaLayoutMode::LongStrip,
             strip_return_mode: None,
+            strip_return_button_only: false,
             titlebar_previous_mode: None,
             titlebar_pending_restore_layout: None,
             pending_masonry_solo_reentry: None,
@@ -4202,10 +4206,25 @@ impl ImageViewer {
         }
     }
 
+    fn fullscreen_layout_ready(&self, ctx: &egui::Context) -> bool {
+        let monitor = self.monitor_size_points(ctx);
+        let viewport = ctx.screen_rect().size();
+
+        (viewport.x - monitor.x).abs() <= 2.0 && (viewport.y - monitor.y).abs() <= 2.0
+    }
+
+    fn strip_return_mode_for_fullscreen_toggle(&self) -> Option<MangaLayoutMode> {
+        if self.strip_return_button_only {
+            None
+        } else {
+            self.strip_return_mode
+        }
+    }
+
     fn current_titlebar_return_mode(&self) -> TitlebarToggleReturnMode {
         if self.manga_mode {
             TitlebarToggleReturnMode::Manga(self.manga_layout_mode)
-        } else if let Some(layout_mode) = self.strip_return_mode {
+        } else if let Some(layout_mode) = self.strip_return_mode_for_fullscreen_toggle() {
             TitlebarToggleReturnMode::Manga(layout_mode)
         } else {
             TitlebarToggleReturnMode::Fullscreen
@@ -4280,13 +4299,7 @@ impl ImageViewer {
             return false;
         }
 
-        let ready = if self.use_native_fullscreen_window_transition() {
-            self.current_window_is_maximized(ctx)
-        } else {
-            let monitor = self.monitor_size_points(ctx);
-            let viewport = ctx.screen_rect().size();
-            (viewport.x - monitor.x).abs() <= 2.0 && (viewport.y - monitor.y).abs() <= 2.0
-        };
+        let ready = self.fullscreen_layout_ready(ctx);
 
         if !ready {
             ctx.request_repaint_after(Duration::from_millis(16));
@@ -4411,7 +4424,7 @@ impl ImageViewer {
         if let Some((_, img_h)) = self.media_display_dimensions() {
             if img_h > 0 {
                 let viewport_height = ctx.screen_rect().height().max(1.0);
-                let target_h = if self.current_window_is_maximized(ctx) {
+                let target_h = if self.fullscreen_layout_ready(ctx) {
                     viewport_height
                 } else {
                     self.monitor_size_points(ctx).y.max(viewport_height)
@@ -4532,6 +4545,7 @@ impl ImageViewer {
             self.strip_return_preserve_masonry_cache && !self.manga_mode;
 
         self.strip_return_mode = None;
+        self.strip_return_button_only = false;
         self.strip_return_masonry_state = None;
         self.strip_return_preserve_masonry_cache = false;
 
@@ -4542,6 +4556,7 @@ impl ImageViewer {
 
     fn activate_strip_return_context(&mut self, layout_mode: MangaLayoutMode) {
         self.strip_return_mode = Some(layout_mode);
+        self.strip_return_button_only = false;
         self.strip_return_preserve_masonry_cache =
             layout_mode == MangaLayoutMode::Masonry && self.manga_mode;
         self.strip_return_masonry_state =
@@ -5952,7 +5967,7 @@ impl ImageViewer {
         }
     }
 
-    fn open_strip_item_in_solo_fullscreen(&mut self, index: usize) {
+    fn open_strip_item_in_solo_fullscreen(&mut self, index: usize, button_only_return: bool) {
         if index >= self.image_list.len() {
             return;
         }
@@ -5969,6 +5984,7 @@ impl ImageViewer {
         self.prepare_mode_switch_placeholder_from_manga_index(index, target_media_type);
 
         self.activate_strip_return_context(return_mode);
+        self.strip_return_button_only = button_only_return;
         self.stop_manga_wheel_scroll();
         self.stop_manga_autoscroll();
         self.reset_gif_seek_interaction_state();
@@ -8746,7 +8762,7 @@ impl ImageViewer {
                             } else {
                                 self.manga_visible_index()
                             };
-                            self.open_strip_item_in_solo_fullscreen(target_index);
+                            self.open_strip_item_in_solo_fullscreen(target_index, true);
                         } else {
                             self.clear_strip_return_context();
                             if target_layout == MangaLayoutMode::Masonry {
@@ -11152,7 +11168,9 @@ impl ImageViewer {
                         actions_to_run.push(Action::NextImage);
                         right_click_navigated = true;
                     } else if !self.manga_mode {
-                        if self.is_fullscreen && self.strip_return_mode.is_some() {
+                        if self.is_fullscreen
+                            && self.strip_return_mode_for_fullscreen_toggle().is_some()
+                        {
                             right_click_return_to_strip = true;
                         } else {
                             right_click_toggle_fullscreen = true;
@@ -11171,7 +11189,7 @@ impl ImageViewer {
             let target_index = strip_item_open_pointer_pos
                 .and_then(|pos| self.manga_index_at_screen_pos(pos))
                 .unwrap_or(self.current_index);
-            self.open_strip_item_in_solo_fullscreen(target_index);
+            self.open_strip_item_in_solo_fullscreen(target_index, false);
             return;
         }
 
@@ -13753,7 +13771,7 @@ impl eframe::App for ImageViewer {
             // intentionally different: it always exits to floating mode.
             if !entering_fullscreen
                 && !self.manga_mode
-                && self.strip_return_mode.is_some()
+                && self.strip_return_mode_for_fullscreen_toggle().is_some()
                 && !toggled_from_titlebar
             {
                 self.return_to_strip_mode_from_middle_click();
@@ -14033,7 +14051,7 @@ impl eframe::App for ImageViewer {
         }
 
         if self.pending_fullscreen_layout {
-            if self.current_window_is_maximized(ctx) {
+            if self.fullscreen_layout_ready(ctx) {
                 self.apply_fullscreen_layout_for_current_image(ctx);
                 self.pending_fullscreen_layout = false;
             } else {
