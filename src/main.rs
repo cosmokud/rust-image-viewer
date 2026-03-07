@@ -3155,7 +3155,7 @@ impl ImageViewer {
         self.tick_masonry_metadata_preload();
     }
 
-    fn maybe_begin_masonry_metadata_preload(&mut self) {
+    fn maybe_begin_masonry_metadata_preload(&mut self, allow_startup_preload: bool) {
         if self.manga_layout_mode != MangaLayoutMode::Masonry || self.image_list.is_empty() {
             self.reset_masonry_metadata_preload();
             return;
@@ -3168,7 +3168,7 @@ impl ImageViewer {
                 && loader.pending_dimension_results_count() == 0
         });
 
-        if fully_warm {
+        if fully_warm || !allow_startup_preload {
             self.reset_masonry_metadata_preload();
         } else {
             self.begin_masonry_metadata_preload();
@@ -5835,7 +5835,7 @@ impl ImageViewer {
         self.manga_scroll_velocity = 0.0;
         self.stop_manga_wheel_scroll();
 
-        self.maybe_begin_masonry_metadata_preload();
+        self.maybe_begin_masonry_metadata_preload(false);
 
         self.manga_update_preload_queue();
     }
@@ -6270,7 +6270,7 @@ impl ImageViewer {
             self.manga_scroll_velocity = 0.0;
             self.stop_manga_wheel_scroll();
 
-            self.maybe_begin_masonry_metadata_preload();
+            self.maybe_begin_masonry_metadata_preload(true);
 
             self.manga_update_preload_queue();
             return;
