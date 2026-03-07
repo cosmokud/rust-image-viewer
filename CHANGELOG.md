@@ -27,6 +27,7 @@ All notable changes to this project will be documented in this file.
 - Visible sharpening retries now go through a dedicated urgent loader lane instead of waiting behind speculative preload work, and masonry starts its post-navigation quality-refine pass sooner so blurry tiles snap to their sharp version faster after they enter view.
 - Manga and masonry now keep a much larger recent texture working set in VRAM and avoid shrinking the cache aggressively during active navigation, which reduces needless texture reloads when you reverse direction and revisit images that were just on screen.
 - Manga preloading and dimension probing now scale from the actual visible-item count produced by the current viewport query path, with a more aggressive directional window of roughly 2x visible items ahead and 1x behind, plus deeper decoded-image staging so backend workers can stay further ahead of the single-threaded texture upload path.
+- Parallel manga decode batches now stream each finished result to the UI handoff queue immediately instead of waiting for the slowest decode in the batch, which reduces the "nothing happens, then many textures pop in at once" behavior in very dense masonry views.
 
 ### Changed
 

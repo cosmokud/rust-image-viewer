@@ -691,51 +691,16 @@ impl MangaLoader {
                 (req.index, req_generation, outcome)
             };
 
-            // IMPORTANT: for "urgent" requests (negative priority), decode the single highest
-            // priority request first (serially) so it is not competing with neighbor prefetch.
-            // This is the key to making far jumps feel instant.
-            let mut results: Vec<(usize, usize, DecodeOutcome)> = Vec::with_capacity(batch.len());
-
-            if batch.first().map_or(false, |r| r.priority < 0) {
-                if let Some(first) = batch.first() {
-                    results.push(process_one(first));
-                }
-
-                if generation_changed() {
-                    // Drop everything from this batch (stale now).
-                    for (idx, req_generation, _outcome) in results.drain(..) {
-                        Self::clear_loading_if_generation(&loading_indices, idx, req_generation);
-                    }
-                    continue;
-                }
-
-                if batch.len() > 1 {
-                    let tail: Vec<(usize, usize, DecodeOutcome)> =
-                        batch[1..].par_iter().map(process_one).collect();
-                    results.extend(tail);
-                }
-            } else {
-                results = batch.par_iter().map(process_one).collect();
-            }
-
-            // Publish results to main thread.
-            // IMPORTANT: only mark an index as loaded after the decoded image is successfully enqueued.
-            // Otherwise, a full result channel would cause the image to be permanently considered "loaded"
-            // even though the main thread never received it, leaving placeholders stuck forever.
-            if generation_changed() {
-                // Generation changed while decoding; treat all results as stale.
-                for (idx, req_generation, _outcome) in results {
-                    Self::clear_loading_if_generation(&loading_indices, idx, req_generation);
-                }
-                continue;
-            }
-
-            for (idx, req_generation, outcome) in results {
+            let publish_one = |idx: usize, req_generation: usize, outcome: DecodeOutcome| {
                 // Request has finished one way or another; allow it to be re-requested if needed.
                 Self::clear_loading_if_generation(&loading_indices, idx, req_generation);
 
+                if generation_changed() {
+                    return true;
+                }
+
                 match outcome {
-                    DecodeOutcome::Skipped => continue,
+                    DecodeOutcome::Skipped => {}
                     DecodeOutcome::Failed => {
                         Self::register_decode_failure(&loaded_levels, &retry_state, idx);
                     }
@@ -770,11 +735,64 @@ impl MangaLoader {
                                 loaded_levels.write().remove(&idx);
                             }
                             Err(TrySendError::Disconnected(_decoded)) => {
-                                return; // Main thread gone, exit
+                                return false; // Main thread gone, exit
                             }
                         }
                     }
                 }
+
+                true
+            };
+
+            // IMPORTANT: for "urgent" requests (negative priority), decode the single highest
+            // priority request first (serially) so it is not competing with neighbor prefetch.
+            // This is the key to making far jumps feel instant.
+            let urgent_head = batch.first().map_or(false, |r| r.priority < 0);
+            let mut start_index = 0usize;
+
+            if urgent_head {
+                if let Some(first) = batch.first() {
+                    let (idx, req_generation, outcome) = process_one(first);
+                    if !publish_one(idx, req_generation, outcome) {
+                        return;
+                    }
+                    start_index = 1;
+                }
+            }
+
+            if start_index >= batch.len() {
+                continue;
+            }
+
+            let parallel_len = batch.len() - start_index;
+            let (outcome_tx, outcome_rx) = crossbeam_channel::unbounded();
+            let mut disconnected = false;
+
+            rayon::scope(|scope| {
+                for req in batch[start_index..].iter() {
+                    let outcome_tx = outcome_tx.clone();
+                    scope.spawn(move |_| {
+                        let outcome = process_one(req);
+                        let _ = outcome_tx.send(outcome);
+                    });
+                }
+
+                drop(outcome_tx);
+
+                for _ in 0..parallel_len {
+                    let Ok((idx, req_generation, outcome)) = outcome_rx.recv() else {
+                        break;
+                    };
+
+                    if !publish_one(idx, req_generation, outcome) {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            });
+
+            if disconnected {
+                return;
             }
         }
     }
