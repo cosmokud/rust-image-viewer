@@ -83,7 +83,7 @@ const PRELOAD_RETRY_BASE_DELAY_MS: u64 = 250;
 const PRELOAD_RETRY_MAX_DELAY_MS: u64 = 4000;
 /// Texture-side buckets used for masonry/strip LOD requests.
 /// Requests are rounded up to the next bucket to avoid churn from tiny deltas.
-const LOD_SIDE_BUCKETS: &[u32] = &[
+pub const LOD_SIDE_BUCKETS: &[u32] = &[
     96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096,
 ];
 
@@ -1651,6 +1651,14 @@ impl MangaLoader {
     pub fn mark_unloaded(&mut self, index: usize) {
         self.loaded_levels.write().remove(&index);
         self.retry_state.write().remove(&index);
+    }
+
+    /// Clear all pending/loaded bookkeeping for an index so a visible placeholder can self-heal.
+    pub fn reset_index_state(&mut self, index: usize) {
+        self.loading_indices.write().remove(&index);
+        self.loaded_levels.write().remove(&index);
+        self.retry_state.write().remove(&index);
+        self.stats.images_pending = self.loading_indices.read().len();
     }
 
     /// Force a high-priority retry for a visible item that is missing a texture.

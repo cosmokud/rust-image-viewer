@@ -28,6 +28,8 @@ All notable changes to this project will be documented in this file.
 - Manga and masonry now keep a much larger recent texture working set in VRAM and avoid shrinking the cache aggressively during active navigation, which reduces needless texture reloads when you reverse direction and revisit images that were just on screen.
 - Manga preloading and dimension probing now scale from the actual visible-item count produced by the current viewport query path, with a more aggressive directional window of roughly 2x visible items ahead and 1x behind, plus deeper decoded-image staging so backend workers can stay further ahead of the single-threaded texture upload path.
 - Parallel manga decode batches now stream each finished result to the UI handoff queue immediately instead of waiting for the slowest decode in the batch, which reduces the "nothing happens, then many textures pop in at once" behavior in very dense masonry views.
+- Static-image LOD bucket selection now follows the current on-screen draw size for each item, using aspect-ratio-aware bucket dimensions so very tall and very wide images stop getting treated as if a matching long edge automatically meant enough total resolution.
+- Visible masonry placeholders now self-heal if a stale load marker survives zoom churn, and Windows fullscreen now uses a borderless topmost monitor-sized window so taskbar auto-hide does not pop over the viewer when the cursor touches the screen edge.
 
 ### Changed
 

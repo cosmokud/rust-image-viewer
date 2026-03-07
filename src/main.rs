@@ -27,7 +27,7 @@ use config::{
 };
 use hashbrown::{HashMap, HashSet};
 use image_loader::{get_media_type, is_supported_video, ImageFrame, LoadedImage, MediaType};
-use manga_loader::{DecodedImage, MangaLoader, MangaMediaType, MangaTextureCache};
+use manga_loader::{DecodedImage, MangaLoader, MangaMediaType, MangaTextureCache, LOD_SIDE_BUCKETS};
 use manga_spatial::{MangaSpatialIndex, SpatialRect, STRIP_QUERY_HALF_WIDTH};
 use media_index::{DirectoryScanResult, MediaDirectoryIndex};
 use metadata_cache::{
@@ -1454,6 +1454,7 @@ impl ImageViewer {
     const MASONRY_QUALITY_REFINE_MAX_FRAMES: u8 = 12;
     const MANGA_TTV_SAMPLE_CAP: usize = 240;
     const MANGA_TTV_PENDING_MAX_AGE: Duration = Duration::from_secs(30);
+    const MANGA_PLACEHOLDER_STALL_RETRY_MS: u64 = 900;
     const FPS_OVERLAY_IDLE_POLL_MS: u64 = 500;
     const FPS_OVERLAY_ACTIVE_POLL_MS: u64 = 120;
     const FPS_IDLE_RESET_AFTER_MS: u64 = 350;
@@ -5059,6 +5060,139 @@ impl ImageViewer {
             .unwrap_or(target_side)
     }
 
+    fn manga_bucket_dimensions_for_side(
+        &self,
+        index: usize,
+        bucket_side: u32,
+        fallback_display_size: egui::Vec2,
+    ) -> (u32, u32) {
+        let fallback_w = fallback_display_size.x.max(1.0).ceil() as u32;
+        let fallback_h = fallback_display_size.y.max(1.0).ceil() as u32;
+        let (source_w, source_h) = self
+            .manga_loader
+            .as_ref()
+            .and_then(|loader| loader.get_dimensions(index))
+            .unwrap_or((fallback_w, fallback_h));
+
+        let source_w = source_w.max(1);
+        let source_h = source_h.max(1);
+        let source_long = source_w.max(source_h).max(1);
+        let clamped_side = bucket_side
+            .max(1)
+            .min(self.max_texture_side.max(1))
+            .min(source_long);
+
+        if source_w >= source_h {
+            let scale = clamped_side as f32 / source_w as f32;
+            let width = clamped_side;
+            let height = ((source_h as f32 * scale).round() as u32).max(1).min(source_h);
+            (width.min(source_w), height)
+        } else {
+            let scale = clamped_side as f32 / source_h as f32;
+            let height = clamped_side;
+            let width = ((source_w as f32 * scale).round() as u32).max(1).min(source_w);
+            (width, height.min(source_h))
+        }
+    }
+
+    fn manga_bucket_side_nearest_pixels_for_rect(
+        &self,
+        index: usize,
+        image_rect: egui::Rect,
+        area_scale: f32,
+    ) -> u32 {
+        let fallback_size = image_rect.size().max(egui::vec2(1.0, 1.0));
+        let target_pixels = ((fallback_size.x * fallback_size.y * area_scale.max(0.0))
+            .ceil()
+            .max(1.0)) as u64;
+        let max_side = self.max_texture_side.max(1);
+        let source_long = self
+            .manga_loader
+            .as_ref()
+            .and_then(|loader| loader.get_dimensions(index))
+            .map(|(w, h)| w.max(h).max(1))
+            .unwrap_or(max_side);
+
+        let mut best_side = source_long.min(max_side).max(1);
+        let mut best_score = (u64::MAX, true, best_side);
+        let mut last_candidate = 0u32;
+
+        for &bucket in LOD_SIDE_BUCKETS {
+            let candidate = bucket.min(max_side).min(source_long.max(1));
+            if candidate == last_candidate {
+                continue;
+            }
+            last_candidate = candidate;
+
+            let (bucket_w, bucket_h) =
+                self.manga_bucket_dimensions_for_side(index, candidate, fallback_size);
+            let pixels = bucket_w as u64 * bucket_h as u64;
+            let diff = pixels.abs_diff(target_pixels);
+            let score = (diff, pixels < target_pixels, candidate);
+            if score < best_score {
+                best_score = score;
+                best_side = candidate;
+            }
+        }
+
+        best_side.max(1)
+    }
+
+    fn manga_bucket_side_covering_rect(&self, index: usize, image_rect: egui::Rect) -> u32 {
+        let fallback_size = image_rect.size().max(egui::vec2(1.0, 1.0));
+        let target_w = fallback_size.x.ceil().max(1.0) as u32;
+        let target_h = fallback_size.y.ceil().max(1.0) as u32;
+        let max_side = self.max_texture_side.max(1);
+        let source_long = self
+            .manga_loader
+            .as_ref()
+            .and_then(|loader| loader.get_dimensions(index))
+            .map(|(w, h)| w.max(h).max(1))
+            .unwrap_or(max_side);
+
+        let mut last_side = source_long.min(max_side).max(1);
+        let mut last_candidate = 0u32;
+        for &bucket in LOD_SIDE_BUCKETS {
+            let candidate = bucket.min(max_side).min(source_long.max(1));
+            if candidate == last_candidate {
+                continue;
+            }
+            last_candidate = candidate;
+            last_side = candidate;
+
+            let (bucket_w, bucket_h) =
+                self.manga_bucket_dimensions_for_side(index, candidate, fallback_size);
+            if bucket_w >= target_w && bucket_h >= target_h {
+                return candidate;
+            }
+        }
+
+        last_side
+    }
+
+    fn manga_retry_target_sides_for_rect(
+        &mut self,
+        index: usize,
+        image_rect: egui::Rect,
+        media_type: MangaMediaType,
+    ) -> (u32, u32) {
+        if media_type != MangaMediaType::StaticImage {
+            let side = self.manga_retry_target_side_for_rect(index, image_rect);
+            return (side, side);
+        }
+
+        let fill_side = self.manga_bucket_side_nearest_pixels_for_rect(index, image_rect, 0.25);
+        let final_side = self.manga_bucket_side_covering_rect(index, image_rect);
+        (fill_side.min(final_side), final_side.max(fill_side))
+    }
+
+    fn manga_should_heal_placeholder_retry(&self, index: usize) -> bool {
+        self.manga_ttv_pending.get(&index).is_some_and(|started_at| {
+            started_at.elapsed()
+                >= Duration::from_millis(Self::MANGA_PLACEHOLDER_STALL_RETRY_MS)
+        })
+    }
+
     fn manga_retry_target_side_for_rect(&mut self, index: usize, image_rect: egui::Rect) -> u32 {
         let max_side = self.max_texture_side.max(1);
         let target_scale = self.manga_lod_target_scale_factor();
@@ -5079,16 +5213,30 @@ impl ImageViewer {
 
     fn manga_texture_upgrade_needed(
         &self,
-        existing_side: u32,
-        desired_side: u32,
+        existing_width: u32,
+        existing_height: u32,
+        desired_width: u32,
+        desired_height: u32,
         media_type: MangaMediaType,
     ) -> bool {
-        if desired_side <= existing_side {
+        let existing_width = existing_width.max(1);
+        let existing_height = existing_height.max(1);
+        let desired_width = desired_width.max(1);
+        let desired_height = desired_height.max(1);
+
+        if desired_width <= existing_width && desired_height <= existing_height {
             return false;
         }
 
+        let existing_side = existing_width.max(existing_height);
+        let desired_side = desired_width.max(desired_height);
+        let existing_pixels = existing_width as u64 * existing_height as u64;
+        let desired_pixels = desired_width as u64 * desired_height as u64;
+
         if self.is_masonry_mode() && media_type == MangaMediaType::StaticImage {
-            return true;
+            return desired_width > existing_width
+                || desired_height > existing_height
+                || desired_pixels > existing_pixels;
         }
 
         let (ratio, delta) = if self.is_masonry_mode() {
@@ -5116,7 +5264,7 @@ impl ImageViewer {
 
         let ratio_threshold = (existing_side as f32 * ratio).ceil() as u32;
         let delta_threshold = existing_side.saturating_add(delta);
-        desired_side >= ratio_threshold.max(delta_threshold)
+        desired_pixels > existing_pixels && desired_side >= ratio_threshold.max(delta_threshold)
     }
 
     fn manga_use_rtree_backend(&self) -> bool {
@@ -7626,16 +7774,15 @@ impl ImageViewer {
                 .record_duration("manga_decode_resize_ms", decoded.resize_time);
             self.manga_record_target_side_sample(decoded.requested_side);
 
-            let incoming_side = decoded.width.max(decoded.height);
-
             // Keep current texture unless the decoded payload is a meaningful quality upgrade.
             if let Some((_, existing_w, existing_h)) =
                 self.manga_texture_cache.get_texture_info(decoded.index)
             {
-                let existing_side = existing_w.max(existing_h);
                 if !self.manga_texture_upgrade_needed(
-                    existing_side,
-                    incoming_side,
+                    existing_w,
+                    existing_h,
+                    decoded.width,
+                    decoded.height,
                     decoded.media_type,
                 ) {
                     self.manga_ttv_pending.remove(&decoded.index);
@@ -9117,6 +9264,7 @@ impl ImageViewer {
         index: usize,
         display_target_side: u32,
         quality_upgrade: bool,
+        media_type: MangaMediaType,
     ) -> bool {
         if !self.manga_mode {
             return false;
@@ -9155,7 +9303,9 @@ impl ImageViewer {
         };
 
         // During active masonry navigation, prioritize fast placeholder fill over texture quality.
-        let target_texture_side = if is_masonry && !quality_upgrade {
+        let target_texture_side = if media_type == MangaMediaType::StaticImage {
+                desired_target_side.clamp(min_target_side, max_side)
+            } else if is_masonry && !quality_upgrade {
                 let fill_cap = masonry_fill_cap
                     .min(self.manga_target_texture_side.max(min_target_side))
                     .max(min_target_side);
@@ -9178,11 +9328,19 @@ impl ImageViewer {
             };
         let (downscale_filter, gif_filter) = self.manga_decode_filters_for_strip_mode();
         let force_triangle_filters = self.manga_should_force_triangle_filters();
-        let current_texture_side = self
+        let current_texture_dims = self
             .manga_texture_cache
             .get_texture_info(index)
-            .map(|(_, tex_w, tex_h)| tex_w.max(tex_h))
-            .unwrap_or(0);
+            .map(|(_, tex_w, tex_h)| (tex_w, tex_h))
+            .unwrap_or((0, 0));
+        let desired_texture_dims = self.manga_bucket_dimensions_for_side(
+            index,
+            target_texture_side,
+            egui::vec2(
+                current_texture_dims.0.max(1) as f32,
+                current_texture_dims.1.max(1) as f32,
+            ),
+        );
 
         let mut requested = self
             .manga_loader
@@ -9202,8 +9360,14 @@ impl ImageViewer {
 
         if !requested
             && quality_upgrade
-            && current_texture_side > 0
-            && current_texture_side < target_texture_side
+            && current_texture_dims.0 > 0
+            && self.manga_texture_upgrade_needed(
+                current_texture_dims.0,
+                current_texture_dims.1,
+                desired_texture_dims.0,
+                desired_texture_dims.1,
+                media_type,
+            )
         {
             if let Some(loader) = self.manga_loader.as_mut() {
                 loader.mark_unloaded(index);
@@ -9221,6 +9385,30 @@ impl ImageViewer {
             if requested {
                 self.perf_metrics
                     .increment_counter("manga_retry_forced_requeue", 1);
+            }
+        }
+
+        if !requested
+            && !quality_upgrade
+            && current_texture_dims == (0, 0)
+            && self.manga_should_heal_placeholder_retry(index)
+        {
+            if let Some(loader) = self.manga_loader.as_mut() {
+                loader.reset_index_state(index);
+                requested = loader.request_visible_retry(
+                    &self.image_list,
+                    index,
+                    self.max_texture_side,
+                    target_texture_side,
+                    downscale_filter,
+                    gif_filter,
+                    force_triangle_filters,
+                );
+            }
+
+            if requested {
+                self.perf_metrics
+                    .increment_counter("manga_retry_stall_heal", 1);
             }
         }
 
@@ -9243,7 +9431,6 @@ impl ImageViewer {
             image_rect
         };
         let mut requested_retry = false;
-        let retry_target_side = self.manga_retry_target_side_for_rect(idx, image_rect);
 
         let cached_media_type = self
             .manga_loader
@@ -9270,6 +9457,13 @@ impl ImageViewer {
         } else {
             MangaMediaType::StaticImage
         };
+        let (fill_retry_target_side, final_retry_target_side) =
+            self.manga_retry_target_sides_for_rect(idx, image_rect, retry_media_type);
+        let final_retry_dims = self.manga_bucket_dimensions_for_side(
+            idx,
+            final_retry_target_side,
+            image_rect.size(),
+        );
 
         let video_load_pending = is_video && self.manga_video_load_pending_for_index(idx);
 
@@ -9341,12 +9535,18 @@ impl ImageViewer {
                 }
 
                 if self.manga_texture_upgrade_needed(
-                    tex_w.max(tex_h),
-                    retry_target_side,
+                    tex_w,
+                    tex_h,
+                    final_retry_dims.0,
+                    final_retry_dims.1,
                     retry_media_type,
                 ) {
-                    requested_retry |=
-                        self.manga_request_retry_for_visible_item(idx, retry_target_side, true);
+                    requested_retry |= self.manga_request_retry_for_visible_item(
+                        idx,
+                        final_retry_target_side,
+                        true,
+                        retry_media_type,
+                    );
                 }
             } else if self.strip_entry_placeholder_index == Some(idx) {
                 // Immediate fallback when entering strip mode from solo-video fullscreen.
@@ -9370,8 +9570,12 @@ impl ImageViewer {
                     );
                 }
 
-                requested_retry |=
-                    self.manga_request_retry_for_visible_item(idx, retry_target_side, false);
+                requested_retry |= self.manga_request_retry_for_visible_item(
+                    idx,
+                    fill_retry_target_side,
+                    false,
+                    retry_media_type,
+                );
             } else {
                 // Video not yet loaded - draw placeholder with video icon
                 ui.painter()
@@ -9386,8 +9590,12 @@ impl ImageViewer {
 
                 self.manga_mark_placeholder_visible(idx);
 
-                requested_retry |=
-                    self.manga_request_retry_for_visible_item(idx, retry_target_side, false);
+                requested_retry |= self.manga_request_retry_for_visible_item(
+                    idx,
+                    fill_retry_target_side,
+                    false,
+                    retry_media_type,
+                );
             }
 
             if video_load_pending
@@ -9449,12 +9657,18 @@ impl ImageViewer {
                 }
 
                 if self.manga_texture_upgrade_needed(
-                    tex_w.max(tex_h),
-                    retry_target_side,
+                    tex_w,
+                    tex_h,
+                    final_retry_dims.0,
+                    final_retry_dims.1,
                     retry_media_type,
                 ) {
-                    requested_retry |=
-                        self.manga_request_retry_for_visible_item(idx, retry_target_side, true);
+                    requested_retry |= self.manga_request_retry_for_visible_item(
+                        idx,
+                        final_retry_target_side,
+                        true,
+                        retry_media_type,
+                    );
                 }
             } else if self.strip_entry_placeholder_index == Some(idx) {
                 // Immediate fallback when entering strip mode from solo-image fullscreen.
@@ -9478,8 +9692,12 @@ impl ImageViewer {
                     );
                 }
 
-                requested_retry |=
-                    self.manga_request_retry_for_visible_item(idx, retry_target_side, false);
+                requested_retry |= self.manga_request_retry_for_visible_item(
+                    idx,
+                    fill_retry_target_side,
+                    false,
+                    retry_media_type,
+                );
             } else {
                 // Image not loaded yet - draw a placeholder
                 ui.painter()
@@ -9496,8 +9714,12 @@ impl ImageViewer {
 
                 self.manga_mark_placeholder_visible(idx);
 
-                requested_retry |=
-                    self.manga_request_retry_for_visible_item(idx, retry_target_side, false);
+                requested_retry |= self.manga_request_retry_for_visible_item(
+                    idx,
+                    fill_retry_target_side,
+                    false,
+                    retry_media_type,
+                );
             }
         }
 
@@ -13564,6 +13786,24 @@ impl eframe::App for ImageViewer {
                     self.fullscreen_transition = 1.0;
                     self.fullscreen_transition_target = 1.0;
 
+                    #[cfg(target_os = "windows")]
+                    {
+                        self.pending_fullscreen_layout = false;
+
+                        if !entering_titlebar_strip {
+                            self.apply_fullscreen_layout_for_current_image(ctx);
+                        }
+
+                        let monitor = self.monitor_size_points(ctx);
+                        self.suppress_outer_pos_tracking_frames =
+                            self.suppress_outer_pos_tracking_frames.max(2);
+                        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::Pos2::ZERO));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(monitor));
+                        self.last_requested_inner_size = Some(monitor);
+                        let _ = crate::windows_env::set_active_window_topmost(true);
+                    }
+
+                    #[cfg(not(target_os = "windows"))]
                     if use_native_transition {
                         if window_was_maximized {
                             self.pending_fullscreen_layout = false;
@@ -13597,6 +13837,11 @@ impl eframe::App for ImageViewer {
                     self.fullscreen_transition_target = 0.0;
                     self.pending_fullscreen_layout = false;
                     self.clear_strip_return_context();
+
+                    #[cfg(target_os = "windows")]
+                    {
+                        let _ = crate::windows_env::set_active_window_topmost(false);
+                    }
 
                     // Exit manga mode when leaving fullscreen
                     if self.manga_mode {
