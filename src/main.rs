@@ -2847,7 +2847,7 @@ impl ImageViewer {
             Action::ToggleFullscreen => self.request_shortcut_fullscreen_toggle(),
             Action::GotoFile => {
                 if !self.manga_mode {
-                    self.request_shortcut_fullscreen_toggle();
+                    self.request_goto_file_fullscreen_toggle();
                 }
             }
             Action::NextImage => self.next_image(),
@@ -4540,6 +4540,31 @@ impl ImageViewer {
             _ => None,
         };
         self.titlebar_previous_mode = None;
+        self.toggle_fullscreen = true;
+    }
+
+    fn request_goto_file_fullscreen_toggle(&mut self) {
+        self.stop_manga_autoscroll();
+
+        if self.is_fullscreen
+            && !self.manga_mode
+            && self.strip_return_mode_for_fullscreen_toggle().is_some()
+        {
+            self.return_to_strip_mode_from_fullscreen_toggle();
+            return;
+        }
+
+        if !self.is_fullscreen {
+            if let Some(previous_mode) = self.titlebar_previous_mode.take() {
+                self.request_titlebar_fullscreen_reentry(Some(previous_mode));
+                return;
+            }
+
+            if self.config.maximize_to_borderless_fullscreen {
+                self.toggle_fullscreen_force_borderless = true;
+            }
+        }
+
         self.toggle_fullscreen = true;
     }
 
@@ -10446,9 +10471,8 @@ impl ImageViewer {
         // Handle scroll/zoom. Ctrl+wheel zoom should still work over the scrollbar track unless
         // the user is actively dragging the scrollbar itself.
         if !title_ui_blocking && !self.manga_scrollbar_dragging {
-            let wants_ctrl_zoom = ctrl_held
-                && manga_ctrl_scroll_zoom_bound
-                && (zoom_delta != 1.0 || wheel_steps_ctrl != 0.0);
+            let wants_ctrl_zoom = manga_ctrl_scroll_zoom_bound
+                && (wheel_steps_ctrl != 0.0 || (ctrl_held && zoom_delta != 1.0));
 
             if wants_ctrl_zoom {
                 if self.manga_wheel_scroll_active {
@@ -11603,7 +11627,7 @@ impl ImageViewer {
         }
 
         if right_click_toggle_fullscreen {
-            self.request_shortcut_fullscreen_toggle();
+            self.request_goto_file_fullscreen_toggle();
             return;
         }
 
@@ -13589,7 +13613,9 @@ impl ImageViewer {
         });
 
         let mut handled_ctrl_zoom = false;
-        if regular_ctrl_scroll_zoom_bound && ctrl_held && (zoom_delta != 1.0 || wheel_steps_ctrl != 0.0) {
+        if regular_ctrl_scroll_zoom_bound
+            && (wheel_steps_ctrl != 0.0 || (ctrl_held && zoom_delta != 1.0))
+        {
             if let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) {
                 if !title_ui_blocking {
                     // IMPORTANT: Use the *same* step-based zoom algorithm as normal wheel zoom.
