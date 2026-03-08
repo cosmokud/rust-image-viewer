@@ -863,6 +863,8 @@ struct ImageViewer {
     zoom_target: f32,
     /// Zoom velocity for critically-damped spring animation
     zoom_velocity: f32,
+    /// Number of 90° clockwise rotations applied to the current loaded image (0-3).
+    current_rotation_steps: u8,
     /// Current arbitrary fullscreen image rotation in degrees.
     precise_rotation_degrees: f32,
     /// Target arbitrary fullscreen image rotation in degrees.
@@ -1318,6 +1320,7 @@ impl Default for ImageViewer {
             zoom: 1.0,
             zoom_target: 1.0,
             zoom_velocity: 0.0,
+            current_rotation_steps: 0,
             precise_rotation_degrees: 0.0,
             precise_rotation_target_degrees: 0.0,
             precise_rotation_velocity: 0.0,
@@ -1650,6 +1653,8 @@ impl ImageViewer {
     fn freeze_current_media_view(&mut self) {
         self.zoom_target = self.zoom;
         self.zoom_velocity = 0.0;
+        self.precise_rotation_target_degrees = self.precise_rotation_degrees;
+        self.precise_rotation_velocity = 0.0;
         self.pending_media_layout = false;
     }
 
@@ -1658,6 +1663,8 @@ impl ImageViewer {
         self.zoom_velocity = 0.0;
         self.zoom = 1.0;
         self.zoom_target = 1.0;
+        self.current_rotation_steps = 0;
+        self.reset_precise_rotation();
         self.pending_media_layout = false;
     }
 
@@ -4306,26 +4313,13 @@ impl ImageViewer {
             return;
         };
 
-        // Count rotation steps from the image (we track this separately since
-        // the image_loader applies rotation physically to pixel data)
-        let rotation_steps = if self.image.is_some() {
-            // We don't have direct access to rotation count in LoadedImage,
-            // so we store it in our state. The rotation is tracked incrementally.
-            self.fullscreen_view_states
-                .get(&path)
-                .map(|s| s.rotation_steps)
-                .unwrap_or(0)
-        } else {
-            0
-        };
-
         let state = FullscreenViewState {
             zoom: self.zoom,
             zoom_target: self.zoom_target,
             offset: self.offset,
             precise_rotation_degrees: self.precise_rotation_degrees,
             precise_rotation_target_degrees: self.precise_rotation_target_degrees,
-            rotation_steps,
+            rotation_steps: self.current_rotation_steps,
             flip_horizontal: false, // Currently not implemented in the viewer
             flip_vertical: false,   // Currently not implemented in the viewer
         };
@@ -4345,6 +4339,7 @@ impl ImageViewer {
             self.zoom_target = state.zoom_target;
             self.offset = state.offset;
             self.zoom_velocity = 0.0;
+            self.current_rotation_steps = state.rotation_steps;
             self.precise_rotation_degrees = state.precise_rotation_degrees;
             self.precise_rotation_target_degrees = state.precise_rotation_target_degrees;
             self.precise_rotation_velocity = 0.0;
@@ -4365,9 +4360,15 @@ impl ImageViewer {
         }
     }
 
-    /// Update the rotation count for the current image in fullscreen state.
-    /// Called after rotation actions to track cumulative rotations.
+    /// Update the discrete 90° rotation count for the current image.
+    /// When fullscreen is active, also sync it into the per-image fullscreen state cache.
     fn update_fullscreen_rotation(&mut self, clockwise: bool) {
+        if clockwise {
+            self.current_rotation_steps = (self.current_rotation_steps + 1) % 4;
+        } else {
+            self.current_rotation_steps = (self.current_rotation_steps + 3) % 4;
+        }
+
         if !self.is_fullscreen {
             return;
         }
@@ -4395,12 +4396,7 @@ impl ImageViewer {
         entry.offset = self.offset;
         entry.precise_rotation_degrees = self.precise_rotation_degrees;
         entry.precise_rotation_target_degrees = self.precise_rotation_target_degrees;
-
-        if clockwise {
-            entry.rotation_steps = (entry.rotation_steps + 1) % 4;
-        } else {
-            entry.rotation_steps = (entry.rotation_steps + 3) % 4; // +3 mod 4 = -1 mod 4
-        }
+        entry.rotation_steps = self.current_rotation_steps;
     }
 
     fn normalize_precise_rotation_degrees(degrees: f32) -> f32 {
@@ -4419,6 +4415,36 @@ impl ImageViewer {
         self.precise_rotation_degrees = 0.0;
         self.precise_rotation_target_degrees = 0.0;
         self.precise_rotation_velocity = 0.0;
+    }
+
+    fn reset_discrete_rotation(&mut self, ctx: &egui::Context) {
+        let steps = self.current_rotation_steps % 4;
+        if steps == 0 {
+            self.current_rotation_steps = 0;
+            return;
+        }
+
+        if let Some(ref mut img) = self.image {
+            match steps {
+                1 => img.rotate_counter_clockwise(),
+                2 => {
+                    img.rotate_clockwise();
+                    img.rotate_clockwise();
+                }
+                3 => img.rotate_clockwise(),
+                _ => {}
+            }
+
+            self.texture_frame = usize::MAX;
+            let _ = self.update_texture(ctx);
+        }
+
+        self.current_rotation_steps = 0;
+    }
+
+    fn reset_current_view_rotation(&mut self, ctx: &egui::Context) {
+        self.reset_discrete_rotation(ctx);
+        self.reset_precise_rotation();
     }
 
     fn update_fullscreen_precise_rotation(&mut self, delta_degrees: f32) {
@@ -5038,10 +5064,18 @@ impl ImageViewer {
             return false;
         }
 
-        const OMEGA: f32 = 24.0;
+        let omega = self.config.precise_rotation_animation_speed;
+        if omega <= 0.0 {
+            self.precise_rotation_degrees = Self::normalize_precise_rotation_degrees(
+                self.precise_rotation_target_degrees,
+            );
+            self.precise_rotation_velocity = 0.0;
+            return false;
+        }
+
         let dt = ctx.input(|i| i.stable_dt).min(0.033);
-        let spring_force = OMEGA * OMEGA * error;
-        let damping_force = 2.0 * OMEGA * self.precise_rotation_velocity;
+        let spring_force = omega * omega * error;
+        let damping_force = 2.0 * omega * self.precise_rotation_velocity;
         let acceleration = spring_force - damping_force;
 
         self.precise_rotation_velocity += acceleration * dt;
@@ -14226,6 +14260,7 @@ impl ImageViewer {
         }) && !title_ui_blocking
             && !pointer_over_shortcut_ui
         {
+            self.reset_current_view_rotation(ctx);
             self.offset = egui::Vec2::ZERO;
             self.zoom_velocity = 0.0;
 
@@ -14276,6 +14311,8 @@ impl ImageViewer {
                     ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(desired));
                     self.center_window_on_monitor(ctx, desired);
                 }
+
+                self.save_current_fullscreen_view_state();
             }
         }
 
