@@ -5312,6 +5312,16 @@ impl ImageViewer {
         scaled.clamp(self.masonry_dynamic_target_min_side(), max_side)
     }
 
+    fn manga_strip_target_texture_side_from_display_side(&self, item_screen_max_side: f32) -> u32 {
+        let max_side = self.max_texture_side.max(1);
+        let scaled = (item_screen_max_side.max(1.0)
+            * Self::MANGA_DYNAMIC_TARGET_OVERSCAN
+            * self.manga_lod_target_scale_factor())
+            .ceil() as u32;
+
+        scaled.clamp(Self::MANGA_DYNAMIC_TARGET_MIN_SIDE.min(max_side), max_side)
+    }
+
     fn masonry_item_current_display_size(&mut self, index: usize) -> Option<egui::Vec2> {
         if !self.is_masonry_mode() {
             return None;
@@ -5885,12 +5895,6 @@ impl ImageViewer {
             return target_side;
         }
 
-        if self.zoom >= 0.95 {
-            return max_side;
-        }
-
-        let target_scale = self.manga_lod_target_scale_factor();
-
         let mut visible_max_side = 0.0f32;
         for &idx in visible_indices.iter().take(6) {
             let display_w = self.manga_get_image_display_width(idx);
@@ -5904,8 +5908,7 @@ impl ImageViewer {
             visible_max_side = display_w.max(display_h);
         }
 
-        let scaled = (visible_max_side * 1.20 * target_scale).ceil() as u32;
-        scaled.clamp(256u32.min(max_side), max_side)
+        self.manga_strip_target_texture_side_from_display_side(visible_max_side.max(1.0))
     }
 
     fn navigation_preload_window(&self) -> (usize, usize) {
@@ -7990,6 +7993,13 @@ impl ImageViewer {
         self.screen_size.y * 0.67 * self.zoom
     }
 
+    fn manga_strip_item_current_display_size(&self, index: usize) -> egui::Vec2 {
+        egui::vec2(
+            self.manga_get_image_display_width(index).max(1.0),
+            self.manga_get_image_display_height(index).max(1.0),
+        )
+    }
+
     /// Select texture options for manga/masonry preload uploads.
     ///
     /// Mipmaps are only enabled for static pages and video thumbnails.
@@ -8035,17 +8045,22 @@ impl ImageViewer {
         width: u32,
         height: u32,
     ) -> egui::TextureOptions {
-        if !self.is_masonry_mode() || media_type == MangaMediaType::AnimatedImage {
+        if media_type == MangaMediaType::AnimatedImage {
             return self.manga_texture_options_for_upload(media_type, width, height);
         }
 
         let min_side = width.min(height);
         let mipmap_allowed_by_size = min_side >= self.config.manga_mipmap_min_side.max(1);
-        let navigation_blocks_mipmaps = self.masonry_navigation_active_for_heavy_work();
-        let display_min_side = self
-            .masonry_item_current_display_size(index)
-            .map(|size| size.x.min(size.y).max(1.0))
-            .unwrap_or(min_side.max(1) as f32);
+        let navigation_blocks_mipmaps =
+            self.is_masonry_mode() && self.masonry_navigation_active_for_heavy_work();
+        let display_min_side = if self.is_masonry_mode() {
+            self.masonry_item_current_display_size(index)
+                .map(|size| size.x.min(size.y).max(1.0))
+                .unwrap_or(min_side.max(1) as f32)
+        } else {
+            let size = self.manga_strip_item_current_display_size(index);
+            size.x.min(size.y)
+        };
         let meaningfully_minified = (min_side as f32) >= display_min_side * 1.15;
 
         match media_type {
