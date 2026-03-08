@@ -1209,6 +1209,10 @@ struct ImageViewer {
     manga_arrow_left_was_down: bool,
     /// Track if right arrow was down last frame (to detect hold vs single tap)
     manga_arrow_right_was_down: bool,
+    /// Next repeat deadline while holding a mouse-bound previous-image action in long-strip mode.
+    manga_prev_image_mouse_repeat_at: Option<Instant>,
+    /// Next repeat deadline while holding a mouse-bound next-image action in long-strip mode.
+    manga_next_image_mouse_repeat_at: Option<Instant>,
 
     // ============ MANGA VIDEO PLAYBACK FIELDS ============
     /// Video players for manga mode, keyed by image list index.
@@ -1490,6 +1494,8 @@ impl Default for ImageViewer {
             manga_ttv_samples_ms: VecDeque::new(),
             manga_arrow_left_was_down: false,
             manga_arrow_right_was_down: false,
+            manga_prev_image_mouse_repeat_at: None,
+            manga_next_image_mouse_repeat_at: None,
 
             // Manga video playback fields
             manga_video_players: HashMap::new(),
@@ -1565,6 +1571,8 @@ impl ImageViewer {
     const MANGA_TTV_SAMPLE_CAP: usize = 240;
     const MANGA_TTV_PENDING_MAX_AGE: Duration = Duration::from_secs(30);
     const MANGA_PLACEHOLDER_STALL_RETRY_MS: u64 = 900;
+    const MANGA_PAGE_NAV_REPEAT_INITIAL_DELAY_MS: u64 = 260;
+    const MANGA_PAGE_NAV_REPEAT_INTERVAL_MS: u64 = 45;
     const FPS_OVERLAY_IDLE_POLL_MS: u64 = 500;
     const FPS_OVERLAY_ACTIVE_POLL_MS: u64 = 120;
     const FPS_IDLE_RESET_AFTER_MS: u64 = 350;
@@ -3179,6 +3187,13 @@ impl ImageViewer {
             .any(|binding| self.binding_down(binding, input, ctrl, shift, alt))
     }
 
+    fn action_mouse_binding_down(&self, action: Action, input: &egui::InputState) -> bool {
+        self.config
+            .get_bindings(action)
+            .iter()
+            .any(|binding| Self::mouse_binding_down(binding, input))
+    }
+
     fn binding_triggered(
         &self,
         binding: &InputBinding,
@@ -3227,6 +3242,56 @@ impl ImageViewer {
             | InputBinding::ScrollDown
             | InputBinding::CtrlScrollUp
             | InputBinding::CtrlScrollDown => false,
+        }
+    }
+
+    fn mouse_binding_down(binding: &InputBinding, input: &egui::InputState) -> bool {
+        match binding {
+            InputBinding::MouseLeft => input.pointer.button_down(egui::PointerButton::Primary),
+            InputBinding::MouseRight => input.pointer.button_down(egui::PointerButton::Secondary),
+            InputBinding::MouseMiddle => input.pointer.button_down(egui::PointerButton::Middle),
+            InputBinding::Mouse4 => input.pointer.button_down(egui::PointerButton::Extra1),
+            InputBinding::Mouse5 => input.pointer.button_down(egui::PointerButton::Extra2),
+            _ => false,
+        }
+    }
+
+    fn manga_page_mouse_repeat_trigger(
+        repeat_at: &mut Option<Instant>,
+        mouse_down: bool,
+        pressed: bool,
+        ctx: &egui::Context,
+    ) -> bool {
+        if !mouse_down {
+            *repeat_at = None;
+            return false;
+        }
+
+        let now = Instant::now();
+        let initial_delay = Duration::from_millis(Self::MANGA_PAGE_NAV_REPEAT_INITIAL_DELAY_MS);
+        let repeat_interval = Duration::from_millis(Self::MANGA_PAGE_NAV_REPEAT_INTERVAL_MS);
+
+        if pressed {
+            *repeat_at = Some(now + initial_delay);
+            ctx.request_repaint_after(initial_delay);
+            return false;
+        }
+
+        match *repeat_at {
+            Some(due_at) if now >= due_at => {
+                *repeat_at = Some(now + repeat_interval);
+                ctx.request_repaint_after(repeat_interval);
+                true
+            }
+            Some(due_at) => {
+                ctx.request_repaint_after(due_at.saturating_duration_since(now));
+                false
+            }
+            None => {
+                *repeat_at = Some(now + initial_delay);
+                ctx.request_repaint_after(initial_delay);
+                false
+            }
         }
     }
 
@@ -6145,6 +6210,39 @@ impl ImageViewer {
         self.manga_strip_preload_window_counts(self.manga_visible_strip_equivalent_last)
     }
 
+    fn manga_prime_navigation_destination(&mut self, target: usize) {
+        if !self.manga_mode || self.image_list.is_empty() {
+            return;
+        }
+
+        let target = target.min(self.image_list.len().saturating_sub(1));
+        let (preload_behind, preload_ahead) = self.navigation_preload_window();
+        let target_texture_side = self.manga_target_texture_side_for_preload(target, &[]);
+        let (downscale_filter, gif_filter) = self.manga_decode_filters_for_strip_mode();
+        let force_triangle_filters = self.manga_should_force_triangle_filters();
+
+        if let Some(ref mut loader) = self.manga_loader {
+            let len = self.image_list.len();
+            let start = target.saturating_sub(preload_behind);
+            let end = target.saturating_add(preload_ahead).min(len);
+            loader.request_dimensions_range(&self.image_list, start, end);
+            loader.update_preload_queue(
+                &self.image_list,
+                target,
+                self.screen_size.y,
+                self.max_texture_side,
+                target_texture_side,
+                downscale_filter,
+                gif_filter,
+                force_triangle_filters,
+            );
+        }
+
+        self.manga_preload_cooldown = 0;
+        self.manga_last_preload_update = Instant::now() - Duration::from_millis(100);
+        self.manga_update_preload_queue();
+    }
+
     fn manga_strip_preload_window_counts(&self, visible_item_equivalent: f32) -> (usize, usize) {
         let visible = visible_item_equivalent.max(1.0);
         let behind = (visible * Self::MANGA_STRIP_LOOK_BEHIND_MULTIPLIER)
@@ -8783,7 +8881,7 @@ impl ImageViewer {
         self.manga_scroll_target = scroll_to;
         self.manga_scroll_offset = scroll_to;
         self.manga_scroll_velocity = 0.0;
-        self.manga_update_preload_queue();
+        self.manga_prime_navigation_destination(target);
     }
 
     /// PageUp-style navigation, but with smooth inertial motion (no instant snap).
@@ -8880,7 +8978,7 @@ impl ImageViewer {
         self.manga_scroll_target = scroll_to;
         self.manga_scroll_offset = scroll_to;
         self.manga_scroll_velocity = 0.0;
-        self.manga_update_preload_queue();
+        self.manga_prime_navigation_destination(target);
     }
 
     /// PageDown-style navigation, but with smooth inertial motion (no instant snap).
@@ -11987,22 +12085,36 @@ impl ImageViewer {
         // - Floating/normal fullscreen: PageUp/PageDown/Home/End navigate files.
         if self.manga_mode && self.is_fullscreen {
             let masonry_fullscreen = self.is_masonry_mode();
-            let page_up = ctx.input(|input| {
-                let ctrl = input.modifiers.ctrl;
-                let shift = input.modifiers.shift;
-                let alt = input.modifiers.alt;
-                self.action_binding_triggered(Action::MangaPreviousImage, input, ctrl, shift, alt)
-            });
-            let page_down = ctx.input(|input| {
-                let ctrl = input.modifiers.ctrl;
-                let shift = input.modifiers.shift;
-                let alt = input.modifiers.alt;
-                self.action_binding_triggered(Action::MangaNextImage, input, ctrl, shift, alt)
-            });
+            let (page_up_pressed, page_down_pressed, page_up_mouse_down, page_down_mouse_down) =
+                ctx.input(|input| {
+                    let ctrl = input.modifiers.ctrl;
+                    let shift = input.modifiers.shift;
+                    let alt = input.modifiers.alt;
+                    (
+                        self.action_binding_triggered(
+                            Action::MangaPreviousImage,
+                            input,
+                            ctrl,
+                            shift,
+                            alt,
+                        ),
+                        self.action_binding_triggered(
+                            Action::MangaNextImage,
+                            input,
+                            ctrl,
+                            shift,
+                            alt,
+                        ),
+                        self.action_mouse_binding_down(Action::MangaPreviousImage, input),
+                        self.action_mouse_binding_down(Action::MangaNextImage, input),
+                    )
+                });
             let home = ctx.input(|i| i.key_pressed(egui::Key::Home));
             let end = ctx.input(|i| i.key_pressed(egui::Key::End));
 
             if masonry_fullscreen {
+                self.manga_prev_image_mouse_repeat_at = None;
+                self.manga_next_image_mouse_repeat_at = None;
                 let (pan_up, pan_down, pan_up_2, pan_down_2, pan_up_3, pan_down_3) =
                     ctx.input(|input| {
                         let ctrl = input.modifiers.ctrl;
@@ -12076,6 +12188,18 @@ impl ImageViewer {
                     self.apply_manga_pan_step(1.0, 2.0);
                 }
             } else {
+                let page_up_repeat = Self::manga_page_mouse_repeat_trigger(
+                    &mut self.manga_prev_image_mouse_repeat_at,
+                    page_up_mouse_down,
+                    page_up_pressed,
+                    ctx,
+                );
+                let page_down_repeat = Self::manga_page_mouse_repeat_trigger(
+                    &mut self.manga_next_image_mouse_repeat_at,
+                    page_down_mouse_down,
+                    page_down_pressed,
+                    ctx,
+                );
                 let (prev_fit_pressed, next_fit_pressed, prev_fit_down, next_fit_down, pan_up, pan_down) =
                     ctx.input(|input| {
                         let ctrl = input.modifiers.ctrl;
@@ -12147,10 +12271,10 @@ impl ImageViewer {
                 if pan_down {
                     self.apply_manga_pan_step(1.0, 1.0);
                 }
-                if page_up {
+                if page_up_pressed || page_up_repeat {
                     self.manga_page_up();
                 }
-                if page_down {
+                if page_down_pressed || page_down_repeat {
                     self.manga_page_down();
                 }
             }
@@ -12164,6 +12288,8 @@ impl ImageViewer {
         } else {
             self.manga_arrow_left_was_down = false;
             self.manga_arrow_right_was_down = false;
+            self.manga_prev_image_mouse_repeat_at = None;
+            self.manga_next_image_mouse_repeat_at = None;
 
             let page_up = ctx.input(|i| i.key_pressed(egui::Key::PageUp));
             let page_down = ctx.input(|i| i.key_pressed(egui::Key::PageDown));
