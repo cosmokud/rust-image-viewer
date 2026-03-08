@@ -610,8 +610,9 @@ impl Config {
     /// Set default keybindings
     fn set_defaults(&mut self) {
         // Fullscreen toggles
-        self.add_binding(InputBinding::MouseMiddle, Action::ToggleFullscreen);
+        self.add_binding(InputBinding::MouseRight, Action::ToggleFullscreen);
         self.add_binding(InputBinding::Key(egui::Key::F), Action::ToggleFullscreen);
+        self.add_binding(InputBinding::Key(egui::Key::F11), Action::ToggleFullscreen);
         self.add_binding(InputBinding::Key(egui::Key::F12), Action::ToggleFullscreen);
         self.add_binding(
             InputBinding::Key(egui::Key::Enter),
@@ -665,6 +666,62 @@ impl Config {
     fn add_binding(&mut self, input: InputBinding, action: Action) {
         self.bindings.insert(input.clone(), action);
         self.action_bindings.entry(action).or_default().push(input);
+    }
+
+    fn replace_action_bindings(&mut self, action: Action, bindings: &[InputBinding]) {
+        if let Some(previous_bindings) = self.action_bindings.remove(&action) {
+            for binding in previous_bindings {
+                if self.bindings.get(&binding) == Some(&action) {
+                    self.bindings.remove(&binding);
+                }
+            }
+        }
+
+        for binding in bindings {
+            self.bindings.insert(binding.clone(), action);
+        }
+
+        self.action_bindings.insert(action, bindings.to_vec());
+    }
+
+    fn migrate_legacy_toggle_fullscreen_binding(&mut self) {
+        let Some(existing_bindings) = self.action_bindings.get(&Action::ToggleFullscreen).cloned()
+        else {
+            return;
+        };
+
+        let legacy_bindings = [
+            InputBinding::MouseMiddle,
+            InputBinding::Key(egui::Key::F),
+            InputBinding::Key(egui::Key::F12),
+            InputBinding::Key(egui::Key::Enter),
+        ];
+
+        if existing_bindings.len() != legacy_bindings.len()
+            || legacy_bindings
+                .iter()
+                .any(|binding| !existing_bindings.contains(binding))
+        {
+            return;
+        }
+
+        let replacement_bindings = [
+            InputBinding::MouseRight,
+            InputBinding::Key(egui::Key::F),
+            InputBinding::Key(egui::Key::F11),
+            InputBinding::Key(egui::Key::F12),
+            InputBinding::Key(egui::Key::Enter),
+        ];
+
+        if replacement_bindings.iter().any(|binding| {
+            self.bindings
+                .get(binding)
+                .is_some_and(|existing_action| *existing_action != Action::ToggleFullscreen)
+        }) {
+            return;
+        }
+
+        self.replace_action_bindings(Action::ToggleFullscreen, &replacement_bindings);
     }
 
     /// Get the configuration directory in AppData/Roaming.
@@ -1228,6 +1285,8 @@ impl Config {
             }
         }
 
+        config.migrate_legacy_toggle_fullscreen_binding();
+
         config
     }
 
@@ -1640,6 +1699,45 @@ fn parse_rgb_triplet(value: &str) -> Option<[u8; 3]> {
     let g = parts[1].parse::<u8>().ok()?;
     let b = parts[2].parse::<u8>().ok()?;
     Some([r, g, b])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Action, Config, InputBinding};
+
+    #[test]
+    fn migrates_legacy_toggle_fullscreen_defaults() {
+        let config = Config::parse_ini(
+            "[Shortcuts]\ntoggle_fullscreen = mouse_middle, f, f12, enter\n",
+        );
+
+        assert_eq!(
+            config.get_bindings(Action::ToggleFullscreen),
+            vec![
+                InputBinding::MouseRight,
+                InputBinding::Key(egui::Key::F),
+                InputBinding::Key(egui::Key::F11),
+                InputBinding::Key(egui::Key::F12),
+                InputBinding::Key(egui::Key::Enter),
+            ]
+        );
+    }
+
+    #[test]
+    fn preserves_custom_toggle_fullscreen_bindings() {
+        let config = Config::parse_ini(
+            "[Shortcuts]\ntoggle_fullscreen = mouse_middle, q, enter\n",
+        );
+
+        assert_eq!(
+            config.get_bindings(Action::ToggleFullscreen),
+            vec![
+                InputBinding::MouseMiddle,
+                InputBinding::Key(egui::Key::Q),
+                InputBinding::Key(egui::Key::Enter),
+            ]
+        );
+    }
 }
 
 fn parse_u8_clamped(value: &str) -> Option<u8> {

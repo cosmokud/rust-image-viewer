@@ -2813,7 +2813,7 @@ impl ImageViewer {
     fn run_action(&mut self, action: Action) {
         match action {
             Action::Exit => self.should_exit = true,
-            Action::ToggleFullscreen => self.toggle_fullscreen = true,
+            Action::ToggleFullscreen => self.request_shortcut_fullscreen_toggle(),
             Action::NextImage => self.next_image(),
             Action::PreviousImage => self.prev_image(),
             Action::RotateClockwise => {
@@ -4408,6 +4408,31 @@ impl ImageViewer {
         self.toggle_fullscreen = true;
     }
 
+    fn request_shortcut_fullscreen_toggle(&mut self) {
+        self.stop_manga_autoscroll();
+
+        if self.is_fullscreen
+            && !self.manga_mode
+            && self.strip_return_mode_for_fullscreen_toggle().is_some()
+        {
+            self.return_to_strip_mode_from_fullscreen_toggle();
+            return;
+        }
+
+        if !self.is_fullscreen {
+            if let Some(previous_mode) = self.titlebar_previous_mode.take() {
+                self.request_titlebar_fullscreen_reentry(Some(previous_mode));
+                return;
+            }
+
+            if self.config.maximize_to_borderless_fullscreen {
+                self.toggle_fullscreen_force_borderless = true;
+            }
+        }
+
+        self.toggle_fullscreen = true;
+    }
+
     fn capture_pending_masonry_solo_reentry(&mut self, index: usize) {
         if self.manga_layout_mode != MangaLayoutMode::Masonry {
             self.pending_masonry_solo_reentry = None;
@@ -4473,7 +4498,7 @@ impl ImageViewer {
         self.titlebar_pending_restore_layout = None;
 
         if self.strip_return_mode_for_fullscreen_toggle() == Some(layout_mode) {
-            self.return_to_strip_mode_from_middle_click();
+            self.return_to_strip_mode_from_fullscreen_toggle();
             self.touch_bottom_overlays();
             return true;
         }
@@ -4842,7 +4867,7 @@ impl ImageViewer {
     }
 
     #[allow(dead_code)]
-    fn return_to_strip_mode_from_middle_click(&mut self) {
+    fn return_to_strip_mode_from_fullscreen_toggle(&mut self) {
         let Some(layout_mode) = self.strip_return_mode else {
             return;
         };
@@ -8942,7 +8967,7 @@ impl ImageViewer {
                             && self.strip_return_mode.is_some()
                         {
                             self.strip_return_mode = Some(target_layout);
-                            self.return_to_strip_mode_from_middle_click();
+                            self.return_to_strip_mode_from_fullscreen_toggle();
                         } else if self.manga_mode && *is_on {
                             // Toggling OFF the currently active strip layout should preserve
                             // exact strip position for immediate ON re-entry (no cumulative drift).
@@ -11409,23 +11434,12 @@ impl ImageViewer {
         }
 
         if right_click_return_to_strip {
-            self.stop_manga_autoscroll();
-            self.return_to_strip_mode_from_middle_click();
+            self.request_shortcut_fullscreen_toggle();
             return;
         }
 
         if right_click_toggle_fullscreen {
-            self.stop_manga_autoscroll();
-            if !self.is_fullscreen {
-                if let Some(previous_mode) = self.titlebar_previous_mode.take() {
-                    self.request_titlebar_fullscreen_reentry(Some(previous_mode));
-                    return;
-                }
-            }
-            if self.config.maximize_to_borderless_fullscreen && !self.is_fullscreen {
-                self.toggle_fullscreen_force_borderless = true;
-            }
-            self.toggle_fullscreen = true;
+            self.request_shortcut_fullscreen_toggle();
             return;
         }
 
@@ -11477,7 +11491,7 @@ impl ImageViewer {
             .bindings
             .contains_key(&InputBinding::Key(egui::Key::Enter));
         if enter_pressed && !enter_bound {
-            self.toggle_fullscreen = true;
+            self.request_shortcut_fullscreen_toggle();
         }
 
         // Handle mode-specific navigation keys.
@@ -14011,7 +14025,7 @@ impl eframe::App for ImageViewer {
                 && self.strip_return_mode_for_fullscreen_toggle().is_some()
                 && !toggled_from_titlebar
             {
-                self.return_to_strip_mode_from_middle_click();
+                self.return_to_strip_mode_from_fullscreen_toggle();
             } else {
                 self.is_fullscreen = entering_fullscreen;
 
