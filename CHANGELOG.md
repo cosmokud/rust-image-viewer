@@ -4,40 +4,21 @@ All notable changes to this project will be documented in this file.
 
 ## [v0.2.2] - 2026-03-08
 
-### Fixed
+### Highlights
 
-- The title-bar maximize or restore button now uses native Win32 maximize and restore behavior instead of routing through the viewer's custom fullscreen toggle path.
-- Fullscreen toggles on Windows now reuse the native maximize or restore transition, so center right-click in solo mode follows the same animated path without changing masonry or long-strip right-click behavior.
-- Leaving masonry mode or manga long-strip mode through the title-bar maximize or restore button now uses the same native maximize or restore-down animation as the solo viewer.
-- Restoring down from masonry or long-strip and maximizing back now restores the remembered fullscreen strip mode only after the window transition has landed, fixing the broken fit-to-screen state and the missing bottom-right hover HUD after the round-trip.
-- Returning from solo fullscreen to masonry now remembers the last solo item for one untouched strip re-entry, so immediately toggling back opens the last viewed file instead of the centered masonry tile.
-- Masonry mode no longer blocks first paint behind a full-screen metadata preload overlay; layout dimensions now warm progressively in the background while the visible canvas keeps rendering.
-- Masonry scrolling now defers off-screen relayout churn and dynamic video or animated texture refresh while navigation is active, reducing frame-time spikes from late metadata, upload work, and moving-media updates.
-- Slow video-dimension probes in the masonry loader now use a tighter discovery timeout so background metadata work is less likely to compete with visible scrolling and preload requests.
-- Visible masonry dimension requests now use a higher-priority worker lane than background warm-up probes, so viewport-critical layout data can preempt whole-folder metadata refinement.
-- Decoded masonry images now pass through a small visible-first mailbox before GPU upload, which keeps active scrolling focused on visible or near-visible textures and sheds stale speculative uploads sooner when the UI falls behind.
-- Added masonry layout, spatial-index, and visible-query timing metrics to the performance overlay so remaining frame spikes can be correlated to concrete hot paths instead of guessed heuristics.
-- Masonry retries, focused video frames, and focused animated-image frames now target a more aggressive display-aware LOD, which reduces oversized uploads and quality-churn stutter in dense zoomed-out views.
-- Masonry navigation now suppresses more unnecessary quality upgrades and mipmap work for transient textures, keeping the draw thread focused on fast visible fills before settling to higher detail.
-- Metadata-cache fingerprint validation now uses a short-lived in-memory stamp cache, which cuts repeated `std::fs::metadata` probes during dense browsing and reduces HDD-sensitive thumbnail and dimension lookup stalls.
-- Visible strip and masonry items no longer get stuck in the blurry fill state, because sharpness upgrades now use the loader's real LOD buckets and can force a self-healing retry when stale bookkeeping gets in the way.
-- Masonry visible sharpening and mipmap decisions now follow each tile's current fitted on-screen size in the active row layout, and loader bookkeeping no longer overstates quality past the source image's real dimensions.
-- Masonry now schedules its own short post-navigation quality-refinement pass after scrolling, panning, or zooming settles, so visible tiles sharpen automatically without needing a manual zoom nudge.
-- Masonry Ctrl+wheel zoom no longer stalls when the pointer crosses the scrollbar track, active zoom stops forcing a full preload refresh every tick, and manga long-strip zoom now keeps the exact cursor position anchored in both axes instead of only following vertical position.
-- Visible sharpening retries now go through a dedicated urgent loader lane instead of waiting behind speculative preload work, and masonry starts its post-navigation quality-refine pass sooner so blurry tiles snap to their sharp version faster after they enter view.
-- Manga and masonry now keep a much larger recent texture working set in VRAM and avoid shrinking the cache aggressively during active navigation, which reduces needless texture reloads when you reverse direction and revisit images that were just on screen.
-- Manga preloading and dimension probing now scale from the actual visible-item count produced by the current viewport query path, with a more aggressive directional window of roughly 2x visible items ahead and 1x behind, plus deeper decoded-image staging so backend workers can stay further ahead of the single-threaded texture upload path.
-- Parallel manga decode batches now stream each finished result to the UI handoff queue immediately instead of waiting for the slowest decode in the batch, which reduces the "nothing happens, then many textures pop in at once" behavior in very dense masonry views.
-- Static-image LOD bucket selection now follows the current on-screen draw size for each item, using aspect-ratio-aware bucket dimensions so very tall and very wide images stop getting treated as if a matching long edge automatically meant enough total resolution.
-- Visible masonry placeholders now self-heal if a stale load marker survives zoom churn, and Windows fullscreen now uses a borderless topmost monitor-sized window so taskbar auto-hide does not pop over the viewer when the cursor touches the screen edge.
+- Extensive masonry and manga performance overhaul: smarter LOD, prioritized preload/visible workloads, larger VRAM cache, deferred off-screen work, and new timing metrics to diagnose frame spikes.
+- Fullscreen/window transitions now use native Win32 maximize/restore animations across solo, masonry, and long-strip modes; state is preserved during round-trips and the title-bar button behaves correctly.
+- UX polish including retained placeholders, last-solo-item memory, improved zoom anchoring, consistent GotoFile/fullscreen toggles, and a self-healing masonry placeholder system.
+- Metadata cache optimizations reduce repeated filesystem probes and eliminate first‑paint blocks; masonry layout warms progressively in the background.
+- Various bug fixes for blurry tiles, stalled zoom, texture upload churn, scrollbar-edge zoom stalls, configuration behavior, and masonry navigation jitter.
 
 ### Changed
 
-- Manga and masonry LOD selection is now automatic again and adapts to current tile fit, row density, visible workload, and screen size instead of exposing manual quality knobs in `config.ini`.
+- Manga and masonry LOD automatically adapts to fit, density, and screen size instead of exposing manual quality knobs.
 
 ### Added
 
-- Added `fullscreen_native_window_transition` to the settings INI so users can switch between the native animated maximize or restore-down fullscreen path and the old instant fullscreen snap.
+- New `fullscreen_native_window_transition` INI option for choosing between native animations and instant snaps.
 
 ## [v0.2.1] - 2026-03-06
 
