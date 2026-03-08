@@ -9,8 +9,69 @@ use std::path::Path;
 const DEFAULT_CONFIG_TEMPLATE_PATH: &str = "assets/config.ini";
 const RUNTIME_CONFIG_FILE_NAME: &str = "config.ini";
 const LEGACY_CONFIG_FILE_NAME: &str = "rust-image-viewer-config.ini";
+const FALLBACK_CONFIG_VERSION: &str = "0.0.0";
 
 type IniValues = HashMap<String, HashMap<String, String>>;
+
+fn current_config_version() -> String {
+    env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| FALLBACK_CONFIG_VERSION.to_string())
+}
+
+fn render_template_with_current_version(template: &str) -> String {
+    render_template_with_version(template, &current_config_version())
+}
+
+fn render_template_with_version(template: &str, version: &str) -> String {
+    let version_tag = format!("[{}]", version);
+
+    if let Some(first_line) = template.lines().next() {
+        if is_version_tag_line(first_line) {
+            let mut rendered = String::with_capacity(template.len() + version_tag.len());
+            rendered.push_str(&version_tag);
+            rendered.push_str(&template[first_line.len()..]);
+            return rendered;
+        }
+    }
+
+    let line_ending = if template.contains("\r\n") { "\r\n" } else { "\n" };
+    let mut rendered = String::with_capacity(template.len() + version_tag.len() + line_ending.len());
+    rendered.push_str(&version_tag);
+    rendered.push_str(line_ending);
+    rendered.push_str(template);
+    rendered
+}
+
+fn has_version_tag_at_top(content: &str) -> bool {
+    let content = content.trim_start_matches('\u{feff}');
+    content
+        .lines()
+        .next()
+        .map(is_version_tag_line)
+        .unwrap_or(false)
+}
+
+fn is_version_tag_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    if !(trimmed.starts_with('[') && trimmed.ends_with(']')) {
+        return false;
+    }
+
+    let version = &trimmed[1..trimmed.len() - 1];
+    is_semver_triplet(version)
+}
+
+fn is_semver_triplet(version: &str) -> bool {
+    let mut parts = version.split('.');
+
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(major), Some(minor), Some(patch), None) => {
+            [major, minor, patch]
+                .iter()
+                .all(|part| !part.is_empty() && part.chars().all(|ch| ch.is_ascii_digit()))
+        }
+        _ => false,
+    }
+}
 
 fn parse_ini_values(content: &str) -> IniValues {
     let mut values: IniValues = HashMap::new();
@@ -110,20 +171,24 @@ fn copy_default_config_to_target(src_config: &Path) {
         let dst_config = target_dir.join(RUNTIME_CONFIG_FILE_NAME);
 
         if src_config.exists() {
-            let should_copy = if dst_config.exists() {
-                let src_modified = fs::metadata(src_config).and_then(|m| m.modified()).ok();
-                let dst_modified = fs::metadata(&dst_config).and_then(|m| m.modified()).ok();
-
-                match (src_modified, dst_modified) {
-                    (Some(src_time), Some(dst_time)) => src_time > dst_time,
-                    _ => true,
+            let default_template = match fs::read_to_string(src_config) {
+                Ok(content) => render_template_with_current_version(&content),
+                Err(e) => {
+                    println!(
+                        "cargo:warning=Failed to read default config template at {}: {}",
+                        DEFAULT_CONFIG_TEMPLATE_PATH, e
+                    );
+                    return;
                 }
-            } else {
-                true
+            };
+
+            let should_copy = match fs::read_to_string(&dst_config) {
+                Ok(existing) => existing != default_template,
+                Err(_) => true,
             };
 
             if should_copy {
-                if let Err(e) = fs::copy(src_config, &dst_config) {
+                if let Err(e) = fs::write(&dst_config, &default_template) {
                     println!(
                         "cargo:warning=Failed to copy default config template to target directory: {}",
                         e
@@ -152,7 +217,7 @@ fn sync_appdata_config(src_config: &Path) {
     }
 
     let default_template = match fs::read_to_string(src_config) {
-        Ok(c) => c,
+        Ok(c) => render_template_with_current_version(&c),
         Err(e) => {
             println!(
                 "cargo:warning=Failed to read default config template at {}: {}",
@@ -187,6 +252,16 @@ fn sync_appdata_config(src_config: &Path) {
 
     match fs::read_to_string(&app_config) {
         Ok(current_content) => {
+            if !has_version_tag_at_top(&current_content) {
+                if let Err(e) = fs::write(&app_config, &default_template) {
+                    println!(
+                        "cargo:warning=Failed to reset AppData {} without version tag: {}",
+                        RUNTIME_CONFIG_FILE_NAME, e
+                    );
+                }
+                return;
+            }
+
             let merged = merge_ini_with_default_template(&default_template, &current_content);
             if merged != current_content {
                 if let Err(e) = fs::write(&app_config, merged) {
@@ -219,8 +294,10 @@ fn main() {
     sync_appdata_config(src_config);
 
     println!("cargo:rerun-if-changed={}", DEFAULT_CONFIG_TEMPLATE_PATH);
+    println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=APPDATA");
+    println!("cargo:rerun-if-env-changed=CARGO_PKG_VERSION");
 
     // Embed Windows icon into PE resources when building for windows-msvc
     // This makes Explorer and shortcuts show the app icon

@@ -4,11 +4,20 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
-const DEFAULT_CONFIG_INI: &str = include_str!("../assets/config.ini");
+const DEFAULT_CONFIG_TEMPLATE: &str = include_str!("../assets/config.ini");
+const CONFIG_FILE_VERSION: &str = env!("CARGO_PKG_VERSION");
 const CONFIG_FILE_NAME: &str = "config.ini";
 const LEGACY_CONFIG_FILE_NAME: &str = "rust-image-viewer-config.ini";
 const LEGACY_SETTINGS_FILE_NAME: &str = "setting.ini";
+static DEFAULT_CONFIG_INI: OnceLock<String> = OnceLock::new();
+
+fn default_config_ini() -> &'static str {
+    DEFAULT_CONFIG_INI
+        .get_or_init(|| render_config_template_with_version(DEFAULT_CONFIG_TEMPLATE, CONFIG_FILE_VERSION))
+        .as_str()
+}
 
 /// Image resampling filter types for scaling operations.
 /// Listed from fastest (lowest quality) to slowest (highest quality).
@@ -925,13 +934,14 @@ impl Config {
     /// Load configuration from INI file
     pub fn load() -> Self {
         let config_path = Self::config_path();
+        let default_config = default_config_ini();
 
         let mut created_from_template = false;
         if !config_path.exists() {
-            if fs::write(&config_path, DEFAULT_CONFIG_INI).is_ok() {
+            if fs::write(&config_path, default_config).is_ok() {
                 created_from_template = true;
             } else {
-                let config = Config::default();
+                let config = Self::parse_ini(default_config);
                 config.save();
                 return config;
             }
@@ -939,7 +949,13 @@ impl Config {
 
         match fs::read_to_string(&config_path) {
             Ok(content) => {
-                let is_template_copy = content == DEFAULT_CONFIG_INI;
+                if !has_config_version_tag_at_top(&content) {
+                    let config = Self::parse_ini(default_config);
+                    let _ = fs::write(&config_path, default_config);
+                    return config;
+                }
+
+                let is_template_copy = content == default_config;
                 let config = Self::parse_ini(&content);
                 if !created_from_template && !is_template_copy {
                     // Save to update the config file with any new default bindings
@@ -948,8 +964,8 @@ impl Config {
                 config
             }
             Err(_) => {
-                let config = Self::parse_ini(DEFAULT_CONFIG_INI);
-                let _ = fs::write(&config_path, DEFAULT_CONFIG_INI);
+                let config = Self::parse_ini(default_config);
+                let _ = fs::write(&config_path, default_config);
                 config
             }
         }
@@ -1428,9 +1444,10 @@ impl Config {
 
     fn render_ini_from_template(&self) -> String {
         let values = self.ini_value_replacements();
-        let mut rendered = String::with_capacity(DEFAULT_CONFIG_INI.len() + 256);
+        let default_config = default_config_ini();
+        let mut rendered = String::with_capacity(default_config.len() + 256);
 
-        for line in DEFAULT_CONFIG_INI.split_inclusive('\n') {
+        for line in default_config.split_inclusive('\n') {
             let (line_body, line_ending) = split_line_ending(line);
             let trimmed = line_body.trim_start();
 
@@ -1907,6 +1924,58 @@ fn split_line_ending(line: &str) -> (&str, &str) {
     }
 }
 
+fn render_config_template_with_version(template: &str, version: &str) -> String {
+    let version_tag = format!("[{}]", version);
+
+    if let Some(first_line) = template.lines().next() {
+        if is_config_version_tag_line(first_line) {
+            let mut rendered = String::with_capacity(template.len() + version_tag.len());
+            rendered.push_str(&version_tag);
+            rendered.push_str(&template[first_line.len()..]);
+            return rendered;
+        }
+    }
+
+    let line_ending = if template.contains("\r\n") { "\r\n" } else { "\n" };
+    let mut rendered = String::with_capacity(template.len() + version_tag.len() + line_ending.len());
+    rendered.push_str(&version_tag);
+    rendered.push_str(line_ending);
+    rendered.push_str(template);
+    rendered
+}
+
+fn has_config_version_tag_at_top(content: &str) -> bool {
+    let content = content.trim_start_matches('\u{feff}');
+    content
+        .lines()
+        .next()
+        .map(is_config_version_tag_line)
+        .unwrap_or(false)
+}
+
+fn is_config_version_tag_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    if !(trimmed.starts_with('[') && trimmed.ends_with(']')) {
+        return false;
+    }
+
+    let version = &trimmed[1..trimmed.len() - 1];
+    is_semver_triplet(version)
+}
+
+fn is_semver_triplet(version: &str) -> bool {
+    let mut parts = version.split('.');
+
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(major), Some(minor), Some(patch), None) => {
+            [major, minor, patch]
+                .iter()
+                .all(|part| !part.is_empty() && part.chars().all(|ch| ch.is_ascii_digit()))
+        }
+        _ => false,
+    }
+}
+
 fn format_with_optional_trailing_zero_f32(value: f32) -> String {
     let mut value_str = format!("{}", value);
     if !value_str.contains('.') && !value_str.contains('e') && !value_str.contains('E') {
@@ -1948,7 +2017,33 @@ fn parse_rgb_triplet(value: &str) -> Option<[u8; 3]> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Action, Config, InputBinding};
+    use super::{
+        default_config_ini, has_config_version_tag_at_top, render_config_template_with_version,
+        Action, Config, InputBinding,
+    };
+
+    #[test]
+    fn default_config_template_uses_current_package_version() {
+        let expected_header = format!("[{}]", env!("CARGO_PKG_VERSION"));
+        let first_line = default_config_ini().lines().next().unwrap_or_default();
+
+        assert_eq!(first_line, expected_header);
+    }
+
+    #[test]
+    fn resets_config_when_version_tag_is_missing_from_top() {
+        assert!(has_config_version_tag_at_top("[0.2.2]\n[Settings]\nshow_fps = false\n"));
+        assert!(!has_config_version_tag_at_top("; old config without version tag\n[Settings]\nshow_fps = false\n"));
+        assert!(!has_config_version_tag_at_top("\n[0.2.2]\n[Settings]\nshow_fps = false\n"));
+        assert!(!has_config_version_tag_at_top(""));
+    }
+
+    #[test]
+    fn replaces_stale_template_version_header() {
+        let rendered = render_config_template_with_version("[0.1.0]\n[Settings]\nshow_fps = false\n", "0.2.2");
+
+        assert_eq!(rendered, "[0.2.2]\n[Settings]\nshow_fps = false\n");
+    }
 
     #[test]
     fn migrates_legacy_toggle_fullscreen_defaults() {
