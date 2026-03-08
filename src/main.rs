@@ -948,6 +948,10 @@ struct ImageViewer {
     /// Maps image paths to their saved view states (zoom, pan, rotation, flip).
     /// Only active in fullscreen mode; cleared when exiting fullscreen.
     fullscreen_view_states: HashMap<PathBuf, FullscreenViewState>,
+    /// True when the current fullscreen solo-media view was explicitly changed by the user.
+    /// Default fit-to-screen transitions keep this false so next/previous only restore real
+    /// pan/zoom/rotation memories instead of whatever transform happened to be visible.
+    current_fullscreen_view_has_memory: bool,
 
     /// One-shot fullscreen-fit override for strip or masonry quick-open into solo fullscreen.
     /// These transitions should start from the usual fit-to-screen layout instead of reviving
@@ -1358,6 +1362,7 @@ impl Default for ImageViewer {
             pending_fullscreen_layout: false,
             pending_maximized_layout: false,
             fullscreen_view_states: HashMap::new(),
+            current_fullscreen_view_has_memory: false,
             strip_open_force_fit_path: None,
             last_known_outer_pos: None,
             floating_user_moved_window: false,
@@ -1665,6 +1670,7 @@ impl ImageViewer {
         self.zoom_target = 1.0;
         self.current_rotation_steps = 0;
         self.reset_precise_rotation();
+        self.current_fullscreen_view_has_memory = false;
         self.pending_media_layout = false;
     }
 
@@ -2977,6 +2983,7 @@ impl ImageViewer {
                 self.zoom_velocity = 0.0;
                 if self.is_fullscreen {
                     self.zoom = 1.0;
+                    self.remember_current_fullscreen_view_state();
                 }
             }
             Action::ZoomIn => {
@@ -2987,6 +2994,7 @@ impl ImageViewer {
                     self.zoom = (self.zoom * step).min(self.max_zoom_factor());
                     self.zoom_target = self.zoom;
                     self.zoom_velocity = 0.0;
+                    self.remember_current_fullscreen_view_state();
                 } else {
                     self.zoom_target = (self.zoom_target * step).min(self.max_zoom_factor());
                     self.zoom_velocity = 0.0;
@@ -3000,6 +3008,7 @@ impl ImageViewer {
                     self.zoom = (self.zoom / step).max(0.1);
                     self.zoom_target = self.zoom;
                     self.zoom_velocity = 0.0;
+                    self.remember_current_fullscreen_view_state();
                 } else {
                     self.zoom_target = (self.zoom_target / step).max(0.1);
                     self.zoom_velocity = 0.0;
@@ -4305,7 +4314,7 @@ impl ImageViewer {
     /// Save the current view state for the current image (fullscreen only).
     /// This allows restoring zoom, pan, and rotation when returning to this image.
     fn save_current_fullscreen_view_state(&mut self) {
-        if !self.is_fullscreen {
+        if !self.is_fullscreen || !self.current_fullscreen_view_has_memory {
             return;
         }
 
@@ -4325,6 +4334,25 @@ impl ImageViewer {
         };
 
         self.fullscreen_view_states.insert(path, state);
+    }
+
+    fn remember_current_fullscreen_view_state(&mut self) {
+        if !self.is_fullscreen || self.manga_mode {
+            return;
+        }
+
+        self.current_fullscreen_view_has_memory = true;
+        self.save_current_fullscreen_view_state();
+    }
+
+    fn clear_current_fullscreen_view_memory(&mut self) {
+        self.current_fullscreen_view_has_memory = false;
+
+        let Some(path) = self.image_list.get(self.current_index).cloned() else {
+            return;
+        };
+
+        self.fullscreen_view_states.remove(&path);
     }
 
     /// Restore the saved view state for a given image path (fullscreen only).
@@ -4354,6 +4382,8 @@ impl ImageViewer {
                 }
             }
 
+            self.current_fullscreen_view_has_memory = true;
+
             true
         } else {
             false
@@ -4373,30 +4403,7 @@ impl ImageViewer {
             return;
         }
 
-        let Some(path) = self.image_list.get(self.current_index).cloned() else {
-            return;
-        };
-
-        let entry =
-            self.fullscreen_view_states
-                .entry(path)
-                .or_insert_with(|| FullscreenViewState {
-                    zoom: self.zoom,
-                    zoom_target: self.zoom_target,
-                    offset: self.offset,
-                    precise_rotation_degrees: self.precise_rotation_degrees,
-                    precise_rotation_target_degrees: self.precise_rotation_target_degrees,
-                    rotation_steps: 0,
-                    flip_horizontal: false,
-                    flip_vertical: false,
-                });
-
-        entry.zoom = self.zoom;
-        entry.zoom_target = self.zoom_target;
-        entry.offset = self.offset;
-        entry.precise_rotation_degrees = self.precise_rotation_degrees;
-        entry.precise_rotation_target_degrees = self.precise_rotation_target_degrees;
-        entry.rotation_steps = self.current_rotation_steps;
+        self.remember_current_fullscreen_view_state();
     }
 
     fn normalize_precise_rotation_degrees(degrees: f32) -> f32 {
@@ -4456,29 +4463,7 @@ impl ImageViewer {
             self.precise_rotation_target_degrees + delta_degrees,
         );
 
-        let Some(path) = self.image_list.get(self.current_index).cloned() else {
-            return;
-        };
-
-        let entry = self
-            .fullscreen_view_states
-            .entry(path)
-            .or_insert_with(|| FullscreenViewState {
-                zoom: self.zoom,
-                zoom_target: self.zoom_target,
-                offset: self.offset,
-                precise_rotation_degrees: self.precise_rotation_degrees,
-                precise_rotation_target_degrees: self.precise_rotation_target_degrees,
-                rotation_steps: 0,
-                flip_horizontal: false,
-                flip_vertical: false,
-            });
-
-        entry.zoom = self.zoom;
-        entry.zoom_target = self.zoom_target;
-        entry.offset = self.offset;
-        entry.precise_rotation_degrees = self.precise_rotation_degrees;
-        entry.precise_rotation_target_degrees = self.precise_rotation_target_degrees;
+        self.remember_current_fullscreen_view_state();
     }
 
     /// Load next image
@@ -4946,6 +4931,7 @@ impl ImageViewer {
         }
 
         // No saved state - apply default fullscreen layout
+        self.current_fullscreen_view_has_memory = false;
         self.offset = egui::Vec2::ZERO;
         self.reset_precise_rotation();
 
@@ -5101,6 +5087,7 @@ impl ImageViewer {
 
             let zoom_ratio = self.zoom / old_zoom;
             self.offset = self.offset * zoom_ratio - cursor_offset * (zoom_ratio - 1.0);
+            self.remember_current_fullscreen_view_state();
         } else {
             self.offset = egui::Vec2::ZERO;
         }
@@ -9565,6 +9552,7 @@ impl ImageViewer {
                     self.zoom_target = new_zoom;
                     self.zoom_velocity = 0.0;
                     self.offset = self.offset * zoom_ratio;
+                    self.remember_current_fullscreen_view_state();
                 }
             }
 
@@ -9795,6 +9783,7 @@ impl ImageViewer {
                                     self.zoom_target = new_zoom;
                                     self.zoom_velocity = 0.0;
                                     self.offset = self.offset * zoom_ratio;
+                                    self.remember_current_fullscreen_view_state();
                                 }
                             }
 
@@ -9905,6 +9894,7 @@ impl ImageViewer {
             self.zoom_target = new_zoom;
             self.zoom_velocity = 0.0;
             self.offset = self.offset * zoom_ratio;
+            self.remember_current_fullscreen_view_state();
         }
     }
 
@@ -14162,6 +14152,7 @@ impl ImageViewer {
                                 // In fullscreen, pan the image
                                 let delta = ctx.input(|i| i.pointer.delta());
                                 self.offset += delta;
+                                self.remember_current_fullscreen_view_state();
                             } else if in_title_bar {
                                 // In floating mode, dragging from title bar always moves window
                                 ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
@@ -14269,6 +14260,7 @@ impl ImageViewer {
                         self.zoom = self.clamp_zoom(fit_zoom);
                         self.zoom_target = self.zoom;
                     }
+                    self.clear_current_fullscreen_view_memory();
                 } else {
                     // Floating mode: fit media to screen while keeping aspect ratio.
                     let monitor = self.monitor_size_points(ctx);
@@ -14304,7 +14296,6 @@ impl ImageViewer {
                     self.center_window_on_monitor(ctx, desired);
                 }
 
-                self.save_current_fullscreen_view_state();
             }
         }
 
@@ -14779,6 +14770,7 @@ impl eframe::App for ImageViewer {
                     // Clear the per-image fullscreen view state cache when exiting fullscreen
                     // (since it's only meant for fullscreen mode comparisons within a session)
                     self.fullscreen_view_states.clear();
+                    self.current_fullscreen_view_has_memory = false;
                     self.reset_precise_rotation();
                     self.strip_open_force_fit_path = None;
 
