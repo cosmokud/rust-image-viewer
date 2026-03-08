@@ -1114,6 +1114,8 @@ struct ImageViewer {
     manga_upload_batch_limit: usize,
     /// Last sampled number of visible media tiles in manga mode.
     manga_visible_indices_last: usize,
+    /// Last sampled long-strip viewport coverage expressed as visible-page equivalents.
+    manga_visible_strip_equivalent_last: f32,
     /// Peak sampled number of visible media tiles in manga mode.
     manga_visible_indices_peak: usize,
     /// Peak background request queue depth while in manga mode.
@@ -1395,6 +1397,7 @@ impl Default for ImageViewer {
             manga_target_texture_side: 4096,
             manga_upload_batch_limit: 4,
             manga_visible_indices_last: 0,
+            manga_visible_strip_equivalent_last: 0.0,
             manga_visible_indices_peak: 0,
             manga_pending_loads_peak: 0,
             manga_pending_decoded_peak: 0,
@@ -1461,6 +1464,8 @@ impl ImageViewer {
     const MANGA_VIRTUALIZATION_AUTO_RTREE_MIN_ITEMS: usize = 2048;
     const MANGA_CACHE_MIN_ENTRIES: usize = 64;
     const MANGA_CACHE_MAX_ENTRIES: usize = 1024;
+    const MANGA_STRIP_LOOK_AHEAD_MULTIPLIER: f32 = 2.0;
+    const MANGA_STRIP_LOOK_BEHIND_MULTIPLIER: f32 = 1.0;
     const MANGA_DYNAMIC_TARGET_MIN_SIDE: u32 = 192;
     const MANGA_DYNAMIC_TARGET_OVERSCAN: f32 = 1.35;
     const MANGA_MASONRY_DYNAMIC_TARGET_DENSE_MIN_SIDE: u32 = 64;
@@ -5904,22 +5909,52 @@ impl ImageViewer {
     }
 
     fn navigation_preload_window(&self) -> (usize, usize) {
-        let visible = self.manga_visible_indices_last.max(1);
-        let min_behind = if self.is_masonry_mode() {
-            self.masonry_items_per_row.clamp(2, 10).saturating_mul(4)
-        } else {
-            8
-        };
-        let min_ahead = if self.is_masonry_mode() {
-            self.masonry_items_per_row.clamp(2, 10).saturating_mul(8)
-        } else {
-            16
-        };
+        if self.is_masonry_mode() {
+            let visible = self.manga_visible_indices_last.max(1);
+            let min_behind = self.masonry_items_per_row.clamp(2, 10).saturating_mul(4);
+            let min_ahead = self.masonry_items_per_row.clamp(2, 10).saturating_mul(8);
 
-        (
-            visible.max(min_behind),
-            visible.saturating_mul(2).max(min_ahead),
-        )
+            return (
+                visible.max(min_behind),
+                visible.saturating_mul(2).max(min_ahead),
+            );
+        }
+
+        self.manga_strip_preload_window_counts(self.manga_visible_strip_equivalent_last)
+    }
+
+    fn manga_strip_preload_window_counts(&self, visible_item_equivalent: f32) -> (usize, usize) {
+        let visible = visible_item_equivalent.max(1.0);
+        let behind = (visible * Self::MANGA_STRIP_LOOK_BEHIND_MULTIPLIER)
+            .ceil()
+            .max(1.0) as usize;
+        let ahead = (visible * Self::MANGA_STRIP_LOOK_AHEAD_MULTIPLIER)
+            .ceil()
+            .max(1.0) as usize;
+
+        (behind, ahead)
+    }
+
+    fn manga_strip_visible_item_equivalent(
+        &mut self,
+        visible_indices: &[usize],
+        viewport_top: f32,
+        viewport_bottom: f32,
+    ) -> f32 {
+        if self.is_masonry_mode() || visible_indices.is_empty() {
+            return visible_indices.len().max(1) as f32;
+        }
+
+        let mut visible_item_equivalent = 0.0f32;
+        for &idx in visible_indices {
+            let item_top = self.manga_page_start_y(idx);
+            let item_height = self.manga_page_height_cached(idx).max(0.0001);
+            let item_bottom = item_top + item_height;
+            let overlap = (viewport_bottom.min(item_bottom) - viewport_top.max(item_top)).max(0.0);
+            visible_item_equivalent += (overlap / item_height).clamp(0.0, 1.0);
+        }
+
+        visible_item_equivalent.max(1.0)
     }
 
     fn invalidate_manga_layout_cache(&mut self) {
@@ -6362,6 +6397,7 @@ impl ImageViewer {
             self.manga_ttv_samples_ms.clear();
             self.manga_upload_batch_limit = Self::MANGA_UPLOAD_BATCH_BASE;
             self.manga_visible_indices_last = 0;
+            self.manga_visible_strip_equivalent_last = 0.0;
             self.manga_visible_indices_peak = 0;
             self.manga_pending_loads_peak = 0;
             self.manga_pending_decoded_peak = 0;
@@ -6784,6 +6820,7 @@ impl ImageViewer {
         self.manga_cache_target_capacity = Self::MANGA_CACHE_MIN_ENTRIES;
         self.manga_target_texture_side = self.max_texture_side.max(1);
         self.manga_visible_indices_last = 0;
+        self.manga_visible_strip_equivalent_last = 0.0;
         self.manga_visible_indices_peak = 0;
         self.manga_pending_loads_peak = 0;
         self.manga_pending_decoded_peak = 0;
@@ -7598,17 +7635,31 @@ impl ImageViewer {
         // Determine which image is currently at the viewport top.
         let current_visible_index = self.manga_index_at_y(self.manga_scroll_offset.max(0.0));
 
-        // Calculate how many pages are currently visible on screen
-        // This determines preload count: visible_pages + 4 ahead and behind
+        // Sample how many items are on screen now.
+        // Long strip also derives a fractional viewport-coverage estimate from this set so
+        // partial pages do not trigger oversized forward/backward probe windows.
         let visible_page_count = self.manga_calculate_visible_page_count();
         let visible_indices = self.manga_collect_visible_indices();
         let visible_indices_count = visible_indices.len().max(1);
+        let viewport_top = self.manga_scroll_offset.max(0.0);
+        let viewport_bottom = viewport_top + self.screen_size.y.max(1.0);
+        let is_masonry = self.is_masonry_mode();
+        let strip_visible_item_equivalent = if is_masonry {
+            self.manga_visible_strip_equivalent_last = 0.0;
+            None
+        } else {
+            let visible_item_equivalent = self.manga_strip_visible_item_equivalent(
+                &visible_indices,
+                viewport_top,
+                viewport_bottom,
+            );
+            self.manga_visible_strip_equivalent_last = visible_item_equivalent;
+            Some(visible_item_equivalent)
+        };
         let visible_set: HashSet<usize> = visible_indices.iter().copied().collect();
         let previous_cache_capacity = self
             .manga_cache_target_capacity
             .max(Self::MANGA_CACHE_MIN_ENTRIES);
-
-        let is_masonry = self.is_masonry_mode();
         let masonry_rows = self.masonry_items_per_row.clamp(2, 10);
         let masonry_side_multiplier = (masonry_rows + 1) / 2;
         let mut target_cache_capacity =
@@ -7680,45 +7731,48 @@ impl ImageViewer {
 
         // Update the loader's visible item count using the actual visible set. When the R-tree
         // backend is active, `visible_indices` already reflects the current on-screen tile count.
+        // Long strip also passes a fractional viewport-coverage hint so partial pages do not
+        // expand the preload window to whole-item minimums.
         if let Some(ref mut loader) = self.manga_loader {
             let visible_for_loader = visible_indices_count.max(1);
             let cache_limited_visible = visible_for_loader.min(self.manga_cache_target_capacity.max(1));
-            loader.update_visible_page_count(cache_limited_visible.max(1));
+            loader.update_visible_page_count(
+                cache_limited_visible.max(1),
+                strip_visible_item_equivalent,
+            );
         }
 
         // Cache dimensions for a directional window around the visible range.
         // Use the actual visible item count so backend probe work scales with what is truly on screen.
         let scrolling_up = self.manga_scroll_offset < prev_scroll_pos - 0.5;
         let moving_up = scrolling_up || self.manga_scroll_velocity < -0.5;
-        let directional_visible = visible_indices_count.max(1);
-        let look_forward = directional_visible.saturating_mul(2);
-        let look_backward = directional_visible;
-        let min_forward = if is_masonry {
-            masonry_rows.saturating_mul(8)
+        let (behind, ahead) = if is_masonry {
+            let directional_visible = visible_indices_count.max(1);
+            let look_forward = directional_visible.saturating_mul(2);
+            let look_backward = directional_visible;
+            let min_forward = masonry_rows.saturating_mul(8);
+            let min_backward = masonry_rows.saturating_mul(4);
+            let max_behind = 384usize.saturating_mul(masonry_rows);
+            let max_ahead = 768usize.saturating_mul(masonry_rows);
+            let forward = look_forward.max(min_forward);
+            let backward = look_backward.max(min_backward);
+
+            if moving_up {
+                (forward.min(max_behind), backward.min(max_ahead))
+            } else {
+                (backward.min(max_behind), forward.min(max_ahead))
+            }
         } else {
-            16
-        };
-        let min_backward = if is_masonry {
-            masonry_rows.saturating_mul(4)
-        } else {
-            8
-        };
-        let max_behind = if is_masonry {
-            384usize.saturating_mul(masonry_rows)
-        } else {
-            384
-        };
-        let max_ahead = if is_masonry {
-            768usize.saturating_mul(masonry_rows)
-        } else {
-            768
-        };
-        let forward = look_forward.max(min_forward);
-        let backward = look_backward.max(min_backward);
-        let (behind, ahead) = if moving_up {
-            (forward.min(max_behind), backward.min(max_ahead))
-        } else {
-            (backward.min(max_behind), forward.min(max_ahead))
+            let visible_item_equivalent =
+                strip_visible_item_equivalent.unwrap_or(visible_indices_count as f32);
+            let (look_backward, look_forward) =
+                self.manga_strip_preload_window_counts(visible_item_equivalent);
+
+            if moving_up {
+                (look_forward, look_backward)
+            } else {
+                (look_backward, look_forward)
+            }
         };
 
         let cache_start = current_visible_index.saturating_sub(behind);

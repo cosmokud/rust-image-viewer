@@ -59,6 +59,11 @@ const URGENT_REQUEST_QUEUE_CAPACITY: usize = 128;
 const PRELOAD_LOOK_AHEAD_MULTIPLIER: usize = 2;
 const PRELOAD_LOOK_BEHIND_MULTIPLIER: usize = 1;
 
+/// Strip mode uses viewport coverage instead of whole-item counts so partial pages do not
+/// inflate preload windows. Example: 1.5 visible pages -> 3 ahead, 2 behind.
+const STRIP_PRELOAD_LOOK_AHEAD_MULTIPLIER: f32 = PRELOAD_LOOK_AHEAD_MULTIPLIER as f32;
+const STRIP_PRELOAD_LOOK_BEHIND_MULTIPLIER: f32 = PRELOAD_LOOK_BEHIND_MULTIPLIER as f32;
+
 /// Clamp the directional preload windows to keep memory usage bounded.
 const MIN_PRELOAD_AHEAD: usize = 12;
 const MIN_PRELOAD_BEHIND: usize = 6;
@@ -196,6 +201,8 @@ pub struct MangaLoader {
     pub stats: LoaderStats,
     /// Estimated number of visible items on screen (for adaptive preloading)
     visible_page_count: usize,
+    /// Long-strip-only viewport coverage equivalent (e.g. 1.5 visible pages).
+    strip_visible_item_equivalent: Option<f32>,
 }
 
 /// Statistics for monitoring loader performance.
@@ -353,6 +360,7 @@ impl MangaLoader {
             current_generation: 0,
             stats: LoaderStats::default(),
             visible_page_count: 1,
+            strip_visible_item_equivalent: None,
         }
     }
 
@@ -1335,18 +1343,27 @@ impl MangaLoader {
         ))
     }
 
-    /// Calculate preload counts based on visible page count.
-    ///
-    /// Formula:
-    /// - AHEAD (scroll direction): visible_pages + 4
-    /// - BEHIND (opposite direction): visible_pages + 2
-    ///
-    /// For example, if 14 items are visible:
-    /// - Scrolling down: 28 ahead, 14 behind
-    /// - Scrolling up: 28 behind, 14 ahead
+    fn calculate_strip_preload_counts(&self, visible_item_equivalent: f32) -> (usize, usize) {
+        let visible_items = visible_item_equivalent.max(1.0);
+        let ahead = (visible_items * STRIP_PRELOAD_LOOK_AHEAD_MULTIPLIER)
+            .ceil()
+            .max(1.0) as usize;
+        let behind = (visible_items * STRIP_PRELOAD_LOOK_BEHIND_MULTIPLIER)
+            .ceil()
+            .max(1.0) as usize;
+
+        (ahead.min(MAX_PRELOAD_AHEAD), behind.min(MAX_PRELOAD_BEHIND))
+    }
+
+    /// Calculate preload counts based on the current layout's visible item signal.
+    /// Long strip uses fractional viewport coverage; masonry keeps the existing whole-item floor.
     ///
     /// Returns (preload_ahead, preload_behind)
     fn calculate_preload_counts(&self) -> (usize, usize) {
+        if let Some(visible_item_equivalent) = self.strip_visible_item_equivalent {
+            return self.calculate_strip_preload_counts(visible_item_equivalent);
+        }
+
         let visible_items = self.visible_page_count.max(1);
         let ahead = visible_items
             .saturating_mul(PRELOAD_LOOK_AHEAD_MULTIPLIER)
@@ -1360,8 +1377,16 @@ impl MangaLoader {
 
     /// Update the visible item count for adaptive preloading.
     /// Call this after calculating how many items are visible on screen.
-    pub fn update_visible_page_count(&mut self, visible_page_count: usize) {
+    /// Long strip can optionally pass fractional viewport coverage to avoid oversized windows.
+    pub fn update_visible_page_count(
+        &mut self,
+        visible_page_count: usize,
+        strip_visible_item_equivalent: Option<f32>,
+    ) {
         self.visible_page_count = visible_page_count.max(1);
+        self.strip_visible_item_equivalent = strip_visible_item_equivalent
+            .filter(|value| value.is_finite())
+            .map(|value| value.max(1.0));
     }
 
     /// Get current preload ahead count (useful for cache eviction in main.rs)
@@ -1869,6 +1894,27 @@ impl Drop for MangaLoader {
     fn drop(&mut self) {
         // Signal shutdown to coordinator thread
         self.shutdown.store(true, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MangaLoader;
+
+    #[test]
+    fn strip_preload_counts_scale_with_fractional_visibility() {
+        let mut loader = MangaLoader::new();
+        loader.update_visible_page_count(2, Some(1.5));
+
+        assert_eq!(loader.calculate_preload_counts(), (3, 2));
+    }
+
+    #[test]
+    fn default_preload_counts_preserve_existing_floor() {
+        let mut loader = MangaLoader::new();
+        loader.update_visible_page_count(2, None);
+
+        assert_eq!(loader.calculate_preload_counts(), (12, 6));
     }
 }
 
