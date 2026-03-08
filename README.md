@@ -8,6 +8,14 @@ A high-performance, minimal, borderless image and video viewer for Windows, buil
 
 **Scope & Purpose:** This app is highly optimized strictly for **quickly viewing and looking up images and videos only**. It is **not** intended to be a replacement for a full-fledged image management app, an image editor, or a comprehensive video player. Think of it as a QuickLook-style preview tool focused on opening media instantly with minimal controls.
 
+[floating.webm](https://github.com/user-attachments/assets/09a10ba9-53e3-4eea-a79a-323ec6b11ffb)
+
+[masonry.webm](https://github.com/user-attachments/assets/2886cffc-f607-4beb-a39e-292abf2bc448)
+
+[longstrip.webm](https://github.com/user-attachments/assets/edbc6b3f-3846-4250-be26-a64f76a02a53)
+
+[transition.webm](https://github.com/user-attachments/assets/6ee089e0-99e9-44cb-828a-4fb7b0c8eea8)
+
 ## Features
 
 ### User Interface
