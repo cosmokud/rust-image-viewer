@@ -2810,6 +2810,13 @@ impl ImageViewer {
         }
     }
 
+    fn apply_manga_pan_step(&mut self, direction: f32, multiplier: f32) {
+        let scroll_amount = self.config.manga_arrow_scroll_speed * 0.5 * multiplier;
+        if self.manga_add_scroll_target_delta(direction * scroll_amount) {
+            self.manga_update_preload_queue();
+        }
+    }
+
     fn run_action(&mut self, action: Action) {
         match action {
             Action::Exit => self.should_exit = true,
@@ -2870,6 +2877,28 @@ impl ImageViewer {
                     self.zoom_velocity = 0.0;
                 }
             }
+            Action::MangaPanUp => self.apply_manga_pan_step(-1.0, 1.0),
+            Action::MangaPanDown => self.apply_manga_pan_step(1.0, 1.0),
+            Action::MangaNextImageFit => self.manga_page_down_smooth(),
+            Action::MangaPreviousImageFit => self.manga_page_up_smooth(),
+            Action::MangaNextImage => self.manga_page_down(),
+            Action::MangaPreviousImage => self.manga_page_up(),
+            Action::MangaZoomIn | Action::MasonryZoomIn => {
+                if self.manga_mode && self.is_fullscreen {
+                    self.apply_manga_zoom_step(true);
+                }
+            }
+            Action::MangaZoomOut | Action::MasonryZoomOut => {
+                if self.manga_mode && self.is_fullscreen {
+                    self.apply_manga_zoom_step(false);
+                }
+            }
+            Action::MasonryPanUp => self.apply_manga_pan_step(-1.0, 1.0),
+            Action::MasonryPanDown => self.apply_manga_pan_step(1.0, 1.0),
+            Action::MasonryPanUp2 => self.apply_manga_pan_step(-1.0, 1.5),
+            Action::MasonryPanDown2 => self.apply_manga_pan_step(1.0, 1.5),
+            Action::MasonryPanUp3 => self.apply_manga_pan_step(-1.0, 2.0),
+            Action::MasonryPanDown3 => self.apply_manga_pan_step(1.0, 2.0),
             Action::VideoPlayPause => {
                 if let Some(ref mut player) = self.video_player {
                     let _ = player.toggle_play_pause();
@@ -2961,10 +2990,8 @@ impl ImageViewer {
     }
 
     fn strip_item_open_uses_right_click(&self) -> bool {
-        matches!(
-            &self.config.strip_item_open_binding,
-            InputBinding::MouseRight
-        )
+        self.config
+            .action_uses_binding(Action::SelectFile, &InputBinding::MouseRight)
     }
 
     fn strip_item_open_binding_triggered(
@@ -2974,16 +3001,89 @@ impl ImageViewer {
         shift: bool,
         alt: bool,
     ) -> bool {
-        match &self.config.strip_item_open_binding {
-            InputBinding::MouseRight => {
-                input.pointer.button_clicked(egui::PointerButton::Secondary)
-            }
-            InputBinding::MouseMiddle => input.pointer.button_pressed(egui::PointerButton::Middle),
+        self.action_binding_triggered(Action::SelectFile, input, ctrl, shift, alt)
+    }
+
+    fn action_uses_binding(&self, action: Action, binding: InputBinding) -> bool {
+        self.config.action_uses_binding(action, &binding)
+    }
+
+    fn action_binding_triggered(
+        &self,
+        action: Action,
+        input: &egui::InputState,
+        ctrl: bool,
+        shift: bool,
+        alt: bool,
+    ) -> bool {
+        self.config
+            .get_bindings(action)
+            .iter()
+            .any(|binding| self.binding_triggered(binding, input, ctrl, shift, alt))
+    }
+
+    fn action_binding_down(
+        &self,
+        action: Action,
+        input: &egui::InputState,
+        ctrl: bool,
+        shift: bool,
+        alt: bool,
+    ) -> bool {
+        self.config
+            .get_bindings(action)
+            .iter()
+            .any(|binding| self.binding_down(binding, input, ctrl, shift, alt))
+    }
+
+    fn binding_triggered(
+        &self,
+        binding: &InputBinding,
+        input: &egui::InputState,
+        ctrl: bool,
+        shift: bool,
+        alt: bool,
+    ) -> bool {
+        match binding {
             InputBinding::Key(key) => !ctrl && !shift && !alt && input.key_pressed(*key),
             InputBinding::KeyWithCtrl(key) => ctrl && !shift && !alt && input.key_pressed(*key),
             InputBinding::KeyWithShift(key) => !ctrl && shift && !alt && input.key_pressed(*key),
             InputBinding::KeyWithAlt(key) => !ctrl && !shift && alt && input.key_pressed(*key),
-            _ => false,
+            InputBinding::MouseLeft => input.pointer.button_pressed(egui::PointerButton::Primary),
+            InputBinding::MouseRight => {
+                input.pointer.button_clicked(egui::PointerButton::Secondary)
+            }
+            InputBinding::MouseMiddle => input.pointer.button_pressed(egui::PointerButton::Middle),
+            InputBinding::Mouse4 => input.pointer.button_pressed(egui::PointerButton::Extra1),
+            InputBinding::Mouse5 => input.pointer.button_pressed(egui::PointerButton::Extra2),
+            InputBinding::ScrollUp => input.smooth_scroll_delta.y > 0.0,
+            InputBinding::ScrollDown => input.smooth_scroll_delta.y < 0.0,
+            InputBinding::CtrlScrollUp | InputBinding::CtrlScrollDown => false,
+        }
+    }
+
+    fn binding_down(
+        &self,
+        binding: &InputBinding,
+        input: &egui::InputState,
+        ctrl: bool,
+        shift: bool,
+        alt: bool,
+    ) -> bool {
+        match binding {
+            InputBinding::Key(key) => !ctrl && !shift && !alt && input.key_down(*key),
+            InputBinding::KeyWithCtrl(key) => ctrl && !shift && !alt && input.key_down(*key),
+            InputBinding::KeyWithShift(key) => !ctrl && shift && !alt && input.key_down(*key),
+            InputBinding::KeyWithAlt(key) => !ctrl && !shift && alt && input.key_down(*key),
+            InputBinding::MouseLeft => input.pointer.button_down(egui::PointerButton::Primary),
+            InputBinding::MouseRight => input.pointer.button_down(egui::PointerButton::Secondary),
+            InputBinding::MouseMiddle => input.pointer.button_down(egui::PointerButton::Middle),
+            InputBinding::Mouse4 => input.pointer.button_down(egui::PointerButton::Extra1),
+            InputBinding::Mouse5 => input.pointer.button_down(egui::PointerButton::Extra2),
+            InputBinding::ScrollUp
+            | InputBinding::ScrollDown
+            | InputBinding::CtrlScrollUp
+            | InputBinding::CtrlScrollDown => false,
         }
     }
 
@@ -9983,6 +10083,26 @@ impl ImageViewer {
         let mut animation_active = false;
         let masonry_preload_input_blocked =
             self.is_masonry_mode() && self.masonry_metadata_preload_active;
+        let mode_scroll_up_action = if self.is_masonry_mode() {
+            Action::MasonryScrollUp
+        } else {
+            Action::MangaScrollUp
+        };
+        let mode_scroll_down_action = if self.is_masonry_mode() {
+            Action::MasonryScrollDown
+        } else {
+            Action::MangaScrollDown
+        };
+        let mode_zoom_in_action = if self.is_masonry_mode() {
+            Action::MasonryZoomIn
+        } else {
+            Action::MangaZoomIn
+        };
+        let mode_zoom_out_action = if self.is_masonry_mode() {
+            Action::MasonryZoomOut
+        } else {
+            Action::MangaZoomOut
+        };
 
         // Get input states
         let ctrl_held = ctx.input(|i| i.modifiers.ctrl);
@@ -10011,8 +10131,6 @@ impl ImageViewer {
                 i.pointer
                     .button_double_clicked(egui::PointerButton::Primary)
             });
-        let middle_pressed = !masonry_preload_input_blocked
-            && ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Middle));
         let pointer_delta = if masonry_preload_input_blocked {
             egui::Vec2::ZERO
         } else {
@@ -10020,6 +10138,26 @@ impl ImageViewer {
         };
         let secondary_clicked = !masonry_preload_input_blocked
             && ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Secondary));
+        let freehand_autoscroll_triggered = !masonry_preload_input_blocked
+            && ctx.input(|input| {
+                let ctrl = input.modifiers.ctrl;
+                let shift = input.modifiers.shift;
+                let alt = input.modifiers.alt;
+                self.action_binding_triggered(
+                    Action::FreehandAutoscroll,
+                    input,
+                    ctrl,
+                    shift,
+                    alt,
+                )
+            });
+        let pan_down_action = !masonry_preload_input_blocked
+            && ctx.input(|input| {
+                let ctrl = input.modifiers.ctrl;
+                let shift = input.modifiers.shift;
+                let alt = input.modifiers.alt;
+                self.action_binding_down(Action::Pan, input, ctrl, shift, alt)
+            });
 
         // Avoid triggering manga interactions while selecting/copying title-bar text.
         // IMPORTANT: allow click-through on the empty title bar area.
@@ -10110,7 +10248,11 @@ impl ImageViewer {
         let mut primary_consumed_for_autoscroll = false;
         let mut secondary_consumed_for_autoscroll = false;
 
-        if middle_pressed && !over_controls && !title_ui_blocking && !pointer_over_shortcut_ui {
+        if freehand_autoscroll_triggered
+            && !over_controls
+            && !title_ui_blocking
+            && !pointer_over_shortcut_ui
+        {
             if self.manga_autoscroll_active {
                 self.stop_manga_autoscroll();
             } else if let Some(anchor) = pointer_pos {
@@ -10268,42 +10410,11 @@ impl ImageViewer {
         // - New default: Ctrl+wheel is part of zoom_in/zoom_out
         // - Backwards-compat: older configs may bind Ctrl+wheel to manga_zoom_in/out
         // If bound, we treat Ctrl+wheel (and corresponding `zoom_delta`) as zoom input.
-        let manga_ctrl_scroll_zoom_bound =
-            self.config
-                .action_bindings
-                .get(&Action::ZoomIn)
-                .map_or(false, |bindings| {
-                    bindings
-                        .iter()
-                        .any(|b| matches!(b, InputBinding::CtrlScrollUp))
-                })
-                || self
-                    .config
-                    .action_bindings
-                    .get(&Action::ZoomOut)
-                    .map_or(false, |bindings| {
-                        bindings
-                            .iter()
-                            .any(|b| matches!(b, InputBinding::CtrlScrollDown))
-                    })
-                || self
-                    .config
-                    .action_bindings
-                    .get(&Action::MangaZoomIn)
-                    .map_or(false, |bindings| {
-                        bindings
-                            .iter()
-                            .any(|b| matches!(b, InputBinding::CtrlScrollUp))
-                    })
-                || self
-                    .config
-                    .action_bindings
-                    .get(&Action::MangaZoomOut)
-                    .map_or(false, |bindings| {
-                        bindings
-                            .iter()
-                            .any(|b| matches!(b, InputBinding::CtrlScrollDown))
-                    });
+        let manga_ctrl_scroll_zoom_bound = self
+            .action_uses_binding(mode_zoom_in_action, InputBinding::CtrlScrollUp)
+            || self.action_uses_binding(mode_zoom_out_action, InputBinding::CtrlScrollDown);
+        let manga_scroll_bound = self.action_uses_binding(mode_scroll_up_action, InputBinding::ScrollUp)
+            || self.action_uses_binding(mode_scroll_down_action, InputBinding::ScrollDown);
 
         // Handle scroll/zoom. Ctrl+wheel zoom should still work over the scrollbar track unless
         // the user is actively dragging the scrollbar itself.
@@ -10372,7 +10483,7 @@ impl ImageViewer {
 
                     animation_active = true;
                 }
-            } else if wheel_steps != 0.0 {
+            } else if manga_scroll_bound && wheel_steps != 0.0 {
                 if self.manga_apply_wheel_scroll_input(wheel_steps) {
                     self.manga_update_preload_queue();
                     animation_active = true;
@@ -10510,14 +10621,14 @@ impl ImageViewer {
         // - Apply pointer delta 1:1 (optionally scaled via config)
         // Manga mode maps vertical drag to strip scrolling and horizontal drag to X offset.
         if panning_allowed {
-            if primary_pressed && !primary_double_clicked {
+            if pan_down_action && !primary_double_clicked {
                 self.is_panning = true;
                 self.last_mouse_pos = pointer_pos;
                 self.stop_manga_wheel_scroll();
                 ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
             }
 
-            if primary_down && self.is_panning {
+            if pan_down_action && self.is_panning {
                 let drag_speed = self.config.manga_drag_pan_speed;
 
                 // Stop any residual inertial scroll while the user is actively dragging.
@@ -10543,7 +10654,7 @@ impl ImageViewer {
         }
 
         // Always clear pan state on release (even if panning_allowed changed mid-drag).
-        if primary_released {
+        if self.is_panning && !pan_down_action {
             self.is_panning = false;
             self.last_mouse_pos = None;
             self.manga_scroll_velocity = 0.0;
@@ -11261,7 +11372,9 @@ impl ImageViewer {
             let shift = input.modifiers.shift;
             let alt = input.modifiers.alt;
             let manga_fullscreen = self.manga_mode && self.is_fullscreen;
+            let masonry_fullscreen = manga_fullscreen && self.is_masonry_mode();
             let middle_pressed = input.pointer.button_pressed(egui::PointerButton::Middle);
+            let secondary_clicked = input.pointer.button_clicked(egui::PointerButton::Secondary);
             let pointer_pos = input
                 .pointer
                 .interact_pos()
@@ -11271,7 +11384,7 @@ impl ImageViewer {
 
             if self.manga_autoscroll_active {
                 let primary_cancel = input.pointer.button_clicked(egui::PointerButton::Primary);
-                let secondary_cancel = input.pointer.button_clicked(egui::PointerButton::Secondary);
+                let secondary_cancel = secondary_clicked;
                 if primary_cancel || secondary_cancel {
                     return;
                 }
@@ -11286,111 +11399,129 @@ impl ImageViewer {
                 return;
             }
 
-            // Check all keyboard bindings from config
-            // We iterate through all configured bindings and check if the corresponding key was pressed
-            for (binding, action) in &self.config.bindings {
-                if manga_fullscreen && binding == &self.config.strip_item_open_binding {
+            // Check discrete bindings that are not handled by dedicated pointer or hold logic.
+            for (action, bindings) in &self.config.action_bindings {
+                let action = *action;
+
+                let handled_elsewhere = matches!(
+                    action,
+                    Action::SelectFile
+                        | Action::SelectArea
+                        | Action::Pan
+                        | Action::FreehandAutoscroll
+                        | Action::MangaPanUp
+                        | Action::MangaPanDown
+                        | Action::MangaNextImageFit
+                        | Action::MangaPreviousImageFit
+                        | Action::MangaScrollUp
+                        | Action::MangaScrollDown
+                        | Action::MasonryPanUp
+                        | Action::MasonryPanDown
+                        | Action::MasonryPanUp2
+                        | Action::MasonryPanDown2
+                        | Action::MasonryPanUp3
+                        | Action::MasonryPanDown3
+                        | Action::MasonryScrollUp
+                        | Action::MasonryScrollDown
+                );
+                if handled_elsewhere {
                     continue;
                 }
 
-                match binding {
-                    InputBinding::Key(key) => {
-                        // In manga mode, repurpose arrow keys for navigation/scroll and disable their
-                        // default image-manipulation bindings (e.g., up/down rotation).
-                        if manga_fullscreen {
-                            let is_arrow = matches!(
-                                key,
-                                egui::Key::ArrowLeft
-                                    | egui::Key::ArrowRight
-                                    | egui::Key::ArrowUp
-                                    | egui::Key::ArrowDown
-                            );
-                            if is_arrow
-                                && matches!(
-                                    action,
-                                    Action::PreviousImage
-                                        | Action::NextImage
-                                        | Action::RotateClockwise
-                                        | Action::RotateCounterClockwise
-                                )
-                            {
-                                continue;
+                let action_active = match action {
+                    Action::ToggleFullscreen
+                    | Action::Exit
+                    | Action::ResetZoom
+                    | Action::Minimize
+                    | Action::Close => true,
+                    Action::NextImage
+                    | Action::PreviousImage
+                    | Action::RotateClockwise
+                    | Action::RotateCounterClockwise
+                    | Action::ZoomIn
+                    | Action::ZoomOut
+                    | Action::VideoPlayPause
+                    | Action::VideoMute => !self.manga_mode,
+                    Action::MangaNextImage
+                    | Action::MangaPreviousImage
+                    | Action::MangaZoomIn
+                    | Action::MangaZoomOut => manga_fullscreen && !masonry_fullscreen,
+                    Action::MasonryZoomIn | Action::MasonryZoomOut => masonry_fullscreen,
+                    _ => false,
+                };
+                if !action_active {
+                    continue;
+                }
+
+                for binding in bindings {
+                    match binding {
+                        InputBinding::Key(key) => {
+                            if !ctrl && !shift && !alt && input.key_pressed(*key) {
+                                actions_to_run.push(action);
                             }
                         }
-                        if !ctrl && !shift && !alt && input.key_pressed(*key) {
-                            actions_to_run.push(*action);
-                        }
-                    }
-                    InputBinding::KeyWithCtrl(key) => {
-                        if ctrl && !shift && !alt && input.key_pressed(*key) {
-                            actions_to_run.push(*action);
-                        }
-                    }
-                    InputBinding::KeyWithShift(key) => {
-                        if !ctrl && shift && !alt && input.key_pressed(*key) {
-                            actions_to_run.push(*action);
-                        }
-                    }
-                    InputBinding::KeyWithAlt(key) => {
-                        if !ctrl && !shift && alt && input.key_pressed(*key) {
-                            actions_to_run.push(*action);
-                        }
-                    }
-                    InputBinding::MouseMiddle => {
-                        if middle_pressed {
-                            if manga_fullscreen || !self.manga_mode {
-                                continue;
-                            }
-                            actions_to_run.push(*action);
-                        }
-                    }
-                    InputBinding::Mouse4 => {
-                        if input.pointer.button_pressed(egui::PointerButton::Extra1) {
-                            actions_to_run.push(*action);
-                        }
-                    }
-                    InputBinding::Mouse5 => {
-                        if input.pointer.button_pressed(egui::PointerButton::Extra2) {
-                            actions_to_run.push(*action);
-                        }
-                    }
-                    InputBinding::ScrollUp => {
-                        // ScrollUp/ScrollDown are handled in draw_image for zoom
-                        // but we check here for other actions (like navigation)
-                        // In manga fullscreen mode, the mouse wheel is reserved for scrolling the
-                        // manga strip (handled in draw_manga_mode). Triggering bindings here can
-                        // fight with scrolling and cause jitter/reversal.
-                        if !manga_fullscreen && input.smooth_scroll_delta.y > 0.0 {
-                            // Only trigger non-zoom actions here; zoom is handled elsewhere
-                            if *action != Action::ZoomIn && *action != Action::ZoomOut {
-                                actions_to_run.push(*action);
+                        InputBinding::KeyWithCtrl(key) => {
+                            if ctrl && !shift && !alt && input.key_pressed(*key) {
+                                actions_to_run.push(action);
                             }
                         }
-                    }
-                    InputBinding::ScrollDown => {
-                        if !manga_fullscreen && input.smooth_scroll_delta.y < 0.0 {
-                            // Only trigger non-zoom actions here; zoom is handled elsewhere
-                            if *action != Action::ZoomIn && *action != Action::ZoomOut {
-                                actions_to_run.push(*action);
+                        InputBinding::KeyWithShift(key) => {
+                            if !ctrl && shift && !alt && input.key_pressed(*key) {
+                                actions_to_run.push(action);
                             }
                         }
+                        InputBinding::KeyWithAlt(key) => {
+                            if !ctrl && !shift && alt && input.key_pressed(*key) {
+                                actions_to_run.push(action);
+                            }
+                        }
+                        InputBinding::MouseMiddle => {
+                            if middle_pressed {
+                                actions_to_run.push(action);
+                            }
+                        }
+                        InputBinding::Mouse4 => {
+                            if input.pointer.button_pressed(egui::PointerButton::Extra1) {
+                                actions_to_run.push(action);
+                            }
+                        }
+                        InputBinding::Mouse5 => {
+                            if input.pointer.button_pressed(egui::PointerButton::Extra2) {
+                                actions_to_run.push(action);
+                            }
+                        }
+                        InputBinding::ScrollUp => {
+                            if !manga_fullscreen && input.smooth_scroll_delta.y > 0.0 {
+                                if action != Action::ZoomIn && action != Action::ZoomOut {
+                                    actions_to_run.push(action);
+                                }
+                            }
+                        }
+                        InputBinding::ScrollDown => {
+                            if !manga_fullscreen && input.smooth_scroll_delta.y < 0.0 {
+                                if action != Action::ZoomIn && action != Action::ZoomOut {
+                                    actions_to_run.push(action);
+                                }
+                            }
+                        }
+                        InputBinding::CtrlScrollUp | InputBinding::CtrlScrollDown => {}
+                        InputBinding::MouseLeft | InputBinding::MouseRight => {}
                     }
-                    // Ctrl+Scroll zoom is handled in draw_manga_mode (manga) and draw_image (normal).
-                    InputBinding::CtrlScrollUp | InputBinding::CtrlScrollDown => {}
-                    // MouseLeft and MouseRight are handled separately for panning/navigation
-                    InputBinding::MouseLeft | InputBinding::MouseRight => {}
                 }
             }
 
-            if input.pointer.button_clicked(egui::PointerButton::Secondary)
-                && !pointer_over_shortcut_ui
-            {
+            if secondary_clicked && !pointer_over_shortcut_ui {
                 if manga_fullscreen && self.strip_item_open_uses_right_click() {
                     return;
                 }
 
                 if let Some(pos) = pointer_pos {
-                    if !self.manga_mode {
+                    let select_area_uses_right_click =
+                        self.action_uses_binding(Action::SelectArea, InputBinding::MouseRight);
+                    let toggle_fullscreen_uses_right_click =
+                        self.action_uses_binding(Action::ToggleFullscreen, InputBinding::MouseRight);
+
+                    if select_area_uses_right_click && !self.manga_mode {
                         if let Some(action) =
                             self.right_click_black_bar_action(pos, input.screen_rect)
                         {
@@ -11401,13 +11532,13 @@ impl ImageViewer {
                     }
 
                     let side_zone = screen_width / 9.0;
-                    if pos.x < side_zone {
+                    if select_area_uses_right_click && pos.x < side_zone {
                         actions_to_run.push(Action::PreviousImage);
                         right_click_navigated = true;
-                    } else if pos.x > screen_width - side_zone {
+                    } else if select_area_uses_right_click && pos.x > screen_width - side_zone {
                         actions_to_run.push(Action::NextImage);
                         right_click_navigated = true;
-                    } else if !self.manga_mode {
+                    } else if !self.manga_mode && toggle_fullscreen_uses_right_click {
                         if self.is_fullscreen
                             && self.strip_return_mode_for_fullscreen_toggle().is_some()
                         {
@@ -11488,8 +11619,7 @@ impl ImageViewer {
         let enter_pressed = ctx.input(|i| i.key_pressed(egui::Key::Enter));
         let enter_bound = self
             .config
-            .bindings
-            .contains_key(&InputBinding::Key(egui::Key::Enter));
+            .any_action_uses_binding(&InputBinding::Key(egui::Key::Enter));
         if enter_pressed && !enter_bound {
             self.request_shortcut_fullscreen_toggle();
         }
@@ -11498,76 +11628,157 @@ impl ImageViewer {
         // - Manga fullscreen: retain manga-specific paging behavior.
         // - Floating/normal fullscreen: PageUp/PageDown/Home/End navigate files.
         if self.manga_mode && self.is_fullscreen {
-            // Arrow keys in manga mode:
-            // - Left/Right: PageUp/PageDown-style page navigation with smooth motion.
-            //   Single tap: check if top/bottom is visible first before navigating.
-            //   Hold: continuous scrolling without the visibility check.
-            // - Up/Down: continuous smooth scrolling.
-            let arrow_left_pressed = ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft));
-            let arrow_right_pressed = ctx.input(|i| i.key_pressed(egui::Key::ArrowRight));
-            let arrow_left_down = ctx.input(|i| i.key_down(egui::Key::ArrowLeft));
-            let arrow_right_down = ctx.input(|i| i.key_down(egui::Key::ArrowRight));
-            let arrow_up = ctx.input(|i| i.key_down(egui::Key::ArrowUp));
-            let arrow_down = ctx.input(|i| i.key_down(egui::Key::ArrowDown));
-
-            let scroll_speed = self.config.manga_arrow_scroll_speed;
-
-            // Detect if this is a first press (single tap) or a repeat from holding.
-            // First press: key_pressed fires AND the key was NOT down last frame.
-            // Hold/repeat: key_pressed fires AND the key WAS down last frame.
-            let arrow_left_is_first_press = arrow_left_pressed && !self.manga_arrow_left_was_down;
-            let arrow_left_is_holding = arrow_left_pressed && self.manga_arrow_left_was_down;
-            let arrow_right_is_first_press =
-                arrow_right_pressed && !self.manga_arrow_right_was_down;
-            let arrow_right_is_holding = arrow_right_pressed && self.manga_arrow_right_was_down;
-
-            if arrow_left_is_first_press {
-                // Single tap: use the new functionality (checks if top is visible)
-                self.manga_page_up_smooth();
-            } else if arrow_left_is_holding {
-                // Holding: use continuous scrolling (old behavior - always navigate)
-                self.manga_page_up_smooth_continuous();
-            }
-
-            if arrow_right_is_first_press {
-                // Single tap: use the new functionality (checks if bottom is visible)
-                self.manga_page_down_smooth();
-            } else if arrow_right_is_holding {
-                // Holding: use continuous scrolling (old behavior - always navigate)
-                self.manga_page_down_smooth_continuous();
-            }
-
-            // Update the "was down" state for next frame
-            self.manga_arrow_left_was_down = arrow_left_down;
-            self.manga_arrow_right_was_down = arrow_right_down;
-
-            // Use velocity-based scrolling for smooth acceleration/deceleration.
-            // This provides a more natural feeling when holding Up/Down.
-            if arrow_up {
-                let scroll_amount = scroll_speed * 0.5; // Per-frame amount
-                if self.manga_add_scroll_target_delta(-scroll_amount) {
-                    self.manga_update_preload_queue();
-                }
-            }
-            if arrow_down {
-                let scroll_amount = scroll_speed * 0.5;
-                if self.manga_add_scroll_target_delta(scroll_amount) {
-                    self.manga_update_preload_queue();
-                }
-            }
-
-            // Check for manga-specific keys
-            let page_up = ctx.input(|i| i.key_pressed(egui::Key::PageUp));
-            let page_down = ctx.input(|i| i.key_pressed(egui::Key::PageDown));
+            let masonry_fullscreen = self.is_masonry_mode();
             let home = ctx.input(|i| i.key_pressed(egui::Key::Home));
             let end = ctx.input(|i| i.key_pressed(egui::Key::End));
 
-            if page_up {
-                self.manga_page_up();
+            if masonry_fullscreen {
+                let (pan_up, pan_down, pan_up_2, pan_down_2, pan_up_3, pan_down_3) =
+                    ctx.input(|input| {
+                        let ctrl = input.modifiers.ctrl;
+                        let shift = input.modifiers.shift;
+                        let alt = input.modifiers.alt;
+                        (
+                            self.action_binding_down(
+                                Action::MasonryPanUp,
+                                input,
+                                ctrl,
+                                shift,
+                                alt,
+                            ),
+                            self.action_binding_down(
+                                Action::MasonryPanDown,
+                                input,
+                                ctrl,
+                                shift,
+                                alt,
+                            ),
+                            self.action_binding_down(
+                                Action::MasonryPanUp2,
+                                input,
+                                ctrl,
+                                shift,
+                                alt,
+                            ),
+                            self.action_binding_down(
+                                Action::MasonryPanDown2,
+                                input,
+                                ctrl,
+                                shift,
+                                alt,
+                            ),
+                            self.action_binding_down(
+                                Action::MasonryPanUp3,
+                                input,
+                                ctrl,
+                                shift,
+                                alt,
+                            ),
+                            self.action_binding_down(
+                                Action::MasonryPanDown3,
+                                input,
+                                ctrl,
+                                shift,
+                                alt,
+                            ),
+                        )
+                    });
+
+                self.manga_arrow_left_was_down = false;
+                self.manga_arrow_right_was_down = false;
+
+                if pan_up {
+                    self.apply_manga_pan_step(-1.0, 1.0);
+                }
+                if pan_down {
+                    self.apply_manga_pan_step(1.0, 1.0);
+                }
+                if pan_up_2 {
+                    self.apply_manga_pan_step(-1.0, 1.5);
+                }
+                if pan_down_2 {
+                    self.apply_manga_pan_step(1.0, 1.5);
+                }
+                if pan_up_3 {
+                    self.apply_manga_pan_step(-1.0, 2.0);
+                }
+                if pan_down_3 {
+                    self.apply_manga_pan_step(1.0, 2.0);
+                }
+            } else {
+                let (prev_fit_pressed, next_fit_pressed, prev_fit_down, next_fit_down, pan_up, pan_down) =
+                    ctx.input(|input| {
+                        let ctrl = input.modifiers.ctrl;
+                        let shift = input.modifiers.shift;
+                        let alt = input.modifiers.alt;
+                        (
+                            self.action_binding_triggered(
+                                Action::MangaPreviousImageFit,
+                                input,
+                                ctrl,
+                                shift,
+                                alt,
+                            ),
+                            self.action_binding_triggered(
+                                Action::MangaNextImageFit,
+                                input,
+                                ctrl,
+                                shift,
+                                alt,
+                            ),
+                            self.action_binding_down(
+                                Action::MangaPreviousImageFit,
+                                input,
+                                ctrl,
+                                shift,
+                                alt,
+                            ),
+                            self.action_binding_down(
+                                Action::MangaNextImageFit,
+                                input,
+                                ctrl,
+                                shift,
+                                alt,
+                            ),
+                            self.action_binding_down(Action::MangaPanUp, input, ctrl, shift, alt),
+                            self.action_binding_down(
+                                Action::MangaPanDown,
+                                input,
+                                ctrl,
+                                shift,
+                                alt,
+                            ),
+                        )
+                    });
+
+                let prev_fit_is_first_press = prev_fit_pressed && !self.manga_arrow_left_was_down;
+                let prev_fit_is_holding = prev_fit_pressed && self.manga_arrow_left_was_down;
+                let next_fit_is_first_press = next_fit_pressed && !self.manga_arrow_right_was_down;
+                let next_fit_is_holding = next_fit_pressed && self.manga_arrow_right_was_down;
+
+                if prev_fit_is_first_press {
+                    self.manga_page_up_smooth();
+                } else if prev_fit_is_holding {
+                    self.manga_page_up_smooth_continuous();
+                }
+
+                if next_fit_is_first_press {
+                    self.manga_page_down_smooth();
+                } else if next_fit_is_holding {
+                    self.manga_page_down_smooth_continuous();
+                }
+
+                self.manga_arrow_left_was_down = prev_fit_down;
+                self.manga_arrow_right_was_down = next_fit_down;
+
+                if pan_up {
+                    self.apply_manga_pan_step(-1.0, 1.0);
+                }
+                if pan_down {
+                    self.apply_manga_pan_step(1.0, 1.0);
+                }
             }
-            if page_down {
-                self.manga_page_down();
-            }
+
             if home {
                 self.manga_go_to_start();
             }
@@ -11575,6 +11786,9 @@ impl ImageViewer {
                 self.manga_go_to_end();
             }
         } else {
+            self.manga_arrow_left_was_down = false;
+            self.manga_arrow_right_was_down = false;
+
             let page_up = ctx.input(|i| i.key_pressed(egui::Key::PageUp));
             let page_down = ctx.input(|i| i.key_pressed(egui::Key::PageDown));
             let home = ctx.input(|i| i.key_pressed(egui::Key::Home));
@@ -11582,20 +11796,16 @@ impl ImageViewer {
 
             let page_up_bound = self
                 .config
-                .bindings
-                .contains_key(&InputBinding::Key(egui::Key::PageUp));
+                .any_action_uses_binding(&InputBinding::Key(egui::Key::PageUp));
             let page_down_bound = self
                 .config
-                .bindings
-                .contains_key(&InputBinding::Key(egui::Key::PageDown));
+                .any_action_uses_binding(&InputBinding::Key(egui::Key::PageDown));
             let home_bound = self
                 .config
-                .bindings
-                .contains_key(&InputBinding::Key(egui::Key::Home));
+                .any_action_uses_binding(&InputBinding::Key(egui::Key::Home));
             let end_bound = self
                 .config
-                .bindings
-                .contains_key(&InputBinding::Key(egui::Key::End));
+                .any_action_uses_binding(&InputBinding::Key(egui::Key::End));
 
             if page_up && !page_up_bound {
                 self.prev_image();
@@ -13290,6 +13500,11 @@ impl ImageViewer {
         // NOTE: In egui/eframe, Ctrl+mouse-wheel is commonly routed into `zoom_delta` (not `smooth_scroll_delta`).
         let ctrl_held = ctx.input(|i| i.modifiers.ctrl);
         let zoom_delta = ctx.input(|i| i.zoom_delta());
+        let regular_ctrl_scroll_zoom_bound = self
+            .action_uses_binding(Action::ZoomIn, InputBinding::CtrlScrollUp)
+            || self.action_uses_binding(Action::ZoomOut, InputBinding::CtrlScrollDown);
+        let regular_scroll_zoom_bound = self.action_uses_binding(Action::ZoomIn, InputBinding::ScrollUp)
+            || self.action_uses_binding(Action::ZoomOut, InputBinding::ScrollDown);
 
         // Also detect Ctrl+wheel via raw events as a fallback.
         const WHEEL_POINTS_PER_LINE: f32 = 50.0;
@@ -13324,7 +13539,7 @@ impl ImageViewer {
         });
 
         let mut handled_ctrl_zoom = false;
-        if ctrl_held && (zoom_delta != 1.0 || wheel_steps_ctrl != 0.0) {
+        if regular_ctrl_scroll_zoom_bound && ctrl_held && (zoom_delta != 1.0 || wheel_steps_ctrl != 0.0) {
             if let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) {
                 if !title_ui_blocking {
                     // IMPORTANT: Use the *same* step-based zoom algorithm as normal wheel zoom.
@@ -13365,7 +13580,7 @@ impl ImageViewer {
         }
 
         // Regular (non-CTRL) scroll wheel zoom.
-        if !handled_ctrl_zoom {
+        if !handled_ctrl_zoom && regular_scroll_zoom_bound {
             let scroll_delta = ctx.input(|i| i.smooth_scroll_delta.y);
             if scroll_delta != 0.0 {
                 if let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) {
@@ -13407,9 +13622,26 @@ impl ImageViewer {
         let primary_pressed = ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary));
         let primary_released =
             ctx.input(|i| i.pointer.button_released(egui::PointerButton::Primary));
-        let middle_pressed = ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Middle));
         let secondary_clicked =
             ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Secondary));
+        let freehand_autoscroll_triggered = ctx.input(|input| {
+            let ctrl = input.modifiers.ctrl;
+            let shift = input.modifiers.shift;
+            let alt = input.modifiers.alt;
+            self.action_binding_triggered(
+                Action::FreehandAutoscroll,
+                input,
+                ctrl,
+                shift,
+                alt,
+            )
+        });
+        let pan_down_action = ctx.input(|input| {
+            let ctrl = input.modifiers.ctrl;
+            let shift = input.modifiers.shift;
+            let alt = input.modifiers.alt;
+            self.action_binding_down(Action::Pan, input, ctrl, shift, alt)
+        });
 
         // Title bar gesture suppression:
         // Allow click-through on the empty title bar; only suppress when the pointer is on
@@ -13440,7 +13672,7 @@ impl ImageViewer {
 
         let mut primary_consumed_for_autoscroll = false;
 
-        if middle_pressed
+        if freehand_autoscroll_triggered
             && !title_ui_blocking
             && !pointer_over_shortcut_ui
             && !over_video_controls
@@ -13514,7 +13746,7 @@ impl ImageViewer {
             self.resize_last_size = None;
         } else if !self.is_resizing {
             // Handle panning/window dragging (only if not resizing, not seeking, and not over video controls)
-            if primary_down
+            if pan_down_action
                 && hover_resize_direction == ResizeDirection::None
                 && !over_video_controls
                 && !self.is_seeking
@@ -14399,14 +14631,75 @@ impl eframe::App for ImageViewer {
             && ((self.manga_scroll_target - self.manga_scroll_offset).abs() > 0.1
                 || self.manga_scroll_velocity.abs() > 0.5
                 || self.manga_wheel_scroll_active);
-        // Check if arrow keys are held for continuous scrolling in manga mode
+        // Check if configured strip/masonry hold bindings are active for continuous scrolling.
         let manga_arrow_held = self.manga_mode
             && self.is_fullscreen
-            && ctx.input(|i| {
-                i.key_down(egui::Key::ArrowLeft)
-                    || i.key_down(egui::Key::ArrowRight)
-                    || i.key_down(egui::Key::ArrowUp)
-                    || i.key_down(egui::Key::ArrowDown)
+            && ctx.input(|input| {
+                let ctrl = input.modifiers.ctrl;
+                let shift = input.modifiers.shift;
+                let alt = input.modifiers.alt;
+
+                if self.is_masonry_mode() {
+                    self.action_binding_down(Action::MasonryPanUp, input, ctrl, shift, alt)
+                        || self.action_binding_down(
+                            Action::MasonryPanDown,
+                            input,
+                            ctrl,
+                            shift,
+                            alt,
+                        )
+                        || self.action_binding_down(
+                            Action::MasonryPanUp2,
+                            input,
+                            ctrl,
+                            shift,
+                            alt,
+                        )
+                        || self.action_binding_down(
+                            Action::MasonryPanDown2,
+                            input,
+                            ctrl,
+                            shift,
+                            alt,
+                        )
+                        || self.action_binding_down(
+                            Action::MasonryPanUp3,
+                            input,
+                            ctrl,
+                            shift,
+                            alt,
+                        )
+                        || self.action_binding_down(
+                            Action::MasonryPanDown3,
+                            input,
+                            ctrl,
+                            shift,
+                            alt,
+                        )
+                } else {
+                    self.action_binding_down(
+                        Action::MangaPreviousImageFit,
+                        input,
+                        ctrl,
+                        shift,
+                        alt,
+                    )
+                        || self.action_binding_down(
+                            Action::MangaNextImageFit,
+                            input,
+                            ctrl,
+                            shift,
+                            alt,
+                        )
+                        || self.action_binding_down(Action::MangaPanUp, input, ctrl, shift, alt)
+                        || self.action_binding_down(
+                            Action::MangaPanDown,
+                            input,
+                            ctrl,
+                            shift,
+                            alt,
+                        )
+                }
             });
 
         let any_animation_active = fullscreen_animation_active

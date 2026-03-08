@@ -148,13 +148,35 @@ pub enum Action {
     ResetZoom,
     Exit,
     Pan,
+    SelectFile,
+    SelectArea,
+    FreehandAutoscroll,
     Minimize,
     Close,
     VideoPlayPause,
     VideoMute,
     // Manga reading mode
+    MangaPanUp,
+    MangaPanDown,
+    MangaNextImageFit,
+    MangaPreviousImageFit,
+    MangaNextImage,
+    MangaPreviousImage,
+    MangaScrollUp,
+    MangaScrollDown,
     MangaZoomIn,
     MangaZoomOut,
+    // Masonry mode
+    MasonryPanUp,
+    MasonryPanDown,
+    MasonryPanUp2,
+    MasonryPanDown2,
+    MasonryPanUp3,
+    MasonryPanDown3,
+    MasonryScrollUp,
+    MasonryScrollDown,
+    MasonryZoomIn,
+    MasonryZoomOut,
 }
 
 impl Action {
@@ -170,12 +192,34 @@ impl Action {
             "reset_zoom" | "reset" => Some(Action::ResetZoom),
             "exit" | "quit" | "close_app" => Some(Action::Exit),
             "pan" => Some(Action::Pan),
+            "select_file" | "strip_item_open" | "strip_item_open_binding"
+            | "manga_item_open_binding" => Some(Action::SelectFile),
+            "select_area" => Some(Action::SelectArea),
+            "freehand_autoscroll" | "autoscroll" => Some(Action::FreehandAutoscroll),
             "minimize" => Some(Action::Minimize),
             "close" => Some(Action::Close),
             "video_play_pause" | "play_pause" | "playpause" => Some(Action::VideoPlayPause),
             "video_mute" | "mute" | "toggle_mute" => Some(Action::VideoMute),
+            "manga_pan_up" => Some(Action::MangaPanUp),
+            "manga_pan_down" => Some(Action::MangaPanDown),
+            "manga_next_image_fit" => Some(Action::MangaNextImageFit),
+            "manga_previous_image_fit" => Some(Action::MangaPreviousImageFit),
+            "manga_next_image" => Some(Action::MangaNextImage),
+            "manga_previous_image" => Some(Action::MangaPreviousImage),
+            "manga_scroll_up" => Some(Action::MangaScrollUp),
+            "manga_scroll_down" => Some(Action::MangaScrollDown),
             "manga_zoom_in" | "manga_zoomin" => Some(Action::MangaZoomIn),
             "manga_zoom_out" | "manga_zoomout" => Some(Action::MangaZoomOut),
+            "masonry_pan_up" => Some(Action::MasonryPanUp),
+            "masonry_pan_down" => Some(Action::MasonryPanDown),
+            "masonry_pan_up_2" => Some(Action::MasonryPanUp2),
+            "masonry_pan_down_2" => Some(Action::MasonryPanDown2),
+            "masonry_pan_up_3" => Some(Action::MasonryPanUp3),
+            "masonry_pan_down_3" => Some(Action::MasonryPanDown3),
+            "masonry_scroll_up" => Some(Action::MasonryScrollUp),
+            "masonry_scroll_down" => Some(Action::MasonryScrollDown),
+            "masonry_zoom_in" | "masony_zoom_in" => Some(Action::MasonryZoomIn),
+            "masonry_zoom_out" | "masony_zoom_out" => Some(Action::MasonryZoomOut),
             _ => None,
         }
     }
@@ -193,12 +237,33 @@ impl Action {
             Action::ResetZoom => "reset_zoom",
             Action::Exit => "exit",
             Action::Pan => "pan",
+            Action::SelectFile => "select_file",
+            Action::SelectArea => "select_area",
+            Action::FreehandAutoscroll => "freehand_autoscroll",
             Action::Minimize => "minimize",
             Action::Close => "close",
             Action::VideoPlayPause => "video_play_pause",
             Action::VideoMute => "video_mute",
+            Action::MangaPanUp => "manga_pan_up",
+            Action::MangaPanDown => "manga_pan_down",
+            Action::MangaNextImageFit => "manga_next_image_fit",
+            Action::MangaPreviousImageFit => "manga_previous_image_fit",
+            Action::MangaNextImage => "manga_next_image",
+            Action::MangaPreviousImage => "manga_previous_image",
+            Action::MangaScrollUp => "manga_scroll_up",
+            Action::MangaScrollDown => "manga_scroll_down",
             Action::MangaZoomIn => "manga_zoom_in",
             Action::MangaZoomOut => "manga_zoom_out",
+            Action::MasonryPanUp => "masonry_pan_up",
+            Action::MasonryPanDown => "masonry_pan_down",
+            Action::MasonryPanUp2 => "masonry_pan_up_2",
+            Action::MasonryPanDown2 => "masonry_pan_down_2",
+            Action::MasonryPanUp3 => "masonry_pan_up_3",
+            Action::MasonryPanDown3 => "masonry_pan_down_3",
+            Action::MasonryScrollUp => "masonry_scroll_up",
+            Action::MasonryScrollDown => "masonry_scroll_down",
+            Action::MasonryZoomIn => "masonry_zoom_in",
+            Action::MasonryZoomOut => "masonry_zoom_out",
         }
     }
 }
@@ -382,9 +447,7 @@ fn parse_key(s: &str) -> Option<egui::Key> {
 
 /// Application configuration loaded from INI file
 pub struct Config {
-    /// Map from input binding to action
-    pub bindings: HashMap<InputBinding, Action>,
-    /// Reverse map for looking up bindings for an action
+    /// Map from action to configured bindings.
     pub action_bindings: HashMap<Action, Vec<InputBinding>>,
     /// How long the controls bar stays visible (in seconds)
     pub controls_hide_delay: f32,
@@ -459,9 +522,6 @@ pub struct Config {
     pub manga_autoscroll_arrow_rgb: [u8; 3],
     /// Manga mode autoscroll indicator arrow alpha (0-255).
     pub manga_autoscroll_arrow_alpha: u8,
-    /// Binding used to open the hovered item into solo fullscreen from manga strip layouts.
-    /// Supports: mouse_right, mouse_middle, or keyboard bindings.
-    pub strip_item_open_binding: InputBinding,
 
     /// Whether videos start muted by default
     pub video_muted_by_default: bool,
@@ -537,7 +597,6 @@ impl StartupWindowMode {
 impl Config {
     fn default_without_bindings() -> Self {
         Self {
-            bindings: HashMap::new(),
             action_bindings: HashMap::new(),
             controls_hide_delay: 0.5,
             bottom_overlay_hide_delay: 0.5,
@@ -573,7 +632,6 @@ impl Config {
             manga_autoscroll_circle_fill_alpha: 110,
             manga_autoscroll_arrow_rgb: [140, 190, 255],
             manga_autoscroll_arrow_alpha: 150,
-            strip_item_open_binding: InputBinding::MouseRight,
             video_muted_by_default: true,
             video_default_volume: 0.0,
             video_loop: true,
@@ -609,6 +667,12 @@ impl Default for Config {
 impl Config {
     /// Set default keybindings
     fn set_defaults(&mut self) {
+        // General shortcuts
+        self.add_binding(InputBinding::MouseLeft, Action::Pan);
+        self.add_binding(InputBinding::MouseRight, Action::SelectFile);
+        self.add_binding(InputBinding::MouseRight, Action::SelectArea);
+        self.add_binding(InputBinding::MouseMiddle, Action::FreehandAutoscroll);
+
         // Fullscreen toggles
         self.add_binding(InputBinding::MouseRight, Action::ToggleFullscreen);
         self.add_binding(InputBinding::Key(egui::Key::F), Action::ToggleFullscreen);
@@ -652,36 +716,62 @@ impl Config {
         self.add_binding(InputBinding::KeyWithCtrl(egui::Key::W), Action::Exit);
         self.add_binding(InputBinding::Key(egui::Key::Escape), Action::Exit);
 
-        // Pan
-        self.add_binding(InputBinding::MouseLeft, Action::Pan);
-
         // Video controls
         self.add_binding(InputBinding::Key(egui::Key::Space), Action::VideoPlayPause);
         self.add_binding(InputBinding::Key(egui::Key::M), Action::VideoMute);
 
-        // Manga mode uses the same CTRL+wheel zoom handling (see main input routing).
+        // Long strip shortcuts
+        self.add_binding(InputBinding::Key(egui::Key::ArrowUp), Action::MangaPanUp);
+        self.add_binding(InputBinding::Key(egui::Key::ArrowDown), Action::MangaPanDown);
+        self.add_binding(
+            InputBinding::Key(egui::Key::ArrowRight),
+            Action::MangaNextImageFit,
+        );
+        self.add_binding(
+            InputBinding::Key(egui::Key::ArrowLeft),
+            Action::MangaPreviousImageFit,
+        );
+        self.add_binding(InputBinding::Key(egui::Key::PageDown), Action::MangaNextImage);
+        self.add_binding(InputBinding::Mouse5, Action::MangaNextImage);
+        self.add_binding(InputBinding::Key(egui::Key::PageUp), Action::MangaPreviousImage);
+        self.add_binding(InputBinding::Mouse4, Action::MangaPreviousImage);
+        self.add_binding(InputBinding::ScrollUp, Action::MangaScrollUp);
+        self.add_binding(InputBinding::ScrollDown, Action::MangaScrollDown);
+        self.add_binding(InputBinding::CtrlScrollUp, Action::MangaZoomIn);
+        self.add_binding(InputBinding::CtrlScrollDown, Action::MangaZoomOut);
+
+        // Masonry shortcuts
+        self.add_binding(InputBinding::Key(egui::Key::ArrowUp), Action::MasonryPanUp);
+        self.add_binding(InputBinding::Key(egui::Key::ArrowDown), Action::MasonryPanDown);
+        self.add_binding(InputBinding::Key(egui::Key::ArrowLeft), Action::MasonryPanUp2);
+        self.add_binding(InputBinding::Key(egui::Key::ArrowRight), Action::MasonryPanDown2);
+        self.add_binding(InputBinding::Key(egui::Key::PageUp), Action::MasonryPanUp3);
+        self.add_binding(InputBinding::Mouse4, Action::MasonryPanUp3);
+        self.add_binding(InputBinding::Key(egui::Key::PageDown), Action::MasonryPanDown3);
+        self.add_binding(InputBinding::Mouse5, Action::MasonryPanDown3);
+        self.add_binding(InputBinding::ScrollUp, Action::MasonryScrollUp);
+        self.add_binding(InputBinding::ScrollDown, Action::MasonryScrollDown);
+        self.add_binding(InputBinding::CtrlScrollUp, Action::MasonryZoomIn);
+        self.add_binding(InputBinding::CtrlScrollDown, Action::MasonryZoomOut);
     }
 
     /// Add a binding
     fn add_binding(&mut self, input: InputBinding, action: Action) {
-        self.bindings.insert(input.clone(), action);
-        self.action_bindings.entry(action).or_default().push(input);
+        let bindings = self.action_bindings.entry(action).or_default();
+        if !bindings.contains(&input) {
+            bindings.push(input);
+        }
     }
 
     fn replace_action_bindings(&mut self, action: Action, bindings: &[InputBinding]) {
-        if let Some(previous_bindings) = self.action_bindings.remove(&action) {
-            for binding in previous_bindings {
-                if self.bindings.get(&binding) == Some(&action) {
-                    self.bindings.remove(&binding);
-                }
+        let mut unique_bindings = Vec::with_capacity(bindings.len());
+        for binding in bindings {
+            if !unique_bindings.contains(binding) {
+                unique_bindings.push(binding.clone());
             }
         }
 
-        for binding in bindings {
-            self.bindings.insert(binding.clone(), action);
-        }
-
-        self.action_bindings.insert(action, bindings.to_vec());
+        self.action_bindings.insert(action, unique_bindings);
     }
 
     fn migrate_legacy_toggle_fullscreen_binding(&mut self) {
@@ -712,14 +802,6 @@ impl Config {
             InputBinding::Key(egui::Key::F12),
             InputBinding::Key(egui::Key::Enter),
         ];
-
-        if replacement_bindings.iter().any(|binding| {
-            self.bindings
-                .get(binding)
-                .is_some_and(|existing_action| *existing_action != Action::ToggleFullscreen)
-        }) {
-            return;
-        }
 
         self.replace_action_bindings(Action::ToggleFullscreen, &replacement_bindings);
     }
@@ -874,12 +956,7 @@ impl Config {
                     let value = value.trim();
 
                     if let Some(action) = Action::from_str(key) {
-                        // Value can be comma-separated for multiple bindings
-                        for binding_str in value.split(',') {
-                            if let Some(binding) = parse_input_binding(binding_str.trim()) {
-                                config.add_binding(binding, action);
-                            }
-                        }
+                        config.replace_action_bindings(action, &parse_binding_list(value));
                     }
                 }
             }
@@ -1134,7 +1211,7 @@ impl Config {
                         | "manga_item_open_trigger" => {
                             if let Some(binding) = parse_input_binding(value) {
                                 if is_strip_item_open_binding(&binding) {
-                                    config.strip_item_open_binding = binding;
+                                    config.replace_action_bindings(Action::SelectFile, &[binding]);
                                 }
                             }
                         }
@@ -1492,10 +1569,6 @@ impl Config {
             "manga_autoscroll_arrow_alpha",
             format!("{}", self.manga_autoscroll_arrow_alpha),
         );
-        values.insert(
-            "strip_item_open_binding",
-            binding_to_string(&self.strip_item_open_binding),
-        );
 
         values.insert(
             "muted_by_default",
@@ -1554,6 +1627,12 @@ impl Config {
             "toggle_fullscreen",
             self.action_bindings_csv(Action::ToggleFullscreen),
         );
+        values.insert("select_file", self.action_bindings_csv(Action::SelectFile));
+        values.insert("select_area", self.action_bindings_csv(Action::SelectArea));
+        values.insert(
+            "freehand_autoscroll",
+            self.action_bindings_csv(Action::FreehandAutoscroll),
+        );
         values.insert("next_image", self.action_bindings_csv(Action::NextImage));
         values.insert(
             "previous_image",
@@ -1584,31 +1663,101 @@ impl Config {
             "manga_zoom_out",
             self.action_bindings_csv(Action::MangaZoomOut),
         );
+        values.insert(
+            "manga_pan_up",
+            self.action_bindings_csv(Action::MangaPanUp),
+        );
+        values.insert(
+            "manga_pan_down",
+            self.action_bindings_csv(Action::MangaPanDown),
+        );
+        values.insert(
+            "manga_next_image_fit",
+            self.action_bindings_csv(Action::MangaNextImageFit),
+        );
+        values.insert(
+            "manga_previous_image_fit",
+            self.action_bindings_csv(Action::MangaPreviousImageFit),
+        );
+        values.insert(
+            "manga_next_image",
+            self.action_bindings_csv(Action::MangaNextImage),
+        );
+        values.insert(
+            "manga_previous_image",
+            self.action_bindings_csv(Action::MangaPreviousImage),
+        );
+        values.insert(
+            "manga_scroll_up",
+            self.action_bindings_csv(Action::MangaScrollUp),
+        );
+        values.insert(
+            "manga_scroll_down",
+            self.action_bindings_csv(Action::MangaScrollDown),
+        );
+        values.insert(
+            "masonry_pan_up",
+            self.action_bindings_csv(Action::MasonryPanUp),
+        );
+        values.insert(
+            "masonry_pan_down",
+            self.action_bindings_csv(Action::MasonryPanDown),
+        );
+        values.insert(
+            "masonry_pan_up_2",
+            self.action_bindings_csv(Action::MasonryPanUp2),
+        );
+        values.insert(
+            "masonry_pan_down_2",
+            self.action_bindings_csv(Action::MasonryPanDown2),
+        );
+        values.insert(
+            "masonry_pan_up_3",
+            self.action_bindings_csv(Action::MasonryPanUp3),
+        );
+        values.insert(
+            "masonry_pan_down_3",
+            self.action_bindings_csv(Action::MasonryPanDown3),
+        );
+        values.insert(
+            "masonry_scroll_up",
+            self.action_bindings_csv(Action::MasonryScrollUp),
+        );
+        values.insert(
+            "masonry_scroll_down",
+            self.action_bindings_csv(Action::MasonryScrollDown),
+        );
+        values.insert(
+            "masonry_zoom_in",
+            self.action_bindings_csv(Action::MasonryZoomIn),
+        );
+        values.insert(
+            "masonry_zoom_out",
+            self.action_bindings_csv(Action::MasonryZoomOut),
+        );
 
         values
     }
 
     fn action_bindings_csv(&self, action: Action) -> String {
-        let mut items = Vec::new();
-
-        if let Some(bindings) = self.action_bindings.get(&action) {
-            for binding in bindings {
-                if self.bindings.get(binding) == Some(&action) {
-                    let binding_str = binding_to_string(binding);
-                    if !items.contains(&binding_str) {
-                        items.push(binding_str);
-                    }
-                }
-            }
-        }
-
-        items.join(", ")
+        self.action_bindings
+            .get(&action)
+            .map(|bindings| {
+                bindings
+                    .iter()
+                    .map(binding_to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default()
     }
 
     /// Check if an input matches a specific action
     #[allow(dead_code)]
     pub fn is_action(&self, input: &InputBinding, action: Action) -> bool {
-        self.bindings.get(input) == Some(&action)
+        self.action_bindings
+            .get(&action)
+            .is_some_and(|bindings| bindings.contains(input))
     }
 
     /// Get all bindings for an action
@@ -1619,6 +1768,31 @@ impl Config {
             .cloned()
             .unwrap_or_default()
     }
+
+    pub fn action_uses_binding(&self, action: Action, binding: &InputBinding) -> bool {
+        self.is_action(binding, action)
+    }
+
+    pub fn any_action_uses_binding(&self, binding: &InputBinding) -> bool {
+        self.action_bindings
+            .values()
+            .any(|bindings| bindings.contains(binding))
+    }
+}
+
+fn parse_binding_list(value: &str) -> Vec<InputBinding> {
+    let mut bindings = Vec::new();
+
+    for binding_str in value.split(',') {
+        let trimmed = binding_str.trim();
+        if let Some(binding) = parse_input_binding(trimmed) {
+            if !bindings.contains(&binding) {
+                bindings.push(binding);
+            }
+        }
+    }
+
+    bindings
 }
 
 /// Convert InputBinding back to string representation
@@ -1737,6 +1911,44 @@ mod tests {
                 InputBinding::Key(egui::Key::Enter),
             ]
         );
+    }
+
+    #[test]
+    fn supports_overlapping_bindings_across_actions() {
+        let config = Config::parse_ini(
+            "[Shortcuts]\nselect_file = mouse_right\nselect_area = mouse_right\ntoggle_fullscreen = mouse_right, f\n",
+        );
+
+        assert_eq!(
+            config.get_bindings(Action::SelectFile),
+            vec![InputBinding::MouseRight]
+        );
+        assert_eq!(
+            config.get_bindings(Action::SelectArea),
+            vec![InputBinding::MouseRight]
+        );
+        assert_eq!(
+            config.get_bindings(Action::ToggleFullscreen),
+            vec![InputBinding::MouseRight, InputBinding::Key(egui::Key::F)]
+        );
+        assert!(config.any_action_uses_binding(&InputBinding::MouseRight));
+    }
+
+    #[test]
+    fn migrates_legacy_strip_item_binding_to_select_file() {
+        let config = Config::parse_ini("[Settings]\nstrip_item_open_binding = mouse_middle\n");
+
+        assert_eq!(
+            config.get_bindings(Action::SelectFile),
+            vec![InputBinding::MouseMiddle]
+        );
+    }
+
+    #[test]
+    fn empty_shortcut_value_disables_default_binding() {
+        let config = Config::parse_ini("[Shortcuts]\nmanga_zoom_in =\n");
+
+        assert!(config.get_bindings(Action::MangaZoomIn).is_empty());
     }
 }
 
