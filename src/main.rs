@@ -2963,12 +2963,12 @@ impl ImageViewer {
             }
             Action::PreciseRotationClockwise => {
                 if self.is_fullscreen && !self.manga_mode && self.image.is_some() {
-                    self.update_fullscreen_precise_rotation(1.0);
+                    self.update_fullscreen_precise_rotation(self.config.precise_rotation_step_degrees);
                 }
             }
             Action::PreciseRotationCounterClockwise => {
                 if self.is_fullscreen && !self.manga_mode && self.image.is_some() {
-                    self.update_fullscreen_precise_rotation(-1.0);
+                    self.update_fullscreen_precise_rotation(-self.config.precise_rotation_step_degrees);
                 }
             }
             Action::ResetZoom => {
@@ -5064,18 +5064,10 @@ impl ImageViewer {
             return false;
         }
 
-        let omega = self.config.precise_rotation_animation_speed;
-        if omega <= 0.0 {
-            self.precise_rotation_degrees = Self::normalize_precise_rotation_degrees(
-                self.precise_rotation_target_degrees,
-            );
-            self.precise_rotation_velocity = 0.0;
-            return false;
-        }
-
+        const OMEGA: f32 = 24.0;
         let dt = ctx.input(|i| i.stable_dt).min(0.033);
-        let spring_force = omega * omega * error;
-        let damping_force = 2.0 * omega * self.precise_rotation_velocity;
+        let spring_force = OMEGA * OMEGA * error;
+        let damping_force = 2.0 * OMEGA * self.precise_rotation_velocity;
         let acceleration = spring_force - damping_force;
 
         self.precise_rotation_velocity += acceleration * dt;

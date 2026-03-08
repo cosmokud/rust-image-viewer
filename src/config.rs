@@ -507,8 +507,8 @@ pub struct Config {
     pub maximize_to_borderless_fullscreen: bool,
     /// Floating-mode zoom animation speed. Higher = faster. 0 = instant snap.
     pub zoom_animation_speed: f32,
-    /// Fullscreen precise-rotation animation speed. Higher = faster. 0 = instant snap.
-    pub precise_rotation_animation_speed: f32,
+    /// Degrees added or removed per Ctrl+Up / Ctrl+Down precise-rotation input.
+    pub precise_rotation_step_degrees: f32,
     /// Zoom step per scroll wheel notch (1.05 = 5% per step, 1.25 = 25% per step)
     pub zoom_step: f32,
 
@@ -646,7 +646,7 @@ impl Config {
             fullscreen_native_window_transition: true,
             maximize_to_borderless_fullscreen: true,
             zoom_animation_speed: 20.0,
-            precise_rotation_animation_speed: 48.0,
+            precise_rotation_step_degrees: 2.0,
             zoom_step: 1.02,
             max_zoom_percent: 1000.0,
             manga_drag_pan_speed: 1.0,
@@ -1126,11 +1126,12 @@ impl Config {
                                 config.zoom_animation_speed = v.clamp(0.0, 60.0);
                             }
                         }
-                        "precise_rotation_animation_speed"
-                        | "fullscreen_precise_rotation_animation_speed"
+                        "precise_rotation_step_degrees"
+                        | "fullscreen_precise_rotation_step_degrees"
+                        | "precise_rotation_step"
                         | "precise_rotation_speed" => {
                             if let Ok(v) = value.parse::<f32>() {
-                                config.precise_rotation_animation_speed = v.clamp(0.0, 120.0);
+                                config.precise_rotation_step_degrees = v.clamp(0.1, 45.0);
                             }
                         }
                         "zoom_step" => {
@@ -1571,8 +1572,8 @@ impl Config {
             format!("{}", self.zoom_animation_speed),
         );
         values.insert(
-            "precise_rotation_animation_speed",
-            format_with_optional_trailing_zero_f32(self.precise_rotation_animation_speed),
+            "precise_rotation_step_degrees",
+            format_with_optional_trailing_zero_f32(self.precise_rotation_step_degrees),
         );
         values.insert("zoom_step", format!("{}", self.zoom_step));
         values.insert("max_zoom_percent", format!("{}", self.max_zoom_percent));
@@ -2181,12 +2182,12 @@ mod tests {
     }
 
     #[test]
-    fn parses_precise_rotation_animation_speed_setting() {
+    fn parses_precise_rotation_step_setting() {
         let config = Config::parse_ini(
-            "[Settings]\nprecise_rotation_animation_speed = 72.0\n",
+            "[Settings]\nprecise_rotation_step_degrees = 3.5\n",
         );
 
-        assert_eq!(config.precise_rotation_animation_speed, 72.0);
+        assert_eq!(config.precise_rotation_step_degrees, 3.5);
     }
 }
 
