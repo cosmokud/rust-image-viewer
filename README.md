@@ -55,9 +55,9 @@ This project is intentionally optimized for one job: opening media fast, navigat
 - GStreamer-backed video playback with `playbin3` fallback to `playbin`.
 - Play / pause, seek, mute, volume, looping, and hover-driven controls.
 - Adaptive seek policy support:
-   - `adaptive` = keyframe while dragging, accurate on release
-   - `accurate` = always frame-accurate seeks
-   - `keyframe` = fastest seeks, less precise
+  - `adaptive` = keyframe while dragging, accurate on release
+  - `accurate` = always frame-accurate seeks
+  - `keyframe` = fastest seeks, less precise
 - Optional hardware-decoder preference on Windows, with a config switch to force software decode.
 - In Long Strip / Masonry, videos use first-frame thumbnails until a focused live player is needed.
 
@@ -75,31 +75,31 @@ This project is intentionally optimized for one job: opening media fast, navigat
 
 ### Images
 
-| Format | Extensions |
-| ------ | ---------- |
-| JPEG | `.jpg`, `.jpeg` |
-| PNG | `.png` |
-| WebP | `.webp` |
-| GIF | `.gif` |
-| BMP | `.bmp` |
-| PSD | `.psd` |
-| ICO | `.ico` |
-| TIFF | `.tiff`, `.tif` |
+| Format | Extensions      |
+| ------ | --------------- |
+| JPEG   | `.jpg`, `.jpeg` |
+| PNG    | `.png`          |
+| WebP   | `.webp`         |
+| GIF    | `.gif`          |
+| BMP    | `.bmp`          |
+| PSD    | `.psd`          |
+| ICO    | `.ico`          |
+| TIFF   | `.tiff`, `.tif` |
 
 ### Videos
 
-| Format | Extensions |
-| ------ | ---------- |
-| MP4 | `.mp4` |
-| MKV | `.mkv` |
-| WebM | `.webm` |
-| AVI | `.avi` |
-| QuickTime | `.mov` |
-| WMV | `.wmv` |
-| FLV | `.flv` |
-| M4V | `.m4v` |
-| 3GP | `.3gp` |
-| OGV | `.ogv` |
+| Format    | Extensions |
+| --------- | ---------- |
+| MP4       | `.mp4`     |
+| MKV       | `.mkv`     |
+| WebM      | `.webm`    |
+| AVI       | `.avi`     |
+| QuickTime | `.mov`     |
+| WMV       | `.wmv`     |
+| FLV       | `.flv`     |
+| M4V       | `.m4v`     |
+| 3GP       | `.3gp`     |
+| OGV       | `.ogv`     |
 
 ## Installation
 
@@ -165,9 +165,9 @@ When you open one file, the viewer builds the media list for its directory and e
 - Floating / solo fullscreen mode is optimized for one current item at a time.
 - Long Strip and Masonry are fullscreen-only multi-item layouts.
 - Right-click is contextual by design:
-   - floating / solo fullscreen side zones and black bars navigate previous / next
-   - right-click on the current media toggles fullscreen when bound to `goto_file`
-   - right-click on a strip or masonry item opens that item into solo fullscreen by default
+  - floating / solo fullscreen side zones and black bars navigate previous / next
+  - right-click on the current media toggles fullscreen when bound to `goto_file`
+  - right-click on a strip or masonry item opens that item into solo fullscreen by default
 - Middle-click is the freehand autoscroll trigger by default, not fullscreen.
 - Center right-click can still act as play / pause for video or animated GIF when it is not consumed by navigation or fullscreen routing.
 
@@ -177,68 +177,68 @@ Bindings are action-first and context-aware. The same input can legally belong t
 
 ### Global
 
-| Action | Default |
-| ------ | ------- |
+| Action            | Default                    |
+| ----------------- | -------------------------- |
 | Toggle fullscreen | `f`, `f11`, `f12`, `enter` |
-| Exit | `ctrl+w`, `escape` |
+| Exit              | `ctrl+w`, `escape`         |
 
 ### Floating and solo fullscreen
 
-| Action | Default |
-| ------ | ------- |
-| Pan current view | `mouse_left` |
-| Side-zone / black-bar previous-next navigation | `mouse_right` |
-| Toggle fullscreen on current media | `mouse_right` |
-| Freehand autoscroll | `mouse_middle` |
-| Next item | `right`, `pagedown`, `mouse5` |
-| Previous item | `left`, `pageup`, `mouse4` |
-| Rotate clockwise | `up` |
-| Rotate counterclockwise | `down` |
-| Precise rotation clockwise | `ctrl+up` |
-| Precise rotation counterclockwise | `ctrl+down` |
-| Zoom in | `scroll_up`, `ctrl+scroll_up` |
-| Zoom out | `scroll_down`, `ctrl+scroll_down` |
-| Jump to first item | built-in fallback `home` |
-| Jump to last item | built-in fallback `end` |
+| Action                                         | Default                           |
+| ---------------------------------------------- | --------------------------------- |
+| Pan current view                               | `mouse_left`                      |
+| Side-zone / black-bar previous-next navigation | `mouse_right`                     |
+| Toggle fullscreen on current media             | `mouse_right`                     |
+| Freehand autoscroll                            | `mouse_middle`                    |
+| Next item                                      | `right`, `pagedown`, `mouse5`     |
+| Previous item                                  | `left`, `pageup`, `mouse4`        |
+| Rotate clockwise                               | `up`                              |
+| Rotate counterclockwise                        | `down`                            |
+| Precise rotation clockwise                     | `ctrl+up`                         |
+| Precise rotation counterclockwise              | `ctrl+down`                       |
+| Zoom in                                        | `scroll_up`, `ctrl+scroll_up`     |
+| Zoom out                                       | `scroll_down`, `ctrl+scroll_down` |
+| Jump to first item                             | built-in fallback `home`          |
+| Jump to last item                              | built-in fallback `end`           |
 
 ### Long Strip
 
-| Action | Default |
-| ------ | ------- |
-| Drag-pan strip | `mouse_left` |
-| Open clicked item in solo fullscreen | `mouse_right` |
-| Freehand autoscroll | `mouse_middle` |
-| Continuous pan up | `up` |
-| Continuous pan down | `down` |
-| Fit-aware next page | `right` |
-| Fit-aware previous page | `left` |
-| Jump to next item | `pagedown`, `mouse5` |
-| Jump to previous item | `pageup`, `mouse4` |
-| Inertial wheel scroll up | `scroll_up` |
-| Inertial wheel scroll down | `scroll_down` |
-| Zoom in | `ctrl+scroll_up` |
-| Zoom out | `ctrl+scroll_down` |
-| Jump to start / end | built-in `home`, `end` |
+| Action                               | Default                |
+| ------------------------------------ | ---------------------- |
+| Drag-pan strip                       | `mouse_left`           |
+| Open clicked item in solo fullscreen | `mouse_right`          |
+| Freehand autoscroll                  | `mouse_middle`         |
+| Continuous pan up                    | `up`                   |
+| Continuous pan down                  | `down`                 |
+| Fit-aware next page                  | `right`                |
+| Fit-aware previous page              | `left`                 |
+| Jump to next item                    | `pagedown`, `mouse5`   |
+| Jump to previous item                | `pageup`, `mouse4`     |
+| Inertial wheel scroll up             | `scroll_up`            |
+| Inertial wheel scroll down           | `scroll_down`          |
+| Zoom in                              | `ctrl+scroll_up`       |
+| Zoom out                             | `ctrl+scroll_down`     |
+| Jump to start / end                  | built-in `home`, `end` |
 
 ### Masonry
 
-| Action | Default |
-| ------ | ------- |
-| Drag-pan masonry | `mouse_left` |
-| Open clicked item in solo fullscreen | `mouse_right` |
-| Freehand autoscroll | `mouse_middle` |
-| Pan up / down | `up`, `down` |
-| Faster pan up / down | `left`, `right` |
-| Fastest pan up / down | `pageup`, `pagedown`, `mouse4`, `mouse5` |
-| Inertial wheel scroll up / down | `scroll_up`, `scroll_down` |
-| Zoom in / out | `ctrl+scroll_up`, `ctrl+scroll_down` |
+| Action                               | Default                                  |
+| ------------------------------------ | ---------------------------------------- |
+| Drag-pan masonry                     | `mouse_left`                             |
+| Open clicked item in solo fullscreen | `mouse_right`                            |
+| Freehand autoscroll                  | `mouse_middle`                           |
+| Pan up / down                        | `up`, `down`                             |
+| Faster pan up / down                 | `left`, `right`                          |
+| Fastest pan up / down                | `pageup`, `pagedown`, `mouse4`, `mouse5` |
+| Inertial wheel scroll up / down      | `scroll_up`, `scroll_down`               |
+| Zoom in / out                        | `ctrl+scroll_up`, `ctrl+scroll_down`     |
 
 ### Video
 
-| Action | Default |
-| ------ | ------- |
+| Action       | Default |
+| ------------ | ------- |
 | Play / pause | `space` |
-| Mute | `m` |
+| Mute         | `m`     |
 
 ### Custom shortcut model
 
@@ -261,16 +261,16 @@ masonry_goto_file = enter
 
 Available binding syntax:
 
-| Type | Values |
-| ---- | ------ |
-| Mouse buttons | `mouse_left`, `mouse_right`, `mouse_middle`, `mouse4`, `mouse5` |
-| Scroll wheel | `scroll_up`, `scroll_down` |
-| Modifiers | `ctrl+<key>`, `shift+<key>`, `alt+<key>` |
-| Letters | `a` - `z` |
-| Numbers | `0` - `9` |
-| Function keys | `f1` - `f12` |
-| Arrow keys | `left`, `right`, `up`, `down` |
-| Special keys | `escape`, `enter`, `space`, `tab`, `backspace`, `delete`, `insert`, `home`, `end`, `pageup`, `pagedown` |
+| Type          | Values                                                                                                  |
+| ------------- | ------------------------------------------------------------------------------------------------------- |
+| Mouse buttons | `mouse_left`, `mouse_right`, `mouse_middle`, `mouse4`, `mouse5`                                         |
+| Scroll wheel  | `scroll_up`, `scroll_down`                                                                              |
+| Modifiers     | `ctrl+<key>`, `shift+<key>`, `alt+<key>`                                                                |
+| Letters       | `a` - `z`                                                                                               |
+| Numbers       | `0` - `9`                                                                                               |
+| Function keys | `f1` - `f12`                                                                                            |
+| Arrow keys    | `left`, `right`, `up`, `down`                                                                           |
+| Special keys  | `escape`, `enter`, `space`, `tab`, `backspace`, `delete`, `insert`, `home`, `end`, `pageup`, `pagedown` |
 
 ## Settings and Config File
 
@@ -280,80 +280,80 @@ Delete `config.ini` if you want to regenerate it from the current defaults.
 
 ### General settings
 
-| Key | Default | Meaning |
-| --- | ------- | ------- |
-| `controls_hide_delay` | `0.5` | Delay before the top controls / title bar hide. |
-| `bottom_overlay_hide_delay` | `0.5` | Delay before bottom overlays hide. Affects video controls, mode buttons, and zoom HUD. |
-| `double_click_grace_period` | `0.35` | Double-click timing window in seconds. |
-| `show_fps` | `false` | Enables the top-right diagnostics overlay. |
-| `resize_border_size` | `6` | Hit area for floating-window resize borders. |
-| `startup_window_mode` | `floating` | `floating` or `fullscreen`. |
-| `single_instance` | `true` | Reuse one window and forward file-open requests into it. |
-| `vsync` | `true` | Enable swapchain vsync to reduce tearing. |
-| `metadata_cache_max_size_mb` | `1024` | Max on-disk size of `metadata_cache.redb` in MiB. `0` disables the size cap. |
-| `background_rgb` | `0, 0, 0` | Background color as one RGB triplet. |
-| `background_r` | `0` | Alternative per-channel background override. |
-| `background_g` | `0` | Alternative per-channel background override. |
-| `background_b` | `0` | Alternative per-channel background override. |
-| `fullscreen_reset_fit_on_enter` | `true` | Reset and fit media when entering fullscreen. |
-| `fullscreen_native_window_transition` | `true` | Use Windows maximize / restore animations during fullscreen transitions. |
-| `maximize_to_borderless_fullscreen` | `true` | Make the title-bar maximize action enter borderless fullscreen instead of a separate maximized floating state. |
-| `zoom_animation_speed` | `20` | Speed of floating zoom animation. `0` disables the animation. |
-| `precise_rotation_step_degrees` | `2.0` | Degrees added per `Ctrl+Up` / `Ctrl+Down`. |
-| `zoom_step` | `1.02` | Scroll-wheel zoom multiplier. |
-| `max_zoom_percent` | `1000` | Maximum zoom level, stored as percent. |
+| Key                                   | Default    | Meaning                                                                                                        |
+| ------------------------------------- | ---------- | -------------------------------------------------------------------------------------------------------------- |
+| `controls_hide_delay`                 | `0.5`      | Delay before the top controls / title bar hide.                                                                |
+| `bottom_overlay_hide_delay`           | `0.5`      | Delay before bottom overlays hide. Affects video controls, mode buttons, and zoom HUD.                         |
+| `double_click_grace_period`           | `0.35`     | Double-click timing window in seconds.                                                                         |
+| `show_fps`                            | `false`    | Enables the top-right diagnostics overlay.                                                                     |
+| `resize_border_size`                  | `6`        | Hit area for floating-window resize borders.                                                                   |
+| `startup_window_mode`                 | `floating` | `floating` or `fullscreen`.                                                                                    |
+| `single_instance`                     | `true`     | Reuse one window and forward file-open requests into it.                                                       |
+| `vsync`                               | `true`     | Enable swapchain vsync to reduce tearing.                                                                      |
+| `metadata_cache_max_size_mb`          | `1024`     | Max on-disk size of `metadata_cache.redb` in MiB. `0` disables the size cap.                                   |
+| `background_rgb`                      | `0, 0, 0`  | Background color as one RGB triplet.                                                                           |
+| `background_r`                        | `0`        | Alternative per-channel background override.                                                                   |
+| `background_g`                        | `0`        | Alternative per-channel background override.                                                                   |
+| `background_b`                        | `0`        | Alternative per-channel background override.                                                                   |
+| `fullscreen_reset_fit_on_enter`       | `true`     | Reset and fit media when entering fullscreen.                                                                  |
+| `fullscreen_native_window_transition` | `true`     | Use Windows maximize / restore animations during fullscreen transitions.                                       |
+| `maximize_to_borderless_fullscreen`   | `true`     | Make the title-bar maximize action enter borderless fullscreen instead of a separate maximized floating state. |
+| `zoom_animation_speed`                | `20`       | Speed of floating zoom animation. `0` disables the animation.                                                  |
+| `precise_rotation_step_degrees`       | `2.0`      | Degrees added per `Ctrl+Up` / `Ctrl+Down`.                                                                     |
+| `zoom_step`                           | `1.02`     | Scroll-wheel zoom multiplier.                                                                                  |
+| `max_zoom_percent`                    | `1000`     | Maximum zoom level, stored as percent.                                                                         |
 
 ### Long Strip and Masonry settings
 
-| Key | Default | Meaning |
-| --- | ------- | ------- |
-| `manga_drag_pan_speed` | `1.0` | Drag-pan multiplier for multi-item layouts. |
-| `manga_wheel_impulse_per_step` | `2400.0` | Velocity injected per wheel step. |
-| `manga_wheel_decay_rate` | `11.0` | Exponential decay for free wheel momentum. |
-| `manga_wheel_max_velocity` | `9000.0` | Cap on accumulated wheel velocity. |
-| `manga_wheel_edge_spring_hz` | `4.5` | Edge return stiffness for overscroll. |
-| `manga_inertial_friction` | `0.33` | Inertial target friction for keyboard / page / autoscroll movement. |
-| `manga_arrow_scroll_speed` | `140` | Base arrow-key pan distance. |
-| `masonry_items_per_row` | `5` | Number of columns in Masonry mode. |
-| `manga_hover_autoplay_resume_delay_ms` | `220` | Delay before Masonry hover autoplay resumes after movement settles. |
-| `manga_virtualization_backend` | `rtree` | `auto`, `linear`, or `rtree`. Default is the R-tree path. |
-| `manga_autoscroll_dead_zone_px` | `14.0` | Freehand autoscroll dead zone around the anchor. |
-| `manga_autoscroll_base_speed_multiplier` | `5.0` | Base autoscroll multiplier relative to arrow-scroll speed. |
-| `manga_autoscroll_min_speed_multiplier` | `0.6` | Lower speed multiplier bound. |
-| `manga_autoscroll_max_speed_multiplier` | `14.0` | Upper speed multiplier bound. |
-| `manga_autoscroll_curve_power` | `2.0` | Speed curve power from center to edge. |
-| `manga_autoscroll_min_speed_px_per_sec` | `80.0` | Absolute minimum autoscroll speed. |
-| `manga_autoscroll_max_speed_px_per_sec` | `14000.0` | Absolute maximum autoscroll speed. |
-| `manga_autoscroll_horizontal_speed_multiplier` | `1.0` | Horizontal autoscroll multiplier. |
-| `manga_autoscroll_vertical_speed_multiplier` | `1.0` | Vertical autoscroll multiplier. |
-| `manga_autoscroll_circle_fill_alpha` | `50` | Fill alpha of the autoscroll anchor ring. |
-| `manga_autoscroll_arrow_rgb` | `140, 190, 255` | Arrow color for the autoscroll indicator. |
-| `manga_autoscroll_arrow_alpha` | `50` | Arrow alpha for the autoscroll indicator. |
+| Key                                            | Default         | Meaning                                                             |
+| ---------------------------------------------- | --------------- | ------------------------------------------------------------------- |
+| `manga_drag_pan_speed`                         | `1.0`           | Drag-pan multiplier for multi-item layouts.                         |
+| `manga_wheel_impulse_per_step`                 | `2400.0`        | Velocity injected per wheel step.                                   |
+| `manga_wheel_decay_rate`                       | `11.0`          | Exponential decay for free wheel momentum.                          |
+| `manga_wheel_max_velocity`                     | `9000.0`        | Cap on accumulated wheel velocity.                                  |
+| `manga_wheel_edge_spring_hz`                   | `4.5`           | Edge return stiffness for overscroll.                               |
+| `manga_inertial_friction`                      | `0.33`          | Inertial target friction for keyboard / page / autoscroll movement. |
+| `manga_arrow_scroll_speed`                     | `140`           | Base arrow-key pan distance.                                        |
+| `masonry_items_per_row`                        | `5`             | Number of columns in Masonry mode.                                  |
+| `manga_hover_autoplay_resume_delay_ms`         | `220`           | Delay before Masonry hover autoplay resumes after movement settles. |
+| `manga_virtualization_backend`                 | `rtree`         | `auto`, `linear`, or `rtree`. Default is the R-tree path.           |
+| `manga_autoscroll_dead_zone_px`                | `14.0`          | Freehand autoscroll dead zone around the anchor.                    |
+| `manga_autoscroll_base_speed_multiplier`       | `5.0`           | Base autoscroll multiplier relative to arrow-scroll speed.          |
+| `manga_autoscroll_min_speed_multiplier`        | `0.6`           | Lower speed multiplier bound.                                       |
+| `manga_autoscroll_max_speed_multiplier`        | `14.0`          | Upper speed multiplier bound.                                       |
+| `manga_autoscroll_curve_power`                 | `2.0`           | Speed curve power from center to edge.                              |
+| `manga_autoscroll_min_speed_px_per_sec`        | `80.0`          | Absolute minimum autoscroll speed.                                  |
+| `manga_autoscroll_max_speed_px_per_sec`        | `14000.0`       | Absolute maximum autoscroll speed.                                  |
+| `manga_autoscroll_horizontal_speed_multiplier` | `1.0`           | Horizontal autoscroll multiplier.                                   |
+| `manga_autoscroll_vertical_speed_multiplier`   | `1.0`           | Vertical autoscroll multiplier.                                     |
+| `manga_autoscroll_circle_fill_alpha`           | `50`            | Fill alpha of the autoscroll anchor ring.                           |
+| `manga_autoscroll_arrow_rgb`                   | `140, 190, 255` | Arrow color for the autoscroll indicator.                           |
+| `manga_autoscroll_arrow_alpha`                 | `50`            | Arrow alpha for the autoscroll indicator.                           |
 
 ### Video settings
 
-| Key | Default | Meaning |
-| --- | ------- | ------- |
-| `muted_by_default` | `true` | Start videos muted. |
-| `default_volume` | `0.0` | Initial video volume. |
-| `loop` | `true` | Restart videos automatically at end-of-stream. |
-| `seek_policy` | `adaptive` | `adaptive`, `accurate`, or `keyframe`. |
-| `prefer_hardware_decode` | `true` | Prefer D3D11 decoders when available on Windows. |
-| `disable_hardware_decode` | `false` | Disable hardware decoders completely. Overrides `prefer_hardware_decode`. |
+| Key                       | Default    | Meaning                                                                   |
+| ------------------------- | ---------- | ------------------------------------------------------------------------- |
+| `muted_by_default`        | `true`     | Start videos muted.                                                       |
+| `default_volume`          | `0.0`      | Initial video volume.                                                     |
+| `loop`                    | `true`     | Restart videos automatically at end-of-stream.                            |
+| `seek_policy`             | `adaptive` | `adaptive`, `accurate`, or `keyframe`.                                    |
+| `prefer_hardware_decode`  | `true`     | Prefer D3D11 decoders when available on Windows.                          |
+| `disable_hardware_decode` | `false`    | Disable hardware decoders completely. Overrides `prefer_hardware_decode`. |
 
 ### Quality settings
 
-| Key | Default | Meaning |
-| --- | ------- | ------- |
-| `upscale_filter` | `catmullrom` | CPU resize filter for enlarging images. |
-| `downscale_filter` | `lanczos3` | CPU resize filter for shrinking images. |
-| `gif_resize_filter` | `triangle` | CPU resize filter for GIF frames. Uses a faster default for animation throughput. |
-| `texture_filter_static` | `linear` | GPU texture filtering for static images. |
-| `texture_filter_animated` | `linear` | GPU texture filtering for GIF / animated WebP textures. |
-| `texture_filter_video` | `linear` | GPU texture filtering for video textures and video thumbnails. |
-| `manga_mipmap_static` | `true` | Enable mipmaps for static textures in Long Strip / Masonry. |
-| `manga_mipmap_video_thumbnails` | `true` | Enable mipmaps for video first-frame thumbnails in Long Strip / Masonry. |
-| `manga_mipmap_min_side` | `128` | Minimum texture side before mipmaps are generated. |
+| Key                             | Default      | Meaning                                                                           |
+| ------------------------------- | ------------ | --------------------------------------------------------------------------------- |
+| `upscale_filter`                | `catmullrom` | CPU resize filter for enlarging images.                                           |
+| `downscale_filter`              | `lanczos3`   | CPU resize filter for shrinking images.                                           |
+| `gif_resize_filter`             | `triangle`   | CPU resize filter for GIF frames. Uses a faster default for animation throughput. |
+| `texture_filter_static`         | `linear`     | GPU texture filtering for static images.                                          |
+| `texture_filter_animated`       | `linear`     | GPU texture filtering for GIF / animated WebP textures.                           |
+| `texture_filter_video`          | `linear`     | GPU texture filtering for video textures and video thumbnails.                    |
+| `manga_mipmap_static`           | `true`       | Enable mipmaps for static textures in Long Strip / Masonry.                       |
+| `manga_mipmap_video_thumbnails` | `true`       | Enable mipmaps for video first-frame thumbnails in Long Strip / Masonry.          |
+| `manga_mipmap_min_side`         | `128`        | Minimum texture side before mipmaps are generated.                                |
 
 Supported filter values:
 
@@ -373,24 +373,24 @@ On Windows MSVC builds, `build.rs` explicitly delay-loads the GStreamer and GLib
 
 ### 2. Very fast third-party libraries, used on purpose
 
-| Library | Where it is used | Why it matters |
-| ------- | ---------------- | -------------- |
-| `zune-image` | Common static image decode path (`jpg`, `jpeg`, `png`, `webp`, `bmp`, `psd`) | Fast decode path with SIMD support for the formats users hit most often. |
-| `image` | Fallback decode path, ICO / TIFF handling, animated WebP helpers | Keeps format coverage broad while the hot path stays specialized. |
-| `fast_image_resize` | CPU resizing before texture upload | Faster high-quality resampling than relying on a naive generic path everywhere. |
-| `memmap2` | Static / GIF / WebP file I/O | Uses OS-backed memory mapping when possible, with buffered fallback when it is not. |
-| `imagesize` | Header-only dimension probes | Lets the app learn dimensions without paying for a full decode first. |
-| `gif` + `gif-dispose` | GIF decode and correct disposal compositing | Supports accurate GIF rendering while still allowing memory-saving strategies for huge files. |
-| `gstreamer`, `gstreamer-app`, `gstreamer-video`, `gstreamer-audio`, `gstreamer-pbutils` | Video playback, first-frame extraction, metadata discoverer | Gives the app a robust video stack plus dimension / thumbnail probing tools. |
-| `rayon` | Parallel sorting and decode-adjacent work | Used where throughput scales with more cores. |
-| `crossbeam-channel` + `crossbeam-queue` | Bounded worker queues, result mailboxes, frame queues | Keeps communication cheap and predictable under load. |
-| `jwalk` | Same-directory media enumeration | Fast directory walking with natural-sort media lists. |
-| `rstar` | R-tree spatial index | Makes visible-item queries scale far better in large Long Strip / Masonry folders. |
-| `redb` | Persistent metadata and thumbnail cache | Durable on-disk cache for dimensions and first-frame thumbnails. |
-| `moka` | In-memory decoded-image cache | Keeps hot solo-view decodes around with size accounting. |
-| `lru` | Directory cache and texture-cache eviction | Simple, predictable recency-based eviction where it fits best. |
-| `hdrhistogram` | Runtime diagnostics overlay | Makes p95 timings visible instead of relying on averages alone. |
-| `mimalloc` | Optional global allocator feature | Available as an opt-in build feature for allocator-sensitive workloads. |
+| Library                                                                                 | Where it is used                                                             | Why it matters                                                                                |
+| --------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| `zune-image`                                                                            | Common static image decode path (`jpg`, `jpeg`, `png`, `webp`, `bmp`, `psd`) | Fast decode path with SIMD support for the formats users hit most often.                      |
+| `image`                                                                                 | Fallback decode path, ICO / TIFF handling, animated WebP helpers             | Keeps format coverage broad while the hot path stays specialized.                             |
+| `fast_image_resize`                                                                     | CPU resizing before texture upload                                           | Faster high-quality resampling than relying on a naive generic path everywhere.               |
+| `memmap2`                                                                               | Static / GIF / WebP file I/O                                                 | Uses OS-backed memory mapping when possible, with buffered fallback when it is not.           |
+| `imagesize`                                                                             | Header-only dimension probes                                                 | Lets the app learn dimensions without paying for a full decode first.                         |
+| `gif` + `gif-dispose`                                                                   | GIF decode and correct disposal compositing                                  | Supports accurate GIF rendering while still allowing memory-saving strategies for huge files. |
+| `gstreamer`, `gstreamer-app`, `gstreamer-video`, `gstreamer-audio`, `gstreamer-pbutils` | Video playback, first-frame extraction, metadata discoverer                  | Gives the app a robust video stack plus dimension / thumbnail probing tools.                  |
+| `rayon`                                                                                 | Parallel sorting and decode-adjacent work                                    | Used where throughput scales with more cores.                                                 |
+| `crossbeam-channel` + `crossbeam-queue`                                                 | Bounded worker queues, result mailboxes, frame queues                        | Keeps communication cheap and predictable under load.                                         |
+| `jwalk`                                                                                 | Same-directory media enumeration                                             | Fast directory walking with natural-sort media lists.                                         |
+| `rstar`                                                                                 | R-tree spatial index                                                         | Makes visible-item queries scale far better in large Long Strip / Masonry folders.            |
+| `redb`                                                                                  | Persistent metadata and thumbnail cache                                      | Durable on-disk cache for dimensions and first-frame thumbnails.                              |
+| `moka`                                                                                  | In-memory decoded-image cache                                                | Keeps hot solo-view decodes around with size accounting.                                      |
+| `lru`                                                                                   | Directory cache and texture-cache eviction                                   | Simple, predictable recency-based eviction where it fits best.                                |
+| `hdrhistogram`                                                                          | Runtime diagnostics overlay                                                  | Makes p95 timings visible instead of relying on averages alone.                               |
+| `mimalloc`                                                                              | Optional global allocator feature                                            | Available as an opt-in build feature for allocator-sensitive workloads.                       |
 
 ### 3. Metadata-first opening and placeholder strategy
 
@@ -429,8 +429,8 @@ There are multiple cache layers because each one solves a different problem:
 - `MediaDirectoryIndex` keeps an LRU of recently scanned directories so next / previous navigation does not re-scan the folder every time.
 - Solo view keeps a `moka` decoded-image cache with a `192 MiB` capacity ceiling and skips oversized single entries above `24 MiB`.
 - Long Strip / Masonry use `MangaTextureCache`, which splits textures into:
-   - pinned entries for currently visible indices
-   - unpinned LRU entries for evictable off-screen content
+  - pinned entries for currently visible indices
+  - unpinned LRU entries for evictable off-screen content
 - The texture-cache target capacity is adaptive rather than fixed. It scales with visible item count, zoom level, and Masonry density.
 
 That combination gives the app short-latency reopens for recent media without letting VRAM and RAM drift upward without bounds.
@@ -540,30 +540,30 @@ Set `show_fps = true` to enable the top-right overlay.
 
 Useful labels:
 
-| Label | Meaning |
-| ----- | ------- |
-| `FPS` | Smoothed render FPS and last active-frame time. |
-| `TTV p50/p95` | Time to visible for multi-item media. |
-| `U` | Current upload batch limit. |
-| `L` | Pending load requests, plus peak. |
-| `D` | Pending decoded images, plus peak. |
-| `V` | Visible item count, plus peak. |
-| `IDX H/M` | Directory-index cache hits / misses. |
-| `DC H/M` | Decoded-image cache hits / misses. |
-| `MC ...` | Metadata-cache hits, misses, expirations, and evictions. |
-| `UP p95` | Upload pass p95. |
-| `QW p95` | Decode queue-wait p95. |
-| `DEC p95` | Decode worker p95. |
-| `RSZ p95` | Resize p95. |
-| `UTX p95` | Texture-upload p95. |
-| `LY p95` | Masonry layout rebuild p95. |
-| `SI p95` | Spatial-index rebuild p95. |
-| `VQ p95` | Visible-query p95. |
-| `VQ R/L` | R-tree vs linear visible-query counts. |
-| `DQ` | Pending Masonry dimension updates. |
-| `DM` | Decoded mailbox size. |
-| `RR` | Retry requests enqueued / rejected. |
-| `TS L/M/H` | Low / mid / high target-side distribution. |
+| Label         | Meaning                                                  |
+| ------------- | -------------------------------------------------------- |
+| `FPS`         | Smoothed render FPS and last active-frame time.          |
+| `TTV p50/p95` | Time to visible for multi-item media.                    |
+| `U`           | Current upload batch limit.                              |
+| `L`           | Pending load requests, plus peak.                        |
+| `D`           | Pending decoded images, plus peak.                       |
+| `V`           | Visible item count, plus peak.                           |
+| `IDX H/M`     | Directory-index cache hits / misses.                     |
+| `DC H/M`      | Decoded-image cache hits / misses.                       |
+| `MC ...`      | Metadata-cache hits, misses, expirations, and evictions. |
+| `UP p95`      | Upload pass p95.                                         |
+| `QW p95`      | Decode queue-wait p95.                                   |
+| `DEC p95`     | Decode worker p95.                                       |
+| `RSZ p95`     | Resize p95.                                              |
+| `UTX p95`     | Texture-upload p95.                                      |
+| `LY p95`      | Masonry layout rebuild p95.                              |
+| `SI p95`      | Spatial-index rebuild p95.                               |
+| `VQ p95`      | Visible-query p95.                                       |
+| `VQ R/L`      | R-tree vs linear visible-query counts.                   |
+| `DQ`          | Pending Masonry dimension updates.                       |
+| `DM`          | Decoded mailbox size.                                    |
+| `RR`          | Retry requests enqueued / rejected.                      |
+| `TS L/M/H`    | Low / mid / high target-side distribution.               |
 
 ### Criterion benchmarks
 
