@@ -879,6 +879,11 @@ struct ImageViewer {
     /// Only active in fullscreen mode; cleared when exiting fullscreen.
     fullscreen_view_states: HashMap<PathBuf, FullscreenViewState>,
 
+    /// One-shot fullscreen-fit override for strip or masonry quick-open into solo fullscreen.
+    /// These transitions should start from the usual fit-to-screen layout instead of reviving
+    /// an older cached fullscreen zoom or pan state for the target file.
+    strip_open_force_fit_path: Option<PathBuf>,
+
     /// Last observed window outer position (top-left in screen coordinates).
     /// Used to keep the window location stable in floating mode after the user moves it.
     last_known_outer_pos: Option<egui::Pos2>,
@@ -1279,6 +1284,7 @@ impl Default for ImageViewer {
             pending_fullscreen_layout: false,
             pending_maximized_layout: false,
             fullscreen_view_states: HashMap::new(),
+            strip_open_force_fit_path: None,
             last_known_outer_pos: None,
             floating_user_moved_window: false,
             suppress_outer_pos_tracking_frames: 0,
@@ -4750,11 +4756,20 @@ impl ImageViewer {
     }
 
     fn apply_fullscreen_layout_for_current_image(&mut self, ctx: &egui::Context) {
-        // Check if we have a saved view state for this image (fullscreen per-image memory)
-        if let Some(path) = self.image_list.get(self.current_index).cloned() {
-            if self.restore_fullscreen_view_state(&path) {
-                // State was restored, don't apply default layout
-                return;
+        let current_path = self.image_list.get(self.current_index).cloned();
+        let force_fit = current_path.as_ref().is_some_and(|path| {
+            self.strip_open_force_fit_path.as_ref() == Some(path)
+        });
+
+        // Check if we have a saved view state for this image (fullscreen per-image memory).
+        // Strip or masonry quick-open into solo fullscreen is intentionally different: it should
+        // start from a fresh fit-to-screen layout instead of restoring a prior zoom or pan.
+        if !force_fit {
+            if let Some(path) = current_path.as_ref() {
+                if self.restore_fullscreen_view_state(path) {
+                    // State was restored, don't apply default layout
+                    return;
+                }
             }
         }
 
@@ -4773,6 +4788,9 @@ impl ImageViewer {
                 let z = (target_h / img_h as f32).clamp(0.1, self.max_zoom_factor());
                 self.zoom = z;
                 self.zoom_target = z;
+                if force_fit {
+                    self.strip_open_force_fit_path = None;
+                }
             }
         }
     }
@@ -5035,6 +5053,7 @@ impl ImageViewer {
 
         self.sync_current_index_to_visible_media();
         self.reset_gif_seek_interaction_state();
+        self.strip_open_force_fit_path = None;
 
         let restore_masonry_state = if layout_mode == MangaLayoutMode::Masonry {
             self.strip_return_masonry_state
@@ -6365,6 +6384,8 @@ impl ImageViewer {
         let Some(path) = self.image_list.get(index).cloned() else {
             return;
         };
+
+        self.strip_open_force_fit_path = Some(path.clone());
 
         let target_media_type = get_media_type(&path);
         self.prepare_mode_switch_placeholder_from_manga_index(index, target_media_type);
@@ -14501,6 +14522,7 @@ impl eframe::App for ImageViewer {
                     // Clear the per-image fullscreen view state cache when exiting fullscreen
                     // (since it's only meant for fullscreen mode comparisons within a session)
                     self.fullscreen_view_states.clear();
+                    self.strip_open_force_fit_path = None;
 
                     let image_changed_while_fullscreen = self
                         .saved_fullscreen_entry_index
