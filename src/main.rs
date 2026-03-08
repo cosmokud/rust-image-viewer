@@ -1083,10 +1083,6 @@ fn process_manga_focused_video_load_request(
 
 const DECODED_IMAGE_CACHE_MAX_BYTES: u64 = 192 * 1024 * 1024;
 const DECODED_IMAGE_CACHE_SKIP_ENTRY_BYTES: usize = 24 * 1024 * 1024;
-const SOLO_LOOK_FORWARD_PROBE_COUNT: usize = 4;
-const SOLO_LOOK_BACKWARD_PROBE_COUNT: usize = 2;
-const SOLO_LOD_OVERSCAN_FLOATING: f32 = 1.10;
-const SOLO_LOD_OVERSCAN_FULLSCREEN: f32 = 1.12;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct FileStamp {
@@ -2259,6 +2255,52 @@ impl ImageViewer {
         )
     }
 
+    fn solo_expected_display_size_for_path(
+        &self,
+        path: &PathBuf,
+        media_type: MediaType,
+        allow_sync_image_probe: bool,
+    ) -> egui::Vec2 {
+        let viewport = self.solo_viewport_size_for_lod();
+        let Some((img_w_u, img_h_u)) =
+            self.solo_known_media_dimensions(path, media_type, allow_sync_image_probe)
+        else {
+            return viewport;
+        };
+
+        let img_w = img_w_u as f32;
+        let img_h = img_h_u as f32;
+        if img_w <= 0.0 || img_h <= 0.0 {
+            return viewport;
+        }
+
+        let zoom = if self.is_fullscreen {
+            let force_fit = self.strip_open_force_fit_path.as_ref() == Some(path);
+            let saved_zoom = if force_fit {
+                None
+            } else {
+                self.fullscreen_view_states
+                    .get(path)
+                    .map(|state| state.zoom.max(state.zoom_target))
+            };
+
+            saved_zoom
+                .unwrap_or_else(|| (viewport.y / img_h).clamp(0.1, self.max_zoom_factor()))
+        } else if media_type == MediaType::Video {
+            if img_h > viewport.y {
+                (viewport.y / img_h).clamp(0.1, self.max_zoom_factor())
+            } else {
+                1.0
+            }
+        } else if img_h > viewport.y || img_w > viewport.x {
+            (viewport.y / img_h).min(viewport.x / img_w).min(1.0)
+        } else {
+            1.0
+        };
+
+        egui::vec2((img_w * zoom).max(1.0), (img_h * zoom).max(1.0))
+    }
+
     fn solo_quantize_target_texture_side(
         &self,
         target_texture_side: u32,
@@ -2292,59 +2334,60 @@ impl ImageViewer {
         media_type: MediaType,
         allow_sync_image_probe: bool,
     ) -> u32 {
-        let viewport = self.solo_viewport_size_for_lod();
         let source_dims = self.solo_known_media_dimensions(path, media_type, allow_sync_image_probe);
-
-        let display_side = if let Some((img_w_u, img_h_u)) = source_dims {
-            let img_w = img_w_u as f32;
-            let img_h = img_h_u as f32;
-            if img_w > 0.0 && img_h > 0.0 {
-                if self.is_fullscreen {
-                    let force_fit = self.strip_open_force_fit_path.as_ref() == Some(path);
-                    let saved_zoom = if force_fit {
-                        None
-                    } else {
-                        self.fullscreen_view_states
-                            .get(path)
-                            .map(|state| state.zoom.max(state.zoom_target))
-                    };
-                    let zoom = saved_zoom.unwrap_or_else(|| {
-                        (viewport.y / img_h).clamp(0.1, self.max_zoom_factor())
-                    });
-                    (img_w * zoom).max(img_h * zoom)
-                } else {
-                    let zoom = if media_type == MediaType::Video {
-                        if img_h > viewport.y {
-                            (viewport.y / img_h).clamp(0.1, self.max_zoom_factor())
-                        } else {
-                            1.0
-                        }
-                    } else if img_h > viewport.y || img_w > viewport.x {
-                        (viewport.y / img_h).min(viewport.x / img_w).min(1.0)
-                    } else {
-                        1.0
-                    };
-                    (img_w * zoom).max(img_h * zoom)
-                }
-            } else {
-                viewport.x.max(viewport.y)
-            }
-        } else {
-            viewport.x.max(viewport.y)
-        };
-
-        let overscan = if self.is_fullscreen {
-            SOLO_LOD_OVERSCAN_FULLSCREEN
-        } else {
-            SOLO_LOD_OVERSCAN_FLOATING
-        };
-        let target = (display_side * overscan).ceil().max(1.0) as u32;
+        let display_size =
+            self.solo_expected_display_size_for_path(path, media_type, allow_sync_image_probe);
+        let target =
+            self.manga_strip_target_texture_side_from_display_side(display_size.x.max(display_size.y));
         self.solo_quantize_target_texture_side(target, source_dims)
     }
 
-    fn solo_expected_min_display_side(&self) -> f32 {
+    fn solo_visible_item_equivalent_for_path(
+        &self,
+        path: &PathBuf,
+        media_type: MediaType,
+        allow_sync_image_probe: bool,
+    ) -> f32 {
         let viewport = self.solo_viewport_size_for_lod();
-        viewport.x.min(viewport.y).max(1.0)
+        let display_size =
+            self.solo_expected_display_size_for_path(path, media_type, allow_sync_image_probe);
+        (viewport.y / display_size.y.max(1.0)).max(1.0)
+    }
+
+    fn solo_probe_window_counts_for_path(
+        &self,
+        path: &PathBuf,
+        media_type: Option<MediaType>,
+    ) -> (usize, usize) {
+        let visible_item_equivalent = media_type
+            .or_else(|| get_media_type(path))
+            .map(|kind| self.solo_visible_item_equivalent_for_path(path, kind, false))
+            .unwrap_or(1.0);
+
+        self.manga_strip_preload_window_counts(visible_item_equivalent)
+    }
+
+    fn solo_current_display_min_side(&self) -> f32 {
+        let current_display = if matches!(self.current_media_type, Some(MediaType::Image)) {
+            self.image_display_size_at_zoom()
+        } else if let Some((width, height)) = self.media_display_dimensions() {
+            Some(egui::vec2(
+                width as f32 * self.zoom.max(0.0001),
+                height as f32 * self.zoom.max(0.0001),
+            ))
+        } else {
+            self.image_list.get(self.current_index).and_then(|path| {
+                self.current_media_type
+                    .map(|media_type| self.solo_expected_display_size_for_path(path, media_type, false))
+            })
+        };
+
+        current_display
+            .map(|size| size.x.min(size.y).max(1.0))
+            .unwrap_or_else(|| {
+                let viewport = self.solo_viewport_size_for_lod();
+                viewport.x.min(viewport.y).max(1.0)
+            })
     }
 
     fn solo_video_thumbnail_texture_options(
@@ -2353,9 +2396,12 @@ impl ImageViewer {
         height: u32,
     ) -> egui::TextureOptions {
         let min_side = width.min(height);
+        let mipmap_allowed_by_size = min_side >= self.config.manga_mipmap_min_side.max(1);
+        let meaningfully_minified =
+            (min_side as f32) >= self.solo_current_display_min_side() * 1.15;
         let enable_mipmap = self.config.manga_mipmap_video_thumbnails
-            && min_side >= self.config.manga_mipmap_min_side.max(1)
-            && (min_side as f32) >= self.solo_expected_min_display_side() * 1.15;
+            && mipmap_allowed_by_size
+            && meaningfully_minified;
 
         self.config
             .texture_filter_video
@@ -2382,10 +2428,13 @@ impl ImageViewer {
 
         let downscale_filter = self.config.downscale_filter.to_image_filter();
         let gif_filter = self.config.gif_resize_filter.to_image_filter();
+        let (mut probe_behind_count, mut probe_ahead_count) =
+            self.solo_probe_window_counts_for_path(current_path, current_media_type);
+        let max_neighbor_count = self.image_list.len().saturating_sub(1);
+        probe_behind_count = probe_behind_count.min(max_neighbor_count);
+        probe_ahead_count = probe_ahead_count.min(max_neighbor_count);
         let mut queued_indices = HashSet::new();
-        let mut requests = Vec::with_capacity(
-            SOLO_LOOK_FORWARD_PROBE_COUNT + SOLO_LOOK_BACKWARD_PROBE_COUNT + 1,
-        );
+        let mut requests = Vec::with_capacity(probe_ahead_count + probe_behind_count + 1);
 
         if current_media_type == Some(MediaType::Video) {
             let current_target_side =
@@ -2404,7 +2453,7 @@ impl ImageViewer {
             }
         }
 
-        for offset in 1..=SOLO_LOOK_FORWARD_PROBE_COUNT as isize {
+        for offset in 1..=probe_ahead_count as isize {
             let Some(index) = self.solo_wrapped_index_with_offset(offset) else {
                 continue;
             };
@@ -2462,7 +2511,7 @@ impl ImageViewer {
             }
         }
 
-        for offset in 1..=SOLO_LOOK_BACKWARD_PROBE_COUNT as isize {
+        for offset in 1..=probe_behind_count as isize {
             let Some(index) = self.solo_wrapped_index_with_offset(-offset) else {
                 continue;
             };
@@ -12531,7 +12580,16 @@ impl ImageViewer {
             }
         }
 
-        let solo_expected_min_display_side = self.solo_expected_min_display_side();
+        let solo_current_display_min_side = self.solo_current_display_min_side();
+        let current_video_path = self.image_list.get(self.current_index).cloned();
+        let current_video_target_side = current_video_path
+            .as_ref()
+            .map(|path| self.solo_target_texture_side_for_path(path, MediaType::Video, false))
+            .unwrap_or(self.max_texture_side.max(1));
+        let solo_video_upload_filter = self.config.downscale_filter.to_image_filter();
+        let solo_video_upload_mipmap_min_side = self.config.manga_mipmap_min_side.max(1);
+        let solo_video_upload_mipmaps_enabled = self.config.manga_mipmap_video_thumbnails;
+        let solo_video_texture_filter = self.config.texture_filter_video;
 
         // Handle image texture updates
         if let Some(ref mut img) = self.image {
@@ -12585,7 +12643,7 @@ impl ImageViewer {
                     let min_side = w.min(h);
                     let enable_mipmap = self.config.manga_mipmap_static
                         && min_side >= self.config.manga_mipmap_min_side.max(1)
-                        && (min_side as f32) >= solo_expected_min_display_side * 1.15;
+                        && (min_side as f32) >= solo_current_display_min_side * 1.15;
                     self.config
                         .texture_filter_static
                         .to_egui_options_with_mipmap(enable_mipmap)
@@ -12632,19 +12690,22 @@ impl ImageViewer {
                     frame.width,
                     frame.height,
                     &frame.pixels,
-                    self.max_texture_side,
-                    self.config.downscale_filter.to_image_filter(),
+                    current_video_target_side,
+                    solo_video_upload_filter,
                 );
                 let color_image = egui::ColorImage::from_rgba_unmultiplied(
                     [w as usize, h as usize],
                     pixels.as_ref(),
                 );
 
-                // Use configured texture filter for video
+                let texture_options = solo_video_texture_filter.to_egui_options_with_mipmap(
+                    solo_video_upload_mipmaps_enabled && w.min(h) >= solo_video_upload_mipmap_min_side,
+                );
+
                 self.video_texture = Some(ctx.load_texture(
                     "video",
                     color_image,
-                    self.config.texture_filter_video.to_egui_options(),
+                    texture_options,
                 ));
                 self.video_texture_dims = Some((w, h));
                 needs_repaint = true;
