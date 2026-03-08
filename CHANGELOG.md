@@ -4,6 +4,34 @@ All notable changes to this project will be documented in this file.
 
 ## [v0.2.3] - 2026-03-08
 
+### Highlights
+
+- Introduce a new solo media probing system with caching for images and videos, speeding up display size calculations and texture handling on open.
+- Precise fullscreen rotation support including keyboard shortcuts, step‑degree configuration, and adjustable animation speed.
+- Mouse‑repeat actions enable smoother manga navigation in long‑strip mode.
+- Fullscreen view state management now remembers zoom/pan across transitions and tracks remembered states more reliably.
+- One‑shot fullscreen‑fit override added for strip or masonry quick‑open operations.
+- Refactored manga strip texture sizing and preload logic for improved display quality and responsiveness.
+
+### Added
+
+- Solo media probing service with image/video dimension caching.
+- Mouse repeat support for manga long‑strip navigation.
+- Configuration options for precise rotation steps and animation speed, plus related keyboard shortcuts.
+- One‑shot fullscreen‑fit override command.
+- Memory tracking enhancements for fullscreen view state.
+
+### Changed
+
+- Refactor solo media probing logic to improve display size calculations and texture handling.
+- Update rotation configuration semantics to use step degrees and refine animation behavior.
+- Refactor manga strip texture size calculations and enhance preload handling.
+- Miscellaneous performance tweaks around manga strip preload logic.
+
+### Fixed
+
+- Various under‑the‑hood fixes and stability improvements related to the above features.
+
 ## [v0.2.2] - 2026-03-08
 
 ### Highlights
