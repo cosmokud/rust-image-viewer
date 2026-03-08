@@ -1409,6 +1409,8 @@ struct ImageViewer {
     strip_return_masonry_state: Option<MasonryReturnState>,
     /// True while solo fullscreen is keeping masonry caches alive for potential middle-click return.
     strip_return_preserve_masonry_cache: bool,
+    /// Image-list signature whose masonry runtime cache must stay resident across mode switches.
+    masonry_runtime_cache_signature: u64,
     /// User-selected masonry density (items per row), controlled by slider.
     masonry_items_per_row: usize,
     /// Whether the manga mode toggle button should be shown (on hover bottom-right)
@@ -1753,6 +1755,7 @@ impl Default for ImageViewer {
             pending_masonry_solo_reentry: None,
             strip_return_masonry_state: None,
             strip_return_preserve_masonry_cache: false,
+            masonry_runtime_cache_signature: 0,
             masonry_items_per_row,
             show_manga_toggle: false,
             manga_toggle_show_time: Instant::now(),
@@ -1919,8 +1922,26 @@ impl ImageViewer {
     }
 
     fn set_image_list(&mut self, files: Vec<PathBuf>) {
+        let new_signature = Self::compute_image_list_signature(&files);
+        if self.image_list_signature != new_signature {
+            self.masonry_runtime_cache_signature = 0;
+        }
+
         self.image_list = files;
-        self.image_list_signature = Self::compute_image_list_signature(&self.image_list);
+        self.image_list_signature = new_signature;
+    }
+
+    fn mark_masonry_runtime_cache_resident(&mut self) {
+        if !self.image_list.is_empty() {
+            self.masonry_runtime_cache_signature = self.image_list_signature;
+        }
+    }
+
+    fn has_resident_masonry_runtime_cache(&self) -> bool {
+        self.masonry_runtime_cache_signature != 0
+            && self.masonry_runtime_cache_signature == self.image_list_signature
+            && (self.manga_dimension_cache_list_signature == self.image_list_signature
+                || !self.manga_texture_cache.is_empty())
     }
 
     fn can_reuse_preserved_masonry_layout(&self) -> bool {
@@ -6042,7 +6063,7 @@ impl ImageViewer {
         self.strip_return_masonry_state = None;
         self.strip_return_preserve_masonry_cache = false;
 
-        if should_clear_preserved_masonry_cache {
+        if should_clear_preserved_masonry_cache && !self.has_resident_masonry_runtime_cache() {
             self.clear_manga_runtime_cache(true);
         }
     }
@@ -6152,7 +6173,12 @@ impl ImageViewer {
 
         // Keep texture/dimension caches alive for fast strip restore,
         // but stop active runtime workloads while in solo fullscreen.
+        self.reset_masonry_metadata_preload();
         self.clear_manga_runtime_workloads();
+        self.manga_video_textures.clear();
+        self.manga_animated_images.clear();
+        self.manga_anim_failed.clear();
+        self.manga_anim_seekbar_total_frames.clear();
     }
 
     #[allow(dead_code)]
@@ -6202,10 +6228,15 @@ impl ImageViewer {
             restore_masonry_state.is_some_and(|state| state.opened_index != current_viewed_index);
         let reuse_masonry_cache = restore_masonry_state
             .is_some_and(|state| self.should_reuse_masonry_cache_on_return(state));
+        let preserve_resident_masonry_cache =
+            layout_mode == MangaLayoutMode::Masonry && self.has_resident_masonry_runtime_cache();
 
         self.manga_layout_mode = layout_mode;
+        if layout_mode == MangaLayoutMode::Masonry {
+            self.mark_masonry_runtime_cache_resident();
+        }
 
-        if reuse_masonry_cache {
+        if reuse_masonry_cache || preserve_resident_masonry_cache {
             self.enter_manga_mode_from_preserved_strip_cache();
         } else {
             if layout_mode == MangaLayoutMode::Masonry {
@@ -7200,6 +7231,9 @@ impl ImageViewer {
 
         if !self.manga_mode {
             self.manga_layout_mode = layout_mode;
+            if layout_mode == MangaLayoutMode::Masonry {
+                self.mark_masonry_runtime_cache_resident();
+            }
             self.toggle_manga_mode();
             return;
         }
@@ -7216,6 +7250,9 @@ impl ImageViewer {
         self.set_current_index_clamped(target_index);
 
         self.manga_layout_mode = layout_mode;
+        if layout_mode == MangaLayoutMode::Masonry {
+            self.mark_masonry_runtime_cache_resident();
+        }
         self.invalidate_manga_layout_cache();
         self.offset = egui::Vec2::ZERO;
 
@@ -7553,6 +7590,9 @@ impl ImageViewer {
         };
 
         self.strip_open_force_fit_path = Some(path.clone());
+        if return_mode == MangaLayoutMode::Masonry {
+            self.mark_masonry_runtime_cache_resident();
+        }
 
         let target_media_type = get_media_type(&path);
         self.prepare_mode_switch_placeholder_from_manga_index(index, target_media_type);
@@ -7564,7 +7604,7 @@ impl ImageViewer {
         self.reset_gif_seek_interaction_state();
         self.reset_masonry_metadata_preload();
         self.manga_mode = false;
-        if return_mode == MangaLayoutMode::Masonry {
+        if return_mode == MangaLayoutMode::Masonry || self.has_resident_masonry_runtime_cache() {
             self.manga_suspend_runtime_for_solo_fullscreen();
         } else {
             self.manga_clear_cache();
@@ -7594,6 +7634,9 @@ impl ImageViewer {
             self.manga_pending_decoded_peak = 0;
 
             self.prepare_enter_manga_mode_state(current_media_type);
+            if self.manga_layout_mode == MangaLayoutMode::Masonry {
+                self.mark_masonry_runtime_cache_resident();
+            }
 
             // Manga layout cache must be rebuilt for the new mode.
             if !reuse_preserved_masonry_layout {
@@ -7690,8 +7733,14 @@ impl ImageViewer {
 
         self.stop_manga_wheel_scroll();
         self.stop_manga_autoscroll();
+        let keep_resident_masonry_cache = self.manga_layout_mode == MangaLayoutMode::Masonry
+            || self.has_resident_masonry_runtime_cache();
         self.manga_mode = false;
-        self.clear_manga_runtime_cache(self.manga_layout_mode == MangaLayoutMode::Masonry);
+        if keep_resident_masonry_cache {
+            self.manga_suspend_runtime_for_solo_fullscreen();
+        } else {
+            self.clear_manga_runtime_cache(false);
+        }
 
         if let Some(path) = target_path {
             // Load the selected page into normal fullscreen mode.
@@ -8004,6 +8053,7 @@ impl ImageViewer {
     fn clear_manga_runtime_cache(&mut self, preserve_dimensions: bool) {
         // Clear the texture cache
         self.manga_texture_cache.clear();
+        self.masonry_runtime_cache_signature = 0;
         self.strip_entry_placeholder_index = None;
         self.manga_ttv_pending.clear();
         self.manga_ttv_samples_ms.clear();
@@ -15808,10 +15858,15 @@ impl eframe::App for ImageViewer {
                             target_media_type,
                         );
 
+                        let keep_resident_masonry_cache =
+                            self.manga_layout_mode == MangaLayoutMode::Masonry
+                                || self.has_resident_masonry_runtime_cache();
                         self.manga_mode = false;
-                        self.clear_manga_runtime_cache(
-                            self.manga_layout_mode == MangaLayoutMode::Masonry,
-                        );
+                        if keep_resident_masonry_cache {
+                            self.manga_suspend_runtime_for_solo_fullscreen();
+                        } else {
+                            self.clear_manga_runtime_cache(false);
+                        }
 
                         if let Some(path) = target_path {
                             self.load_image(&path);
