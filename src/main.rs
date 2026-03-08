@@ -26,13 +26,18 @@ use config::{
     VideoSeekPolicy,
 };
 use hashbrown::{HashMap, HashSet};
-use image_loader::{get_media_type, is_supported_video, ImageFrame, LoadedImage, MediaType};
+use image_loader::{
+    get_media_type, is_supported_video, probe_image_dimensions, ImageFrame, LoadedImage,
+    MediaType,
+};
 use manga_loader::{DecodedImage, MangaLoader, MangaMediaType, MangaTextureCache, LOD_SIDE_BUCKETS};
 use manga_spatial::{MangaSpatialIndex, SpatialRect, STRIP_QUERY_HALF_WIDTH};
 use media_index::{DirectoryScanResult, MediaDirectoryIndex};
 use metadata_cache::{
-    configure_metadata_cache_size_limit, lookup_cached_dimensions, metadata_cache_stats,
-    store_cached_dimensions, CachedMediaKind,
+    configure_metadata_cache_size_limit, lookup_cached_dimensions,
+    lookup_cached_static_thumbnail, lookup_cached_video_thumbnail, metadata_cache_stats,
+    store_cached_dimensions, store_cached_static_thumbnail, store_cached_video_thumbnail,
+    CachedImageThumbnail, CachedMediaKind, CachedVideoThumbnail,
 };
 use perf_metrics::PerfMetrics;
 #[cfg(target_os = "windows")]
@@ -508,6 +513,38 @@ struct AsyncImageLoad {
     gif_filter: FilterType,
 }
 
+#[derive(Clone)]
+struct PendingVideoThumbnailPlaceholder {
+    path: PathBuf,
+    thumbnail: CachedVideoThumbnail,
+}
+
+enum SoloProbeRequest {
+    Image {
+        path: PathBuf,
+        max_texture_side: u32,
+        downscale_filter: FilterType,
+        gif_filter: FilterType,
+    },
+    Video {
+        path: PathBuf,
+        max_texture_side: u32,
+    },
+}
+
+enum SoloProbeResult {
+    Image {
+        path: PathBuf,
+        max_texture_side: u32,
+        cached: Option<CachedDecodedImage>,
+    },
+    Video {
+        path: PathBuf,
+        max_texture_side: u32,
+        thumbnail: Option<CachedVideoThumbnail>,
+    },
+}
+
 enum MediaLoadRequest {
     Image {
         request_id: u64,
@@ -547,6 +584,12 @@ struct MediaLoadCoordinator {
     result_rx: crossbeam_channel::Receiver<MediaLoadResult>,
 }
 
+struct SoloProbeCoordinator {
+    latest_batch: Arc<Mutex<Option<Vec<SoloProbeRequest>>>>,
+    wake_tx: crossbeam_channel::Sender<()>,
+    result_rx: crossbeam_channel::Receiver<SoloProbeResult>,
+}
+
 impl MediaLoadCoordinator {
     fn new() -> Self {
         let latest_request: Arc<Mutex<Option<MediaLoadRequest>>> = Arc::new(Mutex::new(None));
@@ -571,6 +614,34 @@ impl MediaLoadCoordinator {
     }
 
     fn try_recv(&self) -> Result<MediaLoadResult, crossbeam_channel::TryRecvError> {
+        self.result_rx.try_recv()
+    }
+}
+
+impl SoloProbeCoordinator {
+    fn new() -> Self {
+        let latest_batch: Arc<Mutex<Option<Vec<SoloProbeRequest>>>> = Arc::new(Mutex::new(None));
+        let (wake_tx, wake_rx) = crossbeam_channel::bounded::<()>(1);
+        let (result_tx, result_rx) = crossbeam_channel::bounded::<SoloProbeResult>(16);
+
+        let latest_batch_worker = Arc::clone(&latest_batch);
+        crate::async_runtime::spawn_blocking_or_thread("solo-probe-coordinator", move || {
+            run_solo_probe_coordinator(latest_batch_worker, wake_rx, result_tx);
+        });
+
+        Self {
+            latest_batch,
+            wake_tx,
+            result_rx,
+        }
+    }
+
+    fn submit_batch(&self, batch: Vec<SoloProbeRequest>) {
+        *self.latest_batch.lock() = Some(batch);
+        let _ = self.wake_tx.try_send(());
+    }
+
+    fn try_recv(&self) -> Result<SoloProbeResult, crossbeam_channel::TryRecvError> {
         self.result_rx.try_recv()
     }
 }
@@ -659,6 +730,251 @@ fn process_media_load_request(request: MediaLoadRequest) -> MediaLoadResult {
             }
         }
     }
+}
+
+fn run_solo_probe_coordinator(
+    latest_batch: Arc<Mutex<Option<Vec<SoloProbeRequest>>>>,
+    wake_rx: crossbeam_channel::Receiver<()>,
+    result_tx: crossbeam_channel::Sender<SoloProbeResult>,
+) {
+    while wake_rx.recv().is_ok() {
+        'drain: loop {
+            while wake_rx.try_recv().is_ok() {}
+
+            let Some(batch) = latest_batch.lock().take() else {
+                break;
+            };
+
+            for request in batch {
+                let result = process_solo_probe_request(request);
+                if result_tx.send(result).is_err() {
+                    return;
+                }
+
+                if latest_batch.lock().is_some() {
+                    continue 'drain;
+                }
+            }
+
+            if latest_batch.lock().is_none() {
+                break;
+            }
+        }
+    }
+}
+
+fn process_solo_probe_request(request: SoloProbeRequest) -> SoloProbeResult {
+    match request {
+        SoloProbeRequest::Image {
+            path,
+            max_texture_side,
+            downscale_filter,
+            gif_filter,
+        } => SoloProbeResult::Image {
+            cached: load_solo_probe_image(
+                path.as_path(),
+                max_texture_side,
+                downscale_filter,
+                gif_filter,
+            ),
+            path,
+            max_texture_side,
+        },
+        SoloProbeRequest::Video {
+            path,
+            max_texture_side,
+        } => SoloProbeResult::Video {
+            thumbnail: extract_video_first_frame_thumbnail(path.as_path(), max_texture_side),
+            path,
+            max_texture_side,
+        },
+    }
+}
+
+fn load_solo_probe_image(
+    path: &Path,
+    max_texture_side: u32,
+    downscale_filter: FilterType,
+    gif_filter: FilterType,
+) -> Option<CachedDecodedImage> {
+    let stamp = file_stamp_for_path(path)?;
+
+    let may_be_animated_by_ext = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| matches!(ext.to_ascii_lowercase().as_str(), "gif" | "webp"))
+        .unwrap_or(false);
+
+    if !may_be_animated_by_ext {
+        if let Some(cached) = lookup_cached_static_thumbnail(path, max_texture_side) {
+            if cached.pixels.len() > DECODED_IMAGE_CACHE_SKIP_ENTRY_BYTES {
+                return None;
+            }
+
+            return Some(CachedDecodedImage {
+                stamp,
+                first_frame: ImageFrame {
+                    pixels: cached.pixels,
+                    width: cached.width,
+                    height: cached.height,
+                    delay_ms: 0,
+                },
+                original_width: cached.original_width,
+                original_height: cached.original_height,
+                is_animated_webp: false,
+            });
+        }
+    }
+
+    let image = LoadedImage::load_first_frame_only(
+        path,
+        Some(max_texture_side),
+        downscale_filter,
+        gif_filter,
+    )
+    .ok()?;
+
+    let is_animated_webp = LoadedImage::is_animated_webp(path);
+    let frame = image.current_frame_data().clone();
+
+    if !image.is_animated() && !is_animated_webp {
+        store_cached_static_thumbnail(
+            path,
+            max_texture_side,
+            &CachedImageThumbnail {
+                pixels: frame.pixels.clone(),
+                width: frame.width,
+                height: frame.height,
+                original_width: image.original_width,
+                original_height: image.original_height,
+            },
+        );
+    }
+
+    if frame.pixels.len() > DECODED_IMAGE_CACHE_SKIP_ENTRY_BYTES {
+        return None;
+    }
+
+    Some(CachedDecodedImage {
+        stamp,
+        first_frame: frame,
+        original_width: image.original_width,
+        original_height: image.original_height,
+        is_animated_webp,
+    })
+}
+
+fn extract_video_first_frame_thumbnail(
+    path: &Path,
+    max_texture_side: u32,
+) -> Option<CachedVideoThumbnail> {
+    if let Some(cached) = lookup_cached_video_thumbnail(path, max_texture_side) {
+        return Some(cached);
+    }
+
+    use gstreamer as gst;
+    use gstreamer::prelude::*;
+    use gstreamer_app as gst_app;
+    use gstreamer_video as gst_video;
+
+    static GST_INIT: OnceLock<Result<(), ()>> = OnceLock::new();
+    let init_result = GST_INIT.get_or_init(|| gst::init().map_err(|_| ()));
+    if init_result.is_err() {
+        return None;
+    }
+
+    let uri = gst::glib::filename_to_uri(path, None).ok()?.to_string();
+    let pipeline_str = format!(
+        "uridecodebin uri=\"{}\" name=dec ! videoconvert ! videoscale ! \
+         video/x-raw,format=RGBA ! appsink name=sink max-buffers=1 drop=true",
+        uri.replace("\"", "\\\"")
+    );
+
+    let pipeline = gst::parse::launch(&pipeline_str).ok()?;
+    let pipeline = pipeline.downcast::<gst::Pipeline>().ok()?;
+    let appsink = pipeline
+        .by_name("sink")?
+        .dynamic_cast::<gst_app::AppSink>()
+        .ok()?;
+
+    let frame_data: Arc<Mutex<Option<(Vec<u8>, u32, u32)>>> = Arc::new(Mutex::new(None));
+    let frame_data_clone = Arc::clone(&frame_data);
+
+    appsink.set_callbacks(
+        gst_app::AppSinkCallbacks::builder()
+            .new_preroll(move |sink| {
+                if let Ok(sample) = sink.pull_preroll() {
+                    if let (Some(buffer), Some(caps)) = (sample.buffer(), sample.caps()) {
+                        if let Ok(video_info) = gst_video::VideoInfo::from_caps(caps) {
+                            let width = video_info.width();
+                            let height = video_info.height();
+                            if let Ok(map) = buffer.map_readable() {
+                                let pixels = map.as_slice().to_vec();
+                                *frame_data_clone.lock() = Some((pixels, width, height));
+                            }
+                        }
+                    }
+                }
+                Ok(gst::FlowSuccess::Ok)
+            })
+            .build(),
+    );
+
+    if pipeline.set_state(gst::State::Paused).is_err() {
+        let _ = pipeline.set_state(gst::State::Null);
+        return None;
+    }
+
+    let bus = pipeline.bus()?;
+    let deadline = Instant::now() + Duration::from_millis(500);
+    let mut got_frame = false;
+
+    while Instant::now() < deadline {
+        if let Some(msg) = bus.timed_pop(gst::ClockTime::from_mseconds(50)) {
+            match msg.view() {
+                gst::MessageView::AsyncDone(_) | gst::MessageView::Eos(_) => {
+                    got_frame = true;
+                    break;
+                }
+                gst::MessageView::Error(_) => break,
+                _ => {}
+            }
+        }
+
+        if frame_data.lock().is_some() {
+            got_frame = true;
+            break;
+        }
+    }
+
+    let _ = pipeline.set_state(gst::State::Null);
+
+    if !got_frame {
+        return None;
+    }
+
+    let (pixels, width, height) = frame_data.lock().clone()?;
+    if pixels.is_empty() || width == 0 || height == 0 {
+        return None;
+    }
+
+    let (final_width, final_height, final_pixels) = downscale_rgba_if_needed(
+        width,
+        height,
+        &pixels,
+        max_texture_side,
+        FilterType::Triangle,
+    );
+
+    let thumbnail = CachedVideoThumbnail {
+        pixels: final_pixels.into_owned(),
+        width: final_width,
+        height: final_height,
+        original_width: width,
+        original_height: height,
+    };
+    store_cached_video_thumbnail(path, max_texture_side, &thumbnail);
+    Some(thumbnail)
 }
 
 struct MangaFocusedVideoLoadRequest {
@@ -767,6 +1083,10 @@ fn process_manga_focused_video_load_request(
 
 const DECODED_IMAGE_CACHE_MAX_BYTES: u64 = 192 * 1024 * 1024;
 const DECODED_IMAGE_CACHE_SKIP_ENTRY_BYTES: usize = 24 * 1024 * 1024;
+const SOLO_LOOK_FORWARD_PROBE_COUNT: usize = 4;
+const SOLO_LOOK_BACKWARD_PROBE_COUNT: usize = 2;
+const SOLO_LOD_OVERSCAN_FLOATING: f32 = 1.10;
+const SOLO_LOD_OVERSCAN_FULLSCREEN: f32 = 1.12;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct FileStamp {
@@ -847,6 +1167,8 @@ struct ImageViewer {
     next_media_load_request_id: u64,
     /// Latest-only non-blocking solo media load coordinator.
     media_load_coordinator: MediaLoadCoordinator,
+    /// Latest-only background probe worker for floating/fullscreen navigation windows.
+    solo_probe_coordinator: SoloProbeCoordinator,
     /// Active non-blocking media load (if any).
     pending_media_load: Option<PendingMediaLoad>,
     /// Monotonic request id for async manga-focused video startup.
@@ -975,6 +1297,8 @@ struct ImageViewer {
     video_texture_dims: Option<(u32, u32)>,
     /// Current media type being displayed
     current_media_type: Option<MediaType>,
+    /// Prefetched first-frame thumbnail used while a solo video is still warming up.
+    pending_video_thumbnail_placeholder: Option<PendingVideoThumbnailPlaceholder>,
     /// One-shot placeholder to keep the currently visible strip item on screen
     /// while switching from strip mode back to solo mode.
     pending_mode_switch_placeholder: Option<ModeSwitchPlaceholder>,
@@ -1320,6 +1644,7 @@ impl Default for ImageViewer {
             pending_media_directory_started_at: None,
             next_media_load_request_id: 1,
             media_load_coordinator: MediaLoadCoordinator::new(),
+            solo_probe_coordinator: SoloProbeCoordinator::new(),
             pending_media_load: None,
             next_manga_video_load_request_id: 1,
             manga_video_load_coordinator: MangaFocusedVideoLoadCoordinator::new(),
@@ -1376,6 +1701,7 @@ impl Default for ImageViewer {
             video_texture: None,
             video_texture_dims: None,
             current_media_type: None,
+            pending_video_thumbnail_placeholder: None,
             pending_mode_switch_placeholder: None,
             retained_media_placeholder_visible: false,
             defer_media_view_reset: false,
@@ -1762,6 +2088,94 @@ impl ImageViewer {
         true
     }
 
+    fn has_valid_decoded_image_cache_entry(
+        &mut self,
+        path: &PathBuf,
+        max_texture_side: u32,
+    ) -> bool {
+        let key = decoded_image_cache_key(path, max_texture_side);
+        let path_is_gif = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("gif"))
+            .unwrap_or(false);
+        if path_is_gif {
+            self.decoded_image_cache.invalidate(&key);
+            return false;
+        }
+
+        let Some(current_stamp) = file_stamp_for_path(path) else {
+            self.decoded_image_cache.invalidate(&key);
+            return false;
+        };
+
+        let Some(cached) = self.decoded_image_cache.get(&key) else {
+            return false;
+        };
+
+        if cached.stamp != current_stamp {
+            self.decoded_image_cache.invalidate(&key);
+            return false;
+        }
+
+        true
+    }
+
+    fn try_load_image_from_thumbnail_cache(
+        &mut self,
+        path: &PathBuf,
+        max_texture_side: u32,
+    ) -> bool {
+        let may_be_animated_by_ext = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| matches!(ext.to_ascii_lowercase().as_str(), "gif" | "webp"))
+            .unwrap_or(false);
+        if may_be_animated_by_ext {
+            return false;
+        }
+
+        let Some(cached) = lookup_cached_static_thumbnail(path, max_texture_side) else {
+            return false;
+        };
+
+        self.consume_deferred_media_view_reset();
+
+        let frame = ImageFrame {
+            pixels: cached.pixels,
+            width: cached.width,
+            height: cached.height,
+            delay_ms: 0,
+        };
+
+        if let Some(stamp) = file_stamp_for_path(path) {
+            self.decoded_image_cache.insert(
+                decoded_image_cache_key(path, max_texture_side),
+                Arc::new(CachedDecodedImage {
+                    stamp,
+                    first_frame: frame.clone(),
+                    original_width: cached.original_width,
+                    original_height: cached.original_height,
+                    is_animated_webp: false,
+                }),
+            );
+        }
+
+        self.image = Some(LoadedImage::from_single_frame(
+            path.clone(),
+            frame,
+            cached.original_width,
+            cached.original_height,
+        ));
+        self.retained_media_placeholder_visible = false;
+        self.texture_frame = usize::MAX;
+        self.image_changed = true;
+        self.pending_media_layout = false;
+        self.error_message = None;
+
+        true
+    }
+
     fn cache_loaded_image_first_frame(
         &mut self,
         path: &PathBuf,
@@ -1780,6 +2194,21 @@ impl ImageViewer {
         }
 
         let frame = image.current_frame_data();
+
+        if !image.is_animated() && !is_animated_webp {
+            store_cached_static_thumbnail(
+                path,
+                max_texture_side,
+                &CachedImageThumbnail {
+                    pixels: frame.pixels.clone(),
+                    width: frame.width,
+                    height: frame.height,
+                    original_width: image.original_width,
+                    original_height: image.original_height,
+                },
+            );
+        }
+
         if frame.pixels.len() > DECODED_IMAGE_CACHE_SKIP_ENTRY_BYTES {
             return;
         }
@@ -1794,6 +2223,383 @@ impl ImageViewer {
                 is_animated_webp,
             }),
         );
+    }
+
+    fn solo_known_media_dimensions(
+        &self,
+        path: &PathBuf,
+        media_type: MediaType,
+        allow_sync_image_probe: bool,
+    ) -> Option<(u32, u32)> {
+        match media_type {
+            MediaType::Image => lookup_cached_dimensions(path, CachedMediaKind::Image).or_else(|| {
+                if !allow_sync_image_probe {
+                    return None;
+                }
+
+                let dims = probe_image_dimensions(path);
+                if let Some((width, height)) = dims {
+                    store_cached_dimensions(path, CachedMediaKind::Image, width, height);
+                }
+                dims
+            }),
+            MediaType::Video => lookup_cached_dimensions(path, CachedMediaKind::Video),
+        }
+    }
+
+    fn solo_viewport_size_for_lod(&self) -> egui::Vec2 {
+        if self.is_fullscreen {
+            return egui::vec2(self.screen_size.x.max(1.0), self.screen_size.y.max(1.0));
+        }
+
+        let requested = self.last_requested_inner_size.unwrap_or(self.screen_size);
+        egui::vec2(
+            self.screen_size.x.max(requested.x).max(1.0),
+            self.screen_size.y.max(requested.y).max(1.0),
+        )
+    }
+
+    fn solo_quantize_target_texture_side(
+        &self,
+        target_texture_side: u32,
+        source_dims: Option<(u32, u32)>,
+    ) -> u32 {
+        let max_side = self.max_texture_side.max(1);
+        let source_long = source_dims
+            .map(|(width, height)| width.max(height).max(1))
+            .unwrap_or(max_side);
+        let target = target_texture_side.max(1).min(max_side).min(source_long);
+
+        let mut last_candidate = 0u32;
+        for &bucket in LOD_SIDE_BUCKETS {
+            let candidate = bucket.min(max_side).min(source_long);
+            if candidate == 0 || candidate == last_candidate {
+                continue;
+            }
+            last_candidate = candidate;
+
+            if candidate >= target {
+                return candidate;
+            }
+        }
+
+        source_long.min(max_side).max(1)
+    }
+
+    fn solo_target_texture_side_for_path(
+        &self,
+        path: &PathBuf,
+        media_type: MediaType,
+        allow_sync_image_probe: bool,
+    ) -> u32 {
+        let viewport = self.solo_viewport_size_for_lod();
+        let source_dims = self.solo_known_media_dimensions(path, media_type, allow_sync_image_probe);
+
+        let display_side = if let Some((img_w_u, img_h_u)) = source_dims {
+            let img_w = img_w_u as f32;
+            let img_h = img_h_u as f32;
+            if img_w > 0.0 && img_h > 0.0 {
+                if self.is_fullscreen {
+                    let force_fit = self.strip_open_force_fit_path.as_ref() == Some(path);
+                    let saved_zoom = if force_fit {
+                        None
+                    } else {
+                        self.fullscreen_view_states
+                            .get(path)
+                            .map(|state| state.zoom.max(state.zoom_target))
+                    };
+                    let zoom = saved_zoom.unwrap_or_else(|| {
+                        (viewport.y / img_h).clamp(0.1, self.max_zoom_factor())
+                    });
+                    (img_w * zoom).max(img_h * zoom)
+                } else {
+                    let zoom = if media_type == MediaType::Video {
+                        if img_h > viewport.y {
+                            (viewport.y / img_h).clamp(0.1, self.max_zoom_factor())
+                        } else {
+                            1.0
+                        }
+                    } else if img_h > viewport.y || img_w > viewport.x {
+                        (viewport.y / img_h).min(viewport.x / img_w).min(1.0)
+                    } else {
+                        1.0
+                    };
+                    (img_w * zoom).max(img_h * zoom)
+                }
+            } else {
+                viewport.x.max(viewport.y)
+            }
+        } else {
+            viewport.x.max(viewport.y)
+        };
+
+        let overscan = if self.is_fullscreen {
+            SOLO_LOD_OVERSCAN_FULLSCREEN
+        } else {
+            SOLO_LOD_OVERSCAN_FLOATING
+        };
+        let target = (display_side * overscan).ceil().max(1.0) as u32;
+        self.solo_quantize_target_texture_side(target, source_dims)
+    }
+
+    fn solo_expected_min_display_side(&self) -> f32 {
+        let viewport = self.solo_viewport_size_for_lod();
+        viewport.x.min(viewport.y).max(1.0)
+    }
+
+    fn solo_video_thumbnail_texture_options(
+        &self,
+        width: u32,
+        height: u32,
+    ) -> egui::TextureOptions {
+        let min_side = width.min(height);
+        let enable_mipmap = self.config.manga_mipmap_video_thumbnails
+            && min_side >= self.config.manga_mipmap_min_side.max(1)
+            && (min_side as f32) >= self.solo_expected_min_display_side() * 1.15;
+
+        self.config
+            .texture_filter_video
+            .to_egui_options_with_mipmap(enable_mipmap)
+    }
+
+    fn solo_wrapped_index_with_offset(&self, offset: isize) -> Option<usize> {
+        let len = self.image_list.len();
+        if len == 0 {
+            return None;
+        }
+
+        Some((self.current_index as isize + offset).rem_euclid(len as isize) as usize)
+    }
+
+    fn schedule_solo_probe_window(
+        &mut self,
+        current_path: &PathBuf,
+        current_media_type: Option<MediaType>,
+    ) {
+        if self.manga_mode || self.image_list.len() <= 1 {
+            return;
+        }
+
+        let downscale_filter = self.config.downscale_filter.to_image_filter();
+        let gif_filter = self.config.gif_resize_filter.to_image_filter();
+        let mut queued_indices = HashSet::new();
+        let mut requests = Vec::with_capacity(
+            SOLO_LOOK_FORWARD_PROBE_COUNT + SOLO_LOOK_BACKWARD_PROBE_COUNT + 1,
+        );
+
+        if current_media_type == Some(MediaType::Video) {
+            let current_target_side =
+                self.solo_target_texture_side_for_path(current_path, MediaType::Video, false);
+            if let Some(thumbnail) = lookup_cached_video_thumbnail(current_path, current_target_side) {
+                self.pending_video_thumbnail_placeholder = Some(PendingVideoThumbnailPlaceholder {
+                    path: current_path.clone(),
+                    thumbnail,
+                });
+            } else {
+                requests.push(SoloProbeRequest::Video {
+                    path: current_path.clone(),
+                    max_texture_side: current_target_side,
+                });
+                queued_indices.insert(self.current_index);
+            }
+        }
+
+        for offset in 1..=SOLO_LOOK_FORWARD_PROBE_COUNT as isize {
+            let Some(index) = self.solo_wrapped_index_with_offset(offset) else {
+                continue;
+            };
+            if !queued_indices.insert(index) {
+                continue;
+            }
+
+            let Some(path) = self.image_list.get(index).cloned() else {
+                continue;
+            };
+            let Some(media_type) = get_media_type(&path) else {
+                continue;
+            };
+
+            match media_type {
+                MediaType::Image => {
+                    let extension = path
+                        .extension()
+                        .and_then(|ext| ext.to_str())
+                        .map(|ext| ext.to_ascii_lowercase());
+                    if extension.as_deref() == Some("gif") {
+                        continue;
+                    }
+
+                    let target_side = self.solo_target_texture_side_for_path(&path, media_type, false);
+                    if self.has_valid_decoded_image_cache_entry(&path, target_side) {
+                        continue;
+                    }
+
+                    let may_be_animated_by_ext = matches!(extension.as_deref(), Some("webp"));
+                    if !may_be_animated_by_ext
+                        && lookup_cached_static_thumbnail(&path, target_side).is_some()
+                    {
+                        continue;
+                    }
+
+                    requests.push(SoloProbeRequest::Image {
+                        path,
+                        max_texture_side: target_side,
+                        downscale_filter,
+                        gif_filter,
+                    });
+                }
+                MediaType::Video => {
+                    let target_side = self.solo_target_texture_side_for_path(&path, media_type, false);
+                    if lookup_cached_video_thumbnail(&path, target_side).is_some() {
+                        continue;
+                    }
+
+                    requests.push(SoloProbeRequest::Video {
+                        path,
+                        max_texture_side: target_side,
+                    });
+                }
+            }
+        }
+
+        for offset in 1..=SOLO_LOOK_BACKWARD_PROBE_COUNT as isize {
+            let Some(index) = self.solo_wrapped_index_with_offset(-offset) else {
+                continue;
+            };
+            if !queued_indices.insert(index) {
+                continue;
+            }
+
+            let Some(path) = self.image_list.get(index).cloned() else {
+                continue;
+            };
+            let Some(media_type) = get_media_type(&path) else {
+                continue;
+            };
+
+            match media_type {
+                MediaType::Image => {
+                    let extension = path
+                        .extension()
+                        .and_then(|ext| ext.to_str())
+                        .map(|ext| ext.to_ascii_lowercase());
+                    if extension.as_deref() == Some("gif") {
+                        continue;
+                    }
+
+                    let target_side = self.solo_target_texture_side_for_path(&path, media_type, false);
+                    if self.has_valid_decoded_image_cache_entry(&path, target_side) {
+                        continue;
+                    }
+
+                    let may_be_animated_by_ext = matches!(extension.as_deref(), Some("webp"));
+                    if !may_be_animated_by_ext
+                        && lookup_cached_static_thumbnail(&path, target_side).is_some()
+                    {
+                        continue;
+                    }
+
+                    requests.push(SoloProbeRequest::Image {
+                        path,
+                        max_texture_side: target_side,
+                        downscale_filter,
+                        gif_filter,
+                    });
+                }
+                MediaType::Video => {
+                    let target_side = self.solo_target_texture_side_for_path(&path, media_type, false);
+                    if lookup_cached_video_thumbnail(&path, target_side).is_some() {
+                        continue;
+                    }
+
+                    requests.push(SoloProbeRequest::Video {
+                        path,
+                        max_texture_side: target_side,
+                    });
+                }
+            }
+        }
+
+        if !requests.is_empty() {
+            self.solo_probe_coordinator.submit_batch(requests);
+        }
+    }
+
+    fn poll_pending_solo_probe(&mut self, ctx: &egui::Context) {
+        let mut request_repaint = false;
+
+        loop {
+            let result = match self.solo_probe_coordinator.try_recv() {
+                Ok(result) => result,
+                Err(crossbeam_channel::TryRecvError::Empty)
+                | Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+            };
+
+            match result {
+                SoloProbeResult::Image {
+                    path,
+                    max_texture_side,
+                    cached,
+                } => {
+                    let Some(cached) = cached else {
+                        continue;
+                    };
+
+                    self.decoded_image_cache.insert(
+                        decoded_image_cache_key(&path, max_texture_side),
+                        Arc::new(cached),
+                    );
+
+                    let current_matches = self.current_media_type == Some(MediaType::Image)
+                        && self
+                            .image_list
+                            .get(self.current_index)
+                            .is_some_and(|current| current == &path)
+                        && self.image.is_none();
+                    if current_matches {
+                        let gif_filter = self.config.gif_resize_filter.to_image_filter();
+                        if self.try_load_image_from_decoded_cache(&path, max_texture_side, gif_filter) {
+                            if self.pending_media_load.as_ref().is_some_and(|pending| {
+                                pending.kind == PendingMediaLoadKind::Image && pending.path == path
+                            }) {
+                                self.pending_media_load = None;
+                            }
+                            request_repaint = true;
+                        }
+                    }
+                }
+                SoloProbeResult::Video {
+                    path,
+                    max_texture_side,
+                    thumbnail,
+                } => {
+                    let Some(thumbnail) = thumbnail else {
+                        continue;
+                    };
+
+                    let current_matches = self.current_media_type == Some(MediaType::Video)
+                        && self
+                            .image_list
+                            .get(self.current_index)
+                            .is_some_and(|current| current == &path)
+                        && (self.video_texture.is_none() || self.retained_media_placeholder_visible);
+                    if current_matches {
+                        self.pending_video_thumbnail_placeholder =
+                            Some(PendingVideoThumbnailPlaceholder {
+                                path: path.clone(),
+                                thumbnail,
+                            });
+                        request_repaint = true;
+                    } else {
+                        store_cached_video_thumbnail(&path, max_texture_side, &thumbnail);
+                    }
+                }
+            }
+        }
+
+        if request_repaint {
+            ctx.request_repaint();
+        }
     }
 
     fn update_fps_stats(&mut self, frame_was_active: bool) {
@@ -3815,6 +4621,7 @@ impl ImageViewer {
             .position(|candidate| candidate == &target_path)
             .unwrap_or(0);
         self.set_current_index_clamped(resolved_index);
+        self.schedule_solo_probe_window(&target_path, self.current_media_type);
         ctx.request_repaint();
     }
 
@@ -4209,6 +5016,7 @@ impl ImageViewer {
 
         self.reset_masonry_metadata_preload();
         self.clear_pending_media_load();
+        self.pending_video_thumbnail_placeholder = None;
 
         self.current_file_size_label = None;
         self.current_file_size_label_path = None;
@@ -4356,9 +5164,17 @@ impl ImageViewer {
                 // in the background so the animation begins playing progressively.
                 let downscale_filter = self.config.downscale_filter.to_image_filter();
                 let gif_filter = self.config.gif_resize_filter.to_image_filter();
-                let max_tex = self.max_texture_side;
+                let max_tex = self.solo_target_texture_side_for_path(path, MediaType::Image, true);
 
                 if self.try_load_image_from_decoded_cache(path, max_tex, gif_filter) {
+                    self.schedule_solo_probe_window(path, media_type);
+                    self.perf_metrics
+                        .record_duration("load_media_prepare_ms", load_media_start.elapsed());
+                    return;
+                }
+
+                if self.try_load_image_from_thumbnail_cache(path, max_tex) {
+                    self.schedule_solo_probe_window(path, media_type);
                     self.perf_metrics
                         .record_duration("load_media_prepare_ms", load_media_start.elapsed());
                     return;
@@ -4370,6 +5186,10 @@ impl ImageViewer {
                 self.drop_retained_media_placeholder();
                 self.error_message = Some(format!("Unsupported file format: {:?}", path));
             }
+        }
+
+        if media_type.is_some() {
+            self.schedule_solo_probe_window(path, media_type);
         }
 
         self.perf_metrics
@@ -11676,6 +12496,43 @@ impl ImageViewer {
             }
         }
 
+        if matches!(self.current_media_type, Some(MediaType::Video))
+            && (self.video_texture.is_none() || self.retained_media_placeholder_visible)
+        {
+            let current_path = self.image_list.get(self.current_index).cloned();
+            let should_upload_placeholder = self
+                .pending_video_thumbnail_placeholder
+                .as_ref()
+                .is_some_and(|placeholder| Some(&placeholder.path) == current_path.as_ref());
+            if should_upload_placeholder {
+                if let Some(placeholder) = self.pending_video_thumbnail_placeholder.take() {
+                    let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                        [
+                            placeholder.thumbnail.width as usize,
+                            placeholder.thumbnail.height as usize,
+                        ],
+                        &placeholder.thumbnail.pixels,
+                    );
+                    self.video_texture = Some(ctx.load_texture(
+                        "video-thumbnail-placeholder",
+                        color_image,
+                        self.solo_video_thumbnail_texture_options(
+                            placeholder.thumbnail.width,
+                            placeholder.thumbnail.height,
+                        ),
+                    ));
+                    self.video_texture_dims = Some((
+                        placeholder.thumbnail.width,
+                        placeholder.thumbnail.height,
+                    ));
+                    self.retained_media_placeholder_visible = false;
+                    needs_repaint = true;
+                }
+            }
+        }
+
+        let solo_expected_min_display_side = self.solo_expected_min_display_side();
+
         // Handle image texture updates
         if let Some(ref mut img) = self.image {
             // In manga mode, keep the main image static (first frame only).
@@ -11725,7 +12582,13 @@ impl ImageViewer {
                 let texture_options = if img.is_animated() {
                     self.config.texture_filter_animated.to_egui_options()
                 } else {
-                    self.config.texture_filter_static.to_egui_options()
+                    let min_side = w.min(h);
+                    let enable_mipmap = self.config.manga_mipmap_static
+                        && min_side >= self.config.manga_mipmap_min_side.max(1)
+                        && (min_side as f32) >= solo_expected_min_display_side * 1.15;
+                    self.config
+                        .texture_filter_static
+                        .to_egui_options_with_mipmap(enable_mipmap)
                 };
 
                 self.texture = Some(ctx.load_texture("image", color_image, texture_options));
@@ -14618,6 +15481,7 @@ impl eframe::App for ImageViewer {
         }
 
         self.poll_pending_media_directory_scan(ctx);
+        self.poll_pending_solo_probe(ctx);
         self.poll_pending_media_load(ctx);
         if !(self.manga_mode && self.is_fullscreen) {
             self.poll_pending_manga_video_load(ctx);
