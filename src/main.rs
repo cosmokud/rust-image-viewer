@@ -2817,10 +2817,39 @@ impl ImageViewer {
         }
     }
 
+    fn manga_layout_goto_file_action(&self) -> Action {
+        if self.is_masonry_mode() {
+            Action::MasonryGotoFile
+        } else {
+            Action::MangaGotoFile
+        }
+    }
+
+    fn manga_layout_pan_action(&self) -> Action {
+        if self.is_masonry_mode() {
+            Action::MasonryPan
+        } else {
+            Action::MangaPan
+        }
+    }
+
+    fn manga_layout_freehand_autoscroll_action(&self) -> Action {
+        if self.is_masonry_mode() {
+            Action::MasonryFreehandAutoscroll
+        } else {
+            Action::MangaFreehandAutoscroll
+        }
+    }
+
     fn run_action(&mut self, action: Action) {
         match action {
             Action::Exit => self.should_exit = true,
             Action::ToggleFullscreen => self.request_shortcut_fullscreen_toggle(),
+            Action::GotoFile => {
+                if !self.manga_mode {
+                    self.request_shortcut_fullscreen_toggle();
+                }
+            }
             Action::NextImage => self.next_image(),
             Action::PreviousImage => self.prev_image(),
             Action::RotateClockwise => {
@@ -2991,7 +3020,7 @@ impl ImageViewer {
 
     fn strip_item_open_uses_right_click(&self) -> bool {
         self.config
-            .action_uses_binding(Action::SelectFile, &InputBinding::MouseRight)
+            .action_uses_binding(self.manga_layout_goto_file_action(), &InputBinding::MouseRight)
     }
 
     fn strip_item_open_binding_triggered(
@@ -3001,7 +3030,13 @@ impl ImageViewer {
         shift: bool,
         alt: bool,
     ) -> bool {
-        self.action_binding_triggered(Action::SelectFile, input, ctrl, shift, alt)
+        self.action_binding_triggered(
+            self.manga_layout_goto_file_action(),
+            input,
+            ctrl,
+            shift,
+            alt,
+        )
     }
 
     fn action_uses_binding(&self, action: Action, binding: InputBinding) -> bool {
@@ -4511,20 +4546,12 @@ impl ImageViewer {
     fn request_shortcut_fullscreen_toggle(&mut self) {
         self.stop_manga_autoscroll();
 
-        if self.is_fullscreen
-            && !self.manga_mode
-            && self.strip_return_mode_for_fullscreen_toggle().is_some()
-        {
-            self.return_to_strip_mode_from_fullscreen_toggle();
-            return;
-        }
+        self.clear_strip_return_context();
+        self.titlebar_pending_restore_layout = None;
+        self.titlebar_previous_mode = None;
+        self.toggle_fullscreen_from_titlebar = false;
 
         if !self.is_fullscreen {
-            if let Some(previous_mode) = self.titlebar_previous_mode.take() {
-                self.request_titlebar_fullscreen_reentry(Some(previous_mode));
-                return;
-            }
-
             if self.config.maximize_to_borderless_fullscreen {
                 self.toggle_fullscreen_force_borderless = true;
             }
@@ -10144,7 +10171,7 @@ impl ImageViewer {
                 let shift = input.modifiers.shift;
                 let alt = input.modifiers.alt;
                 self.action_binding_triggered(
-                    Action::FreehandAutoscroll,
+                    self.manga_layout_freehand_autoscroll_action(),
                     input,
                     ctrl,
                     shift,
@@ -10156,7 +10183,7 @@ impl ImageViewer {
                 let ctrl = input.modifiers.ctrl;
                 let shift = input.modifiers.shift;
                 let alt = input.modifiers.alt;
-                self.action_binding_down(Action::Pan, input, ctrl, shift, alt)
+                self.action_binding_down(self.manga_layout_pan_action(), input, ctrl, shift, alt)
             });
 
         // Avoid triggering manga interactions while selecting/copying title-bar text.
@@ -11095,11 +11122,7 @@ impl ImageViewer {
         ))
     }
 
-    fn right_click_black_bar_action(
-        &self,
-        pos: egui::Pos2,
-        screen_rect: egui::Rect,
-    ) -> Option<Action> {
+    fn current_media_rect(&self, screen_rect: egui::Rect) -> Option<egui::Rect> {
         let display_size = self.image_display_size_at_zoom()?;
         if display_size.x <= 0.0 || display_size.y <= 0.0 {
             return None;
@@ -11115,7 +11138,20 @@ impl ImageViewer {
             screen_rect.center() + self.offset
         };
 
-        let image_rect = egui::Rect::from_center_size(center, display_size);
+        Some(egui::Rect::from_center_size(center, display_size))
+    }
+
+    fn point_over_current_media(&self, pos: egui::Pos2, screen_rect: egui::Rect) -> bool {
+        self.current_media_rect(screen_rect)
+            .is_some_and(|image_rect| image_rect.contains(pos))
+    }
+
+    fn right_click_black_bar_action(
+        &self,
+        pos: egui::Pos2,
+        screen_rect: egui::Rect,
+    ) -> Option<Action> {
+        let image_rect = self.current_media_rect(screen_rect)?;
 
         const MIN_BAR_WIDTH: f32 = 0.5;
         let left_gap = image_rect.min.x - screen_rect.min.x;
@@ -11363,7 +11399,6 @@ impl ImageViewer {
         let mut actions_to_run: Vec<Action> = Vec::new();
         let mut strip_item_open_from_strip = false;
         let mut strip_item_open_pointer_pos: Option<egui::Pos2> = None;
-        let mut right_click_return_to_strip = false;
         let mut right_click_toggle_fullscreen = false;
         let mut right_click_navigated = false;
 
@@ -11405,16 +11440,21 @@ impl ImageViewer {
 
                 let handled_elsewhere = matches!(
                     action,
-                    Action::SelectFile
-                        | Action::SelectArea
+                    Action::SelectArea
                         | Action::Pan
                         | Action::FreehandAutoscroll
+                        | Action::MangaPan
+                        | Action::MangaGotoFile
+                        | Action::MangaFreehandAutoscroll
                         | Action::MangaPanUp
                         | Action::MangaPanDown
                         | Action::MangaNextImageFit
                         | Action::MangaPreviousImageFit
                         | Action::MangaScrollUp
                         | Action::MangaScrollDown
+                        | Action::MasonryPan
+                        | Action::MasonryGotoFile
+                        | Action::MasonryFreehandAutoscroll
                         | Action::MasonryPanUp
                         | Action::MasonryPanDown
                         | Action::MasonryPanUp2
@@ -11430,6 +11470,7 @@ impl ImageViewer {
 
                 let action_active = match action {
                     Action::ToggleFullscreen
+                    | Action::GotoFile
                     | Action::Exit
                     | Action::ResetZoom
                     | Action::Minimize
@@ -11518,8 +11559,8 @@ impl ImageViewer {
                 if let Some(pos) = pointer_pos {
                     let select_area_uses_right_click =
                         self.action_uses_binding(Action::SelectArea, InputBinding::MouseRight);
-                    let toggle_fullscreen_uses_right_click =
-                        self.action_uses_binding(Action::ToggleFullscreen, InputBinding::MouseRight);
+                    let goto_file_uses_right_click =
+                        self.action_uses_binding(Action::GotoFile, InputBinding::MouseRight);
 
                     if select_area_uses_right_click && !self.manga_mode {
                         if let Some(action) =
@@ -11538,14 +11579,11 @@ impl ImageViewer {
                     } else if select_area_uses_right_click && pos.x > screen_width - side_zone {
                         actions_to_run.push(Action::NextImage);
                         right_click_navigated = true;
-                    } else if !self.manga_mode && toggle_fullscreen_uses_right_click {
-                        if self.is_fullscreen
-                            && self.strip_return_mode_for_fullscreen_toggle().is_some()
-                        {
-                            right_click_return_to_strip = true;
-                        } else {
-                            right_click_toggle_fullscreen = true;
-                        }
+                    } else if !self.manga_mode
+                        && goto_file_uses_right_click
+                        && self.point_over_current_media(pos, input.screen_rect)
+                    {
+                        right_click_toggle_fullscreen = true;
                         return;
                     } else {
                         // Center region: toggle play/pause for videos, do nothing for images
@@ -11561,11 +11599,6 @@ impl ImageViewer {
                 .and_then(|pos| self.manga_index_at_screen_pos(pos))
                 .unwrap_or(self.current_index);
             self.open_strip_item_in_solo_fullscreen(target_index, false);
-            return;
-        }
-
-        if right_click_return_to_strip {
-            self.request_shortcut_fullscreen_toggle();
             return;
         }
 
@@ -11615,11 +11648,10 @@ impl ImageViewer {
         }
 
         // Backward-compatible fallback: treat Enter as fullscreen toggle when unbound.
-        // New defaults bind Enter explicitly, but existing user configs may not include it yet.
         let enter_pressed = ctx.input(|i| i.key_pressed(egui::Key::Enter));
         let enter_bound = self
             .config
-            .any_action_uses_binding(&InputBinding::Key(egui::Key::Enter));
+            .action_uses_binding(Action::ToggleFullscreen, &InputBinding::Key(egui::Key::Enter));
         if enter_pressed && !enter_bound {
             self.request_shortcut_fullscreen_toggle();
         }
@@ -11629,6 +11661,18 @@ impl ImageViewer {
         // - Floating/normal fullscreen: PageUp/PageDown/Home/End navigate files.
         if self.manga_mode && self.is_fullscreen {
             let masonry_fullscreen = self.is_masonry_mode();
+            let page_up = ctx.input(|input| {
+                let ctrl = input.modifiers.ctrl;
+                let shift = input.modifiers.shift;
+                let alt = input.modifiers.alt;
+                self.action_binding_triggered(Action::MangaPreviousImage, input, ctrl, shift, alt)
+            });
+            let page_down = ctx.input(|input| {
+                let ctrl = input.modifiers.ctrl;
+                let shift = input.modifiers.shift;
+                let alt = input.modifiers.alt;
+                self.action_binding_triggered(Action::MangaNextImage, input, ctrl, shift, alt)
+            });
             let home = ctx.input(|i| i.key_pressed(egui::Key::Home));
             let end = ctx.input(|i| i.key_pressed(egui::Key::End));
 
@@ -11777,6 +11821,12 @@ impl ImageViewer {
                 if pan_down {
                     self.apply_manga_pan_step(1.0, 1.0);
                 }
+                if page_up {
+                    self.manga_page_up();
+                }
+                if page_down {
+                    self.manga_page_down();
+                }
             }
 
             if home {
@@ -11796,10 +11846,10 @@ impl ImageViewer {
 
             let page_up_bound = self
                 .config
-                .any_action_uses_binding(&InputBinding::Key(egui::Key::PageUp));
+                .action_uses_binding(Action::PreviousImage, &InputBinding::Key(egui::Key::PageUp));
             let page_down_bound = self
                 .config
-                .any_action_uses_binding(&InputBinding::Key(egui::Key::PageDown));
+                .action_uses_binding(Action::NextImage, &InputBinding::Key(egui::Key::PageDown));
             let home_bound = self
                 .config
                 .any_action_uses_binding(&InputBinding::Key(egui::Key::Home));
