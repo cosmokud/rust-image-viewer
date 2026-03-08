@@ -105,6 +105,62 @@ fn paint_loading_spinner(painter: &egui::Painter, rect: egui::Rect, time: f64) {
     painter.add(egui::Shape::line(points.to_vec(), stroke));
 }
 
+fn rotate_quad_point(center: egui::Pos2, local: egui::Vec2, angle_radians: f32) -> egui::Pos2 {
+    let (sin, cos) = angle_radians.sin_cos();
+    center
+        + egui::vec2(
+            local.x * cos - local.y * sin,
+            local.x * sin + local.y * cos,
+        )
+}
+
+fn rotated_bounding_size(size: egui::Vec2, angle_radians: f32) -> egui::Vec2 {
+    let sin = angle_radians.sin().abs();
+    let cos = angle_radians.cos().abs();
+
+    egui::vec2(
+        size.x * cos + size.y * sin,
+        size.x * sin + size.y * cos,
+    )
+}
+
+fn paint_rotated_texture(
+    painter: &egui::Painter,
+    texture_id: egui::TextureId,
+    center: egui::Pos2,
+    size: egui::Vec2,
+    angle_radians: f32,
+    tint: egui::Color32,
+) {
+    let half = size * 0.5;
+    let local_corners = [
+        egui::vec2(-half.x, -half.y),
+        egui::vec2(half.x, -half.y),
+        egui::vec2(half.x, half.y),
+        egui::vec2(-half.x, half.y),
+    ];
+    let uvs = [
+        egui::pos2(0.0, 0.0),
+        egui::pos2(1.0, 0.0),
+        egui::pos2(1.0, 1.0),
+        egui::pos2(0.0, 1.0),
+    ];
+
+    let mut mesh = egui::epaint::Mesh::with_texture(texture_id);
+    let base = mesh.vertices.len() as u32;
+    for (local, uv) in local_corners.into_iter().zip(uvs) {
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: rotate_quad_point(center, local, angle_radians),
+            uv,
+            color: tint,
+        });
+    }
+    mesh.indices
+        .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+
+    painter.add(egui::Shape::mesh(mesh));
+}
+
 /// Downscale RGBA pixel data if it exceeds the maximum texture size.
 /// Uses Cow to avoid unnecessary allocations when no downscaling is needed.
 /// Uses Triangle filter (faster than Lanczos3) for better performance.
@@ -387,6 +443,10 @@ struct FullscreenViewState {
     zoom_target: f32,
     /// Pan offset
     offset: egui::Vec2,
+    /// Current arbitrary fullscreen rotation in degrees.
+    precise_rotation_degrees: f32,
+    /// Target arbitrary fullscreen rotation in degrees.
+    precise_rotation_target_degrees: f32,
     /// Number of 90° clockwise rotations applied (0-3)
     rotation_steps: u8,
     /// Horizontal flip applied (reserved for future use)
@@ -403,6 +463,8 @@ impl Default for FullscreenViewState {
             zoom: 1.0,
             zoom_target: 1.0,
             offset: egui::Vec2::ZERO,
+            precise_rotation_degrees: 0.0,
+            precise_rotation_target_degrees: 0.0,
             rotation_steps: 0,
             flip_horizontal: false,
             flip_vertical: false,
@@ -801,6 +863,12 @@ struct ImageViewer {
     zoom_target: f32,
     /// Zoom velocity for critically-damped spring animation
     zoom_velocity: f32,
+    /// Current arbitrary fullscreen image rotation in degrees.
+    precise_rotation_degrees: f32,
+    /// Target arbitrary fullscreen image rotation in degrees.
+    precise_rotation_target_degrees: f32,
+    /// Velocity for smooth fullscreen precise-rotation animation.
+    precise_rotation_velocity: f32,
     /// Image offset for panning
     offset: egui::Vec2,
     /// Whether we're currently panning/dragging window
@@ -1250,6 +1318,9 @@ impl Default for ImageViewer {
             zoom: 1.0,
             zoom_target: 1.0,
             zoom_velocity: 0.0,
+            precise_rotation_degrees: 0.0,
+            precise_rotation_target_degrees: 0.0,
+            precise_rotation_velocity: 0.0,
             offset: egui::Vec2::ZERO,
             is_panning: false,
             last_mouse_pos: None,
@@ -2883,6 +2954,16 @@ impl ImageViewer {
                     self.update_fullscreen_rotation(false);
                 }
             }
+            Action::PreciseRotationClockwise => {
+                if self.is_fullscreen && !self.manga_mode && self.image.is_some() {
+                    self.update_fullscreen_precise_rotation(1.0);
+                }
+            }
+            Action::PreciseRotationCounterClockwise => {
+                if self.is_fullscreen && !self.manga_mode && self.image.is_some() {
+                    self.update_fullscreen_precise_rotation(-1.0);
+                }
+            }
             Action::ResetZoom => {
                 self.offset = egui::Vec2::ZERO;
                 self.zoom_target = 1.0;
@@ -4242,6 +4323,8 @@ impl ImageViewer {
             zoom: self.zoom,
             zoom_target: self.zoom_target,
             offset: self.offset,
+            precise_rotation_degrees: self.precise_rotation_degrees,
+            precise_rotation_target_degrees: self.precise_rotation_target_degrees,
             rotation_steps,
             flip_horizontal: false, // Currently not implemented in the viewer
             flip_vertical: false,   // Currently not implemented in the viewer
@@ -4262,6 +4345,9 @@ impl ImageViewer {
             self.zoom_target = state.zoom_target;
             self.offset = state.offset;
             self.zoom_velocity = 0.0;
+            self.precise_rotation_degrees = state.precise_rotation_degrees;
+            self.precise_rotation_target_degrees = state.precise_rotation_target_degrees;
+            self.precise_rotation_velocity = 0.0;
 
             // Apply saved rotations if image was reloaded
             if let Some(ref mut img) = self.image {
@@ -4297,16 +4383,76 @@ impl ImageViewer {
                     zoom: self.zoom,
                     zoom_target: self.zoom_target,
                     offset: self.offset,
+                    precise_rotation_degrees: self.precise_rotation_degrees,
+                    precise_rotation_target_degrees: self.precise_rotation_target_degrees,
                     rotation_steps: 0,
                     flip_horizontal: false,
                     flip_vertical: false,
                 });
+
+        entry.zoom = self.zoom;
+        entry.zoom_target = self.zoom_target;
+        entry.offset = self.offset;
+        entry.precise_rotation_degrees = self.precise_rotation_degrees;
+        entry.precise_rotation_target_degrees = self.precise_rotation_target_degrees;
 
         if clockwise {
             entry.rotation_steps = (entry.rotation_steps + 1) % 4;
         } else {
             entry.rotation_steps = (entry.rotation_steps + 3) % 4; // +3 mod 4 = -1 mod 4
         }
+    }
+
+    fn normalize_precise_rotation_degrees(degrees: f32) -> f32 {
+        (degrees + 180.0).rem_euclid(360.0) - 180.0
+    }
+
+    fn fullscreen_precise_rotation_angle_degrees(&self) -> f32 {
+        if self.is_fullscreen && !self.manga_mode && self.texture.is_some() {
+            Self::normalize_precise_rotation_degrees(self.precise_rotation_degrees)
+        } else {
+            0.0
+        }
+    }
+
+    fn reset_precise_rotation(&mut self) {
+        self.precise_rotation_degrees = 0.0;
+        self.precise_rotation_target_degrees = 0.0;
+        self.precise_rotation_velocity = 0.0;
+    }
+
+    fn update_fullscreen_precise_rotation(&mut self, delta_degrees: f32) {
+        if !self.is_fullscreen || self.manga_mode {
+            return;
+        }
+
+        self.precise_rotation_target_degrees = Self::normalize_precise_rotation_degrees(
+            self.precise_rotation_target_degrees + delta_degrees,
+        );
+
+        let Some(path) = self.image_list.get(self.current_index).cloned() else {
+            return;
+        };
+
+        let entry = self
+            .fullscreen_view_states
+            .entry(path)
+            .or_insert_with(|| FullscreenViewState {
+                zoom: self.zoom,
+                zoom_target: self.zoom_target,
+                offset: self.offset,
+                precise_rotation_degrees: self.precise_rotation_degrees,
+                precise_rotation_target_degrees: self.precise_rotation_target_degrees,
+                rotation_steps: 0,
+                flip_horizontal: false,
+                flip_vertical: false,
+            });
+
+        entry.zoom = self.zoom;
+        entry.zoom_target = self.zoom_target;
+        entry.offset = self.offset;
+        entry.precise_rotation_degrees = self.precise_rotation_degrees;
+        entry.precise_rotation_target_degrees = self.precise_rotation_target_degrees;
     }
 
     /// Load next image
@@ -4775,6 +4921,7 @@ impl ImageViewer {
 
         // No saved state - apply default fullscreen layout
         self.offset = egui::Vec2::ZERO;
+        self.reset_precise_rotation();
 
         // Get dimensions from either image or video
         if let Some((_, img_h)) = self.media_display_dimensions() {
@@ -4863,6 +5010,46 @@ impl ImageViewer {
 
         // Return whether animation needs to continue
         error.abs() > SNAP_THRESHOLD || self.zoom_velocity.abs() > VELOCITY_THRESHOLD
+    }
+
+    fn tick_fullscreen_precise_rotation_animation(&mut self, ctx: &egui::Context) -> bool {
+        if !self.is_fullscreen || self.manga_mode {
+            self.precise_rotation_degrees = Self::normalize_precise_rotation_degrees(
+                self.precise_rotation_target_degrees,
+            );
+            self.precise_rotation_target_degrees = self.precise_rotation_degrees;
+            self.precise_rotation_velocity = 0.0;
+            return false;
+        }
+
+        let error = Self::normalize_precise_rotation_degrees(
+            self.precise_rotation_target_degrees - self.precise_rotation_degrees,
+        );
+
+        const SNAP_THRESHOLD: f32 = 0.01;
+        const VELOCITY_THRESHOLD: f32 = 0.01;
+
+        if error.abs() < SNAP_THRESHOLD && self.precise_rotation_velocity.abs() < VELOCITY_THRESHOLD
+        {
+            self.precise_rotation_degrees = Self::normalize_precise_rotation_degrees(
+                self.precise_rotation_target_degrees,
+            );
+            self.precise_rotation_velocity = 0.0;
+            return false;
+        }
+
+        const OMEGA: f32 = 24.0;
+        let dt = ctx.input(|i| i.stable_dt).min(0.033);
+        let spring_force = OMEGA * OMEGA * error;
+        let damping_force = 2.0 * OMEGA * self.precise_rotation_velocity;
+        let acceleration = spring_force - damping_force;
+
+        self.precise_rotation_velocity += acceleration * dt;
+        self.precise_rotation_degrees = Self::normalize_precise_rotation_degrees(
+            self.precise_rotation_degrees + self.precise_rotation_velocity * dt,
+        );
+
+        error.abs() > SNAP_THRESHOLD || self.precise_rotation_velocity.abs() > VELOCITY_THRESHOLD
     }
 
     fn background_color32(&self) -> egui::Color32 {
@@ -11230,10 +11417,16 @@ impl ImageViewer {
 
     fn image_display_size_at_zoom(&self) -> Option<egui::Vec2> {
         let (img_w, img_h) = self.media_display_dimensions()?;
-        Some(egui::Vec2::new(
+        let base_size = egui::Vec2::new(
             img_w as f32 * self.zoom,
             img_h as f32 * self.zoom,
-        ))
+        );
+        let rotation_degrees = self.fullscreen_precise_rotation_angle_degrees();
+        if rotation_degrees.abs() < 0.01 {
+            Some(base_size)
+        } else {
+            Some(rotated_bounding_size(base_size, rotation_degrees.to_radians()))
+        }
     }
 
     fn current_media_rect(&self, screen_rect: egui::Rect) -> Option<egui::Rect> {
@@ -11597,6 +11790,9 @@ impl ImageViewer {
                     | Action::ZoomOut
                     | Action::VideoPlayPause
                     | Action::VideoMute => !self.manga_mode,
+                    Action::PreciseRotationClockwise | Action::PreciseRotationCounterClockwise => {
+                        self.is_fullscreen && !self.manga_mode
+                    }
                     Action::MangaNextImage
                     | Action::MangaPreviousImage
                     | Action::MangaZoomIn
@@ -13630,6 +13826,10 @@ impl ImageViewer {
             animation_active = true;
         }
 
+        if self.tick_fullscreen_precise_rotation_animation(ctx) {
+            animation_active = true;
+        }
+
         let floating_image_exceeds_window = if self.is_fullscreen {
             false
         } else {
@@ -14113,9 +14313,23 @@ impl ImageViewer {
 
                 if let (Some(texture), Some((img_w, img_h))) = (active_texture, display_dims) {
                     let available = ui.available_rect_before_wrap();
+                    let precise_rotation_degrees = if self.is_fullscreen
+                        && !self.manga_mode
+                        && self.texture.is_some()
+                        && self.video_texture.is_none()
+                    {
+                        Self::normalize_precise_rotation_degrees(self.precise_rotation_degrees)
+                    } else {
+                        0.0
+                    };
 
-                    let display_size =
+                    let base_display_size =
                         egui::Vec2::new(img_w as f32 * self.zoom, img_h as f32 * self.zoom);
+                    let display_size = if precise_rotation_degrees.abs() < 0.01 {
+                        base_display_size
+                    } else {
+                        rotated_bounding_size(base_display_size, precise_rotation_degrees.to_radians())
+                    };
 
                     // During resize, use the commanded size to compute center to avoid jitter
                     // from frame timing mismatches when window position changes.
@@ -14133,12 +14347,26 @@ impl ImageViewer {
 
                     let final_rect = image_rect;
 
-                    ui.painter().image(
-                        texture.id(),
-                        final_rect,
-                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                        egui::Color32::WHITE,
-                    );
+                    if precise_rotation_degrees.abs() < 0.01 {
+                        ui.painter().image(
+                            texture.id(),
+                            final_rect,
+                            egui::Rect::from_min_max(
+                                egui::pos2(0.0, 0.0),
+                                egui::pos2(1.0, 1.0),
+                            ),
+                            egui::Color32::WHITE,
+                        );
+                    } else {
+                        paint_rotated_texture(
+                            ui.painter(),
+                            texture.id(),
+                            center,
+                            base_display_size,
+                            precise_rotation_degrees.to_radians(),
+                            egui::Color32::WHITE,
+                        );
+                    }
 
                     // Show loading spinner while animated WebP frames are still streaming.
                     if !self.anim_stream_done {
@@ -14522,6 +14750,7 @@ impl eframe::App for ImageViewer {
                     // Clear the per-image fullscreen view state cache when exiting fullscreen
                     // (since it's only meant for fullscreen mode comparisons within a session)
                     self.fullscreen_view_states.clear();
+                    self.reset_precise_rotation();
                     self.strip_open_force_fit_path = None;
 
                     let image_changed_while_fullscreen = self

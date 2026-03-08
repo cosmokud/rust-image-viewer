@@ -153,6 +153,8 @@ pub enum Action {
     PreviousImage,
     RotateClockwise,
     RotateCounterClockwise,
+    PreciseRotationClockwise,
+    PreciseRotationCounterClockwise,
     ZoomIn,
     ZoomOut,
     ResetZoom,
@@ -203,6 +205,12 @@ impl Action {
             "previous_image" | "previous" | "prev" => Some(Action::PreviousImage),
             "rotate_clockwise" | "rotate_cw" => Some(Action::RotateClockwise),
             "rotate_counterclockwise" | "rotate_ccw" => Some(Action::RotateCounterClockwise),
+            "precise_rotation_clockwise" | "precise_rotate_clockwise" | "precise_rotate_cw" => {
+                Some(Action::PreciseRotationClockwise)
+            }
+            "precise_rotation_counterclockwise"
+            | "precise_rotate_counterclockwise"
+            | "precise_rotate_ccw" => Some(Action::PreciseRotationCounterClockwise),
             "zoom_in" => Some(Action::ZoomIn),
             "zoom_out" => Some(Action::ZoomOut),
             "reset_zoom" | "reset" => Some(Action::ResetZoom),
@@ -253,6 +261,8 @@ impl Action {
             Action::PreviousImage => "previous_image",
             Action::RotateClockwise => "rotate_clockwise",
             Action::RotateCounterClockwise => "rotate_counterclockwise",
+            Action::PreciseRotationClockwise => "precise_rotation_clockwise",
+            Action::PreciseRotationCounterClockwise => "precise_rotation_counterclockwise",
             Action::ZoomIn => "zoom_in",
             Action::ZoomOut => "zoom_out",
             Action::ResetZoom => "reset_zoom",
@@ -728,6 +738,14 @@ impl Config {
         self.add_binding(
             InputBinding::Key(egui::Key::ArrowDown),
             Action::RotateCounterClockwise,
+        );
+        self.add_binding(
+            InputBinding::KeyWithCtrl(egui::Key::ArrowUp),
+            Action::PreciseRotationClockwise,
+        );
+        self.add_binding(
+            InputBinding::KeyWithCtrl(egui::Key::ArrowDown),
+            Action::PreciseRotationCounterClockwise,
         );
 
         // Zoom
@@ -1716,6 +1734,14 @@ impl Config {
             "rotate_counterclockwise",
             self.action_bindings_csv(Action::RotateCounterClockwise),
         );
+        values.insert(
+            "precise_rotation_clockwise",
+            self.action_bindings_csv(Action::PreciseRotationClockwise),
+        );
+        values.insert(
+            "precise_rotation_counterclockwise",
+            self.action_bindings_csv(Action::PreciseRotationCounterClockwise),
+        );
         values.insert("zoom_in", self.action_bindings_csv(Action::ZoomIn));
         values.insert("zoom_out", self.action_bindings_csv(Action::ZoomOut));
         values.insert("exit", self.action_bindings_csv(Action::Exit));
@@ -2122,6 +2148,22 @@ mod tests {
         let config = Config::parse_ini("[Shortcuts]\nmanga_zoom_in =\n");
 
         assert!(config.get_bindings(Action::MangaZoomIn).is_empty());
+    }
+
+    #[test]
+    fn parses_precise_rotation_shortcuts() {
+        let config = Config::parse_ini(
+            "[Shortcuts]\nprecise_rotation_clockwise = ctrl+up\nprecise_rotation_counterclockwise = ctrl+down\n",
+        );
+
+        assert_eq!(
+            config.get_bindings(Action::PreciseRotationClockwise),
+            vec![InputBinding::KeyWithCtrl(egui::Key::ArrowUp)]
+        );
+        assert_eq!(
+            config.get_bindings(Action::PreciseRotationCounterClockwise),
+            vec![InputBinding::KeyWithCtrl(egui::Key::ArrowDown)]
+        );
     }
 }
 
