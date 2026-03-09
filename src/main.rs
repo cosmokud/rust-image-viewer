@@ -359,6 +359,14 @@ enum FileClipboardOperation {
     Cut,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FileMarkVisual {
+    Preview,
+    Marked,
+    Copied,
+    Cut,
+}
+
 #[derive(Clone, Debug)]
 struct FileContextMenuState {
     screen_pos: egui::Pos2,
@@ -378,6 +386,13 @@ struct MarkSelectionBoxState {
     anchor: egui::Pos2,
     current: egui::Pos2,
     preview_indices: Vec<usize>,
+}
+
+#[derive(Clone, Debug)]
+struct DeleteModalItemInfo {
+    display_name: String,
+    file_size_label: String,
+    dimensions_label: String,
 }
 
 #[cfg(target_os = "windows")]
@@ -1292,6 +1307,8 @@ struct ImageViewer {
     current_index: usize,
     /// File paths explicitly marked by the user for bulk actions.
     marked_files: HashSet<PathBuf>,
+    /// File paths currently prepared on the shell clipboard for cut/copy paste.
+    prepared_clipboard_paths: HashMap<PathBuf, FileClipboardOperation>,
     /// Pointer-anchored file actions context menu state.
     file_action_menu: Option<FileContextMenuState>,
     /// Inline rename editor displayed over the title-bar filename slot.
@@ -1787,6 +1804,7 @@ impl Default for ImageViewer {
             pending_manga_video_load: None,
             current_index: 0,
             marked_files: HashSet::new(),
+            prepared_clipboard_paths: HashMap::new(),
             file_action_menu: None,
             rename_overlay: None,
             mark_selection_box: None,
@@ -2107,6 +2125,10 @@ impl ImageViewer {
         self.marked_files.contains(path)
     }
 
+    fn prepared_clipboard_operation_for_path(&self, path: &Path) -> Option<FileClipboardOperation> {
+        self.prepared_clipboard_paths.get(path).copied()
+    }
+
     fn is_index_marked(&self, index: usize) -> bool {
         self.image_list
             .get(index)
@@ -2126,20 +2148,73 @@ impl ImageViewer {
         true
     }
 
-    fn mark_indices(&mut self, indices: &[usize]) -> usize {
-        let mut added = 0usize;
+    fn toggle_marks_for_indices(&mut self, indices: &[usize]) -> usize {
+        let mut changed = 0usize;
+        let mut seen_paths = HashSet::new();
+
         for index in indices {
             if let Some(path) = self.image_list.get(*index).cloned() {
-                if self.marked_files.insert(path) {
-                    added = added.saturating_add(1);
+                if !seen_paths.insert(path.clone()) {
+                    continue;
                 }
+
+                if !self.marked_files.insert(path.clone()) {
+                    self.marked_files.remove(&path);
+                }
+                changed = changed.saturating_add(1);
             }
         }
+
+        changed
+    }
+
+    fn mark_all_files(&mut self) -> usize {
+        let mut added = 0usize;
+        for path in &self.image_list {
+            if self.marked_files.insert(path.clone()) {
+                added = added.saturating_add(1);
+            }
+        }
+
         added
     }
 
     fn clear_stale_marked_files(&mut self) {
         self.marked_files.retain(|path| path.exists());
+    }
+
+    fn clear_stale_prepared_clipboard_paths(&mut self) {
+        self.prepared_clipboard_paths
+            .retain(|path, _| path.exists());
+    }
+
+    fn set_prepared_clipboard_targets(
+        &mut self,
+        paths: &[PathBuf],
+        operation: FileClipboardOperation,
+    ) {
+        self.prepared_clipboard_paths.clear();
+
+        for path in paths {
+            if path.exists() {
+                self.prepared_clipboard_paths.insert(path.clone(), operation);
+            }
+        }
+    }
+
+    fn mark_visual_for_path(&self, path: &Path) -> Option<FileMarkVisual> {
+        match self.prepared_clipboard_operation_for_path(path) {
+            Some(FileClipboardOperation::Copy) => Some(FileMarkVisual::Copied),
+            Some(FileClipboardOperation::Cut) => Some(FileMarkVisual::Cut),
+            None if self.is_path_marked(path) => Some(FileMarkVisual::Marked),
+            None => None,
+        }
+    }
+
+    fn mark_visual_for_index(&self, index: usize) -> Option<FileMarkVisual> {
+        self.image_list
+            .get(index)
+            .and_then(|path| self.mark_visual_for_path(path))
     }
 
     fn collect_marked_paths_in_current_order(&self) -> Vec<PathBuf> {
@@ -2210,6 +2285,7 @@ impl ImageViewer {
         self.error_message = None;
         self.pending_window_title = Some(env!("CARGO_PKG_NAME").to_string());
         self.marked_files.clear();
+        self.prepared_clipboard_paths.clear();
         self.file_action_menu = None;
         self.rename_overlay = None;
         self.pending_single_delete_target = None;
@@ -2239,6 +2315,7 @@ impl ImageViewer {
         let files = get_media_in_directory(&anchor_path);
         self.set_image_list(files);
         self.clear_stale_marked_files();
+        self.clear_stale_prepared_clipboard_paths();
 
         if self.image_list.is_empty() {
             self.clear_current_media_after_all_files_removed();
@@ -2365,6 +2442,9 @@ impl ImageViewer {
                 if self.marked_files.remove(&state.original_path) {
                     self.marked_files.insert(new_path.clone());
                 }
+                if let Some(operation) = self.prepared_clipboard_paths.remove(&state.original_path) {
+                    self.prepared_clipboard_paths.insert(new_path.clone(), operation);
+                }
 
                 self.rename_overlay = None;
 
@@ -2398,8 +2478,10 @@ impl ImageViewer {
         };
 
         self.file_action_menu = None;
-        if let Err(err) = write_shell_file_list_to_clipboard(&[path], operation) {
+        if let Err(err) = write_shell_file_list_to_clipboard(&[path.clone()], operation) {
             self.error_message = Some(err);
+        } else {
+            self.set_prepared_clipboard_targets(&[path], operation);
         }
     }
 
@@ -2412,6 +2494,8 @@ impl ImageViewer {
         self.file_action_menu = None;
         if let Err(err) = write_shell_file_list_to_clipboard(&marked_paths, operation) {
             self.error_message = Some(err);
+        } else {
+            self.set_prepared_clipboard_targets(&marked_paths, operation);
         }
     }
 
@@ -2450,6 +2534,7 @@ impl ImageViewer {
             self.pending_single_delete_target = None;
             self.pending_marked_delete_targets.clear();
             self.clear_stale_marked_files();
+            self.clear_stale_prepared_clipboard_paths();
             return;
         }
 
@@ -2461,6 +2546,7 @@ impl ImageViewer {
             Ok(()) => {
                 for path in &existing_paths {
                     self.marked_files.remove(path);
+                    self.prepared_clipboard_paths.remove(path);
                 }
 
                 self.pending_single_delete_target = None;
@@ -2540,28 +2626,41 @@ impl ImageViewer {
         &self,
         painter: &egui::Painter,
         rect: egui::Rect,
-        preview: bool,
+        visual: FileMarkVisual,
     ) {
-        let border_color = if preview {
-            egui::Color32::from_rgba_unmultiplied(255, 199, 92, 255)
-        } else {
-            egui::Color32::from_rgb(
-                self.config.marked_file_border_rgb[0],
-                self.config.marked_file_border_rgb[1],
-                self.config.marked_file_border_rgb[2],
-            )
+        let (label, border_color, chip_fill) = match visual {
+            FileMarkVisual::Preview => (
+                "READY",
+                egui::Color32::from_rgba_unmultiplied(255, 199, 92, 255),
+                egui::Color32::from_rgba_unmultiplied(72, 44, 0, 220),
+            ),
+            FileMarkVisual::Marked => (
+                "MARKED",
+                egui::Color32::from_rgb(
+                    self.config.marked_file_border_rgb[0],
+                    self.config.marked_file_border_rgb[1],
+                    self.config.marked_file_border_rgb[2],
+                ),
+                egui::Color32::from_rgba_unmultiplied(16, 56, 74, 220),
+            ),
+            FileMarkVisual::Copied => (
+                "COPIED",
+                egui::Color32::from_rgb(164, 231, 170),
+                egui::Color32::from_rgba_unmultiplied(28, 86, 38, 220),
+            ),
+            FileMarkVisual::Cut => (
+                "CUT",
+                egui::Color32::from_rgb(255, 170, 170),
+                egui::Color32::from_rgba_unmultiplied(96, 36, 36, 220),
+            ),
         };
-        let chip_fill = if preview {
-            egui::Color32::from_rgba_unmultiplied(72, 44, 0, 220)
-        } else {
-            egui::Color32::from_rgba_unmultiplied(16, 56, 74, 220)
-        };
+        let overlay_rect = rect.shrink(1.5);
 
-        painter.rect_stroke(rect.expand(1.5), 12.0, egui::Stroke::new(2.0, border_color));
+        painter.rect_stroke(overlay_rect, 0.0, egui::Stroke::new(2.0, border_color));
         paint_mark_chip(
             painter,
-            rect,
-            if preview { "READY" } else { "MARKED" },
+            overlay_rect,
+            label,
             chip_fill,
             egui::Stroke::new(1.0, border_color),
             egui::Color32::WHITE,
@@ -4236,6 +4335,33 @@ impl ImageViewer {
             .map(|metadata| Self::format_file_size(metadata.len()))
     }
 
+    fn delete_modal_item_info(&self, path: &PathBuf) -> DeleteModalItemInfo {
+        let display_name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.to_string_lossy().to_string());
+        let file_size_label = Self::file_size_label_for_path(path).unwrap_or_else(|| "Unknown size".to_string());
+
+        let current_path = self.current_media_path();
+        let known_dimensions = get_media_type(path).and_then(|media_type| {
+            if current_path.as_ref().is_some_and(|current| current == path) {
+                self.media_display_dimensions()
+                    .or_else(|| self.solo_known_media_dimensions(path, media_type, true))
+            } else {
+                self.solo_known_media_dimensions(path, media_type, true)
+            }
+        });
+        let dimensions_label = known_dimensions
+            .map(|(width, height)| format!("{} x {} px", width, height))
+            .unwrap_or_else(|| "Unknown dimensions".to_string());
+
+        DeleteModalItemInfo {
+            display_name,
+            file_size_label,
+            dimensions_label,
+        }
+    }
+
     fn start_async_file_size_probe(&mut self, path: PathBuf) {
         let (tx, rx) = crossbeam_channel::bounded::<(PathBuf, Option<String>)>(1);
         self.pending_file_size_probe = Some(rx);
@@ -4401,36 +4527,47 @@ impl ImageViewer {
     }
 
     fn render_marked_file_action_buttons(&mut self, ui: &mut egui::Ui) -> bool {
-        if self.collect_marked_paths_in_current_order().is_empty() {
+        if self.image_list.is_empty() {
             return false;
         }
 
+        let marked_paths = self.collect_marked_paths_in_current_order();
         let mut activated = false;
 
-        if ui
-            .add_sized([ui.available_width(), 28.0], egui::Button::new("Cut Marked Files"))
-            .clicked()
-        {
-            self.apply_clipboard_operation_to_marked_files(FileClipboardOperation::Cut);
-            activated = true;
+        if !marked_paths.is_empty() {
+            if ui
+                .add_sized([ui.available_width(), 28.0], egui::Button::new("Cut Marked Files"))
+                .clicked()
+            {
+                self.apply_clipboard_operation_to_marked_files(FileClipboardOperation::Cut);
+                activated = true;
+            }
+            if ui
+                .add_sized([ui.available_width(), 28.0], egui::Button::new("Copy Marked Files"))
+                .clicked()
+            {
+                self.apply_clipboard_operation_to_marked_files(FileClipboardOperation::Copy);
+                activated = true;
+            }
+            if ui
+                .add_sized([ui.available_width(), 28.0], egui::Button::new("Delete Marked Files"))
+                .clicked()
+            {
+                self.request_marked_files_delete();
+                activated = true;
+            }
         }
         if ui
-            .add_sized([ui.available_width(), 28.0], egui::Button::new("Copy Marked Files"))
+            .add_sized([ui.available_width(), 28.0], egui::Button::new("Mark All"))
             .clicked()
         {
-            self.apply_clipboard_operation_to_marked_files(FileClipboardOperation::Copy);
+            self.mark_all_files();
             activated = true;
         }
-        if ui
-            .add_sized([ui.available_width(), 28.0], egui::Button::new("Delete Marked Files"))
-            .clicked()
-        {
-            self.request_marked_files_delete();
-            activated = true;
-        }
-        if ui
-            .add_sized([ui.available_width(), 28.0], egui::Button::new("Unmark All"))
-            .clicked()
+        if !marked_paths.is_empty()
+            && ui
+                .add_sized([ui.available_width(), 28.0], egui::Button::new("Unmark All"))
+                .clicked()
         {
             self.marked_files.clear();
             activated = true;
@@ -4490,6 +4627,11 @@ impl ImageViewer {
                         if self.render_single_file_action_buttons(ui, menu_state.target_index, false) {
                             close_menu = true;
                         }
+
+                        ui.separator();
+                        if self.render_marked_file_action_buttons(ui) {
+                            close_menu = true;
+                        }
                     });
             });
 
@@ -4515,42 +4657,30 @@ impl ImageViewer {
     }
 
     fn draw_delete_confirmation_modal(&mut self, ctx: &egui::Context) {
-        let (targets, title, body) = if let Some(path) = self.pending_single_delete_target.clone() {
-            let label = path
-                .file_name()
-                .map(|name| name.to_string_lossy().to_string())
-                .unwrap_or_else(|| path.to_string_lossy().to_string());
+        let (targets, title, summary) = if let Some(path) = self.pending_single_delete_target.clone() {
             (
                 vec![path],
                 "Delete File to Recycle Bin?".to_string(),
-                format!("This will move {} to the Recycle Bin.", label),
+                "This will move the selected file to the Recycle Bin.".to_string(),
             )
         } else if !self.pending_marked_delete_targets.is_empty() {
             let targets = self.pending_marked_delete_targets.clone();
-            let preview = targets
-                .iter()
-                .take(3)
-                .filter_map(|path| path.file_name().map(|name| name.to_string_lossy().to_string()))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let body = if preview.is_empty() {
-                format!("This will move {} marked files to the Recycle Bin.", targets.len())
-            } else {
-                format!(
-                    "This will move {} marked files to the Recycle Bin: {}{}",
-                    targets.len(),
-                    preview,
-                    if targets.len() > 3 { ", ..." } else { "" }
-                )
-            };
+            let target_count = targets.len();
             (
                 targets,
                 "Delete Marked Files to Recycle Bin?".to_string(),
-                body,
+                format!("This will move {} marked files to the Recycle Bin.", target_count),
             )
         } else {
             return;
         };
+
+        let preview_items: Vec<DeleteModalItemInfo> = targets
+            .iter()
+            .take(4)
+            .map(|path| self.delete_modal_item_info(path))
+            .collect();
+        let remaining_items = targets.len().saturating_sub(preview_items.len());
 
         let mut cancel = ctx.input(|input| input.key_pressed(egui::Key::Escape));
         let mut confirm = false;
@@ -4568,7 +4698,8 @@ impl ImageViewer {
                 );
             });
 
-        let modal_size = egui::vec2(420.0, 220.0);
+        let modal_height = (246.0 + (preview_items.len() as f32 * 60.0)).clamp(246.0, 430.0);
+        let modal_size = egui::vec2(500.0, modal_height);
         let modal_pos = screen_rect.center() - modal_size * 0.5;
         egui::Area::new(egui::Id::new("delete_confirmation_modal"))
             .fixed_pos(modal_pos)
@@ -4593,11 +4724,89 @@ impl ImageViewer {
                             );
                             ui.add_space(8.0);
                             ui.label(
-                                egui::RichText::new(body)
+                                egui::RichText::new(summary)
                                     .color(egui::Color32::from_rgb(210, 216, 224))
                                     .size(14.0),
                             );
-                            ui.add_space(10.0);
+                            ui.add_space(12.0);
+
+                            egui::ScrollArea::vertical()
+                                .max_height((modal_size.y - 150.0).max(96.0))
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    for item in &preview_items {
+                                        egui::Frame::none()
+                                            .fill(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 10))
+                                            .stroke(egui::Stroke::new(
+                                                1.0,
+                                                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 24),
+                                            ))
+                                            .rounding(8.0)
+                                            .inner_margin(egui::Margin::symmetric(12.0, 10.0))
+                                            .show(ui, |ui| {
+                                                ui.vertical(|ui| {
+                                                    ui.label(
+                                                        egui::RichText::new(&item.display_name)
+                                                            .color(egui::Color32::WHITE)
+                                                            .strong(),
+                                                    );
+                                                    ui.add_space(6.0);
+                                                    ui.horizontal_wrapped(|ui| {
+                                                        let render_chip = |ui: &mut egui::Ui,
+                                                                           text: &str,
+                                                                           fill: egui::Color32,
+                                                                           stroke: egui::Stroke,
+                                                                           color: egui::Color32| {
+                                                            egui::Frame::none()
+                                                                .fill(fill)
+                                                                .stroke(stroke)
+                                                                .rounding(4.0)
+                                                                .inner_margin(egui::Margin::symmetric(8.0, 3.0))
+                                                                .show(ui, |ui| {
+                                                                    ui.label(
+                                                                        egui::RichText::new(text)
+                                                                            .color(color)
+                                                                            .size(12.0),
+                                                                    );
+                                                                });
+                                                        };
+
+                                                        render_chip(
+                                                            ui,
+                                                            &item.file_size_label,
+                                                            egui::Color32::from_rgba_unmultiplied(58, 76, 98, 180),
+                                                            egui::Stroke::new(
+                                                                1.0,
+                                                                egui::Color32::from_rgba_unmultiplied(130, 168, 196, 180),
+                                                            ),
+                                                            egui::Color32::from_rgb(222, 233, 243),
+                                                        );
+                                                        render_chip(
+                                                            ui,
+                                                            &item.dimensions_label,
+                                                            egui::Color32::from_rgba_unmultiplied(72, 68, 38, 180),
+                                                            egui::Stroke::new(
+                                                                1.0,
+                                                                egui::Color32::from_rgba_unmultiplied(224, 192, 108, 180),
+                                                            ),
+                                                            egui::Color32::from_rgb(245, 225, 171),
+                                                        );
+                                                    });
+                                                });
+                                            });
+                                        ui.add_space(8.0);
+                                    }
+
+                                    if remaining_items > 0 {
+                                        ui.label(
+                                            egui::RichText::new(format!("And {} more file(s).", remaining_items))
+                                                .color(egui::Color32::from_rgb(150, 166, 182))
+                                                .size(12.0),
+                                        );
+                                    }
+                                });
+
+                            ui.add_space(12.0);
                             ui.label(
                                 egui::RichText::new(
                                     "Set confirm_delete_to_recycle_bin = false in config.ini to skip this confirmation.",
@@ -4612,8 +4821,10 @@ impl ImageViewer {
                                         egui::RichText::new("Delete to Recycle Bin")
                                             .color(egui::Color32::WHITE),
                                     )
+                                    .min_size(egui::vec2(170.0, 32.0))
                                     .fill(egui::Color32::from_rgb(176, 52, 52))
-                                    .rounding(10.0),
+                                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(132, 36, 36)))
+                                    .rounding(4.0),
                                 );
                                 if delete_button.clicked() {
                                     confirm = true;
@@ -4621,8 +4832,13 @@ impl ImageViewer {
 
                                 let cancel_button = ui.add(
                                     egui::Button::new("Cancel")
+                                        .min_size(egui::vec2(100.0, 32.0))
                                         .fill(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 24))
-                                        .rounding(10.0),
+                                        .stroke(egui::Stroke::new(
+                                            1.0,
+                                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 48),
+                                        ))
+                                        .rounding(4.0),
                                 );
                                 if cancel_button.clicked() {
                                     cancel = true;
@@ -12418,9 +12634,15 @@ impl ImageViewer {
             }
         }
 
-        let preview_only = self.mark_selection_preview_contains(idx) && !self.is_index_marked(idx);
-        if self.is_index_marked(idx) || preview_only {
-            self.paint_marked_item_overlay(ui.painter(), image_rect, preview_only);
+        let preview_only =
+            self.mark_selection_preview_contains(idx) && self.mark_visual_for_index(idx).is_none();
+        let mark_visual = if preview_only {
+            Some(FileMarkVisual::Preview)
+        } else {
+            self.mark_visual_for_index(idx)
+        };
+        if let Some(mark_visual) = mark_visual {
+            self.paint_marked_item_overlay(ui.painter(), image_rect, mark_visual);
         }
 
         requested_retry
@@ -12793,7 +13015,7 @@ impl ImageViewer {
 
         if let Some(indices) = finalize_mark_selection {
             if !indices.is_empty() {
-                self.mark_indices(&indices);
+                self.toggle_marks_for_indices(&indices);
             }
         }
 
@@ -14927,7 +15149,7 @@ impl ImageViewer {
                                         ui.separator();
                                     }
 
-                                    if !self.collect_marked_paths_in_current_order().is_empty() {
+                                    if !self.image_list.is_empty() {
                                         if self.render_marked_file_action_buttons(ui) {
                                             close_popup = true;
                                         }
@@ -16778,12 +17000,12 @@ impl ImageViewer {
                         ctx.request_repaint_after(Duration::from_millis(16));
                     }
 
-                    if self
+                    if let Some(mark_visual) = self
                         .image_list
                         .get(self.current_index)
-                        .is_some_and(|path| self.is_path_marked(path))
+                        .and_then(|path| self.mark_visual_for_path(path))
                     {
-                        self.paint_marked_item_overlay(ui.painter(), final_rect, false);
+                        self.paint_marked_item_overlay(ui.painter(), final_rect, mark_visual);
                     }
                 } else if let Some(ref error) = self.error_message {
                     ui.centered_and_justified(|ui| {
