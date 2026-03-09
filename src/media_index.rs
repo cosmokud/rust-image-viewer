@@ -66,6 +66,19 @@ impl MediaDirectoryIndex {
         self.cache.pop(directory);
     }
 
+    pub fn cached_directory_changed_for_path(&mut self, path: &Path) -> bool {
+        let parent = match path.parent() {
+            Some(parent) => parent.to_path_buf(),
+            None => return false,
+        };
+
+        let modified_at = directory_modified_time(&parent);
+        match self.cache.get(&parent) {
+            Some(entry) => !is_entry_fresh(entry, &modified_at),
+            None => true,
+        }
+    }
+
     pub fn try_cached_media_for_path(&mut self, path: &Path) -> Option<Vec<PathBuf>> {
         let parent = match path.parent() {
             Some(parent) => parent.to_path_buf(),

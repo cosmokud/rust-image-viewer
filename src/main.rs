@@ -597,18 +597,66 @@ struct MasonryReturnState {
     scroll_offset: f32,
     scroll_target: f32,
     opened_index: usize,
+    list_signature: u64,
     cache_reuse_radius: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 struct PendingMasonrySoloReentry {
     index: usize,
+    list_signature: u64,
     scroll_offset: f32,
     scroll_target: f32,
     zoom: f32,
     zoom_target: f32,
     offset: egui::Vec2,
     items_per_row: usize,
+}
+
+fn masonry_return_should_restore_saved_scroll(
+    opened_index: usize,
+    opened_list_signature: u64,
+    current_index: usize,
+    current_list_signature: u64,
+) -> bool {
+    opened_list_signature == current_list_signature && opened_index == current_index
+}
+
+fn masonry_return_can_reuse_runtime_cache(
+    opened_list_signature: u64,
+    current_list_signature: u64,
+    strip_return_preserve_masonry_cache: bool,
+    manga_loader_present: bool,
+) -> bool {
+    opened_list_signature == current_list_signature
+        && strip_return_preserve_masonry_cache
+        && manga_loader_present
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        masonry_return_can_reuse_runtime_cache, masonry_return_should_restore_saved_scroll,
+    };
+
+    #[test]
+    fn masonry_return_restores_saved_scroll_only_when_list_is_unchanged() {
+        assert!(masonry_return_should_restore_saved_scroll(3, 17, 3, 17));
+        assert!(!masonry_return_should_restore_saved_scroll(3, 17, 3, 18));
+    }
+
+    #[test]
+    fn masonry_return_follows_current_item_after_index_change() {
+        assert!(!masonry_return_should_restore_saved_scroll(3, 17, 2, 17));
+    }
+
+    #[test]
+    fn masonry_return_reuses_runtime_cache_only_when_list_is_unchanged() {
+        assert!(masonry_return_can_reuse_runtime_cache(17, 17, true, true));
+        assert!(!masonry_return_can_reuse_runtime_cache(17, 18, true, true));
+        assert!(!masonry_return_can_reuse_runtime_cache(17, 17, false, true));
+        assert!(!masonry_return_can_reuse_runtime_cache(17, 17, true, false));
+    }
 }
 
 /// Per-image view state for fullscreen mode memory.
@@ -2584,6 +2632,27 @@ impl ImageViewer {
             self.ensure_manga_loader();
             self.manga_update_preload_queue();
         }
+    }
+
+    fn refresh_media_list_before_masonry_entry(&mut self) -> bool {
+        let anchor_path = self
+            .current_media_path()
+            .or_else(|| self.image_list.first().cloned());
+
+        let Some(anchor_path) = anchor_path else {
+            return false;
+        };
+
+        let current_path_missing = !anchor_path.exists();
+        let directory_changed = self
+            .media_directory_index
+            .cached_directory_changed_for_path(&anchor_path);
+
+        if current_path_missing || directory_changed {
+            self.refresh_media_list_after_path_mutation(Some(anchor_path));
+        }
+
+        !self.image_list.is_empty()
     }
 
     fn open_file_action_menu(&mut self, screen_pos: egui::Pos2, target_index: usize) {
@@ -8318,6 +8387,7 @@ impl ImageViewer {
 
         self.pending_masonry_solo_reentry = Some(PendingMasonrySoloReentry {
             index,
+            list_signature: self.image_list_signature,
             scroll_offset: self.manga_scroll_offset,
             scroll_target: self.manga_scroll_target,
             zoom: self.zoom,
@@ -8329,7 +8399,10 @@ impl ImageViewer {
 
     fn pending_masonry_solo_reentry_index(&self) -> Option<usize> {
         let state = self.pending_masonry_solo_reentry?;
-        if !self.is_masonry_mode() || self.masonry_items_per_row != state.items_per_row {
+        if !self.is_masonry_mode()
+            || self.masonry_items_per_row != state.items_per_row
+            || self.image_list_signature != state.list_signature
+        {
             return None;
         }
 
@@ -8670,7 +8743,7 @@ impl ImageViewer {
         }
     }
 
-    fn activate_strip_return_context(&mut self, layout_mode: MangaLayoutMode) {
+    fn activate_strip_return_context(&mut self, layout_mode: MangaLayoutMode, opened_index: usize) {
         self.strip_return_mode = Some(layout_mode);
         self.strip_return_button_only = false;
         self.strip_return_preserve_masonry_cache =
@@ -8683,7 +8756,8 @@ impl ImageViewer {
                     offset: self.offset,
                     scroll_offset: self.manga_scroll_offset,
                     scroll_target: self.manga_scroll_target,
-                    opened_index: self.current_index,
+                    opened_index: opened_index.min(self.image_list.len().saturating_sub(1)),
+                    list_signature: self.image_list_signature,
                     cache_reuse_radius: self.masonry_cache_reuse_radius(),
                 })
             } else {
@@ -8735,10 +8809,14 @@ impl ImageViewer {
     }
 
     #[allow(dead_code)]
-    fn should_reuse_masonry_cache_on_return(&self, _state: MasonryReturnState) -> bool {
+    fn should_reuse_masonry_cache_on_return(&self, state: MasonryReturnState) -> bool {
         !self.image_list.is_empty()
-            && self.strip_return_preserve_masonry_cache
-            && self.manga_loader.is_some()
+            && masonry_return_can_reuse_runtime_cache(
+                state.list_signature,
+                self.image_list_signature,
+                self.strip_return_preserve_masonry_cache,
+                self.manga_loader.is_some(),
+            )
     }
 
     fn scroll_strip_to_current_index(&mut self) {
@@ -8817,6 +8895,13 @@ impl ImageViewer {
         self.reset_gif_seek_interaction_state();
         self.strip_open_force_fit_path = None;
 
+        if layout_mode == MangaLayoutMode::Masonry {
+            if !self.refresh_media_list_before_masonry_entry() {
+                self.clear_strip_return_context();
+                return;
+            }
+        }
+
         let restore_masonry_state = if layout_mode == MangaLayoutMode::Masonry {
             self.strip_return_masonry_state
         } else {
@@ -8826,8 +8911,14 @@ impl ImageViewer {
             .current_index
             .min(self.image_list.len().saturating_sub(1));
         self.set_current_index_clamped(current_viewed_index);
-        let traversed_during_fullscreen =
-            restore_masonry_state.is_some_and(|state| state.opened_index != current_viewed_index);
+        let follow_current_viewed_item = restore_masonry_state.is_some_and(|state| {
+            !masonry_return_should_restore_saved_scroll(
+                state.opened_index,
+                state.list_signature,
+                current_viewed_index,
+                self.image_list_signature,
+            )
+        });
         let reuse_masonry_cache = restore_masonry_state
             .is_some_and(|state| self.should_reuse_masonry_cache_on_return(state));
         let preserve_resident_masonry_cache =
@@ -8854,8 +8945,9 @@ impl ImageViewer {
                 self.zoom_velocity = 0.0;
                 self.offset = state.offset;
 
-                if traversed_during_fullscreen {
-                    // Follow the currently viewed file in solo fullscreen.
+                if follow_current_viewed_item {
+                    // The current solo item changed, or the list changed underneath it, so
+                    // the old absolute masonry scroll position is no longer trustworthy.
                     self.scroll_strip_to_current_index();
                 } else {
                     let max_scroll = (self.manga_total_height() - self.screen_size.y).max(0.0);
@@ -9831,6 +9923,12 @@ impl ImageViewer {
     fn toggle_strip_mode(&mut self, layout_mode: MangaLayoutMode) {
         self.pending_masonry_solo_reentry = None;
 
+        if layout_mode == MangaLayoutMode::Masonry && !self.manga_mode {
+            if !self.refresh_media_list_before_masonry_entry() {
+                return;
+            }
+        }
+
         if !self.manga_mode {
             self.manga_layout_mode = layout_mode;
             if layout_mode == MangaLayoutMode::Masonry {
@@ -10199,7 +10297,7 @@ impl ImageViewer {
         let target_media_type = get_media_type(&path);
         self.prepare_mode_switch_placeholder_from_manga_index(index, target_media_type);
 
-        self.activate_strip_return_context(return_mode);
+        self.activate_strip_return_context(return_mode, index);
         self.strip_return_button_only = button_only_return;
         self.stop_manga_wheel_scroll();
         self.stop_manga_autoscroll();
