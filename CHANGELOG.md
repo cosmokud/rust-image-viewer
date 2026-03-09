@@ -2,6 +2,66 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.3.0] - 2026-03-09
+
+### Highlights
+
+- Added file marking system with visual indicators and keyboard shortcuts.
+- Clipboard and file action menu enhancements, including Windows system clipboard clearing and improved deletion handling.
+- New image/video flip functionality with keyboard shortcuts.
+- Project renamed to `rust-image-viewer` and comprehensive documentation added (architecture, contributing, security, code of conduct).
+- Deployment workflow improvements with release existence checks and nightly metadata resolution.
+- Optimization of masonry cache management for smoother mode switching and performance.
+- README revisions including example video links and formatting fixes.
+
+### Added
+
+- File marking UI, global shortcuts, and configurable border color.
+- Clipboard management improvements and system clipboard clearing on Windows.
+- Marking options in file action menu.
+- Image/video flip commands.
+- Documentation: ARCHITECTURE.md, CONTRIBUTING.md, SECURITY.md, CODE_OF_CONDUCT.md.
+- Example video links in README.
+- Enhanced deployment workflows.
+
+### Changed
+
+- Project rename to `rust-image-viewer`.
+- Refactored clipboard operations and file deletion handling.
+- Code structure refactor for readability and maintainability.
+- Revised README content for clarity and detail.
+
+### Fixed
+
+- README formatting corrections.
+- Updated architecture and security documentation for clarity and consistency.
+
+## [v0.2.4] - 2026-03-08
+
+### Highlights
+
+- Deployment workflow improvements with release existence checks and nightly metadata resolution.
+- Added image/video flipping functionality with keyboard shortcuts.
+- Project renamed to `rust-image-viewer` and README extensively revised.
+- Masonry cache management optimized for smoother mode switching and performance.
+- Example video links added to documentation.
+
+### Added
+
+- Image/video flip commands.
+- Example video links in README.
+- Deployment workflow checks and nightly metadata handling.
+
+### Changed
+
+- Project rename to `rust-image-viewer`.
+- Masonry cache management improvements for mode switching.
+- README content revised for clarity, detail, and formatting.
+
+### Fixed
+
+- README formatting issues.
+
 ## [v0.2.3] - 2026-03-08
 
 ### Highlights
