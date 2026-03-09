@@ -135,6 +135,8 @@ fn paint_rotated_texture(
     center: egui::Pos2,
     size: egui::Vec2,
     angle_radians: f32,
+    flip_horizontal: bool,
+    flip_vertical: bool,
     tint: egui::Color32,
 ) {
     let half = size * 0.5;
@@ -144,11 +146,15 @@ fn paint_rotated_texture(
         egui::vec2(half.x, half.y),
         egui::vec2(-half.x, half.y),
     ];
+    let u_min = if flip_horizontal { 1.0 } else { 0.0 };
+    let u_max = if flip_horizontal { 0.0 } else { 1.0 };
+    let v_min = if flip_vertical { 1.0 } else { 0.0 };
+    let v_max = if flip_vertical { 0.0 } else { 1.0 };
     let uvs = [
-        egui::pos2(0.0, 0.0),
-        egui::pos2(1.0, 0.0),
-        egui::pos2(1.0, 1.0),
-        egui::pos2(0.0, 1.0),
+        egui::pos2(u_min, v_min),
+        egui::pos2(u_max, v_min),
+        egui::pos2(u_max, v_max),
+        egui::pos2(u_min, v_max),
     ];
 
     let mut mesh = egui::epaint::Mesh::with_texture(texture_id);
@@ -454,11 +460,9 @@ struct FullscreenViewState {
     precise_rotation_target_degrees: f32,
     /// Number of 90° clockwise rotations applied (0-3)
     rotation_steps: u8,
-    /// Horizontal flip applied (reserved for future use)
-    #[allow(dead_code)]
+    /// Horizontal flip applied to the current solo-media view.
     flip_horizontal: bool,
-    /// Vertical flip applied (reserved for future use)
-    #[allow(dead_code)]
+    /// Vertical flip applied to the current solo-media view.
     flip_vertical: bool,
 }
 
@@ -1189,6 +1193,10 @@ struct ImageViewer {
     precise_rotation_target_degrees: f32,
     /// Velocity for smooth fullscreen precise-rotation animation.
     precise_rotation_velocity: f32,
+    /// Whether the current solo media is mirrored horizontally.
+    flip_horizontal: bool,
+    /// Whether the current solo media is mirrored vertically.
+    flip_vertical: bool,
     /// Image offset for panning
     offset: egui::Vec2,
     /// Whether we're currently panning/dragging window
@@ -1531,6 +1539,10 @@ struct ImageViewer {
     manga_arrow_left_was_down: bool,
     /// Track if right arrow was down last frame (to detect hold vs single tap)
     manga_arrow_right_was_down: bool,
+    /// Next repeat deadline while holding a mouse-bound previous-image action in solo mode.
+    prev_image_mouse_repeat_at: Option<Instant>,
+    /// Next repeat deadline while holding a mouse-bound next-image action in solo mode.
+    next_image_mouse_repeat_at: Option<Instant>,
     /// Next repeat deadline while holding a mouse-bound previous-image action in long-strip mode.
     manga_prev_image_mouse_repeat_at: Option<Instant>,
     /// Next repeat deadline while holding a mouse-bound next-image action in long-strip mode.
@@ -1655,6 +1667,8 @@ impl Default for ImageViewer {
             precise_rotation_degrees: 0.0,
             precise_rotation_target_degrees: 0.0,
             precise_rotation_velocity: 0.0,
+            flip_horizontal: false,
+            flip_vertical: false,
             offset: egui::Vec2::ZERO,
             is_panning: false,
             last_mouse_pos: None,
@@ -1819,6 +1833,8 @@ impl Default for ImageViewer {
             manga_ttv_samples_ms: VecDeque::new(),
             manga_arrow_left_was_down: false,
             manga_arrow_right_was_down: false,
+            prev_image_mouse_repeat_at: None,
+            next_image_mouse_repeat_at: None,
             manga_prev_image_mouse_repeat_at: None,
             manga_next_image_mouse_repeat_at: None,
 
@@ -2021,6 +2037,8 @@ impl ImageViewer {
         self.zoom_target = 1.0;
         self.current_rotation_steps = 0;
         self.reset_precise_rotation();
+        self.flip_horizontal = false;
+        self.flip_vertical = false;
         self.current_fullscreen_view_has_memory = false;
         self.pending_media_layout = false;
     }
@@ -3852,15 +3870,17 @@ impl ImageViewer {
                 }
             }
             Action::PreciseRotationClockwise => {
-                if self.is_fullscreen && !self.manga_mode && self.image.is_some() {
-                    self.update_fullscreen_precise_rotation(self.config.precise_rotation_step_degrees);
+                if !self.manga_mode && self.current_media_type.is_some() {
+                    self.update_precise_rotation(self.config.precise_rotation_step_degrees);
                 }
             }
             Action::PreciseRotationCounterClockwise => {
-                if self.is_fullscreen && !self.manga_mode && self.image.is_some() {
-                    self.update_fullscreen_precise_rotation(-self.config.precise_rotation_step_degrees);
+                if !self.manga_mode && self.current_media_type.is_some() {
+                    self.update_precise_rotation(-self.config.precise_rotation_step_degrees);
                 }
             }
+            Action::FlipVertically => self.toggle_media_flip(false, true),
+            Action::FlipHorizontally => self.toggle_media_flip(true, false),
             Action::ResetZoom => {
                 self.offset = egui::Vec2::ZERO;
                 self.zoom_target = 1.0;
@@ -4070,6 +4090,13 @@ impl ImageViewer {
             .any(|binding| Self::mouse_binding_down(binding, input))
     }
 
+    fn action_mouse_binding_triggered(&self, action: Action, input: &egui::InputState) -> bool {
+        self.config
+            .get_bindings(action)
+            .iter()
+            .any(|binding| Self::mouse_binding_triggered(binding, input))
+    }
+
     fn binding_triggered(
         &self,
         binding: &InputBinding,
@@ -4128,6 +4155,19 @@ impl ImageViewer {
             InputBinding::MouseMiddle => input.pointer.button_down(egui::PointerButton::Middle),
             InputBinding::Mouse4 => input.pointer.button_down(egui::PointerButton::Extra1),
             InputBinding::Mouse5 => input.pointer.button_down(egui::PointerButton::Extra2),
+            _ => false,
+        }
+    }
+
+    fn mouse_binding_triggered(binding: &InputBinding, input: &egui::InputState) -> bool {
+        match binding {
+            InputBinding::MouseLeft => input.pointer.button_pressed(egui::PointerButton::Primary),
+            InputBinding::MouseRight => {
+                input.pointer.button_clicked(egui::PointerButton::Secondary)
+            }
+            InputBinding::MouseMiddle => input.pointer.button_pressed(egui::PointerButton::Middle),
+            InputBinding::Mouse4 => input.pointer.button_pressed(egui::PointerButton::Extra1),
+            InputBinding::Mouse5 => input.pointer.button_pressed(egui::PointerButton::Extra2),
             _ => false,
         }
     }
@@ -5284,8 +5324,8 @@ impl ImageViewer {
             precise_rotation_degrees: self.precise_rotation_degrees,
             precise_rotation_target_degrees: self.precise_rotation_target_degrees,
             rotation_steps: self.current_rotation_steps,
-            flip_horizontal: false, // Currently not implemented in the viewer
-            flip_vertical: false,   // Currently not implemented in the viewer
+            flip_horizontal: self.flip_horizontal,
+            flip_vertical: self.flip_vertical,
         };
 
         self.fullscreen_view_states.insert(path, state);
@@ -5326,6 +5366,8 @@ impl ImageViewer {
             self.precise_rotation_degrees = state.precise_rotation_degrees;
             self.precise_rotation_target_degrees = state.precise_rotation_target_degrees;
             self.precise_rotation_velocity = 0.0;
+            self.flip_horizontal = state.flip_horizontal;
+            self.flip_vertical = state.flip_vertical;
 
             // Apply saved rotations if image was reloaded
             if let Some(ref mut img) = self.image {
@@ -5365,8 +5407,8 @@ impl ImageViewer {
         (degrees + 180.0).rem_euclid(360.0) - 180.0
     }
 
-    fn fullscreen_precise_rotation_angle_degrees(&self) -> f32 {
-        if self.is_fullscreen && !self.manga_mode && self.texture.is_some() {
+    fn current_precise_rotation_angle_degrees(&self) -> f32 {
+        if !self.manga_mode && self.current_media_type.is_some() {
             Self::normalize_precise_rotation_degrees(self.precise_rotation_degrees)
         } else {
             0.0
@@ -5409,8 +5451,8 @@ impl ImageViewer {
         self.reset_precise_rotation();
     }
 
-    fn update_fullscreen_precise_rotation(&mut self, delta_degrees: f32) {
-        if !self.is_fullscreen || self.manga_mode {
+    fn update_precise_rotation(&mut self, delta_degrees: f32) {
+        if self.manga_mode || self.current_media_type.is_none() {
             return;
         }
 
@@ -5418,7 +5460,26 @@ impl ImageViewer {
             self.precise_rotation_target_degrees + delta_degrees,
         );
 
-        self.remember_current_fullscreen_view_state();
+        if self.is_fullscreen {
+            self.remember_current_fullscreen_view_state();
+        }
+    }
+
+    fn toggle_media_flip(&mut self, horizontal: bool, vertical: bool) {
+        if self.manga_mode || self.current_media_type.is_none() {
+            return;
+        }
+
+        if horizontal {
+            self.flip_horizontal = !self.flip_horizontal;
+        }
+        if vertical {
+            self.flip_vertical = !self.flip_vertical;
+        }
+
+        if self.is_fullscreen {
+            self.remember_current_fullscreen_view_state();
+        }
     }
 
     /// Load next image
@@ -5980,7 +6041,7 @@ impl ImageViewer {
     }
 
     fn tick_fullscreen_precise_rotation_animation(&mut self, ctx: &egui::Context) -> bool {
-        if !self.is_fullscreen || self.manga_mode {
+        if self.manga_mode || self.current_media_type.is_none() {
             self.precise_rotation_degrees = Self::normalize_precise_rotation_degrees(
                 self.precise_rotation_target_degrees,
             );
@@ -12454,7 +12515,7 @@ impl ImageViewer {
             img_w as f32 * self.zoom,
             img_h as f32 * self.zoom,
         );
-        let rotation_degrees = self.fullscreen_precise_rotation_angle_degrees();
+        let rotation_degrees = self.current_precise_rotation_angle_degrees();
         if rotation_degrees.abs() < 0.01 {
             Some(base_size)
         } else {
@@ -12874,12 +12935,14 @@ impl ImageViewer {
                     | Action::PreviousImage
                     | Action::RotateClockwise
                     | Action::RotateCounterClockwise
+                    | Action::FlipVertically
+                    | Action::FlipHorizontally
                     | Action::ZoomIn
                     | Action::ZoomOut
                     | Action::VideoPlayPause
                     | Action::VideoMute => !self.manga_mode,
                     Action::PreciseRotationClockwise | Action::PreciseRotationCounterClockwise => {
-                        self.is_fullscreen && !self.manga_mode
+                        !self.manga_mode
                     }
                     Action::MangaNextImage
                     | Action::MangaPreviousImage
@@ -13058,6 +13121,8 @@ impl ImageViewer {
         // - Manga fullscreen: retain manga-specific paging behavior.
         // - Floating/normal fullscreen: PageUp/PageDown/Home/End navigate files.
         if self.manga_mode && self.is_fullscreen {
+            self.prev_image_mouse_repeat_at = None;
+            self.next_image_mouse_repeat_at = None;
             let masonry_fullscreen = self.is_masonry_mode();
             let (page_up_pressed, page_down_pressed, page_up_mouse_down, page_down_mouse_down) =
                 ctx.input(|input| {
@@ -13265,6 +13330,28 @@ impl ImageViewer {
             self.manga_prev_image_mouse_repeat_at = None;
             self.manga_next_image_mouse_repeat_at = None;
 
+            let (prev_mouse_pressed, next_mouse_pressed, prev_mouse_down, next_mouse_down) =
+                ctx.input(|input| {
+                    (
+                        self.action_mouse_binding_triggered(Action::PreviousImage, input),
+                        self.action_mouse_binding_triggered(Action::NextImage, input),
+                        self.action_mouse_binding_down(Action::PreviousImage, input),
+                        self.action_mouse_binding_down(Action::NextImage, input),
+                    )
+                });
+            let prev_mouse_repeat = Self::manga_page_mouse_repeat_trigger(
+                &mut self.prev_image_mouse_repeat_at,
+                prev_mouse_down,
+                prev_mouse_pressed,
+                ctx,
+            );
+            let next_mouse_repeat = Self::manga_page_mouse_repeat_trigger(
+                &mut self.next_image_mouse_repeat_at,
+                next_mouse_down,
+                next_mouse_pressed,
+                ctx,
+            );
+
             let page_up = ctx.input(|i| i.key_pressed(egui::Key::PageUp));
             let page_down = ctx.input(|i| i.key_pressed(egui::Key::PageDown));
             let home = ctx.input(|i| i.key_pressed(egui::Key::Home));
@@ -13287,6 +13374,12 @@ impl ImageViewer {
                 self.prev_image();
             }
             if page_down && !page_down_bound {
+                self.next_image();
+            }
+            if prev_mouse_repeat {
+                self.prev_image();
+            }
+            if next_mouse_repeat {
                 self.next_image();
             }
             if home && !home_bound {
@@ -15433,15 +15526,9 @@ impl ImageViewer {
 
                 if let (Some(texture), Some((img_w, img_h))) = (active_texture, display_dims) {
                     let available = ui.available_rect_before_wrap();
-                    let precise_rotation_degrees = if self.is_fullscreen
-                        && !self.manga_mode
-                        && self.texture.is_some()
-                        && self.video_texture.is_none()
-                    {
-                        Self::normalize_precise_rotation_degrees(self.precise_rotation_degrees)
-                    } else {
-                        0.0
-                    };
+                    let precise_rotation_degrees = self.current_precise_rotation_angle_degrees();
+                    let flip_horizontal = !self.manga_mode && self.flip_horizontal;
+                    let flip_vertical = !self.manga_mode && self.flip_vertical;
 
                     let base_display_size =
                         egui::Vec2::new(img_w as f32 * self.zoom, img_h as f32 * self.zoom);
@@ -15467,7 +15554,10 @@ impl ImageViewer {
 
                     let final_rect = image_rect;
 
-                    if precise_rotation_degrees.abs() < 0.01 {
+                    if precise_rotation_degrees.abs() < 0.01
+                        && !flip_horizontal
+                        && !flip_vertical
+                    {
                         ui.painter().image(
                             texture.id(),
                             final_rect,
@@ -15484,6 +15574,8 @@ impl ImageViewer {
                             center,
                             base_display_size,
                             precise_rotation_degrees.to_radians(),
+                            flip_horizontal,
+                            flip_vertical,
                             egui::Color32::WHITE,
                         );
                     }

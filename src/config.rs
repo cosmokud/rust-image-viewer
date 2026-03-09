@@ -155,6 +155,8 @@ pub enum Action {
     RotateCounterClockwise,
     PreciseRotationClockwise,
     PreciseRotationCounterClockwise,
+    FlipVertically,
+    FlipHorizontally,
     ZoomIn,
     ZoomOut,
     ResetZoom,
@@ -211,6 +213,8 @@ impl Action {
             "precise_rotation_counterclockwise"
             | "precise_rotate_counterclockwise"
             | "precise_rotate_ccw" => Some(Action::PreciseRotationCounterClockwise),
+            "flip_vertically" | "flip_vertical" => Some(Action::FlipVertically),
+            "flip_horizontally" | "flip_horizontal" => Some(Action::FlipHorizontally),
             "zoom_in" => Some(Action::ZoomIn),
             "zoom_out" => Some(Action::ZoomOut),
             "reset_zoom" | "reset" => Some(Action::ResetZoom),
@@ -263,6 +267,8 @@ impl Action {
             Action::RotateCounterClockwise => "rotate_counterclockwise",
             Action::PreciseRotationClockwise => "precise_rotation_clockwise",
             Action::PreciseRotationCounterClockwise => "precise_rotation_counterclockwise",
+            Action::FlipVertically => "flip_vertically",
+            Action::FlipHorizontally => "flip_horizontally",
             Action::ZoomIn => "zoom_in",
             Action::ZoomOut => "zoom_out",
             Action::ResetZoom => "reset_zoom",
@@ -749,6 +755,14 @@ impl Config {
         self.add_binding(
             InputBinding::KeyWithCtrl(egui::Key::ArrowDown),
             Action::PreciseRotationCounterClockwise,
+        );
+        self.add_binding(
+            InputBinding::KeyWithCtrl(egui::Key::ArrowLeft),
+            Action::FlipVertically,
+        );
+        self.add_binding(
+            InputBinding::KeyWithCtrl(egui::Key::ArrowRight),
+            Action::FlipHorizontally,
         );
 
         // Zoom
