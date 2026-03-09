@@ -467,6 +467,21 @@ fn write_shell_file_list_to_clipboard(
     Err("Shell file clipboard operations are only implemented on Windows".to_string())
 }
 
+#[cfg(target_os = "windows")]
+fn clear_system_clipboard() -> Result<(), String> {
+    use clipboard_win::{raw, Clipboard};
+
+    let _clipboard = Clipboard::new_attempts(10)
+        .map_err(|err| format!("Failed to open clipboard: {err}"))?;
+    raw::empty().map_err(|err| format!("Failed to clear clipboard: {err}"))?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn clear_system_clipboard() -> Result<(), String> {
+    Ok(())
+}
+
 fn move_paths_to_recycle_bin(paths: &[PathBuf]) -> Result<(), String> {
     if paths.is_empty() {
         return Ok(());
@@ -1349,6 +1364,8 @@ struct ImageViewer {
     pending_exit_confirmation: bool,
     /// Cached thumbnail textures used by delete/rename dialogs.
     modal_thumbnail_cache: HashMap<PathBuf, ModalThumbnailTexture>,
+    /// Rate limit for rescanning the current folder after external file moves/deletes.
+    last_missing_media_refresh_check: Instant,
     /// Current zoom level (1.0 = 100%)
     zoom: f32,
     /// Target zoom for smooth animation in floating mode
@@ -1842,6 +1859,7 @@ impl Default for ImageViewer {
             pending_marked_delete_targets: Vec::new(),
             pending_exit_confirmation: false,
             modal_thumbnail_cache: HashMap::new(),
+            last_missing_media_refresh_check: Instant::now(),
             zoom: 1.0,
             zoom_target: 1.0,
             zoom_velocity: 0.0,
@@ -2157,13 +2175,17 @@ impl ImageViewer {
         self.marked_files.contains(path)
     }
 
-    fn clear_prepared_clipboard_for_path(&mut self, path: &Path) {
-        self.prepared_clipboard_paths.remove(path);
+    fn clear_prepared_clipboard_for_path(&mut self, path: &Path) -> bool {
+        self.prepared_clipboard_paths.remove(path).is_some()
     }
 
     fn clear_all_marks(&mut self) {
         self.marked_files.clear();
+        let had_prepared_clipboard_paths = !self.prepared_clipboard_paths.is_empty();
         self.prepared_clipboard_paths.clear();
+        if had_prepared_clipboard_paths {
+            self.sync_prepared_clipboard_with_system();
+        }
     }
 
     fn has_marked_files(&self) -> bool {
@@ -2205,7 +2227,9 @@ impl ImageViewer {
 
         if !self.marked_files.insert(path.clone()) {
             self.marked_files.remove(&path);
-            self.clear_prepared_clipboard_for_path(&path);
+            if self.clear_prepared_clipboard_for_path(&path) {
+                self.sync_prepared_clipboard_with_system();
+            }
             return false;
         }
 
@@ -2214,6 +2238,7 @@ impl ImageViewer {
 
     fn toggle_marks_for_indices(&mut self, indices: &[usize]) -> usize {
         let mut changed = 0usize;
+        let mut prepared_clipboard_changed = false;
         let mut seen_paths = HashSet::new();
 
         for index in indices {
@@ -2224,10 +2249,16 @@ impl ImageViewer {
 
                 if !self.marked_files.insert(path.clone()) {
                     self.marked_files.remove(&path);
-                    self.clear_prepared_clipboard_for_path(&path);
+                    if self.clear_prepared_clipboard_for_path(&path) {
+                        prepared_clipboard_changed = true;
+                    }
                 }
                 changed = changed.saturating_add(1);
             }
+        }
+
+        if prepared_clipboard_changed {
+            self.sync_prepared_clipboard_with_system();
         }
 
         changed
@@ -2245,14 +2276,104 @@ impl ImageViewer {
     }
 
     fn clear_stale_marked_files(&mut self) {
+        let prepared_count_before = self.prepared_clipboard_paths.len();
         self.marked_files.retain(|path| path.exists());
         self.prepared_clipboard_paths
             .retain(|path, _| path.exists() && self.marked_files.contains(path));
+        if self.prepared_clipboard_paths.len() != prepared_count_before {
+            self.sync_prepared_clipboard_with_system();
+        }
     }
 
     fn clear_stale_prepared_clipboard_paths(&mut self) {
+        let prepared_count_before = self.prepared_clipboard_paths.len();
         self.prepared_clipboard_paths
             .retain(|path, _| path.exists());
+        if self.prepared_clipboard_paths.len() != prepared_count_before {
+            self.sync_prepared_clipboard_with_system();
+        }
+    }
+
+    fn collect_prepared_clipboard_targets(&self) -> Option<(Vec<PathBuf>, FileClipboardOperation)> {
+        let operation = self.prepared_clipboard_paths.values().next().copied()?;
+
+        let mut ordered_paths: Vec<PathBuf> = self
+            .image_list
+            .iter()
+            .filter(|path| {
+                self.prepared_clipboard_paths
+                    .get(*path)
+                    .is_some_and(|current_operation| *current_operation == operation)
+                    && path.exists()
+            })
+            .cloned()
+            .collect();
+
+        let mut extra_paths: Vec<PathBuf> = self
+            .prepared_clipboard_paths
+            .iter()
+            .filter(|(path, current_operation)| {
+                **current_operation == operation && !self.image_list.contains(path) && path.exists()
+            })
+            .map(|(path, _)| path.clone())
+            .collect();
+        extra_paths.sort();
+        ordered_paths.extend(extra_paths);
+
+        if ordered_paths.is_empty() {
+            None
+        } else {
+            Some((ordered_paths, operation))
+        }
+    }
+
+    fn sync_prepared_clipboard_with_system(&mut self) {
+        let result = match self.collect_prepared_clipboard_targets() {
+            Some((paths, operation)) => write_shell_file_list_to_clipboard(&paths, operation),
+            None => clear_system_clipboard(),
+        };
+
+        if let Err(err) = result {
+            self.error_message = Some(err);
+        }
+    }
+
+    fn refresh_media_list_if_entries_disappeared(&mut self) {
+        const MISSING_MEDIA_REFRESH_INTERVAL: Duration = Duration::from_millis(750);
+
+        if self.last_missing_media_refresh_check.elapsed() < MISSING_MEDIA_REFRESH_INTERVAL {
+            return;
+        }
+        self.last_missing_media_refresh_check = Instant::now();
+
+        let has_missing_media = self.image_list.iter().any(|path| !path.exists());
+        let has_missing_prepared_paths = self
+            .prepared_clipboard_paths
+            .keys()
+            .any(|path| !path.exists());
+
+        if !has_missing_media && !has_missing_prepared_paths {
+            return;
+        }
+
+        if has_missing_prepared_paths {
+            self.clear_stale_marked_files();
+            self.clear_stale_prepared_clipboard_paths();
+        }
+
+        if !has_missing_media {
+            return;
+        }
+
+        let refresh_anchor = self
+            .current_media_path()
+            .or_else(|| self.image_list.first().cloned());
+
+        if let Some(anchor_path) = refresh_anchor {
+            self.refresh_media_list_after_path_mutation(Some(anchor_path));
+        } else {
+            self.clear_current_media_after_all_files_removed();
+        }
     }
 
     fn set_prepared_clipboard_targets(
@@ -2640,14 +2761,20 @@ impl ImageViewer {
             completed_final_paths.push((original_path.clone(), new_path.clone()));
         }
 
+        let mut prepared_clipboard_changed = false;
         for (original_path, new_path) in &changed_paths {
             if self.marked_files.remove(original_path) {
                 self.marked_files.insert(new_path.clone());
             }
             if let Some(operation) = self.prepared_clipboard_paths.remove(original_path) {
                 self.prepared_clipboard_paths.insert(new_path.clone(), operation);
+                prepared_clipboard_changed = true;
             }
             self.modal_thumbnail_cache.remove(original_path);
+        }
+
+        if prepared_clipboard_changed {
+            self.sync_prepared_clipboard_with_system();
         }
 
         self.rename_overlay = None;
@@ -2747,10 +2874,17 @@ impl ImageViewer {
 
         match move_paths_to_recycle_bin(&existing_paths) {
             Ok(()) => {
+                let mut prepared_clipboard_changed = false;
                 for path in &existing_paths {
                     self.marked_files.remove(path);
-                    self.clear_prepared_clipboard_for_path(path);
+                    if self.clear_prepared_clipboard_for_path(path) {
+                        prepared_clipboard_changed = true;
+                    }
                     self.modal_thumbnail_cache.remove(path);
+                }
+
+                if prepared_clipboard_changed {
+                    self.sync_prepared_clipboard_with_system();
                 }
 
                 self.pending_single_delete_target = None;
@@ -4878,9 +5012,8 @@ impl ImageViewer {
     ) -> bool {
         let mut activated = false;
 
-        let current_context_labels = current_labels || !self.manga_mode;
         let is_marked = self.is_index_marked(target_index);
-        let mark_label = if current_context_labels {
+        let mark_label = if current_labels {
             if is_marked {
                 "Unmark Current File"
             } else {
@@ -4921,16 +5054,6 @@ impl ImageViewer {
             activated = true;
         }
 
-        let rename_label = if current_labels {
-            "Rename Current File"
-        } else {
-            "Rename"
-        };
-        if self.menu_action_row(ui, rename_label, MenuActionIcon::Rename).clicked() {
-            self.start_inline_rename_for_index(target_index);
-            activated = true;
-        }
-
         let delete_label = if current_labels {
             "Delete Current File"
         } else {
@@ -4938,6 +5061,16 @@ impl ImageViewer {
         };
         if self.menu_action_row(ui, delete_label, MenuActionIcon::Delete).clicked() {
             self.request_single_file_delete(target_index);
+            activated = true;
+        }
+
+        let rename_label = if current_labels {
+            "Rename Current File"
+        } else {
+            "Rename"
+        };
+        if self.menu_action_row(ui, rename_label, MenuActionIcon::Rename).clicked() {
+            self.start_inline_rename_for_index(target_index);
             activated = true;
         }
 
@@ -4968,17 +5101,17 @@ impl ImageViewer {
                 activated = true;
             }
             if self
-                .menu_action_row(ui, "Rename Marked Files", MenuActionIcon::Rename)
-                .clicked()
-            {
-                self.start_inline_rename_for_marked_files();
-                activated = true;
-            }
-            if self
                 .menu_action_row(ui, "Delete Marked Files", MenuActionIcon::Delete)
                 .clicked()
             {
                 self.request_marked_files_delete();
+                activated = true;
+            }
+            if self
+                .menu_action_row(ui, "Rename Marked Files", MenuActionIcon::Rename)
+                .clicked()
+            {
+                self.start_inline_rename_for_marked_files();
                 activated = true;
             }
         }
@@ -17978,6 +18111,10 @@ impl eframe::App for ImageViewer {
 
         // Window title might have changed due to file drops.
         self.apply_pending_window_title(ctx);
+
+        // External delete/move operations can invalidate the current folder contents.
+        // Refresh periodically so cut-then-paste and out-of-process deletes do not leave ghosts.
+        self.refresh_media_list_if_entries_disappeared();
 
         // Keep bottom overlays (video controls + manga toggle + zoom HUD) in sync.
         // Run this before input so the input handler can properly suppress actions over the video bar.
