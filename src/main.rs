@@ -27,7 +27,8 @@ use config::{
 };
 use hashbrown::{HashMap, HashSet};
 use image_loader::{
-    get_media_type, is_supported_video, probe_image_dimensions, ImageFrame, LoadedImage,
+    get_media_in_directory, get_media_type, is_supported_video, probe_image_dimensions,
+    ImageFrame, LoadedImage,
     MediaType,
 };
 use manga_loader::{DecodedImage, MangaLoader, MangaMediaType, MangaTextureCache, LOD_SIDE_BUCKETS};
@@ -51,6 +52,7 @@ use parking_lot::Mutex;
 use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::collections::{hash_map::DefaultHasher, VecDeque};
+use std::fs;
 use std::hash::{Hash, Hasher};
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -349,6 +351,115 @@ fn open_path_in_default_app(path: &std::path::Path) -> std::io::Result<()> {
             .spawn()
             .map(|_| ())
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FileClipboardOperation {
+    Copy,
+    Cut,
+}
+
+#[derive(Clone, Debug)]
+struct FileContextMenuState {
+    screen_pos: egui::Pos2,
+    target_index: usize,
+}
+
+#[derive(Clone, Debug)]
+struct RenameOverlayState {
+    original_path: PathBuf,
+    draft_name: String,
+    error_message: Option<String>,
+    just_opened: bool,
+}
+
+#[derive(Clone, Debug)]
+struct MarkSelectionBoxState {
+    anchor: egui::Pos2,
+    current: egui::Pos2,
+    preview_indices: Vec<usize>,
+}
+
+#[cfg(target_os = "windows")]
+fn write_shell_file_list_to_clipboard(
+    paths: &[PathBuf],
+    operation: FileClipboardOperation,
+) -> Result<(), String> {
+    use clipboard_win::{options::NoClear, raw, Clipboard};
+
+    if paths.is_empty() {
+        return Ok(());
+    }
+
+    let file_list: Vec<String> = paths
+        .iter()
+        .map(|path| path.to_string_lossy().to_string())
+        .collect();
+    let Some(preferred_drop_effect_format) = raw::register_format("Preferred DropEffect") else {
+        return Err("Failed to register Preferred DropEffect clipboard format".to_string());
+    };
+
+    let _clipboard = Clipboard::new_attempts(10)
+        .map_err(|err| format!("Failed to open clipboard: {err}"))?;
+    raw::empty().map_err(|err| format!("Failed to clear clipboard: {err}"))?;
+    raw::set_file_list_with(&file_list, NoClear)
+        .map_err(|err| format!("Failed to place files on clipboard: {err}"))?;
+
+    let preferred_effect = match operation {
+        FileClipboardOperation::Copy => 1u32,
+        FileClipboardOperation::Cut => 2u32,
+    };
+    raw::set_without_clear(
+        preferred_drop_effect_format.get(),
+        &preferred_effect.to_le_bytes(),
+    )
+    .map_err(|err| format!("Failed to set clipboard drop effect: {err}"))?;
+
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn write_shell_file_list_to_clipboard(
+    _paths: &[PathBuf],
+    _operation: FileClipboardOperation,
+) -> Result<(), String> {
+    Err("Shell file clipboard operations are only implemented on Windows".to_string())
+}
+
+fn move_paths_to_recycle_bin(paths: &[PathBuf]) -> Result<(), String> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+
+    trash::delete_all(paths).map_err(|err| format!("Failed to move file(s) to recycle bin: {err}"))
+}
+
+fn paint_mark_chip(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    text: &str,
+    fill: egui::Color32,
+    stroke: egui::Stroke,
+    text_color: egui::Color32,
+) {
+    let chip_pos = egui::pos2(rect.min.x + 10.0, rect.min.y + 10.0);
+    let galley = painter.layout_no_wrap(
+        text.to_owned(),
+        egui::FontId::proportional(11.5),
+        text_color,
+    );
+    let chip_rect = egui::Rect::from_min_size(
+        chip_pos,
+        egui::vec2(galley.rect.width() + 18.0, galley.rect.height() + 10.0),
+    );
+
+    painter.rect_filled(chip_rect, 10.0, fill);
+    painter.rect_stroke(chip_rect, 10.0, stroke);
+    painter.galley(
+        chip_rect.center() - galley.rect.size() * 0.5,
+        galley,
+        text_color,
+    );
 }
 
 /// Resize direction for window edge dragging
@@ -1179,6 +1290,18 @@ struct ImageViewer {
     pending_manga_video_load: Option<PendingMangaFocusedVideoLoad>,
     /// Current image index in the list
     current_index: usize,
+    /// File paths explicitly marked by the user for bulk actions.
+    marked_files: HashSet<PathBuf>,
+    /// Pointer-anchored file actions context menu state.
+    file_action_menu: Option<FileContextMenuState>,
+    /// Inline rename editor displayed over the title-bar filename slot.
+    rename_overlay: Option<RenameOverlayState>,
+    /// Active Ctrl+drag marquee selection used to mark multiple files in strip/masonry mode.
+    mark_selection_box: Option<MarkSelectionBoxState>,
+    /// Delete-confirmation target for a single-file action.
+    pending_single_delete_target: Option<PathBuf>,
+    /// Delete-confirmation target for marked-file actions.
+    pending_marked_delete_targets: Vec<PathBuf>,
     /// Current zoom level (1.0 = 100%)
     zoom: f32,
     /// Target zoom for smooth animation in floating mode
@@ -1660,6 +1783,12 @@ impl Default for ImageViewer {
             manga_video_load_coordinator: MangaFocusedVideoLoadCoordinator::new(),
             pending_manga_video_load: None,
             current_index: 0,
+            marked_files: HashSet::new(),
+            file_action_menu: None,
+            rename_overlay: None,
+            mark_selection_box: None,
+            pending_single_delete_target: None,
+            pending_marked_delete_targets: Vec::new(),
             zoom: 1.0,
             zoom_target: 1.0,
             zoom_velocity: 0.0,
@@ -1945,6 +2074,496 @@ impl ImageViewer {
 
         self.image_list = files;
         self.image_list_signature = new_signature;
+    }
+
+    fn current_media_path(&self) -> Option<PathBuf> {
+        self.image_list.get(self.current_index).cloned()
+    }
+
+    fn mark_target_index_from_pointer(&mut self, ctx: &egui::Context) -> Option<usize> {
+        if self.image_list.is_empty() {
+            return None;
+        }
+
+        if self.manga_mode && self.is_fullscreen {
+            let pointer_pos = ctx.input(|input| input.pointer.hover_pos());
+            if let Some(pos) = pointer_pos {
+                if !self.pointer_over_shortcut_blocking_ui(Some(pos), ctx.screen_rect()) {
+                    if let Some(index) = self.manga_index_at_screen_pos(pos) {
+                        return Some(index);
+                    }
+                }
+            }
+        }
+
+        Some(self.current_index.min(self.image_list.len().saturating_sub(1)))
+    }
+
+    fn is_path_marked(&self, path: &Path) -> bool {
+        self.marked_files.contains(path)
+    }
+
+    fn is_index_marked(&self, index: usize) -> bool {
+        self.image_list
+            .get(index)
+            .is_some_and(|path| self.is_path_marked(path))
+    }
+
+    fn toggle_mark_for_index(&mut self, index: usize) -> bool {
+        let Some(path) = self.image_list.get(index).cloned() else {
+            return false;
+        };
+
+        if !self.marked_files.insert(path.clone()) {
+            self.marked_files.remove(&path);
+            return false;
+        }
+
+        true
+    }
+
+    fn mark_indices(&mut self, indices: &[usize]) -> usize {
+        let mut added = 0usize;
+        for index in indices {
+            if let Some(path) = self.image_list.get(*index).cloned() {
+                if self.marked_files.insert(path) {
+                    added = added.saturating_add(1);
+                }
+            }
+        }
+        added
+    }
+
+    fn clear_stale_marked_files(&mut self) {
+        self.marked_files.retain(|path| path.exists());
+    }
+
+    fn collect_marked_paths_in_current_order(&self) -> Vec<PathBuf> {
+        let mut ordered: Vec<PathBuf> = self
+            .image_list
+            .iter()
+            .filter(|path| self.marked_files.contains(*path) && path.exists())
+            .cloned()
+            .collect();
+
+        let mut extras: Vec<PathBuf> = self
+            .marked_files
+            .iter()
+            .filter(|path| !self.image_list.contains(*path) && path.exists())
+            .cloned()
+            .collect();
+        extras.sort();
+        ordered.extend(extras);
+        ordered
+    }
+
+    fn choose_fallback_path_after_removal(
+        &self,
+        removed_paths: &HashSet<PathBuf>,
+    ) -> Option<PathBuf> {
+        let current_path = self.current_media_path();
+        if let Some(path) = current_path.as_ref() {
+            if !removed_paths.contains(path) && path.exists() {
+                return Some(path.clone());
+            }
+        }
+
+        for candidate in self.image_list.iter().skip(self.current_index.saturating_add(1)) {
+            if !removed_paths.contains(candidate) && candidate.exists() {
+                return Some(candidate.clone());
+            }
+        }
+
+        for candidate in self.image_list.iter().take(self.current_index).rev() {
+            if !removed_paths.contains(candidate) && candidate.exists() {
+                return Some(candidate.clone());
+            }
+        }
+
+        None
+    }
+
+    fn clear_current_media_after_all_files_removed(&mut self) {
+        self.clear_pending_media_load();
+        self.clear_pending_manga_video_load();
+        self.stop_fullscreen_video_playback();
+        self.reset_fullscreen_anim_stream_state();
+
+        self.image = None;
+        self.texture = None;
+        self.image_texture_dims = None;
+        self.video_texture = None;
+        self.video_texture_dims = None;
+        self.current_media_type = None;
+        self.current_index = 0;
+        self.set_image_list(Vec::new());
+
+        self.current_file_size_label = None;
+        self.current_file_size_label_path = None;
+        self.pending_file_size_probe = None;
+        self.pending_file_size_probe_path = None;
+
+        self.error_message = None;
+        self.pending_window_title = Some(env!("CARGO_PKG_NAME").to_string());
+        self.marked_files.clear();
+        self.file_action_menu = None;
+        self.rename_overlay = None;
+        self.pending_single_delete_target = None;
+        self.pending_marked_delete_targets.clear();
+
+        if self.manga_mode {
+            self.manga_clear_cache();
+            self.manga_mode = false;
+        }
+    }
+
+    fn refresh_media_list_after_path_mutation(&mut self, preferred_current_path: Option<PathBuf>) {
+        let anchor_path = preferred_current_path
+            .clone()
+            .or_else(|| self.current_media_path())
+            .or_else(|| self.image_list.first().cloned());
+
+        let Some(anchor_path) = anchor_path else {
+            self.clear_current_media_after_all_files_removed();
+            return;
+        };
+
+        if let Some(parent) = anchor_path.parent() {
+            self.media_directory_index.invalidate_directory(parent);
+        }
+
+        let files = get_media_in_directory(&anchor_path);
+        self.set_image_list(files);
+        self.clear_stale_marked_files();
+
+        if self.image_list.is_empty() {
+            self.clear_current_media_after_all_files_removed();
+            return;
+        }
+
+        let resolved_path = preferred_current_path
+            .as_ref()
+            .and_then(|preferred| {
+                self.image_list
+                    .iter()
+                    .find(|candidate| *candidate == preferred)
+                    .cloned()
+            })
+            .or_else(|| self.current_media_path())
+            .or_else(|| self.image_list.first().cloned());
+
+        if let Some(path) = resolved_path {
+            let resolved_index = self
+                .image_list
+                .iter()
+                .position(|candidate| candidate == &path)
+                .unwrap_or(0);
+            self.set_current_index_clamped(resolved_index);
+            self.pending_window_title = Some(self.compute_window_title_for_path(&path));
+        }
+
+        if self.manga_mode {
+            self.manga_clear_cache();
+            self.ensure_manga_loader();
+            self.manga_update_preload_queue();
+        }
+    }
+
+    fn open_file_action_menu(&mut self, screen_pos: egui::Pos2, target_index: usize) {
+        if target_index >= self.image_list.len() {
+            return;
+        }
+
+        self.file_action_menu = Some(FileContextMenuState {
+            screen_pos,
+            target_index,
+        });
+        self.show_controls = true;
+        self.controls_show_time = Instant::now();
+    }
+
+    fn start_inline_rename_for_index(&mut self, index: usize) {
+        let Some(path) = self.image_list.get(index).cloned() else {
+            return;
+        };
+
+        let draft_name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        self.rename_overlay = Some(RenameOverlayState {
+            original_path: path,
+            draft_name,
+            error_message: None,
+            just_opened: true,
+        });
+        self.file_action_menu = None;
+        self.show_controls = true;
+        self.controls_show_time = Instant::now();
+    }
+
+    fn cancel_inline_rename(&mut self) {
+        self.rename_overlay = None;
+    }
+
+    fn validate_rename_draft(draft_name: &str) -> Result<(), String> {
+        if draft_name.trim().is_empty() {
+            return Err("File name cannot be empty".to_string());
+        }
+
+        if draft_name == "." || draft_name == ".." {
+            return Err("File name is not valid".to_string());
+        }
+
+        if draft_name.contains('\\') || draft_name.contains('/') {
+            return Err("Use a file name only, not a path".to_string());
+        }
+
+        Ok(())
+    }
+
+    fn commit_inline_rename(&mut self) {
+        let Some(state) = self.rename_overlay.clone() else {
+            return;
+        };
+
+        if let Err(err) = Self::validate_rename_draft(&state.draft_name) {
+            if let Some(rename_state) = self.rename_overlay.as_mut() {
+                rename_state.error_message = Some(err);
+            }
+            return;
+        }
+
+        let Some(parent) = state.original_path.parent() else {
+            if let Some(rename_state) = self.rename_overlay.as_mut() {
+                rename_state.error_message = Some("Cannot rename a path without a parent folder".to_string());
+            }
+            return;
+        };
+
+        let new_path = parent.join(&state.draft_name);
+        if new_path == state.original_path {
+            self.rename_overlay = None;
+            return;
+        }
+
+        if new_path.exists() {
+            if let Some(rename_state) = self.rename_overlay.as_mut() {
+                rename_state.error_message = Some("A file with that name already exists".to_string());
+            }
+            return;
+        }
+
+        let current_path_before = self.current_media_path();
+        match fs::rename(&state.original_path, &new_path) {
+            Ok(()) => {
+                if self.marked_files.remove(&state.original_path) {
+                    self.marked_files.insert(new_path.clone());
+                }
+
+                self.rename_overlay = None;
+
+                let renamed_current = current_path_before.as_ref() == Some(&state.original_path);
+                if renamed_current && !self.manga_mode {
+                    self.load_media(&new_path);
+                } else {
+                    let preferred_current = if renamed_current {
+                        Some(new_path.clone())
+                    } else {
+                        current_path_before
+                    };
+                    self.refresh_media_list_after_path_mutation(preferred_current);
+                }
+            }
+            Err(err) => {
+                if let Some(rename_state) = self.rename_overlay.as_mut() {
+                    rename_state.error_message = Some(format!("Rename failed: {err}"));
+                }
+            }
+        }
+    }
+
+    fn apply_clipboard_operation_to_single_file(
+        &mut self,
+        index: usize,
+        operation: FileClipboardOperation,
+    ) {
+        let Some(path) = self.image_list.get(index).cloned() else {
+            return;
+        };
+
+        self.file_action_menu = None;
+        if let Err(err) = write_shell_file_list_to_clipboard(&[path], operation) {
+            self.error_message = Some(err);
+        }
+    }
+
+    fn apply_clipboard_operation_to_marked_files(&mut self, operation: FileClipboardOperation) {
+        let marked_paths = self.collect_marked_paths_in_current_order();
+        if marked_paths.is_empty() {
+            return;
+        }
+
+        self.file_action_menu = None;
+        if let Err(err) = write_shell_file_list_to_clipboard(&marked_paths, operation) {
+            self.error_message = Some(err);
+        }
+    }
+
+    fn request_single_file_delete(&mut self, index: usize) {
+        let Some(path) = self.image_list.get(index).cloned() else {
+            return;
+        };
+
+        self.file_action_menu = None;
+        self.pending_marked_delete_targets.clear();
+        if self.config.confirm_delete_to_recycle_bin {
+            self.pending_single_delete_target = Some(path);
+        } else {
+            self.perform_delete_targets(vec![path]);
+        }
+    }
+
+    fn request_marked_files_delete(&mut self) {
+        let marked_paths = self.collect_marked_paths_in_current_order();
+        if marked_paths.is_empty() {
+            return;
+        }
+
+        self.file_action_menu = None;
+        self.pending_single_delete_target = None;
+        if self.config.confirm_delete_to_recycle_bin {
+            self.pending_marked_delete_targets = marked_paths;
+        } else {
+            self.perform_delete_targets(marked_paths);
+        }
+    }
+
+    fn perform_delete_targets(&mut self, paths: Vec<PathBuf>) {
+        let existing_paths: Vec<PathBuf> = paths.into_iter().filter(|path| path.exists()).collect();
+        if existing_paths.is_empty() {
+            self.pending_single_delete_target = None;
+            self.pending_marked_delete_targets.clear();
+            self.clear_stale_marked_files();
+            return;
+        }
+
+        let removed_paths: HashSet<PathBuf> = existing_paths.iter().cloned().collect();
+        let current_path_before = self.current_media_path();
+        let fallback_path = self.choose_fallback_path_after_removal(&removed_paths);
+
+        match move_paths_to_recycle_bin(&existing_paths) {
+            Ok(()) => {
+                for path in &existing_paths {
+                    self.marked_files.remove(path);
+                }
+
+                self.pending_single_delete_target = None;
+                self.pending_marked_delete_targets.clear();
+                self.rename_overlay = None;
+
+                let removed_current = current_path_before
+                    .as_ref()
+                    .is_some_and(|current| removed_paths.contains(current));
+
+                if removed_current && !self.manga_mode {
+                    if let Some(path) = fallback_path.clone() {
+                        self.load_media(&path);
+                    } else {
+                        self.clear_current_media_after_all_files_removed();
+                    }
+                } else {
+                    self.refresh_media_list_after_path_mutation(
+                        fallback_path.or(current_path_before),
+                    );
+                }
+            }
+            Err(err) => {
+                self.error_message = Some(err);
+            }
+        }
+    }
+
+    fn mark_selection_preview_contains(&self, index: usize) -> bool {
+        self.mark_selection_box
+            .as_ref()
+            .is_some_and(|selection| selection.preview_indices.contains(&index))
+    }
+
+    fn collect_mark_selection_preview_indices(&mut self, selection_rect: egui::Rect) -> Vec<usize> {
+        if !self.manga_mode || !self.is_fullscreen || self.image_list.is_empty() {
+            return Vec::new();
+        }
+
+        if self.is_masonry_mode() {
+            self.masonry_ensure_layout_cache();
+            return self
+                .masonry_layout_items
+                .iter()
+                .enumerate()
+                .filter_map(|(index, _)| {
+                    self.masonry_item_screen_rect(index)
+                        .filter(|rect| rect.intersects(selection_rect))
+                        .map(|_| index)
+                })
+                .collect();
+        }
+
+        let screen_width = self.screen_size.x.max(1.0);
+        let image_count = self.image_list.len();
+        let mut preview_indices = Vec::new();
+
+        for index in 0..image_count {
+            let display_height = self.manga_page_height_cached(index).max(1.0);
+            let display_width = self.manga_get_image_display_width(index);
+            let x = (screen_width - display_width) * 0.5 + self.offset.x;
+            let y = self.manga_page_start_y(index) - self.manga_scroll_offset;
+            let rect = egui::Rect::from_min_size(
+                egui::pos2(x, y),
+                egui::vec2(display_width, display_height),
+            );
+
+            if rect.intersects(selection_rect) {
+                preview_indices.push(index);
+            }
+        }
+
+        preview_indices
+    }
+
+    fn paint_marked_item_overlay(
+        &self,
+        painter: &egui::Painter,
+        rect: egui::Rect,
+        preview: bool,
+    ) {
+        let border_color = if preview {
+            egui::Color32::from_rgba_unmultiplied(255, 199, 92, 255)
+        } else {
+            egui::Color32::from_rgba_unmultiplied(94, 214, 255, 255)
+        };
+        let fill_color = if preview {
+            egui::Color32::from_rgba_unmultiplied(255, 199, 92, 32)
+        } else {
+            egui::Color32::from_rgba_unmultiplied(94, 214, 255, 22)
+        };
+        let chip_fill = if preview {
+            egui::Color32::from_rgba_unmultiplied(72, 44, 0, 220)
+        } else {
+            egui::Color32::from_rgba_unmultiplied(16, 56, 74, 220)
+        };
+
+        painter.rect_filled(rect, 12.0, fill_color);
+        painter.rect_stroke(rect.expand(1.5), 12.0, egui::Stroke::new(2.0, border_color));
+        paint_mark_chip(
+            painter,
+            rect,
+            if preview { "READY" } else { "MARKED" },
+            chip_fill,
+            egui::Stroke::new(1.0, border_color),
+            egui::Color32::WHITE,
+        );
     }
 
     fn mark_masonry_runtime_cache_resident(&mut self) {
@@ -3697,6 +4316,296 @@ impl ImageViewer {
             }
         } else {
             "GIF"
+        }
+    }
+
+    fn current_fab_single_action_index(&self) -> Option<usize> {
+        if self.manga_mode || self.image_list.is_empty() {
+            None
+        } else {
+            Some(self.current_index.min(self.image_list.len().saturating_sub(1)))
+        }
+    }
+
+    fn render_single_file_action_buttons(
+        &mut self,
+        ui: &mut egui::Ui,
+        target_index: usize,
+        current_labels: bool,
+    ) -> bool {
+        let mut activated = false;
+
+        let cut_label = if current_labels {
+            "Cut Current File"
+        } else {
+            "Cut File"
+        };
+        if ui.button(cut_label).clicked() {
+            self.apply_clipboard_operation_to_single_file(target_index, FileClipboardOperation::Cut);
+            activated = true;
+        }
+
+        let copy_label = if current_labels {
+            "Copy Current File"
+        } else {
+            "Copy File"
+        };
+        if ui.button(copy_label).clicked() {
+            self.apply_clipboard_operation_to_single_file(target_index, FileClipboardOperation::Copy);
+            activated = true;
+        }
+
+        let delete_label = if current_labels {
+            "Delete Current File"
+        } else {
+            "Delete File"
+        };
+        if ui.button(delete_label).clicked() {
+            self.request_single_file_delete(target_index);
+            activated = true;
+        }
+
+        let rename_label = if current_labels {
+            "Rename Current File"
+        } else {
+            "Rename File"
+        };
+        if ui.button(rename_label).clicked() {
+            self.start_inline_rename_for_index(target_index);
+            activated = true;
+        }
+
+        activated
+    }
+
+    fn render_marked_file_action_buttons(&mut self, ui: &mut egui::Ui) -> bool {
+        if self.collect_marked_paths_in_current_order().is_empty() {
+            return false;
+        }
+
+        let mut activated = false;
+
+        if ui.button("Cut Marked Files").clicked() {
+            self.apply_clipboard_operation_to_marked_files(FileClipboardOperation::Cut);
+            activated = true;
+        }
+        if ui.button("Copy Marked Files").clicked() {
+            self.apply_clipboard_operation_to_marked_files(FileClipboardOperation::Copy);
+            activated = true;
+        }
+        if ui.button("Delete Marked Files").clicked() {
+            self.request_marked_files_delete();
+            activated = true;
+        }
+
+        activated
+    }
+
+    fn draw_file_action_context_menu(&mut self, ctx: &egui::Context) {
+        let Some(menu_state) = self.file_action_menu.clone() else {
+            return;
+        };
+
+        let screen_rect = ctx.screen_rect();
+        let mut close_menu = ctx.input(|input| input.key_pressed(egui::Key::Escape));
+
+        egui::Area::new(egui::Id::new("file_action_menu_backdrop"))
+            .fixed_pos(screen_rect.min)
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                let local_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, screen_rect.size());
+                let response = ui.allocate_rect(local_rect, egui::Sense::click());
+                if response.clicked() || response.secondary_clicked() {
+                    close_menu = true;
+                }
+            });
+
+        let menu_pos = egui::pos2(
+            menu_state
+                .screen_pos
+                .x
+                .clamp(screen_rect.min.x + 8.0, (screen_rect.max.x - 240.0).max(screen_rect.min.x + 8.0)),
+            menu_state
+                .screen_pos
+                .y
+                .clamp(screen_rect.min.y + 8.0, (screen_rect.max.y - 240.0).max(screen_rect.min.y + 8.0)),
+        );
+
+        egui::Area::new(egui::Id::new("file_action_menu"))
+            .fixed_pos(menu_pos)
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::none()
+                    .fill(egui::Color32::from_rgba_unmultiplied(18, 22, 28, 244))
+                    .stroke(egui::Stroke::new(
+                        1.0,
+                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 36),
+                    ))
+                    .rounding(14.0)
+                    .inner_margin(egui::Margin::same(10.0))
+                    .show(ui, |ui| {
+                        ui.set_min_width(220.0);
+
+                        let title = self
+                            .image_list
+                            .get(menu_state.target_index)
+                            .and_then(|path| path.file_name())
+                            .map(|name| name.to_string_lossy().to_string())
+                            .unwrap_or_else(|| "File".to_string());
+
+                        ui.label(
+                            egui::RichText::new(title)
+                                .color(egui::Color32::WHITE)
+                                .strong()
+                                .size(14.0),
+                        );
+                        ui.add_space(4.0);
+
+                        let mark_label = if self.is_index_marked(menu_state.target_index) {
+                            "Unmark"
+                        } else {
+                            "Mark"
+                        };
+                        if ui.button(mark_label).clicked() {
+                            self.toggle_mark_for_index(menu_state.target_index);
+                            close_menu = true;
+                        }
+
+                        ui.separator();
+                        if self.render_single_file_action_buttons(ui, menu_state.target_index, false) {
+                            close_menu = true;
+                        }
+                    });
+            });
+
+        if close_menu {
+            self.file_action_menu = None;
+        }
+    }
+
+    fn draw_delete_confirmation_modal(&mut self, ctx: &egui::Context) {
+        let (targets, title, body) = if let Some(path) = self.pending_single_delete_target.clone() {
+            let label = path
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.to_string_lossy().to_string());
+            (
+                vec![path],
+                "Delete File to Recycle Bin?".to_string(),
+                format!("This will move {} to the Recycle Bin.", label),
+            )
+        } else if !self.pending_marked_delete_targets.is_empty() {
+            let targets = self.pending_marked_delete_targets.clone();
+            let preview = targets
+                .iter()
+                .take(3)
+                .filter_map(|path| path.file_name().map(|name| name.to_string_lossy().to_string()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let body = if preview.is_empty() {
+                format!("This will move {} marked files to the Recycle Bin.", targets.len())
+            } else {
+                format!(
+                    "This will move {} marked files to the Recycle Bin: {}{}",
+                    targets.len(),
+                    preview,
+                    if targets.len() > 3 { ", ..." } else { "" }
+                )
+            };
+            (
+                targets,
+                "Delete Marked Files to Recycle Bin?".to_string(),
+                body,
+            )
+        } else {
+            return;
+        };
+
+        let mut cancel = ctx.input(|input| input.key_pressed(egui::Key::Escape));
+        let mut confirm = false;
+        let screen_rect = ctx.screen_rect();
+
+        egui::Area::new(egui::Id::new("delete_confirmation_backdrop"))
+            .fixed_pos(screen_rect.min)
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, screen_rect.size());
+                ui.painter().rect_filled(
+                    rect,
+                    0.0,
+                    egui::Color32::from_rgba_unmultiplied(5, 7, 10, 190),
+                );
+            });
+
+        let modal_size = egui::vec2(420.0, 220.0);
+        let modal_pos = screen_rect.center() - modal_size * 0.5;
+        egui::Area::new(egui::Id::new("delete_confirmation_modal"))
+            .fixed_pos(modal_pos)
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                ui.set_min_size(modal_size);
+                egui::Frame::none()
+                    .fill(egui::Color32::from_rgba_unmultiplied(18, 22, 28, 252))
+                    .stroke(egui::Stroke::new(
+                        1.0,
+                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 40),
+                    ))
+                    .rounding(18.0)
+                    .inner_margin(egui::Margin::same(18.0))
+                    .show(ui, |ui| {
+                        ui.vertical(|ui| {
+                            ui.label(
+                                egui::RichText::new(title)
+                                    .color(egui::Color32::WHITE)
+                                    .strong()
+                                    .size(18.0),
+                            );
+                            ui.add_space(8.0);
+                            ui.label(
+                                egui::RichText::new(body)
+                                    .color(egui::Color32::from_rgb(210, 216, 224))
+                                    .size(14.0),
+                            );
+                            ui.add_space(10.0);
+                            ui.label(
+                                egui::RichText::new(
+                                    "Set confirm_delete_to_recycle_bin = false in config.ini to skip this confirmation.",
+                                )
+                                .color(egui::Color32::from_rgb(130, 168, 196))
+                                .size(12.0),
+                            );
+                            ui.add_space(16.0);
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                let delete_button = ui.add(
+                                    egui::Button::new(
+                                        egui::RichText::new("Delete to Recycle Bin")
+                                            .color(egui::Color32::WHITE),
+                                    )
+                                    .fill(egui::Color32::from_rgb(176, 52, 52))
+                                    .rounding(10.0),
+                                );
+                                if delete_button.clicked() {
+                                    confirm = true;
+                                }
+
+                                let cancel_button = ui.add(
+                                    egui::Button::new("Cancel")
+                                        .fill(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 24))
+                                        .rounding(10.0),
+                                );
+                                if cancel_button.clicked() {
+                                    cancel = true;
+                                }
+                            });
+                        });
+                    });
+            });
+
+        if cancel {
+            self.pending_single_delete_target = None;
+            self.pending_marked_delete_targets.clear();
+        } else if confirm {
+            self.perform_delete_targets(targets);
         }
     }
 
@@ -11478,6 +12387,11 @@ impl ImageViewer {
             }
         }
 
+        let preview_only = self.mark_selection_preview_contains(idx) && !self.is_index_marked(idx);
+        if self.is_index_marked(idx) || preview_only {
+            self.paint_marked_item_overlay(ui.painter(), image_rect, preview_only);
+        }
+
         requested_retry
     }
 
@@ -11657,19 +12571,16 @@ impl ImageViewer {
         let over_controls =
             pointer_pos.map_or(false, |p| p.y > screen_height - controls_bar_height);
 
-        if self.is_masonry_mode() {
+        if !title_ui_blocking && !pointer_over_shortcut_ui && !over_controls {
             self.manga_hovered_media_index =
-                if !title_ui_blocking && !pointer_over_shortcut_ui && !over_controls {
-                    pointer_pos.and_then(|pos| self.manga_index_at_screen_pos(pos))
-                } else {
-                    None
-                };
+                pointer_pos.and_then(|pos| self.manga_index_at_screen_pos(pos));
         } else {
             self.manga_hovered_media_index = None;
         }
 
         let mut primary_consumed_for_autoscroll = false;
         let mut secondary_consumed_for_autoscroll = false;
+        let mut secondary_consumed_for_file_menu = false;
 
         if freehand_autoscroll_triggered
             && !over_controls
@@ -11701,8 +12612,25 @@ impl ImageViewer {
         }
 
         if secondary_clicked
+            && ctrl_held
+            && !secondary_consumed_for_autoscroll
+            && !over_controls
+            && !title_ui_blocking
+            && !pointer_over_shortcut_ui
+        {
+            if let Some(target_index) = self.manga_hovered_media_index {
+                self.open_file_action_menu(
+                    pointer_pos.unwrap_or(screen_rect.center()),
+                    target_index,
+                );
+                secondary_consumed_for_file_menu = true;
+            }
+        }
+
+        if secondary_clicked
             && !self.strip_item_open_uses_right_click()
             && !secondary_consumed_for_autoscroll
+            && !secondary_consumed_for_file_menu
             && !over_controls
             && !title_ui_blocking
             && !pointer_over_shortcut_ui
@@ -11771,6 +12699,66 @@ impl ImageViewer {
                 || pointer_pos.map_or(false, |p| scrollbar_hover_zone.contains(p)));
         // Show page indicator whenever scrollbar is visible (same visibility logic)
         let show_page_indicator = show_scrollbar;
+
+        let mark_selection_allowed = ctrl_held
+            && !title_ui_blocking
+            && !pointer_over_shortcut_ui
+            && !over_controls
+            && !over_scrollbar
+            && !self.manga_autoscroll_active;
+
+        if mark_selection_allowed && primary_pressed {
+            if let Some(pos) = pointer_pos {
+                self.mark_selection_box = Some(MarkSelectionBoxState {
+                    anchor: pos,
+                    current: pos,
+                    preview_indices: Vec::new(),
+                });
+                self.is_panning = false;
+                self.last_mouse_pos = None;
+                self.stop_manga_wheel_scroll();
+                animation_active = true;
+            }
+        }
+
+        if let Some(pos) = pointer_pos {
+            let mut selection_rect = None;
+            if let Some(selection) = self.mark_selection_box.as_mut() {
+                if primary_down {
+                    selection.current = pos;
+                    selection_rect = Some(egui::Rect::from_two_pos(selection.anchor, selection.current));
+                }
+            }
+
+            if let Some(rect) = selection_rect {
+                let preview_indices = self.collect_mark_selection_preview_indices(rect);
+                if let Some(selection) = self.mark_selection_box.as_mut() {
+                    selection.preview_indices = preview_indices;
+                }
+                ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+                animation_active = true;
+            }
+        }
+
+        let finalize_mark_selection = self.mark_selection_box.as_ref().and_then(|selection| {
+            if primary_released || !primary_down || !ctrl_held {
+                Some(selection.preview_indices.clone())
+            } else {
+                None
+            }
+        });
+
+        if finalize_mark_selection.is_some() {
+            self.mark_selection_box = None;
+        }
+
+        if let Some(indices) = finalize_mark_selection {
+            if !indices.is_empty() {
+                self.mark_indices(&indices);
+                self.show_controls = true;
+                self.controls_show_time = Instant::now();
+            }
+        }
 
         // Bottom-center page label: show when hovering near bottom of screen
         let page_label_hover_zone = egui::Rect::from_min_max(
@@ -12034,6 +13022,8 @@ impl ImageViewer {
             && !over_scrollbar
             && !over_controls
             && !self.manga_autoscroll_active
+            && self.mark_selection_box.is_none()
+            && !ctrl_held
             && !primary_consumed_for_autoscroll
             && !self.manga_video_seeking
             && !self.gif_seeking
@@ -12450,6 +13440,24 @@ impl ImageViewer {
                         self.paint_manga_autoscroll_indicator(ui.painter(), anchor, pointer_pos);
                     }
                 }
+
+                if let Some(selection) = self.mark_selection_box.as_ref() {
+                    let selection_rect =
+                        egui::Rect::from_two_pos(selection.anchor, selection.current);
+                    ui.painter().rect_filled(
+                        selection_rect,
+                        12.0,
+                        egui::Color32::from_rgba_unmultiplied(94, 214, 255, 28),
+                    );
+                    ui.painter().rect_stroke(
+                        selection_rect,
+                        12.0,
+                        egui::Stroke::new(
+                            1.5,
+                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200),
+                        ),
+                    );
+                }
             });
 
         if self.is_masonry_mode() && self.masonry_metadata_preload_active {
@@ -12850,6 +13858,16 @@ impl ImageViewer {
     /// Handle keyboard and mouse input
     fn handle_input(&mut self, ctx: &egui::Context) {
         let screen_width = ctx.screen_rect().width();
+        let space_pressed_for_mark = self.rename_overlay.is_none()
+            && ctx.input(|input| input.key_pressed(egui::Key::Space));
+
+        if space_pressed_for_mark {
+            if let Some(index) = self.mark_target_index_from_pointer(ctx) {
+                self.toggle_mark_for_index(index);
+                self.show_controls = true;
+                self.controls_show_time = Instant::now();
+            }
+        }
 
         // Collect actions to run (we can't mutate self inside ctx.input closure)
         let mut actions_to_run: Vec<Action> = Vec::new();
@@ -12857,6 +13875,7 @@ impl ImageViewer {
         let mut strip_item_open_pointer_pos: Option<egui::Pos2> = None;
         let mut right_click_toggle_fullscreen = false;
         let mut right_click_navigated = false;
+        let mut ctrl_secondary_single_file_menu_pos: Option<egui::Pos2> = None;
 
         ctx.input(|input| {
             let ctrl = input.modifiers.ctrl;
@@ -12879,6 +13898,13 @@ impl ImageViewer {
                 if primary_cancel || secondary_cancel {
                     return;
                 }
+            }
+
+            if secondary_clicked && ctrl && !self.manga_mode && !pointer_over_shortcut_ui {
+                ctrl_secondary_single_file_menu_pos = Some(
+                    pointer_pos.unwrap_or(input.screen_rect.center()),
+                );
+                return;
             }
 
             if manga_fullscreen
@@ -12958,6 +13984,9 @@ impl ImageViewer {
                 for binding in bindings {
                     match binding {
                         InputBinding::Key(key) => {
+                            if space_pressed_for_mark && *key == egui::Key::Space {
+                                continue;
+                            }
                             if !ctrl && !shift && !alt && input.key_pressed(*key) {
                                 actions_to_run.push(action);
                             }
@@ -13053,6 +14082,16 @@ impl ImageViewer {
                 }
             }
         });
+
+        if let Some(menu_pos) = ctrl_secondary_single_file_menu_pos {
+            if !self.image_list.is_empty() {
+                self.open_file_action_menu(
+                    menu_pos,
+                    self.current_index.min(self.image_list.len().saturating_sub(1)),
+                );
+                return;
+            }
+        }
 
         if strip_item_open_from_strip {
             self.stop_manga_autoscroll();
@@ -13405,6 +14444,11 @@ impl ImageViewer {
             self.title_text_dragging = false;
         }
 
+        if self.rename_overlay.is_some() {
+            self.show_controls = true;
+            self.controls_show_time = Instant::now();
+        }
+
         // Check if mouse is near top
         let mouse_pos = ctx.input(|i| i.pointer.hover_pos());
         if let Some(pos) = mouse_pos {
@@ -13493,7 +14537,76 @@ impl ImageViewer {
                             let mut started_title_text_drag = false;
 
                             let current_path = self.image_list.get(self.current_index).cloned();
-                            if let Some(path) = current_path {
+                            let mut commit_rename = false;
+                            let mut cancel_rename = false;
+
+                            if let Some(rename_state) = self.rename_overlay.as_mut() {
+                                egui::Frame::none()
+                                    .fill(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 18))
+                                    .stroke(egui::Stroke::new(
+                                        1.0,
+                                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 36),
+                                    ))
+                                    .rounding(10.0)
+                                    .inner_margin(egui::Margin::symmetric(10.0, 6.0))
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            let available_width = ui.available_width();
+                                            let editor_width = (available_width - 132.0).max(120.0);
+                                            let response = ui.add_sized(
+                                                [editor_width, 24.0],
+                                                egui::TextEdit::singleline(&mut rename_state.draft_name)
+                                                    .desired_width(editor_width)
+                                                    .text_color(egui::Color32::WHITE),
+                                            );
+                                            if rename_state.just_opened {
+                                                response.request_focus();
+                                                rename_state.just_opened = false;
+                                            }
+                                            over_title_text |= response.contains_pointer() || response.has_focus();
+                                            started_title_text_drag |=
+                                                response.drag_started() || response.dragged();
+
+                                            let save_button = ui.add(
+                                                egui::Button::new("Save")
+                                                    .fill(egui::Color32::from_rgb(44, 116, 86))
+                                                    .rounding(8.0),
+                                            );
+                                            over_title_text |= save_button.hovered();
+                                            if save_button.clicked() {
+                                                commit_rename = true;
+                                            }
+
+                                            let cancel_button = ui.add(
+                                                egui::Button::new("Cancel")
+                                                    .fill(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 20))
+                                                    .rounding(8.0),
+                                            );
+                                            over_title_text |= cancel_button.hovered();
+                                            if cancel_button.clicked() {
+                                                cancel_rename = true;
+                                            }
+                                        });
+
+                                        if let Some(error) = rename_state.error_message.as_ref() {
+                                            ui.add_space(6.0);
+                                            ui.label(
+                                                egui::RichText::new(error)
+                                                    .color(egui::Color32::from_rgb(255, 148, 148))
+                                                    .size(11.0),
+                                            );
+                                        }
+                                    });
+
+                                let enter_pressed = ui.input(|input| input.key_pressed(egui::Key::Enter));
+                                let escape_pressed = ui.input(|input| input.key_pressed(egui::Key::Escape));
+                                if enter_pressed {
+                                    commit_rename = true;
+                                }
+                                if escape_pressed {
+                                    cancel_rename = true;
+                                }
+                            } else if let Some(path) = current_path {
                                 let filename = path
                                     .file_name()
                                     .map(|n| n.to_string_lossy().to_string())
@@ -13508,6 +14621,41 @@ impl ImageViewer {
                                 );
                                 over_title_text |= resp.contains_pointer();
                                 started_title_text_drag |= resp.drag_started() || resp.dragged();
+
+                                if self.is_path_marked(&path) {
+                                    ui.add_space(6.0);
+                                    egui::Frame::none()
+                                        .fill(egui::Color32::from_rgba_unmultiplied(16, 56, 74, 220))
+                                        .stroke(egui::Stroke::new(
+                                            1.0,
+                                            egui::Color32::from_rgba_unmultiplied(94, 214, 255, 255),
+                                        ))
+                                        .rounding(9.0)
+                                        .inner_margin(egui::Margin::symmetric(8.0, 2.0))
+                                        .show(ui, |ui| {
+                                            ui.label(
+                                                egui::RichText::new("MARKED")
+                                                    .color(egui::Color32::WHITE)
+                                                    .size(11.0),
+                                            );
+                                        });
+                                }
+
+                                let marked_count = self.marked_files.len();
+                                if marked_count > 0 {
+                                    ui.add_space(6.0);
+                                    egui::Frame::none()
+                                        .fill(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 14))
+                                        .rounding(9.0)
+                                        .inner_margin(egui::Margin::symmetric(8.0, 2.0))
+                                        .show(ui, |ui| {
+                                            ui.label(
+                                                egui::RichText::new(format!("{} marked", marked_count))
+                                                    .color(egui::Color32::from_rgb(214, 220, 228))
+                                                    .size(11.0),
+                                            );
+                                        });
+                                }
 
                                 ui.add_space(8.0);
 
@@ -13603,6 +14751,12 @@ impl ImageViewer {
                                             resp.drag_started() || resp.dragged();
                                     }
                                 }
+                            }
+
+                            if cancel_rename {
+                                self.cancel_inline_rename();
+                            } else if commit_rename {
+                                self.commit_inline_rename();
                             }
 
                             self.mouse_over_title_text = over_title_text;
@@ -13764,7 +14918,23 @@ impl ImageViewer {
                                 &menu_button_response,
                                 close_on_click_outside,
                                 |ui| {
-                                    ui.set_min_width(170.0);
+                                    ui.set_min_width(190.0);
+
+                                    let mut close_popup = false;
+
+                                    if let Some(target_index) = self.current_fab_single_action_index() {
+                                        if self.render_single_file_action_buttons(ui, target_index, true) {
+                                            close_popup = true;
+                                        }
+                                        ui.separator();
+                                    }
+
+                                    if !self.collect_marked_paths_in_current_order().is_empty() {
+                                        if self.render_marked_file_action_buttons(ui) {
+                                            close_popup = true;
+                                        }
+                                        ui.separator();
+                                    }
 
                                     if ui
                                         .button(
@@ -13774,6 +14944,10 @@ impl ImageViewer {
                                         .clicked()
                                     {
                                         self.open_config_file_in_editor();
+                                        close_popup = true;
+                                    }
+
+                                    if close_popup {
                                         ui.memory_mut(|mem| mem.close_popup());
                                     }
                                 },
@@ -15595,6 +16769,14 @@ impl ImageViewer {
                         paint_loading_spinner(ui.painter(), final_rect, time);
                         ctx.request_repaint_after(Duration::from_millis(16));
                     }
+
+                    if self
+                        .image_list
+                        .get(self.current_index)
+                        .is_some_and(|path| self.is_path_marked(path))
+                    {
+                        self.paint_marked_item_overlay(ui.painter(), final_rect, false);
+                    }
                 } else if let Some(ref error) = self.error_message {
                     ui.centered_and_justified(|ui| {
                         ui.label(
@@ -16214,6 +17396,8 @@ impl eframe::App for ImageViewer {
         // Draw FPS overlay (top-right) when enabled.
         if !skip_drawing {
             self.draw_fps_overlay(ctx);
+                self.draw_file_action_context_menu(ctx);
+                self.draw_delete_confirmation_modal(ctx);
         }
 
         // Startup UX: keep the window hidden until initial layout is applied.

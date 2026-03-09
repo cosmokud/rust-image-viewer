@@ -511,6 +511,8 @@ pub struct Config {
     /// maximized floating-window state. This also forces center right-click fullscreen toggles
     /// through the borderless path.
     pub maximize_to_borderless_fullscreen: bool,
+    /// When true, deleting files asks for confirmation before sending them to the recycle bin.
+    pub confirm_delete_to_recycle_bin: bool,
     /// Floating-mode zoom animation speed. Higher = faster. 0 = instant snap.
     pub zoom_animation_speed: f32,
     /// Degrees added or removed per Ctrl+Up / Ctrl+Down precise-rotation input.
@@ -651,6 +653,7 @@ impl Config {
             fullscreen_reset_fit_on_enter: true,
             fullscreen_native_window_transition: true,
             maximize_to_borderless_fullscreen: true,
+            confirm_delete_to_recycle_bin: true,
             zoom_animation_speed: 20.0,
             precise_rotation_step_degrees: 2.0,
             zoom_step: 1.02,
@@ -774,7 +777,6 @@ impl Config {
         self.add_binding(InputBinding::CtrlScrollDown, Action::ZoomOut);
 
         // Video controls
-        self.add_binding(InputBinding::Key(egui::Key::Space), Action::VideoPlayPause);
         self.add_binding(InputBinding::Key(egui::Key::M), Action::VideoMute);
 
         // Long strip shortcuts
@@ -1132,6 +1134,14 @@ impl Config {
                         | "titlebar_maximize_to_fullscreen" => {
                             if let Some(v) = parse_bool(value) {
                                 config.maximize_to_borderless_fullscreen = v;
+                            }
+                        }
+                        "confirm_delete_to_recycle_bin"
+                        | "confirm_recycle_bin_delete"
+                        | "show_delete_confirmation"
+                        | "confirm_delete" => {
+                            if let Some(v) = parse_bool(value) {
+                                config.confirm_delete_to_recycle_bin = v;
                             }
                         }
                         "zoom_animation_speed" => {
@@ -1580,6 +1590,10 @@ impl Config {
         values.insert(
             "maximize_to_borderless_fullscreen",
             bool_to_ini(self.maximize_to_borderless_fullscreen).to_string(),
+        );
+        values.insert(
+            "confirm_delete_to_recycle_bin",
+            bool_to_ini(self.confirm_delete_to_recycle_bin).to_string(),
         );
         values.insert(
             "zoom_animation_speed",
@@ -2202,6 +2216,15 @@ mod tests {
         );
 
         assert_eq!(config.precise_rotation_step_degrees, 3.5);
+    }
+
+    #[test]
+    fn parses_delete_confirmation_setting() {
+        let config = Config::parse_ini(
+            "[Settings]\nconfirm_delete_to_recycle_bin = false\n",
+        );
+
+        assert!(!config.confirm_delete_to_recycle_bin);
     }
 }
 
