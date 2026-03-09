@@ -1741,6 +1741,27 @@ impl MangaLoader {
         self.stats.images_pending = self.loading_indices.read().len();
     }
 
+    /// Sync loader jump-tracking to an externally handled visible-index change.
+    ///
+    /// Masonry scrollbar dragging can jump far enough that the UI already knows it has
+    /// repositioned to a new destination. In that case we may want to cancel stale work once,
+    /// then prevent `update_preload_queue` from treating the same jump as a second fresh jump.
+    pub fn sync_external_visible_index(&mut self, visible_index: usize, cancel_pending: bool) {
+        let previous_index = self.last_visible_index;
+
+        if visible_index > previous_index {
+            self.scroll_direction = 1;
+        } else if visible_index < previous_index {
+            self.scroll_direction = -1;
+        }
+
+        if cancel_pending {
+            self.cancel_pending_loads();
+        }
+
+        self.last_visible_index = visible_index;
+    }
+
     /// Force a high-priority retry for a visible item that is missing a texture.
     ///
     /// This is used as a self-healing path when UI detects an in-view placeholder
