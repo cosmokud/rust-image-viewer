@@ -2554,6 +2554,102 @@ impl ImageViewer {
         self.controls_show_time = Instant::now();
     }
 
+    fn file_action_menu_labels(&self, target_index: usize) -> Vec<&'static str> {
+        let mut labels = Vec::with_capacity(11);
+        labels.push(if self.is_index_marked(target_index) {
+            "Unmark"
+        } else {
+            "Mark"
+        });
+        labels.extend(["Cut", "Copy", "Delete", "Rename"]);
+
+        let has_marked_paths = !self.collect_marked_paths_in_current_order().is_empty();
+        if has_marked_paths {
+            labels.extend([
+                "Cut Marked Files",
+                "Copy Marked Files",
+                "Delete Marked Files",
+                "Rename Marked Files",
+            ]);
+        }
+
+        labels.push("Mark All");
+        if has_marked_paths {
+            labels.push("Unmark All");
+        }
+
+        labels
+    }
+
+    fn file_action_menu_content_width(&self, ctx: &egui::Context, target_index: usize) -> f32 {
+        let labels = self.file_action_menu_labels(target_index);
+        let font_id = egui::TextStyle::Body.resolve(ctx.style().as_ref());
+        let widest_label = ctx.fonts(|fonts| {
+            labels
+                .iter()
+                .map(|label| {
+                    fonts
+                        .layout_no_wrap(
+                            (*label).to_string(),
+                            font_id.clone(),
+                            egui::Color32::WHITE,
+                        )
+                        .size()
+                        .x
+                })
+                .fold(0.0, f32::max)
+        });
+
+        (widest_label + 72.0).clamp(168.0, 340.0)
+    }
+
+    fn release_video_resources_for_paths(&mut self, paths: &[PathBuf]) {
+        if paths.is_empty() {
+            return;
+        }
+
+        let path_is_targeted = |candidate: &Path| paths.iter().any(|path| path == candidate);
+
+        if self
+            .current_media_path()
+            .as_deref()
+            .is_some_and(path_is_targeted)
+        {
+            self.clear_pending_media_load();
+            self.stop_fullscreen_video_playback();
+            self.reset_fullscreen_anim_stream_state();
+        }
+
+        if self
+            .pending_manga_video_load
+            .as_ref()
+            .is_some_and(|pending| path_is_targeted(&pending.path))
+        {
+            self.clear_pending_manga_video_load();
+        }
+
+        let image_list = &self.image_list;
+        let focused_manga_video = self.manga_focused_video_index;
+        let mut removed_focused_manga_video = false;
+        self.manga_video_players.retain(|index, _| {
+            let should_remove = image_list
+                .get(*index)
+                .is_some_and(|path| path_is_targeted(path));
+            if should_remove && Some(*index) == focused_manga_video {
+                removed_focused_manga_video = true;
+            }
+            !should_remove
+        });
+        self.manga_video_textures.retain(|index, _| {
+            !image_list
+                .get(*index)
+                .is_some_and(|path| path_is_targeted(path))
+        });
+        if removed_focused_manga_video {
+            self.manga_focused_video_index = None;
+        }
+    }
+
     fn start_inline_rename_for_index(&mut self, index: usize) {
         let Some(path) = self.image_list.get(index).cloned() else {
             return;
@@ -2811,6 +2907,9 @@ impl ImageViewer {
         if let Err(err) = write_shell_file_list_to_clipboard(&[path.clone()], operation) {
             self.error_message = Some(err);
         } else {
+            if operation == FileClipboardOperation::Cut {
+                self.release_video_resources_for_paths(std::slice::from_ref(&path));
+            }
             self.set_prepared_clipboard_targets(&[path], operation);
         }
     }
@@ -2825,6 +2924,9 @@ impl ImageViewer {
         if let Err(err) = write_shell_file_list_to_clipboard(&marked_paths, operation) {
             self.error_message = Some(err);
         } else {
+            if operation == FileClipboardOperation::Cut {
+                self.release_video_resources_for_paths(&marked_paths);
+            }
             self.set_prepared_clipboard_targets(&marked_paths, operation);
         }
     }
@@ -2871,6 +2973,8 @@ impl ImageViewer {
         let removed_paths: HashSet<PathBuf> = existing_paths.iter().cloned().collect();
         let current_path_before = self.current_media_path();
         let fallback_path = self.choose_fallback_path_after_removal(&removed_paths);
+
+        self.release_video_resources_for_paths(&existing_paths);
 
         match move_paths_to_recycle_bin(&existing_paths) {
             Ok(()) => {
@@ -5134,6 +5238,59 @@ impl ImageViewer {
         activated
     }
 
+    fn try_handle_global_marked_file_shortcuts(&mut self, ctx: &egui::Context) -> bool {
+        if self.any_modal_dialog_open()
+            || !self.has_marked_files()
+            || self.title_bar_ui_blocking()
+            || ctx.wants_keyboard_input()
+        {
+            return false;
+        }
+
+        let has_actionable_marked_files = !self.collect_marked_paths_in_current_order().is_empty();
+        if !has_actionable_marked_files {
+            return false;
+        }
+
+        enum MarkedFileShortcut {
+            Copy,
+            Cut,
+            Delete,
+        }
+
+        let shortcut = ctx.input(|input| {
+            let ctrl = input.modifiers.ctrl;
+            let shift = input.modifiers.shift;
+            let alt = input.modifiers.alt;
+
+            if ctrl && !shift && !alt && input.key_pressed(egui::Key::C) {
+                Some(MarkedFileShortcut::Copy)
+            } else if ctrl && !shift && !alt && input.key_pressed(egui::Key::X) {
+                Some(MarkedFileShortcut::Cut)
+            } else if !ctrl && !shift && !alt && input.key_pressed(egui::Key::Delete) {
+                Some(MarkedFileShortcut::Delete)
+            } else {
+                None
+            }
+        });
+
+        match shortcut {
+            Some(MarkedFileShortcut::Copy) => {
+                self.apply_clipboard_operation_to_marked_files(FileClipboardOperation::Copy);
+                true
+            }
+            Some(MarkedFileShortcut::Cut) => {
+                self.apply_clipboard_operation_to_marked_files(FileClipboardOperation::Cut);
+                true
+            }
+            Some(MarkedFileShortcut::Delete) => {
+                self.request_marked_files_delete();
+                true
+            }
+            None => false,
+        }
+    }
+
     fn draw_file_action_context_menu(&mut self, ctx: &egui::Context) {
         let Some(menu_state) = self.file_action_menu.clone() else {
             return;
@@ -5141,12 +5298,17 @@ impl ImageViewer {
 
         let screen_rect = ctx.screen_rect();
         let mut close_menu = ctx.input(|input| input.key_pressed(egui::Key::Escape));
+        let menu_content_width = self.file_action_menu_content_width(ctx, menu_state.target_index);
+        let menu_outer_width = menu_content_width + 20.0;
 
         let menu_pos = egui::pos2(
             menu_state
                 .screen_pos
                 .x
-                .clamp(screen_rect.min.x + 8.0, (screen_rect.max.x - 240.0).max(screen_rect.min.x + 8.0)),
+                .clamp(
+                    screen_rect.min.x + 8.0,
+                    (screen_rect.max.x - menu_outer_width - 8.0).max(screen_rect.min.x + 8.0),
+                ),
             menu_state
                 .screen_pos
                 .y
@@ -5166,7 +5328,7 @@ impl ImageViewer {
                     .rounding(14.0)
                     .inner_margin(egui::Margin::same(10.0))
                     .show(ui, |ui| {
-                        ui.set_min_width(220.0);
+                        ui.set_min_width(menu_content_width);
 
                         if self.render_single_file_action_buttons(ui, menu_state.target_index, false) {
                             close_menu = true;
@@ -5870,6 +6032,7 @@ impl ImageViewer {
             self.pending_exit_confirmation = false;
         } else if confirm {
             self.pending_exit_confirmation = false;
+            self.clear_all_marks();
             self.should_exit = true;
         }
     }
@@ -15134,6 +15297,10 @@ impl ImageViewer {
 
     /// Handle keyboard and mouse input
     fn handle_input(&mut self, ctx: &egui::Context) {
+        if self.try_handle_global_marked_file_shortcuts(ctx) {
+            return;
+        }
+
         if self.any_modal_dialog_open() || self.file_action_menu.is_some() {
             return;
         }
