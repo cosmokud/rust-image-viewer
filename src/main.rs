@@ -1702,6 +1702,8 @@ struct ImageViewer {
     manga_scrollbar_dragging: bool,
     /// Most recent time the masonry scrollbar thumb actually moved.
     masonry_scrollbar_last_motion_at: Option<Instant>,
+    /// Most recent time masonry autoscroll actually moved the viewport.
+    masonry_autoscroll_last_motion_at: Option<Instant>,
     /// Browser-style autoscroll mode state for manga strip layouts.
     manga_autoscroll_active: bool,
     /// Anchor point where middle-click autoscroll was activated.
@@ -2048,6 +2050,7 @@ impl Default for ImageViewer {
             manga_decoded_mailbox: Vec::new(),
             manga_scrollbar_dragging: false,
             masonry_scrollbar_last_motion_at: None,
+            masonry_autoscroll_last_motion_at: None,
             manga_autoscroll_active: false,
             manga_autoscroll_anchor: None,
 
@@ -4262,16 +4265,32 @@ impl ImageViewer {
         near_radius
     }
 
+    fn masonry_sync_loader_visible_index(&mut self, previous_visible_index: usize) {
+        if !self.is_masonry_mode() || self.current_index == previous_visible_index {
+            return;
+        }
+
+        let jumped_far = self.current_index.abs_diff(previous_visible_index) > 32;
+        if let Some(loader) = self.manga_loader.as_mut() {
+            loader.sync_external_visible_index(self.current_index, jumped_far);
+        }
+    }
+
     fn masonry_navigation_active_for_heavy_work(&self) -> bool {
+        let recent_navigation_window = Duration::from_millis(90);
         let scrollbar_recently_moving = self.manga_scrollbar_dragging
             && self
                 .masonry_scrollbar_last_motion_at
-                .is_some_and(|started_at| started_at.elapsed() <= Duration::from_millis(90));
+                .is_some_and(|started_at| started_at.elapsed() <= recent_navigation_window);
+        let autoscroll_recently_moving = self.manga_autoscroll_active
+            && self
+                .masonry_autoscroll_last_motion_at
+                .is_some_and(|started_at| started_at.elapsed() <= recent_navigation_window);
 
         self.is_masonry_mode()
             && (scrollbar_recently_moving
+                || autoscroll_recently_moving
                 || self.is_panning
-                || self.manga_autoscroll_active
                 || self.manga_zoom_plus_held
                 || self.manga_zoom_minus_held
                 || self.manga_wheel_scroll_active
@@ -6511,6 +6530,7 @@ impl ImageViewer {
     fn stop_manga_autoscroll(&mut self) {
         self.manga_autoscroll_active = false;
         self.manga_autoscroll_anchor = None;
+        self.masonry_autoscroll_last_motion_at = None;
     }
 
     fn paint_manga_autoscroll_indicator(
@@ -6978,7 +6998,7 @@ impl ImageViewer {
         self.manga_scroll_velocity = 0.0;
         self.manga_scrollbar_dragging = false;
         self.masonry_scrollbar_last_motion_at = None;
-        self.masonry_scrollbar_last_motion_at = None;
+        self.masonry_autoscroll_last_motion_at = None;
         self.is_panning = false;
         self.last_mouse_pos = None;
         self.manga_hovered_media_index = None;
@@ -9164,7 +9184,11 @@ impl ImageViewer {
         true
     }
 
-    fn masonry_target_texture_side_from_display_side(&self, item_screen_max_side: f32) -> u32 {
+    fn masonry_target_texture_side_from_display_side_with_navigation(
+        &self,
+        item_screen_max_side: f32,
+        navigation_active: bool,
+    ) -> u32 {
         let max_side = self.max_texture_side.max(1);
         let zoom = self.zoom.max(0.0001);
         let rows = self.masonry_items_per_row.clamp(2, 10) as f32;
@@ -9181,13 +9205,20 @@ impl ImageViewer {
             * self.masonry_zoom_quality_boost(zoom)
             * self.manga_lod_target_scale_factor())
             .ceil() as u32;
-        let scaled = if self.masonry_navigation_active_for_heavy_work() {
+        let scaled = if navigation_active {
             scaled.min(self.masonry_navigation_target_side_cap())
         } else {
             scaled.min(self.masonry_fill_target_side_cap())
         };
 
         scaled.clamp(self.masonry_dynamic_target_min_side(), max_side)
+    }
+
+    fn masonry_target_texture_side_from_display_side(&self, item_screen_max_side: f32) -> u32 {
+        self.masonry_target_texture_side_from_display_side_with_navigation(
+            item_screen_max_side,
+            self.masonry_navigation_active_for_heavy_work(),
+        )
     }
 
     fn manga_strip_target_texture_side_from_display_side(&self, item_screen_max_side: f32) -> u32 {
@@ -9219,7 +9250,11 @@ impl ImageViewer {
         })
     }
 
-    fn masonry_target_texture_side_for_index(&mut self, index: usize) -> u32 {
+    fn masonry_target_texture_side_for_index_with_navigation(
+        &mut self,
+        index: usize,
+        navigation_active: bool,
+    ) -> u32 {
         let max_side = self.max_texture_side.max(1);
         let display_max_side = self
             .masonry_item_current_display_size(index)
@@ -9228,7 +9263,10 @@ impl ImageViewer {
 
         self.manga_clamp_target_side_to_source(
             index,
-            self.masonry_target_texture_side_from_display_side(display_max_side),
+            self.masonry_target_texture_side_from_display_side_with_navigation(
+                display_max_side,
+                navigation_active,
+            ),
         )
         .clamp(1, max_side)
     }
@@ -9445,7 +9483,11 @@ impl ImageViewer {
         let target_scale = self.manga_lod_target_scale_factor();
 
         let target_side = if self.is_masonry_mode() {
-            self.masonry_target_texture_side_for_index(index)
+            let navigation_active = self.masonry_navigation_active_for_heavy_work();
+            self.masonry_target_texture_side_for_index_with_navigation(
+                index,
+                navigation_active && !self.manga_autoscroll_active,
+            )
         } else {
             ((image_rect.width().max(image_rect.height())
                 * Self::MANGA_DYNAMIC_TARGET_OVERSCAN
@@ -13682,6 +13724,9 @@ impl ImageViewer {
 
         let max_side = self.max_texture_side.max(1);
         let is_masonry = self.is_masonry_mode();
+        let prefer_visible_quality_during_autoscroll = is_masonry && self.manga_autoscroll_active;
+        let defer_visible_quality =
+            navigation_active_for_visible_retry && !prefer_visible_quality_during_autoscroll;
         let min_target_side = if is_masonry {
             Self::MANGA_MASONRY_DYNAMIC_TARGET_MIN_SIDE
         } else {
@@ -13689,7 +13734,7 @@ impl ImageViewer {
         }
         .min(max_side);
 
-        if quality_upgrade && navigation_active_for_visible_retry {
+        if quality_upgrade && defer_visible_quality {
             self.perf_metrics
                 .increment_counter("manga_upgrade_deferred_nav", 1);
             return false;
@@ -13699,7 +13744,7 @@ impl ImageViewer {
             .manga_clamp_target_side_to_source(index, display_target_side)
             .clamp(1, max_side);
         let masonry_fill_cap = if is_masonry {
-            if navigation_active_for_visible_retry {
+            if defer_visible_quality {
                 self.masonry_navigation_target_side_cap()
             } else {
                 self.masonry_fill_target_side_cap()
@@ -13718,7 +13763,7 @@ impl ImageViewer {
                 let side = desired_target_side.min(fill_cap).max(min_target_side);
                 if side < desired_target_side {
                     self.perf_metrics.increment_counter(
-                        if navigation_active_for_visible_retry {
+                        if defer_visible_quality {
                             "manga_retry_low_lod_nav"
                         } else {
                             "manga_retry_low_lod_fill"
@@ -14353,6 +14398,7 @@ impl ImageViewer {
             } else if let Some(anchor) = pointer_pos {
                 self.manga_autoscroll_active = true;
                 self.manga_autoscroll_anchor = Some(anchor);
+                self.masonry_autoscroll_last_motion_at = None;
                 self.is_panning = false;
                 self.last_mouse_pos = None;
                 self.stop_manga_wheel_scroll();
@@ -14899,6 +14945,7 @@ impl ImageViewer {
 
                 if autoscroll_moved_x || autoscroll_moved_y {
                     masonry_autoscroll_moved_this_frame = true;
+                    self.masonry_autoscroll_last_motion_at = Some(Instant::now());
                 }
 
                 if speed_x != 0.0 || speed_y != 0.0 {
@@ -14910,7 +14957,18 @@ impl ImageViewer {
         }
 
         // Tick scroll animation
+        let masonry_previous_visible_index = if self.is_masonry_mode() {
+            Some(self.current_index)
+        } else {
+            None
+        };
+
         if self.manga_tick_scroll_animation(dt) {
+            if self.is_masonry_mode() && self.manga_autoscroll_active {
+                if let Some(previous_visible_index) = masonry_previous_visible_index {
+                    self.masonry_sync_loader_visible_index(previous_visible_index);
+                }
+            }
             masonry_scroll_animation_moved_this_frame = true;
             animation_active = true;
             // Update preload queue during scroll (throttling is handled inside)
