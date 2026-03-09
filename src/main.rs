@@ -3960,7 +3960,12 @@ impl ImageViewer {
         pointer_pos: Option<egui::Pos2>,
         screen_rect: egui::Rect,
     ) -> bool {
-        if self.title_bar_ui_blocking() || self.mouse_over_video_controls {
+        if self.title_bar_ui_blocking()
+            || self.mouse_over_video_controls
+            || self.file_action_menu.is_some()
+            || self.pending_single_delete_target.is_some()
+            || !self.pending_marked_delete_targets.is_empty()
+        {
             return true;
         }
 
@@ -4345,7 +4350,10 @@ impl ImageViewer {
         } else {
             "Cut File"
         };
-        if ui.button(cut_label).clicked() {
+        if ui
+            .add_sized([ui.available_width(), 28.0], egui::Button::new(cut_label))
+            .clicked()
+        {
             self.apply_clipboard_operation_to_single_file(target_index, FileClipboardOperation::Cut);
             activated = true;
         }
@@ -4355,7 +4363,10 @@ impl ImageViewer {
         } else {
             "Copy File"
         };
-        if ui.button(copy_label).clicked() {
+        if ui
+            .add_sized([ui.available_width(), 28.0], egui::Button::new(copy_label))
+            .clicked()
+        {
             self.apply_clipboard_operation_to_single_file(target_index, FileClipboardOperation::Copy);
             activated = true;
         }
@@ -4365,7 +4376,10 @@ impl ImageViewer {
         } else {
             "Delete File"
         };
-        if ui.button(delete_label).clicked() {
+        if ui
+            .add_sized([ui.available_width(), 28.0], egui::Button::new(delete_label))
+            .clicked()
+        {
             self.request_single_file_delete(target_index);
             activated = true;
         }
@@ -4375,7 +4389,10 @@ impl ImageViewer {
         } else {
             "Rename File"
         };
-        if ui.button(rename_label).clicked() {
+        if ui
+            .add_sized([ui.available_width(), 28.0], egui::Button::new(rename_label))
+            .clicked()
+        {
             self.start_inline_rename_for_index(target_index);
             activated = true;
         }
@@ -4390,19 +4407,31 @@ impl ImageViewer {
 
         let mut activated = false;
 
-        if ui.button("Cut Marked Files").clicked() {
+        if ui
+            .add_sized([ui.available_width(), 28.0], egui::Button::new("Cut Marked Files"))
+            .clicked()
+        {
             self.apply_clipboard_operation_to_marked_files(FileClipboardOperation::Cut);
             activated = true;
         }
-        if ui.button("Copy Marked Files").clicked() {
+        if ui
+            .add_sized([ui.available_width(), 28.0], egui::Button::new("Copy Marked Files"))
+            .clicked()
+        {
             self.apply_clipboard_operation_to_marked_files(FileClipboardOperation::Copy);
             activated = true;
         }
-        if ui.button("Delete Marked Files").clicked() {
+        if ui
+            .add_sized([ui.available_width(), 28.0], egui::Button::new("Delete Marked Files"))
+            .clicked()
+        {
             self.request_marked_files_delete();
             activated = true;
         }
-        if ui.button("Unmark All").clicked() {
+        if ui
+            .add_sized([ui.available_width(), 28.0], egui::Button::new("Unmark All"))
+            .clicked()
+        {
             self.marked_files.clear();
             activated = true;
         }
@@ -4418,17 +4447,6 @@ impl ImageViewer {
         let screen_rect = ctx.screen_rect();
         let mut close_menu = ctx.input(|input| input.key_pressed(egui::Key::Escape));
 
-        egui::Area::new(egui::Id::new("file_action_menu_backdrop"))
-            .fixed_pos(screen_rect.min)
-            .order(egui::Order::Foreground)
-            .show(ctx, |ui| {
-                let local_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, screen_rect.size());
-                let response = ui.allocate_rect(local_rect, egui::Sense::click());
-                if response.clicked() || response.secondary_clicked() {
-                    close_menu = true;
-                }
-            });
-
         let menu_pos = egui::pos2(
             menu_state
                 .screen_pos
@@ -4440,7 +4458,7 @@ impl ImageViewer {
                 .clamp(screen_rect.min.y + 8.0, (screen_rect.max.y - 240.0).max(screen_rect.min.y + 8.0)),
         );
 
-        egui::Area::new(egui::Id::new("file_action_menu"))
+        let menu_response = egui::Area::new(egui::Id::new("file_action_menu"))
             .fixed_pos(menu_pos)
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
@@ -4455,27 +4473,15 @@ impl ImageViewer {
                     .show(ui, |ui| {
                         ui.set_min_width(220.0);
 
-                        let title = self
-                            .image_list
-                            .get(menu_state.target_index)
-                            .and_then(|path| path.file_name())
-                            .map(|name| name.to_string_lossy().to_string())
-                            .unwrap_or_else(|| "File".to_string());
-
-                        ui.label(
-                            egui::RichText::new(title)
-                                .color(egui::Color32::WHITE)
-                                .strong()
-                                .size(14.0),
-                        );
-                        ui.add_space(4.0);
-
                         let mark_label = if self.is_index_marked(menu_state.target_index) {
                             "Unmark"
                         } else {
                             "Mark"
                         };
-                        if ui.button(mark_label).clicked() {
+                        if ui
+                            .add_sized([ui.available_width(), 28.0], egui::Button::new(mark_label))
+                            .clicked()
+                        {
                             self.toggle_mark_for_index(menu_state.target_index);
                             close_menu = true;
                         }
@@ -4486,6 +4492,22 @@ impl ImageViewer {
                         }
                     });
             });
+
+        let menu_rect = menu_response.response.rect;
+        let clicked_outside_menu = ctx.input(|input| {
+            let primary_clicked = input.pointer.button_clicked(egui::PointerButton::Primary);
+            let secondary_clicked = input.pointer.button_clicked(egui::PointerButton::Secondary);
+            let pointer_pos = input
+                .pointer
+                .interact_pos()
+                .or_else(|| input.pointer.hover_pos());
+
+            (primary_clicked || secondary_clicked)
+                && pointer_pos.is_some_and(|pos| !menu_rect.contains(pos))
+        });
+        if clicked_outside_menu {
+            close_menu = true;
+        }
 
         if close_menu {
             self.file_action_menu = None;
@@ -12772,8 +12794,6 @@ impl ImageViewer {
         if let Some(indices) = finalize_mark_selection {
             if !indices.is_empty() {
                 self.mark_indices(&indices);
-                self.show_controls = true;
-                self.controls_show_time = Instant::now();
             }
         }
 
@@ -13881,8 +13901,6 @@ impl ImageViewer {
         if space_pressed_for_mark {
             if let Some(index) = self.mark_target_index_from_pointer(ctx) {
                 self.toggle_mark_for_index(index);
-                self.show_controls = true;
-                self.controls_show_time = Instant::now();
             }
         }
 
@@ -13921,6 +13939,10 @@ impl ImageViewer {
                 ctrl_secondary_single_file_menu_pos = Some(
                     pointer_pos.unwrap_or(input.screen_rect.center()),
                 );
+                return;
+            }
+
+            if secondary_clicked && ctrl && manga_fullscreen && !pointer_over_shortcut_ui {
                 return;
             }
 
