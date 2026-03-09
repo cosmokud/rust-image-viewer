@@ -1652,6 +1652,8 @@ struct ImageViewer {
     manga_decoded_mailbox: Vec<DecodedImage>,
     /// Whether the scrollbar is being dragged
     manga_scrollbar_dragging: bool,
+    /// Most recent time the masonry scrollbar thumb actually moved.
+    masonry_scrollbar_last_motion_at: Option<Instant>,
     /// Browser-style autoscroll mode state for manga strip layouts.
     manga_autoscroll_active: bool,
     /// Anchor point where middle-click autoscroll was activated.
@@ -1997,6 +1999,7 @@ impl Default for ImageViewer {
             manga_texture_cache: MangaTextureCache::default(),
             manga_decoded_mailbox: Vec::new(),
             manga_scrollbar_dragging: false,
+            masonry_scrollbar_last_motion_at: None,
             manga_autoscroll_active: false,
             manga_autoscroll_anchor: None,
 
@@ -4191,8 +4194,13 @@ impl ImageViewer {
     }
 
     fn masonry_navigation_active_for_heavy_work(&self) -> bool {
+        let scrollbar_recently_moving = self.manga_scrollbar_dragging
+            && self
+                .masonry_scrollbar_last_motion_at
+                .is_some_and(|started_at| started_at.elapsed() <= Duration::from_millis(90));
+
         self.is_masonry_mode()
-            && (self.manga_scrollbar_dragging
+            && (scrollbar_recently_moving
                 || self.is_panning
                 || self.manga_autoscroll_active
                 || self.manga_zoom_plus_held
@@ -6900,6 +6908,8 @@ impl ImageViewer {
         self.manga_scroll_target = scroll_to;
         self.manga_scroll_velocity = 0.0;
         self.manga_scrollbar_dragging = false;
+        self.masonry_scrollbar_last_motion_at = None;
+        self.masonry_scrollbar_last_motion_at = None;
         self.is_panning = false;
         self.last_mouse_pos = None;
         self.manga_hovered_media_index = None;
@@ -9040,11 +9050,11 @@ impl ImageViewer {
         self.masonry_quality_refine_frames_remaining = 0;
     }
 
-    fn masonry_begin_quality_refine_if_due(&mut self) -> bool {
-        if !self.is_masonry_mode()
-            || !self.manga_mode
-            || self.masonry_navigation_active_for_heavy_work()
-        {
+    fn masonry_begin_quality_refine_if_due(
+        &mut self,
+        navigation_active_for_quality_work: bool,
+    ) -> bool {
+        if !self.is_masonry_mode() || !self.manga_mode || navigation_active_for_quality_work {
             return false;
         }
 
@@ -13562,6 +13572,7 @@ impl ImageViewer {
         display_target_side: u32,
         quality_upgrade: bool,
         media_type: MangaMediaType,
+        navigation_active_for_visible_retry: bool,
     ) -> bool {
         if !self.manga_mode {
             return false;
@@ -13580,7 +13591,7 @@ impl ImageViewer {
         }
         .min(max_side);
 
-        if quality_upgrade && self.masonry_navigation_active_for_heavy_work() {
+        if quality_upgrade && navigation_active_for_visible_retry {
             self.perf_metrics
                 .increment_counter("manga_upgrade_deferred_nav", 1);
             return false;
@@ -13590,7 +13601,7 @@ impl ImageViewer {
             .manga_clamp_target_side_to_source(index, display_target_side)
             .clamp(1, max_side);
         let masonry_fill_cap = if is_masonry {
-            if self.masonry_navigation_active_for_heavy_work() {
+            if navigation_active_for_visible_retry {
                 self.masonry_navigation_target_side_cap()
             } else {
                 self.masonry_fill_target_side_cap()
@@ -13609,7 +13620,7 @@ impl ImageViewer {
                 let side = desired_target_side.min(fill_cap).max(min_target_side);
                 if side < desired_target_side {
                     self.perf_metrics.increment_counter(
-                        if self.masonry_navigation_active_for_heavy_work() {
+                        if navigation_active_for_visible_retry {
                             "manga_retry_low_lod_nav"
                         } else {
                             "manga_retry_low_lod_fill"
@@ -13721,7 +13732,13 @@ impl ImageViewer {
         requested
     }
 
-    fn draw_manga_item(&mut self, ui: &mut egui::Ui, idx: usize, image_rect: egui::Rect) -> bool {
+    fn draw_manga_item(
+        &mut self,
+        ui: &mut egui::Ui,
+        idx: usize,
+        image_rect: egui::Rect,
+        navigation_active_for_visible_retry: bool,
+    ) -> bool {
         let image_rect = if self.is_masonry_mode() {
             self.masonry_item_display_rect(idx, image_rect)
         } else {
@@ -13843,6 +13860,7 @@ impl ImageViewer {
                         final_retry_target_side,
                         true,
                         retry_media_type,
+                        navigation_active_for_visible_retry,
                     );
                 }
             } else if self.strip_entry_placeholder_index == Some(idx) {
@@ -13872,6 +13890,7 @@ impl ImageViewer {
                     fill_retry_target_side,
                     false,
                     retry_media_type,
+                    navigation_active_for_visible_retry,
                 );
             } else {
                 // Video not yet loaded - draw placeholder with video icon
@@ -13892,6 +13911,7 @@ impl ImageViewer {
                     fill_retry_target_side,
                     false,
                     retry_media_type,
+                    navigation_active_for_visible_retry,
                 );
             }
 
@@ -13965,6 +13985,7 @@ impl ImageViewer {
                         final_retry_target_side,
                         true,
                         retry_media_type,
+                        navigation_active_for_visible_retry,
                     );
                 }
             } else if self.strip_entry_placeholder_index == Some(idx) {
@@ -13994,6 +14015,7 @@ impl ImageViewer {
                     fill_retry_target_side,
                     false,
                     retry_media_type,
+                    navigation_active_for_visible_retry,
                 );
             } else {
                 // Image not loaded yet - draw a placeholder
@@ -14016,6 +14038,7 @@ impl ImageViewer {
                     fill_retry_target_side,
                     false,
                     retry_media_type,
+                    navigation_active_for_visible_retry,
                 );
             }
         }
@@ -14057,6 +14080,9 @@ impl ImageViewer {
         let screen_width = screen_rect.width();
         let screen_height = screen_rect.height();
         let mut animation_active = false;
+        let mut masonry_scrollbar_moved_this_frame = false;
+        let mut masonry_autoscroll_moved_this_frame = false;
+        let mut masonry_scroll_animation_moved_this_frame = false;
         let masonry_preload_input_blocked =
             self.is_masonry_mode() && self.masonry_metadata_preload_active;
         let mode_scroll_up_action = if self.is_masonry_mode() {
@@ -14417,30 +14443,27 @@ impl ImageViewer {
         if show_scrollbar {
             if over_scrollbar && primary_pressed && !title_ui_blocking {
                 self.manga_scrollbar_dragging = true;
+                self.masonry_scrollbar_last_motion_at = Some(Instant::now());
+                animation_active = true;
             }
             if primary_released {
                 self.manga_scrollbar_dragging = false;
+                self.masonry_scrollbar_last_motion_at = None;
             }
 
             if !title_ui_blocking
                 && (self.manga_scrollbar_dragging || (over_scrollbar && primary_down))
             {
+                animation_active = true;
                 if let Some(pos) = pointer_pos {
+                    let previous_visible_index = self.current_index;
+
                     // Calculate scroll position from mouse Y
                     let relative_y = (pos.y - 10.0 - scrollbar_height / 2.0)
                         / (scrollbar_track_height - scrollbar_height);
                     let new_scroll = relative_y.clamp(0.0, 1.0) * max_scroll;
-
-                    // Detect large jump (more than 20% of total height)
-                    let jump_distance = (new_scroll - self.manga_last_scroll_position).abs();
-                    let is_large_jump = jump_distance > total_height * 0.2;
-
-                    if is_large_jump {
-                        // Cancel pending loads - we're jumping far
-                        if let Some(ref mut loader) = self.manga_loader {
-                            loader.cancel_pending_loads();
-                        }
-                    }
+                    let scroll_changed = (new_scroll - self.manga_scroll_offset).abs() > 0.25
+                        || (new_scroll - self.manga_scroll_target).abs() > 0.25;
 
                     self.manga_scroll_target = new_scroll;
                     self.manga_scroll_offset = new_scroll; // Instant scroll for responsiveness
@@ -14450,8 +14473,20 @@ impl ImageViewer {
                     // Keep the page indicator in sync even for instant jumps.
                     self.manga_update_current_index();
 
+                    if self.is_masonry_mode() {
+                        let jumped_far = self.current_index.abs_diff(previous_visible_index) > 32;
+                        if let Some(loader) = self.manga_loader.as_mut() {
+                            loader.sync_external_visible_index(self.current_index, jumped_far);
+                        }
+                    }
+
                     // Only update preload queue if we've settled (throttled inside)
                     self.manga_update_preload_queue();
+
+                    if scroll_changed {
+                        masonry_scrollbar_moved_this_frame = true;
+                        self.masonry_scrollbar_last_motion_at = Some(Instant::now());
+                    }
                 }
                 ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
             } else if over_scrollbar {
@@ -14460,6 +14495,7 @@ impl ImageViewer {
         } else if primary_released {
             // If the scrollbar isn't visible, ensure we don't get stuck in a dragging state.
             self.manga_scrollbar_dragging = false;
+            self.masonry_scrollbar_last_motion_at = None;
         }
 
         // Determine whether Ctrl+wheel zoom is bound.
@@ -14750,14 +14786,21 @@ impl ImageViewer {
                     self.config.manga_autoscroll_vertical_speed_multiplier,
                 );
 
+                let autoscroll_moved_x = speed_x != 0.0 && dt > 0.0;
+
                 if speed_x != 0.0 {
                     self.offset.x -= speed_x * dt;
                     animation_active = true;
                 }
 
-                if self.manga_add_scroll_target_delta(speed_y * dt) {
+                let autoscroll_moved_y = self.manga_add_scroll_target_delta(speed_y * dt);
+                if autoscroll_moved_y {
                     self.manga_update_preload_queue();
                     animation_active = true;
+                }
+
+                if autoscroll_moved_x || autoscroll_moved_y {
+                    masonry_autoscroll_moved_this_frame = true;
                 }
 
                 if speed_x != 0.0 || speed_y != 0.0 {
@@ -14770,10 +14813,31 @@ impl ImageViewer {
 
         // Tick scroll animation
         if self.manga_tick_scroll_animation(dt) {
+            masonry_scroll_animation_moved_this_frame = true;
             animation_active = true;
             // Update preload queue during scroll (throttling is handled inside)
             self.manga_update_preload_queue();
         }
+
+        let masonry_navigation_active_for_visible_retry = self.is_masonry_mode()
+            && (self.is_panning
+                || self.mark_selection_box.is_some()
+                || self.manga_zoom_plus_held
+                || self.manga_zoom_minus_held
+                || self.manga_wheel_scroll_active
+                || (self.manga_scroll_target - self.manga_scroll_offset).abs() > 0.25
+                || self.manga_scroll_velocity.abs() > 0.25
+                || self.manga_video_seeking
+                || self.manga_video_volume_dragging
+                || self.gif_seeking
+                || masonry_scrollbar_moved_this_frame
+                || masonry_autoscroll_moved_this_frame
+                || masonry_scroll_animation_moved_this_frame
+                || wheel_steps != 0.0
+                || wheel_steps_ctrl != 0.0
+                || (ctrl_held
+                    && manga_ctrl_scroll_zoom_bound
+                    && (zoom_delta != 1.0 || wheel_steps_ctrl != 0.0)));
 
         // Process decoded images from background threads and upload to GPU.
         // This is now non-blocking - images are decoded in parallel on background threads.
@@ -14805,13 +14869,7 @@ impl ImageViewer {
         }
 
         if self.is_masonry_mode() {
-            let navigation_active = self.masonry_navigation_active_for_heavy_work()
-                || primary_down
-                || wheel_steps != 0.0
-                || wheel_steps_ctrl != 0.0
-                || (ctrl_held
-                    && manga_ctrl_scroll_zoom_bound
-                    && (zoom_delta != 1.0 || wheel_steps_ctrl != 0.0));
+            let navigation_active = masonry_navigation_active_for_visible_retry;
 
             if navigation_active {
                 self.manga_hover_autoplay_resume_at = Instant::now()
@@ -14826,7 +14884,9 @@ impl ImageViewer {
                     ctx.request_repaint_after(Duration::from_millis(
                         Self::MASONRY_QUALITY_REFINE_SETTLE_MS,
                     ));
-                } else if self.masonry_begin_quality_refine_if_due() {
+                } else if self.masonry_begin_quality_refine_if_due(
+                    masonry_navigation_active_for_visible_retry,
+                ) {
                     self.manga_preload_cooldown = 0;
                     self.manga_update_preload_queue();
                     animation_active = true;
@@ -14907,7 +14967,12 @@ impl ImageViewer {
 
                             let image_rect =
                                 item.to_screen_rect(zoom, self.offset.x, self.manga_scroll_offset);
-                            if self.draw_manga_item(ui, *idx, image_rect) {
+                            if self.draw_manga_item(
+                                ui,
+                                *idx,
+                                image_rect,
+                                masonry_navigation_active_for_visible_retry,
+                            ) {
                                 requested_visible_retry = true;
                             }
                         }
@@ -14922,7 +14987,12 @@ impl ImageViewer {
 
                             let image_rect =
                                 item.to_screen_rect(zoom, self.offset.x, self.manga_scroll_offset);
-                            if self.draw_manga_item(ui, idx, image_rect) {
+                            if self.draw_manga_item(
+                                ui,
+                                idx,
+                                image_rect,
+                                masonry_navigation_active_for_visible_retry,
+                            ) {
                                 requested_visible_retry = true;
                             }
                         }
@@ -14946,7 +15016,12 @@ impl ImageViewer {
                                 egui::Vec2::new(display_width, display_height),
                             );
 
-                            if self.draw_manga_item(ui, idx, image_rect) {
+                            if self.draw_manga_item(
+                                ui,
+                                idx,
+                                image_rect,
+                                masonry_navigation_active_for_visible_retry,
+                            ) {
                                 requested_visible_retry = true;
                             }
                         }
@@ -14977,7 +15052,12 @@ impl ImageViewer {
                                 egui::Vec2::new(display_width, display_height),
                             );
 
-                            if self.draw_manga_item(ui, idx, image_rect) {
+                            if self.draw_manga_item(
+                                ui,
+                                idx,
+                                image_rect,
+                                masonry_navigation_active_for_visible_retry,
+                            ) {
                                 requested_visible_retry = true;
                             }
                             y_offset += img_height;
@@ -15113,7 +15193,7 @@ impl ImageViewer {
             self.manga_update_preload_queue();
         }
 
-        if self.is_masonry_mode() && !self.masonry_navigation_active_for_heavy_work() {
+        if self.is_masonry_mode() && !masonry_navigation_active_for_visible_retry {
             if let Some(due_at) = self.masonry_quality_refine_due_at {
                 let now = Instant::now();
                 if now < due_at {
