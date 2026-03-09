@@ -2926,6 +2926,11 @@ impl ImageViewer {
             if operation == FileClipboardOperation::Cut {
                 self.release_video_resources_for_paths(&paths);
             }
+            for path in &paths {
+                if path.exists() {
+                    self.marked_files.insert(path.clone());
+                }
+            }
             self.set_prepared_clipboard_targets(&paths, operation);
         }
     }
@@ -5335,6 +5340,46 @@ impl ImageViewer {
                 true
             }
             None => false,
+        }
+    }
+
+    fn try_handle_ctrl_primary_mark_shortcut(&mut self, ctx: &egui::Context) -> bool {
+        if self.manga_mode
+            || self.image_list.is_empty()
+            || self.any_modal_dialog_open()
+            || self.file_action_menu.is_some()
+        {
+            return false;
+        }
+
+        let target_index = ctx.input(|input| {
+            if !input.modifiers.ctrl
+                || input.modifiers.shift
+                || input.modifiers.alt
+                || !input.pointer.button_clicked(egui::PointerButton::Primary)
+            {
+                return None;
+            }
+
+            let pointer_pos = input
+                .pointer
+                .interact_pos()
+                .or_else(|| input.pointer.hover_pos())?;
+            if self.pointer_over_shortcut_blocking_ui(Some(pointer_pos), input.screen_rect) {
+                return None;
+            }
+            if !self.point_over_current_media(pointer_pos, input.screen_rect) {
+                return None;
+            }
+
+            Some(self.current_index.min(self.image_list.len().saturating_sub(1)))
+        });
+
+        if let Some(index) = target_index {
+            self.toggle_mark_for_index(index);
+            true
+        } else {
+            false
         }
     }
 
@@ -10931,14 +10976,25 @@ impl ImageViewer {
                         pixels.as_ref(),
                     );
 
-                    let texture = ctx.load_texture(
-                        format!("manga_video_{}", focused_idx),
-                        color_image,
-                        self.manga_texture_options_for_upload(MangaMediaType::Video, w, h),
-                    );
+                    let texture_options =
+                        self.manga_texture_options_for_upload(MangaMediaType::Video, w, h);
 
-                    self.manga_video_textures
-                        .insert(focused_idx, (texture, w, h));
+                    if let Some((texture, stored_w, stored_h)) =
+                        self.manga_video_textures.get_mut(&focused_idx)
+                    {
+                        texture.set(color_image, texture_options);
+                        *stored_w = w;
+                        *stored_h = h;
+                    } else {
+                        let texture = ctx.load_texture(
+                            format!("manga_video_{}", focused_idx),
+                            color_image,
+                            texture_options,
+                        );
+
+                        self.manga_video_textures
+                            .insert(focused_idx, (texture, w, h));
+                    }
                 }
             }
 
@@ -14706,12 +14762,6 @@ impl ImageViewer {
             })
             .unwrap_or(false);
 
-        // Check if there's an active video playing
-        let has_active_video = self
-            .manga_focused_video_index
-            .and_then(|idx| self.manga_video_players.get(&idx))
-            .map_or(false, |p| p.is_playing());
-
         let has_pending_focused_video_load = self
             .pending_manga_video_load
             .as_ref()
@@ -14983,11 +15033,7 @@ impl ImageViewer {
             }
         }
 
-        animation_active
-            || has_active_video
-            || has_active_animation
-            || has_pending_focused_video_load
-            || requested_visible_retry
+        animation_active || has_active_animation || has_pending_focused_video_load || requested_visible_retry
     }
 
     /// Get the current media display dimensions (works for both images and videos)
@@ -15355,6 +15401,10 @@ impl ImageViewer {
         }
 
         if self.any_modal_dialog_open() || self.file_action_menu.is_some() {
+            return;
+        }
+
+        if self.try_handle_ctrl_primary_mark_shortcut(ctx) {
             return;
         }
 
@@ -18939,6 +18989,10 @@ impl eframe::App for ImageViewer {
             .video_player
             .as_ref()
             .map_or(false, |player| player.is_playing());
+        let manga_video_playing = self
+            .manga_focused_video_index
+            .and_then(|idx| self.manga_video_players.get(&idx))
+            .map_or(false, |player| player.is_playing());
         let media_load_pending = self.pending_media_load.is_some();
         let manga_video_load_pending = self.pending_manga_video_load.is_some();
         self.fps_last_frame_was_active = any_animation_active
@@ -18947,6 +19001,7 @@ impl eframe::App for ImageViewer {
             || self.pending_media_layout
             || manga_needs_fast_background_poll
             || manga_background_work_pending
+            || manga_video_playing
             || video_playing;
 
         // Update idle state and optimize repaint scheduling
@@ -18984,6 +19039,13 @@ impl eframe::App for ImageViewer {
             ctx.request_repaint_after(Duration::from_millis(16));
         } else if manga_background_work_pending {
             ctx.request_repaint_after(Duration::from_millis(66));
+        } else if manga_video_playing {
+            let interval = if self.manga_mode && !self.is_masonry_mode() {
+                Duration::from_millis(33)
+            } else {
+                Duration::from_millis(16)
+            };
+            ctx.request_repaint_after(interval);
         } else if video_playing {
             ctx.request_repaint_after(Duration::from_millis(16));
         } else if self.video_player.is_some() {
