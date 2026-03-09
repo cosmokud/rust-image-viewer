@@ -503,6 +503,8 @@ pub struct Config {
     pub resize_border_size: f32,
     /// Background color as RGB (0-255)
     pub background_rgb: [u8; 3],
+    /// Border color for marked items as RGB (0-255)
+    pub marked_file_border_rgb: [u8; 3],
     /// When entering fullscreen, reset image to center and fit-to-screen.
     pub fullscreen_reset_fit_on_enter: bool,
     /// On Windows, use native maximize/restore-down animation for fullscreen transitions.
@@ -650,6 +652,7 @@ impl Config {
             show_fps: false,
             resize_border_size: 6.0,
             background_rgb: [0, 0, 0],
+            marked_file_border_rgb: [94, 214, 255],
             fullscreen_reset_fit_on_enter: true,
             fullscreen_native_window_transition: true,
             maximize_to_borderless_fullscreen: true,
@@ -1116,6 +1119,28 @@ impl Config {
                                 config.background_rgb[2] = v;
                             }
                         }
+                        "marked_file_border_rgb"
+                        | "marked_item_border_rgb"
+                        | "mark_border_rgb" => {
+                            if let Some(rgb) = parse_rgb_triplet(value) {
+                                config.marked_file_border_rgb = rgb;
+                            }
+                        }
+                        "marked_file_border_r" => {
+                            if let Ok(v) = value.parse::<u8>() {
+                                config.marked_file_border_rgb[0] = v;
+                            }
+                        }
+                        "marked_file_border_g" => {
+                            if let Ok(v) = value.parse::<u8>() {
+                                config.marked_file_border_rgb[1] = v;
+                            }
+                        }
+                        "marked_file_border_b" => {
+                            if let Ok(v) = value.parse::<u8>() {
+                                config.marked_file_border_rgb[2] = v;
+                            }
+                        }
                         "fullscreen_reset_fit_on_enter" => {
                             if let Some(v) = parse_bool(value) {
                                 config.fullscreen_reset_fit_on_enter = v;
@@ -1579,6 +1604,27 @@ impl Config {
         values.insert("background_r", format!("{}", self.background_rgb[0]));
         values.insert("background_g", format!("{}", self.background_rgb[1]));
         values.insert("background_b", format!("{}", self.background_rgb[2]));
+        values.insert(
+            "marked_file_border_rgb",
+            format!(
+                "{}, {}, {}",
+                self.marked_file_border_rgb[0],
+                self.marked_file_border_rgb[1],
+                self.marked_file_border_rgb[2]
+            ),
+        );
+        values.insert(
+            "marked_file_border_r",
+            format!("{}", self.marked_file_border_rgb[0]),
+        );
+        values.insert(
+            "marked_file_border_g",
+            format!("{}", self.marked_file_border_rgb[1]),
+        );
+        values.insert(
+            "marked_file_border_b",
+            format!("{}", self.marked_file_border_rgb[2]),
+        );
         values.insert(
             "fullscreen_reset_fit_on_enter",
             bool_to_ini(self.fullscreen_reset_fit_on_enter).to_string(),
@@ -2225,6 +2271,13 @@ mod tests {
         );
 
         assert!(!config.confirm_delete_to_recycle_bin);
+    }
+
+    #[test]
+    fn parses_marked_file_border_color_setting() {
+        let config = Config::parse_ini("[Settings]\nmarked_file_border_rgb = 12, 34, 56\n");
+
+        assert_eq!(config.marked_file_border_rgb, [12, 34, 56]);
     }
 }
 

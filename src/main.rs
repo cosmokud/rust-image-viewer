@@ -1449,6 +1449,9 @@ struct ImageViewer {
     /// Whether the pointer is over selectable title-bar text (filename, resolution, zoom, etc.).
     /// Used to suppress drag/pan/double-click gestures while selecting/copying title text.
     mouse_over_title_text: bool,
+    /// Whether the title-bar FAB menu button or popup is active.
+    /// Used to keep the title bar visible and block click-through into the main view.
+    title_bar_menu_active: bool,
     /// Whether title-bar text is currently being drag-selected.
     /// This stays true even if the pointer leaves the title bar during the drag.
     title_text_dragging: bool,
@@ -1852,6 +1855,7 @@ impl Default for ImageViewer {
             mouse_over_video_controls: false,
             mouse_over_window_buttons: false,
             mouse_over_title_text: false,
+            title_bar_menu_active: false,
             title_text_dragging: false,
             is_seeking: false,
             seek_preview_fraction: None,
@@ -2541,12 +2545,11 @@ impl ImageViewer {
         let border_color = if preview {
             egui::Color32::from_rgba_unmultiplied(255, 199, 92, 255)
         } else {
-            egui::Color32::from_rgba_unmultiplied(94, 214, 255, 255)
-        };
-        let fill_color = if preview {
-            egui::Color32::from_rgba_unmultiplied(255, 199, 92, 32)
-        } else {
-            egui::Color32::from_rgba_unmultiplied(94, 214, 255, 22)
+            egui::Color32::from_rgb(
+                self.config.marked_file_border_rgb[0],
+                self.config.marked_file_border_rgb[1],
+                self.config.marked_file_border_rgb[2],
+            )
         };
         let chip_fill = if preview {
             egui::Color32::from_rgba_unmultiplied(72, 44, 0, 220)
@@ -2554,7 +2557,6 @@ impl ImageViewer {
             egui::Color32::from_rgba_unmultiplied(16, 56, 74, 220)
         };
 
-        painter.rect_filled(rect, 12.0, fill_color);
         painter.rect_stroke(rect.expand(1.5), 12.0, egui::Stroke::new(2.0, border_color));
         paint_mark_chip(
             painter,
@@ -3958,11 +3960,7 @@ impl ImageViewer {
         pointer_pos: Option<egui::Pos2>,
         screen_rect: egui::Rect,
     ) -> bool {
-        if self.mouse_over_window_buttons
-            || self.mouse_over_title_text
-            || self.title_text_dragging
-            || self.mouse_over_video_controls
-        {
+        if self.title_bar_ui_blocking() || self.mouse_over_video_controls {
             return true;
         }
 
@@ -4045,6 +4043,13 @@ impl ImageViewer {
         }
 
         false
+    }
+
+    fn title_bar_ui_blocking(&self) -> bool {
+        self.mouse_over_window_buttons
+            || self.mouse_over_title_text
+            || self.title_text_dragging
+            || self.title_bar_menu_active
     }
 
     fn max_zoom_factor(&self) -> f32 {
@@ -4395,6 +4400,10 @@ impl ImageViewer {
         }
         if ui.button("Delete Marked Files").clicked() {
             self.request_marked_files_delete();
+            activated = true;
+        }
+        if ui.button("Unmark All").clicked() {
+            self.marked_files.clear();
             activated = true;
         }
 
@@ -12498,9 +12507,7 @@ impl ImageViewer {
 
         // Avoid triggering manga interactions while selecting/copying title-bar text.
         // IMPORTANT: allow click-through on the empty title bar area.
-        let title_ui_blocking = self.mouse_over_window_buttons
-            || self.mouse_over_title_text
-            || self.title_text_dragging;
+        let title_ui_blocking = self.title_bar_ui_blocking();
         let pointer_over_shortcut_ui =
             self.pointer_over_shortcut_blocking_ui(pointer_pos, screen_rect);
 
@@ -12605,29 +12612,39 @@ impl ImageViewer {
             animation_active = true;
         }
 
-        if self.manga_autoscroll_active && secondary_clicked {
+        let ctrl_secondary_target_index = if secondary_clicked
+            && ctrl_held
+            && !over_controls
+            && !title_ui_blocking
+            && !pointer_over_shortcut_ui
+        {
+            pointer_pos.and_then(|pos| self.manga_index_at_screen_pos(pos))
+        } else {
+            None
+        };
+
+        if let Some(target_index) = ctrl_secondary_target_index {
+            if self.manga_autoscroll_active {
+                self.stop_manga_autoscroll();
+                animation_active = true;
+            }
+
+            self.open_file_action_menu(
+                pointer_pos.unwrap_or(screen_rect.center()),
+                target_index,
+            );
+            secondary_consumed_for_autoscroll = true;
+            secondary_consumed_for_file_menu = true;
+        }
+
+        if self.manga_autoscroll_active && secondary_clicked && !ctrl_held {
             self.stop_manga_autoscroll();
             secondary_consumed_for_autoscroll = true;
             animation_active = true;
         }
 
         if secondary_clicked
-            && ctrl_held
-            && !secondary_consumed_for_autoscroll
-            && !over_controls
-            && !title_ui_blocking
-            && !pointer_over_shortcut_ui
-        {
-            if let Some(target_index) = self.manga_hovered_media_index {
-                self.open_file_action_menu(
-                    pointer_pos.unwrap_or(screen_rect.center()),
-                    target_index,
-                );
-                secondary_consumed_for_file_menu = true;
-            }
-        }
-
-        if secondary_clicked
+            && !ctrl_held
             && !self.strip_item_open_uses_right_click()
             && !secondary_consumed_for_autoscroll
             && !secondary_consumed_for_file_menu
@@ -14433,10 +14450,12 @@ impl ImageViewer {
     /// Draw the control bar
     fn draw_controls(&mut self, ctx: &egui::Context) {
         let screen_rect = ctx.screen_rect();
+        let title_bar_menu_was_active = self.title_bar_menu_active;
 
         // Default to false each frame; updated below when the bar is visible.
         self.mouse_over_window_buttons = false;
         self.mouse_over_title_text = false;
+        self.title_bar_menu_active = false;
 
         // Keep title-text drag-selection state sticky until the primary button is released.
         // This prevents the main view from stealing the drag if the pointer leaves the title bar.
@@ -14444,7 +14463,7 @@ impl ImageViewer {
             self.title_text_dragging = false;
         }
 
-        if self.rename_overlay.is_some() {
+        if self.rename_overlay.is_some() || title_bar_menu_was_active {
             self.show_controls = true;
             self.controls_show_time = Instant::now();
         }
@@ -14463,12 +14482,12 @@ impl ImageViewer {
             if let Some(pos) = mouse_pos {
                 if pos.y >= 50.0 {
                     // Don't hide while selecting title text.
-                    if !self.title_text_dragging {
+                    if !self.title_text_dragging && !title_bar_menu_was_active {
                         self.show_controls = false;
                     }
                 }
             } else {
-                if !self.title_text_dragging {
+                if !self.title_text_dragging && !title_bar_menu_was_active {
                     self.show_controls = false;
                 }
             }
@@ -14537,76 +14556,64 @@ impl ImageViewer {
                             let mut started_title_text_drag = false;
 
                             let current_path = self.image_list.get(self.current_index).cloned();
+                            let details_path = current_path.clone();
                             let mut commit_rename = false;
                             let mut cancel_rename = false;
 
                             if let Some(rename_state) = self.rename_overlay.as_mut() {
-                                egui::Frame::none()
-                                    .fill(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 18))
-                                    .stroke(egui::Stroke::new(
-                                        1.0,
-                                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 36),
-                                    ))
-                                    .rounding(10.0)
-                                    .inner_margin(egui::Margin::symmetric(10.0, 6.0))
-                                    .show(ui, |ui| {
-                                        ui.horizontal(|ui| {
-                                            let available_width = ui.available_width();
-                                            let editor_width = (available_width - 132.0).max(120.0);
-                                            let response = ui.add_sized(
-                                                [editor_width, 24.0],
-                                                egui::TextEdit::singleline(&mut rename_state.draft_name)
-                                                    .desired_width(editor_width)
-                                                    .text_color(egui::Color32::WHITE),
-                                            );
-                                            if rename_state.just_opened {
-                                                response.request_focus();
-                                                rename_state.just_opened = false;
-                                            }
-                                            over_title_text |= response.contains_pointer() || response.has_focus();
-                                            started_title_text_drag |=
-                                                response.drag_started() || response.dragged();
+                                let text_for_width = if rename_state.draft_name.is_empty() {
+                                    " ".to_string()
+                                } else {
+                                    rename_state.draft_name.clone()
+                                };
+                                let font_id = egui::TextStyle::Body.resolve(ui.style());
+                                let editor_width = ui
+                                    .fonts(|fonts| {
+                                        fonts
+                                            .layout_no_wrap(
+                                                text_for_width,
+                                                font_id,
+                                                egui::Color32::WHITE,
+                                            )
+                                            .size()
+                                            .x
+                                            + 20.0
+                                    })
+                                    .clamp(96.0, ui.available_width().max(96.0));
 
-                                            let save_button = ui.add(
-                                                egui::Button::new("Save")
-                                                    .fill(egui::Color32::from_rgb(44, 116, 86))
-                                                    .rounding(8.0),
-                                            );
-                                            over_title_text |= save_button.hovered();
-                                            if save_button.clicked() {
-                                                commit_rename = true;
-                                            }
-
-                                            let cancel_button = ui.add(
-                                                egui::Button::new("Cancel")
-                                                    .fill(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 20))
-                                                    .rounding(8.0),
-                                            );
-                                            over_title_text |= cancel_button.hovered();
-                                            if cancel_button.clicked() {
-                                                cancel_rename = true;
-                                            }
-                                        });
-
-                                        if let Some(error) = rename_state.error_message.as_ref() {
-                                            ui.add_space(6.0);
-                                            ui.label(
-                                                egui::RichText::new(error)
-                                                    .color(egui::Color32::from_rgb(255, 148, 148))
-                                                    .size(11.0),
-                                            );
-                                        }
-                                    });
+                                let response = ui.add(
+                                    egui::TextEdit::singleline(&mut rename_state.draft_name)
+                                        .desired_width(editor_width)
+                                        .frame(false)
+                                        .text_color(egui::Color32::WHITE),
+                                );
+                                let just_opened = rename_state.just_opened;
+                                if just_opened {
+                                    response.request_focus();
+                                    rename_state.just_opened = false;
+                                }
+                                over_title_text |= response.contains_pointer() || response.has_focus();
+                                started_title_text_drag |=
+                                    response.drag_started() || response.dragged();
 
                                 let enter_pressed = ui.input(|input| input.key_pressed(egui::Key::Enter));
                                 let escape_pressed = ui.input(|input| input.key_pressed(egui::Key::Escape));
-                                if enter_pressed {
-                                    commit_rename = true;
-                                }
                                 if escape_pressed {
                                     cancel_rename = true;
+                                } else if enter_pressed || (response.lost_focus() && !just_opened) {
+                                    commit_rename = true;
                                 }
-                            } else if let Some(path) = current_path {
+
+                                if let Some(error) = rename_state.error_message.as_ref() {
+                                    ui.add_space(8.0);
+                                    let error_response = ui.label(
+                                        egui::RichText::new(error)
+                                            .color(egui::Color32::from_rgb(255, 148, 148))
+                                            .size(11.0),
+                                    );
+                                    over_title_text |= error_response.contains_pointer();
+                                }
+                            } else if let Some(path) = current_path.as_ref() {
                                 let filename = path
                                     .file_name()
                                     .map(|n| n.to_string_lossy().to_string())
@@ -14621,42 +14628,9 @@ impl ImageViewer {
                                 );
                                 over_title_text |= resp.contains_pointer();
                                 started_title_text_drag |= resp.drag_started() || resp.dragged();
+                            }
 
-                                if self.is_path_marked(&path) {
-                                    ui.add_space(6.0);
-                                    egui::Frame::none()
-                                        .fill(egui::Color32::from_rgba_unmultiplied(16, 56, 74, 220))
-                                        .stroke(egui::Stroke::new(
-                                            1.0,
-                                            egui::Color32::from_rgba_unmultiplied(94, 214, 255, 255),
-                                        ))
-                                        .rounding(9.0)
-                                        .inner_margin(egui::Margin::symmetric(8.0, 2.0))
-                                        .show(ui, |ui| {
-                                            ui.label(
-                                                egui::RichText::new("MARKED")
-                                                    .color(egui::Color32::WHITE)
-                                                    .size(11.0),
-                                            );
-                                        });
-                                }
-
-                                let marked_count = self.marked_files.len();
-                                if marked_count > 0 {
-                                    ui.add_space(6.0);
-                                    egui::Frame::none()
-                                        .fill(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 14))
-                                        .rounding(9.0)
-                                        .inner_margin(egui::Margin::symmetric(8.0, 2.0))
-                                        .show(ui, |ui| {
-                                            ui.label(
-                                                egui::RichText::new(format!("{} marked", marked_count))
-                                                    .color(egui::Color32::from_rgb(214, 220, 228))
-                                                    .size(11.0),
-                                            );
-                                        });
-                                }
-
+                            if let Some(path) = details_path {
                                 ui.add_space(8.0);
 
                                 // If there isn't enough remaining room, collapse the detailed description.
@@ -14905,6 +14879,7 @@ impl ImageViewer {
                             let menu_button_response =
                                 window_icon_button(ui, WindowButton::Menu).on_hover_text("Menu");
                             let app_menu_popup_id = ui.make_persistent_id("title_bar_fab_menu");
+                            let mut title_bar_menu_active = menu_button_response.hovered();
 
                             if menu_button_response.clicked() {
                                 ui.memory_mut(|mem| mem.toggle_popup(app_menu_popup_id));
@@ -14918,6 +14893,7 @@ impl ImageViewer {
                                 &menu_button_response,
                                 close_on_click_outside,
                                 |ui| {
+                                    title_bar_menu_active = true;
                                     ui.set_min_width(190.0);
 
                                     let mut close_popup = false;
@@ -14950,8 +14926,19 @@ impl ImageViewer {
                                     if close_popup {
                                         ui.memory_mut(|mem| mem.close_popup());
                                     }
+
+                                    if ui.rect_contains_pointer(ui.min_rect()) {
+                                        title_bar_menu_active = true;
+                                    }
                                 },
                             );
+
+                            if ui.memory(|mem| mem.is_popup_open(app_menu_popup_id)) {
+                                title_bar_menu_active = true;
+                                self.show_controls = true;
+                                self.controls_show_time = Instant::now();
+                            }
+                            self.title_bar_menu_active = title_bar_menu_active;
 
                             // Add padding on the LEFT of the button cluster (not on the right),
                             // so the close button remains clickable at the very top-right pixel.
@@ -16200,9 +16187,7 @@ impl ImageViewer {
         let screen_rect = ctx.screen_rect();
         let mut animation_active = false;
         let title_bar_height = 32.0;
-        let title_ui_blocking = self.mouse_over_window_buttons
-            || self.mouse_over_title_text
-            || self.title_text_dragging;
+        let title_ui_blocking = self.title_bar_ui_blocking();
 
         // Smooth zoom animation (floating mode)
         if self.tick_floating_zoom_animation(ctx) {
@@ -16503,6 +16488,7 @@ impl ImageViewer {
                 && !self.gif_seeking
                 && !self.manga_video_seeking
                 && !self.mouse_over_window_buttons
+                && !self.title_bar_menu_active
                 && !self.title_text_dragging
                 && !pointer_over_shortcut_ui
                 && !self.manga_autoscroll_active
