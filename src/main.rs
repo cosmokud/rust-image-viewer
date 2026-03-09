@@ -374,9 +374,14 @@ struct FileContextMenuState {
 }
 
 #[derive(Clone, Debug)]
-struct RenameOverlayState {
+struct RenameDialogItemState {
     original_path: PathBuf,
     draft_name: String,
+}
+
+#[derive(Clone, Debug)]
+struct RenameOverlayState {
+    items: Vec<RenameDialogItemState>,
     error_message: Option<String>,
     just_opened: bool,
 }
@@ -390,9 +395,30 @@ struct MarkSelectionBoxState {
 
 #[derive(Clone, Debug)]
 struct DeleteModalItemInfo {
+    path: PathBuf,
     display_name: String,
     file_size_label: String,
     dimensions_label: String,
+}
+
+#[derive(Clone)]
+struct ModalThumbnailTexture {
+    texture: egui::TextureHandle,
+    width: u32,
+    height: u32,
+    stamp: FileStamp,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MenuActionIcon {
+    Mark,
+    MarkAll,
+    Unmark,
+    Cut,
+    Copy,
+    Delete,
+    Rename,
+    Config,
 }
 
 #[cfg(target_os = "windows")]
@@ -1311,7 +1337,7 @@ struct ImageViewer {
     prepared_clipboard_paths: HashMap<PathBuf, FileClipboardOperation>,
     /// Pointer-anchored file actions context menu state.
     file_action_menu: Option<FileContextMenuState>,
-    /// Inline rename editor displayed over the title-bar filename slot.
+    /// Rename dialog state for single-file or bulk rename operations.
     rename_overlay: Option<RenameOverlayState>,
     /// Active Ctrl+drag marquee selection used to mark multiple files in strip/masonry mode.
     mark_selection_box: Option<MarkSelectionBoxState>,
@@ -1319,6 +1345,10 @@ struct ImageViewer {
     pending_single_delete_target: Option<PathBuf>,
     /// Delete-confirmation target for marked-file actions.
     pending_marked_delete_targets: Vec<PathBuf>,
+    /// Whether an exit confirmation modal is waiting on user input because marks remain.
+    pending_exit_confirmation: bool,
+    /// Cached thumbnail textures used by delete/rename dialogs.
+    modal_thumbnail_cache: HashMap<PathBuf, ModalThumbnailTexture>,
     /// Current zoom level (1.0 = 100%)
     zoom: f32,
     /// Target zoom for smooth animation in floating mode
@@ -1810,6 +1840,8 @@ impl Default for ImageViewer {
             mark_selection_box: None,
             pending_single_delete_target: None,
             pending_marked_delete_targets: Vec::new(),
+            pending_exit_confirmation: false,
+            modal_thumbnail_cache: HashMap::new(),
             zoom: 1.0,
             zoom_target: 1.0,
             zoom_velocity: 0.0,
@@ -2125,6 +2157,37 @@ impl ImageViewer {
         self.marked_files.contains(path)
     }
 
+    fn clear_prepared_clipboard_for_path(&mut self, path: &Path) {
+        self.prepared_clipboard_paths.remove(path);
+    }
+
+    fn clear_all_marks(&mut self) {
+        self.marked_files.clear();
+        self.prepared_clipboard_paths.clear();
+    }
+
+    fn has_marked_files(&self) -> bool {
+        !self.marked_files.is_empty()
+    }
+
+    fn any_modal_dialog_open(&self) -> bool {
+        self.rename_overlay.is_some()
+            || self.pending_single_delete_target.is_some()
+            || !self.pending_marked_delete_targets.is_empty()
+            || self.pending_exit_confirmation
+    }
+
+    fn request_app_exit(&mut self) {
+        if self.has_marked_files() {
+            self.pending_exit_confirmation = true;
+            self.file_action_menu = None;
+            self.show_controls = true;
+            self.controls_show_time = Instant::now();
+        } else {
+            self.should_exit = true;
+        }
+    }
+
     fn prepared_clipboard_operation_for_path(&self, path: &Path) -> Option<FileClipboardOperation> {
         self.prepared_clipboard_paths.get(path).copied()
     }
@@ -2142,6 +2205,7 @@ impl ImageViewer {
 
         if !self.marked_files.insert(path.clone()) {
             self.marked_files.remove(&path);
+            self.clear_prepared_clipboard_for_path(&path);
             return false;
         }
 
@@ -2160,6 +2224,7 @@ impl ImageViewer {
 
                 if !self.marked_files.insert(path.clone()) {
                     self.marked_files.remove(&path);
+                    self.clear_prepared_clipboard_for_path(&path);
                 }
                 changed = changed.saturating_add(1);
             }
@@ -2181,6 +2246,8 @@ impl ImageViewer {
 
     fn clear_stale_marked_files(&mut self) {
         self.marked_files.retain(|path| path.exists());
+        self.prepared_clipboard_paths
+            .retain(|path, _| path.exists() && self.marked_files.contains(path));
     }
 
     fn clear_stale_prepared_clipboard_paths(&mut self) {
@@ -2284,12 +2351,14 @@ impl ImageViewer {
 
         self.error_message = None;
         self.pending_window_title = Some(env!("CARGO_PKG_NAME").to_string());
-        self.marked_files.clear();
+        self.clear_all_marks();
         self.prepared_clipboard_paths.clear();
         self.file_action_menu = None;
         self.rename_overlay = None;
         self.pending_single_delete_target = None;
         self.pending_marked_delete_targets.clear();
+        self.pending_exit_confirmation = false;
+        self.modal_thumbnail_cache.clear();
 
         if self.manga_mode {
             self.manga_clear_cache();
@@ -2316,6 +2385,7 @@ impl ImageViewer {
         self.set_image_list(files);
         self.clear_stale_marked_files();
         self.clear_stale_prepared_clipboard_paths();
+        self.modal_thumbnail_cache.retain(|path, _| path.exists());
 
         if self.image_list.is_empty() {
             self.clear_current_media_after_all_files_removed();
@@ -2368,24 +2438,73 @@ impl ImageViewer {
             return;
         };
 
-        let draft_name = path
-            .file_name()
-            .map(|name| name.to_string_lossy().to_string())
-            .unwrap_or_default();
+        self.start_rename_dialog_for_paths(vec![path]);
+    }
+
+    fn start_inline_rename_for_marked_files(&mut self) {
+        let paths = self.collect_marked_paths_in_current_order();
+        if paths.is_empty() {
+            return;
+        }
+
+        self.start_rename_dialog_for_paths(paths);
+    }
+
+    fn start_rename_dialog_for_paths(&mut self, paths: Vec<PathBuf>) {
+        if paths.is_empty() {
+            return;
+        }
+
+        let items = paths
+            .into_iter()
+            .map(|path| RenameDialogItemState {
+                draft_name: path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+                    .unwrap_or_default(),
+                original_path: path,
+            })
+            .collect();
 
         self.rename_overlay = Some(RenameOverlayState {
-            original_path: path,
-            draft_name,
+            items,
             error_message: None,
             just_opened: true,
         });
         self.file_action_menu = None;
+        self.pending_exit_confirmation = false;
         self.show_controls = true;
         self.controls_show_time = Instant::now();
     }
 
+    fn rename_temp_path(original_path: &Path, serial: usize) -> PathBuf {
+        let parent = original_path.parent().unwrap_or_else(|| Path::new("."));
+        let stem = original_path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or("file");
+        let extension = original_path.extension().and_then(|ext| ext.to_str());
+
+        for attempt in 0..1024usize {
+            let suffix = format!("riv-rename-{}-{}-tmp", std::process::id(), serial + attempt);
+            let candidate_name = if let Some(extension) = extension {
+                format!("{}.{}.{}", stem, suffix, extension)
+            } else {
+                format!("{}.{}", stem, suffix)
+            };
+            let candidate = parent.join(candidate_name);
+            if !candidate.exists() {
+                return candidate;
+            }
+        }
+
+        parent.join(format!("riv-rename-fallback-{}-{}", std::process::id(), serial))
+    }
+
     fn cancel_inline_rename(&mut self) {
         self.rename_overlay = None;
+        self.modal_thumbnail_cache.clear();
     }
 
     fn validate_rename_draft(draft_name: &str) -> Result<(), String> {
@@ -2409,62 +2528,146 @@ impl ImageViewer {
             return;
         };
 
-        if let Err(err) = Self::validate_rename_draft(&state.draft_name) {
-            if let Some(rename_state) = self.rename_overlay.as_mut() {
-                rename_state.error_message = Some(err);
-            }
-            return;
-        }
-
-        let Some(parent) = state.original_path.parent() else {
-            if let Some(rename_state) = self.rename_overlay.as_mut() {
-                rename_state.error_message = Some("Cannot rename a path without a parent folder".to_string());
-            }
-            return;
-        };
-
-        let new_path = parent.join(&state.draft_name);
-        if new_path == state.original_path {
+        if state.items.is_empty() {
             self.rename_overlay = None;
             return;
         }
 
-        if new_path.exists() {
-            if let Some(rename_state) = self.rename_overlay.as_mut() {
-                rename_state.error_message = Some("A file with that name already exists".to_string());
+        let mut planned_paths = Vec::with_capacity(state.items.len());
+        let original_paths: HashSet<PathBuf> = state
+            .items
+            .iter()
+            .map(|item| item.original_path.clone())
+            .collect();
+        let mut seen_targets = HashSet::with_capacity(state.items.len());
+
+        for item in &state.items {
+            if let Err(err) = Self::validate_rename_draft(&item.draft_name) {
+                if let Some(rename_state) = self.rename_overlay.as_mut() {
+                    rename_state.error_message = Some(err);
+                }
+                return;
             }
+
+            let Some(parent) = item.original_path.parent() else {
+                if let Some(rename_state) = self.rename_overlay.as_mut() {
+                    rename_state.error_message =
+                        Some("Cannot rename a path without a parent folder".to_string());
+                }
+                return;
+            };
+
+            let new_path = parent.join(&item.draft_name);
+            if !seen_targets.insert(new_path.clone()) {
+                if let Some(rename_state) = self.rename_overlay.as_mut() {
+                    rename_state.error_message =
+                        Some("Two renamed files would end up with the same name".to_string());
+                }
+                return;
+            }
+
+            if new_path.exists()
+                && !original_paths.contains(&new_path)
+                && new_path != item.original_path
+            {
+                if let Some(rename_state) = self.rename_overlay.as_mut() {
+                    rename_state.error_message =
+                        Some("A file with that name already exists".to_string());
+                }
+                return;
+            }
+
+            planned_paths.push((item.original_path.clone(), new_path));
+        }
+
+        let changed_paths: Vec<(PathBuf, PathBuf)> = planned_paths
+            .iter()
+            .filter(|(original_path, new_path)| original_path != new_path)
+            .cloned()
+            .collect();
+        if changed_paths.is_empty() {
+            self.rename_overlay = None;
             return;
         }
 
         let current_path_before = self.current_media_path();
-        match fs::rename(&state.original_path, &new_path) {
-            Ok(()) => {
-                if self.marked_files.remove(&state.original_path) {
-                    self.marked_files.insert(new_path.clone());
-                }
-                if let Some(operation) = self.prepared_clipboard_paths.remove(&state.original_path) {
-                    self.prepared_clipboard_paths.insert(new_path.clone(), operation);
+        let staged_paths: Vec<(PathBuf, PathBuf, PathBuf)> = changed_paths
+            .iter()
+            .enumerate()
+            .map(|(serial, (original_path, new_path))| {
+                (
+                    original_path.clone(),
+                    Self::rename_temp_path(original_path.as_path(), serial),
+                    new_path.clone(),
+                )
+            })
+            .collect();
+
+        for (original_path, temp_path, _) in &staged_paths {
+            if let Err(err) = fs::rename(original_path, temp_path) {
+                for (rollback_original, rollback_temp, _) in &staged_paths {
+                    if rollback_temp.exists() {
+                        let _ = fs::rename(rollback_temp, rollback_original);
+                    }
                 }
 
-                self.rename_overlay = None;
-
-                let renamed_current = current_path_before.as_ref() == Some(&state.original_path);
-                if renamed_current && !self.manga_mode {
-                    self.load_media(&new_path);
-                } else {
-                    let preferred_current = if renamed_current {
-                        Some(new_path.clone())
-                    } else {
-                        current_path_before
-                    };
-                    self.refresh_media_list_after_path_mutation(preferred_current);
-                }
-            }
-            Err(err) => {
                 if let Some(rename_state) = self.rename_overlay.as_mut() {
                     rename_state.error_message = Some(format!("Rename failed: {err}"));
                 }
+                return;
             }
+        }
+
+        let mut completed_final_paths: Vec<(PathBuf, PathBuf)> =
+            Vec::with_capacity(staged_paths.len());
+        for (original_path, temp_path, new_path) in &staged_paths {
+            if let Err(err) = fs::rename(temp_path, new_path) {
+                for (completed_original, completed_new) in completed_final_paths.iter().rev() {
+                    let _ = fs::rename(completed_new, completed_original);
+                }
+                for (rollback_original, rollback_temp, _) in &staged_paths {
+                    if rollback_temp.exists() {
+                        let _ = fs::rename(rollback_temp, rollback_original);
+                    }
+                }
+
+                if let Some(rename_state) = self.rename_overlay.as_mut() {
+                    rename_state.error_message = Some(format!("Rename failed: {err}"));
+                }
+                return;
+            }
+
+            completed_final_paths.push((original_path.clone(), new_path.clone()));
+        }
+
+        for (original_path, new_path) in &changed_paths {
+            if self.marked_files.remove(original_path) {
+                self.marked_files.insert(new_path.clone());
+            }
+            if let Some(operation) = self.prepared_clipboard_paths.remove(original_path) {
+                self.prepared_clipboard_paths.insert(new_path.clone(), operation);
+            }
+            self.modal_thumbnail_cache.remove(original_path);
+        }
+
+        self.rename_overlay = None;
+        self.modal_thumbnail_cache.clear();
+
+        let renamed_current = current_path_before.as_ref().and_then(|current_path| {
+            changed_paths
+                .iter()
+                .find(|(original_path, _)| original_path == current_path)
+                .map(|(_, new_path)| new_path.clone())
+        });
+
+        if let Some(new_current_path) = renamed_current {
+            if !self.manga_mode {
+                self.load_media(&new_current_path);
+            } else {
+                self.refresh_media_list_after_path_mutation(Some(new_current_path));
+            }
+        } else {
+            self.refresh_media_list_after_path_mutation(current_path_before);
         }
     }
 
@@ -2546,7 +2749,8 @@ impl ImageViewer {
             Ok(()) => {
                 for path in &existing_paths {
                     self.marked_files.remove(path);
-                    self.prepared_clipboard_paths.remove(path);
+                    self.clear_prepared_clipboard_for_path(path);
+                    self.modal_thumbnail_cache.remove(path);
                 }
 
                 self.pending_single_delete_target = None;
@@ -4062,8 +4266,7 @@ impl ImageViewer {
         if self.title_bar_ui_blocking()
             || self.mouse_over_video_controls
             || self.file_action_menu.is_some()
-            || self.pending_single_delete_target.is_some()
-            || !self.pending_marked_delete_targets.is_empty()
+            || self.any_modal_dialog_open()
         {
             return true;
         }
@@ -4356,6 +4559,7 @@ impl ImageViewer {
             .unwrap_or_else(|| "Unknown dimensions".to_string());
 
         DeleteModalItemInfo {
+            path: path.clone(),
             display_name,
             file_size_label,
             dimensions_label,
@@ -4463,6 +4667,209 @@ impl ImageViewer {
         }
     }
 
+    fn paint_menu_action_icon(
+        painter: &egui::Painter,
+        rect: egui::Rect,
+        icon: MenuActionIcon,
+        color: egui::Color32,
+    ) {
+        let stroke = egui::Stroke::new(1.8, color);
+        match icon {
+            MenuActionIcon::Mark => {
+                painter.rect_stroke(rect.shrink(2.0), 4.0, stroke);
+                painter.line_segment(
+                    [
+                        egui::pos2(rect.left() + 4.0, rect.center().y),
+                        egui::pos2(rect.center().x - 1.0, rect.bottom() - 4.0),
+                    ],
+                    stroke,
+                );
+                painter.line_segment(
+                    [
+                        egui::pos2(rect.center().x - 1.0, rect.bottom() - 4.0),
+                        egui::pos2(rect.right() - 3.0, rect.top() + 4.0),
+                    ],
+                    stroke,
+                );
+            }
+            MenuActionIcon::MarkAll => {
+                let back = rect.translate(egui::vec2(-2.0, -2.0)).shrink(3.5);
+                let front = rect.translate(egui::vec2(2.0, 2.0)).shrink(3.5);
+                painter.rect_stroke(back, 3.0, stroke);
+                painter.rect_stroke(front, 3.0, stroke);
+                painter.line_segment(
+                    [
+                        egui::pos2(front.left() + 3.0, front.center().y),
+                        egui::pos2(front.center().x - 1.0, front.bottom() - 3.0),
+                    ],
+                    stroke,
+                );
+                painter.line_segment(
+                    [
+                        egui::pos2(front.center().x - 1.0, front.bottom() - 3.0),
+                        egui::pos2(front.right() - 2.0, front.top() + 3.0),
+                    ],
+                    stroke,
+                );
+            }
+            MenuActionIcon::Unmark => {
+                painter.rect_stroke(rect.shrink(2.0), 4.0, stroke);
+                painter.line_segment(
+                    [
+                        egui::pos2(rect.left() + 4.0, rect.center().y),
+                        egui::pos2(rect.right() - 4.0, rect.center().y),
+                    ],
+                    stroke,
+                );
+            }
+            MenuActionIcon::Cut => {
+                painter.circle_stroke(egui::pos2(rect.left() + 5.0, rect.top() + 6.0), 2.8, stroke);
+                painter.circle_stroke(
+                    egui::pos2(rect.left() + 5.0, rect.bottom() - 6.0),
+                    2.8,
+                    stroke,
+                );
+                painter.line_segment(
+                    [
+                        egui::pos2(rect.left() + 8.0, rect.top() + 8.0),
+                        egui::pos2(rect.right() - 3.0, rect.bottom() - 3.0),
+                    ],
+                    stroke,
+                );
+                painter.line_segment(
+                    [
+                        egui::pos2(rect.left() + 8.0, rect.bottom() - 8.0),
+                        egui::pos2(rect.right() - 3.0, rect.top() + 3.0),
+                    ],
+                    stroke,
+                );
+            }
+            MenuActionIcon::Copy => {
+                let back = rect.translate(egui::vec2(-2.5, -2.5)).shrink(4.0);
+                let front = rect.translate(egui::vec2(2.0, 2.0)).shrink(4.0);
+                painter.rect_stroke(back, 3.0, stroke);
+                painter.rect_stroke(front, 3.0, stroke);
+            }
+            MenuActionIcon::Delete => {
+                let lid_rect = egui::Rect::from_min_max(
+                    egui::pos2(rect.left() + 3.0, rect.top() + 4.0),
+                    egui::pos2(rect.right() - 3.0, rect.top() + 7.5),
+                );
+                let body_rect = egui::Rect::from_min_max(
+                    egui::pos2(rect.left() + 4.5, rect.top() + 7.5),
+                    egui::pos2(rect.right() - 4.5, rect.bottom() - 3.0),
+                );
+                painter.rect_stroke(body_rect, 3.0, stroke);
+                painter.rect_filled(lid_rect, 2.0, color);
+                for offset in [0.0, 3.0, 6.0] {
+                    painter.line_segment(
+                        [
+                            egui::pos2(body_rect.left() + 3.0 + offset, body_rect.top() + 3.0),
+                            egui::pos2(body_rect.left() + 3.0 + offset, body_rect.bottom() - 3.0),
+                        ],
+                        stroke,
+                    );
+                }
+            }
+            MenuActionIcon::Rename => {
+                painter.line_segment(
+                    [
+                        egui::pos2(rect.left() + 3.0, rect.bottom() - 4.0),
+                        egui::pos2(rect.right() - 4.5, rect.top() + 3.5),
+                    ],
+                    stroke,
+                );
+                painter.line_segment(
+                    [
+                        egui::pos2(rect.right() - 6.0, rect.top() + 2.5),
+                        egui::pos2(rect.right() - 2.5, rect.top() + 6.0),
+                    ],
+                    stroke,
+                );
+                painter.line_segment(
+                    [
+                        egui::pos2(rect.left() + 3.0, rect.bottom() - 4.0),
+                        egui::pos2(rect.left() + 7.0, rect.bottom() - 5.5),
+                    ],
+                    stroke,
+                );
+            }
+            MenuActionIcon::Config => {
+                painter.circle_stroke(rect.center(), 4.0, stroke);
+                for angle in [0.0_f32, 45.0, 90.0, 135.0] {
+                    let radians = angle.to_radians();
+                    let dir = egui::vec2(radians.cos(), radians.sin());
+                    painter.line_segment(
+                        [
+                            rect.center() + dir * 5.5,
+                            rect.center() + dir * 8.0,
+                        ],
+                        stroke,
+                    );
+                }
+            }
+        }
+    }
+
+    fn menu_action_row(
+        &self,
+        ui: &mut egui::Ui,
+        label: &str,
+        icon: MenuActionIcon,
+    ) -> egui::Response {
+        let desired_size = egui::vec2(ui.available_width(), 32.0);
+        let (rect, response) = ui.allocate_exact_size(desired_size, egui::Sense::click());
+
+        if ui.is_rect_visible(rect) {
+            let destructive = icon == MenuActionIcon::Delete;
+            let fill = if response.is_pointer_button_down_on() {
+                if destructive {
+                    egui::Color32::from_rgba_unmultiplied(172, 44, 44, 210)
+                } else {
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 28)
+                }
+            } else if response.hovered() {
+                if destructive {
+                    egui::Color32::from_rgba_unmultiplied(160, 42, 42, 170)
+                } else {
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 16)
+                }
+            } else {
+                egui::Color32::TRANSPARENT
+            };
+            let stroke_color = if destructive {
+                egui::Color32::from_rgba_unmultiplied(255, 132, 132, 110)
+            } else {
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 36)
+            };
+            let text_color = if destructive {
+                egui::Color32::from_rgb(255, 225, 225)
+            } else {
+                egui::Color32::WHITE
+            };
+
+            ui.painter().rect_filled(rect, 8.0, fill);
+            ui.painter()
+                .rect_stroke(rect, 8.0, egui::Stroke::new(1.0, stroke_color));
+
+            let icon_rect = egui::Rect::from_center_size(
+                egui::pos2(rect.left() + 17.0, rect.center().y),
+                egui::vec2(15.0, 15.0),
+            );
+            Self::paint_menu_action_icon(ui.painter(), icon_rect, icon, text_color);
+
+            ui.painter().text(
+                egui::pos2(rect.left() + 34.0, rect.center().y),
+                egui::Align2::LEFT_CENTER,
+                label,
+                egui::TextStyle::Body.resolve(ui.style()),
+                text_color,
+            );
+        }
+
+        response
+    }
+
     fn render_single_file_action_buttons(
         &mut self,
         ui: &mut egui::Ui,
@@ -4471,15 +4878,35 @@ impl ImageViewer {
     ) -> bool {
         let mut activated = false;
 
+        let current_context_labels = current_labels || !self.manga_mode;
+        let is_marked = self.is_index_marked(target_index);
+        let mark_label = if current_context_labels {
+            if is_marked {
+                "Unmark Current File"
+            } else {
+                "Mark Current File"
+            }
+        } else if is_marked {
+            "Unmark"
+        } else {
+            "Mark"
+        };
+        let mark_icon = if is_marked {
+            MenuActionIcon::Unmark
+        } else {
+            MenuActionIcon::Mark
+        };
+        if self.menu_action_row(ui, mark_label, mark_icon).clicked() {
+            self.toggle_mark_for_index(target_index);
+            activated = true;
+        }
+
         let cut_label = if current_labels {
             "Cut Current File"
         } else {
-            "Cut File"
+            "Cut"
         };
-        if ui
-            .add_sized([ui.available_width(), 28.0], egui::Button::new(cut_label))
-            .clicked()
-        {
+        if self.menu_action_row(ui, cut_label, MenuActionIcon::Cut).clicked() {
             self.apply_clipboard_operation_to_single_file(target_index, FileClipboardOperation::Cut);
             activated = true;
         }
@@ -4487,39 +4914,30 @@ impl ImageViewer {
         let copy_label = if current_labels {
             "Copy Current File"
         } else {
-            "Copy File"
+            "Copy"
         };
-        if ui
-            .add_sized([ui.available_width(), 28.0], egui::Button::new(copy_label))
-            .clicked()
-        {
+        if self.menu_action_row(ui, copy_label, MenuActionIcon::Copy).clicked() {
             self.apply_clipboard_operation_to_single_file(target_index, FileClipboardOperation::Copy);
-            activated = true;
-        }
-
-        let delete_label = if current_labels {
-            "Delete Current File"
-        } else {
-            "Delete File"
-        };
-        if ui
-            .add_sized([ui.available_width(), 28.0], egui::Button::new(delete_label))
-            .clicked()
-        {
-            self.request_single_file_delete(target_index);
             activated = true;
         }
 
         let rename_label = if current_labels {
             "Rename Current File"
         } else {
-            "Rename File"
+            "Rename"
         };
-        if ui
-            .add_sized([ui.available_width(), 28.0], egui::Button::new(rename_label))
-            .clicked()
-        {
+        if self.menu_action_row(ui, rename_label, MenuActionIcon::Rename).clicked() {
             self.start_inline_rename_for_index(target_index);
+            activated = true;
+        }
+
+        let delete_label = if current_labels {
+            "Delete Current File"
+        } else {
+            "Delete"
+        };
+        if self.menu_action_row(ui, delete_label, MenuActionIcon::Delete).clicked() {
+            self.request_single_file_delete(target_index);
             activated = true;
         }
 
@@ -4535,41 +4953,48 @@ impl ImageViewer {
         let mut activated = false;
 
         if !marked_paths.is_empty() {
-            if ui
-                .add_sized([ui.available_width(), 28.0], egui::Button::new("Cut Marked Files"))
+            if self
+                .menu_action_row(ui, "Cut Marked Files", MenuActionIcon::Cut)
                 .clicked()
             {
                 self.apply_clipboard_operation_to_marked_files(FileClipboardOperation::Cut);
                 activated = true;
             }
-            if ui
-                .add_sized([ui.available_width(), 28.0], egui::Button::new("Copy Marked Files"))
+            if self
+                .menu_action_row(ui, "Copy Marked Files", MenuActionIcon::Copy)
                 .clicked()
             {
                 self.apply_clipboard_operation_to_marked_files(FileClipboardOperation::Copy);
                 activated = true;
             }
-            if ui
-                .add_sized([ui.available_width(), 28.0], egui::Button::new("Delete Marked Files"))
+            if self
+                .menu_action_row(ui, "Rename Marked Files", MenuActionIcon::Rename)
+                .clicked()
+            {
+                self.start_inline_rename_for_marked_files();
+                activated = true;
+            }
+            if self
+                .menu_action_row(ui, "Delete Marked Files", MenuActionIcon::Delete)
                 .clicked()
             {
                 self.request_marked_files_delete();
                 activated = true;
             }
         }
-        if ui
-            .add_sized([ui.available_width(), 28.0], egui::Button::new("Mark All"))
+        if self
+            .menu_action_row(ui, "Mark All", MenuActionIcon::MarkAll)
             .clicked()
         {
             self.mark_all_files();
             activated = true;
         }
         if !marked_paths.is_empty()
-            && ui
-                .add_sized([ui.available_width(), 28.0], egui::Button::new("Unmark All"))
+            && self
+                .menu_action_row(ui, "Unmark All", MenuActionIcon::Unmark)
                 .clicked()
         {
-            self.marked_files.clear();
+            self.clear_all_marks();
             activated = true;
         }
 
@@ -4610,20 +5035,6 @@ impl ImageViewer {
                     .show(ui, |ui| {
                         ui.set_min_width(220.0);
 
-                        let mark_label = if self.is_index_marked(menu_state.target_index) {
-                            "Unmark"
-                        } else {
-                            "Mark"
-                        };
-                        if ui
-                            .add_sized([ui.available_width(), 28.0], egui::Button::new(mark_label))
-                            .clicked()
-                        {
-                            self.toggle_mark_for_index(menu_state.target_index);
-                            close_menu = true;
-                        }
-
-                        ui.separator();
                         if self.render_single_file_action_buttons(ui, menu_state.target_index, false) {
                             close_menu = true;
                         }
@@ -4656,6 +5067,278 @@ impl ImageViewer {
         }
     }
 
+    fn modal_thumbnail_target_side(&self) -> u32 {
+        LOD_SIDE_BUCKETS
+            .iter()
+            .copied()
+            .find(|&side| side >= 192)
+            .unwrap_or(192)
+    }
+
+    fn ensure_modal_thumbnail_texture(
+        &mut self,
+        ctx: &egui::Context,
+        path: &PathBuf,
+    ) -> Option<(egui::TextureId, egui::Vec2)> {
+        let stamp = file_stamp_for_path(path.as_path())?;
+        if let Some(cached) = self.modal_thumbnail_cache.get(path) {
+            if cached.stamp == stamp {
+                return Some((
+                    cached.texture.id(),
+                    egui::vec2(cached.width as f32, cached.height as f32),
+                ));
+            }
+        }
+        self.modal_thumbnail_cache.remove(path);
+
+        let target_side = self.modal_thumbnail_target_side();
+        let media_type = get_media_type(path)?;
+        let animated_by_ext = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| matches!(ext.to_ascii_lowercase().as_str(), "gif" | "webp"))
+            .unwrap_or(false);
+
+        let (pixels, width, height, texture_options) = match media_type {
+            MediaType::Image => {
+                if let Some(cached) = lookup_cached_static_thumbnail(path, target_side) {
+                    let min_side = cached.width.min(cached.height);
+                    let texture_options = if animated_by_ext {
+                        self.config.texture_filter_animated.to_egui_options()
+                    } else {
+                        self.config
+                            .texture_filter_static
+                            .to_egui_options_with_mipmap(
+                                min_side >= self.config.manga_mipmap_min_side.max(1),
+                            )
+                    };
+                    (cached.pixels, cached.width, cached.height, texture_options)
+                } else {
+                    let cached = load_solo_probe_image(
+                        path,
+                        target_side,
+                        self.config.downscale_filter.to_image_filter(),
+                        self.config.gif_resize_filter.to_image_filter(),
+                    )?;
+                    let animated = cached.first_frame.delay_ms > 0
+                        || cached.is_animated_webp
+                        || animated_by_ext;
+                    let min_side = cached.first_frame.width.min(cached.first_frame.height);
+                    let texture_options = if animated {
+                        self.config.texture_filter_animated.to_egui_options()
+                    } else {
+                        self.config
+                            .texture_filter_static
+                            .to_egui_options_with_mipmap(
+                                min_side >= self.config.manga_mipmap_min_side.max(1),
+                            )
+                    };
+                    (
+                        cached.first_frame.pixels,
+                        cached.first_frame.width,
+                        cached.first_frame.height,
+                        texture_options,
+                    )
+                }
+            }
+            MediaType::Video => {
+                let cached = extract_video_first_frame_thumbnail(path, target_side)?;
+                let texture_options =
+                    self.solo_video_thumbnail_texture_options(cached.width, cached.height);
+                (cached.pixels, cached.width, cached.height, texture_options)
+            }
+        };
+
+        let color_image =
+            egui::ColorImage::from_rgba_unmultiplied([width as usize, height as usize], &pixels);
+        let texture = ctx.load_texture(
+            format!("modal-thumbnail:{}", decoded_image_cache_key(path, target_side)),
+            color_image,
+            texture_options,
+        );
+
+        self.modal_thumbnail_cache.insert(
+            path.clone(),
+            ModalThumbnailTexture {
+                texture,
+                width,
+                height,
+                stamp,
+            },
+        );
+
+        self.modal_thumbnail_cache.get(path).map(|cached| {
+            (
+                cached.texture.id(),
+                egui::vec2(cached.width as f32, cached.height as f32),
+            )
+        })
+    }
+
+    fn draw_modal_thumbnail_preview(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        path: &PathBuf,
+    ) {
+        let thumbnail_size = egui::vec2(84.0, 84.0);
+        let (rect, _) = ui.allocate_exact_size(thumbnail_size, egui::Sense::hover());
+        ui.painter().rect_filled(
+            rect,
+            12.0,
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 14),
+        );
+        ui.painter().rect_stroke(
+            rect,
+            12.0,
+            egui::Stroke::new(
+                1.0,
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 28),
+            ),
+        );
+
+        if let Some((texture_id, image_size)) = self.ensure_modal_thumbnail_texture(ctx, path) {
+            let available = rect.shrink2(egui::vec2(6.0, 6.0));
+            let scale = if image_size.x <= 0.0 || image_size.y <= 0.0 {
+                1.0
+            } else {
+                (available.width() / image_size.x)
+                    .min(available.height() / image_size.y)
+                    .max(0.01)
+            };
+            let fitted_size = egui::vec2(image_size.x * scale, image_size.y * scale);
+            let image_rect = egui::Rect::from_center_size(rect.center(), fitted_size);
+            ui.painter().image(
+                texture_id,
+                image_rect,
+                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+        } else {
+            let placeholder = path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext.to_ascii_uppercase())
+                .unwrap_or_else(|| "FILE".to_string());
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                placeholder,
+                egui::TextStyle::Button.resolve(ui.style()),
+                egui::Color32::from_rgb(188, 202, 220),
+            );
+        }
+    }
+
+    fn draw_modal_metadata_chips(
+        ui: &mut egui::Ui,
+        file_size_label: &str,
+        dimensions_label: &str,
+    ) {
+        let render_chip = |ui: &mut egui::Ui,
+                           text: &str,
+                           fill: egui::Color32,
+                           stroke: egui::Stroke,
+                           color: egui::Color32| {
+            egui::Frame::none()
+                .fill(fill)
+                .stroke(stroke)
+                .rounding(6.0)
+                .inner_margin(egui::Margin::symmetric(8.0, 3.0))
+                .show(ui, |ui| {
+                    ui.label(egui::RichText::new(text).color(color).size(12.0));
+                });
+        };
+
+        ui.horizontal_wrapped(|ui| {
+            render_chip(
+                ui,
+                file_size_label,
+                egui::Color32::from_rgba_unmultiplied(58, 76, 98, 180),
+                egui::Stroke::new(
+                    1.0,
+                    egui::Color32::from_rgba_unmultiplied(130, 168, 196, 180),
+                ),
+                egui::Color32::from_rgb(222, 233, 243),
+            );
+            render_chip(
+                ui,
+                dimensions_label,
+                egui::Color32::from_rgba_unmultiplied(72, 68, 38, 180),
+                egui::Stroke::new(
+                    1.0,
+                    egui::Color32::from_rgba_unmultiplied(224, 192, 108, 180),
+                ),
+                egui::Color32::from_rgb(245, 225, 171),
+            );
+        });
+    }
+
+    fn draw_modal_file_card(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        item: &DeleteModalItemInfo,
+        draft_name: Option<&mut String>,
+        request_focus: bool,
+    ) {
+        egui::Frame::none()
+            .fill(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 10))
+            .stroke(egui::Stroke::new(
+                1.0,
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 24),
+            ))
+            .rounding(14.0)
+            .inner_margin(egui::Margin::same(12.0))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    self.draw_modal_thumbnail_preview(ui, ctx, &item.path);
+                    ui.add_space(12.0);
+                    ui.vertical(|ui| {
+                        ui.set_min_height(84.0);
+                        match draft_name {
+                            Some(draft_name) => {
+                                let response = ui.add(
+                                    egui::TextEdit::singleline(draft_name)
+                                        .desired_width(ui.available_width().max(180.0))
+                                        .clip_text(false),
+                                );
+                                if request_focus {
+                                    response.request_focus();
+                                }
+                            }
+                            None => {
+                                ui.label(
+                                    egui::RichText::new(&item.display_name)
+                                        .color(egui::Color32::WHITE)
+                                        .strong()
+                                        .size(15.0),
+                                );
+                            }
+                        }
+
+                        ui.add_space(8.0);
+                        Self::draw_modal_metadata_chips(
+                            ui,
+                            &item.file_size_label,
+                            &item.dimensions_label,
+                        );
+                        ui.add_space(8.0);
+                        let parent_label = item
+                            .path
+                            .parent()
+                            .map(|parent| parent.to_string_lossy().to_string())
+                            .unwrap_or_else(|| item.path.to_string_lossy().to_string());
+                        ui.label(
+                            egui::RichText::new(parent_label)
+                                .color(egui::Color32::from_rgb(146, 162, 178))
+                                .size(11.5),
+                        );
+                    });
+                });
+            });
+    }
+
     fn draw_delete_confirmation_modal(&mut self, ctx: &egui::Context) {
         let (targets, title, summary) = if let Some(path) = self.pending_single_delete_target.clone() {
             (
@@ -4675,12 +5358,8 @@ impl ImageViewer {
             return;
         };
 
-        let preview_items: Vec<DeleteModalItemInfo> = targets
-            .iter()
-            .take(4)
-            .map(|path| self.delete_modal_item_info(path))
-            .collect();
-        let remaining_items = targets.len().saturating_sub(preview_items.len());
+        let preview_items: Vec<DeleteModalItemInfo> =
+            targets.iter().map(|path| self.delete_modal_item_info(path)).collect();
 
         let mut cancel = ctx.input(|input| input.key_pressed(egui::Key::Escape));
         let mut confirm = false;
@@ -4698,8 +5377,12 @@ impl ImageViewer {
                 );
             });
 
-        let modal_height = (246.0 + (preview_items.len() as f32 * 60.0)).clamp(246.0, 430.0);
-        let modal_size = egui::vec2(500.0, modal_height);
+        let list_height = (preview_items.len() as f32 * 108.0)
+            .clamp(120.0, (screen_rect.height() - 260.0).max(120.0));
+        let modal_size = egui::vec2(
+            (screen_rect.width() - 48.0).clamp(420.0, 680.0),
+            (228.0 + list_height).clamp(280.0, screen_rect.height() - 36.0),
+        );
         let modal_pos = screen_rect.center() - modal_size * 0.5;
         egui::Area::new(egui::Id::new("delete_confirmation_modal"))
             .fixed_pos(modal_pos)
@@ -4731,78 +5414,12 @@ impl ImageViewer {
                             ui.add_space(12.0);
 
                             egui::ScrollArea::vertical()
-                                .max_height((modal_size.y - 150.0).max(96.0))
+                                .max_height((modal_size.y - 158.0).max(120.0))
                                 .auto_shrink([false, false])
                                 .show(ui, |ui| {
                                     for item in &preview_items {
-                                        egui::Frame::none()
-                                            .fill(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 10))
-                                            .stroke(egui::Stroke::new(
-                                                1.0,
-                                                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 24),
-                                            ))
-                                            .rounding(8.0)
-                                            .inner_margin(egui::Margin::symmetric(12.0, 10.0))
-                                            .show(ui, |ui| {
-                                                ui.vertical(|ui| {
-                                                    ui.label(
-                                                        egui::RichText::new(&item.display_name)
-                                                            .color(egui::Color32::WHITE)
-                                                            .strong(),
-                                                    );
-                                                    ui.add_space(6.0);
-                                                    ui.horizontal_wrapped(|ui| {
-                                                        let render_chip = |ui: &mut egui::Ui,
-                                                                           text: &str,
-                                                                           fill: egui::Color32,
-                                                                           stroke: egui::Stroke,
-                                                                           color: egui::Color32| {
-                                                            egui::Frame::none()
-                                                                .fill(fill)
-                                                                .stroke(stroke)
-                                                                .rounding(4.0)
-                                                                .inner_margin(egui::Margin::symmetric(8.0, 3.0))
-                                                                .show(ui, |ui| {
-                                                                    ui.label(
-                                                                        egui::RichText::new(text)
-                                                                            .color(color)
-                                                                            .size(12.0),
-                                                                    );
-                                                                });
-                                                        };
-
-                                                        render_chip(
-                                                            ui,
-                                                            &item.file_size_label,
-                                                            egui::Color32::from_rgba_unmultiplied(58, 76, 98, 180),
-                                                            egui::Stroke::new(
-                                                                1.0,
-                                                                egui::Color32::from_rgba_unmultiplied(130, 168, 196, 180),
-                                                            ),
-                                                            egui::Color32::from_rgb(222, 233, 243),
-                                                        );
-                                                        render_chip(
-                                                            ui,
-                                                            &item.dimensions_label,
-                                                            egui::Color32::from_rgba_unmultiplied(72, 68, 38, 180),
-                                                            egui::Stroke::new(
-                                                                1.0,
-                                                                egui::Color32::from_rgba_unmultiplied(224, 192, 108, 180),
-                                                            ),
-                                                            egui::Color32::from_rgb(245, 225, 171),
-                                                        );
-                                                    });
-                                                });
-                                            });
+                                        self.draw_modal_file_card(ui, ctx, item, None, false);
                                         ui.add_space(8.0);
-                                    }
-
-                                    if remaining_items > 0 {
-                                        ui.label(
-                                            egui::RichText::new(format!("And {} more file(s).", remaining_items))
-                                                .color(egui::Color32::from_rgb(150, 166, 182))
-                                                .size(12.0),
-                                        );
                                     }
                                 });
 
@@ -4851,8 +5468,276 @@ impl ImageViewer {
         if cancel {
             self.pending_single_delete_target = None;
             self.pending_marked_delete_targets.clear();
+            self.modal_thumbnail_cache.clear();
         } else if confirm {
             self.perform_delete_targets(targets);
+        }
+    }
+
+    fn draw_rename_modal(&mut self, ctx: &egui::Context) {
+        let Some(rename_state) = self.rename_overlay.clone() else {
+            return;
+        };
+
+        let preview_items: Vec<DeleteModalItemInfo> = rename_state
+            .items
+            .iter()
+            .map(|item| self.delete_modal_item_info(&item.original_path))
+            .collect();
+        let item_count = preview_items.len();
+        let title = if item_count == 1 {
+            "Rename File".to_string()
+        } else {
+            format!("Rename {} Files", item_count)
+        };
+        let summary = if item_count == 1 {
+            "Choose a new name for the selected file.".to_string()
+        } else {
+            "Edit each filename below. Every rename is validated before anything is moved.".to_string()
+        };
+
+        let mut edited_state = rename_state;
+        let mut cancel = ctx.input(|input| input.key_pressed(egui::Key::Escape));
+        let mut confirm = ctx.input(|input| {
+            input.key_pressed(egui::Key::Enter)
+                && !input.modifiers.ctrl
+                && !input.modifiers.shift
+                && !input.modifiers.alt
+        });
+        let screen_rect = ctx.screen_rect();
+
+        egui::Area::new(egui::Id::new("rename_dialog_backdrop"))
+            .fixed_pos(screen_rect.min)
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, screen_rect.size());
+                ui.painter().rect_filled(
+                    rect,
+                    0.0,
+                    egui::Color32::from_rgba_unmultiplied(5, 7, 10, 190),
+                );
+            });
+
+        let list_height = (preview_items.len() as f32 * 108.0)
+            .clamp(120.0, (screen_rect.height() - 272.0).max(120.0));
+        let modal_size = egui::vec2(
+            (screen_rect.width() - 48.0).clamp(440.0, 720.0),
+            (244.0 + list_height).clamp(300.0, screen_rect.height() - 36.0),
+        );
+        let modal_pos = screen_rect.center() - modal_size * 0.5;
+
+        egui::Area::new(egui::Id::new("rename_dialog_modal"))
+            .fixed_pos(modal_pos)
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                ui.set_min_size(modal_size);
+                egui::Frame::none()
+                    .fill(egui::Color32::from_rgba_unmultiplied(18, 22, 28, 252))
+                    .stroke(egui::Stroke::new(
+                        1.0,
+                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 40),
+                    ))
+                    .rounding(18.0)
+                    .inner_margin(egui::Margin::same(18.0))
+                    .show(ui, |ui| {
+                        ui.vertical(|ui| {
+                            ui.label(
+                                egui::RichText::new(title)
+                                    .color(egui::Color32::WHITE)
+                                    .strong()
+                                    .size(18.0),
+                            );
+                            ui.add_space(8.0);
+                            ui.label(
+                                egui::RichText::new(summary)
+                                    .color(egui::Color32::from_rgb(210, 216, 224))
+                                    .size(14.0),
+                            );
+                            if let Some(error) = edited_state.error_message.as_ref() {
+                                ui.add_space(10.0);
+                                ui.label(
+                                    egui::RichText::new(error)
+                                        .color(egui::Color32::from_rgb(255, 148, 148))
+                                        .size(12.5),
+                                );
+                            }
+                            ui.add_space(12.0);
+
+                            egui::ScrollArea::vertical()
+                                .max_height((modal_size.y - 170.0).max(120.0))
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    for (index, item) in preview_items.iter().enumerate() {
+                                        self.draw_modal_file_card(
+                                            ui,
+                                            ctx,
+                                            item,
+                                            Some(&mut edited_state.items[index].draft_name),
+                                            edited_state.just_opened && index == 0,
+                                        );
+                                        ui.add_space(8.0);
+                                    }
+                                });
+
+                            edited_state.just_opened = false;
+
+                            ui.add_space(16.0);
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                let confirm_label = if item_count == 1 {
+                                    "Rename File"
+                                } else {
+                                    "Rename Files"
+                                };
+                                let rename_button = ui.add(
+                                    egui::Button::new(
+                                        egui::RichText::new(confirm_label)
+                                            .color(egui::Color32::WHITE),
+                                    )
+                                    .min_size(egui::vec2(132.0, 32.0))
+                                    .fill(egui::Color32::from_rgb(48, 122, 198))
+                                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(38, 92, 162)))
+                                    .rounding(6.0),
+                                );
+                                if rename_button.clicked() {
+                                    confirm = true;
+                                }
+
+                                let cancel_button = ui.add(
+                                    egui::Button::new("Cancel")
+                                        .min_size(egui::vec2(100.0, 32.0))
+                                        .fill(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 24))
+                                        .stroke(egui::Stroke::new(
+                                            1.0,
+                                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 48),
+                                        ))
+                                        .rounding(6.0),
+                                );
+                                if cancel_button.clicked() {
+                                    cancel = true;
+                                }
+                            });
+                        });
+                    });
+            });
+
+        if cancel {
+            self.cancel_inline_rename();
+            return;
+        }
+
+        self.rename_overlay = Some(edited_state);
+        if confirm {
+            self.commit_inline_rename();
+        }
+    }
+
+    fn draw_exit_confirmation_modal(&mut self, ctx: &egui::Context) {
+        if !self.pending_exit_confirmation {
+            return;
+        }
+
+        let marked_paths = self.collect_marked_paths_in_current_order();
+        let marked_count = marked_paths.len();
+        let summary = if marked_count == 1 {
+            "One file is still marked. Exiting now will discard the current marked, cut, and copy preparation state.".to_string()
+        } else {
+            format!(
+                "{} files are still marked. Exiting now will discard the current marked, cut, and copy preparation state.",
+                marked_count
+            )
+        };
+
+        let mut cancel = ctx.input(|input| input.key_pressed(egui::Key::Escape));
+        let mut confirm = false;
+        let screen_rect = ctx.screen_rect();
+
+        egui::Area::new(egui::Id::new("exit_confirmation_backdrop"))
+            .fixed_pos(screen_rect.min)
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, screen_rect.size());
+                ui.painter().rect_filled(
+                    rect,
+                    0.0,
+                    egui::Color32::from_rgba_unmultiplied(5, 7, 10, 190),
+                );
+            });
+
+        let modal_size = egui::vec2(
+            (screen_rect.width() - 48.0).clamp(380.0, 560.0),
+            236.0,
+        );
+        let modal_pos = screen_rect.center() - modal_size * 0.5;
+        egui::Area::new(egui::Id::new("exit_confirmation_modal"))
+            .fixed_pos(modal_pos)
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                ui.set_min_size(modal_size);
+                egui::Frame::none()
+                    .fill(egui::Color32::from_rgba_unmultiplied(18, 22, 28, 252))
+                    .stroke(egui::Stroke::new(
+                        1.0,
+                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 40),
+                    ))
+                    .rounding(18.0)
+                    .inner_margin(egui::Margin::same(18.0))
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new("Exit With Marked Files?")
+                                .color(egui::Color32::WHITE)
+                                .strong()
+                                .size(18.0),
+                        );
+                        ui.add_space(10.0);
+                        ui.label(
+                            egui::RichText::new(summary)
+                                .color(egui::Color32::from_rgb(210, 216, 224))
+                                .size(14.0),
+                        );
+                        ui.add_space(10.0);
+                        ui.label(
+                            egui::RichText::new("Choose Cancel to keep working, or Exit Viewer to close the program.")
+                                .color(egui::Color32::from_rgb(146, 162, 178))
+                                .size(12.0),
+                        );
+                        ui.add_space(20.0);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let exit_button = ui.add(
+                                egui::Button::new(
+                                    egui::RichText::new("Exit Viewer")
+                                        .color(egui::Color32::WHITE),
+                                )
+                                .min_size(egui::vec2(128.0, 32.0))
+                                .fill(egui::Color32::from_rgb(176, 52, 52))
+                                .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(132, 36, 36)))
+                                .rounding(6.0),
+                            );
+                            if exit_button.clicked() {
+                                confirm = true;
+                            }
+
+                            let cancel_button = ui.add(
+                                egui::Button::new("Cancel")
+                                    .min_size(egui::vec2(100.0, 32.0))
+                                    .fill(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 24))
+                                    .stroke(egui::Stroke::new(
+                                        1.0,
+                                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 48),
+                                    ))
+                                    .rounding(6.0),
+                            );
+                            if cancel_button.clicked() {
+                                cancel = true;
+                            }
+                        });
+                    });
+            });
+
+        if cancel {
+            self.pending_exit_confirmation = false;
+        } else if confirm {
+            self.pending_exit_confirmation = false;
+            self.should_exit = true;
         }
     }
 
@@ -4996,7 +5881,7 @@ impl ImageViewer {
 
     fn run_action(&mut self, action: Action) {
         match action {
-            Action::Exit => self.should_exit = true,
+            Action::Exit => self.request_app_exit(),
             Action::ToggleFullscreen => self.request_shortcut_fullscreen_toggle(),
             Action::GotoFile => {
                 if !self.manga_mode {
@@ -14116,9 +15001,12 @@ impl ImageViewer {
 
     /// Handle keyboard and mouse input
     fn handle_input(&mut self, ctx: &egui::Context) {
+        if self.any_modal_dialog_open() || self.file_action_menu.is_some() {
+            return;
+        }
+
         let screen_width = ctx.screen_rect().width();
-        let space_pressed_for_mark = self.rename_overlay.is_none()
-            && ctx.input(|input| input.key_pressed(egui::Key::Space));
+        let space_pressed_for_mark = ctx.input(|input| input.key_pressed(egui::Key::Space));
 
         if space_pressed_for_mark {
             if let Some(index) = self.mark_target_index_from_pointer(ctx) {
@@ -14707,7 +15595,7 @@ impl ImageViewer {
             self.title_text_dragging = false;
         }
 
-        if self.rename_overlay.is_some() || title_bar_menu_was_active {
+        if title_bar_menu_was_active {
             self.show_controls = true;
             self.controls_show_time = Instant::now();
         }
@@ -14801,63 +15689,7 @@ impl ImageViewer {
 
                             let current_path = self.image_list.get(self.current_index).cloned();
                             let details_path = current_path.clone();
-                            let mut commit_rename = false;
-                            let mut cancel_rename = false;
-
-                            if let Some(rename_state) = self.rename_overlay.as_mut() {
-                                let text_for_width = if rename_state.draft_name.is_empty() {
-                                    " ".to_string()
-                                } else {
-                                    rename_state.draft_name.clone()
-                                };
-                                let font_id = egui::TextStyle::Body.resolve(ui.style());
-                                let editor_width = ui
-                                    .fonts(|fonts| {
-                                        fonts
-                                            .layout_no_wrap(
-                                                text_for_width,
-                                                font_id,
-                                                egui::Color32::WHITE,
-                                            )
-                                            .size()
-                                            .x
-                                            + 20.0
-                                    })
-                                    .clamp(96.0, ui.available_width().max(96.0));
-
-                                let response = ui.add(
-                                    egui::TextEdit::singleline(&mut rename_state.draft_name)
-                                        .desired_width(editor_width)
-                                        .frame(false)
-                                        .text_color(egui::Color32::WHITE),
-                                );
-                                let just_opened = rename_state.just_opened;
-                                if just_opened {
-                                    response.request_focus();
-                                    rename_state.just_opened = false;
-                                }
-                                over_title_text |= response.contains_pointer() || response.has_focus();
-                                started_title_text_drag |=
-                                    response.drag_started() || response.dragged();
-
-                                let enter_pressed = ui.input(|input| input.key_pressed(egui::Key::Enter));
-                                let escape_pressed = ui.input(|input| input.key_pressed(egui::Key::Escape));
-                                if escape_pressed {
-                                    cancel_rename = true;
-                                } else if enter_pressed || (response.lost_focus() && !just_opened) {
-                                    commit_rename = true;
-                                }
-
-                                if let Some(error) = rename_state.error_message.as_ref() {
-                                    ui.add_space(8.0);
-                                    let error_response = ui.label(
-                                        egui::RichText::new(error)
-                                            .color(egui::Color32::from_rgb(255, 148, 148))
-                                            .size(11.0),
-                                    );
-                                    over_title_text |= error_response.contains_pointer();
-                                }
-                            } else if let Some(path) = current_path.as_ref() {
+                            if let Some(path) = current_path.as_ref() {
                                 let filename = path
                                     .file_name()
                                     .map(|n| n.to_string_lossy().to_string())
@@ -14971,12 +15803,6 @@ impl ImageViewer {
                                 }
                             }
 
-                            if cancel_rename {
-                                self.cancel_inline_rename();
-                            } else if commit_rename {
-                                self.commit_inline_rename();
-                            }
-
                             self.mouse_over_title_text = over_title_text;
                             if started_title_text_drag {
                                 self.title_text_dragging = true;
@@ -15077,7 +15903,7 @@ impl ImageViewer {
 
                             // Close button
                             if window_icon_button(ui, WindowButton::Close).clicked() {
-                                self.should_exit = true;
+                                self.request_app_exit();
                             }
 
                             // Maximize/Restore button
@@ -15138,7 +15964,7 @@ impl ImageViewer {
                                 close_on_click_outside,
                                 |ui| {
                                     title_bar_menu_active = true;
-                                    ui.set_min_width(190.0);
+                                    ui.set_min_width(236.0);
 
                                     let mut close_popup = false;
 
@@ -15156,11 +15982,8 @@ impl ImageViewer {
                                         ui.separator();
                                     }
 
-                                    if ui
-                                        .button(
-                                            egui::RichText::new("⚙ Edit Settings")
-                                                .color(egui::Color32::WHITE),
-                                        )
+                                    if self
+                                        .menu_action_row(ui, "Edit config.ini", MenuActionIcon::Config)
                                         .clicked()
                                     {
                                         self.open_config_file_in_editor();
@@ -17163,6 +17986,18 @@ impl eframe::App for ImageViewer {
         // Handle input
         self.handle_input(ctx);
 
+        let viewport_close_requested = ctx.input(|input| input.viewport().close_requested());
+        if viewport_close_requested {
+            if self.pending_exit_confirmation || self.has_marked_files() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                if !self.pending_exit_confirmation {
+                    self.request_app_exit();
+                }
+            } else {
+                self.should_exit = true;
+            }
+        }
+
         // Input can switch media, which updates the title.
         self.apply_pending_window_title(ctx);
 
@@ -17626,8 +18461,10 @@ impl eframe::App for ImageViewer {
         // Draw FPS overlay (top-right) when enabled.
         if !skip_drawing {
             self.draw_fps_overlay(ctx);
-                self.draw_file_action_context_menu(ctx);
-                self.draw_delete_confirmation_modal(ctx);
+            self.draw_file_action_context_menu(ctx);
+            self.draw_delete_confirmation_modal(ctx);
+            self.draw_rename_modal(ctx);
+            self.draw_exit_confirmation_modal(ctx);
         }
 
         // Startup UX: keep the window hidden until initial layout is applied.
