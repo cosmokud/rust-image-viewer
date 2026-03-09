@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.3.1] - 2026-03-10
+
+### Highlights
+
+- Masonry mode now remembers scroll position across layout switches and reuses cached tile data more aggressively, smoothing transitions and reducing jitter.
+- MangaLoader scrollbar state is tracked and can be synchronized with external visible‑index controllers for tighter coordination between views.
+- Introduced a pending media directory scan kind to more clearly represent and manage scan states during background indexing.
+- Updated `.gitignore` to exclude a new `tmp` directory used for ephemeral files.
+
+### Added
+
+- Pending media directory scan kind for improved scan state management.
+- `.gitignore` entry for the `tmp` folder.
+
+### Changed
+
+- Masonry cache and scroll restoration logic enhanced for better reuse and continuity.
+- MangaLoader now tracks its scrollbar and exposes an external visible index sync mechanism.
+
 ## [v0.3.0] - 2026-03-09
 
 ### Highlights
