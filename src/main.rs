@@ -1271,6 +1271,12 @@ struct CachedDecodedImage {
     is_animated_webp: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingMediaDirectoryScanKind {
+    InitialLoad,
+    ExternalRefresh,
+}
+
 fn file_stamp_for_path(path: &Path) -> Option<FileStamp> {
     let metadata = std::fs::metadata(path).ok()?;
     let modified = metadata.modified().ok()?;
@@ -1328,6 +1334,8 @@ struct ImageViewer {
     pending_media_directory_scan: Option<crossbeam_channel::Receiver<DirectoryScanResult>>,
     /// Path associated with `pending_media_directory_scan`.
     pending_media_directory_target: Option<PathBuf>,
+    /// Purpose of the in-flight async directory scan.
+    pending_media_directory_scan_kind: Option<PendingMediaDirectoryScanKind>,
     /// Start time for the in-flight async directory scan.
     pending_media_directory_started_at: Option<Instant>,
     /// Monotonic request id for non-blocking solo media loads.
@@ -1841,6 +1849,7 @@ impl Default for ImageViewer {
             media_directory_index: MediaDirectoryIndex::default(),
             pending_media_directory_scan: None,
             pending_media_directory_target: None,
+            pending_media_directory_scan_kind: None,
             pending_media_directory_started_at: None,
             next_media_load_request_id: 1,
             media_load_coordinator: MediaLoadCoordinator::new(),
@@ -2148,6 +2157,22 @@ impl ImageViewer {
         self.image_list_signature = new_signature;
     }
 
+    fn begin_media_directory_scan(
+        &mut self,
+        path: &Path,
+        kind: PendingMediaDirectoryScanKind,
+    ) -> bool {
+        let Some(rx) = self.media_directory_index.request_media_scan_for_path(path) else {
+            return false;
+        };
+
+        self.pending_media_directory_scan = Some(rx);
+        self.pending_media_directory_target = Some(path.to_path_buf());
+        self.pending_media_directory_scan_kind = Some(kind);
+        self.pending_media_directory_started_at = Some(Instant::now());
+        true
+    }
+
     fn current_media_path(&self) -> Option<PathBuf> {
         self.image_list.get(self.current_index).cloned()
     }
@@ -2346,22 +2371,7 @@ impl ImageViewer {
         }
         self.last_missing_media_refresh_check = Instant::now();
 
-        let has_missing_media = self.image_list.iter().any(|path| !path.exists());
-        let has_missing_prepared_paths = self
-            .prepared_clipboard_paths
-            .keys()
-            .any(|path| !path.exists());
-
-        if !has_missing_media && !has_missing_prepared_paths {
-            return;
-        }
-
-        if has_missing_prepared_paths {
-            self.clear_stale_marked_files();
-            self.clear_stale_prepared_clipboard_paths();
-        }
-
-        if !has_missing_media {
+        if self.pending_media_directory_scan.is_some() {
             return;
         }
 
@@ -2369,11 +2379,22 @@ impl ImageViewer {
             .current_media_path()
             .or_else(|| self.image_list.first().cloned());
 
-        if let Some(anchor_path) = refresh_anchor {
-            self.refresh_media_list_after_path_mutation(Some(anchor_path));
-        } else {
-            self.clear_current_media_after_all_files_removed();
+        let Some(anchor_path) = refresh_anchor else {
+            return;
+        };
+
+        if self
+            .media_directory_index
+            .try_cached_media_for_path(&anchor_path)
+            .is_some()
+        {
+            return;
         }
+
+        let _ = self.begin_media_directory_scan(
+            &anchor_path,
+            PendingMediaDirectoryScanKind::ExternalRefresh,
+        );
     }
 
     fn set_prepared_clipboard_targets(
@@ -2502,7 +2523,28 @@ impl ImageViewer {
             self.media_directory_index.invalidate_directory(parent);
         }
 
+        self.pending_media_directory_scan = None;
+        self.pending_media_directory_target = None;
+        self.pending_media_directory_scan_kind = None;
+        self.pending_media_directory_started_at = None;
+
         let files = get_media_in_directory(&anchor_path);
+        let directory = anchor_path
+            .parent()
+            .unwrap_or(anchor_path.as_path())
+            .to_path_buf();
+        let modified_at = anchor_path.parent().and_then(|parent| {
+            std::fs::metadata(parent)
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+        });
+        let files = self
+            .media_directory_index
+            .apply_directory_scan_result(DirectoryScanResult {
+                directory,
+                files,
+                modified_at,
+            });
         self.set_image_list(files);
         self.clear_stale_marked_files();
         self.clear_stale_prepared_clipboard_paths();
@@ -7131,12 +7173,17 @@ impl ImageViewer {
             Err(crossbeam_channel::TryRecvError::Disconnected) => {
                 self.pending_media_directory_scan = None;
                 self.pending_media_directory_target = None;
+                self.pending_media_directory_scan_kind = None;
                 self.pending_media_directory_started_at = None;
                 return;
             }
         };
 
         self.pending_media_directory_scan = None;
+        let scan_kind = self
+            .pending_media_directory_scan_kind
+            .take()
+            .unwrap_or(PendingMediaDirectoryScanKind::InitialLoad);
         let Some(target_path) = self.pending_media_directory_target.take() else {
             self.pending_media_directory_started_at = None;
             return;
@@ -7147,27 +7194,78 @@ impl ImageViewer {
                 .record_duration("media_index_async_scan_ms", started_at.elapsed());
         }
 
+        let scanned_directory = result.directory.clone();
         let mut files = self
             .media_directory_index
             .apply_directory_scan_result(result);
-        if files.is_empty() {
-            files.push(target_path.clone());
-        }
 
-        let current_path = self.image_list.get(self.current_index).cloned();
-        if current_path.as_ref() != Some(&target_path) {
-            return;
-        }
+        match scan_kind {
+            PendingMediaDirectoryScanKind::InitialLoad => {
+                if files.is_empty() {
+                    files.push(target_path.clone());
+                }
 
-        self.set_image_list(files);
-        let resolved_index = self
-            .image_list
-            .iter()
-            .position(|candidate| candidate == &target_path)
-            .unwrap_or(0);
-        self.set_current_index_clamped(resolved_index);
-        self.schedule_solo_probe_window(&target_path, self.current_media_type);
-        ctx.request_repaint();
+                let current_path = self.image_list.get(self.current_index).cloned();
+                if current_path.as_ref() != Some(&target_path) {
+                    return;
+                }
+
+                self.set_image_list(files);
+                let resolved_index = self
+                    .image_list
+                    .iter()
+                    .position(|candidate| candidate == &target_path)
+                    .unwrap_or(0);
+                self.set_current_index_clamped(resolved_index);
+                self.schedule_solo_probe_window(&target_path, self.current_media_type);
+                ctx.request_repaint();
+            }
+            PendingMediaDirectoryScanKind::ExternalRefresh => {
+                let current_path_before = self.current_media_path();
+                let current_index_before = self.current_index;
+                let current_directory = current_path_before
+                    .as_ref()
+                    .and_then(|path| path.parent().map(Path::to_path_buf))
+                    .or_else(|| {
+                        self.image_list
+                            .first()
+                            .and_then(|path| path.parent().map(Path::to_path_buf))
+                    });
+
+                if current_directory.as_deref() != Some(scanned_directory.as_path()) {
+                    return;
+                }
+
+                self.set_image_list(files);
+                self.clear_stale_marked_files();
+                self.clear_stale_prepared_clipboard_paths();
+                self.modal_thumbnail_cache.retain(|path, _| path.exists());
+
+                if self.image_list.is_empty() {
+                    self.clear_current_media_after_all_files_removed();
+                    ctx.request_repaint();
+                    return;
+                }
+
+                let resolved_index = current_path_before
+                    .as_ref()
+                    .and_then(|path| self.image_list.iter().position(|candidate| candidate == path))
+                    .unwrap_or_else(|| current_index_before.min(self.image_list.len().saturating_sub(1)));
+                self.set_current_index_clamped(resolved_index);
+
+                if let Some(path) = self.current_media_path() {
+                    self.pending_window_title = Some(self.compute_window_title_for_path(&path));
+                }
+
+                if self.manga_mode {
+                    self.manga_clear_cache();
+                    self.ensure_manga_loader();
+                    self.manga_update_preload_queue();
+                }
+
+                ctx.request_repaint();
+            }
+        }
     }
 
     fn clear_pending_media_load(&mut self) {
@@ -7655,6 +7753,7 @@ impl ImageViewer {
 
         self.pending_media_directory_scan = None;
         self.pending_media_directory_target = None;
+        self.pending_media_directory_scan_kind = None;
         self.pending_media_directory_started_at = None;
 
         if let Some(files) = self.media_directory_index.try_cached_media_for_path(path) {
@@ -7662,11 +7761,8 @@ impl ImageViewer {
         } else {
             // Keep current media navigable immediately while the full directory scan runs in background.
             self.set_image_list(vec![path.clone()]);
-            if let Some(rx) = self.media_directory_index.request_media_scan_for_path(path) {
-                self.pending_media_directory_scan = Some(rx);
-                self.pending_media_directory_target = Some(path.clone());
-                self.pending_media_directory_started_at = Some(Instant::now());
-            }
+            let _ =
+                self.begin_media_directory_scan(path, PendingMediaDirectoryScanKind::InitialLoad);
         }
 
         if self.image_list.is_empty() {
