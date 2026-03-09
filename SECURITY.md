@@ -12,11 +12,11 @@ That matters for security expectations:
 
 Current support stance:
 
-| Version line | Status |
-| --- | --- |
+| Version line                  | Status                     |
+| ----------------------------- | -------------------------- |
 | Latest release before `1.0.0` | Best-effort security fixes |
-| Older releases before `1.0.0` | Not supported |
-| `1.0.0` and later | Not applicable yet |
+| Older releases before `1.0.0` | Not supported              |
+| `1.0.0` and later             | Not applicable yet         |
 
 If you report an issue against an older pre-`1.0.0` build, expect to be asked to reproduce it on the latest version first.
 

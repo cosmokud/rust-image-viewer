@@ -26,23 +26,23 @@ The architecture is intentionally biased toward "what helps the next visible fra
 
 ## 2. Codebase map
 
-| Path | Responsibility | Why it matters |
-| --- | --- | --- |
-| `build.rs` | Build-time config-template sync, Windows icon embedding, delay-loaded GStreamer DLL linkage | Keeps runtime config in sync and reduces image-only startup baggage on Windows/MSVC |
-| `src/main.rs` | Main application state, UI loop, solo mode, Long Strip, Masonry, window transitions, async coordinator glue | This is the orchestration center of the app |
-| `src/config.rs` | INI parsing, defaults, action-first shortcut model, save/load, quality and behavior settings | Configuration affects nearly every subsystem |
-| `src/async_runtime.rs` | Shared Tokio runtime with thread fallback | Standardizes background execution without blocking the UI thread |
-| `src/image_loader.rs` | Static image decode, GIF handling, animated WebP helpers, directory enumeration | Owns the image hot path |
-| `src/video_player.rs` | GStreamer live playback and frame extraction | Owns the focused video path |
-| `src/media_index.rs` | Same-directory media list cache | Removes repeated rescans during next/previous navigation |
-| `src/metadata_cache.rs` | Persistent dimensions and thumbnail cache backed by `redb` | Makes warm opens and repeat browsing cheaper across sessions |
-| `src/manga_loader.rs` | Background dimension probing, prioritized strip/masonry decode, LOD bookkeeping, retry logic, texture-cache type | Owns multi-item throughput |
-| `src/manga_spatial.rs` | `rstar` spatial index wrapper and parity tests | Keeps visibility queries from scaling linearly in huge folders |
-| `src/perf_metrics.rs` | Rolling p50/p95-style runtime metrics | Feeds the in-app diagnostics overlay |
-| `src/single_instance.rs` | Windows single-instance mutex and IPC handoff | Lets secondary launches reuse the primary window |
-| `src/windows_env.rs` | Windows PATH refresh and maximize helpers | Makes GStreamer discovery and native window transitions more reliable |
-| `assets/config.ini` | Canonical config template | Source of truth for user-facing configuration |
-| `benches/perf_baseline.rs` | Criterion benchmarks for scan, GIF, and spatial-query performance | Used to catch performance regressions |
+| Path                       | Responsibility                                                                                                   | Why it matters                                                                      |
+| -------------------------- | ---------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
+| `build.rs`                 | Build-time config-template sync, Windows icon embedding, delay-loaded GStreamer DLL linkage                      | Keeps runtime config in sync and reduces image-only startup baggage on Windows/MSVC |
+| `src/main.rs`              | Main application state, UI loop, solo mode, Long Strip, Masonry, window transitions, async coordinator glue      | This is the orchestration center of the app                                         |
+| `src/config.rs`            | INI parsing, defaults, action-first shortcut model, save/load, quality and behavior settings                     | Configuration affects nearly every subsystem                                        |
+| `src/async_runtime.rs`     | Shared Tokio runtime with thread fallback                                                                        | Standardizes background execution without blocking the UI thread                    |
+| `src/image_loader.rs`      | Static image decode, GIF handling, animated WebP helpers, directory enumeration                                  | Owns the image hot path                                                             |
+| `src/video_player.rs`      | GStreamer live playback and frame extraction                                                                     | Owns the focused video path                                                         |
+| `src/media_index.rs`       | Same-directory media list cache                                                                                  | Removes repeated rescans during next/previous navigation                            |
+| `src/metadata_cache.rs`    | Persistent dimensions and thumbnail cache backed by `redb`                                                       | Makes warm opens and repeat browsing cheaper across sessions                        |
+| `src/manga_loader.rs`      | Background dimension probing, prioritized strip/masonry decode, LOD bookkeeping, retry logic, texture-cache type | Owns multi-item throughput                                                          |
+| `src/manga_spatial.rs`     | `rstar` spatial index wrapper and parity tests                                                                   | Keeps visibility queries from scaling linearly in huge folders                      |
+| `src/perf_metrics.rs`      | Rolling p50/p95-style runtime metrics                                                                            | Feeds the in-app diagnostics overlay                                                |
+| `src/single_instance.rs`   | Windows single-instance mutex and IPC handoff                                                                    | Lets secondary launches reuse the primary window                                    |
+| `src/windows_env.rs`       | Windows PATH refresh and maximize helpers                                                                        | Makes GStreamer discovery and native window transitions more reliable               |
+| `assets/config.ini`        | Canonical config template                                                                                        | Source of truth for user-facing configuration                                       |
+| `benches/perf_baseline.rs` | Criterion benchmarks for scan, GIF, and spatial-query performance                                                | Used to catch performance regressions                                               |
 
 Two structural observations are important:
 
@@ -696,107 +696,107 @@ For this project, performance work is not "done" until it can be observed.
 
 The viewer's speed comes from many cooperating techniques rather than one big trick.
 
-| Technique | Where | What it does | Why it exists |
-| --- | --- | --- | --- |
-| Delay-loaded GStreamer DLLs | `build.rs` | Defers Windows/MSVC video DLL mapping until first real video use | Keeps image-only startup and idle memory lower |
-| Metadata-first open | `src/main.rs`, `src/metadata_cache.rs` | Uses cached dimensions and thumbnails before full decode | Produces faster first paint and fewer synchronous probes |
-| Latest-only media coordinator | `src/main.rs` | Collapses solo media load requests to the newest one | Prevents stale navigation backlog |
-| Latest-only solo probe coordinator | `src/main.rs` | Keeps neighbor prewarming aligned with the newest current item | Prevents wasted preprobe work |
-| Latest-only focused-video coordinator | `src/main.rs` | Ensures only the current manga-focused video finishes startup | Avoids stale video-player creation |
-| Directory index LRU | `src/media_index.rs` | Reuses same-folder media lists | Removes repeated directory rescans |
-| Persistent dimension cache | `src/metadata_cache.rs` | Stores dimensions with fingerprint validation | Avoids repeated header or discoverer probes |
-| Persistent thumbnail pyramid | `src/metadata_cache.rs` | Stores static-image and video first-frame thumbnails per texture-side bucket | Avoids repeated decode+resize across sessions |
-| Fingerprint micro-cache | `src/metadata_cache.rs` | Reuses recent file metadata lookups for `750 ms` | Cuts repeated filesystem syscalls during hot navigation |
-| Solo decoded-image cache | `src/main.rs` | Keeps warm first-frame decodes for recent solo items | Makes back/forward navigation very cheap |
-| Directional look-ahead / look-behind | `src/manga_loader.rs` | Prefetches more in the current movement direction | Matches user behavior better than symmetric windows |
-| Large-jump cancellation | `src/manga_loader.rs` | Cancels outdated strip/masonry work on far jumps | Optimizes destination latency |
-| Urgent visible retry queue | `src/manga_loader.rs` | Lets visible placeholders bypass preload backlog | Self-heals missing on-screen tiles |
-| R-tree viewport virtualization | `src/manga_spatial.rs`, `src/main.rs` | Queries only visible or near-visible items | Stops visibility work from scaling linearly in huge folders |
-| LOD side buckets | `src/manga_loader.rs`, `src/main.rs` | Quantizes requested texture sizes | Prevents constant reload churn |
-| Upgrade hysteresis | `src/main.rs` | Requires meaningful size delta before higher-quality reloads | Prevents oscillation |
-| Masonry quality refine pass | `src/main.rs` | Delays visible sharpening until motion settles | Protects frame time during active navigation |
-| Selective mipmapping | `src/config.rs`, `src/main.rs` | Enables mipmaps only when textures are large enough and meaningfully minified | Improves minified quality without wasting upload cost everywhere |
-| Adaptive upload budget | `src/main.rs` | Adjusts per-frame upload count from measured p95 cost and current backlog | Prevents upload bursts from causing stutter |
-| Adaptive video frame queue | `src/video_player.rs` | Sizes queue depth by resolution | Keeps fresher frames without fixed worst-case buffering |
-| Reusable video buffer pool | `src/video_player.rs` | Recycles RGBA frame buffers | Reduces allocation churn |
-| GIF sliding window mode | `src/image_loader.rs` | Keeps only a frame window for large GIFs | Prevents runaway RAM usage |
-| Hidden off-screen video startup | `src/main.rs` | Starts video windows hidden until real dimensions/frame are ready | Prevents ugly startup flashes |
-| Lazy Windows font load | `src/main.rs` | Loads large CJK fonts only when filenames need them | Reduces startup work |
-| Reactive idle rendering | `src/main.rs` | Avoids needless repaint when nothing is changing | Cuts idle CPU/GPU usage |
+| Technique                             | Where                                  | What it does                                                                  | Why it exists                                                    |
+| ------------------------------------- | -------------------------------------- | ----------------------------------------------------------------------------- | ---------------------------------------------------------------- |
+| Delay-loaded GStreamer DLLs           | `build.rs`                             | Defers Windows/MSVC video DLL mapping until first real video use              | Keeps image-only startup and idle memory lower                   |
+| Metadata-first open                   | `src/main.rs`, `src/metadata_cache.rs` | Uses cached dimensions and thumbnails before full decode                      | Produces faster first paint and fewer synchronous probes         |
+| Latest-only media coordinator         | `src/main.rs`                          | Collapses solo media load requests to the newest one                          | Prevents stale navigation backlog                                |
+| Latest-only solo probe coordinator    | `src/main.rs`                          | Keeps neighbor prewarming aligned with the newest current item                | Prevents wasted preprobe work                                    |
+| Latest-only focused-video coordinator | `src/main.rs`                          | Ensures only the current manga-focused video finishes startup                 | Avoids stale video-player creation                               |
+| Directory index LRU                   | `src/media_index.rs`                   | Reuses same-folder media lists                                                | Removes repeated directory rescans                               |
+| Persistent dimension cache            | `src/metadata_cache.rs`                | Stores dimensions with fingerprint validation                                 | Avoids repeated header or discoverer probes                      |
+| Persistent thumbnail pyramid          | `src/metadata_cache.rs`                | Stores static-image and video first-frame thumbnails per texture-side bucket  | Avoids repeated decode+resize across sessions                    |
+| Fingerprint micro-cache               | `src/metadata_cache.rs`                | Reuses recent file metadata lookups for `750 ms`                              | Cuts repeated filesystem syscalls during hot navigation          |
+| Solo decoded-image cache              | `src/main.rs`                          | Keeps warm first-frame decodes for recent solo items                          | Makes back/forward navigation very cheap                         |
+| Directional look-ahead / look-behind  | `src/manga_loader.rs`                  | Prefetches more in the current movement direction                             | Matches user behavior better than symmetric windows              |
+| Large-jump cancellation               | `src/manga_loader.rs`                  | Cancels outdated strip/masonry work on far jumps                              | Optimizes destination latency                                    |
+| Urgent visible retry queue            | `src/manga_loader.rs`                  | Lets visible placeholders bypass preload backlog                              | Self-heals missing on-screen tiles                               |
+| R-tree viewport virtualization        | `src/manga_spatial.rs`, `src/main.rs`  | Queries only visible or near-visible items                                    | Stops visibility work from scaling linearly in huge folders      |
+| LOD side buckets                      | `src/manga_loader.rs`, `src/main.rs`   | Quantizes requested texture sizes                                             | Prevents constant reload churn                                   |
+| Upgrade hysteresis                    | `src/main.rs`                          | Requires meaningful size delta before higher-quality reloads                  | Prevents oscillation                                             |
+| Masonry quality refine pass           | `src/main.rs`                          | Delays visible sharpening until motion settles                                | Protects frame time during active navigation                     |
+| Selective mipmapping                  | `src/config.rs`, `src/main.rs`         | Enables mipmaps only when textures are large enough and meaningfully minified | Improves minified quality without wasting upload cost everywhere |
+| Adaptive upload budget                | `src/main.rs`                          | Adjusts per-frame upload count from measured p95 cost and current backlog     | Prevents upload bursts from causing stutter                      |
+| Adaptive video frame queue            | `src/video_player.rs`                  | Sizes queue depth by resolution                                               | Keeps fresher frames without fixed worst-case buffering          |
+| Reusable video buffer pool            | `src/video_player.rs`                  | Recycles RGBA frame buffers                                                   | Reduces allocation churn                                         |
+| GIF sliding window mode               | `src/image_loader.rs`                  | Keeps only a frame window for large GIFs                                      | Prevents runaway RAM usage                                       |
+| Hidden off-screen video startup       | `src/main.rs`                          | Starts video windows hidden until real dimensions/frame are ready             | Prevents ugly startup flashes                                    |
+| Lazy Windows font load                | `src/main.rs`                          | Loads large CJK fonts only when filenames need them                           | Reduces startup work                                             |
+| Reactive idle rendering               | `src/main.rs`                          | Avoids needless repaint when nothing is changing                              | Cuts idle CPU/GPU usage                                          |
 
 ## 14. Third-party crate map
 
 ### 14.1 UI, runtime, and diagnostics
 
-| Crate | Role in this project |
-| --- | --- |
-| `eframe` | Application shell, renderer integration, viewport commands, and the immediate-mode app loop |
-| `egui` | UI rendering, input handling, texture handles, geometry, and custom title-bar/overlay behavior |
-| `egui_extras` | Optional dependency kept available, but intentionally not installed at startup because the app uses its own optimized media loaders |
-| `tokio` | Shared background runtime for worker tasks, with fallback to OS threads when runtime init fails |
-| `tracing` | Structured runtime diagnostics |
-| `tracing-subscriber` | Log filtering and formatting driven by `RIV_LOG` / `RUST_LOG` |
-| `puffin` | Optional profiling scopes for deeper frame analysis |
-| `mimalloc` | Optional global allocator feature for allocator-sensitive workloads |
+| Crate                | Role in this project                                                                                                                |
+| -------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `eframe`             | Application shell, renderer integration, viewport commands, and the immediate-mode app loop                                         |
+| `egui`               | UI rendering, input handling, texture handles, geometry, and custom title-bar/overlay behavior                                      |
+| `egui_extras`        | Optional dependency kept available, but intentionally not installed at startup because the app uses its own optimized media loaders |
+| `tokio`              | Shared background runtime for worker tasks, with fallback to OS threads when runtime init fails                                     |
+| `tracing`            | Structured runtime diagnostics                                                                                                      |
+| `tracing-subscriber` | Log filtering and formatting driven by `RIV_LOG` / `RUST_LOG`                                                                       |
+| `puffin`             | Optional profiling scopes for deeper frame analysis                                                                                 |
+| `mimalloc`           | Optional global allocator feature for allocator-sensitive workloads                                                                 |
 
 ### 14.2 Image, animation, and resize stack
 
-| Crate | Role in this project |
-| --- | --- |
-| `image` | Fallback decode path, ICO/TIFF support, resize fallback, and icon decoding |
-| `zune-core` | Shared low-level support used by `zune-image` |
-| `zune-image` | Hot-path static decode for common image formats with good SIMD-aware throughput |
-| `imagesize` | Cheap header-only width/height probing |
-| `fast_image_resize` | Main CPU resampling path before texture upload |
-| `memmap2` | Uses memory-mapped file I/O when possible for media reads |
-| `gif` | GIF frame decode |
-| `gif-dispose` | Correct GIF disposal/compositing behavior |
+| Crate               | Role in this project                                                            |
+| ------------------- | ------------------------------------------------------------------------------- |
+| `image`             | Fallback decode path, ICO/TIFF support, resize fallback, and icon decoding      |
+| `zune-core`         | Shared low-level support used by `zune-image`                                   |
+| `zune-image`        | Hot-path static decode for common image formats with good SIMD-aware throughput |
+| `imagesize`         | Cheap header-only width/height probing                                          |
+| `fast_image_resize` | Main CPU resampling path before texture upload                                  |
+| `memmap2`           | Uses memory-mapped file I/O when possible for media reads                       |
+| `gif`               | GIF frame decode                                                                |
+| `gif-dispose`       | Correct GIF disposal/compositing behavior                                       |
 
 ### 14.3 Video stack
 
-| Crate | Role in this project |
-| --- | --- |
-| `gstreamer` | Core playback pipeline, URI handling, state changes, and bus messaging |
-| `gstreamer-video` | Video caps, color-range inspection, and frame metadata |
-| `gstreamer-app` | `appsink` frame extraction for both live playback and thumbnail paths |
-| `gstreamer-audio` | Audio stack integration for video playback |
-| `gstreamer-pbutils` | `Discoverer`-based video metadata probing without full playback startup |
-| `bytes` | Shared frame-pixel ownership for video buffers |
-| `image-simd` (`wide`) | SIMD helpers for hot per-pixel video color-range expansion |
+| Crate                 | Role in this project                                                    |
+| --------------------- | ----------------------------------------------------------------------- |
+| `gstreamer`           | Core playback pipeline, URI handling, state changes, and bus messaging  |
+| `gstreamer-video`     | Video caps, color-range inspection, and frame metadata                  |
+| `gstreamer-app`       | `appsink` frame extraction for both live playback and thumbnail paths   |
+| `gstreamer-audio`     | Audio stack integration for video playback                              |
+| `gstreamer-pbutils`   | `Discoverer`-based video metadata probing without full playback startup |
+| `bytes`               | Shared frame-pixel ownership for video buffers                          |
+| `image-simd` (`wide`) | SIMD helpers for hot per-pixel video color-range expansion              |
 
 ### 14.4 Concurrency, data structures, caching, and metrics
 
-| Crate | Role in this project |
-| --- | --- |
-| `rayon` | Parallel decode-adjacent work, dimension probes, and some sort-heavy tasks |
-| `crossbeam-channel` | Bounded request/result queues between UI and worker systems |
-| `crossbeam-queue` | Lock-free or low-overhead queue structures such as the video buffer pool |
-| `parking_lot` | Lower-overhead `Mutex` / `RwLock` for hot shared state |
-| `lru` | Directory-list caching and unpinned manga texture eviction |
-| `hashbrown` | Performance-oriented `HashMap` / `HashSet` usage across hot paths |
-| `hdrhistogram` | Percentile-friendly runtime metric windows |
-| `jwalk` | Fast directory walking for media enumeration |
-| `smallvec` | Small stack-backed vectors in drawing and geometry helper code |
-| `redb` | Persistent on-disk metadata and thumbnail cache |
-| `moka` | In-memory solo decoded-image cache with weighted capacity control |
-| `rstar` | R-tree implementation for viewport virtualization |
+| Crate               | Role in this project                                                       |
+| ------------------- | -------------------------------------------------------------------------- |
+| `rayon`             | Parallel decode-adjacent work, dimension probes, and some sort-heavy tasks |
+| `crossbeam-channel` | Bounded request/result queues between UI and worker systems                |
+| `crossbeam-queue`   | Lock-free or low-overhead queue structures such as the video buffer pool   |
+| `parking_lot`       | Lower-overhead `Mutex` / `RwLock` for hot shared state                     |
+| `lru`               | Directory-list caching and unpinned manga texture eviction                 |
+| `hashbrown`         | Performance-oriented `HashMap` / `HashSet` usage across hot paths          |
+| `hdrhistogram`      | Percentile-friendly runtime metric windows                                 |
+| `jwalk`             | Fast directory walking for media enumeration                               |
+| `smallvec`          | Small stack-backed vectors in drawing and geometry helper code             |
+| `redb`              | Persistent on-disk metadata and thumbnail cache                            |
+| `moka`              | In-memory solo decoded-image cache with weighted capacity control          |
+| `rstar`             | R-tree implementation for viewport virtualization                          |
 
 ### 14.5 Windows integration and build-time tooling
 
-| Crate | Role in this project |
-| --- | --- |
-| `interprocess` | Single-instance IPC channel for secondary-launch handoff |
-| `winapi` | Win32 integration for window state, environment queries, mutexes, and related platform behavior |
-| `winres` | Embeds the Windows icon resource into the binary |
-| `fs_extra` | Declared build dependency for build-time file operations; not currently central to the active build script logic |
+| Crate          | Role in this project                                                                                             |
+| -------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `interprocess` | Single-instance IPC channel for secondary-launch handoff                                                         |
+| `winapi`       | Win32 integration for window state, environment queries, mutexes, and related platform behavior                  |
+| `winres`       | Embeds the Windows icon resource into the binary                                                                 |
+| `fs_extra`     | Declared build dependency for build-time file operations; not currently central to the active build script logic |
 
 ### 14.6 Dev and benchmarking dependencies
 
-| Crate | Role in this project |
-| --- | --- |
-| `criterion` | Reproducible benchmarks with HTML reports |
-| `tempfile` | Temporary datasets and fixture creation for benches/tests |
-| `pprof` | Non-Windows benchmark profiling and flamegraph generation |
+| Crate       | Role in this project                                      |
+| ----------- | --------------------------------------------------------- |
+| `criterion` | Reproducible benchmarks with HTML reports                 |
+| `tempfile`  | Temporary datasets and fixture creation for benches/tests |
+| `pprof`     | Non-Windows benchmark profiling and flamegraph generation |
 
 One extra code-level note: directory enumeration is natural-sorted in `src/image_loader.rs` so that file names like `page_2` sort before `page_10`.
 
