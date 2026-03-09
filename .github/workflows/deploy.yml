@@ -11,6 +11,30 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Fail if release already exists for tag
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          api_url="https://api.github.com/repos/${REPO}/releases/tags/${TAG}"
+          status=$(curl -sS -o release.json -w "%{http_code}" \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "${api_url}")
+          if [[ "${status}" == "200" ]]; then
+            echo "release already exists for tag ${TAG}; refusing to overwrite"
+            cat release.json
+            exit 1
+          fi
+          if [[ "${status}" != "404" ]]; then
+            echo "unexpected API status while checking tag ${TAG}: ${status}"
+            cat release.json || true
+            exit 1
+          fi
+
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -38,7 +62,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: rust-image-viewer-nightly
+          name: rust-image-viewer-${{ github.ref_name }}
           path: target/release/rust-image-viewer.exe
 
       - name: Create release
@@ -48,4 +72,5 @@ jobs:
           name: ${{ github.ref_name }}
           prerelease: false
           generate_release_notes: true
+          fail_on_unmatched_files: true
           files: target/release/rust-image-viewer.exe

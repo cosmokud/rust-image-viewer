@@ -33,28 +33,31 @@ jobs:
         shell: pwsh
         run: cargo build --release
 
+      - name: Resolve nightly release metadata
+        id: release_meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          stamp="$(date -u +'%Y%m%d-%H%M%S')"
+          short_sha="${GITHUB_SHA::7}"
+          tag="nightly-${stamp}-run${GITHUB_RUN_NUMBER}-${short_sha}"
+          name="Nightly Build ${stamp} (run ${GITHUB_RUN_NUMBER}, ${short_sha})"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: rust-image-viewer-nightly
+          name: rust-image-viewer-${{ steps.release_meta.outputs.tag }}
           path: target/release/rust-image-viewer.exe
-
-      - name: Delete existing nightly release
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          $release = gh release view nightly 2>&1
-          if ($LASTEXITCODE -eq 0) {
-            gh release delete nightly -y --cleanup-tag
-          }
-          $global:LASTEXITCODE = 0
 
       - name: Create nightly release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: nightly
-          name: Nightly Build
+          tag_name: ${{ steps.release_meta.outputs.tag }}
+          name: ${{ steps.release_meta.outputs.name }}
           prerelease: true
           generate_release_notes: true
+          make_latest: false
+          fail_on_unmatched_files: true
           files: target/release/rust-image-viewer.exe
