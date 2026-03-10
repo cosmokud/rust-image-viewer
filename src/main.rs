@@ -15407,41 +15407,216 @@ impl ImageViewer {
             .is_some_and(|image_rect| image_rect.contains(pos))
     }
 
-    fn pointer_over_media_surface_for_cursor_autohide(
+    fn strip_item_screen_rect_for_cursor_autohide(&mut self, index: usize) -> Option<egui::Rect> {
+        if !self.manga_mode
+            || !self.is_fullscreen
+            || self.is_masonry_mode()
+            || index >= self.image_list.len()
+        {
+            return None;
+        }
+
+        let display_width = self.manga_get_image_display_width(index);
+        let display_height = self.manga_page_height_cached(index).max(1.0);
+        let x = (self.screen_size.x - display_width) * 0.5 + self.offset.x;
+        let y = self.manga_page_start_y(index) - self.manga_scroll_offset;
+
+        Some(egui::Rect::from_min_size(
+            egui::pos2(x, y),
+            egui::vec2(display_width, display_height),
+        ))
+    }
+
+    fn mark_chip_label(visual: FileMarkVisual) -> &'static str {
+        match visual {
+            FileMarkVisual::Preview => "READY",
+            FileMarkVisual::Marked => "MARKED",
+            FileMarkVisual::Copied => "COPIED",
+            FileMarkVisual::Cut => "CUT",
+        }
+    }
+
+    fn mark_chip_rect_for_cursor_autohide(
+        &self,
+        ctx: &egui::Context,
+        item_rect: egui::Rect,
+        visual: FileMarkVisual,
+    ) -> egui::Rect {
+        let overlay_rect = item_rect.shrink(1.5);
+        let label = Self::mark_chip_label(visual);
+        let text_size = ctx.fonts(|fonts| {
+            fonts
+                .layout_no_wrap(
+                    label.to_string(),
+                    egui::FontId::proportional(11.5),
+                    egui::Color32::WHITE,
+                )
+                .size()
+        });
+
+        egui::Rect::from_min_size(
+            egui::pos2(overlay_rect.min.x + 10.0, overlay_rect.min.y + 10.0),
+            egui::vec2(text_size.x + 18.0, text_size.y + 10.0),
+        )
+    }
+
+    fn pointer_over_mark_chip_for_cursor_autohide(
         &mut self,
         ctx: &egui::Context,
+        pos: egui::Pos2,
+        screen_rect: egui::Rect,
     ) -> bool {
-        let screen_rect = ctx.screen_rect();
-        let pointer_pos = ctx.input(|input| input.pointer.hover_pos());
-        let Some(pos) = pointer_pos else {
-            return false;
+        let (item_rect, visual) = if self.manga_mode && self.is_fullscreen {
+            let Some(index) = self.manga_index_at_screen_pos(pos) else {
+                return false;
+            };
+            let Some(visual) = self.mark_visual_for_index(index) else {
+                return false;
+            };
+            let item_rect = if self.is_masonry_mode() {
+                self.masonry_item_screen_rect(index)
+            } else {
+                self.strip_item_screen_rect_for_cursor_autohide(index)
+            };
+            let Some(item_rect) = item_rect else {
+                return false;
+            };
+            (item_rect, visual)
+        } else {
+            let Some(path) = self.image_list.get(self.current_index) else {
+                return false;
+            };
+            let Some(visual) = self.mark_visual_for_path(path) else {
+                return false;
+            };
+            let Some(item_rect) = self.current_media_rect(screen_rect) else {
+                return false;
+            };
+            (item_rect, visual)
         };
 
+        self.mark_chip_rect_for_cursor_autohide(ctx, item_rect, visual)
+            .contains(pos)
+    }
+
+    fn pointer_over_ui_for_cursor_autohide(
+        &mut self,
+        ctx: &egui::Context,
+        pos: egui::Pos2,
+    ) -> bool {
+        let screen_rect = ctx.screen_rect();
+
         if self.pointer_over_shortcut_blocking_ui(Some(pos), screen_rect) {
-            return false;
+            return true;
         }
 
         if self.show_controls && pos.y < 50.0 {
-            return false;
+            return true;
         }
 
         if !self.is_fullscreen
             && self.get_resize_direction(pos, screen_rect) != ResizeDirection::None
         {
+            return true;
+        }
+
+        if self.pointer_over_mark_chip_for_cursor_autohide(ctx, pos, screen_rect) {
+            return true;
+        }
+
+        if !self.manga_mode || !self.is_fullscreen {
             return false;
         }
 
-        if self.manga_mode && self.is_fullscreen {
-            return self.manga_index_at_screen_pos(pos).is_some();
+        let screen_width = screen_rect.width();
+        let screen_height = screen_rect.height();
+        let total_height = self.manga_total_height();
+        let scrollbar_width = 12.0;
+        let scrollbar_margin = 8.0;
+        let scrollbar_track_height = screen_height - 20.0;
+        let scrollbar_track_rect = egui::Rect::from_min_size(
+            egui::pos2(screen_width - scrollbar_width - scrollbar_margin, 10.0),
+            egui::Vec2::new(scrollbar_width, scrollbar_track_height),
+        );
+
+        if scrollbar_track_rect.contains(pos) {
+            return true;
         }
 
-        self.point_over_current_media(pos, screen_rect)
+        let scrollbar_hover_zone = egui::Rect::from_min_max(
+            egui::pos2(
+                (screen_width - (scrollbar_width + scrollbar_margin + 40.0)).max(0.0),
+                0.0,
+            ),
+            egui::pos2(screen_width, screen_height),
+        );
+        let show_scrollbar = total_height > screen_height
+            && (self.manga_scrollbar_dragging
+                || scrollbar_track_rect.contains(pos)
+                || scrollbar_hover_zone.contains(pos));
+
+        if show_scrollbar && !self.image_list.is_empty() {
+            let indicator_text = format!("{} / {}", self.current_index + 1, self.image_list.len());
+            let indicator_size = ctx.fonts(|fonts| {
+                fonts
+                    .layout_no_wrap(
+                        indicator_text,
+                        egui::FontId::proportional(13.0),
+                        egui::Color32::WHITE,
+                    )
+                    .size()
+            });
+            let indicator_pos = egui::pos2(
+                screen_width - scrollbar_width - scrollbar_margin - 60.0,
+                screen_height / 2.0,
+            );
+            let pill_rect = egui::Rect::from_center_size(
+                indicator_pos,
+                egui::Vec2::new(indicator_size.x + 16.0, 28.0),
+            );
+            if pill_rect.contains(pos) {
+                return true;
+            }
+        }
+
+        if !self.image_list.is_empty() {
+            let page_label_hover_zone = egui::Rect::from_min_max(
+                egui::pos2(0.0, (screen_height - 100.0).max(0.0)),
+                egui::pos2(screen_width, screen_height),
+            );
+            if page_label_hover_zone.contains(pos) {
+                let indicator_text = format!("{} / {}", self.current_index + 1, self.image_list.len());
+                let indicator_size = ctx.fonts(|fonts| {
+                    fonts
+                        .layout_no_wrap(
+                            indicator_text,
+                            egui::FontId::proportional(14.0),
+                            egui::Color32::WHITE,
+                        )
+                        .size()
+                });
+                let pill_rect = egui::Rect::from_center_size(
+                    egui::pos2(screen_width / 2.0, screen_height - 40.0),
+                    egui::Vec2::new(indicator_size.x + 24.0, 30.0),
+                );
+                if pill_rect.contains(pos) {
+                    return true;
+                }
+            }
+        }
+
+        false
     }
 
-    fn media_cursor_autohide_state(&mut self, ctx: &egui::Context) -> (bool, Option<Duration>) {
+    fn cursor_autohide_state(&mut self, ctx: &egui::Context) -> (bool, Option<Duration>) {
         if self.config.cursor_idle_hide_delay <= 0.0 {
             return (false, None);
         }
+
+        let pointer_pos = ctx.input(|input| input.pointer.hover_pos());
+        let Some(pointer_pos) = pointer_pos else {
+            return (false, None);
+        };
 
         if self.is_panning
             || self.is_resizing
@@ -15460,7 +15635,7 @@ impl ImageViewer {
             return (false, None);
         }
 
-        if !self.pointer_over_media_surface_for_cursor_autohide(ctx) {
+        if self.pointer_over_ui_for_cursor_autohide(ctx, pointer_pos) {
             return (false, None);
         }
 
@@ -19258,7 +19433,7 @@ impl eframe::App for ImageViewer {
         let (hide_idle_cursor, cursor_idle_repaint_after) = if skip_drawing {
             (false, None)
         } else {
-            self.media_cursor_autohide_state(ctx)
+            self.cursor_autohide_state(ctx)
         };
 
         if hide_idle_cursor {

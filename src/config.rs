@@ -443,7 +443,8 @@ pub struct Config {
     pub controls_hide_delay: f32,
     /// How long bottom overlays stay visible (video controls + manga toggle + zoom HUD), in seconds
     pub bottom_overlay_hide_delay: f32,
-    /// How long the mouse cursor stays visible while idle over media, in seconds. `0` disables auto-hide.
+    /// How long the mouse cursor stays visible while idle in the viewer, in seconds.
+    /// Visible UI surfaces keep the cursor shown. `0` disables auto-hide.
     pub cursor_idle_hide_delay: f32,
     /// Maximum delay between clicks for double-click detection (in seconds)
     pub double_click_grace_period: f64,
