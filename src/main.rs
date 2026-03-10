@@ -2231,20 +2231,30 @@ impl ImageViewer {
         self.image_list.get(self.current_index).cloned()
     }
 
+    fn hovered_manga_index_from_pointer(&mut self, ctx: &egui::Context) -> Option<usize> {
+        if !self.manga_mode || !self.is_fullscreen || self.image_list.is_empty() {
+            return None;
+        }
+
+        let pointer_pos = ctx.input(|input| input.pointer.hover_pos());
+        let Some(pos) = pointer_pos else {
+            return None;
+        };
+
+        if self.pointer_over_shortcut_blocking_ui(Some(pos), ctx.screen_rect()) {
+            return None;
+        }
+
+        self.manga_index_at_screen_pos(pos)
+    }
+
     fn mark_target_index_from_pointer(&mut self, ctx: &egui::Context) -> Option<usize> {
         if self.image_list.is_empty() {
             return None;
         }
 
-        if self.manga_mode && self.is_fullscreen {
-            let pointer_pos = ctx.input(|input| input.pointer.hover_pos());
-            if let Some(pos) = pointer_pos {
-                if !self.pointer_over_shortcut_blocking_ui(Some(pos), ctx.screen_rect()) {
-                    if let Some(index) = self.manga_index_at_screen_pos(pos) {
-                        return Some(index);
-                    }
-                }
-            }
+        if let Some(index) = self.hovered_manga_index_from_pointer(ctx) {
+            return Some(index);
         }
 
         Some(self.current_index.min(self.image_list.len().saturating_sub(1)))
@@ -3015,6 +3025,31 @@ impl ImageViewer {
         let marked_paths = self.collect_marked_paths_in_current_order();
         if !marked_paths.is_empty() {
             return marked_paths;
+        }
+
+        if self.manga_mode {
+            return Vec::new();
+        }
+
+        self.current_media_path()
+            .filter(|path| path.exists())
+            .into_iter()
+            .collect()
+    }
+
+    fn collect_keyboard_clipboard_targets(&mut self, ctx: &egui::Context) -> Vec<PathBuf> {
+        let marked_paths = self.collect_marked_paths_in_current_order();
+        if !marked_paths.is_empty() {
+            return marked_paths;
+        }
+
+        if let Some(path) = self
+            .hovered_manga_index_from_pointer(ctx)
+            .and_then(|index| self.image_list.get(index))
+            .filter(|path| path.exists())
+            .cloned()
+        {
+            return vec![path];
         }
 
         if self.manga_mode {
@@ -5427,11 +5462,6 @@ impl ImageViewer {
             return false;
         }
 
-        let target_paths = self.collect_keyboard_file_action_targets();
-        if target_paths.is_empty() {
-            return false;
-        }
-
         enum MarkedFileShortcut {
             Copy,
             Cut,
@@ -5455,7 +5485,10 @@ impl ImageViewer {
 
             if (ctrl && !shift && !alt && input.key_pressed(egui::Key::C)) || saw_copy_event {
                 Some(MarkedFileShortcut::Copy)
-            } else if (ctrl && !shift && !alt && input.key_pressed(egui::Key::X)) || saw_cut_event {
+            } else if ((ctrl && !shift && !alt)
+                && (input.key_pressed(egui::Key::X) || input.key_pressed(egui::Key::V)))
+                || saw_cut_event
+            {
                 Some(MarkedFileShortcut::Cut)
             } else if !ctrl && !shift && !alt && input.key_pressed(egui::Key::Delete) {
                 Some(MarkedFileShortcut::Delete)
@@ -5463,6 +5496,17 @@ impl ImageViewer {
                 None
             }
         });
+
+        let target_paths = match &shortcut {
+            Some(MarkedFileShortcut::Copy) | Some(MarkedFileShortcut::Cut) => {
+                self.collect_keyboard_clipboard_targets(ctx)
+            }
+            Some(MarkedFileShortcut::Delete) => self.collect_keyboard_file_action_targets(),
+            None => return false,
+        };
+        if target_paths.is_empty() {
+            return false;
+        }
 
         match shortcut {
             Some(MarkedFileShortcut::Copy) => {
