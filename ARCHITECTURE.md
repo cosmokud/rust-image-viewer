@@ -37,7 +37,7 @@ The architecture is intentionally biased toward "what helps the next visible fra
 | `src/media_index.rs`       | Same-directory media list cache                                                                                  | Removes repeated rescans during next/previous navigation                            |
 | `src/metadata_cache.rs`    | Persistent dimensions and thumbnail cache backed by `redb`                                                       | Makes warm opens and repeat browsing cheaper across sessions                        |
 | `src/manga_loader.rs`      | Background dimension probing, prioritized strip/masonry decode, LOD bookkeeping, retry logic, texture-cache type | Owns multi-item throughput                                                          |
-| `src/manga_spatial.rs`     | `rstar` spatial index wrapper and parity tests                                                                   | Keeps visibility queries from scaling linearly in huge folders                      |
+| `src/manga_spatial.rs`     | `rstar` spatial index wrapper                                                                                    | Keeps visibility queries from scaling linearly in huge folders                      |
 | `src/perf_metrics.rs`      | Rolling p50/p95-style runtime metrics                                                                            | Feeds the in-app diagnostics overlay                                                |
 | `src/single_instance.rs`   | Windows single-instance mutex and IPC handoff                                                                    | Lets secondary launches reuse the primary window                                    |
 | `src/windows_env.rs`       | Windows PATH refresh and maximize helpers                                                                        | Makes GStreamer discovery and native window transitions more reliable               |
@@ -371,6 +371,8 @@ Current tuning in `src/main.rs`:
 - settle delay: `45 ms`
 - refine frames: up to `12`
 
+Held Masonry freehand autoscroll is also tracked separately from wheel and drag navigation. That lets the viewer keep the loader's visible index synchronized after large autoscroll jumps and avoids over-deferring visible-only quality recovery while the viewport is still moving under autoscroll.
+
 This keeps dense multi-column browsing responsive without permanently accepting blurry visible tiles.
 
 ### 6.10 GPU upload discipline
@@ -445,7 +447,7 @@ Backend selection comes from config:
 - `rtree`: always use the spatial index
 - `auto`: switch to R-tree at `2048` items and above
 
-The repository includes both parity tests and Criterion benchmarks for this subsystem.
+The repository includes Criterion benchmarks for this subsystem.
 
 ## 8. Cache hierarchy and invalidation
 
@@ -795,7 +797,7 @@ The viewer's speed comes from many cooperating techniques rather than one big tr
 | Crate       | Role in this project                                      |
 | ----------- | --------------------------------------------------------- |
 | `criterion` | Reproducible benchmarks with HTML reports                 |
-| `tempfile`  | Temporary datasets and fixture creation for benches/tests |
+| `tempfile`  | Temporary datasets and fixture creation for benchmarks    |
 | `pprof`     | Non-Windows benchmark profiling and flamegraph generation |
 
 One extra code-level note: directory enumeration is natural-sorted in `src/image_loader.rs` so that file names like `page_2` sort before `page_10`.

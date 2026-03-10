@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.3.2] - 2026-03-10
+
+### Highlights
+
+- Masonry freehand autoscroll now tracks real viewport motion and keeps the loader's visible index in sync, improving placeholder recovery and visible-quality refinement during held autoscroll.
+- Keyboard copy and cut actions in Long Strip and Masonry now resolve targets more predictably by preferring marked files and otherwise following the hovered item.
+
+### Changed
+
+- Refactored hovered manga-item detection into a shared helper so multi-item input routing uses the same hit-testing path across clipboard actions and other pointer-driven logic.
+- Masonry texture-target sizing and visible-quality deferral now treat active autoscroll separately from other navigation states.
+
+### Fixed
+
+- Copy and cut shortcuts no longer fall back to stale current-item selection while navigating dense multi-item layouts.
+- Masonry autoscroll no longer leaves loader-visible index tracking lagging behind large viewport jumps.
+
 ## [v0.3.1] - 2026-03-10
 
 ### Highlights

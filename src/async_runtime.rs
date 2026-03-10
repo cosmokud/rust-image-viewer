@@ -1,9 +1,7 @@
 //! Shared Tokio runtime used by background workers across the app.
 //!
 //! The GUI stays synchronous (eframe/egui), but heavy I/O and CPU-bound blocking
-//! work can be dispatched through this runtime via `spawn_blocking`.
-
-use std::future::Future;
+//! work can be dispatched through this runtime via `spawn_blocking_or_thread`.
 use std::sync::OnceLock;
 
 static TOKIO_RUNTIME: OnceLock<Option<tokio::runtime::Runtime>> = OnceLock::new();
@@ -32,28 +30,6 @@ fn runtime() -> Option<&'static tokio::runtime::Runtime> {
 /// Ensure the global runtime is initialized.
 pub fn init_runtime() -> bool {
     runtime().is_some()
-}
-
-/// Spawn a blocking task on the shared runtime.
-#[allow(dead_code)]
-pub fn spawn_blocking<F, R>(job: F) -> Option<tokio::task::JoinHandle<R>>
-where
-    F: FnOnce() -> R + Send + 'static,
-    R: Send + 'static,
-{
-    let runtime = runtime()?;
-    Some(runtime.spawn_blocking(job))
-}
-
-/// Spawn an async future on the shared runtime.
-#[allow(dead_code)]
-pub fn spawn<F>(future: F) -> Option<tokio::task::JoinHandle<F::Output>>
-where
-    F: Future + Send + 'static,
-    F::Output: Send + 'static,
-{
-    let runtime = runtime()?;
-    Some(runtime.spawn(future))
 }
 
 /// Spawn a background worker; fall back to an OS thread when Tokio is unavailable.

@@ -588,7 +588,6 @@ impl MasonryItemLayout {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Default)]
 struct MasonryReturnState {
     zoom: f32,
@@ -598,7 +597,6 @@ struct MasonryReturnState {
     scroll_target: f32,
     opened_index: usize,
     list_signature: u64,
-    cache_reuse_radius: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -631,32 +629,6 @@ fn masonry_return_can_reuse_runtime_cache(
     opened_list_signature == current_list_signature
         && strip_return_preserve_masonry_cache
         && manga_loader_present
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        masonry_return_can_reuse_runtime_cache, masonry_return_should_restore_saved_scroll,
-    };
-
-    #[test]
-    fn masonry_return_restores_saved_scroll_only_when_list_is_unchanged() {
-        assert!(masonry_return_should_restore_saved_scroll(3, 17, 3, 17));
-        assert!(!masonry_return_should_restore_saved_scroll(3, 17, 3, 18));
-    }
-
-    #[test]
-    fn masonry_return_follows_current_item_after_index_change() {
-        assert!(!masonry_return_should_restore_saved_scroll(3, 17, 2, 17));
-    }
-
-    #[test]
-    fn masonry_return_reuses_runtime_cache_only_when_list_is_unchanged() {
-        assert!(masonry_return_can_reuse_runtime_cache(17, 17, true, true));
-        assert!(!masonry_return_can_reuse_runtime_cache(17, 18, true, true));
-        assert!(!masonry_return_can_reuse_runtime_cache(17, 17, false, true));
-        assert!(!masonry_return_can_reuse_runtime_cache(17, 17, true, false));
-    }
 }
 
 /// Per-image view state for fullscreen mode memory.
@@ -8822,57 +8794,12 @@ impl ImageViewer {
                     scroll_target: self.manga_scroll_target,
                     opened_index: opened_index.min(self.image_list.len().saturating_sub(1)),
                     list_signature: self.image_list_signature,
-                    cache_reuse_radius: self.masonry_cache_reuse_radius(),
                 })
             } else {
                 None
             };
     }
 
-    fn masonry_cache_reuse_radius(&self) -> usize {
-        const SIDE_PADDING: f32 = 16.0;
-        const GUTTER: f32 = 12.0;
-
-        let items_per_row = self.masonry_items_per_row.clamp(2, 10);
-        let columns = items_per_row.max(1);
-
-        let estimated_item_height =
-            if self.masonry_layout_valid && !self.masonry_layout_items.is_empty() {
-                let sample_count = self.masonry_layout_items.len().min(64);
-                let sample_sum: f32 = self
-                    .masonry_layout_items
-                    .iter()
-                    .take(sample_count)
-                    .map(|item| item.height.max(1.0))
-                    .sum();
-                (sample_sum / sample_count as f32).max(1.0)
-            } else {
-                let available_width = (self.screen_size.x - SIDE_PADDING * 2.0).max(20.0);
-                let total_gutter = GUTTER * (columns.saturating_sub(1) as f32);
-                let column_width = ((available_width - total_gutter) / columns as f32).max(1.0);
-                (column_width * 1.4).max(1.0)
-            };
-
-        let row_height = (estimated_item_height + GUTTER) * self.zoom.max(0.0001);
-        let visible_rows = (self.screen_size.y.max(1.0) / row_height.max(1.0)).floor() as usize;
-
-        items_per_row.saturating_mul(visible_rows.max(1))
-    }
-
-    #[allow(dead_code)]
-    fn circular_index_distance(&self, from: usize, to: usize) -> usize {
-        let len = self.image_list.len();
-        if len <= 1 {
-            return 0;
-        }
-
-        let from = from.min(len - 1);
-        let to = to.min(len - 1);
-        let direct = from.abs_diff(to);
-        direct.min(len - direct)
-    }
-
-    #[allow(dead_code)]
     fn should_reuse_masonry_cache_on_return(&self, state: MasonryReturnState) -> bool {
         !self.image_list.is_empty()
             && masonry_return_can_reuse_runtime_cache(
@@ -8925,7 +8852,6 @@ impl ImageViewer {
         self.manga_anim_seekbar_total_frames.clear();
     }
 
-    #[allow(dead_code)]
     fn enter_manga_mode_from_preserved_strip_cache(&mut self) {
         let current_media_dims = self.media_display_dimensions().or(self.video_texture_dims);
         let current_media_type = self.current_media_type;
@@ -8945,7 +8871,6 @@ impl ImageViewer {
         }
     }
 
-    #[allow(dead_code)]
     fn return_to_strip_mode_from_fullscreen_toggle(&mut self) {
         let Some(layout_mode) = self.strip_return_mode else {
             return;
@@ -11639,17 +11564,6 @@ impl ImageViewer {
         }
     }
 
-    /// Check if a manga item at the given index is a video/animated content.
-    #[allow(dead_code)]
-    fn manga_is_video_or_animated(&self, index: usize) -> bool {
-        self.manga_loader
-            .as_ref()
-            .and_then(|loader| loader.get_media_type(index))
-            .map_or(false, |mt| {
-                matches!(mt, MangaMediaType::Video | MangaMediaType::AnimatedImage)
-            })
-    }
-
     /// Update the preload queue based on current scroll position
     fn manga_update_preload_queue(&mut self) {
         if !self.manga_mode || self.image_list.is_empty() {
@@ -12544,16 +12458,6 @@ impl ImageViewer {
             return 0.0;
         }
         (self.manga_layout_offsets[index + 1] - self.manga_layout_offsets[index]).max(0.0)
-    }
-
-    /// Scroll manga view by a delta amount
-    #[allow(dead_code)]
-    fn manga_scroll_by(&mut self, delta: f32) {
-        let total_height = self.manga_total_height();
-        let visible_height = self.screen_size.y;
-        let max_scroll = (total_height - visible_height).max(0.0);
-
-        self.manga_scroll_target = (self.manga_scroll_target + delta).clamp(0.0, max_scroll);
     }
 
     /// Compute the most visible manga page index for the current scroll offset.

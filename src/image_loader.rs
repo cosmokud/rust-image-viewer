@@ -310,12 +310,6 @@ pub fn get_media_in_directory(path: &Path) -> Vec<PathBuf> {
     media
 }
 
-/// Get all images in the same directory as the given path (legacy function for compatibility)
-#[allow(dead_code)]
-pub fn get_images_in_directory(path: &Path) -> Vec<PathBuf> {
-    get_media_in_directory(path)
-}
-
 /// A single frame of an image (for animated GIFs)
 #[derive(Clone)]
 pub struct ImageFrame {
@@ -351,7 +345,6 @@ struct GifScanInfo {
 
 /// Loaded image data
 pub struct LoadedImage {
-    #[allow(dead_code)]
     pub path: PathBuf,
     pub frames: Vec<ImageFrame>,
     pub current_frame: usize,
@@ -377,12 +370,6 @@ impl LoadedImage {
             original_height,
             animation_storage: AnimationStorage::FullyDecoded,
         }
-    }
-
-    /// Load an image from path
-    #[allow(dead_code)]
-    pub fn load(path: &Path) -> Result<Self, String> {
-        Self::load_with_max_texture_side(path, None, FilterType::Lanczos3, FilterType::Triangle)
     }
 
     /// Load an image with an optional maximum texture side constraint.

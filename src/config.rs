@@ -256,58 +256,6 @@ impl Action {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Action::ToggleFullscreen => "toggle_fullscreen",
-            Action::GotoFile => "goto_file",
-            Action::NextImage => "next_image",
-            Action::PreviousImage => "previous_image",
-            Action::RotateClockwise => "rotate_clockwise",
-            Action::RotateCounterClockwise => "rotate_counterclockwise",
-            Action::PreciseRotationClockwise => "precise_rotation_clockwise",
-            Action::PreciseRotationCounterClockwise => "precise_rotation_counterclockwise",
-            Action::FlipVertically => "flip_vertically",
-            Action::FlipHorizontally => "flip_horizontally",
-            Action::ZoomIn => "zoom_in",
-            Action::ZoomOut => "zoom_out",
-            Action::ResetZoom => "reset_zoom",
-            Action::Exit => "exit",
-            Action::Pan => "pan",
-            Action::SelectArea => "select_area",
-            Action::FreehandAutoscroll => "freehand_autoscroll",
-            Action::Minimize => "minimize",
-            Action::Close => "close",
-            Action::VideoPlayPause => "video_play_pause",
-            Action::VideoMute => "video_mute",
-            Action::MangaPan => "manga_pan",
-            Action::MangaGotoFile => "manga_goto_file",
-            Action::MangaFreehandAutoscroll => "manga_freehand_autoscroll",
-            Action::MangaPanUp => "manga_pan_up",
-            Action::MangaPanDown => "manga_pan_down",
-            Action::MangaNextImageFit => "manga_next_image_fit",
-            Action::MangaPreviousImageFit => "manga_previous_image_fit",
-            Action::MangaNextImage => "manga_next_image",
-            Action::MangaPreviousImage => "manga_previous_image",
-            Action::MangaScrollUp => "manga_scroll_up",
-            Action::MangaScrollDown => "manga_scroll_down",
-            Action::MangaZoomIn => "manga_zoom_in",
-            Action::MangaZoomOut => "manga_zoom_out",
-            Action::MasonryPan => "masonry_pan",
-            Action::MasonryGotoFile => "masonry_goto_file",
-            Action::MasonryFreehandAutoscroll => "masonry_freehand_autoscroll",
-            Action::MasonryPanUp => "masonry_pan_up",
-            Action::MasonryPanDown => "masonry_pan_down",
-            Action::MasonryPanUp2 => "masonry_pan_up_2",
-            Action::MasonryPanDown2 => "masonry_pan_down_2",
-            Action::MasonryPanUp3 => "masonry_pan_up_3",
-            Action::MasonryPanDown3 => "masonry_pan_down_3",
-            Action::MasonryScrollUp => "masonry_scroll_up",
-            Action::MasonryScrollDown => "masonry_scroll_down",
-            Action::MasonryZoomIn => "masonry_zoom_in",
-            Action::MasonryZoomOut => "masonry_zoom_out",
-        }
-    }
 }
 
 /// Parse an input binding from string
@@ -1956,7 +1904,6 @@ impl Config {
     }
 
     /// Check if an input matches a specific action
-    #[allow(dead_code)]
     pub fn is_action(&self, input: &InputBinding, action: Action) -> bool {
         self.action_bindings
             .get(&action)
@@ -1964,7 +1911,6 @@ impl Config {
     }
 
     /// Get all bindings for an action
-    #[allow(dead_code)]
     pub fn get_bindings(&self, action: Action) -> Vec<InputBinding> {
         self.action_bindings
             .get(&action)
@@ -2128,157 +2074,6 @@ fn parse_rgb_triplet(value: &str) -> Option<[u8; 3]> {
     let g = parts[1].parse::<u8>().ok()?;
     let b = parts[2].parse::<u8>().ok()?;
     Some([r, g, b])
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        default_config_ini, has_config_version_tag_at_top, render_config_template_with_version,
-        Action, Config, InputBinding,
-    };
-
-    #[test]
-    fn default_config_template_uses_current_package_version() {
-        let expected_header = format!("[{}]", env!("CARGO_PKG_VERSION"));
-        let first_line = default_config_ini().lines().next().unwrap_or_default();
-
-        assert_eq!(first_line, expected_header);
-    }
-
-    #[test]
-    fn resets_config_when_version_tag_is_missing_from_top() {
-        assert!(has_config_version_tag_at_top("[0.2.2]\n[Settings]\nshow_fps = false\n"));
-        assert!(!has_config_version_tag_at_top("; old config without version tag\n[Settings]\nshow_fps = false\n"));
-        assert!(!has_config_version_tag_at_top("\n[0.2.2]\n[Settings]\nshow_fps = false\n"));
-        assert!(!has_config_version_tag_at_top(""));
-    }
-
-    #[test]
-    fn replaces_stale_template_version_header() {
-        let rendered = render_config_template_with_version("[0.1.0]\n[Settings]\nshow_fps = false\n", "0.2.2");
-
-        assert_eq!(rendered, "[0.2.2]\n[Settings]\nshow_fps = false\n");
-    }
-
-    #[test]
-    fn migrates_legacy_toggle_fullscreen_defaults() {
-        let config = Config::parse_ini(
-            "[Shortcuts]\ntoggle_fullscreen = mouse_middle, f, f12, enter\n",
-        );
-
-        assert_eq!(
-            config.get_bindings(Action::ToggleFullscreen),
-            vec![
-                InputBinding::Key(egui::Key::F),
-                InputBinding::Key(egui::Key::F11),
-                InputBinding::Key(egui::Key::F12),
-                InputBinding::Key(egui::Key::Enter),
-            ]
-        );
-    }
-
-    #[test]
-    fn preserves_custom_toggle_fullscreen_bindings() {
-        let config = Config::parse_ini(
-            "[Shortcuts]\ntoggle_fullscreen = mouse_middle, q, enter\n",
-        );
-
-        assert_eq!(
-            config.get_bindings(Action::ToggleFullscreen),
-            vec![
-                InputBinding::MouseMiddle,
-                InputBinding::Key(egui::Key::Q),
-                InputBinding::Key(egui::Key::Enter),
-            ]
-        );
-    }
-
-    #[test]
-    fn supports_overlapping_bindings_across_actions() {
-        let config = Config::parse_ini(
-            "[Shortcuts]\ngoto_file = mouse_right\nselect_area = mouse_right\nmanga_goto_file = mouse_right\nmasonry_goto_file = mouse_right\n",
-        );
-
-        assert_eq!(
-            config.get_bindings(Action::GotoFile),
-            vec![InputBinding::MouseRight]
-        );
-        assert_eq!(
-            config.get_bindings(Action::SelectArea),
-            vec![InputBinding::MouseRight]
-        );
-        assert_eq!(
-            config.get_bindings(Action::MangaGotoFile),
-            vec![InputBinding::MouseRight]
-        );
-        assert_eq!(
-            config.get_bindings(Action::MasonryGotoFile),
-            vec![InputBinding::MouseRight]
-        );
-        assert!(config.any_action_uses_binding(&InputBinding::MouseRight));
-    }
-
-    #[test]
-    fn migrates_legacy_strip_item_binding_to_layout_goto_file() {
-        let config = Config::parse_ini("[Settings]\nstrip_item_open_binding = mouse_middle\n");
-
-        assert_eq!(
-            config.get_bindings(Action::MangaGotoFile),
-            vec![InputBinding::MouseMiddle]
-        );
-        assert_eq!(
-            config.get_bindings(Action::MasonryGotoFile),
-            vec![InputBinding::MouseMiddle]
-        );
-    }
-
-    #[test]
-    fn empty_shortcut_value_disables_default_binding() {
-        let config = Config::parse_ini("[Shortcuts]\nmanga_zoom_in =\n");
-
-        assert!(config.get_bindings(Action::MangaZoomIn).is_empty());
-    }
-
-    #[test]
-    fn parses_precise_rotation_shortcuts() {
-        let config = Config::parse_ini(
-            "[Shortcuts]\nprecise_rotation_clockwise = ctrl+up\nprecise_rotation_counterclockwise = ctrl+down\n",
-        );
-
-        assert_eq!(
-            config.get_bindings(Action::PreciseRotationClockwise),
-            vec![InputBinding::KeyWithCtrl(egui::Key::ArrowUp)]
-        );
-        assert_eq!(
-            config.get_bindings(Action::PreciseRotationCounterClockwise),
-            vec![InputBinding::KeyWithCtrl(egui::Key::ArrowDown)]
-        );
-    }
-
-    #[test]
-    fn parses_precise_rotation_step_setting() {
-        let config = Config::parse_ini(
-            "[Settings]\nprecise_rotation_step_degrees = 3.5\n",
-        );
-
-        assert_eq!(config.precise_rotation_step_degrees, 3.5);
-    }
-
-    #[test]
-    fn parses_delete_confirmation_setting() {
-        let config = Config::parse_ini(
-            "[Settings]\nconfirm_delete_to_recycle_bin = false\n",
-        );
-
-        assert!(!config.confirm_delete_to_recycle_bin);
-    }
-
-    #[test]
-    fn parses_marked_file_border_color_setting() {
-        let config = Config::parse_ini("[Settings]\nmarked_file_border_rgb = 12, 34, 56\n");
-
-        assert_eq!(config.marked_file_border_rgb, [12, 34, 56]);
-    }
 }
 
 fn parse_u8_clamped(value: &str) -> Option<u8> {

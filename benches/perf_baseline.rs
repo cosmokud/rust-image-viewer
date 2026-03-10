@@ -18,6 +18,7 @@ use criterion::{black_box, criterion_group, criterion_main, BatchSize, Benchmark
 use manga_spatial::{MangaSpatialIndex, SpatialRect, STRIP_QUERY_HALF_WIDTH};
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 use tempfile::TempDir;
 
 fn create_scan_dataset(file_count: usize) -> (TempDir, PathBuf) {
@@ -71,6 +72,30 @@ fn create_test_gif(path: &Path, width: u16, height: u16, frames: usize) {
     }
 }
 
+fn sync_media_in_directory_for_bench(
+    index: &mut media_index::MediaDirectoryIndex,
+    path: &Path,
+) -> Vec<PathBuf> {
+    if let Some(files) = index.try_cached_media_for_path(path) {
+        return files;
+    }
+
+    let files = image_loader::get_media_in_directory(path);
+    let directory = path.parent().unwrap_or(path).to_path_buf();
+    let modified_at = path.parent().and_then(|parent| {
+        std::fs::metadata(parent)
+            .ok()
+            .and_then(|meta| meta.modified().ok())
+            .or(Some(SystemTime::UNIX_EPOCH))
+    });
+
+    index.apply_directory_scan_result(media_index::DirectoryScanResult {
+        directory,
+        files,
+        modified_at,
+    })
+}
+
 fn bench_directory_scan(c: &mut Criterion) {
     let mut group = c.benchmark_group("directory_scan");
 
@@ -99,10 +124,10 @@ fn bench_directory_index_cache(c: &mut Criterion) {
 
         group.bench_with_input(BenchmarkId::new("cache_hit", size), &anchor, |b, p| {
             let mut index = media_index::MediaDirectoryIndex::new(64);
-            let _ = index.media_in_directory_for_path(p);
+            let _ = sync_media_in_directory_for_bench(&mut index, p);
 
             b.iter(|| {
-                let files = index.media_in_directory_for_path(black_box(p));
+                let files = sync_media_in_directory_for_bench(&mut index, black_box(p));
                 black_box(files.len());
             });
         });
@@ -114,7 +139,7 @@ fn bench_directory_index_cache(c: &mut Criterion) {
                 if let Some(parent) = p.parent() {
                     index.invalidate_directory(parent);
                 }
-                let files = index.media_in_directory_for_path(black_box(p));
+                let files = sync_media_in_directory_for_bench(&mut index, black_box(p));
                 black_box(files.len());
             });
         });

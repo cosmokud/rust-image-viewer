@@ -56,12 +56,10 @@ impl MediaDirectoryIndex {
         }
     }
 
-    #[allow(dead_code)]
     pub fn stats(&self) -> MediaDirectoryIndexStats {
         self.stats
     }
 
-    #[allow(dead_code)]
     pub fn invalidate_directory(&mut self, directory: &Path) {
         self.cache.pop(directory);
     }
@@ -149,23 +147,6 @@ impl MediaDirectoryIndex {
         );
 
         result.files
-    }
-
-    #[allow(dead_code)]
-    pub fn media_in_directory_for_path(&mut self, path: &Path) -> Vec<PathBuf> {
-        if let Some(files) = self.try_cached_media_for_path(path) {
-            return files;
-        }
-
-        self.stats.misses = self.stats.misses.saturating_add(1);
-        self.stats.scans = self.stats.scans.saturating_add(1);
-
-        let files = get_media_in_directory(path);
-        self.apply_directory_scan_result(DirectoryScanResult {
-            directory: path.parent().unwrap_or(path).to_path_buf(),
-            files,
-            modified_at: path.parent().and_then(directory_modified_time),
-        })
     }
 }
 

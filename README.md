@@ -67,6 +67,7 @@ This project is intentionally optimized for one job: opening media fast, navigat
 - Masonry: dense multi-column layout with configurable `masonry_items_per_row`.
 - Bottom-right mode buttons for toggling `Masonry` and `Long Strip` while fullscreen.
 - Inertial scrolling, drag panning, Ctrl+wheel zoom, and a configurable middle-click freehand autoscroll ball.
+- Masonry freehand autoscroll keeps visible-item prioritization and visible-quality recovery aligned with the moving viewport.
 - Video first-frame thumbnails and animated media support inside multi-item layouts.
 - Hover-based autoplay in Masonry after a configurable settle delay.
 - Solo fullscreen quick-open from Long Strip / Masonry with preserved return context and warm-cache reuse.
@@ -164,6 +165,7 @@ When you open one file, the viewer builds the media list for its directory and e
 
 - Floating / solo fullscreen mode is optimized for one current item at a time.
 - Long Strip and Masonry are fullscreen-only multi-item layouts.
+- Keyboard copy / cut actions prefer marked files first; without marks, Long Strip and Masonry target the hovered item.
 - Right-click is contextual by design:
   - floating / solo fullscreen side zones and black bars navigate previous / next
   - right-click on the current media toggles fullscreen when bound to `goto_file`

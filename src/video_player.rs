@@ -306,10 +306,6 @@ impl VideoState {
         }
         queue.pop_front()
     }
-
-    fn has_queued_frame(&self) -> bool {
-        !self.frame_queue.lock().is_empty()
-    }
 }
 
 fn guess_limited_range_rgba(pixels: &[u8]) -> bool {
@@ -791,12 +787,6 @@ Ensure your GStreamer installation includes the playback elements (usually from 
         }
     }
 
-    /// Seek to a position (0.0 to 1.0) using frame-accurate mode.
-    #[allow(dead_code)]
-    pub fn seek(&mut self, position: f64) -> Result<(), String> {
-        self.seek_with_mode(position, VideoSeekMode::Accurate)
-    }
-
     /// Seek to a position (0.0 to 1.0) using the provided mode.
     pub fn seek_with_mode(&mut self, position: f64, mode: VideoSeekMode) -> Result<(), String> {
         let position = position.clamp(0.0, 1.0);
@@ -921,12 +911,6 @@ Ensure your GStreamer installation includes the playback elements (usually from 
         None
     }
 
-    /// Check if a new frame is available
-    #[allow(dead_code)]
-    pub fn has_new_frame(&self) -> bool {
-        self.state.has_queued_frame()
-    }
-
     /// Get video dimensions
     pub fn dimensions(&self) -> (u32, u32) {
         if self.original_width > 0 && self.original_height > 0 {
@@ -949,19 +933,6 @@ Ensure your GStreamer installation includes the playback elements (usually from 
             }
         }
         false
-    }
-
-    /// Check for errors
-    #[allow(dead_code)]
-    pub fn check_error(&self) -> Option<String> {
-        if let Some(bus) = self.pipeline.bus() {
-            while let Some(msg) = bus.pop() {
-                if let gst::MessageView::Error(err) = msg.view() {
-                    return Some(format!("{}: {:?}", err.error(), err.debug()));
-                }
-            }
-        }
-        None
     }
 
     /// Restart playback from the beginning

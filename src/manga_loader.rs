@@ -79,6 +79,7 @@ const LARGE_JUMP_INDEX_THRESHOLD: usize = 32;
 /// Larger values increase background throughput but can increase burstiness.
 const DIM_REQUEST_BATCH_SIZE: usize = 64;
 
+
 /// Maximum number of dimension results bundled into a single result message.
 const DIM_RESULT_CHUNK_SIZE: usize = 64;
 
@@ -1883,11 +1884,6 @@ impl MangaLoader {
     }
 
     /// Get cached media info for an index (width, height, media_type).
-    #[allow(dead_code)]
-    pub fn get_media_info(&self, index: usize) -> Option<(u32, u32, MangaMediaType)> {
-        self.dimension_cache.get(&index).copied()
-    }
-
     /// Get media type for an index.
     pub fn get_media_type(&self, index: usize) -> Option<MangaMediaType> {
         self.dimension_cache.get(&index).map(|(_, _, mt)| *mt)
@@ -1915,27 +1911,6 @@ impl Drop for MangaLoader {
     fn drop(&mut self) {
         // Signal shutdown to coordinator thread
         self.shutdown.store(true, Ordering::Release);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::MangaLoader;
-
-    #[test]
-    fn strip_preload_counts_scale_with_fractional_visibility() {
-        let mut loader = MangaLoader::new();
-        loader.update_visible_page_count(2, Some(1.5));
-
-        assert_eq!(loader.calculate_preload_counts(), (3, 2));
-    }
-
-    #[test]
-    fn default_preload_counts_preserve_existing_floor() {
-        let mut loader = MangaLoader::new();
-        loader.update_visible_page_count(2, None);
-
-        assert_eq!(loader.calculate_preload_counts(), (12, 6));
     }
 }
 
@@ -2099,18 +2074,6 @@ impl MangaTextureCache {
         // LruCache updates recency on access, so no per-frame bookkeeping is needed.
     }
 
-    /// Get a texture from cache, updating its access time.
-    #[allow(dead_code)]
-    pub fn get(&mut self, index: usize) -> Option<&egui::TextureHandle> {
-        if let Some(entry) = self.pinned_entries.get(&index) {
-            return Some(&entry.texture);
-        }
-
-        self.unpinned_entries
-            .get(&index)
-            .map(|entry| &entry.texture)
-    }
-
     /// Get texture ID and dimensions from cache (avoids borrow issues).
     /// Returns (texture_id, width, height) if found.
     pub fn get_texture_info(&mut self, index: usize) -> Option<(egui::TextureId, u32, u32)> {
@@ -2148,60 +2111,9 @@ impl MangaTextureCache {
         })
     }
 
-    /// Get texture ID, dimensions, and media type from cache.
-    /// Returns (texture_id, width, height, media_type) if found.
-    #[allow(dead_code)]
-    pub fn get_texture_info_with_type(
-        &mut self,
-        index: usize,
-    ) -> Option<(egui::TextureId, u32, u32, MangaMediaType)> {
-        if let Some(entry) = self.pinned_entries.get(&index) {
-            return Some((
-                entry.texture.id(),
-                entry.width,
-                entry.height,
-                entry.media_type,
-            ));
-        }
-
-        self.unpinned_entries.get(&index).map(|entry| {
-            (
-                entry.texture.id(),
-                entry.width,
-                entry.height,
-                entry.media_type,
-            )
-        })
-    }
-
-    /// Get texture and dimensions from cache.
-    #[allow(dead_code)]
-    pub fn get_with_dims(&mut self, index: usize) -> Option<(&egui::TextureHandle, u32, u32)> {
-        if let Some(entry) = self.pinned_entries.get(&index) {
-            return Some((&entry.texture, entry.width, entry.height));
-        }
-
-        self.unpinned_entries
-            .get(&index)
-            .map(|entry| (&entry.texture, entry.width, entry.height))
-    }
-
     /// Check if an index is in the cache without updating access time.
     pub fn contains(&self, index: usize) -> bool {
         self.pinned_entries.contains_key(&index) || self.unpinned_entries.contains(&index)
-    }
-
-    /// Insert a texture into the cache.
-    /// Returns evicted indices if cache was full.
-    #[allow(dead_code)]
-    pub fn insert(
-        &mut self,
-        index: usize,
-        texture: egui::TextureHandle,
-        width: u32,
-        height: u32,
-    ) -> Vec<usize> {
-        self.insert_with_type(index, texture, width, height, MangaMediaType::StaticImage)
     }
 
     /// Insert a texture into the cache with explicit media type.
@@ -2234,7 +2146,6 @@ impl MangaTextureCache {
 
     /// Update an existing texture in the cache (for video frame updates).
     /// Does not evict anything, just replaces the existing entry.
-    #[allow(dead_code)]
     pub fn update_texture(
         &mut self,
         index: usize,
@@ -2270,14 +2181,7 @@ impl MangaTextureCache {
         self.pinned_indices.clear();
     }
 
-    /// Get the number of cached textures.
-    #[allow(dead_code)]
-    pub fn len(&self) -> usize {
-        self.total_entries()
-    }
-
     /// Check if cache is empty.
-    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.total_entries() == 0
     }

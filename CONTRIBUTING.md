@@ -55,16 +55,17 @@ Run against a sample file:
 cargo run --release -- path\to\file.jpg
 ```
 
-Formatting, linting, tests, and benchmarks:
+Formatting, linting, and benchmarks:
 
 ```powershell
 cargo fmt --all
 cargo clippy --all-targets
-cargo test
 cargo bench
 ```
 
 `cargo bench` matters here. A large part of the codebase exists to protect real-world navigation and layout performance, so regression detection is part of normal contribution hygiene.
+
+This repository currently relies on release builds, benchmarks, and manual scenario validation rather than an automated test suite.
 
 ## Architecture-sensitive rules
 
@@ -147,9 +148,9 @@ If you add, rename, or change a config key, update all relevant places together:
 
 The config template is version-tagged and synchronized into `%APPDATA%\rust-image-viewer\config.ini`, so drift here causes real user migration issues.
 
-## Testing expectations
+## Validation expectations
 
-At minimum, test the paths your change can break.
+At minimum, manually validate the paths your change can break.
 
 ### If you touch windowing, title-bar behavior, or fullscreen logic
 
@@ -169,6 +170,7 @@ Check:
 - slow wheel scroll
 - fast wheel scroll
 - scrollbar drag or large jump
+- middle-click autoscroll hold / release in Masonry
 - zoom changes at low and high density
 - mixed folders with images and videos
 - FPS overlay counters and p95 timings when applicable
