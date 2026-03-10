@@ -1418,6 +1418,10 @@ struct ImageViewer {
     is_panning: bool,
     /// Last mouse position for panning
     last_mouse_pos: Option<egui::Pos2>,
+    /// Last observed pointer hover position, used for cursor-idle detection.
+    last_pointer_hover_pos: Option<egui::Pos2>,
+    /// Time of the most recent pointer move/click/wheel event.
+    last_pointer_activity_at: Instant,
     /// Configuration
     config: Config,
     /// Whether we're in fullscreen mode
@@ -1905,6 +1909,8 @@ impl Default for ImageViewer {
             offset: egui::Vec2::ZERO,
             is_panning: false,
             last_mouse_pos: None,
+            last_pointer_hover_pos: None,
+            last_pointer_activity_at: Instant::now(),
             config,
             is_fullscreen: false,
             show_controls: false,
@@ -2171,6 +2177,33 @@ impl ImageViewer {
             path.hash(&mut hasher);
         }
         hasher.finish()
+    }
+
+    fn update_pointer_activity_tracking(&mut self, ctx: &egui::Context) {
+        let (pointer_pos, pointer_event_seen) = ctx.input(|input| {
+            let pointer_pos = input.pointer.hover_pos();
+            let pointer_event_seen = input.raw.events.iter().any(|event| {
+                matches!(
+                    event,
+                    egui::Event::PointerMoved(_)
+                        | egui::Event::PointerButton { .. }
+                        | egui::Event::MouseWheel { .. }
+                )
+            });
+            (pointer_pos, pointer_event_seen)
+        });
+
+        let pointer_moved = match (self.last_pointer_hover_pos, pointer_pos) {
+            (Some(previous), Some(current)) => (current - previous).length_sq() > 0.0,
+            (None, Some(_)) | (Some(_), None) => true,
+            (None, None) => false,
+        };
+
+        if pointer_event_seen || pointer_moved {
+            self.last_pointer_activity_at = Instant::now();
+        }
+
+        self.last_pointer_hover_pos = pointer_pos;
     }
 
     fn set_image_list(&mut self, files: Vec<PathBuf>) {
@@ -15374,6 +15407,72 @@ impl ImageViewer {
             .is_some_and(|image_rect| image_rect.contains(pos))
     }
 
+    fn pointer_over_media_surface_for_cursor_autohide(
+        &mut self,
+        ctx: &egui::Context,
+    ) -> bool {
+        let screen_rect = ctx.screen_rect();
+        let pointer_pos = ctx.input(|input| input.pointer.hover_pos());
+        let Some(pos) = pointer_pos else {
+            return false;
+        };
+
+        if self.pointer_over_shortcut_blocking_ui(Some(pos), screen_rect) {
+            return false;
+        }
+
+        if self.show_controls && pos.y < 50.0 {
+            return false;
+        }
+
+        if !self.is_fullscreen
+            && self.get_resize_direction(pos, screen_rect) != ResizeDirection::None
+        {
+            return false;
+        }
+
+        if self.manga_mode && self.is_fullscreen {
+            return self.manga_index_at_screen_pos(pos).is_some();
+        }
+
+        self.point_over_current_media(pos, screen_rect)
+    }
+
+    fn media_cursor_autohide_state(&mut self, ctx: &egui::Context) -> (bool, Option<Duration>) {
+        if self.config.cursor_idle_hide_delay <= 0.0 {
+            return (false, None);
+        }
+
+        if self.is_panning
+            || self.is_resizing
+            || self.is_seeking
+            || self.is_volume_dragging
+            || self.title_text_dragging
+            || self.mark_selection_box.is_some()
+            || self.manga_scrollbar_dragging
+            || self.manga_autoscroll_active
+            || self.manga_zoom_plus_held
+            || self.manga_zoom_minus_held
+            || self.manga_video_seeking
+            || self.manga_video_volume_dragging
+            || self.gif_seeking
+        {
+            return (false, None);
+        }
+
+        if !self.pointer_over_media_surface_for_cursor_autohide(ctx) {
+            return (false, None);
+        }
+
+        let delay = Duration::from_secs_f32(self.config.cursor_idle_hide_delay);
+        let elapsed = self.last_pointer_activity_at.elapsed();
+        if elapsed >= delay {
+            (true, None)
+        } else {
+            (false, Some(delay - elapsed))
+        }
+    }
+
     fn right_click_black_bar_action(
         &self,
         pos: egui::Pos2,
@@ -18630,6 +18729,8 @@ impl eframe::App for ImageViewer {
             return;
         }
 
+        self.update_pointer_activity_tracking(ctx);
+
         // Update FPS stats for the debug overlay (and for general diagnostics).
         // Use the previous frame's activity classification so low-rate overlay polls
         // do not skew FPS downward.
@@ -19154,6 +19255,16 @@ impl eframe::App for ImageViewer {
             self.draw_exit_confirmation_modal(ctx);
         }
 
+        let (hide_idle_cursor, cursor_idle_repaint_after) = if skip_drawing {
+            (false, None)
+        } else {
+            self.media_cursor_autohide_state(ctx)
+        };
+
+        if hide_idle_cursor {
+            ctx.set_cursor_icon(egui::CursorIcon::None);
+        }
+
         // Startup UX: keep the window hidden until initial layout is applied.
         // This avoids the brief flash of the default empty window on Explorer-open.
         self.show_window_if_ready(ctx);
@@ -19329,8 +19440,9 @@ impl eframe::App for ImageViewer {
         } else if video_playing {
             ctx.request_repaint_after(Duration::from_millis(16));
         } else if self.video_player.is_some() {
-            // Paused video: no repaint needed.
-            // Any input will trigger an event-driven repaint.
+            if let Some(delay) = cursor_idle_repaint_after {
+                ctx.request_repaint_after(delay);
+            }
         } else {
             let mut next_repaint: Option<Duration> = None;
 
@@ -19381,6 +19493,10 @@ impl eframe::App for ImageViewer {
                     Duration::ZERO
                 };
                 schedule_min(remaining);
+            }
+
+            if let Some(delay) = cursor_idle_repaint_after {
+                schedule_min(delay);
             }
 
             if let Some(d) = next_repaint {

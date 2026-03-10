@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.3.3] - 2026-03-10
+
+### Highlights
+
+- The mouse cursor now auto-hides after 3 seconds of idle hovering over displayed image or video content, with a new `config.ini` setting to adjust or disable the timeout.
+
+### Added
+
+- New `cursor_idle_hide_delay` setting in `config.ini` for media-hover cursor auto-hide timing.
+
+### Changed
+
+- Idle cursor hiding now only applies while the pointer is over actual media content, and stays visible over title-bar, resize, and bottom-overlay UI.
+
 ## [v0.3.2] - 2026-03-10
 
 ### Highlights

@@ -443,6 +443,8 @@ pub struct Config {
     pub controls_hide_delay: f32,
     /// How long bottom overlays stay visible (video controls + manga toggle + zoom HUD), in seconds
     pub bottom_overlay_hide_delay: f32,
+    /// How long the mouse cursor stays visible while idle over media, in seconds. `0` disables auto-hide.
+    pub cursor_idle_hide_delay: f32,
     /// Maximum delay between clicks for double-click detection (in seconds)
     pub double_click_grace_period: f64,
     /// Show an FPS overlay in the top-right corner (debug)
@@ -596,6 +598,7 @@ impl Config {
             action_bindings: HashMap::new(),
             controls_hide_delay: 0.5,
             bottom_overlay_hide_delay: 0.5,
+            cursor_idle_hide_delay: 3.0,
             double_click_grace_period: 0.35,
             show_fps: false,
             resize_border_size: 6.0,
@@ -1028,6 +1031,15 @@ impl Config {
                         | "bottom_hud_hide_delay" => {
                             if let Ok(v) = value.parse::<f32>() {
                                 config.bottom_overlay_hide_delay = v.max(0.1);
+                            }
+                        }
+                        "cursor_idle_hide_delay"
+                        | "idle_cursor_hide_delay"
+                        | "mouse_idle_hide_delay" => {
+                            if let Ok(v) = value.parse::<f32>() {
+                                if v.is_finite() {
+                                    config.cursor_idle_hide_delay = v.max(0.0);
+                                }
                             }
                         }
                         "double_click_grace_period"
@@ -1522,6 +1534,10 @@ impl Config {
         values.insert(
             "bottom_overlay_hide_delay",
             format!("{}", self.bottom_overlay_hide_delay),
+        );
+        values.insert(
+            "cursor_idle_hide_delay",
+            format_with_optional_trailing_zero_f32(self.cursor_idle_hide_delay),
         );
         values.insert(
             "double_click_grace_period",
