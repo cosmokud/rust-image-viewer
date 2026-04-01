@@ -387,12 +387,7 @@ fn reveal_path_in_file_explorer(path: &Path) -> std::io::Result<()> {
                 .map(|_| ());
         }
 
-        // Open folder first, then ask Explorer to select the file.
-        let _ = std::process::Command::new("explorer.exe")
-            .arg(&target_dir)
-            .spawn();
-
-        let select_arg = format!("/select,\"{}\"", resolved_path.display());
+        let select_arg = format!("/select,{}", resolved_path.display());
 
         match std::process::Command::new("explorer.exe")
             .arg(&select_arg)
