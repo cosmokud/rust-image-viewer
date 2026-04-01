@@ -12523,22 +12523,9 @@ impl ImageViewer {
 
     /// Scroll up by one page (screen height) in manga mode
     fn manga_page_up(&mut self) {
-        if !self.manga_mode {
-            return;
-        }
-        self.stop_manga_wheel_scroll();
-        // PageUp in manga mode: go to the previous file and align its top to the viewport top.
-        let current = self.manga_top_index();
-        if current == 0 {
-            return;
-        }
-        let target = current - 1;
-        self.set_current_index_clamped(target);
-        let scroll_to = self.manga_get_scroll_offset_for_index(target);
-        self.manga_scroll_target = scroll_to;
-        self.manga_scroll_offset = scroll_to;
-        self.manga_scroll_velocity = 0.0;
-        self.manga_prime_navigation_destination(target);
+        // Keep PageUp behavior to exactly one previous file while avoiding
+        // instantaneous strip snaps that can show a transient black frame.
+        self.manga_page_up_smooth_continuous();
     }
 
     /// PageUp-style navigation, but with smooth inertial motion (no instant snap).
@@ -12617,25 +12604,9 @@ impl ImageViewer {
 
     /// Scroll down by one page (screen height) in manga mode
     fn manga_page_down(&mut self) {
-        if !self.manga_mode {
-            return;
-        }
-        self.stop_manga_wheel_scroll();
-        // PageDown in manga mode: go to the next file and align its top to the viewport top.
-        if self.image_list.is_empty() {
-            return;
-        }
-        let current = self.manga_top_index();
-        let target = (current + 1).min(self.image_list.len() - 1);
-        if target == current {
-            return;
-        }
-        self.set_current_index_clamped(target);
-        let scroll_to = self.manga_get_scroll_offset_for_index(target);
-        self.manga_scroll_target = scroll_to;
-        self.manga_scroll_offset = scroll_to;
-        self.manga_scroll_velocity = 0.0;
-        self.manga_prime_navigation_destination(target);
+        // Keep PageDown behavior to exactly one next file while avoiding
+        // instantaneous strip snaps that can show a transient black frame.
+        self.manga_page_down_smooth_continuous();
     }
 
     /// PageDown-style navigation, but with smooth inertial motion (no instant snap).
@@ -12740,32 +12711,7 @@ impl ImageViewer {
         let scroll_to = self.manga_get_scroll_offset_for_index(target);
         self.manga_scroll_target = scroll_to;
         self.manga_scroll_velocity = 0.0;
-
-        // Prime the loader around the destination so the transition stays smooth.
-        let (preload_behind, preload_ahead) = self.navigation_preload_window();
-        let target_texture_side = self.manga_target_texture_side_for_preload(target, &[]);
-        let (downscale_filter, gif_filter) = self.manga_decode_filters_for_strip_mode();
-        let force_triangle_filters = self.manga_should_force_triangle_filters();
-        if let Some(ref mut loader) = self.manga_loader {
-            let len = self.image_list.len();
-            if len > 0 {
-                let start = target.saturating_sub(preload_behind);
-                let end = target.saturating_add(preload_ahead).min(len);
-                loader.request_dimensions_range(&self.image_list, start, end);
-                loader.update_preload_queue(
-                    &self.image_list,
-                    target,
-                    self.screen_size.y,
-                    self.max_texture_side,
-                    target_texture_side,
-                    downscale_filter,
-                    gif_filter,
-                    force_triangle_filters,
-                );
-            }
-        }
-
-        self.manga_update_preload_queue();
+        self.manga_prime_navigation_destination(target);
     }
 
     /// Continuous scrolling version of manga_page_down_smooth for holding ArrowRight.
@@ -12791,30 +12737,7 @@ impl ImageViewer {
         let scroll_to = self.manga_get_scroll_offset_for_index(target);
         self.manga_scroll_target = scroll_to;
         self.manga_scroll_velocity = 0.0;
-
-        // Prime the loader around the destination so the transition stays smooth.
-        let (preload_behind, preload_ahead) = self.navigation_preload_window();
-        let target_texture_side = self.manga_target_texture_side_for_preload(target, &[]);
-        let (downscale_filter, gif_filter) = self.manga_decode_filters_for_strip_mode();
-        let force_triangle_filters = self.manga_should_force_triangle_filters();
-        if let Some(ref mut loader) = self.manga_loader {
-            let len = self.image_list.len();
-            let start = target.saturating_sub(preload_behind);
-            let end = target.saturating_add(preload_ahead).min(len);
-            loader.request_dimensions_range(&self.image_list, start, end);
-            loader.update_preload_queue(
-                &self.image_list,
-                target,
-                self.screen_size.y,
-                self.max_texture_side,
-                target_texture_side,
-                downscale_filter,
-                gif_filter,
-                force_triangle_filters,
-            );
-        }
-
-        self.manga_update_preload_queue();
+        self.manga_prime_navigation_destination(target);
     }
 
     /// Scroll to the first image in manga mode
@@ -16058,6 +15981,8 @@ impl ImageViewer {
                     Action::SelectArea
                         | Action::Pan
                         | Action::FreehandAutoscroll
+                        | Action::MangaNextImage
+                        | Action::MangaPreviousImage
                         | Action::MangaPan
                         | Action::MangaGotoFile
                         | Action::MangaFreehandAutoscroll
