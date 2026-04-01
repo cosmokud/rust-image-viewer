@@ -353,83 +353,35 @@ fn open_path_in_default_app(path: &std::path::Path) -> std::io::Result<()> {
     }
 }
 
-#[cfg(target_os = "windows")]
-fn explorer_friendly_windows_path(path: &Path) -> PathBuf {
-    // Explorer does not reliably handle verbatim paths (`\\?\...`); strip the
-    // prefix so `/select,` targets the expected folder/file instead of defaulting.
-    let raw = path.as_os_str().to_string_lossy();
-
-    if let Some(stripped_unc) = raw.strip_prefix(r"\\?\UNC\") {
-        PathBuf::from(format!(r"\\{}", stripped_unc))
-    } else if let Some(stripped) = raw.strip_prefix(r"\\?\") {
-        PathBuf::from(stripped)
-    } else {
-        path.to_path_buf()
-    }
-}
-
 fn reveal_path_in_file_explorer(path: &Path) -> std::io::Result<()> {
     #[cfg(target_os = "windows")]
     {
-        let mut resolved_path = if path.is_absolute() {
+        let resolved_path = if path.is_absolute() {
             path.to_path_buf()
         } else {
             std::env::current_dir()?.join(path)
         };
 
-        if let Ok(canonical) = resolved_path.canonicalize() {
-            resolved_path = canonical;
-        }
+        let target_dir = if resolved_path.is_dir() {
+            resolved_path
+        } else {
+            resolved_path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or(resolved_path)
+        };
 
-        resolved_path = explorer_friendly_windows_path(&resolved_path);
-
-        if !resolved_path.exists() {
+        if !target_dir.exists() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
-                format!("Path does not exist: {}", resolved_path.display()),
+                format!("Path does not exist: {}", target_dir.display()),
             ));
         }
 
-        if resolved_path.is_dir() {
-            return std::process::Command::new("explorer.exe")
-                .arg(&resolved_path)
-                .spawn()
-                .map(|_| ());
-        }
-
-        let parent = resolved_path
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| resolved_path.clone());
-
-        // Open the parent folder first so Explorer lands in the correct directory
-        // even if `/select,` is ignored by the shell for edge-case paths.
-        let _ = std::process::Command::new("explorer.exe")
-            .arg(&parent)
-            .spawn();
-
-        let mut select_arg = std::ffi::OsString::from("/select,");
-        select_arg.push(resolved_path.as_os_str());
-
-        match std::process::Command::new("explorer.exe")
-            .arg(select_arg)
+        std::process::Command::new("explorer.exe")
+            .arg(target_dir)
             .spawn()
-        {
-            Ok(_) => Ok(()),
-            Err(select_err) => std::process::Command::new("explorer.exe")
-                .arg(&parent)
-                .spawn()
-                .map(|_| ())
-                .map_err(|parent_err| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!(
-                            "Failed to select file in Explorer: {}; fallback opening parent failed: {}",
-                            select_err, parent_err
-                        ),
-                    )
-                }),
-        }
+            .map(|_| ())
     }
 
     #[cfg(target_os = "macos")]
