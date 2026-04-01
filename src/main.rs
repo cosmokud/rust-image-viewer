@@ -361,9 +361,10 @@ fn reveal_path_in_file_explorer(path: &Path) -> std::io::Result<()> {
         } else {
             std::env::current_dir()?.join(path)
         };
+
+        let select_arg = format!("/select,\"{}\"", resolved_path.display());
         std::process::Command::new("explorer")
-            .arg("/select,")
-            .arg(resolved_path)
+            .arg(select_arg)
             .spawn()
             .map(|_| ())
     }
@@ -6584,6 +6585,36 @@ impl ImageViewer {
         }
     }
 
+    fn action_title_for_help(action: Action) -> String {
+        let raw = format!("{:?}", action);
+        let mut title = String::with_capacity(raw.len() + 8);
+
+        for (idx, ch) in raw.chars().enumerate() {
+            if idx > 0 && ch.is_ascii_uppercase() {
+                title.push(' ');
+            }
+            title.push(ch);
+        }
+
+        title
+    }
+
+    fn draw_shortcuts_help_config_rows(&self, ui: &mut egui::Ui) {
+        let mut actions: Vec<Action> = self.config.action_bindings.keys().copied().collect();
+        actions.sort_by_key(|action| format!("{:?}", action));
+
+        for action in actions {
+            let trigger = self.action_bindings_help_label(action);
+            let title = Self::action_title_for_help(action);
+            Self::draw_shortcuts_help_row(
+                ui,
+                trigger.as_str(),
+                title.as_str(),
+                "Loaded from your user config.ini action bindings.",
+            );
+        }
+    }
+
     fn draw_shortcuts_help_modal(&mut self, ctx: &egui::Context) {
         if !self.shortcuts_help_modal_open {
             return;
@@ -6609,6 +6640,7 @@ impl ImageViewer {
             (screen_rect.height() - 44.0).clamp(440.0, 780.0),
         );
         let modal_pos = screen_rect.center() - modal_size * 0.5;
+        let config_path_label = Config::config_path().display().to_string();
 
         let general_rows: &[(Action, &'static str, &'static str)] = &[
             (
@@ -6860,6 +6892,16 @@ impl ImageViewer {
                                         .color(egui::Color32::from_rgb(170, 190, 212))
                                         .size(12.5),
                                     );
+                                    ui.add_space(4.0);
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "Config source: {}",
+                                            config_path_label
+                                        ))
+                                        .monospace()
+                                        .color(egui::Color32::from_rgb(128, 165, 198))
+                                        .size(11.0),
+                                    );
                                 });
 
                                 ui.with_layout(
@@ -7001,6 +7043,16 @@ impl ImageViewer {
                                         "Quick command center",
                                         "Contains current-file actions, marked-file actions, this Help dialog, and Edit config.ini.",
                                     );
+
+                                    ui.add_space(8.0);
+                                    ui.separator();
+
+                                    Self::draw_shortcuts_help_section_header(
+                                        ui,
+                                        "AppData config.ini Bindings",
+                                        "Complete action list loaded from your user config file.",
+                                    );
+                                    self.draw_shortcuts_help_config_rows(ui);
                                 });
                         });
                     });
@@ -18942,6 +18994,17 @@ impl ImageViewer {
             }
         }
 
+        let mut pointer_pos = ctx.input(|i| i.pointer.hover_pos());
+
+        if self.shortcuts_help_modal_open {
+            self.is_panning = false;
+            self.is_resizing = false;
+            self.resize_direction = ResizeDirection::None;
+            self.last_mouse_pos = None;
+            self.manga_autoscroll_active = false;
+            self.manga_autoscroll_anchor = None;
+        } else {
+
         // Handle zoom input (not in manga mode - that's handled in draw_manga_mode)
         // NOTE: In egui/eframe, Ctrl+mouse-wheel is commonly routed into `zoom_delta` (not `smooth_scroll_delta`).
         let ctrl_held = ctx.input(|i| i.modifiers.ctrl);
@@ -19064,7 +19127,7 @@ impl ImageViewer {
         }
 
         // Get pointer state
-        let pointer_pos = ctx.input(|i| i.pointer.hover_pos());
+        pointer_pos = ctx.input(|i| i.pointer.hover_pos());
         let primary_clicked = ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Primary));
         let primary_down = ctx.input(|i| i.pointer.button_down(egui::PointerButton::Primary));
         let primary_pressed = ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary));
@@ -19366,6 +19429,8 @@ impl ImageViewer {
             }
         }
 
+        }
+
         // Draw the image or video
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(self.background_color32()))
@@ -19615,15 +19680,17 @@ impl eframe::App for ImageViewer {
         // Track current floating window position so we can preserve it across media changes.
         self.track_floating_window_position(ctx);
 
-        // Handle file drops
-        ctx.input(|i| {
-            if !i.raw.dropped_files.is_empty() {
-                if let Some(path) = i.raw.dropped_files[0].path.clone() {
-                    // Layout will be applied via `image_changed`.
-                    self.load_image(&path);
+        // Handle file drops (disabled while the help modal is open).
+        if !self.shortcuts_help_modal_open {
+            ctx.input(|i| {
+                if !i.raw.dropped_files.is_empty() {
+                    if let Some(path) = i.raw.dropped_files[0].path.clone() {
+                        // Layout will be applied via `image_changed`.
+                        self.load_image(&path);
+                    }
                 }
-            }
-        });
+            });
+        }
 
         // Window title might have changed due to file drops.
         self.apply_pending_window_title(ctx);
@@ -19636,8 +19703,10 @@ impl eframe::App for ImageViewer {
         // Run this before input so the input handler can properly suppress actions over the video bar.
         let _ = self.update_bottom_overlays_visibility(ctx);
 
-        // Handle input
-        self.handle_input(ctx);
+        // Handle input (disabled while the help modal is open).
+        if !self.shortcuts_help_modal_open {
+            self.handle_input(ctx);
+        }
 
         let viewport_close_requested = ctx.input(|input| input.viewport().close_requested());
         if viewport_close_requested {
@@ -20087,8 +20156,13 @@ impl eframe::App for ImageViewer {
         // Draw controls overlay (top bar for title/buttons) BEFORE the main view.
         // This ensures title-bar hover/selection state is available to suppress gestures
         // (drag/pan/double-click) in the same frame.
-        if !skip_drawing {
+        if !skip_drawing && !self.shortcuts_help_modal_open {
             self.draw_controls(ctx);
+        } else {
+            self.mouse_over_window_buttons = false;
+            self.mouse_over_title_text = false;
+            self.title_bar_menu_active = false;
+            self.title_text_dragging = false;
         }
 
         // Draw image/video and check if draw animations need repaint
@@ -20099,14 +20173,14 @@ impl eframe::App for ImageViewer {
         };
 
         // Draw video controls overlay (bottom bar for video playback controls)
-        if !skip_drawing {
+        if !skip_drawing && !self.shortcuts_help_modal_open {
             self.draw_video_controls(ctx);
             // Also draw manga mode video controls if in manga mode
             self.draw_manga_video_controls(ctx);
         }
 
         // Draw manga mode toggle button and zoom HUD (bottom-right in fullscreen)
-        if !skip_drawing {
+        if !skip_drawing && !self.shortcuts_help_modal_open {
             self.draw_manga_zoom_bar(ctx);
             self.draw_manga_toggle_button(ctx);
         }
