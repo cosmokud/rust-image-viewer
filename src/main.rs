@@ -353,6 +353,48 @@ fn open_path_in_default_app(path: &std::path::Path) -> std::io::Result<()> {
     }
 }
 
+fn reveal_path_in_file_explorer(path: &Path) -> std::io::Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        let resolved_path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()?.join(path)
+        };
+        std::process::Command::new("explorer")
+            .arg("/select,")
+            .arg(resolved_path)
+            .spawn()
+            .map(|_| ())
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let directory = if path.is_dir() {
+            path.to_path_buf()
+        } else {
+            path.parent().unwrap_or(path).to_path_buf()
+        };
+        std::process::Command::new("open")
+            .arg(directory)
+            .spawn()
+            .map(|_| ())
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let directory = if path.is_dir() {
+            path.to_path_buf()
+        } else {
+            path.parent().unwrap_or(path).to_path_buf()
+        };
+        std::process::Command::new("xdg-open")
+            .arg(directory)
+            .spawn()
+            .map(|_| ())
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FileClipboardOperation {
     Copy,
@@ -418,7 +460,9 @@ enum MenuActionIcon {
     Copy,
     Delete,
     Rename,
+    OpenLocation,
     Config,
+    Help,
 }
 
 #[cfg(target_os = "windows")]
@@ -1393,6 +1437,10 @@ struct ImageViewer {
     pending_marked_delete_targets: Vec<PathBuf>,
     /// Whether an exit confirmation modal is waiting on user input because marks remain.
     pending_exit_confirmation: bool,
+    /// Whether the shortcuts/help modal is currently open.
+    shortcuts_help_modal_open: bool,
+    /// Skips one outside-click close check right after opening the shortcuts/help modal.
+    shortcuts_help_modal_skip_outside_click_once: bool,
     /// Cached thumbnail textures used by delete/rename dialogs.
     modal_thumbnail_cache: HashMap<PathBuf, ModalThumbnailTexture>,
     /// Rate limit for rescanning the current folder after external file moves/deletes.
@@ -1899,6 +1947,8 @@ impl Default for ImageViewer {
             pending_single_delete_target: None,
             pending_marked_delete_targets: Vec::new(),
             pending_exit_confirmation: false,
+            shortcuts_help_modal_open: false,
+            shortcuts_help_modal_skip_outside_click_once: false,
             modal_thumbnail_cache: HashMap::new(),
             last_missing_media_refresh_check: Instant::now(),
             zoom: 1.0,
@@ -2295,6 +2345,7 @@ impl ImageViewer {
             || self.pending_single_delete_target.is_some()
             || !self.pending_marked_delete_targets.is_empty()
             || self.pending_exit_confirmation
+            || self.shortcuts_help_modal_open
     }
 
     fn request_app_exit(&mut self) {
@@ -2691,13 +2742,13 @@ impl ImageViewer {
     }
 
     fn file_action_menu_labels(&self, target_index: usize) -> Vec<&'static str> {
-        let mut labels = Vec::with_capacity(11);
+        let mut labels = Vec::with_capacity(12);
         labels.push(if self.is_index_marked(target_index) {
             "Unmark"
         } else {
             "Mark"
         });
-        labels.extend(["Cut", "Copy", "Delete", "Rename"]);
+        labels.extend(["Cut", "Copy", "Delete", "Rename", "Open file location"]);
 
         let has_marked_paths = !self.collect_marked_paths_in_current_order().is_empty();
         if has_marked_paths {
@@ -5257,6 +5308,37 @@ impl ImageViewer {
                     stroke,
                 );
             }
+            MenuActionIcon::OpenLocation => {
+                let folder_rect = egui::Rect::from_min_max(
+                    egui::pos2(rect.left() + 2.5, rect.top() + 5.0),
+                    egui::pos2(rect.right() - 2.5, rect.bottom() - 3.5),
+                );
+                let tab_rect = egui::Rect::from_min_max(
+                    egui::pos2(folder_rect.left() + 1.5, folder_rect.top() - 2.5),
+                    egui::pos2(folder_rect.left() + 8.0, folder_rect.top() + 2.0),
+                );
+                painter.rect_stroke(folder_rect, 3.0, stroke);
+                painter.rect_filled(tab_rect, 2.0, color);
+                let marker = egui::Rect::from_center_size(
+                    egui::pos2(folder_rect.center().x + 2.0, folder_rect.center().y + 0.5),
+                    egui::vec2(6.5, 6.5),
+                );
+                painter.rect_stroke(marker, 2.0, stroke);
+                painter.line_segment(
+                    [
+                        egui::pos2(marker.left() + 1.0, marker.center().y),
+                        egui::pos2(marker.right() - 1.0, marker.center().y),
+                    ],
+                    stroke,
+                );
+                painter.line_segment(
+                    [
+                        egui::pos2(marker.center().x, marker.top() + 1.0),
+                        egui::pos2(marker.center().x, marker.bottom() - 1.0),
+                    ],
+                    stroke,
+                );
+            }
             MenuActionIcon::Config => {
                 painter.circle_stroke(rect.center(), 4.0, stroke);
                 for angle in [0.0_f32, 45.0, 90.0, 135.0] {
@@ -5270,6 +5352,35 @@ impl ImageViewer {
                         stroke,
                     );
                 }
+            }
+            MenuActionIcon::Help => {
+                painter.circle_stroke(rect.center(), 6.0, stroke);
+                painter.line_segment(
+                    [
+                        egui::pos2(rect.center().x - 2.5, rect.top() + 7.0),
+                        egui::pos2(rect.center().x + 0.5, rect.top() + 4.0),
+                    ],
+                    stroke,
+                );
+                painter.line_segment(
+                    [
+                        egui::pos2(rect.center().x + 0.5, rect.top() + 4.0),
+                        egui::pos2(rect.center().x + 2.5, rect.top() + 6.0),
+                    ],
+                    stroke,
+                );
+                painter.line_segment(
+                    [
+                        egui::pos2(rect.center().x, rect.top() + 6.0),
+                        egui::pos2(rect.center().x, rect.center().y + 1.0),
+                    ],
+                    stroke,
+                );
+                painter.circle_filled(
+                    egui::pos2(rect.center().x, rect.bottom() - 3.5),
+                    1.3,
+                    color,
+                );
             }
         }
     }
@@ -5400,6 +5511,19 @@ impl ImageViewer {
         };
         if self.menu_action_row(ui, rename_label, MenuActionIcon::Rename).clicked() {
             self.start_inline_rename_for_index(target_index);
+            activated = true;
+        }
+
+        let open_location_label = if current_labels {
+            "Open Current File Location"
+        } else {
+            "Open file location"
+        };
+        if self
+            .menu_action_row(ui, open_location_label, MenuActionIcon::OpenLocation)
+            .clicked()
+        {
+            self.open_file_location_for_index(target_index);
             activated = true;
         }
 
@@ -6326,6 +6450,588 @@ impl ImageViewer {
         }
     }
 
+    fn key_to_help_label(key: egui::Key) -> String {
+        match key {
+            egui::Key::ArrowLeft => "Left Arrow".to_string(),
+            egui::Key::ArrowRight => "Right Arrow".to_string(),
+            egui::Key::ArrowUp => "Up Arrow".to_string(),
+            egui::Key::ArrowDown => "Down Arrow".to_string(),
+            egui::Key::PageUp => "Page Up".to_string(),
+            egui::Key::PageDown => "Page Down".to_string(),
+            egui::Key::Escape => "Esc".to_string(),
+            egui::Key::Enter => "Enter".to_string(),
+            egui::Key::Space => "Space".to_string(),
+            egui::Key::Delete => "Delete".to_string(),
+            egui::Key::Backspace => "Backspace".to_string(),
+            egui::Key::Tab => "Tab".to_string(),
+            egui::Key::Home => "Home".to_string(),
+            egui::Key::End => "End".to_string(),
+            egui::Key::Num0 => "0".to_string(),
+            egui::Key::Num1 => "1".to_string(),
+            egui::Key::Num2 => "2".to_string(),
+            egui::Key::Num3 => "3".to_string(),
+            egui::Key::Num4 => "4".to_string(),
+            egui::Key::Num5 => "5".to_string(),
+            egui::Key::Num6 => "6".to_string(),
+            egui::Key::Num7 => "7".to_string(),
+            egui::Key::Num8 => "8".to_string(),
+            egui::Key::Num9 => "9".to_string(),
+            _ => format!("{:?}", key),
+        }
+    }
+
+    fn binding_to_help_label(binding: &InputBinding) -> String {
+        match binding {
+            InputBinding::Key(key) => Self::key_to_help_label(*key),
+            InputBinding::KeyWithCtrl(key) => {
+                format!("Ctrl + {}", Self::key_to_help_label(*key))
+            }
+            InputBinding::KeyWithShift(key) => {
+                format!("Shift + {}", Self::key_to_help_label(*key))
+            }
+            InputBinding::KeyWithAlt(key) => {
+                format!("Alt + {}", Self::key_to_help_label(*key))
+            }
+            InputBinding::MouseLeft => "Left Click".to_string(),
+            InputBinding::MouseRight => "Right Click".to_string(),
+            InputBinding::MouseMiddle => "Middle Click".to_string(),
+            InputBinding::Mouse4 => "Mouse 4".to_string(),
+            InputBinding::Mouse5 => "Mouse 5".to_string(),
+            InputBinding::ScrollUp => "Wheel Up".to_string(),
+            InputBinding::ScrollDown => "Wheel Down".to_string(),
+            InputBinding::CtrlScrollUp => "Ctrl + Wheel Up".to_string(),
+            InputBinding::CtrlScrollDown => "Ctrl + Wheel Down".to_string(),
+        }
+    }
+
+    fn action_bindings_help_label(&self, action: Action) -> String {
+        let bindings = self.config.get_bindings(action);
+        if bindings.is_empty() {
+            "Unbound".to_string()
+        } else {
+            bindings
+                .iter()
+                .map(Self::binding_to_help_label)
+                .collect::<Vec<_>>()
+                .join("  |  ")
+        }
+    }
+
+    fn draw_shortcuts_help_section_header(ui: &mut egui::Ui, title: &str, subtitle: &str) {
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(title)
+                .color(egui::Color32::from_rgb(234, 241, 255))
+                .strong()
+                .size(16.0),
+        );
+        ui.add_space(2.0);
+        ui.label(
+            egui::RichText::new(subtitle)
+                .color(egui::Color32::from_rgb(146, 162, 178))
+                .size(12.0),
+        );
+        ui.add_space(8.0);
+    }
+
+    fn draw_shortcuts_help_row(ui: &mut egui::Ui, trigger: &str, title: &str, detail: &str) {
+        ui.horizontal(|ui| {
+            egui::Frame::none()
+                .fill(egui::Color32::from_rgba_unmultiplied(62, 138, 222, 28))
+                .stroke(egui::Stroke::new(
+                    1.0,
+                    egui::Color32::from_rgba_unmultiplied(127, 188, 255, 94),
+                ))
+                .rounding(8.0)
+                .inner_margin(egui::Margin::symmetric(10.0, 7.0))
+                .show(ui, |ui| {
+                    ui.set_min_width(248.0);
+                    ui.label(
+                        egui::RichText::new(trigger)
+                            .monospace()
+                            .color(egui::Color32::from_rgb(208, 228, 252))
+                            .size(12.5),
+                    );
+                });
+
+            ui.add_space(10.0);
+
+            ui.vertical(|ui| {
+                ui.label(
+                    egui::RichText::new(title)
+                        .color(egui::Color32::WHITE)
+                        .strong()
+                        .size(13.5),
+                );
+                ui.label(
+                    egui::RichText::new(detail)
+                        .color(egui::Color32::from_rgb(178, 191, 205))
+                        .size(12.0),
+                );
+            });
+        });
+        ui.add_space(7.0);
+    }
+
+    fn draw_shortcuts_help_action_rows(
+        &self,
+        ui: &mut egui::Ui,
+        rows: &[(Action, &'static str, &'static str)],
+    ) {
+        for (action, title, detail) in rows {
+            let trigger = self.action_bindings_help_label(*action);
+            Self::draw_shortcuts_help_row(ui, trigger.as_str(), title, detail);
+        }
+    }
+
+    fn draw_shortcuts_help_modal(&mut self, ctx: &egui::Context) {
+        if !self.shortcuts_help_modal_open {
+            return;
+        }
+
+        let mut close_modal = ctx.input(|input| input.key_pressed(egui::Key::Escape));
+        let screen_rect = ctx.screen_rect();
+
+        egui::Area::new(egui::Id::new("shortcuts_help_backdrop"))
+            .fixed_pos(screen_rect.min)
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, screen_rect.size());
+                ui.painter().rect_filled(
+                    rect,
+                    0.0,
+                    egui::Color32::from_rgba_unmultiplied(4, 8, 13, 214),
+                );
+            });
+
+        let modal_size = egui::vec2(
+            (screen_rect.width() - 60.0).clamp(560.0, 960.0),
+            (screen_rect.height() - 44.0).clamp(440.0, 780.0),
+        );
+        let modal_pos = screen_rect.center() - modal_size * 0.5;
+
+        let general_rows: &[(Action, &'static str, &'static str)] = &[
+            (
+                Action::ToggleFullscreen,
+                "Toggle fullscreen/window mode",
+                "Switch between floating and fullscreen viewer modes.",
+            ),
+            (
+                Action::Exit,
+                "Exit viewer",
+                "Close the app. If files are marked, you will get a confirmation modal.",
+            ),
+            (
+                Action::Pan,
+                "Pan image/video",
+                "Drag the media while in floating/fullscreen view.",
+            ),
+            (
+                Action::SelectArea,
+                "Edge navigation/select-area behavior",
+                "Uses left/right edge right-click zones for previous/next image navigation.",
+            ),
+            (
+                Action::GotoFile,
+                "Toggle fullscreen via media click zone",
+                "When bound to right click, the center media zone toggles fullscreen.",
+            ),
+            (
+                Action::FreehandAutoscroll,
+                "Freehand autoscroll",
+                "Start pointer-anchored autoscroll in solo view.",
+            ),
+            (
+                Action::NextImage,
+                "Next file",
+                "Move to the next file in the current directory list.",
+            ),
+            (
+                Action::PreviousImage,
+                "Previous file",
+                "Move to the previous file in the current directory list.",
+            ),
+            (
+                Action::RotateClockwise,
+                "Rotate clockwise",
+                "Rotate current media by 90 degrees clockwise.",
+            ),
+            (
+                Action::RotateCounterClockwise,
+                "Rotate counterclockwise",
+                "Rotate current media by 90 degrees counterclockwise.",
+            ),
+            (
+                Action::PreciseRotationClockwise,
+                "Precise rotate clockwise",
+                "Apply fine-grained clockwise rotation in fullscreen.",
+            ),
+            (
+                Action::PreciseRotationCounterClockwise,
+                "Precise rotate counterclockwise",
+                "Apply fine-grained counterclockwise rotation in fullscreen.",
+            ),
+            (
+                Action::ZoomIn,
+                "Zoom in",
+                "Zoom current media in floating/fullscreen mode.",
+            ),
+            (
+                Action::ZoomOut,
+                "Zoom out",
+                "Zoom current media in floating/fullscreen mode.",
+            ),
+            (
+                Action::VideoMute,
+                "Mute/unmute video",
+                "Toggle audio mute for the active video player.",
+            ),
+            (
+                Action::VideoPlayPause,
+                "Play/pause video",
+                "Toggle playback for the active video when this action is bound.",
+            ),
+        ];
+
+        let manga_rows: &[(Action, &'static str, &'static str)] = &[
+            (
+                Action::MangaPan,
+                "Pan manga strip",
+                "Drag and pan in fullscreen strip mode.",
+            ),
+            (
+                Action::MangaGotoFile,
+                "Open strip item in solo fullscreen",
+                "Open the hovered strip item directly in solo fullscreen.",
+            ),
+            (
+                Action::MangaFreehandAutoscroll,
+                "Manga freehand autoscroll",
+                "Start manga autoscroll anchored to pointer direction.",
+            ),
+            (
+                Action::MangaPanUp,
+                "Pan up",
+                "Move strip viewport upward.",
+            ),
+            (
+                Action::MangaPanDown,
+                "Pan down",
+                "Move strip viewport downward.",
+            ),
+            (
+                Action::MangaPreviousImageFit,
+                "Previous fit page",
+                "Smoothly move to previous fitted manga page.",
+            ),
+            (
+                Action::MangaNextImageFit,
+                "Next fit page",
+                "Smoothly move to next fitted manga page.",
+            ),
+            (
+                Action::MangaPreviousImage,
+                "Previous strip file",
+                "Jump to previous file in strip mode.",
+            ),
+            (
+                Action::MangaNextImage,
+                "Next strip file",
+                "Jump to next file in strip mode.",
+            ),
+            (
+                Action::MangaScrollUp,
+                "Wheel scroll up",
+                "Scroll strip content upward.",
+            ),
+            (
+                Action::MangaScrollDown,
+                "Wheel scroll down",
+                "Scroll strip content downward.",
+            ),
+            (
+                Action::MangaZoomIn,
+                "Strip zoom in",
+                "Zoom manga strip thumbnails/layout in.",
+            ),
+            (
+                Action::MangaZoomOut,
+                "Strip zoom out",
+                "Zoom manga strip thumbnails/layout out.",
+            ),
+        ];
+
+        let masonry_rows: &[(Action, &'static str, &'static str)] = &[
+            (
+                Action::MasonryPan,
+                "Pan masonry layout",
+                "Drag/pan in masonry mode.",
+            ),
+            (
+                Action::MasonryGotoFile,
+                "Open masonry item in solo fullscreen",
+                "Open hovered masonry item in solo fullscreen.",
+            ),
+            (
+                Action::MasonryFreehandAutoscroll,
+                "Masonry freehand autoscroll",
+                "Start masonry autoscroll anchored to pointer direction.",
+            ),
+            (
+                Action::MasonryPanUp,
+                "Masonry pan up",
+                "Move masonry viewport upward.",
+            ),
+            (
+                Action::MasonryPanDown,
+                "Masonry pan down",
+                "Move masonry viewport downward.",
+            ),
+            (
+                Action::MasonryPanUp2,
+                "Masonry pan up (fast)",
+                "Move masonry viewport up with increased speed.",
+            ),
+            (
+                Action::MasonryPanDown2,
+                "Masonry pan down (fast)",
+                "Move masonry viewport down with increased speed.",
+            ),
+            (
+                Action::MasonryPanUp3,
+                "Masonry pan up (faster)",
+                "Move masonry viewport up with highest speed tier.",
+            ),
+            (
+                Action::MasonryPanDown3,
+                "Masonry pan down (faster)",
+                "Move masonry viewport down with highest speed tier.",
+            ),
+            (
+                Action::MasonryScrollUp,
+                "Masonry wheel up",
+                "Scroll masonry layout upward.",
+            ),
+            (
+                Action::MasonryScrollDown,
+                "Masonry wheel down",
+                "Scroll masonry layout downward.",
+            ),
+            (
+                Action::MasonryZoomIn,
+                "Masonry zoom in",
+                "Zoom masonry thumbnails/layout in.",
+            ),
+            (
+                Action::MasonryZoomOut,
+                "Masonry zoom out",
+                "Zoom masonry thumbnails/layout out.",
+            ),
+        ];
+
+        let modal_response = egui::Area::new(egui::Id::new("shortcuts_help_modal"))
+            .fixed_pos(modal_pos)
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                ui.set_min_size(modal_size);
+                egui::Frame::none()
+                    .fill(egui::Color32::from_rgba_unmultiplied(16, 23, 31, 252))
+                    .stroke(egui::Stroke::new(
+                        1.0,
+                        egui::Color32::from_rgba_unmultiplied(166, 207, 255, 62),
+                    ))
+                    .rounding(18.0)
+                    .inner_margin(egui::Margin::same(18.0))
+                    .show(ui, |ui| {
+                        ui.vertical(|ui| {
+                            ui.horizontal(|ui| {
+                                ui.vertical(|ui| {
+                                    ui.label(
+                                        egui::RichText::new("Shortcuts & Features")
+                                            .color(egui::Color32::WHITE)
+                                            .strong()
+                                            .size(22.0),
+                                    );
+                                    ui.add_space(2.0);
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "All bindings below reflect your current config.ini, plus built-in mouse gestures and context menu capabilities.",
+                                        )
+                                        .color(egui::Color32::from_rgb(170, 190, 212))
+                                        .size(12.5),
+                                    );
+                                });
+
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        let close_button = ui.add(
+                                            egui::Button::new(
+                                                egui::RichText::new("Close")
+                                                    .color(egui::Color32::WHITE),
+                                            )
+                                            .min_size(egui::vec2(88.0, 30.0))
+                                            .fill(egui::Color32::from_rgba_unmultiplied(
+                                                255, 255, 255, 24,
+                                            ))
+                                            .stroke(egui::Stroke::new(
+                                                1.0,
+                                                egui::Color32::from_rgba_unmultiplied(
+                                                    255, 255, 255, 56,
+                                                ),
+                                            ))
+                                            .rounding(7.0),
+                                        );
+                                        if close_button.clicked() {
+                                            close_modal = true;
+                                        }
+                                    },
+                                );
+                            });
+
+                            ui.add_space(10.0);
+                            ui.separator();
+                            ui.add_space(8.0);
+
+                            egui::ScrollArea::vertical()
+                                .max_height((modal_size.y - 152.0).max(220.0))
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    Self::draw_shortcuts_help_section_header(
+                                        ui,
+                                        "Quick Gestures (Built-in)",
+                                        "These are always available and not tied to configurable action names.",
+                                    );
+                                    Self::draw_shortcuts_help_row(
+                                        ui,
+                                        "Space",
+                                        "Mark/unmark current target",
+                                        "Marks hovered strip/masonry item when available, otherwise the current solo file.",
+                                    );
+                                    Self::draw_shortcuts_help_row(
+                                        ui,
+                                        "Ctrl + Left Click",
+                                        "Toggle mark for current media",
+                                        "Quickly mark/unmark the current media under pointer focus.",
+                                    );
+                                    Self::draw_shortcuts_help_row(
+                                        ui,
+                                        "Ctrl + Right Click",
+                                        "Open file actions context menu",
+                                        "Spawns the right-click file action menu for the current file.",
+                                    );
+                                    Self::draw_shortcuts_help_row(
+                                        ui,
+                                        "Ctrl + Drag (strip/masonry)",
+                                        "Marquee mark selection",
+                                        "Drag a selection box to mark or unmark multiple files in strip and masonry modes.",
+                                    );
+                                    Self::draw_shortcuts_help_row(
+                                        ui,
+                                        "Right Click (center media area)",
+                                        "Toggle GIF/video play-pause",
+                                        "When not consumed by edge navigation or fullscreen actions, center right-click toggles playback.",
+                                    );
+                                    Self::draw_shortcuts_help_row(
+                                        ui,
+                                        "Ctrl + C / Ctrl + X / Delete",
+                                        "Marked-file keyboard actions",
+                                        "Copy, cut, or delete marked files (falls back to current file target when no marks are active).",
+                                    );
+
+                                    ui.add_space(8.0);
+                                    ui.separator();
+
+                                    Self::draw_shortcuts_help_section_header(
+                                        ui,
+                                        "General Viewer Actions",
+                                        "Floating and fullscreen controls for image/video viewing.",
+                                    );
+                                    self.draw_shortcuts_help_action_rows(ui, general_rows);
+
+                                    ui.add_space(8.0);
+                                    ui.separator();
+
+                                    Self::draw_shortcuts_help_section_header(
+                                        ui,
+                                        "Manga Strip Actions",
+                                        "Bindings active in fullscreen strip reading mode.",
+                                    );
+                                    self.draw_shortcuts_help_action_rows(ui, manga_rows);
+
+                                    ui.add_space(8.0);
+                                    ui.separator();
+
+                                    Self::draw_shortcuts_help_section_header(
+                                        ui,
+                                        "Masonry Actions",
+                                        "Bindings active in masonry grid mode.",
+                                    );
+                                    self.draw_shortcuts_help_action_rows(ui, masonry_rows);
+
+                                    ui.add_space(8.0);
+                                    ui.separator();
+
+                                    Self::draw_shortcuts_help_section_header(
+                                        ui,
+                                        "Menu & Workflow Features",
+                                        "Commands available from context menus and title-bar controls.",
+                                    );
+                                    Self::draw_shortcuts_help_row(
+                                        ui,
+                                        "Right-click menu",
+                                        "Single-file actions",
+                                        "Mark/Unmark, Cut, Copy, Delete, Rename, and Open file location for the selected file.",
+                                    );
+                                    Self::draw_shortcuts_help_row(
+                                        ui,
+                                        "Right-click menu",
+                                        "Marked-file bulk actions",
+                                        "Cut/Copy/Delete/Rename marked files, plus Mark All and Unmark All.",
+                                    );
+                                    Self::draw_shortcuts_help_row(
+                                        ui,
+                                        "Open file location",
+                                        "Reveal file in OS explorer",
+                                        "Selects the file in Windows Explorer (or opens containing folder on other platforms).",
+                                    );
+                                    Self::draw_shortcuts_help_row(
+                                        ui,
+                                        "Three-stripes title-bar menu",
+                                        "Quick command center",
+                                        "Contains current-file actions, marked-file actions, this Help dialog, and Edit config.ini.",
+                                    );
+                                });
+                        });
+                    });
+            });
+
+        let modal_rect = modal_response.response.rect;
+        if self.shortcuts_help_modal_skip_outside_click_once {
+            self.shortcuts_help_modal_skip_outside_click_once = false;
+        } else {
+            let clicked_outside_modal = ctx.input(|input| {
+                let primary_clicked = input.pointer.button_clicked(egui::PointerButton::Primary);
+                let secondary_clicked = input.pointer.button_clicked(egui::PointerButton::Secondary);
+                let pointer_pos = input
+                    .pointer
+                    .interact_pos()
+                    .or_else(|| input.pointer.hover_pos());
+
+                (primary_clicked || secondary_clicked)
+                    && pointer_pos.is_some_and(|pos| !modal_rect.contains(pos))
+            });
+            if clicked_outside_modal {
+                close_modal = true;
+            }
+        }
+
+        if close_modal {
+            self.shortcuts_help_modal_open = false;
+            self.shortcuts_help_modal_skip_outside_click_once = false;
+        }
+    }
+
     fn apply_pending_window_title(&mut self, ctx: &egui::Context) {
         if let Some(title) = self.pending_window_title.take() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
@@ -6338,6 +7044,20 @@ impl ImageViewer {
             self.error_message = Some(format!(
                 "Failed to open config file ({}): {}",
                 config_path.display(),
+                e
+            ));
+        }
+    }
+
+    fn open_file_location_for_index(&mut self, target_index: usize) {
+        let Some(path) = self.image_list.get(target_index).cloned() else {
+            return;
+        };
+
+        if let Err(e) = reveal_path_in_file_explorer(path.as_path()) {
+            self.error_message = Some(format!(
+                "Failed to open file location ({}): {}",
+                path.display(),
                 e
             ));
         }
@@ -16892,6 +17612,24 @@ impl ImageViewer {
                                     }
 
                                     if self
+                                        .menu_action_row(
+                                            ui,
+                                            "Shortcuts and Help",
+                                            MenuActionIcon::Help,
+                                        )
+                                        .clicked()
+                                    {
+                                        self.shortcuts_help_modal_open = true;
+                                        self.shortcuts_help_modal_skip_outside_click_once = true;
+                                        self.file_action_menu = None;
+                                        self.show_controls = true;
+                                        self.controls_show_time = Instant::now();
+                                        close_popup = true;
+                                    }
+
+                                    ui.separator();
+
+                                    if self
                                         .menu_action_row(ui, "Edit config.ini", MenuActionIcon::Config)
                                         .clicked()
                                     {
@@ -19380,6 +20118,7 @@ impl eframe::App for ImageViewer {
             self.draw_delete_confirmation_modal(ctx);
             self.draw_rename_modal(ctx);
             self.draw_exit_confirmation_modal(ctx);
+            self.draw_shortcuts_help_modal(ctx);
         }
 
         let (hide_idle_cursor, cursor_idle_repaint_after) = if skip_drawing {
