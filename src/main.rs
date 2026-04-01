@@ -356,17 +356,55 @@ fn open_path_in_default_app(path: &std::path::Path) -> std::io::Result<()> {
 fn reveal_path_in_file_explorer(path: &Path) -> std::io::Result<()> {
     #[cfg(target_os = "windows")]
     {
-        let resolved_path = if path.is_absolute() {
+        let mut resolved_path = if path.is_absolute() {
             path.to_path_buf()
         } else {
             std::env::current_dir()?.join(path)
         };
 
-        let select_arg = format!("/select,\"{}\"", resolved_path.display());
-        std::process::Command::new("explorer")
-            .arg(select_arg)
+        if let Ok(canonical) = resolved_path.canonicalize() {
+            resolved_path = canonical;
+        }
+
+        if !resolved_path.exists() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("Path does not exist: {}", resolved_path.display()),
+            ));
+        }
+
+        if resolved_path.is_dir() {
+            return std::process::Command::new("explorer.exe")
+                .arg(&resolved_path)
+                .spawn()
+                .map(|_| ());
+        }
+
+        let parent = resolved_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| resolved_path.clone());
+
+        match std::process::Command::new("explorer.exe")
+            .arg("/select,")
+            .arg(&resolved_path)
             .spawn()
-            .map(|_| ())
+        {
+            Ok(_) => Ok(()),
+            Err(select_err) => std::process::Command::new("explorer.exe")
+                .arg(&parent)
+                .spawn()
+                .map(|_| ())
+                .map_err(|parent_err| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!(
+                            "Failed to select file in Explorer: {}; fallback opening parent failed: {}",
+                            select_err, parent_err
+                        ),
+                    )
+                }),
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -8326,9 +8364,7 @@ impl ImageViewer {
                     let dims = player.dimensions();
                     if dims.0 > 0 && dims.1 > 0 {
                         if let Some(ref mut loader) = self.manga_loader {
-                            let previous_dims = loader.get_dimensions(index);
-                            loader.update_video_dimensions(index, dims.0, dims.1);
-                            if previous_dims != Some((dims.0, dims.1)) {
+                            if loader.update_video_dimensions(index, dims.0, dims.1) {
                                 pending_dimension_updates.push(index);
                             }
                         }
@@ -11278,11 +11314,8 @@ impl ImageViewer {
             return 0.0;
         }
 
-        let mut cumulative_y: f32 = 0.0;
-        for idx in 0..target_index.min(self.image_list.len()) {
-            cumulative_y += self.manga_get_image_display_height(idx);
-        }
-        cumulative_y
+        // Keep paging aligned with the currently rendered strip geometry.
+        self.manga_page_start_y(target_index.min(self.image_list.len().saturating_sub(1)))
     }
 
     fn masonry_scroll_offset_for_index_centered(&mut self, target_index: usize) -> Option<f32> {
@@ -11977,10 +12010,11 @@ impl ImageViewer {
                     // Update dimensions in loader if changed
                     if frame.width > 0 && frame.height > 0 {
                         if let Some(ref mut loader) = self.manga_loader {
-                            let previous_dims = loader.get_dimensions(focused_idx);
-                            loader.update_video_dimensions(focused_idx, frame.width, frame.height);
-                            video_dimensions_changed =
-                                previous_dims != Some((frame.width, frame.height));
+                            video_dimensions_changed = loader.update_video_dimensions(
+                                focused_idx,
+                                frame.width,
+                                frame.height,
+                            );
                         }
                     }
 
@@ -14886,6 +14920,8 @@ impl ImageViewer {
             return false;
         }
 
+        let freeze_for_help = self.shortcuts_help_modal_open;
+
         self.manga_prune_ttv_pending();
 
         if self.masonry_layout_invalidation_deferred
@@ -14906,8 +14942,8 @@ impl ImageViewer {
         let mut masonry_scrollbar_moved_this_frame = false;
         let mut masonry_autoscroll_moved_this_frame = false;
         let mut masonry_scroll_animation_moved_this_frame = false;
-        let masonry_preload_input_blocked =
-            self.is_masonry_mode() && self.masonry_metadata_preload_active;
+        let masonry_preload_input_blocked = self.shortcuts_help_modal_open
+            || (self.is_masonry_mode() && self.masonry_metadata_preload_active);
         let mode_scroll_up_action = if self.is_masonry_mode() {
             Action::MasonryScrollUp
         } else {
@@ -15643,7 +15679,7 @@ impl ImageViewer {
             None
         };
 
-        if self.manga_tick_scroll_animation(dt) {
+        if !freeze_for_help && self.manga_tick_scroll_animation(dt) {
             if self.is_masonry_mode() && self.manga_autoscroll_active {
                 if let Some(previous_visible_index) = masonry_previous_visible_index {
                     self.masonry_sync_loader_visible_index(previous_visible_index);
@@ -15688,19 +15724,21 @@ impl ImageViewer {
         };
         let dims_updated = self.manga_process_pending_loads(ctx);
         if dims_updated {
-            if self.is_masonry_mode() {
-                // Masonry has non-linear row ordering; index/fraction anchors can oscillate when
-                // late dimension updates reshuffle column heights. Preserve absolute scroll instead.
-                let max_scroll = (self.manga_total_height() - self.screen_size.y).max(0.0);
-                let new_offset = masonry_prev_scroll.clamp(0.0, max_scroll);
-                self.manga_scroll_offset = new_offset;
-                self.manga_scroll_target =
-                    (new_offset + masonry_prev_target_delta).clamp(0.0, max_scroll);
-                self.manga_scroll_velocity = masonry_prev_velocity;
-                self.manga_update_current_index();
-            } else if let Some(anchor) = load_anchor {
-                self.manga_apply_scroll_anchor(anchor);
-                self.manga_update_current_index();
+            if !freeze_for_help {
+                if self.is_masonry_mode() {
+                    // Masonry has non-linear row ordering; index/fraction anchors can oscillate when
+                    // late dimension updates reshuffle column heights. Preserve absolute scroll instead.
+                    let max_scroll = (self.manga_total_height() - self.screen_size.y).max(0.0);
+                    let new_offset = masonry_prev_scroll.clamp(0.0, max_scroll);
+                    self.manga_scroll_offset = new_offset;
+                    self.manga_scroll_target =
+                        (new_offset + masonry_prev_target_delta).clamp(0.0, max_scroll);
+                    self.manga_scroll_velocity = masonry_prev_velocity;
+                    self.manga_update_current_index();
+                } else if let Some(anchor) = load_anchor {
+                    self.manga_apply_scroll_anchor(anchor);
+                    self.manga_update_current_index();
+                }
             }
         }
 
@@ -19702,6 +19740,19 @@ impl eframe::App for ImageViewer {
         // Keep bottom overlays (video controls + manga toggle + zoom HUD) in sync.
         // Run this before input so the input handler can properly suppress actions over the video bar.
         let _ = self.update_bottom_overlays_visibility(ctx);
+
+        if self.shortcuts_help_modal_open {
+            self.stop_manga_wheel_scroll();
+            self.stop_manga_autoscroll();
+            self.manga_scroll_target = self.manga_scroll_offset;
+            self.manga_scroll_velocity = 0.0;
+            self.manga_scrollbar_dragging = false;
+            self.masonry_scrollbar_last_motion_at = None;
+            self.masonry_autoscroll_last_motion_at = None;
+            self.mark_selection_box = None;
+            self.is_panning = false;
+            self.last_mouse_pos = None;
+        }
 
         // Handle input (disabled while the help modal is open).
         if !self.shortcuts_help_modal_open {

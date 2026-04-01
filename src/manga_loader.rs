@@ -570,9 +570,19 @@ impl MangaLoader {
             }
 
             for (idx, w, h, mt) in res.items {
-                self.dimension_cache.insert(idx, (w, h, mt));
+                let changed = self
+                    .dimension_cache
+                    .get(&idx)
+                    .map_or(true, |(old_w, old_h, old_mt)| {
+                        *old_w != w || *old_h != h || *old_mt != mt
+                    });
+
+                if changed {
+                    self.dimension_cache.insert(idx, (w, h, mt));
+                    updated.push(idx);
+                }
+
                 self.dim_pending.remove(&idx);
-                updated.push(idx);
             }
         }
 
@@ -1890,13 +1900,37 @@ impl MangaLoader {
     }
 
     /// Update dimensions for a video (called when actual dimensions are known from playback).
-    pub fn update_video_dimensions(&mut self, index: usize, width: u32, height: u32) {
+    pub fn update_video_dimensions(&mut self, index: usize, width: u32, height: u32) -> bool {
+        if width == 0 || height == 0 {
+            return false;
+        }
+
         if let Some(entry) = self.dimension_cache.get_mut(&index) {
+            if entry.0 == width && entry.1 == height && entry.2 == MangaMediaType::Video {
+                return false;
+            }
+
+            // Ignore tiny frame-size jitter from some decoders; it should not reshuffle masonry.
+            if entry.2 == MangaMediaType::Video {
+                let width_delta = entry.0.abs_diff(width);
+                let height_delta = entry.1.abs_diff(height);
+                if width_delta <= 2 && height_delta <= 2 {
+                    let old_aspect = entry.0 as f32 / entry.1.max(1) as f32;
+                    let new_aspect = width as f32 / height as f32;
+                    if (old_aspect - new_aspect).abs() <= 0.003 {
+                        return false;
+                    }
+                }
+            }
+
             entry.0 = width;
             entry.1 = height;
+            entry.2 = MangaMediaType::Video;
+            true
         } else {
             self.dimension_cache
                 .insert(index, (width, height, MangaMediaType::Video));
+            true
         }
     }
 }
