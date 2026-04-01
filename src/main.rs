@@ -353,6 +353,21 @@ fn open_path_in_default_app(path: &std::path::Path) -> std::io::Result<()> {
     }
 }
 
+#[cfg(target_os = "windows")]
+fn explorer_friendly_windows_path(path: &Path) -> PathBuf {
+    // Explorer does not reliably handle verbatim paths (`\\?\...`); strip the
+    // prefix so `/select,` targets the expected folder/file instead of defaulting.
+    let raw = path.as_os_str().to_string_lossy();
+
+    if let Some(stripped_unc) = raw.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{}", stripped_unc))
+    } else if let Some(stripped) = raw.strip_prefix(r"\\?\") {
+        PathBuf::from(stripped)
+    } else {
+        path.to_path_buf()
+    }
+}
+
 fn reveal_path_in_file_explorer(path: &Path) -> std::io::Result<()> {
     #[cfg(target_os = "windows")]
     {
@@ -365,6 +380,8 @@ fn reveal_path_in_file_explorer(path: &Path) -> std::io::Result<()> {
         if let Ok(canonical) = resolved_path.canonicalize() {
             resolved_path = canonical;
         }
+
+        resolved_path = explorer_friendly_windows_path(&resolved_path);
 
         if !resolved_path.exists() {
             return Err(std::io::Error::new(
