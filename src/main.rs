@@ -385,9 +385,17 @@ fn reveal_path_in_file_explorer(path: &Path) -> std::io::Result<()> {
             .map(Path::to_path_buf)
             .unwrap_or_else(|| resolved_path.clone());
 
+        // Open the parent folder first so Explorer lands in the correct directory
+        // even if `/select,` is ignored by the shell for edge-case paths.
+        let _ = std::process::Command::new("explorer.exe")
+            .arg(&parent)
+            .spawn();
+
+        let mut select_arg = std::ffi::OsString::from("/select,");
+        select_arg.push(resolved_path.as_os_str());
+
         match std::process::Command::new("explorer.exe")
-            .arg("/select,")
-            .arg(&resolved_path)
+            .arg(select_arg)
             .spawn()
         {
             Ok(_) => Ok(()),
@@ -12732,16 +12740,34 @@ impl ImageViewer {
         count.max(1) // At least 1 page is always "visible"
     }
 
-    /// Get the display height of an image at a given index (scaled to fit screen height)
-    fn manga_get_image_display_height(&self, index: usize) -> f32 {
-        // IMPORTANT: for layout stability, prefer header dimensions from the manga loader.
-        // The texture we upload may be downscaled to fit GPU limits; using texture dimensions
-        // for layout would cause pages to "shrink" as they load, producing visible jitter.
-        let img_h = self
+    fn manga_get_image_source_dimensions(&self, index: usize) -> Option<(f32, f32)> {
+        let loader_dims = self
             .manga_loader
             .as_ref()
             .and_then(|loader| loader.get_dimensions(index))
-            .map(|(_w, h)| h as f32);
+            .and_then(|(w, h)| if w > 0 && h > 0 { Some((w, h)) } else { None })
+            .map(|(w, h)| (w as f32, h as f32));
+
+        if loader_dims.is_some() {
+            return loader_dims;
+        }
+
+        if let Some((_, w, h)) = self.manga_video_textures.get(&index) {
+            if *w > 0 && *h > 0 {
+                return Some((*w as f32, *h as f32));
+            }
+        }
+
+        self.manga_texture_cache
+            .peek_texture_dimensions(index)
+            .and_then(|(w, h)| if w > 0 && h > 0 { Some((w as f32, h as f32)) } else { None })
+    }
+
+    /// Get the display height of an image at a given index (scaled to fit screen height)
+    fn manga_get_image_display_height(&self, index: usize) -> f32 {
+        // Prefer metadata dimensions for layout stability; when they are temporarily
+        // unavailable, fall back to cached texture dimensions so visible pages never stretch.
+        let img_h = self.manga_get_image_source_dimensions(index).map(|(_, h)| h);
 
         if let Some(img_h) = img_h {
             if img_h > 0.0 {
@@ -12761,15 +12787,9 @@ impl ImageViewer {
 
     /// Get the display width of an image at a given index (scaled to fit screen height)
     fn manga_get_image_display_width(&self, index: usize) -> f32 {
-        // Prefer original/header dimensions for stable layout
-        let dims = self
-            .manga_loader
-            .as_ref()
-            .and_then(|loader| loader.get_dimensions(index));
+        let dims = self.manga_get_image_source_dimensions(index);
 
-        if let Some((w, h)) = dims {
-            let img_w = w as f32;
-            let img_h = h as f32;
+        if let Some((img_w, img_h)) = dims {
             if img_h > 0.0 {
                 let base_scale = if img_h > self.screen_size.y {
                     self.screen_size.y / img_h
@@ -12903,7 +12923,7 @@ impl ImageViewer {
             self.manga_compute_upload_batch_limit(pending_loads, decoded_backlog_total);
         self.manga_upload_batch_limit = upload_batch_limit;
 
-        let (new_decoded_images, dim_updates) = {
+        let (new_decoded_images, mut layout_dim_updates) = {
             let Some(loader) = self.manga_loader.as_mut() else {
                 return false;
             };
@@ -12911,8 +12931,8 @@ impl ImageViewer {
             // Poll for decoded images from the background threads
             let mailbox_headroom = Self::MANGA_DECODED_MAILBOX_MAX_ITEMS
                 .saturating_sub(self.manga_decoded_mailbox.len());
-            let decoded_images = if mailbox_headroom == 0 {
-                Vec::new()
+            let (decoded_images, decoded_dim_updates) = if mailbox_headroom == 0 {
+                (Vec::new(), Vec::new())
             } else {
                 loader.poll_decoded_images_with_limit(
                     mailbox_headroom.min(upload_batch_limit.saturating_mul(4).max(1)),
@@ -12927,25 +12947,19 @@ impl ImageViewer {
             } else {
                 4
             };
-            let dim_updates = loader.poll_dimension_results(dim_poll_limit);
+            let mut layout_dim_updates = loader.poll_dimension_results(dim_poll_limit);
+            layout_dim_updates.extend(decoded_dim_updates);
 
-            (decoded_images, dim_updates)
+            (decoded_images, layout_dim_updates)
         };
-
-        let video_dim_indices: Vec<usize> = new_decoded_images
-            .iter()
-            .filter(|decoded| decoded.media_type == MangaMediaType::Video)
-            .map(|decoded| decoded.index)
-            .collect();
-        let has_decoded_video_dims = !video_dim_indices.is_empty();
+        layout_dim_updates.sort_unstable();
+        layout_dim_updates.dedup();
+        let layout_dims_changed = !layout_dim_updates.is_empty();
 
         // Dimension updates can change page heights; invalidate cached layout/prefix sums.
-        if !dim_updates.is_empty() || has_decoded_video_dims {
+        if layout_dims_changed {
             if self.is_masonry_mode() {
-                let mut layout_update_indices = dim_updates.clone();
-                layout_update_indices.extend(video_dim_indices.iter().copied());
-
-                self.masonry_queue_dimension_updates(layout_update_indices);
+                self.masonry_queue_dimension_updates(layout_dim_updates.iter().copied());
                 if !defer_masonry_layout_work {
                     let force_flush = !self.masonry_metadata_preload_active;
                     self.masonry_flush_pending_dimension_updates(force_flush);
@@ -12962,7 +12976,7 @@ impl ImageViewer {
             self.manga_decoded_mailbox.extend(new_decoded_images);
         }
 
-        let dims_updated = mailbox_received || !dim_updates.is_empty();
+        let dims_updated = layout_dims_changed;
 
         let visible_indices = self.manga_collect_visible_indices();
         let visible_set: HashSet<usize> = visible_indices.iter().copied().collect();

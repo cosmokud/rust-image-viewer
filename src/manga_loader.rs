@@ -1581,22 +1581,61 @@ impl MangaLoader {
     /// Poll for decoded images ready for GPU upload with a caller-provided limit.
     ///
     /// `max_items` is clamped to `1..=MAX_PENDING_UPLOADS`.
-    pub fn poll_decoded_images_with_limit(&mut self, max_items: usize) -> Vec<DecodedImage> {
+    /// Returns `(decoded_images, dimension_updates)` where `dimension_updates`
+    /// includes indices whose cached source dimensions changed.
+    pub fn poll_decoded_images_with_limit(
+        &mut self,
+        max_items: usize,
+    ) -> (Vec<DecodedImage>, Vec<usize>) {
         let max_items = max_items.clamp(1, MAX_PENDING_UPLOADS);
         let mut results = Vec::with_capacity(max_items);
+        let mut dimension_updates = Vec::with_capacity(max_items);
 
         for _ in 0..max_items {
             match self.result_rx.try_recv() {
                 Ok(decoded) => {
                     // Cache dimensions and media type for stable layout
-                    self.dimension_cache.insert(
-                        decoded.index,
-                        (
-                            decoded.original_width,
-                            decoded.original_height,
-                            decoded.media_type,
-                        ),
+                    let new_dims = (
+                        decoded.original_width,
+                        decoded.original_height,
+                        decoded.media_type,
                     );
+                    let changed = self
+                        .dimension_cache
+                        .get(&decoded.index)
+                        .map_or(true, |(old_w, old_h, old_mt)| {
+                            if *old_w == new_dims.0
+                                && *old_h == new_dims.1
+                                && *old_mt == new_dims.2
+                            {
+                                return false;
+                            }
+
+                            // Ignore tiny video size jitter to avoid perpetual masonry relayouts.
+                            if *old_mt == MangaMediaType::Video
+                                && new_dims.2 == MangaMediaType::Video
+                            {
+                                let width_delta = old_w.abs_diff(new_dims.0);
+                                let height_delta = old_h.abs_diff(new_dims.1);
+                                if width_delta <= 2 && height_delta <= 2 {
+                                    let old_aspect = *old_w as f32 / (*old_h).max(1) as f32;
+                                    let new_aspect = new_dims.0 as f32 / new_dims.1.max(1) as f32;
+                                    if (old_aspect - new_aspect).abs() <= 0.003 {
+                                        return false;
+                                    }
+                                }
+                            }
+
+                            true
+                        });
+
+                    if changed {
+                        self.dimension_cache.insert(decoded.index, new_dims);
+                        if !dimension_updates.contains(&decoded.index) {
+                            dimension_updates.push(decoded.index);
+                        }
+                    }
+
                     results.push(decoded);
                     self.stats.images_loaded += 1;
                 }
@@ -1604,7 +1643,7 @@ impl MangaLoader {
             }
         }
 
-        results
+        (results, dimension_updates)
     }
 
     /// Start async dimension caching for all images in the list.
@@ -2118,6 +2157,18 @@ impl MangaTextureCache {
         self.unpinned_entries
             .get(&index)
             .map(|entry| (entry.texture.id(), entry.width, entry.height))
+    }
+
+    /// Peek texture dimensions without mutating LRU recency state.
+    pub fn peek_texture_dimensions(&self, index: usize) -> Option<(u32, u32)> {
+        self.pinned_entries
+            .get(&index)
+            .map(|entry| (entry.width, entry.height))
+            .or_else(|| {
+                self.unpinned_entries
+                    .peek(&index)
+                    .map(|entry| (entry.width, entry.height))
+            })
     }
 
     /// Get a cloned texture handle, dimensions, and media type from cache.
