@@ -362,13 +362,15 @@ fn reveal_path_in_file_explorer(path: &Path) -> std::io::Result<()> {
             std::env::current_dir()?.join(path)
         };
 
-        let target_dir = if resolved_path.is_dir() {
-            resolved_path
+        let is_directory = resolved_path.is_dir();
+
+        let target_dir = if is_directory {
+            resolved_path.clone()
         } else {
             resolved_path
                 .parent()
                 .map(Path::to_path_buf)
-                .unwrap_or(resolved_path)
+                .unwrap_or_else(|| resolved_path.clone())
         };
 
         if !target_dir.exists() {
@@ -378,10 +380,39 @@ fn reveal_path_in_file_explorer(path: &Path) -> std::io::Result<()> {
             ));
         }
 
-        std::process::Command::new("explorer.exe")
-            .arg(target_dir)
+        if is_directory {
+            return std::process::Command::new("explorer.exe")
+                .arg(&target_dir)
+                .spawn()
+                .map(|_| ());
+        }
+
+        // Open folder first, then ask Explorer to select the file.
+        let _ = std::process::Command::new("explorer.exe")
+            .arg(&target_dir)
+            .spawn();
+
+        let select_arg = format!("/select,\"{}\"", resolved_path.display());
+
+        match std::process::Command::new("explorer.exe")
+            .arg(&select_arg)
             .spawn()
-            .map(|_| ())
+        {
+            Ok(_) => Ok(()),
+            Err(select_err) => std::process::Command::new("explorer.exe")
+                .arg(&target_dir)
+                .spawn()
+                .map(|_| ())
+                .map_err(|folder_err| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!(
+                            "Failed to select file in Explorer: {}; fallback opening folder failed: {}",
+                            select_err, folder_err
+                        ),
+                    )
+                }),
+        }
     }
 
     #[cfg(target_os = "macos")]
