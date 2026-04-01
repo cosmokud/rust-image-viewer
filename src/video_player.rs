@@ -947,7 +947,22 @@ Ensure your GStreamer installation includes the playback elements (usually from 
 
 impl Drop for VideoPlayer {
     fn drop(&mut self) {
-        let _ = self.pipeline.set_state(gst::State::Null);
+        let pipeline = self.pipeline.clone();
+        let shutdown = move || {
+            // Some decoders/drivers can block during teardown. Keep this work off the UI thread.
+            let _ = pipeline.set_state(gst::State::Ready);
+            let _ = pipeline.set_state(gst::State::Null);
+        };
+
+        if std::thread::Builder::new()
+            .name("riv-gst-shutdown".to_string())
+            .spawn(shutdown)
+            .is_err()
+        {
+            // Extremely rare fallback: if thread creation fails, preserve previous behavior.
+            let _ = self.pipeline.set_state(gst::State::Ready);
+            let _ = self.pipeline.set_state(gst::State::Null);
+        }
     }
 }
 

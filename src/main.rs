@@ -1340,6 +1340,9 @@ struct ImageViewer {
     /// Dimensions corresponding to the current `texture`.
     /// Used to keep showing the last image frame while replacement media is loading.
     image_texture_dims: Option<(u32, u32)>,
+    /// Whether the current static image texture was uploaded with mipmaps enabled.
+    /// Used to trigger a one-time quality upgrade when users zoom out after initial load.
+    image_texture_mipmap_enabled: bool,
     /// Current texture frame index (for animation detection)
     texture_frame: usize,
     /// List of images in the current directory
@@ -1864,6 +1867,7 @@ impl Default for ImageViewer {
             image: None,
             texture: None,
             image_texture_dims: None,
+            image_texture_mipmap_enabled: false,
             texture_frame: 0,
             image_list: Vec::new(),
             image_list_signature: 0,
@@ -15823,9 +15827,30 @@ impl ImageViewer {
                 false
             };
 
+            // Static textures may initially upload without mipmaps (e.g. near 1:1 view).
+            // If the user later zooms out far enough, force a one-time texture reupload with
+            // mipmaps to suppress halftone/dot-pattern aliasing noise.
+            let static_mipmap_upgrade_needed = if !img.is_animated()
+                && self.texture.is_some()
+                && self.texture_frame == img.current_frame_index()
+                && !self.image_texture_mipmap_enabled
+            {
+                self.image_texture_dims
+                    .map(|(texture_w, texture_h)| {
+                        let min_side = texture_w.min(texture_h);
+                        self.config.manga_mipmap_static
+                            && min_side >= self.config.manga_mipmap_min_side.max(1)
+                            && (min_side as f32) >= solo_current_display_min_side * 1.15
+                    })
+                    .unwrap_or(false)
+            } else {
+                false
+            };
+
             if self.texture.is_none()
                 || frame_changed
                 || self.texture_frame != img.current_frame_index()
+                || static_mipmap_upgrade_needed
             {
                 let frame = img.current_frame_data();
                 // This should already be constrained in the loader, but keep this guard to
@@ -15850,12 +15875,14 @@ impl ImageViewer {
 
                 // Use configured texture filter based on content type
                 let texture_options = if img.is_animated() {
+                    self.image_texture_mipmap_enabled = false;
                     self.config.texture_filter_animated.to_egui_options()
                 } else {
                     let min_side = w.min(h);
                     let enable_mipmap = self.config.manga_mipmap_static
                         && min_side >= self.config.manga_mipmap_min_side.max(1)
                         && (min_side as f32) >= solo_current_display_min_side * 1.15;
+                    self.image_texture_mipmap_enabled = enable_mipmap;
                     self.config
                         .texture_filter_static
                         .to_egui_options_with_mipmap(enable_mipmap)
