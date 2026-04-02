@@ -412,6 +412,23 @@ fn sh_open_folder_and_select_item(path: &Path) -> std::io::Result<()> {
     })
 }
 
+#[cfg(target_os = "windows")]
+const EXPLORER_SELECT_RETRY_ATTEMPTS: usize = 5;
+#[cfg(target_os = "windows")]
+const EXPLORER_SELECT_RETRY_DELAY: Duration = Duration::from_millis(300);
+
+#[cfg(target_os = "windows")]
+fn spawn_explorer_select_retries(path: PathBuf) {
+    // Explorer can open a new folder window asynchronously and drop the first
+    // selection signal. Re-issuing selection a few times avoids that race.
+    std::thread::spawn(move || {
+        for _ in 1..EXPLORER_SELECT_RETRY_ATTEMPTS {
+            std::thread::sleep(EXPLORER_SELECT_RETRY_DELAY);
+            let _ = sh_open_folder_and_select_item(path.as_path());
+        }
+    });
+}
+
 fn reveal_path_in_file_explorer(path: &Path) -> std::io::Result<()> {
     #[cfg(target_os = "windows")]
     {
@@ -446,12 +463,18 @@ fn reveal_path_in_file_explorer(path: &Path) -> std::io::Result<()> {
                 .map(|_| ());
         }
 
+        let retry_path = resolved_path.clone();
         match sh_open_folder_and_select_item(&resolved_path) {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                spawn_explorer_select_retries(retry_path);
+                Ok(())
+            }
             Err(select_err) => std::process::Command::new("explorer.exe")
                 .arg(&target_dir)
                 .spawn()
-                .map(|_| ())
+                .map(|_| {
+                    spawn_explorer_select_retries(resolved_path.clone());
+                })
                 .map_err(|folder_err| {
                     std::io::Error::new(
                         std::io::ErrorKind::Other,
