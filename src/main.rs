@@ -10953,7 +10953,8 @@ impl ImageViewer {
         self.manga_scroll_velocity = 0.0;
         self.stop_manga_wheel_scroll();
 
-        self.maybe_begin_masonry_metadata_preload(false);
+        let allow_startup_preload = layout_mode == MangaLayoutMode::Masonry;
+        self.maybe_begin_masonry_metadata_preload(allow_startup_preload);
 
         self.manga_update_preload_queue();
     }
