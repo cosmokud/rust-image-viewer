@@ -16,9 +16,9 @@ use zune_core::colorspace::ColorSpace;
 use zune_core::options::DecoderOptions;
 use zune_image::image::Image as ZuneImage;
 
-// Reduced from 4 GiB to 512 MiB for more reasonable memory limits
-// This prevents loading extremely large images that would consume too much RAM
-const DEFAULT_MAX_DECODE_ALLOC_BYTES: u64 = 512 * 1024 * 1024; // 512 MiB
+// Keep a generous decode budget so very large static images can load at full quality.
+// Header-based probing and dimension checks still guard against invalid/corrupt inputs.
+const DEFAULT_MAX_DECODE_ALLOC_BYTES: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
 const ZUNE_STATIC_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "bmp", "psd"];
 const WEBP_STREAM_CHANNEL_CAPACITY: usize = 96;
 const GIF_FRAME_WINDOW_SIZE: usize = 72;

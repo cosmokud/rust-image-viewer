@@ -1191,7 +1191,15 @@ fn load_solo_probe_image(
     let is_animated_webp = LoadedImage::is_animated_webp(path);
     let frame = image.current_frame_data().clone();
 
-    if !image.is_animated() && !is_animated_webp {
+    if !image.is_animated()
+        && !is_animated_webp
+        && should_store_static_thumbnail(
+            frame.width,
+            frame.height,
+            frame.pixels.len(),
+            max_texture_side,
+        )
+    {
         store_cached_static_thumbnail(
             path,
             max_texture_side,
@@ -1437,6 +1445,7 @@ fn process_manga_focused_video_load_request(
 
 const DECODED_IMAGE_CACHE_MAX_BYTES: u64 = 192 * 1024 * 1024;
 const DECODED_IMAGE_CACHE_SKIP_ENTRY_BYTES: usize = 24 * 1024 * 1024;
+const STATIC_THUMBNAIL_CACHE_SKIP_ENTRY_BYTES: usize = 96 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct FileStamp {
@@ -1492,6 +1501,17 @@ fn decoded_image_cache_key(path: &Path, max_texture_side: u32) -> String {
     {
         format!("{}#ts{}", key, max_texture_side.max(1))
     }
+}
+
+fn should_store_static_thumbnail(
+    width: u32,
+    height: u32,
+    pixel_len: usize,
+    max_texture_side: u32,
+) -> bool {
+    width <= max_texture_side
+        && height <= max_texture_side
+        && pixel_len <= STATIC_THUMBNAIL_CACHE_SKIP_ENTRY_BYTES
 }
 
 /// Application state
@@ -2098,7 +2118,7 @@ impl Default for ImageViewer {
             toggle_fullscreen_from_titlebar: false,
             request_minimize: false,
             request_native_maximize: None,
-            max_texture_side: 4096,
+            max_texture_side: 8192,
             startup_window_mode_applied: false,
             pending_window_title: None,
             resize_direction: ResizeDirection::None,
@@ -3766,7 +3786,15 @@ impl ImageViewer {
 
         let frame = image.current_frame_data();
 
-        if !image.is_animated() && !is_animated_webp {
+        if !image.is_animated()
+            && !is_animated_webp
+            && should_store_static_thumbnail(
+                frame.width,
+                frame.height,
+                frame.pixels.len(),
+                max_texture_side,
+            )
+        {
             store_cached_static_thumbnail(
                 path,
                 max_texture_side,
@@ -8170,7 +8198,7 @@ impl ImageViewer {
 
         // Determine the maximum texture size supported by the active backend.
         // This viewer uses eframe's OpenGL (glow) integration; oversized textures can crash.
-        viewer.max_texture_side = cc
+        let queried_max_texture_side = cc
             .gl
             .as_ref()
             .and_then(|gl| unsafe {
@@ -8178,8 +8206,10 @@ impl ImageViewer {
                     .try_into()
                     .ok()
             })
-            .unwrap_or(4096)
-            .max(512);
+            .filter(|side: &u32| *side >= 512);
+
+        // Fall back to a modern-safe default when the backend cannot report limits.
+        viewer.max_texture_side = queried_max_texture_side.unwrap_or(8192);
 
         // Configure visuals (background driven by config)
         let mut visuals = egui::Visuals::dark();
@@ -8845,7 +8875,9 @@ impl ImageViewer {
                 // in the background so the animation begins playing progressively.
                 let downscale_filter = self.config.downscale_filter.to_image_filter();
                 let gif_filter = self.config.gif_resize_filter.to_image_filter();
-                let max_tex = self.solo_target_texture_side_for_path(path, MediaType::Image, true);
+                // Solo mode should decode up to the GPU limit so deep zoom can recover detail
+                // instead of being locked to the initial viewport-sized LOD.
+                let max_tex = self.max_texture_side.max(1);
 
                 if self.try_load_image_from_decoded_cache(path, max_tex, gif_filter) {
                     self.schedule_solo_probe_window(path, media_type);
