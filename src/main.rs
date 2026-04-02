@@ -3888,10 +3888,10 @@ impl ImageViewer {
             };
 
             saved_zoom
-                .unwrap_or_else(|| (viewport.y / img_h).clamp(0.1, self.max_zoom_factor()))
+                .unwrap_or_else(|| self.fit_zoom_for_target_height(viewport.y, img_h))
         } else if media_type == MediaType::Video {
             if img_h > viewport.y {
-                (viewport.y / img_h).clamp(0.1, self.max_zoom_factor())
+                self.fit_zoom_for_target_height(viewport.y, img_h)
             } else {
                 1.0
             }
@@ -5029,6 +5029,18 @@ impl ImageViewer {
 
     fn clamp_zoom(&self, zoom: f32) -> f32 {
         zoom.clamp(0.1, self.max_zoom_factor())
+    }
+
+    fn fit_zoom_for_target_height(&self, target_height: f32, media_height: f32) -> f32 {
+        if target_height <= 0.0 || media_height <= 0.0 {
+            return 1.0;
+        }
+
+        // Layout fit must support very tall media where the correct fit can be < 0.1x.
+        // Keep the interactive zoom floor at 0.1x, but allow fit calculations to go lower.
+        (target_height / media_height)
+            .max(0.0001)
+            .min(self.max_zoom_factor())
     }
 
     fn startup_ready_to_show(&self) -> bool {
@@ -7324,7 +7336,7 @@ impl ImageViewer {
         // - Prefer 100% image size
         // - If the image is taller than the screen, fit vertically to consume the full screen height
         let z = if img_h > monitor.y {
-            (monitor.y / img_h).clamp(0.1, self.max_zoom_factor())
+            self.fit_zoom_for_target_height(monitor.y, img_h)
         } else {
             1.0
         };
@@ -9476,7 +9488,7 @@ impl ImageViewer {
             let is_video = matches!(self.current_media_type, Some(MediaType::Video));
             let fit_zoom = if is_video {
                 if img_h > monitor.y {
-                    (monitor.y / img_h).clamp(0.1, self.max_zoom_factor())
+                    self.fit_zoom_for_target_height(monitor.y, img_h)
                 } else {
                     1.0
                 }
@@ -9529,7 +9541,7 @@ impl ImageViewer {
         }
 
         let available = ctx.screen_rect().size();
-        let fit_zoom = (available.y.max(1.0) / img_h).clamp(0.1, self.max_zoom_factor());
+        let fit_zoom = self.fit_zoom_for_target_height(available.y.max(1.0), img_h);
 
         self.zoom = fit_zoom;
         self.zoom_target = fit_zoom;
@@ -9567,7 +9579,7 @@ impl ImageViewer {
                 } else {
                     self.monitor_size_points(ctx).y.max(viewport_height)
                 };
-                let z = (target_h / img_h as f32).clamp(0.1, self.max_zoom_factor());
+                let z = self.fit_zoom_for_target_height(target_h, img_h as f32);
                 self.zoom = z;
                 self.zoom_target = z;
                 if force_fit {
@@ -19542,8 +19554,8 @@ impl ImageViewer {
                     // Fit media vertically to screen height
                     if img_h > 0.0 {
                         let screen_h = screen_rect.height();
-                        let fit_zoom = screen_h / img_h;
-                        self.zoom = self.clamp_zoom(fit_zoom);
+                        let fit_zoom = self.fit_zoom_for_target_height(screen_h, img_h);
+                        self.zoom = fit_zoom;
                         self.zoom_target = self.zoom;
                     }
                     self.clear_current_fullscreen_view_memory();
@@ -19555,7 +19567,7 @@ impl ImageViewer {
                     let is_video = matches!(self.current_media_type, Some(MediaType::Video));
                     let fit_zoom = if is_video {
                         if img_h > monitor.y {
-                            (monitor.y / img_h).clamp(0.1, self.max_zoom_factor())
+                            self.fit_zoom_for_target_height(monitor.y, img_h)
                         } else {
                             1.0
                         }
@@ -19937,7 +19949,7 @@ impl eframe::App for ImageViewer {
                             .monitor_size_points(ctx)
                             .y
                             .max(ctx.screen_rect().height());
-                        let z = (target_h / img_h as f32).clamp(0.1, self.max_zoom_factor());
+                        let z = self.fit_zoom_for_target_height(target_h, img_h as f32);
                         self.zoom = z;
                         self.zoom_target = z;
                     }
@@ -20205,12 +20217,12 @@ impl eframe::App for ImageViewer {
                                     matches!(self.current_media_type, Some(MediaType::Video));
                                 let z = if is_video {
                                     if img_h > monitor.y {
-                                        (monitor.y / img_h).clamp(0.1, self.max_zoom_factor())
+                                        self.fit_zoom_for_target_height(monitor.y, img_h)
                                     } else {
                                         1.0
                                     }
                                 } else if img_h > monitor.y {
-                                    (monitor.y / img_h).clamp(0.1, self.max_zoom_factor())
+                                    self.fit_zoom_for_target_height(monitor.y, img_h)
                                 } else {
                                     1.0
                                 };
