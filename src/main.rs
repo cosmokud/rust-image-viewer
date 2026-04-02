@@ -1723,6 +1723,11 @@ struct ImageViewer {
     /// Index allowed to reuse the pre-strip solo texture/video as a temporary fallback.
     /// This prevents stale fullscreen frames from showing on unrelated items while scrolling.
     strip_entry_placeholder_index: Option<usize>,
+    /// Most recent reason why video playback is unavailable for the current solo video.
+    /// When set, we keep preview/zoom active but block play attempts.
+    video_playback_unavailable_reason: Option<String>,
+    /// Expiration time for the transient "playback unavailable" popup overlay.
+    video_playback_popup_until: Option<Instant>,
     /// Whether to show video controls bar
     show_video_controls: bool,
     /// Time when video controls were last shown
@@ -2150,6 +2155,8 @@ impl Default for ImageViewer {
             retained_media_placeholder_visible: false,
             defer_media_view_reset: false,
             strip_entry_placeholder_index: None,
+            video_playback_unavailable_reason: None,
+            video_playback_popup_until: None,
             show_video_controls: false,
             video_controls_show_time: Instant::now(),
             mouse_over_video_controls: false,
@@ -4792,6 +4799,185 @@ impl ImageViewer {
         self.manga_zoom_bar_show_time = now;
     }
 
+    fn clear_video_playback_unavailable_state(&mut self) {
+        self.video_playback_unavailable_reason = None;
+        self.video_playback_popup_until = None;
+    }
+
+    fn is_video_playback_unavailable_active(&self) -> bool {
+        if !matches!(self.current_media_type, Some(MediaType::Video)) {
+            return false;
+        }
+
+        if self.video_player.is_some() || self.video_playback_unavailable_reason.is_none() {
+            return false;
+        }
+
+        self.pending_media_load
+            .as_ref()
+            .map_or(true, |pending| pending.kind != PendingMediaLoadKind::Video)
+    }
+
+    fn is_video_playback_preview_mode(&self) -> bool {
+        self.is_video_playback_unavailable_active() && self.video_texture.is_some()
+    }
+
+    fn set_video_playback_unavailable_for_path(&mut self, path: &PathBuf, reason: String) {
+        self.video_player = None;
+        self.pending_media_layout = false;
+        self.video_playback_unavailable_reason = Some(reason);
+
+        let target_side = self.solo_target_texture_side_for_path(path, MediaType::Video, false);
+        let has_pending_for_path = self
+            .pending_video_thumbnail_placeholder
+            .as_ref()
+            .map_or(false, |pending| pending.path == *path);
+
+        if !has_pending_for_path && self.video_texture.is_none() {
+            if let Some(thumbnail) = lookup_cached_video_thumbnail(path, target_side)
+                .or_else(|| extract_video_first_frame_thumbnail(path, target_side))
+            {
+                self.pending_video_thumbnail_placeholder = Some(PendingVideoThumbnailPlaceholder {
+                    path: path.clone(),
+                    thumbnail,
+                });
+            }
+        }
+    }
+
+    fn set_video_playback_unavailable_runtime(&mut self, reason: String) {
+        if let Some(path) = self.image_list.get(self.current_index).cloned() {
+            self.set_video_playback_unavailable_for_path(&path, reason);
+        } else {
+            self.video_player = None;
+            self.pending_media_layout = false;
+            self.video_playback_unavailable_reason = Some(reason);
+        }
+
+        self.show_video_controls = true;
+        self.touch_bottom_overlays();
+        self.queue_video_playback_unavailable_popup();
+    }
+
+    fn queue_video_playback_unavailable_popup(&mut self) {
+        if self.is_video_playback_unavailable_active() {
+            self.video_playback_popup_until = Some(Instant::now() + Duration::from_secs(4));
+        }
+    }
+
+    fn active_video_playback_popup_seconds(&mut self) -> Option<f32> {
+        let Some(until) = self.video_playback_popup_until else {
+            return None;
+        };
+
+        let now = Instant::now();
+        if now >= until {
+            self.video_playback_popup_until = None;
+            return None;
+        }
+
+        Some(until.saturating_duration_since(now).as_secs_f32())
+    }
+
+    fn video_playback_unavailable_popup_detail(&self) -> String {
+        let detail = self
+            .video_playback_unavailable_reason
+            .as_deref()
+            .unwrap_or("GStreamer runtime is unavailable.");
+        let first_line = detail.lines().next().unwrap_or(detail).trim();
+
+        const MAX_CHARS: usize = 160;
+        if first_line.chars().count() <= MAX_CHARS {
+            return first_line.to_string();
+        }
+
+        let trimmed: String = first_line.chars().take(MAX_CHARS).collect();
+        format!("{}...", trimmed)
+    }
+
+    fn paint_video_playback_unavailable_popup(
+        &self,
+        painter: &egui::Painter,
+        frame_rect: egui::Rect,
+        remaining_seconds: f32,
+    ) {
+        let fade = (remaining_seconds / 0.35).clamp(0.0, 1.0);
+        let panel_width = (frame_rect.width() * 0.82).clamp(340.0, 760.0);
+        let panel_height = 96.0;
+        let max_rect = frame_rect.shrink2(egui::vec2(16.0, 16.0));
+        let panel_rect = egui::Rect::from_center_size(max_rect.center(), egui::vec2(panel_width, panel_height))
+            .intersect(max_rect);
+
+        painter.rect_filled(
+            panel_rect,
+            14.0,
+            egui::Color32::from_rgba_unmultiplied(12, 18, 24, (220.0 * fade) as u8),
+        );
+        painter.rect_stroke(
+            panel_rect,
+            14.0,
+            egui::Stroke::new(
+                1.4,
+                egui::Color32::from_rgba_unmultiplied(252, 127, 38, (235.0 * fade) as u8),
+            ),
+        );
+
+        painter.text(
+            panel_rect.left_top() + egui::vec2(18.0, 16.0),
+            egui::Align2::LEFT_TOP,
+            "Playback unavailable",
+            egui::FontId::proportional(22.0),
+            egui::Color32::from_rgba_unmultiplied(255, 196, 150, (255.0 * fade) as u8),
+        );
+        painter.text(
+            panel_rect.left_top() + egui::vec2(18.0, 44.0),
+            egui::Align2::LEFT_TOP,
+            self.video_playback_unavailable_popup_detail(),
+            egui::FontId::proportional(15.0),
+            egui::Color32::from_rgba_unmultiplied(240, 230, 220, (245.0 * fade) as u8),
+        );
+        painter.text(
+            panel_rect.left_bottom() + egui::vec2(18.0, -16.0),
+            egui::Align2::LEFT_BOTTOM,
+            "Preview mode stays active: zoom, pan, and browsing still work.",
+            egui::FontId::proportional(13.0),
+            egui::Color32::from_rgba_unmultiplied(170, 204, 238, (240.0 * fade) as u8),
+        );
+    }
+
+    fn try_toggle_solo_video_play_pause(&mut self) {
+        let toggle_error = self
+            .video_player
+            .as_mut()
+            .and_then(|player| player.toggle_play_pause().err());
+
+        if let Some(err) = toggle_error {
+            self.set_video_playback_unavailable_runtime(err);
+            return;
+        }
+
+        if self.video_player.is_none() && self.is_video_playback_unavailable_active() {
+            self.queue_video_playback_unavailable_popup();
+        }
+    }
+
+    fn try_toggle_manga_video_play_pause(&mut self, index: usize) {
+        let toggle_error = self
+            .manga_video_players
+            .get_mut(&index)
+            .and_then(|player| player.toggle_play_pause().err());
+
+        if let Some(err) = toggle_error {
+            self.manga_video_players.remove(&index);
+            self.manga_video_textures.remove(&index);
+            if self.manga_focused_video_index == Some(index) {
+                self.manga_focused_video_index = None;
+            }
+            self.video_playback_unavailable_reason = Some(err);
+            self.queue_video_playback_unavailable_popup();
+        }
+    }
+
     fn update_bottom_overlays_visibility(&mut self, ctx: &egui::Context) -> bool {
         let screen_rect = ctx.screen_rect();
         let mouse_pos = ctx.input(|i| i.pointer.hover_pos());
@@ -4800,7 +4986,7 @@ impl ImageViewer {
             .map(|p| p.y > screen_rect.height() - 100.0)
             .unwrap_or(false);
 
-        let video_open = self.video_player.is_some();
+        let video_open = self.video_player.is_some() || self.is_video_playback_preview_mode();
 
         // Check if we have an animated GIF in non-manga mode
         let has_animated_gif =
@@ -7497,9 +7683,7 @@ impl ImageViewer {
             Action::MasonryPanUp3 => self.apply_manga_pan_step(-1.0, 2.0),
             Action::MasonryPanDown3 => self.apply_manga_pan_step(1.0, 2.0),
             Action::VideoPlayPause => {
-                if let Some(ref mut player) = self.video_player {
-                    let _ = player.toggle_play_pause();
-                }
+                self.try_toggle_solo_video_play_pause();
             }
             Action::VideoMute => {
                 if let Some(ref mut player) = self.video_player {
@@ -8480,7 +8664,11 @@ impl ImageViewer {
                     );
 
                     if !player.is_playing() {
-                        let _ = player.play();
+                        if let Err(err) = player.play() {
+                            self.video_playback_unavailable_reason = Some(err);
+                            self.manga_focused_video_index = None;
+                            continue;
+                        }
                     }
 
                     let dims = player.dimensions();
@@ -8503,6 +8691,8 @@ impl ImageViewer {
                     result: Err(err),
                     ..
                 } => {
+                    self.video_playback_unavailable_reason =
+                        Some(format!("Failed to load video: {}", err));
                     eprintln!(
                         "Failed to create video player for manga index {} ({}): {}",
                         index,
@@ -8663,6 +8853,7 @@ impl ImageViewer {
                         self.image_changed = true;
                         self.pending_media_layout = false;
                         self.error_message = None;
+                        self.clear_video_playback_unavailable_state();
 
                         if loaded.is_animated_webp {
                             if let Some(rx) = LoadedImage::start_streaming_webp(
@@ -8696,6 +8887,7 @@ impl ImageViewer {
 
                         self.video_player = Some(player);
                         self.error_message = None;
+                        self.clear_video_playback_unavailable_state();
                         self.show_video_controls = true;
                         self.touch_bottom_overlays();
 
@@ -8708,8 +8900,16 @@ impl ImageViewer {
                         }
                     }
                     Err(err) => {
-                        self.drop_retained_media_placeholder();
-                        self.error_message = Some(format!("Failed to load video: {}", err));
+                        if self.retained_media_placeholder_visible {
+                            self.drop_retained_media_placeholder();
+                        }
+                        self.error_message = None;
+                        self.set_video_playback_unavailable_for_path(
+                            &path,
+                            format!("Failed to load video: {}", err),
+                        );
+                        self.show_video_controls = true;
+                        self.touch_bottom_overlays();
                     }
                 },
             }
@@ -8742,6 +8942,7 @@ impl ImageViewer {
         self.reset_masonry_metadata_preload();
         self.clear_pending_media_load();
         self.pending_video_thumbnail_placeholder = None;
+        self.clear_video_playback_unavailable_state();
 
         self.current_file_size_label = None;
         self.current_file_size_label_path = None;
@@ -12022,11 +12223,25 @@ impl ImageViewer {
                 }
             }
 
-            if let Some(player) = self.manga_video_players.get_mut(&focused_idx) {
+            let focus_play_error = if let Some(player) = self.manga_video_players.get_mut(&focused_idx)
+            {
                 if focus_changed && !player.is_playing() {
-                    let _ = player.play();
+                    player.play().err()
+                } else {
+                    None
                 }
+            } else {
+                None
+            };
 
+            if let Some(err) = focus_play_error {
+                self.video_playback_unavailable_reason = Some(err);
+                self.manga_focused_video_index = None;
+                self.clear_pending_manga_video_load();
+                return;
+            }
+
+            if let Some(player) = self.manga_video_players.get_mut(&focused_idx) {
                 if focus_changed {
                     // Apply user's persisted mute/volume settings when switching focus.
                     Self::apply_video_audio_overrides(player, muted_override, volume_override);
@@ -15301,9 +15516,7 @@ impl ImageViewer {
         {
             // Check if we have a focused video
             if let Some(video_idx) = self.manga_focused_video_index {
-                if let Some(player) = self.manga_video_players.get_mut(&video_idx) {
-                    let _ = player.toggle_play_pause();
-                }
+                self.try_toggle_manga_video_play_pause(video_idx);
             } else {
                 // Check if focused item is an animated GIF/WebP
                 let focused_idx = self.manga_get_focused_media_index();
@@ -17133,8 +17346,8 @@ impl ImageViewer {
         };
 
         if should_toggle_media {
-            if let Some(ref mut player) = self.video_player {
-                let _ = player.toggle_play_pause();
+            if matches!(self.current_media_type, Some(MediaType::Video)) {
+                self.try_toggle_solo_video_play_pause();
             } else if has_animated_gif {
                 // Toggle GIF pause state
                 self.gif_paused = !self.gif_paused;
@@ -17892,7 +18105,7 @@ impl ImageViewer {
         }
 
         // Check if we have a video or animated GIF
-        let has_video = self.video_player.is_some();
+        let has_video = self.video_player.is_some() || self.is_video_playback_preview_mode();
         let has_animated_gif = self.image.as_ref().map_or(false, |img| img.is_animated());
 
         if !has_video && !has_animated_gif {
@@ -17939,8 +18152,10 @@ impl ImageViewer {
                 ui.allocate_new_ui(egui::UiBuilder::new().max_rect(inner_rect), |ui| {
                     ui.set_min_height(inner_rect.height());
 
-                    if has_video {
+                    if self.video_player.is_some() {
                         self.draw_video_seekbar_inner(ui, ctx);
+                    } else if self.is_video_playback_preview_mode() {
+                        self.draw_video_playback_unavailable_controls_inner(ui);
                     } else if has_animated_gif {
                         self.draw_gif_seekbar_inner(ui, ctx);
                     }
@@ -17955,6 +18170,22 @@ impl ImageViewer {
         }
     }
 
+    fn draw_video_playback_unavailable_controls_inner(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            let play_btn = ui.add(egui::Button::new("▶").min_size(egui::vec2(32.0, 24.0)));
+            if play_btn.clicked() {
+                self.queue_video_playback_unavailable_popup();
+            }
+
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new("Preview mode: playback unavailable on this system")
+                    .color(egui::Color32::from_rgb(255, 190, 135))
+                    .size(12.0),
+            );
+        });
+    }
+
     fn commit_video_seek_mode(&self) -> VideoSeekMode {
         match self.config.video_seek_policy {
             VideoSeekPolicy::Adaptive | VideoSeekPolicy::Accurate => VideoSeekMode::Accurate,
@@ -17966,6 +18197,8 @@ impl ImageViewer {
     fn draw_video_seekbar_inner(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let drag_seek_mode = self.drag_video_seek_mode();
         let commit_seek_mode = self.commit_video_seek_mode();
+        let mut play_toggle_requested = false;
+        let mut resume_error: Option<String> = None;
 
         ui.vertical(|ui| {
             // === Seek bar (top row) ===
@@ -18085,7 +18318,7 @@ impl ImageViewer {
                 self.last_seek_sent_at = Instant::now();
 
                 if self.seek_was_playing {
-                    let _ = player.play();
+                    resume_error = player.play().err();
                 }
                 self.seek_was_playing = false;
             }
@@ -18106,7 +18339,7 @@ impl ImageViewer {
                 );
 
                 if play_btn.clicked() {
-                    let _ = player.toggle_play_pause();
+                    play_toggle_requested = true;
                 }
 
                 ui.add_space(8.0);
@@ -18198,6 +18431,14 @@ impl ImageViewer {
                 });
             });
         });
+
+        if let Some(err) = resume_error {
+            self.set_video_playback_unavailable_runtime(err);
+        }
+
+        if play_toggle_requested {
+            self.try_toggle_solo_video_play_pause();
+        }
     }
 
     /// Draw GIF seekbar and controls for non-manga mode
@@ -18459,6 +18700,8 @@ impl ImageViewer {
     ) {
         let drag_seek_mode = self.drag_video_seek_mode();
         let commit_seek_mode = self.commit_video_seek_mode();
+        let mut play_toggle_requested = false;
+        let mut resume_error: Option<String> = None;
 
         let Some(player) = self.manga_video_players.get_mut(&video_idx) else {
             return;
@@ -18582,7 +18825,7 @@ impl ImageViewer {
 
                 if self.manga_video_seek_was_playing {
                     if let Some(player) = self.manga_video_players.get_mut(&video_idx) {
-                        let _ = player.play();
+                        resume_error = player.play().err();
                     }
                 }
                 self.manga_video_seek_was_playing = false;
@@ -18604,7 +18847,7 @@ impl ImageViewer {
                 );
 
                 if play_btn.clicked() {
-                    let _ = player.toggle_play_pause();
+                    play_toggle_requested = true;
                 }
 
                 ui.add_space(8.0);
@@ -18697,6 +18940,20 @@ impl ImageViewer {
                 });
             });
         });
+
+        if let Some(err) = resume_error {
+            self.manga_video_players.remove(&video_idx);
+            self.manga_video_textures.remove(&video_idx);
+            if self.manga_focused_video_index == Some(video_idx) {
+                self.manga_focused_video_index = None;
+            }
+            self.video_playback_unavailable_reason = Some(err);
+            self.queue_video_playback_unavailable_popup();
+        }
+
+        if play_toggle_requested {
+            self.try_toggle_manga_video_play_pause(video_idx);
+        }
     }
 
     /// Draw seekbar for animated GIFs in manga mode
@@ -19711,12 +19968,33 @@ impl ImageViewer {
                     {
                         self.paint_marked_item_overlay(ui.painter(), final_rect, mark_visual);
                     }
+
+                    if matches!(self.current_media_type, Some(MediaType::Video)) {
+                        if let Some(remaining_seconds) = self.active_video_playback_popup_seconds() {
+                            self.paint_video_playback_unavailable_popup(
+                                ui.painter(),
+                                final_rect,
+                                remaining_seconds,
+                            );
+                            ctx.request_repaint_after(Duration::from_millis(16));
+                        }
+                    }
                 } else if let Some(ref error) = self.error_message {
                     ui.centered_and_justified(|ui| {
                         ui.label(
                             egui::RichText::new(error)
                                 .color(egui::Color32::RED)
                                 .size(18.0),
+                        );
+                    });
+                } else if self.is_video_playback_unavailable_active() {
+                    ui.centered_and_justified(|ui| {
+                        ui.label(
+                            egui::RichText::new(
+                                "Video playback is unavailable here. Preview mode is still enabled.",
+                            )
+                            .color(egui::Color32::from_rgb(255, 190, 135))
+                            .size(16.0),
                         );
                     });
                 } else {
