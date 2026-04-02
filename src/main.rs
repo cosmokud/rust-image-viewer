@@ -71,7 +71,7 @@ use windows::{
 use eframe::glow::HasContext;
 
 const GSTREAMER_MISSING_VIDEO_ERROR_TEXT: &str =
-    "Can't open video file because gstreamer library is not installed, please install gstreamer library to open a video file";
+    "Cannot open video files because the GStreamer library is not installed. Please install GStreamer to enable video playback.";
 
 /// Paint a smooth, semi-transparent loading spinner in the bottom-right corner
 /// of the given rectangle.  The spinner is a rotating arc that indicates
@@ -5306,6 +5306,27 @@ impl ImageViewer {
                 );
 
                 // Move window on-screen with correct size
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+                self.last_known_outer_pos = Some(pos);
+                self.floating_max_inner_size = Some(size);
+                self.last_requested_inner_size = Some(size);
+            } else {
+                // If video dimensions are still unknown (startup timeout or playback unavailable),
+                // move the previously hidden window back on-screen with a safe fallback size.
+                let monitor = self.monitor_size_points(ctx);
+                let mut size = self
+                    .last_requested_inner_size
+                    .or(self.floating_max_inner_size)
+                    .unwrap_or(egui::Vec2::new(800.0, 600.0));
+                size.x = size.x.max(200.0).min(monitor.x.max(200.0));
+                size.y = size.y.max(150.0).min(monitor.y.max(150.0));
+
+                let pos = egui::Pos2::new(
+                    ((monitor.x - size.x) * 0.5).max(0.0),
+                    ((monitor.y - size.y) * 0.5).max(0.0),
+                );
+
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
                 ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
                 self.last_known_outer_pos = Some(pos);
@@ -21178,12 +21199,22 @@ fn main() -> eframe::Result<()> {
             (size, pos, true) // Images: show window immediately with correct size
         }
         Some(MediaType::Video) => {
-            // Videos: position window OFF-SCREEN initially
-            // This completely hides the window until the first frame is ready.
-            // The window will be moved on-screen once video dimensions and first frame are available.
-            let size = egui::Vec2::new(800.0, 600.0);
-            let off_screen_pos = egui::Pos2::new(-10000.0, -10000.0);
-            (size, off_screen_pos, false)
+            if !gstreamer_runtime_available() {
+                // Missing runtime: show immediately with placeholder text in floating mode.
+                let size = egui::Vec2::new(800.0, 600.0);
+                let pos = egui::Pos2::new(
+                    ((screen_size.x - size.x) * 0.5).max(0.0),
+                    ((screen_size.y - size.y) * 0.5).max(0.0),
+                );
+                (size, pos, true)
+            } else {
+                // Videos: position window OFF-SCREEN initially
+                // This completely hides the window until the first frame is ready.
+                // The window will be moved on-screen once video dimensions and first frame are available.
+                let size = egui::Vec2::new(800.0, 600.0);
+                let off_screen_pos = egui::Pos2::new(-10000.0, -10000.0);
+                (size, off_screen_pos, false)
+            }
         }
         None => {
             // Unknown file type, show error window
