@@ -4944,9 +4944,44 @@ impl ImageViewer {
         remaining_seconds: f32,
     ) {
         let fade = (remaining_seconds / 0.35).clamp(0.0, 1.0);
-        let panel_width = (frame_rect.width() * 0.82).clamp(340.0, 760.0);
-        let panel_height = 96.0;
         let max_rect = frame_rect.shrink2(egui::vec2(16.0, 16.0));
+        let panel_width = (frame_rect.width() * 0.82)
+            .clamp(340.0, 760.0)
+            .min(max_rect.width());
+        let text_width = (panel_width - 36.0).max(180.0);
+
+        let title_text = "Playback unavailable";
+        let detail_text = self.video_playback_unavailable_popup_detail();
+        let footer_text = "Preview mode stays active: zoom, pan, and browsing still work.";
+
+        let title_color = egui::Color32::from_rgba_unmultiplied(255, 196, 150, (255.0 * fade) as u8);
+        let detail_color = egui::Color32::from_rgba_unmultiplied(240, 230, 220, (245.0 * fade) as u8);
+        let footer_color = egui::Color32::from_rgba_unmultiplied(170, 204, 238, (240.0 * fade) as u8);
+
+        let title_galley = painter.layout_no_wrap(
+            title_text.to_owned(),
+            egui::FontId::proportional(22.0),
+            title_color,
+        );
+        let detail_galley = painter.layout(
+            detail_text,
+            egui::FontId::proportional(15.0),
+            detail_color,
+            text_width,
+        );
+        let footer_galley = painter.layout(
+            footer_text.to_owned(),
+            egui::FontId::proportional(13.0),
+            footer_color,
+            text_width,
+        );
+
+        let title_height = title_galley.rect.height();
+        let detail_height = detail_galley.rect.height();
+        let footer_height = footer_galley.rect.height();
+
+        let panel_height = (14.0 + title_height + 8.0 + detail_height + 10.0 + footer_height + 14.0)
+            .clamp(108.0, max_rect.height());
         let panel_rect = egui::Rect::from_center_size(max_rect.center(), egui::vec2(panel_width, panel_height))
             .intersect(max_rect);
 
@@ -4964,27 +4999,13 @@ impl ImageViewer {
             ),
         );
 
-        painter.text(
-            panel_rect.left_top() + egui::vec2(18.0, 16.0),
-            egui::Align2::LEFT_TOP,
-            "Playback unavailable",
-            egui::FontId::proportional(22.0),
-            egui::Color32::from_rgba_unmultiplied(255, 196, 150, (255.0 * fade) as u8),
-        );
-        painter.text(
-            panel_rect.left_top() + egui::vec2(18.0, 44.0),
-            egui::Align2::LEFT_TOP,
-            self.video_playback_unavailable_popup_detail(),
-            egui::FontId::proportional(15.0),
-            egui::Color32::from_rgba_unmultiplied(240, 230, 220, (245.0 * fade) as u8),
-        );
-        painter.text(
-            panel_rect.left_bottom() + egui::vec2(18.0, -16.0),
-            egui::Align2::LEFT_BOTTOM,
-            "Preview mode stays active: zoom, pan, and browsing still work.",
-            egui::FontId::proportional(13.0),
-            egui::Color32::from_rgba_unmultiplied(170, 204, 238, (240.0 * fade) as u8),
-        );
+        let text_left = panel_rect.left() + 18.0;
+        let mut y = panel_rect.top() + 14.0;
+        painter.galley(egui::pos2(text_left, y), title_galley, title_color);
+        y += title_height + 8.0;
+        painter.galley(egui::pos2(text_left, y), detail_galley, detail_color);
+        y += detail_height + 10.0;
+        painter.galley(egui::pos2(text_left, y), footer_galley, footer_color);
     }
 
     fn try_toggle_solo_video_play_pause(&mut self) {
@@ -16530,29 +16551,6 @@ impl ImageViewer {
                     );
                 }
 
-                if !gstreamer_available {
-                    let focused_video_idx = if self.is_masonry_mode() {
-                        self.manga_hovered_media_index
-                    } else if self.image_list.is_empty() {
-                        None
-                    } else {
-                        Some(self.manga_get_focused_media_index())
-                    };
-
-                    let show_video_error_notice = focused_video_idx
-                        .and_then(|index| self.image_list.get(index))
-                        .is_some_and(|path| is_supported_video(path));
-
-                    if show_video_error_notice {
-                        ui.painter().text(
-                            egui::pos2(screen_width * 0.5, 24.0),
-                            egui::Align2::CENTER_TOP,
-                            Self::gstreamer_missing_video_error_text(),
-                            egui::FontId::proportional(14.0),
-                            egui::Color32::from_rgb(255, 190, 135),
-                        );
-                    }
-                }
             });
 
         if self.is_masonry_mode() && self.masonry_metadata_preload_active {
