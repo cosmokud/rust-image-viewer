@@ -4033,6 +4033,7 @@ dependencies = [
  "trash",
  "wide",
  "winapi",
+ "windows 0.58.0",
  "winres",
  "zune-core 0.5.1",
  "zune-image",

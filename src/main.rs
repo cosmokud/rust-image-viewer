@@ -56,9 +56,17 @@ use std::fs;
 use std::hash::{Hash, Hasher};
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
+#[cfg(target_os = "windows")]
+use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, UNIX_EPOCH};
+#[cfg(target_os = "windows")]
+use windows::{
+    core::PCWSTR,
+    Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED},
+    Win32::UI::Shell::{ILCreateFromPathW, ILFree, SHOpenFolderAndSelectItems},
+};
 
 use eframe::glow::HasContext;
 
@@ -353,6 +361,57 @@ fn open_path_in_default_app(path: &std::path::Path) -> std::io::Result<()> {
     }
 }
 
+#[cfg(target_os = "windows")]
+fn sh_open_folder_and_select_item(path: &Path) -> std::io::Result<()> {
+    let mut should_uninitialize = false;
+
+    // Shell selection APIs are COM-based. If this call fails because COM is already
+    // initialized with another model on this thread, we still attempt the shell call.
+    unsafe {
+        if CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok() {
+            should_uninitialize = true;
+        }
+    }
+
+    let wide_path: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let pidl = unsafe { ILCreateFromPathW(PCWSTR(wide_path.as_ptr())) };
+    if pidl.is_null() {
+        if should_uninitialize {
+            unsafe {
+                CoUninitialize();
+            }
+        }
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "ILCreateFromPathW failed: could not create PIDL from path",
+        ));
+    }
+
+    let select_result = unsafe { SHOpenFolderAndSelectItems(pidl as *const _, None, 0) };
+
+    unsafe {
+        ILFree(Some(pidl as *const _));
+    }
+
+    if should_uninitialize {
+        unsafe {
+            CoUninitialize();
+        }
+    }
+
+    select_result.map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("SHOpenFolderAndSelectItems failed: {e}"),
+        )
+    })
+}
+
 fn reveal_path_in_file_explorer(path: &Path) -> std::io::Result<()> {
     #[cfg(target_os = "windows")]
     {
@@ -387,12 +446,7 @@ fn reveal_path_in_file_explorer(path: &Path) -> std::io::Result<()> {
                 .map(|_| ());
         }
 
-        let select_arg = format!("/select,\"{}\"", resolved_path.display());
-
-        match std::process::Command::new("explorer.exe")
-            .raw_arg(&select_arg)
-            .spawn()
-        {
+        match sh_open_folder_and_select_item(&resolved_path) {
             Ok(_) => Ok(()),
             Err(select_err) => std::process::Command::new("explorer.exe")
                 .arg(&target_dir)
