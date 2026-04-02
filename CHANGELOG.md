@@ -2,6 +2,35 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.3.4] - 2026-04-02
+
+### Highlights
+
+- Video handling now degrades gracefully when GStreamer is unavailable: probing and thumbnail paths keep working, and the UI shows clearer unavailability feedback.
+- Windows Explorer integration was hardened with more reliable path revealing, safer quoted-path handling, and COM-backed folder selection retry behavior.
+- Multi-item navigation and rendering quality were improved with smoother transition behavior, mipmap-backed static textures, and cache tuning.
+- Added a shortcuts help modal and a direct "Open file location" flow to improve discoverability and troubleshooting.
+
+### Added
+
+- Runtime GStreamer availability detection and dedicated playback-unavailable UI state handling.
+- Video thumbnail extraction and video-dimension probing paths that do not require GStreamer to be present.
+- A shortcuts help modal and "Open file location" functionality.
+- Windows COM integration for folder selection with retry support.
+
+### Changed
+
+- Removed the `gstreamer-pbutils` dependency from runtime probing paths.
+- Refined fit-zoom behavior using `fit_zoom_for_target_height`.
+- Updated thumbnail caching and memory-allocation limits for steadier behavior under heavy browsing.
+- Enabled startup preload support for Masonry mode.
+
+### Fixed
+
+- Reduced black-flash artifacts during manga navigation transitions.
+- Improved Explorer path-reveal robustness for quoted and edge-case paths.
+- Improved video window positioning and error messaging when playback cannot start.
+
 ## [v0.3.3] - 2026-03-10
 
 ### Highlights
