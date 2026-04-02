@@ -43,6 +43,7 @@ use crate::metadata_cache::{
     store_cached_video_thumbnail, CachedImageThumbnail, CachedMediaKind, CachedVideoThumbnail,
 };
 use crate::video_player::gstreamer_runtime_available;
+use crate::video_thumbnail::extract_video_first_frame_without_gstreamer;
 
 /// Maximum number of decoded images to hold in memory awaiting GPU upload.
 /// This bounds memory usage even if the main thread is slow to consume results.
@@ -1152,7 +1153,22 @@ impl MangaLoader {
         }
 
         if !gstreamer_runtime_available() {
-            return None;
+            let (pixels, width, height, original_width, original_height) =
+                extract_video_first_frame_without_gstreamer(path, max_texture_side)?;
+
+            store_cached_video_thumbnail(
+                path,
+                max_texture_side,
+                &CachedVideoThumbnail {
+                    pixels: pixels.clone(),
+                    width,
+                    height,
+                    original_width,
+                    original_height,
+                },
+            );
+
+            return Some((pixels, width, height, original_width, original_height));
         }
 
         use gstreamer as gst;

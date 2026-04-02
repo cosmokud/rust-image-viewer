@@ -14,6 +14,7 @@ mod perf_metrics;
 #[cfg(target_os = "windows")]
 mod single_instance;
 mod video_player;
+mod video_thumbnail;
 #[cfg(target_os = "windows")]
 mod windows_env;
 
@@ -44,6 +45,7 @@ use perf_metrics::PerfMetrics;
 #[cfg(target_os = "windows")]
 use single_instance::{FileReceiver, SingleInstanceResult};
 use video_player::{format_duration, gstreamer_runtime_available, VideoPlayer, VideoSeekMode};
+use video_thumbnail::extract_video_first_frame_without_gstreamer;
 
 use eframe::egui;
 use fast_image_resize as fir;
@@ -1238,7 +1240,18 @@ fn extract_video_first_frame_thumbnail(
     }
 
     if !gstreamer_runtime_available() {
-        return None;
+        let (pixels, width, height, original_width, original_height) =
+            extract_video_first_frame_without_gstreamer(path, max_texture_side)?;
+
+        let thumbnail = CachedVideoThumbnail {
+            pixels,
+            width,
+            height,
+            original_width,
+            original_height,
+        };
+        store_cached_video_thumbnail(path, max_texture_side, &thumbnail);
+        return Some(thumbnail);
     }
 
     use gstreamer as gst;
@@ -4858,6 +4871,15 @@ impl ImageViewer {
                     thumbnail,
                 });
             }
+        }
+
+        if matches!(self.current_media_type, Some(MediaType::Video))
+            && self
+                .image_list
+                .get(self.current_index)
+                .is_some_and(|current| current == path)
+        {
+            self.queue_video_playback_unavailable_popup();
         }
     }
 
@@ -15067,7 +15089,9 @@ impl ImageViewer {
         } else {
             MangaMediaType::StaticImage
         };
-        let video_runtime_available = !is_video || gstreamer_runtime_available();
+        let video_playback_runtime_available = !is_video || gstreamer_runtime_available();
+        let video_thumbnail_retry_allowed =
+            !is_video || video_playback_runtime_available || cfg!(target_os = "windows");
         let (fill_retry_target_side, final_retry_target_side) =
             self.manga_retry_target_sides_for_rect(idx, image_rect, retry_media_type);
         let final_retry_dims = self.manga_bucket_dimensions_for_side(
@@ -15076,8 +15100,9 @@ impl ImageViewer {
             image_rect.size(),
         );
 
-        let video_load_pending =
-            video_runtime_available && is_video && self.manga_video_load_pending_for_index(idx);
+        let video_load_pending = video_playback_runtime_available
+            && is_video
+            && self.manga_video_load_pending_for_index(idx);
 
         if is_video {
             // Video item: prioritize live video texture, fall back to first-frame thumbnail
@@ -15146,7 +15171,7 @@ impl ImageViewer {
                     );
                 }
 
-                if video_runtime_available
+                if video_thumbnail_retry_allowed
                     && self.manga_texture_upgrade_needed(
                     tex_w,
                     tex_h,
@@ -15185,7 +15210,7 @@ impl ImageViewer {
                     );
                 }
 
-                if video_runtime_available {
+                if video_thumbnail_retry_allowed {
                     requested_retry |= self.manga_request_retry_for_visible_item(
                         idx,
                         fill_retry_target_side,
@@ -15206,7 +15231,7 @@ impl ImageViewer {
                     egui::Color32::from_gray(100),
                 );
 
-                if video_runtime_available {
+                if video_thumbnail_retry_allowed {
                     self.manga_mark_placeholder_visible(idx);
 
                     requested_retry |= self.manga_request_retry_for_visible_item(
