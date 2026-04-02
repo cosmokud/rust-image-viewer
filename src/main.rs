@@ -45,7 +45,9 @@ use perf_metrics::PerfMetrics;
 #[cfg(target_os = "windows")]
 use single_instance::{FileReceiver, SingleInstanceResult};
 use video_player::{format_duration, gstreamer_runtime_available, VideoPlayer, VideoSeekMode};
-use video_thumbnail::extract_video_first_frame_without_gstreamer;
+use video_thumbnail::{
+    extract_video_first_frame_without_gstreamer, probe_video_dimensions_without_gstreamer,
+};
 
 use eframe::egui;
 use fast_image_resize as fir;
@@ -1235,7 +1237,21 @@ fn extract_video_first_frame_thumbnail(
     path: &Path,
     max_texture_side: u32,
 ) -> Option<CachedVideoThumbnail> {
-    if let Some(cached) = lookup_cached_video_thumbnail(path, max_texture_side) {
+    if let Some(mut cached) = lookup_cached_video_thumbnail(path, max_texture_side) {
+        if !gstreamer_runtime_available() {
+            if let Some((original_width, original_height)) =
+                probe_video_dimensions_without_gstreamer(path)
+            {
+                if cached.original_width != original_width
+                    || cached.original_height != original_height
+                {
+                    cached.original_width = original_width;
+                    cached.original_height = original_height;
+                    store_cached_video_thumbnail(path, max_texture_side, &cached);
+                }
+            }
+        }
+
         return Some(cached);
     }
 

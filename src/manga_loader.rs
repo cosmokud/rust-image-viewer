@@ -43,7 +43,9 @@ use crate::metadata_cache::{
     store_cached_video_thumbnail, CachedImageThumbnail, CachedMediaKind, CachedVideoThumbnail,
 };
 use crate::video_player::gstreamer_runtime_available;
-use crate::video_thumbnail::extract_video_first_frame_without_gstreamer;
+use crate::video_thumbnail::{
+    extract_video_first_frame_without_gstreamer, probe_video_dimensions_without_gstreamer,
+};
 
 /// Maximum number of decoded images to hold in memory awaiting GPU upload.
 /// This bounds memory usage even if the main thread is slow to consume results.
@@ -1082,6 +1084,13 @@ impl MangaLoader {
     ///
     /// Uses a lightweight first-frame probe, then falls back to filename heuristics.
     fn probe_video_dimensions(path: &std::path::Path) -> Option<(u32, u32)> {
+        if !gstreamer_runtime_available() {
+            if let Some((w, h)) = probe_video_dimensions_without_gstreamer(path) {
+                store_cached_dimensions(path, CachedMediaKind::Video, w, h);
+                return Some((w, h));
+            }
+        }
+
         if let Some((w, h)) = lookup_cached_dimensions(path, CachedMediaKind::Video) {
             return Some((w, h));
         }
@@ -1142,7 +1151,21 @@ impl MangaLoader {
         path: &std::path::Path,
         max_texture_side: u32,
     ) -> Option<(Vec<u8>, u32, u32, u32, u32)> {
-        if let Some(cached) = lookup_cached_video_thumbnail(path, max_texture_side) {
+        if let Some(mut cached) = lookup_cached_video_thumbnail(path, max_texture_side) {
+            if !gstreamer_runtime_available() {
+                if let Some((original_width, original_height)) =
+                    probe_video_dimensions_without_gstreamer(path)
+                {
+                    if cached.original_width != original_width
+                        || cached.original_height != original_height
+                    {
+                        cached.original_width = original_width;
+                        cached.original_height = original_height;
+                        store_cached_video_thumbnail(path, max_texture_side, &cached);
+                    }
+                }
+            }
+
             return Some((
                 cached.pixels,
                 cached.width,

@@ -19,25 +19,24 @@ pub fn extract_video_first_frame_without_gstreamer(
     }
 }
 
-#[cfg(target_os = "windows")]
-fn extract_video_thumbnail_windows(
-    path: &Path,
-    max_texture_side: u32,
-) -> Option<(Vec<u8>, u32, u32, u32, u32)> {
-    use std::mem::size_of;
-    use std::os::windows::ffi::OsStrExt;
+/// Probe exact video dimensions without relying on GStreamer runtime DLLs.
+pub fn probe_video_dimensions_without_gstreamer(path: &Path) -> Option<(u32, u32)> {
+    #[cfg(target_os = "windows")]
+    {
+        return probe_video_dimensions_windows(path);
+    }
 
-    use windows::core::{Interface, PCWSTR};
-    use windows::Win32::Foundation::{RPC_E_CHANGED_MODE, SIZE};
-    use windows::Win32::Graphics::Gdi::{
-        BI_RGB, BITMAP, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, DIB_RGB_COLORS,
-        DeleteDC, DeleteObject, GetDIBits, GetObjectW, HBITMAP,
-    };
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn with_com_apartment<T>(f: impl FnOnce() -> Option<T>) -> Option<T> {
+    use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
     use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
-    use windows::Win32::UI::Shell::{
-        IShellItem, IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF_BIGGERSIZEOK,
-        SIIGBF_THUMBNAILONLY,
-    };
 
     let mut should_uninitialize = false;
     unsafe {
@@ -49,18 +48,100 @@ fn extract_video_thumbnail_windows(
         }
     }
 
-    let result = (|| {
-        let side = max_texture_side.clamp(128, 2048) as i32;
-        let wide_path: Vec<u16> = path
-            .as_os_str()
+    let result = f();
+
+    if should_uninitialize {
+        unsafe {
+            CoUninitialize();
+        }
+    }
+
+    result
+}
+
+#[cfg(target_os = "windows")]
+fn shell_item_from_path(path: &Path) -> Option<windows::Win32::UI::Shell::IShellItem> {
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows::core::PCWSTR;
+    use windows::Win32::UI::Shell::SHCreateItemFromParsingName;
+
+    let wide_path: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    unsafe { SHCreateItemFromParsingName(PCWSTR(wide_path.as_ptr()), None).ok() }
+}
+
+#[cfg(target_os = "windows")]
+fn probe_video_dimensions_from_shell_item(
+    shell_item: &windows::Win32::UI::Shell::IShellItem,
+) -> Option<(u32, u32)> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows::core::{Interface, PCWSTR};
+    use windows::Win32::UI::Shell::PropertiesSystem::{PROPERTYKEY, PSGetPropertyKeyFromName};
+    use windows::Win32::UI::Shell::IShellItem2;
+
+    fn property_key(canonical_name: &str) -> Option<PROPERTYKEY> {
+        let mut key = PROPERTYKEY::default();
+        let wide: Vec<u16> = OsStr::new(canonical_name)
             .encode_wide()
             .chain(std::iter::once(0))
             .collect();
 
-        let shell_item: IShellItem = unsafe {
-            SHCreateItemFromParsingName(PCWSTR(wide_path.as_ptr()), None)
+        unsafe {
+            PSGetPropertyKeyFromName(PCWSTR(wide.as_ptr()), &mut key)
                 .ok()?
-        };
+        }
+
+        Some(key)
+    }
+
+    let shell_item2: IShellItem2 = shell_item.cast().ok()?;
+    let width_key = property_key("System.Video.FrameWidth")?;
+    let height_key = property_key("System.Video.FrameHeight")?;
+    let width = unsafe { shell_item2.GetUInt32(&width_key).ok()? };
+    let height = unsafe { shell_item2.GetUInt32(&height_key).ok()? };
+
+    if width == 0 || height == 0 {
+        return None;
+    }
+
+    Some((width, height))
+}
+
+#[cfg(target_os = "windows")]
+fn probe_video_dimensions_windows(path: &Path) -> Option<(u32, u32)> {
+    with_com_apartment(|| {
+        let shell_item = shell_item_from_path(path)?;
+        probe_video_dimensions_from_shell_item(&shell_item)
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn extract_video_thumbnail_windows(
+    path: &Path,
+    max_texture_side: u32,
+) -> Option<(Vec<u8>, u32, u32, u32, u32)> {
+    use std::mem::size_of;
+
+    use windows::core::Interface;
+    use windows::Win32::Foundation::SIZE;
+    use windows::Win32::Graphics::Gdi::{
+        BI_RGB, BITMAP, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, DIB_RGB_COLORS,
+        DeleteDC, DeleteObject, GetDIBits, GetObjectW, HBITMAP,
+    };
+    use windows::Win32::UI::Shell::{
+        IShellItemImageFactory, SIIGBF_BIGGERSIZEOK, SIIGBF_THUMBNAILONLY,
+    };
+
+    with_com_apartment(|| {
+        let side = max_texture_side.clamp(128, 2048) as i32;
+        let shell_item = shell_item_from_path(path)?;
         let image_factory: IShellItemImageFactory = shell_item.cast().ok()?;
         let hbitmap: HBITMAP = unsafe {
             image_factory
@@ -135,17 +216,19 @@ fn extract_video_thumbnail_windows(
                 pixel.swap(0, 2);
             }
 
-            Some((pixels, width as u32, height as u32, width as u32, height as u32))
+            let (original_width, original_height) =
+                probe_video_dimensions_from_shell_item(&shell_item)
+                    .unwrap_or((width as u32, height as u32));
+
+            Some((
+                pixels,
+                width as u32,
+                height as u32,
+                original_width,
+                original_height,
+            ))
         };
 
         converted
-    })();
-
-    if should_uninitialize {
-        unsafe {
-            CoUninitialize();
-        }
-    }
-
-    result
+    })
 }
