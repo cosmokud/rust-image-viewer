@@ -331,6 +331,7 @@ fn main() {
                     "gstapp-1.0-0.dll",
                     "gstvideo-1.0-0.dll",
                     "gstaudio-1.0-0.dll",
+                    "gstpbutils-1.0-0.dll",
                     // GLib/GObject stack (pulled in by GStreamer)
                     "glib-2.0-0.dll",
                     "gobject-2.0-0.dll",

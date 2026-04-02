@@ -43,7 +43,7 @@ use metadata_cache::{
 use perf_metrics::PerfMetrics;
 #[cfg(target_os = "windows")]
 use single_instance::{FileReceiver, SingleInstanceResult};
-use video_player::{format_duration, VideoPlayer, VideoSeekMode};
+use video_player::{format_duration, gstreamer_runtime_available, VideoPlayer, VideoSeekMode};
 
 use eframe::egui;
 use fast_image_resize as fir;
@@ -1232,6 +1232,10 @@ fn extract_video_first_frame_thumbnail(
 ) -> Option<CachedVideoThumbnail> {
     if let Some(cached) = lookup_cached_video_thumbnail(path, max_texture_side) {
         return Some(cached);
+    }
+
+    if !gstreamer_runtime_available() {
+        return None;
     }
 
     use gstreamer as gst;

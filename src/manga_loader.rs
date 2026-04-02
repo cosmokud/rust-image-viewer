@@ -42,6 +42,7 @@ use crate::metadata_cache::{
     lookup_cached_video_thumbnail, store_cached_dimensions, store_cached_static_thumbnail,
     store_cached_video_thumbnail, CachedImageThumbnail, CachedMediaKind, CachedVideoThumbnail,
 };
+use crate::video_player::gstreamer_runtime_available;
 
 /// Maximum number of decoded images to hold in memory awaiting GPU upload.
 /// This bounds memory usage even if the main thread is slow to consume results.
@@ -1078,70 +1079,14 @@ impl MangaLoader {
 
     /// Probe video dimensions for stable layout sizing.
     ///
-    /// Uses GStreamer Discoverer metadata probe instead of spinning up a decode pipeline.
-    /// Falls back to filename-based heuristics when probing fails.
+    /// Uses a lightweight first-frame probe, then falls back to filename heuristics.
     fn probe_video_dimensions(path: &std::path::Path) -> Option<(u32, u32)> {
         if let Some((w, h)) = lookup_cached_dimensions(path, CachedMediaKind::Video) {
             return Some((w, h));
         }
 
-        use gstreamer as gst;
-        use gstreamer_pbutils as gst_pbutils;
-
-        static GST_INIT: std::sync::OnceLock<Result<(), ()>> = std::sync::OnceLock::new();
-        let init_result = GST_INIT.get_or_init(|| gst::init().map_err(|_| ()));
-        if init_result.is_err() {
-            let fallback = Self::fallback_video_dimensions(path);
-            if let Some((w, h)) = fallback {
-                store_cached_dimensions(path, CachedMediaKind::Video, w, h);
-            }
-            return fallback;
-        }
-
-        let uri = match gst::glib::filename_to_uri(path, None) {
-            Ok(uri) => uri.to_string(),
-            Err(_) => {
-                let fallback = Self::fallback_video_dimensions(path);
-                if let Some((w, h)) = fallback {
-                    store_cached_dimensions(path, CachedMediaKind::Video, w, h);
-                }
-                return fallback;
-            }
-        };
-
-        // Keep discovery bounded so slow video metadata probes do not monopolize
-        // worker capacity while masonry is trying to stay responsive.
-        let discoverer = match gst_pbutils::Discoverer::new(gst::ClockTime::from_mseconds(250)) {
-            Ok(d) => d,
-            Err(_) => {
-                let fallback = Self::fallback_video_dimensions(path);
-                if let Some((w, h)) = fallback {
-                    store_cached_dimensions(path, CachedMediaKind::Video, w, h);
-                }
-                return fallback;
-            }
-        };
-
-        let info = match discoverer.discover_uri(&uri) {
-            Ok(i) => i,
-            Err(_) => {
-                let fallback = Self::fallback_video_dimensions(path);
-                if let Some((w, h)) = fallback {
-                    store_cached_dimensions(path, CachedMediaKind::Video, w, h);
-                }
-                return fallback;
-            }
-        };
-
-        let probed = info.video_streams().into_iter().find_map(|video| {
-            let w = video.width();
-            let h = video.height();
-            if w > 0 && h > 0 {
-                Some((w, h))
-            } else {
-                None
-            }
-        });
+        let probed = Self::extract_video_first_frame(path, 256)
+            .map(|(_, _, _, original_w, original_h)| (original_w, original_h));
 
         if let Some((w, h)) = probed {
             if w > 0 && h > 0 {
@@ -1204,6 +1149,10 @@ impl MangaLoader {
                 cached.original_width,
                 cached.original_height,
             ));
+        }
+
+        if !gstreamer_runtime_available() {
+            return None;
         }
 
         use gstreamer as gst;

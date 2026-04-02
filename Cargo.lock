@@ -2045,36 +2045,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "gstreamer-pbutils"
-version = "0.23.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "acf4bf5857fa22f910634e86a5bce33b5581a9e90caa4e32fd4a20bdd4c83ed0"
-dependencies = [
- "glib",
- "gstreamer",
- "gstreamer-audio",
- "gstreamer-pbutils-sys",
- "gstreamer-video",
- "libc",
- "thiserror 2.0.17",
-]
-
-[[package]]
-name = "gstreamer-pbutils-sys"
-version = "0.23.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "304101f5fccbbe41e0169536777ddb7680c2c837e18575c22b30fc20cedfb76f"
-dependencies = [
- "glib-sys",
- "gobject-sys",
- "gstreamer-audio-sys",
- "gstreamer-sys",
- "gstreamer-video-sys",
- "libc",
- "system-deps",
-]
-
-[[package]]
 name = "gstreamer-sys"
 version = "0.23.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4007,7 +3977,6 @@ dependencies = [
  "gstreamer",
  "gstreamer-app",
  "gstreamer-audio",
- "gstreamer-pbutils",
  "gstreamer-video",
  "hashbrown 0.15.5",
  "hdrhistogram",

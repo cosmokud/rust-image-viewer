@@ -202,6 +202,63 @@ fn apply_decoder_preference_windows(prefer_hardware_decode: bool, disable_hardwa
 fn apply_decoder_preference_windows(_prefer_hardware_decode: bool, _disable_hardware_decode: bool) {
 }
 
+#[cfg(target_os = "windows")]
+fn try_load_library_windows(dll_name: &str) -> bool {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use winapi::um::libloaderapi::{FreeLibrary, LoadLibraryW};
+
+    let wide: Vec<u16> = OsStr::new(dll_name)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    unsafe {
+        let module = LoadLibraryW(wide.as_ptr());
+        if module.is_null() {
+            return false;
+        }
+        FreeLibrary(module);
+    }
+
+    true
+}
+
+pub fn gstreamer_runtime_available() -> bool {
+    static GST_RUNTIME_AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *GST_RUNTIME_AVAILABLE.get_or_init(|| {
+        #[cfg(target_os = "windows")]
+        {
+            configure_gstreamer_env_windows();
+
+            // Keep this list aligned with delayed imports in build.rs.
+            for dll in [
+                "gstreamer-1.0-0.dll",
+                "gstbase-1.0-0.dll",
+                "gstapp-1.0-0.dll",
+                "gstvideo-1.0-0.dll",
+                "gstaudio-1.0-0.dll",
+                "glib-2.0-0.dll",
+                "gobject-2.0-0.dll",
+                "gmodule-2.0-0.dll",
+                "gthread-2.0-0.dll",
+                "gio-2.0-0.dll",
+            ] {
+                if !try_load_library_windows(dll) {
+                    return false;
+                }
+            }
+
+            true
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            true
+        }
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VideoSeekMode {
     Accurate,
@@ -443,6 +500,10 @@ pub struct VideoPlayer {
 
 impl VideoPlayer {
     fn ensure_init() -> Result<(), String> {
+        if !gstreamer_runtime_available() {
+            return Err("GStreamer runtime was not found. Video playback is unavailable on this system.".to_string());
+        }
+
         static GST_INIT_RESULT: OnceLock<Result<(), String>> = OnceLock::new();
         GST_INIT_RESULT
             .get_or_init(|| {
