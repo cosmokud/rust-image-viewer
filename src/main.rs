@@ -70,6 +70,9 @@ use windows::{
 
 use eframe::glow::HasContext;
 
+const GSTREAMER_MISSING_VIDEO_ERROR_TEXT: &str =
+    "Can't open video file because gstreamer library is not installed, please install gstreamer library to open a video file";
+
 /// Paint a smooth, semi-transparent loading spinner in the bottom-right corner
 /// of the given rectangle.  The spinner is a rotating arc that indicates
 /// background frame decoding is in progress.
@@ -4808,6 +4811,10 @@ impl ImageViewer {
         self.video_playback_popup_until = None;
     }
 
+    fn gstreamer_missing_video_error_text() -> &'static str {
+        GSTREAMER_MISSING_VIDEO_ERROR_TEXT
+    }
+
     fn is_video_playback_unavailable_active(&self) -> bool {
         if !matches!(self.current_media_type, Some(MediaType::Video)) {
             return false;
@@ -4829,7 +4836,12 @@ impl ImageViewer {
     fn set_video_playback_unavailable_for_path(&mut self, path: &PathBuf, reason: String) {
         self.video_player = None;
         self.pending_media_layout = false;
-        self.video_playback_unavailable_reason = Some(reason);
+        let normalized_reason = if !gstreamer_runtime_available() {
+            Self::gstreamer_missing_video_error_text().to_string()
+        } else {
+            reason
+        };
+        self.video_playback_unavailable_reason = Some(normalized_reason);
 
         let target_side = self.solo_target_texture_side_for_path(path, MediaType::Video, false);
         let has_pending_for_path = self
@@ -4884,6 +4896,10 @@ impl ImageViewer {
     }
 
     fn video_playback_unavailable_popup_detail(&self) -> String {
+        if !gstreamer_runtime_available() {
+            return Self::gstreamer_missing_video_error_text().to_string();
+        }
+
         let detail = self
             .video_playback_unavailable_reason
             .as_deref()
@@ -5234,7 +5250,7 @@ impl ImageViewer {
     }
 
     fn startup_ready_to_show(&self) -> bool {
-        if self.error_message.is_some() {
+        if self.error_message.is_some() || self.is_video_playback_unavailable_active() {
             return true;
         }
 
@@ -8569,6 +8585,18 @@ impl ImageViewer {
         muted: bool,
         initial_volume: f64,
     ) {
+        if !gstreamer_runtime_available() {
+            self.clear_pending_manga_video_load();
+            self.manga_video_players.remove(&index);
+            self.manga_video_textures.remove(&index);
+            if self.manga_focused_video_index == Some(index) {
+                self.manga_focused_video_index = None;
+            }
+            self.video_playback_unavailable_reason =
+                Some(Self::gstreamer_missing_video_error_text().to_string());
+            return;
+        }
+
         let request_id = self.next_manga_video_load_request_id;
         self.next_manga_video_load_request_id = self
             .next_manga_video_load_request_id
@@ -8753,6 +8781,16 @@ impl ImageViewer {
     }
 
     fn start_async_video_load(&mut self, path: PathBuf) {
+        if !gstreamer_runtime_available() {
+            self.pending_media_load = None;
+            self.drop_retained_media_placeholder();
+            self.set_video_playback_unavailable_for_path(
+                &path,
+                Self::gstreamer_missing_video_error_text().to_string(),
+            );
+            return;
+        }
+
         let request_id = self.next_media_load_request_id;
         self.next_media_load_request_id = self.next_media_load_request_id.saturating_add(1).max(1);
 
@@ -9080,6 +9118,21 @@ impl ImageViewer {
 
         match media_type {
             Some(MediaType::Video) => {
+                if !gstreamer_runtime_available() {
+                    self.gstreamer_initialized = false;
+                    self.drop_retained_media_placeholder();
+                    self.set_video_playback_unavailable_for_path(
+                        path,
+                        Self::gstreamer_missing_video_error_text().to_string(),
+                    );
+                    self.show_video_controls = false;
+                    self.image_changed = true;
+                    self.pending_media_layout = false;
+                    self.perf_metrics
+                        .record_duration("load_media_prepare_ms", load_media_start.elapsed());
+                    return;
+                }
+
                 // Mark GStreamer as initialized (it will be lazily initialized on first use)
                 self.gstreamer_initialized = true;
 
@@ -12162,6 +12215,21 @@ impl ImageViewer {
             return;
         }
 
+        if !gstreamer_runtime_available() {
+            if self.manga_focused_video_index.is_some() {
+                for player in self.manga_video_players.values_mut() {
+                    if player.is_playing() {
+                        let _ = player.pause();
+                    }
+                }
+            }
+            self.manga_focused_video_index = None;
+            self.clear_pending_manga_video_load();
+            self.video_playback_unavailable_reason =
+                Some(Self::gstreamer_missing_video_error_text().to_string());
+            return;
+        }
+
         if self.is_masonry_mode() && Instant::now() < self.manga_hover_autoplay_resume_at {
             if self.manga_focused_video_index.is_some() {
                 for player in self.manga_video_players.values_mut() {
@@ -14978,6 +15046,7 @@ impl ImageViewer {
         } else {
             MangaMediaType::StaticImage
         };
+        let video_runtime_available = !is_video || gstreamer_runtime_available();
         let (fill_retry_target_side, final_retry_target_side) =
             self.manga_retry_target_sides_for_rect(idx, image_rect, retry_media_type);
         let final_retry_dims = self.manga_bucket_dimensions_for_side(
@@ -14986,7 +15055,8 @@ impl ImageViewer {
             image_rect.size(),
         );
 
-        let video_load_pending = is_video && self.manga_video_load_pending_for_index(idx);
+        let video_load_pending =
+            video_runtime_available && is_video && self.manga_video_load_pending_for_index(idx);
 
         if is_video {
             // Video item: prioritize live video texture, fall back to first-frame thumbnail
@@ -15055,13 +15125,15 @@ impl ImageViewer {
                     );
                 }
 
-                if self.manga_texture_upgrade_needed(
+                if video_runtime_available
+                    && self.manga_texture_upgrade_needed(
                     tex_w,
                     tex_h,
                     final_retry_dims.0,
                     final_retry_dims.1,
                     retry_media_type,
-                ) {
+                )
+                {
                     requested_retry |= self.manga_request_retry_for_visible_item(
                         idx,
                         final_retry_target_side,
@@ -15092,13 +15164,15 @@ impl ImageViewer {
                     );
                 }
 
-                requested_retry |= self.manga_request_retry_for_visible_item(
-                    idx,
-                    fill_retry_target_side,
-                    false,
-                    retry_media_type,
-                    navigation_active_for_visible_retry,
-                );
+                if video_runtime_available {
+                    requested_retry |= self.manga_request_retry_for_visible_item(
+                        idx,
+                        fill_retry_target_side,
+                        false,
+                        retry_media_type,
+                        navigation_active_for_visible_retry,
+                    );
+                }
             } else {
                 // Video not yet loaded - draw placeholder with video icon
                 ui.painter()
@@ -15111,15 +15185,17 @@ impl ImageViewer {
                     egui::Color32::from_gray(100),
                 );
 
-                self.manga_mark_placeholder_visible(idx);
+                if video_runtime_available {
+                    self.manga_mark_placeholder_visible(idx);
 
-                requested_retry |= self.manga_request_retry_for_visible_item(
-                    idx,
-                    fill_retry_target_side,
-                    false,
-                    retry_media_type,
-                    navigation_active_for_visible_retry,
-                );
+                    requested_retry |= self.manga_request_retry_for_visible_item(
+                        idx,
+                        fill_retry_target_side,
+                        false,
+                        retry_media_type,
+                        navigation_active_for_visible_retry,
+                    );
+                }
             }
 
             if video_load_pending
@@ -16116,14 +16192,21 @@ impl ImageViewer {
             }
         }
 
-        // Update video focus - ensures only one video plays at a time (the focused one)
-        self.manga_update_video_focus();
+        let gstreamer_available = gstreamer_runtime_available();
 
-        // Apply any completed focused-video startup before texture polling.
-        self.poll_pending_manga_video_load(ctx);
+        if gstreamer_available {
+            // Update video focus - ensures only one video plays at a time (the focused one)
+            self.manga_update_video_focus();
 
-        // Update video textures for the focused video
-        self.manga_update_video_textures(ctx);
+            // Apply any completed focused-video startup before texture polling.
+            self.poll_pending_manga_video_load(ctx);
+
+            // Update video textures for the focused video
+            self.manga_update_video_textures(ctx);
+        } else {
+            self.clear_pending_manga_video_load();
+            self.manga_focused_video_index = None;
+        }
 
         // Update animated images (GIF, animated WebP)
         let has_active_animation = self.manga_update_animated_textures(ctx);
@@ -16140,7 +16223,8 @@ impl ImageViewer {
             })
             .unwrap_or(false);
 
-        let has_pending_focused_video_load = self
+        let has_pending_focused_video_load = gstreamer_available
+            && self
             .pending_manga_video_load
             .as_ref()
             .is_some_and(|pending| self.manga_focused_video_index == Some(pending.index));
@@ -16398,6 +16482,30 @@ impl ImageViewer {
                             egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200),
                         ),
                     );
+                }
+
+                if !gstreamer_available {
+                    let focused_video_idx = if self.is_masonry_mode() {
+                        self.manga_hovered_media_index
+                    } else if self.image_list.is_empty() {
+                        None
+                    } else {
+                        Some(self.manga_get_focused_media_index())
+                    };
+
+                    let show_video_error_notice = focused_video_idx
+                        .and_then(|index| self.image_list.get(index))
+                        .is_some_and(|path| is_supported_video(path));
+
+                    if show_video_error_notice {
+                        ui.painter().text(
+                            egui::pos2(screen_width * 0.5, 24.0),
+                            egui::Align2::CENTER_TOP,
+                            Self::gstreamer_missing_video_error_text(),
+                            egui::FontId::proportional(14.0),
+                            egui::Color32::from_rgb(255, 190, 135),
+                        );
+                    }
                 }
             });
 
@@ -18183,9 +18291,9 @@ impl ImageViewer {
 
             ui.add_space(8.0);
             ui.label(
-                egui::RichText::new("Preview mode: playback unavailable on this system")
+                egui::RichText::new(Self::gstreamer_missing_video_error_text())
                     .color(egui::Color32::from_rgb(255, 190, 135))
-                    .size(12.0),
+                    .size(11.0),
             );
         });
     }
@@ -19992,13 +20100,13 @@ impl ImageViewer {
                         );
                     });
                 } else if self.is_video_playback_unavailable_active() {
+                    ui.painter()
+                        .rect_filled(ui.max_rect(), 0.0, egui::Color32::BLACK);
                     ui.centered_and_justified(|ui| {
                         ui.label(
-                            egui::RichText::new(
-                                "Video playback is unavailable here. Preview mode is still enabled.",
-                            )
-                            .color(egui::Color32::from_rgb(255, 190, 135))
-                            .size(16.0),
+                            egui::RichText::new(Self::gstreamer_missing_video_error_text())
+                                .color(egui::Color32::from_rgb(255, 190, 135))
+                                .size(16.0),
                         );
                     });
                 } else {
