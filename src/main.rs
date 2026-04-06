@@ -1915,6 +1915,15 @@ struct ImageViewer {
     manga_autoscroll_active: bool,
     /// Anchor point where middle-click autoscroll was activated.
     manga_autoscroll_anchor: Option<egui::Pos2>,
+    /// True when the current autoscroll session was started by a middle-button press.
+    manga_autoscroll_middle_hold_tracking: bool,
+    /// Latched once middle button remains held beyond the initial press frame.
+    /// When latched, releasing middle click cancels autoscroll.
+    manga_autoscroll_cancel_on_middle_release: bool,
+    /// Timestamp when a middle-click started an autoscroll session.
+    manga_autoscroll_middle_hold_started_at: Option<Instant>,
+    /// Horizontal velocity used for smooth shift+wheel panning in strip/masonry layouts.
+    manga_shift_wheel_pan_velocity_x: f32,
 
     /// Cached total height of all pages in manga mode for the current zoom/screen height.
     /// This avoids an O(n) scan on every scroll tick for large folders.
@@ -2267,6 +2276,10 @@ impl Default for ImageViewer {
             masonry_autoscroll_last_motion_at: None,
             manga_autoscroll_active: false,
             manga_autoscroll_anchor: None,
+            manga_autoscroll_middle_hold_tracking: false,
+            manga_autoscroll_cancel_on_middle_release: false,
+            manga_autoscroll_middle_hold_started_at: None,
+            manga_shift_wheel_pan_velocity_x: 0.0,
 
             manga_total_height_cache: 0.0,
             manga_total_height_cache_zoom: 1.0,
@@ -6946,6 +6959,8 @@ impl ImageViewer {
             InputBinding::ScrollDown => "Wheel Down".to_string(),
             InputBinding::CtrlScrollUp => "Ctrl + Wheel Up".to_string(),
             InputBinding::CtrlScrollDown => "Ctrl + Wheel Down".to_string(),
+            InputBinding::ShiftScrollUp => "Shift + Wheel Up".to_string(),
+            InputBinding::ShiftScrollDown => "Shift + Wheel Down".to_string(),
         }
     }
 
@@ -7656,6 +7671,22 @@ impl ImageViewer {
         }
     }
 
+    fn modifier_wheel_pan_step(&self, wheel_steps: f32, horizontal: bool) -> f32 {
+        let step = if horizontal {
+            if wheel_steps >= 0.0 {
+                self.config.shift_scroll_up_pan_speed_px_per_step
+            } else {
+                self.config.shift_scroll_down_pan_speed_px_per_step
+            }
+        } else if wheel_steps >= 0.0 {
+            self.config.ctrl_scroll_up_pan_speed_px_per_step
+        } else {
+            self.config.ctrl_scroll_down_pan_speed_px_per_step
+        };
+
+        step.max(0.1)
+    }
+
     fn manga_layout_goto_file_action(&self) -> Action {
         if self.is_masonry_mode() {
             Action::MasonryGotoFile
@@ -7797,6 +7828,9 @@ impl ImageViewer {
     fn stop_manga_autoscroll(&mut self) {
         self.manga_autoscroll_active = false;
         self.manga_autoscroll_anchor = None;
+        self.manga_autoscroll_middle_hold_tracking = false;
+        self.manga_autoscroll_cancel_on_middle_release = false;
+        self.manga_autoscroll_middle_hold_started_at = None;
         self.masonry_autoscroll_last_motion_at = None;
     }
 
@@ -7960,7 +7994,10 @@ impl ImageViewer {
             InputBinding::Mouse5 => input.pointer.button_pressed(egui::PointerButton::Extra2),
             InputBinding::ScrollUp => input.smooth_scroll_delta.y > 0.0,
             InputBinding::ScrollDown => input.smooth_scroll_delta.y < 0.0,
-            InputBinding::CtrlScrollUp | InputBinding::CtrlScrollDown => false,
+            InputBinding::CtrlScrollUp
+            | InputBinding::CtrlScrollDown
+            | InputBinding::ShiftScrollUp
+            | InputBinding::ShiftScrollDown => false,
         }
     }
 
@@ -7985,7 +8022,9 @@ impl ImageViewer {
             InputBinding::ScrollUp
             | InputBinding::ScrollDown
             | InputBinding::CtrlScrollUp
-            | InputBinding::CtrlScrollDown => false,
+            | InputBinding::CtrlScrollDown
+            | InputBinding::ShiftScrollUp
+            | InputBinding::ShiftScrollDown => false,
         }
     }
 
@@ -15473,9 +15512,21 @@ impl ImageViewer {
         } else {
             Action::MangaZoomOut
         };
+        let mode_pan_up_action = if self.is_masonry_mode() {
+            Action::MasonryPanUp
+        } else {
+            Action::MangaPanUp
+        };
+        let mode_pan_down_action = if self.is_masonry_mode() {
+            Action::MasonryPanDown
+        } else {
+            Action::MangaPanDown
+        };
+        let mode_pan_action = self.manga_layout_pan_action();
 
         // Get input states
-        let ctrl_held = ctx.input(|i| i.modifiers.ctrl);
+        let (ctrl_held, shift_held, alt_held) =
+            ctx.input(|i| (i.modifiers.ctrl, i.modifiers.shift, i.modifiers.alt));
         // NOTE: In egui/eframe, Ctrl+mouse-wheel is commonly routed into `zoom_delta` (not `scroll_delta`).
         // We support both so Ctrl+wheel zoom works reliably across platforms/devices.
         let zoom_delta = if masonry_preload_input_blocked {
@@ -15508,6 +15559,12 @@ impl ImageViewer {
         };
         let secondary_clicked = !masonry_preload_input_blocked
             && ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Secondary));
+        let middle_pressed = !masonry_preload_input_blocked
+            && ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Middle));
+        let middle_down = !masonry_preload_input_blocked
+            && ctx.input(|i| i.pointer.button_down(egui::PointerButton::Middle));
+        let middle_released = !masonry_preload_input_blocked
+            && ctx.input(|i| i.pointer.button_released(egui::PointerButton::Middle));
         let freehand_autoscroll_triggered = !masonry_preload_input_blocked
             && ctx.input(|input| {
                 let ctrl = input.modifiers.ctrl;
@@ -15541,9 +15598,10 @@ impl ImageViewer {
         // We normalize both into "wheel steps" so wheel momentum tuning stays consistent.
         const MANGA_WHEEL_POINTS_PER_LINE: f32 = 50.0;
         const MANGA_WHEEL_MAX_STEPS_PER_EVENT: f32 = 6.0;
-        let (raw_wheel_steps, raw_wheel_steps_ctrl) = ctx.input(|i| {
+        let (raw_wheel_steps, raw_wheel_steps_ctrl, raw_wheel_steps_shift) = ctx.input(|i| {
             let mut normal = 0.0f32;
             let mut ctrl = 0.0f32;
+            let mut shift = 0.0f32;
 
             for e in &i.raw.events {
                 let egui::Event::MouseWheel {
@@ -15575,22 +15633,24 @@ impl ImageViewer {
 
                 if modifiers.ctrl {
                     ctrl += steps;
+                } else if modifiers.shift {
+                    shift += steps;
                 } else {
                     normal += steps;
                 }
             }
 
-            (normal, ctrl)
+            (normal, ctrl, shift)
         });
-        let (wheel_steps, wheel_steps_ctrl) = if masonry_preload_input_blocked {
-            (0.0, 0.0)
+        let (wheel_steps, wheel_steps_ctrl, wheel_steps_shift) = if masonry_preload_input_blocked {
+            (0.0, 0.0, 0.0)
         } else {
-            (raw_wheel_steps, raw_wheel_steps_ctrl)
+            (raw_wheel_steps, raw_wheel_steps_ctrl, raw_wheel_steps_shift)
         };
 
         // In manga fullscreen mode, the wheel is owned by our custom inertial scroller.
         // Remove wheel events so other widgets don't accidentally react to them in the same frame.
-        if raw_wheel_steps != 0.0 || raw_wheel_steps_ctrl != 0.0 {
+        if raw_wheel_steps != 0.0 || raw_wheel_steps_ctrl != 0.0 || raw_wheel_steps_shift != 0.0 {
             ctx.input_mut(|i| {
                 i.raw
                     .events
@@ -15623,12 +15683,51 @@ impl ImageViewer {
             } else if let Some(anchor) = pointer_pos {
                 self.manga_autoscroll_active = true;
                 self.manga_autoscroll_anchor = Some(anchor);
+                self.manga_autoscroll_middle_hold_tracking = middle_pressed
+                    && self.action_uses_binding(
+                        self.manga_layout_freehand_autoscroll_action(),
+                        InputBinding::MouseMiddle,
+                    );
+                self.manga_autoscroll_cancel_on_middle_release = false;
+                self.manga_autoscroll_middle_hold_started_at =
+                    if self.manga_autoscroll_middle_hold_tracking {
+                        Some(Instant::now())
+                    } else {
+                        None
+                    };
                 self.masonry_autoscroll_last_motion_at = None;
                 self.is_panning = false;
                 self.last_mouse_pos = None;
                 self.stop_manga_wheel_scroll();
             }
             animation_active = true;
+        }
+
+        if self.manga_autoscroll_active
+            && self.manga_autoscroll_middle_hold_tracking
+            && middle_down
+            && !middle_pressed
+        {
+            if self
+                .manga_autoscroll_middle_hold_started_at
+                .is_some_and(|started_at| started_at.elapsed().as_secs_f32() >= 0.2)
+            {
+                self.manga_autoscroll_cancel_on_middle_release = true;
+            }
+        }
+
+        if self.manga_autoscroll_active
+            && self.manga_autoscroll_middle_hold_tracking
+            && middle_released
+        {
+            if self.manga_autoscroll_cancel_on_middle_release {
+                self.stop_manga_autoscroll();
+                animation_active = true;
+            } else {
+                // Treat quick middle click as toggle-on (do not auto-cancel on release).
+                self.manga_autoscroll_middle_hold_tracking = false;
+                self.manga_autoscroll_middle_hold_started_at = None;
+            }
         }
 
         if self.manga_autoscroll_active && primary_clicked {
@@ -15865,23 +15964,57 @@ impl ImageViewer {
             self.masonry_scrollbar_last_motion_at = None;
         }
 
-        // Determine whether Ctrl+wheel zoom is bound.
-        // - New default: Ctrl+wheel is part of zoom_in/zoom_out
-        // - Backwards-compat: older configs may bind Ctrl+wheel to manga_zoom_in/out
-        // If bound, we treat Ctrl+wheel (and corresponding `zoom_delta`) as zoom input.
+        // Determine how modifier-wheel bindings are mapped for the current fullscreen strip layout.
+        let manga_ctrl_scroll_pan_bound = self
+            .action_uses_binding(mode_pan_up_action, InputBinding::CtrlScrollUp)
+            || self.action_uses_binding(mode_pan_down_action, InputBinding::CtrlScrollDown);
+        let manga_shift_scroll_pan_bound = self
+            .action_uses_binding(mode_pan_action, InputBinding::ShiftScrollUp)
+            || self.action_uses_binding(mode_pan_action, InputBinding::ShiftScrollDown);
         let manga_ctrl_scroll_zoom_bound = self
             .action_uses_binding(mode_zoom_in_action, InputBinding::CtrlScrollUp)
             || self.action_uses_binding(mode_zoom_out_action, InputBinding::CtrlScrollDown);
         let manga_scroll_bound = self.action_uses_binding(mode_scroll_up_action, InputBinding::ScrollUp)
             || self.action_uses_binding(mode_scroll_down_action, InputBinding::ScrollDown);
 
-        // Handle scroll/zoom. Ctrl+wheel zoom should still work over the scrollbar track unless
-        // the user is actively dragging the scrollbar itself.
+        // Handle scroll/pan/zoom unless the user is actively dragging the scrollbar thumb.
         if !title_ui_blocking && !self.manga_scrollbar_dragging {
-            let wants_ctrl_zoom = manga_ctrl_scroll_zoom_bound
-                && (wheel_steps_ctrl != 0.0 || (ctrl_held && zoom_delta != 1.0));
+            let wheel_steps_ctrl_effective = if wheel_steps_ctrl != 0.0 {
+                wheel_steps_ctrl
+            } else if ctrl_held && !shift_held && !alt_held && zoom_delta != 1.0 {
+                if zoom_delta > 1.0 { 1.0 } else { -1.0 }
+            } else {
+                0.0
+            };
 
-            if wants_ctrl_zoom {
+            let wants_ctrl_pan = manga_ctrl_scroll_pan_bound && wheel_steps_ctrl_effective != 0.0;
+            let wants_shift_pan = manga_shift_scroll_pan_bound && wheel_steps_shift != 0.0;
+            let wants_ctrl_zoom = !wants_ctrl_pan
+                && manga_ctrl_scroll_zoom_bound
+                && wheel_steps_ctrl_effective != 0.0;
+
+            if wants_ctrl_pan {
+                if self.manga_wheel_scroll_active {
+                    self.stop_manga_wheel_scroll();
+                }
+
+                let pan_step = self.modifier_wheel_pan_step(wheel_steps_ctrl_effective, false);
+                if self.manga_add_scroll_target_delta(-wheel_steps_ctrl_effective * pan_step) {
+                    self.manga_update_preload_queue();
+                    animation_active = true;
+                }
+            } else if wants_shift_pan {
+                if self.manga_wheel_scroll_active {
+                    self.stop_manga_wheel_scroll();
+                }
+
+                let pan_step = self.modifier_wheel_pan_step(wheel_steps_shift, true);
+                let impulse = pan_step * self.config.manga_wheel_decay_rate.max(0.5);
+                self.manga_shift_wheel_pan_velocity_x += -wheel_steps_shift * impulse;
+                self.manga_shift_wheel_pan_velocity_x = self.manga_shift_wheel_pan_velocity_x
+                    .clamp(-self.config.manga_wheel_max_velocity, self.config.manga_wheel_max_velocity);
+                animation_active = true;
+            } else if wants_ctrl_zoom {
                 if self.manga_wheel_scroll_active {
                     self.stop_manga_wheel_scroll();
                 }
@@ -15890,11 +16023,7 @@ impl ImageViewer {
                 // `zoom_delta` can be device/platform-dependent and may feel jumpy; only use it
                 // to determine direction when raw Ctrl-wheel steps aren't available.
                 let step = self.config.zoom_step;
-                let zoom_in = if wheel_steps_ctrl != 0.0 {
-                    wheel_steps_ctrl > 0.0
-                } else {
-                    zoom_delta > 1.0
-                };
+                let zoom_in = wheel_steps_ctrl_effective > 0.0;
                 let factor = if zoom_in { step } else { 1.0 / step };
 
                 let old_zoom = self.zoom.max(0.0001);
@@ -16007,6 +16136,7 @@ impl ImageViewer {
                     did_reset = true;
                 }
                 self.offset.x = 0.0;
+                self.manga_shift_wheel_pan_velocity_x = 0.0;
 
                 // Keep vertical context stable while restoring zoom baseline.
                 if let Some(a) = anchor {
@@ -16090,6 +16220,7 @@ impl ImageViewer {
 
             if pan_down_action && self.is_panning {
                 let drag_speed = self.config.manga_drag_pan_speed;
+                self.manga_shift_wheel_pan_velocity_x = 0.0;
 
                 // Stop any residual inertial scroll while the user is actively dragging.
                 self.stop_manga_wheel_scroll();
@@ -16122,6 +16253,16 @@ impl ImageViewer {
         }
 
         let dt = ctx.input(|i| i.stable_dt).clamp(0.0, 0.033);
+
+        if self.manga_shift_wheel_pan_velocity_x.abs() > 0.01 && dt > 0.0 {
+            self.offset.x += self.manga_shift_wheel_pan_velocity_x * dt;
+            let decay = (-self.config.manga_wheel_decay_rate * dt).exp();
+            self.manga_shift_wheel_pan_velocity_x *= decay;
+            if self.manga_shift_wheel_pan_velocity_x.abs() < 2.0 {
+                self.manga_shift_wheel_pan_velocity_x = 0.0;
+            }
+            animation_active = true;
+        }
 
         if self.manga_autoscroll_active {
             if let (Some(anchor), Some(pos)) = (self.manga_autoscroll_anchor, pointer_pos) {
@@ -16156,6 +16297,7 @@ impl ImageViewer {
                 let autoscroll_moved_x = speed_x != 0.0 && dt > 0.0;
 
                 if speed_x != 0.0 {
+                    self.manga_shift_wheel_pan_velocity_x = 0.0;
                     self.offset.x -= speed_x * dt;
                     animation_active = true;
                 }
@@ -16214,8 +16356,9 @@ impl ImageViewer {
                 || masonry_scroll_animation_moved_this_frame
                 || wheel_steps != 0.0
                 || wheel_steps_ctrl != 0.0
+                || wheel_steps_shift != 0.0
                 || (ctrl_held
-                    && manga_ctrl_scroll_zoom_bound
+                    && (manga_ctrl_scroll_pan_bound || manga_ctrl_scroll_zoom_bound)
                     && (zoom_delta != 1.0 || wheel_steps_ctrl != 0.0)));
 
         // Process decoded images from background threads and upload to GPU.
@@ -17419,7 +17562,10 @@ impl ImageViewer {
                                 }
                             }
                         }
-                        InputBinding::CtrlScrollUp | InputBinding::CtrlScrollDown => {}
+                        InputBinding::CtrlScrollUp
+                        | InputBinding::CtrlScrollDown
+                        | InputBinding::ShiftScrollUp
+                        | InputBinding::ShiftScrollDown => {}
                         InputBinding::MouseLeft | InputBinding::MouseRight => {}
                     }
                 }
@@ -19599,25 +19745,36 @@ impl ImageViewer {
             self.is_resizing = false;
             self.resize_direction = ResizeDirection::None;
             self.last_mouse_pos = None;
-            self.manga_autoscroll_active = false;
-            self.manga_autoscroll_anchor = None;
+            self.stop_manga_autoscroll();
         } else {
 
-        // Handle zoom input (not in manga mode - that's handled in draw_manga_mode)
-        // NOTE: In egui/eframe, Ctrl+mouse-wheel is commonly routed into `zoom_delta` (not `smooth_scroll_delta`).
-        let ctrl_held = ctx.input(|i| i.modifiers.ctrl);
+        // Handle modifier-wheel pan/zoom input (not in manga mode - that's handled in draw_manga_mode).
+        // Ctrl+wheel may be routed to `zoom_delta` on some platforms, so we support both raw wheel and
+        // zoom-delta fallback for direction when Ctrl is held.
+        let (ctrl_held, shift_held, alt_held) =
+            ctx.input(|i| (i.modifiers.ctrl, i.modifiers.shift, i.modifiers.alt));
         let zoom_delta = ctx.input(|i| i.zoom_delta());
+        let regular_ctrl_scroll_pan_bound = self
+            .action_uses_binding(Action::Pan, InputBinding::CtrlScrollUp)
+            || self.action_uses_binding(Action::Pan, InputBinding::CtrlScrollDown);
+        let regular_shift_scroll_pan_bound = self
+            .action_uses_binding(Action::Pan, InputBinding::ShiftScrollUp)
+            || self.action_uses_binding(Action::Pan, InputBinding::ShiftScrollDown);
         let regular_ctrl_scroll_zoom_bound = self
             .action_uses_binding(Action::ZoomIn, InputBinding::CtrlScrollUp)
             || self.action_uses_binding(Action::ZoomOut, InputBinding::CtrlScrollDown);
         let regular_scroll_zoom_bound = self.action_uses_binding(Action::ZoomIn, InputBinding::ScrollUp)
             || self.action_uses_binding(Action::ZoomOut, InputBinding::ScrollDown);
+        let pointer_pos_for_wheel = ctx.input(|i| i.pointer.hover_pos());
+        let pointer_over_shortcut_ui_for_wheel =
+            self.pointer_over_shortcut_blocking_ui(pointer_pos_for_wheel, screen_rect);
 
-        // Also detect Ctrl+wheel via raw events as a fallback.
         const WHEEL_POINTS_PER_LINE: f32 = 50.0;
         const WHEEL_MAX_STEPS_PER_EVENT: f32 = 6.0;
-        let wheel_steps_ctrl = ctx.input(|i| {
+        let (wheel_steps_ctrl, wheel_steps_shift) = ctx.input(|i| {
             let mut ctrl_steps = 0.0f32;
+            let mut shift_steps = 0.0f32;
+
             for e in &i.raw.events {
                 let egui::Event::MouseWheel {
                     unit,
@@ -19627,39 +19784,59 @@ impl ImageViewer {
                 else {
                     continue;
                 };
-                if !modifiers.ctrl {
-                    continue;
-                }
+
                 let dy = delta.y;
                 if !dy.is_finite() || dy == 0.0 {
                     continue;
                 }
+
                 let mut steps = match unit {
                     egui::MouseWheelUnit::Line => dy,
                     egui::MouseWheelUnit::Page => dy,
                     egui::MouseWheelUnit::Point => dy / WHEEL_POINTS_PER_LINE,
                 };
                 steps = steps.clamp(-WHEEL_MAX_STEPS_PER_EVENT, WHEEL_MAX_STEPS_PER_EVENT);
-                ctrl_steps += steps;
+
+                if modifiers.ctrl {
+                    ctrl_steps += steps;
+                } else if modifiers.shift {
+                    shift_steps += steps;
+                }
             }
-            ctrl_steps
+
+            (ctrl_steps, shift_steps)
         });
 
-        let mut handled_ctrl_zoom = false;
-        if regular_ctrl_scroll_zoom_bound
-            && (wheel_steps_ctrl != 0.0 || (ctrl_held && zoom_delta != 1.0))
-        {
-            if let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) {
-                if !title_ui_blocking {
-                    // IMPORTANT: Use the *same* step-based zoom algorithm as normal wheel zoom.
-                    // `zoom_delta` can be device/platform-dependent and may feel jumpy; we only
-                    // use it to determine direction when raw wheel steps aren't available.
+        let wheel_steps_ctrl_effective = if wheel_steps_ctrl != 0.0 {
+            wheel_steps_ctrl
+        } else if ctrl_held && !shift_held && !alt_held && zoom_delta != 1.0 {
+            if zoom_delta > 1.0 { 1.0 } else { -1.0 }
+        } else {
+            0.0
+        };
+
+        let mut handled_modifier_wheel = false;
+        if !title_ui_blocking && !pointer_over_shortcut_ui_for_wheel {
+            if regular_ctrl_scroll_pan_bound && wheel_steps_ctrl_effective != 0.0 {
+                let pan_step = self.modifier_wheel_pan_step(wheel_steps_ctrl_effective, false);
+                self.offset.y += wheel_steps_ctrl_effective * pan_step;
+                if self.is_fullscreen {
+                    self.remember_current_fullscreen_view_state();
+                }
+                self.zoom_velocity = 0.0;
+                handled_modifier_wheel = true;
+            } else if regular_shift_scroll_pan_bound && wheel_steps_shift != 0.0 {
+                let pan_step = self.modifier_wheel_pan_step(wheel_steps_shift, true);
+                self.offset.x -= wheel_steps_shift * pan_step;
+                if self.is_fullscreen {
+                    self.remember_current_fullscreen_view_state();
+                }
+                self.zoom_velocity = 0.0;
+                handled_modifier_wheel = true;
+            } else if regular_ctrl_scroll_zoom_bound && wheel_steps_ctrl_effective != 0.0 {
+                if let Some(pos) = pointer_pos_for_wheel {
                     let step = self.config.zoom_step;
-                    let zoom_in = if wheel_steps_ctrl != 0.0 {
-                        wheel_steps_ctrl > 0.0
-                    } else {
-                        zoom_delta > 1.0
-                    };
+                    let zoom_in = wheel_steps_ctrl_effective > 0.0;
                     let factor = if zoom_in { step } else { 1.0 / step };
 
                     if self.is_fullscreen {
@@ -19683,13 +19860,18 @@ impl ImageViewer {
                         self.zoom_velocity = 0.0;
                     }
 
-                    handled_ctrl_zoom = true;
+                    handled_modifier_wheel = true;
                 }
             }
         }
 
-        // Regular (non-CTRL) scroll wheel zoom.
-        if !handled_ctrl_zoom && regular_scroll_zoom_bound {
+        // Regular unmodified wheel zoom.
+        if !handled_modifier_wheel
+            && regular_scroll_zoom_bound
+            && !ctrl_held
+            && !shift_held
+            && !alt_held
+        {
             let scroll_delta = ctx.input(|i| i.smooth_scroll_delta.y);
             if scroll_delta != 0.0 {
                 if let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) {
@@ -19733,6 +19915,10 @@ impl ImageViewer {
             ctx.input(|i| i.pointer.button_released(egui::PointerButton::Primary));
         let secondary_clicked =
             ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Secondary));
+        let middle_pressed = ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Middle));
+        let middle_down = ctx.input(|i| i.pointer.button_down(egui::PointerButton::Middle));
+        let middle_released =
+            ctx.input(|i| i.pointer.button_released(egui::PointerButton::Middle));
         let freehand_autoscroll_triggered = ctx.input(|input| {
             let ctrl = input.modifiers.ctrl;
             let shift = input.modifiers.shift;
@@ -19792,10 +19978,46 @@ impl ImageViewer {
             } else if let Some(anchor) = pointer_pos {
                 self.manga_autoscroll_active = true;
                 self.manga_autoscroll_anchor = Some(anchor);
+                self.manga_autoscroll_middle_hold_tracking = middle_pressed
+                    && self.action_uses_binding(Action::FreehandAutoscroll, InputBinding::MouseMiddle);
+                self.manga_autoscroll_cancel_on_middle_release = false;
+                self.manga_autoscroll_middle_hold_started_at =
+                    if self.manga_autoscroll_middle_hold_tracking {
+                        Some(Instant::now())
+                    } else {
+                        None
+                    };
                 self.is_panning = false;
                 self.last_mouse_pos = None;
             }
             animation_active = true;
+        }
+
+        if self.manga_autoscroll_active
+            && self.manga_autoscroll_middle_hold_tracking
+            && middle_down
+            && !middle_pressed
+        {
+            if self
+                .manga_autoscroll_middle_hold_started_at
+                .is_some_and(|started_at| started_at.elapsed().as_secs_f32() >= 0.2)
+            {
+                self.manga_autoscroll_cancel_on_middle_release = true;
+            }
+        }
+
+        if self.manga_autoscroll_active
+            && self.manga_autoscroll_middle_hold_tracking
+            && middle_released
+        {
+            if self.manga_autoscroll_cancel_on_middle_release {
+                self.stop_manga_autoscroll();
+                animation_active = true;
+            } else {
+                // Treat quick middle click as toggle-on (do not auto-cancel on release).
+                self.manga_autoscroll_middle_hold_tracking = false;
+                self.manga_autoscroll_middle_hold_started_at = None;
+            }
         }
 
         if self.manga_autoscroll_active && primary_clicked {

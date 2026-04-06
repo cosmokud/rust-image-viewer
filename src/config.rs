@@ -138,6 +138,8 @@ pub enum InputBinding {
     // Scroll wheel with modifiers
     CtrlScrollUp,
     CtrlScrollDown,
+    ShiftScrollUp,
+    ShiftScrollDown,
     // Key modifiers
     KeyWithCtrl(egui::Key),
     KeyWithShift(egui::Key),
@@ -271,7 +273,11 @@ pub fn parse_input_binding(s: &str) -> Option<InputBinding> {
         }
     }
     if let Some(key_str) = s.strip_prefix("shift+") {
-        return parse_key(key_str).map(InputBinding::KeyWithShift);
+        match key_str {
+            "scroll_up" | "wheel_up" => return Some(InputBinding::ShiftScrollUp),
+            "scroll_down" | "wheel_down" => return Some(InputBinding::ShiftScrollDown),
+            _ => return parse_key(key_str).map(InputBinding::KeyWithShift),
+        }
     }
     if let Some(key_str) = s.strip_prefix("alt+") {
         return parse_key(key_str).map(InputBinding::KeyWithAlt);
@@ -476,6 +482,15 @@ pub struct Config {
     /// Maximum zoom level in percent (100 = 1.0x, 1000 = 10.0x)
     pub max_zoom_percent: f32,
 
+    /// Ctrl+wheel up pan speed (pixels per normalized wheel step).
+    pub ctrl_scroll_up_pan_speed_px_per_step: f32,
+    /// Ctrl+wheel down pan speed (pixels per normalized wheel step).
+    pub ctrl_scroll_down_pan_speed_px_per_step: f32,
+    /// Shift+wheel up pan speed (pixels per normalized wheel step).
+    pub shift_scroll_up_pan_speed_px_per_step: f32,
+    /// Shift+wheel down pan speed (pixels per normalized wheel step).
+    pub shift_scroll_down_pan_speed_px_per_step: f32,
+
     /// Manga mode: drag pan speed multiplier (1.0 = 1:1 pointer delta)
     pub manga_drag_pan_speed: f32,
     /// Manga mode: wheel momentum injected per normalized scroll step (px/s).
@@ -613,6 +628,10 @@ impl Config {
             precise_rotation_step_degrees: 2.0,
             zoom_step: 1.02,
             max_zoom_percent: 1000.0,
+            ctrl_scroll_up_pan_speed_px_per_step: 20.0,
+            ctrl_scroll_down_pan_speed_px_per_step: 20.0,
+            shift_scroll_up_pan_speed_px_per_step: 20.0,
+            shift_scroll_down_pan_speed_px_per_step: 20.0,
             manga_drag_pan_speed: 1.0,
             manga_wheel_impulse_per_step: 2400.0,
             manga_wheel_decay_rate: 11.0,
@@ -683,6 +702,10 @@ impl Config {
 
         // Floating + fullscreen shortcuts
         self.add_binding(InputBinding::MouseLeft, Action::Pan);
+        self.add_binding(InputBinding::CtrlScrollUp, Action::Pan);
+        self.add_binding(InputBinding::CtrlScrollDown, Action::Pan);
+        self.add_binding(InputBinding::ShiftScrollUp, Action::Pan);
+        self.add_binding(InputBinding::ShiftScrollDown, Action::Pan);
         self.add_binding(InputBinding::MouseRight, Action::SelectArea);
         self.add_binding(InputBinding::MouseRight, Action::GotoFile);
         self.add_binding(InputBinding::MouseMiddle, Action::FreehandAutoscroll);
@@ -727,15 +750,13 @@ impl Config {
         self.add_binding(InputBinding::ScrollUp, Action::ZoomIn);
         self.add_binding(InputBinding::ScrollDown, Action::ZoomOut);
 
-        // Zoom with CTRL + scroll wheel (common muscle memory)
-        self.add_binding(InputBinding::CtrlScrollUp, Action::ZoomIn);
-        self.add_binding(InputBinding::CtrlScrollDown, Action::ZoomOut);
-
         // Video controls
         self.add_binding(InputBinding::Key(egui::Key::M), Action::VideoMute);
 
         // Long strip shortcuts
         self.add_binding(InputBinding::MouseLeft, Action::MangaPan);
+        self.add_binding(InputBinding::ShiftScrollUp, Action::MangaPan);
+        self.add_binding(InputBinding::ShiftScrollDown, Action::MangaPan);
         self.add_binding(InputBinding::MouseRight, Action::MangaGotoFile);
         self.add_binding(InputBinding::MouseMiddle, Action::MangaFreehandAutoscroll);
         self.add_binding(InputBinding::Key(egui::Key::ArrowUp), Action::MangaPanUp);
@@ -759,6 +780,8 @@ impl Config {
 
         // Masonry shortcuts
         self.add_binding(InputBinding::MouseLeft, Action::MasonryPan);
+        self.add_binding(InputBinding::ShiftScrollUp, Action::MasonryPan);
+        self.add_binding(InputBinding::ShiftScrollDown, Action::MasonryPan);
         self.add_binding(InputBinding::MouseRight, Action::MasonryGotoFile);
         self.add_binding(
             InputBinding::MouseMiddle,
@@ -840,6 +863,75 @@ impl Config {
         ];
 
         self.replace_action_bindings(Action::ToggleFullscreen, &replacement_bindings);
+    }
+
+    fn action_bindings_match_exact(&self, action: Action, expected: &[InputBinding]) -> bool {
+        let Some(actual_bindings) = self.action_bindings.get(&action) else {
+            return expected.is_empty();
+        };
+
+        if actual_bindings.len() != expected.len() {
+            return false;
+        }
+
+        expected
+            .iter()
+            .all(|binding| actual_bindings.contains(binding))
+    }
+
+    fn migrate_legacy_modifier_wheel_defaults(&mut self) {
+        let is_legacy_manga_defaults = self.action_bindings_match_exact(
+            Action::MangaPanUp,
+            &[
+                InputBinding::Key(egui::Key::ArrowUp),
+                InputBinding::CtrlScrollUp,
+            ],
+        ) && self.action_bindings_match_exact(
+            Action::MangaPanDown,
+            &[
+                InputBinding::Key(egui::Key::ArrowDown),
+                InputBinding::CtrlScrollDown,
+            ],
+        ) && self.action_bindings_match_exact(Action::MangaZoomIn, &[])
+            && self.action_bindings_match_exact(Action::MangaZoomOut, &[]);
+
+        let is_legacy_masonry_defaults = self.action_bindings_match_exact(
+            Action::MasonryPanUp,
+            &[
+                InputBinding::Key(egui::Key::ArrowUp),
+                InputBinding::CtrlScrollUp,
+            ],
+        ) && self.action_bindings_match_exact(
+            Action::MasonryPanDown,
+            &[
+                InputBinding::Key(egui::Key::ArrowDown),
+                InputBinding::CtrlScrollDown,
+            ],
+        ) && self.action_bindings_match_exact(Action::MasonryZoomIn, &[])
+            && self.action_bindings_match_exact(Action::MasonryZoomOut, &[]);
+
+        if is_legacy_manga_defaults {
+            self.replace_action_bindings(Action::MangaPanUp, &[InputBinding::Key(egui::Key::ArrowUp)]);
+            self.replace_action_bindings(
+                Action::MangaPanDown,
+                &[InputBinding::Key(egui::Key::ArrowDown)],
+            );
+            self.replace_action_bindings(Action::MangaZoomIn, &[InputBinding::CtrlScrollUp]);
+            self.replace_action_bindings(Action::MangaZoomOut, &[InputBinding::CtrlScrollDown]);
+        }
+
+        if is_legacy_masonry_defaults {
+            self.replace_action_bindings(
+                Action::MasonryPanUp,
+                &[InputBinding::Key(egui::Key::ArrowUp)],
+            );
+            self.replace_action_bindings(
+                Action::MasonryPanDown,
+                &[InputBinding::Key(egui::Key::ArrowDown)],
+            );
+            self.replace_action_bindings(Action::MasonryZoomIn, &[InputBinding::CtrlScrollUp]);
+            self.replace_action_bindings(Action::MasonryZoomOut, &[InputBinding::CtrlScrollDown]);
+        }
     }
 
     /// Get the configuration directory in AppData/Roaming.
@@ -1148,6 +1240,41 @@ impl Config {
                             if let Ok(v) = value.parse::<f32>() {
                                 // Zoom multiplier per scroll step (1.05 = 5%, 1.25 = 25%)
                                 config.zoom_step = v.clamp(1.01, 2.0);
+                            }
+                        }
+                        "ctrl_scroll_up_pan_speed_px_per_step"
+                        | "ctrl_scroll_up_pan_speed"
+                        | "ctrl_scroll_up_pan_px"
+                        | "ctrl_wheel_up_pan_speed" => {
+                            if let Ok(v) = value.parse::<f32>() {
+                                config.ctrl_scroll_up_pan_speed_px_per_step = v.clamp(0.1, 1000.0);
+                            }
+                        }
+                        "ctrl_scroll_down_pan_speed_px_per_step"
+                        | "ctrl_scroll_down_pan_speed"
+                        | "ctrl_scroll_down_pan_px"
+                        | "ctrl_wheel_down_pan_speed" => {
+                            if let Ok(v) = value.parse::<f32>() {
+                                config.ctrl_scroll_down_pan_speed_px_per_step =
+                                    v.clamp(0.1, 1000.0);
+                            }
+                        }
+                        "shift_scroll_up_pan_speed_px_per_step"
+                        | "shift_scroll_up_pan_speed"
+                        | "shift_scroll_up_pan_px"
+                        | "shift_wheel_up_pan_speed" => {
+                            if let Ok(v) = value.parse::<f32>() {
+                                config.shift_scroll_up_pan_speed_px_per_step =
+                                    v.clamp(0.1, 1000.0);
+                            }
+                        }
+                        "shift_scroll_down_pan_speed_px_per_step"
+                        | "shift_scroll_down_pan_speed"
+                        | "shift_scroll_down_pan_px"
+                        | "shift_wheel_down_pan_speed" => {
+                            if let Ok(v) = value.parse::<f32>() {
+                                config.shift_scroll_down_pan_speed_px_per_step =
+                                    v.clamp(0.1, 1000.0);
                             }
                         }
                         "max_zoom_percent" | "max_zoom_percentage" | "max_zoom" => {
@@ -1471,6 +1598,7 @@ impl Config {
         }
 
         config.migrate_legacy_toggle_fullscreen_binding();
+        config.migrate_legacy_modifier_wheel_defaults();
 
         config
     }
@@ -1615,6 +1743,22 @@ impl Config {
             format_with_optional_trailing_zero_f32(self.precise_rotation_step_degrees),
         );
         values.insert("zoom_step", format!("{}", self.zoom_step));
+        values.insert(
+            "ctrl_scroll_up_pan_speed_px_per_step",
+            format_with_optional_trailing_zero_f32(self.ctrl_scroll_up_pan_speed_px_per_step),
+        );
+        values.insert(
+            "ctrl_scroll_down_pan_speed_px_per_step",
+            format_with_optional_trailing_zero_f32(self.ctrl_scroll_down_pan_speed_px_per_step),
+        );
+        values.insert(
+            "shift_scroll_up_pan_speed_px_per_step",
+            format_with_optional_trailing_zero_f32(self.shift_scroll_up_pan_speed_px_per_step),
+        );
+        values.insert(
+            "shift_scroll_down_pan_speed_px_per_step",
+            format_with_optional_trailing_zero_f32(self.shift_scroll_down_pan_speed_px_per_step),
+        );
         values.insert("max_zoom_percent", format!("{}", self.max_zoom_percent));
         values.insert(
             "manga_drag_pan_speed",
@@ -1974,6 +2118,8 @@ fn binding_to_string(binding: &InputBinding) -> String {
         InputBinding::ScrollDown => "scroll_down".to_string(),
         InputBinding::CtrlScrollUp => "ctrl+scroll_up".to_string(),
         InputBinding::CtrlScrollDown => "ctrl+scroll_down".to_string(),
+        InputBinding::ShiftScrollUp => "shift+scroll_up".to_string(),
+        InputBinding::ShiftScrollDown => "shift+scroll_down".to_string(),
         InputBinding::KeyWithCtrl(key) => format!("ctrl+{}", key_to_string(key)),
         InputBinding::KeyWithShift(key) => format!("shift+{}", key_to_string(key)),
         InputBinding::KeyWithAlt(key) => format!("alt+{}", key_to_string(key)),
