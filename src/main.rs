@@ -7671,8 +7671,8 @@ impl ImageViewer {
         }
     }
 
-    fn modifier_wheel_pan_step(&self, wheel_steps: f32, horizontal: bool) -> f32 {
-        let step = if horizontal {
+    fn modifier_wheel_pan_step(&self, wheel_steps: f32, horizontal: bool, viewport_span: f32) -> f32 {
+        let configured = if horizontal {
             if wheel_steps >= 0.0 {
                 self.config.shift_scroll_up_pan_speed_px_per_step
             } else {
@@ -7684,7 +7684,15 @@ impl ImageViewer {
             self.config.ctrl_scroll_down_pan_speed_px_per_step
         };
 
-        step.max(0.1)
+        if horizontal {
+            // Normalize horizontal wheel-pan by viewport width so it feels consistent across
+            // different resolutions and independent of image dimensions.
+            let baseline_config = 20.0f32;
+            let scale = (configured / baseline_config).max(0.05);
+            (viewport_span.max(1.0) * 0.08 * scale).max(0.1)
+        } else {
+            configured.max(0.1)
+        }
     }
 
     fn manga_layout_goto_file_action(&self) -> Action {
@@ -15998,7 +16006,11 @@ impl ImageViewer {
                     self.stop_manga_wheel_scroll();
                 }
 
-                let pan_step = self.modifier_wheel_pan_step(wheel_steps_ctrl_effective, false);
+                let pan_step = self.modifier_wheel_pan_step(
+                    wheel_steps_ctrl_effective,
+                    false,
+                    screen_height,
+                );
                 if self.manga_add_scroll_target_delta(-wheel_steps_ctrl_effective * pan_step) {
                     self.manga_update_preload_queue();
                     animation_active = true;
@@ -16008,7 +16020,7 @@ impl ImageViewer {
                     self.stop_manga_wheel_scroll();
                 }
 
-                let pan_step = self.modifier_wheel_pan_step(wheel_steps_shift, true);
+                let pan_step = self.modifier_wheel_pan_step(wheel_steps_shift, true, screen_width);
                 let impulse = pan_step * self.config.manga_wheel_decay_rate.max(0.5);
                 self.manga_shift_wheel_pan_velocity_x += -wheel_steps_shift * impulse;
                 self.manga_shift_wheel_pan_velocity_x = self.manga_shift_wheel_pan_velocity_x
@@ -19818,7 +19830,11 @@ impl ImageViewer {
         let mut handled_modifier_wheel = false;
         if !title_ui_blocking && !pointer_over_shortcut_ui_for_wheel {
             if regular_ctrl_scroll_pan_bound && wheel_steps_ctrl_effective != 0.0 {
-                let pan_step = self.modifier_wheel_pan_step(wheel_steps_ctrl_effective, false);
+                let pan_step = self.modifier_wheel_pan_step(
+                    wheel_steps_ctrl_effective,
+                    false,
+                    screen_rect.height(),
+                );
                 self.offset.y += wheel_steps_ctrl_effective * pan_step;
                 if self.is_fullscreen {
                     self.remember_current_fullscreen_view_state();
@@ -19826,11 +19842,12 @@ impl ImageViewer {
                 self.zoom_velocity = 0.0;
                 handled_modifier_wheel = true;
             } else if regular_shift_scroll_pan_bound && wheel_steps_shift != 0.0 {
-                let pan_step = self.modifier_wheel_pan_step(wheel_steps_shift, true);
-                self.offset.x -= wheel_steps_shift * pan_step;
-                if self.is_fullscreen {
-                    self.remember_current_fullscreen_view_state();
-                }
+                let pan_step =
+                    self.modifier_wheel_pan_step(wheel_steps_shift, true, screen_rect.width());
+                let impulse = pan_step * self.config.manga_wheel_decay_rate.max(0.5);
+                self.manga_shift_wheel_pan_velocity_x += -wheel_steps_shift * impulse;
+                self.manga_shift_wheel_pan_velocity_x = self.manga_shift_wheel_pan_velocity_x
+                    .clamp(-self.config.manga_wheel_max_velocity, self.config.manga_wheel_max_velocity);
                 self.zoom_velocity = 0.0;
                 handled_modifier_wheel = true;
             } else if regular_ctrl_scroll_zoom_bound && wheel_steps_ctrl_effective != 0.0 {
@@ -20092,6 +20109,7 @@ impl ImageViewer {
                 && !primary_consumed_for_autoscroll
                 && !(over_title_bar && self.mouse_over_title_text)
             {
+                self.manga_shift_wheel_pan_velocity_x = 0.0;
                 if let Some(pos) = pointer_pos {
                     // Check if drag started from title bar area (top 50px) for window dragging
                     let in_title_bar = self.last_mouse_pos.map_or(pos.y < 50.0, |lp| lp.y < 50.0);
@@ -20141,6 +20159,20 @@ impl ImageViewer {
         }
 
         let dt = ctx.input(|i| i.stable_dt).clamp(0.0, 0.033);
+
+        if self.manga_shift_wheel_pan_velocity_x.abs() > 0.01 && dt > 0.0 {
+            self.offset.x += self.manga_shift_wheel_pan_velocity_x * dt;
+            let decay = (-self.config.manga_wheel_decay_rate * dt).exp();
+            self.manga_shift_wheel_pan_velocity_x *= decay;
+            if self.manga_shift_wheel_pan_velocity_x.abs() < 2.0 {
+                self.manga_shift_wheel_pan_velocity_x = 0.0;
+            }
+            if self.is_fullscreen {
+                self.remember_current_fullscreen_view_state();
+            }
+            animation_active = true;
+        }
+
         if self.manga_autoscroll_active {
             if let (Some(anchor), Some(pos)) = (self.manga_autoscroll_anchor, pointer_pos) {
                 let speed_base = self.config.manga_arrow_scroll_speed.max(1.0);
@@ -20172,6 +20204,7 @@ impl ImageViewer {
                 );
 
                 if speed_x != 0.0 || speed_y != 0.0 {
+                    self.manga_shift_wheel_pan_velocity_x = 0.0;
                     self.offset.x -= speed_x * dt;
                     self.offset.y -= speed_y * dt;
                     ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
@@ -20195,6 +20228,7 @@ impl ImageViewer {
         {
             self.reset_current_view_rotation(ctx);
             self.offset = egui::Vec2::ZERO;
+            self.manga_shift_wheel_pan_velocity_x = 0.0;
             self.zoom_velocity = 0.0;
 
             // Get dimensions from current media (image or video)
