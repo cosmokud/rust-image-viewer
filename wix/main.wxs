@@ -32,9 +32,29 @@
       AllowAdvertise='no'
       Display='expand'>
       <ComponentGroupRef Id='HarvestedPayloadGroup' />
+
+      <Feature
+        Id='ImageAssociationsFeature'
+        Title='Associate image files'
+        Description='Set Rust Image Viewer as the default app for supported image file types.'
+        Level='1'
+        AllowAdvertise='no'
+        Display='expand'>
+        <ComponentGroupRef Id='ImageAssociationsGroup' />
+      </Feature>
+
+      <Feature
+        Id='VideoAssociationsFeature'
+        Title='Associate video files'
+        Description='Set Rust Image Viewer as the default app for supported video file types.'
+        Level='1'
+        AllowAdvertise='no'
+        Display='expand'>
+        <ComponentGroupRef Id='VideoAssociationsGroup' />
+      </Feature>
     </Feature>
 
-    <ui:WixUI Id='WixUI_Minimal' />
+    <ui:WixUI Id='WixUI_FeatureTree' />
 
     <SetProperty Id='ARPINSTALLLOCATION' Value='[INSTALLFOLDER]' After='CostFinalize' />
   </Package>
@@ -42,6 +62,46 @@
   <Fragment>
     <ComponentGroup Id='HarvestedPayloadGroup' Directory='INSTALLFOLDER'>
       <Files Include='$(var.PayloadDir)\**' />
+    </ComponentGroup>
+  </Fragment>
+
+  <Fragment>
+    <ComponentGroup Id='ImageAssociationsGroup' Directory='INSTALLFOLDER'>
+      <Component Id='ImageAssociationsComponent' Guid='*'>
+        <RegistryValue Root='HKCU' Key='Software\Classes\RustImageViewer.Image' Type='string' Value='Rust Image Viewer Image' KeyPath='yes' />
+        <RegistryValue Root='HKCU' Key='Software\Classes\RustImageViewer.Image\DefaultIcon' Type='string' Value='[INSTALLFOLDER]rust-image-viewer.exe,0' />
+        <RegistryValue Root='HKCU' Key='Software\Classes\RustImageViewer.Image\shell\open\command' Type='string' Value='"[INSTALLFOLDER]rust-image-viewer.exe" "%1"' />
+
+        <RegistryValue Root='HKCU' Key='Software\Classes\.jpg' Type='string' Value='RustImageViewer.Image' />
+        <RegistryValue Root='HKCU' Key='Software\Classes\.jpeg' Type='string' Value='RustImageViewer.Image' />
+        <RegistryValue Root='HKCU' Key='Software\Classes\.png' Type='string' Value='RustImageViewer.Image' />
+        <RegistryValue Root='HKCU' Key='Software\Classes\.webp' Type='string' Value='RustImageViewer.Image' />
+        <RegistryValue Root='HKCU' Key='Software\Classes\.gif' Type='string' Value='RustImageViewer.Image' />
+        <RegistryValue Root='HKCU' Key='Software\Classes\.bmp' Type='string' Value='RustImageViewer.Image' />
+        <RegistryValue Root='HKCU' Key='Software\Classes\.psd' Type='string' Value='RustImageViewer.Image' />
+        <RegistryValue Root='HKCU' Key='Software\Classes\.ico' Type='string' Value='RustImageViewer.Image' />
+        <RegistryValue Root='HKCU' Key='Software\Classes\.tiff' Type='string' Value='RustImageViewer.Image' />
+        <RegistryValue Root='HKCU' Key='Software\Classes\.tif' Type='string' Value='RustImageViewer.Image' />
+      </Component>
+    </ComponentGroup>
+
+    <ComponentGroup Id='VideoAssociationsGroup' Directory='INSTALLFOLDER'>
+      <Component Id='VideoAssociationsComponent' Guid='*'>
+        <RegistryValue Root='HKCU' Key='Software\Classes\RustImageViewer.Video' Type='string' Value='Rust Image Viewer Video' KeyPath='yes' />
+        <RegistryValue Root='HKCU' Key='Software\Classes\RustImageViewer.Video\DefaultIcon' Type='string' Value='[INSTALLFOLDER]rust-image-viewer.exe,0' />
+        <RegistryValue Root='HKCU' Key='Software\Classes\RustImageViewer.Video\shell\open\command' Type='string' Value='"[INSTALLFOLDER]rust-image-viewer.exe" "%1"' />
+
+        <RegistryValue Root='HKCU' Key='Software\Classes\.mp4' Type='string' Value='RustImageViewer.Video' />
+        <RegistryValue Root='HKCU' Key='Software\Classes\.mkv' Type='string' Value='RustImageViewer.Video' />
+        <RegistryValue Root='HKCU' Key='Software\Classes\.webm' Type='string' Value='RustImageViewer.Video' />
+        <RegistryValue Root='HKCU' Key='Software\Classes\.avi' Type='string' Value='RustImageViewer.Video' />
+        <RegistryValue Root='HKCU' Key='Software\Classes\.mov' Type='string' Value='RustImageViewer.Video' />
+        <RegistryValue Root='HKCU' Key='Software\Classes\.wmv' Type='string' Value='RustImageViewer.Video' />
+        <RegistryValue Root='HKCU' Key='Software\Classes\.flv' Type='string' Value='RustImageViewer.Video' />
+        <RegistryValue Root='HKCU' Key='Software\Classes\.m4v' Type='string' Value='RustImageViewer.Video' />
+        <RegistryValue Root='HKCU' Key='Software\Classes\.3gp' Type='string' Value='RustImageViewer.Video' />
+        <RegistryValue Root='HKCU' Key='Software\Classes\.ogv' Type='string' Value='RustImageViewer.Video' />
+      </Component>
     </ComponentGroup>
   </Fragment>
 </Wix>
