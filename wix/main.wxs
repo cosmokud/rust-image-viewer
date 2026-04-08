@@ -1,5 +1,7 @@
 <?xml version='1.0' encoding='UTF-8'?>
-<Wix xmlns='http://wixtoolset.org/schemas/v4/wxs'>
+<Wix
+  xmlns='http://wixtoolset.org/schemas/v4/wxs'
+  xmlns:ui='http://wixtoolset.org/schemas/v4/wxs/ui'>
   <Package
     Name='Rust Image Viewer'
     Manufacturer='cosmokud'
@@ -15,8 +17,6 @@
 
     <MediaTemplate EmbedCab='yes' CompressionLevel='high' />
 
-    <Property Id='ARPNOMODIFY' Value='1' />
-    <Property Id='ARPNOREPAIR' Value='1' />
     <Property Id='ARPHELPLINK' Value='https://github.com/cosmokud/rust-image-viewer' />
 
     <StandardDirectory Id='AppDataFolder'>
@@ -33,6 +33,8 @@
       Display='expand'>
       <ComponentGroupRef Id='HarvestedPayloadGroup' />
     </Feature>
+
+    <ui:WixUI Id='WixUI_Minimal' />
 
     <SetProperty Id='ARPINSTALLLOCATION' Value='[INSTALLFOLDER]' After='CostFinalize' />
   </Package>

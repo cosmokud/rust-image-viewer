@@ -47,12 +47,10 @@ jobs:
 
           $tag = "nightly-$stamp-run$runNumber-$shortSha"
           $name = "Nightly Build $stamp (run $runNumber, $shortSha)"
-          $productVersion = "0.0.$build"
           $msiName = "rust-image-viewer-$tag.msi"
 
           Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "tag=$tag"
           Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "name=$name"
-          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "product_version=$productVersion"
           Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "msi_name=$msiName"
 
       - name: Install WiX Toolset v7
@@ -73,7 +71,6 @@ jobs:
         run: |
           $outputPath = Join-Path $PWD "target\wix\${{ steps.release_meta.outputs.msi_name }}"
           .\scripts\build-wix-installer.ps1 `
-            -ProductVersion "${{ steps.release_meta.outputs.product_version }}" `
             -Configuration release `
             -WorkspaceRoot "$PWD" `
             -OutputMsi $outputPath

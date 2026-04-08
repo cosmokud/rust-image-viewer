@@ -74,7 +74,6 @@ jobs:
 
           $msiName = "rust-image-viewer-$tag.msi"
 
-          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "product_version=$tag"
           Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "msi_name=$msiName"
 
       - name: Install WiX Toolset v7
@@ -95,7 +94,6 @@ jobs:
         run: |
           $outputPath = Join-Path $PWD "target\wix\${{ steps.installer_meta.outputs.msi_name }}"
           .\scripts\build-wix-installer.ps1 `
-            -ProductVersion "${{ steps.installer_meta.outputs.product_version }}" `
             -Configuration release `
             -WorkspaceRoot "$PWD" `
             -OutputMsi $outputPath

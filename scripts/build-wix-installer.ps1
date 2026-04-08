@@ -51,6 +51,11 @@ function Ensure-Wix7 {
     if ($LASTEXITCODE -ne 0) {
         throw "Failed to accept WiX v7 EULA non-interactively."
     }
+
+    & wix extension add --global WixToolset.UI.wixext/7.0.0 --acceptEula yes | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to add WixToolset.UI.wixext extension for installer UI."
+    }
 }
 
 function Normalize-MsiProductVersion {
@@ -194,15 +199,14 @@ if (-not (Test-Path -LiteralPath $wixSource)) {
 
 Ensure-Wix7
 
-$stagingDir = Join-Path $WorkspaceRoot "target\\wix\\payload"
+$stagingRoot = Join-Path $WorkspaceRoot "target\\wix"
+$stagingDirName = "payload-" + [Guid]::NewGuid().ToString("N")
+$stagingDir = Join-Path $stagingRoot $stagingDirName
 
 if (-not $OutputMsi) {
     $OutputMsi = Join-Path $WorkspaceRoot "target\\wix\\rust-image-viewer-$ProductVersion.msi"
 }
 
-if (Test-Path -LiteralPath $stagingDir) {
-    Remove-Item -LiteralPath $stagingDir -Recurse -Force
-}
 New-Item -ItemType Directory -Path $stagingDir -Force | Out-Null
 
 Copy-Item -LiteralPath $exePath -Destination (Join-Path $stagingDir "rust-image-viewer.exe") -Force
@@ -228,6 +232,8 @@ $wixArgs = @(
     "build",
     "--acceptEula",
     "yes",
+    "-ext",
+    "WixToolset.UI.wixext",
     "-d",
     "ProductVersion=$ProductVersion",
     "-d",
