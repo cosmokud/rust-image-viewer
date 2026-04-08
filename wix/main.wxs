@@ -1,0 +1,54 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<Wix xmlns='http://schemas.microsoft.com/wix/2006/wi'>
+  <Product
+    Id='*'
+    Name='Rust Image Viewer'
+    UpgradeCode='3F8BFA13-5D50-4AD4-BDE3-D6A266DB3E5A'
+    Manufacturer='cosmokud'
+    Language='1033'
+    Codepage='1252'
+    Version='$(var.Version)'>
+
+    <Package
+      Id='*'
+      Keywords='Installer'
+      Description='High-performance image and video viewer for Windows 10/11'
+      Manufacturer='cosmokud'
+      InstallerVersion='500'
+      Languages='1033'
+      Compressed='yes'
+      InstallScope='perUser'
+      InstallPrivileges='limited'
+      SummaryCodepage='1252' />
+
+    <MajorUpgrade
+      Schedule='afterInstallInitialize'
+      DowngradeErrorMessage='A newer version of [ProductName] is already installed. Setup will now exit.' />
+
+    <MediaTemplate EmbedCab='yes' CompressionLevel='high' />
+
+    <Property Id='ARPNOMODIFY' Value='1' />
+    <Property Id='ARPNOREPAIR' Value='1' />
+    <Property Id='ARPHELPLINK' Value='https://github.com/cosmokud/rust-image-viewer' />
+
+    <Directory Id='TARGETDIR' Name='SourceDir'>
+      <Directory Id='AppDataFolder'>
+        <Directory Id='INSTALLFOLDER' Name='rust-image-viewer' />
+      </Directory>
+    </Directory>
+
+    <Feature
+      Id='MainFeature'
+      Title='Rust Image Viewer'
+      Description='Installs Rust Image Viewer and bundled GStreamer runtime.'
+      Level='1'
+      ConfigurableDirectory='INSTALLFOLDER'
+      AllowAdvertise='no'
+      Display='expand'
+      Absent='disallow'>
+      <ComponentGroupRef Id='HarvestedPayloadGroup' />
+    </Feature>
+
+    <SetProperty Id='ARPINSTALLLOCATION' Value='[INSTALLFOLDER]' After='CostFinalize' />
+  </Product>
+</Wix>

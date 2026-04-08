@@ -112,6 +112,39 @@ fn configure_gstreamer_env_windows() {
         .collect()
     }
 
+    fn appdata_prefixes() -> Vec<PathBuf> {
+        let mut prefixes = Vec::new();
+
+        let Ok(appdata) = std::env::var("APPDATA") else {
+            return prefixes;
+        };
+
+        let app_root = PathBuf::from(appdata).join("rust-image-viewer");
+        prefixes.push(app_root.join("gstreamer"));
+        prefixes.push(app_root.join("app").join("gstreamer"));
+
+        prefixes
+    }
+
+    fn exe_neighbor_prefixes() -> Vec<PathBuf> {
+        let mut prefixes = Vec::new();
+
+        let Ok(exe) = std::env::current_exe() else {
+            return prefixes;
+        };
+
+        let Some(exe_dir) = exe.parent() else {
+            return prefixes;
+        };
+
+        prefixes.push(exe_dir.join("gstreamer"));
+        if let Some(parent) = exe_dir.parent() {
+            prefixes.push(parent.join("gstreamer"));
+        }
+
+        prefixes
+    }
+
     fn choose_prefix(candidates: Vec<PathBuf>) -> Option<PathBuf> {
         for prefix in candidates {
             if plugin_dir_for_prefix(&prefix).exists() {
@@ -121,10 +154,12 @@ fn configure_gstreamer_env_windows() {
         None
     }
 
-    // Prefer a prefix derived from the actually loaded GStreamer DLL. If that prefix doesn't
-    // contain plugins (common when only some DLLs were copied next to the .exe), fall back to
-    // discovering an installed GStreamer via PATH or common install locations.
+    // Prefer an app-local runtime bundle first (AppData/exe-adjacent), then a prefix derived
+    // from an already loaded DLL, and only after that use PATH/common install locations.
     let mut candidates: Vec<PathBuf> = Vec::new();
+
+    candidates.extend(appdata_prefixes());
+    candidates.extend(exe_neighbor_prefixes());
 
     let dll_name = OsStr::new("gstreamer-1.0-0.dll");
     if let Some(dll_path) = unsafe { get_module_path(dll_name) } {
