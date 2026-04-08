@@ -1,5 +1,4 @@
 param(
-    [Parameter(Mandatory = $true)]
     [string]$ProductVersion,
 
     [string]$Configuration = "release",
@@ -33,6 +32,58 @@ function Resolve-WixTool {
 function Resolve-WixBinDir {
     $candlePath = Resolve-WixTool -ToolName "candle.exe"
     return (Split-Path -Parent $candlePath)
+}
+
+function Normalize-MsiProductVersion {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Version
+    )
+
+    $trimmed = $Version.Trim()
+    if ($trimmed -notmatch '^(?<major>\d+)\.(?<minor>\d+)\.(?<patch>\d+)(?:[-+].*)?$') {
+        throw "Version '$Version' is not a supported semantic version (expected Major.Minor.Patch)."
+    }
+
+    $major = [int]$Matches['major']
+    $minor = [int]$Matches['minor']
+    $patch = [int]$Matches['patch']
+
+    if ($major -gt 255 -or $minor -gt 255 -or $patch -gt 65535) {
+        throw "MSI ProductVersion parts are out of range for '$Version' (major<=255, minor<=255, patch<=65535)."
+    }
+
+    return "$major.$minor.$patch"
+}
+
+function Resolve-ProductVersion {
+    param(
+        [string]$WorkspacePath,
+        [string]$RequestedVersion
+    )
+
+    if ($RequestedVersion -and $RequestedVersion.Trim().Length -gt 0) {
+        return Normalize-MsiProductVersion -Version $RequestedVersion
+    }
+
+    $cargoToml = Join-Path $WorkspacePath "Cargo.toml"
+    if (-not (Test-Path -LiteralPath $cargoToml)) {
+        throw "Cargo.toml not found at $cargoToml"
+    }
+
+    $version = $null
+    foreach ($line in Get-Content -LiteralPath $cargoToml) {
+        if ($line -match '^\s*version\s*=\s*"([^"]+)"\s*$') {
+            $version = $Matches[1]
+            break
+        }
+    }
+
+    if (-not $version) {
+        throw "Could not find package version in $cargoToml"
+    }
+
+    return Normalize-MsiProductVersion -Version $version
 }
 
 function Resolve-GStreamerPrefix {
@@ -107,6 +158,9 @@ if (-not $WorkspaceRoot) {
 } else {
     $WorkspaceRoot = (Resolve-Path -LiteralPath $WorkspaceRoot).Path
 }
+
+$ProductVersion = Resolve-ProductVersion -WorkspacePath $WorkspaceRoot -RequestedVersion $ProductVersion
+Write-Host "Using product version: $ProductVersion"
 
 $exePath = Join-Path $WorkspaceRoot "target\\$Configuration\\rust-image-viewer.exe"
 if (-not (Test-Path -LiteralPath $exePath)) {
