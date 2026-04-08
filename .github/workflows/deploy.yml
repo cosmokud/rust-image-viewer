@@ -77,13 +77,17 @@ jobs:
           Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "product_version=$tag"
           Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "msi_name=$msiName"
 
-      - name: Install WiX Toolset v3
+      - name: Install WiX Toolset v7
         shell: pwsh
-        run: choco install wixtoolset --version 3.11.2 --yes --no-progress
-
-      - name: Install cargo-wix
-        shell: pwsh
-        run: cargo install cargo-wix --locked
+        run: |
+          $hasWix = dotnet tool list --global | Select-String -Pattern '^\s*wix\s'
+          if ($hasWix) {
+            dotnet tool update --global wix --version 7.0.0
+          } else {
+            dotnet tool install --global wix --version 7.0.0
+          }
+          $env:PATH = "$env:USERPROFILE\.dotnet\tools;$env:PATH"
+          wix eula accept wix7 --acceptEula yes
 
       - name: Build WiX installer (AppData + bundled GStreamer)
         id: build_installer

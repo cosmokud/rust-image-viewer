@@ -1,28 +1,16 @@
 <?xml version='1.0' encoding='UTF-8'?>
-<Wix xmlns='http://schemas.microsoft.com/wix/2006/wi'>
-  <Product
-    Id='*'
+<Wix xmlns='http://wixtoolset.org/schemas/v4/wxs'>
+  <Package
     Name='Rust Image Viewer'
-    UpgradeCode='3F8BFA13-5D50-4AD4-BDE3-D6A266DB3E5A'
     Manufacturer='cosmokud'
-    Language='1033'
-    Codepage='1252'
-    Version='$(var.Version)'>
-
-    <Package
-      Id='*'
-      Keywords='Installer'
-      Description='High-performance image and video viewer for Windows 10/11'
-      Manufacturer='cosmokud'
-      InstallerVersion='500'
-      Languages='1033'
-      Compressed='yes'
-      InstallScope='perUser'
-      InstallPrivileges='limited'
-      SummaryCodepage='1252' />
+    Version='$(var.ProductVersion)'
+    UpgradeCode='3F8BFA13-5D50-4AD4-BDE3-D6A266DB3E5A'
+    InstallerVersion='500'
+    Scope='perUser'
+    Compressed='yes'
+    Language='1033'>
 
     <MajorUpgrade
-      Schedule='afterInstallInitialize'
       DowngradeErrorMessage='A newer version of [ProductName] is already installed. Setup will now exit.' />
 
     <MediaTemplate EmbedCab='yes' CompressionLevel='high' />
@@ -31,11 +19,9 @@
     <Property Id='ARPNOREPAIR' Value='1' />
     <Property Id='ARPHELPLINK' Value='https://github.com/cosmokud/rust-image-viewer' />
 
-    <Directory Id='TARGETDIR' Name='SourceDir'>
-      <Directory Id='AppDataFolder'>
-        <Directory Id='INSTALLFOLDER' Name='rust-image-viewer' />
-      </Directory>
-    </Directory>
+    <StandardDirectory Id='AppDataFolder'>
+      <Directory Id='INSTALLFOLDER' Name='rust-image-viewer' />
+    </StandardDirectory>
 
     <Feature
       Id='MainFeature'
@@ -44,11 +30,16 @@
       Level='1'
       ConfigurableDirectory='INSTALLFOLDER'
       AllowAdvertise='no'
-      Display='expand'
-      Absent='disallow'>
+      Display='expand'>
       <ComponentGroupRef Id='HarvestedPayloadGroup' />
     </Feature>
 
     <SetProperty Id='ARPINSTALLLOCATION' Value='[INSTALLFOLDER]' After='CostFinalize' />
-  </Product>
+  </Package>
+
+  <Fragment>
+    <ComponentGroup Id='HarvestedPayloadGroup' Directory='INSTALLFOLDER'>
+      <Files Include='$(var.PayloadDir)\**' />
+    </ComponentGroup>
+  </Fragment>
 </Wix>

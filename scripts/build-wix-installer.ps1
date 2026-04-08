@@ -10,28 +10,47 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-function Resolve-WixTool {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$ToolName
-    )
-
-    $cmd = Get-Command $ToolName -ErrorAction SilentlyContinue
-    if ($cmd) {
-        return $cmd.Source
+function Ensure-Wix7 {
+    $dotnetTools = Join-Path $env:USERPROFILE ".dotnet\\tools"
+    if (Test-Path -LiteralPath $dotnetTools) {
+        $env:PATH = "$dotnetTools;$env:PATH"
     }
 
-    $fallback = Join-Path ${env:ProgramFiles(x86)} "WiX Toolset v3.11\\bin\\$ToolName"
-    if (Test-Path -LiteralPath $fallback) {
-        return $fallback
+    $wixCmd = Get-Command "wix" -ErrorAction SilentlyContinue
+    if (-not $wixCmd) {
+        $hasNugetOrg = dotnet nuget list source | Select-String -SimpleMatch "nuget.org"
+        if (-not $hasNugetOrg) {
+            dotnet nuget add source https://api.nuget.org/v3/index.json -n nuget.org | Out-Null
+        }
+
+        dotnet tool install --global wix --version 7.0.0 | Out-Null
+        $env:PATH = "$dotnetTools;$env:PATH"
+        $wixCmd = Get-Command "wix" -ErrorAction SilentlyContinue
     }
 
-    throw "Could not find WiX tool '$ToolName'. Ensure WiX Toolset v3 is installed and on PATH."
-}
+    if (-not $wixCmd) {
+        throw "WiX Toolset v7 CLI was not found after installation attempt."
+    }
 
-function Resolve-WixBinDir {
-    $candlePath = Resolve-WixTool -ToolName "candle.exe"
-    return (Split-Path -Parent $candlePath)
+    $versionText = & wix --version
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to query WiX version."
+    }
+
+    if ($versionText -notmatch '^7\.') {
+        dotnet tool update --global wix --version 7.0.0 | Out-Null
+        $env:PATH = "$dotnetTools;$env:PATH"
+
+        $versionText = & wix --version
+        if ($LASTEXITCODE -ne 0 -or $versionText -notmatch '^7\.') {
+            throw "WiX v7 is required. Found: $versionText"
+        }
+    }
+
+    & wix eula accept wix7 --acceptEula yes | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to accept WiX v7 EULA non-interactively."
+    }
 }
 
 function Normalize-MsiProductVersion {
@@ -167,16 +186,13 @@ if (-not (Test-Path -LiteralPath $exePath)) {
     throw "Executable not found at $exePath. Build the release executable first."
 }
 
-$harvestWxs = Join-Path $WorkspaceRoot "target\\wix\\HarvestedPayload.wxs"
-$cargoWixTemplate = Join-Path $WorkspaceRoot "wix\\main.wxs"
+$wixSource = Join-Path $WorkspaceRoot "wix\\main.wxs"
 
-if (-not (Test-Path -LiteralPath $cargoWixTemplate)) {
-    throw "Missing cargo-wix template: $cargoWixTemplate"
+if (-not (Test-Path -LiteralPath $wixSource)) {
+    throw "Missing WiX source file: $wixSource"
 }
 
-if (-not (Get-Command "cargo-wix" -ErrorAction SilentlyContinue)) {
-    throw "cargo-wix is not installed. Install it with: cargo install cargo-wix --locked"
-}
+Ensure-Wix7
 
 $stagingDir = Join-Path $WorkspaceRoot "target\\wix\\payload"
 
@@ -205,47 +221,26 @@ if ($scannerCount -eq 0 -and -not (Test-Path -LiteralPath (Join-Path $gstStageRo
     throw "gst-plugin-scanner.exe is missing from both libexec and bin locations."
 }
 
-$heatExe = Resolve-WixTool -ToolName "heat.exe"
-$wixBinDir = Resolve-WixBinDir
-
-& $heatExe dir $stagingDir `
-    -nologo `
-    -gg `
-    -sreg `
-    -sfrag `
-    -srd `
-    -dr INSTALLFOLDER `
-    -cg HarvestedPayloadGroup `
-    -var var.PayloadDir `
-    -out $harvestWxs
-
 $msiOutputDir = Split-Path -Parent $OutputMsi
 New-Item -ItemType Directory -Path $msiOutputDir -Force | Out-Null
 
-$cargoWixArgs = @(
-    "wix",
-    "--no-build",
-    "--profile",
-    $Configuration,
-    "--install-version",
-    $ProductVersion,
-    "--output",
+$wixArgs = @(
+    "build",
+    "--acceptEula",
+    "yes",
+    "-d",
+    "ProductVersion=$ProductVersion",
+    "-d",
+    "PayloadDir=$stagingDir",
+    "-o",
     $OutputMsi,
-    "--target-bin-dir",
-    $stagingDir,
-    "--include",
-    $harvestWxs,
-    "--compiler-arg",
-    "-dPayloadDir=$stagingDir",
-    "--bin-path",
-    $wixBinDir,
-    "--nocapture"
+    $wixSource
 )
 
-& cargo @cargoWixArgs
+& wix @wixArgs
 
 if ($LASTEXITCODE -ne 0) {
-    throw "cargo wix failed with exit code $LASTEXITCODE"
+    throw "wix build failed with exit code $LASTEXITCODE"
 }
 
 Write-Host "Built installer: $OutputMsi"
