@@ -17,6 +17,8 @@
 
     <MediaTemplate EmbedCab='yes' CompressionLevel='high' />
 
+    <Icon Id='RustImageViewerIcon' SourceFile='$(sys.SOURCEFILEDIR)..\assets\icon.ico' />
+    <Property Id='ARPPRODUCTICON' Value='RustImageViewerIcon' />
     <Property Id='ARPHELPLINK' Value='https://github.com/cosmokud/rust-image-viewer' />
 
     <StandardDirectory Id='AppDataFolder'>
@@ -55,6 +57,7 @@
     </Feature>
 
     <ui:WixUI Id='WixUI_FeatureTree' />
+    <WixVariable Id='WixUILicenseRtf' Value='$(sys.SOURCEFILEDIR)Eula.rtf' />
 
     <SetProperty Id='ARPINSTALLLOCATION' Value='[INSTALLFOLDER]' After='CostFinalize' />
   </Package>
