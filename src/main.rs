@@ -1654,6 +1654,8 @@ struct ImageViewer {
     is_fullscreen: bool,
     /// Whether to show the control bar
     show_controls: bool,
+    /// Whether to show the breadcrumb address bar under the title bar.
+    show_breadcrumb_bar: bool,
     /// Time when controls were last shown
     controls_show_time: Instant,
     /// Error message to display
@@ -2157,6 +2159,7 @@ impl Default for ImageViewer {
             config,
             is_fullscreen: false,
             show_controls: false,
+            show_breadcrumb_bar: true,
             controls_show_time: Instant::now(),
             error_message: None,
             image_changed: false,
@@ -2371,6 +2374,9 @@ impl Default for ImageViewer {
 }
 
 impl ImageViewer {
+    const TITLE_BAR_HEIGHT: f32 = 32.0;
+    const BREADCRUMB_BAR_HEIGHT: f32 = 30.0;
+    const TOP_CONTROLS_HOTZONE_EXTRA: f32 = 18.0;
     const BOTTOM_RIGHT_OVERLAY_MARGIN: f32 = 16.0;
     const BOTTOM_RIGHT_OVERLAY_SCROLLBAR_PADDING: f32 = 35.0;
     const MANGA_HUD_PANEL_WIDTH: f32 = 224.0;
@@ -2408,6 +2414,19 @@ impl ImageViewer {
     const FPS_OVERLAY_IDLE_POLL_MS: u64 = 500;
     const FPS_OVERLAY_ACTIVE_POLL_MS: u64 = 120;
     const FPS_IDLE_RESET_AFTER_MS: u64 = 350;
+
+    fn top_controls_visible_height(&self) -> f32 {
+        Self::TITLE_BAR_HEIGHT
+            + if self.show_breadcrumb_bar {
+                Self::BREADCRUMB_BAR_HEIGHT
+            } else {
+                0.0
+            }
+    }
+
+    fn top_controls_hotzone_height(&self) -> f32 {
+        self.top_controls_visible_height() + Self::TOP_CONTROLS_HOTZONE_EXTRA
+    }
 
     fn set_current_index_clamped(&mut self, index: usize) {
         if self.image_list.is_empty() {
@@ -2483,6 +2502,118 @@ impl ImageViewer {
 
     fn current_media_path(&self) -> Option<PathBuf> {
         self.image_list.get(self.current_index).cloned()
+    }
+
+    fn breadcrumb_segments_for_path(path: &Path) -> Vec<(String, PathBuf)> {
+        let directory = if path.is_dir() {
+            path.to_path_buf()
+        } else {
+            path.parent().unwrap_or(path).to_path_buf()
+        };
+
+        let mut chain: Vec<PathBuf> = directory.ancestors().map(Path::to_path_buf).collect();
+        chain.reverse();
+
+        let mut segments: Vec<(String, PathBuf)> = Vec::with_capacity(chain.len());
+        for segment_path in chain {
+            let label = segment_path
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| segment_path.display().to_string());
+
+            if label.is_empty() {
+                continue;
+            }
+
+            if segments
+                .last()
+                .is_some_and(|(_, existing_path)| *existing_path == segment_path)
+            {
+                continue;
+            }
+
+            segments.push((label, segment_path));
+        }
+
+        segments
+    }
+
+    fn breadcrumb_child_directories(path: &Path) -> Vec<PathBuf> {
+        let mut children: Vec<PathBuf> = fs::read_dir(path)
+            .ok()
+            .into_iter()
+            .flat_map(|entries| entries.filter_map(Result::ok))
+            .map(|entry| entry.path())
+            .filter(|child| child.is_dir())
+            .collect();
+
+        children.sort_by(|a, b| {
+            let a_name = a
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let b_name = b
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_default();
+            a_name
+                .to_lowercase()
+                .cmp(&b_name.to_lowercase())
+                .then_with(|| a_name.cmp(&b_name))
+        });
+
+        children
+    }
+
+    fn navigate_to_breadcrumb_directory(&mut self, directory: &Path) {
+        if !directory.exists() || !directory.is_dir() {
+            self.error_message = Some(format!(
+                "Folder does not exist: {}",
+                directory.display()
+            ));
+            return;
+        }
+
+        let files = get_media_in_directory(directory);
+        if files.is_empty() {
+            self.error_message = Some(format!(
+                "No supported media files found in folder: {}",
+                directory.display()
+            ));
+            return;
+        }
+
+        let preferred_name = self
+            .current_media_path()
+            .and_then(|path| path.file_name().map(|name| name.to_os_string()));
+
+        let target_path = preferred_name
+            .as_ref()
+            .and_then(|name| {
+                files
+                    .iter()
+                    .find(|candidate| {
+                        candidate
+                            .file_name()
+                            .is_some_and(|candidate_name| candidate_name == name.as_os_str())
+                    })
+                    .cloned()
+            })
+            .unwrap_or_else(|| files[0].clone());
+
+        self.error_message = None;
+        self.show_controls = true;
+        self.controls_show_time = Instant::now();
+
+        if self.manga_mode && self.is_fullscreen {
+            self.refresh_media_list_after_path_mutation(Some(target_path));
+            self.manga_scroll_offset = 0.0;
+            self.manga_scroll_target = 0.0;
+            self.manga_scroll_velocity = 0.0;
+        } else {
+            self.load_media(&target_path);
+        }
     }
 
     fn hovered_manga_index_from_pointer(&mut self, ctx: &egui::Context) -> Option<usize> {
@@ -4803,8 +4934,12 @@ impl ImageViewer {
             }
         }
 
-        // Keep it below the title bar buttons when the bar is visible.
-        let y_offset = if self.show_controls { 40.0 } else { 8.0 };
+        // Keep it below the title/breadcrumb bars when visible.
+        let y_offset = if self.show_controls {
+            self.top_controls_visible_height() + 8.0
+        } else {
+            8.0
+        };
         egui::Area::new(egui::Id::new("fps_overlay"))
             .order(egui::Order::Foreground)
             .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-8.0, y_offset))
@@ -16918,7 +17053,7 @@ impl ImageViewer {
             return true;
         }
 
-        if self.show_controls && pos.y < 50.0 {
+        if self.show_controls && pos.y < self.top_controls_hotzone_height() {
             return true;
         }
 
@@ -17996,7 +18131,7 @@ impl ImageViewer {
         // Check if mouse is near top
         let mouse_pos = ctx.input(|i| i.pointer.hover_pos());
         if let Some(pos) = mouse_pos {
-            if pos.y < 50.0 {
+            if pos.y < self.top_controls_hotzone_height() {
                 self.show_controls = true;
                 self.controls_show_time = Instant::now();
             }
@@ -18005,7 +18140,7 @@ impl ImageViewer {
         // Auto-hide controls after configured delay
         if self.controls_show_time.elapsed().as_secs_f32() > self.config.controls_hide_delay {
             if let Some(pos) = mouse_pos {
-                if pos.y >= 50.0 {
+                if pos.y >= self.top_controls_hotzone_height() {
                     // Don't hide while selecting title text.
                     if !self.title_text_dragging && !title_bar_menu_was_active {
                         self.show_controls = false;
@@ -18022,8 +18157,12 @@ impl ImageViewer {
             return;
         }
 
+        let mut breadcrumb_target_directory: Option<PathBuf> = None;
+        let mut breadcrumb_ui_hovered = false;
+        let mut breadcrumb_popup_active = false;
+
         // Draw control bar
-        let bar_height = 32.0;
+        let bar_height = Self::TITLE_BAR_HEIGHT;
         let bar_rect = egui::Rect::from_min_size(
             screen_rect.min,
             egui::Vec2::new(screen_rect.width(), bar_height),
@@ -18073,12 +18212,55 @@ impl ImageViewer {
                     // Left side: filename + details (or "...")
                     ui.allocate_new_ui(egui::UiBuilder::new().max_rect(left_rect), |ui| {
                         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                            ui.add_space(10.0);
+                            ui.add_space(8.0);
 
                             // Track whether the pointer is interacting with title text so we can
                             // suppress drag/pan/double-click gestures while selecting/copying.
                             let mut over_title_text = false;
                             let mut started_title_text_drag = false;
+
+                            let toggle_size = egui::vec2(24.0, 24.0);
+                            let (toggle_rect, toggle_resp_base) =
+                                ui.allocate_exact_size(toggle_size, egui::Sense::click());
+                            let toggle_resp = toggle_resp_base.on_hover_text(
+                                if self.show_breadcrumb_bar {
+                                    "Hide breadcrumb address bar"
+                                } else {
+                                    "Show breadcrumb address bar"
+                                },
+                            );
+
+                            if ui.is_rect_visible(toggle_rect) {
+                                let bg = if toggle_resp.is_pointer_button_down_on() {
+                                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 40)
+                                } else if toggle_resp.hovered() {
+                                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 22)
+                                } else {
+                                    egui::Color32::TRANSPARENT
+                                };
+                                ui.painter().rect_filled(toggle_rect, 4.0, bg);
+
+                                let icon_rect = toggle_rect.shrink2(egui::vec2(4.0, 4.0));
+                                let icon_color = if self.show_breadcrumb_bar {
+                                    egui::Color32::WHITE
+                                } else {
+                                    egui::Color32::from_gray(170)
+                                };
+                                Self::paint_menu_action_icon(
+                                    ui.painter(),
+                                    icon_rect,
+                                    MenuActionIcon::OpenLocation,
+                                    icon_color,
+                                );
+                            }
+
+                            if toggle_resp.clicked() {
+                                self.show_breadcrumb_bar = !self.show_breadcrumb_bar;
+                                self.show_controls = true;
+                                self.controls_show_time = Instant::now();
+                            }
+                            over_title_text |= toggle_resp.contains_pointer();
+                            ui.add_space(6.0);
 
                             let current_path = self.image_list.get(self.current_index).cloned();
                             let details_path = current_path.clone();
@@ -18425,6 +18607,164 @@ impl ImageViewer {
                     });
                 });
             });
+
+        if self.show_breadcrumb_bar {
+            let breadcrumb_height = Self::BREADCRUMB_BAR_HEIGHT;
+            let breadcrumb_rect = egui::Rect::from_min_size(
+                egui::pos2(screen_rect.min.x, screen_rect.min.y + bar_height),
+                egui::Vec2::new(screen_rect.width(), breadcrumb_height),
+            );
+
+            egui::Area::new(egui::Id::new("breadcrumb_bar"))
+                .fixed_pos(breadcrumb_rect.min)
+                .order(egui::Order::Foreground)
+                .show(ctx, |ui| {
+                    ui.painter().rect_filled(
+                        breadcrumb_rect,
+                        0.0,
+                        egui::Color32::from_rgba_unmultiplied(32, 32, 32, 214),
+                    );
+
+                    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(breadcrumb_rect), |ui| {
+                        ui.set_min_height(breadcrumb_height);
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            ui.add_space(8.0);
+
+                            let Some(current_path) = self.current_media_path() else {
+                                ui.label(
+                                    egui::RichText::new("No file loaded")
+                                        .color(egui::Color32::from_gray(170)),
+                                );
+                                return;
+                            };
+
+                            let current_directory =
+                                current_path.parent().unwrap_or(current_path.as_path());
+                            let segments = Self::breadcrumb_segments_for_path(current_directory);
+
+                            if segments.is_empty() {
+                                ui.label(
+                                    egui::RichText::new(current_directory.display().to_string())
+                                        .color(egui::Color32::from_gray(210)),
+                                );
+                                return;
+                            }
+
+                            for (index, (segment_label, segment_path)) in segments.iter().enumerate()
+                            {
+                                if index > 0 {
+                                    ui.add_space(2.0);
+                                    ui.label(
+                                        egui::RichText::new(">")
+                                            .color(egui::Color32::from_gray(150)),
+                                    );
+                                    ui.add_space(2.0);
+                                }
+
+                                let is_leaf = index + 1 == segments.len();
+                                let segment_response = ui.add(
+                                    egui::Button::new(
+                                        egui::RichText::new(segment_label)
+                                            .color(if is_leaf {
+                                                egui::Color32::WHITE
+                                            } else {
+                                                egui::Color32::from_gray(210)
+                                            }),
+                                    )
+                                    .frame(false),
+                                );
+
+                                if segment_response.contains_pointer() {
+                                    breadcrumb_ui_hovered = true;
+                                }
+
+                                let popup_id =
+                                    ui.make_persistent_id(("breadcrumb_segment_popup", segment_path));
+                                if segment_response.clicked() {
+                                    ui.memory_mut(|mem| mem.toggle_popup(popup_id));
+                                }
+
+                                let close_on_click_outside =
+                                    egui::popup::PopupCloseBehavior::CloseOnClickOutside;
+                                egui::popup::popup_below_widget(
+                                    ui,
+                                    popup_id,
+                                    &segment_response,
+                                    close_on_click_outside,
+                                    |ui| {
+                                        breadcrumb_popup_active = true;
+                                        ui.set_min_width(240.0);
+
+                                        let child_dirs =
+                                            Self::breadcrumb_child_directories(segment_path.as_path());
+                                        let mut close_popup = false;
+
+                                        if child_dirs.is_empty() {
+                                            ui.label(
+                                                egui::RichText::new("No subfolders")
+                                                    .color(egui::Color32::from_gray(150)),
+                                            );
+                                        } else {
+                                            egui::ScrollArea::vertical()
+                                                .max_height(280.0)
+                                                .show(ui, |ui| {
+                                                    for child in child_dirs {
+                                                        let child_name = child
+                                                            .file_name()
+                                                            .map(|name| {
+                                                                name.to_string_lossy().to_string()
+                                                            })
+                                                            .filter(|name| !name.is_empty())
+                                                            .unwrap_or_else(|| {
+                                                                child.display().to_string()
+                                                            });
+
+                                                        let row = ui.selectable_label(false, child_name);
+                                                        if row.contains_pointer() {
+                                                            breadcrumb_ui_hovered = true;
+                                                        }
+                                                        if row.clicked() {
+                                                            breadcrumb_target_directory =
+                                                                Some(child.clone());
+                                                            close_popup = true;
+                                                        }
+                                                    }
+                                                });
+                                        }
+
+                                        if close_popup {
+                                            ui.memory_mut(|mem| mem.close_popup());
+                                        }
+
+                                        if ui.rect_contains_pointer(ui.min_rect()) {
+                                            breadcrumb_ui_hovered = true;
+                                            breadcrumb_popup_active = true;
+                                        }
+                                    },
+                                );
+
+                                if ui.memory(|mem| mem.is_popup_open(popup_id)) {
+                                    breadcrumb_popup_active = true;
+                                }
+                            }
+                        });
+                    });
+                });
+        }
+
+        if breadcrumb_ui_hovered {
+            self.mouse_over_title_text = true;
+        }
+
+        if breadcrumb_popup_active {
+            self.title_bar_menu_active = true;
+            self.show_controls = true;
+            self.controls_show_time = Instant::now();
+        }
+
+        if let Some(directory) = breadcrumb_target_directory {
+            self.navigate_to_breadcrumb_directory(directory.as_path());
+        }
     }
 
     /// Draw video controls bar at the bottom of the screen
@@ -19708,7 +20048,7 @@ impl ImageViewer {
 
         let screen_rect = ctx.screen_rect();
         let mut animation_active = false;
-        let title_bar_height = 32.0;
+        let title_bar_height = self.top_controls_visible_height();
         let title_ui_blocking = self.title_bar_ui_blocking();
 
         // Smooth zoom animation (floating mode)
@@ -20111,8 +20451,11 @@ impl ImageViewer {
             {
                 self.manga_shift_wheel_pan_velocity_x = 0.0;
                 if let Some(pos) = pointer_pos {
-                    // Check if drag started from title bar area (top 50px) for window dragging
-                    let in_title_bar = self.last_mouse_pos.map_or(pos.y < 50.0, |lp| lp.y < 50.0);
+                    // Check if drag started from the top controls region for window dragging.
+                    let in_title_bar = self.last_mouse_pos.map_or(
+                        pos.y < self.top_controls_hotzone_height(),
+                        |lp| lp.y < self.top_controls_hotzone_height(),
+                    );
 
                     if let Some(_last_pos) = self.last_mouse_pos {
                         if self.is_panning {
@@ -21294,8 +21637,11 @@ impl eframe::App for ImageViewer {
 
             // Top control bar auto-hide: schedule a single repaint right when it should disappear.
             if self.show_controls {
-                let hovering_top =
-                    ctx.input(|i| i.pointer.hover_pos().map_or(false, |p| p.y < 50.0));
+                let hovering_top = ctx.input(|i| {
+                    i.pointer
+                        .hover_pos()
+                        .map_or(false, |p| p.y < self.top_controls_hotzone_height())
+                });
                 if !hovering_top {
                     let delay = Duration::from_secs_f32(self.config.controls_hide_delay.max(0.0));
                     let elapsed = self.controls_show_time.elapsed();
