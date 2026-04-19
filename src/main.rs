@@ -2803,6 +2803,16 @@ impl ImageViewer {
 
             self.manga_clear_cache();
             self.ensure_manga_loader();
+
+            if self.is_masonry_mode() {
+                if let Some(ref mut loader) = self.manga_loader {
+                    loader.cache_all_dimensions(&self.image_list);
+                }
+                self.maybe_begin_masonry_metadata_preload(true);
+            } else {
+                self.reset_masonry_metadata_preload();
+            }
+
             self.manga_update_preload_queue();
             self.manga_scroll_offset = 0.0;
             self.manga_scroll_target = 0.0;
