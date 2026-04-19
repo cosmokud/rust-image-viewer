@@ -2517,7 +2517,14 @@ impl ImageViewer {
 
     fn folder_entry_display_name(path: &Path) -> String {
         path.file_name()
-            .map(|name| name.to_string_lossy().to_string())
+            .map(|name| {
+                let label = name.to_string_lossy().to_string();
+                if Self::is_up_navigation_entry_name(label.as_str()) {
+                    "[..]".to_string()
+                } else {
+                    label
+                }
+            })
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| path.display().to_string())
     }
@@ -2645,15 +2652,15 @@ impl ImageViewer {
             painter.rect_stroke(icon, 3.0, stroke);
         }
 
-        let label_size = (rect.width() * 0.095).clamp(24.0, 72.0);
-        let label_pos = egui::pos2(rect.center().x, rect.bottom() - rect.height() * 0.13);
-        painter.text(
-            label_pos,
-            egui::Align2::CENTER_CENTER,
-            label,
-            egui::FontId::proportional(label_size),
-            egui::Color32::from_rgb(245, 245, 245),
-        );
+        let label_size = (rect.width() * 0.045).clamp(13.0, 22.0);
+        let label_font = egui::FontId::proportional(label_size);
+        let label_color = egui::Color32::from_rgb(245, 245, 245);
+        let max_label_width = (rect.width() * 0.82).max(90.0);
+        let galley = painter.layout(label.to_string(), label_font, label_color, max_label_width);
+        let label_bottom_padding = (rect.height() * 0.06).clamp(10.0, 28.0);
+        let label_top = rect.bottom() - label_bottom_padding - galley.rect.height();
+        let label_pos = egui::pos2(rect.center().x - galley.rect.width() * 0.5, label_top);
+        painter.galley(label_pos, galley, label_color);
     }
 
     fn breadcrumb_segments_for_path(path: &Path) -> Vec<(String, PathBuf)> {
@@ -2727,7 +2734,7 @@ impl ImageViewer {
             return;
         }
 
-        let files = get_media_in_directory(directory);
+        let mut files = get_media_in_directory(directory);
         if files.is_empty() {
             self.error_message = Some(format!(
                 "No supported media files found in folder: {}",
@@ -2736,23 +2743,24 @@ impl ImageViewer {
             return;
         }
 
-        let preferred_name = self
-            .current_media_path()
-            .and_then(|path| path.file_name().map(|name| name.to_os_string()));
+        let modified_at = std::fs::metadata(directory)
+            .ok()
+            .and_then(|metadata| metadata.modified().ok());
+        files = self
+            .media_directory_index
+            .apply_directory_scan_result(DirectoryScanResult {
+                directory: directory.to_path_buf(),
+                files,
+                modified_at,
+            });
 
-        let target_path = preferred_name
-            .as_ref()
-            .and_then(|name| {
-                files
-                    .iter()
-                    .find(|candidate| {
-                        !Self::is_up_navigation_entry_path(candidate.as_path())
-                            &&
-                        candidate
-                            .file_name()
-                            .is_some_and(|candidate_name| candidate_name == name.as_os_str())
-                    })
-                    .cloned()
+        let current_path = self.current_media_path();
+        let target_path = current_path
+            .filter(|path| {
+                path.parent() == Some(directory)
+                    && files
+                        .iter()
+                        .any(|candidate| candidate.as_path() == path.as_path())
             })
             .or_else(|| {
                 files
@@ -2767,7 +2775,22 @@ impl ImageViewer {
         self.controls_show_time = Instant::now();
 
         if self.manga_mode && self.is_fullscreen {
-            self.refresh_media_list_after_path_mutation(Some(target_path));
+            self.set_image_list(files);
+            self.clear_stale_marked_files();
+            self.clear_stale_prepared_clipboard_paths();
+            self.modal_thumbnail_cache.retain(|path, _| path.exists());
+
+            let resolved_index = self
+                .image_list
+                .iter()
+                .position(|candidate| candidate == &target_path)
+                .unwrap_or(0);
+            self.set_current_index_clamped(resolved_index);
+            self.pending_window_title = Some(self.compute_window_title_for_path(&target_path));
+
+            self.manga_clear_cache();
+            self.ensure_manga_loader();
+            self.manga_update_preload_queue();
             self.manga_scroll_offset = 0.0;
             self.manga_scroll_target = 0.0;
             self.manga_scroll_velocity = 0.0;
@@ -8569,8 +8592,16 @@ impl ImageViewer {
         }
 
         let total = self.image_list.len();
+        let folder_ready = self
+            .image_list
+            .iter()
+            .filter(|path| self.is_folder_navigation_entry_path(path.as_path()))
+            .count();
         let fully_warm = self.manga_loader.as_ref().is_some_and(|loader| {
-            loader.cached_dimensions_count(total) >= total
+            loader
+                .cached_dimensions_count(total)
+                .saturating_add(folder_ready)
+                >= total
                 && loader.pending_dimension_probe_count() == 0
                 && loader.pending_dimension_results_count() == 0
         });
@@ -8634,6 +8665,12 @@ impl ImageViewer {
         let preload_cursor = self.masonry_metadata_preload_cursor.min(total.saturating_sub(1));
         let preload_window = 96usize.max(self.masonry_items_per_row.clamp(2, 10) * 48);
         let preload_end = (preload_cursor + preload_window).min(total);
+        let folder_ready = self
+            .image_list
+            .iter()
+            .take(total)
+            .filter(|path| self.is_folder_navigation_entry_path(path.as_path()))
+            .count();
 
         let (loaded_count, pending_probe_count, pending_result_count) = {
             let Some(loader) = self.manga_loader.as_mut() else {
@@ -8650,7 +8687,10 @@ impl ImageViewer {
             }
 
             (
-                loader.cached_dimensions_count(total).min(total),
+                loader
+                    .cached_dimensions_count(total)
+                    .saturating_add(folder_ready)
+                    .min(total),
                 loader.pending_dimension_probe_count(),
                 loader.pending_dimension_results_count(),
             )
@@ -16043,23 +16083,6 @@ impl ImageViewer {
             self.manga_hovered_media_index = None;
         }
 
-        if primary_clicked
-            && !ctrl_held
-            && !title_ui_blocking
-            && !pointer_over_shortcut_ui
-            && !over_controls
-        {
-            if let Some(pos) = pointer_pos {
-                if let Some(target_index) = self.manga_index_at_screen_pos(pos) {
-                    if let Some(path) = self.image_list.get(target_index).cloned() {
-                        if self.traverse_folder_entry_path(path.as_path()) {
-                            return true;
-                        }
-                    }
-                }
-            }
-        }
-
         let mut primary_consumed_for_autoscroll = false;
         let mut secondary_consumed_for_autoscroll = false;
         let mut secondary_consumed_for_file_menu = false;
@@ -17792,7 +17815,7 @@ impl ImageViewer {
         let mut right_click_toggle_fullscreen = false;
         let mut right_click_navigated = false;
         let mut ctrl_secondary_single_file_menu_pos: Option<egui::Pos2> = None;
-        let mut primary_folder_traverse_requested = false;
+        let mut goto_bound_folder_traverse_requested = false;
 
         ctx.input(|input| {
             let ctrl = input.modifiers.ctrl;
@@ -17810,7 +17833,7 @@ impl ImageViewer {
                 self.pointer_over_shortcut_blocking_ui(pointer_pos, input.screen_rect);
 
             if !self.manga_mode
-                && input.pointer.button_clicked(egui::PointerButton::Primary)
+                && self.action_binding_triggered(Action::GotoFile, input, ctrl, shift, alt)
                 && !pointer_over_shortcut_ui
             {
                 if let Some(pos) = pointer_pos {
@@ -17820,7 +17843,7 @@ impl ImageViewer {
                         .is_some_and(|path| self.is_folder_navigation_entry_path(path.as_path()))
                         && self.point_over_current_media(pos, input.screen_rect)
                     {
-                        primary_folder_traverse_requested = true;
+                        goto_bound_folder_traverse_requested = true;
                         return;
                     }
                 }
@@ -18036,7 +18059,7 @@ impl ImageViewer {
             }
         }
 
-        if primary_folder_traverse_requested {
+        if goto_bound_folder_traverse_requested {
             if let Some(path) = self.current_media_path() {
                 if self.traverse_folder_entry_path(path.as_path()) {
                     return;
