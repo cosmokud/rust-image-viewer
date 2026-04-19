@@ -29,6 +29,7 @@ use config::{
 use hashbrown::{HashMap, HashSet};
 use image_loader::{
     get_media_in_directory, get_media_type, is_supported_video, probe_image_dimensions,
+    FOLDER_UP_ENTRY_NAME,
     ImageFrame, LoadedImage,
     MediaType,
 };
@@ -2504,6 +2505,135 @@ impl ImageViewer {
         self.image_list.get(self.current_index).cloned()
     }
 
+    fn is_up_navigation_entry_path(path: &Path) -> bool {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == FOLDER_UP_ENTRY_NAME)
+    }
+
+    fn folder_entry_target_directory(path: &Path) -> Option<PathBuf> {
+        if path.is_dir() {
+            Some(path.to_path_buf())
+        } else if Self::is_up_navigation_entry_path(path) {
+            let current_directory = path.parent()?;
+            current_directory.parent().map(Path::to_path_buf)
+        } else {
+            None
+        }
+    }
+
+    fn is_folder_navigation_entry_path(&self, path: &Path) -> bool {
+        Self::folder_entry_target_directory(path).is_some()
+    }
+
+    fn traverse_folder_entry_path(&mut self, path: &Path) -> bool {
+        let Some(target_directory) = Self::folder_entry_target_directory(path) else {
+            return false;
+        };
+
+        self.navigate_to_breadcrumb_directory(target_directory.as_path());
+        true
+    }
+
+    fn build_folder_placeholder_image(path: PathBuf, is_up_entry: bool) -> LoadedImage {
+        const SIZE: usize = 512;
+
+        let mut pixels = vec![0_u8; SIZE * SIZE * 4];
+        let mut fill_rect = |x0: usize, y0: usize, x1: usize, y1: usize, rgba: [u8; 4]| {
+            let x_start = x0.min(SIZE);
+            let y_start = y0.min(SIZE);
+            let x_end = x1.min(SIZE);
+            let y_end = y1.min(SIZE);
+            for y in y_start..y_end {
+                for x in x_start..x_end {
+                    let base = (y * SIZE + x) * 4;
+                    pixels[base] = rgba[0];
+                    pixels[base + 1] = rgba[1];
+                    pixels[base + 2] = rgba[2];
+                    pixels[base + 3] = rgba[3];
+                }
+            }
+        };
+
+        fill_rect(0, 0, SIZE, SIZE, [24, 28, 34, 255]);
+        fill_rect(64, 132, 448, 424, [221, 178, 73, 255]);
+        fill_rect(100, 92, 284, 170, [234, 196, 108, 255]);
+        fill_rect(84, 176, 428, 392, [247, 219, 149, 255]);
+        fill_rect(84, 392, 428, 424, [194, 146, 48, 255]);
+
+        if is_up_entry {
+            fill_rect(248, 228, 264, 332, [255, 255, 255, 255]);
+            fill_rect(216, 228, 296, 244, [255, 255, 255, 255]);
+            fill_rect(224, 208, 288, 224, [255, 255, 255, 255]);
+            fill_rect(232, 188, 280, 204, [255, 255, 255, 255]);
+        } else {
+            fill_rect(220, 248, 292, 264, [255, 255, 255, 255]);
+            fill_rect(220, 248, 236, 322, [255, 255, 255, 255]);
+            fill_rect(276, 248, 292, 322, [255, 255, 255, 255]);
+            fill_rect(220, 306, 292, 322, [255, 255, 255, 255]);
+        }
+
+        LoadedImage::from_single_frame(
+            path,
+            ImageFrame {
+                pixels,
+                width: SIZE as u32,
+                height: SIZE as u32,
+                delay_ms: 0,
+            },
+            SIZE as u32,
+            SIZE as u32,
+        )
+    }
+
+    fn paint_folder_entry_card(
+        painter: &egui::Painter,
+        rect: egui::Rect,
+        is_up_entry: bool,
+    ) {
+        painter.rect_filled(rect, 6.0, egui::Color32::from_rgb(30, 34, 40));
+
+        let body = egui::Rect::from_min_max(
+            egui::pos2(rect.left() + rect.width() * 0.12, rect.top() + rect.height() * 0.36),
+            egui::pos2(rect.right() - rect.width() * 0.12, rect.bottom() - rect.height() * 0.14),
+        );
+        let tab = egui::Rect::from_min_max(
+            egui::pos2(rect.left() + rect.width() * 0.2, rect.top() + rect.height() * 0.2),
+            egui::pos2(rect.left() + rect.width() * 0.5, rect.top() + rect.height() * 0.36),
+        );
+
+        painter.rect_filled(body, 5.0, egui::Color32::from_rgb(221, 178, 73));
+        painter.rect_filled(tab, 4.0, egui::Color32::from_rgb(234, 196, 108));
+
+        let stroke = egui::Stroke::new(2.0, egui::Color32::WHITE);
+        let center = body.center();
+        if is_up_entry {
+            let shaft_top = egui::pos2(center.x, center.y - body.height() * 0.18);
+            let shaft_bottom = egui::pos2(center.x, center.y + body.height() * 0.2);
+            painter.line_segment([shaft_bottom, shaft_top], stroke);
+            painter.line_segment(
+                [
+                    shaft_top,
+                    egui::pos2(center.x - body.width() * 0.12, center.y - body.height() * 0.02),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    shaft_top,
+                    egui::pos2(center.x + body.width() * 0.12, center.y - body.height() * 0.02),
+                ],
+                stroke,
+            );
+        } else {
+            let icon = egui::Rect::from_center_size(
+                center,
+                egui::vec2(body.width() * 0.26, body.height() * 0.28),
+            );
+            painter.rect_stroke(icon, 3.0, stroke);
+        }
+    }
+
     fn breadcrumb_segments_for_path(path: &Path) -> Vec<(String, PathBuf)> {
         let directory = if path.is_dir() {
             path.to_path_buf()
@@ -2594,10 +2724,18 @@ impl ImageViewer {
                 files
                     .iter()
                     .find(|candidate| {
+                        !Self::is_up_navigation_entry_path(candidate.as_path())
+                            &&
                         candidate
                             .file_name()
                             .is_some_and(|candidate_name| candidate_name == name.as_os_str())
                     })
+                    .cloned()
+            })
+            .or_else(|| {
+                files
+                    .iter()
+                    .find(|candidate| !Self::is_up_navigation_entry_path(candidate.as_path()))
                     .cloned()
             })
             .unwrap_or_else(|| files[0].clone());
@@ -9252,13 +9390,20 @@ impl ImageViewer {
         self.current_file_size_label_path = None;
         self.pending_file_size_probe = None;
         self.pending_file_size_probe_path = None;
-        self.start_async_file_size_probe(path.clone());
+        if path.exists() {
+            self.start_async_file_size_probe(path.clone());
+        }
 
         // Update the native window title (taskbar title) using Unicode-safe conversion.
         self.pending_window_title = Some(self.compute_window_title_for_path(path));
 
         // Determine media type up-front so we can decide whether to keep a placeholder frame.
-        let media_type = get_media_type(path);
+        let is_folder_entry = self.is_folder_navigation_entry_path(path.as_path());
+        let media_type = if is_folder_entry {
+            Some(MediaType::Image)
+        } else {
+            get_media_type(path)
+        };
         self.current_media_type = media_type;
 
         let mut used_mode_switch_placeholder = false;
@@ -9401,6 +9546,24 @@ impl ImageViewer {
                 self.start_async_video_load(path.clone());
             }
             Some(MediaType::Image) => {
+                if is_folder_entry {
+                    self.consume_deferred_media_view_reset();
+                    self.drop_retained_media_placeholder();
+                    self.image = Some(Self::build_folder_placeholder_image(
+                        path.clone(),
+                        Self::is_up_navigation_entry_path(path.as_path()),
+                    ));
+                    self.texture = None;
+                    self.image_texture_dims = Some((512, 512));
+                    self.show_video_controls = false;
+                    self.error_message = None;
+                    self.image_changed = true;
+                    self.pending_media_layout = false;
+                    self.perf_metrics
+                        .record_duration("load_media_prepare_ms", load_media_start.elapsed());
+                    return;
+                }
+
                 // Load as image with configured filters.
                 // For animated WebP we only decode the FIRST frame here so the
                 // window appears instantly, then start streaming remaining frames
@@ -9433,7 +9596,7 @@ impl ImageViewer {
             }
         }
 
-        if media_type.is_some() {
+        if media_type.is_some() && !is_folder_entry {
             self.schedule_solo_probe_window(path, media_type);
         }
 
@@ -11790,6 +11953,10 @@ impl ImageViewer {
             return;
         };
 
+        if self.traverse_folder_entry_path(path.as_path()) {
+            return;
+        }
+
         self.strip_open_force_fit_path = Some(path.clone());
         if return_mode == MangaLayoutMode::Masonry {
             self.mark_masonry_runtime_cache_resident();
@@ -13407,6 +13574,14 @@ impl ImageViewer {
     }
 
     fn manga_get_image_source_dimensions(&self, index: usize) -> Option<(f32, f32)> {
+        if self
+            .image_list
+            .get(index)
+            .is_some_and(|path| self.is_folder_navigation_entry_path(path.as_path()))
+        {
+            return Some((512.0, 512.0));
+        }
+
         let loader_dims = self
             .manga_loader
             .as_ref()
@@ -15282,6 +15457,39 @@ impl ImageViewer {
             image_rect
         };
         let mut requested_retry = false;
+
+        let folder_entry = self
+            .image_list
+            .get(idx)
+            .cloned()
+            .and_then(|path| {
+                if self.is_folder_navigation_entry_path(path.as_path()) {
+                    Some(path)
+                } else {
+                    None
+                }
+            });
+
+        if let Some(path) = folder_entry.as_ref() {
+            Self::paint_folder_entry_card(
+                ui.painter(),
+                image_rect,
+                Self::is_up_navigation_entry_path(path.as_path()),
+            );
+
+            let preview_only =
+                self.mark_selection_preview_contains(idx) && self.mark_visual_for_index(idx).is_none();
+            let mark_visual = if preview_only {
+                Some(FileMarkVisual::Preview)
+            } else {
+                self.mark_visual_for_index(idx)
+            };
+            if let Some(mark_visual) = mark_visual {
+                self.paint_marked_item_overlay(ui.painter(), image_rect, mark_visual);
+            }
+
+            return false;
+        }
 
         let cached_media_type = self
             .manga_loader
@@ -17544,6 +17752,7 @@ impl ImageViewer {
         let mut right_click_toggle_fullscreen = false;
         let mut right_click_navigated = false;
         let mut ctrl_secondary_single_file_menu_pos: Option<egui::Pos2> = None;
+        let mut primary_folder_traverse_requested = false;
 
         ctx.input(|input| {
             let ctrl = input.modifiers.ctrl;
@@ -17559,6 +17768,23 @@ impl ImageViewer {
                 .or_else(|| input.pointer.hover_pos());
             let pointer_over_shortcut_ui =
                 self.pointer_over_shortcut_blocking_ui(pointer_pos, input.screen_rect);
+
+            if !self.manga_mode
+                && input.pointer.button_clicked(egui::PointerButton::Primary)
+                && !pointer_over_shortcut_ui
+            {
+                if let Some(pos) = pointer_pos {
+                    if self
+                        .current_media_path()
+                        .as_ref()
+                        .is_some_and(|path| self.is_folder_navigation_entry_path(path.as_path()))
+                        && self.point_over_current_media(pos, input.screen_rect)
+                    {
+                        primary_folder_traverse_requested = true;
+                        return;
+                    }
+                }
+            }
 
             if self.manga_autoscroll_active {
                 let primary_cancel = input.pointer.button_clicked(egui::PointerButton::Primary);
@@ -17767,6 +17993,14 @@ impl ImageViewer {
                     self.current_index.min(self.image_list.len().saturating_sub(1)),
                 );
                 return;
+            }
+        }
+
+        if primary_folder_traverse_requested {
+            if let Some(path) = self.current_media_path() {
+                if self.traverse_folder_entry_path(path.as_path()) {
+                    return;
+                }
             }
         }
 
