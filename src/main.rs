@@ -1976,6 +1976,8 @@ struct ImageViewer {
     masonry_metadata_preload_cursor: usize,
     /// Item to restore once startup metadata warmup finishes rebuilding the masonry layout.
     masonry_metadata_preload_restore_index: Option<usize>,
+    /// Deferred folder-travel restore payload applied after masonry metadata warmup completes.
+    pending_masonry_folder_travel_restore: Option<(usize, f32)>,
     /// True if masonry was actively scrolling/panning/zooming on the previous frame.
     masonry_navigation_was_active: bool,
     /// Earliest time when a post-navigation visible-quality refinement pass may begin.
@@ -2314,6 +2316,7 @@ impl Default for ImageViewer {
             masonry_metadata_preload_loaded: 0,
             masonry_metadata_preload_cursor: 0,
             masonry_metadata_preload_restore_index: None,
+            pending_masonry_folder_travel_restore: None,
             masonry_navigation_was_active: false,
             masonry_quality_refine_due_at: None,
             masonry_quality_refine_frames_remaining: 0,
@@ -2601,11 +2604,35 @@ impl ImageViewer {
 
         self.set_current_index_clamped(resolved_index);
 
-        let max_scroll = (self.manga_total_height() - self.screen_size.y).max(0.0);
-        let restored_offset = position.scroll_offset.clamp(0.0, max_scroll);
-        self.manga_scroll_offset = restored_offset;
-        self.manga_scroll_target = restored_offset;
-        self.manga_scroll_velocity = 0.0;
+        match layout_mode {
+            FolderTravelLayoutMode::LongStrip => {
+                let max_scroll = (self.manga_total_height() - self.screen_size.y).max(0.0);
+                let scroll_to = self
+                    .manga_get_scroll_offset_for_index(resolved_index)
+                    .clamp(0.0, max_scroll);
+                self.manga_scroll_offset = scroll_to;
+                self.manga_scroll_target = scroll_to;
+                self.manga_scroll_velocity = 0.0;
+            }
+            FolderTravelLayoutMode::Masonry => {
+                let max_scroll = (self.manga_total_height() - self.screen_size.y).max(0.0);
+                let restored_offset = if position.scroll_offset.is_finite() {
+                    position.scroll_offset.max(0.0)
+                } else {
+                    0.0
+                }
+                .clamp(0.0, max_scroll);
+
+                if self.masonry_metadata_preload_active {
+                    self.pending_masonry_folder_travel_restore =
+                        Some((resolved_index, restored_offset));
+                } else {
+                    self.manga_scroll_offset = restored_offset;
+                    self.manga_scroll_target = restored_offset;
+                    self.manga_scroll_velocity = 0.0;
+                }
+            }
+        }
 
         true
     }
@@ -8674,6 +8701,7 @@ impl ImageViewer {
         self.masonry_metadata_preload_loaded = 0;
         self.masonry_metadata_preload_cursor = 0;
         self.masonry_metadata_preload_restore_index = None;
+        self.pending_masonry_folder_travel_restore = None;
     }
 
     fn begin_masonry_metadata_preload(&mut self) {
@@ -8738,35 +8766,54 @@ impl ImageViewer {
     }
 
     fn restore_masonry_scroll_after_metadata_preload(&mut self) {
-        let Some(target_index) = self.masonry_metadata_preload_restore_index.take() else {
-            return;
-        };
-
         if !self.manga_mode || !self.is_masonry_mode() || self.image_list.is_empty() {
+            self.masonry_metadata_preload_restore_index = None;
+            self.pending_masonry_folder_travel_restore = None;
             return;
         }
 
-        let target_index = target_index.min(self.image_list.len().saturating_sub(1));
-        self.set_current_index_clamped(target_index);
+        if let Some(target_index) = self.masonry_metadata_preload_restore_index.take() {
+            let target_index = target_index.min(self.image_list.len().saturating_sub(1));
+            self.set_current_index_clamped(target_index);
 
-        let max_scroll = (self.manga_total_height() - self.screen_size.y).max(0.0);
-        let scroll_to = self
-            .masonry_scroll_offset_for_index_centered(target_index)
-            .unwrap_or_else(|| {
-                self.manga_get_scroll_offset_for_index(target_index)
-                    .clamp(0.0, max_scroll)
-            });
+            let max_scroll = (self.manga_total_height() - self.screen_size.y).max(0.0);
+            let scroll_to = self
+                .masonry_scroll_offset_for_index_centered(target_index)
+                .unwrap_or_else(|| {
+                    self.manga_get_scroll_offset_for_index(target_index)
+                        .clamp(0.0, max_scroll)
+                });
 
-        self.manga_scroll_offset = scroll_to;
-        self.manga_scroll_target = scroll_to;
-        self.manga_scroll_velocity = 0.0;
-        self.manga_scrollbar_dragging = false;
-        self.masonry_scrollbar_last_motion_at = None;
-        self.masonry_autoscroll_last_motion_at = None;
-        self.is_panning = false;
-        self.last_mouse_pos = None;
-        self.manga_hovered_media_index = None;
-        self.stop_manga_wheel_scroll();
+            self.manga_scroll_offset = scroll_to;
+            self.manga_scroll_target = scroll_to;
+            self.manga_scroll_velocity = 0.0;
+            self.manga_scrollbar_dragging = false;
+            self.masonry_scrollbar_last_motion_at = None;
+            self.masonry_autoscroll_last_motion_at = None;
+            self.is_panning = false;
+            self.last_mouse_pos = None;
+            self.manga_hovered_media_index = None;
+            self.stop_manga_wheel_scroll();
+        }
+
+        if let Some((target_index, restored_offset)) = self.pending_masonry_folder_travel_restore.take()
+        {
+            let target_index = target_index.min(self.image_list.len().saturating_sub(1));
+            self.set_current_index_clamped(target_index);
+
+            let max_scroll = (self.manga_total_height() - self.screen_size.y).max(0.0);
+            let restored_offset = restored_offset.clamp(0.0, max_scroll);
+            self.manga_scroll_offset = restored_offset;
+            self.manga_scroll_target = restored_offset;
+            self.manga_scroll_velocity = 0.0;
+            self.manga_scrollbar_dragging = false;
+            self.masonry_scrollbar_last_motion_at = None;
+            self.masonry_autoscroll_last_motion_at = None;
+            self.is_panning = false;
+            self.last_mouse_pos = None;
+            self.manga_hovered_media_index = None;
+            self.stop_manga_wheel_scroll();
+        }
     }
 
     fn tick_masonry_metadata_preload(&mut self) {
@@ -18647,59 +18694,51 @@ impl ImageViewer {
 
                             let breadcrumb_toggle_enabled = self.folder_navigation_ui_enabled();
 
-                            let toggle_size = egui::vec2(24.0, 24.0);
-                            let toggle_sense = if breadcrumb_toggle_enabled {
-                                egui::Sense::click()
-                            } else {
-                                egui::Sense::hover()
-                            };
-                            let (toggle_rect, toggle_resp_base) =
-                                ui.allocate_exact_size(toggle_size, toggle_sense);
-                            let toggle_resp = toggle_resp_base.on_hover_text(
-                                if breadcrumb_toggle_enabled {
+                            if breadcrumb_toggle_enabled {
+                                let toggle_size = egui::vec2(24.0, 24.0);
+                                let (toggle_rect, toggle_resp_base) =
+                                    ui.allocate_exact_size(toggle_size, egui::Sense::click());
+                                let toggle_resp = toggle_resp_base.on_hover_text(
                                     if self.show_breadcrumb_bar {
                                         "Hide breadcrumb address bar"
                                     } else {
                                         "Show breadcrumb address bar"
-                                    }
-                                } else {
-                                    "Breadcrumb address bar is only available in Manga Strip/Masonry modes"
-                                },
-                            );
-
-                            if ui.is_rect_visible(toggle_rect) {
-                                let bg = if toggle_resp.is_pointer_button_down_on() {
-                                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 40)
-                                } else if toggle_resp.hovered() {
-                                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 22)
-                                } else {
-                                    egui::Color32::TRANSPARENT
-                                };
-                                ui.painter().rect_filled(toggle_rect, 4.0, bg);
-
-                                let icon_rect = toggle_rect.shrink2(egui::vec2(4.0, 4.0));
-                                let icon_color = if !breadcrumb_toggle_enabled {
-                                    egui::Color32::from_gray(90)
-                                } else if self.show_breadcrumb_bar {
-                                    egui::Color32::WHITE
-                                } else {
-                                    egui::Color32::from_gray(170)
-                                };
-                                Self::paint_menu_action_icon(
-                                    ui.painter(),
-                                    icon_rect,
-                                    MenuActionIcon::OpenLocation,
-                                    icon_color,
+                                    },
                                 );
-                            }
 
-                            if breadcrumb_toggle_enabled && toggle_resp.clicked() {
-                                self.show_breadcrumb_bar = !self.show_breadcrumb_bar;
-                                self.show_controls = true;
-                                self.controls_show_time = Instant::now();
+                                if ui.is_rect_visible(toggle_rect) {
+                                    let bg = if toggle_resp.is_pointer_button_down_on() {
+                                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 40)
+                                    } else if toggle_resp.hovered() {
+                                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 22)
+                                    } else {
+                                        egui::Color32::TRANSPARENT
+                                    };
+                                    ui.painter().rect_filled(toggle_rect, 4.0, bg);
+
+                                    let icon_rect = toggle_rect.shrink2(egui::vec2(4.0, 4.0));
+                                    let icon_color = if self.show_breadcrumb_bar {
+                                        egui::Color32::WHITE
+                                    } else {
+                                        egui::Color32::from_gray(170)
+                                    };
+                                    Self::paint_menu_action_icon(
+                                        ui.painter(),
+                                        icon_rect,
+                                        MenuActionIcon::OpenLocation,
+                                        icon_color,
+                                    );
+                                }
+
+                                if toggle_resp.clicked() {
+                                    self.show_breadcrumb_bar = !self.show_breadcrumb_bar;
+                                    self.show_controls = true;
+                                    self.controls_show_time = Instant::now();
+                                }
+
+                                over_title_text |= toggle_resp.contains_pointer();
+                                ui.add_space(6.0);
                             }
-                            over_title_text |= toggle_resp.contains_pointer();
-                            ui.add_space(6.0);
 
                             let current_path = self.image_list.get(self.current_index).cloned();
                             let details_path = current_path.clone();
