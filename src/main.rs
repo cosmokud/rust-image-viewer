@@ -5,6 +5,7 @@
 
 mod async_runtime;
 mod config;
+mod folder_travel_cache;
 mod image_loader;
 mod manga_loader;
 mod manga_spatial;
@@ -25,6 +26,10 @@ static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use config::{
     Action, Config, InputBinding, MangaVirtualizationBackend, StartupWindowMode,
     VideoSeekPolicy,
+};
+use folder_travel_cache::{
+    lookup_folder_travel_position, store_folder_travel_position, FolderTravelLayoutMode,
+    FolderTravelPosition,
 };
 use hashbrown::{HashMap, HashSet};
 use image_loader::{
@@ -2518,6 +2523,93 @@ impl ImageViewer {
         self.image_list.get(self.current_index).cloned()
     }
 
+    fn active_folder_travel_layout_mode(&self) -> Option<FolderTravelLayoutMode> {
+        if !self.manga_mode || !self.is_fullscreen {
+            return None;
+        }
+
+        if self.is_masonry_mode() {
+            Some(FolderTravelLayoutMode::Masonry)
+        } else {
+            Some(FolderTravelLayoutMode::LongStrip)
+        }
+    }
+
+    fn store_folder_travel_position_for_current_folder(&self) {
+        let Some(layout_mode) = self.active_folder_travel_layout_mode() else {
+            return;
+        };
+
+        let Some(current_path) = self.current_media_path() else {
+            return;
+        };
+
+        let Some(current_directory) = current_path.parent().map(Path::to_path_buf) else {
+            return;
+        };
+
+        let position = FolderTravelPosition {
+            current_path,
+            current_index: self.current_index,
+            scroll_offset: self.manga_scroll_offset.max(0.0),
+        };
+        store_folder_travel_position(current_directory.as_path(), layout_mode, &position);
+    }
+
+    fn restore_folder_travel_position_for_directory(&mut self, directory: &Path) -> bool {
+        let Some(layout_mode) = self.active_folder_travel_layout_mode() else {
+            return false;
+        };
+
+        let Some(position) = lookup_folder_travel_position(directory, layout_mode) else {
+            return false;
+        };
+
+        if self.image_list.is_empty() {
+            return false;
+        }
+
+        let mut resolved_index = self
+            .image_list
+            .iter()
+            .position(|candidate| {
+                candidate.as_path() == position.current_path.as_path()
+                    && !Self::is_up_navigation_entry_path(candidate.as_path())
+            });
+
+        if resolved_index.is_none() {
+            let fallback_index = position.current_index.min(self.image_list.len().saturating_sub(1));
+            if self
+                .image_list
+                .get(fallback_index)
+                .is_some_and(|path| !Self::is_up_navigation_entry_path(path.as_path()))
+            {
+                resolved_index = Some(fallback_index);
+            }
+        }
+
+        if resolved_index.is_none() {
+            resolved_index = self
+                .image_list
+                .iter()
+                .position(|candidate| !Self::is_up_navigation_entry_path(candidate.as_path()));
+        }
+
+        let Some(resolved_index) = resolved_index else {
+            return false;
+        };
+
+        self.set_current_index_clamped(resolved_index);
+
+        let max_scroll = (self.manga_total_height() - self.screen_size.y).max(0.0);
+        let restored_offset = position.scroll_offset.clamp(0.0, max_scroll);
+        self.manga_scroll_offset = restored_offset;
+        self.manga_scroll_target = restored_offset;
+        self.manga_scroll_velocity = 0.0;
+
+        true
+    }
+
     fn is_up_navigation_entry_name(name: &str) -> bool {
         name == FOLDER_UP_ENTRY_NAME || name == "[...]"
     }
@@ -2747,6 +2839,9 @@ impl ImageViewer {
             return;
         }
 
+        // Persist the current folder viewport state before any folder-travel jump.
+        self.store_folder_travel_position_for_current_folder();
+
         let mut files = get_media_in_directory(directory);
         if files.is_empty() {
             self.error_message = Some(format!(
@@ -2814,9 +2909,15 @@ impl ImageViewer {
             }
 
             self.manga_update_preload_queue();
-            self.manga_scroll_offset = 0.0;
-            self.manga_scroll_target = 0.0;
-            self.manga_scroll_velocity = 0.0;
+            if !self.restore_folder_travel_position_for_directory(directory) {
+                self.manga_scroll_offset = 0.0;
+                self.manga_scroll_target = 0.0;
+                self.manga_scroll_velocity = 0.0;
+            }
+
+            if let Some(active_path) = self.current_media_path() {
+                self.pending_window_title = Some(self.compute_window_title_for_path(&active_path));
+            }
         } else {
             self.load_media(&target_path);
         }
