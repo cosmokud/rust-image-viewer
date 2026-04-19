@@ -2416,9 +2416,13 @@ impl ImageViewer {
     const FPS_OVERLAY_ACTIVE_POLL_MS: u64 = 120;
     const FPS_IDLE_RESET_AFTER_MS: u64 = 350;
 
+    fn folder_navigation_ui_enabled(&self) -> bool {
+        self.manga_mode && self.is_fullscreen
+    }
+
     fn top_controls_visible_height(&self) -> f32 {
         Self::TITLE_BAR_HEIGHT
-            + if self.show_breadcrumb_bar {
+            + if self.folder_navigation_ui_enabled() && self.show_breadcrumb_bar {
                 Self::BREADCRUMB_BAR_HEIGHT
             } else {
                 0.0
@@ -2476,6 +2480,15 @@ impl ImageViewer {
     }
 
     fn set_image_list(&mut self, files: Vec<PathBuf>) {
+        let files = if self.folder_navigation_ui_enabled() {
+            files
+        } else {
+            files
+                .into_iter()
+                .filter(|path| !self.is_folder_navigation_entry_path(path.as_path()))
+                .collect()
+        };
+
         let new_signature = Self::compute_image_list_signature(&files);
         if self.image_list_signature != new_signature {
             self.masonry_runtime_cache_signature = 0;
@@ -12064,6 +12077,11 @@ impl ImageViewer {
             self.manga_pending_decoded_peak = 0;
 
             self.prepare_enter_manga_mode_state(current_media_type);
+
+            if let Some(anchor_path) = self.current_media_path() {
+                self.refresh_media_list_after_path_mutation(Some(anchor_path));
+            }
+
             if self.manga_layout_mode == MangaLayoutMode::Masonry {
                 self.mark_masonry_runtime_cache_resident();
             }
@@ -18516,14 +18534,25 @@ impl ImageViewer {
                             let mut over_title_text = false;
                             let mut started_title_text_drag = false;
 
+                            let breadcrumb_toggle_enabled = self.folder_navigation_ui_enabled();
+
                             let toggle_size = egui::vec2(24.0, 24.0);
+                            let toggle_sense = if breadcrumb_toggle_enabled {
+                                egui::Sense::click()
+                            } else {
+                                egui::Sense::hover()
+                            };
                             let (toggle_rect, toggle_resp_base) =
-                                ui.allocate_exact_size(toggle_size, egui::Sense::click());
+                                ui.allocate_exact_size(toggle_size, toggle_sense);
                             let toggle_resp = toggle_resp_base.on_hover_text(
-                                if self.show_breadcrumb_bar {
-                                    "Hide breadcrumb address bar"
+                                if breadcrumb_toggle_enabled {
+                                    if self.show_breadcrumb_bar {
+                                        "Hide breadcrumb address bar"
+                                    } else {
+                                        "Show breadcrumb address bar"
+                                    }
                                 } else {
-                                    "Show breadcrumb address bar"
+                                    "Breadcrumb address bar is only available in Manga Strip/Masonry modes"
                                 },
                             );
 
@@ -18538,7 +18567,9 @@ impl ImageViewer {
                                 ui.painter().rect_filled(toggle_rect, 4.0, bg);
 
                                 let icon_rect = toggle_rect.shrink2(egui::vec2(4.0, 4.0));
-                                let icon_color = if self.show_breadcrumb_bar {
+                                let icon_color = if !breadcrumb_toggle_enabled {
+                                    egui::Color32::from_gray(90)
+                                } else if self.show_breadcrumb_bar {
                                     egui::Color32::WHITE
                                 } else {
                                     egui::Color32::from_gray(170)
@@ -18551,7 +18582,7 @@ impl ImageViewer {
                                 );
                             }
 
-                            if toggle_resp.clicked() {
+                            if breadcrumb_toggle_enabled && toggle_resp.clicked() {
                                 self.show_breadcrumb_bar = !self.show_breadcrumb_bar;
                                 self.show_controls = true;
                                 self.controls_show_time = Instant::now();
@@ -18905,7 +18936,7 @@ impl ImageViewer {
                 });
             });
 
-        if self.show_breadcrumb_bar {
+        if self.folder_navigation_ui_enabled() && self.show_breadcrumb_bar {
             let breadcrumb_height = Self::BREADCRUMB_BAR_HEIGHT;
             let breadcrumb_rect = egui::Rect::from_min_size(
                 egui::pos2(screen_rect.min.x, screen_rect.min.y + bar_height),

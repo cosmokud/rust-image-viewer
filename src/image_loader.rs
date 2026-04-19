@@ -315,10 +315,17 @@ pub fn get_media_in_directory(path: &Path) -> Vec<PathBuf> {
     }
 
     media.par_sort_unstable_by(|a, b| {
-        natord::compare(
-            a.file_name().unwrap_or_default().to_str().unwrap_or(""),
-            b.file_name().unwrap_or_default().to_str().unwrap_or(""),
-        )
+        let a_name = a.file_name().unwrap_or_default().to_str().unwrap_or("");
+        let b_name = b.file_name().unwrap_or_default().to_str().unwrap_or("");
+
+        let a_is_folder = a.is_dir() || a_name == FOLDER_UP_ENTRY_NAME;
+        let b_is_folder = b.is_dir() || b_name == FOLDER_UP_ENTRY_NAME;
+
+        match (a_is_folder, b_is_folder) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => natord::compare(a_name, b_name),
+        }
     });
 
     media
