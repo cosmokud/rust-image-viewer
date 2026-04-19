@@ -2505,18 +2505,29 @@ impl ImageViewer {
         self.image_list.get(self.current_index).cloned()
     }
 
+    fn is_up_navigation_entry_name(name: &str) -> bool {
+        name == FOLDER_UP_ENTRY_NAME || name == "[...]"
+    }
+
     fn is_up_navigation_entry_path(path: &Path) -> bool {
         path.file_name()
             .and_then(|name| name.to_str())
-            .is_some_and(|name| name == FOLDER_UP_ENTRY_NAME)
+            .is_some_and(Self::is_up_navigation_entry_name)
+    }
+
+    fn folder_entry_display_name(path: &Path) -> String {
+        path.file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| path.display().to_string())
     }
 
     fn folder_entry_target_directory(path: &Path) -> Option<PathBuf> {
-        if path.is_dir() {
-            Some(path.to_path_buf())
-        } else if Self::is_up_navigation_entry_path(path) {
+        if Self::is_up_navigation_entry_path(path) {
             let current_directory = path.parent()?;
             current_directory.parent().map(Path::to_path_buf)
+        } else if path.is_dir() {
+            Some(path.to_path_buf())
         } else {
             None
         }
@@ -2590,6 +2601,7 @@ impl ImageViewer {
         painter: &egui::Painter,
         rect: egui::Rect,
         is_up_entry: bool,
+        label: &str,
     ) {
         painter.rect_filled(rect, 6.0, egui::Color32::from_rgb(30, 34, 40));
 
@@ -2632,6 +2644,16 @@ impl ImageViewer {
             );
             painter.rect_stroke(icon, 3.0, stroke);
         }
+
+        let label_size = (rect.width() * 0.095).clamp(24.0, 72.0);
+        let label_pos = egui::pos2(rect.center().x, rect.bottom() - rect.height() * 0.13);
+        painter.text(
+            label_pos,
+            egui::Align2::CENTER_CENTER,
+            label,
+            egui::FontId::proportional(label_size),
+            egui::Color32::from_rgb(245, 245, 245),
+        );
     }
 
     fn breadcrumb_segments_for_path(path: &Path) -> Vec<(String, PathBuf)> {
@@ -15475,6 +15497,7 @@ impl ImageViewer {
                 ui.painter(),
                 image_rect,
                 Self::is_up_navigation_entry_path(path.as_path()),
+                &Self::folder_entry_display_name(path.as_path()),
             );
 
             let preview_only =
@@ -16018,6 +16041,23 @@ impl ImageViewer {
                 pointer_pos.and_then(|pos| self.manga_index_at_screen_pos(pos));
         } else {
             self.manga_hovered_media_index = None;
+        }
+
+        if primary_clicked
+            && !ctrl_held
+            && !title_ui_blocking
+            && !pointer_over_shortcut_ui
+            && !over_controls
+        {
+            if let Some(pos) = pointer_pos {
+                if let Some(target_index) = self.manga_index_at_screen_pos(pos) {
+                    if let Some(path) = self.image_list.get(target_index).cloned() {
+                        if self.traverse_folder_entry_path(path.as_path()) {
+                            return true;
+                        }
+                    }
+                }
+            }
         }
 
         let mut primary_consumed_for_autoscroll = false;
@@ -18886,15 +18926,6 @@ impl ImageViewer {
 
                             for (index, (segment_label, segment_path)) in segments.iter().enumerate()
                             {
-                                if index > 0 {
-                                    ui.add_space(2.0);
-                                    ui.label(
-                                        egui::RichText::new(">")
-                                            .color(egui::Color32::from_gray(150)),
-                                    );
-                                    ui.add_space(2.0);
-                                }
-
                                 let is_leaf = index + 1 == segments.len();
                                 let segment_response = ui.add(
                                     egui::Button::new(
@@ -18912,9 +18943,27 @@ impl ImageViewer {
                                     breadcrumb_ui_hovered = true;
                                 }
 
-                                let popup_id =
-                                    ui.make_persistent_id(("breadcrumb_segment_popup", segment_path));
                                 if segment_response.clicked() {
+                                    breadcrumb_target_directory = Some(segment_path.clone());
+                                }
+
+                                let arrow_response = ui.add(
+                                    egui::Button::new(
+                                        egui::RichText::new(">")
+                                            .color(egui::Color32::from_gray(150)),
+                                    )
+                                    .frame(false),
+                                );
+
+                                if arrow_response.contains_pointer() {
+                                    breadcrumb_ui_hovered = true;
+                                }
+
+                                let popup_id = ui.make_persistent_id((
+                                    "breadcrumb_segment_children_popup",
+                                    segment_path,
+                                ));
+                                if arrow_response.clicked() {
                                     ui.memory_mut(|mem| mem.toggle_popup(popup_id));
                                 }
 
@@ -18923,7 +18972,7 @@ impl ImageViewer {
                                 egui::popup::popup_below_widget(
                                     ui,
                                     popup_id,
-                                    &segment_response,
+                                    &arrow_response,
                                     close_on_click_outside,
                                     |ui| {
                                         breadcrumb_popup_active = true;
@@ -18980,6 +19029,8 @@ impl ImageViewer {
                                 if ui.memory(|mem| mem.is_popup_open(popup_id)) {
                                     breadcrumb_popup_active = true;
                                 }
+
+                                ui.add_space(2.0);
                             }
                         });
                     });
@@ -20948,6 +20999,17 @@ impl ImageViewer {
                             flip_vertical,
                             egui::Color32::WHITE,
                         );
+                    }
+
+                    if let Some(path) = self.image_list.get(self.current_index) {
+                        if self.is_folder_navigation_entry_path(path.as_path()) {
+                            Self::paint_folder_entry_card(
+                                ui.painter(),
+                                final_rect,
+                                Self::is_up_navigation_entry_path(path.as_path()),
+                                &Self::folder_entry_display_name(path.as_path()),
+                            );
+                        }
                     }
 
                     // Show loading spinner while animated WebP frames are still streaming.
