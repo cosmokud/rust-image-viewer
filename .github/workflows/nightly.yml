@@ -18,7 +18,7 @@ jobs:
         with:
           version: "1.27.90"
           arch: "x86_64"
-          msiUrl: https://gstreamer.freedesktop.org/data/pkg/windows/1.27.90/msvc/gstreamer-1.0-msvc-x86-1.27.90.msi
+          msiUrl: https://gstreamer.freedesktop.org/data/pkg/windows/1.27.90/msvc/gstreamer-1.0-msvc-x86_64-1.27.90.msi
           devMsiUrl: https://gstreamer.freedesktop.org/data/pkg/windows/1.27.90/msvc/gstreamer-1.0-devel-msvc-x86_64-1.27.90.msi
 
       - name: Install Rust (MSVC)
@@ -35,21 +35,51 @@ jobs:
 
       - name: Resolve nightly release metadata
         id: release_meta
-        shell: bash
+        shell: pwsh
         run: |
-          set -euo pipefail
-          stamp="$(date -u +'%Y%m%d-%H%M%S')"
-          short_sha="${GITHUB_SHA::7}"
-          tag="nightly-${stamp}-run${GITHUB_RUN_NUMBER}-${short_sha}"
-          name="Nightly Build ${stamp} (run ${GITHUB_RUN_NUMBER}, ${short_sha})"
-          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
-          echo "name=${name}" >> "$GITHUB_OUTPUT"
+          $stamp = (Get-Date).ToUniversalTime().ToString('yyyyMMdd-HHmmss')
+          $shortSha = "${{ github.sha }}".Substring(0, 7)
+          $runNumber = [int]"${{ github.run_number }}"
+          $build = $runNumber % 65535
+          if ($build -le 0) {
+            $build = 1
+          }
+
+          $tag = "nightly-$stamp-run$runNumber-$shortSha"
+          $name = "Nightly Build $stamp (run $runNumber, $shortSha)"
+          $msiName = "rust-image-viewer-$tag.msi"
+
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "tag=$tag"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "name=$name"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "msi_name=$msiName"
+
+      - name: Install WiX Toolset v7
+        shell: pwsh
+        run: |
+          $hasWix = dotnet tool list --global | Select-String -Pattern '^\s*wix\s'
+          if ($hasWix) {
+            dotnet tool update --global wix --version 7.0.0
+          } else {
+            dotnet tool install --global wix --version 7.0.0
+          }
+          $env:PATH = "$env:USERPROFILE\.dotnet\tools;$env:PATH"
+          wix eula accept wix7 --acceptEula yes
+
+      - name: Build WiX installer (AppData + bundled GStreamer)
+        id: build_installer
+        shell: pwsh
+        run: |
+          $outputPath = Join-Path $PWD "target\wix\${{ steps.release_meta.outputs.msi_name }}"
+          .\scripts\build-wix-installer.ps1 `
+            -Configuration release `
+            -WorkspaceRoot "$PWD" `
+            -OutputMsi $outputPath
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: rust-image-viewer-${{ steps.release_meta.outputs.tag }}
-          path: target/release/rust-image-viewer.exe
+          path: ${{ steps.build_installer.outputs.msi_path }}
 
       - name: Create nightly release
         uses: softprops/action-gh-release@v2
@@ -60,4 +90,4 @@ jobs:
           make_latest: false
           generate_release_notes: true
           fail_on_unmatched_files: true
-          files: target/release/rust-image-viewer.exe
+          files: ${{ steps.build_installer.outputs.msi_path }}
