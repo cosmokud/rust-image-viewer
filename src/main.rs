@@ -14438,7 +14438,7 @@ impl ImageViewer {
             })
             .collect();
 
-        indexed_distances.sort_by_key(|&(_, dist)| std::cmp::Reverse(dist));
+        indexed_distances.sort_by_key(|&(_, dist)| dist);
 
         // Remove the furthest players until we're under the limit
         while self.manga_video_players.len() > self.manga_max_video_players {
@@ -14702,14 +14702,21 @@ impl ImageViewer {
         // ── Drain frames from active streams ──
         let stream_indices: Vec<usize> = self.manga_anim_streams.keys().copied().collect();
         for idx in stream_indices {
+            const MAX_MANGA_STREAM_FRAMES_PER_TICK: usize = 8;
             let mut disconnected = false;
+            let mut drained_this_tick = 0usize;
             if let Some(rx) = self.manga_anim_streams.get(&idx) {
                 loop {
+                    if drained_this_tick >= MAX_MANGA_STREAM_FRAMES_PER_TICK {
+                        break;
+                    }
+
                     match rx.try_recv() {
                         Ok(frame) => {
                             if let Some(img) = self.manga_animated_images.get_mut(&idx) {
                                 img.frames.push(frame);
                             }
+                            drained_this_tick += 1;
                             needs_repaint = true;
                         }
                         Err(crossbeam_channel::TryRecvError::Empty) => break,
@@ -14770,23 +14777,31 @@ impl ImageViewer {
                         pixels.as_ref(),
                     );
 
-                    let texture = ctx.load_texture(
-                        format!("manga_anim_{}", idx),
-                        color_image,
-                        self.config.texture_filter_animated.to_egui_options(),
-                    );
+                    let texture_options = self.config.texture_filter_animated.to_egui_options();
+                    if let Some((mut texture, _, _, _)) =
+                        self.manga_texture_cache.get_texture_handle_info(idx)
+                    {
+                        texture.set(color_image, texture_options);
+                        self.manga_texture_cache.update_texture(idx, texture, w, h);
+                    } else {
+                        let texture = ctx.load_texture(
+                            format!("manga_anim_{}", idx),
+                            color_image,
+                            texture_options,
+                        );
 
-                    let evicted = self.manga_texture_cache.insert_with_type(
-                        idx,
-                        texture,
-                        w,
-                        h,
-                        MangaMediaType::AnimatedImage,
-                    );
-                    if !evicted.is_empty() {
-                        if let Some(loader) = self.manga_loader.as_mut() {
-                            for evicted_idx in evicted {
-                                loader.mark_unloaded(evicted_idx);
+                        let evicted = self.manga_texture_cache.insert_with_type(
+                            idx,
+                            texture,
+                            w,
+                            h,
+                            MangaMediaType::AnimatedImage,
+                        );
+                        if !evicted.is_empty() {
+                            if let Some(loader) = self.manga_loader.as_mut() {
+                                for evicted_idx in evicted {
+                                    loader.mark_unloaded(evicted_idx);
+                                }
                             }
                         }
                     }
@@ -14863,14 +14878,17 @@ impl ImageViewer {
             );
             let color_image =
                 egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], pixels.as_ref());
-            let texture = ctx.load_texture(
-                format!("manga_anim_{}", idx),
-                color_image,
-                self.config.texture_filter_animated.to_egui_options(),
-            );
-            if self.manga_texture_cache.contains(idx) {
+            let texture_options = self.config.texture_filter_animated.to_egui_options();
+            if let Some((mut texture, _, _, _)) = self.manga_texture_cache.get_texture_handle_info(idx)
+            {
+                texture.set(color_image, texture_options);
                 self.manga_texture_cache.update_texture(idx, texture, w, h);
             } else {
+                let texture = ctx.load_texture(
+                    format!("manga_anim_{}", idx),
+                    color_image,
+                    texture_options,
+                );
                 let evicted = self.manga_texture_cache.insert_with_type(
                     idx,
                     texture,
@@ -19121,10 +19139,17 @@ impl ImageViewer {
         // progressively — no need to wait for the full decode.
         if !self.manga_mode {
             if let Some(ref rx) = self.anim_stream_rx {
+                const MAX_SOLO_STREAM_FRAMES_PER_TICK: usize = 8;
                 let mut got_frames = false;
+                let mut drained_this_tick = 0usize;
                 loop {
+                    if drained_this_tick >= MAX_SOLO_STREAM_FRAMES_PER_TICK {
+                        break;
+                    }
+
                     match rx.try_recv() {
                         Ok(frame) => {
+                            drained_this_tick += 1;
                             // Only accept if path still matches what we are viewing.
                             let path_ok = self
                                 .anim_stream_path
@@ -19282,7 +19307,11 @@ impl ImageViewer {
                         .to_egui_options_with_mipmap(enable_mipmap)
                 };
 
-                self.texture = Some(ctx.load_texture("image", color_image, texture_options));
+                if let Some(texture) = self.texture.as_mut() {
+                    texture.set(color_image, texture_options);
+                } else {
+                    self.texture = Some(ctx.load_texture("image", color_image, texture_options));
+                }
                 self.image_texture_dims = Some((w, h));
                 self.texture_frame = img.current_frame_index();
             }
