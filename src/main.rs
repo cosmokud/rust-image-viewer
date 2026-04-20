@@ -4731,13 +4731,13 @@ impl ImageViewer {
             return false;
         }
 
-        let Some(current_stamp) = file_stamp_for_path(path) else {
+        let Some(cached) = self.decoded_image_cache.get(&key) else {
             self.perf_metrics
                 .increment_counter("decoded_image_cache_miss", 1);
             return false;
         };
 
-        let Some(cached) = self.decoded_image_cache.get(&key) else {
+        let Some(current_stamp) = file_stamp_for_path(path) else {
             self.perf_metrics
                 .increment_counter("decoded_image_cache_miss", 1);
             return false;
@@ -4798,12 +4798,12 @@ impl ImageViewer {
             return false;
         }
 
-        let Some(current_stamp) = file_stamp_for_path(path) else {
-            self.decoded_image_cache.invalidate(&key);
+        let Some(cached) = self.decoded_image_cache.get(&key) else {
             return false;
         };
 
-        let Some(cached) = self.decoded_image_cache.get(&key) else {
+        let Some(current_stamp) = file_stamp_for_path(path) else {
+            self.decoded_image_cache.invalidate(&key);
             return false;
         };
 
@@ -6642,6 +6642,10 @@ impl ImageViewer {
             self.current_file_size_label_path = None;
             return;
         };
+
+        if self.defer_directory_work_for_fast_startup() {
+            return;
+        }
 
         if self
             .current_file_size_label_path
@@ -10227,9 +10231,6 @@ impl ImageViewer {
         self.current_file_size_label_path = None;
         self.pending_file_size_probe = None;
         self.pending_file_size_probe_path = None;
-        if path.exists() {
-            self.start_async_file_size_probe(path.clone());
-        }
 
         // Update the native window title (taskbar title) using Unicode-safe conversion.
         self.pending_window_title = Some(self.compute_window_title_for_path(path));
@@ -10316,6 +10317,11 @@ impl ImageViewer {
         }
         self.error_message = None;
 
+        let defer_directory_work_for_fast_startup = self.defer_directory_work_for_fast_startup();
+        if !defer_directory_work_for_fast_startup {
+            self.start_async_file_size_probe(path.clone());
+        }
+
         // Reuse cached directory listing when the parent folder is unchanged.
         let index_stats_before = self.media_directory_index.stats();
         let index_lookup_start = Instant::now();
@@ -10325,12 +10331,14 @@ impl ImageViewer {
         self.pending_media_directory_scan_kind = None;
         self.pending_media_directory_started_at = None;
 
-        if let Some(files) = self.media_directory_index.try_cached_media_for_path(path) {
-            self.set_image_list(files);
-        } else {
-            // Keep current media navigable immediately while the full directory scan runs in background.
+        if defer_directory_work_for_fast_startup {
             self.set_image_list(vec![path.clone()]);
-            if !self.defer_directory_work_for_fast_startup() {
+        } else {
+            if let Some(files) = self.media_directory_index.try_cached_media_for_path(path) {
+                self.set_image_list(files);
+            } else {
+                // Keep current media navigable immediately while the full directory scan runs in background.
+                self.set_image_list(vec![path.clone()]);
                 let _ =
                     self.begin_media_directory_scan(path, PendingMediaDirectoryScanKind::InitialLoad);
             }
@@ -10414,7 +10422,7 @@ impl ImageViewer {
                 let max_tex = self.max_texture_side.max(1);
 
                 if self.try_load_image_from_decoded_cache(path, max_tex, gif_filter) {
-                    if !self.defer_directory_work_for_fast_startup() {
+                    if !defer_directory_work_for_fast_startup {
                         self.schedule_solo_probe_window(path, media_type);
                     }
                     self.perf_metrics
@@ -10423,7 +10431,7 @@ impl ImageViewer {
                 }
 
                 if self.try_load_image_from_thumbnail_cache(path, max_tex) {
-                    if !self.defer_directory_work_for_fast_startup() {
+                    if !defer_directory_work_for_fast_startup {
                         self.schedule_solo_probe_window(path, media_type);
                     }
                     self.perf_metrics
@@ -10441,7 +10449,7 @@ impl ImageViewer {
 
         if media_type.is_some()
             && !is_folder_entry
-            && !self.defer_directory_work_for_fast_startup()
+            && !defer_directory_work_for_fast_startup
         {
             self.schedule_solo_probe_window(path, media_type);
         }
