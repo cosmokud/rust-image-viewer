@@ -19335,11 +19335,16 @@ impl ImageViewer {
                     solo_video_upload_mipmaps_enabled && w.min(h) >= solo_video_upload_mipmap_min_side,
                 );
 
-                self.video_texture = Some(ctx.load_texture(
-                    "video",
-                    color_image,
-                    texture_options,
-                ));
+                // Reuse the same GPU texture across frames to avoid per-frame allocations.
+                if let Some(texture) = self.video_texture.as_mut() {
+                    texture.set(color_image, texture_options);
+                } else {
+                    self.video_texture = Some(ctx.load_texture(
+                        "video",
+                        color_image,
+                        texture_options,
+                    ));
+                }
                 self.video_texture_dims = Some((w, h));
                 needs_repaint = true;
             }
