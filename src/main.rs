@@ -889,6 +889,15 @@ impl MasonryFolderMetadataRamCache {
         Some(snapshot)
     }
 
+    fn peek_entries_for_folder(
+        &self,
+        folder: &Path,
+    ) -> Option<&HashMap<PathBuf, (u32, u32, MangaMediaType)>> {
+        self.entries_by_folder
+            .get(&folder.to_path_buf())
+            .map(|snapshot| &snapshot.entries_by_path)
+    }
+
     fn evict_if_needed(&mut self) {
         while self.total_bytes > self.max_bytes {
             let Some(oldest_folder) = self.lru_folders.pop_front() else {
@@ -2027,6 +2036,11 @@ struct ImageViewer {
     /// In-memory per-folder masonry metadata snapshots (path -> dimensions/media kind),
     /// kept across folder switches until process exit under a global RAM cap.
     masonry_folder_metadata_ram_cache: MasonryFolderMetadataRamCache,
+    /// When non-zero and equal to `image_list_signature`, masonry dimension updates from
+    /// async probes/decodes are ignored to keep layout geometry stable.
+    masonry_authoritative_dimension_signature: u64,
+    /// Folder key backing the active authoritative masonry-dimension snapshot.
+    masonry_authoritative_dimension_folder: Option<PathBuf>,
     /// LRU texture cache for manga mode
     manga_texture_cache: MangaTextureCache,
     /// Decoded-image mailbox drained on the UI thread so visible uploads can win over speculative ones.
@@ -2404,6 +2418,8 @@ impl Default for ImageViewer {
             masonry_folder_metadata_ram_cache: MasonryFolderMetadataRamCache::new(
                 masonry_metadata_ram_cache_max_bytes,
             ),
+            masonry_authoritative_dimension_signature: 0,
+            masonry_authoritative_dimension_folder: None,
             manga_texture_cache: MangaTextureCache::default(),
             manga_decoded_mailbox: Vec::new(),
             manga_scrollbar_dragging: false,
@@ -2590,6 +2606,18 @@ impl ImageViewer {
             .saturating_mul(1024 * 1024)
     }
 
+    fn clear_masonry_authoritative_dimension_lock(&mut self) {
+        self.masonry_authoritative_dimension_signature = 0;
+        self.masonry_authoritative_dimension_folder = None;
+    }
+
+    fn masonry_authoritative_dimension_lock_active(&self) -> bool {
+        self.is_masonry_mode()
+            && self.masonry_authoritative_dimension_signature != 0
+            && self.masonry_authoritative_dimension_signature == self.image_list_signature
+            && self.masonry_authoritative_dimension_folder.is_some()
+    }
+
     fn current_masonry_metadata_folder_key(&self) -> Option<PathBuf> {
         self.current_media_path()
             .filter(|path| !self.is_folder_navigation_entry_path(path.as_path()))
@@ -2653,6 +2681,7 @@ impl ImageViewer {
     fn restore_masonry_folder_metadata_snapshot(&mut self) -> usize {
         self.masonry_folder_metadata_ram_cache
             .set_max_bytes(self.masonry_metadata_ram_cache_limit_bytes());
+        self.clear_masonry_authoritative_dimension_lock();
 
         let Some(folder) = self.current_masonry_metadata_folder_key() else {
             return 0;
@@ -2688,12 +2717,75 @@ impl ImageViewer {
             loader.dimension_cache.insert(*idx, *dims);
         }
 
+        let total_non_folder_entries = self
+            .image_list
+            .iter()
+            .filter(|path| !self.is_folder_navigation_entry_path(path.as_path()))
+            .count();
+
+        if total_non_folder_entries > 0 && restored_entries.len() >= total_non_folder_entries {
+            self.masonry_authoritative_dimension_signature = self.image_list_signature;
+            self.masonry_authoritative_dimension_folder = Some(folder);
+        }
+
         self.manga_dimension_cache_list_signature = self.image_list_signature;
         if self.manga_layout_mode == MangaLayoutMode::Masonry {
             self.mark_masonry_runtime_cache_resident();
         }
 
         restored_entries.len()
+    }
+
+    fn sync_masonry_authoritative_dimensions(&mut self) -> usize {
+        if !self.masonry_authoritative_dimension_lock_active() {
+            return 0;
+        }
+
+        let Some(folder) = self.masonry_authoritative_dimension_folder.clone() else {
+            self.clear_masonry_authoritative_dimension_lock();
+            return 0;
+        };
+
+        let Some(entries_by_path) = self
+            .masonry_folder_metadata_ram_cache
+            .peek_entries_for_folder(folder.as_path())
+        else {
+            self.clear_masonry_authoritative_dimension_lock();
+            return 0;
+        };
+
+        let Some(loader) = self.manga_loader.as_ref() else {
+            return 0;
+        };
+
+        let mut corrections: Vec<(usize, (u32, u32, MangaMediaType))> = Vec::new();
+        for (idx, path) in self.image_list.iter().enumerate() {
+            if self.is_folder_navigation_entry_path(path.as_path()) {
+                continue;
+            }
+
+            let Some(snapshot_dims) = entries_by_path.get(path).copied() else {
+                continue;
+            };
+
+            if loader.dimension_cache.get(&idx).copied() != Some(snapshot_dims) {
+                corrections.push((idx, snapshot_dims));
+            }
+        }
+
+        if corrections.is_empty() {
+            return 0;
+        }
+
+        let Some(loader) = self.manga_loader.as_mut() else {
+            return 0;
+        };
+
+        for (idx, dims) in &corrections {
+            loader.dimension_cache.insert(*idx, *dims);
+        }
+
+        corrections.len()
     }
 
     fn update_pointer_activity_tracking(&mut self, ctx: &egui::Context) {
@@ -2736,6 +2828,7 @@ impl ImageViewer {
         let new_signature = Self::compute_image_list_signature(&files);
         if self.image_list_signature != new_signature {
             self.masonry_runtime_cache_signature = 0;
+            self.clear_masonry_authoritative_dimension_lock();
         }
 
         self.image_list = files;
@@ -8919,6 +9012,10 @@ impl ImageViewer {
         current_media_type: Option<MediaType>,
         current_image_is_animated: bool,
     ) -> bool {
+        if self.is_masonry_mode() && self.masonry_authoritative_dimension_lock_active() {
+            return false;
+        }
+
         let (Some((w, h)), Some(media_type)) = (current_media_dims, current_media_type) else {
             return false;
         };
@@ -9602,9 +9699,11 @@ impl ImageViewer {
 
                     let dims = player.dimensions();
                     if dims.0 > 0 && dims.1 > 0 {
-                        if let Some(ref mut loader) = self.manga_loader {
-                            if loader.update_video_dimensions(index, dims.0, dims.1) {
-                                pending_dimension_updates.push(index);
+                        if !self.masonry_authoritative_dimension_lock_active() {
+                            if let Some(ref mut loader) = self.manga_loader {
+                                if loader.update_video_dimensions(index, dims.0, dims.1) {
+                                    pending_dimension_updates.push(index);
+                                }
                             }
                         }
                     }
@@ -9638,7 +9737,10 @@ impl ImageViewer {
             }
         }
 
-        if self.is_masonry_mode() && !pending_dimension_updates.is_empty() {
+        if self.is_masonry_mode()
+            && !self.masonry_authoritative_dimension_lock_active()
+            && !pending_dimension_updates.is_empty()
+        {
             self.masonry_queue_dimension_updates(pending_dimension_updates);
             if !self.masonry_navigation_active_for_heavy_work() {
                 let force_flush = !self.masonry_metadata_preload_active;
@@ -12949,6 +13051,7 @@ impl ImageViewer {
         // Clear the texture cache
         self.manga_texture_cache.clear();
         self.masonry_runtime_cache_signature = 0;
+        self.clear_masonry_authoritative_dimension_lock();
         self.strip_entry_placeholder_index = None;
         self.manga_ttv_pending.clear();
         self.manga_ttv_samples_ms.clear();
@@ -13380,12 +13483,14 @@ impl ImageViewer {
                 if let Some(frame) = player.get_frame() {
                     // Update dimensions in loader if changed
                     if frame.width > 0 && frame.height > 0 {
-                        if let Some(ref mut loader) = self.manga_loader {
-                            video_dimensions_changed = loader.update_video_dimensions(
-                                focused_idx,
-                                frame.width,
-                                frame.height,
-                            );
+                        if !self.masonry_authoritative_dimension_lock_active() {
+                            if let Some(ref mut loader) = self.manga_loader {
+                                video_dimensions_changed = loader.update_video_dimensions(
+                                    focused_idx,
+                                    frame.width,
+                                    frame.height,
+                                );
+                            }
                         }
                     }
 
@@ -13427,7 +13532,10 @@ impl ImageViewer {
                 }
             }
 
-            if self.is_masonry_mode() && video_dimensions_changed {
+            if self.is_masonry_mode()
+                && !self.masonry_authoritative_dimension_lock_active()
+                && video_dimensions_changed
+            {
                 self.masonry_queue_dimension_updates(std::iter::once(focused_idx));
                 if !self.masonry_navigation_active_for_heavy_work() {
                     let force_flush = !self.masonry_metadata_preload_active;
@@ -14325,6 +14433,15 @@ impl ImageViewer {
         };
         layout_dim_updates.sort_unstable();
         layout_dim_updates.dedup();
+
+        if self.is_masonry_mode()
+            && self.masonry_authoritative_dimension_lock_active()
+            && !layout_dim_updates.is_empty()
+        {
+            self.sync_masonry_authoritative_dimensions();
+            layout_dim_updates.clear();
+        }
+
         let layout_dims_changed = !layout_dim_updates.is_empty();
 
         // Dimension updates can change page heights; invalidate cached layout/prefix sums.
