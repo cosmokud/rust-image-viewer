@@ -801,6 +801,27 @@ struct MasonryFolderMetadataRamCache {
     max_bytes: u64,
 }
 
+#[derive(Clone, Default)]
+struct MasonryModeSessionSnapshot {
+    image_list: Vec<PathBuf>,
+    image_list_signature: u64,
+    current_index: usize,
+    current_path: Option<PathBuf>,
+    folder_key: Option<PathBuf>,
+    zoom: f32,
+    zoom_target: f32,
+    offset: egui::Vec2,
+    scroll_offset: f32,
+    scroll_target: f32,
+    layout_items: Vec<MasonryItemLayout>,
+    layout_total_height: f32,
+    layout_screen_x: f32,
+    layout_items_per_row: usize,
+    layout_len: usize,
+    layout_list_signature: u64,
+    layout_valid: bool,
+}
+
 impl MasonryFolderMetadataRamCache {
     fn new(max_bytes: u64) -> Self {
         Self {
@@ -2003,6 +2024,8 @@ struct ImageViewer {
     /// Exact masonry image-list snapshot captured when entering solo fullscreen from masonry.
     /// Restored from RAM before fullscreen -> masonry return so cached layout signatures still match.
     strip_return_masonry_list_snapshot: Option<Vec<PathBuf>>,
+    /// Full masonry mode session snapshot used to preserve layout across temporary mode switches.
+    masonry_mode_session_snapshot: Option<MasonryModeSessionSnapshot>,
     /// True while solo fullscreen is keeping masonry caches alive for potential middle-click return.
     strip_return_preserve_masonry_cache: bool,
     /// Image-list signature whose masonry runtime cache must stay resident across mode switches.
@@ -2403,6 +2426,7 @@ impl Default for ImageViewer {
             pending_masonry_solo_reentry: None,
             strip_return_masonry_state: None,
             strip_return_masonry_list_snapshot: None,
+            masonry_mode_session_snapshot: None,
             strip_return_preserve_masonry_cache: false,
             masonry_runtime_cache_signature: 0,
             masonry_items_per_row,
@@ -2738,6 +2762,119 @@ impl ImageViewer {
         }
 
         restored_entries.len()
+    }
+
+    fn capture_masonry_mode_session_snapshot(&mut self) {
+        if !self.is_masonry_mode() || self.image_list.is_empty() {
+            return;
+        }
+
+        self.masonry_ensure_layout_cache();
+
+        self.masonry_mode_session_snapshot = Some(MasonryModeSessionSnapshot {
+            image_list: self.image_list.clone(),
+            image_list_signature: self.image_list_signature,
+            current_index: self.current_index.min(self.image_list.len().saturating_sub(1)),
+            current_path: self.current_media_path(),
+            folder_key: self.current_masonry_metadata_folder_key(),
+            zoom: self.zoom,
+            zoom_target: self.zoom_target,
+            offset: self.offset,
+            scroll_offset: self.manga_scroll_offset,
+            scroll_target: self.manga_scroll_target,
+            layout_items: self.masonry_layout_items.clone(),
+            layout_total_height: self.masonry_layout_total_height,
+            layout_screen_x: self.masonry_layout_screen_x,
+            layout_items_per_row: self.masonry_layout_items_per_row,
+            layout_len: self.masonry_layout_len,
+            layout_list_signature: self.masonry_layout_list_signature,
+            layout_valid: self.masonry_layout_valid,
+        });
+    }
+
+    fn try_restore_masonry_mode_session_snapshot(&mut self, preferred_path: Option<PathBuf>) -> bool {
+        let Some(snapshot) = self.masonry_mode_session_snapshot.clone() else {
+            return false;
+        };
+
+        if snapshot.image_list.is_empty() {
+            return false;
+        }
+
+        if let (Some(path), Some(folder_key)) = (preferred_path.as_ref(), snapshot.folder_key.as_ref()) {
+            if !self.is_folder_navigation_entry_path(path.as_path())
+                && path.parent() != Some(folder_key.as_path())
+            {
+                return false;
+            }
+        }
+
+        self.set_image_list_raw(snapshot.image_list.clone());
+
+        let restore_path = preferred_path
+            .and_then(|path| {
+                if self.is_folder_navigation_entry_path(path.as_path()) {
+                    None
+                } else {
+                    Some(path)
+                }
+            })
+            .or(snapshot.current_path.clone());
+
+        if let Some(path) = restore_path {
+            if let Some(index) = self.image_list.iter().position(|candidate| candidate == &path) {
+                self.set_current_index_clamped(index);
+            } else {
+                self.set_current_index_clamped(
+                    snapshot
+                        .current_index
+                        .min(self.image_list.len().saturating_sub(1)),
+                );
+            }
+        } else {
+            self.set_current_index_clamped(
+                snapshot
+                    .current_index
+                    .min(self.image_list.len().saturating_sub(1)),
+            );
+        }
+
+        let compatible_layout = snapshot.layout_valid
+            && snapshot.image_list_signature == self.image_list_signature
+            && snapshot.layout_list_signature == self.image_list_signature
+            && snapshot.layout_len == self.image_list.len()
+            && snapshot.layout_items.len() == self.image_list.len()
+            && snapshot.layout_items_per_row == self.masonry_items_per_row
+            && (snapshot.layout_screen_x - self.screen_size.x.round()).abs() <= 1.0;
+
+        if !compatible_layout {
+            return false;
+        }
+
+        self.masonry_layout_items = snapshot.layout_items;
+        self.masonry_layout_total_height = snapshot.layout_total_height;
+        self.masonry_layout_screen_x = snapshot.layout_screen_x;
+        self.masonry_layout_items_per_row = snapshot.layout_items_per_row;
+        self.masonry_layout_len = snapshot.layout_len;
+        self.masonry_layout_list_signature = self.image_list_signature;
+        self.masonry_layout_valid = true;
+        self.masonry_spatial_index = None;
+
+        self.zoom = self.clamp_zoom(snapshot.zoom);
+        self.zoom_target = self.clamp_zoom(snapshot.zoom_target);
+        self.zoom_velocity = 0.0;
+        self.offset = snapshot.offset;
+        self.manga_total_height_cache_valid = false;
+
+        let max_scroll = (self.manga_total_height() - self.screen_size.y).max(0.0);
+        self.manga_scroll_offset = snapshot.scroll_offset.clamp(0.0, max_scroll);
+        self.manga_scroll_target = snapshot.scroll_target.clamp(0.0, max_scroll);
+        self.manga_scroll_velocity = 0.0;
+        self.stop_manga_wheel_scroll();
+
+        self.manga_dimension_cache_list_signature = self.image_list_signature;
+        self.mark_masonry_runtime_cache_resident();
+        true
     }
 
     fn sync_masonry_authoritative_dimensions(&mut self) -> usize {
@@ -12268,40 +12405,65 @@ impl ImageViewer {
             .manga_visible_index()
             .min(self.image_list.len().saturating_sub(1));
         self.set_current_index_clamped(target_index);
+        let target_path = self.current_media_path();
 
         if self.manga_layout_mode == MangaLayoutMode::Masonry {
+            self.capture_masonry_mode_session_snapshot();
             self.persist_current_masonry_folder_metadata_snapshot();
         }
 
+        let follow_current_viewed_item_on_restore = if layout_mode == MangaLayoutMode::Masonry {
+            self.masonry_mode_session_snapshot.as_ref().is_some_and(|snapshot| {
+                target_path
+                    .as_ref()
+                    .is_some_and(|path| snapshot.current_path.as_ref() != Some(path))
+            })
+        } else {
+            false
+        };
+
         self.manga_layout_mode = layout_mode;
-        if layout_mode == MangaLayoutMode::Masonry {
+        let restored_masonry_session = if layout_mode == MangaLayoutMode::Masonry {
             self.mark_masonry_runtime_cache_resident();
             self.restore_masonry_folder_metadata_snapshot();
             if !self.image_list.is_empty() {
                 self.manga_dimension_cache_list_signature = self.image_list_signature;
             }
-        }
-        self.invalidate_manga_layout_cache();
-        self.offset = egui::Vec2::ZERO;
-
-        let max_scroll = (self.manga_total_height() - self.screen_size.y).max(0.0);
-        let scroll_to = if layout_mode == MangaLayoutMode::Masonry {
-            self.masonry_scroll_offset_for_index_centered(target_index)
-                .unwrap_or_else(|| {
-                    self.manga_get_scroll_offset_for_index(target_index)
-                        .clamp(0.0, max_scroll)
-                })
+            self.try_restore_masonry_mode_session_snapshot(target_path.clone())
         } else {
-            self.manga_get_scroll_offset_for_index(target_index)
-                .clamp(0.0, max_scroll)
+            false
         };
 
-        self.manga_scroll_offset = scroll_to;
-        self.manga_scroll_target = scroll_to;
-        self.manga_scroll_velocity = 0.0;
-        self.stop_manga_wheel_scroll();
+        if layout_mode != MangaLayoutMode::Masonry || !restored_masonry_session {
+            self.invalidate_manga_layout_cache();
+            self.offset = egui::Vec2::ZERO;
 
-        let allow_startup_preload = layout_mode == MangaLayoutMode::Masonry;
+            let max_scroll = (self.manga_total_height() - self.screen_size.y).max(0.0);
+            let scroll_to = if layout_mode == MangaLayoutMode::Masonry {
+                self.masonry_scroll_offset_for_index_centered(target_index)
+                    .unwrap_or_else(|| {
+                        self.manga_get_scroll_offset_for_index(target_index)
+                            .clamp(0.0, max_scroll)
+                    })
+            } else {
+                self.manga_get_scroll_offset_for_index(target_index)
+                    .clamp(0.0, max_scroll)
+            };
+
+            self.manga_scroll_offset = scroll_to;
+            self.manga_scroll_target = scroll_to;
+            self.manga_scroll_velocity = 0.0;
+            self.stop_manga_wheel_scroll();
+        } else if follow_current_viewed_item_on_restore {
+            self.scroll_strip_to_current_index();
+        }
+
+        if layout_mode == MangaLayoutMode::Masonry {
+            self.manga_update_current_index();
+            self.persist_current_masonry_folder_metadata_snapshot();
+        }
+
+        let allow_startup_preload = layout_mode == MangaLayoutMode::Masonry && !restored_masonry_session;
         self.maybe_begin_masonry_metadata_preload(allow_startup_preload);
 
         self.manga_update_preload_queue();
@@ -12625,6 +12787,7 @@ impl ImageViewer {
         self.strip_open_force_fit_path = Some(path.clone());
         if return_mode == MangaLayoutMode::Masonry {
             self.mark_masonry_runtime_cache_resident();
+            self.capture_masonry_mode_session_snapshot();
         }
 
         let target_media_type = get_media_type(&path);
@@ -12653,7 +12816,21 @@ impl ImageViewer {
         if !self.manga_mode {
             self.pending_masonry_solo_reentry = None;
             self.sync_current_index_to_visible_media();
-            let reuse_preserved_masonry_layout = self.can_reuse_preserved_masonry_layout();
+            let preferred_masonry_path = if self.manga_layout_mode == MangaLayoutMode::Masonry {
+                self.current_media_path()
+            } else {
+                None
+            };
+            let follow_current_viewed_item_on_restore =
+                if self.manga_layout_mode == MangaLayoutMode::Masonry {
+                    self.masonry_mode_session_snapshot.as_ref().is_some_and(|snapshot| {
+                        preferred_masonry_path
+                            .as_ref()
+                            .is_some_and(|path| snapshot.current_path.as_ref() != Some(path))
+                    })
+                } else {
+                    false
+                };
 
             let current_media_dims = self.media_display_dimensions().or(self.video_texture_dims);
             let current_media_type = self.current_media_type;
@@ -12675,9 +12852,18 @@ impl ImageViewer {
                 self.refresh_media_list_after_path_mutation(Some(anchor_path));
             }
 
+            let restored_masonry_session = if self.manga_layout_mode == MangaLayoutMode::Masonry {
+                self.try_restore_masonry_mode_session_snapshot(preferred_masonry_path.clone())
+            } else {
+                false
+            };
+
             if self.manga_layout_mode == MangaLayoutMode::Masonry {
                 self.mark_masonry_runtime_cache_resident();
             }
+
+            let reuse_preserved_masonry_layout =
+                restored_masonry_session || self.can_reuse_preserved_masonry_layout();
 
             // Manga layout cache must be rebuilt for the new mode.
             if !reuse_preserved_masonry_layout {
@@ -12708,15 +12894,18 @@ impl ImageViewer {
             );
 
             // Dimensions may have changed; rebuild height cache.
-            if !reuse_preserved_masonry_layout || current_dims_changed {
+            if !reuse_preserved_masonry_layout || (current_dims_changed && !restored_masonry_session)
+            {
                 self.invalidate_manga_layout_cache();
             }
 
             if self.manga_layout_mode == MangaLayoutMode::Masonry {
-                let new_zoom = self.clamp_zoom(1.0);
-                self.zoom = new_zoom;
-                self.zoom_target = new_zoom;
-                self.zoom_velocity = 0.0;
+                if !restored_masonry_session {
+                    let new_zoom = self.clamp_zoom(1.0);
+                    self.zoom = new_zoom;
+                    self.zoom_target = new_zoom;
+                    self.zoom_velocity = 0.0;
+                }
             } else {
                 // Enter long-strip mode: start in a "fit-to-screen by height" zoom (like fullscreen fit).
                 // In long-strip mode we apply a per-image `base_scale` (fit tall pages down) and then
@@ -12739,30 +12928,40 @@ impl ImageViewer {
                 }
             }
 
-            // Reset offset (horizontal pan) and scroll to current image position
-            self.offset = egui::Vec2::ZERO;
-            let target_index = self
-                .current_index
-                .min(self.image_list.len().saturating_sub(1));
-            self.set_current_index_clamped(target_index);
-            let max_scroll = (self.manga_total_height() - self.screen_size.y).max(0.0);
-            let scroll_to = if self.manga_layout_mode == MangaLayoutMode::Masonry {
-                self.masonry_scroll_offset_for_index_centered(target_index)
-                    .unwrap_or_else(|| {
-                        self.manga_get_scroll_offset_for_index(target_index)
-                            .clamp(0.0, max_scroll)
-                    })
+            if !restored_masonry_session {
+                // Reset offset (horizontal pan) and scroll to current image position
+                self.offset = egui::Vec2::ZERO;
+                let target_index = self
+                    .current_index
+                    .min(self.image_list.len().saturating_sub(1));
+                self.set_current_index_clamped(target_index);
+                let max_scroll = (self.manga_total_height() - self.screen_size.y).max(0.0);
+                let scroll_to = if self.manga_layout_mode == MangaLayoutMode::Masonry {
+                    self.masonry_scroll_offset_for_index_centered(target_index)
+                        .unwrap_or_else(|| {
+                            self.manga_get_scroll_offset_for_index(target_index)
+                                .clamp(0.0, max_scroll)
+                        })
+                } else {
+                    self.manga_get_scroll_offset_for_index(target_index)
+                        .clamp(0.0, max_scroll)
+                };
+                self.manga_scroll_offset = scroll_to;
+                self.manga_scroll_target = scroll_to;
+                self.manga_scroll_velocity = 0.0;
+                self.stop_manga_wheel_scroll();
+            } else if follow_current_viewed_item_on_restore {
+                self.scroll_strip_to_current_index();
             } else {
-                self.manga_get_scroll_offset_for_index(target_index)
-                    .clamp(0.0, max_scroll)
-            };
-            self.manga_scroll_offset = scroll_to;
-            self.manga_scroll_target = scroll_to;
-            self.manga_scroll_velocity = 0.0;
-            self.stop_manga_wheel_scroll();
+                self.manga_scroll_velocity = 0.0;
+                self.stop_manga_wheel_scroll();
+            }
 
-            self.maybe_begin_masonry_metadata_preload(true);
+            let allow_startup_preload =
+                self.manga_layout_mode == MangaLayoutMode::Masonry && !restored_masonry_session;
+            self.maybe_begin_masonry_metadata_preload(allow_startup_preload);
             if self.manga_layout_mode == MangaLayoutMode::Masonry {
+                self.manga_update_current_index();
                 self.persist_current_masonry_folder_metadata_snapshot();
             }
 
@@ -12780,6 +12979,9 @@ impl ImageViewer {
 
         self.stop_manga_wheel_scroll();
         self.stop_manga_autoscroll();
+        if self.manga_layout_mode == MangaLayoutMode::Masonry {
+            self.capture_masonry_mode_session_snapshot();
+        }
         if self.manga_layout_mode == MangaLayoutMode::Masonry
             || self.has_resident_masonry_runtime_cache()
         {
@@ -22110,6 +22312,15 @@ impl eframe::App for ImageViewer {
                             visible_idx,
                             target_media_type,
                         );
+
+                        if self.manga_layout_mode == MangaLayoutMode::Masonry {
+                            self.capture_masonry_mode_session_snapshot();
+                        }
+                        if self.manga_layout_mode == MangaLayoutMode::Masonry
+                            || self.has_resident_masonry_runtime_cache()
+                        {
+                            self.persist_current_masonry_folder_metadata_snapshot();
+                        }
 
                         let keep_resident_masonry_cache =
                             self.manga_layout_mode == MangaLayoutMode::Masonry
