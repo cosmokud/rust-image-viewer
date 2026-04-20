@@ -2000,6 +2000,9 @@ struct ImageViewer {
     pending_masonry_solo_reentry: Option<PendingMasonrySoloReentry>,
     /// Saved masonry viewport state while temporarily opening a single item fullscreen.
     strip_return_masonry_state: Option<MasonryReturnState>,
+    /// Exact masonry image-list snapshot captured when entering solo fullscreen from masonry.
+    /// Restored from RAM before fullscreen -> masonry return so cached layout signatures still match.
+    strip_return_masonry_list_snapshot: Option<Vec<PathBuf>>,
     /// True while solo fullscreen is keeping masonry caches alive for potential middle-click return.
     strip_return_preserve_masonry_cache: bool,
     /// Image-list signature whose masonry runtime cache must stay resident across mode switches.
@@ -2399,6 +2402,7 @@ impl Default for ImageViewer {
             titlebar_pending_restore_layout: None,
             pending_masonry_solo_reentry: None,
             strip_return_masonry_state: None,
+            strip_return_masonry_list_snapshot: None,
             strip_return_preserve_masonry_cache: false,
             masonry_runtime_cache_signature: 0,
             masonry_items_per_row,
@@ -2815,6 +2819,17 @@ impl ImageViewer {
         self.last_pointer_hover_pos = pointer_pos;
     }
 
+    fn set_image_list_raw(&mut self, files: Vec<PathBuf>) {
+        let new_signature = Self::compute_image_list_signature(&files);
+        if self.image_list_signature != new_signature {
+            self.masonry_runtime_cache_signature = 0;
+            self.clear_masonry_authoritative_dimension_lock();
+        }
+
+        self.image_list = files;
+        self.image_list_signature = new_signature;
+    }
+
     fn set_image_list(&mut self, files: Vec<PathBuf>) {
         let files = if self.folder_navigation_ui_enabled() {
             files
@@ -2825,14 +2840,7 @@ impl ImageViewer {
                 .collect()
         };
 
-        let new_signature = Self::compute_image_list_signature(&files);
-        if self.image_list_signature != new_signature {
-            self.masonry_runtime_cache_signature = 0;
-            self.clear_masonry_authoritative_dimension_lock();
-        }
-
-        self.image_list = files;
-        self.image_list_signature = new_signature;
+        self.set_image_list_raw(files);
     }
 
     fn begin_media_directory_scan(
@@ -3729,6 +3737,7 @@ impl ImageViewer {
             .cached_directory_changed_for_path(&anchor_path);
 
         if current_path_missing || directory_changed {
+            self.strip_return_masonry_list_snapshot = None;
             self.refresh_media_list_after_path_mutation(Some(anchor_path));
         }
 
@@ -11023,6 +11032,7 @@ impl ImageViewer {
         self.strip_return_mode = None;
         self.strip_return_button_only = false;
         self.strip_return_masonry_state = None;
+        self.strip_return_masonry_list_snapshot = None;
         self.strip_return_preserve_masonry_cache = false;
 
         if should_clear_preserved_masonry_cache && !self.has_resident_masonry_runtime_cache() {
@@ -11035,6 +11045,12 @@ impl ImageViewer {
         self.strip_return_button_only = false;
         self.strip_return_preserve_masonry_cache =
             layout_mode == MangaLayoutMode::Masonry && self.manga_mode;
+        self.strip_return_masonry_list_snapshot =
+            if layout_mode == MangaLayoutMode::Masonry && self.manga_mode {
+                Some(self.image_list.clone())
+            } else {
+                None
+            };
         self.strip_return_masonry_state =
             if layout_mode == MangaLayoutMode::Masonry && self.manga_mode {
                 Some(MasonryReturnState {
@@ -11052,10 +11068,16 @@ impl ImageViewer {
     }
 
     fn should_reuse_masonry_cache_on_return(&self, state: MasonryReturnState) -> bool {
+        let current_signature = self
+            .strip_return_masonry_list_snapshot
+            .as_ref()
+            .map(|files| Self::compute_image_list_signature(files))
+            .unwrap_or(self.image_list_signature);
+
         !self.image_list.is_empty()
             && masonry_return_can_reuse_runtime_cache(
                 state.list_signature,
-                self.image_list_signature,
+                current_signature,
                 self.strip_return_preserve_masonry_cache,
                 self.manga_loader.is_some(),
             )
@@ -11107,9 +11129,19 @@ impl ImageViewer {
         let current_media_dims = self.media_display_dimensions().or(self.video_texture_dims);
         let current_media_type = self.current_media_type;
         let current_image_is_animated = self.image.as_ref().is_some_and(|img| img.is_animated());
+        let current_path = self.current_media_path();
 
         self.prepare_enter_manga_mode_state(current_media_type);
         if self.manga_layout_mode == MangaLayoutMode::Masonry {
+            if let Some(snapshot) = self.strip_return_masonry_list_snapshot.clone() {
+                self.set_image_list_raw(snapshot);
+                if let Some(path) = current_path.as_ref() {
+                    if let Some(idx) = self.image_list.iter().position(|candidate| candidate == path)
+                    {
+                        self.set_current_index_clamped(idx);
+                    }
+                }
+            }
             self.restore_masonry_folder_metadata_snapshot();
             if !self.image_list.is_empty() {
                 self.manga_dimension_cache_list_signature = self.image_list_signature;
@@ -11153,6 +11185,26 @@ impl ImageViewer {
         } else {
             None
         };
+
+        let current_viewed_path = self.current_media_path();
+        if layout_mode == MangaLayoutMode::Masonry {
+            if let (Some(state), Some(snapshot)) = (
+                restore_masonry_state,
+                self.strip_return_masonry_list_snapshot.clone(),
+            ) {
+                let snapshot_signature = Self::compute_image_list_signature(&snapshot);
+                if state.list_signature == snapshot_signature {
+                    self.set_image_list_raw(snapshot);
+                    if let Some(path) = current_viewed_path.as_ref() {
+                        if let Some(idx) = self.image_list.iter().position(|candidate| candidate == path)
+                        {
+                            self.set_current_index_clamped(idx);
+                        }
+                    }
+                }
+            }
+        }
+
         let current_viewed_index = self
             .current_index
             .min(self.image_list.len().saturating_sub(1));
