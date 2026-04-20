@@ -60,6 +60,12 @@ fn configure_gstreamer_env_windows() {
         if len == 0 {
             return None;
         }
+
+        // If len reaches buffer capacity, the path may be truncated.
+        if len as usize >= buf.len() {
+            return None;
+        }
+
         buf.truncate(len as usize);
         Some(PathBuf::from(String::from_utf16_lossy(&buf)))
     }

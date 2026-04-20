@@ -75,6 +75,7 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 #[cfg(target_os = "windows")]
 use windows::{
     core::PCWSTR,
+    Win32::Foundation::RPC_E_CHANGED_MODE,
     Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED},
     Win32::UI::Shell::{ILCreateFromPathW, ILFree, SHOpenFolderAndSelectItems},
 };
@@ -412,11 +413,17 @@ fn open_path_in_default_app(path: &std::path::Path) -> std::io::Result<()> {
 fn sh_open_folder_and_select_item(path: &Path) -> std::io::Result<()> {
     let mut should_uninitialize = false;
 
-    // Shell selection APIs are COM-based. If this call fails because COM is already
-    // initialized with another model on this thread, we still attempt the shell call.
+    // Shell selection APIs are COM-based. If COM is already initialized on this thread with
+    // another model, continue (RPC_E_CHANGED_MODE). For any other failure, abort early.
     unsafe {
-        if CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok() {
+        let hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        if hr.is_ok() {
             should_uninitialize = true;
+        } else if hr != RPC_E_CHANGED_MODE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("CoInitializeEx failed before shell selection: {hr:?}"),
+            ));
         }
     }
 

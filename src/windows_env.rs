@@ -161,22 +161,35 @@ fn active_or_foreground_window() -> winapi::shared::windef::HWND {
 }
 
 pub fn active_window_is_maximized() -> Option<bool> {
-    use winapi::um::winuser::IsZoomed;
+    use winapi::um::winuser::{IsWindow, IsZoomed};
 
     let hwnd = active_or_foreground_window();
     if hwnd.is_null() {
         return None;
     }
 
+    // The active/foreground window may race with destruction; validate handle before use.
+    unsafe {
+        if IsWindow(hwnd) == 0 {
+            return None;
+        }
+    }
+
     unsafe { Some(IsZoomed(hwnd) != 0) }
 }
 
 pub fn set_active_window_maximized(maximize: bool) -> bool {
-    use winapi::um::winuser::{ShowWindow, SW_MAXIMIZE, SW_RESTORE};
+    use winapi::um::winuser::{IsWindow, ShowWindow, SW_MAXIMIZE, SW_RESTORE};
 
     let hwnd = active_or_foreground_window();
     if hwnd.is_null() {
         return false;
+    }
+
+    unsafe {
+        if IsWindow(hwnd) == 0 {
+            return false;
+        }
     }
 
     let cmd = if maximize { SW_MAXIMIZE } else { SW_RESTORE };
