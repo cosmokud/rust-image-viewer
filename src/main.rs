@@ -2897,30 +2897,34 @@ impl ImageViewer {
 
         let snapshot_folder_key = snapshot.folder_key.clone();
         let mut restored_entries: Vec<(usize, (u32, u32, MangaMediaType))> = Vec::new();
+        let mut total_non_folder_entries = 0usize;
 
-        for (idx, path) in self.image_list.iter().enumerate() {
-            if self.is_folder_navigation_entry_path(path.as_path()) {
-                continue;
+        {
+            let loader = self.manga_loader.as_ref();
+
+            for (idx, path) in self.image_list.iter().enumerate() {
+                let Some(media_type_hint) = get_media_type(path) else {
+                    continue;
+                };
+                total_non_folder_entries = total_non_folder_entries.saturating_add(1);
+
+                let Some(item) = snapshot.layout_items.get(idx) else {
+                    continue;
+                };
+
+                if item.source_width == 0 || item.source_height == 0 {
+                    continue;
+                }
+
+                let media_type = loader
+                    .and_then(|loader| loader.dimension_cache.get(&idx).map(|(_, _, mt)| *mt))
+                    .unwrap_or(match media_type_hint {
+                        MediaType::Video => MangaMediaType::Video,
+                        MediaType::Image => MangaMediaType::StaticImage,
+                    });
+
+                restored_entries.push((idx, (item.source_width, item.source_height, media_type)));
             }
-
-            let Some(item) = snapshot.layout_items.get(idx) else {
-                continue;
-            };
-
-            if item.source_width == 0 || item.source_height == 0 {
-                continue;
-            }
-
-            let media_type = self
-                .manga_loader
-                .as_ref()
-                .and_then(|loader| loader.dimension_cache.get(&idx).map(|(_, _, mt)| *mt))
-                .unwrap_or_else(|| match get_media_type(path) {
-                    Some(MediaType::Video) => MangaMediaType::Video,
-                    _ => MangaMediaType::StaticImage,
-                });
-
-            restored_entries.push((idx, (item.source_width, item.source_height, media_type)));
         }
 
         if restored_entries.is_empty() {
@@ -2934,12 +2938,6 @@ impl ImageViewer {
         for (idx, dims) in &restored_entries {
             loader.dimension_cache.insert(*idx, *dims);
         }
-
-        let total_non_folder_entries = self
-            .image_list
-            .iter()
-            .filter(|path| !self.is_folder_navigation_entry_path(path.as_path()))
-            .count();
 
         if total_non_folder_entries > 0 && restored_entries.len() >= total_non_folder_entries {
             self.masonry_authoritative_dimension_signature = self.image_list_signature;
