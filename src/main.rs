@@ -3195,6 +3195,31 @@ impl ImageViewer {
         self.last_pointer_hover_pos = pointer_pos;
     }
 
+    fn handle_masonry_preload_focus_loss(&mut self, ctx: &egui::Context) {
+        if !(self.manga_mode && self.is_masonry_mode() && self.masonry_metadata_preload_active) {
+            return;
+        }
+
+        let viewport_has_focus = ctx.input(|i| i.raw.viewport().focused.unwrap_or(true));
+        if viewport_has_focus {
+            return;
+        }
+
+        // Losing focus can drop key/pointer release events. Clear transient interaction
+        // latches so masonry warmup keeps advancing while the app is in the background.
+        self.manga_zoom_plus_held = false;
+        self.manga_zoom_minus_held = false;
+        self.manga_video_seeking = false;
+        self.manga_video_volume_dragging = false;
+        self.gif_seeking = false;
+        self.manga_scrollbar_dragging = false;
+        self.masonry_scrollbar_last_motion_at = None;
+        self.is_panning = false;
+        self.last_mouse_pos = None;
+        self.stop_manga_wheel_scroll();
+        self.stop_manga_autoscroll();
+    }
+
     fn set_image_list_raw(&mut self, files: Vec<PathBuf>) {
         let new_signature = Self::compute_image_list_signature(&files);
         if self.image_list_signature != new_signature {
@@ -18422,6 +18447,7 @@ impl ImageViewer {
                 loader.pending_load_count() > 0
                     || loader.pending_decoded_count() > 0
                     || loader.pending_dimension_results_count() > 0
+                    || loader.pending_dimension_probe_count() > 0
             })
             .unwrap_or(false);
 
@@ -22762,6 +22788,7 @@ impl eframe::App for ImageViewer {
             return;
         }
 
+        self.handle_masonry_preload_focus_loss(ctx);
         self.update_pointer_activity_tracking(ctx);
 
         // Update FPS stats for the debug overlay (and for general diagnostics).
@@ -23338,7 +23365,12 @@ impl eframe::App for ImageViewer {
         // Determine if we need continuous repainting.
         // Keep visual animations separate from background loader work so idle
         // masonry does not run at full frame rate while decoding off-screen items.
-        let (manga_pending_loads, manga_pending_decoded, manga_pending_dimensions) = self
+        let (
+            manga_pending_loads,
+            manga_pending_decoded,
+            manga_pending_dimensions,
+            manga_pending_dimension_probes,
+        ) = self
             .manga_loader
             .as_ref()
             .map(|loader| {
@@ -23346,17 +23378,24 @@ impl eframe::App for ImageViewer {
                     loader.pending_load_count(),
                     loader.pending_decoded_count(),
                     loader.pending_dimension_results_count(),
+                    loader.pending_dimension_probe_count(),
                 )
             })
-            .unwrap_or((0, 0, 0));
+            .unwrap_or((0, 0, 0, 0));
+        let masonry_metadata_preload_running =
+            self.manga_mode && self.is_masonry_mode() && self.masonry_metadata_preload_active;
         let manga_background_work_pending = self.manga_mode
             && (manga_pending_loads > 0
                 || manga_pending_decoded > 0
-                || manga_pending_dimensions > 0);
+                || manga_pending_dimensions > 0
+                || manga_pending_dimension_probes > 0
+                || masonry_metadata_preload_running);
         let manga_needs_fast_background_poll = self.manga_mode
-            && (!self.manga_ttv_pending.is_empty()
+            && (masonry_metadata_preload_running
+                || !self.manga_ttv_pending.is_empty()
                 || manga_pending_decoded > 0
-                || manga_pending_dimensions > 0);
+                || manga_pending_dimensions > 0
+                || manga_pending_dimension_probes > 0);
         let manga_scroll_active = self.manga_mode
             && ((self.manga_scroll_target - self.manga_scroll_offset).abs() > 0.1
                 || self.manga_scroll_velocity.abs() > 0.5
