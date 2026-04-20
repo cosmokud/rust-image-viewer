@@ -561,6 +561,8 @@ pub struct Config {
     pub vsync: bool,
 
     /// Maximum size for metadata_cache.redb in MiB.
+    /// This covers persistent metadata plus image/video thumbnails,
+    /// including folder-placeholder preview thumbnails.
     /// 0 disables the size limit.
     pub metadata_cache_max_size_mb: u64,
     /// Maximum RAM budget for per-folder masonry metadata preload snapshots in MiB.
@@ -1471,7 +1473,10 @@ impl Config {
                         }
                         "metadata_cache_max_size_mb"
                         | "metadata_cache_limit_mb"
-                        | "metadata_cache_max_mb" => {
+                        | "metadata_cache_max_mb"
+                        | "thumbnail_cache_max_size_mb"
+                        | "thumbnail_cache_limit_mb"
+                        | "folder_placeholder_thumbnail_cache_max_size_mb" => {
                             if let Ok(v) = value.parse::<u64>() {
                                 config.metadata_cache_max_size_mb = v.min(1_048_576);
                             }

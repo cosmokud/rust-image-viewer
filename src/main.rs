@@ -134,6 +134,39 @@ fn paint_loading_spinner(painter: &egui::Painter, rect: egui::Rect, time: f64) {
     painter.add(egui::Shape::line(points.to_vec(), stroke));
 }
 
+fn paint_compact_loading_spinner(painter: &egui::Painter, rect: egui::Rect, time: f64) {
+    let center = rect.center();
+    let radius = (rect.width().min(rect.height()) * 0.18).clamp(4.0, 12.0);
+
+    painter.circle_stroke(
+        center,
+        radius,
+        egui::Stroke::new(
+            1.5,
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 50),
+        ),
+    );
+
+    let start_angle = (time * 5.2) as f32;
+    let sweep = std::f32::consts::PI * 1.25;
+    let segments = 18;
+    let points: SmallVec<[egui::Pos2; 24]> = (0..=segments)
+        .map(|i| {
+            let t = i as f32 / segments as f32;
+            let angle = start_angle + sweep * t;
+            center + radius * egui::vec2(angle.cos(), angle.sin())
+        })
+        .collect();
+
+    painter.add(egui::Shape::line(
+        points.to_vec(),
+        egui::Stroke::new(
+            2.0,
+            egui::Color32::from_rgba_unmultiplied(245, 245, 245, 220),
+        ),
+    ));
+}
+
 fn rotate_quad_point(center: egui::Pos2, local: egui::Vec2, angle_radians: f32) -> egui::Pos2 {
     let (sin, cos) = angle_radians.sin_cos();
     center
@@ -1038,6 +1071,29 @@ struct PendingVideoThumbnailPlaceholder {
     thumbnail: CachedVideoThumbnail,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FolderPlaceholderThumbnailMediaKind {
+    StaticImage,
+    AnimatedImage,
+    Video,
+}
+
+#[derive(Clone, Debug)]
+struct FolderPlaceholderThumbnailDecoded {
+    path: PathBuf,
+    stamp: FileStamp,
+    pixels: Vec<u8>,
+    width: u32,
+    height: u32,
+    media_kind: FolderPlaceholderThumbnailMediaKind,
+}
+
+#[derive(Clone, Debug)]
+enum FolderPlaceholderThumbnailLoadResult {
+    Ready(FolderPlaceholderThumbnailDecoded),
+    Failed { path: PathBuf },
+}
+
 enum SoloProbeRequest {
     Image {
         path: PathBuf,
@@ -1533,6 +1589,55 @@ fn extract_video_first_frame_thumbnail(
     Some(thumbnail)
 }
 
+fn load_folder_placeholder_thumbnail(
+    path: &Path,
+    max_texture_side: u32,
+    downscale_filter: FilterType,
+    gif_filter: FilterType,
+) -> Option<FolderPlaceholderThumbnailDecoded> {
+    let stamp = file_stamp_for_path(path)?;
+    let media_type = get_media_type(path)?;
+
+    match media_type {
+        MediaType::Image => {
+            let animated_by_ext = path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| matches!(ext.to_ascii_lowercase().as_str(), "gif" | "webp"))
+                .unwrap_or(false);
+
+            let cached =
+                load_solo_probe_image(path, max_texture_side, downscale_filter, gif_filter)?;
+            let frame = cached.first_frame;
+            let media_kind = if animated_by_ext || cached.is_animated_webp || frame.delay_ms > 0 {
+                FolderPlaceholderThumbnailMediaKind::AnimatedImage
+            } else {
+                FolderPlaceholderThumbnailMediaKind::StaticImage
+            };
+
+            Some(FolderPlaceholderThumbnailDecoded {
+                path: path.to_path_buf(),
+                stamp,
+                pixels: frame.pixels,
+                width: frame.width,
+                height: frame.height,
+                media_kind,
+            })
+        }
+        MediaType::Video => {
+            let thumbnail = extract_video_first_frame_thumbnail(path, max_texture_side)?;
+            Some(FolderPlaceholderThumbnailDecoded {
+                path: path.to_path_buf(),
+                stamp,
+                pixels: thumbnail.pixels,
+                width: thumbnail.width,
+                height: thumbnail.height,
+                media_kind: FolderPlaceholderThumbnailMediaKind::Video,
+            })
+        }
+    }
+}
+
 struct MangaFocusedVideoLoadRequest {
     request_id: u64,
     index: usize,
@@ -1776,6 +1881,16 @@ struct ImageViewer {
     shortcuts_help_modal_skip_outside_click_once: bool,
     /// Cached thumbnail textures used by delete/rename dialogs.
     modal_thumbnail_cache: HashMap<PathBuf, ModalThumbnailTexture>,
+    /// Background decode jobs currently in-flight for folder-placeholder thumbnails.
+    folder_placeholder_thumbnail_pending: HashSet<PathBuf>,
+    /// Recently failed folder-placeholder thumbnail loads (for retry backoff).
+    folder_placeholder_thumbnail_failures: HashMap<PathBuf, Instant>,
+    /// Worker-thread completion channel for folder-placeholder thumbnails.
+    folder_placeholder_thumbnail_result_rx:
+        crossbeam_channel::Receiver<FolderPlaceholderThumbnailLoadResult>,
+    /// Sender paired with `folder_placeholder_thumbnail_result_rx`.
+    folder_placeholder_thumbnail_result_tx:
+        crossbeam_channel::Sender<FolderPlaceholderThumbnailLoadResult>,
     /// Cached per-folder media picks for folder placeholders (max 4 reverse-sorted by filename).
     folder_placeholder_thumbnail_cache: HashMap<PathBuf, FolderPlaceholderThumbnailSelection>,
     /// Rate limit for rescanning the current folder after external file moves/deletes.
@@ -2275,6 +2390,8 @@ struct ImageViewer {
 impl Default for ImageViewer {
     fn default() -> Self {
         let config = Config::load();
+        let (folder_placeholder_thumbnail_result_tx, folder_placeholder_thumbnail_result_rx) =
+            crossbeam_channel::bounded::<FolderPlaceholderThumbnailLoadResult>(128);
         let masonry_items_per_row = config.masonry_items_per_row.clamp(2, 10);
         let masonry_metadata_ram_cache_max_bytes = config
             .masonry_metadata_ram_cache_limit_mb
@@ -2319,6 +2436,10 @@ impl Default for ImageViewer {
             shortcuts_help_modal_open: false,
             shortcuts_help_modal_skip_outside_click_once: false,
             modal_thumbnail_cache: HashMap::new(),
+            folder_placeholder_thumbnail_pending: HashSet::new(),
+            folder_placeholder_thumbnail_failures: HashMap::new(),
+            folder_placeholder_thumbnail_result_rx,
+            folder_placeholder_thumbnail_result_tx,
             folder_placeholder_thumbnail_cache: HashMap::new(),
             last_missing_media_refresh_check: Instant::now(),
             zoom: 1.0,
@@ -3072,6 +3193,10 @@ impl ImageViewer {
 
         self.folder_placeholder_thumbnail_cache
             .retain(|directory, _| directory.exists());
+        self.folder_placeholder_thumbnail_pending
+            .retain(|path| path.exists());
+        self.folder_placeholder_thumbnail_failures
+            .retain(|path, _| path.exists());
 
         self.set_image_list_raw(files);
     }
@@ -3464,7 +3589,7 @@ impl ImageViewer {
             let tile_width = ((preview_rect.width() - grid_gap) * 0.5).max(1.0);
             let tile_height = ((preview_rect.height() - grid_gap) * 0.5).max(1.0);
             let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
-            let thumbnail_ctx = ui.ctx();
+            let mut waiting_for_thumbnail = false;
 
             for (slot, media_path) in preview_paths.iter().take(4).enumerate() {
                 let row = (slot / 2) as f32;
@@ -3482,7 +3607,7 @@ impl ImageViewer {
                 );
 
                 if let Some((texture_id, image_size)) =
-                    self.ensure_modal_thumbnail_texture(thumbnail_ctx, media_path)
+                    self.try_get_cached_modal_thumbnail_texture(media_path)
                 {
                     let fitted = tile_rect.shrink(2.0);
                     let scale = if image_size.x <= 0.0 || image_size.y <= 0.0 {
@@ -3495,6 +3620,10 @@ impl ImageViewer {
                     let fitted_size = egui::vec2(image_size.x * scale, image_size.y * scale);
                     let fitted_rect = egui::Rect::from_center_size(tile_rect.center(), fitted_size);
                     painter.image(texture_id, fitted_rect, uv, egui::Color32::WHITE);
+                } else if self.request_folder_placeholder_thumbnail_load(media_path) {
+                    let time = ui.input(|input| input.time);
+                    paint_compact_loading_spinner(painter, tile_rect, time);
+                    waiting_for_thumbnail = true;
                 } else {
                     let placeholder = media_path
                         .extension()
@@ -3509,6 +3638,10 @@ impl ImageViewer {
                         egui::Color32::from_rgb(188, 202, 220),
                     );
                 }
+            }
+
+            if waiting_for_thumbnail {
+                ui.ctx().request_repaint_after(Duration::from_millis(16));
             }
 
             if is_up_entry {
@@ -7500,9 +7633,8 @@ impl ImageViewer {
             .unwrap_or(192)
     }
 
-    fn ensure_modal_thumbnail_texture(
+    fn try_get_cached_modal_thumbnail_texture(
         &mut self,
-        ctx: &egui::Context,
         path: &PathBuf,
     ) -> Option<(egui::TextureId, egui::Vec2)> {
         let stamp = file_stamp_for_path(path.as_path())?;
@@ -7514,7 +7646,144 @@ impl ImageViewer {
                 ));
             }
         }
+
         self.modal_thumbnail_cache.remove(path);
+        None
+    }
+
+    fn request_folder_placeholder_thumbnail_load(&mut self, path: &PathBuf) -> bool {
+        if self.try_get_cached_modal_thumbnail_texture(path).is_some() {
+            return false;
+        }
+
+        if self.folder_placeholder_thumbnail_pending.contains(path) {
+            return true;
+        }
+
+        if self
+            .folder_placeholder_thumbnail_failures
+            .get(path)
+            .is_some_and(|failed_at| failed_at.elapsed() < Duration::from_secs(3))
+        {
+            return false;
+        }
+
+        let target_side = self.modal_thumbnail_target_side();
+        let downscale_filter = self.config.downscale_filter.to_image_filter();
+        let gif_filter = self.config.gif_resize_filter.to_image_filter();
+        let result_tx = self.folder_placeholder_thumbnail_result_tx.clone();
+        let path_clone = path.clone();
+
+        self.folder_placeholder_thumbnail_pending
+            .insert(path_clone.clone());
+        self.folder_placeholder_thumbnail_failures.remove(&path_clone);
+
+        crate::async_runtime::spawn_blocking_or_thread("folder-placeholder-thumbnail-load", move || {
+            let result = load_folder_placeholder_thumbnail(
+                path_clone.as_path(),
+                target_side,
+                downscale_filter,
+                gif_filter,
+            )
+            .map(FolderPlaceholderThumbnailLoadResult::Ready)
+            .unwrap_or(FolderPlaceholderThumbnailLoadResult::Failed { path: path_clone });
+
+            let _ = result_tx.send(result);
+        });
+
+        true
+    }
+
+    fn poll_pending_folder_placeholder_thumbnail_loads(&mut self, ctx: &egui::Context) {
+        let mut uploaded_any = false;
+
+        loop {
+            let result = match self.folder_placeholder_thumbnail_result_rx.try_recv() {
+                Ok(result) => result,
+                Err(_) => break,
+            };
+
+            match result {
+                FolderPlaceholderThumbnailLoadResult::Ready(decoded) => {
+                    self.folder_placeholder_thumbnail_pending.remove(&decoded.path);
+
+                    let Some(current_stamp) = file_stamp_for_path(decoded.path.as_path()) else {
+                        self.modal_thumbnail_cache.remove(&decoded.path);
+                        self.folder_placeholder_thumbnail_failures
+                            .insert(decoded.path, Instant::now());
+                        continue;
+                    };
+                    if current_stamp != decoded.stamp {
+                        self.modal_thumbnail_cache.remove(&decoded.path);
+                        continue;
+                    }
+
+                    let texture_options = match decoded.media_kind {
+                        FolderPlaceholderThumbnailMediaKind::Video => {
+                            self.solo_video_thumbnail_texture_options(decoded.width, decoded.height)
+                        }
+                        FolderPlaceholderThumbnailMediaKind::AnimatedImage => {
+                            self.config.texture_filter_animated.to_egui_options()
+                        }
+                        FolderPlaceholderThumbnailMediaKind::StaticImage => {
+                            self.config.texture_filter_static.to_egui_options_with_mipmap(
+                                decoded.width.min(decoded.height)
+                                    >= self.config.manga_mipmap_min_side.max(1),
+                            )
+                        }
+                    };
+
+                    let texture = ctx.load_texture(
+                        format!(
+                            "folder-placeholder-thumbnail:{}",
+                            decoded_image_cache_key(
+                                decoded.path.as_path(),
+                                self.modal_thumbnail_target_side(),
+                            )
+                        ),
+                        egui::ColorImage::from_rgba_unmultiplied(
+                            [decoded.width as usize, decoded.height as usize],
+                            &decoded.pixels,
+                        ),
+                        texture_options,
+                    );
+
+                    self.folder_placeholder_thumbnail_failures
+                        .remove(&decoded.path);
+                    self.modal_thumbnail_cache.insert(
+                        decoded.path,
+                        ModalThumbnailTexture {
+                            texture,
+                            width: decoded.width,
+                            height: decoded.height,
+                            stamp: decoded.stamp,
+                        },
+                    );
+                    uploaded_any = true;
+                }
+                FolderPlaceholderThumbnailLoadResult::Failed { path } => {
+                    self.folder_placeholder_thumbnail_pending.remove(&path);
+                    self.folder_placeholder_thumbnail_failures
+                        .insert(path, Instant::now());
+                }
+            }
+        }
+
+        if uploaded_any {
+            ctx.request_repaint();
+        }
+    }
+
+    fn ensure_modal_thumbnail_texture(
+        &mut self,
+        ctx: &egui::Context,
+        path: &PathBuf,
+    ) -> Option<(egui::TextureId, egui::Vec2)> {
+        if let Some(texture) = self.try_get_cached_modal_thumbnail_texture(path) {
+            return Some(texture);
+        }
+
+        let stamp = file_stamp_for_path(path.as_path())?;
 
         let target_side = self.modal_thumbnail_target_side();
         let media_type = get_media_type(path)?;
@@ -9489,7 +9758,7 @@ impl ImageViewer {
         self.reset_gif_seek_interaction_state();
         self.reset_masonry_metadata_preload();
         self.manga_mode = true;
-        set_metadata_cache_enabled(self.manga_layout_mode == MangaLayoutMode::Masonry);
+        set_metadata_cache_enabled(true);
         self.stop_fullscreen_video_playback();
         self.reset_fullscreen_anim_stream_state();
         self.reset_manga_video_user_preferences();
@@ -12742,7 +13011,7 @@ impl ImageViewer {
         };
 
         self.manga_layout_mode = layout_mode;
-        set_metadata_cache_enabled(layout_mode == MangaLayoutMode::Masonry);
+        set_metadata_cache_enabled(true);
         let restored_masonry_session = if layout_mode == MangaLayoutMode::Masonry {
             self.mark_masonry_runtime_cache_resident();
             self.restore_masonry_folder_metadata_snapshot();
@@ -22348,6 +22617,7 @@ impl eframe::App for ImageViewer {
         self.poll_pending_media_directory_scan(ctx);
         self.poll_pending_solo_probe(ctx);
         self.poll_pending_media_load(ctx);
+        self.poll_pending_folder_placeholder_thumbnail_loads(ctx);
         if !(self.manga_mode && self.is_fullscreen) {
             self.poll_pending_manga_video_load(ctx);
         }
