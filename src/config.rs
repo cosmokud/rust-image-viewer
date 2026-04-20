@@ -563,6 +563,9 @@ pub struct Config {
     /// Maximum size for metadata_cache.redb in MiB.
     /// 0 disables the size limit.
     pub metadata_cache_max_size_mb: u64,
+    /// Maximum RAM budget for per-folder masonry metadata preload snapshots in MiB.
+    /// Default is 2048 (2 GiB).
+    pub masonry_metadata_ram_cache_limit_mb: u64,
 
     // ============ IMAGE QUALITY SETTINGS ============
     /// Filter for upscaling images (making them larger)
@@ -664,6 +667,7 @@ impl Config {
             single_instance: true,
             vsync: true,
             metadata_cache_max_size_mb: 1024,
+            masonry_metadata_ram_cache_limit_mb: 2048,
             // Image quality defaults
             upscale_filter: ImageFilter::CatmullRom,
             downscale_filter: ImageFilter::Lanczos3,
@@ -1472,6 +1476,14 @@ impl Config {
                                 config.metadata_cache_max_size_mb = v.min(1_048_576);
                             }
                         }
+                        "masonry_metadata_ram_cache_limit_mb"
+                        | "masonry_metadata_ram_limit_mb"
+                        | "masonry_metadata_preload_ram_limit_mb"
+                        | "masonry_metadata_ram_mb" => {
+                            if let Ok(v) = value.parse::<u64>() {
+                                config.masonry_metadata_ram_cache_limit_mb = v.clamp(1, 1_048_576);
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -1686,6 +1698,10 @@ impl Config {
         values.insert(
             "metadata_cache_max_size_mb",
             format!("{}", self.metadata_cache_max_size_mb),
+        );
+        values.insert(
+            "masonry_metadata_ram_cache_limit_mb",
+            format!("{}", self.masonry_metadata_ram_cache_limit_mb),
         );
         values.insert(
             "background_rgb",
