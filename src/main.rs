@@ -584,6 +584,12 @@ struct ModalThumbnailTexture {
     stamp: FileStamp,
 }
 
+#[derive(Clone, Debug)]
+struct FolderPlaceholderThumbnailSelection {
+    stamp: Option<FileStamp>,
+    media_paths: Vec<PathBuf>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MenuActionIcon {
     Mark,
@@ -1770,6 +1776,8 @@ struct ImageViewer {
     shortcuts_help_modal_skip_outside_click_once: bool,
     /// Cached thumbnail textures used by delete/rename dialogs.
     modal_thumbnail_cache: HashMap<PathBuf, ModalThumbnailTexture>,
+    /// Cached per-folder media picks for folder placeholders (max 4 reverse-sorted by filename).
+    folder_placeholder_thumbnail_cache: HashMap<PathBuf, FolderPlaceholderThumbnailSelection>,
     /// Rate limit for rescanning the current folder after external file moves/deletes.
     last_missing_media_refresh_check: Instant,
     /// Current zoom level (1.0 = 100%)
@@ -2311,6 +2319,7 @@ impl Default for ImageViewer {
             shortcuts_help_modal_open: false,
             shortcuts_help_modal_skip_outside_click_once: false,
             modal_thumbnail_cache: HashMap::new(),
+            folder_placeholder_thumbnail_cache: HashMap::new(),
             last_missing_media_refresh_check: Instant::now(),
             zoom: 1.0,
             zoom_target: 1.0,
@@ -3061,6 +3070,9 @@ impl ImageViewer {
                 .collect()
         };
 
+        self.folder_placeholder_thumbnail_cache
+            .retain(|directory, _| directory.exists());
+
         self.set_image_list_raw(files);
     }
 
@@ -3294,26 +3306,105 @@ impl ImageViewer {
         )
     }
 
-    fn paint_folder_entry_card(
-        painter: &egui::Painter,
-        rect: egui::Rect,
-        is_up_entry: bool,
-        label: &str,
-    ) {
-        painter.rect_filled(rect, 6.0, egui::Color32::from_rgb(30, 34, 40));
+    fn collect_folder_placeholder_preview_media_paths(
+        target_directory: &Path,
+        max_count: usize,
+    ) -> Vec<PathBuf> {
+        let max_count = max_count.min(4);
+        if max_count == 0 || !target_directory.is_dir() {
+            return Vec::new();
+        }
 
-        let body = egui::Rect::from_min_max(
-            egui::pos2(rect.left() + rect.width() * 0.12, rect.top() + rect.height() * 0.36),
-            egui::pos2(rect.right() - rect.width() * 0.12, rect.bottom() - rect.height() * 0.14),
+        let Ok(entries) = fs::read_dir(target_directory) else {
+            return Vec::new();
+        };
+
+        // Keep only the best `max_count` reverse-sorted file names while scanning.
+        // This avoids sorting the full directory listing.
+        let mut top_media: Vec<(String, PathBuf)> = Vec::with_capacity(max_count);
+        for entry in entries.flatten() {
+            let candidate = entry.path();
+            if !candidate.is_file() || get_media_type(candidate.as_path()).is_none() {
+                continue;
+            }
+
+            let Some(file_name) = candidate
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.to_string())
+            else {
+                continue;
+            };
+
+            if file_name.is_empty() {
+                continue;
+            }
+
+            let mut insert_at = top_media.len();
+            for (idx, (existing_name, _)) in top_media.iter().enumerate() {
+                if file_name > *existing_name {
+                    insert_at = idx;
+                    break;
+                }
+            }
+
+            if insert_at >= max_count {
+                if top_media.len() < max_count {
+                    top_media.push((file_name, candidate));
+                }
+                continue;
+            }
+
+            top_media.insert(insert_at, (file_name, candidate));
+            if top_media.len() > max_count {
+                top_media.pop();
+            }
+        }
+
+        top_media.into_iter().map(|(_, path)| path).collect()
+    }
+
+    fn folder_entry_preview_media_paths(
+        &mut self,
+        entry_path: &Path,
+        max_count: usize,
+    ) -> Vec<PathBuf> {
+        let max_count = max_count.min(4);
+        if max_count == 0 {
+            return Vec::new();
+        }
+
+        let Some(target_directory) = Self::folder_entry_target_directory(entry_path) else {
+            return Vec::new();
+        };
+
+        let stamp = file_stamp_for_path(target_directory.as_path());
+        if let Some(cached) = self
+            .folder_placeholder_thumbnail_cache
+            .get(target_directory.as_path())
+        {
+            if cached.stamp == stamp {
+                return cached.media_paths.clone();
+            }
+        }
+
+        let media_paths = Self::collect_folder_placeholder_preview_media_paths(
+            target_directory.as_path(),
+            max_count,
         );
-        let tab = egui::Rect::from_min_max(
-            egui::pos2(rect.left() + rect.width() * 0.2, rect.top() + rect.height() * 0.2),
-            egui::pos2(rect.left() + rect.width() * 0.5, rect.top() + rect.height() * 0.36),
+
+        self.folder_placeholder_thumbnail_cache.insert(
+            target_directory,
+            FolderPlaceholderThumbnailSelection {
+                stamp,
+                media_paths: media_paths.clone(),
+            },
         );
 
-        painter.rect_filled(body, 5.0, egui::Color32::from_rgb(221, 178, 73));
-        painter.rect_filled(tab, 4.0, egui::Color32::from_rgb(234, 196, 108));
+        media_paths
+    }
 
+    fn paint_folder_entry_icon(painter: &egui::Painter, body: egui::Rect, is_up_entry: bool) {
         let stroke = egui::Stroke::new(2.0, egui::Color32::WHITE);
         let center = body.center();
         if is_up_entry {
@@ -3341,12 +3432,131 @@ impl ImageViewer {
             );
             painter.rect_stroke(icon, 3.0, stroke);
         }
+    }
+
+    fn paint_folder_entry_card(&mut self, ui: &mut egui::Ui, rect: egui::Rect, entry_path: &Path) {
+        let painter = ui.painter();
+        let is_up_entry = Self::is_up_navigation_entry_path(entry_path);
+        let label = Self::folder_entry_display_name(entry_path);
+
+        painter.rect_filled(rect, 6.0, egui::Color32::from_rgb(30, 34, 40));
+
+        let body = egui::Rect::from_min_max(
+            egui::pos2(rect.left() + rect.width() * 0.12, rect.top() + rect.height() * 0.36),
+            egui::pos2(rect.right() - rect.width() * 0.12, rect.bottom() - rect.height() * 0.14),
+        );
+        let tab = egui::Rect::from_min_max(
+            egui::pos2(rect.left() + rect.width() * 0.2, rect.top() + rect.height() * 0.2),
+            egui::pos2(rect.left() + rect.width() * 0.5, rect.top() + rect.height() * 0.36),
+        );
+
+        painter.rect_filled(body, 5.0, egui::Color32::from_rgb(221, 178, 73));
+        painter.rect_filled(tab, 4.0, egui::Color32::from_rgb(234, 196, 108));
+
+        let preview_paths = self.folder_entry_preview_media_paths(entry_path, 4);
+        if preview_paths.is_empty() {
+            // Preserve previous behavior when no media thumbnail candidates exist.
+            Self::paint_folder_entry_icon(painter, body, is_up_entry);
+        } else {
+            let preview_margin = body.width().min(body.height()) * 0.06;
+            let preview_rect = body.shrink(preview_margin);
+            let grid_gap = (preview_rect.width().min(preview_rect.height()) * 0.04).clamp(2.0, 8.0);
+            let tile_width = ((preview_rect.width() - grid_gap) * 0.5).max(1.0);
+            let tile_height = ((preview_rect.height() - grid_gap) * 0.5).max(1.0);
+            let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
+            let thumbnail_ctx = ui.ctx();
+
+            for (slot, media_path) in preview_paths.iter().take(4).enumerate() {
+                let row = (slot / 2) as f32;
+                let col = (slot % 2) as f32;
+                let tile_min = egui::pos2(
+                    preview_rect.left() + col * (tile_width + grid_gap),
+                    preview_rect.top() + row * (tile_height + grid_gap),
+                );
+                let tile_rect = egui::Rect::from_min_size(tile_min, egui::vec2(tile_width, tile_height));
+
+                painter.rect_filled(
+                    tile_rect,
+                    3.0,
+                    egui::Color32::from_rgba_unmultiplied(22, 26, 31, 235),
+                );
+
+                if let Some((texture_id, image_size)) =
+                    self.ensure_modal_thumbnail_texture(thumbnail_ctx, media_path)
+                {
+                    let fitted = tile_rect.shrink(2.0);
+                    let scale = if image_size.x <= 0.0 || image_size.y <= 0.0 {
+                        1.0
+                    } else {
+                        (fitted.width() / image_size.x)
+                            .min(fitted.height() / image_size.y)
+                            .max(0.01)
+                    };
+                    let fitted_size = egui::vec2(image_size.x * scale, image_size.y * scale);
+                    let fitted_rect = egui::Rect::from_center_size(tile_rect.center(), fitted_size);
+                    painter.image(texture_id, fitted_rect, uv, egui::Color32::WHITE);
+                } else {
+                    let placeholder = media_path
+                        .extension()
+                        .and_then(|ext| ext.to_str())
+                        .map(|ext| ext.to_ascii_uppercase())
+                        .unwrap_or_else(|| "FILE".to_string());
+                    painter.text(
+                        tile_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        placeholder,
+                        egui::TextStyle::Small.resolve(ui.style()),
+                        egui::Color32::from_rgb(188, 202, 220),
+                    );
+                }
+            }
+
+            if is_up_entry {
+                let badge_size = egui::vec2(body.width() * 0.22, body.height() * 0.2);
+                let badge = egui::Rect::from_center_size(body.center(), badge_size);
+                painter.rect_filled(
+                    badge,
+                    6.0,
+                    egui::Color32::from_rgba_unmultiplied(0, 0, 0, 160),
+                );
+                let stroke = egui::Stroke::new(1.8, egui::Color32::WHITE);
+                let shaft_top = egui::pos2(badge.center().x, badge.center().y - badge.height() * 0.28);
+                let shaft_bottom = egui::pos2(badge.center().x, badge.center().y + badge.height() * 0.22);
+                painter.line_segment([shaft_bottom, shaft_top], stroke);
+                painter.line_segment(
+                    [
+                        shaft_top,
+                        egui::pos2(
+                            badge.center().x - badge.width() * 0.16,
+                            badge.center().y - badge.height() * 0.02,
+                        ),
+                    ],
+                    stroke,
+                );
+                painter.line_segment(
+                    [
+                        shaft_top,
+                        egui::pos2(
+                            badge.center().x + badge.width() * 0.16,
+                            badge.center().y - badge.height() * 0.02,
+                        ),
+                    ],
+                    stroke,
+                );
+            }
+
+            painter.rect_stroke(
+                preview_rect,
+                4.0,
+                egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 26)),
+            );
+        }
 
         let label_size = (rect.width() * 0.045).clamp(13.0, 22.0);
         let label_font = egui::FontId::proportional(label_size);
         let label_color = egui::Color32::from_rgb(245, 245, 245);
         let max_label_width = (rect.width() * 0.82).max(90.0);
-        let galley = painter.layout(label.to_string(), label_font, label_color, max_label_width);
+        let galley = painter.layout(label, label_font, label_color, max_label_width);
         let label_bottom_padding = (rect.height() * 0.06).clamp(10.0, 28.0);
         let label_top = rect.bottom() - label_bottom_padding - galley.rect.height();
         let label_pos = egui::pos2(rect.center().x - galley.rect.width() * 0.5, label_top);
@@ -16500,12 +16710,7 @@ impl ImageViewer {
             });
 
         if let Some(path) = folder_entry.as_ref() {
-            Self::paint_folder_entry_card(
-                ui.painter(),
-                image_rect,
-                Self::is_up_navigation_entry_path(path.as_path()),
-                &Self::folder_entry_display_name(path.as_path()),
-            );
+            self.paint_folder_entry_card(ui, image_rect, path.as_path());
 
             let preview_only =
                 self.mark_selection_preview_contains(idx) && self.mark_visual_for_index(idx).is_none();
@@ -21998,15 +22203,13 @@ impl ImageViewer {
                         );
                     }
 
-                    if let Some(path) = self.image_list.get(self.current_index) {
-                        if self.is_folder_navigation_entry_path(path.as_path()) {
-                            Self::paint_folder_entry_card(
-                                ui.painter(),
-                                final_rect,
-                                Self::is_up_navigation_entry_path(path.as_path()),
-                                &Self::folder_entry_display_name(path.as_path()),
-                            );
-                        }
+                    let folder_entry_path = self
+                        .image_list
+                        .get(self.current_index)
+                        .cloned()
+                        .filter(|path| self.is_folder_navigation_entry_path(path.as_path()));
+                    if let Some(path) = folder_entry_path.as_ref() {
+                        self.paint_folder_entry_card(ui, final_rect, path.as_path());
                     }
 
                     // Show loading spinner while animated WebP frames are still streaming.
