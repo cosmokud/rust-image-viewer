@@ -2641,10 +2641,20 @@ impl ImageViewer {
     }
 
     fn defer_directory_work_for_fast_startup(&self) -> bool {
-        self.config.startup_window_mode == StartupWindowMode::Floating
-            && !self.startup_window_shown
-            && !self.manga_mode
-            && self.image_list.len() <= 1
+        if self.config.startup_window_mode != StartupWindowMode::Floating
+            || self.manga_mode
+            || self.image_list.len() > 1
+        {
+            return false;
+        }
+
+        match self.current_media_type {
+            Some(MediaType::Image) => self.image.is_none() && self.error_message.is_none(),
+            Some(MediaType::Video) => {
+                self.video_texture.is_none() && !self.is_video_playback_unavailable_active()
+            }
+            None => false,
+        }
     }
 
     fn masonry_authoritative_dimension_lock_active(&self) -> bool {
@@ -10207,7 +10217,6 @@ impl ImageViewer {
 
     fn load_media_internal(&mut self, path: &PathBuf, retain_visible_media_until_ready: bool) {
         let load_media_start = Instant::now();
-        let defer_directory_work_for_fast_startup = self.defer_directory_work_for_fast_startup();
 
         self.reset_masonry_metadata_preload();
         self.clear_pending_media_load();
@@ -10321,7 +10330,7 @@ impl ImageViewer {
         } else {
             // Keep current media navigable immediately while the full directory scan runs in background.
             self.set_image_list(vec![path.clone()]);
-            if !defer_directory_work_for_fast_startup {
+            if !self.defer_directory_work_for_fast_startup() {
                 let _ =
                     self.begin_media_directory_scan(path, PendingMediaDirectoryScanKind::InitialLoad);
             }
@@ -10405,7 +10414,7 @@ impl ImageViewer {
                 let max_tex = self.max_texture_side.max(1);
 
                 if self.try_load_image_from_decoded_cache(path, max_tex, gif_filter) {
-                    if !defer_directory_work_for_fast_startup {
+                    if !self.defer_directory_work_for_fast_startup() {
                         self.schedule_solo_probe_window(path, media_type);
                     }
                     self.perf_metrics
@@ -10414,7 +10423,7 @@ impl ImageViewer {
                 }
 
                 if self.try_load_image_from_thumbnail_cache(path, max_tex) {
-                    if !defer_directory_work_for_fast_startup {
+                    if !self.defer_directory_work_for_fast_startup() {
                         self.schedule_solo_probe_window(path, media_type);
                     }
                     self.perf_metrics
@@ -10430,7 +10439,10 @@ impl ImageViewer {
             }
         }
 
-        if media_type.is_some() && !is_folder_entry && !defer_directory_work_for_fast_startup {
+        if media_type.is_some()
+            && !is_folder_entry
+            && !self.defer_directory_work_for_fast_startup()
+        {
             self.schedule_solo_probe_window(path, media_type);
         }
 
