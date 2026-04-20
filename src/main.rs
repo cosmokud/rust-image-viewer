@@ -621,6 +621,7 @@ struct ModalThumbnailTexture {
 struct FolderPlaceholderThumbnailSelection {
     stamp: Option<FileStamp>,
     media_paths: Vec<PathBuf>,
+    loading: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1092,6 +1093,15 @@ struct FolderPlaceholderThumbnailDecoded {
 enum FolderPlaceholderThumbnailLoadResult {
     Ready(FolderPlaceholderThumbnailDecoded),
     Failed { path: PathBuf },
+}
+
+#[derive(Clone, Debug)]
+enum FolderPlaceholderPreviewScanResult {
+    Ready {
+        directory: PathBuf,
+        stamp: Option<FileStamp>,
+        media_paths: Vec<PathBuf>,
+    },
 }
 
 enum SoloProbeRequest {
@@ -1881,6 +1891,14 @@ struct ImageViewer {
     shortcuts_help_modal_skip_outside_click_once: bool,
     /// Cached thumbnail textures used by delete/rename dialogs.
     modal_thumbnail_cache: HashMap<PathBuf, ModalThumbnailTexture>,
+    /// Background folder scan jobs currently in-flight for placeholder media candidate selection.
+    folder_placeholder_preview_scan_pending: HashSet<PathBuf>,
+    /// Worker-thread completion channel for folder-preview media path scans.
+    folder_placeholder_preview_scan_result_rx:
+        crossbeam_channel::Receiver<FolderPlaceholderPreviewScanResult>,
+    /// Sender paired with `folder_placeholder_preview_scan_result_rx`.
+    folder_placeholder_preview_scan_result_tx:
+        crossbeam_channel::Sender<FolderPlaceholderPreviewScanResult>,
     /// Background decode jobs currently in-flight for folder-placeholder thumbnails.
     folder_placeholder_thumbnail_pending: HashSet<PathBuf>,
     /// Recently failed folder-placeholder thumbnail loads (for retry backoff).
@@ -2390,6 +2408,10 @@ struct ImageViewer {
 impl Default for ImageViewer {
     fn default() -> Self {
         let config = Config::load();
+        let (
+            folder_placeholder_preview_scan_result_tx,
+            folder_placeholder_preview_scan_result_rx,
+        ) = crossbeam_channel::bounded::<FolderPlaceholderPreviewScanResult>(128);
         let (folder_placeholder_thumbnail_result_tx, folder_placeholder_thumbnail_result_rx) =
             crossbeam_channel::bounded::<FolderPlaceholderThumbnailLoadResult>(128);
         let masonry_items_per_row = config.masonry_items_per_row.clamp(2, 10);
@@ -2436,6 +2458,9 @@ impl Default for ImageViewer {
             shortcuts_help_modal_open: false,
             shortcuts_help_modal_skip_outside_click_once: false,
             modal_thumbnail_cache: HashMap::new(),
+            folder_placeholder_preview_scan_pending: HashSet::new(),
+            folder_placeholder_preview_scan_result_rx,
+            folder_placeholder_preview_scan_result_tx,
             folder_placeholder_thumbnail_pending: HashSet::new(),
             folder_placeholder_thumbnail_failures: HashMap::new(),
             folder_placeholder_thumbnail_result_rx,
@@ -3193,6 +3218,8 @@ impl ImageViewer {
 
         self.folder_placeholder_thumbnail_cache
             .retain(|directory, _| directory.exists());
+        self.folder_placeholder_preview_scan_pending
+            .retain(|directory| directory.exists());
         self.folder_placeholder_thumbnail_pending
             .retain(|path| path.exists());
         self.folder_placeholder_thumbnail_failures
@@ -3489,18 +3516,54 @@ impl ImageViewer {
         top_media.into_iter().map(|(_, path)| path).collect()
     }
 
+    fn request_folder_placeholder_preview_scan(
+        &mut self,
+        target_directory: &PathBuf,
+        max_count: usize,
+    ) {
+        if !target_directory.is_dir() {
+            return;
+        }
+
+        if self
+            .folder_placeholder_preview_scan_pending
+            .contains(target_directory)
+        {
+            return;
+        }
+
+        let directory = target_directory.clone();
+        let result_tx = self.folder_placeholder_preview_scan_result_tx.clone();
+        self.folder_placeholder_preview_scan_pending
+            .insert(directory.clone());
+
+        crate::async_runtime::spawn_blocking_or_thread("folder-placeholder-preview-scan", move || {
+            let stamp = file_stamp_for_path(directory.as_path());
+            let media_paths = Self::collect_folder_placeholder_preview_media_paths(
+                directory.as_path(),
+                max_count,
+            );
+
+            let _ = result_tx.send(FolderPlaceholderPreviewScanResult::Ready {
+                directory,
+                stamp,
+                media_paths,
+            });
+        });
+    }
+
     fn folder_entry_preview_media_paths(
         &mut self,
         entry_path: &Path,
         max_count: usize,
-    ) -> Vec<PathBuf> {
+    ) -> (Vec<PathBuf>, bool) {
         let max_count = max_count.min(4);
         if max_count == 0 {
-            return Vec::new();
+            return (Vec::new(), false);
         }
 
         let Some(target_directory) = Self::folder_entry_target_directory(entry_path) else {
-            return Vec::new();
+            return (Vec::new(), false);
         };
 
         let stamp = file_stamp_for_path(target_directory.as_path());
@@ -3509,24 +3572,30 @@ impl ImageViewer {
             .get(target_directory.as_path())
         {
             if cached.stamp == stamp {
-                return cached.media_paths.clone();
+                return (cached.media_paths.clone(), cached.loading);
             }
         }
 
-        let media_paths = Self::collect_folder_placeholder_preview_media_paths(
-            target_directory.as_path(),
-            max_count,
-        );
+        self.request_folder_placeholder_preview_scan(&target_directory, max_count);
+
+        if let Some(cached) = self
+            .folder_placeholder_thumbnail_cache
+            .get_mut(target_directory.as_path())
+        {
+            cached.loading = true;
+            return (cached.media_paths.clone(), true);
+        }
 
         self.folder_placeholder_thumbnail_cache.insert(
             target_directory,
             FolderPlaceholderThumbnailSelection {
                 stamp,
-                media_paths: media_paths.clone(),
+                media_paths: Vec::new(),
+                loading: true,
             },
         );
 
-        media_paths
+        (Vec::new(), true)
     }
 
     fn paint_folder_entry_icon(painter: &egui::Painter, body: egui::Rect, is_up_entry: bool) {
@@ -3578,10 +3647,17 @@ impl ImageViewer {
         painter.rect_filled(body, 5.0, egui::Color32::from_rgb(221, 178, 73));
         painter.rect_filled(tab, 4.0, egui::Color32::from_rgb(234, 196, 108));
 
-        let preview_paths = self.folder_entry_preview_media_paths(entry_path, 4);
+        let (preview_paths, preview_list_loading) =
+            self.folder_entry_preview_media_paths(entry_path, 4);
         if preview_paths.is_empty() {
-            // Preserve previous behavior when no media thumbnail candidates exist.
-            Self::paint_folder_entry_icon(painter, body, is_up_entry);
+            if preview_list_loading {
+                let time = ui.input(|input| input.time);
+                paint_compact_loading_spinner(painter, body, time);
+                ui.ctx().request_repaint_after(Duration::from_millis(16));
+            } else {
+                // Preserve previous behavior when no media thumbnail candidates exist.
+                Self::paint_folder_entry_icon(painter, body, is_up_entry);
+            }
         } else {
             let preview_margin = body.width().min(body.height()) * 0.06;
             let preview_rect = body.shrink(preview_margin);
@@ -7694,14 +7770,55 @@ impl ImageViewer {
         true
     }
 
-    fn poll_pending_folder_placeholder_thumbnail_loads(&mut self, ctx: &egui::Context) {
-        let mut uploaded_any = false;
+    fn poll_pending_folder_placeholder_preview_scans(&mut self, ctx: &egui::Context) {
+        const MAX_SCAN_RESULTS_PER_FRAME: usize = 48;
 
-        loop {
+        let mut applied = 0usize;
+        while applied < MAX_SCAN_RESULTS_PER_FRAME {
+            let result = match self.folder_placeholder_preview_scan_result_rx.try_recv() {
+                Ok(result) => result,
+                Err(_) => break,
+            };
+
+            match result {
+                FolderPlaceholderPreviewScanResult::Ready {
+                    directory,
+                    stamp,
+                    media_paths,
+                } => {
+                    self.folder_placeholder_preview_scan_pending.remove(&directory);
+                    self.folder_placeholder_thumbnail_cache.insert(
+                        directory,
+                        FolderPlaceholderThumbnailSelection {
+                            stamp,
+                            media_paths,
+                            loading: false,
+                        },
+                    );
+                }
+            }
+
+            applied = applied.saturating_add(1);
+        }
+
+        if applied > 0 || !self.folder_placeholder_preview_scan_pending.is_empty() {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        }
+    }
+
+    fn poll_pending_folder_placeholder_thumbnail_loads(&mut self, ctx: &egui::Context) {
+        const MAX_THUMBNAIL_RESULTS_PER_FRAME: usize = 8;
+
+        let mut uploaded_any = false;
+        let mut processed = 0usize;
+
+        while processed < MAX_THUMBNAIL_RESULTS_PER_FRAME {
             let result = match self.folder_placeholder_thumbnail_result_rx.try_recv() {
                 Ok(result) => result,
                 Err(_) => break,
             };
+
+            processed = processed.saturating_add(1);
 
             match result {
                 FolderPlaceholderThumbnailLoadResult::Ready(decoded) => {
@@ -7769,8 +7886,8 @@ impl ImageViewer {
             }
         }
 
-        if uploaded_any {
-            ctx.request_repaint();
+        if uploaded_any || !self.folder_placeholder_thumbnail_pending.is_empty() {
+            ctx.request_repaint_after(Duration::from_millis(16));
         }
     }
 
@@ -22617,6 +22734,7 @@ impl eframe::App for ImageViewer {
         self.poll_pending_media_directory_scan(ctx);
         self.poll_pending_solo_probe(ctx);
         self.poll_pending_media_load(ctx);
+        self.poll_pending_folder_placeholder_preview_scans(ctx);
         self.poll_pending_folder_placeholder_thumbnail_loads(ctx);
         if !(self.manga_mode && self.is_fullscreen) {
             self.poll_pending_manga_video_load(ctx);
