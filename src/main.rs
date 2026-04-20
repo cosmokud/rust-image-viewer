@@ -19938,7 +19938,9 @@ impl ImageViewer {
                                     breadcrumb_ui_hovered = true;
                                 }
 
-                                if segment_response.clicked() {
+                                if segment_response.clicked()
+                                    || segment_response.secondary_clicked()
+                                {
                                     breadcrumb_target_directory = Some(segment_path.clone());
                                 }
 
@@ -19958,7 +19960,7 @@ impl ImageViewer {
                                     "breadcrumb_segment_children_popup",
                                     segment_path,
                                 ));
-                                if arrow_response.clicked() {
+                                if arrow_response.clicked() || arrow_response.secondary_clicked() {
                                     ui.memory_mut(|mem| mem.toggle_popup(popup_id));
                                 }
 
@@ -20001,7 +20003,7 @@ impl ImageViewer {
                                                         if row.contains_pointer() {
                                                             breadcrumb_ui_hovered = true;
                                                         }
-                                                        if row.clicked() {
+                                                        if row.clicked() || row.secondary_clicked() {
                                                             breadcrumb_target_directory =
                                                                 Some(child.clone());
                                                             close_popup = true;
