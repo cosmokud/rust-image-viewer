@@ -44,6 +44,7 @@ use media_index::{DirectoryScanResult, MediaDirectoryIndex};
 use metadata_cache::{
     configure_metadata_cache_size_limit, lookup_cached_dimensions,
     lookup_cached_static_thumbnail, lookup_cached_video_thumbnail, metadata_cache_stats,
+    set_metadata_cache_enabled,
     store_cached_dimensions, store_cached_static_thumbnail, store_cached_video_thumbnail,
     CachedImageThumbnail, CachedMediaKind, CachedVideoThumbnail,
 };
@@ -3848,6 +3849,7 @@ impl ImageViewer {
         if self.manga_mode {
             self.manga_clear_cache();
             self.manga_mode = false;
+            set_metadata_cache_enabled(false);
         }
     }
 
@@ -9263,6 +9265,7 @@ impl ImageViewer {
         self.reset_gif_seek_interaction_state();
         self.reset_masonry_metadata_preload();
         self.manga_mode = true;
+        set_metadata_cache_enabled(self.manga_layout_mode == MangaLayoutMode::Masonry);
         self.stop_fullscreen_video_playback();
         self.reset_fullscreen_anim_stream_state();
         self.reset_manga_video_user_preferences();
@@ -12509,6 +12512,7 @@ impl ImageViewer {
         };
 
         self.manga_layout_mode = layout_mode;
+        set_metadata_cache_enabled(layout_mode == MangaLayoutMode::Masonry);
         let restored_masonry_session = if layout_mode == MangaLayoutMode::Masonry {
             self.mark_masonry_runtime_cache_resident();
             self.restore_masonry_folder_metadata_snapshot();
@@ -12897,6 +12901,7 @@ impl ImageViewer {
         }
         self.reset_masonry_metadata_preload();
         self.manga_mode = false;
+        set_metadata_cache_enabled(false);
         if return_mode == MangaLayoutMode::Masonry || self.has_resident_masonry_runtime_cache() {
             self.manga_suspend_runtime_for_solo_fullscreen();
         } else {
@@ -13092,6 +13097,7 @@ impl ImageViewer {
         let keep_resident_masonry_cache = self.manga_layout_mode == MangaLayoutMode::Masonry
             || self.has_resident_masonry_runtime_cache();
         self.manga_mode = false;
+        set_metadata_cache_enabled(false);
         if keep_resident_masonry_cache {
             self.manga_suspend_runtime_for_solo_fullscreen();
         } else {
@@ -22101,6 +22107,7 @@ impl eframe::App for ImageViewer {
                     self.stop_manga_wheel_scroll();
                     self.stop_manga_autoscroll();
                     self.manga_mode = false;
+                    set_metadata_cache_enabled(false);
                     self.manga_clear_cache();
 
                     // Fully drop the loader thread pool on handoff from another instance.
@@ -22428,6 +22435,7 @@ impl eframe::App for ImageViewer {
                             self.manga_layout_mode == MangaLayoutMode::Masonry
                                 || self.has_resident_masonry_runtime_cache();
                         self.manga_mode = false;
+                        set_metadata_cache_enabled(false);
                         if keep_resident_masonry_cache {
                             self.manga_suspend_runtime_for_solo_fullscreen();
                         } else {
@@ -23051,6 +23059,7 @@ fn main() -> eframe::Result<()> {
     // Load config early to check single_instance setting
     let config = Config::load();
     configure_metadata_cache_size_limit(config.metadata_cache_max_size_mb);
+    set_metadata_cache_enabled(false);
 
     // ============ SINGLE INSTANCE MODE ============
     // Try to become the primary instance or send the file to an existing instance
@@ -23090,9 +23099,9 @@ fn main() -> eframe::Result<()> {
     // For videos, we start hidden and show once GStreamer decodes the first frame.
     let (initial_size, initial_pos, start_visible) = match media_type {
         Some(MediaType::Image) => {
-            // Prefer cached dimensions to avoid touching the media file on every startup.
-            let (img_w, img_h) =
-                lookup_cached_dimensions(&file_path, CachedMediaKind::Image).unwrap_or((800, 600));
+            // Startup sizing intentionally bypasses metadata_cache.redb to keep single-file
+            // launches independent from cache size.
+            let (img_w, img_h) = probe_image_dimensions(&file_path).unwrap_or((800, 600));
             let img_w = img_w as f32;
             let img_h = img_h as f32;
 
