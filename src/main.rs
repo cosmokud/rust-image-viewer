@@ -2877,6 +2877,74 @@ impl ImageViewer {
         true
     }
 
+    fn hydrate_masonry_dimensions_from_session_snapshot(&mut self) -> usize {
+        let Some(snapshot) = self.masonry_mode_session_snapshot.as_ref() else {
+            return 0;
+        };
+
+        if snapshot.image_list_signature != self.image_list_signature
+            || snapshot.layout_items.len() != self.image_list.len()
+        {
+            return 0;
+        }
+
+        let snapshot_folder_key = snapshot.folder_key.clone();
+        let mut restored_entries: Vec<(usize, (u32, u32, MangaMediaType))> = Vec::new();
+
+        for (idx, path) in self.image_list.iter().enumerate() {
+            if self.is_folder_navigation_entry_path(path.as_path()) {
+                continue;
+            }
+
+            let Some(item) = snapshot.layout_items.get(idx) else {
+                continue;
+            };
+
+            if item.source_width == 0 || item.source_height == 0 {
+                continue;
+            }
+
+            let media_type = self
+                .manga_loader
+                .as_ref()
+                .and_then(|loader| loader.dimension_cache.get(&idx).map(|(_, _, mt)| *mt))
+                .unwrap_or_else(|| match get_media_type(path) {
+                    Some(MediaType::Video) => MangaMediaType::Video,
+                    _ => MangaMediaType::StaticImage,
+                });
+
+            restored_entries.push((idx, (item.source_width, item.source_height, media_type)));
+        }
+
+        if restored_entries.is_empty() {
+            return 0;
+        }
+
+        let Some(loader) = self.manga_loader.as_mut() else {
+            return 0;
+        };
+
+        for (idx, dims) in &restored_entries {
+            loader.dimension_cache.insert(*idx, *dims);
+        }
+
+        let total_non_folder_entries = self
+            .image_list
+            .iter()
+            .filter(|path| !self.is_folder_navigation_entry_path(path.as_path()))
+            .count();
+
+        if total_non_folder_entries > 0 && restored_entries.len() >= total_non_folder_entries {
+            self.masonry_authoritative_dimension_signature = self.image_list_signature;
+            self.masonry_authoritative_dimension_folder = self
+                .current_masonry_metadata_folder_key()
+                .or(snapshot_folder_key);
+        }
+
+        self.manga_dimension_cache_list_signature = self.image_list_signature;
+        restored_entries.len()
+    }
+
     fn sync_masonry_authoritative_dimensions(&mut self) -> usize {
         if !self.masonry_authoritative_dimension_lock_active() {
             return 0;
@@ -12429,10 +12497,17 @@ impl ImageViewer {
             if !self.image_list.is_empty() {
                 self.manga_dimension_cache_list_signature = self.image_list_signature;
             }
-            self.try_restore_masonry_mode_session_snapshot(target_path.clone())
+            let restored = self.try_restore_masonry_mode_session_snapshot(target_path.clone());
+            if restored {
+                self.hydrate_masonry_dimensions_from_session_snapshot();
+            }
+            restored
         } else {
             false
         };
+        let masonry_authoritative_ready =
+            layout_mode == MangaLayoutMode::Masonry
+                && self.masonry_authoritative_dimension_lock_active();
 
         if layout_mode != MangaLayoutMode::Masonry || !restored_masonry_session {
             self.invalidate_manga_layout_cache();
@@ -12463,7 +12538,8 @@ impl ImageViewer {
             self.persist_current_masonry_folder_metadata_snapshot();
         }
 
-        let allow_startup_preload = layout_mode == MangaLayoutMode::Masonry && !restored_masonry_session;
+        let allow_startup_preload = layout_mode == MangaLayoutMode::Masonry
+            && (!restored_masonry_session || !masonry_authoritative_ready);
         self.maybe_begin_masonry_metadata_preload(allow_startup_preload);
 
         self.manga_update_preload_queue();
@@ -12857,6 +12933,7 @@ impl ImageViewer {
             } else {
                 false
             };
+            let mut masonry_authoritative_ready = false;
 
             if self.manga_layout_mode == MangaLayoutMode::Masonry {
                 self.mark_masonry_runtime_cache_resident();
@@ -12879,6 +12956,10 @@ impl ImageViewer {
             }
             if self.manga_layout_mode == MangaLayoutMode::Masonry {
                 self.restore_masonry_folder_metadata_snapshot();
+                if restored_masonry_session {
+                    self.hydrate_masonry_dimensions_from_session_snapshot();
+                }
+                masonry_authoritative_ready = self.masonry_authoritative_dimension_lock_active();
             }
             if !self.image_list.is_empty() {
                 self.manga_dimension_cache_list_signature = self.image_list_signature;
@@ -12894,7 +12975,9 @@ impl ImageViewer {
             );
 
             // Dimensions may have changed; rebuild height cache.
-            if !reuse_preserved_masonry_layout || (current_dims_changed && !restored_masonry_session)
+            if !reuse_preserved_masonry_layout
+                || (current_dims_changed
+                    && !(restored_masonry_session && masonry_authoritative_ready))
             {
                 self.invalidate_manga_layout_cache();
             }
@@ -12958,7 +13041,8 @@ impl ImageViewer {
             }
 
             let allow_startup_preload =
-                self.manga_layout_mode == MangaLayoutMode::Masonry && !restored_masonry_session;
+                self.manga_layout_mode == MangaLayoutMode::Masonry
+                    && (!restored_masonry_session || !masonry_authoritative_ready);
             self.maybe_begin_masonry_metadata_preload(allow_startup_preload);
             if self.manga_layout_mode == MangaLayoutMode::Masonry {
                 self.manga_update_current_index();
