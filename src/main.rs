@@ -2639,6 +2639,13 @@ impl ImageViewer {
         self.masonry_authoritative_dimension_folder = None;
     }
 
+    fn defer_directory_work_for_fast_startup(&self) -> bool {
+        self.config.startup_window_mode == StartupWindowMode::Floating
+            && !self.startup_window_shown
+            && !self.manga_mode
+            && self.image_list.len() <= 1
+    }
+
     fn masonry_authoritative_dimension_lock_active(&self) -> bool {
         self.is_masonry_mode()
             && self.masonry_authoritative_dimension_signature != 0
@@ -3699,6 +3706,10 @@ impl ImageViewer {
 
     fn refresh_media_list_if_entries_disappeared(&mut self) {
         const MISSING_MEDIA_REFRESH_INTERVAL: Duration = Duration::from_millis(750);
+
+        if self.defer_directory_work_for_fast_startup() {
+            return;
+        }
 
         if self.last_missing_media_refresh_check.elapsed() < MISSING_MEDIA_REFRESH_INTERVAL {
             return;
@@ -9703,7 +9714,9 @@ impl ImageViewer {
                     .position(|candidate| candidate == &target_path)
                     .unwrap_or(0);
                 self.set_current_index_clamped(resolved_index);
-                self.schedule_solo_probe_window(&target_path, self.current_media_type);
+                if !self.defer_directory_work_for_fast_startup() {
+                    self.schedule_solo_probe_window(&target_path, self.current_media_type);
+                }
                 ctx.request_repaint();
             }
             PendingMediaDirectoryScanKind::ExternalRefresh => {
@@ -10193,6 +10206,7 @@ impl ImageViewer {
 
     fn load_media_internal(&mut self, path: &PathBuf, retain_visible_media_until_ready: bool) {
         let load_media_start = Instant::now();
+        let defer_directory_work_for_fast_startup = self.defer_directory_work_for_fast_startup();
 
         self.reset_masonry_metadata_preload();
         self.clear_pending_media_load();
@@ -10306,8 +10320,10 @@ impl ImageViewer {
         } else {
             // Keep current media navigable immediately while the full directory scan runs in background.
             self.set_image_list(vec![path.clone()]);
-            let _ =
-                self.begin_media_directory_scan(path, PendingMediaDirectoryScanKind::InitialLoad);
+            if !defer_directory_work_for_fast_startup {
+                let _ =
+                    self.begin_media_directory_scan(path, PendingMediaDirectoryScanKind::InitialLoad);
+            }
         }
 
         if self.image_list.is_empty() {
@@ -10388,14 +10404,18 @@ impl ImageViewer {
                 let max_tex = self.max_texture_side.max(1);
 
                 if self.try_load_image_from_decoded_cache(path, max_tex, gif_filter) {
-                    self.schedule_solo_probe_window(path, media_type);
+                    if !defer_directory_work_for_fast_startup {
+                        self.schedule_solo_probe_window(path, media_type);
+                    }
                     self.perf_metrics
                         .record_duration("load_media_prepare_ms", load_media_start.elapsed());
                     return;
                 }
 
                 if self.try_load_image_from_thumbnail_cache(path, max_tex) {
-                    self.schedule_solo_probe_window(path, media_type);
+                    if !defer_directory_work_for_fast_startup {
+                        self.schedule_solo_probe_window(path, media_type);
+                    }
                     self.perf_metrics
                         .record_duration("load_media_prepare_ms", load_media_start.elapsed());
                     return;
@@ -10409,7 +10429,7 @@ impl ImageViewer {
             }
         }
 
-        if media_type.is_some() && !is_folder_entry {
+        if media_type.is_some() && !is_folder_entry && !defer_directory_work_for_fast_startup {
             self.schedule_solo_probe_window(path, media_type);
         }
 
