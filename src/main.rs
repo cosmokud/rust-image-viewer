@@ -1111,6 +1111,22 @@ enum FolderPlaceholderPreviewScanResult {
     },
 }
 
+#[derive(Clone, Debug)]
+struct FolderPlaceholderPreviewScanRequest {
+    directory: PathBuf,
+    max_count: usize,
+    priority: i64,
+}
+
+#[derive(Clone, Debug)]
+struct FolderPlaceholderThumbnailLoadRequest {
+    path: PathBuf,
+    max_texture_side: u32,
+    downscale_filter: FilterType,
+    gif_filter: FilterType,
+    priority: i64,
+}
+
 enum SoloProbeRequest {
     Image {
         path: PathBuf,
@@ -1380,6 +1396,99 @@ fn process_solo_probe_request(request: SoloProbeRequest) -> SoloProbeResult {
             path,
             max_texture_side,
         },
+    }
+}
+
+fn run_folder_placeholder_preview_scan_worker(
+    request_rx: crossbeam_channel::Receiver<FolderPlaceholderPreviewScanRequest>,
+    result_tx: crossbeam_channel::Sender<FolderPlaceholderPreviewScanResult>,
+) {
+    const MAX_BATCH: usize = 24;
+
+    let mut batch: Vec<FolderPlaceholderPreviewScanRequest> = Vec::with_capacity(MAX_BATCH);
+
+    loop {
+        let first = match request_rx.recv() {
+            Ok(req) => req,
+            Err(_) => return,
+        };
+
+        batch.clear();
+        batch.push(first);
+
+        while batch.len() < MAX_BATCH {
+            match request_rx.try_recv() {
+                Ok(req) => batch.push(req),
+                Err(crossbeam_channel::TryRecvError::Empty)
+                | Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+            }
+        }
+
+        batch.sort_by_key(|req| req.priority);
+
+        for req in batch.drain(..) {
+            let stamp = file_stamp_for_path(req.directory.as_path());
+            let media_paths = ImageViewer::collect_folder_placeholder_preview_media_paths(
+                req.directory.as_path(),
+                req.max_count,
+            );
+
+            if result_tx
+                .send(FolderPlaceholderPreviewScanResult::Ready {
+                    directory: req.directory,
+                    stamp,
+                    media_paths,
+                })
+                .is_err()
+            {
+                return;
+            }
+        }
+    }
+}
+
+fn run_folder_placeholder_thumbnail_load_worker(
+    request_rx: crossbeam_channel::Receiver<FolderPlaceholderThumbnailLoadRequest>,
+    result_tx: crossbeam_channel::Sender<FolderPlaceholderThumbnailLoadResult>,
+) {
+    const MAX_BATCH: usize = 24;
+
+    let mut batch: Vec<FolderPlaceholderThumbnailLoadRequest> = Vec::with_capacity(MAX_BATCH);
+
+    loop {
+        let first = match request_rx.recv() {
+            Ok(req) => req,
+            Err(_) => return,
+        };
+
+        batch.clear();
+        batch.push(first);
+
+        while batch.len() < MAX_BATCH {
+            match request_rx.try_recv() {
+                Ok(req) => batch.push(req),
+                Err(crossbeam_channel::TryRecvError::Empty)
+                | Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+            }
+        }
+
+        batch.sort_by_key(|req| req.priority);
+
+        for req in batch.drain(..) {
+            let path = req.path;
+            let result = load_folder_placeholder_thumbnail(
+                path.as_path(),
+                req.max_texture_side,
+                req.downscale_filter,
+                req.gif_filter,
+            )
+            .map(FolderPlaceholderThumbnailLoadResult::Ready)
+            .unwrap_or(FolderPlaceholderThumbnailLoadResult::Failed { path });
+
+            if result_tx.send(result).is_err() {
+                return;
+            }
+        }
     }
 }
 
@@ -1906,24 +2015,28 @@ struct ImageViewer {
     modal_thumbnail_cache: HashMap<PathBuf, ModalThumbnailTexture>,
     /// Background folder scan jobs currently in-flight for placeholder media candidate selection.
     folder_placeholder_preview_scan_pending: HashSet<PathBuf>,
+    /// Request channel for queued folder-preview media scans.
+    folder_placeholder_preview_scan_request_tx:
+        crossbeam_channel::Sender<FolderPlaceholderPreviewScanRequest>,
     /// Worker-thread completion channel for folder-preview media path scans.
     folder_placeholder_preview_scan_result_rx:
         crossbeam_channel::Receiver<FolderPlaceholderPreviewScanResult>,
-    /// Sender paired with `folder_placeholder_preview_scan_result_rx`.
-    folder_placeholder_preview_scan_result_tx:
-        crossbeam_channel::Sender<FolderPlaceholderPreviewScanResult>,
     /// Background decode jobs currently in-flight for folder-placeholder thumbnails.
     folder_placeholder_thumbnail_pending: HashSet<PathBuf>,
     /// Recently failed folder-placeholder thumbnail loads (for retry backoff).
     folder_placeholder_thumbnail_failures: HashMap<PathBuf, Instant>,
+    /// Request channel for queued folder-placeholder thumbnail decode work.
+    folder_placeholder_thumbnail_request_tx:
+        crossbeam_channel::Sender<FolderPlaceholderThumbnailLoadRequest>,
     /// Worker-thread completion channel for folder-placeholder thumbnails.
     folder_placeholder_thumbnail_result_rx:
         crossbeam_channel::Receiver<FolderPlaceholderThumbnailLoadResult>,
-    /// Sender paired with `folder_placeholder_thumbnail_result_rx`.
-    folder_placeholder_thumbnail_result_tx:
-        crossbeam_channel::Sender<FolderPlaceholderThumbnailLoadResult>,
     /// Cached per-folder media picks for folder placeholders (max 4 reverse-sorted by filename).
     folder_placeholder_thumbnail_cache: HashMap<PathBuf, FolderPlaceholderThumbnailSelection>,
+    /// Monotonic priority seed for folder-preview scan request ordering.
+    folder_placeholder_preview_request_priority_seed: i64,
+    /// Monotonic priority seed for folder-thumbnail decode request ordering.
+    folder_placeholder_thumbnail_request_priority_seed: i64,
     /// Short-lived stamp cache to avoid per-frame metadata syscalls while drawing folder previews.
     folder_placeholder_stamp_cache: HashMap<PathBuf, CachedPathStamp>,
     /// Rate limit for rescanning the current folder after external file moves/deletes.
@@ -2426,11 +2539,45 @@ impl Default for ImageViewer {
     fn default() -> Self {
         let config = Config::load();
         let (
+            folder_placeholder_preview_scan_request_tx,
+            folder_placeholder_preview_scan_request_rx,
+        ) = crossbeam_channel::bounded::<FolderPlaceholderPreviewScanRequest>(256);
+        let (
             folder_placeholder_preview_scan_result_tx,
             folder_placeholder_preview_scan_result_rx,
         ) = crossbeam_channel::bounded::<FolderPlaceholderPreviewScanResult>(128);
+        let (
+            folder_placeholder_thumbnail_request_tx,
+            folder_placeholder_thumbnail_request_rx,
+        ) = crossbeam_channel::bounded::<FolderPlaceholderThumbnailLoadRequest>(256);
+        let folder_placeholder_thumbnail_worker_count =
+            std::thread::available_parallelism().map_or(2usize, |count| {
+                count.get().clamp(2, 4)
+            });
         let (folder_placeholder_thumbnail_result_tx, folder_placeholder_thumbnail_result_rx) =
             crossbeam_channel::bounded::<FolderPlaceholderThumbnailLoadResult>(128);
+
+        crate::async_runtime::spawn_blocking_or_thread(
+            "folder-placeholder-preview-worker",
+            move || {
+                run_folder_placeholder_preview_scan_worker(
+                    folder_placeholder_preview_scan_request_rx,
+                    folder_placeholder_preview_scan_result_tx,
+                );
+            },
+        );
+
+        for worker_idx in 0..folder_placeholder_thumbnail_worker_count {
+            let request_rx = folder_placeholder_thumbnail_request_rx.clone();
+            let result_tx = folder_placeholder_thumbnail_result_tx.clone();
+            crate::async_runtime::spawn_blocking_or_thread(
+                &format!("folder-placeholder-thumbnail-worker-{}", worker_idx),
+                move || {
+                    run_folder_placeholder_thumbnail_load_worker(request_rx, result_tx);
+                },
+            );
+        }
+
         let masonry_items_per_row = config.masonry_items_per_row.clamp(2, 10);
         let masonry_metadata_ram_cache_max_bytes = config
             .masonry_metadata_ram_cache_limit_mb
@@ -2476,13 +2623,15 @@ impl Default for ImageViewer {
             shortcuts_help_modal_skip_outside_click_once: false,
             modal_thumbnail_cache: HashMap::new(),
             folder_placeholder_preview_scan_pending: HashSet::new(),
+            folder_placeholder_preview_scan_request_tx,
             folder_placeholder_preview_scan_result_rx,
-            folder_placeholder_preview_scan_result_tx,
             folder_placeholder_thumbnail_pending: HashSet::new(),
             folder_placeholder_thumbnail_failures: HashMap::new(),
+            folder_placeholder_thumbnail_request_tx,
             folder_placeholder_thumbnail_result_rx,
-            folder_placeholder_thumbnail_result_tx,
             folder_placeholder_thumbnail_cache: HashMap::new(),
+            folder_placeholder_preview_request_priority_seed: 0,
+            folder_placeholder_thumbnail_request_priority_seed: 0,
             folder_placeholder_stamp_cache: HashMap::new(),
             last_missing_media_refresh_check: Instant::now(),
             zoom: 1.0,
@@ -3592,23 +3741,25 @@ impl ImageViewer {
         }
 
         let directory = target_directory.clone();
-        let result_tx = self.folder_placeholder_preview_scan_result_tx.clone();
+        self.folder_placeholder_preview_request_priority_seed =
+            self.folder_placeholder_preview_request_priority_seed.saturating_add(1);
+        let priority = -self.folder_placeholder_preview_request_priority_seed;
         self.folder_placeholder_preview_scan_pending
             .insert(directory.clone());
 
-        crate::async_runtime::spawn_blocking_or_thread("folder-placeholder-preview-scan", move || {
-            let stamp = file_stamp_for_path(directory.as_path());
-            let media_paths = Self::collect_folder_placeholder_preview_media_paths(
-                directory.as_path(),
-                max_count,
-            );
+        let request = FolderPlaceholderPreviewScanRequest {
+            directory: directory.clone(),
+            max_count,
+            priority,
+        };
 
-            let _ = result_tx.send(FolderPlaceholderPreviewScanResult::Ready {
-                directory,
-                stamp,
-                media_paths,
-            });
-        });
+        if self
+            .folder_placeholder_preview_scan_request_tx
+            .try_send(request)
+            .is_err()
+        {
+            self.folder_placeholder_preview_scan_pending.remove(&directory);
+        }
     }
 
     fn folder_entry_preview_media_paths(
@@ -7810,8 +7961,6 @@ impl ImageViewer {
     }
 
     fn request_folder_placeholder_thumbnail_load(&mut self, path: &PathBuf) -> bool {
-        const MAX_IN_FLIGHT_THUMBNAIL_LOADS: usize = 1;
-
         if self.try_get_cached_modal_thumbnail_texture(path).is_some() {
             return false;
         }
@@ -7828,32 +7977,36 @@ impl ImageViewer {
             return false;
         }
 
-        if self.folder_placeholder_thumbnail_pending.len() >= MAX_IN_FLIGHT_THUMBNAIL_LOADS {
-            return true;
-        }
-
         let target_side = self.modal_thumbnail_target_side();
         let downscale_filter = self.config.downscale_filter.to_image_filter();
         let gif_filter = self.config.gif_resize_filter.to_image_filter();
-        let result_tx = self.folder_placeholder_thumbnail_result_tx.clone();
         let path_clone = path.clone();
+        self.folder_placeholder_thumbnail_request_priority_seed =
+            self.folder_placeholder_thumbnail_request_priority_seed.saturating_add(1);
+        let priority = -self.folder_placeholder_thumbnail_request_priority_seed;
 
         self.folder_placeholder_thumbnail_pending
             .insert(path_clone.clone());
         self.folder_placeholder_thumbnail_failures.remove(&path_clone);
 
-        crate::async_runtime::spawn_blocking_or_thread("folder-placeholder-thumbnail-load", move || {
-            let result = load_folder_placeholder_thumbnail(
-                path_clone.as_path(),
-                target_side,
-                downscale_filter,
-                gif_filter,
-            )
-            .map(FolderPlaceholderThumbnailLoadResult::Ready)
-            .unwrap_or(FolderPlaceholderThumbnailLoadResult::Failed { path: path_clone });
+        let request = FolderPlaceholderThumbnailLoadRequest {
+            path: path_clone.clone(),
+            max_texture_side: target_side,
+            downscale_filter,
+            gif_filter,
+            priority,
+        };
 
-            let _ = result_tx.send(result);
-        });
+        if self
+            .folder_placeholder_thumbnail_request_tx
+            .try_send(request)
+            .is_err()
+        {
+            self.folder_placeholder_thumbnail_pending.remove(&path_clone);
+            self.folder_placeholder_thumbnail_failures
+                .insert(path_clone, Instant::now());
+            return false;
+        }
 
         true
     }
