@@ -1950,6 +1950,8 @@ struct ImageViewer {
     last_pointer_activity_at: Instant,
     /// Configuration
     config: Config,
+    /// One-shot deferred AppData config.ini normalization for fast startup.
+    pending_idle_config_sync: bool,
     /// Whether we're in fullscreen mode
     is_fullscreen: bool,
     /// Whether to show the control bar
@@ -2489,6 +2491,7 @@ impl Default for ImageViewer {
             last_pointer_hover_pos: None,
             last_pointer_activity_at: Instant::now(),
             config,
+            pending_idle_config_sync: true,
             is_fullscreen: false,
             show_controls: false,
             show_breadcrumb_bar: true,
@@ -2817,6 +2820,15 @@ impl ImageViewer {
             }
             None => false,
         }
+    }
+
+    fn run_idle_config_sync_if_needed(&mut self) {
+        if !self.pending_idle_config_sync || !self.is_idle {
+            return;
+        }
+
+        self.pending_idle_config_sync = false;
+        self.config.sync_disk_file_with_template();
     }
 
     fn masonry_authoritative_dimension_lock_active(&self) -> bool {
@@ -23551,6 +23563,8 @@ impl eframe::App for ImageViewer {
             let idle_threshold = Duration::from_millis(100);
             self.is_idle = self.last_activity_time.elapsed() > idle_threshold;
         }
+
+        self.run_idle_config_sync_if_needed();
 
         // Smart repaint scheduling for CPU efficiency:
         // - Active animations: immediate repaint

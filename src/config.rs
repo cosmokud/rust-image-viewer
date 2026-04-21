@@ -1,22 +1,18 @@
 //! Configuration module for customizable shortcuts and settings.
 //! Supports keyboard keys and mouse buttons including scroll wheel.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::OnceLock;
 
 const DEFAULT_CONFIG_TEMPLATE: &str = include_str!("../assets/config.ini");
-const CONFIG_FILE_VERSION: &str = env!("CARGO_PKG_VERSION");
 const CONFIG_FILE_NAME: &str = "config.ini";
 const LEGACY_CONFIG_FILE_NAME: &str = "rust-image-viewer-config.ini";
 const LEGACY_SETTINGS_FILE_NAME: &str = "setting.ini";
-static DEFAULT_CONFIG_INI: OnceLock<String> = OnceLock::new();
 
 fn default_config_ini() -> &'static str {
-    DEFAULT_CONFIG_INI
-        .get_or_init(|| render_config_template_with_version(DEFAULT_CONFIG_TEMPLATE, CONFIG_FILE_VERSION))
-        .as_str()
+    DEFAULT_CONFIG_TEMPLATE
 }
 
 /// Image resampling filter types for scaling operations.
@@ -1026,10 +1022,8 @@ impl Config {
         let config_path = Self::config_path();
         let default_config = default_config_ini();
 
-        let mut created_from_template = false;
         if !config_path.exists() {
             if fs::write(&config_path, default_config).is_ok() {
-                created_from_template = true;
             } else {
                 let config = Self::parse_ini(default_config);
                 config.save();
@@ -1039,19 +1033,8 @@ impl Config {
 
         match fs::read_to_string(&config_path) {
             Ok(content) => {
-                if !has_config_version_tag_at_top(&content) {
-                    let config = Self::parse_ini(default_config);
-                    let _ = fs::write(&config_path, default_config);
-                    return config;
-                }
-
-                let is_template_copy = content == default_config;
-                let config = Self::parse_ini(&content);
-                if !created_from_template && !is_template_copy {
-                    // Save to update the config file with any new default bindings
-                    config.save();
-                }
-                config
+                let (content_without_legacy_header, _) = strip_legacy_config_version_tag(&content);
+                Self::parse_ini(content_without_legacy_header.as_ref())
             }
             Err(_) => {
                 let config = Self::parse_ini(default_config);
@@ -1626,6 +1609,28 @@ impl Config {
         let _ = fs::write(Self::config_path(), content);
     }
 
+    /// Rewrites AppData `config.ini` into template order with comments and missing keys.
+    ///
+    /// Also strips a legacy top-line semver header like `[0.3.5]` if present.
+    pub fn sync_disk_file_with_template(&self) {
+        let config_path = Self::config_path();
+        let expected_content = self.render_ini_from_template();
+
+        match fs::read_to_string(&config_path) {
+            Ok(existing_content) => {
+                let (existing_without_legacy_header, had_legacy_header) =
+                    strip_legacy_config_version_tag(&existing_content);
+
+                if had_legacy_header || existing_without_legacy_header.as_ref() != expected_content {
+                    let _ = fs::write(config_path, expected_content);
+                }
+            }
+            Err(_) => {
+                let _ = fs::write(config_path, expected_content);
+            }
+        }
+    }
+
     fn render_ini_from_template(&self) -> String {
         let values = self.ini_value_replacements();
         let default_config = default_config_ini();
@@ -2169,33 +2174,19 @@ fn split_line_ending(line: &str) -> (&str, &str) {
     }
 }
 
-fn render_config_template_with_version(template: &str, version: &str) -> String {
-    let version_tag = format!("[{}]", version);
+fn strip_legacy_config_version_tag(content: &str) -> (Cow<'_, str>, bool) {
+    let content = content.trim_start_matches('\u{feff}');
+    let Some(first_line) = content.lines().next() else {
+        return (Cow::Borrowed(content), false);
+    };
 
-    if let Some(first_line) = template.lines().next() {
-        if is_config_version_tag_line(first_line) {
-            let mut rendered = String::with_capacity(template.len() + version_tag.len());
-            rendered.push_str(&version_tag);
-            rendered.push_str(&template[first_line.len()..]);
-            return rendered;
-        }
+    if !is_config_version_tag_line(first_line) {
+        return (Cow::Borrowed(content), false);
     }
 
-    let line_ending = if template.contains("\r\n") { "\r\n" } else { "\n" };
-    let mut rendered = String::with_capacity(template.len() + version_tag.len() + line_ending.len());
-    rendered.push_str(&version_tag);
-    rendered.push_str(line_ending);
-    rendered.push_str(template);
-    rendered
-}
-
-fn has_config_version_tag_at_top(content: &str) -> bool {
-    let content = content.trim_start_matches('\u{feff}');
-    content
-        .lines()
-        .next()
-        .map(is_config_version_tag_line)
-        .unwrap_or(false)
+    let remaining = &content[first_line.len()..];
+    let remaining = remaining.trim_start_matches(&['\r', '\n'][..]);
+    (Cow::Owned(remaining.to_string()), true)
 }
 
 fn is_config_version_tag_line(line: &str) -> bool {
