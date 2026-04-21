@@ -1088,8 +1088,6 @@ enum FolderPlaceholderThumbnailMediaKind {
 
 #[derive(Clone, Debug)]
 struct FolderPlaceholderThumbnailDecoded {
-    generation: u64,
-    priority: i64,
     path: PathBuf,
     stamp: FileStamp,
     pixels: Vec<u8>,
@@ -1101,13 +1099,12 @@ struct FolderPlaceholderThumbnailDecoded {
 #[derive(Clone, Debug)]
 enum FolderPlaceholderThumbnailLoadResult {
     Ready(FolderPlaceholderThumbnailDecoded),
-    Failed { path: PathBuf, generation: u64 },
+    Failed { path: PathBuf },
 }
 
 #[derive(Clone, Debug)]
 enum FolderPlaceholderPreviewScanResult {
     Ready {
-        generation: u64,
         directory: PathBuf,
         stamp: Option<FileStamp>,
         media_paths: Vec<PathBuf>,
@@ -1116,7 +1113,6 @@ enum FolderPlaceholderPreviewScanResult {
 
 #[derive(Clone, Debug)]
 struct FolderPlaceholderPreviewScanRequest {
-    generation: u64,
     directory: PathBuf,
     max_count: usize,
     priority: i64,
@@ -1124,7 +1120,6 @@ struct FolderPlaceholderPreviewScanRequest {
 
 #[derive(Clone, Debug)]
 struct FolderPlaceholderThumbnailLoadRequest {
-    generation: u64,
     path: PathBuf,
     max_texture_side: u32,
     downscale_filter: FilterType,
@@ -1440,7 +1435,6 @@ fn run_folder_placeholder_preview_scan_worker(
 
             if result_tx
                 .send(FolderPlaceholderPreviewScanResult::Ready {
-                    generation: req.generation,
                     directory: req.directory,
                     stamp,
                     media_paths,
@@ -1481,19 +1475,15 @@ fn run_folder_placeholder_thumbnail_load_worker(
         batch.sort_by_key(|req| req.priority);
 
         for req in batch.drain(..) {
-            let generation = req.generation;
-            let priority = req.priority;
             let path = req.path;
             let result = load_folder_placeholder_thumbnail(
                 path.as_path(),
-                generation,
-                priority,
                 req.max_texture_side,
                 req.downscale_filter,
                 req.gif_filter,
             )
             .map(FolderPlaceholderThumbnailLoadResult::Ready)
-            .unwrap_or(FolderPlaceholderThumbnailLoadResult::Failed { path, generation });
+            .unwrap_or(FolderPlaceholderThumbnailLoadResult::Failed { path });
 
             if result_tx.send(result).is_err() {
                 return;
@@ -1727,8 +1717,6 @@ fn extract_video_first_frame_thumbnail(
 
 fn load_folder_placeholder_thumbnail(
     path: &Path,
-    generation: u64,
-    priority: i64,
     max_texture_side: u32,
     downscale_filter: FilterType,
     gif_filter: FilterType,
@@ -1754,8 +1742,6 @@ fn load_folder_placeholder_thumbnail(
             };
 
             Some(FolderPlaceholderThumbnailDecoded {
-                generation,
-                priority,
                 path: path.to_path_buf(),
                 stamp,
                 pixels: frame.pixels,
@@ -1767,8 +1753,6 @@ fn load_folder_placeholder_thumbnail(
         MediaType::Video => {
             let thumbnail = extract_video_first_frame_thumbnail(path, max_texture_side)?;
             Some(FolderPlaceholderThumbnailDecoded {
-                generation,
-                priority,
                 path: path.to_path_buf(),
                 stamp,
                 pixels: thumbnail.pixels,
@@ -2047,12 +2031,8 @@ struct ImageViewer {
     /// Worker-thread completion channel for folder-placeholder thumbnails.
     folder_placeholder_thumbnail_result_rx:
         crossbeam_channel::Receiver<FolderPlaceholderThumbnailLoadResult>,
-    /// Decoded folder-placeholder thumbnails waiting for throttled UI-thread texture upload.
-    folder_placeholder_thumbnail_mailbox: Vec<FolderPlaceholderThumbnailDecoded>,
     /// Cached per-folder media picks for folder placeholders (max 4 reverse-sorted by filename).
     folder_placeholder_thumbnail_cache: HashMap<PathBuf, FolderPlaceholderThumbnailSelection>,
-    /// Generation id for folder-placeholder requests; stale worker results are dropped.
-    folder_placeholder_request_generation: u64,
     /// Monotonic priority seed for folder-preview scan request ordering.
     folder_placeholder_preview_request_priority_seed: i64,
     /// Monotonic priority seed for folder-thumbnail decode request ordering.
@@ -2649,9 +2629,7 @@ impl Default for ImageViewer {
             folder_placeholder_thumbnail_failures: HashMap::new(),
             folder_placeholder_thumbnail_request_tx,
             folder_placeholder_thumbnail_result_rx,
-            folder_placeholder_thumbnail_mailbox: Vec::new(),
             folder_placeholder_thumbnail_cache: HashMap::new(),
-            folder_placeholder_request_generation: 1,
             folder_placeholder_preview_request_priority_seed: 0,
             folder_placeholder_thumbnail_request_priority_seed: 0,
             folder_placeholder_stamp_cache: HashMap::new(),
@@ -3445,17 +3423,14 @@ impl ImageViewer {
                 .collect()
         };
 
-        self.folder_placeholder_request_generation =
-            self.folder_placeholder_request_generation.saturating_add(1);
-        self.folder_placeholder_preview_request_priority_seed = 0;
-        self.folder_placeholder_thumbnail_request_priority_seed = 0;
-
         self.folder_placeholder_thumbnail_cache
             .retain(|directory, _| directory.exists());
-        self.folder_placeholder_preview_scan_pending.clear();
-        self.folder_placeholder_thumbnail_pending.clear();
-        self.folder_placeholder_thumbnail_failures.clear();
-        self.folder_placeholder_thumbnail_mailbox.clear();
+        self.folder_placeholder_preview_scan_pending
+            .retain(|directory| directory.exists());
+        self.folder_placeholder_thumbnail_pending
+            .retain(|path| path.exists());
+        self.folder_placeholder_thumbnail_failures
+            .retain(|path, _| path.exists());
         self.folder_placeholder_stamp_cache.clear();
 
         self.set_image_list_raw(files);
@@ -3773,7 +3748,6 @@ impl ImageViewer {
             .insert(directory.clone());
 
         let request = FolderPlaceholderPreviewScanRequest {
-            generation: self.folder_placeholder_request_generation,
             directory: directory.clone(),
             max_count,
             priority,
@@ -7947,32 +7921,6 @@ impl ImageViewer {
             .unwrap_or(192)
     }
 
-    fn folder_placeholder_thumbnail_upload_batch_limit(&self) -> usize {
-        const MIN_BATCH: usize = 1;
-        const MAX_BATCH: usize = 2;
-
-        if self.is_masonry_mode() && self.masonry_navigation_active_for_heavy_work() {
-            return MIN_BATCH;
-        }
-
-        let mut limit = MIN_BATCH;
-
-        if self.folder_placeholder_thumbnail_mailbox.len() >= 8 {
-            limit = limit.saturating_add(1);
-        }
-
-        if self.fps_last_dt_s.is_finite() && self.fps_last_dt_s > 0.0 {
-            let frame_ms = self.fps_last_dt_s * 1000.0;
-            if frame_ms >= 18.0 {
-                limit = MIN_BATCH;
-            } else if frame_ms <= 12.5 && self.folder_placeholder_thumbnail_mailbox.len() >= 4 {
-                limit = MAX_BATCH;
-            }
-        }
-
-        limit.clamp(MIN_BATCH, MAX_BATCH)
-    }
-
     fn cached_file_stamp(&mut self, path: &Path, ttl: Duration) -> Option<FileStamp> {
         if let Some(cached) = self.folder_placeholder_stamp_cache.get(path) {
             if cached.checked_at.elapsed() <= ttl {
@@ -8042,7 +7990,6 @@ impl ImageViewer {
         self.folder_placeholder_thumbnail_failures.remove(&path_clone);
 
         let request = FolderPlaceholderThumbnailLoadRequest {
-            generation: self.folder_placeholder_request_generation,
             path: path_clone.clone(),
             max_texture_side: target_side,
             downscale_filter,
@@ -8076,15 +8023,10 @@ impl ImageViewer {
 
             match result {
                 FolderPlaceholderPreviewScanResult::Ready {
-                    generation,
                     directory,
                     stamp,
                     media_paths,
                 } => {
-                    if generation != self.folder_placeholder_request_generation {
-                        continue;
-                    }
-
                     self.folder_placeholder_preview_scan_pending.remove(&directory);
                     self.folder_placeholder_stamp_cache.insert(
                         directory.clone(),
@@ -8113,44 +8055,85 @@ impl ImageViewer {
     }
 
     fn poll_pending_folder_placeholder_thumbnail_loads(&mut self, ctx: &egui::Context) {
-        const MAX_THUMBNAIL_RESULTS_PER_FRAME: usize = 24;
-        const MAX_THUMBNAIL_MAILBOX_ITEMS: usize = 48;
-        const STAMP_CACHE_TTL: Duration = Duration::from_millis(450);
+        const MAX_THUMBNAIL_RESULTS_PER_FRAME: usize = 2;
 
-        let mut processed_results = 0usize;
+        let mut uploaded_any = false;
+        let mut processed = 0usize;
 
-        while processed_results < MAX_THUMBNAIL_RESULTS_PER_FRAME {
+        while processed < MAX_THUMBNAIL_RESULTS_PER_FRAME {
             let result = match self.folder_placeholder_thumbnail_result_rx.try_recv() {
                 Ok(result) => result,
                 Err(_) => break,
             };
 
-            processed_results = processed_results.saturating_add(1);
+            processed = processed.saturating_add(1);
 
             match result {
                 FolderPlaceholderThumbnailLoadResult::Ready(decoded) => {
-                    if decoded.generation != self.folder_placeholder_request_generation {
-                        continue;
-                    }
-
                     self.folder_placeholder_thumbnail_pending.remove(&decoded.path);
 
-                    if let Some(existing_idx) = self
-                        .folder_placeholder_thumbnail_mailbox
-                        .iter()
-                        .position(|pending| pending.path == decoded.path)
-                    {
-                        self.folder_placeholder_thumbnail_mailbox
-                            .swap_remove(existing_idx);
-                    }
-
-                    self.folder_placeholder_thumbnail_mailbox.push(decoded);
-                }
-                FolderPlaceholderThumbnailLoadResult::Failed { path, generation } => {
-                    if generation != self.folder_placeholder_request_generation {
+                    let Some(current_stamp) = file_stamp_for_path(decoded.path.as_path()) else {
+                        self.modal_thumbnail_cache.remove(&decoded.path);
+                        self.folder_placeholder_thumbnail_failures
+                            .insert(decoded.path, Instant::now());
+                        continue;
+                    };
+                    if current_stamp != decoded.stamp {
+                        self.modal_thumbnail_cache.remove(&decoded.path);
                         continue;
                     }
 
+                    let texture_options = match decoded.media_kind {
+                        FolderPlaceholderThumbnailMediaKind::Video => {
+                            self.solo_video_thumbnail_texture_options(decoded.width, decoded.height)
+                        }
+                        FolderPlaceholderThumbnailMediaKind::AnimatedImage => {
+                            self.config.texture_filter_animated.to_egui_options()
+                        }
+                        FolderPlaceholderThumbnailMediaKind::StaticImage => {
+                            self.config.texture_filter_static.to_egui_options_with_mipmap(
+                                decoded.width.min(decoded.height)
+                                    >= self.config.manga_mipmap_min_side.max(1),
+                            )
+                        }
+                    };
+
+                    let texture = ctx.load_texture(
+                        format!(
+                            "folder-placeholder-thumbnail:{}",
+                            decoded_image_cache_key(
+                                decoded.path.as_path(),
+                                self.modal_thumbnail_target_side(),
+                            )
+                        ),
+                        egui::ColorImage::from_rgba_unmultiplied(
+                            [decoded.width as usize, decoded.height as usize],
+                            &decoded.pixels,
+                        ),
+                        texture_options,
+                    );
+
+                    self.folder_placeholder_thumbnail_failures
+                        .remove(&decoded.path);
+                    self.folder_placeholder_stamp_cache.insert(
+                        decoded.path.clone(),
+                        CachedPathStamp {
+                            stamp: Some(decoded.stamp),
+                            checked_at: Instant::now(),
+                        },
+                    );
+                    self.modal_thumbnail_cache.insert(
+                        decoded.path,
+                        ModalThumbnailTexture {
+                            texture,
+                            width: decoded.width,
+                            height: decoded.height,
+                            stamp: decoded.stamp,
+                        },
+                    );
+                    uploaded_any = true;
+                }
+                FolderPlaceholderThumbnailLoadResult::Failed { path } => {
                     self.folder_placeholder_thumbnail_pending.remove(&path);
                     self.folder_placeholder_thumbnail_failures
                         .insert(path, Instant::now());
@@ -8158,96 +8141,7 @@ impl ImageViewer {
             }
         }
 
-        if self.folder_placeholder_thumbnail_mailbox.len() > MAX_THUMBNAIL_MAILBOX_ITEMS {
-            self.folder_placeholder_thumbnail_mailbox
-                .sort_by_key(|decoded| decoded.priority);
-            self.folder_placeholder_thumbnail_mailbox
-                .truncate(MAX_THUMBNAIL_MAILBOX_ITEMS);
-        }
-
-        let mut uploaded_any = false;
-        if !self.folder_placeholder_thumbnail_mailbox.is_empty() {
-            self.folder_placeholder_thumbnail_mailbox
-                .sort_by_key(|decoded| decoded.priority);
-
-            let upload_budget = self
-                .folder_placeholder_thumbnail_upload_batch_limit()
-                .min(self.folder_placeholder_thumbnail_mailbox.len());
-
-            let upload_batch: Vec<FolderPlaceholderThumbnailDecoded> = self
-                .folder_placeholder_thumbnail_mailbox
-                .drain(0..upload_budget)
-                .collect();
-
-            for decoded in upload_batch {
-                let Some(current_stamp) =
-                    self.cached_file_stamp(decoded.path.as_path(), STAMP_CACHE_TTL)
-                else {
-                    self.modal_thumbnail_cache.remove(&decoded.path);
-                    self.folder_placeholder_thumbnail_failures
-                        .insert(decoded.path, Instant::now());
-                    continue;
-                };
-                if current_stamp != decoded.stamp {
-                    self.modal_thumbnail_cache.remove(&decoded.path);
-                    continue;
-                }
-
-                let texture_options = match decoded.media_kind {
-                    FolderPlaceholderThumbnailMediaKind::Video => {
-                        self.solo_video_thumbnail_texture_options(decoded.width, decoded.height)
-                    }
-                    FolderPlaceholderThumbnailMediaKind::AnimatedImage => {
-                        self.config.texture_filter_animated.to_egui_options()
-                    }
-                    FolderPlaceholderThumbnailMediaKind::StaticImage => {
-                        self.config.texture_filter_static.to_egui_options_with_mipmap(
-                            decoded.width.min(decoded.height)
-                                >= self.config.manga_mipmap_min_side.max(1),
-                        )
-                    }
-                };
-
-                let texture = ctx.load_texture(
-                    format!(
-                        "folder-placeholder-thumbnail:{}",
-                        decoded_image_cache_key(
-                            decoded.path.as_path(),
-                            self.modal_thumbnail_target_side(),
-                        )
-                    ),
-                    egui::ColorImage::from_rgba_unmultiplied(
-                        [decoded.width as usize, decoded.height as usize],
-                        &decoded.pixels,
-                    ),
-                    texture_options,
-                );
-
-                self.folder_placeholder_thumbnail_failures.remove(&decoded.path);
-                self.folder_placeholder_stamp_cache.insert(
-                    decoded.path.clone(),
-                    CachedPathStamp {
-                        stamp: Some(decoded.stamp),
-                        checked_at: Instant::now(),
-                    },
-                );
-                self.modal_thumbnail_cache.insert(
-                    decoded.path,
-                    ModalThumbnailTexture {
-                        texture,
-                        width: decoded.width,
-                        height: decoded.height,
-                        stamp: decoded.stamp,
-                    },
-                );
-                uploaded_any = true;
-            }
-        }
-
-        if uploaded_any
-            || !self.folder_placeholder_thumbnail_pending.is_empty()
-            || !self.folder_placeholder_thumbnail_mailbox.is_empty()
-        {
+        if uploaded_any || !self.folder_placeholder_thumbnail_pending.is_empty() {
             ctx.request_repaint_after(Duration::from_millis(16));
         }
     }
