@@ -2993,10 +2993,15 @@ impl ImageViewer {
             return false;
         }
 
-        if let (Some(path), Some(folder_key)) = (preferred_path.as_ref(), snapshot.folder_key.as_ref()) {
-            if !self.is_folder_navigation_entry_path(path.as_path())
-                && path.parent() != Some(folder_key.as_path())
-            {
+        let snapshot_folder_key = snapshot.folder_key.clone().or_else(|| {
+            snapshot
+                .current_path
+                .as_ref()
+                .and_then(|path| path.parent().map(Path::to_path_buf))
+        });
+
+        if let (Some(path), Some(folder_key)) = (preferred_path.as_ref(), snapshot_folder_key.as_ref()) {
+            if path.parent() != Some(folder_key.as_path()) {
                 return false;
             }
         }
