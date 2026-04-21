@@ -7810,7 +7810,7 @@ impl ImageViewer {
     }
 
     fn request_folder_placeholder_thumbnail_load(&mut self, path: &PathBuf) -> bool {
-        const MAX_IN_FLIGHT_THUMBNAIL_LOADS: usize = 2;
+        const MAX_IN_FLIGHT_THUMBNAIL_LOADS: usize = 1;
 
         if self.try_get_cached_modal_thumbnail_texture(path).is_some() {
             return false;
