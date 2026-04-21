@@ -261,6 +261,7 @@ impl MangaLoader {
         // Spawn a lightweight dimension probe worker.
         // This keeps header-based size probes off the UI thread.
         let shutdown_clone = Arc::clone(&shutdown);
+        let generation_clone = Arc::clone(&generation);
         crate::async_runtime::spawn_blocking_or_thread("manga-dimension-worker", move || {
             while !shutdown_clone.load(Ordering::Acquire) {
                 let req = loop {
@@ -294,6 +295,12 @@ impl MangaLoader {
                 let Some(req) = req else {
                     break;
                 };
+
+                // Drop stale generation requests immediately so folder switches do not keep
+                // the dimension worker busy with obsolete probes.
+                if req.generation != generation_clone.load(Ordering::Acquire) {
+                    continue;
+                }
 
                 let mut out: Vec<(usize, u32, u32, MangaMediaType)> = req
                     .items
@@ -333,6 +340,11 @@ impl MangaLoader {
                 out.par_sort_unstable_by_key(|(idx, _, _, _)| *idx);
 
                 for chunk in out.chunks(DIM_RESULT_CHUNK_SIZE) {
+                    // Generation may advance while probing; avoid pushing obsolete results.
+                    if req.generation != generation_clone.load(Ordering::Acquire) {
+                        break;
+                    }
+
                     if dim_result_tx
                         .send(DimResult {
                             generation: req.generation,
@@ -567,9 +579,6 @@ impl MangaLoader {
 
             // Drop stale results (e.g., after cancel/clear).
             if res.generation != self.current_generation {
-                for (idx, _w, _h, _mt) in res.items {
-                    self.dim_pending.remove(&idx);
-                }
                 continue;
             }
 
