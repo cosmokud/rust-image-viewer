@@ -1770,6 +1770,12 @@ struct FileStamp {
     modified_nanos: u32,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct CachedPathStamp {
+    stamp: Option<FileStamp>,
+    checked_at: Instant,
+}
+
 #[derive(Clone)]
 struct CachedDecodedImage {
     stamp: FileStamp,
@@ -1918,6 +1924,8 @@ struct ImageViewer {
         crossbeam_channel::Sender<FolderPlaceholderThumbnailLoadResult>,
     /// Cached per-folder media picks for folder placeholders (max 4 reverse-sorted by filename).
     folder_placeholder_thumbnail_cache: HashMap<PathBuf, FolderPlaceholderThumbnailSelection>,
+    /// Short-lived stamp cache to avoid per-frame metadata syscalls while drawing folder previews.
+    folder_placeholder_stamp_cache: HashMap<PathBuf, CachedPathStamp>,
     /// Rate limit for rescanning the current folder after external file moves/deletes.
     last_missing_media_refresh_check: Instant,
     /// Current zoom level (1.0 = 100%)
@@ -2475,6 +2483,7 @@ impl Default for ImageViewer {
             folder_placeholder_thumbnail_result_rx,
             folder_placeholder_thumbnail_result_tx,
             folder_placeholder_thumbnail_cache: HashMap::new(),
+            folder_placeholder_stamp_cache: HashMap::new(),
             last_missing_media_refresh_check: Instant::now(),
             zoom: 1.0,
             zoom_target: 1.0,
@@ -3273,6 +3282,7 @@ impl ImageViewer {
             .retain(|path| path.exists());
         self.folder_placeholder_thumbnail_failures
             .retain(|path, _| path.exists());
+        self.folder_placeholder_stamp_cache.clear();
 
         self.set_image_list_raw(files);
     }
@@ -3606,6 +3616,8 @@ impl ImageViewer {
         entry_path: &Path,
         max_count: usize,
     ) -> (Vec<PathBuf>, bool) {
+        const STAMP_CACHE_TTL: Duration = Duration::from_millis(450);
+
         let max_count = max_count.min(4);
         if max_count == 0 {
             return (Vec::new(), false);
@@ -3615,7 +3627,7 @@ impl ImageViewer {
             return (Vec::new(), false);
         };
 
-        let stamp = file_stamp_for_path(target_directory.as_path());
+        let stamp = self.cached_file_stamp(target_directory.as_path(), STAMP_CACHE_TTL);
         if let Some(cached) = self
             .folder_placeholder_thumbnail_cache
             .get(target_directory.as_path())
@@ -7758,11 +7770,32 @@ impl ImageViewer {
             .unwrap_or(192)
     }
 
+    fn cached_file_stamp(&mut self, path: &Path, ttl: Duration) -> Option<FileStamp> {
+        if let Some(cached) = self.folder_placeholder_stamp_cache.get(path) {
+            if cached.checked_at.elapsed() <= ttl {
+                return cached.stamp;
+            }
+        }
+
+        let stamp = file_stamp_for_path(path);
+        self.folder_placeholder_stamp_cache.insert(
+            path.to_path_buf(),
+            CachedPathStamp {
+                stamp,
+                checked_at: Instant::now(),
+            },
+        );
+
+        stamp
+    }
+
     fn try_get_cached_modal_thumbnail_texture(
         &mut self,
         path: &PathBuf,
     ) -> Option<(egui::TextureId, egui::Vec2)> {
-        let stamp = file_stamp_for_path(path.as_path())?;
+        const STAMP_CACHE_TTL: Duration = Duration::from_millis(450);
+
+        let stamp = self.cached_file_stamp(path.as_path(), STAMP_CACHE_TTL)?;
         if let Some(cached) = self.modal_thumbnail_cache.get(path) {
             if cached.stamp == stamp {
                 return Some((
@@ -7777,6 +7810,8 @@ impl ImageViewer {
     }
 
     fn request_folder_placeholder_thumbnail_load(&mut self, path: &PathBuf) -> bool {
+        const MAX_IN_FLIGHT_THUMBNAIL_LOADS: usize = 2;
+
         if self.try_get_cached_modal_thumbnail_texture(path).is_some() {
             return false;
         }
@@ -7791,6 +7826,10 @@ impl ImageViewer {
             .is_some_and(|failed_at| failed_at.elapsed() < Duration::from_secs(3))
         {
             return false;
+        }
+
+        if self.folder_placeholder_thumbnail_pending.len() >= MAX_IN_FLIGHT_THUMBNAIL_LOADS {
+            return true;
         }
 
         let target_side = self.modal_thumbnail_target_side();
@@ -7836,6 +7875,13 @@ impl ImageViewer {
                     media_paths,
                 } => {
                     self.folder_placeholder_preview_scan_pending.remove(&directory);
+                    self.folder_placeholder_stamp_cache.insert(
+                        directory.clone(),
+                        CachedPathStamp {
+                            stamp,
+                            checked_at: Instant::now(),
+                        },
+                    );
                     self.folder_placeholder_thumbnail_cache.insert(
                         directory,
                         FolderPlaceholderThumbnailSelection {
@@ -7856,7 +7902,7 @@ impl ImageViewer {
     }
 
     fn poll_pending_folder_placeholder_thumbnail_loads(&mut self, ctx: &egui::Context) {
-        const MAX_THUMBNAIL_RESULTS_PER_FRAME: usize = 8;
+        const MAX_THUMBNAIL_RESULTS_PER_FRAME: usize = 2;
 
         let mut uploaded_any = false;
         let mut processed = 0usize;
@@ -7916,6 +7962,13 @@ impl ImageViewer {
 
                     self.folder_placeholder_thumbnail_failures
                         .remove(&decoded.path);
+                    self.folder_placeholder_stamp_cache.insert(
+                        decoded.path.clone(),
+                        CachedPathStamp {
+                            stamp: Some(decoded.stamp),
+                            checked_at: Instant::now(),
+                        },
+                    );
                     self.modal_thumbnail_cache.insert(
                         decoded.path,
                         ModalThumbnailTexture {
