@@ -48,10 +48,12 @@ jobs:
           $tag = "nightly-$stamp-run$runNumber-$shortSha"
           $name = "Nightly Build $stamp (run $runNumber, $shortSha)"
           $msiName = "rust-image-viewer-$tag.msi"
+          $exeName = "rust-image-viewer-$tag-portable.exe"
 
           Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "tag=$tag"
           Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "name=$name"
           Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "msi_name=$msiName"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "exe_name=$exeName"
 
       - name: Install WiX Toolset v7
         shell: pwsh
@@ -75,19 +77,33 @@ jobs:
             -WorkspaceRoot "$PWD" `
             -OutputMsi $outputPath
 
+          # Write the MSI output so subsequent steps can reference it
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "msi_path=$outputPath"
+
+      - name: Copy portable exe with versioned name
+        id: portable_exe
+        shell: pwsh
+        run: |
+          $exePath = Join-Path $PWD "target\release\${{ steps.release_meta.outputs.exe_name }}"
+          Copy-Item "target\release\rust-image-viewer.exe" $exePath
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "exe_path=$exePath"
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: rust-image-viewer-${{ steps.release_meta.outputs.tag }}
-          path: ${{ steps.build_installer.outputs.msi_path }}
+          path: |
+            ${{ steps.build_installer.outputs.msi_path }}
+            ${{ steps.portable_exe.outputs.exe_path }}
 
       - name: Create nightly release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.release_meta.outputs.tag }}
-          name: ${{ steps.release_meta.outputs.name }}
-          prerelease: true
-          make_latest: true
-          generate_release_notes: true
-          fail_on_unmatched_files: true
-          files: ${{ steps.build_installer.outputs.msi_path }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ steps.release_meta.outputs.tag }}" `
+            "${{ steps.build_installer.outputs.msi_path }}" `
+            "${{ steps.portable_exe.outputs.exe_path }}" `
+            --title "${{ steps.release_meta.outputs.name }}" `
+            --prerelease `
+            --generate-notes
