@@ -2,6 +2,59 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.3.6] - 2026-04-23
+
+### Highlights
+
+- Added richer folder navigation and breadcrumb interaction with improved entry display, secondary-click support, and folder travel restoration for manga and masonry workflows.
+- Introduced masonry snapshot and preload resilience, including in-memory snapshot hydration, cached metadata preload, and stable dimension locking to preserve layout across mode switches.
+- Expanded folder placeholder browsing with preview thumbnail caching, generation-aware load requests, preview scan handling, and reduced thumbnail load concurrency for smoother directory browsing.
+- Improved video playback reliability with GPU texture reuse, stale dimension probing handling, and Windows COM/window-handle validation.
+- Streamlined startup and config maintenance by deferring directory work when cached data is available and normalizing `config.ini` automatically during idle-time maintenance.
+
+### Added
+
+- Folder navigation entry and enhanced media directory handling for folder and breadcrumb display.
+- Breadcrumb bar improvements with better display, interaction, and secondary-click support.
+- Manga/masonry-mode improvements: dimension locking, snapshot management, in-memory snapshot caching, and pending restore after metadata preload.
+- Folder placeholder preview thumbnail caching and improved preview media path collection.
+- Masonry preload focus-loss handling and background loading logic improvements.
+- Metadata cache enable/disable control and optimized cached path stamping for preview metadata access.
+
+### Changed
+
+- Optimized video texture handling by reusing GPU textures and improving bus message processing.
+- Reduced concurrent thumbnail loads to improve stability during heavy folder browsing.
+- Refined fast startup logic to defer directory work and improve cached image handling.
+- Normalized `config.ini` content and template ordering automatically during idle maintenance.
+- Refactored folder key retrieval and path validation, and improved stale dimension probing handling.
+
+### Fixed
+
+- Improved COM initialization handling and validated window handles in the Windows environment.
+- Dropped stale dimension probing requests and results to prevent outdated behavior.
+- Enhanced folder placeholder thumbnail request handling and preview scan state management.
+
+## [v0.3.5] - 2026-04-19
+
+### Highlights
+
+- Added a Windows installer with EULA, product icon, license metadata, and file associations for image and video formats.
+- Upgraded the installer toolchain to WiX Toolset v7 and streamlined installer build, packaging, and workflow integration.
+- Improved modifier-wheel panning by normalizing viewport movement for more consistent scrolling behavior.
+
+### Added
+
+- WiX installer build process with bundled GStreamer support.
+- Image and video file association support in the Windows installer.
+- EULA presentation, product icon, and license information in installer metadata.
+- Product version normalization and resolution functions for installer packaging.
+
+### Changed
+
+- Upgraded Windows packaging to WiX Toolset v7 and improved workflow integration.
+- Refined modifier-wheel panning logic with viewport normalization and explanatory comments.
+
 ## [v0.3.4] - 2026-04-02
 
 ### Highlights

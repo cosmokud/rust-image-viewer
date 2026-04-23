@@ -1611,7 +1611,6 @@ impl Config {
 
     /// Rewrites AppData `config.ini` into template order with comments and missing keys.
     ///
-    /// Also strips a legacy top-line semver header like `[0.3.5]` if present.
     pub fn sync_disk_file_with_template(&self) {
         let config_path = Self::config_path();
         let expected_content = self.render_ini_from_template();
