@@ -12,47 +12,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Download GStreamer from Mirror
-        uses: robinraju/release-downloader@v1.10
+      - name: Setup GStreamer
+        id: setup_gstreamer
+        uses: blinemedical/setup-gstreamer@v1.4.0
         with:
-          repository: cosmokud/rust-image-viewer
-          tag: ci-dependencies-v1
-          fileName: "gstreamer-1.0-msvc-x86_64-1.28.2.exe"
-
-      - name: Install GStreamer
-        shell: pwsh
-        run: |
-          Write-Host "Checking for downloaded files..."
-          Get-ChildItem -Filter "*.exe" | Select-Object Name
-
-          $gstExe = (Get-ChildItem -Filter "gstreamer-1.0-msvc-x86_64-1.28.2.exe" | Select-Object -First 1).FullName
-
-          if (-not $gstExe) {
-            Write-Error "ERROR: The GStreamer installer was not found. The download step likely failed."
-            exit 1
-          }
-
-          Write-Host "Unblocking file..."
-          Unblock-File -Path $gstExe
-
-          Write-Host "Installing $gstExe..."
-          $gstRoot = "C:\gstreamer\1.0\msvc_x86_64"
-          $process = Start-Process -FilePath $gstExe -ArgumentList "/S /D=$gstRoot" -Wait -PassThru -Verb RunAs
-          if ($process.ExitCode -ne 0) {
-            Write-Error "Installer failed with exit code $($process.ExitCode)"
-            exit 1
-          }
-
-          Write-Host "Verifying installation..."
-          if (-not (Test-Path "$gstRoot\bin")) {
-            Write-Error "ERROR: GStreamer bin directory not found after install. Installation may have silently failed."
-            exit 1
-          }
-
-          Write-Host "Setting up environment variables..."
-          "GSTREAMER_1_0_ROOT_MSVC_X86_64=$gstRoot" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "PKG_CONFIG_PATH=$gstRoot\lib\pkgconfig" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "$gstRoot\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+          version: "1.27.90"
+          arch: "x86_64"
+          msiUrl: https://gstreamer.freedesktop.org/data/pkg/windows/1.27.90/msvc/gstreamer-1.0-msvc-x86_64-1.27.90.msi
+          devMsiUrl: https://gstreamer.freedesktop.org/data/pkg/windows/1.27.90/msvc/gstreamer-1.0-devel-msvc-x86_64-1.27.90.msi
 
       - name: Install Rust (MSVC)
         uses: dtolnay/rust-toolchain@stable
@@ -120,7 +87,7 @@ jobs:
           tag_name: ${{ steps.release_meta.outputs.tag }}
           name: ${{ steps.release_meta.outputs.name }}
           prerelease: true
-          make_latest: true
+          make_latest: false
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: ${{ steps.build_installer.outputs.msi_path }}
