@@ -22,14 +22,28 @@ jobs:
       - name: Install GStreamer
         shell: pwsh
         run: |
-          # The files are already downloaded to the current directory!
+          Write-Host "Checking for downloaded files..."
+          Get-ChildItem -Filter "*.exe" | Select-Object Name
+
           $gstExe = Get-ChildItem -Filter "gstreamer-1.0-msvc*.exe" -Exclude "*devel*" | Select-Object -First 1 -ExpandProperty Name
           $gstDevExe = Get-ChildItem -Filter "gstreamer-1.0-devel*.exe" | Select-Object -First 1 -ExpandProperty Name
           
+          if (-not $gstExe -or -not $gstDevExe) {
+            Write-Error "ERROR: The GStreamer installers were not found. The download step likely failed."
+            exit 1
+          }
+
+          Write-Host "Unblocking files to bypass Windows security..."
+          Unblock-File -Path ".\$gstExe"
+          Unblock-File -Path ".\$gstDevExe"
+          
+          Write-Host "Installing $gstExe..."
           Start-Process -FilePath ".\$gstExe" -ArgumentList "/quiet" -Wait -NoNewWindow
+          
+          Write-Host "Installing $gstDevExe..."
           Start-Process -FilePath ".\$gstDevExe" -ArgumentList "/quiet" -Wait -NoNewWindow
           
-          # Setup environment
+          Write-Host "Setting up environment variables..."
           $gstRoot = "C:\gstreamer\1.0\msvc_x86_64"
           "GSTREAMER_1_0_ROOT_MSVC_X86_64=$gstRoot" | Out-File -FilePath $env:GITHUB_ENV -Append
           "PKG_CONFIG_PATH=$gstRoot\lib\pkgconfig" | Out-File -FilePath $env:GITHUB_ENV -Append
