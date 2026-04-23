@@ -35,11 +35,11 @@ jobs:
           Write-Host "Unblocking file..."
           Unblock-File -Path $gstExe
 
-          Write-Host "Installing $gstExe via msiexec..."
+          Write-Host "Installing $gstExe..."
           $gstRoot = "C:\gstreamer\1.0\msvc_x86_64"
-          $process = Start-Process "msiexec.exe" -ArgumentList "/i `"$gstExe`" /qn ADDLOCAL=ALL INSTALLDIR=`"$gstRoot`"" -Wait -PassThru -NoNewWindow
+          $process = Start-Process -FilePath $gstExe -ArgumentList "/S /D=$gstRoot" -Wait -PassThru -NoNewWindow
           if ($process.ExitCode -ne 0) {
-            Write-Error "msiexec failed with exit code $($process.ExitCode)"
+            Write-Error "Installer failed with exit code $($process.ExitCode)"
             exit 1
           }
 
