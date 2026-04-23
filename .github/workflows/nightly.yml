@@ -14,22 +14,28 @@ jobs:
 
       - name: Setup GStreamer manually
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          # Download directly from your GitHub repository release (bypasses bot protection)
-          $gstUrl = "https://github.com/cosmokud/rust-image-viewer/releases/download/ci-dependencies-v1/gstreamer-1.0-msvc-x86_64-1.28.2.exe"
-          $gstDevUrl = "https://github.com/cosmokud/rust-image-viewer/releases/download/ci-dependencies-v1/gstreamer-1.0-devel-msvc-x86_64-1.28.2.exe"
+          Write-Host "Downloading GStreamer from GitHub Release..."
+          
+          # Use the native GitHub CLI to pull all .exe files from that release
+          gh release download ci-dependencies-v1 --repo cosmokud/rust-image-viewer --pattern "*.exe"
+          
+          # Automatically find the exact filenames that were downloaded
+          $gstExe = Get-ChildItem -Filter "gstreamer-1.0-msvc*.exe" -Exclude "*devel*" | Select-Object -First 1 -ExpandProperty Name
+          $gstDevExe = Get-ChildItem -Filter "gstreamer-1.0-devel*.exe" | Select-Object -First 1 -ExpandProperty Name
+          
+          if (-not $gstExe -or -not $gstDevExe) {
+            Write-Error "Failed to download one or both GStreamer executables. Check your GitHub Release assets."
+            exit 1
+          }
 
-          Write-Host "Downloading GStreamer Runtime..."
-          Invoke-WebRequest -Uri $gstUrl -OutFile "gstreamer.exe"
+          Write-Host "Installing GStreamer Runtime ($gstExe)..."
+          Start-Process -FilePath ".\$gstExe" -ArgumentList "/quiet" -Wait -NoNewWindow
 
-          Write-Host "Downloading GStreamer Devel (Required for Rust build)..."
-          Invoke-WebRequest -Uri $gstDevUrl -OutFile "gstreamer-devel.exe"
-
-          Write-Host "Installing GStreamer Runtime..."
-          Start-Process -FilePath ".\gstreamer.exe" -ArgumentList "/quiet" -Wait -NoNewWindow
-
-          Write-Host "Installing GStreamer Devel..."
-          Start-Process -FilePath ".\gstreamer-devel.exe" -ArgumentList "/quiet" -Wait -NoNewWindow
+          Write-Host "Installing GStreamer Devel ($gstDevExe)..."
+          Start-Process -FilePath ".\$gstDevExe" -ArgumentList "/quiet" -Wait -NoNewWindow
 
           $gstRoot = "C:\gstreamer\1.0\msvc_x86_64"
           Write-Host "Setting up environment variables for Cargo/pkg-config..."
