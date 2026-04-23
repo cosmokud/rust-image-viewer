@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
@@ -49,6 +49,15 @@ static STATIC_THUMBNAIL_EVICTED: AtomicU64 = AtomicU64::new(0);
 static LAST_PRUNE_SECS: AtomicU64 = AtomicU64::new(0);
 static METADATA_CACHE_MAX_SIZE_BYTES: AtomicU64 =
     AtomicU64::new(METADATA_CACHE_DEFAULT_MAX_SIZE_BYTES);
+static METADATA_CACHE_ENABLED: AtomicBool = AtomicBool::new(false);
+
+fn metadata_cache_access_enabled() -> bool {
+    METADATA_CACHE_ENABLED.load(Ordering::Relaxed)
+}
+
+pub fn set_metadata_cache_enabled(enabled: bool) {
+    METADATA_CACHE_ENABLED.store(enabled, Ordering::Relaxed);
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MetadataCacheStats {
@@ -827,6 +836,10 @@ fn cache_write_loop(
 }
 
 pub fn lookup_cached_dimensions(path: &Path, expected_kind: CachedMediaKind) -> Option<(u32, u32)> {
+    if !metadata_cache_access_enabled() {
+        return None;
+    }
+
     let Some(cache) = global_cache_handle() else {
         DIMENSION_MISSES.fetch_add(1, Ordering::Relaxed);
         return None;
@@ -849,6 +862,10 @@ pub fn lookup_cached_dimensions_batch(
         return Vec::new();
     }
 
+    if !metadata_cache_access_enabled() {
+        return vec![None; items.len()];
+    }
+
     let Some(cache) = global_cache_handle() else {
         DIMENSION_MISSES.fetch_add(items.len() as u64, Ordering::Relaxed);
         return vec![None; items.len()];
@@ -868,6 +885,10 @@ pub fn lookup_cached_dimensions_batch(
 }
 
 pub fn store_cached_dimensions(path: &Path, media_kind: CachedMediaKind, width: u32, height: u32) {
+    if !metadata_cache_access_enabled() {
+        return;
+    }
+
     if let Some(tx) = cache_write_tx() {
         let op = CacheWriteOp::Dimensions {
             path: path.to_path_buf(),
@@ -891,6 +912,10 @@ pub fn lookup_cached_video_thumbnail(
     path: &Path,
     max_texture_side: u32,
 ) -> Option<CachedVideoThumbnail> {
+    if !metadata_cache_access_enabled() {
+        return None;
+    }
+
     let Some(cache) = global_cache_handle() else {
         THUMBNAIL_MISSES.fetch_add(1, Ordering::Relaxed);
         return None;
@@ -911,6 +936,10 @@ pub fn store_cached_video_thumbnail(
     max_texture_side: u32,
     thumbnail: &CachedVideoThumbnail,
 ) {
+    if !metadata_cache_access_enabled() {
+        return;
+    }
+
     if let Some(tx) = cache_write_tx() {
         let op = CacheWriteOp::VideoThumbnail {
             path: path.to_path_buf(),
@@ -933,6 +962,10 @@ pub fn lookup_cached_static_thumbnail(
     path: &Path,
     max_texture_side: u32,
 ) -> Option<CachedImageThumbnail> {
+    if !metadata_cache_access_enabled() {
+        return None;
+    }
+
     let Some(cache) = global_cache_handle() else {
         STATIC_THUMBNAIL_MISSES.fetch_add(1, Ordering::Relaxed);
         return None;
@@ -953,6 +986,10 @@ pub fn store_cached_static_thumbnail(
     max_texture_side: u32,
     thumbnail: &CachedImageThumbnail,
 ) {
+    if !metadata_cache_access_enabled() {
+        return;
+    }
+
     if let Some(tx) = cache_write_tx() {
         let op = CacheWriteOp::StaticThumbnail {
             path: path.to_path_buf(),
@@ -972,6 +1009,10 @@ pub fn store_cached_static_thumbnail(
 }
 
 pub fn metadata_cache_stats() -> MetadataCacheStats {
+    if !metadata_cache_access_enabled() {
+        return MetadataCacheStats::default();
+    }
+
     MetadataCacheStats {
         dimension_hits: DIMENSION_HITS.load(Ordering::Relaxed),
         dimension_misses: DIMENSION_MISSES.load(Ordering::Relaxed),

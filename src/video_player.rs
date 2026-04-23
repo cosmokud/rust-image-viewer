@@ -60,6 +60,12 @@ fn configure_gstreamer_env_windows() {
         if len == 0 {
             return None;
         }
+
+        // If len reaches buffer capacity, the path may be truncated.
+        if len as usize >= buf.len() {
+            return None;
+        }
+
         buf.truncate(len as usize);
         Some(PathBuf::from(String::from_utf16_lossy(&buf)))
     }
@@ -1021,8 +1027,15 @@ Ensure your GStreamer installation includes the playback elements (usually from 
 
     /// Check if video has ended
     pub fn is_eos(&self) -> bool {
+        const EOS_BUS_MESSAGES_PER_TICK: usize = 64;
+
         if let Some(bus) = self.pipeline.bus() {
-            while let Some(msg) = bus.pop() {
+            // Bound per-call bus draining so a large message burst cannot stall the UI thread.
+            for _ in 0..EOS_BUS_MESSAGES_PER_TICK {
+                let Some(msg) = bus.pop() else {
+                    break;
+                };
+
                 if let gst::MessageView::Eos(_) = msg.view() {
                     return true;
                 }

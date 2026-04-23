@@ -5,6 +5,7 @@
 
 mod async_runtime;
 mod config;
+mod folder_travel_cache;
 mod image_loader;
 mod manga_loader;
 mod manga_spatial;
@@ -26,9 +27,14 @@ use config::{
     Action, Config, InputBinding, MangaVirtualizationBackend, StartupWindowMode,
     VideoSeekPolicy,
 };
+use folder_travel_cache::{
+    lookup_folder_travel_position, store_folder_travel_position, FolderTravelLayoutMode,
+    FolderTravelPosition,
+};
 use hashbrown::{HashMap, HashSet};
 use image_loader::{
     get_media_in_directory, get_media_type, is_supported_video, probe_image_dimensions,
+    FOLDER_UP_ENTRY_NAME,
     ImageFrame, LoadedImage,
     MediaType,
 };
@@ -38,6 +44,7 @@ use media_index::{DirectoryScanResult, MediaDirectoryIndex};
 use metadata_cache::{
     configure_metadata_cache_size_limit, lookup_cached_dimensions,
     lookup_cached_static_thumbnail, lookup_cached_video_thumbnail, metadata_cache_stats,
+    set_metadata_cache_enabled,
     store_cached_dimensions, store_cached_static_thumbnail, store_cached_video_thumbnail,
     CachedImageThumbnail, CachedMediaKind, CachedVideoThumbnail,
 };
@@ -68,6 +75,7 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 #[cfg(target_os = "windows")]
 use windows::{
     core::PCWSTR,
+    Win32::Foundation::RPC_E_CHANGED_MODE,
     Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED},
     Win32::UI::Shell::{ILCreateFromPathW, ILFree, SHOpenFolderAndSelectItems},
 };
@@ -125,6 +133,39 @@ fn paint_loading_spinner(painter: &egui::Painter, rect: egui::Rect, time: f64) {
         egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200),
     );
     painter.add(egui::Shape::line(points.to_vec(), stroke));
+}
+
+fn paint_compact_loading_spinner(painter: &egui::Painter, rect: egui::Rect, time: f64) {
+    let center = rect.center();
+    let radius = (rect.width().min(rect.height()) * 0.18).clamp(4.0, 12.0);
+
+    painter.circle_stroke(
+        center,
+        radius,
+        egui::Stroke::new(
+            1.5,
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 50),
+        ),
+    );
+
+    let start_angle = (time * 5.2) as f32;
+    let sweep = std::f32::consts::PI * 1.25;
+    let segments = 18;
+    let points: SmallVec<[egui::Pos2; 24]> = (0..=segments)
+        .map(|i| {
+            let t = i as f32 / segments as f32;
+            let angle = start_angle + sweep * t;
+            center + radius * egui::vec2(angle.cos(), angle.sin())
+        })
+        .collect();
+
+    painter.add(egui::Shape::line(
+        points.to_vec(),
+        egui::Stroke::new(
+            2.0,
+            egui::Color32::from_rgba_unmultiplied(245, 245, 245, 220),
+        ),
+    ));
 }
 
 fn rotate_quad_point(center: egui::Pos2, local: egui::Vec2, angle_radians: f32) -> egui::Pos2 {
@@ -372,11 +413,17 @@ fn open_path_in_default_app(path: &std::path::Path) -> std::io::Result<()> {
 fn sh_open_folder_and_select_item(path: &Path) -> std::io::Result<()> {
     let mut should_uninitialize = false;
 
-    // Shell selection APIs are COM-based. If this call fails because COM is already
-    // initialized with another model on this thread, we still attempt the shell call.
+    // Shell selection APIs are COM-based. If COM is already initialized on this thread with
+    // another model, continue (RPC_E_CHANGED_MODE). For any other failure, abort early.
     unsafe {
-        if CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok() {
+        let hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        if hr.is_ok() {
             should_uninitialize = true;
+        } else if hr != RPC_E_CHANGED_MODE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("CoInitializeEx failed before shell selection: {hr:?}"),
+            ));
         }
     }
 
@@ -575,6 +622,13 @@ struct ModalThumbnailTexture {
     width: u32,
     height: u32,
     stamp: FileStamp,
+}
+
+#[derive(Clone, Debug)]
+struct FolderPlaceholderThumbnailSelection {
+    stamp: Option<FileStamp>,
+    media_paths: Vec<PathBuf>,
+    loading: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -781,6 +835,151 @@ struct PendingMasonrySoloReentry {
     items_per_row: usize,
 }
 
+#[derive(Clone, Default)]
+struct MasonryFolderMetadataSnapshot {
+    entries_by_path: HashMap<PathBuf, (u32, u32, MangaMediaType)>,
+    approx_bytes: u64,
+}
+
+#[derive(Default)]
+struct MasonryFolderMetadataRamCache {
+    entries_by_folder: HashMap<PathBuf, MasonryFolderMetadataSnapshot>,
+    lru_folders: VecDeque<PathBuf>,
+    total_bytes: u64,
+    max_bytes: u64,
+}
+
+#[derive(Clone, Default)]
+struct MasonryModeSessionSnapshot {
+    image_list: Vec<PathBuf>,
+    image_list_signature: u64,
+    current_index: usize,
+    current_path: Option<PathBuf>,
+    folder_key: Option<PathBuf>,
+    zoom: f32,
+    zoom_target: f32,
+    offset: egui::Vec2,
+    scroll_offset: f32,
+    scroll_target: f32,
+    layout_items: Vec<MasonryItemLayout>,
+    layout_total_height: f32,
+    layout_screen_x: f32,
+    layout_items_per_row: usize,
+    layout_len: usize,
+    layout_list_signature: u64,
+    layout_valid: bool,
+}
+
+impl MasonryFolderMetadataRamCache {
+    fn new(max_bytes: u64) -> Self {
+        Self {
+            entries_by_folder: HashMap::new(),
+            lru_folders: VecDeque::new(),
+            total_bytes: 0,
+            max_bytes,
+        }
+    }
+
+    fn set_max_bytes(&mut self, max_bytes: u64) {
+        self.max_bytes = max_bytes;
+        self.evict_if_needed();
+    }
+
+    fn approx_entry_bytes(path: &Path) -> u64 {
+        path.as_os_str()
+            .to_string_lossy()
+            .len()
+            .saturating_add(48) as u64
+    }
+
+    fn approx_snapshot_bytes(
+        folder: &Path,
+        entries_by_path: &HashMap<PathBuf, (u32, u32, MangaMediaType)>,
+    ) -> u64 {
+        let mut total = folder
+            .as_os_str()
+            .to_string_lossy()
+            .len()
+            .saturating_add(256) as u64;
+
+        for path in entries_by_path.keys() {
+            total = total.saturating_add(Self::approx_entry_bytes(path));
+        }
+
+        total
+    }
+
+    fn remove_folder_entry(&mut self, folder: &PathBuf) {
+        if let Some(previous) = self.entries_by_folder.remove(folder) {
+            self.total_bytes = self.total_bytes.saturating_sub(previous.approx_bytes);
+        }
+        self.lru_folders.retain(|candidate| candidate != folder);
+    }
+
+    fn touch_folder(&mut self, folder: &PathBuf) {
+        self.lru_folders.retain(|candidate| candidate != folder);
+        self.lru_folders.push_back(folder.clone());
+    }
+
+    fn insert_snapshot(
+        &mut self,
+        folder: PathBuf,
+        entries_by_path: HashMap<PathBuf, (u32, u32, MangaMediaType)>,
+    ) {
+        self.remove_folder_entry(&folder);
+
+        if self.max_bytes == 0 || entries_by_path.is_empty() {
+            return;
+        }
+
+        let approx_bytes = Self::approx_snapshot_bytes(folder.as_path(), &entries_by_path);
+        self.total_bytes = self.total_bytes.saturating_add(approx_bytes);
+        self.entries_by_folder.insert(
+            folder.clone(),
+            MasonryFolderMetadataSnapshot {
+                entries_by_path,
+                approx_bytes,
+            },
+        );
+        self.touch_folder(&folder);
+        self.evict_if_needed();
+    }
+
+    fn snapshot_for_folder(
+        &mut self,
+        folder: &Path,
+    ) -> Option<HashMap<PathBuf, (u32, u32, MangaMediaType)>> {
+        let key = folder.to_path_buf();
+        let snapshot = self
+            .entries_by_folder
+            .get(&key)
+            .map(|entry| entry.entries_by_path.clone())?;
+        self.touch_folder(&key);
+        Some(snapshot)
+    }
+
+    fn peek_entries_for_folder(
+        &self,
+        folder: &Path,
+    ) -> Option<&HashMap<PathBuf, (u32, u32, MangaMediaType)>> {
+        self.entries_by_folder
+            .get(&folder.to_path_buf())
+            .map(|snapshot| &snapshot.entries_by_path)
+    }
+
+    fn evict_if_needed(&mut self) {
+        while self.total_bytes > self.max_bytes {
+            let Some(oldest_folder) = self.lru_folders.pop_front() else {
+                break;
+            };
+
+            if let Some(removed) = self.entries_by_folder.remove(&oldest_folder) {
+                self.total_bytes = self.total_bytes.saturating_sub(removed.approx_bytes);
+            }
+        }
+    }
+}
+
 fn masonry_return_should_restore_saved_scroll(
     opened_index: usize,
     opened_list_signature: u64,
@@ -878,6 +1077,54 @@ struct AsyncImageLoad {
 struct PendingVideoThumbnailPlaceholder {
     path: PathBuf,
     thumbnail: CachedVideoThumbnail,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FolderPlaceholderThumbnailMediaKind {
+    StaticImage,
+    AnimatedImage,
+    Video,
+}
+
+#[derive(Clone, Debug)]
+struct FolderPlaceholderThumbnailDecoded {
+    path: PathBuf,
+    stamp: FileStamp,
+    pixels: Vec<u8>,
+    width: u32,
+    height: u32,
+    media_kind: FolderPlaceholderThumbnailMediaKind,
+}
+
+#[derive(Clone, Debug)]
+enum FolderPlaceholderThumbnailLoadResult {
+    Ready(FolderPlaceholderThumbnailDecoded),
+    Failed { path: PathBuf },
+}
+
+#[derive(Clone, Debug)]
+enum FolderPlaceholderPreviewScanResult {
+    Ready {
+        directory: PathBuf,
+        stamp: Option<FileStamp>,
+        media_paths: Vec<PathBuf>,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct FolderPlaceholderPreviewScanRequest {
+    directory: PathBuf,
+    max_count: usize,
+    priority: i64,
+}
+
+#[derive(Clone, Debug)]
+struct FolderPlaceholderThumbnailLoadRequest {
+    path: PathBuf,
+    max_texture_side: u32,
+    downscale_filter: FilterType,
+    gif_filter: FilterType,
+    priority: i64,
 }
 
 enum SoloProbeRequest {
@@ -1152,6 +1399,99 @@ fn process_solo_probe_request(request: SoloProbeRequest) -> SoloProbeResult {
     }
 }
 
+fn run_folder_placeholder_preview_scan_worker(
+    request_rx: crossbeam_channel::Receiver<FolderPlaceholderPreviewScanRequest>,
+    result_tx: crossbeam_channel::Sender<FolderPlaceholderPreviewScanResult>,
+) {
+    const MAX_BATCH: usize = 24;
+
+    let mut batch: Vec<FolderPlaceholderPreviewScanRequest> = Vec::with_capacity(MAX_BATCH);
+
+    loop {
+        let first = match request_rx.recv() {
+            Ok(req) => req,
+            Err(_) => return,
+        };
+
+        batch.clear();
+        batch.push(first);
+
+        while batch.len() < MAX_BATCH {
+            match request_rx.try_recv() {
+                Ok(req) => batch.push(req),
+                Err(crossbeam_channel::TryRecvError::Empty)
+                | Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+            }
+        }
+
+        batch.sort_by_key(|req| req.priority);
+
+        for req in batch.drain(..) {
+            let stamp = file_stamp_for_path(req.directory.as_path());
+            let media_paths = ImageViewer::collect_folder_placeholder_preview_media_paths(
+                req.directory.as_path(),
+                req.max_count,
+            );
+
+            if result_tx
+                .send(FolderPlaceholderPreviewScanResult::Ready {
+                    directory: req.directory,
+                    stamp,
+                    media_paths,
+                })
+                .is_err()
+            {
+                return;
+            }
+        }
+    }
+}
+
+fn run_folder_placeholder_thumbnail_load_worker(
+    request_rx: crossbeam_channel::Receiver<FolderPlaceholderThumbnailLoadRequest>,
+    result_tx: crossbeam_channel::Sender<FolderPlaceholderThumbnailLoadResult>,
+) {
+    const MAX_BATCH: usize = 24;
+
+    let mut batch: Vec<FolderPlaceholderThumbnailLoadRequest> = Vec::with_capacity(MAX_BATCH);
+
+    loop {
+        let first = match request_rx.recv() {
+            Ok(req) => req,
+            Err(_) => return,
+        };
+
+        batch.clear();
+        batch.push(first);
+
+        while batch.len() < MAX_BATCH {
+            match request_rx.try_recv() {
+                Ok(req) => batch.push(req),
+                Err(crossbeam_channel::TryRecvError::Empty)
+                | Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+            }
+        }
+
+        batch.sort_by_key(|req| req.priority);
+
+        for req in batch.drain(..) {
+            let path = req.path;
+            let result = load_folder_placeholder_thumbnail(
+                path.as_path(),
+                req.max_texture_side,
+                req.downscale_filter,
+                req.gif_filter,
+            )
+            .map(FolderPlaceholderThumbnailLoadResult::Ready)
+            .unwrap_or(FolderPlaceholderThumbnailLoadResult::Failed { path });
+
+            if result_tx.send(result).is_err() {
+                return;
+            }
+        }
+    }
+}
+
 fn load_solo_probe_image(
     path: &Path,
     max_texture_side: u32,
@@ -1375,6 +1715,55 @@ fn extract_video_first_frame_thumbnail(
     Some(thumbnail)
 }
 
+fn load_folder_placeholder_thumbnail(
+    path: &Path,
+    max_texture_side: u32,
+    downscale_filter: FilterType,
+    gif_filter: FilterType,
+) -> Option<FolderPlaceholderThumbnailDecoded> {
+    let stamp = file_stamp_for_path(path)?;
+    let media_type = get_media_type(path)?;
+
+    match media_type {
+        MediaType::Image => {
+            let animated_by_ext = path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| matches!(ext.to_ascii_lowercase().as_str(), "gif" | "webp"))
+                .unwrap_or(false);
+
+            let cached =
+                load_solo_probe_image(path, max_texture_side, downscale_filter, gif_filter)?;
+            let frame = cached.first_frame;
+            let media_kind = if animated_by_ext || cached.is_animated_webp || frame.delay_ms > 0 {
+                FolderPlaceholderThumbnailMediaKind::AnimatedImage
+            } else {
+                FolderPlaceholderThumbnailMediaKind::StaticImage
+            };
+
+            Some(FolderPlaceholderThumbnailDecoded {
+                path: path.to_path_buf(),
+                stamp,
+                pixels: frame.pixels,
+                width: frame.width,
+                height: frame.height,
+                media_kind,
+            })
+        }
+        MediaType::Video => {
+            let thumbnail = extract_video_first_frame_thumbnail(path, max_texture_side)?;
+            Some(FolderPlaceholderThumbnailDecoded {
+                path: path.to_path_buf(),
+                stamp,
+                pixels: thumbnail.pixels,
+                width: thumbnail.width,
+                height: thumbnail.height,
+                media_kind: FolderPlaceholderThumbnailMediaKind::Video,
+            })
+        }
+    }
+}
+
 struct MangaFocusedVideoLoadRequest {
     request_id: u64,
     index: usize,
@@ -1488,6 +1877,12 @@ struct FileStamp {
     size_bytes: u64,
     modified_secs: u64,
     modified_nanos: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CachedPathStamp {
+    stamp: Option<FileStamp>,
+    checked_at: Instant,
 }
 
 #[derive(Clone)]
@@ -1618,6 +2013,32 @@ struct ImageViewer {
     shortcuts_help_modal_skip_outside_click_once: bool,
     /// Cached thumbnail textures used by delete/rename dialogs.
     modal_thumbnail_cache: HashMap<PathBuf, ModalThumbnailTexture>,
+    /// Background folder scan jobs currently in-flight for placeholder media candidate selection.
+    folder_placeholder_preview_scan_pending: HashSet<PathBuf>,
+    /// Request channel for queued folder-preview media scans.
+    folder_placeholder_preview_scan_request_tx:
+        crossbeam_channel::Sender<FolderPlaceholderPreviewScanRequest>,
+    /// Worker-thread completion channel for folder-preview media path scans.
+    folder_placeholder_preview_scan_result_rx:
+        crossbeam_channel::Receiver<FolderPlaceholderPreviewScanResult>,
+    /// Background decode jobs currently in-flight for folder-placeholder thumbnails.
+    folder_placeholder_thumbnail_pending: HashSet<PathBuf>,
+    /// Recently failed folder-placeholder thumbnail loads (for retry backoff).
+    folder_placeholder_thumbnail_failures: HashMap<PathBuf, Instant>,
+    /// Request channel for queued folder-placeholder thumbnail decode work.
+    folder_placeholder_thumbnail_request_tx:
+        crossbeam_channel::Sender<FolderPlaceholderThumbnailLoadRequest>,
+    /// Worker-thread completion channel for folder-placeholder thumbnails.
+    folder_placeholder_thumbnail_result_rx:
+        crossbeam_channel::Receiver<FolderPlaceholderThumbnailLoadResult>,
+    /// Cached per-folder media picks for folder placeholders (max 4 reverse-sorted by filename).
+    folder_placeholder_thumbnail_cache: HashMap<PathBuf, FolderPlaceholderThumbnailSelection>,
+    /// Monotonic priority seed for folder-preview scan request ordering.
+    folder_placeholder_preview_request_priority_seed: i64,
+    /// Monotonic priority seed for folder-thumbnail decode request ordering.
+    folder_placeholder_thumbnail_request_priority_seed: i64,
+    /// Short-lived stamp cache to avoid per-frame metadata syscalls while drawing folder previews.
+    folder_placeholder_stamp_cache: HashMap<PathBuf, CachedPathStamp>,
     /// Rate limit for rescanning the current folder after external file moves/deletes.
     last_missing_media_refresh_check: Instant,
     /// Current zoom level (1.0 = 100%)
@@ -1650,10 +2071,14 @@ struct ImageViewer {
     last_pointer_activity_at: Instant,
     /// Configuration
     config: Config,
+    /// One-shot deferred AppData config.ini normalization for fast startup.
+    pending_idle_config_sync: bool,
     /// Whether we're in fullscreen mode
     is_fullscreen: bool,
     /// Whether to show the control bar
     show_controls: bool,
+    /// Whether to show the breadcrumb address bar under the title bar.
+    show_breadcrumb_bar: bool,
     /// Time when controls were last shown
     controls_show_time: Instant,
     /// Error message to display
@@ -1868,6 +2293,11 @@ struct ImageViewer {
     pending_masonry_solo_reentry: Option<PendingMasonrySoloReentry>,
     /// Saved masonry viewport state while temporarily opening a single item fullscreen.
     strip_return_masonry_state: Option<MasonryReturnState>,
+    /// Exact masonry image-list snapshot captured when entering solo fullscreen from masonry.
+    /// Restored from RAM before fullscreen -> masonry return so cached layout signatures still match.
+    strip_return_masonry_list_snapshot: Option<Vec<PathBuf>>,
+    /// Full masonry mode session snapshot used to preserve layout across temporary mode switches.
+    masonry_mode_session_snapshot: Option<MasonryModeSessionSnapshot>,
     /// True while solo fullscreen is keeping masonry caches alive for potential middle-click return.
     strip_return_preserve_masonry_cache: bool,
     /// Image-list signature whose masonry runtime cache must stay resident across mode switches.
@@ -1901,6 +2331,14 @@ struct ImageViewer {
     manga_loader: Option<MangaLoader>,
     /// Signature of the image list currently represented by `manga_loader.dimension_cache`.
     manga_dimension_cache_list_signature: u64,
+    /// In-memory per-folder masonry metadata snapshots (path -> dimensions/media kind),
+    /// kept across folder switches until process exit under a global RAM cap.
+    masonry_folder_metadata_ram_cache: MasonryFolderMetadataRamCache,
+    /// When non-zero and equal to `image_list_signature`, masonry dimension updates from
+    /// async probes/decodes are ignored to keep layout geometry stable.
+    masonry_authoritative_dimension_signature: u64,
+    /// Folder key backing the active authoritative masonry-dimension snapshot.
+    masonry_authoritative_dimension_folder: Option<PathBuf>,
     /// LRU texture cache for manga mode
     manga_texture_cache: MangaTextureCache,
     /// Decoded-image mailbox drained on the UI thread so visible uploads can win over speculative ones.
@@ -1968,6 +2406,8 @@ struct ImageViewer {
     masonry_metadata_preload_cursor: usize,
     /// Item to restore once startup metadata warmup finishes rebuilding the masonry layout.
     masonry_metadata_preload_restore_index: Option<usize>,
+    /// Deferred folder-travel restore payload applied after masonry metadata warmup completes.
+    pending_masonry_folder_travel_restore: Option<(usize, f32)>,
     /// True if masonry was actively scrolling/panning/zooming on the previous frame.
     masonry_navigation_was_active: bool,
     /// Earliest time when a post-navigation visible-quality refinement pass may begin.
@@ -2098,7 +2538,50 @@ struct ImageViewer {
 impl Default for ImageViewer {
     fn default() -> Self {
         let config = Config::load();
+        let (
+            folder_placeholder_preview_scan_request_tx,
+            folder_placeholder_preview_scan_request_rx,
+        ) = crossbeam_channel::bounded::<FolderPlaceholderPreviewScanRequest>(256);
+        let (
+            folder_placeholder_preview_scan_result_tx,
+            folder_placeholder_preview_scan_result_rx,
+        ) = crossbeam_channel::bounded::<FolderPlaceholderPreviewScanResult>(128);
+        let (
+            folder_placeholder_thumbnail_request_tx,
+            folder_placeholder_thumbnail_request_rx,
+        ) = crossbeam_channel::bounded::<FolderPlaceholderThumbnailLoadRequest>(256);
+        let folder_placeholder_thumbnail_worker_count =
+            std::thread::available_parallelism().map_or(2usize, |count| {
+                count.get().clamp(2, 4)
+            });
+        let (folder_placeholder_thumbnail_result_tx, folder_placeholder_thumbnail_result_rx) =
+            crossbeam_channel::bounded::<FolderPlaceholderThumbnailLoadResult>(128);
+
+        crate::async_runtime::spawn_blocking_or_thread(
+            "folder-placeholder-preview-worker",
+            move || {
+                run_folder_placeholder_preview_scan_worker(
+                    folder_placeholder_preview_scan_request_rx,
+                    folder_placeholder_preview_scan_result_tx,
+                );
+            },
+        );
+
+        for worker_idx in 0..folder_placeholder_thumbnail_worker_count {
+            let request_rx = folder_placeholder_thumbnail_request_rx.clone();
+            let result_tx = folder_placeholder_thumbnail_result_tx.clone();
+            crate::async_runtime::spawn_blocking_or_thread(
+                &format!("folder-placeholder-thumbnail-worker-{}", worker_idx),
+                move || {
+                    run_folder_placeholder_thumbnail_load_worker(request_rx, result_tx);
+                },
+            );
+        }
+
         let masonry_items_per_row = config.masonry_items_per_row.clamp(2, 10);
+        let masonry_metadata_ram_cache_max_bytes = config
+            .masonry_metadata_ram_cache_limit_mb
+            .saturating_mul(1024 * 1024);
 
         Self {
             image: None,
@@ -2139,6 +2622,17 @@ impl Default for ImageViewer {
             shortcuts_help_modal_open: false,
             shortcuts_help_modal_skip_outside_click_once: false,
             modal_thumbnail_cache: HashMap::new(),
+            folder_placeholder_preview_scan_pending: HashSet::new(),
+            folder_placeholder_preview_scan_request_tx,
+            folder_placeholder_preview_scan_result_rx,
+            folder_placeholder_thumbnail_pending: HashSet::new(),
+            folder_placeholder_thumbnail_failures: HashMap::new(),
+            folder_placeholder_thumbnail_request_tx,
+            folder_placeholder_thumbnail_result_rx,
+            folder_placeholder_thumbnail_cache: HashMap::new(),
+            folder_placeholder_preview_request_priority_seed: 0,
+            folder_placeholder_thumbnail_request_priority_seed: 0,
+            folder_placeholder_stamp_cache: HashMap::new(),
             last_missing_media_refresh_check: Instant::now(),
             zoom: 1.0,
             zoom_target: 1.0,
@@ -2155,8 +2649,10 @@ impl Default for ImageViewer {
             last_pointer_hover_pos: None,
             last_pointer_activity_at: Instant::now(),
             config,
+            pending_idle_config_sync: true,
             is_fullscreen: false,
             show_controls: false,
+            show_breadcrumb_bar: true,
             controls_show_time: Instant::now(),
             error_message: None,
             image_changed: false,
@@ -2253,6 +2749,8 @@ impl Default for ImageViewer {
             titlebar_pending_restore_layout: None,
             pending_masonry_solo_reentry: None,
             strip_return_masonry_state: None,
+            strip_return_masonry_list_snapshot: None,
+            masonry_mode_session_snapshot: None,
             strip_return_preserve_masonry_cache: false,
             masonry_runtime_cache_signature: 0,
             masonry_items_per_row,
@@ -2269,6 +2767,11 @@ impl Default for ImageViewer {
             manga_wheel_scroll_active: false,
             manga_loader: None,
             manga_dimension_cache_list_signature: 0,
+            masonry_folder_metadata_ram_cache: MasonryFolderMetadataRamCache::new(
+                masonry_metadata_ram_cache_max_bytes,
+            ),
+            masonry_authoritative_dimension_signature: 0,
+            masonry_authoritative_dimension_folder: None,
             manga_texture_cache: MangaTextureCache::default(),
             manga_decoded_mailbox: Vec::new(),
             manga_scrollbar_dragging: false,
@@ -2305,6 +2808,7 @@ impl Default for ImageViewer {
             masonry_metadata_preload_loaded: 0,
             masonry_metadata_preload_cursor: 0,
             masonry_metadata_preload_restore_index: None,
+            pending_masonry_folder_travel_restore: None,
             masonry_navigation_was_active: false,
             masonry_quality_refine_due_at: None,
             masonry_quality_refine_frames_remaining: 0,
@@ -2371,6 +2875,9 @@ impl Default for ImageViewer {
 }
 
 impl ImageViewer {
+    const TITLE_BAR_HEIGHT: f32 = 32.0;
+    const BREADCRUMB_BAR_HEIGHT: f32 = 30.0;
+    const TOP_CONTROLS_HOTZONE_EXTRA: f32 = 18.0;
     const BOTTOM_RIGHT_OVERLAY_MARGIN: f32 = 16.0;
     const BOTTOM_RIGHT_OVERLAY_SCROLLBAR_PADDING: f32 = 35.0;
     const MANGA_HUD_PANEL_WIDTH: f32 = 224.0;
@@ -2409,6 +2916,23 @@ impl ImageViewer {
     const FPS_OVERLAY_ACTIVE_POLL_MS: u64 = 120;
     const FPS_IDLE_RESET_AFTER_MS: u64 = 350;
 
+    fn folder_navigation_ui_enabled(&self) -> bool {
+        self.manga_mode && self.is_fullscreen
+    }
+
+    fn top_controls_visible_height(&self) -> f32 {
+        Self::TITLE_BAR_HEIGHT
+            + if self.folder_navigation_ui_enabled() && self.show_breadcrumb_bar {
+                Self::BREADCRUMB_BAR_HEIGHT
+            } else {
+                0.0
+            }
+    }
+
+    fn top_controls_hotzone_height(&self) -> f32 {
+        self.top_controls_visible_height() + Self::TOP_CONTROLS_HOTZONE_EXTRA
+    }
+
     fn set_current_index_clamped(&mut self, index: usize) {
         if self.image_list.is_empty() {
             self.current_index = 0;
@@ -2426,6 +2950,404 @@ impl ImageViewer {
             path.hash(&mut hasher);
         }
         hasher.finish()
+    }
+
+    fn masonry_metadata_ram_cache_limit_bytes(&self) -> u64 {
+        self.config
+            .masonry_metadata_ram_cache_limit_mb
+            .saturating_mul(1024 * 1024)
+    }
+
+    fn clear_masonry_authoritative_dimension_lock(&mut self) {
+        self.masonry_authoritative_dimension_signature = 0;
+        self.masonry_authoritative_dimension_folder = None;
+    }
+
+    fn defer_directory_work_for_fast_startup(&self) -> bool {
+        if self.config.startup_window_mode != StartupWindowMode::Floating
+            || self.manga_mode
+            || self.image_list.len() > 1
+        {
+            return false;
+        }
+
+        match self.current_media_type {
+            Some(MediaType::Image) => self.image.is_none() && self.error_message.is_none(),
+            Some(MediaType::Video) => {
+                self.video_texture.is_none() && !self.is_video_playback_unavailable_active()
+            }
+            None => false,
+        }
+    }
+
+    fn run_idle_config_sync_if_needed(&mut self) {
+        if !self.pending_idle_config_sync || !self.is_idle {
+            return;
+        }
+
+        self.pending_idle_config_sync = false;
+        self.config.sync_disk_file_with_template();
+    }
+
+    fn masonry_authoritative_dimension_lock_active(&self) -> bool {
+        self.is_masonry_mode()
+            && self.masonry_authoritative_dimension_signature != 0
+            && self.masonry_authoritative_dimension_signature == self.image_list_signature
+            && self.masonry_authoritative_dimension_folder.is_some()
+    }
+
+    fn current_masonry_metadata_folder_key(&self) -> Option<PathBuf> {
+        self.current_media_path()
+            .filter(|path| !self.is_folder_navigation_entry_path(path.as_path()))
+            .and_then(|path| path.parent().map(Path::to_path_buf))
+            .or_else(|| {
+                self.image_list
+                    .iter()
+                    .find(|path| !self.is_folder_navigation_entry_path(path.as_path()))
+                    .and_then(|path| path.parent().map(Path::to_path_buf))
+            })
+    }
+
+    fn collect_current_masonry_folder_metadata_snapshot(
+        &self,
+    ) -> Option<(PathBuf, HashMap<PathBuf, (u32, u32, MangaMediaType)>)> {
+        let folder = self.current_masonry_metadata_folder_key()?;
+        let loader = self.manga_loader.as_ref()?;
+
+        let mut entries_by_path: HashMap<PathBuf, (u32, u32, MangaMediaType)> = HashMap::new();
+
+        for (idx, path) in self.image_list.iter().enumerate() {
+            if self.is_folder_navigation_entry_path(path.as_path()) {
+                continue;
+            }
+
+            if path.parent() != Some(folder.as_path()) {
+                continue;
+            }
+
+            let Some((width, height, media_type)) = loader.dimension_cache.get(&idx).copied() else {
+                continue;
+            };
+
+            if width == 0 || height == 0 {
+                continue;
+            }
+
+            entries_by_path.insert(path.clone(), (width, height, media_type));
+        }
+
+        if entries_by_path.is_empty() {
+            None
+        } else {
+            Some((folder, entries_by_path))
+        }
+    }
+
+    fn persist_current_masonry_folder_metadata_snapshot(&mut self) {
+        self.masonry_folder_metadata_ram_cache
+            .set_max_bytes(self.masonry_metadata_ram_cache_limit_bytes());
+
+        let Some((folder, entries_by_path)) = self.collect_current_masonry_folder_metadata_snapshot()
+        else {
+            return;
+        };
+
+        self.masonry_folder_metadata_ram_cache
+            .insert_snapshot(folder, entries_by_path);
+    }
+
+    fn restore_masonry_folder_metadata_snapshot(&mut self) -> usize {
+        self.masonry_folder_metadata_ram_cache
+            .set_max_bytes(self.masonry_metadata_ram_cache_limit_bytes());
+        self.clear_masonry_authoritative_dimension_lock();
+
+        let Some(folder) = self.current_masonry_metadata_folder_key() else {
+            return 0;
+        };
+
+        let Some(entries_by_path) = self
+            .masonry_folder_metadata_ram_cache
+            .snapshot_for_folder(folder.as_path())
+        else {
+            return 0;
+        };
+
+        let mut restored_entries: Vec<(usize, (u32, u32, MangaMediaType))> = Vec::new();
+        for (idx, path) in self.image_list.iter().enumerate() {
+            if self.is_folder_navigation_entry_path(path.as_path()) {
+                continue;
+            }
+
+            if let Some(dims) = entries_by_path.get(path).copied() {
+                restored_entries.push((idx, dims));
+            }
+        }
+
+        if restored_entries.is_empty() {
+            return 0;
+        }
+
+        let Some(loader) = self.manga_loader.as_mut() else {
+            return 0;
+        };
+
+        for (idx, dims) in &restored_entries {
+            loader.dimension_cache.insert(*idx, *dims);
+        }
+
+        let total_non_folder_entries = self
+            .image_list
+            .iter()
+            .filter(|path| !self.is_folder_navigation_entry_path(path.as_path()))
+            .count();
+
+        if total_non_folder_entries > 0 && restored_entries.len() >= total_non_folder_entries {
+            self.masonry_authoritative_dimension_signature = self.image_list_signature;
+            self.masonry_authoritative_dimension_folder = Some(folder);
+        }
+
+        self.manga_dimension_cache_list_signature = self.image_list_signature;
+        if self.manga_layout_mode == MangaLayoutMode::Masonry {
+            self.mark_masonry_runtime_cache_resident();
+        }
+
+        restored_entries.len()
+    }
+
+    fn capture_masonry_mode_session_snapshot(&mut self) {
+        if !self.is_masonry_mode() || self.image_list.is_empty() {
+            return;
+        }
+
+        self.masonry_ensure_layout_cache();
+
+        self.masonry_mode_session_snapshot = Some(MasonryModeSessionSnapshot {
+            image_list: self.image_list.clone(),
+            image_list_signature: self.image_list_signature,
+            current_index: self.current_index.min(self.image_list.len().saturating_sub(1)),
+            current_path: self.current_media_path(),
+            folder_key: self.current_masonry_metadata_folder_key(),
+            zoom: self.zoom,
+            zoom_target: self.zoom_target,
+            offset: self.offset,
+            scroll_offset: self.manga_scroll_offset,
+            scroll_target: self.manga_scroll_target,
+            layout_items: self.masonry_layout_items.clone(),
+            layout_total_height: self.masonry_layout_total_height,
+            layout_screen_x: self.masonry_layout_screen_x,
+            layout_items_per_row: self.masonry_layout_items_per_row,
+            layout_len: self.masonry_layout_len,
+            layout_list_signature: self.masonry_layout_list_signature,
+            layout_valid: self.masonry_layout_valid,
+        });
+    }
+
+    fn try_restore_masonry_mode_session_snapshot(&mut self, preferred_path: Option<PathBuf>) -> bool {
+        let Some(snapshot) = self.masonry_mode_session_snapshot.clone() else {
+            return false;
+        };
+
+        if snapshot.image_list.is_empty() {
+            return false;
+        }
+
+        let snapshot_folder_key = snapshot.folder_key.clone().or_else(|| {
+            snapshot
+                .current_path
+                .as_ref()
+                .and_then(|path| path.parent().map(Path::to_path_buf))
+        });
+
+        if let (Some(path), Some(folder_key)) = (preferred_path.as_ref(), snapshot_folder_key.as_ref()) {
+            if path.parent() != Some(folder_key.as_path()) {
+                return false;
+            }
+        }
+
+        self.set_image_list_raw(snapshot.image_list.clone());
+
+        let restore_path = preferred_path
+            .and_then(|path| {
+                if self.is_folder_navigation_entry_path(path.as_path()) {
+                    None
+                } else {
+                    Some(path)
+                }
+            })
+            .or(snapshot.current_path.clone());
+
+        if let Some(path) = restore_path {
+            if let Some(index) = self.image_list.iter().position(|candidate| candidate == &path) {
+                self.set_current_index_clamped(index);
+            } else {
+                self.set_current_index_clamped(
+                    snapshot
+                        .current_index
+                        .min(self.image_list.len().saturating_sub(1)),
+                );
+            }
+        } else {
+            self.set_current_index_clamped(
+                snapshot
+                    .current_index
+                    .min(self.image_list.len().saturating_sub(1)),
+            );
+        }
+
+        let compatible_layout = snapshot.layout_valid
+            && snapshot.image_list_signature == self.image_list_signature
+            && snapshot.layout_list_signature == self.image_list_signature
+            && snapshot.layout_len == self.image_list.len()
+            && snapshot.layout_items.len() == self.image_list.len()
+            && snapshot.layout_items_per_row == self.masonry_items_per_row
+            && (snapshot.layout_screen_x - self.screen_size.x.round()).abs() <= 1.0;
+
+        if !compatible_layout {
+            return false;
+        }
+
+        self.masonry_layout_items = snapshot.layout_items;
+        self.masonry_layout_total_height = snapshot.layout_total_height;
+        self.masonry_layout_screen_x = snapshot.layout_screen_x;
+        self.masonry_layout_items_per_row = snapshot.layout_items_per_row;
+        self.masonry_layout_len = snapshot.layout_len;
+        self.masonry_layout_list_signature = self.image_list_signature;
+        self.masonry_layout_valid = true;
+        self.masonry_spatial_index = None;
+
+        self.zoom = self.clamp_zoom(snapshot.zoom);
+        self.zoom_target = self.clamp_zoom(snapshot.zoom_target);
+        self.zoom_velocity = 0.0;
+        self.offset = snapshot.offset;
+        self.manga_total_height_cache_valid = false;
+
+        let max_scroll = (self.manga_total_height() - self.screen_size.y).max(0.0);
+        self.manga_scroll_offset = snapshot.scroll_offset.clamp(0.0, max_scroll);
+        self.manga_scroll_target = snapshot.scroll_target.clamp(0.0, max_scroll);
+        self.manga_scroll_velocity = 0.0;
+        self.stop_manga_wheel_scroll();
+
+        self.manga_dimension_cache_list_signature = self.image_list_signature;
+        self.mark_masonry_runtime_cache_resident();
+        true
+    }
+
+    fn hydrate_masonry_dimensions_from_session_snapshot(&mut self) -> usize {
+        let Some(snapshot) = self.masonry_mode_session_snapshot.as_ref() else {
+            return 0;
+        };
+
+        if snapshot.image_list_signature != self.image_list_signature
+            || snapshot.layout_items.len() != self.image_list.len()
+        {
+            return 0;
+        }
+
+        let snapshot_folder_key = snapshot.folder_key.clone();
+        let mut restored_entries: Vec<(usize, (u32, u32, MangaMediaType))> = Vec::new();
+        let mut total_non_folder_entries = 0usize;
+
+        {
+            let loader = self.manga_loader.as_ref();
+
+            for (idx, path) in self.image_list.iter().enumerate() {
+                let Some(media_type_hint) = get_media_type(path) else {
+                    continue;
+                };
+                total_non_folder_entries = total_non_folder_entries.saturating_add(1);
+
+                let Some(item) = snapshot.layout_items.get(idx) else {
+                    continue;
+                };
+
+                if item.source_width == 0 || item.source_height == 0 {
+                    continue;
+                }
+
+                let media_type = loader
+                    .and_then(|loader| loader.dimension_cache.get(&idx).map(|(_, _, mt)| *mt))
+                    .unwrap_or(match media_type_hint {
+                        MediaType::Video => MangaMediaType::Video,
+                        MediaType::Image => MangaMediaType::StaticImage,
+                    });
+
+                restored_entries.push((idx, (item.source_width, item.source_height, media_type)));
+            }
+        }
+
+        if restored_entries.is_empty() {
+            return 0;
+        }
+
+        let Some(loader) = self.manga_loader.as_mut() else {
+            return 0;
+        };
+
+        for (idx, dims) in &restored_entries {
+            loader.dimension_cache.insert(*idx, *dims);
+        }
+
+        if total_non_folder_entries > 0 && restored_entries.len() >= total_non_folder_entries {
+            self.masonry_authoritative_dimension_signature = self.image_list_signature;
+            self.masonry_authoritative_dimension_folder = self
+                .current_masonry_metadata_folder_key()
+                .or(snapshot_folder_key);
+        }
+
+        self.manga_dimension_cache_list_signature = self.image_list_signature;
+        restored_entries.len()
+    }
+
+    fn sync_masonry_authoritative_dimensions(&mut self) -> usize {
+        if !self.masonry_authoritative_dimension_lock_active() {
+            return 0;
+        }
+
+        let Some(folder) = self.masonry_authoritative_dimension_folder.clone() else {
+            self.clear_masonry_authoritative_dimension_lock();
+            return 0;
+        };
+
+        let Some(entries_by_path) = self
+            .masonry_folder_metadata_ram_cache
+            .peek_entries_for_folder(folder.as_path())
+        else {
+            self.clear_masonry_authoritative_dimension_lock();
+            return 0;
+        };
+
+        let Some(loader) = self.manga_loader.as_ref() else {
+            return 0;
+        };
+
+        let mut corrections: Vec<(usize, (u32, u32, MangaMediaType))> = Vec::new();
+        for (idx, path) in self.image_list.iter().enumerate() {
+            if self.is_folder_navigation_entry_path(path.as_path()) {
+                continue;
+            }
+
+            let Some(snapshot_dims) = entries_by_path.get(path).copied() else {
+                continue;
+            };
+
+            if loader.dimension_cache.get(&idx).copied() != Some(snapshot_dims) {
+                corrections.push((idx, snapshot_dims));
+            }
+        }
+
+        if corrections.is_empty() {
+            return 0;
+        }
+
+        let Some(loader) = self.manga_loader.as_mut() else {
+            return 0;
+        };
+
+        for (idx, dims) in &corrections {
+            loader.dimension_cache.insert(*idx, *dims);
+        }
+
+        corrections.len()
     }
 
     fn update_pointer_activity_tracking(&mut self, ctx: &egui::Context) {
@@ -2455,14 +3377,63 @@ impl ImageViewer {
         self.last_pointer_hover_pos = pointer_pos;
     }
 
-    fn set_image_list(&mut self, files: Vec<PathBuf>) {
+    fn handle_masonry_preload_focus_loss(&mut self, ctx: &egui::Context) {
+        if !(self.manga_mode && self.is_masonry_mode() && self.masonry_metadata_preload_active) {
+            return;
+        }
+
+        let viewport_has_focus = ctx.input(|i| i.raw.viewport().focused.unwrap_or(true));
+        if viewport_has_focus {
+            return;
+        }
+
+        // Losing focus can drop key/pointer release events. Clear transient interaction
+        // latches so masonry warmup keeps advancing while the app is in the background.
+        self.manga_zoom_plus_held = false;
+        self.manga_zoom_minus_held = false;
+        self.manga_video_seeking = false;
+        self.manga_video_volume_dragging = false;
+        self.gif_seeking = false;
+        self.manga_scrollbar_dragging = false;
+        self.masonry_scrollbar_last_motion_at = None;
+        self.is_panning = false;
+        self.last_mouse_pos = None;
+        self.stop_manga_wheel_scroll();
+        self.stop_manga_autoscroll();
+    }
+
+    fn set_image_list_raw(&mut self, files: Vec<PathBuf>) {
         let new_signature = Self::compute_image_list_signature(&files);
         if self.image_list_signature != new_signature {
             self.masonry_runtime_cache_signature = 0;
+            self.clear_masonry_authoritative_dimension_lock();
         }
 
         self.image_list = files;
         self.image_list_signature = new_signature;
+    }
+
+    fn set_image_list(&mut self, files: Vec<PathBuf>) {
+        let files = if self.folder_navigation_ui_enabled() {
+            files
+        } else {
+            files
+                .into_iter()
+                .filter(|path| !self.is_folder_navigation_entry_path(path.as_path()))
+                .collect()
+        };
+
+        self.folder_placeholder_thumbnail_cache
+            .retain(|directory, _| directory.exists());
+        self.folder_placeholder_preview_scan_pending
+            .retain(|directory| directory.exists());
+        self.folder_placeholder_thumbnail_pending
+            .retain(|path| path.exists());
+        self.folder_placeholder_thumbnail_failures
+            .retain(|path, _| path.exists());
+        self.folder_placeholder_stamp_cache.clear();
+
+        self.set_image_list_raw(files);
     }
 
     fn begin_media_directory_scan(
@@ -2483,6 +3454,697 @@ impl ImageViewer {
 
     fn current_media_path(&self) -> Option<PathBuf> {
         self.image_list.get(self.current_index).cloned()
+    }
+
+    fn active_folder_travel_layout_mode(&self) -> Option<FolderTravelLayoutMode> {
+        if !self.manga_mode || !self.is_fullscreen {
+            return None;
+        }
+
+        if self.is_masonry_mode() {
+            Some(FolderTravelLayoutMode::Masonry)
+        } else {
+            Some(FolderTravelLayoutMode::LongStrip)
+        }
+    }
+
+    fn store_folder_travel_position_for_current_folder(&self) {
+        let Some(layout_mode) = self.active_folder_travel_layout_mode() else {
+            return;
+        };
+
+        let Some(current_path) = self.current_media_path() else {
+            return;
+        };
+
+        let Some(current_directory) = current_path.parent().map(Path::to_path_buf) else {
+            return;
+        };
+
+        let position = FolderTravelPosition {
+            current_path,
+            current_index: self.current_index,
+            scroll_offset: self.manga_scroll_offset.max(0.0),
+        };
+        store_folder_travel_position(current_directory.as_path(), layout_mode, &position);
+    }
+
+    fn restore_folder_travel_position_for_directory(&mut self, directory: &Path) -> bool {
+        let Some(layout_mode) = self.active_folder_travel_layout_mode() else {
+            return false;
+        };
+
+        let Some(position) = lookup_folder_travel_position(directory, layout_mode) else {
+            return false;
+        };
+
+        if self.image_list.is_empty() {
+            return false;
+        }
+
+        let mut resolved_index = self
+            .image_list
+            .iter()
+            .position(|candidate| {
+                candidate.as_path() == position.current_path.as_path()
+                    && !Self::is_up_navigation_entry_path(candidate.as_path())
+            });
+
+        if resolved_index.is_none() {
+            let fallback_index = position.current_index.min(self.image_list.len().saturating_sub(1));
+            if self
+                .image_list
+                .get(fallback_index)
+                .is_some_and(|path| !Self::is_up_navigation_entry_path(path.as_path()))
+            {
+                resolved_index = Some(fallback_index);
+            }
+        }
+
+        if resolved_index.is_none() {
+            resolved_index = self
+                .image_list
+                .iter()
+                .position(|candidate| !Self::is_up_navigation_entry_path(candidate.as_path()));
+        }
+
+        let Some(resolved_index) = resolved_index else {
+            return false;
+        };
+
+        self.set_current_index_clamped(resolved_index);
+
+        match layout_mode {
+            FolderTravelLayoutMode::LongStrip => {
+                let max_scroll = (self.manga_total_height() - self.screen_size.y).max(0.0);
+                let scroll_to = self
+                    .manga_get_scroll_offset_for_index(resolved_index)
+                    .clamp(0.0, max_scroll);
+                self.manga_scroll_offset = scroll_to;
+                self.manga_scroll_target = scroll_to;
+                self.manga_scroll_velocity = 0.0;
+            }
+            FolderTravelLayoutMode::Masonry => {
+                let max_scroll = (self.manga_total_height() - self.screen_size.y).max(0.0);
+                let restored_offset = if position.scroll_offset.is_finite() {
+                    position.scroll_offset.max(0.0)
+                } else {
+                    0.0
+                }
+                .clamp(0.0, max_scroll);
+
+                if self.masonry_metadata_preload_active {
+                    self.pending_masonry_folder_travel_restore =
+                        Some((resolved_index, restored_offset));
+                } else {
+                    self.manga_scroll_offset = restored_offset;
+                    self.manga_scroll_target = restored_offset;
+                    self.manga_scroll_velocity = 0.0;
+                }
+            }
+        }
+
+        true
+    }
+
+    fn is_up_navigation_entry_name(name: &str) -> bool {
+        name == FOLDER_UP_ENTRY_NAME || name == "[...]"
+    }
+
+    fn is_up_navigation_entry_path(path: &Path) -> bool {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(Self::is_up_navigation_entry_name)
+    }
+
+    fn folder_entry_display_name(path: &Path) -> String {
+        path.file_name()
+            .map(|name| {
+                let label = name.to_string_lossy().to_string();
+                if Self::is_up_navigation_entry_name(label.as_str()) {
+                    "[..]".to_string()
+                } else {
+                    label
+                }
+            })
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| path.display().to_string())
+    }
+
+    fn folder_entry_target_directory(path: &Path) -> Option<PathBuf> {
+        if Self::is_up_navigation_entry_path(path) {
+            let current_directory = path.parent()?;
+            current_directory.parent().map(Path::to_path_buf)
+        } else if path.is_dir() {
+            Some(path.to_path_buf())
+        } else {
+            None
+        }
+    }
+
+    fn is_folder_navigation_entry_path(&self, path: &Path) -> bool {
+        Self::folder_entry_target_directory(path).is_some()
+    }
+
+    fn traverse_folder_entry_path(&mut self, path: &Path) -> bool {
+        let Some(target_directory) = Self::folder_entry_target_directory(path) else {
+            return false;
+        };
+
+        self.navigate_to_breadcrumb_directory(target_directory.as_path());
+        true
+    }
+
+    fn build_folder_placeholder_image(path: PathBuf, is_up_entry: bool) -> LoadedImage {
+        const SIZE: usize = 512;
+
+        let mut pixels = vec![0_u8; SIZE * SIZE * 4];
+        let mut fill_rect = |x0: usize, y0: usize, x1: usize, y1: usize, rgba: [u8; 4]| {
+            let x_start = x0.min(SIZE);
+            let y_start = y0.min(SIZE);
+            let x_end = x1.min(SIZE);
+            let y_end = y1.min(SIZE);
+            for y in y_start..y_end {
+                for x in x_start..x_end {
+                    let base = (y * SIZE + x) * 4;
+                    pixels[base] = rgba[0];
+                    pixels[base + 1] = rgba[1];
+                    pixels[base + 2] = rgba[2];
+                    pixels[base + 3] = rgba[3];
+                }
+            }
+        };
+
+        fill_rect(0, 0, SIZE, SIZE, [24, 28, 34, 255]);
+        fill_rect(64, 132, 448, 424, [221, 178, 73, 255]);
+        fill_rect(100, 92, 284, 170, [234, 196, 108, 255]);
+        fill_rect(84, 176, 428, 392, [247, 219, 149, 255]);
+        fill_rect(84, 392, 428, 424, [194, 146, 48, 255]);
+
+        if is_up_entry {
+            fill_rect(248, 228, 264, 332, [255, 255, 255, 255]);
+            fill_rect(216, 228, 296, 244, [255, 255, 255, 255]);
+            fill_rect(224, 208, 288, 224, [255, 255, 255, 255]);
+            fill_rect(232, 188, 280, 204, [255, 255, 255, 255]);
+        } else {
+            fill_rect(220, 248, 292, 264, [255, 255, 255, 255]);
+            fill_rect(220, 248, 236, 322, [255, 255, 255, 255]);
+            fill_rect(276, 248, 292, 322, [255, 255, 255, 255]);
+            fill_rect(220, 306, 292, 322, [255, 255, 255, 255]);
+        }
+
+        LoadedImage::from_single_frame(
+            path,
+            ImageFrame {
+                pixels,
+                width: SIZE as u32,
+                height: SIZE as u32,
+                delay_ms: 0,
+            },
+            SIZE as u32,
+            SIZE as u32,
+        )
+    }
+
+    fn collect_folder_placeholder_preview_media_paths(
+        target_directory: &Path,
+        max_count: usize,
+    ) -> Vec<PathBuf> {
+        let max_count = max_count.min(4);
+        if max_count == 0 || !target_directory.is_dir() {
+            return Vec::new();
+        }
+
+        let Ok(entries) = fs::read_dir(target_directory) else {
+            return Vec::new();
+        };
+
+        // Keep only the best `max_count` reverse-sorted file names while scanning.
+        // This avoids sorting the full directory listing.
+        let mut top_media: Vec<(String, PathBuf)> = Vec::with_capacity(max_count);
+        for entry in entries.flatten() {
+            let candidate = entry.path();
+            if !candidate.is_file() || get_media_type(candidate.as_path()).is_none() {
+                continue;
+            }
+
+            let Some(file_name) = candidate
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.to_string())
+            else {
+                continue;
+            };
+
+            if file_name.is_empty() {
+                continue;
+            }
+
+            let mut insert_at = top_media.len();
+            for (idx, (existing_name, _)) in top_media.iter().enumerate() {
+                if file_name > *existing_name {
+                    insert_at = idx;
+                    break;
+                }
+            }
+
+            if insert_at >= max_count {
+                if top_media.len() < max_count {
+                    top_media.push((file_name, candidate));
+                }
+                continue;
+            }
+
+            top_media.insert(insert_at, (file_name, candidate));
+            if top_media.len() > max_count {
+                top_media.pop();
+            }
+        }
+
+        top_media.into_iter().map(|(_, path)| path).collect()
+    }
+
+    fn request_folder_placeholder_preview_scan(
+        &mut self,
+        target_directory: &PathBuf,
+        max_count: usize,
+    ) {
+        if !target_directory.is_dir() {
+            return;
+        }
+
+        if self
+            .folder_placeholder_preview_scan_pending
+            .contains(target_directory)
+        {
+            return;
+        }
+
+        let directory = target_directory.clone();
+        self.folder_placeholder_preview_request_priority_seed =
+            self.folder_placeholder_preview_request_priority_seed.saturating_add(1);
+        let priority = -self.folder_placeholder_preview_request_priority_seed;
+        self.folder_placeholder_preview_scan_pending
+            .insert(directory.clone());
+
+        let request = FolderPlaceholderPreviewScanRequest {
+            directory: directory.clone(),
+            max_count,
+            priority,
+        };
+
+        if self
+            .folder_placeholder_preview_scan_request_tx
+            .try_send(request)
+            .is_err()
+        {
+            self.folder_placeholder_preview_scan_pending.remove(&directory);
+        }
+    }
+
+    fn folder_entry_preview_media_paths(
+        &mut self,
+        entry_path: &Path,
+        max_count: usize,
+    ) -> (Vec<PathBuf>, bool) {
+        const STAMP_CACHE_TTL: Duration = Duration::from_millis(450);
+
+        let max_count = max_count.min(4);
+        if max_count == 0 {
+            return (Vec::new(), false);
+        }
+
+        let Some(target_directory) = Self::folder_entry_target_directory(entry_path) else {
+            return (Vec::new(), false);
+        };
+
+        let stamp = self.cached_file_stamp(target_directory.as_path(), STAMP_CACHE_TTL);
+        if let Some(cached) = self
+            .folder_placeholder_thumbnail_cache
+            .get(target_directory.as_path())
+        {
+            if cached.stamp == stamp {
+                return (cached.media_paths.clone(), cached.loading);
+            }
+        }
+
+        self.request_folder_placeholder_preview_scan(&target_directory, max_count);
+
+        if let Some(cached) = self
+            .folder_placeholder_thumbnail_cache
+            .get_mut(target_directory.as_path())
+        {
+            cached.loading = true;
+            return (cached.media_paths.clone(), true);
+        }
+
+        self.folder_placeholder_thumbnail_cache.insert(
+            target_directory,
+            FolderPlaceholderThumbnailSelection {
+                stamp,
+                media_paths: Vec::new(),
+                loading: true,
+            },
+        );
+
+        (Vec::new(), true)
+    }
+
+    fn paint_folder_entry_icon(painter: &egui::Painter, body: egui::Rect, is_up_entry: bool) {
+        let stroke = egui::Stroke::new(2.0, egui::Color32::WHITE);
+        let center = body.center();
+        if is_up_entry {
+            let shaft_top = egui::pos2(center.x, center.y - body.height() * 0.18);
+            let shaft_bottom = egui::pos2(center.x, center.y + body.height() * 0.2);
+            painter.line_segment([shaft_bottom, shaft_top], stroke);
+            painter.line_segment(
+                [
+                    shaft_top,
+                    egui::pos2(center.x - body.width() * 0.12, center.y - body.height() * 0.02),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    shaft_top,
+                    egui::pos2(center.x + body.width() * 0.12, center.y - body.height() * 0.02),
+                ],
+                stroke,
+            );
+        } else {
+            let icon = egui::Rect::from_center_size(
+                center,
+                egui::vec2(body.width() * 0.26, body.height() * 0.28),
+            );
+            painter.rect_stroke(icon, 3.0, stroke);
+        }
+    }
+
+    fn paint_folder_entry_card(&mut self, ui: &mut egui::Ui, rect: egui::Rect, entry_path: &Path) {
+        let painter = ui.painter();
+        let is_up_entry = Self::is_up_navigation_entry_path(entry_path);
+        let label = Self::folder_entry_display_name(entry_path);
+
+        painter.rect_filled(rect, 6.0, egui::Color32::from_rgb(30, 34, 40));
+
+        let body = egui::Rect::from_min_max(
+            egui::pos2(rect.left() + rect.width() * 0.12, rect.top() + rect.height() * 0.36),
+            egui::pos2(rect.right() - rect.width() * 0.12, rect.bottom() - rect.height() * 0.14),
+        );
+        let tab = egui::Rect::from_min_max(
+            egui::pos2(rect.left() + rect.width() * 0.2, rect.top() + rect.height() * 0.2),
+            egui::pos2(rect.left() + rect.width() * 0.5, rect.top() + rect.height() * 0.36),
+        );
+
+        painter.rect_filled(body, 5.0, egui::Color32::from_rgb(221, 178, 73));
+        painter.rect_filled(tab, 4.0, egui::Color32::from_rgb(234, 196, 108));
+
+        let (preview_paths, preview_list_loading) =
+            self.folder_entry_preview_media_paths(entry_path, 4);
+        if preview_paths.is_empty() {
+            if preview_list_loading {
+                let time = ui.input(|input| input.time);
+                paint_compact_loading_spinner(painter, body, time);
+                ui.ctx().request_repaint_after(Duration::from_millis(16));
+            } else {
+                // Preserve previous behavior when no media thumbnail candidates exist.
+                Self::paint_folder_entry_icon(painter, body, is_up_entry);
+            }
+        } else {
+            let preview_margin = body.width().min(body.height()) * 0.06;
+            let preview_rect = body.shrink(preview_margin);
+            let grid_gap = (preview_rect.width().min(preview_rect.height()) * 0.04).clamp(2.0, 8.0);
+            let tile_width = ((preview_rect.width() - grid_gap) * 0.5).max(1.0);
+            let tile_height = ((preview_rect.height() - grid_gap) * 0.5).max(1.0);
+            let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
+            let mut waiting_for_thumbnail = false;
+
+            for (slot, media_path) in preview_paths.iter().take(4).enumerate() {
+                let row = (slot / 2) as f32;
+                let col = (slot % 2) as f32;
+                let tile_min = egui::pos2(
+                    preview_rect.left() + col * (tile_width + grid_gap),
+                    preview_rect.top() + row * (tile_height + grid_gap),
+                );
+                let tile_rect = egui::Rect::from_min_size(tile_min, egui::vec2(tile_width, tile_height));
+
+                painter.rect_filled(
+                    tile_rect,
+                    3.0,
+                    egui::Color32::from_rgba_unmultiplied(22, 26, 31, 235),
+                );
+
+                if let Some((texture_id, image_size)) =
+                    self.try_get_cached_modal_thumbnail_texture(media_path)
+                {
+                    let fitted = tile_rect.shrink(2.0);
+                    let scale = if image_size.x <= 0.0 || image_size.y <= 0.0 {
+                        1.0
+                    } else {
+                        (fitted.width() / image_size.x)
+                            .min(fitted.height() / image_size.y)
+                            .max(0.01)
+                    };
+                    let fitted_size = egui::vec2(image_size.x * scale, image_size.y * scale);
+                    let fitted_rect = egui::Rect::from_center_size(tile_rect.center(), fitted_size);
+                    painter.image(texture_id, fitted_rect, uv, egui::Color32::WHITE);
+                } else if self.request_folder_placeholder_thumbnail_load(media_path) {
+                    let time = ui.input(|input| input.time);
+                    paint_compact_loading_spinner(painter, tile_rect, time);
+                    waiting_for_thumbnail = true;
+                } else {
+                    let placeholder = media_path
+                        .extension()
+                        .and_then(|ext| ext.to_str())
+                        .map(|ext| ext.to_ascii_uppercase())
+                        .unwrap_or_else(|| "FILE".to_string());
+                    painter.text(
+                        tile_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        placeholder,
+                        egui::TextStyle::Small.resolve(ui.style()),
+                        egui::Color32::from_rgb(188, 202, 220),
+                    );
+                }
+            }
+
+            if waiting_for_thumbnail {
+                ui.ctx().request_repaint_after(Duration::from_millis(16));
+            }
+
+            if is_up_entry {
+                let badge_size = egui::vec2(body.width() * 0.22, body.height() * 0.2);
+                let badge = egui::Rect::from_center_size(body.center(), badge_size);
+                painter.rect_filled(
+                    badge,
+                    6.0,
+                    egui::Color32::from_rgba_unmultiplied(0, 0, 0, 160),
+                );
+                let stroke = egui::Stroke::new(1.8, egui::Color32::WHITE);
+                let shaft_top = egui::pos2(badge.center().x, badge.center().y - badge.height() * 0.28);
+                let shaft_bottom = egui::pos2(badge.center().x, badge.center().y + badge.height() * 0.22);
+                painter.line_segment([shaft_bottom, shaft_top], stroke);
+                painter.line_segment(
+                    [
+                        shaft_top,
+                        egui::pos2(
+                            badge.center().x - badge.width() * 0.16,
+                            badge.center().y - badge.height() * 0.02,
+                        ),
+                    ],
+                    stroke,
+                );
+                painter.line_segment(
+                    [
+                        shaft_top,
+                        egui::pos2(
+                            badge.center().x + badge.width() * 0.16,
+                            badge.center().y - badge.height() * 0.02,
+                        ),
+                    ],
+                    stroke,
+                );
+            }
+
+            painter.rect_stroke(
+                preview_rect,
+                4.0,
+                egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 26)),
+            );
+        }
+
+        let label_size = (rect.width() * 0.045).clamp(13.0, 22.0);
+        let label_font = egui::FontId::proportional(label_size);
+        let label_color = egui::Color32::from_rgb(245, 245, 245);
+        let max_label_width = (rect.width() * 0.82).max(90.0);
+        let galley = painter.layout(label, label_font, label_color, max_label_width);
+        let label_bottom_padding = (rect.height() * 0.06).clamp(10.0, 28.0);
+        let label_top = rect.bottom() - label_bottom_padding - galley.rect.height();
+        let label_pos = egui::pos2(rect.center().x - galley.rect.width() * 0.5, label_top);
+        painter.galley(label_pos, galley, label_color);
+    }
+
+    fn breadcrumb_segments_for_path(path: &Path) -> Vec<(String, PathBuf)> {
+        let directory = if path.is_dir() {
+            path.to_path_buf()
+        } else {
+            path.parent().unwrap_or(path).to_path_buf()
+        };
+
+        let mut chain: Vec<PathBuf> = directory.ancestors().map(Path::to_path_buf).collect();
+        chain.reverse();
+
+        let mut segments: Vec<(String, PathBuf)> = Vec::with_capacity(chain.len());
+        for segment_path in chain {
+            let label = segment_path
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| segment_path.display().to_string());
+
+            if label.is_empty() {
+                continue;
+            }
+
+            if segments
+                .last()
+                .is_some_and(|(_, existing_path)| *existing_path == segment_path)
+            {
+                continue;
+            }
+
+            segments.push((label, segment_path));
+        }
+
+        segments
+    }
+
+    fn breadcrumb_child_directories(path: &Path) -> Vec<PathBuf> {
+        let mut children: Vec<PathBuf> = fs::read_dir(path)
+            .ok()
+            .into_iter()
+            .flat_map(|entries| entries.filter_map(Result::ok))
+            .map(|entry| entry.path())
+            .filter(|child| child.is_dir())
+            .collect();
+
+        children.sort_by(|a, b| {
+            let a_name = a
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let b_name = b
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_default();
+            a_name
+                .to_lowercase()
+                .cmp(&b_name.to_lowercase())
+                .then_with(|| a_name.cmp(&b_name))
+        });
+
+        children
+    }
+
+    fn navigate_to_breadcrumb_directory(&mut self, directory: &Path) {
+        if !directory.exists() || !directory.is_dir() {
+            self.error_message = Some(format!(
+                "Folder does not exist: {}",
+                directory.display()
+            ));
+            return;
+        }
+
+        if self.is_masonry_mode() {
+            self.persist_current_masonry_folder_metadata_snapshot();
+        }
+
+        // Persist the current folder viewport state before any folder-travel jump.
+        self.store_folder_travel_position_for_current_folder();
+
+        let mut files = get_media_in_directory(directory);
+        if files.is_empty() {
+            self.error_message = Some(format!(
+                "No supported media files found in folder: {}",
+                directory.display()
+            ));
+            return;
+        }
+
+        let modified_at = std::fs::metadata(directory)
+            .ok()
+            .and_then(|metadata| metadata.modified().ok());
+        files = self
+            .media_directory_index
+            .apply_directory_scan_result(DirectoryScanResult {
+                directory: directory.to_path_buf(),
+                files,
+                modified_at,
+            });
+
+        let current_path = self.current_media_path();
+        let target_path = current_path
+            .filter(|path| {
+                path.parent() == Some(directory)
+                    && files
+                        .iter()
+                        .any(|candidate| candidate.as_path() == path.as_path())
+            })
+            .or_else(|| {
+                files
+                    .iter()
+                    .find(|candidate| !Self::is_up_navigation_entry_path(candidate.as_path()))
+                    .cloned()
+            })
+            .unwrap_or_else(|| files[0].clone());
+
+        self.error_message = None;
+        self.show_controls = true;
+        self.controls_show_time = Instant::now();
+
+        if self.manga_mode && self.is_fullscreen {
+            self.set_image_list(files);
+            self.clear_stale_marked_files();
+            self.clear_stale_prepared_clipboard_paths();
+            self.modal_thumbnail_cache.retain(|path, _| path.exists());
+
+            let resolved_index = self
+                .image_list
+                .iter()
+                .position(|candidate| candidate == &target_path)
+                .unwrap_or(0);
+            self.set_current_index_clamped(resolved_index);
+            self.pending_window_title = Some(self.compute_window_title_for_path(&target_path));
+
+            self.manga_clear_cache();
+            self.ensure_manga_loader();
+
+            if self.is_masonry_mode() {
+                if let Some(ref mut loader) = self.manga_loader {
+                    loader.cache_all_dimensions(&self.image_list);
+                }
+                self.restore_masonry_folder_metadata_snapshot();
+                if !self.image_list.is_empty() {
+                    self.manga_dimension_cache_list_signature = self.image_list_signature;
+                }
+                self.maybe_begin_masonry_metadata_preload(true);
+            } else {
+                self.reset_masonry_metadata_preload();
+            }
+
+            self.manga_update_preload_queue();
+            if !self.restore_folder_travel_position_for_directory(directory) {
+                self.manga_scroll_offset = 0.0;
+                self.manga_scroll_target = 0.0;
+                self.manga_scroll_velocity = 0.0;
+            }
+
+            if let Some(active_path) = self.current_media_path() {
+                self.pending_window_title = Some(self.compute_window_title_for_path(&active_path));
+            }
+        } else {
+            self.load_media(&target_path);
+        }
     }
 
     fn hovered_manga_index_from_pointer(&mut self, ctx: &egui::Context) -> Option<usize> {
@@ -2685,6 +4347,10 @@ impl ImageViewer {
     fn refresh_media_list_if_entries_disappeared(&mut self) {
         const MISSING_MEDIA_REFRESH_INTERVAL: Duration = Duration::from_millis(750);
 
+        if self.defer_directory_work_for_fast_startup() {
+            return;
+        }
+
         if self.last_missing_media_refresh_check.elapsed() < MISSING_MEDIA_REFRESH_INTERVAL {
             return;
         }
@@ -2824,6 +4490,7 @@ impl ImageViewer {
         if self.manga_mode {
             self.manga_clear_cache();
             self.manga_mode = false;
+            set_metadata_cache_enabled(false);
         }
     }
 
@@ -2837,6 +4504,10 @@ impl ImageViewer {
             self.clear_current_media_after_all_files_removed();
             return;
         };
+
+        if self.manga_mode && self.manga_layout_mode == MangaLayoutMode::Masonry {
+            self.persist_current_masonry_folder_metadata_snapshot();
+        }
 
         if let Some(parent) = anchor_path.parent() {
             self.media_directory_index.invalidate_directory(parent);
@@ -2898,6 +4569,12 @@ impl ImageViewer {
         if self.manga_mode {
             self.manga_clear_cache();
             self.ensure_manga_loader();
+            if self.manga_layout_mode == MangaLayoutMode::Masonry {
+                self.restore_masonry_folder_metadata_snapshot();
+                if !self.image_list.is_empty() {
+                    self.manga_dimension_cache_list_signature = self.image_list_signature;
+                }
+            }
             self.manga_update_preload_queue();
         }
     }
@@ -2917,6 +4594,7 @@ impl ImageViewer {
             .cached_directory_changed_for_path(&anchor_path);
 
         if current_path_missing || directory_changed {
+            self.strip_return_masonry_list_snapshot = None;
             self.refresh_media_list_after_path_mutation(Some(anchor_path));
         }
 
@@ -3684,13 +5362,13 @@ impl ImageViewer {
             return false;
         }
 
-        let Some(current_stamp) = file_stamp_for_path(path) else {
+        let Some(cached) = self.decoded_image_cache.get(&key) else {
             self.perf_metrics
                 .increment_counter("decoded_image_cache_miss", 1);
             return false;
         };
 
-        let Some(cached) = self.decoded_image_cache.get(&key) else {
+        let Some(current_stamp) = file_stamp_for_path(path) else {
             self.perf_metrics
                 .increment_counter("decoded_image_cache_miss", 1);
             return false;
@@ -3751,12 +5429,12 @@ impl ImageViewer {
             return false;
         }
 
-        let Some(current_stamp) = file_stamp_for_path(path) else {
-            self.decoded_image_cache.invalidate(&key);
+        let Some(cached) = self.decoded_image_cache.get(&key) else {
             return false;
         };
 
-        let Some(cached) = self.decoded_image_cache.get(&key) else {
+        let Some(current_stamp) = file_stamp_for_path(path) else {
+            self.decoded_image_cache.invalidate(&key);
             return false;
         };
 
@@ -4803,8 +6481,12 @@ impl ImageViewer {
             }
         }
 
-        // Keep it below the title bar buttons when the bar is visible.
-        let y_offset = if self.show_controls { 40.0 } else { 8.0 };
+        // Keep it below the title/breadcrumb bars when visible.
+        let y_offset = if self.show_controls {
+            self.top_controls_visible_height() + 8.0
+        } else {
+            8.0
+        };
         egui::Area::new(egui::Id::new("fps_overlay"))
             .order(egui::Order::Foreground)
             .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-8.0, y_offset))
@@ -5592,6 +7274,10 @@ impl ImageViewer {
             return;
         };
 
+        if self.defer_directory_work_for_fast_startup() {
+            return;
+        }
+
         if self
             .current_file_size_label_path
             .as_ref()
@@ -6235,12 +7921,32 @@ impl ImageViewer {
             .unwrap_or(192)
     }
 
-    fn ensure_modal_thumbnail_texture(
+    fn cached_file_stamp(&mut self, path: &Path, ttl: Duration) -> Option<FileStamp> {
+        if let Some(cached) = self.folder_placeholder_stamp_cache.get(path) {
+            if cached.checked_at.elapsed() <= ttl {
+                return cached.stamp;
+            }
+        }
+
+        let stamp = file_stamp_for_path(path);
+        self.folder_placeholder_stamp_cache.insert(
+            path.to_path_buf(),
+            CachedPathStamp {
+                stamp,
+                checked_at: Instant::now(),
+            },
+        );
+
+        stamp
+    }
+
+    fn try_get_cached_modal_thumbnail_texture(
         &mut self,
-        ctx: &egui::Context,
         path: &PathBuf,
     ) -> Option<(egui::TextureId, egui::Vec2)> {
-        let stamp = file_stamp_for_path(path.as_path())?;
+        const STAMP_CACHE_TTL: Duration = Duration::from_millis(450);
+
+        let stamp = self.cached_file_stamp(path.as_path(), STAMP_CACHE_TTL)?;
         if let Some(cached) = self.modal_thumbnail_cache.get(path) {
             if cached.stamp == stamp {
                 return Some((
@@ -6249,7 +7955,207 @@ impl ImageViewer {
                 ));
             }
         }
+
         self.modal_thumbnail_cache.remove(path);
+        None
+    }
+
+    fn request_folder_placeholder_thumbnail_load(&mut self, path: &PathBuf) -> bool {
+        if self.try_get_cached_modal_thumbnail_texture(path).is_some() {
+            return false;
+        }
+
+        if self.folder_placeholder_thumbnail_pending.contains(path) {
+            return true;
+        }
+
+        if self
+            .folder_placeholder_thumbnail_failures
+            .get(path)
+            .is_some_and(|failed_at| failed_at.elapsed() < Duration::from_secs(3))
+        {
+            return false;
+        }
+
+        let target_side = self.modal_thumbnail_target_side();
+        let downscale_filter = self.config.downscale_filter.to_image_filter();
+        let gif_filter = self.config.gif_resize_filter.to_image_filter();
+        let path_clone = path.clone();
+        self.folder_placeholder_thumbnail_request_priority_seed =
+            self.folder_placeholder_thumbnail_request_priority_seed.saturating_add(1);
+        let priority = -self.folder_placeholder_thumbnail_request_priority_seed;
+
+        self.folder_placeholder_thumbnail_pending
+            .insert(path_clone.clone());
+        self.folder_placeholder_thumbnail_failures.remove(&path_clone);
+
+        let request = FolderPlaceholderThumbnailLoadRequest {
+            path: path_clone.clone(),
+            max_texture_side: target_side,
+            downscale_filter,
+            gif_filter,
+            priority,
+        };
+
+        if self
+            .folder_placeholder_thumbnail_request_tx
+            .try_send(request)
+            .is_err()
+        {
+            self.folder_placeholder_thumbnail_pending.remove(&path_clone);
+            self.folder_placeholder_thumbnail_failures
+                .insert(path_clone, Instant::now());
+            return false;
+        }
+
+        true
+    }
+
+    fn poll_pending_folder_placeholder_preview_scans(&mut self, ctx: &egui::Context) {
+        const MAX_SCAN_RESULTS_PER_FRAME: usize = 48;
+
+        let mut applied = 0usize;
+        while applied < MAX_SCAN_RESULTS_PER_FRAME {
+            let result = match self.folder_placeholder_preview_scan_result_rx.try_recv() {
+                Ok(result) => result,
+                Err(_) => break,
+            };
+
+            match result {
+                FolderPlaceholderPreviewScanResult::Ready {
+                    directory,
+                    stamp,
+                    media_paths,
+                } => {
+                    self.folder_placeholder_preview_scan_pending.remove(&directory);
+                    self.folder_placeholder_stamp_cache.insert(
+                        directory.clone(),
+                        CachedPathStamp {
+                            stamp,
+                            checked_at: Instant::now(),
+                        },
+                    );
+                    self.folder_placeholder_thumbnail_cache.insert(
+                        directory,
+                        FolderPlaceholderThumbnailSelection {
+                            stamp,
+                            media_paths,
+                            loading: false,
+                        },
+                    );
+                }
+            }
+
+            applied = applied.saturating_add(1);
+        }
+
+        if applied > 0 || !self.folder_placeholder_preview_scan_pending.is_empty() {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        }
+    }
+
+    fn poll_pending_folder_placeholder_thumbnail_loads(&mut self, ctx: &egui::Context) {
+        const MAX_THUMBNAIL_RESULTS_PER_FRAME: usize = 2;
+
+        let mut uploaded_any = false;
+        let mut processed = 0usize;
+
+        while processed < MAX_THUMBNAIL_RESULTS_PER_FRAME {
+            let result = match self.folder_placeholder_thumbnail_result_rx.try_recv() {
+                Ok(result) => result,
+                Err(_) => break,
+            };
+
+            processed = processed.saturating_add(1);
+
+            match result {
+                FolderPlaceholderThumbnailLoadResult::Ready(decoded) => {
+                    self.folder_placeholder_thumbnail_pending.remove(&decoded.path);
+
+                    let Some(current_stamp) = file_stamp_for_path(decoded.path.as_path()) else {
+                        self.modal_thumbnail_cache.remove(&decoded.path);
+                        self.folder_placeholder_thumbnail_failures
+                            .insert(decoded.path, Instant::now());
+                        continue;
+                    };
+                    if current_stamp != decoded.stamp {
+                        self.modal_thumbnail_cache.remove(&decoded.path);
+                        continue;
+                    }
+
+                    let texture_options = match decoded.media_kind {
+                        FolderPlaceholderThumbnailMediaKind::Video => {
+                            self.solo_video_thumbnail_texture_options(decoded.width, decoded.height)
+                        }
+                        FolderPlaceholderThumbnailMediaKind::AnimatedImage => {
+                            self.config.texture_filter_animated.to_egui_options()
+                        }
+                        FolderPlaceholderThumbnailMediaKind::StaticImage => {
+                            self.config.texture_filter_static.to_egui_options_with_mipmap(
+                                decoded.width.min(decoded.height)
+                                    >= self.config.manga_mipmap_min_side.max(1),
+                            )
+                        }
+                    };
+
+                    let texture = ctx.load_texture(
+                        format!(
+                            "folder-placeholder-thumbnail:{}",
+                            decoded_image_cache_key(
+                                decoded.path.as_path(),
+                                self.modal_thumbnail_target_side(),
+                            )
+                        ),
+                        egui::ColorImage::from_rgba_unmultiplied(
+                            [decoded.width as usize, decoded.height as usize],
+                            &decoded.pixels,
+                        ),
+                        texture_options,
+                    );
+
+                    self.folder_placeholder_thumbnail_failures
+                        .remove(&decoded.path);
+                    self.folder_placeholder_stamp_cache.insert(
+                        decoded.path.clone(),
+                        CachedPathStamp {
+                            stamp: Some(decoded.stamp),
+                            checked_at: Instant::now(),
+                        },
+                    );
+                    self.modal_thumbnail_cache.insert(
+                        decoded.path,
+                        ModalThumbnailTexture {
+                            texture,
+                            width: decoded.width,
+                            height: decoded.height,
+                            stamp: decoded.stamp,
+                        },
+                    );
+                    uploaded_any = true;
+                }
+                FolderPlaceholderThumbnailLoadResult::Failed { path } => {
+                    self.folder_placeholder_thumbnail_pending.remove(&path);
+                    self.folder_placeholder_thumbnail_failures
+                        .insert(path, Instant::now());
+                }
+            }
+        }
+
+        if uploaded_any || !self.folder_placeholder_thumbnail_pending.is_empty() {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        }
+    }
+
+    fn ensure_modal_thumbnail_texture(
+        &mut self,
+        ctx: &egui::Context,
+        path: &PathBuf,
+    ) -> Option<(egui::TextureId, egui::Vec2)> {
+        if let Some(texture) = self.try_get_cached_modal_thumbnail_texture(path) {
+            return Some(texture);
+        }
+
+        let stamp = file_stamp_for_path(path.as_path())?;
 
         let target_side = self.modal_thumbnail_target_side();
         let media_type = get_media_type(path)?;
@@ -8196,6 +10102,10 @@ impl ImageViewer {
         current_media_type: Option<MediaType>,
         current_image_is_animated: bool,
     ) -> bool {
+        if self.is_masonry_mode() && self.masonry_authoritative_dimension_lock_active() {
+            return false;
+        }
+
         let (Some((w, h)), Some(media_type)) = (current_media_dims, current_media_type) else {
             return false;
         };
@@ -8220,6 +10130,7 @@ impl ImageViewer {
         self.reset_gif_seek_interaction_state();
         self.reset_masonry_metadata_preload();
         self.manga_mode = true;
+        set_metadata_cache_enabled(true);
         self.stop_fullscreen_video_playback();
         self.reset_fullscreen_anim_stream_state();
         self.reset_manga_video_user_preferences();
@@ -8232,6 +10143,7 @@ impl ImageViewer {
         self.masonry_metadata_preload_loaded = 0;
         self.masonry_metadata_preload_cursor = 0;
         self.masonry_metadata_preload_restore_index = None;
+        self.pending_masonry_folder_travel_restore = None;
     }
 
     fn begin_masonry_metadata_preload(&mut self) {
@@ -8274,8 +10186,16 @@ impl ImageViewer {
         }
 
         let total = self.image_list.len();
+        let folder_ready = self
+            .image_list
+            .iter()
+            .filter(|path| self.is_folder_navigation_entry_path(path.as_path()))
+            .count();
         let fully_warm = self.manga_loader.as_ref().is_some_and(|loader| {
-            loader.cached_dimensions_count(total) >= total
+            loader
+                .cached_dimensions_count(total)
+                .saturating_add(folder_ready)
+                >= total
                 && loader.pending_dimension_probe_count() == 0
                 && loader.pending_dimension_results_count() == 0
         });
@@ -8288,35 +10208,54 @@ impl ImageViewer {
     }
 
     fn restore_masonry_scroll_after_metadata_preload(&mut self) {
-        let Some(target_index) = self.masonry_metadata_preload_restore_index.take() else {
-            return;
-        };
-
         if !self.manga_mode || !self.is_masonry_mode() || self.image_list.is_empty() {
+            self.masonry_metadata_preload_restore_index = None;
+            self.pending_masonry_folder_travel_restore = None;
             return;
         }
 
-        let target_index = target_index.min(self.image_list.len().saturating_sub(1));
-        self.set_current_index_clamped(target_index);
+        if let Some(target_index) = self.masonry_metadata_preload_restore_index.take() {
+            let target_index = target_index.min(self.image_list.len().saturating_sub(1));
+            self.set_current_index_clamped(target_index);
 
-        let max_scroll = (self.manga_total_height() - self.screen_size.y).max(0.0);
-        let scroll_to = self
-            .masonry_scroll_offset_for_index_centered(target_index)
-            .unwrap_or_else(|| {
-                self.manga_get_scroll_offset_for_index(target_index)
-                    .clamp(0.0, max_scroll)
-            });
+            let max_scroll = (self.manga_total_height() - self.screen_size.y).max(0.0);
+            let scroll_to = self
+                .masonry_scroll_offset_for_index_centered(target_index)
+                .unwrap_or_else(|| {
+                    self.manga_get_scroll_offset_for_index(target_index)
+                        .clamp(0.0, max_scroll)
+                });
 
-        self.manga_scroll_offset = scroll_to;
-        self.manga_scroll_target = scroll_to;
-        self.manga_scroll_velocity = 0.0;
-        self.manga_scrollbar_dragging = false;
-        self.masonry_scrollbar_last_motion_at = None;
-        self.masonry_autoscroll_last_motion_at = None;
-        self.is_panning = false;
-        self.last_mouse_pos = None;
-        self.manga_hovered_media_index = None;
-        self.stop_manga_wheel_scroll();
+            self.manga_scroll_offset = scroll_to;
+            self.manga_scroll_target = scroll_to;
+            self.manga_scroll_velocity = 0.0;
+            self.manga_scrollbar_dragging = false;
+            self.masonry_scrollbar_last_motion_at = None;
+            self.masonry_autoscroll_last_motion_at = None;
+            self.is_panning = false;
+            self.last_mouse_pos = None;
+            self.manga_hovered_media_index = None;
+            self.stop_manga_wheel_scroll();
+        }
+
+        if let Some((target_index, restored_offset)) = self.pending_masonry_folder_travel_restore.take()
+        {
+            let target_index = target_index.min(self.image_list.len().saturating_sub(1));
+            self.set_current_index_clamped(target_index);
+
+            let max_scroll = (self.manga_total_height() - self.screen_size.y).max(0.0);
+            let restored_offset = restored_offset.clamp(0.0, max_scroll);
+            self.manga_scroll_offset = restored_offset;
+            self.manga_scroll_target = restored_offset;
+            self.manga_scroll_velocity = 0.0;
+            self.manga_scrollbar_dragging = false;
+            self.masonry_scrollbar_last_motion_at = None;
+            self.masonry_autoscroll_last_motion_at = None;
+            self.is_panning = false;
+            self.last_mouse_pos = None;
+            self.manga_hovered_media_index = None;
+            self.stop_manga_wheel_scroll();
+        }
     }
 
     fn tick_masonry_metadata_preload(&mut self) {
@@ -8339,6 +10278,12 @@ impl ImageViewer {
         let preload_cursor = self.masonry_metadata_preload_cursor.min(total.saturating_sub(1));
         let preload_window = 96usize.max(self.masonry_items_per_row.clamp(2, 10) * 48);
         let preload_end = (preload_cursor + preload_window).min(total);
+        let folder_ready = self
+            .image_list
+            .iter()
+            .take(total)
+            .filter(|path| self.is_folder_navigation_entry_path(path.as_path()))
+            .count();
 
         let (loaded_count, pending_probe_count, pending_result_count) = {
             let Some(loader) = self.manga_loader.as_mut() else {
@@ -8355,7 +10300,10 @@ impl ImageViewer {
             }
 
             (
-                loader.cached_dimensions_count(total).min(total),
+                loader
+                    .cached_dimensions_count(total)
+                    .saturating_add(folder_ready)
+                    .min(total),
                 loader.pending_dimension_probe_count(),
                 loader.pending_dimension_results_count(),
             )
@@ -8632,7 +10580,9 @@ impl ImageViewer {
                     .position(|candidate| candidate == &target_path)
                     .unwrap_or(0);
                 self.set_current_index_clamped(resolved_index);
-                self.schedule_solo_probe_window(&target_path, self.current_media_type);
+                if !self.defer_directory_work_for_fast_startup() {
+                    self.schedule_solo_probe_window(&target_path, self.current_media_type);
+                }
                 ctx.request_repaint();
             }
             PendingMediaDirectoryScanKind::ExternalRefresh => {
@@ -8649,6 +10599,10 @@ impl ImageViewer {
 
                 if current_directory.as_deref() != Some(scanned_directory.as_path()) {
                     return;
+                }
+
+                if self.manga_mode && self.manga_layout_mode == MangaLayoutMode::Masonry {
+                    self.persist_current_masonry_folder_metadata_snapshot();
                 }
 
                 self.set_image_list(files);
@@ -8675,6 +10629,12 @@ impl ImageViewer {
                 if self.manga_mode {
                     self.manga_clear_cache();
                     self.ensure_manga_loader();
+                    if self.manga_layout_mode == MangaLayoutMode::Masonry {
+                        self.restore_masonry_folder_metadata_snapshot();
+                        if !self.image_list.is_empty() {
+                            self.manga_dimension_cache_list_signature = self.image_list_signature;
+                        }
+                    }
                     self.manga_update_preload_queue();
                 }
 
@@ -8832,9 +10792,11 @@ impl ImageViewer {
 
                     let dims = player.dimensions();
                     if dims.0 > 0 && dims.1 > 0 {
-                        if let Some(ref mut loader) = self.manga_loader {
-                            if loader.update_video_dimensions(index, dims.0, dims.1) {
-                                pending_dimension_updates.push(index);
+                        if !self.masonry_authoritative_dimension_lock_active() {
+                            if let Some(ref mut loader) = self.manga_loader {
+                                if loader.update_video_dimensions(index, dims.0, dims.1) {
+                                    pending_dimension_updates.push(index);
+                                }
                             }
                         }
                     }
@@ -8868,7 +10830,10 @@ impl ImageViewer {
             }
         }
 
-        if self.is_masonry_mode() && !pending_dimension_updates.is_empty() {
+        if self.is_masonry_mode()
+            && !self.masonry_authoritative_dimension_lock_active()
+            && !pending_dimension_updates.is_empty()
+        {
             self.masonry_queue_dimension_updates(pending_dimension_updates);
             if !self.masonry_navigation_active_for_heavy_work() {
                 let force_flush = !self.masonry_metadata_preload_active;
@@ -9117,13 +11082,17 @@ impl ImageViewer {
         self.current_file_size_label_path = None;
         self.pending_file_size_probe = None;
         self.pending_file_size_probe_path = None;
-        self.start_async_file_size_probe(path.clone());
 
         // Update the native window title (taskbar title) using Unicode-safe conversion.
         self.pending_window_title = Some(self.compute_window_title_for_path(path));
 
         // Determine media type up-front so we can decide whether to keep a placeholder frame.
-        let media_type = get_media_type(path);
+        let is_folder_entry = self.is_folder_navigation_entry_path(path.as_path());
+        let media_type = if is_folder_entry {
+            Some(MediaType::Image)
+        } else {
+            get_media_type(path)
+        };
         self.current_media_type = media_type;
 
         let mut used_mode_switch_placeholder = false;
@@ -9199,6 +11168,11 @@ impl ImageViewer {
         }
         self.error_message = None;
 
+        let defer_directory_work_for_fast_startup = self.defer_directory_work_for_fast_startup();
+        if !defer_directory_work_for_fast_startup {
+            self.start_async_file_size_probe(path.clone());
+        }
+
         // Reuse cached directory listing when the parent folder is unchanged.
         let index_stats_before = self.media_directory_index.stats();
         let index_lookup_start = Instant::now();
@@ -9208,13 +11182,17 @@ impl ImageViewer {
         self.pending_media_directory_scan_kind = None;
         self.pending_media_directory_started_at = None;
 
-        if let Some(files) = self.media_directory_index.try_cached_media_for_path(path) {
-            self.set_image_list(files);
-        } else {
-            // Keep current media navigable immediately while the full directory scan runs in background.
+        if defer_directory_work_for_fast_startup {
             self.set_image_list(vec![path.clone()]);
-            let _ =
-                self.begin_media_directory_scan(path, PendingMediaDirectoryScanKind::InitialLoad);
+        } else {
+            if let Some(files) = self.media_directory_index.try_cached_media_for_path(path) {
+                self.set_image_list(files);
+            } else {
+                // Keep current media navigable immediately while the full directory scan runs in background.
+                self.set_image_list(vec![path.clone()]);
+                let _ =
+                    self.begin_media_directory_scan(path, PendingMediaDirectoryScanKind::InitialLoad);
+            }
         }
 
         if self.image_list.is_empty() {
@@ -9266,6 +11244,24 @@ impl ImageViewer {
                 self.start_async_video_load(path.clone());
             }
             Some(MediaType::Image) => {
+                if is_folder_entry {
+                    self.consume_deferred_media_view_reset();
+                    self.drop_retained_media_placeholder();
+                    self.image = Some(Self::build_folder_placeholder_image(
+                        path.clone(),
+                        Self::is_up_navigation_entry_path(path.as_path()),
+                    ));
+                    self.texture = None;
+                    self.image_texture_dims = Some((512, 512));
+                    self.show_video_controls = false;
+                    self.error_message = None;
+                    self.image_changed = true;
+                    self.pending_media_layout = false;
+                    self.perf_metrics
+                        .record_duration("load_media_prepare_ms", load_media_start.elapsed());
+                    return;
+                }
+
                 // Load as image with configured filters.
                 // For animated WebP we only decode the FIRST frame here so the
                 // window appears instantly, then start streaming remaining frames
@@ -9277,14 +11273,18 @@ impl ImageViewer {
                 let max_tex = self.max_texture_side.max(1);
 
                 if self.try_load_image_from_decoded_cache(path, max_tex, gif_filter) {
-                    self.schedule_solo_probe_window(path, media_type);
+                    if !defer_directory_work_for_fast_startup {
+                        self.schedule_solo_probe_window(path, media_type);
+                    }
                     self.perf_metrics
                         .record_duration("load_media_prepare_ms", load_media_start.elapsed());
                     return;
                 }
 
                 if self.try_load_image_from_thumbnail_cache(path, max_tex) {
-                    self.schedule_solo_probe_window(path, media_type);
+                    if !defer_directory_work_for_fast_startup {
+                        self.schedule_solo_probe_window(path, media_type);
+                    }
                     self.perf_metrics
                         .record_duration("load_media_prepare_ms", load_media_start.elapsed());
                     return;
@@ -9298,7 +11298,10 @@ impl ImageViewer {
             }
         }
 
-        if media_type.is_some() {
+        if media_type.is_some()
+            && !is_folder_entry
+            && !defer_directory_work_for_fast_startup
+        {
             self.schedule_solo_probe_window(path, media_type);
         }
 
@@ -10126,6 +12129,7 @@ impl ImageViewer {
         self.strip_return_mode = None;
         self.strip_return_button_only = false;
         self.strip_return_masonry_state = None;
+        self.strip_return_masonry_list_snapshot = None;
         self.strip_return_preserve_masonry_cache = false;
 
         if should_clear_preserved_masonry_cache && !self.has_resident_masonry_runtime_cache() {
@@ -10138,6 +12142,12 @@ impl ImageViewer {
         self.strip_return_button_only = false;
         self.strip_return_preserve_masonry_cache =
             layout_mode == MangaLayoutMode::Masonry && self.manga_mode;
+        self.strip_return_masonry_list_snapshot =
+            if layout_mode == MangaLayoutMode::Masonry && self.manga_mode {
+                Some(self.image_list.clone())
+            } else {
+                None
+            };
         self.strip_return_masonry_state =
             if layout_mode == MangaLayoutMode::Masonry && self.manga_mode {
                 Some(MasonryReturnState {
@@ -10155,10 +12165,16 @@ impl ImageViewer {
     }
 
     fn should_reuse_masonry_cache_on_return(&self, state: MasonryReturnState) -> bool {
+        let current_signature = self
+            .strip_return_masonry_list_snapshot
+            .as_ref()
+            .map(|files| Self::compute_image_list_signature(files))
+            .unwrap_or(self.image_list_signature);
+
         !self.image_list.is_empty()
             && masonry_return_can_reuse_runtime_cache(
                 state.list_signature,
-                self.image_list_signature,
+                current_signature,
                 self.strip_return_preserve_masonry_cache,
                 self.manga_loader.is_some(),
             )
@@ -10210,8 +12226,24 @@ impl ImageViewer {
         let current_media_dims = self.media_display_dimensions().or(self.video_texture_dims);
         let current_media_type = self.current_media_type;
         let current_image_is_animated = self.image.as_ref().is_some_and(|img| img.is_animated());
+        let current_path = self.current_media_path();
 
         self.prepare_enter_manga_mode_state(current_media_type);
+        if self.manga_layout_mode == MangaLayoutMode::Masonry {
+            if let Some(snapshot) = self.strip_return_masonry_list_snapshot.clone() {
+                self.set_image_list_raw(snapshot);
+                if let Some(path) = current_path.as_ref() {
+                    if let Some(idx) = self.image_list.iter().position(|candidate| candidate == path)
+                    {
+                        self.set_current_index_clamped(idx);
+                    }
+                }
+            }
+            self.restore_masonry_folder_metadata_snapshot();
+            if !self.image_list.is_empty() {
+                self.manga_dimension_cache_list_signature = self.image_list_signature;
+            }
+        }
         let current_dims_changed = self.cache_current_media_dimensions_for_manga(
             current_media_dims,
             current_media_type,
@@ -10250,6 +12282,26 @@ impl ImageViewer {
         } else {
             None
         };
+
+        let current_viewed_path = self.current_media_path();
+        if layout_mode == MangaLayoutMode::Masonry {
+            if let (Some(state), Some(snapshot)) = (
+                restore_masonry_state,
+                self.strip_return_masonry_list_snapshot.clone(),
+            ) {
+                let snapshot_signature = Self::compute_image_list_signature(&snapshot);
+                if state.list_signature == snapshot_signature {
+                    self.set_image_list_raw(snapshot);
+                    if let Some(path) = current_viewed_path.as_ref() {
+                        if let Some(idx) = self.image_list.iter().position(|candidate| candidate == path)
+                        {
+                            self.set_current_index_clamped(idx);
+                        }
+                    }
+                }
+            }
+        }
+
         let current_viewed_index = self
             .current_index
             .min(self.image_list.len().saturating_sub(1));
@@ -11313,32 +13365,74 @@ impl ImageViewer {
             .manga_visible_index()
             .min(self.image_list.len().saturating_sub(1));
         self.set_current_index_clamped(target_index);
+        let target_path = self.current_media_path();
 
-        self.manga_layout_mode = layout_mode;
-        if layout_mode == MangaLayoutMode::Masonry {
-            self.mark_masonry_runtime_cache_resident();
+        if self.manga_layout_mode == MangaLayoutMode::Masonry {
+            self.capture_masonry_mode_session_snapshot();
+            self.persist_current_masonry_folder_metadata_snapshot();
         }
-        self.invalidate_manga_layout_cache();
-        self.offset = egui::Vec2::ZERO;
 
-        let max_scroll = (self.manga_total_height() - self.screen_size.y).max(0.0);
-        let scroll_to = if layout_mode == MangaLayoutMode::Masonry {
-            self.masonry_scroll_offset_for_index_centered(target_index)
-                .unwrap_or_else(|| {
-                    self.manga_get_scroll_offset_for_index(target_index)
-                        .clamp(0.0, max_scroll)
-                })
+        let follow_current_viewed_item_on_restore = if layout_mode == MangaLayoutMode::Masonry {
+            self.masonry_mode_session_snapshot.as_ref().is_some_and(|snapshot| {
+                target_path
+                    .as_ref()
+                    .is_some_and(|path| snapshot.current_path.as_ref() != Some(path))
+            })
         } else {
-            self.manga_get_scroll_offset_for_index(target_index)
-                .clamp(0.0, max_scroll)
+            false
         };
 
-        self.manga_scroll_offset = scroll_to;
-        self.manga_scroll_target = scroll_to;
-        self.manga_scroll_velocity = 0.0;
-        self.stop_manga_wheel_scroll();
+        self.manga_layout_mode = layout_mode;
+        set_metadata_cache_enabled(true);
+        let restored_masonry_session = if layout_mode == MangaLayoutMode::Masonry {
+            self.mark_masonry_runtime_cache_resident();
+            self.restore_masonry_folder_metadata_snapshot();
+            if !self.image_list.is_empty() {
+                self.manga_dimension_cache_list_signature = self.image_list_signature;
+            }
+            let restored = self.try_restore_masonry_mode_session_snapshot(target_path.clone());
+            if restored {
+                self.hydrate_masonry_dimensions_from_session_snapshot();
+            }
+            restored
+        } else {
+            false
+        };
+        let masonry_authoritative_ready =
+            layout_mode == MangaLayoutMode::Masonry
+                && self.masonry_authoritative_dimension_lock_active();
 
-        let allow_startup_preload = layout_mode == MangaLayoutMode::Masonry;
+        if layout_mode != MangaLayoutMode::Masonry || !restored_masonry_session {
+            self.invalidate_manga_layout_cache();
+            self.offset = egui::Vec2::ZERO;
+
+            let max_scroll = (self.manga_total_height() - self.screen_size.y).max(0.0);
+            let scroll_to = if layout_mode == MangaLayoutMode::Masonry {
+                self.masonry_scroll_offset_for_index_centered(target_index)
+                    .unwrap_or_else(|| {
+                        self.manga_get_scroll_offset_for_index(target_index)
+                            .clamp(0.0, max_scroll)
+                    })
+            } else {
+                self.manga_get_scroll_offset_for_index(target_index)
+                    .clamp(0.0, max_scroll)
+            };
+
+            self.manga_scroll_offset = scroll_to;
+            self.manga_scroll_target = scroll_to;
+            self.manga_scroll_velocity = 0.0;
+            self.stop_manga_wheel_scroll();
+        } else if follow_current_viewed_item_on_restore {
+            self.scroll_strip_to_current_index();
+        }
+
+        if layout_mode == MangaLayoutMode::Masonry {
+            self.manga_update_current_index();
+            self.persist_current_masonry_folder_metadata_snapshot();
+        }
+
+        let allow_startup_preload = layout_mode == MangaLayoutMode::Masonry
+            && (!restored_masonry_session || !masonry_authoritative_ready);
         self.maybe_begin_masonry_metadata_preload(allow_startup_preload);
 
         self.manga_update_preload_queue();
@@ -11655,9 +13749,14 @@ impl ImageViewer {
             return;
         };
 
+        if self.traverse_folder_entry_path(path.as_path()) {
+            return;
+        }
+
         self.strip_open_force_fit_path = Some(path.clone());
         if return_mode == MangaLayoutMode::Masonry {
             self.mark_masonry_runtime_cache_resident();
+            self.capture_masonry_mode_session_snapshot();
         }
 
         let target_media_type = get_media_type(&path);
@@ -11668,8 +13767,12 @@ impl ImageViewer {
         self.stop_manga_wheel_scroll();
         self.stop_manga_autoscroll();
         self.reset_gif_seek_interaction_state();
+        if return_mode == MangaLayoutMode::Masonry {
+            self.persist_current_masonry_folder_metadata_snapshot();
+        }
         self.reset_masonry_metadata_preload();
         self.manga_mode = false;
+        set_metadata_cache_enabled(false);
         if return_mode == MangaLayoutMode::Masonry || self.has_resident_masonry_runtime_cache() {
             self.manga_suspend_runtime_for_solo_fullscreen();
         } else {
@@ -11683,7 +13786,21 @@ impl ImageViewer {
         if !self.manga_mode {
             self.pending_masonry_solo_reentry = None;
             self.sync_current_index_to_visible_media();
-            let reuse_preserved_masonry_layout = self.can_reuse_preserved_masonry_layout();
+            let preferred_masonry_path = if self.manga_layout_mode == MangaLayoutMode::Masonry {
+                self.current_media_path()
+            } else {
+                None
+            };
+            let follow_current_viewed_item_on_restore =
+                if self.manga_layout_mode == MangaLayoutMode::Masonry {
+                    self.masonry_mode_session_snapshot.as_ref().is_some_and(|snapshot| {
+                        preferred_masonry_path
+                            .as_ref()
+                            .is_some_and(|path| snapshot.current_path.as_ref() != Some(path))
+                    })
+                } else {
+                    false
+                };
 
             let current_media_dims = self.media_display_dimensions().or(self.video_texture_dims);
             let current_media_type = self.current_media_type;
@@ -11700,9 +13817,24 @@ impl ImageViewer {
             self.manga_pending_decoded_peak = 0;
 
             self.prepare_enter_manga_mode_state(current_media_type);
+
+            if let Some(anchor_path) = self.current_media_path() {
+                self.refresh_media_list_after_path_mutation(Some(anchor_path));
+            }
+
+            let restored_masonry_session = if self.manga_layout_mode == MangaLayoutMode::Masonry {
+                self.try_restore_masonry_mode_session_snapshot(preferred_masonry_path.clone())
+            } else {
+                false
+            };
+            let mut masonry_authoritative_ready = false;
+
             if self.manga_layout_mode == MangaLayoutMode::Masonry {
                 self.mark_masonry_runtime_cache_resident();
             }
+
+            let reuse_preserved_masonry_layout =
+                restored_masonry_session || self.can_reuse_preserved_masonry_layout();
 
             // Manga layout cache must be rebuilt for the new mode.
             if !reuse_preserved_masonry_layout {
@@ -11715,6 +13847,13 @@ impl ImageViewer {
                 if !reuse_preserved_masonry_layout {
                     loader.cache_all_dimensions(&self.image_list);
                 }
+            }
+            if self.manga_layout_mode == MangaLayoutMode::Masonry {
+                self.restore_masonry_folder_metadata_snapshot();
+                if restored_masonry_session {
+                    self.hydrate_masonry_dimensions_from_session_snapshot();
+                }
+                masonry_authoritative_ready = self.masonry_authoritative_dimension_lock_active();
             }
             if !self.image_list.is_empty() {
                 self.manga_dimension_cache_list_signature = self.image_list_signature;
@@ -11730,15 +13869,20 @@ impl ImageViewer {
             );
 
             // Dimensions may have changed; rebuild height cache.
-            if !reuse_preserved_masonry_layout || current_dims_changed {
+            if !reuse_preserved_masonry_layout
+                || (current_dims_changed
+                    && !(restored_masonry_session && masonry_authoritative_ready))
+            {
                 self.invalidate_manga_layout_cache();
             }
 
             if self.manga_layout_mode == MangaLayoutMode::Masonry {
-                let new_zoom = self.clamp_zoom(1.0);
-                self.zoom = new_zoom;
-                self.zoom_target = new_zoom;
-                self.zoom_velocity = 0.0;
+                if !restored_masonry_session {
+                    let new_zoom = self.clamp_zoom(1.0);
+                    self.zoom = new_zoom;
+                    self.zoom_target = new_zoom;
+                    self.zoom_velocity = 0.0;
+                }
             } else {
                 // Enter long-strip mode: start in a "fit-to-screen by height" zoom (like fullscreen fit).
                 // In long-strip mode we apply a per-image `base_scale` (fit tall pages down) and then
@@ -11761,29 +13905,43 @@ impl ImageViewer {
                 }
             }
 
-            // Reset offset (horizontal pan) and scroll to current image position
-            self.offset = egui::Vec2::ZERO;
-            let target_index = self
-                .current_index
-                .min(self.image_list.len().saturating_sub(1));
-            self.set_current_index_clamped(target_index);
-            let max_scroll = (self.manga_total_height() - self.screen_size.y).max(0.0);
-            let scroll_to = if self.manga_layout_mode == MangaLayoutMode::Masonry {
-                self.masonry_scroll_offset_for_index_centered(target_index)
-                    .unwrap_or_else(|| {
-                        self.manga_get_scroll_offset_for_index(target_index)
-                            .clamp(0.0, max_scroll)
-                    })
+            if !restored_masonry_session {
+                // Reset offset (horizontal pan) and scroll to current image position
+                self.offset = egui::Vec2::ZERO;
+                let target_index = self
+                    .current_index
+                    .min(self.image_list.len().saturating_sub(1));
+                self.set_current_index_clamped(target_index);
+                let max_scroll = (self.manga_total_height() - self.screen_size.y).max(0.0);
+                let scroll_to = if self.manga_layout_mode == MangaLayoutMode::Masonry {
+                    self.masonry_scroll_offset_for_index_centered(target_index)
+                        .unwrap_or_else(|| {
+                            self.manga_get_scroll_offset_for_index(target_index)
+                                .clamp(0.0, max_scroll)
+                        })
+                } else {
+                    self.manga_get_scroll_offset_for_index(target_index)
+                        .clamp(0.0, max_scroll)
+                };
+                self.manga_scroll_offset = scroll_to;
+                self.manga_scroll_target = scroll_to;
+                self.manga_scroll_velocity = 0.0;
+                self.stop_manga_wheel_scroll();
+            } else if follow_current_viewed_item_on_restore {
+                self.scroll_strip_to_current_index();
             } else {
-                self.manga_get_scroll_offset_for_index(target_index)
-                    .clamp(0.0, max_scroll)
-            };
-            self.manga_scroll_offset = scroll_to;
-            self.manga_scroll_target = scroll_to;
-            self.manga_scroll_velocity = 0.0;
-            self.stop_manga_wheel_scroll();
+                self.manga_scroll_velocity = 0.0;
+                self.stop_manga_wheel_scroll();
+            }
 
-            self.maybe_begin_masonry_metadata_preload(true);
+            let allow_startup_preload =
+                self.manga_layout_mode == MangaLayoutMode::Masonry
+                    && (!restored_masonry_session || !masonry_authoritative_ready);
+            self.maybe_begin_masonry_metadata_preload(allow_startup_preload);
+            if self.manga_layout_mode == MangaLayoutMode::Masonry {
+                self.manga_update_current_index();
+                self.persist_current_masonry_folder_metadata_snapshot();
+            }
 
             self.manga_update_preload_queue();
             return;
@@ -11799,9 +13957,18 @@ impl ImageViewer {
 
         self.stop_manga_wheel_scroll();
         self.stop_manga_autoscroll();
+        if self.manga_layout_mode == MangaLayoutMode::Masonry {
+            self.capture_masonry_mode_session_snapshot();
+        }
+        if self.manga_layout_mode == MangaLayoutMode::Masonry
+            || self.has_resident_masonry_runtime_cache()
+        {
+            self.persist_current_masonry_folder_metadata_snapshot();
+        }
         let keep_resident_masonry_cache = self.manga_layout_mode == MangaLayoutMode::Masonry
             || self.has_resident_masonry_runtime_cache();
         self.manga_mode = false;
+        set_metadata_cache_enabled(false);
         if keep_resident_masonry_cache {
             self.manga_suspend_runtime_for_solo_fullscreen();
         } else {
@@ -12117,6 +14284,7 @@ impl ImageViewer {
         // Clear the texture cache
         self.manga_texture_cache.clear();
         self.masonry_runtime_cache_signature = 0;
+        self.clear_masonry_authoritative_dimension_lock();
         self.strip_entry_placeholder_index = None;
         self.manga_ttv_pending.clear();
         self.manga_ttv_samples_ms.clear();
@@ -12500,7 +14668,7 @@ impl ImageViewer {
             })
             .collect();
 
-        indexed_distances.sort_by_key(|&(_, dist)| std::cmp::Reverse(dist));
+        indexed_distances.sort_by_key(|&(_, dist)| dist);
 
         // Remove the furthest players until we're under the limit
         while self.manga_video_players.len() > self.manga_max_video_players {
@@ -12548,12 +14716,14 @@ impl ImageViewer {
                 if let Some(frame) = player.get_frame() {
                     // Update dimensions in loader if changed
                     if frame.width > 0 && frame.height > 0 {
-                        if let Some(ref mut loader) = self.manga_loader {
-                            video_dimensions_changed = loader.update_video_dimensions(
-                                focused_idx,
-                                frame.width,
-                                frame.height,
-                            );
+                        if !self.masonry_authoritative_dimension_lock_active() {
+                            if let Some(ref mut loader) = self.manga_loader {
+                                video_dimensions_changed = loader.update_video_dimensions(
+                                    focused_idx,
+                                    frame.width,
+                                    frame.height,
+                                );
+                            }
                         }
                     }
 
@@ -12595,7 +14765,10 @@ impl ImageViewer {
                 }
             }
 
-            if self.is_masonry_mode() && video_dimensions_changed {
+            if self.is_masonry_mode()
+                && !self.masonry_authoritative_dimension_lock_active()
+                && video_dimensions_changed
+            {
                 self.masonry_queue_dimension_updates(std::iter::once(focused_idx));
                 if !self.masonry_navigation_active_for_heavy_work() {
                     let force_flush = !self.masonry_metadata_preload_active;
@@ -12759,14 +14932,21 @@ impl ImageViewer {
         // ── Drain frames from active streams ──
         let stream_indices: Vec<usize> = self.manga_anim_streams.keys().copied().collect();
         for idx in stream_indices {
+            const MAX_MANGA_STREAM_FRAMES_PER_TICK: usize = 8;
             let mut disconnected = false;
+            let mut drained_this_tick = 0usize;
             if let Some(rx) = self.manga_anim_streams.get(&idx) {
                 loop {
+                    if drained_this_tick >= MAX_MANGA_STREAM_FRAMES_PER_TICK {
+                        break;
+                    }
+
                     match rx.try_recv() {
                         Ok(frame) => {
                             if let Some(img) = self.manga_animated_images.get_mut(&idx) {
                                 img.frames.push(frame);
                             }
+                            drained_this_tick += 1;
                             needs_repaint = true;
                         }
                         Err(crossbeam_channel::TryRecvError::Empty) => break,
@@ -12827,23 +15007,31 @@ impl ImageViewer {
                         pixels.as_ref(),
                     );
 
-                    let texture = ctx.load_texture(
-                        format!("manga_anim_{}", idx),
-                        color_image,
-                        self.config.texture_filter_animated.to_egui_options(),
-                    );
+                    let texture_options = self.config.texture_filter_animated.to_egui_options();
+                    if let Some((mut texture, _, _, _)) =
+                        self.manga_texture_cache.get_texture_handle_info(idx)
+                    {
+                        texture.set(color_image, texture_options);
+                        self.manga_texture_cache.update_texture(idx, texture, w, h);
+                    } else {
+                        let texture = ctx.load_texture(
+                            format!("manga_anim_{}", idx),
+                            color_image,
+                            texture_options,
+                        );
 
-                    let evicted = self.manga_texture_cache.insert_with_type(
-                        idx,
-                        texture,
-                        w,
-                        h,
-                        MangaMediaType::AnimatedImage,
-                    );
-                    if !evicted.is_empty() {
-                        if let Some(loader) = self.manga_loader.as_mut() {
-                            for evicted_idx in evicted {
-                                loader.mark_unloaded(evicted_idx);
+                        let evicted = self.manga_texture_cache.insert_with_type(
+                            idx,
+                            texture,
+                            w,
+                            h,
+                            MangaMediaType::AnimatedImage,
+                        );
+                        if !evicted.is_empty() {
+                            if let Some(loader) = self.manga_loader.as_mut() {
+                                for evicted_idx in evicted {
+                                    loader.mark_unloaded(evicted_idx);
+                                }
                             }
                         }
                     }
@@ -12920,14 +15108,17 @@ impl ImageViewer {
             );
             let color_image =
                 egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], pixels.as_ref());
-            let texture = ctx.load_texture(
-                format!("manga_anim_{}", idx),
-                color_image,
-                self.config.texture_filter_animated.to_egui_options(),
-            );
-            if self.manga_texture_cache.contains(idx) {
+            let texture_options = self.config.texture_filter_animated.to_egui_options();
+            if let Some((mut texture, _, _, _)) = self.manga_texture_cache.get_texture_handle_info(idx)
+            {
+                texture.set(color_image, texture_options);
                 self.manga_texture_cache.update_texture(idx, texture, w, h);
             } else {
+                let texture = ctx.load_texture(
+                    format!("manga_anim_{}", idx),
+                    color_image,
+                    texture_options,
+                );
                 let evicted = self.manga_texture_cache.insert_with_type(
                     idx,
                     texture,
@@ -13272,6 +15463,14 @@ impl ImageViewer {
     }
 
     fn manga_get_image_source_dimensions(&self, index: usize) -> Option<(f32, f32)> {
+        if self
+            .image_list
+            .get(index)
+            .is_some_and(|path| self.is_folder_navigation_entry_path(path.as_path()))
+        {
+            return Some((512.0, 512.0));
+        }
+
         let loader_dims = self
             .manga_loader
             .as_ref()
@@ -13485,6 +15684,15 @@ impl ImageViewer {
         };
         layout_dim_updates.sort_unstable();
         layout_dim_updates.dedup();
+
+        if self.is_masonry_mode()
+            && self.masonry_authoritative_dimension_lock_active()
+            && !layout_dim_updates.is_empty()
+        {
+            self.sync_masonry_authoritative_dimensions();
+            layout_dim_updates.clear();
+        }
+
         let layout_dims_changed = !layout_dim_updates.is_empty();
 
         // Dimension updates can change page heights; invalidate cached layout/prefix sums.
@@ -15148,6 +17356,35 @@ impl ImageViewer {
         };
         let mut requested_retry = false;
 
+        let folder_entry = self
+            .image_list
+            .get(idx)
+            .cloned()
+            .and_then(|path| {
+                if self.is_folder_navigation_entry_path(path.as_path()) {
+                    Some(path)
+                } else {
+                    None
+                }
+            });
+
+        if let Some(path) = folder_entry.as_ref() {
+            self.paint_folder_entry_card(ui, image_rect, path.as_path());
+
+            let preview_only =
+                self.mark_selection_preview_contains(idx) && self.mark_visual_for_index(idx).is_none();
+            let mark_visual = if preview_only {
+                Some(FileMarkVisual::Preview)
+            } else {
+                self.mark_visual_for_index(idx)
+            };
+            if let Some(mark_visual) = mark_visual {
+                self.paint_marked_item_overlay(ui.painter(), image_rect, mark_visual);
+            }
+
+            return false;
+        }
+
         let cached_media_type = self
             .manga_loader
             .as_ref()
@@ -16458,6 +18695,7 @@ impl ImageViewer {
                 loader.pending_load_count() > 0
                     || loader.pending_decoded_count() > 0
                     || loader.pending_dimension_results_count() > 0
+                    || loader.pending_dimension_probe_count() > 0
             })
             .unwrap_or(false);
 
@@ -16918,7 +19156,7 @@ impl ImageViewer {
             return true;
         }
 
-        if self.show_controls && pos.y < 50.0 {
+        if self.show_controls && pos.y < self.top_controls_hotzone_height() {
             return true;
         }
 
@@ -17131,10 +19369,17 @@ impl ImageViewer {
         // progressively — no need to wait for the full decode.
         if !self.manga_mode {
             if let Some(ref rx) = self.anim_stream_rx {
+                const MAX_SOLO_STREAM_FRAMES_PER_TICK: usize = 8;
                 let mut got_frames = false;
+                let mut drained_this_tick = 0usize;
                 loop {
+                    if drained_this_tick >= MAX_SOLO_STREAM_FRAMES_PER_TICK {
+                        break;
+                    }
+
                     match rx.try_recv() {
                         Ok(frame) => {
+                            drained_this_tick += 1;
                             // Only accept if path still matches what we are viewing.
                             let path_ok = self
                                 .anim_stream_path
@@ -17292,7 +19537,11 @@ impl ImageViewer {
                         .to_egui_options_with_mipmap(enable_mipmap)
                 };
 
-                self.texture = Some(ctx.load_texture("image", color_image, texture_options));
+                if let Some(texture) = self.texture.as_mut() {
+                    texture.set(color_image, texture_options);
+                } else {
+                    self.texture = Some(ctx.load_texture("image", color_image, texture_options));
+                }
                 self.image_texture_dims = Some((w, h));
                 self.texture_frame = img.current_frame_index();
             }
@@ -17345,11 +19594,16 @@ impl ImageViewer {
                     solo_video_upload_mipmaps_enabled && w.min(h) >= solo_video_upload_mipmap_min_side,
                 );
 
-                self.video_texture = Some(ctx.load_texture(
-                    "video",
-                    color_image,
-                    texture_options,
-                ));
+                // Reuse the same GPU texture across frames to avoid per-frame allocations.
+                if let Some(texture) = self.video_texture.as_mut() {
+                    texture.set(color_image, texture_options);
+                } else {
+                    self.video_texture = Some(ctx.load_texture(
+                        "video",
+                        color_image,
+                        texture_options,
+                    ));
+                }
                 self.video_texture_dims = Some((w, h));
                 needs_repaint = true;
             }
@@ -17409,6 +19663,7 @@ impl ImageViewer {
         let mut right_click_toggle_fullscreen = false;
         let mut right_click_navigated = false;
         let mut ctrl_secondary_single_file_menu_pos: Option<egui::Pos2> = None;
+        let mut goto_bound_folder_traverse_requested = false;
 
         ctx.input(|input| {
             let ctrl = input.modifiers.ctrl;
@@ -17424,6 +19679,23 @@ impl ImageViewer {
                 .or_else(|| input.pointer.hover_pos());
             let pointer_over_shortcut_ui =
                 self.pointer_over_shortcut_blocking_ui(pointer_pos, input.screen_rect);
+
+            if !self.manga_mode
+                && self.action_binding_triggered(Action::GotoFile, input, ctrl, shift, alt)
+                && !pointer_over_shortcut_ui
+            {
+                if let Some(pos) = pointer_pos {
+                    if self
+                        .current_media_path()
+                        .as_ref()
+                        .is_some_and(|path| self.is_folder_navigation_entry_path(path.as_path()))
+                        && self.point_over_current_media(pos, input.screen_rect)
+                    {
+                        goto_bound_folder_traverse_requested = true;
+                        return;
+                    }
+                }
+            }
 
             if self.manga_autoscroll_active {
                 let primary_cancel = input.pointer.button_clicked(egui::PointerButton::Primary);
@@ -17632,6 +19904,14 @@ impl ImageViewer {
                     self.current_index.min(self.image_list.len().saturating_sub(1)),
                 );
                 return;
+            }
+        }
+
+        if goto_bound_folder_traverse_requested {
+            if let Some(path) = self.current_media_path() {
+                if self.traverse_folder_entry_path(path.as_path()) {
+                    return;
+                }
             }
         }
 
@@ -17996,7 +20276,7 @@ impl ImageViewer {
         // Check if mouse is near top
         let mouse_pos = ctx.input(|i| i.pointer.hover_pos());
         if let Some(pos) = mouse_pos {
-            if pos.y < 50.0 {
+            if pos.y < self.top_controls_hotzone_height() {
                 self.show_controls = true;
                 self.controls_show_time = Instant::now();
             }
@@ -18005,7 +20285,7 @@ impl ImageViewer {
         // Auto-hide controls after configured delay
         if self.controls_show_time.elapsed().as_secs_f32() > self.config.controls_hide_delay {
             if let Some(pos) = mouse_pos {
-                if pos.y >= 50.0 {
+                if pos.y >= self.top_controls_hotzone_height() {
                     // Don't hide while selecting title text.
                     if !self.title_text_dragging && !title_bar_menu_was_active {
                         self.show_controls = false;
@@ -18022,8 +20302,12 @@ impl ImageViewer {
             return;
         }
 
+        let mut breadcrumb_target_directory: Option<PathBuf> = None;
+        let mut breadcrumb_ui_hovered = false;
+        let mut breadcrumb_popup_active = false;
+
         // Draw control bar
-        let bar_height = 32.0;
+        let bar_height = Self::TITLE_BAR_HEIGHT;
         let bar_rect = egui::Rect::from_min_size(
             screen_rect.min,
             egui::Vec2::new(screen_rect.width(), bar_height),
@@ -18073,12 +20357,60 @@ impl ImageViewer {
                     // Left side: filename + details (or "...")
                     ui.allocate_new_ui(egui::UiBuilder::new().max_rect(left_rect), |ui| {
                         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                            ui.add_space(10.0);
+                            ui.add_space(8.0);
 
                             // Track whether the pointer is interacting with title text so we can
                             // suppress drag/pan/double-click gestures while selecting/copying.
                             let mut over_title_text = false;
                             let mut started_title_text_drag = false;
+
+                            let breadcrumb_toggle_enabled = self.folder_navigation_ui_enabled();
+
+                            if breadcrumb_toggle_enabled {
+                                let toggle_size = egui::vec2(24.0, 24.0);
+                                let (toggle_rect, toggle_resp_base) =
+                                    ui.allocate_exact_size(toggle_size, egui::Sense::click());
+                                let toggle_resp = toggle_resp_base.on_hover_text(
+                                    if self.show_breadcrumb_bar {
+                                        "Hide breadcrumb address bar"
+                                    } else {
+                                        "Show breadcrumb address bar"
+                                    },
+                                );
+
+                                if ui.is_rect_visible(toggle_rect) {
+                                    let bg = if toggle_resp.is_pointer_button_down_on() {
+                                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 40)
+                                    } else if toggle_resp.hovered() {
+                                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 22)
+                                    } else {
+                                        egui::Color32::TRANSPARENT
+                                    };
+                                    ui.painter().rect_filled(toggle_rect, 4.0, bg);
+
+                                    let icon_rect = toggle_rect.shrink2(egui::vec2(4.0, 4.0));
+                                    let icon_color = if self.show_breadcrumb_bar {
+                                        egui::Color32::WHITE
+                                    } else {
+                                        egui::Color32::from_gray(170)
+                                    };
+                                    Self::paint_menu_action_icon(
+                                        ui.painter(),
+                                        icon_rect,
+                                        MenuActionIcon::OpenLocation,
+                                        icon_color,
+                                    );
+                                }
+
+                                if toggle_resp.clicked() {
+                                    self.show_breadcrumb_bar = !self.show_breadcrumb_bar;
+                                    self.show_controls = true;
+                                    self.controls_show_time = Instant::now();
+                                }
+
+                                over_title_text |= toggle_resp.contains_pointer();
+                                ui.add_space(6.0);
+                            }
 
                             let current_path = self.image_list.get(self.current_index).cloned();
                             let details_path = current_path.clone();
@@ -18425,6 +20757,177 @@ impl ImageViewer {
                     });
                 });
             });
+
+        if self.folder_navigation_ui_enabled() && self.show_breadcrumb_bar {
+            let breadcrumb_height = Self::BREADCRUMB_BAR_HEIGHT;
+            let breadcrumb_rect = egui::Rect::from_min_size(
+                egui::pos2(screen_rect.min.x, screen_rect.min.y + bar_height),
+                egui::Vec2::new(screen_rect.width(), breadcrumb_height),
+            );
+
+            egui::Area::new(egui::Id::new("breadcrumb_bar"))
+                .fixed_pos(breadcrumb_rect.min)
+                .order(egui::Order::Foreground)
+                .show(ctx, |ui| {
+                    ui.painter().rect_filled(
+                        breadcrumb_rect,
+                        0.0,
+                        egui::Color32::from_rgba_unmultiplied(32, 32, 32, 214),
+                    );
+
+                    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(breadcrumb_rect), |ui| {
+                        ui.set_min_height(breadcrumb_height);
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            ui.add_space(8.0);
+
+                            let Some(current_path) = self.current_media_path() else {
+                                ui.label(
+                                    egui::RichText::new("No file loaded")
+                                        .color(egui::Color32::from_gray(170)),
+                                );
+                                return;
+                            };
+
+                            let current_directory =
+                                current_path.parent().unwrap_or(current_path.as_path());
+                            let segments = Self::breadcrumb_segments_for_path(current_directory);
+
+                            if segments.is_empty() {
+                                ui.label(
+                                    egui::RichText::new(current_directory.display().to_string())
+                                        .color(egui::Color32::from_gray(210)),
+                                );
+                                return;
+                            }
+
+                            for (index, (segment_label, segment_path)) in segments.iter().enumerate()
+                            {
+                                let is_leaf = index + 1 == segments.len();
+                                let segment_response = ui.add(
+                                    egui::Button::new(
+                                        egui::RichText::new(segment_label)
+                                            .color(if is_leaf {
+                                                egui::Color32::WHITE
+                                            } else {
+                                                egui::Color32::from_gray(210)
+                                            }),
+                                    )
+                                    .frame(false),
+                                );
+
+                                if segment_response.contains_pointer() {
+                                    breadcrumb_ui_hovered = true;
+                                }
+
+                                if segment_response.clicked()
+                                    || segment_response.secondary_clicked()
+                                {
+                                    breadcrumb_target_directory = Some(segment_path.clone());
+                                }
+
+                                let arrow_response = ui.add(
+                                    egui::Button::new(
+                                        egui::RichText::new(">")
+                                            .color(egui::Color32::from_gray(150)),
+                                    )
+                                    .frame(false),
+                                );
+
+                                if arrow_response.contains_pointer() {
+                                    breadcrumb_ui_hovered = true;
+                                }
+
+                                let popup_id = ui.make_persistent_id((
+                                    "breadcrumb_segment_children_popup",
+                                    segment_path,
+                                ));
+                                if arrow_response.clicked() || arrow_response.secondary_clicked() {
+                                    ui.memory_mut(|mem| mem.toggle_popup(popup_id));
+                                }
+
+                                let close_on_click_outside =
+                                    egui::popup::PopupCloseBehavior::CloseOnClickOutside;
+                                egui::popup::popup_below_widget(
+                                    ui,
+                                    popup_id,
+                                    &arrow_response,
+                                    close_on_click_outside,
+                                    |ui| {
+                                        breadcrumb_popup_active = true;
+                                        ui.set_min_width(240.0);
+
+                                        let child_dirs =
+                                            Self::breadcrumb_child_directories(segment_path.as_path());
+                                        let mut close_popup = false;
+
+                                        if child_dirs.is_empty() {
+                                            ui.label(
+                                                egui::RichText::new("No subfolders")
+                                                    .color(egui::Color32::from_gray(150)),
+                                            );
+                                        } else {
+                                            egui::ScrollArea::vertical()
+                                                .max_height(280.0)
+                                                .show(ui, |ui| {
+                                                    for child in child_dirs {
+                                                        let child_name = child
+                                                            .file_name()
+                                                            .map(|name| {
+                                                                name.to_string_lossy().to_string()
+                                                            })
+                                                            .filter(|name| !name.is_empty())
+                                                            .unwrap_or_else(|| {
+                                                                child.display().to_string()
+                                                            });
+
+                                                        let row = ui.selectable_label(false, child_name);
+                                                        if row.contains_pointer() {
+                                                            breadcrumb_ui_hovered = true;
+                                                        }
+                                                        if row.clicked() || row.secondary_clicked() {
+                                                            breadcrumb_target_directory =
+                                                                Some(child.clone());
+                                                            close_popup = true;
+                                                        }
+                                                    }
+                                                });
+                                        }
+
+                                        if close_popup {
+                                            ui.memory_mut(|mem| mem.close_popup());
+                                        }
+
+                                        if ui.rect_contains_pointer(ui.min_rect()) {
+                                            breadcrumb_ui_hovered = true;
+                                            breadcrumb_popup_active = true;
+                                        }
+                                    },
+                                );
+
+                                if ui.memory(|mem| mem.is_popup_open(popup_id)) {
+                                    breadcrumb_popup_active = true;
+                                }
+
+                                ui.add_space(2.0);
+                            }
+                        });
+                    });
+                });
+        }
+
+        if breadcrumb_ui_hovered {
+            self.mouse_over_title_text = true;
+        }
+
+        if breadcrumb_popup_active {
+            self.title_bar_menu_active = true;
+            self.show_controls = true;
+            self.controls_show_time = Instant::now();
+        }
+
+        if let Some(directory) = breadcrumb_target_directory {
+            self.navigate_to_breadcrumb_directory(directory.as_path());
+        }
     }
 
     /// Draw video controls bar at the bottom of the screen
@@ -19708,7 +22211,7 @@ impl ImageViewer {
 
         let screen_rect = ctx.screen_rect();
         let mut animation_active = false;
-        let title_bar_height = 32.0;
+        let title_bar_height = self.top_controls_visible_height();
         let title_ui_blocking = self.title_bar_ui_blocking();
 
         // Smooth zoom animation (floating mode)
@@ -20111,8 +22614,11 @@ impl ImageViewer {
             {
                 self.manga_shift_wheel_pan_velocity_x = 0.0;
                 if let Some(pos) = pointer_pos {
-                    // Check if drag started from title bar area (top 50px) for window dragging
-                    let in_title_bar = self.last_mouse_pos.map_or(pos.y < 50.0, |lp| lp.y < 50.0);
+                    // Check if drag started from the top controls region for window dragging.
+                    let in_title_bar = self.last_mouse_pos.map_or(
+                        pos.y < self.top_controls_hotzone_height(),
+                        |lp| lp.y < self.top_controls_hotzone_height(),
+                    );
 
                     if let Some(_last_pos) = self.last_mouse_pos {
                         if self.is_panning {
@@ -20373,6 +22879,15 @@ impl ImageViewer {
                         );
                     }
 
+                    let folder_entry_path = self
+                        .image_list
+                        .get(self.current_index)
+                        .cloned()
+                        .filter(|path| self.is_folder_navigation_entry_path(path.as_path()));
+                    if let Some(path) = folder_entry_path.as_ref() {
+                        self.paint_folder_entry_card(ui, final_rect, path.as_path());
+                    }
+
                     // Show loading spinner while animated WebP frames are still streaming.
                     if !self.anim_stream_done {
                         let time = ui.input(|i| i.time);
@@ -20493,6 +23008,7 @@ impl eframe::App for ImageViewer {
                     self.stop_manga_wheel_scroll();
                     self.stop_manga_autoscroll();
                     self.manga_mode = false;
+                    set_metadata_cache_enabled(false);
                     self.manga_clear_cache();
 
                     // Fully drop the loader thread pool on handoff from another instance.
@@ -20508,6 +23024,8 @@ impl eframe::App for ImageViewer {
         self.poll_pending_media_directory_scan(ctx);
         self.poll_pending_solo_probe(ctx);
         self.poll_pending_media_load(ctx);
+        self.poll_pending_folder_placeholder_preview_scans(ctx);
+        self.poll_pending_folder_placeholder_thumbnail_loads(ctx);
         if !(self.manga_mode && self.is_fullscreen) {
             self.poll_pending_manga_video_load(ctx);
         }
@@ -20534,6 +23052,7 @@ impl eframe::App for ImageViewer {
             return;
         }
 
+        self.handle_masonry_preload_focus_loss(ctx);
         self.update_pointer_activity_tracking(ctx);
 
         // Update FPS stats for the debug overlay (and for general diagnostics).
@@ -20807,10 +23326,20 @@ impl eframe::App for ImageViewer {
                             target_media_type,
                         );
 
+                        if self.manga_layout_mode == MangaLayoutMode::Masonry {
+                            self.capture_masonry_mode_session_snapshot();
+                        }
+                        if self.manga_layout_mode == MangaLayoutMode::Masonry
+                            || self.has_resident_masonry_runtime_cache()
+                        {
+                            self.persist_current_masonry_folder_metadata_snapshot();
+                        }
+
                         let keep_resident_masonry_cache =
                             self.manga_layout_mode == MangaLayoutMode::Masonry
                                 || self.has_resident_masonry_runtime_cache();
                         self.manga_mode = false;
+                        set_metadata_cache_enabled(false);
                         if keep_resident_masonry_cache {
                             self.manga_suspend_runtime_for_solo_fullscreen();
                         } else {
@@ -21100,7 +23629,12 @@ impl eframe::App for ImageViewer {
         // Determine if we need continuous repainting.
         // Keep visual animations separate from background loader work so idle
         // masonry does not run at full frame rate while decoding off-screen items.
-        let (manga_pending_loads, manga_pending_decoded, manga_pending_dimensions) = self
+        let (
+            manga_pending_loads,
+            manga_pending_decoded,
+            manga_pending_dimensions,
+            manga_pending_dimension_probes,
+        ) = self
             .manga_loader
             .as_ref()
             .map(|loader| {
@@ -21108,17 +23642,24 @@ impl eframe::App for ImageViewer {
                     loader.pending_load_count(),
                     loader.pending_decoded_count(),
                     loader.pending_dimension_results_count(),
+                    loader.pending_dimension_probe_count(),
                 )
             })
-            .unwrap_or((0, 0, 0));
+            .unwrap_or((0, 0, 0, 0));
+        let masonry_metadata_preload_running =
+            self.manga_mode && self.is_masonry_mode() && self.masonry_metadata_preload_active;
         let manga_background_work_pending = self.manga_mode
             && (manga_pending_loads > 0
                 || manga_pending_decoded > 0
-                || manga_pending_dimensions > 0);
+                || manga_pending_dimensions > 0
+                || manga_pending_dimension_probes > 0
+                || masonry_metadata_preload_running);
         let manga_needs_fast_background_poll = self.manga_mode
-            && (!self.manga_ttv_pending.is_empty()
+            && (masonry_metadata_preload_running
+                || !self.manga_ttv_pending.is_empty()
                 || manga_pending_decoded > 0
-                || manga_pending_dimensions > 0);
+                || manga_pending_dimensions > 0
+                || manga_pending_dimension_probes > 0);
         let manga_scroll_active = self.manga_mode
             && ((self.manga_scroll_target - self.manga_scroll_offset).abs() > 0.1
                 || self.manga_scroll_velocity.abs() > 0.5
@@ -21234,6 +23775,8 @@ impl eframe::App for ImageViewer {
             self.is_idle = self.last_activity_time.elapsed() > idle_threshold;
         }
 
+        self.run_idle_config_sync_if_needed();
+
         // Smart repaint scheduling for CPU efficiency:
         // - Active animations: immediate repaint
         // - Visible manga placeholders / queued uploads: poll near 60fps
@@ -21294,8 +23837,11 @@ impl eframe::App for ImageViewer {
 
             // Top control bar auto-hide: schedule a single repaint right when it should disappear.
             if self.show_controls {
-                let hovering_top =
-                    ctx.input(|i| i.pointer.hover_pos().map_or(false, |p| p.y < 50.0));
+                let hovering_top = ctx.input(|i| {
+                    i.pointer
+                        .hover_pos()
+                        .map_or(false, |p| p.y < self.top_controls_hotzone_height())
+                });
                 if !hovering_top {
                     let delay = Duration::from_secs_f32(self.config.controls_hide_delay.max(0.0));
                     let elapsed = self.controls_show_time.elapsed();
@@ -21431,6 +23977,7 @@ fn main() -> eframe::Result<()> {
     // Load config early to check single_instance setting
     let config = Config::load();
     configure_metadata_cache_size_limit(config.metadata_cache_max_size_mb);
+    set_metadata_cache_enabled(false);
 
     // ============ SINGLE INSTANCE MODE ============
     // Try to become the primary instance or send the file to an existing instance
@@ -21470,9 +24017,9 @@ fn main() -> eframe::Result<()> {
     // For videos, we start hidden and show once GStreamer decodes the first frame.
     let (initial_size, initial_pos, start_visible) = match media_type {
         Some(MediaType::Image) => {
-            // Prefer cached dimensions to avoid touching the media file on every startup.
-            let (img_w, img_h) =
-                lookup_cached_dimensions(&file_path, CachedMediaKind::Image).unwrap_or((800, 600));
+            // Startup sizing intentionally bypasses metadata_cache.redb to keep single-file
+            // launches independent from cache size.
+            let (img_w, img_h) = probe_image_dimensions(&file_path).unwrap_or((800, 600));
             let img_w = img_w as f32;
             let img_h = img_h as f32;
 

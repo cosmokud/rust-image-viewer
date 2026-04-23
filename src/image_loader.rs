@@ -251,6 +251,9 @@ pub const SUPPORTED_EXTENSIONS: &[&str] = &[
     "mp4", "mkv", "webm", "avi", "mov", "wmv", "flv", "m4v", "3gp", "ogv",
 ];
 
+/// Synthetic entry name used to navigate to the parent directory.
+pub const FOLDER_UP_ENTRY_NAME: &str = "[]...]";
+
 /// Media type enum
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaType {
@@ -286,25 +289,43 @@ pub fn get_media_type(path: &Path) -> Option<MediaType> {
 
 /// Get all media files (images and videos) in the same directory as the given path
 pub fn get_media_in_directory(path: &Path) -> Vec<PathBuf> {
-    let parent = match path.parent() {
-        Some(p) => p,
-        None => return vec![path.to_path_buf()],
+    let directory = if path.is_dir() {
+        path.to_path_buf()
+    } else {
+        match path.parent() {
+            Some(p) => p.to_path_buf(),
+            None => return vec![path.to_path_buf()],
+        }
     };
 
-    let mut media: Vec<PathBuf> = WalkDir::new(parent)
+    let mut media: Vec<PathBuf> = WalkDir::new(&directory)
         .max_depth(1)
         .min_depth(1)
         .into_iter()
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.path())
-        .filter(|p| p.is_file() && is_supported_media(p))
+        .filter(|p| p.is_dir() || (p.is_file() && is_supported_media(p)))
         .collect();
 
+    if directory.parent().is_some() {
+        let up_entry = directory.join(FOLDER_UP_ENTRY_NAME);
+        if !media.iter().any(|entry| entry == &up_entry) {
+            media.push(up_entry);
+        }
+    }
+
     media.par_sort_unstable_by(|a, b| {
-        natord::compare(
-            a.file_name().unwrap_or_default().to_str().unwrap_or(""),
-            b.file_name().unwrap_or_default().to_str().unwrap_or(""),
-        )
+        let a_name = a.file_name().unwrap_or_default().to_str().unwrap_or("");
+        let b_name = b.file_name().unwrap_or_default().to_str().unwrap_or("");
+
+        let a_is_folder = a.is_dir() || a_name == FOLDER_UP_ENTRY_NAME;
+        let b_is_folder = b.is_dir() || b_name == FOLDER_UP_ENTRY_NAME;
+
+        match (a_is_folder, b_is_folder) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => natord::compare(a_name, b_name),
+        }
     });
 
     media
