@@ -12,14 +12,33 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup GStreamer
-        id: setup_gstreamer
-        uses: blinemedical/setup-gstreamer@v1.4.0
-        with:
-          version: "1.27.90"
-          arch: "x86_64"
-          msiUrl: https://gstreamer.freedesktop.org/data/pkg/windows/1.27.90/msvc/gstreamer-1.0-msvc-x86_64-1.27.90.msi
-          devMsiUrl: https://gstreamer.freedesktop.org/data/pkg/windows/1.27.90/msvc/gstreamer-1.0-devel-msvc-x86_64-1.27.90.msi
+      - name: Setup GStreamer manually
+        shell: pwsh
+        run: |
+          # URLs for the runtime and development installers
+          $gstUrl = "https://gstreamer.freedesktop.org/data/pkg/windows/1.28.2/msvc/gstreamer-1.0-msvc-x86_64-1.28.2.exe"
+          $gstDevUrl = "https://gstreamer.freedesktop.org/data/pkg/windows/1.28.2/msvc/gstreamer-1.0-devel-msvc-x86_64-1.28.2.exe"
+
+          Write-Host "Downloading GStreamer Runtime..."
+          Invoke-WebRequest -Uri $gstUrl -OutFile "gstreamer.exe"
+
+          Write-Host "Downloading GStreamer Devel (Required for Rust build)..."
+          Invoke-WebRequest -Uri $gstDevUrl -OutFile "gstreamer-devel.exe"
+
+          # Run the installers silently (standard /quiet flag for WiX bootstrapper EXEs)
+          Write-Host "Installing GStreamer Runtime..."
+          Start-Process -FilePath ".\gstreamer.exe" -ArgumentList "/quiet" -Wait -NoNewWindow
+
+          Write-Host "Installing GStreamer Devel..."
+          Start-Process -FilePath ".\gstreamer-devel.exe" -ArgumentList "/quiet" -Wait -NoNewWindow
+
+          # Emulate the deprecated setup-gstreamer action by injecting environment variables
+          $gstRoot = "C:\gstreamer\1.0\msvc_x86_64"
+          Write-Host "Setting up environment variables for Cargo/pkg-config..."
+          
+          "GSTREAMER_1_0_ROOT_MSVC_X86_64=$gstRoot" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "PKG_CONFIG_PATH=$gstRoot\lib\pkgconfig" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "$gstRoot\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
 
       - name: Install Rust (MSVC)
         uses: dtolnay/rust-toolchain@stable
