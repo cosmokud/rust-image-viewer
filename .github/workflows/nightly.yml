@@ -12,34 +12,25 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup GStreamer manually
+      - name: Download GStreamer from Mirror
+        uses: robinraju/release-downloader@v1.10
+        with:
+          repository: cosmokud/rust-image-viewer
+          tag: ci-dependencies-v1
+          fileName: "*.exe"
+
+      - name: Install GStreamer
         shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
-          Write-Host "Downloading GStreamer from GitHub Release..."
-          
-          # Use the native GitHub CLI to pull all .exe files from that release
-          gh release download ci-dependencies-v1 --repo cosmokud/rust-image-viewer --pattern "*.exe"
-          
-          # Automatically find the exact filenames that were downloaded
+          # The files are already downloaded to the current directory!
           $gstExe = Get-ChildItem -Filter "gstreamer-1.0-msvc*.exe" -Exclude "*devel*" | Select-Object -First 1 -ExpandProperty Name
           $gstDevExe = Get-ChildItem -Filter "gstreamer-1.0-devel*.exe" | Select-Object -First 1 -ExpandProperty Name
           
-          if (-not $gstExe -or -not $gstDevExe) {
-            Write-Error "Failed to download one or both GStreamer executables. Check your GitHub Release assets."
-            exit 1
-          }
-
-          Write-Host "Installing GStreamer Runtime ($gstExe)..."
           Start-Process -FilePath ".\$gstExe" -ArgumentList "/quiet" -Wait -NoNewWindow
-
-          Write-Host "Installing GStreamer Devel ($gstDevExe)..."
           Start-Process -FilePath ".\$gstDevExe" -ArgumentList "/quiet" -Wait -NoNewWindow
-
-          $gstRoot = "C:\gstreamer\1.0\msvc_x86_64"
-          Write-Host "Setting up environment variables for Cargo/pkg-config..."
           
+          # Setup environment
+          $gstRoot = "C:\gstreamer\1.0\msvc_x86_64"
           "GSTREAMER_1_0_ROOT_MSVC_X86_64=$gstRoot" | Out-File -FilePath $env:GITHUB_ENV -Append
           "PKG_CONFIG_PATH=$gstRoot\lib\pkgconfig" | Out-File -FilePath $env:GITHUB_ENV -Append
           "$gstRoot\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
