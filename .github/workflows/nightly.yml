@@ -87,7 +87,7 @@ jobs:
           tag_name: ${{ steps.release_meta.outputs.tag }}
           name: ${{ steps.release_meta.outputs.name }}
           prerelease: true
-          make_latest: false
+          make_latest: true
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: ${{ steps.build_installer.outputs.msi_path }}
