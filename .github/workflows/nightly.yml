@@ -15,9 +15,9 @@ jobs:
       - name: Setup GStreamer manually
         shell: pwsh
         run: |
-          # URLs for the runtime and development installers
-          $gstUrl = "https://gstreamer.freedesktop.org/data/pkg/windows/1.28.2/msvc/gstreamer-1.0-msvc-x86_64-1.28.2.exe"
-          $gstDevUrl = "https://gstreamer.freedesktop.org/data/pkg/windows/1.28.2/msvc/gstreamer-1.0-devel-msvc-x86_64-1.28.2.exe"
+          # Download directly from your GitHub repository release (bypasses bot protection)
+          $gstUrl = "https://github.com/cosmokud/rust-image-viewer/releases/download/ci-dependencies-v1/gstreamer-1.0-msvc-x86_64-1.28.2.exe"
+          $gstDevUrl = "https://github.com/cosmokud/rust-image-viewer/releases/download/ci-dependencies-v1/gstreamer-1.0-devel-msvc-x86_64-1.28.2.exe"
 
           Write-Host "Downloading GStreamer Runtime..."
           Invoke-WebRequest -Uri $gstUrl -OutFile "gstreamer.exe"
@@ -25,14 +25,12 @@ jobs:
           Write-Host "Downloading GStreamer Devel (Required for Rust build)..."
           Invoke-WebRequest -Uri $gstDevUrl -OutFile "gstreamer-devel.exe"
 
-          # Run the installers silently (standard /quiet flag for WiX bootstrapper EXEs)
           Write-Host "Installing GStreamer Runtime..."
           Start-Process -FilePath ".\gstreamer.exe" -ArgumentList "/quiet" -Wait -NoNewWindow
 
           Write-Host "Installing GStreamer Devel..."
           Start-Process -FilePath ".\gstreamer-devel.exe" -ArgumentList "/quiet" -Wait -NoNewWindow
 
-          # Emulate the deprecated setup-gstreamer action by injecting environment variables
           $gstRoot = "C:\gstreamer\1.0\msvc_x86_64"
           Write-Host "Setting up environment variables for Cargo/pkg-config..."
           
@@ -106,7 +104,7 @@ jobs:
           tag_name: ${{ steps.release_meta.outputs.tag }}
           name: ${{ steps.release_meta.outputs.name }}
           prerelease: true
-          make_latest: false
+          make_latest: true
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: ${{ steps.build_installer.outputs.msi_path }}
