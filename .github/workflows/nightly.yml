@@ -37,9 +37,15 @@ jobs:
 
           Write-Host "Installing $gstExe..."
           $gstRoot = "C:\gstreamer\1.0\msvc_x86_64"
-          $process = Start-Process -FilePath $gstExe -ArgumentList "/S /D=$gstRoot" -Wait -PassThru -NoNewWindow
+          $process = Start-Process -FilePath $gstExe -ArgumentList "/S /D=$gstRoot" -Wait -PassThru -Verb RunAs
           if ($process.ExitCode -ne 0) {
             Write-Error "Installer failed with exit code $($process.ExitCode)"
+            exit 1
+          }
+
+          Write-Host "Verifying installation..."
+          if (-not (Test-Path "$gstRoot\bin")) {
+            Write-Error "ERROR: GStreamer bin directory not found after install. Installation may have silently failed."
             exit 1
           }
 
