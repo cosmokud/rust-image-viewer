@@ -110,6 +110,21 @@ Download the latest release from the [Releases](https://github.com/cosmokud/rust
 
 The app is portable in the sense that you can place the executable folder anywhere. Use Windows `Open with` or file associations to launch media directly into it.
 
+### Windows SmartScreen / Smart App Control
+
+Because this project is built and distributed by a solo developer, the installer is not signed with an expensive enterprise code-signing certificate. As a result, Windows may treat the downloaded file as unfamiliar and flag it with a Mark of the Web (MotW), showing a "Windows protected your PC" or Smart App Control warning.
+
+This is a safety mechanism in Windows for unsigned downloads, not proof that the app is malware. If you trust the source, you can unblock the installer manually:
+
+1. Download the installer.
+2. Right-click the downloaded file and select **Properties**.
+3. Go to the **General** tab.
+4. Look at the bottom for a Security warning and check the box that says **Unblock**.
+5. Click **Apply** and **OK**.
+6. Run the installer normally.
+
+If you still see warnings after unblocking, Windows is simply being cautious about unsigned software. The unblock step tells Windows that you trust this file from this source.
+
 ### Video prerequisites
 
 Image viewing works without GStreamer, but video playback requires a GStreamer runtime install.
