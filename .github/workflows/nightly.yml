@@ -47,13 +47,9 @@ jobs:
 
           $tag = "nightly-$stamp-run$runNumber-$shortSha"
           $name = "Nightly Build $stamp (run $runNumber, $shortSha)"
-          $msiName = "rust-image-viewer-$tag.msi"
-          $exeName = "rust-image-viewer-$tag-portable.exe"
 
           Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "tag=$tag"
           Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "name=$name"
-          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "msi_name=$msiName"
-          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "exe_name=$exeName"
 
       - name: Install WiX Toolset v7
         shell: pwsh
@@ -71,21 +67,19 @@ jobs:
         id: build_installer
         shell: pwsh
         run: |
-          $outputPath = Join-Path $PWD "target\wix\${{ steps.release_meta.outputs.msi_name }}"
+          $outputPath = Join-Path $PWD "target\wix\rust-image-viewer-installer.msi"
           .\scripts\build-wix-installer.ps1 `
             -Configuration release `
             -WorkspaceRoot "$PWD" `
             -OutputMsi $outputPath
 
-          # Write the MSI output so subsequent steps can reference it
           Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "msi_path=$outputPath"
 
-      - name: Copy portable exe with versioned name
+      - name: Copy portable exe
         id: portable_exe
         shell: pwsh
         run: |
-          $exePath = Join-Path $PWD "target\release\${{ steps.release_meta.outputs.exe_name }}"
-          Copy-Item "target\release\rust-image-viewer.exe" $exePath
+          $exePath = Join-Path $PWD "target\release\rust-image-viewer.exe"
           Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "exe_path=$exePath"
 
       - name: Upload artifact
