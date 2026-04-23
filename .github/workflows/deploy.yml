@@ -42,10 +42,10 @@ jobs:
         id: setup_gstreamer
         uses: blinemedical/setup-gstreamer@v1.4.0
         with:
-          version: "1.27.90"
+          version: "1.26.11"
           arch: "x86_64"
-          msiUrl: https://gstreamer.freedesktop.org/data/pkg/windows/1.27.90/msvc/gstreamer-1.0-msvc-x86_64-1.27.90.msi
-          devMsiUrl: https://gstreamer.freedesktop.org/data/pkg/windows/1.27.90/msvc/gstreamer-1.0-devel-msvc-x86_64-1.27.90.msi
+          msiUrl: https://gstreamer.freedesktop.org/data/pkg/windows/1.26.11/msvc/gstreamer-1.0-msvc-x86_64-1.26.11.msi
+          devMsiUrl: https://gstreamer.freedesktop.org/data/pkg/windows/1.26.11/msvc/gstreamer-1.0-devel-msvc-x86_64-1.26.11.msi
 
       - name: Install Rust (MSVC)
         uses: dtolnay/rust-toolchain@stable
@@ -72,10 +72,6 @@ jobs:
             throw "Release tag must be v<major>.<minor>.<patch>; got '${{ github.ref_name }}'."
           }
 
-          $msiName = "rust-image-viewer-$tag.msi"
-
-          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "msi_name=$msiName"
-
       - name: Install WiX Toolset v7
         shell: pwsh
         run: |
@@ -92,24 +88,29 @@ jobs:
         id: build_installer
         shell: pwsh
         run: |
-          $outputPath = Join-Path $PWD "target\wix\${{ steps.installer_meta.outputs.msi_name }}"
+          $outputPath = Join-Path $PWD "target\wix\rust-image-viewer-installer.msi"
           .\scripts\build-wix-installer.ps1 `
             -Configuration release `
             -WorkspaceRoot "$PWD" `
             -OutputMsi $outputPath
 
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "msi_path=$outputPath"
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: rust-image-viewer-${{ github.ref_name }}
-          path: ${{ steps.build_installer.outputs.msi_path }}
+          path: |
+            ${{ steps.build_installer.outputs.msi_path }}
+            target/release/rust-image-viewer.exe
 
       - name: Create release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.ref_name }}
-          name: ${{ github.ref_name }}
-          prerelease: false
-          generate_release_notes: true
-          fail_on_unmatched_files: true
-          files: ${{ steps.build_installer.outputs.msi_path }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ github.ref_name }}" `
+            "${{ steps.build_installer.outputs.msi_path }}" `
+            "target\release\rust-image-viewer.exe" `
+            --title "${{ github.ref_name }}" `
+            --generate-notes
