@@ -535,8 +535,17 @@ pub struct Config {
 
     /// Whether videos start muted by default
     pub video_muted_by_default: bool,
+    /// Whether to remember muted state from last session
+    pub video_muted_remember: bool,
     /// Default video volume (0.0 to 1.0)
     pub video_default_volume: f64,
+    /// Whether to remember volume from last session
+    pub video_volume_remember: bool,
+
+    /// Persisted muted state from last video session
+    pub state_muted: bool,
+    /// Persisted volume state from last video session
+    pub state_volume: f64,
     /// Whether videos loop by default
     pub video_loop: bool,
     /// Seek policy for scrub interactions: adaptive, accurate, or keyframe.
@@ -656,7 +665,11 @@ impl Config {
             manga_autoscroll_arrow_rgb: [140, 190, 255],
             manga_autoscroll_arrow_alpha: 150,
             video_muted_by_default: true,
+            video_muted_remember: false,
             video_default_volume: 0.0,
+            video_volume_remember: false,
+            state_muted: true,
+            state_volume: 0.0,
             video_loop: true,
             video_seek_policy: VideoSeekPolicy::Adaptive,
             video_prefer_hardware_decode: true,
@@ -1052,6 +1065,7 @@ impl Config {
         let mut in_settings_section = false;
         let mut in_video_section = false;
         let mut in_quality_section = false;
+        let mut in_state_section = false;
 
         for line in content.lines() {
             let line = line.trim();
@@ -1070,6 +1084,8 @@ impl Config {
                 in_quality_section = section.eq_ignore_ascii_case("quality")
                     || section.eq_ignore_ascii_case("image_quality")
                     || section.eq_ignore_ascii_case("filters");
+                in_state_section = section.eq_ignore_ascii_case("state")
+                    || section.eq_ignore_ascii_case("video_state");
                 continue;
             }
 
@@ -1485,13 +1501,21 @@ impl Config {
 
                     match key.as_str() {
                         "muted_by_default" | "muted" => {
-                            if let Some(v) = parse_bool(value) {
+                            if value.eq_ignore_ascii_case("remember") {
+                                config.video_muted_by_default = true;
+                                config.video_muted_remember = true;
+                            } else if let Some(v) = parse_bool(value) {
                                 config.video_muted_by_default = v;
+                                config.video_muted_remember = false;
                             }
                         }
                         "default_volume" | "volume" => {
-                            if let Ok(v) = value.parse::<f64>() {
+                            if value.eq_ignore_ascii_case("remember") {
+                                config.video_default_volume = 0.0;
+                                config.video_volume_remember = true;
+                            } else if let Ok(v) = value.parse::<f64>() {
                                 config.video_default_volume = v.clamp(0.0, 1.0);
+                                config.video_volume_remember = false;
                             }
                         }
                         "loop" => {
@@ -1579,6 +1603,28 @@ impl Config {
                         "manga_mipmap_min_side" | "manga_mipmap_min_size" => {
                             if let Ok(v) = value.parse::<u32>() {
                                 config.manga_mipmap_min_side = v.clamp(1, 4096);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            // Parse key=value pairs in state section
+            if in_state_section {
+                if let Some((key, value)) = line.split_once('=') {
+                    let key = key.trim().to_lowercase();
+                    let value = value.trim();
+
+                    match key.as_str() {
+                        "muted_state" | "muted" => {
+                            if let Some(v) = parse_bool(value) {
+                                config.state_muted = v;
+                            }
+                        }
+                        "volume_state" | "volume" => {
+                            if let Ok(v) = value.parse::<f64>() {
+                                config.state_volume = v.clamp(0.0, 1.0);
                             }
                         }
                         _ => {}
@@ -1883,11 +1929,19 @@ impl Config {
 
         values.insert(
             "muted_by_default",
-            bool_to_ini(self.video_muted_by_default).to_string(),
+            if self.video_muted_remember {
+                "remember".to_string()
+            } else {
+                bool_to_ini(self.video_muted_by_default).to_string()
+            },
         );
         values.insert(
             "default_volume",
-            format_with_optional_trailing_zero_f64(self.video_default_volume),
+            if self.video_volume_remember {
+                "remember".to_string()
+            } else {
+                format_with_optional_trailing_zero_f64(self.video_default_volume)
+            },
         );
         values.insert("loop", bool_to_ini(self.video_loop).to_string());
         values.insert("seek_policy", self.video_seek_policy.as_str().to_string());
@@ -1898,6 +1952,14 @@ impl Config {
         values.insert(
             "disable_hardware_decode",
             bool_to_ini(self.video_disable_hardware_decode).to_string(),
+        );
+        values.insert(
+            "muted_state",
+            bool_to_ini(self.state_muted).to_string(),
+        );
+        values.insert(
+            "volume_state",
+            format_with_optional_trailing_zero_f64(self.state_volume),
         );
 
         values.insert("upscale_filter", self.upscale_filter.as_str().to_string());
@@ -2112,6 +2174,11 @@ impl Config {
         self.action_bindings
             .values()
             .any(|bindings| bindings.contains(binding))
+    }
+
+    pub fn update_video_state(&mut self, muted: bool, volume: f64) {
+        self.state_muted = muted;
+        self.state_volume = volume.clamp(0.0, 1.0);
     }
 }
 

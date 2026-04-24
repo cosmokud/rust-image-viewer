@@ -10886,8 +10886,16 @@ impl ImageViewer {
         let request_id = self.next_media_load_request_id;
         self.next_media_load_request_id = self.next_media_load_request_id.saturating_add(1).max(1);
 
-        let muted = self.config.video_muted_by_default;
-        let initial_volume = self.config.video_default_volume;
+        let muted = if self.config.video_muted_remember {
+            self.config.state_muted
+        } else {
+            self.config.video_muted_by_default
+        };
+        let initial_volume = if self.config.video_volume_remember {
+            self.config.state_volume
+        } else {
+            self.config.video_default_volume
+        };
         let prefer_hardware_decode = self.config.video_prefer_hardware_decode;
         let disable_hardware_decode = self.config.video_disable_hardware_decode;
 
@@ -14575,8 +14583,16 @@ impl ImageViewer {
 
         let muted_override = self.manga_video_user_muted;
         let volume_override = self.manga_video_user_volume;
-        let muted = muted_override.unwrap_or(self.config.video_muted_by_default);
-        let volume = volume_override.unwrap_or(self.config.video_default_volume);
+        let muted = muted_override.unwrap_or(if self.config.video_muted_remember {
+            self.config.state_muted
+        } else {
+            self.config.video_muted_by_default
+        });
+        let volume = volume_override.unwrap_or(if self.config.video_volume_remember {
+            self.config.state_volume
+        } else {
+            self.config.video_default_volume
+        });
 
         if focused_is_video {
             let focus_changed = self.manga_focused_video_index != Some(focused_idx);
@@ -21205,6 +21221,8 @@ impl ImageViewer {
 
                     if mute_btn.clicked() {
                         player.toggle_mute();
+                        self.config.update_video_state(player.is_muted(), player.volume());
+                        self.config.sync_disk_file_with_template();
                     }
 
                     // Volume slider
@@ -21256,6 +21274,9 @@ impl ImageViewer {
                             if player.is_muted() && new_vol > 0.0 {
                                 player.set_muted(false);
                             }
+                            self.config
+                                .update_video_state(player.is_muted(), player.volume());
+                            self.config.sync_disk_file_with_template();
                         }
                     }
                     if vol_response.drag_stopped() {
@@ -21715,6 +21736,8 @@ impl ImageViewer {
                         player.toggle_mute();
                         // Persist user's mute choice for all manga videos
                         self.manga_video_user_muted = Some(player.is_muted());
+                        self.config.update_video_state(player.is_muted(), player.volume());
+                        self.config.sync_disk_file_with_template();
                     }
 
                     // Volume slider
@@ -21765,6 +21788,9 @@ impl ImageViewer {
                                 // Also persist unmuted state
                                 self.manga_video_user_muted = Some(false);
                             }
+                            self.config
+                                .update_video_state(player.is_muted(), player.volume());
+                            self.config.sync_disk_file_with_template();
                         }
                     }
                     if vol_response.drag_stopped() {
