@@ -638,6 +638,7 @@ enum MenuActionIcon {
     Unmark,
     Cut,
     Copy,
+    Paste,
     Delete,
     Rename,
     OpenLocation,
@@ -704,6 +705,48 @@ fn clear_system_clipboard() -> Result<(), String> {
 #[cfg(not(target_os = "windows"))]
 fn clear_system_clipboard() -> Result<(), String> {
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn read_shell_file_list_from_clipboard() -> Result<Vec<PathBuf>, String> {
+    use clipboard_win::{raw, Clipboard};
+
+    let _clipboard = Clipboard::new_attempts(10)
+        .map_err(|err| format!("Failed to open clipboard: {err}"))?;
+    let mut file_list: Vec<String> = Vec::new();
+    raw::get_file_list(&mut file_list)
+        .map_err(|err| format!("Failed to read file list from clipboard: {err}"))?;
+    Ok(file_list.into_iter().map(PathBuf::from).collect())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn read_shell_file_list_from_clipboard() -> Result<Vec<PathBuf>, String> {
+    Err("Shell file clipboard operations are only implemented on Windows".to_string())
+}
+
+#[cfg(target_os = "windows")]
+fn read_drop_effect_from_clipboard() -> Result<FileClipboardOperation, String> {
+    use clipboard_win::{raw, Clipboard};
+
+    let _clipboard = Clipboard::new_attempts(10)
+        .map_err(|err| format!("Failed to open clipboard: {err}"))?;
+    let Some(preferred_drop_effect_format) = raw::register_format("Preferred DropEffect") else {
+        return Err("Failed to register Preferred DropEffect clipboard format".to_string());
+    };
+    let mut effect_bytes = [0u8; 4];
+    raw::get(preferred_drop_effect_format.get(), &mut effect_bytes)
+        .map_err(|err| format!("Failed to read drop effect: {err}"))?;
+    let effect = u32::from_le_bytes(effect_bytes);
+    match effect {
+        1 => Ok(FileClipboardOperation::Copy),
+        2 => Ok(FileClipboardOperation::Cut),
+        _ => Ok(FileClipboardOperation::Copy),
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn read_drop_effect_from_clipboard() -> Result<FileClipboardOperation, String> {
+    Ok(FileClipboardOperation::Copy)
 }
 
 fn move_paths_to_recycle_bin(paths: &[PathBuf]) -> Result<(), String> {
@@ -5084,6 +5127,103 @@ impl ImageViewer {
         self.request_delete_for_paths(marked_paths);
     }
 
+    fn request_paste_marked_files_into_current_folder(&mut self) {
+        let file_list = match read_shell_file_list_from_clipboard() {
+            Ok(list) => list,
+            Err(err) => {
+                self.error_message = Some(err);
+                return;
+            }
+        };
+        if file_list.is_empty() {
+            return;
+        }
+
+        let operation = match read_drop_effect_from_clipboard() {
+            Ok(op) => op,
+            Err(_) => FileClipboardOperation::Copy,
+        };
+
+        let Some(current_path) = self.current_media_path() else {
+            return;
+        };
+        let Some(target_directory) = current_path.parent().map(Path::to_path_buf) else {
+            return;
+        };
+
+        let mut new_paths: Vec<PathBuf> = Vec::new();
+        let mut errors: Vec<String> = Vec::new();
+
+        for source_path in &file_list {
+            if !source_path.exists() {
+                continue;
+            }
+
+            let file_name = match source_path.file_name() {
+                Some(name) => name,
+                None => continue,
+            };
+
+            let mut dest_path = target_directory.join(file_name);
+            let mut suffix = 1;
+            while dest_path.exists() {
+                let stem = source_path.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
+                let ext = source_path.extension().and_then(|e| e.to_str());
+                let new_name = if let Some(ext) = ext {
+                    format!("{} ({}).{}", stem, suffix, ext)
+                } else {
+                    format!("{} ({})", stem, suffix)
+                };
+                dest_path = target_directory.join(&new_name);
+                suffix += 1;
+                if suffix > 1000 {
+                    break;
+                }
+            }
+
+            match operation {
+                FileClipboardOperation::Copy => {
+                    match std::fs::copy(source_path, &dest_path) {
+                        Ok(_) => new_paths.push(dest_path),
+                        Err(err) => errors.push(format!("Failed to copy '{}': {}", file_name.to_string_lossy(), err)),
+                    }
+                }
+                FileClipboardOperation::Cut => {
+                    match std::fs::rename(source_path, &dest_path) {
+                        Ok(_) => new_paths.push(dest_path.clone()),
+                        Err(_) => {
+                            match std::fs::copy(source_path, &dest_path) {
+                                Ok(_) => {
+                                    if let Err(e) = std::fs::remove_file(source_path) {
+                                        errors.push(format!("Copied '{}' but failed to remove original: {}", file_name.to_string_lossy(), e));
+                                    } else {
+                                        new_paths.push(dest_path.clone());
+                                    }
+                                }
+                                Err(copy_err) => errors.push(format!("Failed to move '{}': {}", file_name.to_string_lossy(), copy_err)),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if !errors.is_empty() {
+            self.error_message = Some(errors.join("\n"));
+        }
+
+        if !new_paths.is_empty() {
+            self.clear_stale_marked_files();
+            self.clear_stale_prepared_clipboard_paths();
+            let _ = clear_system_clipboard();
+
+            self.begin_media_directory_scan(
+                &target_directory,
+                PendingMediaDirectoryScanKind::ExternalRefresh,
+            );
+        }
+    }
+
     fn perform_delete_targets(&mut self, paths: Vec<PathBuf>) {
         let existing_paths: Vec<PathBuf> = paths.into_iter().filter(|path| path.exists()).collect();
         if existing_paths.is_empty() {
@@ -7407,6 +7547,30 @@ impl ImageViewer {
                 let front = rect.translate(egui::vec2(2.0, 2.0)).shrink(4.0);
                 painter.rect_stroke(back, 3.0, stroke);
                 painter.rect_stroke(front, 3.0, stroke);
+            }
+            MenuActionIcon::Paste => {
+                let folder_rect = egui::Rect::from_min_max(
+                    egui::pos2(rect.left() + 2.0, rect.center().y),
+                    egui::pos2(rect.right() - 2.0, rect.bottom() - 2.0),
+                );
+                let tab_rect = egui::Rect::from_min_max(
+                    egui::pos2(folder_rect.left() + 1.5, folder_rect.top() - 2.5),
+                    egui::pos2(folder_rect.left() + 8.0, folder_rect.top() + 2.0),
+                );
+                painter.rect_stroke(folder_rect, 3.0, stroke);
+                painter.rect_filled(tab_rect, 2.0, color);
+                painter.line_segment([
+                    egui::pos2(rect.center().x, rect.top() + 3.0),
+                    egui::pos2(rect.center().x, folder_rect.top() + 3.0),
+                ], stroke);
+                painter.line_segment([
+                    egui::pos2(rect.center().x - 3.0, folder_rect.top() + 6.0),
+                    egui::pos2(rect.center().x, folder_rect.top() + 3.0),
+                ], stroke);
+                painter.line_segment([
+                    egui::pos2(rect.center().x + 3.0, folder_rect.top() + 6.0),
+                    egui::pos2(rect.center().x, folder_rect.top() + 3.0),
+                ], stroke);
             }
             MenuActionIcon::Delete => {
                 let lid_rect = egui::Rect::from_min_max(
@@ -20718,6 +20882,17 @@ impl ImageViewer {
 
                                     if !self.image_list.is_empty() {
                                         if self.render_marked_file_action_buttons(ui) {
+                                            close_popup = true;
+                                        }
+                                        ui.separator();
+                                    }
+
+                                    if self.manga_mode {
+                                        if self
+                                            .menu_action_row(ui, "Paste Marked File(s) Into This Folder", MenuActionIcon::Paste)
+                                            .clicked()
+                                        {
+                                            self.request_paste_marked_files_into_current_folder();
                                             close_popup = true;
                                         }
                                         ui.separator();
