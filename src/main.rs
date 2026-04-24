@@ -4552,25 +4552,23 @@ impl ImageViewer {
             self.persist_current_masonry_folder_metadata_snapshot();
         }
 
-        if let Some(parent) = anchor_path.parent() {
-            self.media_directory_index.invalidate_directory(parent);
-        }
+        // Always resolve the actual directory we are viewing, whether the anchor is a file or a subfolder.
+        let directory = anchor_path
+            .parent()
+            .unwrap_or(anchor_path.as_path())
+            .to_path_buf();
+
+        self.media_directory_index.invalidate_directory(&directory);
 
         self.pending_media_directory_scan = None;
         self.pending_media_directory_target = None;
         self.pending_media_directory_scan_kind = None;
         self.pending_media_directory_started_at = None;
 
-        let files = get_media_in_directory(&anchor_path);
-        let directory = anchor_path
-            .parent()
-            .unwrap_or(anchor_path.as_path())
-            .to_path_buf();
-        let modified_at = anchor_path.parent().and_then(|parent| {
-            std::fs::metadata(parent)
-                .ok()
-                .and_then(|metadata| metadata.modified().ok())
-        });
+        let files = get_media_in_directory(&directory);
+        let modified_at = std::fs::metadata(&directory)
+            .ok()
+            .and_then(|metadata| metadata.modified().ok());
         let files = self
             .media_directory_index
             .apply_directory_scan_result(DirectoryScanResult {
@@ -5003,10 +5001,6 @@ impl ImageViewer {
             return marked_paths;
         }
 
-        if self.manga_mode {
-            return Vec::new();
-        }
-
         self.current_media_path()
             .filter(|path| path.exists())
             .into_iter()
@@ -5026,10 +5020,6 @@ impl ImageViewer {
             .cloned()
         {
             return vec![path];
-        }
-
-        if self.manga_mode {
-            return Vec::new();
         }
 
         self.current_media_path()
@@ -7906,6 +7896,7 @@ impl ImageViewer {
         enum MarkedFileShortcut {
             Copy,
             Cut,
+            Paste,
             Delete,
         }
 
@@ -7923,14 +7914,18 @@ impl ImageViewer {
                 .events
                 .iter()
                 .any(|event| matches!(event, egui::Event::Cut));
+            let saw_paste_event = input
+                .raw
+                .events
+                .iter()
+                .any(|event| matches!(event, egui::Event::Paste(_)));
 
             if (ctrl && !shift && !alt && input.key_pressed(egui::Key::C)) || saw_copy_event {
                 Some(MarkedFileShortcut::Copy)
-            } else if ((ctrl && !shift && !alt)
-                && (input.key_pressed(egui::Key::X) || input.key_pressed(egui::Key::V)))
-                || saw_cut_event
-            {
+            } else if (ctrl && !shift && !alt && input.key_pressed(egui::Key::X)) || saw_cut_event {
                 Some(MarkedFileShortcut::Cut)
+            } else if (ctrl && !shift && !alt && input.key_pressed(egui::Key::V)) || saw_paste_event {
+                Some(MarkedFileShortcut::Paste)
             } else if !ctrl && !shift && !alt && input.key_pressed(egui::Key::Delete) {
                 Some(MarkedFileShortcut::Delete)
             } else {
@@ -7938,13 +7933,20 @@ impl ImageViewer {
             }
         });
 
+        if let Some(MarkedFileShortcut::Paste) = shortcut {
+            self.request_paste_marked_files_into_current_folder();
+            return true;
+        }
+
         let target_paths = match &shortcut {
             Some(MarkedFileShortcut::Copy) | Some(MarkedFileShortcut::Cut) => {
                 self.collect_keyboard_clipboard_targets(ctx)
             }
             Some(MarkedFileShortcut::Delete) => self.collect_keyboard_file_action_targets(),
-            None => return false,
+            // Use a wildcard catch-all here to satisfy the compiler for None and Paste
+            _ => return false, 
         };
+
         if target_paths.is_empty() {
             return false;
         }
@@ -7962,10 +7964,9 @@ impl ImageViewer {
                 self.request_delete_for_paths(target_paths);
                 true
             }
-            None => false,
+            _ => false,
         }
     }
-
     fn try_handle_ctrl_primary_mark_shortcut(&mut self, ctx: &egui::Context) -> bool {
         if self.manga_mode
             || self.image_list.is_empty()
