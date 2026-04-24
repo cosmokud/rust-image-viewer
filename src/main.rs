@@ -5137,9 +5137,9 @@ impl ImageViewer {
         let Some(current_path) = self.current_media_path() else {
             return;
         };
-        let Some(target_directory) = current_path.parent().map(Path::to_path_buf) else {
-            return;
-        };
+        
+        // Robust directory resolution
+        let target_directory = current_path.parent().unwrap_or(current_path.as_path()).to_path_buf();
 
         let mut new_paths: Vec<PathBuf> = Vec::new();
         let mut errors: Vec<String> = Vec::new();
@@ -5207,13 +5207,11 @@ impl ImageViewer {
             self.clear_stale_prepared_clipboard_paths();
             let _ = clear_system_clipboard();
 
-            self.begin_media_directory_scan(
-                &target_directory,
-                PendingMediaDirectoryScanKind::ExternalRefresh,
-            );
+            // FIX: Use the robust synchronous refresh we just fixed for deletions
+            let preferred_anchor = self.current_media_path();
+            self.refresh_media_list_after_path_mutation(preferred_anchor);
         }
     }
-
     fn perform_delete_targets(&mut self, paths: Vec<PathBuf>) {
         let existing_paths: Vec<PathBuf> = paths.into_iter().filter(|path| path.exists()).collect();
         if existing_paths.is_empty() {
