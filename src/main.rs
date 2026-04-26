@@ -5134,12 +5134,44 @@ impl ImageViewer {
             Err(_) => FileClipboardOperation::Copy,
         };
 
-        let Some(current_path) = self.current_media_path() else {
+        let target_directory = if self.manga_mode && self.is_fullscreen && !self.image_list.is_empty() {
+            if !self.refresh_media_list_before_masonry_entry() {
+                if let Some(path) = self.current_media_path() {
+                    let dir = path.parent().unwrap_or(path.as_path()).to_path_buf();
+                    if dir.exists() && dir.is_dir() {
+                        dir
+                    } else {
+                        if let Some(first) = self.image_list.first().cloned() {
+                            first.parent().unwrap_or(first.as_path()).to_path_buf()
+                        } else {
+                            return;
+                        }
+                    }
+                } else if let Some(first) = self.image_list.first().cloned() {
+                    first.parent().unwrap_or(first.as_path()).to_path_buf()
+                } else {
+                    return;
+                }
+            } else {
+                if let Some(path) = self.current_media_path() {
+                    path.parent().unwrap_or(path.as_path()).to_path_buf()
+                } else if let Some(first) = self.image_list.first().cloned() {
+                    first.parent().unwrap_or(first.as_path()).to_path_buf()
+                } else {
+                    return;
+                }
+            }
+        } else if let Some(current_path) = self.current_media_path() {
+            current_path.parent().unwrap_or(current_path.as_path()).to_path_buf()
+        } else if !self.image_list.is_empty() {
+            if let Some(first) = self.image_list.first().cloned() {
+                first.parent().unwrap_or(first.as_path()).to_path_buf()
+            } else {
+                return;
+            }
+        } else {
             return;
         };
-        
-        // Robust directory resolution
-        let target_directory = current_path.parent().unwrap_or(current_path.as_path()).to_path_buf();
 
         let mut new_paths: Vec<PathBuf> = Vec::new();
         let mut errors: Vec<String> = Vec::new();
@@ -7884,10 +7916,7 @@ impl ImageViewer {
     }
 
     fn try_handle_global_marked_file_shortcuts(&mut self, ctx: &egui::Context) -> bool {
-        if self.any_modal_dialog_open()
-            || self.file_action_menu.is_some()
-            || self.title_bar_ui_blocking()
-        {
+        if self.any_modal_dialog_open() || self.file_action_menu.is_some() {
             return false;
         }
 
@@ -7934,6 +7963,10 @@ impl ImageViewer {
         if let Some(MarkedFileShortcut::Paste) = shortcut {
             self.request_paste_marked_files_into_current_folder();
             return true;
+        }
+
+        if self.title_bar_ui_blocking() {
+            return false;
         }
 
         let target_paths = match &shortcut {
