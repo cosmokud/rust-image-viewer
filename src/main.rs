@@ -1926,6 +1926,12 @@ enum PendingMediaDirectoryScanKind {
     ExternalRefresh,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FolderHistoryNavigationKind {
+    Record,
+    FromHistory,
+}
+
 fn file_stamp_for_path(path: &Path) -> Option<FileStamp> {
     let metadata = std::fs::metadata(path).ok()?;
     let modified = metadata.modified().ok()?;
@@ -2132,6 +2138,10 @@ struct ImageViewer {
     show_controls: bool,
     /// Whether to show the breadcrumb address bar under the title bar.
     show_breadcrumb_bar: bool,
+    /// Folder traversal history for breadcrumb back/forward navigation.
+    folder_navigation_history: Vec<PathBuf>,
+    /// Active index into `folder_navigation_history` for Explorer-like traversal.
+    folder_navigation_history_index: Option<usize>,
     /// Time when controls were last shown
     controls_show_time: Instant,
     /// Error message to display
@@ -2711,6 +2721,8 @@ impl Default for ImageViewer {
             is_fullscreen: false,
             show_controls: false,
             show_breadcrumb_bar: true,
+            folder_navigation_history: Vec::new(),
+            folder_navigation_history_index: None,
             controls_show_time: Instant::now(),
             error_message: None,
             image_changed: false,
@@ -2979,6 +2991,7 @@ impl ImageViewer {
     const FOLDER_PLACEHOLDER_THUMBNAIL_UPLOADS_PER_FRAME: usize = 2;
     const FOLDER_PLACEHOLDER_PREVIEW_SCAN_PENDING_SOFT_LIMIT_NAV: usize = 16;
     const FOLDER_PLACEHOLDER_THUMBNAIL_PENDING_SOFT_LIMIT_NAV: usize = 24;
+    const FOLDER_NAVIGATION_HISTORY_MAX_ENTRIES: usize = 256;
 
     fn folder_navigation_ui_enabled(&self) -> bool {
         self.manga_mode && self.is_fullscreen
@@ -4116,13 +4129,155 @@ impl ImageViewer {
         children
     }
 
+    fn trim_folder_navigation_history(&mut self) {
+        if self.folder_navigation_history.len() <= Self::FOLDER_NAVIGATION_HISTORY_MAX_ENTRIES {
+            return;
+        }
+
+        let overflow =
+            self.folder_navigation_history.len() - Self::FOLDER_NAVIGATION_HISTORY_MAX_ENTRIES;
+        self.folder_navigation_history.drain(0..overflow);
+
+        if let Some(index) = self.folder_navigation_history_index {
+            if self.folder_navigation_history.is_empty() {
+                self.folder_navigation_history_index = None;
+            } else {
+                self.folder_navigation_history_index = Some(
+                    index
+                        .saturating_sub(overflow)
+                        .min(self.folder_navigation_history.len().saturating_sub(1)),
+                );
+            }
+        }
+    }
+
+    fn folder_navigation_can_go_back(&self) -> bool {
+        self.folder_navigation_history_index
+            .is_some_and(|index| index > 0 && index < self.folder_navigation_history.len())
+    }
+
+    fn folder_navigation_can_go_forward(&self) -> bool {
+        self.folder_navigation_history_index.is_some_and(|index| {
+            index + 1 < self.folder_navigation_history.len()
+        })
+    }
+
+    fn record_folder_navigation_to_directory(&mut self, directory: &Path) {
+        let destination = directory.to_path_buf();
+        let current_directory = self
+            .current_media_path()
+            .and_then(|path| path.parent().map(Path::to_path_buf));
+
+        if current_directory
+            .as_ref()
+            .is_some_and(|current| current == &destination)
+        {
+            return;
+        }
+
+        if self.folder_navigation_history.is_empty() {
+            if let Some(current) = current_directory {
+                self.folder_navigation_history.push(current);
+                self.folder_navigation_history_index = Some(0);
+            }
+        } else {
+            let mut index = self
+                .folder_navigation_history_index
+                .unwrap_or_else(|| self.folder_navigation_history.len().saturating_sub(1));
+            index = index.min(self.folder_navigation_history.len().saturating_sub(1));
+            self.folder_navigation_history_index = Some(index);
+
+            if let Some(current) = current_directory {
+                if self.folder_navigation_history.get(index) != Some(&current) {
+                    self.folder_navigation_history
+                        .truncate(index.saturating_add(1));
+                    if self.folder_navigation_history.last() != Some(&current) {
+                        self.folder_navigation_history.push(current);
+                    }
+                    self.folder_navigation_history_index =
+                        Some(self.folder_navigation_history.len().saturating_sub(1));
+                }
+            }
+
+            let index = self
+                .folder_navigation_history_index
+                .unwrap_or_else(|| self.folder_navigation_history.len().saturating_sub(1));
+            self.folder_navigation_history
+                .truncate(index.saturating_add(1));
+        }
+
+        if self.folder_navigation_history.last() != Some(&destination) {
+            self.folder_navigation_history.push(destination);
+        }
+        if !self.folder_navigation_history.is_empty() {
+            self.folder_navigation_history_index =
+                Some(self.folder_navigation_history.len().saturating_sub(1));
+        }
+        self.trim_folder_navigation_history();
+    }
+
+    fn navigate_folder_history_back(&mut self) -> bool {
+        let Some(current_index) = self.folder_navigation_history_index else {
+            return false;
+        };
+        if current_index == 0 {
+            return false;
+        }
+
+        let target_index = current_index - 1;
+        let Some(target_directory) = self.folder_navigation_history.get(target_index).cloned() else {
+            return false;
+        };
+
+        if self.navigate_to_breadcrumb_directory_internal(
+            target_directory.as_path(),
+            FolderHistoryNavigationKind::FromHistory,
+        ) {
+            self.folder_navigation_history_index = Some(target_index);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn navigate_folder_history_forward(&mut self) -> bool {
+        let Some(current_index) = self.folder_navigation_history_index else {
+            return false;
+        };
+        let target_index = current_index.saturating_add(1);
+        let Some(target_directory) = self.folder_navigation_history.get(target_index).cloned() else {
+            return false;
+        };
+
+        if self.navigate_to_breadcrumb_directory_internal(
+            target_directory.as_path(),
+            FolderHistoryNavigationKind::FromHistory,
+        ) {
+            self.folder_navigation_history_index = Some(target_index);
+            true
+        } else {
+            false
+        }
+    }
+
     fn navigate_to_breadcrumb_directory(&mut self, directory: &Path) {
+        let _ = self.navigate_to_breadcrumb_directory_internal(
+            directory,
+            FolderHistoryNavigationKind::Record,
+        );
+    }
+
+    fn navigate_to_breadcrumb_directory_internal(
+        &mut self,
+        directory: &Path,
+        history_navigation: FolderHistoryNavigationKind,
+    ) -> bool {
         if !directory.exists() || !directory.is_dir() {
             self.error_message = Some(format!(
                 "Folder does not exist: {}",
                 directory.display()
             ));
-            return;
+            return false;
         }
 
         if self.is_masonry_mode() {
@@ -4138,7 +4293,7 @@ impl ImageViewer {
                 "No supported media files found in folder: {}",
                 directory.display()
             ));
-            return;
+            return false;
         }
 
         let modified_at = std::fs::metadata(directory)
@@ -4151,6 +4306,10 @@ impl ImageViewer {
                 files,
                 modified_at,
             });
+
+        if history_navigation == FolderHistoryNavigationKind::Record {
+            self.record_folder_navigation_to_directory(directory);
+        }
 
         let current_path = self.current_media_path();
         let target_path = current_path
@@ -4215,6 +4374,8 @@ impl ImageViewer {
         } else {
             self.load_media(&target_path);
         }
+
+        true
     }
 
     fn hovered_manga_index_from_pointer(&mut self, ctx: &egui::Context) -> Option<usize> {
@@ -20641,6 +20802,8 @@ impl ImageViewer {
         }
 
         let mut breadcrumb_target_directory: Option<PathBuf> = None;
+        let mut breadcrumb_nav_back_requested = false;
+        let mut breadcrumb_nav_forward_requested = false;
         let mut breadcrumb_ui_hovered = false;
         let mut breadcrumb_popup_active = false;
 
@@ -21129,6 +21292,44 @@ impl ImageViewer {
                         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                             ui.add_space(8.0);
 
+                            let can_go_back = self.folder_navigation_can_go_back();
+                            let back_response = ui
+                                .add_enabled(
+                                    can_go_back,
+                                    egui::Button::new(
+                                        egui::RichText::new("<")
+                                            .color(egui::Color32::from_gray(220)),
+                                    )
+                                    .min_size(egui::vec2(24.0, 22.0)),
+                                )
+                                .on_hover_text("Back");
+                            if back_response.contains_pointer() {
+                                breadcrumb_ui_hovered = true;
+                            }
+                            if back_response.clicked() {
+                                breadcrumb_nav_back_requested = true;
+                            }
+
+                            let can_go_forward = self.folder_navigation_can_go_forward();
+                            let forward_response = ui
+                                .add_enabled(
+                                    can_go_forward,
+                                    egui::Button::new(
+                                        egui::RichText::new(">")
+                                            .color(egui::Color32::from_gray(220)),
+                                    )
+                                    .min_size(egui::vec2(24.0, 22.0)),
+                                )
+                                .on_hover_text("Forward");
+                            if forward_response.contains_pointer() {
+                                breadcrumb_ui_hovered = true;
+                            }
+                            if forward_response.clicked() {
+                                breadcrumb_nav_forward_requested = true;
+                            }
+
+                            ui.add_space(8.0);
+
                             let Some(current_path) = self.current_media_path() else {
                                 ui.label(
                                     egui::RichText::new("No file loaded")
@@ -21274,7 +21475,11 @@ impl ImageViewer {
             self.controls_show_time = Instant::now();
         }
 
-        if let Some(directory) = breadcrumb_target_directory {
+        if breadcrumb_nav_back_requested {
+            self.navigate_folder_history_back();
+        } else if breadcrumb_nav_forward_requested {
+            self.navigate_folder_history_forward();
+        } else if let Some(directory) = breadcrumb_target_directory {
             self.navigate_to_breadcrumb_directory(directory.as_path());
         }
     }
