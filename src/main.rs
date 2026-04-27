@@ -2084,7 +2084,7 @@ struct ImageViewer {
     /// Worker-thread completion channel for folder-placeholder thumbnails.
     folder_placeholder_thumbnail_result_rx:
         crossbeam_channel::Receiver<FolderPlaceholderThumbnailLoadResult>,
-    /// Cached per-folder media picks for folder placeholders (max 4 reverse-sorted by filename).
+    /// Cached per-folder media picks for folder placeholders (max 4 from tail of raw directory order).
     folder_placeholder_thumbnail_cache: HashMap<PathBuf, FolderPlaceholderThumbnailSelection>,
     /// Monotonic priority seed for folder-preview scan request ordering.
     folder_placeholder_preview_request_priority_seed: i64,
@@ -3733,49 +3733,29 @@ impl ImageViewer {
             return Vec::new();
         };
 
-        // Keep only the best `max_count` reverse-sorted file names while scanning.
-        // This avoids sorting the full directory listing.
-        let mut top_media: Vec<(String, PathBuf)> = Vec::with_capacity(max_count);
+        // Keep only the newest tail of the raw directory listing order and return
+        // it in stack-pop order (last seen first). This avoids filename sorting.
+        let mut tail_media: VecDeque<PathBuf> = VecDeque::with_capacity(max_count);
         for entry in entries.flatten() {
-            let candidate = entry.path();
-            if !candidate.is_file() || get_media_type(candidate.as_path()).is_none() {
-                continue;
-            }
-
-            let Some(file_name) = candidate
-                .file_name()
-                .and_then(|name| name.to_str())
-                .map(|name| name.to_string())
-            else {
+            let Ok(file_type) = entry.file_type() else {
                 continue;
             };
-
-            if file_name.is_empty() {
+            if !file_type.is_file() {
                 continue;
             }
 
-            let mut insert_at = top_media.len();
-            for (idx, (existing_name, _)) in top_media.iter().enumerate() {
-                if file_name > *existing_name {
-                    insert_at = idx;
-                    break;
-                }
-            }
-
-            if insert_at >= max_count {
-                if top_media.len() < max_count {
-                    top_media.push((file_name, candidate));
-                }
+            let candidate = entry.path();
+            if get_media_type(candidate.as_path()).is_none() {
                 continue;
             }
 
-            top_media.insert(insert_at, (file_name, candidate));
-            if top_media.len() > max_count {
-                top_media.pop();
+            if tail_media.len() == max_count {
+                tail_media.pop_front();
             }
+            tail_media.push_back(candidate);
         }
 
-        top_media.into_iter().map(|(_, path)| path).collect()
+        tail_media.into_iter().rev().collect()
     }
 
     fn request_folder_placeholder_preview_scan(
