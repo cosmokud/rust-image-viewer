@@ -1988,6 +1988,31 @@ fn should_store_static_thumbnail(
         && pixel_len <= STATIC_THUMBNAIL_CACHE_SKIP_ENTRY_BYTES
 }
 
+#[cfg(target_os = "windows")]
+fn windows_ctrl_v_shortcut_down() -> bool {
+    use winapi::um::winuser::{
+        GetAsyncKeyState, VK_CONTROL, VK_LCONTROL, VK_MENU, VK_RCONTROL, VK_SHIFT,
+    };
+
+    const VK_V_KEY: i32 = 0x56;
+
+    unsafe {
+        let v_down = (GetAsyncKeyState(VK_V_KEY) as u16 & 0x8000) != 0;
+        let ctrl_down = (GetAsyncKeyState(VK_CONTROL) as u16 & 0x8000) != 0
+            || (GetAsyncKeyState(VK_LCONTROL) as u16 & 0x8000) != 0
+            || (GetAsyncKeyState(VK_RCONTROL) as u16 & 0x8000) != 0;
+        let shift_down = (GetAsyncKeyState(VK_SHIFT) as u16 & 0x8000) != 0;
+        let alt_down = (GetAsyncKeyState(VK_MENU) as u16 & 0x8000) != 0;
+
+        v_down && ctrl_down && !shift_down && !alt_down
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn windows_ctrl_v_shortcut_down() -> bool {
+    false
+}
+
 /// Application state
 struct ImageViewer {
     /// Current loaded image
@@ -2054,6 +2079,8 @@ struct ImageViewer {
     shortcuts_help_modal_open: bool,
     /// Skips one outside-click close check right after opening the shortcuts/help modal.
     shortcuts_help_modal_skip_outside_click_once: bool,
+    /// Tracks Ctrl+V hold state so paste triggers once per key press even if key_pressed is swallowed.
+    paste_shortcut_ctrl_v_was_down: bool,
     /// Cached thumbnail textures used by delete/rename dialogs.
     modal_thumbnail_cache: HashMap<PathBuf, ModalThumbnailTexture>,
     /// Background folder scan jobs currently in-flight for placeholder media candidate selection.
@@ -2664,6 +2691,7 @@ impl Default for ImageViewer {
             pending_exit_confirmation: false,
             shortcuts_help_modal_open: false,
             shortcuts_help_modal_skip_outside_click_once: false,
+            paste_shortcut_ctrl_v_was_down: false,
             modal_thumbnail_cache: HashMap::new(),
             folder_placeholder_preview_scan_pending: HashSet::new(),
             folder_placeholder_preview_scan_request_tx,
@@ -7916,6 +7944,22 @@ impl ImageViewer {
     }
 
     fn try_handle_global_marked_file_shortcuts(&mut self, ctx: &egui::Context) -> bool {
+        // Use key-down edge detection as a fallback for frames where Ctrl+V key_pressed
+        // is consumed by other UI code before this global shortcut pass.
+        let ctrl_v_down_in_egui = ctx.input(|input| {
+            if !input.raw.viewport().focused.unwrap_or(true) {
+                return false;
+            }
+
+            let shortcut_mod = (input.modifiers.ctrl || input.modifiers.command)
+                && !input.modifiers.shift
+                && !input.modifiers.alt;
+            shortcut_mod && input.key_down(egui::Key::V)
+        });
+        let ctrl_v_down = ctrl_v_down_in_egui || windows_ctrl_v_shortcut_down();
+        let ctrl_v_pressed_edge = ctrl_v_down && !self.paste_shortcut_ctrl_v_was_down;
+        self.paste_shortcut_ctrl_v_was_down = ctrl_v_down;
+
         if self.any_modal_dialog_open() || self.file_action_menu.is_some() {
             return false;
         }
@@ -7929,8 +7973,10 @@ impl ImageViewer {
 
         let shortcut = ctx.input(|input| {
             let ctrl = input.modifiers.ctrl;
+            let command = input.modifiers.command;
             let shift = input.modifiers.shift;
             let alt = input.modifiers.alt;
+            let shortcut_mod = (ctrl || command) && !shift && !alt;
             let saw_copy_event = input
                 .raw
                 .events
@@ -7946,12 +7992,27 @@ impl ImageViewer {
                 .events
                 .iter()
                 .any(|event| matches!(event, egui::Event::Paste(_)));
+            let saw_ctrl_v_key_event = input.raw.events.iter().any(|event| {
+                matches!(
+                    event,
+                    egui::Event::Key {
+                        key: egui::Key::V,
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } if (modifiers.ctrl || modifiers.command) && !modifiers.shift && !modifiers.alt
+                )
+            });
 
-            if (ctrl && !shift && !alt && input.key_pressed(egui::Key::C)) || saw_copy_event {
+            if (shortcut_mod && input.key_pressed(egui::Key::C)) || saw_copy_event {
                 Some(MarkedFileShortcut::Copy)
-            } else if (ctrl && !shift && !alt && input.key_pressed(egui::Key::X)) || saw_cut_event {
+            } else if (shortcut_mod && input.key_pressed(egui::Key::X)) || saw_cut_event {
                 Some(MarkedFileShortcut::Cut)
-            } else if (ctrl && !shift && !alt && input.key_pressed(egui::Key::V)) || saw_paste_event {
+            } else if (shortcut_mod && input.key_pressed(egui::Key::V))
+                || saw_paste_event
+                || saw_ctrl_v_key_event
+                || ctrl_v_pressed_edge
+            {
                 Some(MarkedFileShortcut::Paste)
             } else if !ctrl && !shift && !alt && input.key_pressed(egui::Key::Delete) {
                 Some(MarkedFileShortcut::Delete)
