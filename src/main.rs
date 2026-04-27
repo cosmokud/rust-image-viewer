@@ -51,7 +51,10 @@ use metadata_cache::{
 use perf_metrics::PerfMetrics;
 #[cfg(target_os = "windows")]
 use single_instance::{FileReceiver, SingleInstanceResult};
-use video_player::{format_duration, gstreamer_runtime_available, VideoPlayer, VideoSeekMode};
+use video_player::{
+    format_duration, gstreamer_runtime_available, VideoPlayer, VideoSeekMode,
+    VideoSubtitleSelection, VideoTrackInfo,
+};
 use video_thumbnail::{
     extract_video_first_frame_without_gstreamer, probe_video_dimensions_without_gstreamer,
 };
@@ -672,6 +675,26 @@ enum MenuActionIcon {
     OpenLocation,
     Config,
     Help,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VideoControlIcon {
+    Previous,
+    Next,
+    AudioTracks,
+    SubtitleTracks,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VideoFileNavigation {
+    Previous,
+    Next,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ExternalSubtitleOption {
+    path: PathBuf,
+    label: String,
 }
 
 #[cfg(target_os = "windows")]
@@ -7259,6 +7282,413 @@ impl ImageViewer {
         }
     }
 
+    fn solo_video_audio_popup_id() -> egui::Id {
+        egui::Id::new("solo_video_audio_tracks_popup")
+    }
+
+    fn solo_video_subtitle_popup_id() -> egui::Id {
+        egui::Id::new("solo_video_subtitle_tracks_popup")
+    }
+
+    fn manga_video_audio_popup_id(video_idx: usize) -> egui::Id {
+        egui::Id::new(("manga_video_audio_tracks_popup", video_idx))
+    }
+
+    fn manga_video_subtitle_popup_id(video_idx: usize) -> egui::Id {
+        egui::Id::new(("manga_video_subtitle_tracks_popup", video_idx))
+    }
+
+    fn video_track_popup_active(&self, ctx: &egui::Context) -> bool {
+        let solo_popup_open = self.video_player.is_some()
+            && ctx.memory(|mem| {
+                mem.is_popup_open(Self::solo_video_audio_popup_id())
+                    || mem.is_popup_open(Self::solo_video_subtitle_popup_id())
+            });
+
+        let manga_popup_open = self.manga_focused_video_index.is_some_and(|video_idx| {
+            ctx.memory(|mem| {
+                mem.is_popup_open(Self::manga_video_audio_popup_id(video_idx))
+                    || mem.is_popup_open(Self::manga_video_subtitle_popup_id(video_idx))
+            })
+        });
+
+        solo_popup_open || manga_popup_open
+    }
+
+    fn subtitle_candidate_matches_video_stem(video_stem: &str, candidate_stem: &str) -> bool {
+        let video_stem = video_stem.trim().to_ascii_lowercase();
+        let candidate_stem = candidate_stem.trim().to_ascii_lowercase();
+
+        if candidate_stem == video_stem {
+            return true;
+        }
+
+        candidate_stem
+            .strip_prefix(video_stem.as_str())
+            .is_some_and(|rest| {
+                rest.starts_with('.')
+                    || rest.starts_with('_')
+                    || rest.starts_with('-')
+                    || rest.starts_with(' ')
+            })
+    }
+
+    fn external_subtitle_label(video_path: &Path, subtitle_path: &Path) -> String {
+        let video_stem = video_path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let subtitle_stem = subtitle_path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let extension = subtitle_path
+            .extension()
+            .map(|ext| ext.to_string_lossy().to_ascii_uppercase())
+            .unwrap_or_else(|| "SUB".to_string());
+
+        let suffix = subtitle_stem
+            .strip_prefix(video_stem.as_str())
+            .unwrap_or(subtitle_stem.as_str())
+            .trim_start_matches(['.', '_', '-', ' ']);
+
+        if suffix.is_empty() {
+            format!(
+                "External / {} / {}",
+                extension,
+                subtitle_path.file_name().unwrap_or_default().to_string_lossy()
+            )
+        } else {
+            format!(
+                "External / {} / {}",
+                extension,
+                suffix.replace(['.', '_', '-'], " ")
+            )
+        }
+    }
+
+    fn external_subtitle_options_for_video(video_path: &Path) -> Vec<ExternalSubtitleOption> {
+        const SUPPORTED_EXTERNAL_SUBTITLE_EXTENSIONS: [&str; 4] = ["srt", "ass", "ssa", "vtt"];
+
+        let Some(parent_dir) = video_path.parent() else {
+            return Vec::new();
+        };
+        let Some(video_stem) = video_path.file_stem().map(|stem| stem.to_string_lossy().to_string())
+        else {
+            return Vec::new();
+        };
+
+        let mut options = Vec::new();
+        let Ok(entries) = fs::read_dir(parent_dir) else {
+            return options;
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path == video_path {
+                continue;
+            }
+
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_file() {
+                continue;
+            }
+
+            let Some(extension) = path.extension().map(|ext| ext.to_string_lossy().to_ascii_lowercase())
+            else {
+                continue;
+            };
+            if !SUPPORTED_EXTERNAL_SUBTITLE_EXTENSIONS.contains(&extension.as_str()) {
+                continue;
+            }
+
+            let Some(candidate_stem) = path.file_stem().map(|stem| stem.to_string_lossy().to_string())
+            else {
+                continue;
+            };
+            if !Self::subtitle_candidate_matches_video_stem(&video_stem, &candidate_stem) {
+                continue;
+            }
+
+            options.push(ExternalSubtitleOption {
+                label: Self::external_subtitle_label(video_path, &path),
+                path,
+            });
+        }
+
+        options.sort_by(|a, b| {
+            a.label
+                .to_ascii_lowercase()
+                .cmp(&b.label.to_ascii_lowercase())
+                .then_with(|| a.path.cmp(&b.path))
+        });
+        options
+    }
+
+    fn paint_video_control_icon(
+        painter: &egui::Painter,
+        rect: egui::Rect,
+        icon: VideoControlIcon,
+        color: egui::Color32,
+    ) {
+        let stroke = egui::Stroke::new(1.7, color);
+
+        match icon {
+            VideoControlIcon::Previous => {
+                let left = rect.left() + 1.0;
+                let right = rect.right() - 1.0;
+                let mid_x = rect.center().x + 1.0;
+                let top = rect.top() + 1.0;
+                let bottom = rect.bottom() - 1.0;
+                let center_y = rect.center().y;
+
+                painter.line_segment(
+                    [egui::pos2(right, top), egui::pos2(mid_x, center_y)],
+                    stroke,
+                );
+                painter.line_segment(
+                    [egui::pos2(right, bottom), egui::pos2(mid_x, center_y)],
+                    stroke,
+                );
+                painter.line_segment(
+                    [egui::pos2(mid_x, top), egui::pos2(left, center_y)],
+                    stroke,
+                );
+                painter.line_segment(
+                    [egui::pos2(mid_x, bottom), egui::pos2(left, center_y)],
+                    stroke,
+                );
+            }
+            VideoControlIcon::Next => {
+                let left = rect.left() + 1.0;
+                let right = rect.right() - 1.0;
+                let mid_x = rect.center().x - 1.0;
+                let top = rect.top() + 1.0;
+                let bottom = rect.bottom() - 1.0;
+                let center_y = rect.center().y;
+
+                painter.line_segment(
+                    [egui::pos2(left, top), egui::pos2(mid_x, center_y)],
+                    stroke,
+                );
+                painter.line_segment(
+                    [egui::pos2(left, bottom), egui::pos2(mid_x, center_y)],
+                    stroke,
+                );
+                painter.line_segment(
+                    [egui::pos2(mid_x, top), egui::pos2(right, center_y)],
+                    stroke,
+                );
+                painter.line_segment(
+                    [egui::pos2(mid_x, bottom), egui::pos2(right, center_y)],
+                    stroke,
+                );
+            }
+            VideoControlIcon::AudioTracks => {
+                let bar_width = 3.0;
+                let gap = 3.0;
+                let start_x = rect.center().x - (bar_width * 1.5 + gap);
+                let heights = [6.0, 11.0, 8.0];
+
+                for (idx, height) in heights.into_iter().enumerate() {
+                    let x = start_x + idx as f32 * (bar_width + gap);
+                    let bar_rect = egui::Rect::from_center_size(
+                        egui::pos2(x, rect.center().y),
+                        egui::vec2(bar_width, height),
+                    );
+                    painter.rect_filled(bar_rect, 1.5, color);
+                }
+            }
+            VideoControlIcon::SubtitleTracks => {
+                let frame = rect.shrink2(egui::vec2(1.5, 2.0));
+                painter.rect_stroke(frame, 3.0, stroke);
+
+                let first_line_y = frame.top() + 4.0;
+                let second_line_y = frame.bottom() - 4.0;
+                painter.line_segment(
+                    [
+                        egui::pos2(frame.left() + 3.0, first_line_y),
+                        egui::pos2(frame.right() - 3.0, first_line_y),
+                    ],
+                    stroke,
+                );
+                painter.line_segment(
+                    [
+                        egui::pos2(frame.left() + 5.0, second_line_y),
+                        egui::pos2(frame.right() - 5.0, second_line_y),
+                    ],
+                    stroke,
+                );
+            }
+        }
+    }
+
+    fn video_control_icon_button(
+        ui: &mut egui::Ui,
+        icon: VideoControlIcon,
+        tooltip: &str,
+        active: bool,
+    ) -> egui::Response {
+        let size = egui::Vec2::new(28.0, 24.0);
+        let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+
+        if ui.is_rect_visible(rect) {
+            let bg = if response.is_pointer_button_down_on() {
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 38)
+            } else if active {
+                egui::Color32::from_rgba_unmultiplied(66, 133, 244, 52)
+            } else if response.hovered() {
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 18)
+            } else {
+                egui::Color32::TRANSPARENT
+            };
+            let stroke_color = if active {
+                egui::Color32::from_rgb(108, 168, 255)
+            } else {
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 24)
+            };
+            let icon_color = if active {
+                egui::Color32::from_rgb(224, 239, 255)
+            } else {
+                egui::Color32::WHITE
+            };
+
+            ui.painter().rect_filled(rect, 6.0, bg);
+            ui.painter()
+                .rect_stroke(rect.shrink(0.5), 6.0, egui::Stroke::new(1.0, stroke_color));
+
+            let icon_rect = rect.shrink2(egui::vec2(7.0, 5.0));
+            Self::paint_video_control_icon(ui.painter(), icon_rect, icon, icon_color);
+        }
+
+        response.on_hover_text(tooltip)
+    }
+
+    fn draw_audio_track_popup(
+        ui: &mut egui::Ui,
+        popup_id: egui::Id,
+        button_response: &egui::Response,
+        tracks: &[VideoTrackInfo],
+        current_track: Option<i32>,
+    ) -> Option<i32> {
+        let mut selected_track = None;
+        let close_on_click_outside = egui::popup::PopupCloseBehavior::CloseOnClickOutside;
+
+        let _ = egui::popup::popup_below_widget(
+            ui,
+            popup_id,
+            button_response,
+            close_on_click_outside,
+            |ui| {
+                ui.set_min_width(240.0);
+
+                if tracks.is_empty() {
+                    ui.label(
+                        egui::RichText::new("No alternate audio tracks")
+                            .color(egui::Color32::from_gray(160)),
+                    );
+                } else {
+                    for track in tracks {
+                        let row =
+                            ui.selectable_label(current_track == Some(track.index), &track.label);
+                        if row.clicked() {
+                            selected_track = Some(track.index);
+                            ui.memory_mut(|mem| mem.close_popup());
+                        }
+                    }
+                }
+
+                ui.rect_contains_pointer(ui.min_rect())
+            },
+        );
+
+        selected_track
+    }
+
+    fn draw_subtitle_track_popup(
+        ui: &mut egui::Ui,
+        popup_id: egui::Id,
+        button_response: &egui::Response,
+        embedded_tracks: &[VideoTrackInfo],
+        external_tracks: &[ExternalSubtitleOption],
+        current_selection: &VideoSubtitleSelection,
+    ) -> Option<VideoSubtitleSelection> {
+        let mut selected_track = None;
+        let close_on_click_outside = egui::popup::PopupCloseBehavior::CloseOnClickOutside;
+
+        let _ = egui::popup::popup_below_widget(
+            ui,
+            popup_id,
+            button_response,
+            close_on_click_outside,
+            |ui| {
+                ui.set_min_width(260.0);
+
+                let off_row =
+                    ui.selectable_label(matches!(current_selection, VideoSubtitleSelection::Off), "Off");
+                if off_row.clicked() {
+                    selected_track = Some(VideoSubtitleSelection::Off);
+                    ui.memory_mut(|mem| mem.close_popup());
+                }
+
+                if !embedded_tracks.is_empty() {
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new("Embedded")
+                            .color(egui::Color32::from_gray(150))
+                            .size(11.0),
+                    );
+                    for track in embedded_tracks {
+                        let is_selected = matches!(
+                            current_selection,
+                            VideoSubtitleSelection::Embedded(index) if *index == track.index
+                        );
+                        let row = ui.selectable_label(is_selected, &track.label);
+                        if row.clicked() {
+                            selected_track = Some(VideoSubtitleSelection::Embedded(track.index));
+                            ui.memory_mut(|mem| mem.close_popup());
+                        }
+                    }
+                }
+
+                if !external_tracks.is_empty() {
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new("External")
+                            .color(egui::Color32::from_gray(150))
+                            .size(11.0),
+                    );
+                    for option in external_tracks {
+                        let is_selected = matches!(
+                            current_selection,
+                            VideoSubtitleSelection::External(path) if path == &option.path
+                        );
+                        let row = ui.selectable_label(is_selected, &option.label);
+                        if row.clicked() {
+                            selected_track =
+                                Some(VideoSubtitleSelection::External(option.path.clone()));
+                            ui.memory_mut(|mem| mem.close_popup());
+                        }
+                    }
+                }
+
+                if embedded_tracks.is_empty() && external_tracks.is_empty() {
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new("No subtitles found")
+                            .color(egui::Color32::from_gray(160)),
+                    );
+                }
+
+                ui.rect_contains_pointer(ui.min_rect())
+            },
+        );
+
+        selected_track
+    }
+
     fn update_bottom_overlays_visibility(&mut self, ctx: &egui::Context) -> bool {
         let screen_rect = ctx.screen_rect();
         let mouse_pos = ctx.input(|i| i.pointer.hover_pos());
@@ -7336,6 +7766,7 @@ impl ImageViewer {
         let interacting_manga_video =
             self.manga_video_seeking || self.manga_video_volume_dragging || self.gif_seeking;
         let interacting_manga_zoom = self.manga_zoom_plus_held || self.manga_zoom_minus_held;
+        let track_popup_active = self.video_track_popup_active(ctx);
 
         // Track whether the pointer is currently over the bottom video controls region.
         // (Used for input suppression and for keeping overlays alive while hovering.)
@@ -7351,6 +7782,7 @@ impl ImageViewer {
                 || hover_bottom_right
                 || interacting_video
                 || interacting_manga_video
+                || track_popup_active
                 || self.mouse_over_video_controls
                 || interacting_manga_zoom
         } else {
@@ -22025,10 +22457,14 @@ impl ImageViewer {
         let video_seek_policy = self.config.video_seek_policy;
         let commit_seek_mode = self.commit_video_seek_mode();
         let mut play_toggle_requested = false;
+        let mut file_navigation_requested: Option<VideoFileNavigation> = None;
+        let mut audio_track_requested: Option<i32> = None;
+        let mut subtitle_selection_requested: Option<VideoSubtitleSelection> = None;
         let mut resume_error: Option<String> = None;
 
         ui.vertical(|ui| {
             // === Seek bar (top row) ===
+            let current_video_path = self.image_list.get(self.current_index).cloned();
             let Some(player) = self.video_player.as_mut() else {
                 return;
             };
@@ -22036,6 +22472,10 @@ impl ImageViewer {
             let position_fraction = player.position_fraction() as f32;
             let duration = player.duration();
             let position = player.position();
+            let audio_tracks = player.audio_tracks();
+            let current_audio_track = player.current_audio_track_index();
+            let embedded_subtitle_tracks = player.embedded_subtitle_tracks();
+            let current_subtitle_selection = player.current_subtitle_selection();
 
             // Seek bar
             let seek_bar_height = 6.0;
@@ -22178,6 +22618,24 @@ impl ImageViewer {
                     play_toggle_requested = true;
                 }
 
+                ui.add_space(4.0);
+
+                let prev_btn = Self::video_control_icon_button(
+                    ui,
+                    VideoControlIcon::Previous,
+                    "Previous file",
+                    false,
+                );
+                if prev_btn.clicked() {
+                    file_navigation_requested = Some(VideoFileNavigation::Previous);
+                }
+
+                let next_btn =
+                    Self::video_control_icon_button(ui, VideoControlIcon::Next, "Next file", false);
+                if next_btn.clicked() {
+                    file_navigation_requested = Some(VideoFileNavigation::Next);
+                }
+
                 ui.add_space(8.0);
 
                 // Time display
@@ -22269,6 +22727,60 @@ impl ImageViewer {
                     if vol_response.drag_stopped() {
                         self.is_volume_dragging = false;
                     }
+
+                    ui.add_space(6.0);
+
+                    let subtitle_popup_id = Self::solo_video_subtitle_popup_id();
+                    let subtitle_popup_open =
+                        ui.memory(|mem| mem.is_popup_open(subtitle_popup_id));
+                    let subtitle_btn = Self::video_control_icon_button(
+                        ui,
+                        VideoControlIcon::SubtitleTracks,
+                        "Subtitle track",
+                        subtitle_popup_open,
+                    );
+                    if subtitle_btn.clicked() {
+                        ui.memory_mut(|mem| mem.toggle_popup(subtitle_popup_id));
+                    }
+                    let external_subtitle_tracks = if subtitle_popup_open || subtitle_btn.clicked() {
+                        current_video_path
+                            .as_deref()
+                            .map(Self::external_subtitle_options_for_video)
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
+                    if let Some(selection) = Self::draw_subtitle_track_popup(
+                        ui,
+                        subtitle_popup_id,
+                        &subtitle_btn,
+                        &embedded_subtitle_tracks,
+                        &external_subtitle_tracks,
+                        &current_subtitle_selection,
+                    ) {
+                        subtitle_selection_requested = Some(selection);
+                    }
+
+                    let audio_popup_id = Self::solo_video_audio_popup_id();
+                    let audio_popup_open = ui.memory(|mem| mem.is_popup_open(audio_popup_id));
+                    let audio_btn = Self::video_control_icon_button(
+                        ui,
+                        VideoControlIcon::AudioTracks,
+                        "Audio track",
+                        audio_popup_open,
+                    );
+                    if audio_btn.clicked() {
+                        ui.memory_mut(|mem| mem.toggle_popup(audio_popup_id));
+                    }
+                    if let Some(selected_track) = Self::draw_audio_track_popup(
+                        ui,
+                        audio_popup_id,
+                        &audio_btn,
+                        &audio_tracks,
+                        current_audio_track,
+                    ) {
+                        audio_track_requested = Some(selected_track);
+                    }
                 });
             });
         });
@@ -22279,6 +22791,29 @@ impl ImageViewer {
 
         if play_toggle_requested {
             self.try_toggle_solo_video_play_pause();
+        }
+
+        if let Some(selected_track) = audio_track_requested {
+            if let Some(player) = self.video_player.as_mut() {
+                if let Err(err) = player.set_audio_track(selected_track) {
+                    tracing::warn!("failed to switch audio track: {}", err);
+                }
+            }
+        }
+
+        if let Some(selection) = subtitle_selection_requested {
+            if let Some(player) = self.video_player.as_mut() {
+                if let Err(err) = player.set_subtitle_selection(selection) {
+                    tracing::warn!("failed to switch subtitle track: {}", err);
+                }
+            }
+        }
+
+        if let Some(navigation) = file_navigation_requested {
+            match navigation {
+                VideoFileNavigation::Previous => self.prev_image(),
+                VideoFileNavigation::Next => self.next_image(),
+            }
         }
     }
 
@@ -22542,8 +23077,12 @@ impl ImageViewer {
         let video_seek_policy = self.config.video_seek_policy;
         let commit_seek_mode = self.commit_video_seek_mode();
         let mut play_toggle_requested = false;
+        let mut file_navigation_requested: Option<VideoFileNavigation> = None;
+        let mut audio_track_requested: Option<i32> = None;
+        let mut subtitle_selection_requested: Option<VideoSubtitleSelection> = None;
         let mut resume_error: Option<String> = None;
 
+        let current_video_path = self.image_list.get(video_idx).cloned();
         let Some(player) = self.manga_video_players.get_mut(&video_idx) else {
             return;
         };
@@ -22551,6 +23090,10 @@ impl ImageViewer {
         let position_fraction = player.position_fraction() as f32;
         let duration = player.duration();
         let position = player.position();
+        let audio_tracks = player.audio_tracks();
+        let current_audio_track = player.current_audio_track_index();
+        let embedded_subtitle_tracks = player.embedded_subtitle_tracks();
+        let current_subtitle_selection = player.current_subtitle_selection();
 
         ui.vertical(|ui| {
             // === Seek bar (top row) ===
@@ -22702,6 +23245,24 @@ impl ImageViewer {
                     play_toggle_requested = true;
                 }
 
+                ui.add_space(4.0);
+
+                let prev_btn = Self::video_control_icon_button(
+                    ui,
+                    VideoControlIcon::Previous,
+                    "Previous file",
+                    false,
+                );
+                if prev_btn.clicked() {
+                    file_navigation_requested = Some(VideoFileNavigation::Previous);
+                }
+
+                let next_btn =
+                    Self::video_control_icon_button(ui, VideoControlIcon::Next, "Next file", false);
+                if next_btn.clicked() {
+                    file_navigation_requested = Some(VideoFileNavigation::Next);
+                }
+
                 ui.add_space(8.0);
 
                 // Time display
@@ -22794,6 +23355,60 @@ impl ImageViewer {
                     if vol_response.drag_stopped() {
                         self.manga_video_volume_dragging = false;
                     }
+
+                    ui.add_space(6.0);
+
+                    let subtitle_popup_id = Self::manga_video_subtitle_popup_id(video_idx);
+                    let subtitle_popup_open =
+                        ui.memory(|mem| mem.is_popup_open(subtitle_popup_id));
+                    let subtitle_btn = Self::video_control_icon_button(
+                        ui,
+                        VideoControlIcon::SubtitleTracks,
+                        "Subtitle track",
+                        subtitle_popup_open,
+                    );
+                    if subtitle_btn.clicked() {
+                        ui.memory_mut(|mem| mem.toggle_popup(subtitle_popup_id));
+                    }
+                    let external_subtitle_tracks = if subtitle_popup_open || subtitle_btn.clicked() {
+                        current_video_path
+                            .as_deref()
+                            .map(Self::external_subtitle_options_for_video)
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
+                    if let Some(selection) = Self::draw_subtitle_track_popup(
+                        ui,
+                        subtitle_popup_id,
+                        &subtitle_btn,
+                        &embedded_subtitle_tracks,
+                        &external_subtitle_tracks,
+                        &current_subtitle_selection,
+                    ) {
+                        subtitle_selection_requested = Some(selection);
+                    }
+
+                    let audio_popup_id = Self::manga_video_audio_popup_id(video_idx);
+                    let audio_popup_open = ui.memory(|mem| mem.is_popup_open(audio_popup_id));
+                    let audio_btn = Self::video_control_icon_button(
+                        ui,
+                        VideoControlIcon::AudioTracks,
+                        "Audio track",
+                        audio_popup_open,
+                    );
+                    if audio_btn.clicked() {
+                        ui.memory_mut(|mem| mem.toggle_popup(audio_popup_id));
+                    }
+                    if let Some(selected_track) = Self::draw_audio_track_popup(
+                        ui,
+                        audio_popup_id,
+                        &audio_btn,
+                        &audio_tracks,
+                        current_audio_track,
+                    ) {
+                        audio_track_requested = Some(selected_track);
+                    }
                 });
             });
         });
@@ -22810,6 +23425,29 @@ impl ImageViewer {
 
         if play_toggle_requested {
             self.try_toggle_manga_video_play_pause(video_idx);
+        }
+
+        if let Some(selected_track) = audio_track_requested {
+            if let Some(player) = self.manga_video_players.get_mut(&video_idx) {
+                if let Err(err) = player.set_audio_track(selected_track) {
+                    tracing::warn!("failed to switch manga audio track: {}", err);
+                }
+            }
+        }
+
+        if let Some(selection) = subtitle_selection_requested {
+            if let Some(player) = self.manga_video_players.get_mut(&video_idx) {
+                if let Err(err) = player.set_subtitle_selection(selection) {
+                    tracing::warn!("failed to switch manga subtitle track: {}", err);
+                }
+            }
+        }
+
+        if let Some(navigation) = file_navigation_requested {
+            match navigation {
+                VideoFileNavigation::Previous => self.prev_image(),
+                VideoFileNavigation::Next => self.next_image(),
+            }
         }
     }
 

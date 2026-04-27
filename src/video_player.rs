@@ -1,7 +1,7 @@
 //! Video player module using GStreamer for video playback.
 //! Supports MP4, MKV, WEBM and other popular video formats.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicI8, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -306,6 +306,19 @@ pub enum VideoSeekMode {
     Keyframe,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VideoTrackInfo {
+    pub index: i32,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VideoSubtitleSelection {
+    Off,
+    Embedded(i32),
+    External(PathBuf),
+}
+
 /// Video frame data extracted from GStreamer
 #[derive(Clone)]
 pub struct VideoFrame {
@@ -333,6 +346,7 @@ const RANGE_EXPAND_TRUE: i8 = 1;
 const DEFAULT_FRAME_QUEUE_CAPACITY: usize = 4;
 const MAX_FRAME_QUEUE_CAPACITY: usize = 6;
 const FRAME_BUFFER_POOL_CAPACITY: usize = 16;
+const PLAY_FLAG_TEXT: u64 = 1 << 2;
 const PLAY_FLAG_DOWNLOAD: u64 = 1 << 7;
 const PLAY_FLAG_BUFFERING: u64 = 1 << 8;
 const LOCAL_FILE_BUFFER_DURATION_NS: i64 = 10_000_000_000;
@@ -444,6 +458,18 @@ fn set_optional_bool_property(element: &gst::Element, name: &str, value: bool) {
     if element.property_value(name).get::<bool>().is_ok() {
         element.set_property(name, value);
     }
+}
+
+fn get_optional_i32_or_u32_property(element: &gst::Element, name: &str) -> Option<i32> {
+    if element.find_property(name).is_none() {
+        return None;
+    }
+
+    let property = element.property_value(name);
+    property
+        .get::<i32>()
+        .ok()
+        .or_else(|| property.get::<u32>().ok().map(|value| value as i32))
 }
 
 fn set_optional_i64_or_u64_property(element: &gst::Element, name: &str, value: i64) {
@@ -658,6 +684,63 @@ fn expand_limited_range_rgba_in_place(pixels: &mut [u8]) {
     }
 }
 
+fn tag_string_from_list<T>(tags: &gst::TagList) -> Option<String>
+where
+    for<'a> T: gst::tags::Tag<'a, TagType = &'a str>,
+{
+    tags.get::<T>().map(|value| value.get().to_string())
+}
+
+fn push_unique_label_part(parts: &mut Vec<String>, value: Option<String>) {
+    let Some(value) = value.map(|v| v.trim().to_string()) else {
+        return;
+    };
+    if value.is_empty() || parts.iter().any(|existing| existing.eq_ignore_ascii_case(&value)) {
+        return;
+    }
+    parts.push(value);
+}
+
+fn format_audio_track_label(index: i32, tags: Option<&gst::TagList>) -> String {
+    let mut parts = vec![format!("Audio {}", index + 1)];
+
+    if let Some(tags) = tags {
+        push_unique_label_part(&mut parts, tag_string_from_list::<gst::tags::Title>(tags));
+        push_unique_label_part(
+            &mut parts,
+            tag_string_from_list::<gst::tags::LanguageName>(tags)
+                .or_else(|| tag_string_from_list::<gst::tags::LanguageCode>(tags)),
+        );
+        push_unique_label_part(
+            &mut parts,
+            tag_string_from_list::<gst::tags::AudioCodec>(tags)
+                .or_else(|| tag_string_from_list::<gst::tags::Codec>(tags)),
+        );
+    }
+
+    parts.join(" / ")
+}
+
+fn format_subtitle_track_label(index: i32, tags: Option<&gst::TagList>) -> String {
+    let mut parts = vec![format!("Subtitle {}", index + 1)];
+
+    if let Some(tags) = tags {
+        push_unique_label_part(&mut parts, tag_string_from_list::<gst::tags::Title>(tags));
+        push_unique_label_part(
+            &mut parts,
+            tag_string_from_list::<gst::tags::LanguageName>(tags)
+                .or_else(|| tag_string_from_list::<gst::tags::LanguageCode>(tags)),
+        );
+        push_unique_label_part(
+            &mut parts,
+            tag_string_from_list::<gst::tags::SubtitleCodec>(tags)
+                .or_else(|| tag_string_from_list::<gst::tags::Codec>(tags)),
+        );
+    }
+
+    parts.join(" / ")
+}
+
 fn process_video_sample(sample: gst::Sample, state: &VideoState) {
     let Some(buffer) = sample.buffer() else {
         return;
@@ -734,6 +817,7 @@ pub struct VideoPlayer {
     volume: f64, // 0.0 to 1.0
     original_width: u32,
     original_height: u32,
+    subtitle_selection: VideoSubtitleSelection,
 }
 
 impl VideoPlayer {
@@ -967,7 +1051,14 @@ Ensure your GStreamer installation includes the playback elements (usually from 
             volume: initial_volume.clamp(0.0, 1.0),
             original_width: source_dimensions.map_or(0, |(width, _)| width),
             original_height: source_dimensions.map_or(0, |(_, height)| height),
+            subtitle_selection: VideoSubtitleSelection::Off,
         };
+
+        let mut player = player;
+        player.subtitle_selection = player.current_embedded_subtitle_track_index().map_or(
+            VideoSubtitleSelection::Off,
+            VideoSubtitleSelection::Embedded,
+        );
 
         // Apply initial volume/mute settings
         player.apply_volume();
@@ -1195,6 +1286,110 @@ Ensure your GStreamer installation includes the playback elements (usually from 
     /// Get current volume
     pub fn volume(&self) -> f64 {
         self.volume
+    }
+
+    pub fn audio_tracks(&self) -> Vec<VideoTrackInfo> {
+        let Some(track_count) =
+            get_optional_i32_or_u32_property(self.pipeline.upcast_ref(), "n-audio")
+        else {
+            return Vec::new();
+        };
+
+        let mut tracks = Vec::with_capacity(track_count.max(0) as usize);
+        for index in 0..track_count.max(0) {
+            let tags = self
+                .pipeline
+                .emit_by_name::<Option<gst::TagList>>("get-audio-tags", &[&index]);
+            tracks.push(VideoTrackInfo {
+                index,
+                label: format_audio_track_label(index, tags.as_ref()),
+            });
+        }
+        tracks
+    }
+
+    pub fn current_audio_track_index(&self) -> Option<i32> {
+        get_optional_i32_or_u32_property(self.pipeline.upcast_ref(), "current-audio")
+            .filter(|index| *index >= 0)
+    }
+
+    pub fn set_audio_track(&mut self, index: i32) -> Result<(), String> {
+        if index < 0 {
+            return Err("Audio track index must be non-negative".to_string());
+        }
+
+        set_optional_i32_or_u32_property(self.pipeline.upcast_ref(), "current-audio", index);
+        Ok(())
+    }
+
+    pub fn embedded_subtitle_tracks(&self) -> Vec<VideoTrackInfo> {
+        let Some(track_count) =
+            get_optional_i32_or_u32_property(self.pipeline.upcast_ref(), "n-text")
+        else {
+            return Vec::new();
+        };
+
+        let mut tracks = Vec::with_capacity(track_count.max(0) as usize);
+        for index in 0..track_count.max(0) {
+            let tags = self
+                .pipeline
+                .emit_by_name::<Option<gst::TagList>>("get-text-tags", &[&index]);
+            tracks.push(VideoTrackInfo {
+                index,
+                label: format_subtitle_track_label(index, tags.as_ref()),
+            });
+        }
+        tracks
+    }
+
+    fn current_embedded_subtitle_track_index(&self) -> Option<i32> {
+        get_optional_i32_or_u32_property(self.pipeline.upcast_ref(), "current-text")
+            .filter(|index| *index >= 0)
+    }
+
+    pub fn current_subtitle_selection(&self) -> VideoSubtitleSelection {
+        match &self.subtitle_selection {
+            VideoSubtitleSelection::External(path) => VideoSubtitleSelection::External(path.clone()),
+            _ => self
+                .current_embedded_subtitle_track_index()
+                .map_or(VideoSubtitleSelection::Off, VideoSubtitleSelection::Embedded),
+        }
+    }
+
+    pub fn set_subtitle_selection(
+        &mut self,
+        selection: VideoSubtitleSelection,
+    ) -> Result<(), String> {
+        match &selection {
+            VideoSubtitleSelection::Off => {
+                self.pipeline.set_property("suburi", "");
+                set_optional_i32_or_u32_property(self.pipeline.upcast_ref(), "current-text", -1);
+            }
+            VideoSubtitleSelection::Embedded(index) => {
+                if *index < 0 {
+                    return Err("Subtitle track index must be non-negative".to_string());
+                }
+
+                enable_playbin_flags(self.pipeline.upcast_ref(), PLAY_FLAG_TEXT);
+                self.pipeline.set_property("suburi", "");
+                set_optional_i32_or_u32_property(
+                    self.pipeline.upcast_ref(),
+                    "current-text",
+                    *index,
+                );
+            }
+            VideoSubtitleSelection::External(path) => {
+                let subtitle_uri = gst::glib::filename_to_uri(path, None)
+                    .map_err(|err| format!("Failed to build subtitle URI: {}", err))?
+                    .to_string();
+
+                enable_playbin_flags(self.pipeline.upcast_ref(), PLAY_FLAG_TEXT);
+                self.pipeline.set_property("suburi", subtitle_uri.as_str());
+            }
+        }
+
+        self.subtitle_selection = selection;
+        Ok(())
     }
 
     /// Set muted state
