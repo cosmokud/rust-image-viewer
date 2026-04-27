@@ -21540,29 +21540,22 @@ impl ImageViewer {
                                                 .color(egui::Color32::from_gray(150)),
                                         );
                                     } else {
-                                        egui::ScrollArea::vertical()
-                                            .max_height(320.0)
-                                            .show(ui, |ui| {
-                                                for (history_index, folder_path) in
-                                                    back_history_items.iter()
-                                                {
-                                                    let folder_label = Self::format_folder_history_entry_label(
-                                                        folder_path.as_path(),
-                                                        Self::FOLDER_NAVIGATION_BACK_POPUP_MAX_DEPTH,
-                                                    );
-                                                    let row = ui
-                                                        .selectable_label(false, folder_label)
-                                                        .on_hover_text(folder_path.display().to_string());
-                                                    if row.contains_pointer() {
-                                                        breadcrumb_ui_hovered = true;
-                                                    }
-                                                    if row.clicked() || row.secondary_clicked() {
-                                                        breadcrumb_nav_back_target_index =
-                                                            Some(*history_index);
-                                                        close_popup = true;
-                                                    }
-                                                }
-                                            });
+                                        for (history_index, folder_path) in back_history_items.iter() {
+                                            let folder_label = Self::format_folder_history_entry_label(
+                                                folder_path.as_path(),
+                                                Self::FOLDER_NAVIGATION_BACK_POPUP_MAX_DEPTH,
+                                            );
+                                            let row = ui
+                                                .selectable_label(false, folder_label)
+                                                .on_hover_text(folder_path.display().to_string());
+                                            if row.contains_pointer() {
+                                                breadcrumb_ui_hovered = true;
+                                            }
+                                            if row.clicked() || row.secondary_clicked() {
+                                                breadcrumb_nav_back_target_index = Some(*history_index);
+                                                close_popup = true;
+                                            }
+                                        }
                                     }
 
                                     if close_popup {
