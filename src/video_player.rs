@@ -329,22 +329,27 @@ struct VideoState {
 const RANGE_EXPAND_UNKNOWN: i8 = -1;
 const RANGE_EXPAND_FALSE: i8 = 0;
 const RANGE_EXPAND_TRUE: i8 = 1;
-const DEFAULT_FRAME_QUEUE_CAPACITY: usize = 3;
-const MAX_FRAME_QUEUE_CAPACITY: usize = 6;
-const FRAME_BUFFER_POOL_CAPACITY: usize = 16;
+const DEFAULT_FRAME_QUEUE_CAPACITY: usize = 6;
+const MAX_FRAME_QUEUE_CAPACITY: usize = 12;
+const FRAME_BUFFER_POOL_CAPACITY: usize = 24;
+const PLAY_FLAG_DOWNLOAD: u64 = 1 << 7;
+const PLAY_FLAG_BUFFERING: u64 = 1 << 8;
+const LOCAL_FILE_BUFFER_DURATION_NS: i64 = 10_000_000_000;
+const LOCAL_FILE_BUFFER_SIZE_BYTES: i32 = 48 * 1024 * 1024;
+const LOCAL_FILE_RING_BUFFER_MAX_SIZE_BYTES: u64 = 96 * 1024 * 1024;
 
 impl VideoState {
     fn adaptive_capacity_for_dims(width: u32, height: u32) -> usize {
         let pixels = (width as u64).saturating_mul(height as u64);
 
         if pixels >= (3840u64 * 2160u64) {
-            2
-        } else if pixels >= (2560u64 * 1440u64) {
             3
-        } else if pixels >= (1920u64 * 1080u64) {
-            4
-        } else {
+        } else if pixels >= (2560u64 * 1440u64) {
             5
+        } else if pixels >= (1920u64 * 1080u64) {
+            7
+        } else {
+            9
         }
     }
 
@@ -404,6 +409,88 @@ impl VideoState {
         }
         queue.pop_front()
     }
+}
+
+fn set_optional_bool_property(pipeline: &gst::Pipeline, name: &str, value: bool) {
+    if pipeline.find_property(name).is_none() {
+        return;
+    }
+
+    if pipeline.property_value(name).get::<bool>().is_ok() {
+        pipeline.set_property(name, value);
+    }
+}
+
+fn set_optional_i64_or_u64_property(pipeline: &gst::Pipeline, name: &str, value: i64) {
+    if pipeline.find_property(name).is_none() {
+        return;
+    }
+
+    let property = pipeline.property_value(name);
+    if property.get::<i64>().is_ok() {
+        pipeline.set_property(name, value);
+    } else if property.get::<u64>().is_ok() {
+        pipeline.set_property(name, value.max(0) as u64);
+    }
+}
+
+fn set_optional_i32_or_u32_property(pipeline: &gst::Pipeline, name: &str, value: i32) {
+    if pipeline.find_property(name).is_none() {
+        return;
+    }
+
+    let property = pipeline.property_value(name);
+    if property.get::<i32>().is_ok() {
+        pipeline.set_property(name, value);
+    } else if property.get::<u32>().is_ok() {
+        pipeline.set_property(name, value.max(0) as u32);
+    } else if property.get::<i64>().is_ok() {
+        pipeline.set_property(name, value as i64);
+    } else if property.get::<u64>().is_ok() {
+        pipeline.set_property(name, value.max(0) as u64);
+    }
+}
+
+fn enable_playbin_flags(pipeline: &gst::Pipeline, flags_mask: u64) {
+    if pipeline.find_property("flags").is_none() {
+        return;
+    }
+
+    let property = pipeline.property_value("flags");
+    if let Ok(current) = property.get::<u32>() {
+        let desired = current | flags_mask as u32;
+        if desired != current {
+            pipeline.set_property("flags", desired);
+        }
+    } else if let Ok(current) = property.get::<i32>() {
+        let desired = current | flags_mask as i32;
+        if desired != current {
+            pipeline.set_property("flags", desired);
+        }
+    } else if let Ok(current) = property.get::<u64>() {
+        let desired = current | flags_mask;
+        if desired != current {
+            pipeline.set_property("flags", desired);
+        }
+    }
+}
+
+fn configure_local_file_playback_buffering(pipeline: &gst::Pipeline, uri: &str) {
+    if !uri.starts_with("file://") {
+        return;
+    }
+
+    // Browsers keep deeper local read-ahead when disk stalls occur.
+    // Mirror that behavior by asking playbin/queue2 to buffer more aggressively.
+    enable_playbin_flags(pipeline, PLAY_FLAG_DOWNLOAD | PLAY_FLAG_BUFFERING);
+    set_optional_bool_property(pipeline, "use-buffering", true);
+    set_optional_i32_or_u32_property(pipeline, "buffer-size", LOCAL_FILE_BUFFER_SIZE_BYTES);
+    set_optional_i64_or_u64_property(pipeline, "buffer-duration", LOCAL_FILE_BUFFER_DURATION_NS);
+    set_optional_i64_or_u64_property(
+        pipeline,
+        "ring-buffer-max-size",
+        LOCAL_FILE_RING_BUFFER_MAX_SIZE_BYTES as i64,
+    );
 }
 
 fn guess_limited_range_rgba(pixels: &[u8]) -> bool {
@@ -533,6 +620,7 @@ pub struct VideoPlayer {
     volume_element: Option<gst::Element>,
     duration: Option<Duration>,
     is_playing: bool,
+    buffering_paused: bool,
     is_muted: bool,
     volume: f64, // 0.0 to 1.0
     original_width: u32,
@@ -615,6 +703,8 @@ Ensure your GStreamer installation includes the playback elements (usually from 
         let pipeline = pipeline
             .downcast::<gst::Pipeline>()
             .map_err(|_| "Failed to cast to Pipeline")?;
+
+        configure_local_file_playback_buffering(&pipeline, uri.as_str());
 
         // Create appsink for video frames
         // Explicitly request sRGB RGBA output. This nudges GStreamer into producing full-range RGB
@@ -795,6 +885,7 @@ Ensure your GStreamer installation includes the playback elements (usually from 
             volume_element: volume,
             duration: None,
             is_playing: false,
+            buffering_paused: false,
             is_muted: muted,
             volume: initial_volume.clamp(0.0, 1.0),
             original_width: 0,
@@ -819,6 +910,7 @@ Ensure your GStreamer installation includes the playback elements (usually from 
             }
         })?;
         self.is_playing = true;
+        self.buffering_paused = false;
 
         // Try to get duration after starting
         self.update_duration();
@@ -865,6 +957,7 @@ Ensure your GStreamer installation includes the playback elements (usually from 
             .set_state(gst::State::Paused)
             .map_err(|e| format!("Failed to pause playback: {}", e))?;
         self.is_playing = false;
+        self.buffering_paused = false;
         Ok(())
     }
 
@@ -1026,7 +1119,7 @@ Ensure your GStreamer installation includes the playback elements (usually from 
     }
 
     /// Check if video has ended
-    pub fn is_eos(&self) -> bool {
+    pub fn is_eos(&mut self) -> bool {
         const EOS_BUS_MESSAGES_PER_TICK: usize = 64;
 
         if let Some(bus) = self.pipeline.bus() {
@@ -1036,8 +1129,21 @@ Ensure your GStreamer installation includes the playback elements (usually from 
                     break;
                 };
 
-                if let gst::MessageView::Eos(_) = msg.view() {
-                    return true;
+                match msg.view() {
+                    gst::MessageView::Eos(_) => return true,
+                    gst::MessageView::Buffering(buffering) => {
+                        let percent = buffering.percent();
+                        if percent < 100 {
+                            if self.is_playing && !self.buffering_paused {
+                                let _ = self.pipeline.set_state(gst::State::Paused);
+                                self.buffering_paused = true;
+                            }
+                        } else if self.is_playing && self.buffering_paused {
+                            let _ = self.pipeline.set_state(gst::State::Playing);
+                            self.buffering_paused = false;
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
