@@ -1,9 +1,11 @@
 //! Video player module using GStreamer for video playback.
 //! Supports MP4, MKV, WEBM and other popular video formats.
 
+use std::fs::OpenOptions;
+use std::io::Read;
 use std::path::Path;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicI8, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI8, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -329,27 +331,29 @@ struct VideoState {
 const RANGE_EXPAND_UNKNOWN: i8 = -1;
 const RANGE_EXPAND_FALSE: i8 = 0;
 const RANGE_EXPAND_TRUE: i8 = 1;
-const DEFAULT_FRAME_QUEUE_CAPACITY: usize = 6;
-const MAX_FRAME_QUEUE_CAPACITY: usize = 12;
-const FRAME_BUFFER_POOL_CAPACITY: usize = 24;
+const DEFAULT_FRAME_QUEUE_CAPACITY: usize = 12;
+const MAX_FRAME_QUEUE_CAPACITY: usize = 24;
+const FRAME_BUFFER_POOL_CAPACITY: usize = 48;
 const PLAY_FLAG_DOWNLOAD: u64 = 1 << 7;
 const PLAY_FLAG_BUFFERING: u64 = 1 << 8;
-const LOCAL_FILE_BUFFER_DURATION_NS: i64 = 10_000_000_000;
-const LOCAL_FILE_BUFFER_SIZE_BYTES: i32 = 48 * 1024 * 1024;
-const LOCAL_FILE_RING_BUFFER_MAX_SIZE_BYTES: u64 = 96 * 1024 * 1024;
+const LOCAL_FILE_BUFFER_DURATION_NS: i64 = 180_000_000_000;
+const LOCAL_FILE_BUFFER_SIZE_BYTES: i32 = 512 * 1024 * 1024;
+const LOCAL_FILE_RING_BUFFER_MAX_SIZE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const LOCAL_FILE_SOURCE_BLOCK_SIZE_BYTES: i32 = 8 * 1024 * 1024;
+const LOCAL_FILE_PREFETCH_CHUNK_SIZE_BYTES: usize = 128 * 1024 * 1024;
 
 impl VideoState {
     fn adaptive_capacity_for_dims(width: u32, height: u32) -> usize {
         let pixels = (width as u64).saturating_mul(height as u64);
 
         if pixels >= (3840u64 * 2160u64) {
-            3
+            8
         } else if pixels >= (2560u64 * 1440u64) {
-            5
+            12
         } else if pixels >= (1920u64 * 1080u64) {
-            7
+            16
         } else {
-            9
+            24
         }
     }
 
@@ -411,86 +415,155 @@ impl VideoState {
     }
 }
 
-fn set_optional_bool_property(pipeline: &gst::Pipeline, name: &str, value: bool) {
-    if pipeline.find_property(name).is_none() {
+fn set_optional_bool_property(element: &gst::Element, name: &str, value: bool) {
+    if element.find_property(name).is_none() {
         return;
     }
 
-    if pipeline.property_value(name).get::<bool>().is_ok() {
-        pipeline.set_property(name, value);
+    if element.property_value(name).get::<bool>().is_ok() {
+        element.set_property(name, value);
     }
 }
 
-fn set_optional_i64_or_u64_property(pipeline: &gst::Pipeline, name: &str, value: i64) {
-    if pipeline.find_property(name).is_none() {
+fn set_optional_i64_or_u64_property(element: &gst::Element, name: &str, value: i64) {
+    if element.find_property(name).is_none() {
         return;
     }
 
-    let property = pipeline.property_value(name);
+    let property = element.property_value(name);
     if property.get::<i64>().is_ok() {
-        pipeline.set_property(name, value);
+        element.set_property(name, value);
     } else if property.get::<u64>().is_ok() {
-        pipeline.set_property(name, value.max(0) as u64);
+        element.set_property(name, value.max(0) as u64);
     }
 }
 
-fn set_optional_i32_or_u32_property(pipeline: &gst::Pipeline, name: &str, value: i32) {
-    if pipeline.find_property(name).is_none() {
+fn set_optional_i32_or_u32_property(element: &gst::Element, name: &str, value: i32) {
+    if element.find_property(name).is_none() {
         return;
     }
 
-    let property = pipeline.property_value(name);
+    let property = element.property_value(name);
     if property.get::<i32>().is_ok() {
-        pipeline.set_property(name, value);
+        element.set_property(name, value);
     } else if property.get::<u32>().is_ok() {
-        pipeline.set_property(name, value.max(0) as u32);
+        element.set_property(name, value.max(0) as u32);
     } else if property.get::<i64>().is_ok() {
-        pipeline.set_property(name, value as i64);
+        element.set_property(name, value as i64);
     } else if property.get::<u64>().is_ok() {
-        pipeline.set_property(name, value.max(0) as u64);
+        element.set_property(name, value.max(0) as u64);
     }
 }
 
-fn enable_playbin_flags(pipeline: &gst::Pipeline, flags_mask: u64) {
-    if pipeline.find_property("flags").is_none() {
+fn enable_playbin_flags(playbin: &gst::Element, flags_mask: u64) {
+    if playbin.find_property("flags").is_none() {
         return;
     }
 
-    let property = pipeline.property_value("flags");
+    let property = playbin.property_value("flags");
     if let Ok(current) = property.get::<u32>() {
         let desired = current | flags_mask as u32;
         if desired != current {
-            pipeline.set_property("flags", desired);
+            playbin.set_property("flags", desired);
         }
     } else if let Ok(current) = property.get::<i32>() {
         let desired = current | flags_mask as i32;
         if desired != current {
-            pipeline.set_property("flags", desired);
+            playbin.set_property("flags", desired);
         }
     } else if let Ok(current) = property.get::<u64>() {
         let desired = current | flags_mask;
         if desired != current {
-            pipeline.set_property("flags", desired);
+            playbin.set_property("flags", desired);
         }
     }
 }
 
-fn configure_local_file_playback_buffering(pipeline: &gst::Pipeline, uri: &str) {
+fn configure_local_file_playback_buffering(playbin: &gst::Element, uri: &str) {
     if !uri.starts_with("file://") {
         return;
     }
 
     // Browsers keep deeper local read-ahead when disk stalls occur.
     // Mirror that behavior by asking playbin/queue2 to buffer more aggressively.
-    enable_playbin_flags(pipeline, PLAY_FLAG_DOWNLOAD | PLAY_FLAG_BUFFERING);
-    set_optional_bool_property(pipeline, "use-buffering", true);
-    set_optional_i32_or_u32_property(pipeline, "buffer-size", LOCAL_FILE_BUFFER_SIZE_BYTES);
-    set_optional_i64_or_u64_property(pipeline, "buffer-duration", LOCAL_FILE_BUFFER_DURATION_NS);
+    enable_playbin_flags(playbin, PLAY_FLAG_DOWNLOAD | PLAY_FLAG_BUFFERING);
+    set_optional_bool_property(playbin, "use-buffering", true);
+    set_optional_i32_or_u32_property(playbin, "buffer-size", LOCAL_FILE_BUFFER_SIZE_BYTES);
+    set_optional_i64_or_u64_property(playbin, "buffer-duration", LOCAL_FILE_BUFFER_DURATION_NS);
     set_optional_i64_or_u64_property(
-        pipeline,
+        playbin,
         "ring-buffer-max-size",
         LOCAL_FILE_RING_BUFFER_MAX_SIZE_BYTES as i64,
     );
+}
+
+fn configure_local_file_source_read_behavior(playbin: &gst::Element, uri: &str) {
+    if !uri.starts_with("file://") {
+        return;
+    }
+
+    playbin.connect("source-setup", false, move |values| {
+        let Some(source) = values.get(1).and_then(|value| value.get::<gst::Element>().ok()) else {
+            return None;
+        };
+
+        // Prefer larger source reads to reduce queue wait frequency under heavy disk contention.
+        set_optional_i32_or_u32_property(&source, "blocksize", LOCAL_FILE_SOURCE_BLOCK_SIZE_BYTES);
+        set_optional_bool_property(&source, "use-mmap", true);
+        None
+    });
+}
+
+#[cfg(target_os = "windows")]
+fn open_prefetch_file_for_sequential_scan(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_FLAG_SEQUENTIAL_SCAN: u32 = 0x08000000;
+
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_SEQUENTIAL_SCAN)
+        .open(path)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn open_prefetch_file_for_sequential_scan(path: &Path) -> std::io::Result<std::fs::File> {
+    OpenOptions::new().read(true).open(path)
+}
+
+fn start_local_file_prefetch(path: &Path) -> Option<Arc<AtomicBool>> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_for_worker = Arc::clone(&stop);
+    let prefetch_path = path.to_path_buf();
+
+    if std::thread::Builder::new()
+        .name("riv-video-prefetch".to_string())
+        .spawn(move || {
+            let mut file = match open_prefetch_file_for_sequential_scan(prefetch_path.as_path()) {
+                Ok(file) => file,
+                Err(_) => return,
+            };
+
+            let mut buffer = vec![0u8; LOCAL_FILE_PREFETCH_CHUNK_SIZE_BYTES];
+
+            loop {
+                if stop_for_worker.load(Ordering::Acquire) {
+                    break;
+                }
+
+                match file.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+        })
+        .is_err()
+    {
+        return None;
+    }
+
+    Some(stop)
 }
 
 fn guess_limited_range_rgba(pixels: &[u8]) -> bool {
@@ -621,6 +694,7 @@ pub struct VideoPlayer {
     duration: Option<Duration>,
     is_playing: bool,
     buffering_paused: bool,
+    prefetch_stop: Option<Arc<AtomicBool>>,
     is_muted: bool,
     volume: f64, // 0.0 to 1.0
     original_width: u32,
@@ -676,7 +750,7 @@ impl VideoPlayer {
         // Create the pipeline.
         // Some GStreamer distributions (especially minimal Windows runtimes) ship `playbin` but
         // not `playbin3`. Prefer `playbin3` when available, but fall back to `playbin`.
-        let pipeline = match gst::ElementFactory::make("playbin3")
+        let playbin = match gst::ElementFactory::make("playbin3")
             .name("playbin")
             .property("uri", &uri)
             .build()
@@ -700,11 +774,14 @@ Ensure your GStreamer installation includes the playback elements (usually from 
             }
         };
 
-        let pipeline = pipeline
+        configure_local_file_playback_buffering(&playbin, uri.as_str());
+        configure_local_file_source_read_behavior(&playbin, uri.as_str());
+
+        let pipeline = playbin
             .downcast::<gst::Pipeline>()
             .map_err(|_| "Failed to cast to Pipeline")?;
 
-        configure_local_file_playback_buffering(&pipeline, uri.as_str());
+        let prefetch_stop = start_local_file_prefetch(path);
 
         // Create appsink for video frames
         // Explicitly request sRGB RGBA output. This nudges GStreamer into producing full-range RGB
@@ -886,6 +963,7 @@ Ensure your GStreamer installation includes the playback elements (usually from 
             duration: None,
             is_playing: false,
             buffering_paused: false,
+            prefetch_stop,
             is_muted: muted,
             volume: initial_volume.clamp(0.0, 1.0),
             original_width: 0,
@@ -1162,6 +1240,10 @@ Ensure your GStreamer installation includes the playback elements (usually from 
 
 impl Drop for VideoPlayer {
     fn drop(&mut self) {
+        if let Some(stop) = self.prefetch_stop.take() {
+            stop.store(true, Ordering::Release);
+        }
+
         let pipeline = self.pipeline.clone();
         let shutdown = move || {
             // Some decoders/drivers can block during teardown. Keep this work off the UI thread.
