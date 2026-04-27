@@ -4396,7 +4396,15 @@ impl ImageViewer {
             .or_else(|| {
                 files
                     .iter()
-                    .find(|candidate| !Self::is_up_navigation_entry_path(candidate.as_path()))
+                    .find(|candidate| {
+                        !self.is_folder_navigation_entry_path(candidate.as_path())
+                    })
+                    .cloned()
+            })
+            .or_else(|| {
+                files
+                    .iter()
+                    .find(|candidate| Self::is_up_navigation_entry_path(candidate.as_path()))
                     .cloned()
             })
             .unwrap_or_else(|| files[0].clone());
@@ -11173,10 +11181,30 @@ impl ImageViewer {
                     return;
                 }
 
-                let resolved_index = current_path_before
+                let previous_was_folder_entry = current_path_before
                     .as_ref()
-                    .and_then(|path| self.image_list.iter().position(|candidate| candidate == path))
-                    .unwrap_or_else(|| current_index_before.min(self.image_list.len().saturating_sub(1)));
+                    .is_some_and(|path| self.is_folder_navigation_entry_path(path.as_path()));
+                let same_path_index = current_path_before
+                    .as_ref()
+                    .and_then(|path| self.image_list.iter().position(|candidate| candidate == path));
+                let first_media_index = self
+                    .image_list
+                    .iter()
+                    .position(|path| !self.is_folder_navigation_entry_path(path.as_path()));
+
+                let resolved_index = if previous_was_folder_entry {
+                    first_media_index
+                        .or(same_path_index)
+                        .unwrap_or_else(|| {
+                            current_index_before.min(self.image_list.len().saturating_sub(1))
+                        })
+                } else {
+                    same_path_index
+                        .or(first_media_index)
+                        .unwrap_or_else(|| {
+                            current_index_before.min(self.image_list.len().saturating_sub(1))
+                        })
+                };
                 self.set_current_index_clamped(resolved_index);
 
                 if let Some(path) = self.current_media_path() {
@@ -21436,11 +21464,13 @@ impl ImageViewer {
                                     }
                                     BreadcrumbNavIcon::Refresh => {
                                         let center = icon_rect.center();
-                                        let radius = (icon_rect.width().min(icon_rect.height()) * 0.38)
-                                            .max(3.0);
-                                        let start = -1.9f32;
-                                        let end = 1.35f32;
-                                        let steps = 18usize;
+                                        let radius = (icon_rect.width().min(icon_rect.height()) * 0.40)
+                                            .max(3.2);
+                                        // Match Explorer-style clockwise refresh glyph:
+                                        // a near-circle arc with a head at the upper-right.
+                                        let start = 1.05f32;
+                                        let end = 5.45f32;
+                                        let steps = 26usize;
                                         let mut points = Vec::with_capacity(steps + 1);
                                         for i in 0..=steps {
                                             let t = start + (end - start) * (i as f32 / steps as f32);
@@ -21457,7 +21487,7 @@ impl ImageViewer {
                                         );
                                         let tangent = egui::vec2(-end.sin(), end.cos());
                                         let normal = egui::vec2(end.cos(), end.sin());
-                                        let head = 3.8;
+                                        let head = 4.2;
                                         ui.painter().line_segment(
                                             [
                                                 end_point,

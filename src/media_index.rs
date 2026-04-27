@@ -120,11 +120,14 @@ impl MediaDirectoryIndex {
         self.stats.misses = self.stats.misses.saturating_add(1);
         self.stats.scans = self.stats.scans.saturating_add(1);
 
-        let anchor = path.to_path_buf();
+        let scan_directory = directory.clone();
         let (tx, rx) = crossbeam_channel::bounded::<DirectoryScanResult>(1);
 
         crate::async_runtime::spawn_blocking_or_thread("media-directory-scan", move || {
-            let files = get_media_in_directory(&anchor);
+            // Always scan the containing directory key we cache under.
+            // This avoids accidentally scanning a child folder when `path`
+            // itself is a folder-navigation entry.
+            let files = get_media_in_directory(&scan_directory);
             let modified_at = directory_modified_time(&directory);
             let _ = tx.send(DirectoryScanResult {
                 directory,
