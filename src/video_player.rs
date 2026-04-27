@@ -695,6 +695,8 @@ impl VideoPlayer {
         initial_volume: f64,
         prefer_hardware_decode: bool,
         disable_hardware_decode: bool,
+        source_dimensions: Option<(u32, u32)>,
+        output_dimensions: Option<(u32, u32)>,
     ) -> Result<Self, String> {
         apply_decoder_preference_windows(prefer_hardware_decode, disable_hardware_decode);
         Self::ensure_init()?;
@@ -742,7 +744,14 @@ Ensure your GStreamer installation includes the playback elements (usually from 
         // Create appsink for video frames
         // Explicitly request sRGB RGBA output. This nudges GStreamer into producing full-range RGB
         // and avoids washed-out output when input colorimetry/range metadata is incomplete.
-        let video_caps = gst::Caps::from_str("video/x-raw,format=RGBA,colorimetry=sRGB")
+        let video_caps_string = match output_dimensions {
+            Some((width, height)) if width > 0 && height > 0 => format!(
+                "video/x-raw,format=RGBA,colorimetry=sRGB,width={},height={},pixel-aspect-ratio=1/1",
+                width, height
+            ),
+            _ => "video/x-raw,format=RGBA,colorimetry=sRGB".to_string(),
+        };
+        let video_caps = gst::Caps::from_str(&video_caps_string)
             .map_err(|e| format!("Failed to create video caps: {}", e))?;
         let appsink = gst_app::AppSink::builder()
             .name("videosink")
@@ -767,14 +776,14 @@ Ensure your GStreamer installation includes the playback elements (usually from 
             .map_err(|e| format!("Failed to create videoscale: {}", e))?;
 
         video_bin
-            .add_many([&videoconvert, &videoscale, appsink.upcast_ref()])
+            .add_many([&videoscale, &videoconvert, appsink.upcast_ref()])
             .map_err(|e| format!("Failed to add elements to bin: {}", e))?;
 
-        gst::Element::link_many([&videoconvert, &videoscale, appsink.upcast_ref()])
+        gst::Element::link_many([&videoscale, &videoconvert, appsink.upcast_ref()])
             .map_err(|e| format!("Failed to link video elements: {}", e))?;
 
         // Create ghost pad for the bin
-        let pad = videoconvert
+        let pad = videoscale
             .static_pad("sink")
             .ok_or("Failed to get sink pad")?;
         let ghost_pad = gst::GhostPad::with_target(&pad)
@@ -927,8 +936,8 @@ Ensure your GStreamer installation includes the playback elements (usually from 
             buffering_paused: false,
             is_muted: muted,
             volume: initial_volume.clamp(0.0, 1.0),
-            original_width: 0,
-            original_height: 0,
+            original_width: source_dimensions.map_or(0, |(width, _)| width),
+            original_height: source_dimensions.map_or(0, |(_, height)| height),
         };
 
         // Apply initial volume/mute settings
@@ -1137,7 +1146,11 @@ Ensure your GStreamer installation includes the playback elements (usually from 
         let latest = self.state.pop_latest_frame();
 
         if let Some(frame) = latest {
-            if frame.width > 0 && frame.height > 0 {
+            if self.original_width == 0
+                && self.original_height == 0
+                && frame.width > 0
+                && frame.height > 0
+            {
                 self.original_width = frame.width;
                 self.original_height = frame.height;
             }

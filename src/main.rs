@@ -291,6 +291,51 @@ fn downscale_rgba_if_needed<'a>(
     (new_w, new_h, Cow::Owned(resized.into_raw()))
 }
 
+fn cached_or_probe_video_dimensions(path: &Path) -> Option<(u32, u32)> {
+    if let Some(dims) = lookup_cached_dimensions(path, CachedMediaKind::Video) {
+        return Some(dims);
+    }
+
+    let dims = probe_video_dimensions_without_gstreamer(path)?;
+    if dims.0 > 0 && dims.1 > 0 {
+        store_cached_dimensions(path, CachedMediaKind::Video, dims.0, dims.1);
+        Some(dims)
+    } else {
+        None
+    }
+}
+
+fn even_video_dimension(value: f64, source_limit: u32) -> u32 {
+    let mut dimension = value.round().clamp(1.0, source_limit.max(1) as f64) as u32;
+    if dimension > 1 && dimension % 2 != 0 {
+        dimension -= 1;
+    }
+    dimension.max(1)
+}
+
+fn video_output_dimensions_for_bounds(
+    source_dimensions: Option<(u32, u32)>,
+    output_bounds: Option<(u32, u32)>,
+) -> Option<(u32, u32)> {
+    let (source_w, source_h) = source_dimensions?;
+    let (bound_w, bound_h) = output_bounds?;
+    if source_w == 0 || source_h == 0 || bound_w == 0 || bound_h == 0 {
+        return None;
+    }
+
+    let scale = (bound_w as f64 / source_w as f64)
+        .min(bound_h as f64 / source_h as f64)
+        .min(1.0);
+    if scale >= 0.999 {
+        return None;
+    }
+
+    Some((
+        even_video_dimension(source_w as f64 * scale, source_w),
+        even_video_dimension(source_h as f64 * scale, source_h),
+    ))
+}
+
 #[cfg(target_os = "windows")]
 fn windows_cjk_font_candidates() -> [(&'static str, &'static str); 6] {
     [
@@ -1194,6 +1239,7 @@ enum MediaLoadRequest {
         initial_volume: f64,
         prefer_hardware_decode: bool,
         disable_hardware_decode: bool,
+        output_bounds: Option<(u32, u32)>,
     },
 }
 
@@ -1343,13 +1389,19 @@ fn process_media_load_request(request: MediaLoadRequest) -> MediaLoadResult {
             initial_volume,
             prefer_hardware_decode,
             disable_hardware_decode,
+            output_bounds,
         } => {
+            let source_dimensions = cached_or_probe_video_dimensions(&path);
+            let output_dimensions =
+                video_output_dimensions_for_bounds(source_dimensions, output_bounds);
             let result = VideoPlayer::new(
                 &path,
                 muted,
                 initial_volume,
                 prefer_hardware_decode,
                 disable_hardware_decode,
+                source_dimensions,
+                output_dimensions,
             )
             .and_then(|mut player| {
                 player.play()?;
@@ -1798,6 +1850,7 @@ struct MangaFocusedVideoLoadRequest {
     initial_volume: f64,
     prefer_hardware_decode: bool,
     disable_hardware_decode: bool,
+    output_bounds: Option<(u32, u32)>,
 }
 
 struct MangaFocusedVideoLoadResult {
@@ -1873,12 +1926,17 @@ fn process_manga_focused_video_load_request(
 ) -> MangaFocusedVideoLoadResult {
     let started_at = Instant::now();
 
+    let source_dimensions = cached_or_probe_video_dimensions(&request.path);
+    let output_dimensions =
+        video_output_dimensions_for_bounds(source_dimensions, request.output_bounds);
     let result = VideoPlayer::new(
         &request.path,
         request.muted,
         request.initial_volume,
         request.prefer_hardware_decode,
         request.disable_hardware_decode,
+        source_dimensions,
+        output_dimensions,
     )
     .and_then(|mut player| {
         player.play()?;
@@ -11275,6 +11333,9 @@ impl ImageViewer {
             .next_manga_video_load_request_id
             .saturating_add(1)
             .max(1);
+        let target_side =
+            self.manga_target_texture_side_for_dynamic_media(index, MangaMediaType::Video);
+        let output_bounds = Some((target_side, target_side));
 
         self.pending_manga_video_load = Some(PendingMangaFocusedVideoLoad {
             request_id,
@@ -11292,6 +11353,7 @@ impl ImageViewer {
                 initial_volume,
                 prefer_hardware_decode: self.config.video_prefer_hardware_decode,
                 disable_hardware_decode: self.config.video_disable_hardware_decode,
+                output_bounds,
             });
     }
 
@@ -11458,6 +11520,14 @@ impl ImageViewer {
         });
     }
 
+    fn live_video_output_bounds_for_solo(&self) -> Option<(u32, u32)> {
+        let viewport = self.solo_viewport_size_for_lod();
+        let max_side = self.max_texture_side.max(1);
+        let width = (viewport.x.ceil() as u32).clamp(1, max_side);
+        let height = (viewport.y.ceil() as u32).clamp(1, max_side);
+        Some((width, height))
+    }
+
     fn start_async_video_load(&mut self, path: PathBuf) {
         if !gstreamer_runtime_available() {
             self.pending_media_load = None;
@@ -11484,6 +11554,7 @@ impl ImageViewer {
         };
         let prefer_hardware_decode = self.config.video_prefer_hardware_decode;
         let disable_hardware_decode = self.config.video_disable_hardware_decode;
+        let output_bounds = self.live_video_output_bounds_for_solo();
 
         self.pending_media_load = Some(PendingMediaLoad {
             request_id,
@@ -11499,6 +11570,7 @@ impl ImageViewer {
             initial_volume,
             prefer_hardware_decode,
             disable_hardware_decode,
+            output_bounds,
         });
     }
 
@@ -15345,8 +15417,9 @@ impl ImageViewer {
                         pixels.as_ref(),
                     );
 
-                    let texture_options =
-                        self.manga_texture_options_for_upload(MangaMediaType::Video, w, h);
+                    // Live video textures are updated every frame; generating mipmaps here is
+                    // expensive and the video sink already outputs near-display resolution.
+                    let texture_options = self.config.texture_filter_video.to_egui_options();
 
                     if let Some((texture, stored_w, stored_h)) =
                         self.manga_video_textures.get_mut(&focused_idx)
@@ -20054,8 +20127,6 @@ impl ImageViewer {
             .map(|path| self.solo_target_texture_side_for_path(path, MediaType::Video, false))
             .unwrap_or(self.max_texture_side.max(1));
         let solo_video_upload_filter = self.config.downscale_filter.to_image_filter();
-        let solo_video_upload_mipmap_min_side = self.config.manga_mipmap_min_side.max(1);
-        let solo_video_upload_mipmaps_enabled = self.config.manga_mipmap_video_thumbnails;
         let solo_video_texture_filter = self.config.texture_filter_video;
 
         // Handle image texture updates
@@ -20192,9 +20263,9 @@ impl ImageViewer {
                     pixels.as_ref(),
                 );
 
-                let texture_options = solo_video_texture_filter.to_egui_options_with_mipmap(
-                    solo_video_upload_mipmaps_enabled && w.min(h) >= solo_video_upload_mipmap_min_side,
-                );
+                // Live video frames change continuously, so per-frame mipmap generation is wasted
+                // work. Thumbnails still use the manga_mipmap_video_thumbnails setting elsewhere.
+                let texture_options = solo_video_texture_filter.to_egui_options();
 
                 // Reuse the same GPU texture across frames to avoid per-frame allocations.
                 if let Some(texture) = self.video_texture.as_mut() {
