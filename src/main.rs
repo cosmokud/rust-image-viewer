@@ -5263,8 +5263,12 @@ impl ImageViewer {
         }
 
         if !new_paths.is_empty() {
-            self.clear_stale_marked_files();
-            self.clear_stale_prepared_clipboard_paths();
+            if self.config.auto_unmark_after_paste {
+                self.clear_all_marks();
+            } else {
+                self.clear_stale_marked_files();
+                self.clear_stale_prepared_clipboard_paths();
+            }
             let _ = clear_system_clipboard();
 
             // FIX: Use the robust synchronous refresh we just fixed for deletions

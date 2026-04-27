@@ -468,6 +468,8 @@ pub struct Config {
     pub maximize_to_borderless_fullscreen: bool,
     /// When true, deleting files asks for confirmation before sending them to the recycle bin.
     pub confirm_delete_to_recycle_bin: bool,
+    /// When true, successful paste clears current marked-file selection by default.
+    pub auto_unmark_after_paste: bool,
     /// Floating-mode zoom animation speed. Higher = faster. 0 = instant snap.
     pub zoom_animation_speed: f32,
     /// Degrees added or removed per Ctrl+Up / Ctrl+Down precise-rotation input.
@@ -634,6 +636,7 @@ impl Config {
             fullscreen_native_window_transition: true,
             maximize_to_borderless_fullscreen: true,
             confirm_delete_to_recycle_bin: true,
+            auto_unmark_after_paste: true,
             zoom_animation_speed: 20.0,
             precise_rotation_step_degrees: 2.0,
             zoom_step: 1.02,
@@ -1227,6 +1230,14 @@ impl Config {
                                 config.confirm_delete_to_recycle_bin = v;
                             }
                         }
+                        "auto_unmark_after_paste"
+                        | "unmark_after_paste"
+                        | "clear_marks_after_paste"
+                        | "clear_marked_files_after_paste" => {
+                            if let Some(v) = parse_bool(value) {
+                                config.auto_unmark_after_paste = v;
+                            }
+                        }
                         "zoom_animation_speed" => {
                             if let Ok(v) = value.parse::<f32>() {
                                 // 0 disables animation (snap), otherwise speed controls spring stiffness.
@@ -1804,6 +1815,10 @@ impl Config {
         values.insert(
             "confirm_delete_to_recycle_bin",
             bool_to_ini(self.confirm_delete_to_recycle_bin).to_string(),
+        );
+        values.insert(
+            "auto_unmark_after_paste",
+            bool_to_ini(self.auto_unmark_after_paste).to_string(),
         );
         values.insert(
             "zoom_animation_speed",
