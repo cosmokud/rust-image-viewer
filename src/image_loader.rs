@@ -254,10 +254,6 @@ pub const SUPPORTED_EXTENSIONS: &[&str] = &[
 /// Synthetic entry name used to navigate to the parent directory.
 pub const FOLDER_UP_ENTRY_NAME: &str = "[]...]";
 
-fn is_up_navigation_entry_name(name: &str) -> bool {
-    name == FOLDER_UP_ENTRY_NAME || name == "[...]" || name == "[..]"
-}
-
 /// Media type enum
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaType {
@@ -302,48 +298,65 @@ pub fn get_media_in_directory(path: &Path) -> Vec<PathBuf> {
         }
     };
 
-    let mut media: Vec<PathBuf> = WalkDir::new(&directory)
+    #[derive(Clone)]
+    struct MediaDirectoryEntry {
+        path: PathBuf,
+        is_folder: bool,
+        is_up_entry: bool,
+    }
+
+    let mut media: Vec<MediaDirectoryEntry> = WalkDir::new(&directory)
         .max_depth(1)
         .min_depth(1)
         .into_iter()
         .filter_map(|entry| entry.ok())
-        .map(|entry| entry.path())
-        .filter(|p| p.is_dir() || (p.is_file() && is_supported_media(p)))
+        .filter_map(|entry| {
+            let file_type = entry.file_type();
+            let path = entry.path();
+            let is_folder = file_type.is_dir();
+            if is_folder || (file_type.is_file() && is_supported_media(&path)) {
+                Some(MediaDirectoryEntry {
+                    path,
+                    is_folder,
+                    is_up_entry: false,
+                })
+            } else {
+                None
+            }
+        })
         .collect();
 
     if directory.parent().is_some() {
         let up_entry = directory.join(FOLDER_UP_ENTRY_NAME);
-        if !media.iter().any(|entry| entry == &up_entry) {
-            media.push(up_entry);
+        if !media.iter().any(|entry| entry.path == up_entry) {
+            media.push(MediaDirectoryEntry {
+                path: up_entry,
+                is_folder: true,
+                is_up_entry: true,
+            });
         }
     }
 
     media.par_sort_unstable_by(|a, b| {
-        let a_name = a.file_name().unwrap_or_default().to_str().unwrap_or("");
-        let b_name = b.file_name().unwrap_or_default().to_str().unwrap_or("");
+        let a_name = a.path.file_name().unwrap_or_default().to_str().unwrap_or("");
+        let b_name = b.path.file_name().unwrap_or_default().to_str().unwrap_or("");
 
-        let a_is_up_entry = is_up_navigation_entry_name(a_name);
-        let b_is_up_entry = is_up_navigation_entry_name(b_name);
-
-        if a_is_up_entry != b_is_up_entry {
-            return if a_is_up_entry {
+        if a.is_up_entry != b.is_up_entry {
+            return if a.is_up_entry {
                 std::cmp::Ordering::Less
             } else {
                 std::cmp::Ordering::Greater
             };
         }
 
-        let a_is_folder = a.is_dir() || a_is_up_entry;
-        let b_is_folder = b.is_dir() || b_is_up_entry;
-
-        match (a_is_folder, b_is_folder) {
+        match (a.is_folder, b.is_folder) {
             (true, false) => std::cmp::Ordering::Less,
             (false, true) => std::cmp::Ordering::Greater,
             _ => natord::compare(a_name, b_name),
         }
     });
 
-    media
+    media.into_iter().map(|entry| entry.path).collect()
 }
 
 /// A single frame of an image (for animated GIFs)

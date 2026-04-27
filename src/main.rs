@@ -2604,8 +2604,12 @@ impl Default for ImageViewer {
             folder_placeholder_thumbnail_request_rx,
         ) = crossbeam_channel::bounded::<FolderPlaceholderThumbnailLoadRequest>(256);
         let folder_placeholder_thumbnail_worker_count =
-            std::thread::available_parallelism().map_or(2usize, |count| {
-                count.get().clamp(2, 4)
+            std::thread::available_parallelism().map_or(1usize, |count| {
+                if count.get() >= 8 {
+                    2
+                } else {
+                    1
+                }
             });
         let (folder_placeholder_thumbnail_result_tx, folder_placeholder_thumbnail_result_rx) =
             crossbeam_channel::bounded::<FolderPlaceholderThumbnailLoadResult>(128);
@@ -2969,6 +2973,10 @@ impl ImageViewer {
     const FPS_OVERLAY_IDLE_POLL_MS: u64 = 500;
     const FPS_OVERLAY_ACTIVE_POLL_MS: u64 = 120;
     const FPS_IDLE_RESET_AFTER_MS: u64 = 350;
+    const FOLDER_PLACEHOLDER_STAMP_CACHE_TTL: Duration = Duration::from_secs(2);
+    const FOLDER_PLACEHOLDER_PREVIEW_SCAN_PENDING_SOFT_LIMIT: usize = 32;
+    const FOLDER_PLACEHOLDER_THUMBNAIL_PENDING_SOFT_LIMIT: usize = 48;
+    const FOLDER_PLACEHOLDER_THUMBNAIL_UPLOADS_PER_FRAME: usize = 2;
 
     fn folder_navigation_ui_enabled(&self) -> bool {
         self.manga_mode && self.is_fullscreen
@@ -3657,6 +3665,10 @@ impl ImageViewer {
     }
 
     fn is_folder_navigation_entry_path(&self, path: &Path) -> bool {
+        if get_media_type(path).is_some() {
+            return false;
+        }
+
         Self::folder_entry_target_directory(path).is_some()
     }
 
@@ -3733,10 +3745,11 @@ impl ImageViewer {
             return Vec::new();
         };
 
-        // Keep only the newest tail of the raw directory listing order and return
-        // it in stack-pop order (last seen first). This avoids filename sorting.
-        let mut tail_media: VecDeque<PathBuf> = VecDeque::with_capacity(max_count);
-        for entry in entries.flatten() {
+        // Folder cards are non-critical UI. Stop as soon as enough preview
+        // candidates are found so a large child folder cannot monopolize disk I/O.
+        const MAX_SCANNED_ENTRIES: usize = 2048;
+        let mut media_paths: Vec<PathBuf> = Vec::with_capacity(max_count);
+        for entry in entries.flatten().take(MAX_SCANNED_ENTRIES) {
             let Ok(file_type) = entry.file_type() else {
                 continue;
             };
@@ -3749,29 +3762,31 @@ impl ImageViewer {
                 continue;
             }
 
-            if tail_media.len() == max_count {
-                tail_media.pop_front();
+            media_paths.push(candidate);
+            if media_paths.len() >= max_count {
+                break;
             }
-            tail_media.push_back(candidate);
         }
 
-        tail_media.into_iter().rev().collect()
+        media_paths
     }
 
     fn request_folder_placeholder_preview_scan(
         &mut self,
         target_directory: &PathBuf,
         max_count: usize,
-    ) {
-        if !target_directory.is_dir() {
-            return;
-        }
-
+    ) -> bool {
         if self
             .folder_placeholder_preview_scan_pending
             .contains(target_directory)
         {
-            return;
+            return true;
+        }
+
+        if self.folder_placeholder_preview_scan_pending.len()
+            >= Self::FOLDER_PLACEHOLDER_PREVIEW_SCAN_PENDING_SOFT_LIMIT
+        {
+            return false;
         }
 
         let directory = target_directory.clone();
@@ -3793,7 +3808,10 @@ impl ImageViewer {
             .is_err()
         {
             self.folder_placeholder_preview_scan_pending.remove(&directory);
+            return false;
         }
+
+        true
     }
 
     fn folder_entry_preview_media_paths(
@@ -3801,8 +3819,6 @@ impl ImageViewer {
         entry_path: &Path,
         max_count: usize,
     ) -> (Vec<PathBuf>, bool) {
-        const STAMP_CACHE_TTL: Duration = Duration::from_millis(450);
-
         let max_count = max_count.min(4);
         if max_count == 0 {
             return (Vec::new(), false);
@@ -3812,36 +3828,60 @@ impl ImageViewer {
             return (Vec::new(), false);
         };
 
-        let stamp = self.cached_file_stamp(target_directory.as_path(), STAMP_CACHE_TTL);
-        if let Some(cached) = self
+        let cached_selection = self
             .folder_placeholder_thumbnail_cache
             .get(target_directory.as_path())
-        {
+            .cloned();
+        if let Some(cached) = cached_selection {
+            if cached.loading {
+                return (cached.media_paths, true);
+            }
+
+            let stamp = self.cached_file_stamp(
+                target_directory.as_path(),
+                Self::FOLDER_PLACEHOLDER_STAMP_CACHE_TTL,
+            );
             if cached.stamp == stamp {
+                return (cached.media_paths, cached.loading);
+            }
+
+            if self.folder_placeholder_heavy_work_deferred() {
+                return (cached.media_paths, true);
+            }
+
+            let loading =
+                self.request_folder_placeholder_preview_scan(&target_directory, max_count);
+            if let Some(cached) = self
+                .folder_placeholder_thumbnail_cache
+                .get_mut(target_directory.as_path())
+            {
+                cached.loading = loading;
                 return (cached.media_paths.clone(), cached.loading);
             }
+        } else if self.folder_placeholder_heavy_work_deferred() {
+            return (Vec::new(), true);
         }
 
-        self.request_folder_placeholder_preview_scan(&target_directory, max_count);
+        let loading = self.request_folder_placeholder_preview_scan(&target_directory, max_count);
 
         if let Some(cached) = self
             .folder_placeholder_thumbnail_cache
             .get_mut(target_directory.as_path())
         {
-            cached.loading = true;
-            return (cached.media_paths.clone(), true);
+            cached.loading = loading;
+            return (cached.media_paths.clone(), cached.loading);
         }
 
         self.folder_placeholder_thumbnail_cache.insert(
             target_directory,
             FolderPlaceholderThumbnailSelection {
-                stamp,
+                stamp: None,
                 media_paths: Vec::new(),
-                loading: true,
+                loading,
             },
         );
 
-        (Vec::new(), true)
+        (Vec::new(), loading)
     }
 
     fn paint_folder_entry_icon(painter: &egui::Painter, body: egui::Rect, is_up_entry: bool) {
@@ -6387,7 +6427,7 @@ impl ImageViewer {
         }
     }
 
-    fn masonry_navigation_active_for_heavy_work(&self) -> bool {
+    fn manga_navigation_active_for_heavy_work(&self) -> bool {
         let recent_navigation_window = Duration::from_millis(90);
         let scrollbar_recently_moving = self.manga_scrollbar_dragging
             && self
@@ -6398,7 +6438,7 @@ impl ImageViewer {
                 .masonry_autoscroll_last_motion_at
                 .is_some_and(|started_at| started_at.elapsed() <= recent_navigation_window);
 
-        self.is_masonry_mode()
+        self.manga_mode
             && (scrollbar_recently_moving
                 || autoscroll_recently_moving
                 || self.is_panning
@@ -6410,6 +6450,14 @@ impl ImageViewer {
                 || self.manga_video_seeking
                 || self.manga_video_volume_dragging
                 || self.gif_seeking)
+    }
+
+    fn masonry_navigation_active_for_heavy_work(&self) -> bool {
+        self.is_masonry_mode() && self.manga_navigation_active_for_heavy_work()
+    }
+
+    fn folder_placeholder_heavy_work_deferred(&self) -> bool {
+        self.manga_navigation_active_for_heavy_work()
     }
 
     fn draw_fps_overlay(&self, ctx: &egui::Context) {
@@ -8148,16 +8196,21 @@ impl ImageViewer {
         &mut self,
         path: &PathBuf,
     ) -> Option<(egui::TextureId, egui::Vec2)> {
-        const STAMP_CACHE_TTL: Duration = Duration::from_millis(450);
+        let (texture_id, image_size, cached_stamp) = match self.modal_thumbnail_cache.get(path) {
+            Some(cached) => (
+                cached.texture.id(),
+                egui::vec2(cached.width as f32, cached.height as f32),
+                cached.stamp,
+            ),
+            None => return None,
+        };
 
-        let stamp = self.cached_file_stamp(path.as_path(), STAMP_CACHE_TTL)?;
-        if let Some(cached) = self.modal_thumbnail_cache.get(path) {
-            if cached.stamp == stamp {
-                return Some((
-                    cached.texture.id(),
-                    egui::vec2(cached.width as f32, cached.height as f32),
-                ));
-            }
+        let stamp = self.cached_file_stamp(
+            path.as_path(),
+            Self::FOLDER_PLACEHOLDER_STAMP_CACHE_TTL,
+        )?;
+        if cached_stamp == stamp {
+            return Some((texture_id, image_size));
         }
 
         self.modal_thumbnail_cache.remove(path);
@@ -8170,6 +8223,16 @@ impl ImageViewer {
         }
 
         if self.folder_placeholder_thumbnail_pending.contains(path) {
+            return true;
+        }
+
+        if self.folder_placeholder_heavy_work_deferred() {
+            return true;
+        }
+
+        if self.folder_placeholder_thumbnail_pending.len()
+            >= Self::FOLDER_PLACEHOLDER_THUMBNAIL_PENDING_SOFT_LIMIT
+        {
             return true;
         }
 
@@ -8216,10 +8279,14 @@ impl ImageViewer {
     }
 
     fn poll_pending_folder_placeholder_preview_scans(&mut self, ctx: &egui::Context) {
-        const MAX_SCAN_RESULTS_PER_FRAME: usize = 48;
+        let max_scan_results_per_frame = if self.folder_placeholder_heavy_work_deferred() {
+            8
+        } else {
+            48
+        };
 
         let mut applied = 0usize;
-        while applied < MAX_SCAN_RESULTS_PER_FRAME {
+        while applied < max_scan_results_per_frame {
             let result = match self.folder_placeholder_preview_scan_result_rx.try_recv() {
                 Ok(result) => result,
                 Err(_) => break,
@@ -8260,13 +8327,62 @@ impl ImageViewer {
         }
     }
 
-    fn poll_pending_folder_placeholder_thumbnail_loads(&mut self, ctx: &egui::Context) {
-        const MAX_THUMBNAIL_RESULTS_PER_FRAME: usize = 2;
+    fn folder_placeholder_upload_frame_budget_tight(&self) -> bool {
+        self.fps_last_dt_s.is_finite()
+            && self.fps_last_dt_s > 0.0
+            && self.fps_last_dt_s * 1000.0 >= 18.0
+    }
 
+    fn folder_placeholder_thumbnail_upload_limit(&self) -> usize {
+        if self.folder_placeholder_upload_frame_budget_tight() {
+            1
+        } else {
+            Self::FOLDER_PLACEHOLDER_THUMBNAIL_UPLOADS_PER_FRAME
+        }
+    }
+
+    fn folder_placeholder_texture_options(
+        &self,
+        media_kind: FolderPlaceholderThumbnailMediaKind,
+        width: u32,
+        height: u32,
+    ) -> egui::TextureOptions {
+        let min_side = width.min(height);
+        let mipmap_allowed_by_size = min_side >= self.config.manga_mipmap_min_side.max(1);
+        let allow_mipmaps = mipmap_allowed_by_size
+            && !self.folder_placeholder_upload_frame_budget_tight()
+            && !self.folder_placeholder_heavy_work_deferred();
+
+        match media_kind {
+            FolderPlaceholderThumbnailMediaKind::Video => self
+                .config
+                .texture_filter_video
+                .to_egui_options_with_mipmap(
+                    self.config.manga_mipmap_video_thumbnails && allow_mipmaps,
+                ),
+            FolderPlaceholderThumbnailMediaKind::AnimatedImage => {
+                self.config.texture_filter_animated.to_egui_options()
+            }
+            FolderPlaceholderThumbnailMediaKind::StaticImage => self
+                .config
+                .texture_filter_static
+                .to_egui_options_with_mipmap(allow_mipmaps),
+        }
+    }
+
+    fn poll_pending_folder_placeholder_thumbnail_loads(&mut self, ctx: &egui::Context) {
+        if self.folder_placeholder_heavy_work_deferred() {
+            if !self.folder_placeholder_thumbnail_pending.is_empty() {
+                ctx.request_repaint_after(Duration::from_millis(66));
+            }
+            return;
+        }
+
+        let max_thumbnail_results_per_frame = self.folder_placeholder_thumbnail_upload_limit();
         let mut uploaded_any = false;
         let mut processed = 0usize;
 
-        while processed < MAX_THUMBNAIL_RESULTS_PER_FRAME {
+        while processed < max_thumbnail_results_per_frame {
             let result = match self.folder_placeholder_thumbnail_result_rx.try_recv() {
                 Ok(result) => result,
                 Err(_) => break,
@@ -8289,20 +8405,11 @@ impl ImageViewer {
                         continue;
                     }
 
-                    let texture_options = match decoded.media_kind {
-                        FolderPlaceholderThumbnailMediaKind::Video => {
-                            self.solo_video_thumbnail_texture_options(decoded.width, decoded.height)
-                        }
-                        FolderPlaceholderThumbnailMediaKind::AnimatedImage => {
-                            self.config.texture_filter_animated.to_egui_options()
-                        }
-                        FolderPlaceholderThumbnailMediaKind::StaticImage => {
-                            self.config.texture_filter_static.to_egui_options_with_mipmap(
-                                decoded.width.min(decoded.height)
-                                    >= self.config.manga_mipmap_min_side.max(1),
-                            )
-                        }
-                    };
+                    let texture_options = self.folder_placeholder_texture_options(
+                        decoded.media_kind,
+                        decoded.width,
+                        decoded.height,
+                    );
 
                     let texture = ctx.load_texture(
                         format!(
