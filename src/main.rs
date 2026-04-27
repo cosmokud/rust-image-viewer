@@ -2142,6 +2142,8 @@ struct ImageViewer {
     folder_navigation_history: Vec<PathBuf>,
     /// Active index into `folder_navigation_history` for Explorer-like traversal.
     folder_navigation_history_index: Option<usize>,
+    /// Grace timeout for closing the back-history hover popup while transitioning pointer focus.
+    breadcrumb_back_history_popup_hover_deadline: Option<Instant>,
     /// Time when controls were last shown
     controls_show_time: Instant,
     /// Error message to display
@@ -2723,6 +2725,7 @@ impl Default for ImageViewer {
             show_breadcrumb_bar: true,
             folder_navigation_history: Vec::new(),
             folder_navigation_history_index: None,
+            breadcrumb_back_history_popup_hover_deadline: None,
             controls_show_time: Instant::now(),
             error_message: None,
             image_changed: false,
@@ -2993,6 +2996,8 @@ impl ImageViewer {
     const FOLDER_PLACEHOLDER_THUMBNAIL_PENDING_SOFT_LIMIT_NAV: usize = 24;
     const FOLDER_NAVIGATION_HISTORY_MAX_ENTRIES: usize = 256;
     const FOLDER_NAVIGATION_BACK_POPUP_MAX_ITEMS: usize = 10;
+    const FOLDER_NAVIGATION_BACK_POPUP_MAX_DEPTH: usize = 3;
+    const FOLDER_NAVIGATION_BACK_POPUP_HOVER_GRACE: Duration = Duration::from_millis(220);
 
     fn folder_navigation_ui_enabled(&self) -> bool {
         self.manga_mode && self.is_fullscreen
@@ -4272,6 +4277,40 @@ impl ImageViewer {
         }
 
         entries
+    }
+
+    fn format_folder_history_entry_label(path: &Path, max_depth: usize) -> String {
+        if max_depth == 0 {
+            return path.display().to_string();
+        }
+
+        let mut segments: Vec<String> = Vec::new();
+        let mut cursor = Some(path);
+        while let Some(current) = cursor {
+            if let Some(name) = current.file_name() {
+                let text = name.to_string_lossy();
+                if !text.is_empty() {
+                    segments.push(text.to_string());
+                }
+            }
+            cursor = current.parent();
+        }
+
+        if segments.is_empty() {
+            return path.display().to_string();
+        }
+
+        let truncated = segments.len() > max_depth;
+        segments.truncate(max_depth);
+        segments.reverse();
+
+        let separator = std::path::MAIN_SEPARATOR.to_string();
+        let joined = segments.join(separator.as_str());
+        if truncated {
+            format!("..{}{}", separator, joined)
+        } else {
+            joined
+        }
     }
 
     fn current_breadcrumb_directory(&self) -> Option<PathBuf> {
@@ -21473,17 +21512,19 @@ impl ImageViewer {
                             let back_history_items = self.folder_navigation_back_history_items(
                                 Self::FOLDER_NAVIGATION_BACK_POPUP_MAX_ITEMS,
                             );
+                            let now = Instant::now();
                             if can_go_back
                                 && !back_history_items.is_empty()
                                 && back_response.hovered()
                             {
                                 ui.memory_mut(|mem| mem.open_popup(back_history_popup_id));
+                                self.breadcrumb_back_history_popup_hover_deadline =
+                                    Some(now + Self::FOLDER_NAVIGATION_BACK_POPUP_HOVER_GRACE);
                             }
 
-                            let mut back_history_popup_hovered = false;
                             let close_on_click_outside =
                                 egui::popup::PopupCloseBehavior::CloseOnClickOutside;
-                            egui::popup::popup_below_widget(
+                            let back_history_popup_hovered = egui::popup::popup_below_widget(
                                 ui,
                                 back_history_popup_id,
                                 &back_response,
@@ -21505,13 +21546,10 @@ impl ImageViewer {
                                                 for (history_index, folder_path) in
                                                     back_history_items.iter()
                                                 {
-                                                    let folder_label = folder_path
-                                                        .file_name()
-                                                        .map(|name| name.to_string_lossy().to_string())
-                                                        .filter(|name| !name.is_empty())
-                                                        .unwrap_or_else(|| {
-                                                            folder_path.display().to_string()
-                                                        });
+                                                    let folder_label = Self::format_folder_history_entry_label(
+                                                        folder_path.as_path(),
+                                                        Self::FOLDER_NAVIGATION_BACK_POPUP_MAX_DEPTH,
+                                                    );
                                                     let row = ui
                                                         .selectable_label(false, folder_label)
                                                         .on_hover_text(folder_path.display().to_string());
@@ -21531,24 +21569,37 @@ impl ImageViewer {
                                         ui.memory_mut(|mem| mem.close_popup());
                                     }
 
-                                    if ui.rect_contains_pointer(ui.min_rect()) {
+                                    let hovered = ui.rect_contains_pointer(ui.min_rect());
+                                    if hovered {
                                         breadcrumb_ui_hovered = true;
                                         breadcrumb_popup_active = true;
-                                        back_history_popup_hovered = true;
                                     }
+                                    hovered
                                 },
-                            );
+                            )
+                            .unwrap_or(false);
+
+                            if back_response.contains_pointer() || back_history_popup_hovered {
+                                self.breadcrumb_back_history_popup_hover_deadline =
+                                    Some(now + Self::FOLDER_NAVIGATION_BACK_POPUP_HOVER_GRACE);
+                            }
 
                             let back_history_popup_open =
                                 ui.memory(|mem| mem.is_popup_open(back_history_popup_id));
                             if back_history_popup_open {
                                 breadcrumb_popup_active = true;
-                            }
-                            if back_history_popup_open
-                                && !back_response.hovered()
-                                && !back_history_popup_hovered
-                            {
-                                ui.memory_mut(|mem| mem.close_popup());
+                                let should_close = self
+                                    .breadcrumb_back_history_popup_hover_deadline
+                                    .map_or(true, |deadline| Instant::now() >= deadline);
+                                if should_close
+                                    && !back_response.contains_pointer()
+                                    && !back_history_popup_hovered
+                                {
+                                    ui.memory_mut(|mem| mem.close_popup());
+                                    self.breadcrumb_back_history_popup_hover_deadline = None;
+                                }
+                            } else {
+                                self.breadcrumb_back_history_popup_hover_deadline = None;
                             }
 
                             let can_go_forward = self.folder_navigation_can_go_forward();
