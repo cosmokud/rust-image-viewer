@@ -254,6 +254,10 @@ pub const SUPPORTED_EXTENSIONS: &[&str] = &[
 /// Synthetic entry name used to navigate to the parent directory.
 pub const FOLDER_UP_ENTRY_NAME: &str = "[]...]";
 
+fn is_up_navigation_entry_name(name: &str) -> bool {
+    name == FOLDER_UP_ENTRY_NAME || name == "[...]" || name == "[..]"
+}
+
 /// Media type enum
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaType {
@@ -318,8 +322,19 @@ pub fn get_media_in_directory(path: &Path) -> Vec<PathBuf> {
         let a_name = a.file_name().unwrap_or_default().to_str().unwrap_or("");
         let b_name = b.file_name().unwrap_or_default().to_str().unwrap_or("");
 
-        let a_is_folder = a.is_dir() || a_name == FOLDER_UP_ENTRY_NAME;
-        let b_is_folder = b.is_dir() || b_name == FOLDER_UP_ENTRY_NAME;
+        let a_is_up_entry = is_up_navigation_entry_name(a_name);
+        let b_is_up_entry = is_up_navigation_entry_name(b_name);
+
+        if a_is_up_entry != b_is_up_entry {
+            return if a_is_up_entry {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Greater
+            };
+        }
+
+        let a_is_folder = a.is_dir() || a_is_up_entry;
+        let b_is_folder = b.is_dir() || b_is_up_entry;
 
         match (a_is_folder, b_is_folder) {
             (true, false) => std::cmp::Ordering::Less,
