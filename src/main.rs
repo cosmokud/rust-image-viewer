@@ -22081,6 +22081,7 @@ impl ImageViewer {
                     resume_error = player.play().err();
                 }
                 self.seek_was_playing = false;
+                ctx.request_repaint();
             }
 
             ui.add_space(4.0);
@@ -22594,6 +22595,7 @@ impl ImageViewer {
                     }
                 }
                 self.manga_video_seek_was_playing = false;
+                ctx.request_repaint();
             }
 
             ui.add_space(4.0);

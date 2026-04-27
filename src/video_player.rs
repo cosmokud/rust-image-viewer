@@ -3,10 +3,10 @@
 
 use std::path::Path;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicI8, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI8, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
 use crossbeam_queue::ArrayQueue;
@@ -322,6 +322,7 @@ struct VideoState {
     buffer_pool: ArrayQueue<BytesMut>,
     video_width: AtomicU32,
     video_height: AtomicU32,
+    seek_in_progress: AtomicBool,
     // -1 unknown, 0 full-range (no expand), 1 limited-range (expand)
     needs_range_expand: AtomicI8,
 }
@@ -339,6 +340,9 @@ const LOCAL_FILE_BUFFER_SIZE_BYTES: i32 = 50 * 1024 * 1024;
 const LOCAL_FILE_RING_BUFFER_MAX_SIZE_BYTES: u64 = 96 * 1024 * 1024;
 const LOCAL_FILE_SOURCE_BLOCK_SIZE_BYTES: i32 = 256 * 1024;
 const APPSINK_MAX_BUFFERS: u32 = 3;
+const KEYFRAME_SEEK_PREROLL_TIMEOUT_MS: u64 = 20;
+const ACCURATE_SEEK_PREROLL_TIMEOUT_MS: u64 = 75;
+const SEEK_PREROLL_POLL_SLICE_MS: u64 = 5;
 
 impl VideoState {
     fn adaptive_capacity_for_dims(width: u32, height: u32) -> usize {
@@ -417,6 +421,18 @@ impl VideoState {
         while let Some(stale) = queue.pop_front() {
             self.recycle_buffer(stale.pixels);
         }
+    }
+
+    fn begin_seek(&self) {
+        self.seek_in_progress.store(true, Ordering::Release);
+    }
+
+    fn end_seek(&self) {
+        self.seek_in_progress.store(false, Ordering::Release);
+    }
+
+    fn seek_in_progress(&self) -> bool {
+        self.seek_in_progress.load(Ordering::Acquire)
     }
 }
 
@@ -642,9 +658,73 @@ fn expand_limited_range_rgba_in_place(pixels: &mut [u8]) {
     }
 }
 
+fn process_video_sample(sample: gst::Sample, state: &VideoState) {
+    let Some(buffer) = sample.buffer() else {
+        return;
+    };
+    let Some(caps) = sample.caps() else {
+        return;
+    };
+    let Ok(video_info) = gst_video::VideoInfo::from_caps(caps) else {
+        return;
+    };
+
+    let width = video_info.width();
+    let height = video_info.height();
+    let Ok(map) = buffer.map_readable() else {
+        return;
+    };
+
+    let mapped = map.as_slice();
+    let mut data = state.take_buffer(mapped.len());
+    data.resize(mapped.len(), 0);
+    data.copy_from_slice(mapped);
+
+    let should_expand = match state.needs_range_expand.load(Ordering::Acquire) {
+        RANGE_EXPAND_TRUE => true,
+        RANGE_EXPAND_FALSE => false,
+        _ => {
+            let by_caps = match video_info.colorimetry().range() {
+                gst_video::VideoColorRange::Range16_235 => Some(true),
+                gst_video::VideoColorRange::Range0_255 => Some(false),
+                _ => None,
+            };
+
+            // If caps don't clearly say, infer from first frame.
+            let inferred = by_caps.unwrap_or_else(|| guess_limited_range_rgba(&data));
+            state.needs_range_expand.store(
+                if inferred {
+                    RANGE_EXPAND_TRUE
+                } else {
+                    RANGE_EXPAND_FALSE
+                },
+                Ordering::Release,
+            );
+            inferred
+        }
+    };
+
+    if should_expand {
+        expand_limited_range_rgba_in_place(data.as_mut());
+    }
+
+    state.video_width.store(width, Ordering::Release);
+    state.video_height.store(height, Ordering::Release);
+    state.update_queue_capacity(width, height);
+
+    let frame = VideoFrame {
+        pixels: data.freeze(),
+        width,
+        height,
+    };
+
+    state.push_frame(frame);
+}
+
 /// Video player using GStreamer
 pub struct VideoPlayer {
     pipeline: gst::Pipeline,
+    video_sink: gst_app::AppSink,
     state: Arc<VideoState>,
     volume_element: Option<gst::Element>,
     duration: Option<Duration>,
@@ -763,6 +843,7 @@ Ensure your GStreamer installation includes the playback elements (usually from 
             .qos(true)
             .sync(true)
             .build();
+        appsink.set_drop_out_of_segment(true);
 
         // Create a bin to hold the appsink with video conversion
         let video_bin = gst::Bin::new();
@@ -842,6 +923,7 @@ Ensure your GStreamer installation includes the playback elements (usually from 
             buffer_pool: ArrayQueue::new(FRAME_BUFFER_POOL_CAPACITY),
             video_width: AtomicU32::new(0),
             video_height: AtomicU32::new(0),
+            seek_in_progress: AtomicBool::new(false),
             needs_range_expand: AtomicI8::new(RANGE_EXPAND_UNKNOWN),
         });
 
@@ -850,78 +932,24 @@ Ensure your GStreamer installation includes the playback elements (usually from 
         // playbin/appsink typically delivers the next frame as a *preroll* buffer, not a
         // regular sample. To show the exact frame when seeking while paused, handle BOTH.
 
-        fn process_sample(sample: gst::Sample, state: &Arc<VideoState>) {
-            if let Some(buffer) = sample.buffer() {
-                if let Some(caps) = sample.caps() {
-                    if let Ok(video_info) = gst_video::VideoInfo::from_caps(caps) {
-                        let width = video_info.width();
-                        let height = video_info.height();
-
-                        if let Ok(map) = buffer.map_readable() {
-                            let mapped = map.as_slice();
-                            let mut data = state.take_buffer(mapped.len());
-                            data.resize(mapped.len(), 0);
-                            data.copy_from_slice(mapped);
-
-                            let should_expand =
-                                match state.needs_range_expand.load(Ordering::Acquire) {
-                                    RANGE_EXPAND_TRUE => true,
-                                    RANGE_EXPAND_FALSE => false,
-                                    _ => {
-                                        let by_caps = match video_info.colorimetry().range() {
-                                            gst_video::VideoColorRange::Range16_235 => Some(true),
-                                            gst_video::VideoColorRange::Range0_255 => Some(false),
-                                            _ => None,
-                                        };
-
-                                        // If caps don't clearly say, infer from first frame.
-                                        let inferred = by_caps
-                                            .unwrap_or_else(|| guess_limited_range_rgba(&data));
-                                        state.needs_range_expand.store(
-                                            if inferred {
-                                                RANGE_EXPAND_TRUE
-                                            } else {
-                                                RANGE_EXPAND_FALSE
-                                            },
-                                            Ordering::Release,
-                                        );
-                                        inferred
-                                    }
-                                };
-
-                            if should_expand {
-                                expand_limited_range_rgba_in_place(data.as_mut());
-                            }
-
-                            state.video_width.store(width, Ordering::Release);
-                            state.video_height.store(height, Ordering::Release);
-                            state.update_queue_capacity(width, height);
-
-                            let frame = VideoFrame {
-                                pixels: data.freeze(),
-                                width,
-                                height,
-                            };
-
-                            state.push_frame(frame);
-                        }
-                    }
-                }
-            }
-        }
-
         let state_clone = Arc::clone(&state);
         let state_clone_preroll = Arc::clone(&state);
         appsink.set_callbacks(
             gst_app::AppSinkCallbacks::builder()
                 .new_sample(move |sink| {
                     let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
-                    process_sample(sample, &state_clone);
+                    if !state_clone.seek_in_progress() {
+                        process_video_sample(sample, state_clone.as_ref());
+                    }
                     Ok(gst::FlowSuccess::Ok)
                 })
                 .new_preroll(move |sink| {
-                    let sample = sink.pull_preroll().map_err(|_| gst::FlowError::Eos)?;
-                    process_sample(sample, &state_clone_preroll);
+                    if state_clone_preroll.seek_in_progress() {
+                        return Ok(gst::FlowSuccess::Ok);
+                    }
+                    if let Ok(sample) = sink.pull_preroll() {
+                        process_video_sample(sample, state_clone_preroll.as_ref());
+                    }
                     Ok(gst::FlowSuccess::Ok)
                 })
                 .build(),
@@ -929,6 +957,7 @@ Ensure your GStreamer installation includes the playback elements (usually from 
 
         let player = VideoPlayer {
             pipeline,
+            video_sink: appsink,
             state,
             volume_element: volume,
             duration: None,
@@ -1026,8 +1055,73 @@ Ensure your GStreamer installation includes the playback elements (usually from 
     fn seek_flags_for_mode(mode: VideoSeekMode) -> gst::SeekFlags {
         match mode {
             VideoSeekMode::Accurate => gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
-            VideoSeekMode::Keyframe => gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT,
+            VideoSeekMode::Keyframe => {
+                gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT | gst::SeekFlags::SNAP_BEFORE
+            }
         }
+    }
+
+    fn seek_preroll_timeout(mode: VideoSeekMode) -> Duration {
+        match mode {
+            VideoSeekMode::Accurate => Duration::from_millis(ACCURATE_SEEK_PREROLL_TIMEOUT_MS),
+            VideoSeekMode::Keyframe => Duration::from_millis(KEYFRAME_SEEK_PREROLL_TIMEOUT_MS),
+        }
+    }
+
+    fn duration_to_clock_time(duration: Duration) -> gst::ClockTime {
+        gst::ClockTime::from_nseconds(duration.as_nanos().min(u64::MAX as u128) as u64)
+    }
+
+    fn prime_post_seek_frame(&self, mode: VideoSeekMode) {
+        if self.is_playing {
+            return;
+        }
+
+        let timeout = Self::seek_preroll_timeout(mode);
+        let deadline = Instant::now() + timeout;
+
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+
+            let remaining = deadline.saturating_duration_since(now);
+            let wait = remaining.min(Duration::from_millis(SEEK_PREROLL_POLL_SLICE_MS));
+            let wait_clock_time = Self::duration_to_clock_time(wait);
+
+            if let Some(sample) = self.video_sink.try_pull_preroll(wait_clock_time) {
+                self.state.clear_frames();
+                process_video_sample(sample, self.state.as_ref());
+                return;
+            }
+        }
+
+        if let Some(sample) = self.video_sink.try_pull_preroll(gst::ClockTime::ZERO) {
+            self.state.clear_frames();
+            process_video_sample(sample, self.state.as_ref());
+        }
+    }
+
+    fn seek_to_clock_time(
+        &mut self,
+        target: gst::ClockTime,
+        mode: VideoSeekMode,
+    ) -> Result<(), String> {
+        self.state.begin_seek();
+        self.state.clear_frames();
+
+        let seek_result = self
+            .pipeline
+            .seek_simple(Self::seek_flags_for_mode(mode), target)
+            .map_err(|e| format!("Failed to seek: {}", e));
+
+        if seek_result.is_ok() {
+            self.prime_post_seek_frame(mode);
+        }
+
+        self.state.end_seek();
+        seek_result
     }
 
     /// Seek to a position (0.0 to 1.0) using the provided mode.
@@ -1038,13 +1132,7 @@ Ensure your GStreamer installation includes the playback elements (usually from 
             let seek_pos = Duration::from_secs_f64(duration.as_secs_f64() * position);
             let seek_pos_ns = seek_pos.as_nanos() as i64;
 
-            self.state.clear_frames();
-            self.pipeline
-                .seek_simple(
-                    Self::seek_flags_for_mode(mode),
-                    gst::ClockTime::from_nseconds(seek_pos_ns as u64),
-                )
-                .map_err(|e| format!("Failed to seek: {}", e))?;
+            self.seek_to_clock_time(gst::ClockTime::from_nseconds(seek_pos_ns as u64), mode)?;
         }
 
         Ok(())
@@ -1063,13 +1151,7 @@ Ensure your GStreamer installation includes the playback elements (usually from 
     ) -> Result<(), String> {
         let seek_pos_ns = (seconds * 1_000_000_000.0) as u64;
 
-        self.state.clear_frames();
-        self.pipeline
-            .seek_simple(
-                Self::seek_flags_for_mode(mode),
-                gst::ClockTime::from_nseconds(seek_pos_ns),
-            )
-            .map_err(|e| format!("Failed to seek: {}", e))?;
+        self.seek_to_clock_time(gst::ClockTime::from_nseconds(seek_pos_ns), mode)?;
 
         Ok(())
     }
