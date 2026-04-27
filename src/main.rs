@@ -2992,6 +2992,7 @@ impl ImageViewer {
     const FOLDER_PLACEHOLDER_PREVIEW_SCAN_PENDING_SOFT_LIMIT_NAV: usize = 16;
     const FOLDER_PLACEHOLDER_THUMBNAIL_PENDING_SOFT_LIMIT_NAV: usize = 24;
     const FOLDER_NAVIGATION_HISTORY_MAX_ENTRIES: usize = 256;
+    const FOLDER_NAVIGATION_BACK_POPUP_MAX_ITEMS: usize = 10;
 
     fn folder_navigation_ui_enabled(&self) -> bool {
         self.manga_mode && self.is_fullscreen
@@ -4224,7 +4225,17 @@ impl ImageViewer {
             return false;
         }
 
-        let target_index = current_index - 1;
+        self.navigate_folder_history_to_index(current_index - 1)
+    }
+
+    fn navigate_folder_history_forward(&mut self) -> bool {
+        let Some(current_index) = self.folder_navigation_history_index else {
+            return false;
+        };
+        self.navigate_folder_history_to_index(current_index.saturating_add(1))
+    }
+
+    fn navigate_folder_history_to_index(&mut self, target_index: usize) -> bool {
         let Some(target_directory) = self.folder_navigation_history.get(target_index).cloned() else {
             return false;
         };
@@ -4240,24 +4251,27 @@ impl ImageViewer {
         }
     }
 
-    fn navigate_folder_history_forward(&mut self) -> bool {
-        let Some(current_index) = self.folder_navigation_history_index else {
-            return false;
-        };
-        let target_index = current_index.saturating_add(1);
-        let Some(target_directory) = self.folder_navigation_history.get(target_index).cloned() else {
-            return false;
-        };
-
-        if self.navigate_to_breadcrumb_directory_internal(
-            target_directory.as_path(),
-            FolderHistoryNavigationKind::FromHistory,
-        ) {
-            self.folder_navigation_history_index = Some(target_index);
-            true
-        } else {
-            false
+    fn folder_navigation_back_history_items(&self, max_items: usize) -> Vec<(usize, PathBuf)> {
+        if max_items == 0 {
+            return Vec::new();
         }
+
+        let Some(current_index) = self.folder_navigation_history_index else {
+            return Vec::new();
+        };
+        if current_index == 0 || self.folder_navigation_history.is_empty() {
+            return Vec::new();
+        }
+
+        let start_index = current_index.saturating_sub(max_items);
+        let mut entries = Vec::with_capacity(current_index.saturating_sub(start_index));
+        for history_index in (start_index..current_index).rev() {
+            if let Some(path) = self.folder_navigation_history.get(history_index) {
+                entries.push((history_index, path.clone()));
+            }
+        }
+
+        entries
     }
 
     fn current_breadcrumb_directory(&self) -> Option<PathBuf> {
@@ -4280,58 +4294,6 @@ impl ImageViewer {
 
         self.navigate_to_breadcrumb_directory(parent_directory.as_path());
         true
-    }
-
-    fn refresh_current_breadcrumb_directory(&mut self) -> bool {
-        let Some(current_directory) = self.current_breadcrumb_directory() else {
-            return false;
-        };
-
-        if !current_directory.exists() || !current_directory.is_dir() {
-            self.error_message = Some(format!(
-                "Folder does not exist: {}",
-                current_directory.display()
-            ));
-            return false;
-        }
-
-        if self.pending_media_directory_scan.is_some() {
-            self.pending_media_directory_scan = None;
-            self.pending_media_directory_target = None;
-            self.pending_media_directory_scan_kind = None;
-            self.pending_media_directory_started_at = None;
-        }
-
-        self.media_directory_index
-            .invalidate_directory(current_directory.as_path());
-
-        let refresh_anchor = self
-            .current_media_path()
-            .filter(|path| {
-                path.parent() == Some(current_directory.as_path())
-                    && !self.is_folder_navigation_entry_path(path.as_path())
-            })
-            .or_else(|| {
-                self.image_list
-                    .iter()
-                    .find(|path| {
-                        path.parent() == Some(current_directory.as_path())
-                            && !self.is_folder_navigation_entry_path(path.as_path())
-                    })
-                    .cloned()
-            })
-            .unwrap_or_else(|| current_directory.join(FOLDER_UP_ENTRY_NAME));
-
-        let started = self.begin_media_directory_scan(
-            refresh_anchor.as_path(),
-            PendingMediaDirectoryScanKind::ExternalRefresh,
-        );
-        if started {
-            self.show_controls = true;
-            self.controls_show_time = Instant::now();
-        }
-
-        started
     }
 
     fn navigate_to_breadcrumb_directory(&mut self, directory: &Path) {
@@ -20905,9 +20867,9 @@ impl ImageViewer {
 
         let mut breadcrumb_target_directory: Option<PathBuf> = None;
         let mut breadcrumb_nav_back_requested = false;
+        let mut breadcrumb_nav_back_target_index: Option<usize> = None;
         let mut breadcrumb_nav_forward_requested = false;
         let mut breadcrumb_nav_up_requested = false;
-        let mut breadcrumb_refresh_requested = false;
         let mut breadcrumb_ui_hovered = false;
         let mut breadcrumb_popup_active = false;
 
@@ -21401,7 +21363,6 @@ impl ImageViewer {
                                 Back,
                                 Forward,
                                 Up,
-                                Refresh,
                             }
 
                             let draw_breadcrumb_nav_icon = |
@@ -21462,47 +21423,6 @@ impl ImageViewer {
                                             stroke,
                                         );
                                     }
-                                    BreadcrumbNavIcon::Refresh => {
-                                        let center = icon_rect.center();
-                                        let radius = (icon_rect.width().min(icon_rect.height()) * 0.40)
-                                            .max(3.2);
-                                        // Match Explorer-style clockwise refresh glyph:
-                                        // a near-circle arc with a head at the upper-right.
-                                        let start = 1.05f32;
-                                        let end = 5.45f32;
-                                        let steps = 26usize;
-                                        let mut points = Vec::with_capacity(steps + 1);
-                                        for i in 0..=steps {
-                                            let t = start + (end - start) * (i as f32 / steps as f32);
-                                            points.push(egui::pos2(
-                                                center.x + radius * t.cos(),
-                                                center.y + radius * t.sin(),
-                                            ));
-                                        }
-                                        ui.painter().add(egui::Shape::line(points, stroke));
-
-                                        let end_point = egui::pos2(
-                                            center.x + radius * end.cos(),
-                                            center.y + radius * end.sin(),
-                                        );
-                                        let tangent = egui::vec2(-end.sin(), end.cos());
-                                        let normal = egui::vec2(end.cos(), end.sin());
-                                        let head = 4.2;
-                                        ui.painter().line_segment(
-                                            [
-                                                end_point,
-                                                end_point - tangent * head + normal * (head * 0.6),
-                                            ],
-                                            stroke,
-                                        );
-                                        ui.painter().line_segment(
-                                            [
-                                                end_point,
-                                                end_point - tangent * head - normal * (head * 0.6),
-                                            ],
-                                            stroke,
-                                        );
-                                    }
                                 }
                             };
 
@@ -21548,6 +21468,89 @@ impl ImageViewer {
                                 breadcrumb_nav_back_requested = true;
                             }
 
+                            let back_history_popup_id =
+                                ui.make_persistent_id("breadcrumb_back_history_popup");
+                            let back_history_items = self.folder_navigation_back_history_items(
+                                Self::FOLDER_NAVIGATION_BACK_POPUP_MAX_ITEMS,
+                            );
+                            if can_go_back
+                                && !back_history_items.is_empty()
+                                && back_response.hovered()
+                            {
+                                ui.memory_mut(|mem| mem.open_popup(back_history_popup_id));
+                            }
+
+                            let mut back_history_popup_hovered = false;
+                            let close_on_click_outside =
+                                egui::popup::PopupCloseBehavior::CloseOnClickOutside;
+                            egui::popup::popup_below_widget(
+                                ui,
+                                back_history_popup_id,
+                                &back_response,
+                                close_on_click_outside,
+                                |ui| {
+                                    breadcrumb_popup_active = true;
+                                    ui.set_min_width(320.0);
+
+                                    let mut close_popup = false;
+                                    if back_history_items.is_empty() {
+                                        ui.label(
+                                            egui::RichText::new("No previous folders")
+                                                .color(egui::Color32::from_gray(150)),
+                                        );
+                                    } else {
+                                        egui::ScrollArea::vertical()
+                                            .max_height(320.0)
+                                            .show(ui, |ui| {
+                                                for (history_index, folder_path) in
+                                                    back_history_items.iter()
+                                                {
+                                                    let folder_label = folder_path
+                                                        .file_name()
+                                                        .map(|name| name.to_string_lossy().to_string())
+                                                        .filter(|name| !name.is_empty())
+                                                        .unwrap_or_else(|| {
+                                                            folder_path.display().to_string()
+                                                        });
+                                                    let row = ui
+                                                        .selectable_label(false, folder_label)
+                                                        .on_hover_text(folder_path.display().to_string());
+                                                    if row.contains_pointer() {
+                                                        breadcrumb_ui_hovered = true;
+                                                    }
+                                                    if row.clicked() || row.secondary_clicked() {
+                                                        breadcrumb_nav_back_target_index =
+                                                            Some(*history_index);
+                                                        close_popup = true;
+                                                    }
+                                                }
+                                            });
+                                    }
+
+                                    if close_popup {
+                                        ui.memory_mut(|mem| mem.close_popup());
+                                    }
+
+                                    if ui.rect_contains_pointer(ui.min_rect()) {
+                                        breadcrumb_ui_hovered = true;
+                                        breadcrumb_popup_active = true;
+                                        back_history_popup_hovered = true;
+                                    }
+                                },
+                            );
+
+                            let back_history_popup_open =
+                                ui.memory(|mem| mem.is_popup_open(back_history_popup_id));
+                            if back_history_popup_open {
+                                breadcrumb_popup_active = true;
+                            }
+                            if back_history_popup_open
+                                && !back_response.hovered()
+                                && !back_history_popup_hovered
+                            {
+                                ui.memory_mut(|mem| mem.close_popup());
+                            }
+
                             let can_go_forward = self.folder_navigation_can_go_forward();
                             let forward_response = breadcrumb_nav_icon_button(
                                 ui,
@@ -21577,19 +21580,6 @@ impl ImageViewer {
                             }
                             if up_response.clicked() {
                                 breadcrumb_nav_up_requested = true;
-                            }
-
-                            let refresh_response = breadcrumb_nav_icon_button(
-                                ui,
-                                BreadcrumbNavIcon::Refresh,
-                                true,
-                                "Refresh current folder",
-                            );
-                            if refresh_response.contains_pointer() {
-                                breadcrumb_ui_hovered = true;
-                            }
-                            if refresh_response.clicked() {
-                                breadcrumb_refresh_requested = true;
                             }
 
                             ui.add_space(8.0);
@@ -21739,14 +21729,14 @@ impl ImageViewer {
             self.controls_show_time = Instant::now();
         }
 
-        if breadcrumb_nav_back_requested {
+        if let Some(target_index) = breadcrumb_nav_back_target_index {
+            self.navigate_folder_history_to_index(target_index);
+        } else if breadcrumb_nav_back_requested {
             self.navigate_folder_history_back();
         } else if breadcrumb_nav_forward_requested {
             self.navigate_folder_history_forward();
         } else if breadcrumb_nav_up_requested {
             self.navigate_up_from_breadcrumb();
-        } else if breadcrumb_refresh_requested {
-            self.refresh_current_breadcrumb_directory();
         } else if let Some(directory) = breadcrumb_target_directory {
             self.navigate_to_breadcrumb_directory(directory.as_path());
         }
