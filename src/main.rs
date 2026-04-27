@@ -2334,6 +2334,8 @@ struct ImageViewer {
     is_seeking: bool,
     /// Seekbar fraction to display while dragging (prevents flicker)
     seek_preview_fraction: Option<f32>,
+    /// Last fraction actually sent to the player during an active drag.
+    seek_last_requested_fraction: Option<f32>,
     /// Rate-limit continuous seeks while dragging
     last_seek_sent_at: Instant,
     /// Whether the video was playing when a seek interaction started
@@ -2640,6 +2642,8 @@ struct ImageViewer {
     manga_video_seeking: bool,
     /// Preview fraction for manga video seekbar
     manga_video_seek_preview_fraction: Option<f32>,
+    /// Last fraction actually sent to the focused manga video during an active drag.
+    manga_video_seek_last_requested_fraction: Option<f32>,
     /// Whether the manga video was playing when seek started
     manga_video_seek_was_playing: bool,
     /// Last seek sent time for manga video (rate limiting)
@@ -2838,6 +2842,7 @@ impl Default for ImageViewer {
             title_text_dragging: false,
             is_seeking: false,
             seek_preview_fraction: None,
+            seek_last_requested_fraction: None,
             last_seek_sent_at: Instant::now(),
             seek_was_playing: false,
             is_volume_dragging: false,
@@ -2992,6 +2997,7 @@ impl Default for ImageViewer {
             // Manga video controls fields
             manga_video_seeking: false,
             manga_video_seek_preview_fraction: None,
+            manga_video_seek_last_requested_fraction: None,
             manga_video_seek_was_playing: false,
             manga_video_last_seek_sent: Instant::now(),
             manga_video_volume_dragging: false,
@@ -21923,13 +21929,6 @@ impl ImageViewer {
             });
     }
 
-    fn drag_video_seek_mode(&self) -> VideoSeekMode {
-        match self.config.video_seek_policy {
-            VideoSeekPolicy::Adaptive | VideoSeekPolicy::Keyframe => VideoSeekMode::Keyframe,
-            VideoSeekPolicy::Accurate => VideoSeekMode::Accurate,
-        }
-    }
-
     fn draw_video_playback_unavailable_controls_inner(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             let play_btn = ui.add(egui::Button::new("▶").min_size(egui::vec2(32.0, 24.0)));
@@ -21953,9 +21952,77 @@ impl ImageViewer {
         }
     }
 
+    fn active_seek_pointer_fraction(ctx: &egui::Context, bar_inner: egui::Rect) -> Option<f32> {
+        ctx.input(|i| {
+            i.pointer
+                .interact_pos()
+                .or_else(|| i.pointer.latest_pos())
+                .map(|pos| ((pos.x - bar_inner.min.x) / bar_inner.width()).clamp(0.0, 1.0))
+        })
+    }
+
+    fn drag_seek_delta_seconds(
+        duration: Option<Duration>,
+        current_fraction: f32,
+        last_fraction: f32,
+    ) -> f64 {
+        duration
+            .map(|dur| dur.as_secs_f64() * (current_fraction - last_fraction).abs() as f64)
+            .unwrap_or_else(|| (current_fraction - last_fraction).abs() as f64)
+    }
+
+    fn should_emit_drag_seek(
+        duration: Option<Duration>,
+        current_fraction: f32,
+        last_requested_fraction: Option<f32>,
+        last_seek_sent_at: Instant,
+    ) -> bool {
+        const MIN_DRAG_SEEK_DELTA_FRACTION: f32 = 0.001;
+        const DRAG_SEEK_INTERVAL_MS: u64 = 24;
+        const FORCE_DRAG_SEEK_DELTA_SECONDS: f64 = 2.0;
+
+        let Some(last_requested_fraction) = last_requested_fraction else {
+            return true;
+        };
+
+        let fraction_delta = (current_fraction - last_requested_fraction).abs();
+        if fraction_delta < MIN_DRAG_SEEK_DELTA_FRACTION {
+            return false;
+        }
+
+        last_seek_sent_at.elapsed() >= Duration::from_millis(DRAG_SEEK_INTERVAL_MS)
+            || Self::drag_seek_delta_seconds(duration, current_fraction, last_requested_fraction)
+                >= FORCE_DRAG_SEEK_DELTA_SECONDS
+    }
+
+    fn adaptive_drag_seek_mode_for_fraction(
+        video_seek_policy: VideoSeekPolicy,
+        duration: Option<Duration>,
+        current_fraction: f32,
+        last_requested_fraction: Option<f32>,
+    ) -> VideoSeekMode {
+        match video_seek_policy {
+            VideoSeekPolicy::Accurate => VideoSeekMode::Accurate,
+            VideoSeekPolicy::Keyframe => VideoSeekMode::Keyframe,
+            VideoSeekPolicy::Adaptive => {
+                const ADAPTIVE_ACCURATE_DELTA_SECONDS: f64 = 1.0;
+
+                let delta_seconds = last_requested_fraction
+                    .map(|last| Self::drag_seek_delta_seconds(duration, current_fraction, last))
+                    .unwrap_or(f64::INFINITY);
+
+                if delta_seconds <= ADAPTIVE_ACCURATE_DELTA_SECONDS {
+                    VideoSeekMode::Accurate
+                } else {
+                    VideoSeekMode::Keyframe
+                }
+            }
+        }
+    }
+
     /// Draw video seekbar and controls (called from draw_video_controls)
     fn draw_video_seekbar_inner(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let drag_seek_mode = self.drag_video_seek_mode();
+        let video_seek_policy = self.config.video_seek_policy;
         let commit_seek_mode = self.commit_video_seek_mode();
         let mut play_toggle_requested = false;
         let mut resume_error: Option<String> = None;
@@ -22030,29 +22097,32 @@ impl ImageViewer {
                 if self.seek_was_playing {
                     let _ = player.pause();
                 }
+                self.seek_last_requested_fraction = None;
                 // Allow an immediate seek on the first frame of interaction.
                 self.last_seek_sent_at = Instant::now() - Duration::from_millis(1000);
             }
 
             // While the button is held and we're in seeking mode, update preview and seek.
             if self.is_seeking && primary_down {
-                if let Some(pos) = seek_response
-                    .interact_pointer_pos()
-                    .or_else(|| ctx.input(|i| i.pointer.hover_pos()))
-                {
-                    let seek_fraction =
-                        ((pos.x - bar_inner.min.x) / bar_inner.width()).clamp(0.0, 1.0);
-
-                    let fraction_changed = self
-                        .seek_preview_fraction
-                        .map_or(true, |prev| (prev - seek_fraction).abs() > 0.001);
-
+                if let Some(seek_fraction) = Self::active_seek_pointer_fraction(ctx, bar_inner) {
                     self.seek_preview_fraction = Some(seek_fraction);
 
-                    if fraction_changed
-                        && self.last_seek_sent_at.elapsed() >= Duration::from_millis(50)
+                    if Self::should_emit_drag_seek(
+                        duration,
+                        seek_fraction,
+                        self.seek_last_requested_fraction,
+                        self.last_seek_sent_at,
+                    )
                     {
-                        let _ = player.seek_with_mode(seek_fraction as f64, drag_seek_mode);
+                        let effective_drag_seek_mode = Self::adaptive_drag_seek_mode_for_fraction(
+                            video_seek_policy,
+                            duration,
+                            seek_fraction,
+                            self.seek_last_requested_fraction,
+                        );
+                        let _ =
+                            player.seek_with_mode(seek_fraction as f64, effective_drag_seek_mode);
+                        self.seek_last_requested_fraction = Some(seek_fraction);
                         self.last_seek_sent_at = Instant::now();
                     }
                 }
@@ -22071,10 +22141,15 @@ impl ImageViewer {
 
             // On mouse release, finalize seek and restore prior play state.
             if self.is_seeking && primary_released {
-                if let Some(final_fraction) = self.seek_preview_fraction.take() {
+                let final_fraction = Self::active_seek_pointer_fraction(ctx, bar_inner)
+                    .or(self.seek_preview_fraction)
+                    .or(self.seek_last_requested_fraction);
+                if let Some(final_fraction) = final_fraction {
                     let _ = player.seek_with_mode(final_fraction as f64, commit_seek_mode);
                 }
                 self.is_seeking = false;
+                self.seek_preview_fraction = None;
+                self.seek_last_requested_fraction = None;
                 self.last_seek_sent_at = Instant::now();
 
                 if self.seek_was_playing {
@@ -22464,7 +22539,7 @@ impl ImageViewer {
         ctx: &egui::Context,
         video_idx: usize,
     ) {
-        let drag_seek_mode = self.drag_video_seek_mode();
+        let video_seek_policy = self.config.video_seek_policy;
         let commit_seek_mode = self.commit_video_seek_mode();
         let mut play_toggle_requested = false;
         let mut resume_error: Option<String> = None;
@@ -22540,29 +22615,34 @@ impl ImageViewer {
                             let _ = p.pause();
                         }
                     }
+                    self.manga_video_seek_last_requested_fraction = None;
                     self.manga_video_last_seek_sent = Instant::now() - Duration::from_millis(1000);
                 }
             }
 
             if self.manga_video_seeking && primary_down {
-                if let Some(pos) = seek_response
-                    .interact_pointer_pos()
-                    .or_else(|| ctx.input(|i| i.pointer.hover_pos()))
-                {
-                    let seek_fraction =
-                        ((pos.x - bar_inner.min.x) / bar_inner.width()).clamp(0.0, 1.0);
-                    let fraction_changed = self
-                        .manga_video_seek_preview_fraction
-                        .map_or(true, |prev| (prev - seek_fraction).abs() > 0.001);
-
+                if let Some(seek_fraction) = Self::active_seek_pointer_fraction(ctx, bar_inner) {
                     self.manga_video_seek_preview_fraction = Some(seek_fraction);
 
-                    if fraction_changed
-                        && self.manga_video_last_seek_sent.elapsed() >= Duration::from_millis(50)
+                    if Self::should_emit_drag_seek(
+                        duration,
+                        seek_fraction,
+                        self.manga_video_seek_last_requested_fraction,
+                        self.manga_video_last_seek_sent,
+                    )
                     {
                         if let Some(player) = self.manga_video_players.get_mut(&video_idx) {
-                            let _ = player.seek_with_mode(seek_fraction as f64, drag_seek_mode);
+                            let effective_drag_seek_mode =
+                                Self::adaptive_drag_seek_mode_for_fraction(
+                                    video_seek_policy,
+                                    duration,
+                                    seek_fraction,
+                                    self.manga_video_seek_last_requested_fraction,
+                                );
+                            let _ = player
+                                .seek_with_mode(seek_fraction as f64, effective_drag_seek_mode);
                         }
+                        self.manga_video_seek_last_requested_fraction = Some(seek_fraction);
                         self.manga_video_last_seek_sent = Instant::now();
                     }
                 }
@@ -22581,12 +22661,17 @@ impl ImageViewer {
             }
 
             if self.manga_video_seeking && primary_released {
-                if let Some(final_fraction) = self.manga_video_seek_preview_fraction.take() {
+                let final_fraction = Self::active_seek_pointer_fraction(ctx, bar_inner)
+                    .or(self.manga_video_seek_preview_fraction)
+                    .or(self.manga_video_seek_last_requested_fraction);
+                if let Some(final_fraction) = final_fraction {
                     if let Some(player) = self.manga_video_players.get_mut(&video_idx) {
                         let _ = player.seek_with_mode(final_fraction as f64, commit_seek_mode);
                     }
                 }
                 self.manga_video_seeking = false;
+                self.manga_video_seek_preview_fraction = None;
+                self.manga_video_seek_last_requested_fraction = None;
                 self.manga_video_last_seek_sent = Instant::now();
 
                 if self.manga_video_seek_was_playing {
