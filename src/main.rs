@@ -2977,9 +2977,27 @@ impl ImageViewer {
     const FOLDER_PLACEHOLDER_PREVIEW_SCAN_PENDING_SOFT_LIMIT: usize = 32;
     const FOLDER_PLACEHOLDER_THUMBNAIL_PENDING_SOFT_LIMIT: usize = 48;
     const FOLDER_PLACEHOLDER_THUMBNAIL_UPLOADS_PER_FRAME: usize = 2;
+    const FOLDER_PLACEHOLDER_PREVIEW_SCAN_PENDING_SOFT_LIMIT_NAV: usize = 16;
+    const FOLDER_PLACEHOLDER_THUMBNAIL_PENDING_SOFT_LIMIT_NAV: usize = 24;
 
     fn folder_navigation_ui_enabled(&self) -> bool {
         self.manga_mode && self.is_fullscreen
+    }
+
+    fn folder_placeholder_preview_scan_pending_soft_limit(&self) -> usize {
+        if self.folder_placeholder_heavy_work_deferred() {
+            Self::FOLDER_PLACEHOLDER_PREVIEW_SCAN_PENDING_SOFT_LIMIT_NAV
+        } else {
+            Self::FOLDER_PLACEHOLDER_PREVIEW_SCAN_PENDING_SOFT_LIMIT
+        }
+    }
+
+    fn folder_placeholder_thumbnail_pending_soft_limit(&self) -> usize {
+        if self.folder_placeholder_heavy_work_deferred() {
+            Self::FOLDER_PLACEHOLDER_THUMBNAIL_PENDING_SOFT_LIMIT_NAV
+        } else {
+            Self::FOLDER_PLACEHOLDER_THUMBNAIL_PENDING_SOFT_LIMIT
+        }
     }
 
     fn top_controls_visible_height(&self) -> f32 {
@@ -3784,7 +3802,7 @@ impl ImageViewer {
         }
 
         if self.folder_placeholder_preview_scan_pending.len()
-            >= Self::FOLDER_PLACEHOLDER_PREVIEW_SCAN_PENDING_SOFT_LIMIT
+            >= self.folder_placeholder_preview_scan_pending_soft_limit()
         {
             return false;
         }
@@ -3858,8 +3876,6 @@ impl ImageViewer {
                 cached.loading = loading;
                 return (cached.media_paths.clone(), cached.loading);
             }
-        } else if self.folder_placeholder_heavy_work_deferred() {
-            return (Vec::new(), true);
         }
 
         let loading = self.request_folder_placeholder_preview_scan(&target_directory, max_count);
@@ -8226,12 +8242,8 @@ impl ImageViewer {
             return true;
         }
 
-        if self.folder_placeholder_heavy_work_deferred() {
-            return true;
-        }
-
         if self.folder_placeholder_thumbnail_pending.len()
-            >= Self::FOLDER_PLACEHOLDER_THUMBNAIL_PENDING_SOFT_LIMIT
+            >= self.folder_placeholder_thumbnail_pending_soft_limit()
         {
             return true;
         }
@@ -8334,7 +8346,9 @@ impl ImageViewer {
     }
 
     fn folder_placeholder_thumbnail_upload_limit(&self) -> usize {
-        if self.folder_placeholder_upload_frame_budget_tight() {
+        if self.folder_placeholder_heavy_work_deferred()
+            || self.folder_placeholder_upload_frame_budget_tight()
+        {
             1
         } else {
             Self::FOLDER_PLACEHOLDER_THUMBNAIL_UPLOADS_PER_FRAME
@@ -8371,13 +8385,6 @@ impl ImageViewer {
     }
 
     fn poll_pending_folder_placeholder_thumbnail_loads(&mut self, ctx: &egui::Context) {
-        if self.folder_placeholder_heavy_work_deferred() {
-            if !self.folder_placeholder_thumbnail_pending.is_empty() {
-                ctx.request_repaint_after(Duration::from_millis(66));
-            }
-            return;
-        }
-
         let max_thumbnail_results_per_frame = self.folder_placeholder_thumbnail_upload_limit();
         let mut uploaded_any = false;
         let mut processed = 0usize;
