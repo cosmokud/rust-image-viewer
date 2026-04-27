@@ -4260,6 +4260,80 @@ impl ImageViewer {
         }
     }
 
+    fn current_breadcrumb_directory(&self) -> Option<PathBuf> {
+        self.current_media_path()
+            .and_then(|path| path.parent().map(Path::to_path_buf))
+            .or_else(|| {
+                self.image_list
+                    .first()
+                    .and_then(|path| path.parent().map(Path::to_path_buf))
+            })
+    }
+
+    fn navigate_up_from_breadcrumb(&mut self) -> bool {
+        let Some(current_directory) = self.current_breadcrumb_directory() else {
+            return false;
+        };
+        let Some(parent_directory) = current_directory.parent().map(Path::to_path_buf) else {
+            return false;
+        };
+
+        self.navigate_to_breadcrumb_directory(parent_directory.as_path());
+        true
+    }
+
+    fn refresh_current_breadcrumb_directory(&mut self) -> bool {
+        let Some(current_directory) = self.current_breadcrumb_directory() else {
+            return false;
+        };
+
+        if !current_directory.exists() || !current_directory.is_dir() {
+            self.error_message = Some(format!(
+                "Folder does not exist: {}",
+                current_directory.display()
+            ));
+            return false;
+        }
+
+        if self.pending_media_directory_scan.is_some() {
+            self.pending_media_directory_scan = None;
+            self.pending_media_directory_target = None;
+            self.pending_media_directory_scan_kind = None;
+            self.pending_media_directory_started_at = None;
+        }
+
+        self.media_directory_index
+            .invalidate_directory(current_directory.as_path());
+
+        let refresh_anchor = self
+            .current_media_path()
+            .filter(|path| {
+                path.parent() == Some(current_directory.as_path())
+                    && !self.is_folder_navigation_entry_path(path.as_path())
+            })
+            .or_else(|| {
+                self.image_list
+                    .iter()
+                    .find(|path| {
+                        path.parent() == Some(current_directory.as_path())
+                            && !self.is_folder_navigation_entry_path(path.as_path())
+                    })
+                    .cloned()
+            })
+            .unwrap_or_else(|| current_directory.join(FOLDER_UP_ENTRY_NAME));
+
+        let started = self.begin_media_directory_scan(
+            refresh_anchor.as_path(),
+            PendingMediaDirectoryScanKind::ExternalRefresh,
+        );
+        if started {
+            self.show_controls = true;
+            self.controls_show_time = Instant::now();
+        }
+
+        started
+    }
+
     fn navigate_to_breadcrumb_directory(&mut self, directory: &Path) {
         let _ = self.navigate_to_breadcrumb_directory_internal(
             directory,
@@ -20804,6 +20878,8 @@ impl ImageViewer {
         let mut breadcrumb_target_directory: Option<PathBuf> = None;
         let mut breadcrumb_nav_back_requested = false;
         let mut breadcrumb_nav_forward_requested = false;
+        let mut breadcrumb_nav_up_requested = false;
+        let mut breadcrumb_refresh_requested = false;
         let mut breadcrumb_ui_hovered = false;
         let mut breadcrumb_popup_active = false;
 
@@ -21292,17 +21368,149 @@ impl ImageViewer {
                         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                             ui.add_space(8.0);
 
-                            let can_go_back = self.folder_navigation_can_go_back();
-                            let back_response = ui
-                                .add_enabled(
-                                    can_go_back,
-                                    egui::Button::new(
-                                        egui::RichText::new("<")
-                                            .color(egui::Color32::from_gray(220)),
+                            #[derive(Clone, Copy)]
+                            enum BreadcrumbNavIcon {
+                                Back,
+                                Forward,
+                                Up,
+                                Refresh,
+                            }
+
+                            let draw_breadcrumb_nav_icon = |
+                                ui: &mut egui::Ui,
+                                rect: egui::Rect,
+                                icon: BreadcrumbNavIcon,
+                                stroke_color: egui::Color32,
+                            | {
+                                let icon_rect = rect.shrink2(egui::vec2(5.0, 4.0));
+                                let stroke = egui::Stroke::new(1.7, stroke_color);
+                                match icon {
+                                    BreadcrumbNavIcon::Back => {
+                                        let left = icon_rect.left() + 1.0;
+                                        let right = icon_rect.right() - 1.0;
+                                        let top = icon_rect.top() + 0.5;
+                                        let mid = icon_rect.center().y;
+                                        let bottom = icon_rect.bottom() - 0.5;
+                                        ui.painter().line_segment(
+                                            [egui::pos2(right, top), egui::pos2(left, mid)],
+                                            stroke,
+                                        );
+                                        ui.painter().line_segment(
+                                            [egui::pos2(right, bottom), egui::pos2(left, mid)],
+                                            stroke,
+                                        );
+                                    }
+                                    BreadcrumbNavIcon::Forward => {
+                                        let left = icon_rect.left() + 1.0;
+                                        let right = icon_rect.right() - 1.0;
+                                        let top = icon_rect.top() + 0.5;
+                                        let mid = icon_rect.center().y;
+                                        let bottom = icon_rect.bottom() - 0.5;
+                                        ui.painter().line_segment(
+                                            [egui::pos2(left, top), egui::pos2(right, mid)],
+                                            stroke,
+                                        );
+                                        ui.painter().line_segment(
+                                            [egui::pos2(left, bottom), egui::pos2(right, mid)],
+                                            stroke,
+                                        );
+                                    }
+                                    BreadcrumbNavIcon::Up => {
+                                        let center_x = icon_rect.center().x;
+                                        let top = icon_rect.top() + 0.5;
+                                        let mid = icon_rect.center().y;
+                                        let bottom = icon_rect.bottom() - 0.5;
+                                        ui.painter().line_segment(
+                                            [egui::pos2(center_x, bottom), egui::pos2(center_x, top)],
+                                            stroke,
+                                        );
+                                        let wing = (icon_rect.width() * 0.22).clamp(2.5, 4.5);
+                                        ui.painter().line_segment(
+                                            [egui::pos2(center_x, top), egui::pos2(center_x - wing, mid)],
+                                            stroke,
+                                        );
+                                        ui.painter().line_segment(
+                                            [egui::pos2(center_x, top), egui::pos2(center_x + wing, mid)],
+                                            stroke,
+                                        );
+                                    }
+                                    BreadcrumbNavIcon::Refresh => {
+                                        let center = icon_rect.center();
+                                        let radius = (icon_rect.width().min(icon_rect.height()) * 0.38)
+                                            .max(3.0);
+                                        let start = -1.9f32;
+                                        let end = 1.35f32;
+                                        let steps = 18usize;
+                                        let mut points = Vec::with_capacity(steps + 1);
+                                        for i in 0..=steps {
+                                            let t = start + (end - start) * (i as f32 / steps as f32);
+                                            points.push(egui::pos2(
+                                                center.x + radius * t.cos(),
+                                                center.y + radius * t.sin(),
+                                            ));
+                                        }
+                                        ui.painter().add(egui::Shape::line(points, stroke));
+
+                                        let end_point = egui::pos2(
+                                            center.x + radius * end.cos(),
+                                            center.y + radius * end.sin(),
+                                        );
+                                        let tangent = egui::vec2(-end.sin(), end.cos());
+                                        let normal = egui::vec2(end.cos(), end.sin());
+                                        let head = 3.8;
+                                        ui.painter().line_segment(
+                                            [
+                                                end_point,
+                                                end_point - tangent * head + normal * (head * 0.6),
+                                            ],
+                                            stroke,
+                                        );
+                                        ui.painter().line_segment(
+                                            [
+                                                end_point,
+                                                end_point - tangent * head - normal * (head * 0.6),
+                                            ],
+                                            stroke,
+                                        );
+                                    }
+                                }
+                            };
+
+                            let breadcrumb_nav_icon_button = |
+                                ui: &mut egui::Ui,
+                                icon: BreadcrumbNavIcon,
+                                enabled: bool,
+                                tooltip: &str,
+                            | {
+                                let response = ui
+                                    .add_enabled(
+                                        enabled,
+                                        egui::Button::new("")
+                                            .min_size(egui::vec2(24.0, 22.0)),
                                     )
-                                    .min_size(egui::vec2(24.0, 22.0)),
-                                )
-                                .on_hover_text("Back");
+                                    .on_hover_text(tooltip);
+
+                                let color = if enabled {
+                                    if response.hovered() {
+                                        egui::Color32::WHITE
+                                    } else {
+                                        egui::Color32::from_gray(216)
+                                    }
+                                } else {
+                                    egui::Color32::from_gray(90)
+                                };
+
+                                draw_breadcrumb_nav_icon(ui, response.rect, icon, color);
+                                response
+                            };
+
+                            let can_go_back = self.folder_navigation_can_go_back();
+                            let back_response = breadcrumb_nav_icon_button(
+                                ui,
+                                BreadcrumbNavIcon::Back,
+                                can_go_back,
+                                "Back",
+                            );
                             if back_response.contains_pointer() {
                                 breadcrumb_ui_hovered = true;
                             }
@@ -21311,21 +21519,47 @@ impl ImageViewer {
                             }
 
                             let can_go_forward = self.folder_navigation_can_go_forward();
-                            let forward_response = ui
-                                .add_enabled(
-                                    can_go_forward,
-                                    egui::Button::new(
-                                        egui::RichText::new(">")
-                                            .color(egui::Color32::from_gray(220)),
-                                    )
-                                    .min_size(egui::vec2(24.0, 22.0)),
-                                )
-                                .on_hover_text("Forward");
+                            let forward_response = breadcrumb_nav_icon_button(
+                                ui,
+                                BreadcrumbNavIcon::Forward,
+                                can_go_forward,
+                                "Forward",
+                            );
                             if forward_response.contains_pointer() {
                                 breadcrumb_ui_hovered = true;
                             }
                             if forward_response.clicked() {
                                 breadcrumb_nav_forward_requested = true;
+                            }
+
+                            let can_go_up = self
+                                .current_breadcrumb_directory()
+                                .and_then(|directory| directory.parent().map(Path::to_path_buf))
+                                .is_some();
+                            let up_response = breadcrumb_nav_icon_button(
+                                ui,
+                                BreadcrumbNavIcon::Up,
+                                can_go_up,
+                                "Up one folder",
+                            );
+                            if up_response.contains_pointer() {
+                                breadcrumb_ui_hovered = true;
+                            }
+                            if up_response.clicked() {
+                                breadcrumb_nav_up_requested = true;
+                            }
+
+                            let refresh_response = breadcrumb_nav_icon_button(
+                                ui,
+                                BreadcrumbNavIcon::Refresh,
+                                true,
+                                "Refresh current folder",
+                            );
+                            if refresh_response.contains_pointer() {
+                                breadcrumb_ui_hovered = true;
+                            }
+                            if refresh_response.clicked() {
+                                breadcrumb_refresh_requested = true;
                             }
 
                             ui.add_space(8.0);
@@ -21479,6 +21713,10 @@ impl ImageViewer {
             self.navigate_folder_history_back();
         } else if breadcrumb_nav_forward_requested {
             self.navigate_folder_history_forward();
+        } else if breadcrumb_nav_up_requested {
+            self.navigate_up_from_breadcrumb();
+        } else if breadcrumb_refresh_requested {
+            self.refresh_current_breadcrumb_directory();
         } else if let Some(directory) = breadcrumb_target_directory {
             self.navigate_to_breadcrumb_directory(directory.as_path());
         }
