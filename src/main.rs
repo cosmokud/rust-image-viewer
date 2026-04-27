@@ -135,37 +135,20 @@ fn paint_loading_spinner(painter: &egui::Painter, rect: egui::Rect, time: f64) {
     painter.add(egui::Shape::line(points.to_vec(), stroke));
 }
 
-fn paint_compact_loading_spinner(painter: &egui::Painter, rect: egui::Rect, time: f64) {
-    let center = rect.center();
-    let radius = (rect.width().min(rect.height()) * 0.18).clamp(4.0, 12.0);
-
-    painter.circle_stroke(
-        center,
-        radius,
-        egui::Stroke::new(
-            1.5,
-            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 50),
-        ),
+fn paint_static_hourglass_placeholder(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    corner_radius: f32,
+) {
+    painter.rect_filled(rect, corner_radius, egui::Color32::from_gray(30));
+    let font_size = (rect.width().min(rect.height()) * 0.38).clamp(10.0, 24.0);
+    painter.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        "⏳",
+        egui::FontId::proportional(font_size),
+        egui::Color32::from_gray(80),
     );
-
-    let start_angle = (time * 5.2) as f32;
-    let sweep = std::f32::consts::PI * 1.25;
-    let segments = 18;
-    let points: SmallVec<[egui::Pos2; 24]> = (0..=segments)
-        .map(|i| {
-            let t = i as f32 / segments as f32;
-            let angle = start_angle + sweep * t;
-            center + radius * egui::vec2(angle.cos(), angle.sin())
-        })
-        .collect();
-
-    painter.add(egui::Shape::line(
-        points.to_vec(),
-        egui::Stroke::new(
-            2.0,
-            egui::Color32::from_rgba_unmultiplied(245, 245, 245, 220),
-        ),
-    ));
 }
 
 fn rotate_quad_point(center: egui::Pos2, local: egui::Vec2, angle_radians: f32) -> egui::Pos2 {
@@ -3934,9 +3917,7 @@ impl ImageViewer {
             self.folder_entry_preview_media_paths(entry_path, 4);
         if preview_paths.is_empty() {
             if preview_list_loading {
-                let time = ui.input(|input| input.time);
-                paint_compact_loading_spinner(painter, body, time);
-                ui.ctx().request_repaint_after(Duration::from_millis(16));
+                paint_static_hourglass_placeholder(painter, body, 5.0);
             } else {
                 // Preserve previous behavior when no media thumbnail candidates exist.
                 Self::paint_folder_entry_icon(painter, body, is_up_entry);
@@ -3948,7 +3929,6 @@ impl ImageViewer {
             let tile_width = ((preview_rect.width() - grid_gap) * 0.5).max(1.0);
             let tile_height = ((preview_rect.height() - grid_gap) * 0.5).max(1.0);
             let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
-            let mut waiting_for_thumbnail = false;
 
             for (slot, media_path) in preview_paths.iter().take(4).enumerate() {
                 let row = (slot / 2) as f32;
@@ -3980,27 +3960,10 @@ impl ImageViewer {
                     let fitted_rect = egui::Rect::from_center_size(tile_rect.center(), fitted_size);
                     painter.image(texture_id, fitted_rect, uv, egui::Color32::WHITE);
                 } else if self.request_folder_placeholder_thumbnail_load(media_path) {
-                    let time = ui.input(|input| input.time);
-                    paint_compact_loading_spinner(painter, tile_rect, time);
-                    waiting_for_thumbnail = true;
+                    paint_static_hourglass_placeholder(painter, tile_rect, 3.0);
                 } else {
-                    let placeholder = media_path
-                        .extension()
-                        .and_then(|ext| ext.to_str())
-                        .map(|ext| ext.to_ascii_uppercase())
-                        .unwrap_or_else(|| "FILE".to_string());
-                    painter.text(
-                        tile_rect.center(),
-                        egui::Align2::CENTER_CENTER,
-                        placeholder,
-                        egui::TextStyle::Small.resolve(ui.style()),
-                        egui::Color32::from_rgb(188, 202, 220),
-                    );
+                    paint_static_hourglass_placeholder(painter, tile_rect, 3.0);
                 }
-            }
-
-            if waiting_for_thumbnail {
-                ui.ctx().request_repaint_after(Duration::from_millis(16));
             }
 
             if is_up_entry {
@@ -8310,8 +8273,10 @@ impl ImageViewer {
             applied = applied.saturating_add(1);
         }
 
-        if applied > 0 || !self.folder_placeholder_preview_scan_pending.is_empty() {
-            ctx.request_repaint_after(Duration::from_millis(16));
+        if applied > 0 {
+            ctx.request_repaint();
+        } else if !self.folder_placeholder_preview_scan_pending.is_empty() {
+            ctx.request_repaint_after(Duration::from_millis(66));
         }
     }
 
@@ -8402,8 +8367,10 @@ impl ImageViewer {
             }
         }
 
-        if uploaded_any || !self.folder_placeholder_thumbnail_pending.is_empty() {
-            ctx.request_repaint_after(Duration::from_millis(16));
+        if uploaded_any {
+            ctx.request_repaint();
+        } else if !self.folder_placeholder_thumbnail_pending.is_empty() {
+            ctx.request_repaint_after(Duration::from_millis(66));
         }
     }
 
