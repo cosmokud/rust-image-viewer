@@ -346,6 +346,7 @@ const RANGE_EXPAND_TRUE: i8 = 1;
 const DEFAULT_FRAME_QUEUE_CAPACITY: usize = 4;
 const MAX_FRAME_QUEUE_CAPACITY: usize = 6;
 const FRAME_BUFFER_POOL_CAPACITY: usize = 16;
+const PLAY_FLAG_AUDIO: u64 = 1 << 1;
 const PLAY_FLAG_TEXT: u64 = 1 << 2;
 const PLAY_FLAG_DOWNLOAD: u64 = 1 << 7;
 const PLAY_FLAG_BUFFERING: u64 = 1 << 8;
@@ -502,26 +503,56 @@ fn set_optional_i32_or_u32_property(element: &gst::Element, name: &str, value: i
     }
 }
 
-fn enable_playbin_flags(playbin: &gst::Element, flags_mask: u64) {
+fn get_playbin_flags(playbin: &gst::Element) -> Option<u64> {
+    if playbin.find_property("flags").is_none() {
+        return None;
+    }
+
+    let property = playbin.property_value("flags");
+    if let Ok(current) = property.get::<u32>() {
+        Some(current as u64)
+    } else if let Ok(current) = property.get::<i32>() {
+        Some(current.max(0) as u64)
+    } else if let Ok(current) = property.get::<u64>() {
+        Some(current)
+    } else if let Ok(current) = property.get::<i64>() {
+        Some(current.max(0) as u64)
+    } else {
+        None
+    }
+}
+
+fn set_playbin_flags(playbin: &gst::Element, flags: u64) {
     if playbin.find_property("flags").is_none() {
         return;
     }
 
     let property = playbin.property_value("flags");
-    if let Ok(current) = property.get::<u32>() {
-        let desired = current | flags_mask as u32;
-        if desired != current {
-            playbin.set_property("flags", desired);
-        }
-    } else if let Ok(current) = property.get::<i32>() {
-        let desired = current | flags_mask as i32;
-        if desired != current {
-            playbin.set_property("flags", desired);
-        }
-    } else if let Ok(current) = property.get::<u64>() {
+    if property.get::<u32>().is_ok() {
+        playbin.set_property("flags", flags as u32);
+    } else if property.get::<i32>().is_ok() {
+        playbin.set_property("flags", flags.min(i32::MAX as u64) as i32);
+    } else if property.get::<u64>().is_ok() {
+        playbin.set_property("flags", flags);
+    } else if property.get::<i64>().is_ok() {
+        playbin.set_property("flags", flags.min(i64::MAX as u64) as i64);
+    }
+}
+
+fn enable_playbin_flags(playbin: &gst::Element, flags_mask: u64) {
+    if let Some(current) = get_playbin_flags(playbin) {
         let desired = current | flags_mask;
         if desired != current {
-            playbin.set_property("flags", desired);
+            set_playbin_flags(playbin, desired);
+        }
+    }
+}
+
+fn disable_playbin_flags(playbin: &gst::Element, flags_mask: u64) {
+    if let Some(current) = get_playbin_flags(playbin) {
+        let desired = current & !flags_mask;
+        if desired != current {
+            set_playbin_flags(playbin, desired);
         }
     }
 }
@@ -1288,6 +1319,11 @@ Ensure your GStreamer installation includes the playback elements (usually from 
         self.volume
     }
 
+    pub fn audio_enabled(&self) -> bool {
+        get_playbin_flags(self.pipeline.upcast_ref())
+            .is_some_and(|flags| (flags & PLAY_FLAG_AUDIO) != 0)
+    }
+
     pub fn audio_tracks(&self) -> Vec<VideoTrackInfo> {
         let Some(track_count) =
             get_optional_i32_or_u32_property(self.pipeline.upcast_ref(), "n-audio")
@@ -1309,15 +1345,29 @@ Ensure your GStreamer installation includes the playback elements (usually from 
     }
 
     pub fn current_audio_track_index(&self) -> Option<i32> {
-        get_optional_i32_or_u32_property(self.pipeline.upcast_ref(), "current-audio")
-            .filter(|index| *index >= 0)
+        if !self.audio_enabled() {
+            return None;
+        }
+
+        let current_index =
+            get_optional_i32_or_u32_property(self.pipeline.upcast_ref(), "current-audio")
+                .unwrap_or(-1);
+        if current_index >= 0 {
+            return Some(current_index);
+        }
+
+        let track_count =
+            get_optional_i32_or_u32_property(self.pipeline.upcast_ref(), "n-audio").unwrap_or(0);
+        (track_count > 0).then_some(0)
     }
 
     pub fn set_audio_track(&mut self, index: i32) -> Result<(), String> {
         if index < 0 {
-            return Err("Audio track index must be non-negative".to_string());
+            disable_playbin_flags(self.pipeline.upcast_ref(), PLAY_FLAG_AUDIO);
+            return Ok(());
         }
 
+        enable_playbin_flags(self.pipeline.upcast_ref(), PLAY_FLAG_AUDIO);
         set_optional_i32_or_u32_property(self.pipeline.upcast_ref(), "current-audio", index);
         Ok(())
     }
@@ -1342,12 +1392,29 @@ Ensure your GStreamer installation includes the playback elements (usually from 
         tracks
     }
 
+    pub fn subtitles_enabled(&self) -> bool {
+        get_playbin_flags(self.pipeline.upcast_ref())
+            .is_some_and(|flags| (flags & PLAY_FLAG_TEXT) != 0)
+    }
+
     fn current_embedded_subtitle_track_index(&self) -> Option<i32> {
-        get_optional_i32_or_u32_property(self.pipeline.upcast_ref(), "current-text")
-            .filter(|index| *index >= 0)
+        let current_index =
+            get_optional_i32_or_u32_property(self.pipeline.upcast_ref(), "current-text")
+                .unwrap_or(-1);
+        if current_index >= 0 {
+            return Some(current_index);
+        }
+
+        let track_count =
+            get_optional_i32_or_u32_property(self.pipeline.upcast_ref(), "n-text").unwrap_or(0);
+        (track_count > 0).then_some(0)
     }
 
     pub fn current_subtitle_selection(&self) -> VideoSubtitleSelection {
+        if !self.subtitles_enabled() {
+            return VideoSubtitleSelection::Off;
+        }
+
         match &self.subtitle_selection {
             VideoSubtitleSelection::External(path) => VideoSubtitleSelection::External(path.clone()),
             _ => self
@@ -1362,8 +1429,8 @@ Ensure your GStreamer installation includes the playback elements (usually from 
     ) -> Result<(), String> {
         match &selection {
             VideoSubtitleSelection::Off => {
-                self.pipeline.set_property("suburi", "");
-                set_optional_i32_or_u32_property(self.pipeline.upcast_ref(), "current-text", -1);
+                self.pipeline.set_property("suburi", Option::<String>::None);
+                disable_playbin_flags(self.pipeline.upcast_ref(), PLAY_FLAG_TEXT);
             }
             VideoSubtitleSelection::Embedded(index) => {
                 if *index < 0 {
@@ -1371,7 +1438,7 @@ Ensure your GStreamer installation includes the playback elements (usually from 
                 }
 
                 enable_playbin_flags(self.pipeline.upcast_ref(), PLAY_FLAG_TEXT);
-                self.pipeline.set_property("suburi", "");
+                self.pipeline.set_property("suburi", Option::<String>::None);
                 set_optional_i32_or_u32_property(
                     self.pipeline.upcast_ref(),
                     "current-text",

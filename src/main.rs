@@ -679,6 +679,10 @@ enum MenuActionIcon {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum VideoControlIcon {
+    Play,
+    Pause,
+    VolumeOn,
+    VolumeOff,
     Previous,
     Next,
     AudioTracks,
@@ -7427,6 +7431,67 @@ impl ImageViewer {
         options
     }
 
+    fn compact_video_track_button_label(label: &str) -> String {
+        const MAX_LABEL_CHARS: usize = 18;
+
+        let parts: Vec<&str> = label
+            .split(" / ")
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .collect();
+
+        let preferred = parts
+            .iter()
+            .skip(1)
+            .find(|part| {
+                !part.starts_with("Audio ")
+                    && !part.starts_with("Subtitle ")
+                    && !part.eq_ignore_ascii_case("external")
+            })
+            .copied()
+            .or_else(|| parts.last().copied())
+            .unwrap_or("Track");
+
+        let preferred = preferred.replace(['_', '-'], " ");
+        if preferred.chars().count() <= MAX_LABEL_CHARS {
+            preferred
+        } else {
+            let truncated: String = preferred.chars().take(MAX_LABEL_CHARS - 1).collect();
+            format!("{}…", truncated.trim_end())
+        }
+    }
+
+    fn current_audio_button_label(
+        tracks: &[VideoTrackInfo],
+        current_track: Option<i32>,
+    ) -> String {
+        current_track
+            .and_then(|track_index| tracks.iter().find(|track| track.index == track_index))
+            .map(|track| Self::compact_video_track_button_label(&track.label))
+            .unwrap_or_else(|| "Off".to_string())
+    }
+
+    fn current_subtitle_button_label(
+        current_selection: &VideoSubtitleSelection,
+        embedded_tracks: &[VideoTrackInfo],
+    ) -> String {
+        match current_selection {
+            VideoSubtitleSelection::Off => "Off".to_string(),
+            VideoSubtitleSelection::Embedded(track_index) => embedded_tracks
+                .iter()
+                .find(|track| track.index == *track_index)
+                .map(|track| Self::compact_video_track_button_label(&track.label))
+                .unwrap_or_else(|| format!("Sub {}", track_index + 1)),
+            VideoSubtitleSelection::External(path) => {
+                let label = path
+                    .file_stem()
+                    .map(|stem| stem.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "External".to_string());
+                Self::compact_video_track_button_label(&label)
+            }
+        }
+    }
+
     fn paint_video_control_icon(
         painter: &egui::Painter,
         rect: egui::Rect,
@@ -7436,6 +7501,79 @@ impl ImageViewer {
         let stroke = egui::Stroke::new(1.7, color);
 
         match icon {
+            VideoControlIcon::Play => {
+                let left = rect.left() + 1.0;
+                let right = rect.right() - 1.0;
+                let top = rect.top() + 1.0;
+                let bottom = rect.bottom() - 1.0;
+                painter.add(egui::Shape::convex_polygon(
+                    vec![
+                        egui::pos2(left, top),
+                        egui::pos2(right, rect.center().y),
+                        egui::pos2(left, bottom),
+                    ],
+                    color,
+                    egui::Stroke::NONE,
+                ));
+            }
+            VideoControlIcon::Pause => {
+                let bar_width = 3.4;
+                let gap = 3.6;
+                let left_center = rect.center().x - (bar_width / 2.0 + gap / 2.0);
+                let right_center = rect.center().x + (bar_width / 2.0 + gap / 2.0);
+                for center_x in [left_center, right_center] {
+                    let bar_rect = egui::Rect::from_center_size(
+                        egui::pos2(center_x, rect.center().y),
+                        egui::vec2(bar_width, rect.height() - 2.0),
+                    );
+                    painter.rect_filled(bar_rect, 1.4, color);
+                }
+            }
+            VideoControlIcon::VolumeOn | VideoControlIcon::VolumeOff => {
+                let speaker = [
+                    egui::pos2(rect.left() + 1.0, rect.center().y - 2.6),
+                    egui::pos2(rect.left() + 4.0, rect.center().y - 2.6),
+                    egui::pos2(rect.center().x - 1.5, rect.top() + 1.0),
+                    egui::pos2(rect.center().x - 1.5, rect.bottom() - 1.0),
+                    egui::pos2(rect.left() + 4.0, rect.center().y + 2.6),
+                    egui::pos2(rect.left() + 1.0, rect.center().y + 2.6),
+                ];
+                painter.add(egui::Shape::convex_polygon(
+                    speaker.to_vec(),
+                    color,
+                    egui::Stroke::NONE,
+                ));
+
+                if icon == VideoControlIcon::VolumeOn {
+                    let wave_center = egui::pos2(rect.center().x + 1.0, rect.center().y);
+                    for radius in [3.6, 5.7] {
+                        painter.add(egui::Shape::line(
+                            vec![
+                                egui::pos2(wave_center.x + radius * 0.15, wave_center.y - radius * 0.7),
+                                egui::pos2(wave_center.x + radius * 0.55, wave_center.y - radius * 0.25),
+                                egui::pos2(wave_center.x + radius * 0.65, wave_center.y + radius * 0.25),
+                                egui::pos2(wave_center.x + radius * 0.25, wave_center.y + radius * 0.7),
+                            ],
+                            stroke,
+                        ));
+                    }
+                } else {
+                    painter.line_segment(
+                        [
+                            egui::pos2(rect.center().x + 1.0, rect.top() + 1.5),
+                            egui::pos2(rect.right() - 1.0, rect.bottom() - 1.5),
+                        ],
+                        stroke,
+                    );
+                    painter.line_segment(
+                        [
+                            egui::pos2(rect.right() - 1.0, rect.top() + 1.5),
+                            egui::pos2(rect.center().x + 1.0, rect.bottom() - 1.5),
+                        ],
+                        stroke,
+                    );
+                }
+            }
             VideoControlIcon::Previous => {
                 let left = rect.left() + 1.0;
                 let right = rect.right() - 1.0;
@@ -7529,38 +7667,60 @@ impl ImageViewer {
         ui: &mut egui::Ui,
         icon: VideoControlIcon,
         tooltip: &str,
+        label: Option<&str>,
         active: bool,
     ) -> egui::Response {
-        let size = egui::Vec2::new(28.0, 24.0);
+        let label_galley = label.filter(|label| !label.is_empty()).map(|text| {
+            ui.painter().layout_no_wrap(
+                text.to_string(),
+                egui::FontId::proportional(11.0),
+                egui::Color32::from_rgba_unmultiplied(245, 245, 245, 220),
+            )
+        });
+        let size = egui::Vec2::new(
+            28.0 + label_galley.as_ref().map_or(0.0, |galley| galley.size().x + 12.0),
+            24.0,
+        );
         let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
 
         if ui.is_rect_visible(rect) {
             let bg = if response.is_pointer_button_down_on() {
-                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 38)
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 42)
             } else if active {
-                egui::Color32::from_rgba_unmultiplied(66, 133, 244, 52)
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 30)
             } else if response.hovered() {
-                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 18)
-            } else {
-                egui::Color32::TRANSPARENT
-            };
-            let stroke_color = if active {
-                egui::Color32::from_rgb(108, 168, 255)
-            } else {
                 egui::Color32::from_rgba_unmultiplied(255, 255, 255, 24)
-            };
-            let icon_color = if active {
-                egui::Color32::from_rgb(224, 239, 255)
             } else {
-                egui::Color32::WHITE
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 14)
+            };
+            let stroke_color = if active || response.hovered() {
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 42)
+            } else {
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 26)
+            };
+            let icon_color = if response.is_pointer_button_down_on() {
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 245)
+            } else {
+                egui::Color32::from_rgba_unmultiplied(245, 245, 245, 228)
             };
 
             ui.painter().rect_filled(rect, 6.0, bg);
             ui.painter()
                 .rect_stroke(rect.shrink(0.5), 6.0, egui::Stroke::new(1.0, stroke_color));
 
-            let icon_rect = rect.shrink2(egui::vec2(7.0, 5.0));
+            let icon_rect = egui::Rect::from_min_max(
+                egui::pos2(rect.left() + 7.0, rect.top() + 5.0),
+                egui::pos2(rect.left() + 19.0, rect.bottom() - 5.0),
+            );
             Self::paint_video_control_icon(ui.painter(), icon_rect, icon, icon_color);
+
+            if let Some(galley) = label_galley {
+                let text_pos = egui::pos2(
+                    rect.left() + 24.0,
+                    rect.center().y - galley.size().y / 2.0,
+                );
+                ui.painter().galley(text_pos, galley, egui::Color32::WHITE);
+            }
         }
 
         response.on_hover_text(tooltip)
@@ -7590,11 +7750,23 @@ impl ImageViewer {
                             .color(egui::Color32::from_gray(160)),
                     );
                 } else {
+                    let off_row =
+                        ui.selectable_label(current_track.is_none(), "Off");
+                    if off_row.clicked() {
+                        selected_track = Some(-1);
+                        ui.memory_mut(|mem| mem.close_popup());
+                    }
+
+                    ui.add_space(4.0);
                     for track in tracks {
                         let row =
                             ui.selectable_label(current_track == Some(track.index), &track.label);
                         if row.clicked() {
-                            selected_track = Some(track.index);
+                            selected_track = Some(if current_track == Some(track.index) {
+                                -1
+                            } else {
+                                track.index
+                            });
                             ui.memory_mut(|mem| mem.close_popup());
                         }
                     }
@@ -7647,7 +7819,11 @@ impl ImageViewer {
                         );
                         let row = ui.selectable_label(is_selected, &track.label);
                         if row.clicked() {
-                            selected_track = Some(VideoSubtitleSelection::Embedded(track.index));
+                            selected_track = Some(if is_selected {
+                                VideoSubtitleSelection::Off
+                            } else {
+                                VideoSubtitleSelection::Embedded(track.index)
+                            });
                             ui.memory_mut(|mem| mem.close_popup());
                         }
                     }
@@ -7667,8 +7843,11 @@ impl ImageViewer {
                         );
                         let row = ui.selectable_label(is_selected, &option.label);
                         if row.clicked() {
-                            selected_track =
-                                Some(VideoSubtitleSelection::External(option.path.clone()));
+                            selected_track = Some(if is_selected {
+                                VideoSubtitleSelection::Off
+                            } else {
+                                VideoSubtitleSelection::External(option.path.clone())
+                            });
                             ui.memory_mut(|mem| mem.close_popup());
                         }
                     }
@@ -22476,6 +22655,12 @@ impl ImageViewer {
             let current_audio_track = player.current_audio_track_index();
             let embedded_subtitle_tracks = player.embedded_subtitle_tracks();
             let current_subtitle_selection = player.current_subtitle_selection();
+            let current_audio_button_label =
+                Self::current_audio_button_label(&audio_tracks, current_audio_track);
+            let current_subtitle_button_label = Self::current_subtitle_button_label(
+                &current_subtitle_selection,
+                &embedded_subtitle_tracks,
+            );
 
             // Seek bar
             let seek_bar_height = 6.0;
@@ -22609,11 +22794,17 @@ impl ImageViewer {
 
                 // Play/Pause button
                 let is_playing = player.is_playing();
-                let play_btn = ui.add(
-                    egui::Button::new(if is_playing { "⏸" } else { "▶" })
-                        .min_size(egui::vec2(32.0, 24.0)),
+                let play_btn = Self::video_control_icon_button(
+                    ui,
+                    if is_playing {
+                        VideoControlIcon::Pause
+                    } else {
+                        VideoControlIcon::Play
+                    },
+                    if is_playing { "Pause" } else { "Play" },
+                    None,
+                    false,
                 );
-
                 if play_btn.clicked() {
                     play_toggle_requested = true;
                 }
@@ -22624,14 +22815,20 @@ impl ImageViewer {
                     ui,
                     VideoControlIcon::Previous,
                     "Previous file",
+                    None,
                     false,
                 );
                 if prev_btn.clicked() {
                     file_navigation_requested = Some(VideoFileNavigation::Previous);
                 }
 
-                let next_btn =
-                    Self::video_control_icon_button(ui, VideoControlIcon::Next, "Next file", false);
+                let next_btn = Self::video_control_icon_button(
+                    ui,
+                    VideoControlIcon::Next,
+                    "Next file",
+                    None,
+                    false,
+                );
                 if next_btn.clicked() {
                     file_navigation_requested = Some(VideoFileNavigation::Next);
                 }
@@ -22659,11 +22856,17 @@ impl ImageViewer {
 
                     // Mute button
                     let is_muted = player.is_muted();
-                    let mute_btn = ui.add(
-                        egui::Button::new(if is_muted { "🔇" } else { "🔊" })
-                            .min_size(egui::vec2(32.0, 24.0)),
+                    let mute_btn = Self::video_control_icon_button(
+                        ui,
+                        if is_muted {
+                            VideoControlIcon::VolumeOff
+                        } else {
+                            VideoControlIcon::VolumeOn
+                        },
+                        if is_muted { "Unmute" } else { "Mute" },
+                        None,
+                        false,
                     );
-
                     if mute_btn.clicked() {
                         player.toggle_mute();
                         self.config.update_video_state(player.is_muted(), player.volume());
@@ -22737,6 +22940,7 @@ impl ImageViewer {
                         ui,
                         VideoControlIcon::SubtitleTracks,
                         "Subtitle track",
+                        Some(current_subtitle_button_label.as_str()),
                         subtitle_popup_open,
                     );
                     if subtitle_btn.clicked() {
@@ -22767,6 +22971,7 @@ impl ImageViewer {
                         ui,
                         VideoControlIcon::AudioTracks,
                         "Audio track",
+                        Some(current_audio_button_label.as_str()),
                         audio_popup_open,
                     );
                     if audio_btn.clicked() {
@@ -23094,6 +23299,12 @@ impl ImageViewer {
         let current_audio_track = player.current_audio_track_index();
         let embedded_subtitle_tracks = player.embedded_subtitle_tracks();
         let current_subtitle_selection = player.current_subtitle_selection();
+        let current_audio_button_label =
+            Self::current_audio_button_label(&audio_tracks, current_audio_track);
+        let current_subtitle_button_label = Self::current_subtitle_button_label(
+            &current_subtitle_selection,
+            &embedded_subtitle_tracks,
+        );
 
         ui.vertical(|ui| {
             // === Seek bar (top row) ===
@@ -23236,11 +23447,17 @@ impl ImageViewer {
 
                 // Play/Pause button
                 let is_playing = player.is_playing();
-                let play_btn = ui.add(
-                    egui::Button::new(if is_playing { "⏸" } else { "▶" })
-                        .min_size(egui::vec2(32.0, 24.0)),
+                let play_btn = Self::video_control_icon_button(
+                    ui,
+                    if is_playing {
+                        VideoControlIcon::Pause
+                    } else {
+                        VideoControlIcon::Play
+                    },
+                    if is_playing { "Pause" } else { "Play" },
+                    None,
+                    false,
                 );
-
                 if play_btn.clicked() {
                     play_toggle_requested = true;
                 }
@@ -23251,14 +23468,20 @@ impl ImageViewer {
                     ui,
                     VideoControlIcon::Previous,
                     "Previous file",
+                    None,
                     false,
                 );
                 if prev_btn.clicked() {
                     file_navigation_requested = Some(VideoFileNavigation::Previous);
                 }
 
-                let next_btn =
-                    Self::video_control_icon_button(ui, VideoControlIcon::Next, "Next file", false);
+                let next_btn = Self::video_control_icon_button(
+                    ui,
+                    VideoControlIcon::Next,
+                    "Next file",
+                    None,
+                    false,
+                );
                 if next_btn.clicked() {
                     file_navigation_requested = Some(VideoFileNavigation::Next);
                 }
@@ -23286,11 +23509,17 @@ impl ImageViewer {
 
                     // Mute button
                     let is_muted = player.is_muted();
-                    let mute_btn = ui.add(
-                        egui::Button::new(if is_muted { "🔇" } else { "🔊" })
-                            .min_size(egui::vec2(32.0, 24.0)),
+                    let mute_btn = Self::video_control_icon_button(
+                        ui,
+                        if is_muted {
+                            VideoControlIcon::VolumeOff
+                        } else {
+                            VideoControlIcon::VolumeOn
+                        },
+                        if is_muted { "Unmute" } else { "Mute" },
+                        None,
+                        false,
                     );
-
                     if mute_btn.clicked() {
                         player.toggle_mute();
                         // Persist user's mute choice for all manga videos
@@ -23365,6 +23594,7 @@ impl ImageViewer {
                         ui,
                         VideoControlIcon::SubtitleTracks,
                         "Subtitle track",
+                        Some(current_subtitle_button_label.as_str()),
                         subtitle_popup_open,
                     );
                     if subtitle_btn.clicked() {
@@ -23395,6 +23625,7 @@ impl ImageViewer {
                         ui,
                         VideoControlIcon::AudioTracks,
                         "Audio track",
+                        Some(current_audio_button_label.as_str()),
                         audio_popup_open,
                     );
                     if audio_btn.clicked() {
