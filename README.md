@@ -354,22 +354,22 @@ Delete `config.ini` if you want to regenerate it from the current defaults.
 
 ### Video settings
 
-| Key                       | Default    | Meaning                                                                                             |
-| ------------------------- | ---------- | --------------------------------------------------------------------------------------------------- |
-| `muted_by_default`        | `remember` | `true`, `false`, or `remember` (remember uses the persisted state from the last video).             |
-| `default_volume`          | `remember` | Initial video volume (0.0 to 1.0) or `remember` to reuse the last stored volume.                    |
-| `loop`                    | `true`     | Restart videos automatically at end-of-stream.                                                      |
-| `seek_policy`             | `adaptive` | `adaptive`, `accurate`, or `keyframe`.                                                              |
-| `prefer_hardware_decode`  | `true`     | Prefer D3D11 decoders when available on Windows.                                                    |
-| `disable_hardware_decode` | `false`    | Disable hardware decoders completely. Overrides `prefer_hardware_decode`.                           |
+| Key                       | Default    | Meaning                                                                                 |
+| ------------------------- | ---------- | --------------------------------------------------------------------------------------- |
+| `muted_by_default`        | `remember` | `true`, `false`, or `remember` (remember uses the persisted state from the last video). |
+| `default_volume`          | `remember` | Initial video volume (0.0 to 1.0) or `remember` to reuse the last stored volume.        |
+| `loop`                    | `true`     | Restart videos automatically at end-of-stream.                                          |
+| `seek_policy`             | `adaptive` | `adaptive`, `accurate`, or `keyframe`.                                                  |
+| `prefer_hardware_decode`  | `true`     | Prefer D3D11 decoders when available on Windows.                                        |
+| `disable_hardware_decode` | `false`    | Disable hardware decoders completely. Overrides `prefer_hardware_decode`.               |
 
 ### Persisted video state
 
 These values are updated automatically and used when `muted_by_default` or `default_volume` are set to `remember`.
 
-| Key           | Default | Meaning                          |
-| ------------- | ------- | -------------------------------- |
-| `muted_state` | `true`  | Last muted state for video audio |
+| Key            | Default | Meaning                           |
+| -------------- | ------- | --------------------------------- |
+| `muted_state`  | `true`  | Last muted state for video audio  |
 | `volume_state` | `0.0`   | Last volume level for video audio |
 
 ### Quality settings
