@@ -140,6 +140,12 @@ The per-frame order is deliberate:
 
 This ordering keeps the app biased toward "consume async results, upload what matters, then draw the correct geometry once."
 
+### 4.1 Folder navigation UI and history
+
+Fullscreen manga modes can show a breadcrumb bar under the title bar. It exposes back/forward/up navigation plus clickable path segments. The viewer maintains a bounded folder history (256 entries) so traversal feels Explorer-like, and hovering the back icon opens a popup of recent folders (up to 10 entries, labels trimmed to 3 segments).
+
+Breadcrumb segments can open child-folder menus so you can jump directly into sibling subfolders without leaving fullscreen. When a folder jump occurs, the viewer records the current folder travel position (and persists Masonry metadata snapshots) so returning to a folder restores scroll context and warm state.
+
 ## 5. Solo media pipeline
 
 Solo mode is the path used for floating window viewing and single-item fullscreen.
@@ -506,6 +512,7 @@ Implementation:
 - `lru::LruCache`
 - default capacity: `64` directories
 - short mtime revalidation window for hot navigation
+- scans are anchored to the cached directory key so folder-navigation entries do not trigger child-folder scans
 
 ### 8.4 Strip/Masonry texture cache (`src/manga_loader.rs`)
 
@@ -626,7 +633,13 @@ Optimization details:
 
 This keeps the focused video path responsive without growing queues indefinitely.
 
-### 10.5 Focus policy in strip and masonry
+### 10.5 Seek, buffering, and output sizing
+
+Local file playback enables playbin buffering plus bounded ring buffers so brief disk stalls do not force full-file prefetching. The appsink caps its internal queue and drops stale buffers to keep frame delivery responsive.
+
+Seeking clears queued frames, marks a seek-in-progress flag to ignore stale samples, and primes a preroll frame so paused scrubs show the right image quickly. When possible, solo playback passes output bounds so GStreamer scales toward the viewport instead of decoding full-resolution frames.
+
+### 10.6 Focus policy in strip and masonry
 
 The viewer does not try to run every video tile live.
 

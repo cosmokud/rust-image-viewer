@@ -20,6 +20,8 @@ This project is intentionally optimized for one job: opening media fast, navigat
 
 - Borderless floating window with custom title bar, auto-hide controls, and native-feeling fullscreen / maximize transitions on Windows.
 - Fast single-file viewing plus fast folder navigation, including natural-sort media lists and optional single-instance reuse.
+- Breadcrumb address bar with back/forward/up navigation and a folder-history popup in fullscreen manga modes.
+- Windows cut/copy/paste for marked files with optional auto-unmark after paste.
 - Static images, animated GIF, animated WebP, and video playback in one app.
 - Two fullscreen multi-item layouts: Long Strip and Masonry.
 - Context-aware shortcut system where the same input can map to different actions in different modes.
@@ -37,6 +39,8 @@ This project is intentionally optimized for one job: opening media fast, navigat
 - Smart initial sizing: open at 100% when possible, otherwise fit to the screen.
 - Drag and drop support.
 - Single-instance mode that forwards file-open requests from secondary launches to the primary window.
+- Breadcrumb address bar for fullscreen manga modes with back/forward/up navigation and history popup.
+- Windows cut/copy/paste for marked files; paste into the current folder via Ctrl+V or the menu.
 - Title bar menu entry for `Edit Settings`, which opens the active `config.ini` in the default editor.
 - CJK filename support through lazy Windows font loading.
 
@@ -315,6 +319,7 @@ Delete `config.ini` if you want to regenerate it from the current defaults.
 | `fullscreen_reset_fit_on_enter`       | `true`     | Reset and fit media when entering fullscreen.                                                                  |
 | `fullscreen_native_window_transition` | `true`     | Use Windows maximize / restore animations during fullscreen transitions.                                       |
 | `maximize_to_borderless_fullscreen`   | `true`     | Make the title-bar maximize action enter borderless fullscreen instead of a separate maximized floating state. |
+| `auto_unmark_after_paste`             | `true`     | Clear current marked-file selection after a successful paste operation.                                        |
 | `zoom_animation_speed`                | `20`       | Speed of floating zoom animation. `0` disables the animation.                                                  |
 | `precise_rotation_step_degrees`       | `2.0`      | Degrees added per `Ctrl+Up` / `Ctrl+Down`.                                                                     |
 | `zoom_step`                           | `1.02`     | Scroll-wheel zoom multiplier.                                                                                  |
@@ -349,14 +354,23 @@ Delete `config.ini` if you want to regenerate it from the current defaults.
 
 ### Video settings
 
-| Key                       | Default    | Meaning                                                                   |
-| ------------------------- | ---------- | ------------------------------------------------------------------------- |
-| `muted_by_default`        | `true`     | Start videos muted.                                                       |
-| `default_volume`          | `0.0`      | Initial video volume.                                                     |
-| `loop`                    | `true`     | Restart videos automatically at end-of-stream.                            |
-| `seek_policy`             | `adaptive` | `adaptive`, `accurate`, or `keyframe`.                                    |
-| `prefer_hardware_decode`  | `true`     | Prefer D3D11 decoders when available on Windows.                          |
-| `disable_hardware_decode` | `false`    | Disable hardware decoders completely. Overrides `prefer_hardware_decode`. |
+| Key                       | Default    | Meaning                                                                                             |
+| ------------------------- | ---------- | --------------------------------------------------------------------------------------------------- |
+| `muted_by_default`        | `remember` | `true`, `false`, or `remember` (remember uses the persisted state from the last video).             |
+| `default_volume`          | `remember` | Initial video volume (0.0 to 1.0) or `remember` to reuse the last stored volume.                    |
+| `loop`                    | `true`     | Restart videos automatically at end-of-stream.                                                      |
+| `seek_policy`             | `adaptive` | `adaptive`, `accurate`, or `keyframe`.                                                              |
+| `prefer_hardware_decode`  | `true`     | Prefer D3D11 decoders when available on Windows.                                                    |
+| `disable_hardware_decode` | `false`    | Disable hardware decoders completely. Overrides `prefer_hardware_decode`.                           |
+
+### Persisted video state
+
+These values are updated automatically and used when `muted_by_default` or `default_volume` are set to `remember`.
+
+| Key           | Default | Meaning                          |
+| ------------- | ------- | -------------------------------- |
+| `muted_state` | `true`  | Last muted state for video audio |
+| `volume_state` | `0.0`   | Last volume level for video audio |
 
 ### Quality settings
 
