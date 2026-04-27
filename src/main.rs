@@ -7492,238 +7492,30 @@ impl ImageViewer {
         }
     }
 
-    fn paint_video_control_icon(
-        painter: &egui::Painter,
-        rect: egui::Rect,
-        icon: VideoControlIcon,
-        color: egui::Color32,
-    ) {
-        let stroke = egui::Stroke::new(1.7, color);
-
-        match icon {
-            VideoControlIcon::Play => {
-                let left = rect.left() + 1.0;
-                let right = rect.right() - 1.0;
-                let top = rect.top() + 1.0;
-                let bottom = rect.bottom() - 1.0;
-                painter.add(egui::Shape::convex_polygon(
-                    vec![
-                        egui::pos2(left, top),
-                        egui::pos2(right, rect.center().y),
-                        egui::pos2(left, bottom),
-                    ],
-                    color,
-                    egui::Stroke::NONE,
-                ));
-            }
-            VideoControlIcon::Pause => {
-                let bar_width = 3.4;
-                let gap = 3.6;
-                let left_center = rect.center().x - (bar_width / 2.0 + gap / 2.0);
-                let right_center = rect.center().x + (bar_width / 2.0 + gap / 2.0);
-                for center_x in [left_center, right_center] {
-                    let bar_rect = egui::Rect::from_center_size(
-                        egui::pos2(center_x, rect.center().y),
-                        egui::vec2(bar_width, rect.height() - 2.0),
-                    );
-                    painter.rect_filled(bar_rect, 1.4, color);
-                }
-            }
-            VideoControlIcon::VolumeOn | VideoControlIcon::VolumeOff => {
-                let speaker = [
-                    egui::pos2(rect.left() + 1.0, rect.center().y - 2.6),
-                    egui::pos2(rect.left() + 4.0, rect.center().y - 2.6),
-                    egui::pos2(rect.center().x - 1.5, rect.top() + 1.0),
-                    egui::pos2(rect.center().x - 1.5, rect.bottom() - 1.0),
-                    egui::pos2(rect.left() + 4.0, rect.center().y + 2.6),
-                    egui::pos2(rect.left() + 1.0, rect.center().y + 2.6),
-                ];
-                painter.add(egui::Shape::convex_polygon(
-                    speaker.to_vec(),
-                    color,
-                    egui::Stroke::NONE,
-                ));
-
-                if icon == VideoControlIcon::VolumeOn {
-                    let wave_center = egui::pos2(rect.center().x + 1.0, rect.center().y);
-                    for radius in [3.6, 5.7] {
-                        painter.add(egui::Shape::line(
-                            vec![
-                                egui::pos2(wave_center.x + radius * 0.15, wave_center.y - radius * 0.7),
-                                egui::pos2(wave_center.x + radius * 0.55, wave_center.y - radius * 0.25),
-                                egui::pos2(wave_center.x + radius * 0.65, wave_center.y + radius * 0.25),
-                                egui::pos2(wave_center.x + radius * 0.25, wave_center.y + radius * 0.7),
-                            ],
-                            stroke,
-                        ));
-                    }
-                } else {
-                    painter.line_segment(
-                        [
-                            egui::pos2(rect.center().x + 1.0, rect.top() + 1.5),
-                            egui::pos2(rect.right() - 1.0, rect.bottom() - 1.5),
-                        ],
-                        stroke,
-                    );
-                    painter.line_segment(
-                        [
-                            egui::pos2(rect.right() - 1.0, rect.top() + 1.5),
-                            egui::pos2(rect.center().x + 1.0, rect.bottom() - 1.5),
-                        ],
-                        stroke,
-                    );
-                }
-            }
-            VideoControlIcon::Previous => {
-                let left = rect.left() + 1.0;
-                let right = rect.right() - 1.0;
-                let mid_x = rect.center().x + 1.0;
-                let top = rect.top() + 1.0;
-                let bottom = rect.bottom() - 1.0;
-                let center_y = rect.center().y;
-
-                painter.line_segment(
-                    [egui::pos2(right, top), egui::pos2(mid_x, center_y)],
-                    stroke,
-                );
-                painter.line_segment(
-                    [egui::pos2(right, bottom), egui::pos2(mid_x, center_y)],
-                    stroke,
-                );
-                painter.line_segment(
-                    [egui::pos2(mid_x, top), egui::pos2(left, center_y)],
-                    stroke,
-                );
-                painter.line_segment(
-                    [egui::pos2(mid_x, bottom), egui::pos2(left, center_y)],
-                    stroke,
-                );
-            }
-            VideoControlIcon::Next => {
-                let left = rect.left() + 1.0;
-                let right = rect.right() - 1.0;
-                let mid_x = rect.center().x - 1.0;
-                let top = rect.top() + 1.0;
-                let bottom = rect.bottom() - 1.0;
-                let center_y = rect.center().y;
-
-                painter.line_segment(
-                    [egui::pos2(left, top), egui::pos2(mid_x, center_y)],
-                    stroke,
-                );
-                painter.line_segment(
-                    [egui::pos2(left, bottom), egui::pos2(mid_x, center_y)],
-                    stroke,
-                );
-                painter.line_segment(
-                    [egui::pos2(mid_x, top), egui::pos2(right, center_y)],
-                    stroke,
-                );
-                painter.line_segment(
-                    [egui::pos2(mid_x, bottom), egui::pos2(right, center_y)],
-                    stroke,
-                );
-            }
-            VideoControlIcon::AudioTracks => {
-                let bar_width = 3.0;
-                let gap = 3.0;
-                let start_x = rect.center().x - (bar_width * 1.5 + gap);
-                let heights = [6.0, 11.0, 8.0];
-
-                for (idx, height) in heights.into_iter().enumerate() {
-                    let x = start_x + idx as f32 * (bar_width + gap);
-                    let bar_rect = egui::Rect::from_center_size(
-                        egui::pos2(x, rect.center().y),
-                        egui::vec2(bar_width, height),
-                    );
-                    painter.rect_filled(bar_rect, 1.5, color);
-                }
-            }
-            VideoControlIcon::SubtitleTracks => {
-                let frame = rect.shrink2(egui::vec2(1.5, 2.0));
-                painter.rect_stroke(frame, 3.0, stroke);
-
-                let first_line_y = frame.top() + 4.0;
-                let second_line_y = frame.bottom() - 4.0;
-                painter.line_segment(
-                    [
-                        egui::pos2(frame.left() + 3.0, first_line_y),
-                        egui::pos2(frame.right() - 3.0, first_line_y),
-                    ],
-                    stroke,
-                );
-                painter.line_segment(
-                    [
-                        egui::pos2(frame.left() + 5.0, second_line_y),
-                        egui::pos2(frame.right() - 5.0, second_line_y),
-                    ],
-                    stroke,
-                );
-            }
-        }
-    }
-
     fn video_control_icon_button(
         ui: &mut egui::Ui,
         icon: VideoControlIcon,
         tooltip: &str,
         label: Option<&str>,
-        active: bool,
+        _active: bool,
     ) -> egui::Response {
-        let label_galley = label.filter(|label| !label.is_empty()).map(|text| {
-            ui.painter().layout_no_wrap(
-                text.to_string(),
-                egui::FontId::proportional(11.0),
-                egui::Color32::from_rgba_unmultiplied(245, 245, 245, 220),
-            )
-        });
-        let size = egui::Vec2::new(
-            28.0 + label_galley.as_ref().map_or(0.0, |galley| galley.size().x + 12.0),
-            24.0,
-        );
-        let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+        let icon_text = match icon {
+            VideoControlIcon::Play => "\u{25B6}",
+            VideoControlIcon::Pause => "\u{23F8}",
+            VideoControlIcon::VolumeOn => "\u{1F50A}",
+            VideoControlIcon::VolumeOff => "\u{1F507}",
+            VideoControlIcon::Previous => "\u{23EE}",
+            VideoControlIcon::Next => "\u{23ED}",
+            VideoControlIcon::AudioTracks => "\u{1F3A7}",
+            VideoControlIcon::SubtitleTracks => "CC",
+        };
 
-        if ui.is_rect_visible(rect) {
-            let bg = if response.is_pointer_button_down_on() {
-                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 42)
-            } else if active {
-                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 30)
-            } else if response.hovered() {
-                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 24)
-            } else {
-                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 14)
-            };
-            let stroke_color = if active || response.hovered() {
-                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 42)
-            } else {
-                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 26)
-            };
-            let icon_color = if response.is_pointer_button_down_on() {
-                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 245)
-            } else {
-                egui::Color32::from_rgba_unmultiplied(245, 245, 245, 228)
-            };
+        let button_text = label
+            .filter(|text| !text.is_empty())
+            .map_or_else(|| icon_text.to_string(), |text| format!("{} {}", icon_text, text));
 
-            ui.painter().rect_filled(rect, 6.0, bg);
-            ui.painter()
-                .rect_stroke(rect.shrink(0.5), 6.0, egui::Stroke::new(1.0, stroke_color));
-
-            let icon_rect = egui::Rect::from_min_max(
-                egui::pos2(rect.left() + 7.0, rect.top() + 5.0),
-                egui::pos2(rect.left() + 19.0, rect.bottom() - 5.0),
-            );
-            Self::paint_video_control_icon(ui.painter(), icon_rect, icon, icon_color);
-
-            if let Some(galley) = label_galley {
-                let text_pos = egui::pos2(
-                    rect.left() + 24.0,
-                    rect.center().y - galley.size().y / 2.0,
-                );
-                ui.painter().galley(text_pos, galley, egui::Color32::WHITE);
-            }
-        }
-
-        response.on_hover_text(tooltip)
+        ui.add(egui::Button::new(button_text).min_size(egui::vec2(32.0, 24.0)))
+            .on_hover_text(tooltip)
     }
 
     fn draw_audio_track_popup(
