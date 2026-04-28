@@ -556,6 +556,12 @@ pub struct Config {
     pub video_prefer_hardware_decode: bool,
     /// Disable hardware decoders and force software decode path.
     pub video_disable_hardware_decode: bool,
+    /// Priority binding for previous video-file navigation while solo video playback is active.
+    pub video_priority_previous_file_binding: Option<InputBinding>,
+    /// Priority binding for next video-file navigation while solo video playback is active.
+    pub video_priority_next_file_binding: Option<InputBinding>,
+    /// Priority binding for play/pause while solo video playback mode is active.
+    pub video_priority_play_pause_binding: Option<InputBinding>,
 
     /// Startup window mode: `floating` (default) or `fullscreen`
     pub startup_window_mode: StartupWindowMode,
@@ -677,6 +683,9 @@ impl Config {
             video_seek_policy: VideoSeekPolicy::Adaptive,
             video_prefer_hardware_decode: true,
             video_disable_hardware_decode: false,
+            video_priority_previous_file_binding: Some(InputBinding::Key(egui::Key::PageUp)),
+            video_priority_next_file_binding: Some(InputBinding::Key(egui::Key::PageDown)),
+            video_priority_play_pause_binding: Some(InputBinding::Key(egui::Key::Space)),
             startup_window_mode: StartupWindowMode::Floating,
             single_instance: true,
             vsync: true,
@@ -1551,6 +1560,27 @@ impl Config {
                                 config.video_disable_hardware_decode = v;
                             }
                         }
+                        "priority_previous_file_binding"
+                        | "priority_prev_file_binding"
+                        | "priority_pageup_binding" => {
+                            if let Some(binding) = parse_optional_binding(value) {
+                                config.video_priority_previous_file_binding = binding;
+                            }
+                        }
+                        "priority_next_file_binding"
+                        | "priority_nxt_file_binding"
+                        | "priority_pagedown_binding" => {
+                            if let Some(binding) = parse_optional_binding(value) {
+                                config.video_priority_next_file_binding = binding;
+                            }
+                        }
+                        "priority_play_pause_binding"
+                        | "priority_pause_binding"
+                        | "priority_video_pause_binding" => {
+                            if let Some(binding) = parse_optional_binding(value) {
+                                config.video_priority_play_pause_binding = binding;
+                            }
+                        }
                         // Backwards-compat: legacy per-video hide delay now maps to the unified bottom overlay delay.
                         "controls_hide_delay" | "video_controls_hide_delay" => {
                             if let Ok(v) = value.parse::<f32>() {
@@ -1969,6 +1999,18 @@ impl Config {
             bool_to_ini(self.video_disable_hardware_decode).to_string(),
         );
         values.insert(
+            "priority_previous_file_binding",
+            optional_binding_to_string(self.video_priority_previous_file_binding.as_ref()),
+        );
+        values.insert(
+            "priority_next_file_binding",
+            optional_binding_to_string(self.video_priority_next_file_binding.as_ref()),
+        );
+        values.insert(
+            "priority_play_pause_binding",
+            optional_binding_to_string(self.video_priority_play_pause_binding.as_ref()),
+        );
+        values.insert(
             "muted_state",
             bool_to_ini(self.state_muted).to_string(),
         );
@@ -2233,6 +2275,12 @@ fn binding_to_string(binding: &InputBinding) -> String {
     }
 }
 
+fn optional_binding_to_string(binding: Option<&InputBinding>) -> String {
+    binding
+        .map(binding_to_string)
+        .unwrap_or_else(|| "none".to_string())
+}
+
 fn key_to_string(key: &egui::Key) -> String {
     format!("{:?}", key).to_lowercase()
 }
@@ -2315,6 +2363,18 @@ fn parse_bool(value: &str) -> Option<bool> {
         "0" | "false" | "no" | "n" | "off" => Some(false),
         _ => None,
     }
+}
+
+fn parse_optional_binding(value: &str) -> Option<Option<InputBinding>> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("none")
+        || value.eq_ignore_ascii_case("off")
+        || value.eq_ignore_ascii_case("disabled")
+    {
+        return Some(None);
+    }
+
+    parse_input_binding(value).map(Some)
 }
 
 fn parse_rgb_triplet(value: &str) -> Option<[u8; 3]> {

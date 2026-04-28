@@ -10919,6 +10919,69 @@ impl ImageViewer {
             .any(|binding| Self::mouse_binding_triggered(binding, input))
     }
 
+    fn solo_video_playback_mode_active(&self) -> bool {
+        !self.manga_mode
+            && matches!(self.current_media_type, Some(MediaType::Video))
+            && self.video_player.is_some()
+    }
+
+    fn solo_video_playing_active(&self) -> bool {
+        self.solo_video_playback_mode_active()
+            && self.video_player.as_ref().is_some_and(|player| player.is_playing())
+    }
+
+    fn try_handle_video_priority_shortcuts(&mut self, ctx: &egui::Context) -> bool {
+        if !self.solo_video_playback_mode_active() {
+            return false;
+        }
+
+        let video_playing = self.solo_video_playing_active();
+        let (prev_pressed, next_pressed, pause_pressed) = ctx.input(|input| {
+            let ctrl = input.modifiers.ctrl;
+            let shift = input.modifiers.shift;
+            let alt = input.modifiers.alt;
+
+            let prev_pressed = video_playing
+                && self
+                    .config
+                    .video_priority_previous_file_binding
+                    .as_ref()
+                    .is_some_and(|binding| {
+                        self.binding_triggered(binding, input, ctrl, shift, alt)
+                    });
+            let next_pressed = video_playing
+                && self
+                    .config
+                    .video_priority_next_file_binding
+                    .as_ref()
+                    .is_some_and(|binding| {
+                        self.binding_triggered(binding, input, ctrl, shift, alt)
+                    });
+            let pause_pressed = self
+                .config
+                .video_priority_play_pause_binding
+                .as_ref()
+                .is_some_and(|binding| self.binding_triggered(binding, input, ctrl, shift, alt));
+
+            (prev_pressed, next_pressed, pause_pressed)
+        });
+
+        if prev_pressed {
+            self.navigate_video_file(false);
+            return true;
+        }
+        if next_pressed {
+            self.navigate_video_file(true);
+            return true;
+        }
+        if pause_pressed {
+            self.try_toggle_solo_video_play_pause();
+            return true;
+        }
+
+        false
+    }
+
     fn binding_triggered(
         &self,
         binding: &InputBinding,
@@ -12588,6 +12651,50 @@ impl ImageViewer {
         } else {
             self.current_index + 1
         });
+        let path = self.image_list[self.current_index].clone();
+        self.load_image_retaining_visible_media(&path);
+    }
+
+    fn adjacent_video_index(&self, forward: bool) -> Option<usize> {
+        let len = self.image_list.len();
+        if len <= 1 {
+            return None;
+        }
+
+        for step in 1..len {
+            let candidate = if forward {
+                (self.current_index + step) % len
+            } else {
+                (self.current_index + len - (step % len)) % len
+            };
+
+            if self
+                .image_list
+                .get(candidate)
+                .is_some_and(|path| is_supported_video(path))
+            {
+                return Some(candidate);
+            }
+        }
+
+        None
+    }
+
+    fn navigate_video_file(&mut self, forward: bool) {
+        let Some(target_index) = self.adjacent_video_index(forward) else {
+            return;
+        };
+
+        if self.manga_mode && self.is_fullscreen {
+            self.set_current_index_clamped(target_index);
+            let scroll_to = self.manga_get_scroll_offset_for_index(target_index);
+            self.manga_scroll_target = scroll_to;
+            self.manga_update_preload_queue();
+            return;
+        }
+
+        self.save_current_fullscreen_view_state();
+        self.set_current_index_clamped(target_index);
         let path = self.image_list[self.current_index].clone();
         self.load_image_retaining_visible_media(&path);
     }
@@ -20729,6 +20836,10 @@ impl ImageViewer {
             return;
         }
 
+        if self.try_handle_video_priority_shortcuts(ctx) {
+            return;
+        }
+
         let screen_width = ctx.screen_rect().width();
         let space_pressed_for_mark = ctx.input(|input| input.key_pressed(egui::Key::Space));
 
@@ -22808,8 +22919,8 @@ impl ImageViewer {
 
         if let Some(navigation) = file_navigation_requested {
             match navigation {
-                VideoFileNavigation::Previous => self.prev_image(),
-                VideoFileNavigation::Next => self.next_image(),
+                VideoFileNavigation::Previous => self.navigate_video_file(false),
+                VideoFileNavigation::Next => self.navigate_video_file(true),
             }
         }
     }
@@ -23468,8 +23579,8 @@ impl ImageViewer {
 
         if let Some(navigation) = file_navigation_requested {
             match navigation {
-                VideoFileNavigation::Previous => self.prev_image(),
-                VideoFileNavigation::Next => self.next_image(),
+                VideoFileNavigation::Previous => self.navigate_video_file(false),
+                VideoFileNavigation::Next => self.navigate_video_file(true),
             }
         }
     }
