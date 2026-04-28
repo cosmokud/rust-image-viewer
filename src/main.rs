@@ -20237,6 +20237,11 @@ impl ImageViewer {
         if let Some(ref img) = self.image {
             Some(img.display_dimensions())
         } else if let Some(ref player) = self.video_player {
+            // During video-to-video handoff we can briefly have a new player but still render
+            // an older retained texture. Prefer texture dims first to avoid transient stretching.
+            if let Some(texture_dims) = self.video_texture_dims {
+                return Some(texture_dims);
+            }
             let dims = player.dimensions();
             if dims.0 > 0 && dims.1 > 0 {
                 Some(dims)
@@ -24640,19 +24645,16 @@ impl ImageViewer {
                 // Determine which texture to use and get dimensions
                 let (active_texture, display_dims) = if let Some(ref texture) = self.video_texture {
                     // Video mode (or video placeholder while the next video is loading)
-                    let dims = self
-                        .video_player
-                        .as_ref()
-                        .map(|p| p.dimensions())
-                        .unwrap_or((0, 0));
-
-                    if dims.0 > 0 && dims.1 > 0 {
-                        (Some(texture), Some(dims))
-                    } else {
-                        // Dimensions not ready yet (common right after switching videos).
-                        // Keep showing the last decoded frame to avoid a black flash.
-                        (Some(texture), self.video_texture_dims)
-                    }
+                    // Prefer current texture dimensions. This prevents temporary aspect
+                    // mismatch when a new player is ready before its first frame replaces
+                    // the retained previous texture.
+                    let dims = self.video_texture_dims.or_else(|| {
+                        self.video_player.as_ref().and_then(|p| {
+                            let dims = p.dimensions();
+                            (dims.0 > 0 && dims.1 > 0).then_some(dims)
+                        })
+                    });
+                    (Some(texture), dims)
                 } else if let Some(ref texture) = self.texture {
                     // Image mode
                     let dims = self
