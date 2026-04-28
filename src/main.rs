@@ -2125,6 +2125,11 @@ struct ImageViewer {
     solo_probe_coordinator: SoloProbeCoordinator,
     /// Active non-blocking media load (if any).
     pending_media_load: Option<PendingMediaLoad>,
+    /// One-shot flag: suppress auto-showing the bottom video controls
+    /// for the next solo video load request.
+    suppress_video_controls_for_next_video_load: bool,
+    /// Request id for which bottom video-controls auto-show is suppressed.
+    suppress_video_controls_for_request_id: Option<u64>,
     /// Monotonic request id for async manga-focused video startup.
     next_manga_video_load_request_id: u64,
     /// Latest-only coordinator for async manga-focused video startup.
@@ -2765,6 +2770,8 @@ impl Default for ImageViewer {
             media_load_coordinator: MediaLoadCoordinator::new(),
             solo_probe_coordinator: SoloProbeCoordinator::new(),
             pending_media_load: None,
+            suppress_video_controls_for_next_video_load: false,
+            suppress_video_controls_for_request_id: None,
             next_manga_video_load_request_id: 1,
             manga_video_load_coordinator: MangaFocusedVideoLoadCoordinator::new(),
             pending_manga_video_load: None,
@@ -10967,11 +10974,17 @@ impl ImageViewer {
         });
 
         if prev_pressed {
-            self.navigate_video_file(false);
+            if let Some(target_index) = self.adjacent_video_index(false) {
+                self.suppress_video_controls_for_next_video_load = true;
+                self.navigate_video_file_to_index(target_index);
+            }
             return true;
         }
         if next_pressed {
-            self.navigate_video_file(true);
+            if let Some(target_index) = self.adjacent_video_index(true) {
+                self.suppress_video_controls_for_next_video_load = true;
+                self.navigate_video_file_to_index(target_index);
+            }
             return true;
         }
         if pause_pressed {
@@ -12002,6 +12015,8 @@ impl ImageViewer {
 
     fn start_async_video_load(&mut self, path: PathBuf) {
         if !gstreamer_runtime_available() {
+            self.suppress_video_controls_for_next_video_load = false;
+            self.suppress_video_controls_for_request_id = None;
             self.pending_media_load = None;
             self.drop_retained_media_placeholder();
             self.set_video_playback_unavailable_for_path(
@@ -12013,6 +12028,13 @@ impl ImageViewer {
 
         let request_id = self.next_media_load_request_id;
         self.next_media_load_request_id = self.next_media_load_request_id.saturating_add(1).max(1);
+
+        if self.suppress_video_controls_for_next_video_load {
+            self.suppress_video_controls_for_request_id = Some(request_id);
+        } else {
+            self.suppress_video_controls_for_request_id = None;
+        }
+        self.suppress_video_controls_for_next_video_load = false;
 
         let muted = if self.config.video_muted_remember {
             self.config.state_muted
@@ -12150,40 +12172,52 @@ impl ImageViewer {
                         self.error_message = Some(err);
                     }
                 },
-                MediaLoadResult::Video { path, result, .. } => match result {
-                    Ok(player) => {
-                        let dims = player.dimensions();
-                        if dims.0 > 0 && dims.1 > 0 {
-                            store_cached_dimensions(&path, CachedMediaKind::Video, dims.0, dims.1);
+                MediaLoadResult::Video { path, result, .. } => {
+                    let suppress_controls_reveal =
+                        self.suppress_video_controls_for_request_id == Some(result_request_id);
+                    if suppress_controls_reveal {
+                        self.suppress_video_controls_for_request_id = None;
+                    }
+
+                    match result {
+                        Ok(player) => {
+                            let dims = player.dimensions();
+                            if dims.0 > 0 && dims.1 > 0 {
+                                store_cached_dimensions(&path, CachedMediaKind::Video, dims.0, dims.1);
+                            }
+
+                            self.video_player = Some(player);
+                            self.error_message = None;
+                            self.clear_video_playback_unavailable_state();
+                            if !suppress_controls_reveal {
+                                self.show_video_controls = true;
+                                self.touch_bottom_overlays();
+                            }
+
+                            if self.defer_media_view_reset {
+                                self.pending_media_layout = false;
+                            } else {
+                                self.retained_media_placeholder_visible = false;
+                                self.image_changed = true;
+                                self.pending_media_layout = true;
+                            }
                         }
-
-                        self.video_player = Some(player);
-                        self.error_message = None;
-                        self.clear_video_playback_unavailable_state();
-                        self.show_video_controls = true;
-                        self.touch_bottom_overlays();
-
-                        if self.defer_media_view_reset {
-                            self.pending_media_layout = false;
-                        } else {
-                            self.retained_media_placeholder_visible = false;
-                            self.image_changed = true;
-                            self.pending_media_layout = true;
+                        Err(err) => {
+                            if self.retained_media_placeholder_visible {
+                                self.drop_retained_media_placeholder();
+                            }
+                            self.error_message = None;
+                            self.set_video_playback_unavailable_for_path(
+                                &path,
+                                format!("Failed to load video: {}", err),
+                            );
+                            if !suppress_controls_reveal {
+                                self.show_video_controls = true;
+                                self.touch_bottom_overlays();
+                            }
                         }
                     }
-                    Err(err) => {
-                        if self.retained_media_placeholder_visible {
-                            self.drop_retained_media_placeholder();
-                        }
-                        self.error_message = None;
-                        self.set_video_playback_unavailable_for_path(
-                            &path,
-                            format!("Failed to load video: {}", err),
-                        );
-                        self.show_video_controls = true;
-                        self.touch_bottom_overlays();
-                    }
-                },
+                }
             }
 
             applied_any = true;
@@ -12684,6 +12718,18 @@ impl ImageViewer {
         let Some(target_index) = self.adjacent_video_index(forward) else {
             return;
         };
+
+        self.navigate_video_file_to_index(target_index);
+    }
+
+    fn navigate_video_file_to_index(&mut self, target_index: usize) {
+        if !self
+            .image_list
+            .get(target_index)
+            .is_some_and(|path| is_supported_video(path))
+        {
+            return;
+        }
 
         if self.manga_mode && self.is_fullscreen {
             self.set_current_index_clamped(target_index);
