@@ -7499,6 +7499,28 @@ impl ImageViewer {
         }
     }
 
+    fn short_language_button_tag(value: &str) -> Option<String> {
+        value
+            .split(|ch: char| !ch.is_ascii_alphabetic())
+            .filter(|token| !token.is_empty())
+            .find_map(|token| match token.to_ascii_lowercase().as_str() {
+                "ja" | "jp" | "jpn" | "japanese" => Some("JA".to_string()),
+                "en" | "eng" | "english" => Some("EN".to_string()),
+                "ko" | "kr" | "kor" | "korean" => Some("KR".to_string()),
+                "zh" | "zho" | "chi" | "chinese" => Some("ZH".to_string()),
+                "fr" | "fre" | "fra" | "french" => Some("FR".to_string()),
+                "de" | "ger" | "deu" | "german" => Some("DE".to_string()),
+                "es" | "spa" | "spanish" => Some("ES".to_string()),
+                "it" | "ita" | "italian" => Some("IT".to_string()),
+                "pt" | "por" | "portuguese" => Some("PT".to_string()),
+                "ru" | "rus" | "russian" => Some("RU".to_string()),
+                "th" | "tha" | "thai" => Some("TH".to_string()),
+                "vi" | "vie" | "vietnamese" => Some("VI".to_string()),
+                "id" | "ind" | "indonesian" => Some("ID".to_string()),
+                _ => None,
+            })
+    }
+
     fn current_audio_button_label(tracks: &[VideoTrackInfo], current_track: Option<i32>) -> String {
         current_track
             .and_then(|track_index| tracks.iter().find(|track| track.index == track_index))
@@ -7522,7 +7544,8 @@ impl ImageViewer {
                     .file_stem()
                     .map(|stem| stem.to_string_lossy().to_string())
                     .unwrap_or_else(|| "External".to_string());
-                Self::compact_video_track_button_label(&label)
+                Self::short_language_button_tag(&label)
+                    .unwrap_or_else(|| Self::compact_video_track_button_label(&label))
             }
         }
     }
