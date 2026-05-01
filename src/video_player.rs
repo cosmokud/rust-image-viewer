@@ -504,6 +504,19 @@ fn set_optional_i32_or_u32_property(element: &gst::Element, name: &str, value: i
     }
 }
 
+fn clear_optional_track_selection_property(element: &gst::Element, name: &str) {
+    if element.find_property(name).is_none() {
+        return;
+    }
+
+    let property = element.property_value(name);
+    if property.get::<i32>().is_ok() {
+        element.set_property(name, -1i32);
+    } else if property.get::<i64>().is_ok() {
+        element.set_property(name, -1i64);
+    }
+}
+
 fn get_playbin_flags(playbin: &gst::Element) -> Option<u64> {
     if playbin.find_property("flags").is_none() {
         return None;
@@ -1301,25 +1314,20 @@ Ensure your GStreamer installation includes the playback elements (usually from 
             return;
         };
 
-        let target = current_position.saturating_sub(Duration::from_millis(180));
+        let target = current_position.saturating_sub(Duration::from_millis(120));
         let flags = if self.is_playing {
-            gst::SeekFlags::FLUSH | gst::SeekFlags::SNAP_BEFORE
+            gst::SeekFlags::KEY_UNIT | gst::SeekFlags::SNAP_BEFORE
         } else {
             gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE
         };
 
-        self.state.begin_seek();
-        self.state.clear_frames();
-
-        let seek_result =
-            self.pipeline
-                .seek_simple(flags, Self::duration_to_clock_time(target));
+        let seek_result = self
+            .pipeline
+            .seek_simple(flags, Self::duration_to_clock_time(target));
 
         if seek_result.is_ok() && !self.is_playing {
             self.prime_post_seek_frame(VideoSeekMode::Accurate);
         }
-
-        self.state.end_seek();
     }
 
     fn seek_flags_for_mode(mode: VideoSeekMode) -> gst::SeekFlags {
@@ -1632,7 +1640,8 @@ Ensure your GStreamer installation includes the playback elements (usually from 
     pub fn set_audio_track(&mut self, index: i32) -> Result<(), String> {
         if index < 0 {
             self.audio_track_disabled = true;
-            set_optional_i32_or_u32_property(self.pipeline.upcast_ref(), "current-audio", -1);
+            self.apply_volume();
+            clear_optional_track_selection_property(self.pipeline.upcast_ref(), "current-audio");
             disable_playbin_flags(self.pipeline.upcast_ref(), PLAY_FLAG_AUDIO);
             let subtitle_stream_id = self.current_embedded_subtitle_stream_id();
             let _ = self.apply_playbin3_stream_selection(None, subtitle_stream_id.as_deref());
@@ -1641,6 +1650,7 @@ Ensure your GStreamer installation includes the playback elements (usually from 
         }
 
         self.audio_track_disabled = false;
+        self.apply_volume();
         enable_playbin_flags(self.pipeline.upcast_ref(), PLAY_FLAG_AUDIO);
         set_optional_i32_or_u32_property(self.pipeline.upcast_ref(), "current-audio", index);
         if let Some(track) = self.audio_tracks().into_iter().find(|track| track.index == index) {
@@ -1729,7 +1739,7 @@ Ensure your GStreamer installation includes the playback elements (usually from 
             VideoSubtitleSelection::Off => {
                 self.subtitle_track_disabled = true;
                 self.pipeline.set_property("suburi", Option::<String>::None);
-                set_optional_i32_or_u32_property(self.pipeline.upcast_ref(), "current-text", -1);
+                clear_optional_track_selection_property(self.pipeline.upcast_ref(), "current-text");
                 disable_playbin_flags(self.pipeline.upcast_ref(), PLAY_FLAG_TEXT);
                 let audio_stream_id = self.current_audio_stream_id();
                 let _ = self.apply_playbin3_stream_selection(audio_stream_id.as_deref(), None);
@@ -1764,7 +1774,7 @@ Ensure your GStreamer installation includes the playback elements (usually from 
 
                 self.subtitle_track_disabled = false;
                 enable_playbin_flags(self.pipeline.upcast_ref(), PLAY_FLAG_TEXT);
-                set_optional_i32_or_u32_property(self.pipeline.upcast_ref(), "current-text", -1);
+                clear_optional_track_selection_property(self.pipeline.upcast_ref(), "current-text");
                 self.pipeline.set_property("suburi", subtitle_uri.as_str());
                 let audio_stream_id = self.current_audio_stream_id();
                 let _ = self.apply_playbin3_stream_selection(audio_stream_id.as_deref(), None);
@@ -1797,7 +1807,11 @@ Ensure your GStreamer installation includes the playback elements (usually from 
     /// Apply volume settings to the pipeline
     fn apply_volume(&self) {
         if let Some(ref vol) = self.volume_element {
-            let effective_volume = if self.is_muted { 0.0 } else { self.volume };
+            let effective_volume = if self.is_muted || self.audio_track_disabled {
+                0.0
+            } else {
+                self.volume
+            };
             vol.set_property("volume", effective_volume);
         }
     }
