@@ -2350,6 +2350,10 @@ struct ImageViewer {
     seek_was_playing: bool,
     /// Whether user is dragging the volume slider
     is_volume_dragging: bool,
+    /// Deferred solo-video audio switch to reduce visible stutter on large files.
+    pending_solo_audio_track_switch: Option<(Instant, usize, i32)>,
+    /// Deferred manga-video audio switches keyed by image-list index.
+    pending_manga_audio_track_switches: HashMap<usize, (Instant, i32)>,
     // ============ RESIZE STATE FIELDS ============
     /// Initial window outer position when resize started (in screen coordinates)
     resize_start_outer_pos: Option<egui::Pos2>,
@@ -2840,6 +2844,8 @@ impl Default for ImageViewer {
             last_seek_sent_at: Instant::now(),
             seek_was_playing: false,
             is_volume_dragging: false,
+            pending_solo_audio_track_switch: None,
+            pending_manga_audio_track_switches: HashMap::new(),
             // Resize state fields
             resize_start_outer_pos: None,
             resize_start_inner_size: None,
@@ -3036,6 +3042,7 @@ impl ImageViewer {
     const MANGA_TEXTURE_UPGRADE_MIN_RATIO: f32 = 1.12;
     const MANGA_TEXTURE_UPGRADE_MASONRY_MIN_DELTA_SIDE: u32 = 96;
     const MANGA_TEXTURE_UPGRADE_MASONRY_MIN_RATIO: f32 = 1.24;
+    const AUDIO_TRACK_SWITCH_DELAY: Duration = Duration::from_millis(90);
     const MASONRY_QUALITY_REFINE_SETTLE_MS: u64 = 45;
     const MASONRY_QUALITY_REFINE_MAX_FRAMES: u8 = 12;
     const MANGA_TTV_SAMPLE_CAP: usize = 240;
@@ -7315,6 +7322,78 @@ impl ImageViewer {
         }
     }
 
+    fn queue_solo_audio_track_switch(&mut self, ctx: &egui::Context, track_index: i32) {
+        self.pending_solo_audio_track_switch =
+            Some((
+                Instant::now() + Self::AUDIO_TRACK_SWITCH_DELAY,
+                self.current_index,
+                track_index,
+            ));
+        ctx.request_repaint_after(Self::AUDIO_TRACK_SWITCH_DELAY);
+    }
+
+    fn queue_manga_audio_track_switch(
+        &mut self,
+        ctx: &egui::Context,
+        video_idx: usize,
+        track_index: i32,
+    ) {
+        self.pending_manga_audio_track_switches.insert(
+            video_idx,
+            (Instant::now() + Self::AUDIO_TRACK_SWITCH_DELAY, track_index),
+        );
+        ctx.request_repaint_after(Self::AUDIO_TRACK_SWITCH_DELAY);
+    }
+
+    fn poll_pending_audio_track_switches(&mut self, ctx: &egui::Context) {
+        let now = Instant::now();
+        let mut next_repaint_after: Option<Duration> = None;
+
+        match self.pending_solo_audio_track_switch {
+            Some((_, media_index, _)) if media_index != self.current_index => {
+                self.pending_solo_audio_track_switch = None;
+            }
+            Some((apply_at, _, track_index)) if now >= apply_at => {
+                self.pending_solo_audio_track_switch = None;
+                if let Some(player) = self.video_player.as_mut() {
+                    if let Err(err) = player.set_audio_track(track_index) {
+                        tracing::warn!("failed to switch audio track: {}", err);
+                    }
+                }
+            }
+            Some((apply_at, _, _)) => {
+                next_repaint_after = Some(apply_at.saturating_duration_since(now));
+            }
+            None => {}
+        }
+
+        let mut ready_manga_switches = Vec::new();
+        for (&video_idx, &(apply_at, track_index)) in &self.pending_manga_audio_track_switches {
+            if now >= apply_at {
+                ready_manga_switches.push((video_idx, track_index));
+            } else {
+                let remaining = apply_at.saturating_duration_since(now);
+                next_repaint_after = Some(match next_repaint_after {
+                    Some(current) => current.min(remaining),
+                    None => remaining,
+                });
+            }
+        }
+
+        for (video_idx, track_index) in ready_manga_switches {
+            self.pending_manga_audio_track_switches.remove(&video_idx);
+            if let Some(player) = self.manga_video_players.get_mut(&video_idx) {
+                if let Err(err) = player.set_audio_track(track_index) {
+                    tracing::warn!("failed to switch manga audio track: {}", err);
+                }
+            }
+        }
+
+        if let Some(delay) = next_repaint_after {
+            ctx.request_repaint_after(delay);
+        }
+    }
+
     fn solo_video_audio_popup_id() -> egui::Id {
         egui::Id::new("solo_video_audio_tracks_popup")
     }
@@ -8000,7 +8079,8 @@ impl ImageViewer {
             .map(|p| p.y > screen_rect.height() - bar_height)
             .unwrap_or(false);
 
-        self.mouse_over_video_controls = has_controllable_media && over_controls_bar;
+        self.mouse_over_video_controls =
+            has_controllable_media && (over_controls_bar || track_popup_active);
 
         let should_show = if has_controllable_media {
             hover_bottom
@@ -22674,7 +22754,8 @@ impl ImageViewer {
                 );
 
                 // Check if mouse is over this bar
-                self.mouse_over_video_controls = ui.rect_contains_pointer(bar_rect);
+                self.mouse_over_video_controls =
+                    self.mouse_over_video_controls || ui.rect_contains_pointer(bar_rect);
 
                 // Create inner rect with padding (more on bottom for visual breathing room)
                 let inner_rect = egui::Rect::from_min_max(
@@ -23155,11 +23236,7 @@ impl ImageViewer {
         }
 
         if let Some(selected_track) = audio_track_requested {
-            if let Some(player) = self.video_player.as_mut() {
-                if let Err(err) = player.set_audio_track(selected_track) {
-                    tracing::warn!("failed to switch audio track: {}", err);
-                }
-            }
+            self.queue_solo_audio_track_switch(ctx, selected_track);
         }
 
         if let Some(selection) = subtitle_selection_requested {
@@ -23408,7 +23485,8 @@ impl ImageViewer {
                     egui::Color32::from_rgba_unmultiplied(20, 20, 20, 230),
                 );
 
-                self.mouse_over_video_controls = ui.rect_contains_pointer(bar_rect);
+                self.mouse_over_video_controls =
+                    self.mouse_over_video_controls || ui.rect_contains_pointer(bar_rect);
 
                 let inner_rect = egui::Rect::from_min_max(
                     egui::pos2(bar_rect.min.x + 8.0, bar_rect.min.y + 6.0),
@@ -23815,11 +23893,7 @@ impl ImageViewer {
         }
 
         if let Some(selected_track) = audio_track_requested {
-            if let Some(player) = self.manga_video_players.get_mut(&video_idx) {
-                if let Err(err) = player.set_audio_track(selected_track) {
-                    tracing::warn!("failed to switch manga audio track: {}", err);
-                }
-            }
+            self.queue_manga_audio_track_switch(ctx, video_idx, selected_track);
         }
 
         if let Some(selection) = subtitle_selection_requested {
@@ -25005,6 +25079,7 @@ impl eframe::App for ImageViewer {
         if !(self.manga_mode && self.is_fullscreen) {
             self.poll_pending_manga_video_load(ctx);
         }
+        self.poll_pending_audio_track_switches(ctx);
         self.poll_pending_file_size_probe(ctx);
         self.ensure_current_file_size_label();
 

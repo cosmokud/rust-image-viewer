@@ -1309,27 +1309,6 @@ Ensure your GStreamer installation includes the playback elements (usually from 
         }
     }
 
-    fn refresh_subtitle_after_switch(&mut self) {
-        let Some(current_position) = self.position() else {
-            return;
-        };
-
-        let target = current_position.saturating_sub(Duration::from_millis(120));
-        let flags = if self.is_playing {
-            gst::SeekFlags::KEY_UNIT | gst::SeekFlags::SNAP_BEFORE
-        } else {
-            gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE
-        };
-
-        let seek_result = self
-            .pipeline
-            .seek_simple(flags, Self::duration_to_clock_time(target));
-
-        if seek_result.is_ok() && !self.is_playing {
-            self.prime_post_seek_frame(VideoSeekMode::Accurate);
-        }
-    }
-
     fn seek_flags_for_mode(mode: VideoSeekMode) -> gst::SeekFlags {
         match mode {
             VideoSeekMode::Accurate => gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
@@ -1638,13 +1617,17 @@ Ensure your GStreamer installation includes the playback elements (usually from 
     }
 
     pub fn set_audio_track(&mut self, index: i32) -> Result<(), String> {
+        let uses_legacy_selection = !self.legacy_audio_tracks().is_empty();
+
         if index < 0 {
             self.audio_track_disabled = true;
             self.apply_volume();
             clear_optional_track_selection_property(self.pipeline.upcast_ref(), "current-audio");
             disable_playbin_flags(self.pipeline.upcast_ref(), PLAY_FLAG_AUDIO);
-            let subtitle_stream_id = self.current_embedded_subtitle_stream_id();
-            let _ = self.apply_playbin3_stream_selection(None, subtitle_stream_id.as_deref());
+            if !uses_legacy_selection {
+                let subtitle_stream_id = self.current_embedded_subtitle_stream_id();
+                let _ = self.apply_playbin3_stream_selection(None, subtitle_stream_id.as_deref());
+            }
             self.suppress_buffering_pause_for_track_switch();
             return Ok(());
         }
@@ -1652,16 +1635,16 @@ Ensure your GStreamer installation includes the playback elements (usually from 
         self.audio_track_disabled = false;
         self.apply_volume();
         enable_playbin_flags(self.pipeline.upcast_ref(), PLAY_FLAG_AUDIO);
-        set_optional_i32_or_u32_property(self.pipeline.upcast_ref(), "current-audio", index);
-        if let Some(track) = self.audio_tracks().into_iter().find(|track| track.index == index) {
+        if uses_legacy_selection {
+            set_optional_i32_or_u32_property(self.pipeline.upcast_ref(), "current-audio", index);
+        } else if let Some(track) = self.audio_tracks().into_iter().find(|track| track.index == index)
+        {
             if let Some(stream_id) = track.stream_id {
                 let subtitle_stream_id = self.current_embedded_subtitle_stream_id();
-                if self.apply_playbin3_stream_selection(
+                self.apply_playbin3_stream_selection(
                     Some(stream_id.as_str()),
                     subtitle_stream_id.as_deref(),
-                )? {
-                    return Ok(());
-                }
+                )?;
             }
         }
 
@@ -1735,14 +1718,19 @@ Ensure your GStreamer installation includes the playback elements (usually from 
         &mut self,
         selection: VideoSubtitleSelection,
     ) -> Result<(), String> {
+        let uses_legacy_selection = !self.legacy_embedded_subtitle_tracks().is_empty();
+
         match &selection {
             VideoSubtitleSelection::Off => {
                 self.subtitle_track_disabled = true;
                 self.pipeline.set_property("suburi", Option::<String>::None);
-                clear_optional_track_selection_property(self.pipeline.upcast_ref(), "current-text");
                 disable_playbin_flags(self.pipeline.upcast_ref(), PLAY_FLAG_TEXT);
-                let audio_stream_id = self.current_audio_stream_id();
-                let _ = self.apply_playbin3_stream_selection(audio_stream_id.as_deref(), None);
+                if uses_legacy_selection {
+                    clear_optional_track_selection_property(self.pipeline.upcast_ref(), "current-text");
+                } else {
+                    let audio_stream_id = self.current_audio_stream_id();
+                    let _ = self.apply_playbin3_stream_selection(audio_stream_id.as_deref(), None);
+                }
             }
             VideoSubtitleSelection::Embedded(index) => {
                 if *index < 0 {
@@ -1752,15 +1740,16 @@ Ensure your GStreamer installation includes the playback elements (usually from 
                 self.subtitle_track_disabled = false;
                 enable_playbin_flags(self.pipeline.upcast_ref(), PLAY_FLAG_TEXT);
                 self.pipeline.set_property("suburi", Option::<String>::None);
-                set_optional_i32_or_u32_property(self.pipeline.upcast_ref(), "current-text", *index);
-                if let Some(track) = self
+                if uses_legacy_selection {
+                    set_optional_i32_or_u32_property(self.pipeline.upcast_ref(), "current-text", *index);
+                } else if let Some(track) = self
                     .embedded_subtitle_tracks()
                     .into_iter()
                     .find(|track| track.index == *index)
                 {
                     if let Some(stream_id) = track.stream_id {
                         let audio_stream_id = self.current_audio_stream_id();
-                        let _ = self.apply_playbin3_stream_selection(
+                        self.apply_playbin3_stream_selection(
                             audio_stream_id.as_deref(),
                             Some(stream_id.as_str()),
                         )?;
@@ -1774,16 +1763,18 @@ Ensure your GStreamer installation includes the playback elements (usually from 
 
                 self.subtitle_track_disabled = false;
                 enable_playbin_flags(self.pipeline.upcast_ref(), PLAY_FLAG_TEXT);
-                clear_optional_track_selection_property(self.pipeline.upcast_ref(), "current-text");
                 self.pipeline.set_property("suburi", subtitle_uri.as_str());
-                let audio_stream_id = self.current_audio_stream_id();
-                let _ = self.apply_playbin3_stream_selection(audio_stream_id.as_deref(), None);
+                if uses_legacy_selection {
+                    clear_optional_track_selection_property(self.pipeline.upcast_ref(), "current-text");
+                } else {
+                    let audio_stream_id = self.current_audio_stream_id();
+                    let _ = self.apply_playbin3_stream_selection(audio_stream_id.as_deref(), None);
+                }
             }
         }
 
         self.suppress_buffering_pause_for_track_switch();
         self.subtitle_selection = selection;
-        self.refresh_subtitle_after_switch();
         Ok(())
     }
 
