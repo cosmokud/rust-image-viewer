@@ -24562,15 +24562,27 @@ impl ImageViewer {
                 // Determine which texture to use and get dimensions
                 let (active_texture, display_dims) = if let Some(ref texture) = self.video_texture {
                     // Video mode (or video placeholder while the next video is loading)
-                    // Prefer current texture dimensions. This prevents temporary aspect
-                    // mismatch when a new player is ready before its first frame replaces
-                    // the retained previous texture.
-                    let dims = self.video_texture_dims.or_else(|| {
-                        self.video_player.as_ref().and_then(|p| {
-                            let dims = p.dimensions();
-                            (dims.0 > 0 && dims.1 > 0).then_some(dims)
+                    // Once the real player is active, size/center against the source dimensions
+                    // so high-resolution videos that are decoded to a smaller working texture
+                    // still fill their intended floating window without apparent black bars.
+                    // While we are still showing a retained placeholder, stick to the placeholder
+                    // texture dimensions so the temporary frame does not jump/stretch.
+                    let dims = if self.retained_media_placeholder_visible {
+                        self.video_texture_dims.or_else(|| {
+                            self.video_player.as_ref().and_then(|p| {
+                                let dims = p.dimensions();
+                                (dims.0 > 0 && dims.1 > 0).then_some(dims)
+                            })
                         })
-                    });
+                    } else {
+                        self.video_player
+                            .as_ref()
+                            .and_then(|p| {
+                                let dims = p.dimensions();
+                                (dims.0 > 0 && dims.1 > 0).then_some(dims)
+                            })
+                            .or(self.video_texture_dims)
+                    };
                     (Some(texture), dims)
                 } else if let Some(ref texture) = self.texture {
                     // Image mode
