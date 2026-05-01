@@ -7527,6 +7527,14 @@ impl ImageViewer {
         }
     }
 
+    fn popup_track_row_label(is_selected: bool, label: &str) -> String {
+        if is_selected {
+            format!("• {}", label)
+        } else {
+            format!("  {}", label)
+        }
+    }
+
     fn video_control_icon_arc_points(
         center: egui::Pos2,
         radius: f32,
@@ -7748,23 +7756,30 @@ impl ImageViewer {
             |ui| {
                 ui.set_min_width(240.0);
 
-                let off_row = ui.selectable_label(current_track.is_none(), "Off");
+                let off_selected = current_track.is_none();
+                let off_row = ui.selectable_label(
+                    off_selected,
+                    Self::popup_track_row_label(off_selected, "Off"),
+                );
                 if off_row.clicked() {
-                    selected_track = Some(-1);
+                    if !off_selected {
+                        selected_track = Some(-1);
+                    }
                     ui.memory_mut(|mem| mem.close_popup());
                 }
 
                 if !tracks.is_empty() {
                     ui.add_space(4.0);
                     for track in tracks {
-                        let row =
-                            ui.selectable_label(current_track == Some(track.index), &track.label);
+                        let is_selected = current_track == Some(track.index);
+                        let row = ui.selectable_label(
+                            is_selected,
+                            Self::popup_track_row_label(is_selected, &track.label),
+                        );
                         if row.clicked() {
-                            selected_track = Some(if current_track == Some(track.index) {
-                                -1
-                            } else {
-                                track.index
-                            });
+                            if !is_selected {
+                                selected_track = Some(track.index);
+                            }
                             ui.memory_mut(|mem| mem.close_popup());
                         }
                     }
@@ -7796,12 +7811,15 @@ impl ImageViewer {
             |ui| {
                 ui.set_min_width(260.0);
 
+                let off_selected = matches!(current_selection, VideoSubtitleSelection::Off);
                 let off_row = ui.selectable_label(
-                    matches!(current_selection, VideoSubtitleSelection::Off),
-                    "Off",
+                    off_selected,
+                    Self::popup_track_row_label(off_selected, "Off"),
                 );
                 if off_row.clicked() {
-                    selected_track = Some(VideoSubtitleSelection::Off);
+                    if !off_selected {
+                        selected_track = Some(VideoSubtitleSelection::Off);
+                    }
                     ui.memory_mut(|mem| mem.close_popup());
                 }
 
@@ -7817,13 +7835,16 @@ impl ImageViewer {
                             current_selection,
                             VideoSubtitleSelection::Embedded(index) if *index == track.index
                         );
-                        let row = ui.selectable_label(is_selected, &track.label);
+                        let row = ui.selectable_label(
+                            is_selected,
+                            Self::popup_track_row_label(is_selected, &track.label),
+                        );
                         if row.clicked() {
-                            selected_track = Some(if is_selected {
-                                VideoSubtitleSelection::Off
-                            } else {
-                                VideoSubtitleSelection::Embedded(track.index)
-                            });
+                            if !is_selected {
+                                selected_track = Some(
+                                    VideoSubtitleSelection::Embedded(track.index),
+                                );
+                            }
                             ui.memory_mut(|mem| mem.close_popup());
                         }
                     }
@@ -7841,13 +7862,15 @@ impl ImageViewer {
                             current_selection,
                             VideoSubtitleSelection::External(path) if path == &option.path
                         );
-                        let row = ui.selectable_label(is_selected, &option.label);
+                        let row = ui.selectable_label(
+                            is_selected,
+                            Self::popup_track_row_label(is_selected, &option.label),
+                        );
                         if row.clicked() {
-                            selected_track = Some(if is_selected {
-                                VideoSubtitleSelection::Off
-                            } else {
-                                VideoSubtitleSelection::External(option.path.clone())
-                            });
+                            if !is_selected {
+                                selected_track =
+                                    Some(VideoSubtitleSelection::External(option.path.clone()));
+                            }
                             ui.memory_mut(|mem| mem.close_popup());
                         }
                     }

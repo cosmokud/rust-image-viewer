@@ -723,6 +723,56 @@ where
     tags.get::<T>().map(|value| value.get().to_string())
 }
 
+fn short_language_tag(value: &str) -> Option<String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return None;
+    }
+
+    let primary = normalized
+        .split(['-', '_'])
+        .next()
+        .unwrap_or(normalized.as_str());
+
+    let tag = match primary {
+        "ja" | "jp" | "jpn" | "japanese" => "JA",
+        "en" | "eng" | "english" => "EN",
+        "ko" | "kr" | "kor" | "korean" => "KR",
+        "zh" | "zho" | "chi" | "chinese" => "ZH",
+        "fr" | "fre" | "fra" | "french" => "FR",
+        "de" | "ger" | "deu" | "german" => "DE",
+        "es" | "spa" | "spanish" => "ES",
+        "it" | "ita" | "italian" => "IT",
+        "pt" | "por" | "portuguese" => "PT",
+        "ru" | "rus" | "russian" => "RU",
+        "th" | "tha" | "thai" => "TH",
+        "vi" | "vie" | "vietnamese" => "VI",
+        "id" | "ind" | "indonesian" => "ID",
+        _ if primary.len() == 2 && primary.chars().all(|c| c.is_ascii_alphabetic()) => {
+            return Some(primary.to_ascii_uppercase());
+        }
+        _ if primary.len() == 3 && primary.chars().all(|c| c.is_ascii_alphabetic()) => {
+            return Some(primary.chars().take(2).collect::<String>().to_ascii_uppercase());
+        }
+        _ => return None,
+    };
+
+    Some(tag.to_string())
+}
+
+fn push_language_label_parts(parts: &mut Vec<String>, tags: &gst::TagList) {
+    push_unique_label_part(
+        parts,
+        tag_string_from_list::<gst::tags::LanguageCode>(tags)
+            .and_then(|value| short_language_tag(&value))
+            .or_else(|| {
+                tag_string_from_list::<gst::tags::LanguageName>(tags)
+                    .and_then(|value| short_language_tag(&value))
+            }),
+    );
+    push_unique_label_part(parts, tag_string_from_list::<gst::tags::LanguageName>(tags));
+}
+
 fn push_unique_label_part(parts: &mut Vec<String>, value: Option<String>) {
     let Some(value) = value.map(|v| v.trim().to_string()) else {
         return;
@@ -742,11 +792,7 @@ fn format_audio_track_label(index: i32, tags: Option<&gst::TagList>) -> String {
 
     if let Some(tags) = tags {
         push_unique_label_part(&mut parts, tag_string_from_list::<gst::tags::Title>(tags));
-        push_unique_label_part(
-            &mut parts,
-            tag_string_from_list::<gst::tags::LanguageName>(tags)
-                .or_else(|| tag_string_from_list::<gst::tags::LanguageCode>(tags)),
-        );
+        push_language_label_parts(&mut parts, tags);
         push_unique_label_part(
             &mut parts,
             tag_string_from_list::<gst::tags::AudioCodec>(tags)
@@ -762,11 +808,7 @@ fn format_subtitle_track_label(index: i32, tags: Option<&gst::TagList>) -> Strin
 
     if let Some(tags) = tags {
         push_unique_label_part(&mut parts, tag_string_from_list::<gst::tags::Title>(tags));
-        push_unique_label_part(
-            &mut parts,
-            tag_string_from_list::<gst::tags::LanguageName>(tags)
-                .or_else(|| tag_string_from_list::<gst::tags::LanguageCode>(tags)),
-        );
+        push_language_label_parts(&mut parts, tags);
         push_unique_label_part(
             &mut parts,
             tag_string_from_list::<gst::tags::SubtitleCodec>(tags)
@@ -877,6 +919,7 @@ pub struct VideoPlayer {
     duration: Option<Duration>,
     is_playing: bool,
     buffering_paused: bool,
+    buffering_pause_suppressed_until: Option<Instant>,
     is_muted: bool,
     volume: f64, // 0.0 to 1.0
     original_width: u32,
@@ -938,26 +981,26 @@ impl VideoPlayer {
             .to_string();
 
         // Create the pipeline.
-        // Some GStreamer distributions (especially minimal Windows runtimes) ship `playbin` but
-        // not `playbin3`. Prefer `playbin3` when available, but fall back to `playbin`.
-        let playbin = match gst::ElementFactory::make("playbin3")
+        // Prefer `playbin` first because its legacy track-selection properties are more stable
+        // with our current selector flow. Fall back to `playbin3` when it is the only option.
+        let playbin = match gst::ElementFactory::make("playbin")
             .name("playbin")
             .property("uri", &uri)
             .build()
         {
             Ok(p) => p,
-            Err(e_playbin3) => {
-                match gst::ElementFactory::make("playbin")
+            Err(e_playbin) => {
+                match gst::ElementFactory::make("playbin3")
                     .name("playbin")
                     .property("uri", &uri)
                     .build()
                 {
                     Ok(p) => p,
-                    Err(e_playbin) => {
+                    Err(e_playbin3) => {
                         return Err(format!(
-                            "Failed to create video pipeline. Tried `playbin3` ({}) and `playbin` ({}). \
+                            "Failed to create video pipeline. Tried `playbin` ({}) and `playbin3` ({}). \
 Ensure your GStreamer installation includes the playback elements (usually from gst-plugins-base).",
-                            e_playbin3, e_playbin
+                            e_playbin, e_playbin3
                         ));
                     }
                 }
@@ -1113,6 +1156,7 @@ Ensure your GStreamer installation includes the playback elements (usually from 
             duration: None,
             is_playing: false,
             buffering_paused: false,
+            buffering_pause_suppressed_until: None,
             is_muted: muted,
             volume: initial_volume.clamp(0.0, 1.0),
             original_width: source_dimensions.map_or(0, |(width, _)| width),
@@ -1148,6 +1192,7 @@ Ensure your GStreamer installation includes the playback elements (usually from 
         }
         self.is_playing = true;
         self.buffering_paused = false;
+        self.buffering_pause_suppressed_until = None;
 
         // Try to get duration after starting
         self.update_duration();
@@ -1206,6 +1251,7 @@ Ensure your GStreamer installation includes the playback elements (usually from 
             .map_err(|e| format!("Failed to pause playback: {}", e))?;
         self.is_playing = false;
         self.buffering_paused = false;
+        self.buffering_pause_suppressed_until = None;
         Ok(())
     }
 
@@ -1221,6 +1267,29 @@ Ensure your GStreamer installation includes the playback elements (usually from 
     /// Check if currently playing
     pub fn is_playing(&self) -> bool {
         self.is_playing
+    }
+
+    fn suppress_buffering_pause_for_track_switch(&mut self) {
+        if !self.is_playing {
+            return;
+        }
+
+        self.buffering_pause_suppressed_until = Some(Instant::now() + Duration::from_secs(1));
+        if self.buffering_paused {
+            let _ = self.pipeline.set_state(gst::State::Playing);
+            self.buffering_paused = false;
+        }
+    }
+
+    fn buffering_pause_suppressed(&mut self) -> bool {
+        match self.buffering_pause_suppressed_until {
+            Some(deadline) if Instant::now() < deadline => true,
+            Some(_) => {
+                self.buffering_pause_suppressed_until = None;
+                false
+            }
+            None => false,
+        }
     }
 
     fn seek_flags_for_mode(mode: VideoSeekMode) -> gst::SeekFlags {
@@ -1540,6 +1609,7 @@ Ensure your GStreamer installation includes the playback elements (usually from 
             disable_playbin_flags(self.pipeline.upcast_ref(), PLAY_FLAG_AUDIO);
             let subtitle_stream_id = self.current_embedded_subtitle_stream_id();
             let _ = self.apply_playbin3_stream_selection(None, subtitle_stream_id.as_deref());
+            self.suppress_buffering_pause_for_track_switch();
             return Ok(());
         }
 
@@ -1557,6 +1627,7 @@ Ensure your GStreamer installation includes the playback elements (usually from 
         }
 
         set_optional_i32_or_u32_property(self.pipeline.upcast_ref(), "current-audio", index);
+        self.suppress_buffering_pause_for_track_switch();
         Ok(())
     }
 
@@ -1685,6 +1756,7 @@ Ensure your GStreamer installation includes the playback elements (usually from 
             }
         }
 
+        self.suppress_buffering_pause_for_track_switch();
         self.subtitle_selection = selection;
         Ok(())
     }
@@ -1772,14 +1844,20 @@ Ensure your GStreamer installation includes the playback elements (usually from 
                     }
                     gst::MessageView::Buffering(buffering) => {
                         let percent = buffering.percent();
-                        if percent < 100 {
-                            if self.is_playing && !self.buffering_paused {
-                                let _ = self.pipeline.set_state(gst::State::Paused);
-                                self.buffering_paused = true;
+                        if percent >= 100 {
+                            self.buffering_pause_suppressed_until = None;
+                            if self.is_playing && self.buffering_paused {
+                                let _ = self.pipeline.set_state(gst::State::Playing);
+                                self.buffering_paused = false;
                             }
-                        } else if self.is_playing && self.buffering_paused {
-                            let _ = self.pipeline.set_state(gst::State::Playing);
-                            self.buffering_paused = false;
+                        } else if self.buffering_pause_suppressed() {
+                            if self.buffering_paused {
+                                let _ = self.pipeline.set_state(gst::State::Playing);
+                                self.buffering_paused = false;
+                            }
+                        } else if self.is_playing && !self.buffering_paused {
+                            let _ = self.pipeline.set_state(gst::State::Paused);
+                            self.buffering_paused = true;
                         }
                     }
                     _ => {}
