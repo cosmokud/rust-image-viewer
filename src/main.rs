@@ -7527,13 +7527,190 @@ impl ImageViewer {
         }
     }
 
+    fn video_control_icon_arc_points(
+        center: egui::Pos2,
+        radius: f32,
+        start_angle: f32,
+        end_angle: f32,
+        steps: usize,
+    ) -> Vec<egui::Pos2> {
+        let steps = steps.max(1);
+        (0..=steps)
+            .map(|step| {
+                let t = step as f32 / steps as f32;
+                let angle = start_angle + (end_angle - start_angle) * t;
+                egui::pos2(
+                    center.x + radius * angle.cos(),
+                    center.y + radius * angle.sin(),
+                )
+            })
+            .collect()
+    }
+
+    fn draw_video_track_button_icon(
+        painter: &egui::Painter,
+        icon: VideoControlIcon,
+        rect: egui::Rect,
+        color: egui::Color32,
+    ) {
+        match icon {
+            VideoControlIcon::AudioTracks => {
+                let speaker_points = vec![
+                    egui::pos2(rect.left() + 1.0, rect.center().y - 2.6),
+                    egui::pos2(rect.left() + 5.2, rect.center().y - 2.6),
+                    egui::pos2(rect.center().x - 1.4, rect.center().y - 5.2),
+                    egui::pos2(rect.center().x - 1.4, rect.center().y + 5.2),
+                    egui::pos2(rect.left() + 5.2, rect.center().y + 2.6),
+                    egui::pos2(rect.left() + 1.0, rect.center().y + 2.6),
+                ];
+                painter.add(egui::Shape::convex_polygon(
+                    speaker_points,
+                    color,
+                    egui::Stroke::NONE,
+                ));
+
+                let stroke = egui::Stroke::new(1.5, color);
+                let wave_center = egui::pos2(rect.center().x + 0.8, rect.center().y);
+                for radius in [3.0, 5.3] {
+                    painter.add(egui::epaint::PathShape::line(
+                        Self::video_control_icon_arc_points(
+                            wave_center,
+                            radius,
+                            -0.95,
+                            0.95,
+                            12,
+                        ),
+                        stroke,
+                    ));
+                }
+            }
+            VideoControlIcon::SubtitleTracks => {
+                let bubble_rect = egui::Rect::from_center_size(
+                    rect.center() + egui::vec2(0.0, -1.0),
+                    egui::vec2(rect.width() - 2.0, rect.height() - 5.0),
+                );
+                let stroke = egui::Stroke::new(1.4, color);
+                painter.rect_stroke(bubble_rect, 4.0, stroke);
+
+                let tail_tip = egui::pos2(bubble_rect.left() + 5.0, bubble_rect.bottom() + 3.0);
+                painter.line_segment(
+                    [
+                        egui::pos2(bubble_rect.left() + 6.5, bubble_rect.bottom() - 0.4),
+                        tail_tip,
+                    ],
+                    stroke,
+                );
+                painter.line_segment(
+                    [
+                        tail_tip,
+                        egui::pos2(bubble_rect.left() + 11.2, bubble_rect.bottom() - 0.4),
+                    ],
+                    stroke,
+                );
+
+                let line_one_y = bubble_rect.center().y - 2.5;
+                let line_two_y = bubble_rect.center().y + 1.4;
+                painter.line_segment(
+                    [
+                        egui::pos2(bubble_rect.left() + 4.0, line_one_y),
+                        egui::pos2(bubble_rect.right() - 4.0, line_one_y),
+                    ],
+                    stroke,
+                );
+                painter.line_segment(
+                    [
+                        egui::pos2(bubble_rect.left() + 4.0, line_two_y),
+                        egui::pos2(bubble_rect.right() - 7.0, line_two_y),
+                    ],
+                    stroke,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    fn video_control_vector_icon_button(
+        ui: &mut egui::Ui,
+        icon: VideoControlIcon,
+        tooltip: &str,
+        label: Option<&str>,
+        active: bool,
+    ) -> egui::Response {
+        let label_text = label.filter(|text| !text.is_empty()).unwrap_or("");
+        let font_id = egui::TextStyle::Button.resolve(ui.style());
+        let label_galley = (!label_text.is_empty()).then(|| {
+            ui.painter().layout_no_wrap(
+                label_text.to_string(),
+                font_id.clone(),
+                egui::Color32::WHITE,
+            )
+        });
+        let label_size = label_galley
+            .as_ref()
+            .map(|galley| galley.rect.size())
+            .unwrap_or(egui::Vec2::ZERO);
+        let icon_size = egui::vec2(18.0, 18.0);
+        let gap = if label_galley.is_some() { 6.0 } else { 0.0 };
+        let padding = ui.spacing().button_padding;
+        let min_size = ui.spacing().interact_size;
+        let desired_size = egui::vec2(
+            (icon_size.x + gap + label_size.x + padding.x * 2.0)
+                .max(32.0)
+                .max(min_size.x),
+            (icon_size.y.max(label_size.y) + padding.y * 2.0)
+                .max(24.0)
+                .max(min_size.y),
+        );
+
+        let (rect, response) = ui.allocate_exact_size(desired_size, egui::Sense::click());
+        let visuals = if !ui.is_enabled() {
+            &ui.visuals().widgets.noninteractive
+        } else if response.is_pointer_button_down_on() || active {
+            &ui.visuals().widgets.active
+        } else if response.hovered() {
+            &ui.visuals().widgets.hovered
+        } else {
+            &ui.visuals().widgets.inactive
+        };
+
+        let painter = ui.painter();
+        painter.rect_filled(rect, visuals.rounding, visuals.bg_fill);
+        painter.rect_stroke(rect, visuals.rounding, visuals.bg_stroke);
+
+        let content_width = icon_size.x + gap + label_size.x;
+        let content_start_x = rect.center().x - content_width * 0.5;
+        let icon_rect = egui::Rect::from_min_size(
+            egui::pos2(content_start_x, rect.center().y - icon_size.y * 0.5),
+            icon_size,
+        );
+        let text_color = visuals.fg_stroke.color;
+        Self::draw_video_track_button_icon(painter, icon, icon_rect, text_color);
+
+        if let Some(label_galley) = label_galley {
+            let text_pos = egui::pos2(
+                icon_rect.right() + gap,
+                rect.center().y - label_galley.rect.height() * 0.5,
+            );
+            painter.galley(text_pos, label_galley, text_color);
+        }
+
+        response.on_hover_text(tooltip)
+    }
+
     fn video_control_icon_button(
         ui: &mut egui::Ui,
         icon: VideoControlIcon,
         tooltip: &str,
         label: Option<&str>,
-        _active: bool,
+        active: bool,
     ) -> egui::Response {
+        if matches!(
+            icon,
+            VideoControlIcon::AudioTracks | VideoControlIcon::SubtitleTracks
+        ) {
+            return Self::video_control_vector_icon_button(ui, icon, tooltip, label, active);
+        }
+
         let icon_text = match icon {
             VideoControlIcon::Play => "\u{25B6}",
             VideoControlIcon::Pause => "\u{23F8}",
@@ -7541,8 +7718,7 @@ impl ImageViewer {
             VideoControlIcon::VolumeOff => "\u{1F507}",
             VideoControlIcon::Previous => "\u{23EE}",
             VideoControlIcon::Next => "\u{23ED}",
-            VideoControlIcon::AudioTracks => "\u{1F3A7}",
-            VideoControlIcon::SubtitleTracks => "CC",
+            VideoControlIcon::AudioTracks | VideoControlIcon::SubtitleTracks => "",
         };
 
         let button_text = label.filter(|text| !text.is_empty()).map_or_else(
@@ -7572,18 +7748,13 @@ impl ImageViewer {
             |ui| {
                 ui.set_min_width(240.0);
 
-                if tracks.is_empty() {
-                    ui.label(
-                        egui::RichText::new("No alternate audio tracks")
-                            .color(egui::Color32::from_gray(160)),
-                    );
-                } else {
-                    let off_row = ui.selectable_label(current_track.is_none(), "Off");
-                    if off_row.clicked() {
-                        selected_track = Some(-1);
-                        ui.memory_mut(|mem| mem.close_popup());
-                    }
+                let off_row = ui.selectable_label(current_track.is_none(), "Off");
+                if off_row.clicked() {
+                    selected_track = Some(-1);
+                    ui.memory_mut(|mem| mem.close_popup());
+                }
 
+                if !tracks.is_empty() {
                     ui.add_space(4.0);
                     for track in tracks {
                         let row =

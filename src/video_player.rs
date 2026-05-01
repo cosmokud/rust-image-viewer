@@ -310,6 +310,7 @@ pub enum VideoSeekMode {
 pub struct VideoTrackInfo {
     pub index: i32,
     pub label: String,
+    stream_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -776,6 +777,34 @@ fn format_subtitle_track_label(index: i32, tags: Option<&gst::TagList>) -> Strin
     parts.join(" / ")
 }
 
+fn track_infos_from_stream_collection(
+    collection: &gst::StreamCollection,
+    stream_type: gst::StreamType,
+    label_builder: fn(i32, Option<&gst::TagList>) -> String,
+) -> Vec<VideoTrackInfo> {
+    let mut tracks = Vec::new();
+
+    for stream in collection {
+        if !stream.stream_type().contains(stream_type) {
+            continue;
+        }
+
+        let Some(stream_id) = stream.stream_id().map(|id| id.to_string()) else {
+            continue;
+        };
+
+        let index = tracks.len() as i32;
+        let tags = stream.tags();
+        tracks.push(VideoTrackInfo {
+            index,
+            label: label_builder(index, tags.as_ref()),
+            stream_id: Some(stream_id),
+        });
+    }
+
+    tracks
+}
+
 fn process_video_sample(sample: gst::Sample, state: &VideoState) {
     let Some(buffer) = sample.buffer() else {
         return;
@@ -853,6 +882,8 @@ pub struct VideoPlayer {
     original_width: u32,
     original_height: u32,
     subtitle_selection: VideoSubtitleSelection,
+    stream_collection: Option<gst::StreamCollection>,
+    selected_stream_ids: Vec<String>,
 }
 
 impl VideoPlayer {
@@ -1087,6 +1118,8 @@ Ensure your GStreamer installation includes the playback elements (usually from 
             original_width: source_dimensions.map_or(0, |(width, _)| width),
             original_height: source_dimensions.map_or(0, |(_, height)| height),
             subtitle_selection: VideoSubtitleSelection::Off,
+            stream_collection: None,
+            selected_stream_ids: Vec::new(),
         };
 
         let mut player = player;
@@ -1103,15 +1136,16 @@ Ensure your GStreamer installation includes the playback elements (usually from 
 
     /// Start playback
     pub fn play(&mut self) -> Result<(), String> {
-        self.pipeline.set_state(gst::State::Playing).map_err(|e| {
+        if let Err(err) = self.pipeline.set_state(gst::State::Playing) {
             // State-change errors are often just a symptom. Try to extract the *real* reason
             // from the bus (missing demuxer/decoder, invalid URI, missing device/sink, etc.).
             let details = self.drain_bus_error_string();
-            match details {
-                Some(d) => format!("Failed to start playback: {} ({})", e, d),
-                None => format!("Failed to start playback: {}", e),
-            }
-        })?;
+            let message = match details {
+                Some(d) => format!("Failed to start playback: {} ({})", err, d),
+                None => format!("Failed to start playback: {}", err),
+            };
+            return Err(message);
+        }
         self.is_playing = true;
         self.buffering_paused = false;
 
@@ -1121,7 +1155,7 @@ Ensure your GStreamer installation includes the playback elements (usually from 
         Ok(())
     }
 
-    fn drain_bus_error_string(&self) -> Option<String> {
+    fn drain_bus_error_string(&mut self) -> Option<String> {
         let bus = self.pipeline.bus()?;
         let mut last_warning: Option<String> = None;
 
@@ -1132,6 +1166,17 @@ Ensure your GStreamer installation includes the playback elements (usually from 
                 break;
             };
             match msg.view() {
+                gst::MessageView::StreamCollection(collection) => {
+                    self.stream_collection = Some(collection.stream_collection());
+                }
+                gst::MessageView::StreamsSelected(selected) => {
+                    self.stream_collection = Some(selected.stream_collection());
+                    self.selected_stream_ids = selected
+                        .streams()
+                        .into_iter()
+                        .filter_map(|stream| stream.stream_id().map(|id| id.to_string()))
+                        .collect();
+                }
                 gst::MessageView::Error(err) => {
                     let debug = err.debug().unwrap_or_else(|| gst::glib::GString::from(""));
                     if debug.is_empty() {
@@ -1323,12 +1368,7 @@ Ensure your GStreamer installation includes the playback elements (usually from 
         self.volume
     }
 
-    pub fn audio_enabled(&self) -> bool {
-        get_playbin_flags(self.pipeline.upcast_ref())
-            .is_some_and(|flags| (flags & PLAY_FLAG_AUDIO) != 0)
-    }
-
-    pub fn audio_tracks(&self) -> Vec<VideoTrackInfo> {
+    fn legacy_audio_tracks(&self) -> Vec<VideoTrackInfo> {
         let Some(track_count) =
             get_optional_i32_or_u32_property(self.pipeline.upcast_ref(), "n-audio")
         else {
@@ -1343,40 +1383,13 @@ Ensure your GStreamer installation includes the playback elements (usually from 
             tracks.push(VideoTrackInfo {
                 index,
                 label: format_audio_track_label(index, tags.as_ref()),
+                stream_id: None,
             });
         }
         tracks
     }
 
-    pub fn current_audio_track_index(&self) -> Option<i32> {
-        if !self.audio_enabled() {
-            return None;
-        }
-
-        let current_index =
-            get_optional_i32_or_u32_property(self.pipeline.upcast_ref(), "current-audio")
-                .unwrap_or(-1);
-        if current_index >= 0 {
-            return Some(current_index);
-        }
-
-        let track_count =
-            get_optional_i32_or_u32_property(self.pipeline.upcast_ref(), "n-audio").unwrap_or(0);
-        (track_count > 0).then_some(0)
-    }
-
-    pub fn set_audio_track(&mut self, index: i32) -> Result<(), String> {
-        if index < 0 {
-            disable_playbin_flags(self.pipeline.upcast_ref(), PLAY_FLAG_AUDIO);
-            return Ok(());
-        }
-
-        enable_playbin_flags(self.pipeline.upcast_ref(), PLAY_FLAG_AUDIO);
-        set_optional_i32_or_u32_property(self.pipeline.upcast_ref(), "current-audio", index);
-        Ok(())
-    }
-
-    pub fn embedded_subtitle_tracks(&self) -> Vec<VideoTrackInfo> {
+    fn legacy_embedded_subtitle_tracks(&self) -> Vec<VideoTrackInfo> {
         let Some(track_count) =
             get_optional_i32_or_u32_property(self.pipeline.upcast_ref(), "n-text")
         else {
@@ -1391,9 +1404,178 @@ Ensure your GStreamer installation includes the playback elements (usually from 
             tracks.push(VideoTrackInfo {
                 index,
                 label: format_subtitle_track_label(index, tags.as_ref()),
+                stream_id: None,
             });
         }
         tracks
+    }
+
+    fn selected_stream_id_for_tracks(&self, tracks: &[VideoTrackInfo]) -> Option<String> {
+        tracks.iter().find_map(|track| {
+            let stream_id = track.stream_id.as_ref()?;
+            self.selected_stream_ids
+                .iter()
+                .any(|selected| selected == stream_id)
+                .then(|| stream_id.clone())
+        })
+    }
+
+    fn current_audio_stream_id(&self) -> Option<String> {
+        let current_index = self.current_audio_track_index()?;
+        self.audio_tracks()
+            .into_iter()
+            .find(|track| track.index == current_index)
+            .and_then(|track| track.stream_id)
+    }
+
+    fn current_embedded_subtitle_stream_id(&self) -> Option<String> {
+        let VideoSubtitleSelection::Embedded(current_index) = self.current_subtitle_selection()
+        else {
+            return None;
+        };
+        self.embedded_subtitle_tracks()
+            .into_iter()
+            .find(|track| track.index == current_index)
+            .and_then(|track| track.stream_id)
+    }
+
+    fn apply_playbin3_stream_selection(
+        &mut self,
+        audio_stream_id: Option<&str>,
+        subtitle_stream_id: Option<&str>,
+    ) -> Result<bool, String> {
+        if self.selected_stream_ids.is_empty() {
+            return Ok(false);
+        }
+
+        let audio_tracks = self.audio_tracks();
+        let subtitle_tracks = self.embedded_subtitle_tracks();
+        let mut desired_stream_ids = self.selected_stream_ids.clone();
+        desired_stream_ids.retain(|stream_id| {
+            !audio_tracks
+                .iter()
+                .any(|track| track.stream_id.as_deref() == Some(stream_id.as_str()))
+                && !subtitle_tracks
+                    .iter()
+                    .any(|track| track.stream_id.as_deref() == Some(stream_id.as_str()))
+        });
+
+        if let Some(stream_id) = audio_stream_id {
+            desired_stream_ids.push(stream_id.to_string());
+        }
+        if let Some(stream_id) = subtitle_stream_id {
+            desired_stream_ids.push(stream_id.to_string());
+        }
+
+        if desired_stream_ids.is_empty() {
+            return Ok(false);
+        }
+
+        let desired_stream_refs: Vec<&str> =
+            desired_stream_ids.iter().map(String::as_str).collect();
+        if !self
+            .pipeline
+            .send_event(gst::event::SelectStreams::new(&desired_stream_refs))
+        {
+            return Err("Failed to select video streams".to_string());
+        }
+
+        self.selected_stream_ids = desired_stream_ids;
+        Ok(true)
+    }
+
+    pub fn audio_enabled(&self) -> bool {
+        get_playbin_flags(self.pipeline.upcast_ref())
+            .is_some_and(|flags| (flags & PLAY_FLAG_AUDIO) != 0)
+    }
+
+    pub fn audio_tracks(&self) -> Vec<VideoTrackInfo> {
+        let legacy_tracks = self.legacy_audio_tracks();
+        if !legacy_tracks.is_empty() {
+            legacy_tracks
+        } else {
+            self.stream_collection
+                .as_ref()
+                .map(|collection| {
+                    track_infos_from_stream_collection(
+                        collection,
+                        gst::StreamType::AUDIO,
+                        format_audio_track_label,
+                    )
+                })
+                .unwrap_or_default()
+        }
+    }
+
+    pub fn current_audio_track_index(&self) -> Option<i32> {
+        if !self.audio_enabled() {
+            return None;
+        }
+
+        let legacy_tracks = self.legacy_audio_tracks();
+        if !legacy_tracks.is_empty() {
+            let current_index =
+                get_optional_i32_or_u32_property(self.pipeline.upcast_ref(), "current-audio")
+                    .unwrap_or(-1);
+            if current_index >= 0 {
+                return Some(current_index);
+            }
+
+            return legacy_tracks.first().map(|track| track.index);
+        }
+
+        let tracks = self.audio_tracks();
+        if let Some(selected_stream_id) = self.selected_stream_id_for_tracks(&tracks) {
+            return tracks
+                .iter()
+                .find(|track| track.stream_id.as_deref() == Some(selected_stream_id.as_str()))
+                .map(|track| track.index);
+        }
+
+        tracks.first().map(|track| track.index)
+    }
+
+    pub fn set_audio_track(&mut self, index: i32) -> Result<(), String> {
+        if index < 0 {
+            disable_playbin_flags(self.pipeline.upcast_ref(), PLAY_FLAG_AUDIO);
+            let subtitle_stream_id = self.current_embedded_subtitle_stream_id();
+            let _ = self.apply_playbin3_stream_selection(None, subtitle_stream_id.as_deref());
+            return Ok(());
+        }
+
+        enable_playbin_flags(self.pipeline.upcast_ref(), PLAY_FLAG_AUDIO);
+        if let Some(track) = self.audio_tracks().into_iter().find(|track| track.index == index) {
+            if let Some(stream_id) = track.stream_id {
+                let subtitle_stream_id = self.current_embedded_subtitle_stream_id();
+                if self.apply_playbin3_stream_selection(
+                    Some(stream_id.as_str()),
+                    subtitle_stream_id.as_deref(),
+                )? {
+                    return Ok(());
+                }
+            }
+        }
+
+        set_optional_i32_or_u32_property(self.pipeline.upcast_ref(), "current-audio", index);
+        Ok(())
+    }
+
+    pub fn embedded_subtitle_tracks(&self) -> Vec<VideoTrackInfo> {
+        let legacy_tracks = self.legacy_embedded_subtitle_tracks();
+        if !legacy_tracks.is_empty() {
+            legacy_tracks
+        } else {
+            self.stream_collection
+                .as_ref()
+                .map(|collection| {
+                    track_infos_from_stream_collection(
+                        collection,
+                        gst::StreamType::TEXT,
+                        format_subtitle_track_label,
+                    )
+                })
+                .unwrap_or_default()
+        }
     }
 
     pub fn subtitles_enabled(&self) -> bool {
@@ -1402,16 +1584,27 @@ Ensure your GStreamer installation includes the playback elements (usually from 
     }
 
     fn current_embedded_subtitle_track_index(&self) -> Option<i32> {
-        let current_index =
-            get_optional_i32_or_u32_property(self.pipeline.upcast_ref(), "current-text")
-                .unwrap_or(-1);
-        if current_index >= 0 {
-            return Some(current_index);
+        let legacy_tracks = self.legacy_embedded_subtitle_tracks();
+        if !legacy_tracks.is_empty() {
+            let current_index =
+                get_optional_i32_or_u32_property(self.pipeline.upcast_ref(), "current-text")
+                    .unwrap_or(-1);
+            if current_index >= 0 {
+                return Some(current_index);
+            }
+
+            return legacy_tracks.first().map(|track| track.index);
         }
 
-        let track_count =
-            get_optional_i32_or_u32_property(self.pipeline.upcast_ref(), "n-text").unwrap_or(0);
-        (track_count > 0).then_some(0)
+        let tracks = self.embedded_subtitle_tracks();
+        if let Some(selected_stream_id) = self.selected_stream_id_for_tracks(&tracks) {
+            return tracks
+                .iter()
+                .find(|track| track.stream_id.as_deref() == Some(selected_stream_id.as_str()))
+                .map(|track| track.index);
+        }
+
+        tracks.first().map(|track| track.index)
     }
 
     pub fn current_subtitle_selection(&self) -> VideoSubtitleSelection {
@@ -1438,6 +1631,8 @@ Ensure your GStreamer installation includes the playback elements (usually from 
             VideoSubtitleSelection::Off => {
                 self.pipeline.set_property("suburi", Option::<String>::None);
                 disable_playbin_flags(self.pipeline.upcast_ref(), PLAY_FLAG_TEXT);
+                let audio_stream_id = self.current_audio_stream_id();
+                let _ = self.apply_playbin3_stream_selection(audio_stream_id.as_deref(), None);
             }
             VideoSubtitleSelection::Embedded(index) => {
                 if *index < 0 {
@@ -1446,11 +1641,37 @@ Ensure your GStreamer installation includes the playback elements (usually from 
 
                 enable_playbin_flags(self.pipeline.upcast_ref(), PLAY_FLAG_TEXT);
                 self.pipeline.set_property("suburi", Option::<String>::None);
-                set_optional_i32_or_u32_property(
-                    self.pipeline.upcast_ref(),
-                    "current-text",
-                    *index,
-                );
+                if let Some(track) = self
+                    .embedded_subtitle_tracks()
+                    .into_iter()
+                    .find(|track| track.index == *index)
+                {
+                    if let Some(stream_id) = track.stream_id {
+                        let audio_stream_id = self.current_audio_stream_id();
+                        if !self.apply_playbin3_stream_selection(
+                            audio_stream_id.as_deref(),
+                            Some(stream_id.as_str()),
+                        )? {
+                            set_optional_i32_or_u32_property(
+                                self.pipeline.upcast_ref(),
+                                "current-text",
+                                *index,
+                            );
+                        }
+                    } else {
+                        set_optional_i32_or_u32_property(
+                            self.pipeline.upcast_ref(),
+                            "current-text",
+                            *index,
+                        );
+                    }
+                } else {
+                    set_optional_i32_or_u32_property(
+                        self.pipeline.upcast_ref(),
+                        "current-text",
+                        *index,
+                    );
+                }
             }
             VideoSubtitleSelection::External(path) => {
                 let subtitle_uri = gst::glib::filename_to_uri(path, None)
@@ -1459,6 +1680,8 @@ Ensure your GStreamer installation includes the playback elements (usually from 
 
                 enable_playbin_flags(self.pipeline.upcast_ref(), PLAY_FLAG_TEXT);
                 self.pipeline.set_property("suburi", subtitle_uri.as_str());
+                let audio_stream_id = self.current_audio_stream_id();
+                let _ = self.apply_playbin3_stream_selection(audio_stream_id.as_deref(), None);
             }
         }
 
@@ -1536,6 +1759,17 @@ Ensure your GStreamer installation includes the playback elements (usually from 
 
                 match msg.view() {
                     gst::MessageView::Eos(_) => return true,
+                    gst::MessageView::StreamCollection(collection) => {
+                        self.stream_collection = Some(collection.stream_collection());
+                    }
+                    gst::MessageView::StreamsSelected(selected) => {
+                        self.stream_collection = Some(selected.stream_collection());
+                        self.selected_stream_ids = selected
+                            .streams()
+                            .into_iter()
+                            .filter_map(|stream| stream.stream_id().map(|id| id.to_string()))
+                            .collect();
+                    }
                     gst::MessageView::Buffering(buffering) => {
                         let percent = buffering.percent();
                         if percent < 100 {
