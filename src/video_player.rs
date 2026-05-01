@@ -1152,9 +1152,6 @@ Ensure your GStreamer installation includes the playback elements (usually from 
                     Ok(gst::FlowSuccess::Ok)
                 })
                 .new_preroll(move |sink| {
-                    if state_clone_preroll.seek_in_progress() {
-                        return Ok(gst::FlowSuccess::Ok);
-                    }
                     if let Ok(sample) = sink.pull_preroll() {
                         process_video_sample(sample, state_clone_preroll.as_ref());
                     }
@@ -1373,11 +1370,12 @@ Ensure your GStreamer installation includes the playback elements (usually from 
             .seek_simple(Self::seek_flags_for_mode(mode), target)
             .map_err(|e| format!("Failed to seek: {}", e));
 
+        self.state.end_seek();
+
         if seek_result.is_ok() {
             self.prime_post_seek_frame(mode);
         }
 
-        self.state.end_seek();
         seek_result
     }
 
@@ -1680,7 +1678,7 @@ Ensure your GStreamer installation includes the playback elements (usually from 
                 return Some(current_index);
             }
 
-            return legacy_tracks.first().map(|track| track.index);
+            return None;
         }
 
         let tracks = self.embedded_subtitle_tracks();
@@ -1775,6 +1773,14 @@ Ensure your GStreamer installation includes the playback elements (usually from 
 
         self.suppress_buffering_pause_for_track_switch();
         self.subtitle_selection = selection;
+        if !self.is_playing {
+            if let Some(current_position) = self.position() {
+                let _ = self.seek_to_clock_time(
+                    Self::duration_to_clock_time(current_position),
+                    VideoSeekMode::Accurate,
+                );
+            }
+        }
         Ok(())
     }
 
