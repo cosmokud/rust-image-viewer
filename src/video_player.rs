@@ -358,7 +358,6 @@ const LOCAL_FILE_SOURCE_BLOCK_SIZE_BYTES: i32 = 256 * 1024;
 const APPSINK_MAX_BUFFERS: u32 = 3;
 const KEYFRAME_SEEK_PREROLL_TIMEOUT_MS: u64 = 20;
 const ACCURATE_SEEK_PREROLL_TIMEOUT_MS: u64 = 75;
-const SEEK_PREROLL_POLL_SLICE_MS: u64 = 5;
 
 impl VideoState {
     fn adaptive_capacity_for_dims(width: u32, height: u32) -> usize {
@@ -569,6 +568,12 @@ fn disable_playbin_flags(playbin: &gst::Element, flags_mask: u64) {
             set_playbin_flags(playbin, desired);
         }
     }
+}
+
+fn playbin_flag_enabled(playbin: &gst::Element, flags_mask: u64) -> bool {
+    get_playbin_flags(playbin)
+        .map(|flags| flags & flags_mask != 0)
+        .unwrap_or(false)
 }
 
 fn configure_local_file_playback_buffering(playbin: &gst::Element, uri: &str) {
@@ -1185,6 +1190,7 @@ Ensure your GStreamer installation includes the playback elements (usually from 
             VideoSubtitleSelection::Off,
             VideoSubtitleSelection::Embedded,
         );
+        player.subtitle_track_disabled = !player.subtitle_output_enabled();
 
         // Apply initial volume/mute settings
         player.apply_volume();
@@ -1332,23 +1338,16 @@ Ensure your GStreamer installation includes the playback elements (usually from 
         }
 
         let timeout = Self::seek_preroll_timeout(mode);
-        let deadline = Instant::now() + timeout;
+        let timeout_clock_time = Self::duration_to_clock_time(timeout);
 
-        loop {
-            let now = Instant::now();
-            if now >= deadline {
-                break;
-            }
+        // A flushing seek completes asynchronously. Wait for the paused pipeline to preroll
+        // before pulling the frame that should be visible at the target timestamp.
+        let _ = self.pipeline.state(timeout_clock_time);
 
-            let remaining = deadline.saturating_duration_since(now);
-            let wait = remaining.min(Duration::from_millis(SEEK_PREROLL_POLL_SLICE_MS));
-            let wait_clock_time = Self::duration_to_clock_time(wait);
-
-            if let Some(sample) = self.video_sink.try_pull_preroll(wait_clock_time) {
-                self.state.clear_frames();
-                process_video_sample(sample, self.state.as_ref());
-                return;
-            }
+        if let Some(sample) = self.video_sink.try_pull_preroll(timeout_clock_time) {
+            self.state.clear_frames();
+            process_video_sample(sample, self.state.as_ref());
+            return;
         }
 
         if let Some(sample) = self.video_sink.try_pull_preroll(gst::ClockTime::ZERO) {
@@ -1512,6 +1511,10 @@ Ensure your GStreamer installation includes the playback elements (usually from 
             .and_then(|track| track.stream_id)
     }
 
+    fn subtitle_output_enabled(&self) -> bool {
+        playbin_flag_enabled(self.pipeline.upcast_ref(), PLAY_FLAG_TEXT)
+    }
+
     fn current_embedded_subtitle_stream_id(&self) -> Option<String> {
         let VideoSubtitleSelection::Embedded(current_index) = self.current_subtitle_selection()
         else {
@@ -1671,6 +1674,10 @@ Ensure your GStreamer installation includes the playback elements (usually from 
     fn current_embedded_subtitle_track_index(&self) -> Option<i32> {
         let legacy_tracks = self.legacy_embedded_subtitle_tracks();
         if !legacy_tracks.is_empty() {
+            if !self.subtitle_output_enabled() {
+                return None;
+            }
+
             let current_index =
                 get_optional_i32_or_u32_property(self.pipeline.upcast_ref(), "current-text")
                     .unwrap_or(-1);
@@ -1678,7 +1685,7 @@ Ensure your GStreamer installation includes the playback elements (usually from 
                 return Some(current_index);
             }
 
-            return None;
+            return legacy_tracks.first().map(|track| track.index);
         }
 
         let tracks = self.embedded_subtitle_tracks();
