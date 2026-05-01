@@ -1205,10 +1205,7 @@ fn fingerprint_cache() -> &'static Mutex<HashMap<PathBuf, CachedFingerprintEntry
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn fingerprint_cache_prune(
-    cache: &mut HashMap<PathBuf, CachedFingerprintEntry>,
-    now: Instant,
-) {
+fn fingerprint_cache_prune(cache: &mut HashMap<PathBuf, CachedFingerprintEntry>, now: Instant) {
     cache.retain(|_, entry| now.duration_since(entry.cached_at) <= FINGERPRINT_CACHE_TTL);
 
     while cache.len() >= FINGERPRINT_CACHE_MAX_ENTRIES {

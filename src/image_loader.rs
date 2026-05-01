@@ -338,8 +338,18 @@ pub fn get_media_in_directory(path: &Path) -> Vec<PathBuf> {
     }
 
     media.par_sort_unstable_by(|a, b| {
-        let a_name = a.path.file_name().unwrap_or_default().to_str().unwrap_or("");
-        let b_name = b.path.file_name().unwrap_or_default().to_str().unwrap_or("");
+        let a_name = a
+            .path
+            .file_name()
+            .unwrap_or_default()
+            .to_str()
+            .unwrap_or("");
+        let b_name = b
+            .path
+            .file_name()
+            .unwrap_or_default()
+            .to_str()
+            .unwrap_or("");
 
         if a.is_up_entry != b.is_up_entry {
             return if a.is_up_entry {

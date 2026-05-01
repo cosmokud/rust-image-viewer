@@ -36,7 +36,7 @@ pub fn probe_video_dimensions_without_gstreamer(path: &Path) -> Option<(u32, u32
 #[cfg(target_os = "windows")]
 fn with_com_apartment<T>(f: impl FnOnce() -> Option<T>) -> Option<T> {
     use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
-    use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
+    use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
 
     let mut should_uninitialize = false;
     unsafe {
@@ -83,8 +83,8 @@ fn probe_video_dimensions_from_shell_item(
     use std::os::windows::ffi::OsStrExt;
 
     use windows::core::{Interface, PCWSTR};
-    use windows::Win32::UI::Shell::PropertiesSystem::{PROPERTYKEY, PSGetPropertyKeyFromName};
     use windows::Win32::UI::Shell::IShellItem2;
+    use windows::Win32::UI::Shell::PropertiesSystem::{PSGetPropertyKeyFromName, PROPERTYKEY};
 
     fn property_key(canonical_name: &str) -> Option<PROPERTYKEY> {
         let mut key = PROPERTYKEY::default();
@@ -93,10 +93,7 @@ fn probe_video_dimensions_from_shell_item(
             .chain(std::iter::once(0))
             .collect();
 
-        unsafe {
-            PSGetPropertyKeyFromName(PCWSTR(wide.as_ptr()), &mut key)
-                .ok()?
-        }
+        unsafe { PSGetPropertyKeyFromName(PCWSTR(wide.as_ptr()), &mut key).ok()? }
 
         Some(key)
     }
@@ -132,8 +129,8 @@ fn extract_video_thumbnail_windows(
     use windows::core::Interface;
     use windows::Win32::Foundation::SIZE;
     use windows::Win32::Graphics::Gdi::{
-        BI_RGB, BITMAP, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, DIB_RGB_COLORS,
-        DeleteDC, DeleteObject, GetDIBits, GetObjectW, HBITMAP,
+        CreateCompatibleDC, DeleteDC, DeleteObject, GetDIBits, GetObjectW, BITMAP, BITMAPINFO,
+        BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP,
     };
     use windows::Win32::UI::Shell::{
         IShellItemImageFactory, SIIGBF_BIGGERSIZEOK, SIIGBF_THUMBNAILONLY,
@@ -182,7 +179,12 @@ fn extract_video_thumbnail_windows(
                 ..Default::default()
             };
 
-            let mut pixels = vec![0u8; (width as usize).saturating_mul(height as usize).saturating_mul(4)];
+            let mut pixels = vec![
+                0u8;
+                (width as usize)
+                    .saturating_mul(height as usize)
+                    .saturating_mul(4)
+            ];
             if pixels.is_empty() {
                 let _ = DeleteObject(hbitmap);
                 return None;

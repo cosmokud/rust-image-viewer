@@ -726,7 +726,11 @@ fn push_unique_label_part(parts: &mut Vec<String>, value: Option<String>) {
     let Some(value) = value.map(|v| v.trim().to_string()) else {
         return;
     };
-    if value.is_empty() || parts.iter().any(|existing| existing.eq_ignore_ascii_case(&value)) {
+    if value.is_empty()
+        || parts
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(&value))
+    {
         return;
     }
     parts.push(value);
@@ -1416,10 +1420,13 @@ Ensure your GStreamer installation includes the playback elements (usually from 
         }
 
         match &self.subtitle_selection {
-            VideoSubtitleSelection::External(path) => VideoSubtitleSelection::External(path.clone()),
-            _ => self
-                .current_embedded_subtitle_track_index()
-                .map_or(VideoSubtitleSelection::Off, VideoSubtitleSelection::Embedded),
+            VideoSubtitleSelection::External(path) => {
+                VideoSubtitleSelection::External(path.clone())
+            }
+            _ => self.current_embedded_subtitle_track_index().map_or(
+                VideoSubtitleSelection::Off,
+                VideoSubtitleSelection::Embedded,
+            ),
         }
     }
 

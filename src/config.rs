@@ -253,7 +253,6 @@ impl Action {
             _ => None,
         }
     }
-
 }
 
 /// Parse an input binding from string
@@ -787,7 +786,10 @@ impl Config {
         self.add_binding(InputBinding::MouseRight, Action::MangaGotoFile);
         self.add_binding(InputBinding::MouseMiddle, Action::MangaFreehandAutoscroll);
         self.add_binding(InputBinding::Key(egui::Key::ArrowUp), Action::MangaPanUp);
-        self.add_binding(InputBinding::Key(egui::Key::ArrowDown), Action::MangaPanDown);
+        self.add_binding(
+            InputBinding::Key(egui::Key::ArrowDown),
+            Action::MangaPanDown,
+        );
         self.add_binding(
             InputBinding::Key(egui::Key::ArrowRight),
             Action::MangaNextImageFit,
@@ -796,9 +798,15 @@ impl Config {
             InputBinding::Key(egui::Key::ArrowLeft),
             Action::MangaPreviousImageFit,
         );
-        self.add_binding(InputBinding::Key(egui::Key::PageDown), Action::MangaNextImage);
+        self.add_binding(
+            InputBinding::Key(egui::Key::PageDown),
+            Action::MangaNextImage,
+        );
         self.add_binding(InputBinding::Mouse5, Action::MangaNextImage);
-        self.add_binding(InputBinding::Key(egui::Key::PageUp), Action::MangaPreviousImage);
+        self.add_binding(
+            InputBinding::Key(egui::Key::PageUp),
+            Action::MangaPreviousImage,
+        );
         self.add_binding(InputBinding::Mouse4, Action::MangaPreviousImage);
         self.add_binding(InputBinding::ScrollUp, Action::MangaScrollUp);
         self.add_binding(InputBinding::ScrollDown, Action::MangaScrollDown);
@@ -810,17 +818,26 @@ impl Config {
         self.add_binding(InputBinding::ShiftScrollUp, Action::MasonryPan);
         self.add_binding(InputBinding::ShiftScrollDown, Action::MasonryPan);
         self.add_binding(InputBinding::MouseRight, Action::MasonryGotoFile);
-        self.add_binding(
-            InputBinding::MouseMiddle,
-            Action::MasonryFreehandAutoscroll,
-        );
+        self.add_binding(InputBinding::MouseMiddle, Action::MasonryFreehandAutoscroll);
         self.add_binding(InputBinding::Key(egui::Key::ArrowUp), Action::MasonryPanUp);
-        self.add_binding(InputBinding::Key(egui::Key::ArrowDown), Action::MasonryPanDown);
-        self.add_binding(InputBinding::Key(egui::Key::ArrowLeft), Action::MasonryPanUp2);
-        self.add_binding(InputBinding::Key(egui::Key::ArrowRight), Action::MasonryPanDown2);
+        self.add_binding(
+            InputBinding::Key(egui::Key::ArrowDown),
+            Action::MasonryPanDown,
+        );
+        self.add_binding(
+            InputBinding::Key(egui::Key::ArrowLeft),
+            Action::MasonryPanUp2,
+        );
+        self.add_binding(
+            InputBinding::Key(egui::Key::ArrowRight),
+            Action::MasonryPanDown2,
+        );
         self.add_binding(InputBinding::Key(egui::Key::PageUp), Action::MasonryPanUp3);
         self.add_binding(InputBinding::Mouse4, Action::MasonryPanUp3);
-        self.add_binding(InputBinding::Key(egui::Key::PageDown), Action::MasonryPanDown3);
+        self.add_binding(
+            InputBinding::Key(egui::Key::PageDown),
+            Action::MasonryPanDown3,
+        );
         self.add_binding(InputBinding::Mouse5, Action::MasonryPanDown3);
         self.add_binding(InputBinding::ScrollUp, Action::MasonryScrollUp);
         self.add_binding(InputBinding::ScrollDown, Action::MasonryScrollDown);
@@ -919,7 +936,8 @@ impl Config {
                 InputBinding::Key(egui::Key::ArrowDown),
                 InputBinding::CtrlScrollDown,
             ],
-        ) && self.action_bindings_match_exact(Action::MangaZoomIn, &[])
+        ) && self
+            .action_bindings_match_exact(Action::MangaZoomIn, &[])
             && self.action_bindings_match_exact(Action::MangaZoomOut, &[]);
 
         let is_legacy_masonry_defaults = self.action_bindings_match_exact(
@@ -934,11 +952,15 @@ impl Config {
                 InputBinding::Key(egui::Key::ArrowDown),
                 InputBinding::CtrlScrollDown,
             ],
-        ) && self.action_bindings_match_exact(Action::MasonryZoomIn, &[])
+        ) && self
+            .action_bindings_match_exact(Action::MasonryZoomIn, &[])
             && self.action_bindings_match_exact(Action::MasonryZoomOut, &[]);
 
         if is_legacy_manga_defaults {
-            self.replace_action_bindings(Action::MangaPanUp, &[InputBinding::Key(egui::Key::ArrowUp)]);
+            self.replace_action_bindings(
+                Action::MangaPanUp,
+                &[InputBinding::Key(egui::Key::ArrowUp)],
+            );
             self.replace_action_bindings(
                 Action::MangaPanDown,
                 &[InputBinding::Key(egui::Key::ArrowDown)],
@@ -1189,9 +1211,7 @@ impl Config {
                                 config.background_rgb[2] = v;
                             }
                         }
-                        "marked_file_border_rgb"
-                        | "marked_item_border_rgb"
-                        | "mark_border_rgb" => {
+                        "marked_file_border_rgb" | "marked_item_border_rgb" | "mark_border_rgb" => {
                             if let Some(rgb) = parse_rgb_triplet(value) {
                                 config.marked_file_border_rgb = rgb;
                             }
@@ -1289,8 +1309,7 @@ impl Config {
                         | "shift_scroll_up_pan_px"
                         | "shift_wheel_up_pan_speed" => {
                             if let Ok(v) = value.parse::<f32>() {
-                                config.shift_scroll_up_pan_speed_px_per_step =
-                                    v.clamp(0.1, 1000.0);
+                                config.shift_scroll_up_pan_speed_px_per_step = v.clamp(0.1, 1000.0);
                             }
                         }
                         "shift_scroll_down_pan_speed_px_per_step"
@@ -1333,8 +1352,7 @@ impl Config {
                                 config.manga_wheel_max_velocity = v.clamp(200.0, 30000.0);
                             }
                         }
-                        "manga_wheel_edge_spring_hz"
-                        | "manga_wheel_edge_spring_frequency" => {
+                        "manga_wheel_edge_spring_hz" | "manga_wheel_edge_spring_frequency" => {
                             if let Ok(v) = value.parse::<f32>() {
                                 config.manga_wheel_edge_spring_hz = v.clamp(0.5, 20.0);
                             }
@@ -1707,7 +1725,8 @@ impl Config {
                 let (existing_without_legacy_header, had_legacy_header) =
                     strip_legacy_config_version_tag(&existing_content);
 
-                if had_legacy_header || existing_without_legacy_header.as_ref() != expected_content {
+                if had_legacy_header || existing_without_legacy_header.as_ref() != expected_content
+                {
                     let _ = fs::write(config_path, expected_content);
                 }
             }
@@ -2010,10 +2029,7 @@ impl Config {
             "priority_play_pause_binding",
             optional_binding_to_string(self.video_priority_play_pause_binding.as_ref()),
         );
-        values.insert(
-            "muted_state",
-            bool_to_ini(self.state_muted).to_string(),
-        );
+        values.insert("muted_state", bool_to_ini(self.state_muted).to_string());
         values.insert(
             "volume_state",
             format_with_optional_trailing_zero_f64(self.state_volume),
@@ -2110,10 +2126,7 @@ impl Config {
             "manga_freehand_autoscroll",
             self.action_bindings_csv(Action::MangaFreehandAutoscroll),
         );
-        values.insert(
-            "manga_pan_up",
-            self.action_bindings_csv(Action::MangaPanUp),
-        );
+        values.insert("manga_pan_up", self.action_bindings_csv(Action::MangaPanUp));
         values.insert(
             "manga_pan_down",
             self.action_bindings_csv(Action::MangaPanDown),
@@ -2332,11 +2345,9 @@ fn is_semver_triplet(version: &str) -> bool {
     let mut parts = version.split('.');
 
     match (parts.next(), parts.next(), parts.next(), parts.next()) {
-        (Some(major), Some(minor), Some(patch), None) => {
-            [major, minor, patch]
-                .iter()
-                .all(|part| !part.is_empty() && part.chars().all(|ch| ch.is_ascii_digit()))
-        }
+        (Some(major), Some(minor), Some(patch), None) => [major, minor, patch]
+            .iter()
+            .all(|part| !part.is_empty() && part.chars().all(|ch| ch.is_ascii_digit())),
         _ => false,
     }
 }

@@ -83,7 +83,6 @@ const LARGE_JUMP_INDEX_THRESHOLD: usize = 32;
 /// Larger values increase background throughput but can increase burstiness.
 const DIM_REQUEST_BATCH_SIZE: usize = 64;
 
-
 /// Maximum number of dimension results bundled into a single result message.
 const DIM_RESULT_CHUNK_SIZE: usize = 64;
 
@@ -1597,13 +1596,10 @@ impl MangaLoader {
                         decoded.original_height,
                         decoded.media_type,
                     );
-                    let changed = self
-                        .dimension_cache
-                        .get(&decoded.index)
-                        .map_or(true, |(old_w, old_h, old_mt)| {
-                            if *old_w == new_dims.0
-                                && *old_h == new_dims.1
-                                && *old_mt == new_dims.2
+                    let changed = self.dimension_cache.get(&decoded.index).map_or(
+                        true,
+                        |(old_w, old_h, old_mt)| {
+                            if *old_w == new_dims.0 && *old_h == new_dims.1 && *old_mt == new_dims.2
                             {
                                 return false;
                             }
@@ -1624,7 +1620,8 @@ impl MangaLoader {
                             }
 
                             true
-                        });
+                        },
+                    );
 
                     if changed {
                         self.dimension_cache.insert(decoded.index, new_dims);
@@ -1679,7 +1676,8 @@ impl MangaLoader {
                 .collect();
             let cached_results = lookup_cached_dimensions_batch(&batch_items);
 
-            for ((idx, kind, _), cached) in cached_lookup_items.iter().zip(cached_results.into_iter())
+            for ((idx, kind, _), cached) in
+                cached_lookup_items.iter().zip(cached_results.into_iter())
             {
                 if let Some((w, h)) = cached {
                     let media_type = match kind {

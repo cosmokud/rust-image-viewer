@@ -24,8 +24,7 @@ mod windows_env;
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use config::{
-    Action, Config, InputBinding, MangaVirtualizationBackend, StartupWindowMode,
-    VideoSeekPolicy,
+    Action, Config, InputBinding, MangaVirtualizationBackend, StartupWindowMode, VideoSeekPolicy,
 };
 use folder_travel_cache::{
     lookup_folder_travel_position, store_folder_travel_position, FolderTravelLayoutMode,
@@ -33,18 +32,17 @@ use folder_travel_cache::{
 };
 use hashbrown::{HashMap, HashSet};
 use image_loader::{
-    get_media_in_directory, get_media_type, is_supported_video, probe_image_dimensions,
-    FOLDER_UP_ENTRY_NAME,
-    ImageFrame, LoadedImage,
-    MediaType,
+    get_media_in_directory, get_media_type, is_supported_video, probe_image_dimensions, ImageFrame,
+    LoadedImage, MediaType, FOLDER_UP_ENTRY_NAME,
 };
-use manga_loader::{DecodedImage, MangaLoader, MangaMediaType, MangaTextureCache, LOD_SIDE_BUCKETS};
+use manga_loader::{
+    DecodedImage, MangaLoader, MangaMediaType, MangaTextureCache, LOD_SIDE_BUCKETS,
+};
 use manga_spatial::{MangaSpatialIndex, SpatialRect, STRIP_QUERY_HALF_WIDTH};
 use media_index::{DirectoryScanResult, MediaDirectoryIndex};
 use metadata_cache::{
-    configure_metadata_cache_size_limit, lookup_cached_dimensions,
-    lookup_cached_static_thumbnail, lookup_cached_video_thumbnail, metadata_cache_stats,
-    set_metadata_cache_enabled,
+    configure_metadata_cache_size_limit, lookup_cached_dimensions, lookup_cached_static_thumbnail,
+    lookup_cached_video_thumbnail, metadata_cache_stats, set_metadata_cache_enabled,
     store_cached_dimensions, store_cached_static_thumbnail, store_cached_video_thumbnail,
     CachedImageThumbnail, CachedMediaKind, CachedVideoThumbnail,
 };
@@ -69,9 +67,9 @@ use std::collections::{hash_map::DefaultHasher, VecDeque};
 use std::fs;
 use std::hash::{Hash, Hasher};
 #[cfg(target_os = "windows")]
-use std::os::windows::process::CommandExt;
-#[cfg(target_os = "windows")]
 use std::os::windows::ffi::OsStrExt;
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, UNIX_EPOCH};
@@ -156,21 +154,14 @@ fn paint_static_hourglass_placeholder(
 
 fn rotate_quad_point(center: egui::Pos2, local: egui::Vec2, angle_radians: f32) -> egui::Pos2 {
     let (sin, cos) = angle_radians.sin_cos();
-    center
-        + egui::vec2(
-            local.x * cos - local.y * sin,
-            local.x * sin + local.y * cos,
-        )
+    center + egui::vec2(local.x * cos - local.y * sin, local.x * sin + local.y * cos)
 }
 
 fn rotated_bounding_size(size: egui::Vec2, angle_radians: f32) -> egui::Vec2 {
     let sin = angle_radians.sin().abs();
     let cos = angle_radians.cos().abs();
 
-    egui::vec2(
-        size.x * cos + size.y * sin,
-        size.x * sin + size.y * cos,
-    )
+    egui::vec2(size.x * cos + size.y * sin, size.x * sin + size.y * cos)
 }
 
 fn paint_rotated_texture(
@@ -720,8 +711,8 @@ fn write_shell_file_list_to_clipboard(
         return Err("Failed to register Preferred DropEffect clipboard format".to_string());
     };
 
-    let _clipboard = Clipboard::new_attempts(10)
-        .map_err(|err| format!("Failed to open clipboard: {err}"))?;
+    let _clipboard =
+        Clipboard::new_attempts(10).map_err(|err| format!("Failed to open clipboard: {err}"))?;
     raw::empty().map_err(|err| format!("Failed to clear clipboard: {err}"))?;
     raw::set_file_list_with(&file_list, NoClear)
         .map_err(|err| format!("Failed to place files on clipboard: {err}"))?;
@@ -751,8 +742,8 @@ fn write_shell_file_list_to_clipboard(
 fn clear_system_clipboard() -> Result<(), String> {
     use clipboard_win::{raw, Clipboard};
 
-    let _clipboard = Clipboard::new_attempts(10)
-        .map_err(|err| format!("Failed to open clipboard: {err}"))?;
+    let _clipboard =
+        Clipboard::new_attempts(10).map_err(|err| format!("Failed to open clipboard: {err}"))?;
     raw::empty().map_err(|err| format!("Failed to clear clipboard: {err}"))?;
     Ok(())
 }
@@ -766,8 +757,8 @@ fn clear_system_clipboard() -> Result<(), String> {
 fn read_shell_file_list_from_clipboard() -> Result<Vec<PathBuf>, String> {
     use clipboard_win::{raw, Clipboard};
 
-    let _clipboard = Clipboard::new_attempts(10)
-        .map_err(|err| format!("Failed to open clipboard: {err}"))?;
+    let _clipboard =
+        Clipboard::new_attempts(10).map_err(|err| format!("Failed to open clipboard: {err}"))?;
     let mut file_list: Vec<String> = Vec::new();
     raw::get_file_list(&mut file_list)
         .map_err(|err| format!("Failed to read file list from clipboard: {err}"))?;
@@ -783,8 +774,8 @@ fn read_shell_file_list_from_clipboard() -> Result<Vec<PathBuf>, String> {
 fn read_drop_effect_from_clipboard() -> Result<FileClipboardOperation, String> {
     use clipboard_win::{raw, Clipboard};
 
-    let _clipboard = Clipboard::new_attempts(10)
-        .map_err(|err| format!("Failed to open clipboard: {err}"))?;
+    let _clipboard =
+        Clipboard::new_attempts(10).map_err(|err| format!("Failed to open clipboard: {err}"))?;
     let Some(preferred_drop_effect_format) = raw::register_format("Preferred DropEffect") else {
         return Err("Failed to register Preferred DropEffect clipboard format".to_string());
     };
@@ -984,10 +975,7 @@ impl MasonryFolderMetadataRamCache {
     }
 
     fn approx_entry_bytes(path: &Path) -> u64 {
-        path.as_os_str()
-            .to_string_lossy()
-            .len()
-            .saturating_add(48) as u64
+        path.as_os_str().to_string_lossy().len().saturating_add(48) as u64
     }
 
     fn approx_snapshot_bytes(
@@ -2258,6 +2246,9 @@ struct ImageViewer {
     request_minimize: bool,
     /// Request native maximize (`Some(true)`) or restore (`Some(false)`) for the root window.
     request_native_maximize: Option<bool>,
+    /// One-shot override used by single-instance file handoff to ignore the current
+    /// maximize/fullscreen placement and re-center the next media in floating mode.
+    force_floating_layout_once: bool,
 
     /// Maximum supported texture side for the active GPU backend.
     /// Used to prevent crashes when attempting to upload oversized images.
@@ -2272,14 +2263,6 @@ struct ImageViewer {
     resize_direction: ResizeDirection,
     /// Whether we're currently resizing
     is_resizing: bool,
-    /// Captured maximum inner size for floating autosize-to-image (fit-to-screen cap)
-    floating_max_inner_size: Option<egui::Vec2>,
-    /// Last inner size we requested (to avoid spamming viewport commands)
-    last_requested_inner_size: Option<egui::Vec2>,
-    /// Saved floating state before entering fullscreen (zoom, zoom_target, offset, window_size, window_pos)
-    saved_floating_state: Option<(f32, f32, egui::Vec2, egui::Vec2, egui::Pos2)>,
-    /// Whether the floating window was already maximized before entering fullscreen.
-    saved_floating_was_maximized: bool,
     /// Image index at the moment we entered fullscreen (used to detect next/prev navigation)
     saved_fullscreen_entry_index: Option<usize>,
     /// Fullscreen transition animation progress (0.0 = floating, 1.0 = fullscreen)
@@ -2309,13 +2292,6 @@ struct ImageViewer {
     /// an older cached fullscreen zoom or pan state for the target file.
     strip_open_force_fit_path: Option<PathBuf>,
 
-    /// Last observed window outer position (top-left in screen coordinates).
-    /// Used to keep the window location stable in floating mode after the user moves it.
-    last_known_outer_pos: Option<egui::Pos2>,
-    /// Once the user has manually moved/resized the floating window, stop auto-centering on media changes.
-    floating_user_moved_window: bool,
-    /// Suppress position-change tracking for a few frames after programmatic moves.
-    suppress_outer_pos_tracking_frames: u8,
     // ============ VIDEO-SPECIFIC FIELDS ============
     /// Current video player (None if viewing an image)
     video_player: Option<VideoPlayer>,
@@ -2701,22 +2677,12 @@ impl Default for ImageViewer {
             folder_placeholder_preview_scan_request_tx,
             folder_placeholder_preview_scan_request_rx,
         ) = crossbeam_channel::bounded::<FolderPlaceholderPreviewScanRequest>(256);
-        let (
-            folder_placeholder_preview_scan_result_tx,
-            folder_placeholder_preview_scan_result_rx,
-        ) = crossbeam_channel::bounded::<FolderPlaceholderPreviewScanResult>(128);
-        let (
-            folder_placeholder_thumbnail_request_tx,
-            folder_placeholder_thumbnail_request_rx,
-        ) = crossbeam_channel::bounded::<FolderPlaceholderThumbnailLoadRequest>(256);
-        let folder_placeholder_thumbnail_worker_count =
-            std::thread::available_parallelism().map_or(1usize, |count| {
-                if count.get() >= 8 {
-                    2
-                } else {
-                    1
-                }
-            });
+        let (folder_placeholder_preview_scan_result_tx, folder_placeholder_preview_scan_result_rx) =
+            crossbeam_channel::bounded::<FolderPlaceholderPreviewScanResult>(128);
+        let (folder_placeholder_thumbnail_request_tx, folder_placeholder_thumbnail_request_rx) =
+            crossbeam_channel::bounded::<FolderPlaceholderThumbnailLoadRequest>(256);
+        let folder_placeholder_thumbnail_worker_count = std::thread::available_parallelism()
+            .map_or(1usize, |count| if count.get() >= 8 { 2 } else { 1 });
         let (folder_placeholder_thumbnail_result_tx, folder_placeholder_thumbnail_result_rx) =
             crossbeam_channel::bounded::<FolderPlaceholderThumbnailLoadResult>(128);
 
@@ -2833,15 +2799,12 @@ impl Default for ImageViewer {
             toggle_fullscreen_from_titlebar: false,
             request_minimize: false,
             request_native_maximize: None,
+            force_floating_layout_once: false,
             max_texture_side: 8192,
             startup_window_mode_applied: false,
             pending_window_title: None,
             resize_direction: ResizeDirection::None,
             is_resizing: false,
-            floating_max_inner_size: None,
-            last_requested_inner_size: None,
-            saved_floating_state: None,
-            saved_floating_was_maximized: false,
             saved_fullscreen_entry_index: None,
             fullscreen_transition: 0.0,
             fullscreen_transition_target: 0.0,
@@ -2852,9 +2815,6 @@ impl Default for ImageViewer {
             fullscreen_view_states: HashMap::new(),
             current_fullscreen_view_has_memory: false,
             strip_open_force_fit_path: None,
-            last_known_outer_pos: None,
-            floating_user_moved_window: false,
-            suppress_outer_pos_tracking_frames: 0,
             // Video-specific fields
             video_player: None,
             video_texture: None,
@@ -3222,7 +3182,8 @@ impl ImageViewer {
                 continue;
             }
 
-            let Some((width, height, media_type)) = loader.dimension_cache.get(&idx).copied() else {
+            let Some((width, height, media_type)) = loader.dimension_cache.get(&idx).copied()
+            else {
                 continue;
             };
 
@@ -3244,7 +3205,8 @@ impl ImageViewer {
         self.masonry_folder_metadata_ram_cache
             .set_max_bytes(self.masonry_metadata_ram_cache_limit_bytes());
 
-        let Some((folder, entries_by_path)) = self.collect_current_masonry_folder_metadata_snapshot()
+        let Some((folder, entries_by_path)) =
+            self.collect_current_masonry_folder_metadata_snapshot()
         else {
             return;
         };
@@ -3321,7 +3283,9 @@ impl ImageViewer {
         self.masonry_mode_session_snapshot = Some(MasonryModeSessionSnapshot {
             image_list: self.image_list.clone(),
             image_list_signature: self.image_list_signature,
-            current_index: self.current_index.min(self.image_list.len().saturating_sub(1)),
+            current_index: self
+                .current_index
+                .min(self.image_list.len().saturating_sub(1)),
             current_path: self.current_media_path(),
             folder_key: self.current_masonry_metadata_folder_key(),
             zoom: self.zoom,
@@ -3339,7 +3303,10 @@ impl ImageViewer {
         });
     }
 
-    fn try_restore_masonry_mode_session_snapshot(&mut self, preferred_path: Option<PathBuf>) -> bool {
+    fn try_restore_masonry_mode_session_snapshot(
+        &mut self,
+        preferred_path: Option<PathBuf>,
+    ) -> bool {
         let Some(snapshot) = self.masonry_mode_session_snapshot.clone() else {
             return false;
         };
@@ -3355,7 +3322,9 @@ impl ImageViewer {
                 .and_then(|path| path.parent().map(Path::to_path_buf))
         });
 
-        if let (Some(path), Some(folder_key)) = (preferred_path.as_ref(), snapshot_folder_key.as_ref()) {
+        if let (Some(path), Some(folder_key)) =
+            (preferred_path.as_ref(), snapshot_folder_key.as_ref())
+        {
             if path.parent() != Some(folder_key.as_path()) {
                 return false;
             }
@@ -3374,7 +3343,11 @@ impl ImageViewer {
             .or(snapshot.current_path.clone());
 
         if let Some(path) = restore_path {
-            if let Some(index) = self.image_list.iter().position(|candidate| candidate == &path) {
+            if let Some(index) = self
+                .image_list
+                .iter()
+                .position(|candidate| candidate == &path)
+            {
                 self.set_current_index_clamped(index);
             } else {
                 self.set_current_index_clamped(
@@ -3699,16 +3672,15 @@ impl ImageViewer {
             return false;
         }
 
-        let mut resolved_index = self
-            .image_list
-            .iter()
-            .position(|candidate| {
-                candidate.as_path() == position.current_path.as_path()
-                    && !Self::is_up_navigation_entry_path(candidate.as_path())
-            });
+        let mut resolved_index = self.image_list.iter().position(|candidate| {
+            candidate.as_path() == position.current_path.as_path()
+                && !Self::is_up_navigation_entry_path(candidate.as_path())
+        });
 
         if resolved_index.is_none() {
-            let fallback_index = position.current_index.min(self.image_list.len().saturating_sub(1));
+            let fallback_index = position
+                .current_index
+                .min(self.image_list.len().saturating_sub(1));
             if self
                 .image_list
                 .get(fallback_index)
@@ -3925,8 +3897,9 @@ impl ImageViewer {
         }
 
         let directory = target_directory.clone();
-        self.folder_placeholder_preview_request_priority_seed =
-            self.folder_placeholder_preview_request_priority_seed.saturating_add(1);
+        self.folder_placeholder_preview_request_priority_seed = self
+            .folder_placeholder_preview_request_priority_seed
+            .saturating_add(1);
         let priority = -self.folder_placeholder_preview_request_priority_seed;
         self.folder_placeholder_preview_scan_pending
             .insert(directory.clone());
@@ -3942,7 +3915,8 @@ impl ImageViewer {
             .try_send(request)
             .is_err()
         {
-            self.folder_placeholder_preview_scan_pending.remove(&directory);
+            self.folder_placeholder_preview_scan_pending
+                .remove(&directory);
             return false;
         }
 
@@ -4027,14 +4001,20 @@ impl ImageViewer {
             painter.line_segment(
                 [
                     shaft_top,
-                    egui::pos2(center.x - body.width() * 0.12, center.y - body.height() * 0.02),
+                    egui::pos2(
+                        center.x - body.width() * 0.12,
+                        center.y - body.height() * 0.02,
+                    ),
                 ],
                 stroke,
             );
             painter.line_segment(
                 [
                     shaft_top,
-                    egui::pos2(center.x + body.width() * 0.12, center.y - body.height() * 0.02),
+                    egui::pos2(
+                        center.x + body.width() * 0.12,
+                        center.y - body.height() * 0.02,
+                    ),
                 ],
                 stroke,
             );
@@ -4055,12 +4035,24 @@ impl ImageViewer {
         painter.rect_filled(rect, 6.0, egui::Color32::from_rgb(30, 34, 40));
 
         let body = egui::Rect::from_min_max(
-            egui::pos2(rect.left() + rect.width() * 0.12, rect.top() + rect.height() * 0.36),
-            egui::pos2(rect.right() - rect.width() * 0.12, rect.bottom() - rect.height() * 0.14),
+            egui::pos2(
+                rect.left() + rect.width() * 0.12,
+                rect.top() + rect.height() * 0.36,
+            ),
+            egui::pos2(
+                rect.right() - rect.width() * 0.12,
+                rect.bottom() - rect.height() * 0.14,
+            ),
         );
         let tab = egui::Rect::from_min_max(
-            egui::pos2(rect.left() + rect.width() * 0.2, rect.top() + rect.height() * 0.2),
-            egui::pos2(rect.left() + rect.width() * 0.5, rect.top() + rect.height() * 0.36),
+            egui::pos2(
+                rect.left() + rect.width() * 0.2,
+                rect.top() + rect.height() * 0.2,
+            ),
+            egui::pos2(
+                rect.left() + rect.width() * 0.5,
+                rect.top() + rect.height() * 0.36,
+            ),
         );
 
         painter.rect_filled(body, 5.0, egui::Color32::from_rgb(221, 178, 73));
@@ -4090,7 +4082,8 @@ impl ImageViewer {
                     preview_rect.left() + col * (tile_width + grid_gap),
                     preview_rect.top() + row * (tile_height + grid_gap),
                 );
-                let tile_rect = egui::Rect::from_min_size(tile_min, egui::vec2(tile_width, tile_height));
+                let tile_rect =
+                    egui::Rect::from_min_size(tile_min, egui::vec2(tile_width, tile_height));
 
                 painter.rect_filled(
                     tile_rect,
@@ -4128,8 +4121,10 @@ impl ImageViewer {
                     egui::Color32::from_rgba_unmultiplied(0, 0, 0, 160),
                 );
                 let stroke = egui::Stroke::new(1.8, egui::Color32::WHITE);
-                let shaft_top = egui::pos2(badge.center().x, badge.center().y - badge.height() * 0.28);
-                let shaft_bottom = egui::pos2(badge.center().x, badge.center().y + badge.height() * 0.22);
+                let shaft_top =
+                    egui::pos2(badge.center().x, badge.center().y - badge.height() * 0.28);
+                let shaft_bottom =
+                    egui::pos2(badge.center().x, badge.center().y + badge.height() * 0.22);
                 painter.line_segment([shaft_bottom, shaft_top], stroke);
                 painter.line_segment(
                     [
@@ -4156,7 +4151,10 @@ impl ImageViewer {
             painter.rect_stroke(
                 preview_rect,
                 4.0,
-                egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 26)),
+                egui::Stroke::new(
+                    1.0,
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 26),
+                ),
             );
         }
 
@@ -4261,9 +4259,8 @@ impl ImageViewer {
     }
 
     fn folder_navigation_can_go_forward(&self) -> bool {
-        self.folder_navigation_history_index.is_some_and(|index| {
-            index + 1 < self.folder_navigation_history.len()
-        })
+        self.folder_navigation_history_index
+            .is_some_and(|index| index + 1 < self.folder_navigation_history.len())
     }
 
     fn record_folder_navigation_to_directory(&mut self, directory: &Path) {
@@ -4339,7 +4336,8 @@ impl ImageViewer {
     }
 
     fn navigate_folder_history_to_index(&mut self, target_index: usize) -> bool {
-        let Some(target_directory) = self.folder_navigation_history.get(target_index).cloned() else {
+        let Some(target_directory) = self.folder_navigation_history.get(target_index).cloned()
+        else {
             return false;
         };
 
@@ -4446,10 +4444,7 @@ impl ImageViewer {
         history_navigation: FolderHistoryNavigationKind,
     ) -> bool {
         if !directory.exists() || !directory.is_dir() {
-            self.error_message = Some(format!(
-                "Folder does not exist: {}",
-                directory.display()
-            ));
+            self.error_message = Some(format!("Folder does not exist: {}", directory.display()));
             return false;
         }
 
@@ -4495,9 +4490,7 @@ impl ImageViewer {
             .or_else(|| {
                 files
                     .iter()
-                    .find(|candidate| {
-                        !self.is_folder_navigation_entry_path(candidate.as_path())
-                    })
+                    .find(|candidate| !self.is_folder_navigation_entry_path(candidate.as_path()))
                     .cloned()
             })
             .or_else(|| {
@@ -4585,7 +4578,10 @@ impl ImageViewer {
             return Some(index);
         }
 
-        Some(self.current_index.min(self.image_list.len().saturating_sub(1)))
+        Some(
+            self.current_index
+                .min(self.image_list.len().saturating_sub(1)),
+        )
     }
 
     fn is_path_marked(&self, path: &Path) -> bool {
@@ -4803,7 +4799,8 @@ impl ImageViewer {
 
         for path in paths {
             if path.exists() {
-                self.prepared_clipboard_paths.insert(path.clone(), operation);
+                self.prepared_clipboard_paths
+                    .insert(path.clone(), operation);
             }
         }
     }
@@ -4853,7 +4850,11 @@ impl ImageViewer {
             }
         }
 
-        for candidate in self.image_list.iter().skip(self.current_index.saturating_add(1)) {
+        for candidate in self
+            .image_list
+            .iter()
+            .skip(self.current_index.saturating_add(1))
+        {
             if !removed_paths.contains(candidate) && candidate.exists() {
                 return Some(candidate.clone());
             }
@@ -5059,18 +5060,14 @@ impl ImageViewer {
                 .iter()
                 .map(|label| {
                     fonts
-                        .layout_no_wrap(
-                            (*label).to_string(),
-                            font_id.clone(),
-                            egui::Color32::WHITE,
-                        )
+                        .layout_no_wrap((*label).to_string(), font_id.clone(), egui::Color32::WHITE)
                         .size()
                         .x
                 })
                 .fold(0.0, f32::max)
         });
 
-            (widest_label + 46.0).clamp(128.0, 240.0)
+        (widest_label + 46.0).clamp(128.0, 240.0)
     }
 
     fn release_video_resources_for_paths(&mut self, paths: &[PathBuf]) {
@@ -5186,7 +5183,11 @@ impl ImageViewer {
             }
         }
 
-        parent.join(format!("riv-rename-fallback-{}-{}", std::process::id(), serial))
+        parent.join(format!(
+            "riv-rename-fallback-{}-{}",
+            std::process::id(),
+            serial
+        ))
     }
 
     fn cancel_inline_rename(&mut self) {
@@ -5333,7 +5334,8 @@ impl ImageViewer {
                 self.marked_files.insert(new_path.clone());
             }
             if let Some(operation) = self.prepared_clipboard_paths.remove(original_path) {
-                self.prepared_clipboard_paths.insert(new_path.clone(), operation);
+                self.prepared_clipboard_paths
+                    .insert(new_path.clone(), operation);
                 prepared_clipboard_changed = true;
             }
             self.modal_thumbnail_cache.remove(original_path);
@@ -5503,44 +5505,48 @@ impl ImageViewer {
             Err(_) => FileClipboardOperation::Copy,
         };
 
-        let target_directory = if self.manga_mode && self.is_fullscreen && !self.image_list.is_empty() {
-            if !self.refresh_media_list_before_masonry_entry() {
-                if let Some(path) = self.current_media_path() {
-                    let dir = path.parent().unwrap_or(path.as_path()).to_path_buf();
-                    if dir.exists() && dir.is_dir() {
-                        dir
-                    } else {
-                        if let Some(first) = self.image_list.first().cloned() {
-                            first.parent().unwrap_or(first.as_path()).to_path_buf()
+        let target_directory =
+            if self.manga_mode && self.is_fullscreen && !self.image_list.is_empty() {
+                if !self.refresh_media_list_before_masonry_entry() {
+                    if let Some(path) = self.current_media_path() {
+                        let dir = path.parent().unwrap_or(path.as_path()).to_path_buf();
+                        if dir.exists() && dir.is_dir() {
+                            dir
                         } else {
-                            return;
+                            if let Some(first) = self.image_list.first().cloned() {
+                                first.parent().unwrap_or(first.as_path()).to_path_buf()
+                            } else {
+                                return;
+                            }
                         }
+                    } else if let Some(first) = self.image_list.first().cloned() {
+                        first.parent().unwrap_or(first.as_path()).to_path_buf()
+                    } else {
+                        return;
                     }
-                } else if let Some(first) = self.image_list.first().cloned() {
+                } else {
+                    if let Some(path) = self.current_media_path() {
+                        path.parent().unwrap_or(path.as_path()).to_path_buf()
+                    } else if let Some(first) = self.image_list.first().cloned() {
+                        first.parent().unwrap_or(first.as_path()).to_path_buf()
+                    } else {
+                        return;
+                    }
+                }
+            } else if let Some(current_path) = self.current_media_path() {
+                current_path
+                    .parent()
+                    .unwrap_or(current_path.as_path())
+                    .to_path_buf()
+            } else if !self.image_list.is_empty() {
+                if let Some(first) = self.image_list.first().cloned() {
                     first.parent().unwrap_or(first.as_path()).to_path_buf()
                 } else {
                     return;
                 }
-            } else {
-                if let Some(path) = self.current_media_path() {
-                    path.parent().unwrap_or(path.as_path()).to_path_buf()
-                } else if let Some(first) = self.image_list.first().cloned() {
-                    first.parent().unwrap_or(first.as_path()).to_path_buf()
-                } else {
-                    return;
-                }
-            }
-        } else if let Some(current_path) = self.current_media_path() {
-            current_path.parent().unwrap_or(current_path.as_path()).to_path_buf()
-        } else if !self.image_list.is_empty() {
-            if let Some(first) = self.image_list.first().cloned() {
-                first.parent().unwrap_or(first.as_path()).to_path_buf()
             } else {
                 return;
-            }
-        } else {
-            return;
-        };
+            };
 
         let mut new_paths: Vec<PathBuf> = Vec::new();
         let mut errors: Vec<String> = Vec::new();
@@ -5558,7 +5564,10 @@ impl ImageViewer {
             let mut dest_path = target_directory.join(file_name);
             let mut suffix = 1;
             while dest_path.exists() {
-                let stem = source_path.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
+                let stem = source_path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("file");
                 let ext = source_path.extension().and_then(|e| e.to_str());
                 let new_name = if let Some(ext) = ext {
                     format!("{} ({}).{}", stem, suffix, ext)
@@ -5573,29 +5582,35 @@ impl ImageViewer {
             }
 
             match operation {
-                FileClipboardOperation::Copy => {
-                    match std::fs::copy(source_path, &dest_path) {
-                        Ok(_) => new_paths.push(dest_path),
-                        Err(err) => errors.push(format!("Failed to copy '{}': {}", file_name.to_string_lossy(), err)),
-                    }
-                }
-                FileClipboardOperation::Cut => {
-                    match std::fs::rename(source_path, &dest_path) {
-                        Ok(_) => new_paths.push(dest_path.clone()),
-                        Err(_) => {
-                            match std::fs::copy(source_path, &dest_path) {
-                                Ok(_) => {
-                                    if let Err(e) = std::fs::remove_file(source_path) {
-                                        errors.push(format!("Copied '{}' but failed to remove original: {}", file_name.to_string_lossy(), e));
-                                    } else {
-                                        new_paths.push(dest_path.clone());
-                                    }
-                                }
-                                Err(copy_err) => errors.push(format!("Failed to move '{}': {}", file_name.to_string_lossy(), copy_err)),
+                FileClipboardOperation::Copy => match std::fs::copy(source_path, &dest_path) {
+                    Ok(_) => new_paths.push(dest_path),
+                    Err(err) => errors.push(format!(
+                        "Failed to copy '{}': {}",
+                        file_name.to_string_lossy(),
+                        err
+                    )),
+                },
+                FileClipboardOperation::Cut => match std::fs::rename(source_path, &dest_path) {
+                    Ok(_) => new_paths.push(dest_path.clone()),
+                    Err(_) => match std::fs::copy(source_path, &dest_path) {
+                        Ok(_) => {
+                            if let Err(e) = std::fs::remove_file(source_path) {
+                                errors.push(format!(
+                                    "Copied '{}' but failed to remove original: {}",
+                                    file_name.to_string_lossy(),
+                                    e
+                                ));
+                            } else {
+                                new_paths.push(dest_path.clone());
                             }
                         }
-                    }
-                }
+                        Err(copy_err) => errors.push(format!(
+                            "Failed to move '{}': {}",
+                            file_name.to_string_lossy(),
+                            copy_err
+                        )),
+                    },
+                },
             }
         }
 
@@ -6098,31 +6113,25 @@ impl ImageViewer {
         allow_sync_image_probe: bool,
     ) -> Option<(u32, u32)> {
         match media_type {
-            MediaType::Image => lookup_cached_dimensions(path, CachedMediaKind::Image).or_else(|| {
-                if !allow_sync_image_probe {
-                    return None;
-                }
+            MediaType::Image => {
+                lookup_cached_dimensions(path, CachedMediaKind::Image).or_else(|| {
+                    if !allow_sync_image_probe {
+                        return None;
+                    }
 
-                let dims = probe_image_dimensions(path);
-                if let Some((width, height)) = dims {
-                    store_cached_dimensions(path, CachedMediaKind::Image, width, height);
-                }
-                dims
-            }),
+                    let dims = probe_image_dimensions(path);
+                    if let Some((width, height)) = dims {
+                        store_cached_dimensions(path, CachedMediaKind::Image, width, height);
+                    }
+                    dims
+                })
+            }
             MediaType::Video => lookup_cached_dimensions(path, CachedMediaKind::Video),
         }
     }
 
     fn solo_viewport_size_for_lod(&self) -> egui::Vec2 {
-        if self.is_fullscreen {
-            return egui::vec2(self.screen_size.x.max(1.0), self.screen_size.y.max(1.0));
-        }
-
-        let requested = self.last_requested_inner_size.unwrap_or(self.screen_size);
-        egui::vec2(
-            self.screen_size.x.max(requested.x).max(1.0),
-            self.screen_size.y.max(requested.y).max(1.0),
-        )
+        egui::vec2(self.screen_size.x.max(1.0), self.screen_size.y.max(1.0))
     }
 
     fn solo_expected_display_size_for_path(
@@ -6154,18 +6163,11 @@ impl ImageViewer {
                     .map(|state| state.zoom.max(state.zoom_target))
             };
 
-            saved_zoom
-                .unwrap_or_else(|| self.fit_zoom_for_target_height(viewport.y, img_h))
-        } else if media_type == MediaType::Video {
-            if img_h > viewport.y {
-                self.fit_zoom_for_target_height(viewport.y, img_h)
-            } else {
-                1.0
-            }
-        } else if img_h > viewport.y || img_w > viewport.x {
-            (viewport.y / img_h).min(viewport.x / img_w).min(1.0)
+            saved_zoom.unwrap_or_else(|| self.fit_zoom_for_target_height(viewport.y, img_h))
         } else {
-            1.0
+            self.floating_layout_size_for_media(img_w, img_h, viewport)
+                .map(|(zoom, _)| zoom)
+                .unwrap_or(1.0)
         };
 
         egui::vec2((img_w * zoom).max(1.0), (img_h * zoom).max(1.0))
@@ -6204,11 +6206,12 @@ impl ImageViewer {
         media_type: MediaType,
         allow_sync_image_probe: bool,
     ) -> u32 {
-        let source_dims = self.solo_known_media_dimensions(path, media_type, allow_sync_image_probe);
+        let source_dims =
+            self.solo_known_media_dimensions(path, media_type, allow_sync_image_probe);
         let display_size =
             self.solo_expected_display_size_for_path(path, media_type, allow_sync_image_probe);
-        let target =
-            self.manga_strip_target_texture_side_from_display_side(display_size.x.max(display_size.y));
+        let target = self
+            .manga_strip_target_texture_side_from_display_side(display_size.x.max(display_size.y));
         self.solo_quantize_target_texture_side(target, source_dims)
     }
 
@@ -6247,8 +6250,9 @@ impl ImageViewer {
             ))
         } else {
             self.image_list.get(self.current_index).and_then(|path| {
-                self.current_media_type
-                    .map(|media_type| self.solo_expected_display_size_for_path(path, media_type, false))
+                self.current_media_type.map(|media_type| {
+                    self.solo_expected_display_size_for_path(path, media_type, false)
+                })
             })
         };
 
@@ -6309,7 +6313,9 @@ impl ImageViewer {
         if current_media_type == Some(MediaType::Video) {
             let current_target_side =
                 self.solo_target_texture_side_for_path(current_path, MediaType::Video, false);
-            if let Some(thumbnail) = lookup_cached_video_thumbnail(current_path, current_target_side) {
+            if let Some(thumbnail) =
+                lookup_cached_video_thumbnail(current_path, current_target_side)
+            {
                 self.pending_video_thumbnail_placeholder = Some(PendingVideoThumbnailPlaceholder {
                     path: current_path.clone(),
                     thumbnail,
@@ -6348,7 +6354,8 @@ impl ImageViewer {
                         continue;
                     }
 
-                    let target_side = self.solo_target_texture_side_for_path(&path, media_type, false);
+                    let target_side =
+                        self.solo_target_texture_side_for_path(&path, media_type, false);
                     if self.has_valid_decoded_image_cache_entry(&path, target_side) {
                         continue;
                     }
@@ -6368,7 +6375,8 @@ impl ImageViewer {
                     });
                 }
                 MediaType::Video => {
-                    let target_side = self.solo_target_texture_side_for_path(&path, media_type, false);
+                    let target_side =
+                        self.solo_target_texture_side_for_path(&path, media_type, false);
                     if lookup_cached_video_thumbnail(&path, target_side).is_some() {
                         continue;
                     }
@@ -6406,7 +6414,8 @@ impl ImageViewer {
                         continue;
                     }
 
-                    let target_side = self.solo_target_texture_side_for_path(&path, media_type, false);
+                    let target_side =
+                        self.solo_target_texture_side_for_path(&path, media_type, false);
                     if self.has_valid_decoded_image_cache_entry(&path, target_side) {
                         continue;
                     }
@@ -6426,7 +6435,8 @@ impl ImageViewer {
                     });
                 }
                 MediaType::Video => {
-                    let target_side = self.solo_target_texture_side_for_path(&path, media_type, false);
+                    let target_side =
+                        self.solo_target_texture_side_for_path(&path, media_type, false);
                     if lookup_cached_video_thumbnail(&path, target_side).is_some() {
                         continue;
                     }
@@ -6477,7 +6487,11 @@ impl ImageViewer {
                         && self.image.is_none();
                     if current_matches {
                         let gif_filter = self.config.gif_resize_filter.to_image_filter();
-                        if self.try_load_image_from_decoded_cache(&path, max_texture_side, gif_filter) {
+                        if self.try_load_image_from_decoded_cache(
+                            &path,
+                            max_texture_side,
+                            gif_filter,
+                        ) {
                             if self.pending_media_load.as_ref().is_some_and(|pending| {
                                 pending.kind == PendingMediaLoadKind::Image && pending.path == path
                             }) {
@@ -6501,7 +6515,8 @@ impl ImageViewer {
                             .image_list
                             .get(self.current_index)
                             .is_some_and(|current| current == &path)
-                        && (self.video_texture.is_none() || self.retained_media_placeholder_visible);
+                        && (self.video_texture.is_none()
+                            || self.retained_media_placeholder_visible);
                     if current_matches {
                         self.pending_video_thumbnail_placeholder =
                             Some(PendingVideoThumbnailPlaceholder {
@@ -6724,7 +6739,8 @@ impl ImageViewer {
                 near_radius,
             );
             let distance = decoded.index.abs_diff(anchor_index);
-            let media_penalty = if navigation_active && decoded.media_type == MangaMediaType::Video {
+            let media_penalty = if navigation_active && decoded.media_type == MangaMediaType::Video
+            {
                 1u8
             } else {
                 0u8
@@ -6747,8 +6763,11 @@ impl ImageViewer {
         anchor_index: usize,
         navigation_active: bool,
     ) -> usize {
-        let near_radius =
-            self.manga_sort_decoded_mailbox_for_upload(visible_set, anchor_index, navigation_active);
+        let near_radius = self.manga_sort_decoded_mailbox_for_upload(
+            visible_set,
+            anchor_index,
+            navigation_active,
+        );
 
         if self.manga_decoded_mailbox.len() <= Self::MANGA_DECODED_MAILBOX_MAX_ITEMS {
             return near_radius;
@@ -6983,8 +7002,7 @@ impl ImageViewer {
 
                 let dim_commit_visible = self.perf_metrics.counter("masonry_dim_commit_visible");
                 let dim_commit_idle = self.perf_metrics.counter("masonry_dim_commit_idle");
-                let dim_commit_deferred =
-                    self.perf_metrics.counter("masonry_dim_commit_deferred");
+                let dim_commit_deferred = self.perf_metrics.counter("masonry_dim_commit_deferred");
                 if dim_commit_visible > 0 || dim_commit_idle > 0 || dim_commit_deferred > 0 {
                     text.push_str(&format!(
                         " | DQ V/I/D {}/{}/{}",
@@ -6992,8 +7010,7 @@ impl ImageViewer {
                     ));
                 }
 
-                let decoded_mailbox_drop =
-                    self.perf_metrics.counter("manga_decoded_mailbox_drop");
+                let decoded_mailbox_drop = self.perf_metrics.counter("manga_decoded_mailbox_drop");
                 if decoded_mailbox_drop > 0 {
                     text.push_str(&format!(" | DMdrop {}", decoded_mailbox_drop));
                 }
@@ -7206,9 +7223,12 @@ impl ImageViewer {
         let detail_text = self.video_playback_unavailable_popup_detail();
         let footer_text = "Preview mode stays active: zoom, pan, and browsing still work.";
 
-        let title_color = egui::Color32::from_rgba_unmultiplied(255, 196, 150, (255.0 * fade) as u8);
-        let detail_color = egui::Color32::from_rgba_unmultiplied(240, 230, 220, (245.0 * fade) as u8);
-        let footer_color = egui::Color32::from_rgba_unmultiplied(170, 204, 238, (240.0 * fade) as u8);
+        let title_color =
+            egui::Color32::from_rgba_unmultiplied(255, 196, 150, (255.0 * fade) as u8);
+        let detail_color =
+            egui::Color32::from_rgba_unmultiplied(240, 230, 220, (245.0 * fade) as u8);
+        let footer_color =
+            egui::Color32::from_rgba_unmultiplied(170, 204, 238, (240.0 * fade) as u8);
 
         let title_galley = painter.layout_no_wrap(
             title_text.to_owned(),
@@ -7232,10 +7252,12 @@ impl ImageViewer {
         let detail_height = detail_galley.rect.height();
         let footer_height = footer_galley.rect.height();
 
-        let panel_height = (14.0 + title_height + 8.0 + detail_height + 10.0 + footer_height + 14.0)
-            .clamp(108.0, max_rect.height());
-        let panel_rect = egui::Rect::from_center_size(max_rect.center(), egui::vec2(panel_width, panel_height))
-            .intersect(max_rect);
+        let panel_height =
+            (14.0 + title_height + 8.0 + detail_height + 10.0 + footer_height + 14.0)
+                .clamp(108.0, max_rect.height());
+        let panel_rect =
+            egui::Rect::from_center_size(max_rect.center(), egui::vec2(panel_width, panel_height))
+                .intersect(max_rect);
 
         painter.rect_filled(
             panel_rect,
@@ -7367,7 +7389,10 @@ impl ImageViewer {
             format!(
                 "External / {} / {}",
                 extension,
-                subtitle_path.file_name().unwrap_or_default().to_string_lossy()
+                subtitle_path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
             )
         } else {
             format!(
@@ -7384,7 +7409,9 @@ impl ImageViewer {
         let Some(parent_dir) = video_path.parent() else {
             return Vec::new();
         };
-        let Some(video_stem) = video_path.file_stem().map(|stem| stem.to_string_lossy().to_string())
+        let Some(video_stem) = video_path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().to_string())
         else {
             return Vec::new();
         };
@@ -7407,7 +7434,9 @@ impl ImageViewer {
                 continue;
             }
 
-            let Some(extension) = path.extension().map(|ext| ext.to_string_lossy().to_ascii_lowercase())
+            let Some(extension) = path
+                .extension()
+                .map(|ext| ext.to_string_lossy().to_ascii_lowercase())
             else {
                 continue;
             };
@@ -7415,7 +7444,9 @@ impl ImageViewer {
                 continue;
             }
 
-            let Some(candidate_stem) = path.file_stem().map(|stem| stem.to_string_lossy().to_string())
+            let Some(candidate_stem) = path
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().to_string())
             else {
                 continue;
             };
@@ -7468,10 +7499,7 @@ impl ImageViewer {
         }
     }
 
-    fn current_audio_button_label(
-        tracks: &[VideoTrackInfo],
-        current_track: Option<i32>,
-    ) -> String {
+    fn current_audio_button_label(tracks: &[VideoTrackInfo], current_track: Option<i32>) -> String {
         current_track
             .and_then(|track_index| tracks.iter().find(|track| track.index == track_index))
             .map(|track| Self::compact_video_track_button_label(&track.label))
@@ -7517,9 +7545,10 @@ impl ImageViewer {
             VideoControlIcon::SubtitleTracks => "CC",
         };
 
-        let button_text = label
-            .filter(|text| !text.is_empty())
-            .map_or_else(|| icon_text.to_string(), |text| format!("{} {}", icon_text, text));
+        let button_text = label.filter(|text| !text.is_empty()).map_or_else(
+            || icon_text.to_string(),
+            |text| format!("{} {}", icon_text, text),
+        );
 
         ui.add(egui::Button::new(button_text).min_size(egui::vec2(32.0, 24.0)))
             .on_hover_text(tooltip)
@@ -7549,8 +7578,7 @@ impl ImageViewer {
                             .color(egui::Color32::from_gray(160)),
                     );
                 } else {
-                    let off_row =
-                        ui.selectable_label(current_track.is_none(), "Off");
+                    let off_row = ui.selectable_label(current_track.is_none(), "Off");
                     if off_row.clicked() {
                         selected_track = Some(-1);
                         ui.memory_mut(|mem| mem.close_popup());
@@ -7597,8 +7625,10 @@ impl ImageViewer {
             |ui| {
                 ui.set_min_width(260.0);
 
-                let off_row =
-                    ui.selectable_label(matches!(current_selection, VideoSubtitleSelection::Off), "Off");
+                let off_row = ui.selectable_label(
+                    matches!(current_selection, VideoSubtitleSelection::Off),
+                    "Off",
+                );
                 if off_row.clicked() {
                     selected_track = Some(VideoSubtitleSelection::Off);
                     ui.memory_mut(|mem| mem.close_popup());
@@ -7952,58 +7982,21 @@ impl ImageViewer {
             return;
         }
 
-        // For videos: the window was created off-screen (-10000, -10000).
-        // Now that we're ready, move it on-screen with the correct size and position.
         if matches!(self.current_media_type, Some(MediaType::Video)) {
-            if let Some((vid_w, vid_h)) = self.media_display_dimensions() {
-                let monitor = self.monitor_size_points(ctx);
-                let vid_w = vid_w as f32;
-                let vid_h = vid_h as f32;
-
-                // Calculate fit zoom (same logic as images)
-                let fit_zoom = if vid_h > monitor.y {
-                    (monitor.y / vid_h).clamp(0.1, self.max_zoom_factor())
-                } else {
-                    1.0
-                };
-
-                let size =
-                    egui::Vec2::new((vid_w * fit_zoom).max(200.0), (vid_h * fit_zoom).max(150.0));
-
-                // Center on screen
-                let pos = egui::Pos2::new(
-                    ((monitor.x - size.x) * 0.5).max(0.0),
-                    ((monitor.y - size.y) * 0.5).max(0.0),
-                );
-
-                // Move window on-screen with correct size
-                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
-                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
-                self.last_known_outer_pos = Some(pos);
-                self.floating_max_inner_size = Some(size);
-                self.last_requested_inner_size = Some(size);
+            let size = if let Some((vid_w, vid_h)) = self.media_display_dimensions() {
+                self.floating_layout_size_for_media(
+                    vid_w as f32,
+                    vid_h as f32,
+                    self.monitor_size_points(ctx),
+                )
+                .map(|(_, size)| size)
+                .unwrap_or(egui::Vec2::new(800.0, 600.0))
             } else {
-                // If video dimensions are still unknown (startup timeout or playback unavailable),
-                // move the previously hidden window back on-screen with a safe fallback size.
-                let monitor = self.monitor_size_points(ctx);
-                let mut size = self
-                    .last_requested_inner_size
-                    .or(self.floating_max_inner_size)
-                    .unwrap_or(egui::Vec2::new(800.0, 600.0));
-                size.x = size.x.max(200.0).min(monitor.x.max(200.0));
-                size.y = size.y.max(150.0).min(monitor.y.max(150.0));
+                egui::Vec2::new(800.0, 600.0)
+            };
 
-                let pos = egui::Pos2::new(
-                    ((monitor.x - size.x) * 0.5).max(0.0),
-                    ((monitor.y - size.y) * 0.5).max(0.0),
-                );
-
-                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
-                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
-                self.last_known_outer_pos = Some(pos);
-                self.floating_max_inner_size = Some(size);
-                self.last_requested_inner_size = Some(size);
-            }
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+            self.center_window_on_monitor(ctx, size);
         }
 
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
@@ -8114,7 +8107,8 @@ impl ImageViewer {
             .file_name()
             .map(|name| name.to_string_lossy().to_string())
             .unwrap_or_else(|| path.to_string_lossy().to_string());
-        let file_size_label = Self::file_size_label_for_path(path).unwrap_or_else(|| "Unknown size".to_string());
+        let file_size_label =
+            Self::file_size_label_for_path(path).unwrap_or_else(|| "Unknown size".to_string());
 
         let current_path = self.current_media_path();
         let known_dimensions = get_media_type(path).and_then(|media_type| {
@@ -8238,7 +8232,10 @@ impl ImageViewer {
         if self.manga_mode || self.image_list.is_empty() {
             None
         } else {
-            Some(self.current_index.min(self.image_list.len().saturating_sub(1)))
+            Some(
+                self.current_index
+                    .min(self.image_list.len().saturating_sub(1)),
+            )
         }
     }
 
@@ -8336,18 +8333,27 @@ impl ImageViewer {
                 );
                 painter.rect_stroke(folder_rect, 3.0, stroke);
                 painter.rect_filled(tab_rect, 2.0, color);
-                painter.line_segment([
-                    egui::pos2(rect.center().x, rect.top() + 3.0),
-                    egui::pos2(rect.center().x, folder_rect.top() + 3.0),
-                ], stroke);
-                painter.line_segment([
-                    egui::pos2(rect.center().x - 3.0, folder_rect.top() + 6.0),
-                    egui::pos2(rect.center().x, folder_rect.top() + 3.0),
-                ], stroke);
-                painter.line_segment([
-                    egui::pos2(rect.center().x + 3.0, folder_rect.top() + 6.0),
-                    egui::pos2(rect.center().x, folder_rect.top() + 3.0),
-                ], stroke);
+                painter.line_segment(
+                    [
+                        egui::pos2(rect.center().x, rect.top() + 3.0),
+                        egui::pos2(rect.center().x, folder_rect.top() + 3.0),
+                    ],
+                    stroke,
+                );
+                painter.line_segment(
+                    [
+                        egui::pos2(rect.center().x - 3.0, folder_rect.top() + 6.0),
+                        egui::pos2(rect.center().x, folder_rect.top() + 3.0),
+                    ],
+                    stroke,
+                );
+                painter.line_segment(
+                    [
+                        egui::pos2(rect.center().x + 3.0, folder_rect.top() + 6.0),
+                        egui::pos2(rect.center().x, folder_rect.top() + 3.0),
+                    ],
+                    stroke,
+                );
             }
             MenuActionIcon::Delete => {
                 let lid_rect = egui::Rect::from_min_max(
@@ -8430,10 +8436,7 @@ impl ImageViewer {
                     let radians = angle.to_radians();
                     let dir = egui::vec2(radians.cos(), radians.sin());
                     painter.line_segment(
-                        [
-                            rect.center() + dir * 5.5,
-                            rect.center() + dir * 8.0,
-                        ],
+                        [rect.center() + dir * 5.5, rect.center() + dir * 8.0],
                         stroke,
                     );
                 }
@@ -8461,11 +8464,7 @@ impl ImageViewer {
                     ],
                     stroke,
                 );
-                painter.circle_filled(
-                    egui::pos2(rect.center().x, rect.bottom() - 3.5),
-                    1.3,
-                    color,
-                );
+                painter.circle_filled(egui::pos2(rect.center().x, rect.bottom() - 3.5), 1.3, color);
             }
         }
     }
@@ -8564,8 +8563,14 @@ impl ImageViewer {
         } else {
             "Cut"
         };
-        if self.menu_action_row(ui, cut_label, MenuActionIcon::Cut).clicked() {
-            self.apply_clipboard_operation_to_single_file(target_index, FileClipboardOperation::Cut);
+        if self
+            .menu_action_row(ui, cut_label, MenuActionIcon::Cut)
+            .clicked()
+        {
+            self.apply_clipboard_operation_to_single_file(
+                target_index,
+                FileClipboardOperation::Cut,
+            );
             activated = true;
         }
 
@@ -8574,8 +8579,14 @@ impl ImageViewer {
         } else {
             "Copy"
         };
-        if self.menu_action_row(ui, copy_label, MenuActionIcon::Copy).clicked() {
-            self.apply_clipboard_operation_to_single_file(target_index, FileClipboardOperation::Copy);
+        if self
+            .menu_action_row(ui, copy_label, MenuActionIcon::Copy)
+            .clicked()
+        {
+            self.apply_clipboard_operation_to_single_file(
+                target_index,
+                FileClipboardOperation::Copy,
+            );
             activated = true;
         }
 
@@ -8584,7 +8595,10 @@ impl ImageViewer {
         } else {
             "Delete"
         };
-        if self.menu_action_row(ui, delete_label, MenuActionIcon::Delete).clicked() {
+        if self
+            .menu_action_row(ui, delete_label, MenuActionIcon::Delete)
+            .clicked()
+        {
             self.request_single_file_delete(target_index);
             activated = true;
         }
@@ -8594,7 +8608,10 @@ impl ImageViewer {
         } else {
             "Rename"
         };
-        if self.menu_action_row(ui, rename_label, MenuActionIcon::Rename).clicked() {
+        if self
+            .menu_action_row(ui, rename_label, MenuActionIcon::Rename)
+            .clicked()
+        {
             self.start_inline_rename_for_index(target_index);
             activated = true;
         }
@@ -8765,7 +8782,7 @@ impl ImageViewer {
             }
             Some(MarkedFileShortcut::Delete) => self.collect_keyboard_file_action_targets(),
             // Use a wildcard catch-all here to satisfy the compiler for None and Paste
-            _ => return false, 
+            _ => return false,
         };
 
         if target_paths.is_empty() {
@@ -8817,7 +8834,10 @@ impl ImageViewer {
                 return None;
             }
 
-            Some(self.current_index.min(self.image_list.len().saturating_sub(1)))
+            Some(
+                self.current_index
+                    .min(self.image_list.len().saturating_sub(1)),
+            )
         });
 
         if let Some(index) = target_index {
@@ -8839,17 +8859,14 @@ impl ImageViewer {
         let menu_outer_width = menu_content_width + 20.0;
 
         let menu_pos = egui::pos2(
-            menu_state
-                .screen_pos
-                .x
-                .clamp(
-                    screen_rect.min.x + 8.0,
-                    (screen_rect.max.x - menu_outer_width - 8.0).max(screen_rect.min.x + 8.0),
-                ),
-            menu_state
-                .screen_pos
-                .y
-                .clamp(screen_rect.min.y + 8.0, (screen_rect.max.y - 240.0).max(screen_rect.min.y + 8.0)),
+            menu_state.screen_pos.x.clamp(
+                screen_rect.min.x + 8.0,
+                (screen_rect.max.x - menu_outer_width - 8.0).max(screen_rect.min.x + 8.0),
+            ),
+            menu_state.screen_pos.y.clamp(
+                screen_rect.min.y + 8.0,
+                (screen_rect.max.y - 240.0).max(screen_rect.min.y + 8.0),
+            ),
         );
 
         let menu_response = egui::Area::new(egui::Id::new("file_action_menu"))
@@ -8867,7 +8884,11 @@ impl ImageViewer {
                     .show(ui, |ui| {
                         ui.set_min_width(menu_content_width);
 
-                        if self.render_single_file_action_buttons(ui, menu_state.target_index, false) {
+                        if self.render_single_file_action_buttons(
+                            ui,
+                            menu_state.target_index,
+                            false,
+                        ) {
                             close_menu = true;
                         }
 
@@ -8939,10 +8960,8 @@ impl ImageViewer {
             None => return None,
         };
 
-        let stamp = self.cached_file_stamp(
-            path.as_path(),
-            Self::FOLDER_PLACEHOLDER_STAMP_CACHE_TTL,
-        )?;
+        let stamp =
+            self.cached_file_stamp(path.as_path(), Self::FOLDER_PLACEHOLDER_STAMP_CACHE_TTL)?;
         if cached_stamp == stamp {
             return Some((texture_id, image_size));
         }
@@ -8978,13 +8997,15 @@ impl ImageViewer {
         let downscale_filter = self.config.downscale_filter.to_image_filter();
         let gif_filter = self.config.gif_resize_filter.to_image_filter();
         let path_clone = path.clone();
-        self.folder_placeholder_thumbnail_request_priority_seed =
-            self.folder_placeholder_thumbnail_request_priority_seed.saturating_add(1);
+        self.folder_placeholder_thumbnail_request_priority_seed = self
+            .folder_placeholder_thumbnail_request_priority_seed
+            .saturating_add(1);
         let priority = -self.folder_placeholder_thumbnail_request_priority_seed;
 
         self.folder_placeholder_thumbnail_pending
             .insert(path_clone.clone());
-        self.folder_placeholder_thumbnail_failures.remove(&path_clone);
+        self.folder_placeholder_thumbnail_failures
+            .remove(&path_clone);
 
         let request = FolderPlaceholderThumbnailLoadRequest {
             path: path_clone.clone(),
@@ -8999,7 +9020,8 @@ impl ImageViewer {
             .try_send(request)
             .is_err()
         {
-            self.folder_placeholder_thumbnail_pending.remove(&path_clone);
+            self.folder_placeholder_thumbnail_pending
+                .remove(&path_clone);
             self.folder_placeholder_thumbnail_failures
                 .insert(path_clone, Instant::now());
             return false;
@@ -9028,7 +9050,8 @@ impl ImageViewer {
                     stamp,
                     media_paths,
                 } => {
-                    self.folder_placeholder_preview_scan_pending.remove(&directory);
+                    self.folder_placeholder_preview_scan_pending
+                        .remove(&directory);
                     self.folder_placeholder_stamp_cache.insert(
                         directory.clone(),
                         CachedPathStamp {
@@ -9117,7 +9140,8 @@ impl ImageViewer {
 
             match result {
                 FolderPlaceholderThumbnailLoadResult::Ready(decoded) => {
-                    self.folder_placeholder_thumbnail_pending.remove(&decoded.path);
+                    self.folder_placeholder_thumbnail_pending
+                        .remove(&decoded.path);
 
                     let Some(current_stamp) = file_stamp_for_path(decoded.path.as_path()) else {
                         self.modal_thumbnail_cache.remove(&decoded.path);
@@ -9258,7 +9282,10 @@ impl ImageViewer {
         let color_image =
             egui::ColorImage::from_rgba_unmultiplied([width as usize, height as usize], &pixels);
         let texture = ctx.load_texture(
-            format!("modal-thumbnail:{}", decoded_image_cache_key(path, target_side)),
+            format!(
+                "modal-thumbnail:{}",
+                decoded_image_cache_key(path, target_side)
+            ),
             color_image,
             texture_options,
         );
@@ -9336,11 +9363,7 @@ impl ImageViewer {
         }
     }
 
-    fn draw_modal_metadata_chips(
-        ui: &mut egui::Ui,
-        file_size_label: &str,
-        dimensions_label: &str,
-    ) {
+    fn draw_modal_metadata_chips(ui: &mut egui::Ui, file_size_label: &str, dimensions_label: &str) {
         let render_chip = |ui: &mut egui::Ui,
                            text: &str,
                            fill: egui::Color32,
@@ -9446,26 +9469,32 @@ impl ImageViewer {
     }
 
     fn draw_delete_confirmation_modal(&mut self, ctx: &egui::Context) {
-        let (targets, title, summary) = if let Some(path) = self.pending_single_delete_target.clone() {
-            (
-                vec![path],
-                "Delete File to Recycle Bin?".to_string(),
-                "This will move the selected file to the Recycle Bin.".to_string(),
-            )
-        } else if !self.pending_marked_delete_targets.is_empty() {
-            let targets = self.pending_marked_delete_targets.clone();
-            let target_count = targets.len();
-            (
-                targets,
-                "Delete Marked Files to Recycle Bin?".to_string(),
-                format!("This will move {} marked files to the Recycle Bin.", target_count),
-            )
-        } else {
-            return;
-        };
+        let (targets, title, summary) =
+            if let Some(path) = self.pending_single_delete_target.clone() {
+                (
+                    vec![path],
+                    "Delete File to Recycle Bin?".to_string(),
+                    "This will move the selected file to the Recycle Bin.".to_string(),
+                )
+            } else if !self.pending_marked_delete_targets.is_empty() {
+                let targets = self.pending_marked_delete_targets.clone();
+                let target_count = targets.len();
+                (
+                    targets,
+                    "Delete Marked Files to Recycle Bin?".to_string(),
+                    format!(
+                        "This will move {} marked files to the Recycle Bin.",
+                        target_count
+                    ),
+                )
+            } else {
+                return;
+            };
 
-        let preview_items: Vec<DeleteModalItemInfo> =
-            targets.iter().map(|path| self.delete_modal_item_info(path)).collect();
+        let preview_items: Vec<DeleteModalItemInfo> = targets
+            .iter()
+            .map(|path| self.delete_modal_item_info(path))
+            .collect();
 
         let mut cancel = ctx.input(|input| input.key_pressed(egui::Key::Escape));
         let mut confirm = ctx.input(|input| {
@@ -9604,7 +9633,8 @@ impl ImageViewer {
         let summary = if item_count == 1 {
             "Choose a new name for the selected file.".to_string()
         } else {
-            "Edit each filename below. Every rename is validated before anything is moved.".to_string()
+            "Edit each filename below. Every rename is validated before anything is moved."
+                .to_string()
         };
 
         let mut edited_state = rename_state;
@@ -9693,40 +9723,50 @@ impl ImageViewer {
                             edited_state.just_opened = false;
 
                             ui.add_space(16.0);
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                let confirm_label = if item_count == 1 {
-                                    "Rename File"
-                                } else {
-                                    "Rename Files"
-                                };
-                                let rename_button = ui.add(
-                                    egui::Button::new(
-                                        egui::RichText::new(confirm_label)
-                                            .color(egui::Color32::WHITE),
-                                    )
-                                    .min_size(egui::vec2(132.0, 32.0))
-                                    .fill(egui::Color32::from_rgb(48, 122, 198))
-                                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(38, 92, 162)))
-                                    .rounding(6.0),
-                                );
-                                if rename_button.clicked() {
-                                    confirm = true;
-                                }
-
-                                let cancel_button = ui.add(
-                                    egui::Button::new("Cancel")
-                                        .min_size(egui::vec2(100.0, 32.0))
-                                        .fill(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 24))
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    let confirm_label = if item_count == 1 {
+                                        "Rename File"
+                                    } else {
+                                        "Rename Files"
+                                    };
+                                    let rename_button = ui.add(
+                                        egui::Button::new(
+                                            egui::RichText::new(confirm_label)
+                                                .color(egui::Color32::WHITE),
+                                        )
+                                        .min_size(egui::vec2(132.0, 32.0))
+                                        .fill(egui::Color32::from_rgb(48, 122, 198))
                                         .stroke(egui::Stroke::new(
                                             1.0,
-                                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 48),
+                                            egui::Color32::from_rgb(38, 92, 162),
                                         ))
                                         .rounding(6.0),
-                                );
-                                if cancel_button.clicked() {
-                                    cancel = true;
-                                }
-                            });
+                                    );
+                                    if rename_button.clicked() {
+                                        confirm = true;
+                                    }
+
+                                    let cancel_button = ui.add(
+                                        egui::Button::new("Cancel")
+                                            .min_size(egui::vec2(100.0, 32.0))
+                                            .fill(egui::Color32::from_rgba_unmultiplied(
+                                                255, 255, 255, 24,
+                                            ))
+                                            .stroke(egui::Stroke::new(
+                                                1.0,
+                                                egui::Color32::from_rgba_unmultiplied(
+                                                    255, 255, 255, 48,
+                                                ),
+                                            ))
+                                            .rounding(6.0),
+                                    );
+                                    if cancel_button.clicked() {
+                                        cancel = true;
+                                    }
+                                },
+                            );
                         });
                     });
             });
@@ -9774,10 +9814,7 @@ impl ImageViewer {
                 );
             });
 
-        let modal_size = egui::vec2(
-            (screen_rect.width() - 48.0).clamp(380.0, 560.0),
-            236.0,
-        );
+        let modal_size = egui::vec2((screen_rect.width() - 48.0).clamp(380.0, 560.0), 236.0);
         let modal_pos = screen_rect.center() - modal_size * 0.5;
         egui::Area::new(egui::Id::new("exit_confirmation_modal"))
             .fixed_pos(modal_pos)
@@ -10146,11 +10183,7 @@ impl ImageViewer {
                 "Manga freehand autoscroll",
                 "Start manga autoscroll anchored to pointer direction.",
             ),
-            (
-                Action::MangaPanUp,
-                "Pan up",
-                "Move strip viewport upward.",
-            ),
+            (Action::MangaPanUp, "Pan up", "Move strip viewport upward."),
             (
                 Action::MangaPanDown,
                 "Pan down",
@@ -10469,7 +10502,8 @@ impl ImageViewer {
         } else {
             let clicked_outside_modal = ctx.input(|input| {
                 let primary_clicked = input.pointer.button_clicked(egui::PointerButton::Primary);
-                let secondary_clicked = input.pointer.button_clicked(egui::PointerButton::Secondary);
+                let secondary_clicked =
+                    input.pointer.button_clicked(egui::PointerButton::Secondary);
                 let pointer_pos = input
                     .pointer
                     .interact_pos()
@@ -10520,94 +10554,8 @@ impl ImageViewer {
         }
     }
 
-    fn track_floating_window_position(&mut self, ctx: &egui::Context) {
-        let Some(pos) = ctx.input(|i| i.raw.viewport().outer_rect).map(|r| r.min) else {
-            return;
-        };
-
-        // Always keep this updated so we have a good fallback.
-        if self.is_fullscreen {
-            self.last_known_outer_pos = Some(pos);
-            return;
-        }
-
-        if self.suppress_outer_pos_tracking_frames > 0 {
-            self.suppress_outer_pos_tracking_frames =
-                self.suppress_outer_pos_tracking_frames.saturating_sub(1);
-            self.last_known_outer_pos = Some(pos);
-            return;
-        }
-
-        if let Some(prev) = self.last_known_outer_pos {
-            let delta = pos - prev;
-            if delta.length() > 0.5 {
-                self.floating_user_moved_window = true;
-            }
-        }
-
-        self.last_known_outer_pos = Some(pos);
-    }
-
     fn send_outer_position(&mut self, ctx: &egui::Context, pos: egui::Pos2) {
-        // Programmatic move: ignore any resulting outer-pos deltas for a couple frames.
-        self.suppress_outer_pos_tracking_frames = self.suppress_outer_pos_tracking_frames.max(2);
         ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
-        self.last_known_outer_pos = Some(pos);
-    }
-
-    fn suppress_programmatic_native_window_transition_tracking(&mut self) {
-        // Native maximize/restore animations can emit several intermediate outer-position updates.
-        // Treat them like programmatic moves so floating media changes keep their normal centering behavior.
-        self.suppress_outer_pos_tracking_frames = self.suppress_outer_pos_tracking_frames.max(12);
-    }
-
-    #[allow(dead_code)]
-    fn apply_floating_layout_exit_fullscreen_current_image(&mut self, ctx: &egui::Context) {
-        self.offset = egui::Vec2::ZERO;
-        self.zoom_velocity = 0.0;
-
-        let Some(ref img) = self.image else {
-            return;
-        };
-
-        let (img_w_u, img_h_u) = img.display_dimensions();
-        if img_w_u == 0 || img_h_u == 0 {
-            return;
-        }
-
-        let img_w = img_w_u as f32;
-        let img_h = img_h_u as f32;
-        let monitor = self.monitor_size_points(ctx);
-
-        // Normal floating behavior for this fullscreen-exit case:
-        // - Prefer 100% image size
-        // - If the image is taller than the screen, fit vertically to consume the full screen height
-        let z = if img_h > monitor.y {
-            self.fit_zoom_for_target_height(monitor.y, img_h)
-        } else {
-            1.0
-        };
-
-        self.zoom = z;
-        self.zoom_target = z;
-
-        let mut size = egui::Vec2::new(img_w * z, img_h * z);
-        size.x = size.x.max(200.0);
-        size.y = size.y.max(150.0);
-
-        self.floating_max_inner_size = Some(size);
-        self.last_requested_inner_size = Some(size);
-        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
-
-        if self.floating_user_moved_window {
-            if let Some(pos) = self.last_known_outer_pos {
-                self.send_outer_position(ctx, pos);
-            } else {
-                self.center_window_on_monitor(ctx, size);
-            }
-        } else {
-            self.center_window_on_monitor(ctx, size);
-        }
     }
 
     fn apply_manga_pan_step(&mut self, direction: f32, multiplier: f32) {
@@ -10617,7 +10565,12 @@ impl ImageViewer {
         }
     }
 
-    fn modifier_wheel_pan_step(&self, wheel_steps: f32, horizontal: bool, viewport_span: f32) -> f32 {
+    fn modifier_wheel_pan_step(
+        &self,
+        wheel_steps: f32,
+        horizontal: bool,
+        viewport_span: f32,
+    ) -> f32 {
         let configured = if horizontal {
             if wheel_steps >= 0.0 {
                 self.config.shift_scroll_up_pan_speed_px_per_step
@@ -10860,8 +10813,10 @@ impl ImageViewer {
     }
 
     fn strip_item_open_uses_right_click(&self) -> bool {
-        self.config
-            .action_uses_binding(self.manga_layout_goto_file_action(), &InputBinding::MouseRight)
+        self.config.action_uses_binding(
+            self.manga_layout_goto_file_action(),
+            &InputBinding::MouseRight,
+        )
     }
 
     fn strip_item_open_binding_triggered(
@@ -10934,7 +10889,10 @@ impl ImageViewer {
 
     fn solo_video_playing_active(&self) -> bool {
         self.solo_video_playback_mode_active()
-            && self.video_player.as_ref().is_some_and(|player| player.is_playing())
+            && self
+                .video_player
+                .as_ref()
+                .is_some_and(|player| player.is_playing())
     }
 
     fn try_handle_video_priority_shortcuts(&mut self, ctx: &egui::Context) -> bool {
@@ -11224,7 +11182,8 @@ impl ImageViewer {
 
         if let Some(ref mut loader) = self.manga_loader {
             let new_entry = (w, h, manga_media_type);
-            let changed = loader.dimension_cache.get(&self.current_index).copied() != Some(new_entry);
+            let changed =
+                loader.dimension_cache.get(&self.current_index).copied() != Some(new_entry);
             loader.dimension_cache.insert(self.current_index, new_entry);
             return changed;
         }
@@ -11261,7 +11220,10 @@ impl ImageViewer {
         self.masonry_metadata_preload_restore_index = if self.image_list.is_empty() {
             None
         } else {
-            Some(self.current_index.min(self.image_list.len().saturating_sub(1)))
+            Some(
+                self.current_index
+                    .min(self.image_list.len().saturating_sub(1)),
+            )
         };
         let preload_window = 96usize.max(self.masonry_items_per_row.clamp(2, 10) * 48);
         self.masonry_metadata_preload_cursor = self
@@ -11347,7 +11309,8 @@ impl ImageViewer {
             self.stop_manga_wheel_scroll();
         }
 
-        if let Some((target_index, restored_offset)) = self.pending_masonry_folder_travel_restore.take()
+        if let Some((target_index, restored_offset)) =
+            self.pending_masonry_folder_travel_restore.take()
         {
             let target_index = target_index.min(self.image_list.len().saturating_sub(1));
             self.set_current_index_clamped(target_index);
@@ -11377,14 +11340,18 @@ impl ImageViewer {
             return;
         }
 
-        let total = self.masonry_metadata_preload_total.min(self.image_list.len());
+        let total = self
+            .masonry_metadata_preload_total
+            .min(self.image_list.len());
         if total == 0 {
             self.reset_masonry_metadata_preload();
             return;
         }
 
         let navigation_active = self.masonry_navigation_active_for_heavy_work();
-        let preload_cursor = self.masonry_metadata_preload_cursor.min(total.saturating_sub(1));
+        let preload_cursor = self
+            .masonry_metadata_preload_cursor
+            .min(total.saturating_sub(1));
         let preload_window = 96usize.max(self.masonry_items_per_row.clamp(2, 10) * 48);
         let preload_end = (preload_cursor + preload_window).min(total);
         let folder_ready = self
@@ -11419,14 +11386,14 @@ impl ImageViewer {
         };
 
         if !navigation_active {
-            self.masonry_metadata_preload_cursor = if preload_end >= total { 0 } else { preload_end };
+            self.masonry_metadata_preload_cursor =
+                if preload_end >= total { 0 } else { preload_end };
         }
 
         self.masonry_metadata_preload_loaded = loaded_count;
 
-        let scan_complete = loaded_count >= total
-            && pending_probe_count == 0
-            && pending_result_count == 0;
+        let scan_complete =
+            loaded_count >= total && pending_probe_count == 0 && pending_result_count == 0;
 
         if scan_complete {
             self.masonry_metadata_preload_loaded = total;
@@ -11728,26 +11695,24 @@ impl ImageViewer {
                 let previous_was_folder_entry = current_path_before
                     .as_ref()
                     .is_some_and(|path| self.is_folder_navigation_entry_path(path.as_path()));
-                let same_path_index = current_path_before
-                    .as_ref()
-                    .and_then(|path| self.image_list.iter().position(|candidate| candidate == path));
+                let same_path_index = current_path_before.as_ref().and_then(|path| {
+                    self.image_list
+                        .iter()
+                        .position(|candidate| candidate == path)
+                });
                 let first_media_index = self
                     .image_list
                     .iter()
                     .position(|path| !self.is_folder_navigation_entry_path(path.as_path()));
 
                 let resolved_index = if previous_was_folder_entry {
-                    first_media_index
-                        .or(same_path_index)
-                        .unwrap_or_else(|| {
-                            current_index_before.min(self.image_list.len().saturating_sub(1))
-                        })
+                    first_media_index.or(same_path_index).unwrap_or_else(|| {
+                        current_index_before.min(self.image_list.len().saturating_sub(1))
+                    })
                 } else {
-                    same_path_index
-                        .or(first_media_index)
-                        .unwrap_or_else(|| {
-                            current_index_before.min(self.image_list.len().saturating_sub(1))
-                        })
+                    same_path_index.or(first_media_index).unwrap_or_else(|| {
+                        current_index_before.min(self.image_list.len().saturating_sub(1))
+                    })
                 };
                 self.set_current_index_clamped(resolved_index);
 
@@ -12183,7 +12148,12 @@ impl ImageViewer {
                         Ok(player) => {
                             let dims = player.dimensions();
                             if dims.0 > 0 && dims.1 > 0 {
-                                store_cached_dimensions(&path, CachedMediaKind::Video, dims.0, dims.1);
+                                store_cached_dimensions(
+                                    &path,
+                                    CachedMediaKind::Video,
+                                    dims.0,
+                                    dims.1,
+                                );
                             }
 
                             self.video_player = Some(player);
@@ -12362,8 +12332,8 @@ impl ImageViewer {
             } else {
                 // Keep current media navigable immediately while the full directory scan runs in background.
                 self.set_image_list(vec![path.clone()]);
-                let _ =
-                    self.begin_media_directory_scan(path, PendingMediaDirectoryScanKind::InitialLoad);
+                let _ = self
+                    .begin_media_directory_scan(path, PendingMediaDirectoryScanKind::InitialLoad);
             }
         }
 
@@ -12470,10 +12440,7 @@ impl ImageViewer {
             }
         }
 
-        if media_type.is_some()
-            && !is_folder_entry
-            && !defer_directory_work_for_fast_startup
-        {
+        if media_type.is_some() && !is_folder_entry && !defer_directory_work_for_fast_startup {
             self.schedule_solo_probe_window(path, media_type);
         }
 
@@ -12831,40 +12798,68 @@ impl ImageViewer {
             .unwrap_or(self.screen_size)
     }
 
-    fn floating_available_size(&self, ctx: &egui::Context) -> egui::Vec2 {
-        // Keep a small margin so borderless floating mode doesn't look like "true fullscreen".
-        let monitor = self.monitor_size_points(ctx);
-        egui::Vec2::new((monitor.x - 40.0).max(200.0), (monitor.y - 80.0).max(150.0))
-    }
-
-    fn initial_window_size_for_available(&self, available: egui::Vec2) -> egui::Vec2 {
-        if let Some(ref img) = self.image {
-            let (img_w, img_h) = img.display_dimensions();
-            let img_w = img_w as f32;
-            let img_h = img_h as f32;
-
-            if img_w <= 0.0 || img_h <= 0.0 {
-                return egui::Vec2::new(800.0, 600.0);
-            }
-
-            if img_w > available.x || img_h > available.y {
-                let scale = (available.x / img_w).min(available.y / img_h).min(1.0);
-                egui::Vec2::new(img_w * scale, img_h * scale)
-            } else {
-                egui::Vec2::new(img_w, img_h)
-            }
-        } else {
-            egui::Vec2::new(800.0, 600.0)
-        }
-    }
-
     fn center_window_on_monitor(&mut self, ctx: &egui::Context, inner_size: egui::Vec2) {
         let monitor = self.monitor_size_points(ctx);
         let x = (monitor.x - inner_size.x) * 0.5;
         let y = (monitor.y - inner_size.y) * 0.5;
-        // Centering is a programmatic placement, so it resets the "user moved" latch.
-        self.floating_user_moved_window = false;
         self.send_outer_position(ctx, egui::pos2(x.max(0.0), y.max(0.0)));
+    }
+
+    fn floating_layout_size_for_media(
+        &self,
+        media_w: f32,
+        media_h: f32,
+        monitor: egui::Vec2,
+    ) -> Option<(f32, egui::Vec2)> {
+        if media_w <= 0.0 || media_h <= 0.0 || monitor.x <= 0.0 || monitor.y <= 0.0 {
+            return None;
+        }
+
+        let zoom = if media_w > monitor.x || media_h > monitor.y {
+            (monitor.x / media_w).min(monitor.y / media_h).min(1.0)
+        } else {
+            1.0
+        };
+
+        let size = egui::Vec2::new((media_w * zoom).max(200.0), (media_h * zoom).max(150.0));
+        Some((zoom, size))
+    }
+
+    fn prepare_single_instance_media_handoff(&mut self, ctx: &egui::Context) {
+        if self.manga_mode {
+            self.stop_manga_wheel_scroll();
+            self.stop_manga_autoscroll();
+            self.manga_mode = false;
+            set_metadata_cache_enabled(false);
+            self.manga_clear_cache();
+            self.manga_loader = None;
+        }
+
+        self.clear_strip_return_context();
+        self.titlebar_pending_restore_layout = None;
+        self.titlebar_previous_mode = None;
+        self.toggle_fullscreen = false;
+        self.toggle_fullscreen_force_borderless = false;
+        self.toggle_fullscreen_from_titlebar = false;
+        self.pending_fullscreen_layout = false;
+        self.pending_maximized_layout = false;
+        self.pending_window_resize = None;
+        self.image_changed = false;
+        self.pending_media_layout = false;
+        self.saved_fullscreen_entry_index = None;
+        self.fullscreen_view_states.clear();
+        self.current_fullscreen_view_has_memory = false;
+        self.strip_open_force_fit_path = None;
+        self.is_fullscreen = false;
+        self.fullscreen_transition = 0.0;
+        self.fullscreen_transition_target = 0.0;
+        self.force_floating_layout_once = true;
+
+        self.request_native_maximize = if self.current_window_is_maximized(ctx) {
+            Some(false)
+        } else {
+            None
+        };
     }
 
     fn current_window_is_maximized(&self, ctx: &egui::Context) -> bool {
@@ -13031,7 +13026,8 @@ impl ImageViewer {
         const ZOOM_EPSILON: f32 = 0.0005;
         const OFFSET_EPSILON: f32 = 0.5;
 
-        let scroll_unchanged = (self.manga_scroll_offset - state.scroll_offset).abs() <= SCROLL_EPSILON
+        let scroll_unchanged = (self.manga_scroll_offset - state.scroll_offset).abs()
+            <= SCROLL_EPSILON
             && (self.manga_scroll_target - state.scroll_target).abs() <= SCROLL_EPSILON;
         let zoom_unchanged = (self.zoom - state.zoom).abs() <= ZOOM_EPSILON
             && (self.zoom_target - state.zoom_target).abs() <= ZOOM_EPSILON;
@@ -13085,62 +13081,21 @@ impl ImageViewer {
     fn apply_floating_layout_for_current_image(&mut self, ctx: &egui::Context) {
         self.offset = egui::Vec2::ZERO;
 
-        // Get dimensions from either image or video
-        let dims = self.media_display_dimensions();
-        if let Some((img_w_u, img_h_u)) = dims {
-            let img_w = img_w_u as f32;
-            let img_h = img_h_u as f32;
+        let Some((media_w_u, media_h_u)) = self.media_display_dimensions() else {
+            return;
+        };
+        let media_w = media_w_u as f32;
+        let media_h = media_h_u as f32;
+        let monitor = self.monitor_size_points(ctx);
+        let Some((zoom, size)) = self.floating_layout_size_for_media(media_w, media_h, monitor)
+        else {
+            return;
+        };
 
-            if img_w <= 0.0 || img_h <= 0.0 {
-                return;
-            }
-
-            let monitor = self.monitor_size_points(ctx);
-
-            // Floating mode sizing:
-            // - Images: keep the existing fit-to-screen behavior (fit by min(width,height) if needed).
-            // - Videos (per spec): fit vertically ONLY if the video is taller than the screen;
-            //   otherwise show at 100% size and center.
-            let is_video = matches!(self.current_media_type, Some(MediaType::Video));
-            let fit_zoom = if is_video {
-                if img_h > monitor.y {
-                    self.fit_zoom_for_target_height(monitor.y, img_h)
-                } else {
-                    1.0
-                }
-            } else if img_h > monitor.y || img_w > monitor.x {
-                // Scale to fit: use the smaller scale factor to ensure it fits.
-                (monitor.y / img_h).min(monitor.x / img_w).min(1.0)
-            } else {
-                1.0
-            };
-
-            self.zoom = fit_zoom;
-            self.zoom_target = fit_zoom;
-
-            // Compute window size based on zoom.
-            let mut size = egui::Vec2::new(img_w * fit_zoom, img_h * fit_zoom);
-
-            // Respect the viewport minimum size.
-            size.x = size.x.max(200.0);
-            size.y = size.y.max(150.0);
-
-            self.floating_max_inner_size = Some(size);
-            self.last_requested_inner_size = Some(size);
-            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
-
-            // In floating mode, keep the user's window placement once they've moved/resized it.
-            // Otherwise, keep the existing behavior: center on the monitor.
-            if self.floating_user_moved_window {
-                if let Some(pos) = self.last_known_outer_pos {
-                    self.send_outer_position(ctx, pos);
-                } else {
-                    self.center_window_on_monitor(ctx, size);
-                }
-            } else {
-                self.center_window_on_monitor(ctx, size);
-            }
-        }
+        self.zoom = zoom;
+        self.zoom_target = zoom;
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+        self.center_window_on_monitor(ctx, size);
     }
 
     fn apply_maximized_layout_for_current_image(&mut self, ctx: &egui::Context) {
@@ -13165,9 +13120,9 @@ impl ImageViewer {
 
     fn apply_fullscreen_layout_for_current_image(&mut self, ctx: &egui::Context) {
         let current_path = self.image_list.get(self.current_index).cloned();
-        let force_fit = current_path.as_ref().is_some_and(|path| {
-            self.strip_open_force_fit_path.as_ref() == Some(path)
-        });
+        let force_fit = current_path
+            .as_ref()
+            .is_some_and(|path| self.strip_open_force_fit_path.as_ref() == Some(path));
 
         // Check if we have a saved view state for this image (fullscreen per-image memory).
         // Strip or masonry quick-open into solo fullscreen is intentionally different: it should
@@ -13277,9 +13232,8 @@ impl ImageViewer {
 
     fn tick_fullscreen_precise_rotation_animation(&mut self, ctx: &egui::Context) -> bool {
         if self.manga_mode || self.current_media_type.is_none() {
-            self.precise_rotation_degrees = Self::normalize_precise_rotation_degrees(
-                self.precise_rotation_target_degrees,
-            );
+            self.precise_rotation_degrees =
+                Self::normalize_precise_rotation_degrees(self.precise_rotation_target_degrees);
             self.precise_rotation_target_degrees = self.precise_rotation_degrees;
             self.precise_rotation_velocity = 0.0;
             return false;
@@ -13294,9 +13248,8 @@ impl ImageViewer {
 
         if error.abs() < SNAP_THRESHOLD && self.precise_rotation_velocity.abs() < VELOCITY_THRESHOLD
         {
-            self.precise_rotation_degrees = Self::normalize_precise_rotation_degrees(
-                self.precise_rotation_target_degrees,
-            );
+            self.precise_rotation_degrees =
+                Self::normalize_precise_rotation_degrees(self.precise_rotation_target_degrees);
             self.precise_rotation_velocity = 0.0;
             return false;
         }
@@ -13461,7 +13414,10 @@ impl ImageViewer {
             if let Some(snapshot) = self.strip_return_masonry_list_snapshot.clone() {
                 self.set_image_list_raw(snapshot);
                 if let Some(path) = current_path.as_ref() {
-                    if let Some(idx) = self.image_list.iter().position(|candidate| candidate == path)
+                    if let Some(idx) = self
+                        .image_list
+                        .iter()
+                        .position(|candidate| candidate == path)
                     {
                         self.set_current_index_clamped(idx);
                     }
@@ -13521,7 +13477,10 @@ impl ImageViewer {
                 if state.list_signature == snapshot_signature {
                     self.set_image_list_raw(snapshot);
                     if let Some(path) = current_viewed_path.as_ref() {
-                        if let Some(idx) = self.image_list.iter().position(|candidate| candidate == path)
+                        if let Some(idx) = self
+                            .image_list
+                            .iter()
+                            .position(|candidate| candidate == path)
                         {
                             self.set_current_index_clamped(idx);
                         }
@@ -13759,9 +13718,8 @@ impl ImageViewer {
     }
 
     fn masonry_schedule_quality_refine(&mut self) {
-        self.masonry_quality_refine_due_at = Some(
-            Instant::now() + Duration::from_millis(Self::MASONRY_QUALITY_REFINE_SETTLE_MS),
-        );
+        self.masonry_quality_refine_due_at =
+            Some(Instant::now() + Duration::from_millis(Self::MASONRY_QUALITY_REFINE_SETTLE_MS));
         self.masonry_quality_refine_frames_remaining = 0;
     }
 
@@ -13804,10 +13762,9 @@ impl ImageViewer {
         let basis = item_screen_max_side
             .max(baseline_item_width.min(item_screen_max_side.max(1.0) * 1.08))
             .max(48.0);
-        let scaled = (basis
-            * self.masonry_zoom_quality_boost(zoom)
-            * self.manga_lod_target_scale_factor())
-            .ceil() as u32;
+        let scaled =
+            (basis * self.masonry_zoom_quality_boost(zoom) * self.manga_lod_target_scale_factor())
+                .ceil() as u32;
         let scaled = if navigation_active {
             scaled.min(self.masonry_navigation_target_side_cap())
         } else {
@@ -13829,7 +13786,7 @@ impl ImageViewer {
         let scaled = (item_screen_max_side.max(1.0)
             * Self::MANGA_DYNAMIC_TARGET_OVERSCAN
             * self.manga_lod_target_scale_factor())
-            .ceil() as u32;
+        .ceil() as u32;
 
         scaled.clamp(Self::MANGA_DYNAMIC_TARGET_MIN_SIDE.min(max_side), max_side)
     }
@@ -13915,18 +13872,21 @@ impl ImageViewer {
         };
 
         let min_side = if self.is_masonry_mode() {
-            self.masonry_dynamic_target_min_side().max(match media_type {
-                MangaMediaType::Video => 96,
-                MangaMediaType::AnimatedImage => 96,
-                MangaMediaType::StaticImage => self.masonry_dynamic_target_min_side(),
-            })
+            self.masonry_dynamic_target_min_side()
+                .max(match media_type {
+                    MangaMediaType::Video => 96,
+                    MangaMediaType::AnimatedImage => 96,
+                    MangaMediaType::StaticImage => self.masonry_dynamic_target_min_side(),
+                })
         } else {
             Self::MANGA_DYNAMIC_TARGET_MIN_SIDE.min(max_side)
         };
 
-        let mut target_side = ((display_side * overscan * target_scale).ceil() as u32)
-            .clamp(min_side, max_side);
-        target_side = self.manga_clamp_target_side_to_source(index, target_side).clamp(1, max_side);
+        let mut target_side =
+            ((display_side * overscan * target_scale).ceil() as u32).clamp(min_side, max_side);
+        target_side = self
+            .manga_clamp_target_side_to_source(index, target_side)
+            .clamp(1, max_side);
 
         if self.is_masonry_mode() {
             let fill_cap = if self.masonry_navigation_active_for_heavy_work() {
@@ -13973,12 +13933,16 @@ impl ImageViewer {
         if source_w >= source_h {
             let scale = clamped_side as f32 / source_w as f32;
             let width = clamped_side;
-            let height = ((source_h as f32 * scale).round() as u32).max(1).min(source_h);
+            let height = ((source_h as f32 * scale).round() as u32)
+                .max(1)
+                .min(source_h);
             (width.min(source_w), height)
         } else {
             let scale = clamped_side as f32 / source_h as f32;
             let height = clamped_side;
-            let width = ((source_w as f32 * scale).round() as u32).max(1).min(source_w);
+            let width = ((source_w as f32 * scale).round() as u32)
+                .max(1)
+                .min(source_w);
             (width, height.min(source_h))
         }
     }
@@ -14075,10 +14039,12 @@ impl ImageViewer {
     }
 
     fn manga_should_heal_placeholder_retry(&self, index: usize) -> bool {
-        self.manga_ttv_pending.get(&index).is_some_and(|started_at| {
-            started_at.elapsed()
-                >= Duration::from_millis(Self::MANGA_PLACEHOLDER_STALL_RETRY_MS)
-        })
+        self.manga_ttv_pending
+            .get(&index)
+            .is_some_and(|started_at| {
+                started_at.elapsed()
+                    >= Duration::from_millis(Self::MANGA_PLACEHOLDER_STALL_RETRY_MS)
+            })
     }
 
     fn manga_retry_target_side_for_rect(&mut self, index: usize, image_rect: egui::Rect) -> u32 {
@@ -14133,7 +14099,10 @@ impl ImageViewer {
 
         let (ratio, delta) = if self.is_masonry_mode() {
             let dense_view = self.masonry_visible_density_hint() >= 48;
-            let moving_media = matches!(media_type, MangaMediaType::Video | MangaMediaType::AnimatedImage);
+            let moving_media = matches!(
+                media_type,
+                MangaMediaType::Video | MangaMediaType::AnimatedImage
+            );
 
             if dense_view || moving_media {
                 (1.32f32, 128u32)
@@ -14200,10 +14169,8 @@ impl ImageViewer {
                 ));
             }
             self.masonry_spatial_index = Some(MangaSpatialIndex::from_rects(rects));
-            self.perf_metrics.record_duration(
-                "masonry_spatial_rebuild_ms",
-                rebuild_started.elapsed(),
-            );
+            self.perf_metrics
+                .record_duration("masonry_spatial_rebuild_ms", rebuild_started.elapsed());
         }
 
         self.masonry_spatial_index.as_ref()
@@ -14601,11 +14568,13 @@ impl ImageViewer {
         }
 
         let follow_current_viewed_item_on_restore = if layout_mode == MangaLayoutMode::Masonry {
-            self.masonry_mode_session_snapshot.as_ref().is_some_and(|snapshot| {
-                target_path
-                    .as_ref()
-                    .is_some_and(|path| snapshot.current_path.as_ref() != Some(path))
-            })
+            self.masonry_mode_session_snapshot
+                .as_ref()
+                .is_some_and(|snapshot| {
+                    target_path
+                        .as_ref()
+                        .is_some_and(|path| snapshot.current_path.as_ref() != Some(path))
+                })
         } else {
             false
         };
@@ -14626,9 +14595,8 @@ impl ImageViewer {
         } else {
             false
         };
-        let masonry_authoritative_ready =
-            layout_mode == MangaLayoutMode::Masonry
-                && self.masonry_authoritative_dimension_lock_active();
+        let masonry_authoritative_ready = layout_mode == MangaLayoutMode::Masonry
+            && self.masonry_authoritative_dimension_lock_active();
 
         if layout_mode != MangaLayoutMode::Masonry || !restored_masonry_session {
             self.invalidate_manga_layout_cache();
@@ -14843,7 +14811,9 @@ impl ImageViewer {
             .saturating_add(buffer)
             .min(self.image_list.len().saturating_sub(1));
 
-        updated_indices.iter().any(|idx| *idx >= start && *idx <= end)
+        updated_indices
+            .iter()
+            .any(|idx| *idx >= start && *idx <= end)
     }
 
     fn masonry_queue_dimension_updates<I>(&mut self, updated_indices: I)
@@ -14870,7 +14840,8 @@ impl ImageViewer {
             .iter()
             .copied()
             .collect();
-        let should_apply = force || self.masonry_should_apply_dimension_updates_now(&pending_indices);
+        let should_apply =
+            force || self.masonry_should_apply_dimension_updates_now(&pending_indices);
         if !should_apply {
             self.perf_metrics
                 .increment_counter("masonry_dim_commit_deferred", 1);
@@ -15021,11 +14992,13 @@ impl ImageViewer {
             };
             let follow_current_viewed_item_on_restore =
                 if self.manga_layout_mode == MangaLayoutMode::Masonry {
-                    self.masonry_mode_session_snapshot.as_ref().is_some_and(|snapshot| {
-                        preferred_masonry_path
-                            .as_ref()
-                            .is_some_and(|path| snapshot.current_path.as_ref() != Some(path))
-                    })
+                    self.masonry_mode_session_snapshot
+                        .as_ref()
+                        .is_some_and(|snapshot| {
+                            preferred_masonry_path
+                                .as_ref()
+                                .is_some_and(|path| snapshot.current_path.as_ref() != Some(path))
+                        })
                 } else {
                     false
                 };
@@ -15162,9 +15135,8 @@ impl ImageViewer {
                 self.stop_manga_wheel_scroll();
             }
 
-            let allow_startup_preload =
-                self.manga_layout_mode == MangaLayoutMode::Masonry
-                    && (!restored_masonry_session || !masonry_authoritative_ready);
+            let allow_startup_preload = self.manga_layout_mode == MangaLayoutMode::Masonry
+                && (!restored_masonry_session || !masonry_authoritative_ready);
             self.maybe_begin_masonry_metadata_preload(allow_startup_preload);
             if self.manga_layout_mode == MangaLayoutMode::Masonry {
                 self.manga_update_current_index();
@@ -15826,16 +15798,16 @@ impl ImageViewer {
                 }
             }
 
-            let focus_play_error = if let Some(player) = self.manga_video_players.get_mut(&focused_idx)
-            {
-                if focus_changed && !player.is_playing() {
-                    player.play().err()
+            let focus_play_error =
+                if let Some(player) = self.manga_video_players.get_mut(&focused_idx) {
+                    if focus_changed && !player.is_playing() {
+                        player.play().err()
+                    } else {
+                        None
+                    }
                 } else {
                     None
-                }
-            } else {
-                None
-            };
+                };
 
             if let Some(err) = focus_play_error {
                 self.video_playback_unavailable_reason = Some(err);
@@ -15930,8 +15902,8 @@ impl ImageViewer {
 
         // Only update the focused video's texture (to save resources)
         if let Some(focused_idx) = self.manga_focused_video_index {
-            let target_side =
-                self.manga_target_texture_side_for_dynamic_media(focused_idx, MangaMediaType::Video);
+            let target_side = self
+                .manga_target_texture_side_for_dynamic_media(focused_idx, MangaMediaType::Video);
             let mut video_dimensions_changed = false;
             if let Some(player) = self.manga_video_players.get_mut(&focused_idx) {
                 // Update duration cache
@@ -16208,8 +16180,8 @@ impl ImageViewer {
 
         // ── Update animation frames for the focused animated image only ──
         for &idx in focused_anim_idx.iter() {
-            let target_side =
-                self.manga_target_texture_side_for_dynamic_media(idx, MangaMediaType::AnimatedImage);
+            let target_side = self
+                .manga_target_texture_side_for_dynamic_media(idx, MangaMediaType::AnimatedImage);
             let stream_done = self
                 .manga_anim_stream_done
                 .get(&idx)
@@ -16346,16 +16318,14 @@ impl ImageViewer {
             let color_image =
                 egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], pixels.as_ref());
             let texture_options = self.config.texture_filter_animated.to_egui_options();
-            if let Some((mut texture, _, _, _)) = self.manga_texture_cache.get_texture_handle_info(idx)
+            if let Some((mut texture, _, _, _)) =
+                self.manga_texture_cache.get_texture_handle_info(idx)
             {
                 texture.set(color_image, texture_options);
                 self.manga_texture_cache.update_texture(idx, texture, w, h);
             } else {
-                let texture = ctx.load_texture(
-                    format!("manga_anim_{}", idx),
-                    color_image,
-                    texture_options,
-                );
+                let texture =
+                    ctx.load_texture(format!("manga_anim_{}", idx), color_image, texture_options);
                 let evicted = self.manga_texture_cache.insert_with_type(
                     idx,
                     texture,
@@ -16497,7 +16467,8 @@ impl ImageViewer {
         // expand the preload window to whole-item minimums.
         if let Some(ref mut loader) = self.manga_loader {
             let visible_for_loader = visible_indices_count.max(1);
-            let cache_limited_visible = visible_for_loader.min(self.manga_cache_target_capacity.max(1));
+            let cache_limited_visible =
+                visible_for_loader.min(self.manga_cache_target_capacity.max(1));
             loader.update_visible_page_count(
                 cache_limited_visible.max(1),
                 strip_visible_item_equivalent,
@@ -16727,14 +16698,22 @@ impl ImageViewer {
 
         self.manga_texture_cache
             .peek_texture_dimensions(index)
-            .and_then(|(w, h)| if w > 0 && h > 0 { Some((w as f32, h as f32)) } else { None })
+            .and_then(|(w, h)| {
+                if w > 0 && h > 0 {
+                    Some((w as f32, h as f32))
+                } else {
+                    None
+                }
+            })
     }
 
     /// Get the display height of an image at a given index (scaled to fit screen height)
     fn manga_get_image_display_height(&self, index: usize) -> f32 {
         // Prefer metadata dimensions for layout stability; when they are temporarily
         // unavailable, fall back to cached texture dimensions so visible pages never stretch.
-        let img_h = self.manga_get_image_source_dimensions(index).map(|(_, h)| h);
+        let img_h = self
+            .manga_get_image_source_dimensions(index)
+            .map(|(_, h)| h);
 
         if let Some(img_h) = img_h {
             if img_h > 0.0 {
@@ -16805,10 +16784,9 @@ impl ImageViewer {
                     .to_egui_options_with_mipmap(enable_mipmap)
             }
             MangaMediaType::Video => {
-                let enable_mipmap =
-                    self.config.manga_mipmap_video_thumbnails
-                        && mipmap_allowed_by_size
-                        && !navigation_blocks_mipmaps;
+                let enable_mipmap = self.config.manga_mipmap_video_thumbnails
+                    && mipmap_allowed_by_size
+                    && !navigation_blocks_mipmaps;
                 self.config
                     .texture_filter_video
                     .to_egui_options_with_mipmap(enable_mipmap)
@@ -16881,11 +16859,11 @@ impl ImageViewer {
             .as_ref()
             .map(|loader| (loader.pending_load_count(), loader.pending_decoded_count()))
             .unwrap_or((0, 0));
-        let decoded_backlog_total = pending_decoded.saturating_add(self.manga_decoded_mailbox.len());
+        let decoded_backlog_total =
+            pending_decoded.saturating_add(self.manga_decoded_mailbox.len());
         self.manga_pending_loads_peak = self.manga_pending_loads_peak.max(pending_loads);
-        self.manga_pending_decoded_peak = self
-            .manga_pending_decoded_peak
-            .max(decoded_backlog_total);
+        self.manga_pending_decoded_peak =
+            self.manga_pending_decoded_peak.max(decoded_backlog_total);
         let upload_batch_limit =
             self.manga_compute_upload_batch_limit(pending_loads, decoded_backlog_total);
         self.manga_upload_batch_limit = upload_batch_limit;
@@ -16908,12 +16886,12 @@ impl ImageViewer {
 
             // Also poll async dimension probe results (header reads), applied incrementally.
             // Limiting messages per frame prevents layout updates from causing bursts of work.
-            let dim_poll_limit = if defer_masonry_layout_work || self.masonry_metadata_preload_active
-            {
-                1
-            } else {
-                4
-            };
+            let dim_poll_limit =
+                if defer_masonry_layout_work || self.masonry_metadata_preload_active {
+                    1
+                } else {
+                    4
+                };
             let mut layout_dim_updates = loader.poll_dimension_results(dim_poll_limit);
             layout_dim_updates.extend(decoded_dim_updates);
 
@@ -16963,10 +16941,10 @@ impl ImageViewer {
         self.manga_texture_cache
             .set_pinned_indices(visible_indices.iter().copied());
 
-        let upload_anchor_index = visible_indices
-            .first()
-            .copied()
-            .unwrap_or(self.current_index.min(self.image_list.len().saturating_sub(1)));
+        let upload_anchor_index = visible_indices.first().copied().unwrap_or(
+            self.current_index
+                .min(self.image_list.len().saturating_sub(1)),
+        );
         let near_radius = self.manga_prune_decoded_mailbox(
             &visible_set,
             upload_anchor_index,
@@ -17621,7 +17599,10 @@ impl ImageViewer {
             return false;
         }
 
-        let impulse_per_step = self.config.manga_wheel_impulse_per_step.clamp(50.0, 20000.0);
+        let impulse_per_step = self
+            .config
+            .manga_wheel_impulse_per_step
+            .clamp(50.0, 20000.0);
         let max_velocity = self
             .config
             .manga_wheel_max_velocity
@@ -17629,9 +17610,8 @@ impl ImageViewer {
 
         self.manga_wheel_scroll_active = true;
         self.manga_scroll_target = self.manga_scroll_offset.clamp(0.0, max_scroll);
-        self.manga_scroll_velocity =
-            (self.manga_scroll_velocity - wheel_steps * impulse_per_step)
-                .clamp(-max_velocity, max_velocity);
+        self.manga_scroll_velocity = (self.manga_scroll_velocity - wheel_steps * impulse_per_step)
+            .clamp(-max_velocity, max_velocity);
 
         true
     }
@@ -17669,8 +17649,9 @@ impl ImageViewer {
             self.manga_scroll_velocity *= decay;
         }
 
-        self.manga_scroll_offset =
-            self.manga_scroll_offset.clamp(-max_overscroll, max_scroll + max_overscroll);
+        self.manga_scroll_offset = self
+            .manga_scroll_offset
+            .clamp(-max_overscroll, max_scroll + max_overscroll);
         self.manga_scroll_target = self.manga_scroll_offset.clamp(0.0, max_scroll);
 
         self.manga_update_current_index();
@@ -18459,28 +18440,28 @@ impl ImageViewer {
 
         // During active masonry navigation, prioritize fast placeholder fill over texture quality.
         let target_texture_side = if media_type == MangaMediaType::StaticImage {
-                desired_target_side.clamp(min_target_side, max_side)
-            } else if is_masonry && !quality_upgrade {
-                let fill_cap = masonry_fill_cap
-                    .min(self.manga_target_texture_side.max(min_target_side))
-                    .max(min_target_side);
-                let side = desired_target_side.min(fill_cap).max(min_target_side);
-                if side < desired_target_side {
-                    self.perf_metrics.increment_counter(
-                        if defer_visible_quality {
-                            "manga_retry_low_lod_nav"
-                        } else {
-                            "manga_retry_low_lod_fill"
-                        },
-                        1,
-                    );
-                }
-                side
-            } else {
-                desired_target_side
-                    .max(self.manga_target_texture_side.min(max_side))
-                    .clamp(min_target_side, max_side)
-            };
+            desired_target_side.clamp(min_target_side, max_side)
+        } else if is_masonry && !quality_upgrade {
+            let fill_cap = masonry_fill_cap
+                .min(self.manga_target_texture_side.max(min_target_side))
+                .max(min_target_side);
+            let side = desired_target_side.min(fill_cap).max(min_target_side);
+            if side < desired_target_side {
+                self.perf_metrics.increment_counter(
+                    if defer_visible_quality {
+                        "manga_retry_low_lod_nav"
+                    } else {
+                        "manga_retry_low_lod_fill"
+                    },
+                    1,
+                );
+            }
+            side
+        } else {
+            desired_target_side
+                .max(self.manga_target_texture_side.min(max_side))
+                .clamp(min_target_side, max_side)
+        };
         let (downscale_filter, gif_filter) = self.manga_decode_filters_for_strip_mode();
         let force_triangle_filters = self.manga_should_force_triangle_filters();
         let current_texture_dims = self
@@ -18593,23 +18574,19 @@ impl ImageViewer {
         };
         let mut requested_retry = false;
 
-        let folder_entry = self
-            .image_list
-            .get(idx)
-            .cloned()
-            .and_then(|path| {
-                if self.is_folder_navigation_entry_path(path.as_path()) {
-                    Some(path)
-                } else {
-                    None
-                }
-            });
+        let folder_entry = self.image_list.get(idx).cloned().and_then(|path| {
+            if self.is_folder_navigation_entry_path(path.as_path()) {
+                Some(path)
+            } else {
+                None
+            }
+        });
 
         if let Some(path) = folder_entry.as_ref() {
             self.paint_folder_entry_card(ui, image_rect, path.as_path());
 
-            let preview_only =
-                self.mark_selection_preview_contains(idx) && self.mark_visual_for_index(idx).is_none();
+            let preview_only = self.mark_selection_preview_contains(idx)
+                && self.mark_visual_for_index(idx).is_none();
             let mark_visual = if preview_only {
                 Some(FileMarkVisual::Preview)
             } else {
@@ -18652,11 +18629,8 @@ impl ImageViewer {
             !is_video || video_playback_runtime_available || cfg!(target_os = "windows");
         let (fill_retry_target_side, final_retry_target_side) =
             self.manga_retry_target_sides_for_rect(idx, image_rect, retry_media_type);
-        let final_retry_dims = self.manga_bucket_dimensions_for_side(
-            idx,
-            final_retry_target_side,
-            image_rect.size(),
-        );
+        let final_retry_dims =
+            self.manga_bucket_dimensions_for_side(idx, final_retry_target_side, image_rect.size());
 
         let video_load_pending = video_playback_runtime_available
             && is_video
@@ -18731,12 +18705,12 @@ impl ImageViewer {
 
                 if video_thumbnail_retry_allowed
                     && self.manga_texture_upgrade_needed(
-                    tex_w,
-                    tex_h,
-                    final_retry_dims.0,
-                    final_retry_dims.1,
-                    retry_media_type,
-                )
+                        tex_w,
+                        tex_h,
+                        final_retry_dims.0,
+                        final_retry_dims.1,
+                        retry_media_type,
+                    )
                 {
                     requested_retry |= self.manga_request_retry_for_visible_item(
                         idx,
@@ -19235,10 +19209,7 @@ impl ImageViewer {
                 animation_active = true;
             }
 
-            self.open_file_action_menu(
-                pointer_pos.unwrap_or(screen_rect.center()),
-                target_index,
-            );
+            self.open_file_action_menu(pointer_pos.unwrap_or(screen_rect.center()), target_index);
             secondary_consumed_for_autoscroll = true;
             secondary_consumed_for_file_menu = true;
         }
@@ -19347,7 +19318,10 @@ impl ImageViewer {
             if let Some(selection) = self.mark_selection_box.as_mut() {
                 if primary_down {
                     selection.current = pos;
-                    selection_rect = Some(egui::Rect::from_two_pos(selection.anchor, selection.current));
+                    selection_rect = Some(egui::Rect::from_two_pos(
+                        selection.anchor,
+                        selection.current,
+                    ));
                 }
             }
 
@@ -19456,7 +19430,8 @@ impl ImageViewer {
         let manga_ctrl_scroll_zoom_bound = self
             .action_uses_binding(mode_zoom_in_action, InputBinding::CtrlScrollUp)
             || self.action_uses_binding(mode_zoom_out_action, InputBinding::CtrlScrollDown);
-        let manga_scroll_bound = self.action_uses_binding(mode_scroll_up_action, InputBinding::ScrollUp)
+        let manga_scroll_bound = self
+            .action_uses_binding(mode_scroll_up_action, InputBinding::ScrollUp)
             || self.action_uses_binding(mode_scroll_down_action, InputBinding::ScrollDown);
 
         // Handle scroll/pan/zoom unless the user is actively dragging the scrollbar thumb.
@@ -19464,7 +19439,11 @@ impl ImageViewer {
             let wheel_steps_ctrl_effective = if wheel_steps_ctrl != 0.0 {
                 wheel_steps_ctrl
             } else if ctrl_held && !shift_held && !alt_held && zoom_delta != 1.0 {
-                if zoom_delta > 1.0 { 1.0 } else { -1.0 }
+                if zoom_delta > 1.0 {
+                    1.0
+                } else {
+                    -1.0
+                }
             } else {
                 0.0
             };
@@ -19480,11 +19459,8 @@ impl ImageViewer {
                     self.stop_manga_wheel_scroll();
                 }
 
-                let pan_step = self.modifier_wheel_pan_step(
-                    wheel_steps_ctrl_effective,
-                    false,
-                    screen_height,
-                );
+                let pan_step =
+                    self.modifier_wheel_pan_step(wheel_steps_ctrl_effective, false, screen_height);
                 if self.manga_add_scroll_target_delta(-wheel_steps_ctrl_effective * pan_step) {
                     self.manga_update_preload_queue();
                     animation_active = true;
@@ -19497,8 +19473,11 @@ impl ImageViewer {
                 let pan_step = self.modifier_wheel_pan_step(wheel_steps_shift, true, screen_width);
                 let impulse = pan_step * self.config.manga_wheel_decay_rate.max(0.5);
                 self.manga_shift_wheel_pan_velocity_x += -wheel_steps_shift * impulse;
-                self.manga_shift_wheel_pan_velocity_x = self.manga_shift_wheel_pan_velocity_x
-                    .clamp(-self.config.manga_wheel_max_velocity, self.config.manga_wheel_max_velocity);
+                self.manga_shift_wheel_pan_velocity_x =
+                    self.manga_shift_wheel_pan_velocity_x.clamp(
+                        -self.config.manga_wheel_max_velocity,
+                        self.config.manga_wheel_max_velocity,
+                    );
                 animation_active = true;
             } else if wants_ctrl_zoom {
                 if self.manga_wheel_scroll_active {
@@ -19938,9 +19917,9 @@ impl ImageViewer {
 
         let has_pending_focused_video_load = gstreamer_available
             && self
-            .pending_manga_video_load
-            .as_ref()
-            .is_some_and(|pending| self.manga_focused_video_index == Some(pending.index));
+                .pending_manga_video_load
+                .as_ref()
+                .is_some_and(|pending| self.manga_focused_video_index == Some(pending.index));
 
         let masonry_visible_indices = if self.is_masonry_mode() && self.manga_use_rtree_backend() {
             Some(self.manga_collect_visible_indices())
@@ -20196,7 +20175,6 @@ impl ImageViewer {
                         ),
                     );
                 }
-
             });
 
         if self.is_masonry_mode() && self.masonry_metadata_preload_active {
@@ -20229,24 +20207,21 @@ impl ImageViewer {
             }
         }
 
-        animation_active || has_active_animation || has_pending_focused_video_load || requested_visible_retry
+        animation_active
+            || has_active_animation
+            || has_pending_focused_video_load
+            || requested_visible_retry
     }
 
-    /// Get the current media display dimensions (works for both images and videos)
     fn media_display_dimensions(&self) -> Option<(u32, u32)> {
         if let Some(ref img) = self.image {
             Some(img.display_dimensions())
         } else if let Some(ref player) = self.video_player {
-            // During video-to-video handoff we can briefly have a new player but still render
-            // an older retained texture. Prefer texture dims first to avoid transient stretching.
-            if let Some(texture_dims) = self.video_texture_dims {
-                return Some(texture_dims);
-            }
             let dims = player.dimensions();
             if dims.0 > 0 && dims.1 > 0 {
                 Some(dims)
             } else {
-                None
+                self.video_texture_dims
             }
         } else if matches!(self.current_media_type, Some(MediaType::Image)) {
             self.image_texture_dims
@@ -20259,15 +20234,15 @@ impl ImageViewer {
 
     fn image_display_size_at_zoom(&self) -> Option<egui::Vec2> {
         let (img_w, img_h) = self.media_display_dimensions()?;
-        let base_size = egui::Vec2::new(
-            img_w as f32 * self.zoom,
-            img_h as f32 * self.zoom,
-        );
+        let base_size = egui::Vec2::new(img_w as f32 * self.zoom, img_h as f32 * self.zoom);
         let rotation_degrees = self.current_precise_rotation_angle_degrees();
         if rotation_degrees.abs() < 0.01 {
             Some(base_size)
         } else {
-            Some(rotated_bounding_size(base_size, rotation_degrees.to_radians()))
+            Some(rotated_bounding_size(
+                base_size,
+                rotation_degrees.to_radians(),
+            ))
         }
     }
 
@@ -20473,7 +20448,8 @@ impl ImageViewer {
                 egui::pos2(screen_width, screen_height),
             );
             if page_label_hover_zone.contains(pos) {
-                let indicator_text = format!("{} / {}", self.current_index + 1, self.image_list.len());
+                let indicator_text =
+                    format!("{} / {}", self.current_index + 1, self.image_list.len());
                 let indicator_size = ctx.fonts(|fonts| {
                     fonts
                         .layout_no_wrap(
@@ -20571,25 +20547,16 @@ impl ImageViewer {
             return;
         };
 
-        if let Some(max_size) = self.floating_max_inner_size {
-            // Only grow up to the captured fit-to-screen cap.
-            if desired.x > max_size.x || desired.y > max_size.y {
-                desired = max_size;
-            }
-        }
-
-        // Respect the viewport minimum size.
         desired.x = desired.x.max(200.0);
         desired.y = desired.y.max(150.0);
 
-        let should_send = match self.last_requested_inner_size {
-            None => true,
-            Some(last) => (last - desired).length() > 0.5,
-        };
+        let should_send = ctx
+            .input(|i| i.raw.viewport().inner_rect)
+            .map(|rect| (rect.size() - desired).length() > 0.5)
+            .unwrap_or(true);
 
         if should_send {
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(desired));
-            self.last_requested_inner_size = Some(desired);
         }
     }
 
@@ -20677,10 +20644,8 @@ impl ImageViewer {
                             placeholder.thumbnail.height,
                         ),
                     ));
-                    self.video_texture_dims = Some((
-                        placeholder.thumbnail.width,
-                        placeholder.thumbnail.height,
-                    ));
+                    self.video_texture_dims =
+                        Some((placeholder.thumbnail.width, placeholder.thumbnail.height));
                     self.retained_media_placeholder_visible = false;
                     needs_repaint = true;
                 }
@@ -20838,11 +20803,8 @@ impl ImageViewer {
                 if let Some(texture) = self.video_texture.as_mut() {
                     texture.set(color_image, texture_options);
                 } else {
-                    self.video_texture = Some(ctx.load_texture(
-                        "video",
-                        color_image,
-                        texture_options,
-                    ));
+                    self.video_texture =
+                        Some(ctx.load_texture("video", color_image, texture_options));
                 }
                 self.video_texture_dims = Some((w, h));
                 needs_repaint = true;
@@ -20950,9 +20912,8 @@ impl ImageViewer {
             }
 
             if secondary_clicked && ctrl && !self.manga_mode && !pointer_over_shortcut_ui {
-                ctrl_secondary_single_file_menu_pos = Some(
-                    pointer_pos.unwrap_or(input.screen_rect.center()),
-                );
+                ctrl_secondary_single_file_menu_pos =
+                    Some(pointer_pos.unwrap_or(input.screen_rect.center()));
                 return;
             }
 
@@ -21145,7 +21106,8 @@ impl ImageViewer {
             if !self.image_list.is_empty() {
                 self.open_file_action_menu(
                     menu_pos,
-                    self.current_index.min(self.image_list.len().saturating_sub(1)),
+                    self.current_index
+                        .min(self.image_list.len().saturating_sub(1)),
                 );
                 return;
             }
@@ -21215,9 +21177,10 @@ impl ImageViewer {
 
         // Backward-compatible fallback: treat Enter as fullscreen toggle when unbound.
         let enter_pressed = ctx.input(|i| i.key_pressed(egui::Key::Enter));
-        let enter_bound = self
-            .config
-            .action_uses_binding(Action::ToggleFullscreen, &InputBinding::Key(egui::Key::Enter));
+        let enter_bound = self.config.action_uses_binding(
+            Action::ToggleFullscreen,
+            &InputBinding::Key(egui::Key::Enter),
+        );
         if enter_pressed && !enter_bound {
             self.request_shortcut_fullscreen_toggle();
         }
@@ -21265,13 +21228,7 @@ impl ImageViewer {
                         let shift = input.modifiers.shift;
                         let alt = input.modifiers.alt;
                         (
-                            self.action_binding_down(
-                                Action::MasonryPanUp,
-                                input,
-                                ctrl,
-                                shift,
-                                alt,
-                            ),
+                            self.action_binding_down(Action::MasonryPanUp, input, ctrl, shift, alt),
                             self.action_binding_down(
                                 Action::MasonryPanDown,
                                 input,
@@ -21344,50 +21301,50 @@ impl ImageViewer {
                     page_down_pressed,
                     ctx,
                 );
-                let (prev_fit_pressed, next_fit_pressed, prev_fit_down, next_fit_down, pan_up, pan_down) =
-                    ctx.input(|input| {
-                        let ctrl = input.modifiers.ctrl;
-                        let shift = input.modifiers.shift;
-                        let alt = input.modifiers.alt;
-                        (
-                            self.action_binding_triggered(
-                                Action::MangaPreviousImageFit,
-                                input,
-                                ctrl,
-                                shift,
-                                alt,
-                            ),
-                            self.action_binding_triggered(
-                                Action::MangaNextImageFit,
-                                input,
-                                ctrl,
-                                shift,
-                                alt,
-                            ),
-                            self.action_binding_down(
-                                Action::MangaPreviousImageFit,
-                                input,
-                                ctrl,
-                                shift,
-                                alt,
-                            ),
-                            self.action_binding_down(
-                                Action::MangaNextImageFit,
-                                input,
-                                ctrl,
-                                shift,
-                                alt,
-                            ),
-                            self.action_binding_down(Action::MangaPanUp, input, ctrl, shift, alt),
-                            self.action_binding_down(
-                                Action::MangaPanDown,
-                                input,
-                                ctrl,
-                                shift,
-                                alt,
-                            ),
-                        )
-                    });
+                let (
+                    prev_fit_pressed,
+                    next_fit_pressed,
+                    prev_fit_down,
+                    next_fit_down,
+                    pan_up,
+                    pan_down,
+                ) = ctx.input(|input| {
+                    let ctrl = input.modifiers.ctrl;
+                    let shift = input.modifiers.shift;
+                    let alt = input.modifiers.alt;
+                    (
+                        self.action_binding_triggered(
+                            Action::MangaPreviousImageFit,
+                            input,
+                            ctrl,
+                            shift,
+                            alt,
+                        ),
+                        self.action_binding_triggered(
+                            Action::MangaNextImageFit,
+                            input,
+                            ctrl,
+                            shift,
+                            alt,
+                        ),
+                        self.action_binding_down(
+                            Action::MangaPreviousImageFit,
+                            input,
+                            ctrl,
+                            shift,
+                            alt,
+                        ),
+                        self.action_binding_down(
+                            Action::MangaNextImageFit,
+                            input,
+                            ctrl,
+                            shift,
+                            alt,
+                        ),
+                        self.action_binding_down(Action::MangaPanUp, input, ctrl, shift, alt),
+                        self.action_binding_down(Action::MangaPanDown, input, ctrl, shift, alt),
+                    )
+                });
 
                 let prev_fit_is_first_press = prev_fit_pressed && !self.manga_arrow_left_was_down;
                 let prev_fit_is_holding = prev_fit_pressed && self.manga_arrow_left_was_down;
@@ -21435,8 +21392,8 @@ impl ImageViewer {
             self.manga_prev_image_mouse_repeat_at = None;
             self.manga_next_image_mouse_repeat_at = None;
 
-            let (prev_mouse_pressed, next_mouse_pressed, prev_mouse_down, next_mouse_down) =
-                ctx.input(|input| {
+            let (prev_mouse_pressed, next_mouse_pressed, prev_mouse_down, next_mouse_down) = ctx
+                .input(|input| {
                     (
                         self.action_mouse_binding_triggered(Action::PreviousImage, input),
                         self.action_mouse_binding_triggered(Action::NextImage, input),
@@ -21618,13 +21575,12 @@ impl ImageViewer {
                                 let toggle_size = egui::vec2(24.0, 24.0);
                                 let (toggle_rect, toggle_resp_base) =
                                     ui.allocate_exact_size(toggle_size, egui::Sense::click());
-                                let toggle_resp = toggle_resp_base.on_hover_text(
-                                    if self.show_breadcrumb_bar {
+                                let toggle_resp =
+                                    toggle_resp_base.on_hover_text(if self.show_breadcrumb_bar {
                                         "Hide breadcrumb address bar"
                                     } else {
                                         "Show breadcrumb address bar"
-                                    },
-                                );
+                                    });
 
                                 if ui.is_rect_visible(toggle_rect) {
                                     let bg = if toggle_resp.is_pointer_button_down_on() {
@@ -21881,7 +21837,8 @@ impl ImageViewer {
 
                             // Maximize/Restore button
                             let window_is_maximized = self.current_window_is_maximized(ctx);
-                            let use_native_transition = self.use_native_fullscreen_window_transition();
+                            let use_native_transition =
+                                self.use_native_fullscreen_window_transition();
                             let button = if self.is_fullscreen || window_is_maximized {
                                 WindowButton::Restore
                             } else {
@@ -21941,8 +21898,14 @@ impl ImageViewer {
 
                                     let mut close_popup = false;
 
-                                    if let Some(target_index) = self.current_fab_single_action_index() {
-                                        if self.render_single_file_action_buttons(ui, target_index, true) {
+                                    if let Some(target_index) =
+                                        self.current_fab_single_action_index()
+                                    {
+                                        if self.render_single_file_action_buttons(
+                                            ui,
+                                            target_index,
+                                            true,
+                                        ) {
                                             close_popup = true;
                                         }
                                         ui.separator();
@@ -21957,7 +21920,11 @@ impl ImageViewer {
 
                                     if self.manga_mode {
                                         if self
-                                            .menu_action_row(ui, "Paste Marked File(s) Into This Folder", MenuActionIcon::Paste)
+                                            .menu_action_row(
+                                                ui,
+                                                "Paste Marked File(s) Into This Folder",
+                                                MenuActionIcon::Paste,
+                                            )
                                             .clicked()
                                         {
                                             self.request_paste_marked_files_into_current_folder();
@@ -21985,7 +21952,11 @@ impl ImageViewer {
                                     ui.separator();
 
                                     if self
-                                        .menu_action_row(ui, "Edit config.ini", MenuActionIcon::Config)
+                                        .menu_action_row(
+                                            ui,
+                                            "Edit config.ini",
+                                            MenuActionIcon::Config,
+                                        )
                                         .clicked()
                                     {
                                         self.open_config_file_in_editor();
@@ -22046,94 +22017,100 @@ impl ImageViewer {
                                 Up,
                             }
 
-                            let draw_breadcrumb_nav_icon = |
-                                ui: &mut egui::Ui,
-                                rect: egui::Rect,
-                                icon: BreadcrumbNavIcon,
-                                stroke_color: egui::Color32,
-                            | {
-                                let icon_rect = rect.shrink2(egui::vec2(5.0, 4.0));
-                                let stroke = egui::Stroke::new(1.7, stroke_color);
-                                match icon {
-                                    BreadcrumbNavIcon::Back => {
-                                        let left = icon_rect.left() + 1.0;
-                                        let right = icon_rect.right() - 1.0;
-                                        let top = icon_rect.top() + 0.5;
-                                        let mid = icon_rect.center().y;
-                                        let bottom = icon_rect.bottom() - 0.5;
-                                        ui.painter().line_segment(
-                                            [egui::pos2(right, top), egui::pos2(left, mid)],
-                                            stroke,
-                                        );
-                                        ui.painter().line_segment(
-                                            [egui::pos2(right, bottom), egui::pos2(left, mid)],
-                                            stroke,
-                                        );
+                            let draw_breadcrumb_nav_icon =
+                                |ui: &mut egui::Ui,
+                                 rect: egui::Rect,
+                                 icon: BreadcrumbNavIcon,
+                                 stroke_color: egui::Color32| {
+                                    let icon_rect = rect.shrink2(egui::vec2(5.0, 4.0));
+                                    let stroke = egui::Stroke::new(1.7, stroke_color);
+                                    match icon {
+                                        BreadcrumbNavIcon::Back => {
+                                            let left = icon_rect.left() + 1.0;
+                                            let right = icon_rect.right() - 1.0;
+                                            let top = icon_rect.top() + 0.5;
+                                            let mid = icon_rect.center().y;
+                                            let bottom = icon_rect.bottom() - 0.5;
+                                            ui.painter().line_segment(
+                                                [egui::pos2(right, top), egui::pos2(left, mid)],
+                                                stroke,
+                                            );
+                                            ui.painter().line_segment(
+                                                [egui::pos2(right, bottom), egui::pos2(left, mid)],
+                                                stroke,
+                                            );
+                                        }
+                                        BreadcrumbNavIcon::Forward => {
+                                            let left = icon_rect.left() + 1.0;
+                                            let right = icon_rect.right() - 1.0;
+                                            let top = icon_rect.top() + 0.5;
+                                            let mid = icon_rect.center().y;
+                                            let bottom = icon_rect.bottom() - 0.5;
+                                            ui.painter().line_segment(
+                                                [egui::pos2(left, top), egui::pos2(right, mid)],
+                                                stroke,
+                                            );
+                                            ui.painter().line_segment(
+                                                [egui::pos2(left, bottom), egui::pos2(right, mid)],
+                                                stroke,
+                                            );
+                                        }
+                                        BreadcrumbNavIcon::Up => {
+                                            let center_x = icon_rect.center().x;
+                                            let top = icon_rect.top() + 0.5;
+                                            let mid = icon_rect.center().y;
+                                            let bottom = icon_rect.bottom() - 0.5;
+                                            ui.painter().line_segment(
+                                                [
+                                                    egui::pos2(center_x, bottom),
+                                                    egui::pos2(center_x, top),
+                                                ],
+                                                stroke,
+                                            );
+                                            let wing = (icon_rect.width() * 0.22).clamp(2.5, 4.5);
+                                            ui.painter().line_segment(
+                                                [
+                                                    egui::pos2(center_x, top),
+                                                    egui::pos2(center_x - wing, mid),
+                                                ],
+                                                stroke,
+                                            );
+                                            ui.painter().line_segment(
+                                                [
+                                                    egui::pos2(center_x, top),
+                                                    egui::pos2(center_x + wing, mid),
+                                                ],
+                                                stroke,
+                                            );
+                                        }
                                     }
-                                    BreadcrumbNavIcon::Forward => {
-                                        let left = icon_rect.left() + 1.0;
-                                        let right = icon_rect.right() - 1.0;
-                                        let top = icon_rect.top() + 0.5;
-                                        let mid = icon_rect.center().y;
-                                        let bottom = icon_rect.bottom() - 0.5;
-                                        ui.painter().line_segment(
-                                            [egui::pos2(left, top), egui::pos2(right, mid)],
-                                            stroke,
-                                        );
-                                        ui.painter().line_segment(
-                                            [egui::pos2(left, bottom), egui::pos2(right, mid)],
-                                            stroke,
-                                        );
-                                    }
-                                    BreadcrumbNavIcon::Up => {
-                                        let center_x = icon_rect.center().x;
-                                        let top = icon_rect.top() + 0.5;
-                                        let mid = icon_rect.center().y;
-                                        let bottom = icon_rect.bottom() - 0.5;
-                                        ui.painter().line_segment(
-                                            [egui::pos2(center_x, bottom), egui::pos2(center_x, top)],
-                                            stroke,
-                                        );
-                                        let wing = (icon_rect.width() * 0.22).clamp(2.5, 4.5);
-                                        ui.painter().line_segment(
-                                            [egui::pos2(center_x, top), egui::pos2(center_x - wing, mid)],
-                                            stroke,
-                                        );
-                                        ui.painter().line_segment(
-                                            [egui::pos2(center_x, top), egui::pos2(center_x + wing, mid)],
-                                            stroke,
-                                        );
-                                    }
-                                }
-                            };
-
-                            let breadcrumb_nav_icon_button = |
-                                ui: &mut egui::Ui,
-                                icon: BreadcrumbNavIcon,
-                                enabled: bool,
-                                tooltip: &str,
-                            | {
-                                let response = ui
-                                    .add_enabled(
-                                        enabled,
-                                        egui::Button::new("")
-                                            .min_size(egui::vec2(24.0, 22.0)),
-                                    )
-                                    .on_hover_text(tooltip);
-
-                                let color = if enabled {
-                                    if response.hovered() {
-                                        egui::Color32::WHITE
-                                    } else {
-                                        egui::Color32::from_gray(216)
-                                    }
-                                } else {
-                                    egui::Color32::from_gray(90)
                                 };
 
-                                draw_breadcrumb_nav_icon(ui, response.rect, icon, color);
-                                response
-                            };
+                            let breadcrumb_nav_icon_button =
+                                |ui: &mut egui::Ui,
+                                 icon: BreadcrumbNavIcon,
+                                 enabled: bool,
+                                 tooltip: &str| {
+                                    let response = ui
+                                        .add_enabled(
+                                            enabled,
+                                            egui::Button::new("").min_size(egui::vec2(24.0, 22.0)),
+                                        )
+                                        .on_hover_text(tooltip);
+
+                                    let color = if enabled {
+                                        if response.hovered() {
+                                            egui::Color32::WHITE
+                                        } else {
+                                            egui::Color32::from_gray(216)
+                                        }
+                                    } else {
+                                        egui::Color32::from_gray(90)
+                                    };
+
+                                    draw_breadcrumb_nav_icon(ui, response.rect, icon, color);
+                                    response
+                                };
 
                             let can_go_back = self.folder_navigation_can_go_back();
                             let back_response = breadcrumb_nav_icon_button(
@@ -22182,11 +22159,14 @@ impl ImageViewer {
                                                 .color(egui::Color32::from_gray(150)),
                                         );
                                     } else {
-                                        for (history_index, folder_path) in back_history_items.iter() {
-                                            let folder_label = Self::format_folder_history_entry_label(
-                                                folder_path.as_path(),
-                                                Self::FOLDER_NAVIGATION_BACK_POPUP_MAX_DEPTH,
-                                            );
+                                        for (history_index, folder_path) in
+                                            back_history_items.iter()
+                                        {
+                                            let folder_label =
+                                                Self::format_folder_history_entry_label(
+                                                    folder_path.as_path(),
+                                                    Self::FOLDER_NAVIGATION_BACK_POPUP_MAX_DEPTH,
+                                                );
                                             let row = ui
                                                 .selectable_label(false, folder_label)
                                                 .on_hover_text(folder_path.display().to_string());
@@ -22194,7 +22174,8 @@ impl ImageViewer {
                                                 breadcrumb_ui_hovered = true;
                                             }
                                             if row.clicked() || row.secondary_clicked() {
-                                                breadcrumb_nav_back_target_index = Some(*history_index);
+                                                breadcrumb_nav_back_target_index =
+                                                    Some(*history_index);
                                                 close_popup = true;
                                             }
                                         }
@@ -22290,18 +22271,18 @@ impl ImageViewer {
                                 return;
                             }
 
-                            for (index, (segment_label, segment_path)) in segments.iter().enumerate()
+                            for (index, (segment_label, segment_path)) in
+                                segments.iter().enumerate()
                             {
                                 let is_leaf = index + 1 == segments.len();
                                 let segment_response = ui.add(
-                                    egui::Button::new(
-                                        egui::RichText::new(segment_label)
-                                            .color(if is_leaf {
-                                                egui::Color32::WHITE
-                                            } else {
-                                                egui::Color32::from_gray(210)
-                                            }),
-                                    )
+                                    egui::Button::new(egui::RichText::new(segment_label).color(
+                                        if is_leaf {
+                                            egui::Color32::WHITE
+                                        } else {
+                                            egui::Color32::from_gray(210)
+                                        },
+                                    ))
                                     .frame(false),
                                 );
 
@@ -22346,8 +22327,9 @@ impl ImageViewer {
                                         breadcrumb_popup_active = true;
                                         ui.set_min_width(240.0);
 
-                                        let child_dirs =
-                                            Self::breadcrumb_child_directories(segment_path.as_path());
+                                        let child_dirs = Self::breadcrumb_child_directories(
+                                            segment_path.as_path(),
+                                        );
                                         let mut close_popup = false;
 
                                         if child_dirs.is_empty() {
@@ -22356,9 +22338,9 @@ impl ImageViewer {
                                                     .color(egui::Color32::from_gray(150)),
                                             );
                                         } else {
-                                            egui::ScrollArea::vertical()
-                                                .max_height(280.0)
-                                                .show(ui, |ui| {
+                                            egui::ScrollArea::vertical().max_height(280.0).show(
+                                                ui,
+                                                |ui| {
                                                     for child in child_dirs {
                                                         let child_name = child
                                                             .file_name()
@@ -22370,17 +22352,20 @@ impl ImageViewer {
                                                                 child.display().to_string()
                                                             });
 
-                                                        let row = ui.selectable_label(false, child_name);
+                                                        let row =
+                                                            ui.selectable_label(false, child_name);
                                                         if row.contains_pointer() {
                                                             breadcrumb_ui_hovered = true;
                                                         }
-                                                        if row.clicked() || row.secondary_clicked() {
+                                                        if row.clicked() || row.secondary_clicked()
+                                                        {
                                                             breadcrumb_target_directory =
                                                                 Some(child.clone());
                                                             close_popup = true;
                                                         }
                                                     }
-                                                });
+                                                },
+                                            );
                                         }
 
                                         if close_popup {
@@ -22691,8 +22676,7 @@ impl ImageViewer {
                         seek_fraction,
                         self.seek_last_requested_fraction,
                         self.last_seek_sent_at,
-                    )
-                    {
+                    ) {
                         let effective_drag_seek_mode = Self::adaptive_drag_seek_mode_for_fraction(
                             video_seek_policy,
                             duration,
@@ -22823,7 +22807,8 @@ impl ImageViewer {
                     );
                     if mute_btn.clicked() {
                         player.toggle_mute();
-                        self.config.update_video_state(player.is_muted(), player.volume());
+                        self.config
+                            .update_video_state(player.is_muted(), player.volume());
                         self.config.sync_disk_file_with_template();
                     }
 
@@ -22888,8 +22873,7 @@ impl ImageViewer {
                     ui.add_space(6.0);
 
                     let subtitle_popup_id = Self::solo_video_subtitle_popup_id();
-                    let subtitle_popup_open =
-                        ui.memory(|mem| mem.is_popup_open(subtitle_popup_id));
+                    let subtitle_popup_open = ui.memory(|mem| mem.is_popup_open(subtitle_popup_id));
                     let subtitle_btn = Self::video_control_icon_button(
                         ui,
                         VideoControlIcon::SubtitleTracks,
@@ -22900,7 +22884,8 @@ impl ImageViewer {
                     if subtitle_btn.clicked() {
                         ui.memory_mut(|mem| mem.toggle_popup(subtitle_popup_id));
                     }
-                    let external_subtitle_tracks = if subtitle_popup_open || subtitle_btn.clicked() {
+                    let external_subtitle_tracks = if subtitle_popup_open || subtitle_btn.clicked()
+                    {
                         current_video_path
                             .as_deref()
                             .map(Self::external_subtitle_options_for_video)
@@ -23337,8 +23322,7 @@ impl ImageViewer {
                         seek_fraction,
                         self.manga_video_seek_last_requested_fraction,
                         self.manga_video_last_seek_sent,
-                    )
-                    {
+                    ) {
                         if let Some(player) = self.manga_video_players.get_mut(&video_idx) {
                             let effective_drag_seek_mode =
                                 Self::adaptive_drag_seek_mode_for_fraction(
@@ -23478,7 +23462,8 @@ impl ImageViewer {
                         player.toggle_mute();
                         // Persist user's mute choice for all manga videos
                         self.manga_video_user_muted = Some(player.is_muted());
-                        self.config.update_video_state(player.is_muted(), player.volume());
+                        self.config
+                            .update_video_state(player.is_muted(), player.volume());
                         self.config.sync_disk_file_with_template();
                     }
 
@@ -23542,8 +23527,7 @@ impl ImageViewer {
                     ui.add_space(6.0);
 
                     let subtitle_popup_id = Self::manga_video_subtitle_popup_id(video_idx);
-                    let subtitle_popup_open =
-                        ui.memory(|mem| mem.is_popup_open(subtitle_popup_id));
+                    let subtitle_popup_open = ui.memory(|mem| mem.is_popup_open(subtitle_popup_id));
                     let subtitle_btn = Self::video_control_icon_button(
                         ui,
                         VideoControlIcon::SubtitleTracks,
@@ -23554,7 +23538,8 @@ impl ImageViewer {
                     if subtitle_btn.clicked() {
                         ui.memory_mut(|mem| mem.toggle_popup(subtitle_popup_id));
                     }
-                    let external_subtitle_tracks = if subtitle_popup_open || subtitle_btn.clicked() {
+                    let external_subtitle_tracks = if subtitle_popup_open || subtitle_btn.clicked()
+                    {
                         current_video_path
                             .as_deref()
                             .map(Self::external_subtitle_options_for_video)
@@ -23863,13 +23848,10 @@ impl ImageViewer {
         let media_h = media_h_u as f32;
         let aspect = media_w / media_h;
 
-        // Get current global cursor position using Windows API.
-        // This is completely independent of window position and has no frame delay.
         let Some(current_cursor_screen) = get_global_cursor_pos() else {
             return;
         };
 
-        // On first call (resize just started), capture initial window state and cursor position.
         let (start_outer_pos, start_inner_size, start_cursor_screen) = match (
             self.resize_start_outer_pos,
             self.resize_start_inner_size,
@@ -23877,7 +23859,6 @@ impl ImageViewer {
         ) {
             (Some(p), Some(s), Some(c)) => (p, s, c),
             _ => {
-                // Capture the window position at resize start
                 let outer_pos = ctx
                     .input(|i| i.raw.viewport().outer_rect)
                     .map(|r| r.min)
@@ -23895,18 +23876,12 @@ impl ImageViewer {
             }
         };
 
-        // Calculate mouse delta in TRUE SCREEN SPACE.
-        // Using Windows API GetCursorPos gives us coordinates that are:
-        // 1. Completely independent of the window position
-        // 2. Not subject to any frame delays from viewport updates
-        // 3. Stable even when the window origin is moving (top/left resize)
         let delta = current_cursor_screen - start_cursor_screen;
 
         let clamp_min_w: f32 = 200.0;
         let clamp_min_h: f32 = 150.0;
         let max_size = egui::Vec2::new(16000.0, 16000.0);
 
-        // Use rounded anchor edges from the start state.
         let start_left = start_outer_pos.x.round();
         let start_top = start_outer_pos.y.round();
         let start_right = (start_outer_pos.x + start_inner_size.x).round();
@@ -23914,7 +23889,6 @@ impl ImageViewer {
         let start_w = start_right - start_left;
         let start_h = start_bottom - start_top;
 
-        // Helper to compute new size from width, maintaining aspect ratio
         let size_from_width = |w: f32| -> (f32, f32) {
             let w = w.clamp(clamp_min_w, max_size.x);
             let h = (w / aspect).clamp(clamp_min_h, max_size.y);
@@ -23922,7 +23896,6 @@ impl ImageViewer {
             (w.round(), h.round())
         };
 
-        // Helper to compute new size from height, maintaining aspect ratio
         let size_from_height = |h: f32| -> (f32, f32) {
             let h = h.clamp(clamp_min_h, max_size.y);
             let w = (h * aspect).clamp(clamp_min_w, max_size.x);
@@ -23930,18 +23903,9 @@ impl ImageViewer {
             (w.round(), h.round())
         };
 
-        // Compute new size based on direction and accumulated delta.
-        // For right/bottom/bottom-right (stable edges), delta adds to size.
-        // For left/top edges, delta subtracts from size (moving left = smaller delta.x but bigger width).
         let (new_w, new_h) = match direction {
-            ResizeDirection::Right => {
-                let desired_w = start_w + delta.x;
-                size_from_width(desired_w)
-            }
-            ResizeDirection::Bottom => {
-                let desired_h = start_h + delta.y;
-                size_from_height(desired_h)
-            }
+            ResizeDirection::Right => size_from_width(start_w + delta.x),
+            ResizeDirection::Bottom => size_from_height(start_h + delta.y),
             ResizeDirection::BottomRight => {
                 let dx = start_w + delta.x;
                 let dy = start_h + delta.y;
@@ -23955,16 +23919,8 @@ impl ImageViewer {
                     (w2, h2)
                 }
             }
-            ResizeDirection::Left => {
-                // Moving left (negative delta.x) increases width
-                let desired_w = start_w - delta.x;
-                size_from_width(desired_w)
-            }
-            ResizeDirection::Top => {
-                // Moving up (negative delta.y) increases height
-                let desired_h = start_h - delta.y;
-                size_from_height(desired_h)
-            }
+            ResizeDirection::Left => size_from_width(start_w - delta.x),
+            ResizeDirection::Top => size_from_height(start_h - delta.y),
             ResizeDirection::TopLeft => {
                 let dx = start_w - delta.x;
                 let dy = start_h - delta.y;
@@ -24007,7 +23963,6 @@ impl ImageViewer {
             ResizeDirection::None => return,
         };
 
-        // Compute new position: anchor the opposite edge/corner.
         let (new_x, new_y) = match direction {
             ResizeDirection::Right | ResizeDirection::Bottom | ResizeDirection::BottomRight => {
                 (start_left, start_top)
@@ -24023,29 +23978,22 @@ impl ImageViewer {
         let new_size = egui::Vec2::new(new_w, new_h);
         let new_pos = egui::pos2(new_x, new_y);
 
-        // Update zoom based on new window size
         let new_zoom = self.clamp_zoom(new_h / media_h);
         self.zoom = new_zoom;
         self.zoom_target = new_zoom;
         self.zoom_velocity = 0.0;
         self.offset = egui::Vec2::ZERO;
-
-        // Store the commanded size for stable content rendering
         self.resize_last_size = Some(new_size);
 
-        // Send viewport commands: position first (if needed), then size.
-        // For edges that don't move position, only send size.
         match direction {
             ResizeDirection::Right | ResizeDirection::Bottom | ResizeDirection::BottomRight => {
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(new_size));
             }
             _ => {
-                // For edges/corners that require position change, send position first.
                 self.send_outer_position(ctx, new_pos);
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(new_size));
             }
         }
-        self.last_requested_inner_size = Some(new_size);
     }
 
     /// Draw the main image
@@ -24109,151 +24057,116 @@ impl ImageViewer {
             self.last_mouse_pos = None;
             self.stop_manga_autoscroll();
         } else {
+            // Handle modifier-wheel pan/zoom input (not in manga mode - that's handled in draw_manga_mode).
+            // Ctrl+wheel may be routed to `zoom_delta` on some platforms, so we support both raw wheel and
+            // zoom-delta fallback for direction when Ctrl is held.
+            let (ctrl_held, shift_held, alt_held) =
+                ctx.input(|i| (i.modifiers.ctrl, i.modifiers.shift, i.modifiers.alt));
+            let zoom_delta = ctx.input(|i| i.zoom_delta());
+            let regular_ctrl_scroll_pan_bound = self
+                .action_uses_binding(Action::Pan, InputBinding::CtrlScrollUp)
+                || self.action_uses_binding(Action::Pan, InputBinding::CtrlScrollDown);
+            let regular_shift_scroll_pan_bound = self
+                .action_uses_binding(Action::Pan, InputBinding::ShiftScrollUp)
+                || self.action_uses_binding(Action::Pan, InputBinding::ShiftScrollDown);
+            let regular_ctrl_scroll_zoom_bound = self
+                .action_uses_binding(Action::ZoomIn, InputBinding::CtrlScrollUp)
+                || self.action_uses_binding(Action::ZoomOut, InputBinding::CtrlScrollDown);
+            let regular_scroll_zoom_bound = self
+                .action_uses_binding(Action::ZoomIn, InputBinding::ScrollUp)
+                || self.action_uses_binding(Action::ZoomOut, InputBinding::ScrollDown);
+            let pointer_pos_for_wheel = ctx.input(|i| i.pointer.hover_pos());
+            let pointer_over_shortcut_ui_for_wheel =
+                self.pointer_over_shortcut_blocking_ui(pointer_pos_for_wheel, screen_rect);
 
-        // Handle modifier-wheel pan/zoom input (not in manga mode - that's handled in draw_manga_mode).
-        // Ctrl+wheel may be routed to `zoom_delta` on some platforms, so we support both raw wheel and
-        // zoom-delta fallback for direction when Ctrl is held.
-        let (ctrl_held, shift_held, alt_held) =
-            ctx.input(|i| (i.modifiers.ctrl, i.modifiers.shift, i.modifiers.alt));
-        let zoom_delta = ctx.input(|i| i.zoom_delta());
-        let regular_ctrl_scroll_pan_bound = self
-            .action_uses_binding(Action::Pan, InputBinding::CtrlScrollUp)
-            || self.action_uses_binding(Action::Pan, InputBinding::CtrlScrollDown);
-        let regular_shift_scroll_pan_bound = self
-            .action_uses_binding(Action::Pan, InputBinding::ShiftScrollUp)
-            || self.action_uses_binding(Action::Pan, InputBinding::ShiftScrollDown);
-        let regular_ctrl_scroll_zoom_bound = self
-            .action_uses_binding(Action::ZoomIn, InputBinding::CtrlScrollUp)
-            || self.action_uses_binding(Action::ZoomOut, InputBinding::CtrlScrollDown);
-        let regular_scroll_zoom_bound = self.action_uses_binding(Action::ZoomIn, InputBinding::ScrollUp)
-            || self.action_uses_binding(Action::ZoomOut, InputBinding::ScrollDown);
-        let pointer_pos_for_wheel = ctx.input(|i| i.pointer.hover_pos());
-        let pointer_over_shortcut_ui_for_wheel =
-            self.pointer_over_shortcut_blocking_ui(pointer_pos_for_wheel, screen_rect);
+            const WHEEL_POINTS_PER_LINE: f32 = 50.0;
+            const WHEEL_MAX_STEPS_PER_EVENT: f32 = 6.0;
+            let (wheel_steps_ctrl, wheel_steps_shift) = ctx.input(|i| {
+                let mut ctrl_steps = 0.0f32;
+                let mut shift_steps = 0.0f32;
 
-        const WHEEL_POINTS_PER_LINE: f32 = 50.0;
-        const WHEEL_MAX_STEPS_PER_EVENT: f32 = 6.0;
-        let (wheel_steps_ctrl, wheel_steps_shift) = ctx.input(|i| {
-            let mut ctrl_steps = 0.0f32;
-            let mut shift_steps = 0.0f32;
+                for e in &i.raw.events {
+                    let egui::Event::MouseWheel {
+                        unit,
+                        delta,
+                        modifiers,
+                    } = e
+                    else {
+                        continue;
+                    };
 
-            for e in &i.raw.events {
-                let egui::Event::MouseWheel {
-                    unit,
-                    delta,
-                    modifiers,
-                } = e
-                else {
-                    continue;
-                };
-
-                let dy = delta.y;
-                if !dy.is_finite() || dy == 0.0 {
-                    continue;
-                }
-
-                let mut steps = match unit {
-                    egui::MouseWheelUnit::Line => dy,
-                    egui::MouseWheelUnit::Page => dy,
-                    egui::MouseWheelUnit::Point => dy / WHEEL_POINTS_PER_LINE,
-                };
-                steps = steps.clamp(-WHEEL_MAX_STEPS_PER_EVENT, WHEEL_MAX_STEPS_PER_EVENT);
-
-                if modifiers.ctrl {
-                    ctrl_steps += steps;
-                } else if modifiers.shift {
-                    shift_steps += steps;
-                }
-            }
-
-            (ctrl_steps, shift_steps)
-        });
-
-        let wheel_steps_ctrl_effective = if wheel_steps_ctrl != 0.0 {
-            wheel_steps_ctrl
-        } else if ctrl_held && !shift_held && !alt_held && zoom_delta != 1.0 {
-            if zoom_delta > 1.0 { 1.0 } else { -1.0 }
-        } else {
-            0.0
-        };
-
-        let mut handled_modifier_wheel = false;
-        if !title_ui_blocking && !pointer_over_shortcut_ui_for_wheel {
-            if regular_ctrl_scroll_pan_bound && wheel_steps_ctrl_effective != 0.0 {
-                let pan_step = self.modifier_wheel_pan_step(
-                    wheel_steps_ctrl_effective,
-                    false,
-                    screen_rect.height(),
-                );
-                self.offset.y += wheel_steps_ctrl_effective * pan_step;
-                if self.is_fullscreen {
-                    self.remember_current_fullscreen_view_state();
-                }
-                self.zoom_velocity = 0.0;
-                handled_modifier_wheel = true;
-            } else if regular_shift_scroll_pan_bound && wheel_steps_shift != 0.0 {
-                let pan_step =
-                    self.modifier_wheel_pan_step(wheel_steps_shift, true, screen_rect.width());
-                let impulse = pan_step * self.config.manga_wheel_decay_rate.max(0.5);
-                self.manga_shift_wheel_pan_velocity_x += -wheel_steps_shift * impulse;
-                self.manga_shift_wheel_pan_velocity_x = self.manga_shift_wheel_pan_velocity_x
-                    .clamp(-self.config.manga_wheel_max_velocity, self.config.manga_wheel_max_velocity);
-                self.zoom_velocity = 0.0;
-                handled_modifier_wheel = true;
-            } else if regular_ctrl_scroll_zoom_bound && wheel_steps_ctrl_effective != 0.0 {
-                if let Some(pos) = pointer_pos_for_wheel {
-                    let step = self.config.zoom_step;
-                    let zoom_in = wheel_steps_ctrl_effective > 0.0;
-                    let factor = if zoom_in { step } else { 1.0 / step };
-
-                    if self.is_fullscreen {
-                        self.zoom_at(pos, factor, screen_rect);
-                        self.zoom_target = self.zoom;
-                        self.zoom_velocity = 0.0;
-                    } else {
-                        // In floating mode, follow cursor when zoomed past 100%
-                        let old_zoom = self.zoom;
-                        self.zoom_target = self.clamp_zoom(self.zoom_target * factor);
-                        self.zoom = self.clamp_zoom(self.zoom * factor);
-
-                        let has_offset = self.offset.length() > 0.1;
-                        if old_zoom > 1.0 || self.zoom > 1.0 || has_offset {
-                            let rect_center = screen_rect.center();
-                            let cursor_offset = pos - rect_center;
-                            let zoom_ratio = self.zoom / old_zoom;
-                            self.offset =
-                                self.offset * zoom_ratio - cursor_offset * (zoom_ratio - 1.0);
-                        }
-                        self.zoom_velocity = 0.0;
+                    let dy = delta.y;
+                    if !dy.is_finite() || dy == 0.0 {
+                        continue;
                     }
 
-                    handled_modifier_wheel = true;
-                }
-            }
-        }
+                    let mut steps = match unit {
+                        egui::MouseWheelUnit::Line => dy,
+                        egui::MouseWheelUnit::Page => dy,
+                        egui::MouseWheelUnit::Point => dy / WHEEL_POINTS_PER_LINE,
+                    };
+                    steps = steps.clamp(-WHEEL_MAX_STEPS_PER_EVENT, WHEEL_MAX_STEPS_PER_EVENT);
 
-        // Regular unmodified wheel zoom.
-        if !handled_modifier_wheel
-            && regular_scroll_zoom_bound
-            && !ctrl_held
-            && !shift_held
-            && !alt_held
-        {
-            let scroll_delta = ctx.input(|i| i.smooth_scroll_delta.y);
-            if scroll_delta != 0.0 {
-                if let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) {
-                    // Only suppress zoom when the pointer is on the title *text* (or window buttons),
-                    // not on the empty title bar area.
-                    if title_ui_blocking {
-                        // Intentionally ignore scroll for zoom while selecting/copying title text.
-                    } else {
+                    if modifiers.ctrl {
+                        ctrl_steps += steps;
+                    } else if modifiers.shift {
+                        shift_steps += steps;
+                    }
+                }
+
+                (ctrl_steps, shift_steps)
+            });
+
+            let wheel_steps_ctrl_effective = if wheel_steps_ctrl != 0.0 {
+                wheel_steps_ctrl
+            } else if ctrl_held && !shift_held && !alt_held && zoom_delta != 1.0 {
+                if zoom_delta > 1.0 {
+                    1.0
+                } else {
+                    -1.0
+                }
+            } else {
+                0.0
+            };
+
+            let mut handled_modifier_wheel = false;
+            if !title_ui_blocking && !pointer_over_shortcut_ui_for_wheel {
+                if regular_ctrl_scroll_pan_bound && wheel_steps_ctrl_effective != 0.0 {
+                    let pan_step = self.modifier_wheel_pan_step(
+                        wheel_steps_ctrl_effective,
+                        false,
+                        screen_rect.height(),
+                    );
+                    self.offset.y += wheel_steps_ctrl_effective * pan_step;
+                    if self.is_fullscreen {
+                        self.remember_current_fullscreen_view_state();
+                    }
+                    self.zoom_velocity = 0.0;
+                    handled_modifier_wheel = true;
+                } else if regular_shift_scroll_pan_bound && wheel_steps_shift != 0.0 {
+                    let pan_step =
+                        self.modifier_wheel_pan_step(wheel_steps_shift, true, screen_rect.width());
+                    let impulse = pan_step * self.config.manga_wheel_decay_rate.max(0.5);
+                    self.manga_shift_wheel_pan_velocity_x += -wheel_steps_shift * impulse;
+                    self.manga_shift_wheel_pan_velocity_x =
+                        self.manga_shift_wheel_pan_velocity_x.clamp(
+                            -self.config.manga_wheel_max_velocity,
+                            self.config.manga_wheel_max_velocity,
+                        );
+                    self.zoom_velocity = 0.0;
+                    handled_modifier_wheel = true;
+                } else if regular_ctrl_scroll_zoom_bound && wheel_steps_ctrl_effective != 0.0 {
+                    if let Some(pos) = pointer_pos_for_wheel {
                         let step = self.config.zoom_step;
-                        let factor = if scroll_delta > 0.0 { step } else { 1.0 / step };
+                        let zoom_in = wheel_steps_ctrl_effective > 0.0;
+                        let factor = if zoom_in { step } else { 1.0 / step };
+
                         if self.is_fullscreen {
                             self.zoom_at(pos, factor, screen_rect);
                             self.zoom_target = self.zoom;
                             self.zoom_velocity = 0.0;
                         } else {
+                            // In floating mode, follow cursor when zoomed past 100%
                             let old_zoom = self.zoom;
                             self.zoom_target = self.clamp_zoom(self.zoom_target * factor);
                             self.zoom = self.clamp_zoom(self.zoom * factor);
@@ -24268,374 +24181,378 @@ impl ImageViewer {
                             }
                             self.zoom_velocity = 0.0;
                         }
+
+                        handled_modifier_wheel = true;
                     }
                 }
             }
-        }
 
-        // Get pointer state
-        pointer_pos = ctx.input(|i| i.pointer.hover_pos());
-        let primary_clicked = ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Primary));
-        let primary_down = ctx.input(|i| i.pointer.button_down(egui::PointerButton::Primary));
-        let primary_pressed = ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary));
-        let primary_released =
-            ctx.input(|i| i.pointer.button_released(egui::PointerButton::Primary));
-        let secondary_clicked =
-            ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Secondary));
-        let middle_pressed = ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Middle));
-        let middle_down = ctx.input(|i| i.pointer.button_down(egui::PointerButton::Middle));
-        let middle_released =
-            ctx.input(|i| i.pointer.button_released(egui::PointerButton::Middle));
-        let freehand_autoscroll_triggered = ctx.input(|input| {
-            let ctrl = input.modifiers.ctrl;
-            let shift = input.modifiers.shift;
-            let alt = input.modifiers.alt;
-            self.action_binding_triggered(
-                Action::FreehandAutoscroll,
-                input,
-                ctrl,
-                shift,
-                alt,
-            )
-        });
-        let pan_down_action = ctx.input(|input| {
-            let ctrl = input.modifiers.ctrl;
-            let shift = input.modifiers.shift;
-            let alt = input.modifiers.alt;
-            self.action_binding_down(Action::Pan, input, ctrl, shift, alt)
-        });
-
-        // Title bar gesture suppression:
-        // Allow click-through on the empty title bar; only suppress when the pointer is on
-        // selectable title text (or window buttons), or while a title-text selection drag is active.
-        let over_title_bar =
-            self.show_controls && pointer_pos.map_or(false, |p| p.y <= title_bar_height);
-
-        // Determine if we're over a resize edge (only in floating mode)
-        let hover_resize_direction = if !self.is_fullscreen {
-            if let Some(pos) = pointer_pos {
-                self.get_resize_direction(pos, screen_rect)
-            } else {
-                ResizeDirection::None
-            }
-        } else {
-            ResizeDirection::None
-        };
-
-        // Check if pointer is over the video controls bar area (bottom of screen when visible)
-        // Important: give resize edges priority over the overlay so bottom/bottom-corner resizing works.
-        let over_video_controls =
-            self.show_video_controls && hover_resize_direction == ResizeDirection::None && {
-                let bar_height = 56.0;
-                pointer_pos.map_or(false, |pos| pos.y > screen_rect.height() - bar_height)
-            };
-        let pointer_over_shortcut_ui =
-            self.pointer_over_shortcut_blocking_ui(pointer_pos, screen_rect);
-
-        let mut primary_consumed_for_autoscroll = false;
-
-        if freehand_autoscroll_triggered
-            && !title_ui_blocking
-            && !pointer_over_shortcut_ui
-            && !over_video_controls
-            && hover_resize_direction == ResizeDirection::None
-        {
-            if self.manga_autoscroll_active {
-                self.stop_manga_autoscroll();
-            } else if let Some(anchor) = pointer_pos {
-                self.manga_autoscroll_active = true;
-                self.manga_autoscroll_anchor = Some(anchor);
-                self.manga_autoscroll_middle_hold_tracking = middle_pressed
-                    && self.action_uses_binding(Action::FreehandAutoscroll, InputBinding::MouseMiddle);
-                self.manga_autoscroll_cancel_on_middle_release = false;
-                self.manga_autoscroll_middle_hold_started_at =
-                    if self.manga_autoscroll_middle_hold_tracking {
-                        Some(Instant::now())
-                    } else {
-                        None
-                    };
-                self.is_panning = false;
-                self.last_mouse_pos = None;
-            }
-            animation_active = true;
-        }
-
-        if self.manga_autoscroll_active
-            && self.manga_autoscroll_middle_hold_tracking
-            && middle_down
-            && !middle_pressed
-        {
-            if self
-                .manga_autoscroll_middle_hold_started_at
-                .is_some_and(|started_at| started_at.elapsed().as_secs_f32() >= 0.2)
+            // Regular unmodified wheel zoom.
+            if !handled_modifier_wheel
+                && regular_scroll_zoom_bound
+                && !ctrl_held
+                && !shift_held
+                && !alt_held
             {
-                self.manga_autoscroll_cancel_on_middle_release = true;
-            }
-        }
-
-        if self.manga_autoscroll_active
-            && self.manga_autoscroll_middle_hold_tracking
-            && middle_released
-        {
-            if self.manga_autoscroll_cancel_on_middle_release {
-                self.stop_manga_autoscroll();
-                animation_active = true;
-            } else {
-                // Treat quick middle click as toggle-on (do not auto-cancel on release).
-                self.manga_autoscroll_middle_hold_tracking = false;
-                self.manga_autoscroll_middle_hold_started_at = None;
-            }
-        }
-
-        if self.manga_autoscroll_active && primary_clicked {
-            self.stop_manga_autoscroll();
-            primary_consumed_for_autoscroll = true;
-            animation_active = true;
-        }
-
-        if self.manga_autoscroll_active && secondary_clicked {
-            self.stop_manga_autoscroll();
-            animation_active = true;
-        }
-
-        // Handle resize start (but not if over video controls)
-        if primary_pressed
-            && hover_resize_direction != ResizeDirection::None
-            && !self.is_resizing
-            && !self.is_panning
-        {
-            self.is_resizing = true;
-            self.resize_direction = hover_resize_direction;
-            self.last_mouse_pos = pointer_pos;
-            // Clear any stale resize state - it will be captured fresh on first resize call
-            self.resize_start_outer_pos = None;
-            self.resize_start_inner_size = None;
-            self.resize_start_cursor_screen = None;
-            self.resize_last_size = None;
-        }
-
-        // Handle resizing
-        if self.is_resizing && primary_down {
-            self.resize_floating_keep_aspect(ctx, self.resize_direction);
-            ctx.set_cursor_icon(self.get_resize_cursor(self.resize_direction));
-        } else if self.is_resizing && primary_released {
-            // Persist the user's manual resize as the new floating cap so autosize doesn't
-            // snap back to the initial 100%/fit size.
-            if let Some(sz) = self.resize_last_size {
-                let updated = if let Some(prev) = self.floating_max_inner_size {
-                    egui::Vec2::new(prev.x.max(sz.x), prev.y.max(sz.y))
-                } else {
-                    sz
-                };
-                self.floating_max_inner_size = Some(updated);
-            }
-
-            // Manual resize counts as the user "placing" the window.
-            // After this, keep the window location stable on next/prev and file drops.
-            self.floating_user_moved_window = true;
-
-            self.is_resizing = false;
-            self.resize_direction = ResizeDirection::None;
-            self.last_mouse_pos = None;
-            // Clear resize start state
-            self.resize_start_outer_pos = None;
-            self.resize_start_inner_size = None;
-            self.resize_start_cursor_screen = None;
-            self.resize_last_size = None;
-        } else if !self.is_resizing {
-            // Handle panning/window dragging (only if not resizing, not seeking, and not over video controls)
-            if pan_down_action
-                && hover_resize_direction == ResizeDirection::None
-                && !over_video_controls
-                && !self.is_seeking
-                && !self.is_volume_dragging
-                && !self.gif_seeking
-                && !self.manga_video_seeking
-                && !self.mouse_over_window_buttons
-                && !self.title_bar_menu_active
-                && !self.title_text_dragging
-                && !pointer_over_shortcut_ui
-                && !self.manga_autoscroll_active
-                && !primary_consumed_for_autoscroll
-                && !(over_title_bar && self.mouse_over_title_text)
-            {
-                self.manga_shift_wheel_pan_velocity_x = 0.0;
-                if let Some(pos) = pointer_pos {
-                    // Check if drag started from the top controls region for window dragging.
-                    let in_title_bar = self.last_mouse_pos.map_or(
-                        pos.y < self.top_controls_hotzone_height(),
-                        |lp| lp.y < self.top_controls_hotzone_height(),
-                    );
-
-                    if let Some(_last_pos) = self.last_mouse_pos {
-                        if self.is_panning {
+                let scroll_delta = ctx.input(|i| i.smooth_scroll_delta.y);
+                if scroll_delta != 0.0 {
+                    if let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) {
+                        // Only suppress zoom when the pointer is on the title *text* (or window buttons),
+                        // not on the empty title bar area.
+                        if title_ui_blocking {
+                            // Intentionally ignore scroll for zoom while selecting/copying title text.
+                        } else {
+                            let step = self.config.zoom_step;
+                            let factor = if scroll_delta > 0.0 { step } else { 1.0 / step };
                             if self.is_fullscreen {
-                                // In fullscreen, pan the image
-                                let delta = ctx.input(|i| i.pointer.delta());
-                                self.offset += delta;
-                                self.remember_current_fullscreen_view_state();
-                            } else if in_title_bar {
-                                // In floating mode, dragging from title bar always moves window
-                                ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
-                            } else if floating_image_exceeds_window {
-                                // In floating mode when zoomed past 100%, pan image inside window
-                                let delta = ctx.input(|i| i.pointer.delta());
-                                self.offset += delta;
+                                self.zoom_at(pos, factor, screen_rect);
+                                self.zoom_target = self.zoom;
+                                self.zoom_velocity = 0.0;
                             } else {
-                                // In floating mode at/below 100%, drag the window
-                                ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                                let old_zoom = self.zoom;
+                                self.zoom_target = self.clamp_zoom(self.zoom_target * factor);
+                                self.zoom = self.clamp_zoom(self.zoom * factor);
+
+                                let has_offset = self.offset.length() > 0.1;
+                                if old_zoom > 1.0 || self.zoom > 1.0 || has_offset {
+                                    let rect_center = screen_rect.center();
+                                    let cursor_offset = pos - rect_center;
+                                    let zoom_ratio = self.zoom / old_zoom;
+                                    self.offset = self.offset * zoom_ratio
+                                        - cursor_offset * (zoom_ratio - 1.0);
+                                }
+                                self.zoom_velocity = 0.0;
                             }
                         }
                     }
-                    if !self.is_panning {
-                        self.is_panning = true;
-                    }
-                    self.last_mouse_pos = Some(pos);
-                    ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+                }
+            }
+
+            // Get pointer state
+            pointer_pos = ctx.input(|i| i.pointer.hover_pos());
+            let primary_clicked =
+                ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Primary));
+            let primary_down = ctx.input(|i| i.pointer.button_down(egui::PointerButton::Primary));
+            let primary_pressed =
+                ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary));
+            let primary_released =
+                ctx.input(|i| i.pointer.button_released(egui::PointerButton::Primary));
+            let secondary_clicked =
+                ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Secondary));
+            let middle_pressed =
+                ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Middle));
+            let middle_down = ctx.input(|i| i.pointer.button_down(egui::PointerButton::Middle));
+            let middle_released =
+                ctx.input(|i| i.pointer.button_released(egui::PointerButton::Middle));
+            let freehand_autoscroll_triggered = ctx.input(|input| {
+                let ctrl = input.modifiers.ctrl;
+                let shift = input.modifiers.shift;
+                let alt = input.modifiers.alt;
+                self.action_binding_triggered(Action::FreehandAutoscroll, input, ctrl, shift, alt)
+            });
+            let pan_down_action = ctx.input(|input| {
+                let ctrl = input.modifiers.ctrl;
+                let shift = input.modifiers.shift;
+                let alt = input.modifiers.alt;
+                self.action_binding_down(Action::Pan, input, ctrl, shift, alt)
+            });
+
+            // Title bar gesture suppression:
+            // Allow click-through on the empty title bar; only suppress when the pointer is on
+            // selectable title text (or window buttons), or while a title-text selection drag is active.
+            let over_title_bar =
+                self.show_controls && pointer_pos.map_or(false, |p| p.y <= title_bar_height);
+
+            // Determine if we're over a resize edge (only in floating mode)
+            let hover_resize_direction = if !self.is_fullscreen {
+                if let Some(pos) = pointer_pos {
+                    self.get_resize_direction(pos, screen_rect)
+                } else {
+                    ResizeDirection::None
                 }
             } else {
-                if self.is_panning {
-                    self.is_panning = false;
-                }
-                self.last_mouse_pos = None;
+                ResizeDirection::None
+            };
 
-                // Set cursor based on hover state
-                // Don't fight egui's cursor when the pointer is over title-bar UI (text selection, buttons).
-                if !(title_ui_blocking && over_title_bar) {
-                    if hover_resize_direction != ResizeDirection::None {
-                        ctx.set_cursor_icon(self.get_resize_cursor(hover_resize_direction));
-                    } else {
-                        ctx.set_cursor_icon(egui::CursorIcon::Default);
-                    }
-                }
-            }
-        }
-
-        let dt = ctx.input(|i| i.stable_dt).clamp(0.0, 0.033);
-
-        if self.manga_shift_wheel_pan_velocity_x.abs() > 0.01 && dt > 0.0 {
-            self.offset.x += self.manga_shift_wheel_pan_velocity_x * dt;
-            let decay = (-self.config.manga_wheel_decay_rate * dt).exp();
-            self.manga_shift_wheel_pan_velocity_x *= decay;
-            if self.manga_shift_wheel_pan_velocity_x.abs() < 2.0 {
-                self.manga_shift_wheel_pan_velocity_x = 0.0;
-            }
-            if self.is_fullscreen {
-                self.remember_current_fullscreen_view_state();
-            }
-            animation_active = true;
-        }
-
-        if self.manga_autoscroll_active {
-            if let (Some(anchor), Some(pos)) = (self.manga_autoscroll_anchor, pointer_pos) {
-                let speed_base = self.config.manga_arrow_scroll_speed.max(1.0);
-                let delta_x = pos.x - anchor.x;
-                let delta_y = pos.y - anchor.y;
-
-                let max_distance_x = if delta_x >= 0.0 {
-                    (screen_rect.max.x - anchor.x).max(1.0)
-                } else {
-                    (anchor.x - screen_rect.min.x).max(1.0)
+            // Check if pointer is over the video controls bar area (bottom of screen when visible)
+            // Important: give resize edges priority over the overlay so bottom/bottom-corner resizing works.
+            let over_video_controls =
+                self.show_video_controls && hover_resize_direction == ResizeDirection::None && {
+                    let bar_height = 56.0;
+                    pointer_pos.map_or(false, |pos| pos.y > screen_rect.height() - bar_height)
                 };
-                let max_distance_y = if delta_y >= 0.0 {
-                    (screen_rect.max.y - anchor.y).max(1.0)
-                } else {
-                    (anchor.y - screen_rect.min.y).max(1.0)
-                };
+            let pointer_over_shortcut_ui =
+                self.pointer_over_shortcut_blocking_ui(pointer_pos, screen_rect);
 
-                let speed_x = self.manga_autoscroll_axis_speed(
-                    delta_x,
-                    speed_base,
-                    max_distance_x,
-                    self.config.manga_autoscroll_horizontal_speed_multiplier,
-                );
-                let speed_y = self.manga_autoscroll_axis_speed(
-                    delta_y,
-                    speed_base,
-                    max_distance_y,
-                    self.config.manga_autoscroll_vertical_speed_multiplier,
-                );
+            let mut primary_consumed_for_autoscroll = false;
 
-                if speed_x != 0.0 || speed_y != 0.0 {
-                    self.manga_shift_wheel_pan_velocity_x = 0.0;
-                    self.offset.x -= speed_x * dt;
-                    self.offset.y -= speed_y * dt;
-                    ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
-                    animation_active = true;
-                }
-            } else {
-                self.stop_manga_autoscroll();
-            }
-        }
-
-        // Floating mode: autosize the window to match the image (up to a cap).
-        // Called after resize handling to avoid fighting with resize on first click frame.
-        self.request_floating_autosize(ctx);
-
-        // Handle double-click to fit media to screen (fullscreen) or reset zoom (floating)
-        if ctx.input(|i| {
-            i.pointer
-                .button_double_clicked(egui::PointerButton::Primary)
-        }) && !title_ui_blocking
-            && !pointer_over_shortcut_ui
-        {
-            self.reset_current_view_rotation(ctx);
-            self.offset = egui::Vec2::ZERO;
-            self.manga_shift_wheel_pan_velocity_x = 0.0;
-            self.zoom_velocity = 0.0;
-
-            // Get dimensions from current media (image or video)
-            if let Some((img_w_u, img_h_u)) = self.media_display_dimensions() {
-                let img_w = img_w_u as f32;
-                let img_h = img_h_u as f32;
-
-                if self.is_fullscreen {
-                    // Fit media vertically to screen height
-                    if img_h > 0.0 {
-                        let screen_h = screen_rect.height();
-                        let fit_zoom = self.fit_zoom_for_target_height(screen_h, img_h);
-                        self.zoom = fit_zoom;
-                        self.zoom_target = self.zoom;
-                    }
-                    self.clear_current_fullscreen_view_memory();
-                } else {
-                    // Floating mode: fit media to screen while keeping aspect ratio.
-                    let monitor = self.monitor_size_points(ctx);
-
-                    // Determine if media needs to be scaled down to fit the screen.
-                    let is_video = matches!(self.current_media_type, Some(MediaType::Video));
-                    let fit_zoom = if is_video {
-                        if img_h > monitor.y {
-                            self.fit_zoom_for_target_height(monitor.y, img_h)
+            if freehand_autoscroll_triggered
+                && !title_ui_blocking
+                && !pointer_over_shortcut_ui
+                && !over_video_controls
+                && hover_resize_direction == ResizeDirection::None
+            {
+                if self.manga_autoscroll_active {
+                    self.stop_manga_autoscroll();
+                } else if let Some(anchor) = pointer_pos {
+                    self.manga_autoscroll_active = true;
+                    self.manga_autoscroll_anchor = Some(anchor);
+                    self.manga_autoscroll_middle_hold_tracking = middle_pressed
+                        && self.action_uses_binding(
+                            Action::FreehandAutoscroll,
+                            InputBinding::MouseMiddle,
+                        );
+                    self.manga_autoscroll_cancel_on_middle_release = false;
+                    self.manga_autoscroll_middle_hold_started_at =
+                        if self.manga_autoscroll_middle_hold_tracking {
+                            Some(Instant::now())
                         } else {
-                            1.0
+                            None
+                        };
+                    self.is_panning = false;
+                    self.last_mouse_pos = None;
+                }
+                animation_active = true;
+            }
+
+            if self.manga_autoscroll_active
+                && self.manga_autoscroll_middle_hold_tracking
+                && middle_down
+                && !middle_pressed
+            {
+                if self
+                    .manga_autoscroll_middle_hold_started_at
+                    .is_some_and(|started_at| started_at.elapsed().as_secs_f32() >= 0.2)
+                {
+                    self.manga_autoscroll_cancel_on_middle_release = true;
+                }
+            }
+
+            if self.manga_autoscroll_active
+                && self.manga_autoscroll_middle_hold_tracking
+                && middle_released
+            {
+                if self.manga_autoscroll_cancel_on_middle_release {
+                    self.stop_manga_autoscroll();
+                    animation_active = true;
+                } else {
+                    // Treat quick middle click as toggle-on (do not auto-cancel on release).
+                    self.manga_autoscroll_middle_hold_tracking = false;
+                    self.manga_autoscroll_middle_hold_started_at = None;
+                }
+            }
+
+            if self.manga_autoscroll_active && primary_clicked {
+                self.stop_manga_autoscroll();
+                primary_consumed_for_autoscroll = true;
+                animation_active = true;
+            }
+
+            if self.manga_autoscroll_active && secondary_clicked {
+                self.stop_manga_autoscroll();
+                animation_active = true;
+            }
+
+            // Handle resize start (but not if over video controls)
+            if primary_pressed
+                && hover_resize_direction != ResizeDirection::None
+                && !self.is_resizing
+                && !self.is_panning
+            {
+                self.is_resizing = true;
+                self.resize_direction = hover_resize_direction;
+                self.last_mouse_pos = pointer_pos;
+                // Clear any stale resize state - it will be captured fresh on first resize call
+                self.resize_start_outer_pos = None;
+                self.resize_start_inner_size = None;
+                self.resize_start_cursor_screen = None;
+                self.resize_last_size = None;
+            }
+
+            // Handle resizing
+            if self.is_resizing && primary_down {
+                self.resize_floating_keep_aspect(ctx, self.resize_direction);
+                ctx.set_cursor_icon(self.get_resize_cursor(self.resize_direction));
+            } else if self.is_resizing && primary_released {
+                self.is_resizing = false;
+                self.resize_direction = ResizeDirection::None;
+                self.last_mouse_pos = None;
+                // Clear resize start state
+                self.resize_start_outer_pos = None;
+                self.resize_start_inner_size = None;
+                self.resize_start_cursor_screen = None;
+                self.resize_last_size = None;
+            } else if !self.is_resizing {
+                // Handle panning/window dragging (only if not resizing, not seeking, and not over video controls)
+                if pan_down_action
+                    && hover_resize_direction == ResizeDirection::None
+                    && !over_video_controls
+                    && !self.is_seeking
+                    && !self.is_volume_dragging
+                    && !self.gif_seeking
+                    && !self.manga_video_seeking
+                    && !self.mouse_over_window_buttons
+                    && !self.title_bar_menu_active
+                    && !self.title_text_dragging
+                    && !pointer_over_shortcut_ui
+                    && !self.manga_autoscroll_active
+                    && !primary_consumed_for_autoscroll
+                    && !(over_title_bar && self.mouse_over_title_text)
+                {
+                    self.manga_shift_wheel_pan_velocity_x = 0.0;
+                    if let Some(pos) = pointer_pos {
+                        // Check if drag started from the top controls region for window dragging.
+                        let in_title_bar = self
+                            .last_mouse_pos
+                            .map_or(pos.y < self.top_controls_hotzone_height(), |lp| {
+                                lp.y < self.top_controls_hotzone_height()
+                            });
+
+                        if let Some(_last_pos) = self.last_mouse_pos {
+                            if self.is_panning {
+                                if self.is_fullscreen {
+                                    // In fullscreen, pan the image
+                                    let delta = ctx.input(|i| i.pointer.delta());
+                                    self.offset += delta;
+                                    self.remember_current_fullscreen_view_state();
+                                } else if in_title_bar {
+                                    // In floating mode, dragging from title bar always moves window
+                                    ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                                } else if floating_image_exceeds_window {
+                                    // In floating mode when zoomed past 100%, pan image inside window
+                                    let delta = ctx.input(|i| i.pointer.delta());
+                                    self.offset += delta;
+                                } else {
+                                    // In floating mode at/below 100%, drag the window
+                                    ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                                }
+                            }
                         }
-                    } else if img_h > monitor.y || img_w > monitor.x {
-                        (monitor.y / img_h).min(monitor.x / img_w).min(1.0)
+                        if !self.is_panning {
+                            self.is_panning = true;
+                        }
+                        self.last_mouse_pos = Some(pos);
+                        ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+                    }
+                } else {
+                    if self.is_panning {
+                        self.is_panning = false;
+                    }
+                    self.last_mouse_pos = None;
+
+                    // Set cursor based on hover state
+                    // Don't fight egui's cursor when the pointer is over title-bar UI (text selection, buttons).
+                    if !(title_ui_blocking && over_title_bar) {
+                        if hover_resize_direction != ResizeDirection::None {
+                            ctx.set_cursor_icon(self.get_resize_cursor(hover_resize_direction));
+                        } else {
+                            ctx.set_cursor_icon(egui::CursorIcon::Default);
+                        }
+                    }
+                }
+            }
+
+            let dt = ctx.input(|i| i.stable_dt).clamp(0.0, 0.033);
+
+            if self.manga_shift_wheel_pan_velocity_x.abs() > 0.01 && dt > 0.0 {
+                self.offset.x += self.manga_shift_wheel_pan_velocity_x * dt;
+                let decay = (-self.config.manga_wheel_decay_rate * dt).exp();
+                self.manga_shift_wheel_pan_velocity_x *= decay;
+                if self.manga_shift_wheel_pan_velocity_x.abs() < 2.0 {
+                    self.manga_shift_wheel_pan_velocity_x = 0.0;
+                }
+                if self.is_fullscreen {
+                    self.remember_current_fullscreen_view_state();
+                }
+                animation_active = true;
+            }
+
+            if self.manga_autoscroll_active {
+                if let (Some(anchor), Some(pos)) = (self.manga_autoscroll_anchor, pointer_pos) {
+                    let speed_base = self.config.manga_arrow_scroll_speed.max(1.0);
+                    let delta_x = pos.x - anchor.x;
+                    let delta_y = pos.y - anchor.y;
+
+                    let max_distance_x = if delta_x >= 0.0 {
+                        (screen_rect.max.x - anchor.x).max(1.0)
                     } else {
-                        1.0
+                        (anchor.x - screen_rect.min.x).max(1.0)
+                    };
+                    let max_distance_y = if delta_y >= 0.0 {
+                        (screen_rect.max.y - anchor.y).max(1.0)
+                    } else {
+                        (anchor.y - screen_rect.min.y).max(1.0)
                     };
 
-                    self.zoom = fit_zoom;
-                    self.zoom_target = fit_zoom;
+                    let speed_x = self.manga_autoscroll_axis_speed(
+                        delta_x,
+                        speed_base,
+                        max_distance_x,
+                        self.config.manga_autoscroll_horizontal_speed_multiplier,
+                    );
+                    let speed_y = self.manga_autoscroll_axis_speed(
+                        delta_y,
+                        speed_base,
+                        max_distance_y,
+                        self.config.manga_autoscroll_vertical_speed_multiplier,
+                    );
 
-                    // Compute window size based on zoom.
-                    let mut desired = egui::Vec2::new(img_w * fit_zoom, img_h * fit_zoom);
-
-                    // Respect the viewport minimum size.
-                    desired.x = desired.x.max(200.0);
-                    desired.y = desired.y.max(150.0);
-
-                    // Update cap so autosize doesn't fight this request.
-                    self.floating_max_inner_size = Some(desired);
-                    self.last_requested_inner_size = Some(desired);
-                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(desired));
-                    self.center_window_on_monitor(ctx, desired);
+                    if speed_x != 0.0 || speed_y != 0.0 {
+                        self.manga_shift_wheel_pan_velocity_x = 0.0;
+                        self.offset.x -= speed_x * dt;
+                        self.offset.y -= speed_y * dt;
+                        ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+                        animation_active = true;
+                    }
+                } else {
+                    self.stop_manga_autoscroll();
                 }
-
             }
-        }
 
+            // Floating mode: autosize the window to match the current zoomed media size.
+            // Called after resize handling to avoid fighting with resize on first click frame.
+            self.request_floating_autosize(ctx);
+
+            // Handle double-click to fit media to screen (fullscreen) or reset zoom (floating)
+            if ctx.input(|i| {
+                i.pointer
+                    .button_double_clicked(egui::PointerButton::Primary)
+            }) && !title_ui_blocking
+                && !pointer_over_shortcut_ui
+            {
+                self.reset_current_view_rotation(ctx);
+                self.offset = egui::Vec2::ZERO;
+                self.manga_shift_wheel_pan_velocity_x = 0.0;
+                self.zoom_velocity = 0.0;
+
+                // Get dimensions from current media (image or video)
+                if let Some((img_w_u, img_h_u)) = self.media_display_dimensions() {
+                    let img_w = img_w_u as f32;
+                    let img_h = img_h_u as f32;
+
+                    if self.is_fullscreen {
+                        // Fit media vertically to screen height
+                        if img_h > 0.0 {
+                            let screen_h = screen_rect.height();
+                            let fit_zoom = self.fit_zoom_for_target_height(screen_h, img_h);
+                            self.zoom = fit_zoom;
+                            self.zoom_target = self.zoom;
+                        }
+                        self.clear_current_fullscreen_view_memory();
+                    } else {
+                        // Floating mode: reset to 100% size, or fit to screen if needed.
+                        let monitor = self.monitor_size_points(ctx);
+                        if let Some((fit_zoom, desired)) =
+                            self.floating_layout_size_for_media(img_w, img_h, monitor)
+                        {
+                            self.zoom = fit_zoom;
+                            self.zoom_target = fit_zoom;
+                            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(desired));
+                            self.center_window_on_monitor(ctx, desired);
+                        }
+                    }
+                }
+            }
         }
 
         // Draw the image or video
@@ -24678,7 +24595,10 @@ impl ImageViewer {
                     let display_size = if precise_rotation_degrees.abs() < 0.01 {
                         base_display_size
                     } else {
-                        rotated_bounding_size(base_display_size, precise_rotation_degrees.to_radians())
+                        rotated_bounding_size(
+                            base_display_size,
+                            precise_rotation_degrees.to_radians(),
+                        )
                     };
 
                     // During resize, use the commanded size to compute center to avoid jitter
@@ -24697,17 +24617,11 @@ impl ImageViewer {
 
                     let final_rect = image_rect;
 
-                    if precise_rotation_degrees.abs() < 0.01
-                        && !flip_horizontal
-                        && !flip_vertical
-                    {
+                    if precise_rotation_degrees.abs() < 0.01 && !flip_horizontal && !flip_vertical {
                         ui.painter().image(
                             texture.id(),
                             final_rect,
-                            egui::Rect::from_min_max(
-                                egui::pos2(0.0, 0.0),
-                                egui::pos2(1.0, 1.0),
-                            ),
+                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                             egui::Color32::WHITE,
                         );
                     } else {
@@ -24740,8 +24654,7 @@ impl ImageViewer {
                         ctx.request_repaint();
                     }
 
-                    if self.pending_media_load.is_some()
-                        && !self.retained_media_placeholder_visible
+                    if self.pending_media_load.is_some() && !self.retained_media_placeholder_visible
                     {
                         let time = ui.input(|i| i.time);
                         paint_loading_spinner(ui.painter(), final_rect, time);
@@ -24757,7 +24670,8 @@ impl ImageViewer {
                     }
 
                     if matches!(self.current_media_type, Some(MediaType::Video)) {
-                        if let Some(remaining_seconds) = self.active_video_playback_popup_seconds() {
+                        if let Some(remaining_seconds) = self.active_video_playback_popup_seconds()
+                        {
                             self.paint_video_playback_unavailable_popup(
                                 ui.painter(),
                                 final_rect,
@@ -24841,24 +24755,13 @@ impl eframe::App for ImageViewer {
         #[cfg(target_os = "windows")]
         if let Some(ref receiver) = self.file_receiver {
             if let Some(path) = receiver.try_recv() {
+                self.prepare_single_instance_media_handoff(ctx);
+
                 // Load the new file
                 self.load_media(&path);
 
                 // Bring window to foreground
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-
-                // If we're in fullscreen manga mode, exit it to show the new file normally
-                if self.manga_mode && self.is_fullscreen {
-                    self.stop_manga_wheel_scroll();
-                    self.stop_manga_autoscroll();
-                    self.manga_mode = false;
-                    set_metadata_cache_enabled(false);
-                    self.manga_clear_cache();
-
-                    // Fully drop the loader thread pool on handoff from another instance.
-                    // This matches prior behavior and frees resources immediately.
-                    self.manga_loader = None;
-                }
 
                 // Request repaint to show the new content
                 ctx.request_repaint();
@@ -24914,9 +24817,6 @@ impl eframe::App for ImageViewer {
                 self.toggle_fullscreen = true;
             }
         }
-
-        // Track current floating window position so we can preserve it across media changes.
-        self.track_floating_window_position(ctx);
 
         // Handle file drops (disabled while the help modal is open).
         if !self.shortcuts_help_modal_open {
@@ -24992,7 +24892,12 @@ impl eframe::App for ImageViewer {
                 // Fullscreen entry logic will apply the appropriate layout.
                 self.image_changed = false;
             } else {
-                if self.is_fullscreen {
+                if self.force_floating_layout_once && window_is_maximized {
+                    self.pending_media_layout = true;
+                } else if self.force_floating_layout_once {
+                    self.apply_floating_layout_for_current_image(ctx);
+                    self.force_floating_layout_once = false;
+                } else if self.is_fullscreen {
                     // Fullscreen: keep fullscreen and fit vertically, centered.
                     self.apply_fullscreen_layout_for_current_image(ctx);
                 } else if window_is_maximized {
@@ -25037,14 +24942,22 @@ impl eframe::App for ImageViewer {
         // Retry layout once we have dimensions so next/prev video switches obey the sizing rules.
         if self.pending_media_layout {
             if self.media_display_dimensions().is_some() {
-                if self.is_fullscreen {
+                if self.force_floating_layout_once && window_is_maximized {
+                    ctx.request_repaint_after(Duration::from_millis(16));
+                } else if self.force_floating_layout_once {
+                    self.apply_floating_layout_for_current_image(ctx);
+                    self.force_floating_layout_once = false;
+                    self.pending_media_layout = false;
+                } else if self.is_fullscreen {
                     self.apply_fullscreen_layout_for_current_image(ctx);
+                    self.pending_media_layout = false;
                 } else if window_is_maximized {
                     self.apply_maximized_layout_for_current_image(ctx);
+                    self.pending_media_layout = false;
                 } else {
                     self.apply_floating_layout_for_current_image(ctx);
+                    self.pending_media_layout = false;
                 }
-                self.pending_media_layout = false;
             }
         }
 
@@ -25089,23 +25002,6 @@ impl eframe::App for ImageViewer {
                 self.is_fullscreen = entering_fullscreen;
 
                 if entering_fullscreen {
-                    // Save current floating state before entering fullscreen
-                    let inner_size = ctx
-                        .input(|i| i.raw.viewport().inner_rect)
-                        .map(|r| r.size())
-                        .unwrap_or(egui::Vec2::new(800.0, 600.0));
-                    let outer_pos = ctx
-                        .input(|i| i.raw.viewport().outer_rect)
-                        .map(|r| r.min)
-                        .unwrap_or(egui::Pos2::ZERO);
-                    self.saved_floating_state = Some((
-                        self.zoom,
-                        self.zoom_target,
-                        self.offset,
-                        inner_size,
-                        outer_pos,
-                    ));
-                    self.saved_floating_was_maximized = use_native_transition && window_was_maximized;
                     self.saved_fullscreen_entry_index = Some(self.current_index);
                     self.pending_window_resize = None;
                     self.pending_maximized_layout = false;
@@ -25135,11 +25031,10 @@ impl eframe::App for ImageViewer {
                         // Use borderless "pseudo-fullscreen" instead of OS fullscreen.
                         // This avoids a brief desktop flash on Windows caused by toggling window styles/swapchain.
                         let monitor = self.monitor_size_points(ctx);
-                        self.suppress_outer_pos_tracking_frames =
-                            self.suppress_outer_pos_tracking_frames.max(2);
-                        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::Pos2::ZERO));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(
+                            egui::Pos2::ZERO,
+                        ));
                         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(monitor));
-                        self.last_requested_inner_size = Some(monitor);
                     }
                 } else {
                     // Exiting fullscreen - use delayed resize to prevent flash
@@ -25179,9 +25074,9 @@ impl eframe::App for ImageViewer {
                             self.persist_current_masonry_folder_metadata_snapshot();
                         }
 
-                        let keep_resident_masonry_cache =
-                            self.manga_layout_mode == MangaLayoutMode::Masonry
-                                || self.has_resident_masonry_runtime_cache();
+                        let keep_resident_masonry_cache = self.manga_layout_mode
+                            == MangaLayoutMode::Masonry
+                            || self.has_resident_masonry_runtime_cache();
                         self.manga_mode = false;
                         set_metadata_cache_enabled(false);
                         if keep_resident_masonry_cache {
@@ -25201,142 +25096,21 @@ impl eframe::App for ImageViewer {
                     self.current_fullscreen_view_has_memory = false;
                     self.reset_precise_rotation();
                     self.strip_open_force_fit_path = None;
+                    self.saved_fullscreen_entry_index = None;
+                    self.pending_window_resize = None;
+                    self.pending_maximized_layout = false;
+                    self.force_floating_layout_once = true;
 
-                    let image_changed_while_fullscreen = self
-                        .saved_fullscreen_entry_index
-                        .is_some_and(|idx| idx != self.current_index);
-                    let restore_to_maximized = use_native_transition && self.saved_floating_was_maximized;
-                    let should_native_restore =
-                        use_native_transition && window_was_maximized && !restore_to_maximized;
-                    self.saved_floating_was_maximized = false;
-
-                    // Restore previous floating state if available
-                    if !image_changed_while_fullscreen {
-                        self.saved_fullscreen_entry_index = None;
-                    }
-
-                    if !image_changed_while_fullscreen {
-                        if let Some((
-                            saved_zoom,
-                            saved_zoom_target,
-                            saved_offset,
-                            saved_size,
-                            saved_pos,
-                        )) = self.saved_floating_state.take()
-                        {
-                            self.zoom = saved_zoom;
-                            self.zoom_target = saved_zoom_target;
-                            self.offset = saved_offset;
-                            self.zoom_velocity = 0.0;
-                            self.floating_max_inner_size = Some(saved_size);
-                            self.last_requested_inner_size = Some(saved_size);
-                            if should_native_restore {
-                                self.request_native_maximize = Some(false);
-                                self.last_known_outer_pos = Some(saved_pos);
-                            } else if !restore_to_maximized {
-                                // Delay window resize by 2 frames to prevent flash
-                                self.pending_window_resize = Some((saved_size, saved_pos, 2));
-                            }
-                        } else {
-                            // Fallback: reset to centered at 100% and resize to 100% image size (capped by fit-to-screen)
-                            self.offset = egui::Vec2::ZERO;
-                            self.zoom = 1.0;
-                            self.zoom_target = 1.0;
-                            self.zoom_velocity = 0.0;
-
-                            if restore_to_maximized {
-                                self.pending_maximized_layout = true;
-                            } else if let Some(img) = self.image.as_ref() {
-                                let (w, h) = img.display_dimensions();
-                                let mut desired = egui::Vec2::new(w as f32, h as f32);
-                                let available = self.floating_available_size(ctx);
-                                let cap = self.initial_window_size_for_available(available);
-                                self.floating_max_inner_size = Some(cap);
-                                if desired.x > cap.x || desired.y > cap.y {
-                                    desired = cap;
-                                }
-                                desired.x = desired.x.max(200.0);
-                                desired.y = desired.y.max(150.0);
-                                self.last_requested_inner_size = Some(desired);
-                                // Calculate center position
-                                let monitor = self.monitor_size_points(ctx);
-                                let x = (monitor.x - desired.x) * 0.5;
-                                let y = (monitor.y - desired.y) * 0.5;
-                                let pos = egui::pos2(x.max(0.0), y.max(0.0));
-                                // Delay window resize by 2 frames to prevent flash
-                                self.pending_window_resize = Some((desired, pos, 2));
-                                if should_native_restore {
-                                    self.request_native_maximize = Some(false);
-                                }
-                            }
-                        }
+                    if use_native_transition && window_was_maximized {
+                        self.pending_media_layout = true;
+                        self.request_native_maximize = Some(false);
+                    } else if self.media_display_dimensions().is_some() {
+                        self.apply_floating_layout_for_current_image(ctx);
+                        self.force_floating_layout_once = false;
+                        self.pending_media_layout = false;
                     } else {
-                        // If the user navigated to a different image while fullscreen,
-                        // don't restore the previous floating zoom/position; apply normal floating sizing.
-                        self.saved_fullscreen_entry_index = None;
-                        self.saved_floating_state = None;
-                        if restore_to_maximized {
-                            // Returning to a previously maximized floating window should keep
-                            // the window maximized and only recompute the fit for the new media.
-                            if self.media_display_dimensions().is_some() {
-                                self.apply_maximized_layout_for_current_image(ctx);
-                            } else {
-                                self.pending_media_layout =
-                                    matches!(self.current_media_type, Some(MediaType::Video));
-                            }
-                        } else if let Some((img_w_u, img_h_u)) = self.media_display_dimensions() {
-                            if img_w_u > 0 && img_h_u > 0 {
-                                let img_w = img_w_u as f32;
-                                let img_h = img_h_u as f32;
-                                let monitor = self.monitor_size_points(ctx);
-
-                                // Floating sizing when leaving fullscreen after navigation:
-                                // - Videos: fit vertically only if taller than the screen, else 100%.
-                                // - Images: keep existing behavior for this branch (fit vertically if taller).
-                                let is_video =
-                                    matches!(self.current_media_type, Some(MediaType::Video));
-                                let z = if is_video {
-                                    if img_h > monitor.y {
-                                        self.fit_zoom_for_target_height(monitor.y, img_h)
-                                    } else {
-                                        1.0
-                                    }
-                                } else if img_h > monitor.y {
-                                    self.fit_zoom_for_target_height(monitor.y, img_h)
-                                } else {
-                                    1.0
-                                };
-
-                                self.zoom = z;
-                                self.zoom_target = z;
-                                self.offset = egui::Vec2::ZERO;
-                                self.zoom_velocity = 0.0;
-
-                                let mut size = egui::Vec2::new(img_w * z, img_h * z);
-                                size.x = size.x.max(200.0);
-                                size.y = size.y.max(150.0);
-
-                                self.floating_max_inner_size = Some(size);
-                                self.last_requested_inner_size = Some(size);
-
-                                let x = (monitor.x - size.x) * 0.5;
-                                let y = (monitor.y - size.y) * 0.5;
-                                let pos = egui::pos2(x.max(0.0), y.max(0.0));
-                                // Delay window resize by 2 frames to prevent flash
-                                self.pending_window_resize = Some((size, pos, 2));
-                                if should_native_restore {
-                                    self.request_native_maximize = Some(false);
-                                }
-                            }
-                        } else {
-                            // If we don't have dimensions yet (possible for videos right after switching),
-                            // schedule a retry once dimensions become available.
-                            self.pending_media_layout =
-                                matches!(self.current_media_type, Some(MediaType::Video));
-                            if should_native_restore {
-                                self.request_native_maximize = Some(false);
-                            }
-                        }
+                        self.pending_media_layout =
+                            matches!(self.current_media_type, Some(MediaType::Video));
                     }
                 }
             }
@@ -25353,10 +25127,7 @@ impl eframe::App for ImageViewer {
                 if frames_remaining <= 1 {
                     // Apply the resize now
                     ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
-                    self.suppress_outer_pos_tracking_frames =
-                        self.suppress_outer_pos_tracking_frames.max(2);
                     ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
-                    self.last_known_outer_pos = Some(pos);
                     false
                 } else {
                     // Wait another frame
@@ -25368,8 +25139,6 @@ impl eframe::App for ImageViewer {
             };
 
         if let Some(maximize) = self.request_native_maximize.take() {
-            self.suppress_programmatic_native_window_transition_tracking();
-
             #[cfg(target_os = "windows")]
             {
                 let _ = crate::windows_env::set_active_window_maximized(maximize);
@@ -25518,20 +25287,8 @@ impl eframe::App for ImageViewer {
 
                 if self.is_masonry_mode() {
                     self.action_binding_down(Action::MasonryPanUp, input, ctrl, shift, alt)
-                        || self.action_binding_down(
-                            Action::MasonryPanDown,
-                            input,
-                            ctrl,
-                            shift,
-                            alt,
-                        )
-                        || self.action_binding_down(
-                            Action::MasonryPanUp2,
-                            input,
-                            ctrl,
-                            shift,
-                            alt,
-                        )
+                        || self.action_binding_down(Action::MasonryPanDown, input, ctrl, shift, alt)
+                        || self.action_binding_down(Action::MasonryPanUp2, input, ctrl, shift, alt)
                         || self.action_binding_down(
                             Action::MasonryPanDown2,
                             input,
@@ -25539,13 +25296,7 @@ impl eframe::App for ImageViewer {
                             shift,
                             alt,
                         )
-                        || self.action_binding_down(
-                            Action::MasonryPanUp3,
-                            input,
-                            ctrl,
-                            shift,
-                            alt,
-                        )
+                        || self.action_binding_down(Action::MasonryPanUp3, input, ctrl, shift, alt)
                         || self.action_binding_down(
                             Action::MasonryPanDown3,
                             input,
@@ -25554,13 +25305,7 @@ impl eframe::App for ImageViewer {
                             alt,
                         )
                 } else {
-                    self.action_binding_down(
-                        Action::MangaPreviousImageFit,
-                        input,
-                        ctrl,
-                        shift,
-                        alt,
-                    )
+                    self.action_binding_down(Action::MangaPreviousImageFit, input, ctrl, shift, alt)
                         || self.action_binding_down(
                             Action::MangaNextImageFit,
                             input,
@@ -25569,13 +25314,7 @@ impl eframe::App for ImageViewer {
                             alt,
                         )
                         || self.action_binding_down(Action::MangaPanUp, input, ctrl, shift, alt)
-                        || self.action_binding_down(
-                            Action::MangaPanDown,
-                            input,
-                            ctrl,
-                            shift,
-                            alt,
-                        )
+                        || self.action_binding_down(Action::MangaPanDown, input, ctrl, shift, alt)
                 }
             });
 

@@ -97,7 +97,8 @@ impl FolderTravelCache {
     }
 }
 
-static GLOBAL_FOLDER_TRAVEL_CACHE: OnceLock<Option<Arc<Mutex<FolderTravelCache>>>> = OnceLock::new();
+static GLOBAL_FOLDER_TRAVEL_CACHE: OnceLock<Option<Arc<Mutex<FolderTravelCache>>>> =
+    OnceLock::new();
 
 fn global_folder_travel_cache_handle() -> Option<&'static Arc<Mutex<FolderTravelCache>>> {
     GLOBAL_FOLDER_TRAVEL_CACHE
@@ -202,7 +203,9 @@ fn normalize_path_key(path: &Path) -> Option<String> {
     let normalized_path = if path.is_absolute() {
         path.to_path_buf()
     } else {
-        path.canonicalize().ok().unwrap_or_else(|| path.to_path_buf())
+        path.canonicalize()
+            .ok()
+            .unwrap_or_else(|| path.to_path_buf())
     };
 
     let key = normalized_path.to_string_lossy().to_string();
@@ -312,8 +315,7 @@ fn open_database_with_size_limit(path: &Path, max_size_bytes: u64) -> Option<Dat
     let current_len = file.metadata().ok().map(|m| m.len()).unwrap_or(0);
 
     let base_backend = FileBackend::new(file).ok()?;
-    let limited_backend =
-        SizeLimitedFileBackend::new(base_backend, max_size_bytes, current_len);
+    let limited_backend = SizeLimitedFileBackend::new(base_backend, max_size_bytes, current_len);
 
     match Database::builder().create_with_backend(limited_backend) {
         Ok(db) => Some(db),

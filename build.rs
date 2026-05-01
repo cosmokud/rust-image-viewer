@@ -33,8 +33,13 @@ fn render_template_with_version(template: &str, version: &str) -> String {
         }
     }
 
-    let line_ending = if template.contains("\r\n") { "\r\n" } else { "\n" };
-    let mut rendered = String::with_capacity(template.len() + version_tag.len() + line_ending.len());
+    let line_ending = if template.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    let mut rendered =
+        String::with_capacity(template.len() + version_tag.len() + line_ending.len());
     rendered.push_str(&version_tag);
     rendered.push_str(line_ending);
     rendered.push_str(template);
@@ -64,11 +69,9 @@ fn is_semver_triplet(version: &str) -> bool {
     let mut parts = version.split('.');
 
     match (parts.next(), parts.next(), parts.next(), parts.next()) {
-        (Some(major), Some(minor), Some(patch), None) => {
-            [major, minor, patch]
-                .iter()
-                .all(|part| !part.is_empty() && part.chars().all(|ch| ch.is_ascii_digit()))
-        }
+        (Some(major), Some(minor), Some(patch), None) => [major, minor, patch]
+            .iter()
+            .all(|part| !part.is_empty() && part.chars().all(|ch| ch.is_ascii_digit())),
         _ => false,
     }
 }
