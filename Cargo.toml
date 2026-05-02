@@ -93,6 +93,19 @@ binaries-dir = "target/release"
 before-packaging-command = "cargo build --release"
 icons = ["assets/icon.ico"]
 
+[package.metadata.packager.nsis]
+install-mode = "currentUser"
+appdata-paths = ["$APPDATA/rust-image-viewer", "$LOCALAPPDATA/rust-image-viewer"]
+preinstall-section = '''
+; Keep current-user install path at AppData\Local\rust-image-viewer instead of product display name.
+Section PreInstallPathOverride
+  !if "${INSTALLMODE}" == "currentUser"
+    StrCmp $INSTDIR "$LOCALAPPDATA\${PRODUCTNAME}" 0 +2
+    StrCpy $INSTDIR "$LOCALAPPDATA\rust-image-viewer"
+  !endif
+SectionEnd
+'''
+
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 tempfile = "3.12"
