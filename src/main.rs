@@ -3001,9 +3001,9 @@ impl Default for ImageViewer {
             gif_paused: false,
             gif_seeking: false,
             gif_seek_preview_frame: None,
-            webp_fps_override: None,
-            webp_custom_fps: 60,
-            webp_show_custom_fps_slider: false,
+            webp_fps_override: Some(Self::ANIMATED_IMAGE_CUSTOM_DEFAULT_FPS),
+            webp_custom_fps: Self::ANIMATED_IMAGE_CUSTOM_DEFAULT_FPS,
+            webp_show_custom_fps_slider: true,
 
             // Background animation streaming fields
             anim_stream_rx: None,
@@ -3084,6 +3084,7 @@ impl ImageViewer {
     const FOLDER_NAVIGATION_BACK_POPUP_MAX_ITEMS: usize = 10;
     const FOLDER_NAVIGATION_BACK_POPUP_MAX_DEPTH: usize = 3;
     const FOLDER_NAVIGATION_BACK_POPUP_HOVER_GRACE: Duration = Duration::from_millis(220);
+    const ANIMATED_IMAGE_CUSTOM_DEFAULT_FPS: u32 = 60;
 
     fn folder_navigation_ui_enabled(&self) -> bool {
         self.manga_mode && self.is_fullscreen
@@ -23592,8 +23593,13 @@ impl ImageViewer {
         ctx: &egui::Context,
         popup_id: egui::Id,
     ) {
-        let fps_button = ui.add(egui::Button::new("FPS").min_size(egui::vec2(40.0, 22.0)));
-        if fps_button.clicked() {
+        let default_custom_fps = Self::ANIMATED_IMAGE_CUSTOM_DEFAULT_FPS;
+        self.webp_custom_fps = self.webp_custom_fps.clamp(1, 240);
+
+        let fps_input_button = ui.add(
+            egui::Button::new(format!("{} FPS", self.webp_custom_fps)).min_size(egui::vec2(74.0, 22.0)),
+        );
+        if fps_input_button.clicked() {
             ui.memory_mut(|mem| mem.toggle_popup(popup_id));
         }
 
@@ -23601,31 +23607,25 @@ impl ImageViewer {
         let _ = egui::popup::popup_below_widget(
             ui,
             popup_id,
-            &fps_button,
+            &fps_input_button,
             close_on_click_outside,
             |ui| {
                 ui.set_min_width(120.0);
 
                 for fps in [120_u32, 90, 60, 30, 24] {
                     if ui.button(format!("{} FPS", fps)).clicked() {
+                        self.webp_custom_fps = fps;
                         self.webp_fps_override = Some(fps);
-                        self.webp_show_custom_fps_slider = false;
+                        self.webp_show_custom_fps_slider = true;
                         ui.memory_mut(|mem| mem.close_popup());
                         ctx.request_repaint();
                     }
                 }
 
-                if ui.button("Custom").clicked() {
-                    self.webp_custom_fps = self.webp_custom_fps.clamp(1, 240);
-                    self.webp_fps_override = Some(self.webp_custom_fps);
-                    self.webp_show_custom_fps_slider = true;
-                    ui.memory_mut(|mem| mem.close_popup());
-                    ctx.request_repaint();
-                }
-
                 if ui.button("Default").clicked() {
                     self.webp_fps_override = None;
-                    self.webp_show_custom_fps_slider = false;
+                    self.webp_custom_fps = default_custom_fps;
+                    self.webp_show_custom_fps_slider = true;
                     ui.memory_mut(|mem| mem.close_popup());
                     ctx.request_repaint();
                 }
@@ -23634,16 +23634,31 @@ impl ImageViewer {
             },
         );
 
-        if self.webp_show_custom_fps_slider {
-            ui.add_space(6.0);
-            let mut custom_fps = self.webp_custom_fps.clamp(1, 240);
-            let slider_response =
-                ui.add(egui::Slider::new(&mut custom_fps, 1..=240).text("FPS"));
-            if slider_response.changed() {
-                self.webp_custom_fps = custom_fps;
-                self.webp_fps_override = Some(custom_fps);
-                ctx.request_repaint();
-            }
+        ui.add_space(6.0);
+        let mut custom_fps = self.webp_custom_fps.clamp(1, 240);
+        let slider_response = ui.add_sized(
+            [320.0, 22.0],
+            egui::Slider::new(&mut custom_fps, 1..=240)
+                .smart_aim(false)
+                .step_by(1.0)
+                .text("FPS"),
+        );
+        if slider_response.changed() {
+            self.webp_custom_fps = custom_fps;
+            self.webp_fps_override = Some(custom_fps);
+            self.webp_show_custom_fps_slider = true;
+            ctx.request_repaint();
+        }
+
+        let slider_double_clicked = slider_response.double_clicked()
+            || (slider_response.hovered()
+                && ctx.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary)));
+
+        if slider_double_clicked {
+            self.webp_custom_fps = default_custom_fps;
+            self.webp_fps_override = Some(default_custom_fps);
+            self.webp_show_custom_fps_slider = true;
+            ctx.request_repaint();
         }
     }
 
