@@ -20553,8 +20553,10 @@ impl ImageViewer {
             let navigation_active = masonry_navigation_active_for_visible_retry;
 
             if navigation_active {
-                self.manga_hover_autoplay_resume_at = Instant::now()
-                    + Duration::from_millis(self.config.manga_hover_autoplay_resume_delay_ms);
+                let hover_resume_delay =
+                    Duration::from_millis(self.config.manga_hover_autoplay_resume_delay_ms);
+                self.manga_hover_autoplay_resume_at = Instant::now() + hover_resume_delay;
+                ctx.request_repaint_after(hover_resume_delay);
                 self.masonry_navigation_was_active = true;
                 self.masonry_quality_refine_due_at = None;
                 self.masonry_quality_refine_frames_remaining = 0;
