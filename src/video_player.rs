@@ -522,17 +522,15 @@ fn get_playbin_flags(playbin: &gst::Element) -> Option<u64> {
     }
 
     let property = playbin.property_value("flags");
-    if let Ok(current) = property.get::<u32>() {
-        Some(current as u64)
-    } else if let Ok(current) = property.get::<i32>() {
-        Some(current.max(0) as u64)
-    } else if let Ok(current) = property.get::<u64>() {
-        Some(current)
-    } else if let Ok(current) = property.get::<i64>() {
-        Some(current.max(0) as u64)
-    } else {
-        None
-    }
+    // "flags" is a GLib flags type. Read it via g_value_get_flags so we don't
+    // depend on integer Value conversions that can fail for custom flags types.
+    let bits = unsafe {
+        gst::glib::gobject_ffi::g_value_get_flags(gst::glib::translate::ToGlibPtr::to_glib_none(
+            &property,
+        )
+        .0)
+    };
+    Some(bits as u64)
 }
 
 fn set_playbin_flags(playbin: &gst::Element, flags: u64) {
@@ -540,16 +538,15 @@ fn set_playbin_flags(playbin: &gst::Element, flags: u64) {
         return;
     }
 
-    let property = playbin.property_value("flags");
-    if property.get::<u32>().is_ok() {
-        playbin.set_property("flags", flags as u32);
-    } else if property.get::<i32>().is_ok() {
-        playbin.set_property("flags", flags.min(i32::MAX as u64) as i32);
-    } else if property.get::<u64>().is_ok() {
-        playbin.set_property("flags", flags);
-    } else if property.get::<i64>().is_ok() {
-        playbin.set_property("flags", flags.min(i64::MAX as u64) as i64);
+    // Keep the property's dynamic flags type and set bits through GLib flags API.
+    let mut property = playbin.property_value("flags");
+    unsafe {
+        gst::glib::gobject_ffi::g_value_set_flags(
+            gst::glib::translate::ToGlibPtrMut::to_glib_none_mut(&mut property).0,
+            flags as u32,
+        );
     }
+    playbin.set_property_from_value("flags", &property);
 }
 
 fn enable_playbin_flags(playbin: &gst::Element, flags_mask: u64) {
@@ -1700,7 +1697,10 @@ Ensure your GStreamer installation includes the playback elements (usually from 
     }
 
     pub fn current_subtitle_selection(&self) -> VideoSubtitleSelection {
-        if self.subtitle_track_disabled {
+        let uses_legacy_selection = !self.legacy_embedded_subtitle_tracks().is_empty();
+        if (uses_legacy_selection && !self.subtitle_output_enabled())
+            || (!uses_legacy_selection && self.subtitle_track_disabled)
+        {
             return VideoSubtitleSelection::Off;
         }
 
