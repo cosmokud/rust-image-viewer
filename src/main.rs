@@ -6170,7 +6170,9 @@ impl ImageViewer {
                     .map(|state| state.zoom.max(state.zoom_target))
             };
 
-            saved_zoom.unwrap_or_else(|| self.fit_zoom_for_target_height(viewport.y, img_h))
+            saved_zoom.unwrap_or_else(|| {
+                self.fit_zoom_for_target_bounds(viewport, egui::vec2(img_w, img_h))
+            })
         } else {
             self.floating_layout_size_for_media(img_w, img_h, viewport)
                 .map(|(zoom, _)| zoom)
@@ -8245,6 +8247,22 @@ impl ImageViewer {
         (target_height / media_height)
             .max(0.0001)
             .min(self.max_zoom_factor())
+    }
+
+    fn fit_zoom_for_target_bounds(&self, target_size: egui::Vec2, media_size: egui::Vec2) -> f32 {
+        if target_size.x <= 0.0
+            || target_size.y <= 0.0
+            || media_size.x <= 0.0
+            || media_size.y <= 0.0
+        {
+            return 1.0;
+        }
+
+        let fit_x = target_size.x / media_size.x;
+        let fit_y = target_size.y / media_size.y;
+
+        // Fit to whichever axis is limiting first.
+        fit_x.min(fit_y).max(0.0001).min(self.max_zoom_factor())
     }
 
     fn startup_ready_to_show(&self) -> bool {
@@ -13464,15 +13482,22 @@ impl ImageViewer {
         self.reset_precise_rotation();
 
         // Get dimensions from either image or video
-        if let Some((_, img_h)) = self.media_display_dimensions() {
-            if img_h > 0 {
-                let viewport_height = ctx.screen_rect().height().max(1.0);
-                let target_h = if self.fullscreen_layout_ready(ctx) {
-                    viewport_height
+        if let Some((img_w, img_h)) = self.media_display_dimensions() {
+            if img_w > 0 && img_h > 0 {
+                let viewport_bounds = ctx.screen_rect().size().max(egui::vec2(1.0, 1.0));
+                let target_bounds = if self.fullscreen_layout_ready(ctx) {
+                    viewport_bounds
                 } else {
-                    self.monitor_size_points(ctx).y.max(viewport_height)
+                    let monitor = self.monitor_size_points(ctx);
+                    egui::vec2(
+                        monitor.x.max(viewport_bounds.x),
+                        monitor.y.max(viewport_bounds.y),
+                    )
                 };
-                let z = self.fit_zoom_for_target_height(target_h, img_h as f32);
+                let z = self.fit_zoom_for_target_bounds(
+                    target_bounds,
+                    egui::vec2(img_w as f32, img_h as f32),
+                );
                 self.zoom = z;
                 self.zoom_target = z;
                 if force_fit {
@@ -24900,10 +24925,12 @@ impl ImageViewer {
                     let img_h = img_h_u as f32;
 
                     if self.is_fullscreen {
-                        // Fit media vertically to screen height
-                        if img_h > 0.0 {
-                            let screen_h = screen_rect.height();
-                            let fit_zoom = self.fit_zoom_for_target_height(screen_h, img_h);
+                        // Fit to whichever fullscreen axis is exhausted first.
+                        if img_w > 0.0 && img_h > 0.0 {
+                            let fit_zoom = self.fit_zoom_for_target_bounds(
+                                screen_rect.size(),
+                                egui::vec2(img_w, img_h),
+                            );
                             self.zoom = fit_zoom;
                             self.zoom_target = self.zoom;
                         }
@@ -25300,13 +25327,18 @@ impl eframe::App for ImageViewer {
                 // try to restore the saved state (which has old rotation). Instead, just
                 // recalculate zoom for the new rotated dimensions.
                 self.offset = egui::Vec2::ZERO;
-                if let Some((_, img_h)) = self.media_display_dimensions() {
-                    if img_h > 0 {
-                        let target_h = self
-                            .monitor_size_points(ctx)
-                            .y
-                            .max(ctx.screen_rect().height());
-                        let z = self.fit_zoom_for_target_height(target_h, img_h as f32);
+                if let Some((img_w, img_h)) = self.media_display_dimensions() {
+                    if img_w > 0 && img_h > 0 {
+                        let viewport_bounds = ctx.screen_rect().size().max(egui::vec2(1.0, 1.0));
+                        let monitor = self.monitor_size_points(ctx);
+                        let target_bounds = egui::vec2(
+                            monitor.x.max(viewport_bounds.x),
+                            monitor.y.max(viewport_bounds.y),
+                        );
+                        let z = self.fit_zoom_for_target_bounds(
+                            target_bounds,
+                            egui::vec2(img_w as f32, img_h as f32),
+                        );
                         self.zoom = z;
                         self.zoom_target = z;
                     }
