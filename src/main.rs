@@ -2363,6 +2363,10 @@ struct ImageViewer {
     resize_start_cursor_screen: Option<egui::Pos2>,
     /// Last commanded window size during resize (for stable content rendering)
     resize_last_size: Option<egui::Vec2>,
+    /// Initial window outer position when a manual floating-window drag starts.
+    floating_drag_start_outer_pos: Option<egui::Pos2>,
+    /// Global screen cursor position when a manual floating-window drag starts.
+    floating_drag_start_cursor_screen: Option<egui::Pos2>,
 
     // ============ PERFORMANCE OPTIMIZATION FIELDS ============
     /// Whether any animation or state change requires a repaint
@@ -2851,6 +2855,8 @@ impl Default for ImageViewer {
             resize_start_inner_size: None,
             resize_start_cursor_screen: None,
             resize_last_size: None,
+            floating_drag_start_outer_pos: None,
+            floating_drag_start_cursor_screen: None,
 
             // Performance optimization fields
             needs_repaint: false,
@@ -10886,6 +10892,39 @@ impl ImageViewer {
         ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
     }
 
+    fn reset_floating_window_drag_anchor(&mut self) {
+        self.floating_drag_start_outer_pos = None;
+        self.floating_drag_start_cursor_screen = None;
+    }
+
+    fn drag_floating_window_without_native_snap(&mut self, ctx: &egui::Context) {
+        let Some(current_cursor_screen) = get_global_cursor_pos() else {
+            // Fallback for platforms where global cursor coordinates are unavailable.
+            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+            return;
+        };
+
+        let (start_outer_pos, start_cursor_screen) = match (
+            self.floating_drag_start_outer_pos,
+            self.floating_drag_start_cursor_screen,
+        ) {
+            (Some(outer), Some(cursor)) => (outer, cursor),
+            _ => {
+                let outer_pos = ctx
+                    .input(|i| i.raw.viewport().outer_rect)
+                    .map(|r| r.min)
+                    .unwrap_or(egui::Pos2::ZERO);
+                self.floating_drag_start_outer_pos = Some(outer_pos);
+                self.floating_drag_start_cursor_screen = Some(current_cursor_screen);
+                return;
+            }
+        };
+
+        let delta = current_cursor_screen - start_cursor_screen;
+        let new_pos = start_outer_pos + delta;
+        self.send_outer_position(ctx, new_pos);
+    }
+
     fn apply_manga_pan_step(&mut self, direction: f32, multiplier: f32) {
         let scroll_amount = self.config.manga_arrow_scroll_speed * 0.5 * multiplier;
         if self.manga_add_scroll_target_delta(direction * scroll_amount) {
@@ -13142,7 +13181,7 @@ impl ImageViewer {
         let monitor = self.monitor_size_points(ctx);
         let x = (monitor.x - inner_size.x) * 0.5;
         let y = (monitor.y - inner_size.y) * 0.5;
-        self.send_outer_position(ctx, egui::pos2(x.max(0.0), y.max(0.0)));
+        self.send_outer_position(ctx, egui::pos2(x.max(0.0), y));
     }
 
     fn floating_layout_size_for_media(
@@ -24462,6 +24501,7 @@ impl ImageViewer {
             self.is_resizing = false;
             self.resize_direction = ResizeDirection::None;
             self.last_mouse_pos = None;
+            self.reset_floating_window_drag_anchor();
             self.stop_manga_autoscroll();
         } else {
             // Handle modifier-wheel pan/zoom input (not in manga mode - that's handled in draw_manga_mode).
@@ -24818,25 +24858,28 @@ impl ImageViewer {
                         if let Some(_last_pos) = self.last_mouse_pos {
                             if self.is_panning {
                                 if self.is_fullscreen {
+                                    self.reset_floating_window_drag_anchor();
                                     // In fullscreen, pan the image
                                     let delta = ctx.input(|i| i.pointer.delta());
                                     self.offset += delta;
                                     self.remember_current_fullscreen_view_state();
                                 } else if in_title_bar {
-                                    // In floating mode, dragging from title bar always moves window
-                                    ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                                    // In floating mode, bypass native StartDrag to avoid Win11 top-edge snap.
+                                    self.drag_floating_window_without_native_snap(ctx);
                                 } else if floating_image_exceeds_window {
+                                    self.reset_floating_window_drag_anchor();
                                     // In floating mode when zoomed past 100%, pan image inside window
                                     let delta = ctx.input(|i| i.pointer.delta());
                                     self.offset += delta;
                                 } else {
-                                    // In floating mode at/below 100%, drag the window
-                                    ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                                    // In floating mode at/below 100%, bypass native StartDrag snap behavior.
+                                    self.drag_floating_window_without_native_snap(ctx);
                                 }
                             }
                         }
                         if !self.is_panning {
                             self.is_panning = true;
+                            self.reset_floating_window_drag_anchor();
                         }
                         self.last_mouse_pos = Some(pos);
                         ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
@@ -24846,6 +24889,7 @@ impl ImageViewer {
                         self.is_panning = false;
                     }
                     self.last_mouse_pos = None;
+                    self.reset_floating_window_drag_anchor();
 
                     // Set cursor based on hover state
                     // Don't fight egui's cursor when the pointer is over title-bar UI (text selection, buttons).
