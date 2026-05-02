@@ -21904,7 +21904,7 @@ impl ImageViewer {
                     let button_size = egui::Vec2::new(32.0, bar_height);
                     let buttons_area_w =
                         5.0 + (button_size.x * 4.0) + (ui.spacing().item_spacing.x * 3.0) + 6.0;
-                    let button_edge_gap = 1.0;
+                    let button_edge_gap = 2.0;
                     let buttons_rect = egui::Rect::from_min_max(
                         egui::pos2(bar_rect.max.x - buttons_area_w, bar_rect.min.y + button_edge_gap),
                         egui::pos2(bar_rect.max.x - button_edge_gap, bar_rect.max.y),
