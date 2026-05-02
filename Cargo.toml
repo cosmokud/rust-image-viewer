@@ -118,13 +118,6 @@ Section PreInstallPathOverride
 SectionEnd
 '''
 
-[dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
-tempfile = "3.12"
-
-[target.'cfg(not(windows))'.dev-dependencies]
-pprof = { version = "0.14", features = ["criterion", "flamegraph"] }
-
 [profile.release]
 opt-level = 3
 lto = true
@@ -145,7 +138,3 @@ codegen-units = 4
 [[bin]]
 name = "rust-image-viewer"
 path = "src/main.rs"
-
-[[bench]]
-name = "perf_baseline"
-harness = false

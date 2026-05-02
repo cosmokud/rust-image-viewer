@@ -27,7 +27,7 @@ This project is intentionally optimized for one job: opening media fast, navigat
 - Context-aware shortcut system where the same input can map to different actions in different modes.
 - Persistent metadata and thumbnail caching, plus in-memory decode and texture caches.
 - R-tree viewport virtualization, LOD bucketing, mipmapping, batch uploads, and bounded worker queues for dense layouts.
-- Built-in FPS / diagnostics overlay and Criterion benchmarks for tracking regressions.
+- Built-in FPS / diagnostics overlay for runtime diagnostics.
 
 ## Features
 
@@ -436,25 +436,6 @@ Useful labels:
 | `DM`          | Decoded mailbox size.                                    |
 | `RR`          | Retry requests enqueued / rejected.                      |
 | `TS L/M/H`    | Low / mid / high target-side distribution.               |
-
-### Criterion benchmarks
-
-The repository ships Criterion benchmarks for:
-
-- `directory_scan`
-- `directory_index_cache`
-- `gif_decode_120_frames`
-- `rtree_strip_query`
-- `rtree_masonry_query`
-- `rtree_rebuild`
-
-Run them with:
-
-```bash
-cargo bench
-```
-
-Criterion HTML reports are written under `target/criterion/`.
 
 ### Reproducible Masonry profiling checklist
 

@@ -55,17 +55,14 @@ Run against a sample file:
 cargo run --release -- path\to\file.jpg
 ```
 
-Formatting, linting, and benchmarks:
+Formatting and linting:
 
 ```powershell
 cargo fmt --all
 cargo clippy --all-targets
-cargo bench
 ```
 
-`cargo bench` matters here. A large part of the codebase exists to protect real-world navigation and layout performance, so regression detection is part of normal contribution hygiene.
-
-This repository currently relies on release builds, benchmarks, and manual scenario validation rather than an automated test suite.
+This repository currently relies on release builds and manual scenario validation rather than an automated test suite.
 
 ## Architecture-sensitive rules
 
