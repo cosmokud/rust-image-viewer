@@ -23651,7 +23651,7 @@ impl ImageViewer {
         // stays tucked right beside the WEBP/GIF label.
         let mut custom_fps = self.webp_custom_fps.clamp(1, 240);
         let (slider_rect, slider_response) =
-            ui.allocate_exact_size(egui::vec2(300.0, 22.0), egui::Sense::click_and_drag());
+            ui.allocate_exact_size(egui::vec2(80.0, 22.0), egui::Sense::click_and_drag());
 
         let slider_double_clicked = slider_response.double_clicked()
             || (slider_response.hovered()
