@@ -18,7 +18,7 @@ This project is intentionally optimized for one job: opening media fast, navigat
 
 ## Highlights
 
-- Borderless floating window with custom title bar, auto-hide controls, and native-feeling fullscreen / maximize transitions on Windows.
+- Borderless floating window with custom title bar, auto-hide controls, native-feeling fullscreen / maximize transitions, and steadier drag/zoom/resize behavior on Windows.
 - Fast single-file viewing plus fast folder navigation, including natural-sort media lists and optional single-instance reuse.
 - Breadcrumb address bar with back/forward/up navigation and a folder-history popup in fullscreen manga modes.
 - Windows cut/copy/paste for marked files with optional auto-unmark after paste.
@@ -36,6 +36,7 @@ This project is intentionally optimized for one job: opening media fast, navigat
 - Borderless floating mode for quick previewing.
 - Fullscreen mode with configurable Windows-native maximize / restore transitions.
 - Optional borderless fullscreen behavior for the custom maximize button and fullscreen shortcuts.
+- Floating drag/resize behavior tuned to reduce accidental snap-style jumps and keep zoomed centering more predictable.
 - Smart initial sizing: open at 100% when possible, otherwise fit to the screen.
 - Drag and drop support.
 - Single-instance mode that forwards file-open requests from secondary launches to the primary window.
@@ -58,11 +59,13 @@ This project is intentionally optimized for one job: opening media fast, navigat
 
 - GStreamer-backed video playback with `playbin3` fallback to `playbin`.
 - Play / pause, seek, mute, volume, looping, and hover-driven controls.
+- Deferred audio-track switching to reduce playback stutter during active transitions.
 - Adaptive seek policy support:
   - `adaptive` = keyframe while dragging, accurate on release
   - `accurate` = always frame-accurate seeks
   - `keyframe` = fastest seeks, less precise
 - Optional hardware-decoder preference on Windows, with a config switch to force software decode.
+- Improved multilingual subtitle/audio track labeling and selection behavior.
 - In Long Strip / Masonry, videos use first-frame thumbnails until a focused live player is needed.
 
 ### Long Strip and Masonry
