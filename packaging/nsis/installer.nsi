@@ -135,34 +135,6 @@ Var RegisterFileAssociationsState
 {{/if}}
 Page custom PageReinstall PageLeaveReinstall
 Function PageReinstall
-  ; Uninstall previous WiX installation if exists.
-  ;
-  ; A WiX installer stores the isntallation info in registry
-  ; using a UUID and so we have to loop through all keys under
-  ; `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall`
-  ; and check if `DisplayName` and `Publisher` keys match ${PRODUCTNAME} and ${MANUFACTURER}
-  ;
-  ; This has a potentional issue that there maybe another installation that matches
-  ; our ${PRODUCTNAME} and ${MANUFACTURER} but wasn't installed by our WiX installer,
-  ; however, this should be fine since the user will have to confirm the uninstallation
-  ; and they can chose to abort it if doesn't make sense.
-  StrCpy $0 0
-  wix_loop:
-    EnumRegKey $1 HKLM "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall" $0
-    StrCmp $1 "" wix_done ; Exit loop if there is no more keys to loop on
-    IntOp $0 $0 + 1
-    ReadRegStr $R0 HKLM "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\$1" "DisplayName"
-    ReadRegStr $R1 HKLM "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\$1" "Publisher"
-    StrCmp "$R0$R1" "${PRODUCTNAME}${MANUFACTURER}" 0 wix_loop
-    ReadRegStr $R0 HKLM "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\$1" "UninstallString"
-    ${StrCase} $R1 $R0 "L"
-    ${StrLoc} $R0 $R1 "msiexec" ">"
-    StrCmp $R0 0 0 wix_done
-    StrCpy $R7 "wix"
-    StrCpy $R6 "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\$1"
-    Goto compare_version
-  wix_done:
-
   ; Check if there is an existing installation, if not, abort the reinstall page
   ReadRegStr $R0 SHCTX "${UNINSTKEY}" ""
   ReadRegStr $R1 SHCTX "${UNINSTKEY}" "UninstallString"
@@ -172,11 +144,7 @@ Function PageReinstall
   ; and modify the messages presented to the user accordingly
   compare_version:
   StrCpy $R4 "$(older)"
-  ${If} $R7 == "wix"
-    ReadRegStr $R0 HKLM "$R6" "DisplayVersion"
-  ${Else}
-    ReadRegStr $R0 SHCTX "${UNINSTKEY}" "DisplayVersion"
-  ${EndIf}
+  ReadRegStr $R0 SHCTX "${UNINSTKEY}" "DisplayVersion"
   ${IfThen} $R0 == "" ${|} StrCpy $R4 "$(unknown)" ${|}
 
   nsis_tauri_utils::SemverCompare "${VERSION}" $R0
@@ -267,14 +235,9 @@ Function PageLeaveReinstall
     HideWindow
     ClearErrors
 
-    ${If} $R7 == "wix"
-      ReadRegStr $R1 HKLM "$R6" "UninstallString"
-      ExecWait '$R1' $0
-    ${Else}
-      ReadRegStr $4 SHCTX "${MANUPRODUCTKEY}" ""
-      ReadRegStr $R1 SHCTX "${UNINSTKEY}" "UninstallString"
-      ExecWait '$R1 /P _?=$4' $0
-    ${EndIf}
+    ReadRegStr $4 SHCTX "${MANUPRODUCTKEY}" ""
+    ReadRegStr $R1 SHCTX "${UNINSTKEY}" "UninstallString"
+    ExecWait '$R1 /P _?=$4' $0
 
     BringToFront
 

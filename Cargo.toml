@@ -87,7 +87,7 @@ identifier = "dev.rust-image-viewer.app"
 publisher = "Rust Image Viewer Contributors"
 description = "High-performance image and video viewer for Windows 10/11"
 license-file = "LICENSE"
-formats = ["nsis", "wix"]
+formats = ["nsis"]
 out-dir = "target/packager"
 binaries-dir = "target/release"
 before-packaging-command = "cargo build --release"
@@ -116,10 +116,6 @@ Section PreInstallPathOverride
   !endif
 SectionEnd
 '''
-
-[package.metadata.packager.wix]
-template = "packaging/wix/main.wxs"
-languages = ["en-US"]
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

@@ -192,14 +192,12 @@ function Write-PackagerConfig {
     $licensePathAbs = [System.IO.Path]::GetFullPath((Join-Path $repoRootAbs "LICENSE"))
     $iconPathAbs = [System.IO.Path]::GetFullPath((Join-Path $repoRootAbs "assets\icon.ico"))
     $nsisTemplatePathAbs = [System.IO.Path]::GetFullPath((Join-Path $repoRootAbs "packaging\nsis\installer.nsi"))
-    $wixTemplatePathAbs = [System.IO.Path]::GetFullPath((Join-Path $repoRootAbs "packaging\wix\main.wxs"))
 
     $tomlOutputDir = $outputDirAbs.Replace("\", "/")
     $tomlReleaseDir = $releaseDirAbs.Replace("\", "/")
     $tomlLicensePath = $licensePathAbs.Replace("\", "/")
     $tomlIconPath = $iconPathAbs.Replace("\", "/")
     $tomlNsisTemplatePath = $nsisTemplatePathAbs.Replace("\", "/")
-    $tomlWixTemplatePath = $wixTemplatePathAbs.Replace("\", "/")
 
     $lines = @(
         "name = ""$PackageName""",
@@ -210,7 +208,7 @@ function Write-PackagerConfig {
         "description = ""High-performance image and video viewer for Windows 10/11""",
         "license-file = ""$tomlLicensePath""",
         "icons = [""$tomlIconPath""]",
-        "formats = [""nsis"", ""wix""]",
+        "formats = [""nsis""]",
         "out-dir = ""$tomlOutputDir""",
         "binaries-dir = ""$tomlReleaseDir""",
         "before-packaging-command = ""cargo build --release""",
@@ -254,12 +252,7 @@ function Write-PackagerConfig {
         '    StrCpy $INSTDIR "$LOCALAPPDATA\rust-image-viewer"',
         '  !endif',
         'SectionEnd',
-        "'''",
-        "",
-        "[wix]",
-        "template = ""$tomlWixTemplatePath""",
-        "languages = [""en-US""]",
-        ""
+        "'''"
     )
 
     $configDir = Split-Path -Parent $ConfigPath
@@ -267,63 +260,17 @@ function Write-PackagerConfig {
     Set-Content -LiteralPath $ConfigPath -Value ($lines -join [Environment]::NewLine) -Encoding utf8
 }
 
-function Invoke-PackagerFormat {
+function Invoke-Packager {
     param(
         [Parameter(Mandatory = $true)]
         [string]$ConfigPath,
 
         [Parameter(Mandatory = $true)]
-        [string]$Format,
-
-        [Parameter(Mandatory = $true)]
-        [string]$OutputDir,
-
-        [Parameter(Mandatory = $true)]
-        [string]$PackageName,
-
-        [Parameter(Mandatory = $true)]
-        [string]$PackageVersion
+        [string]$OutputDir
     )
 
-    cargo packager --release --config $ConfigPath --formats $Format
+    cargo packager --release --config $ConfigPath --formats nsis
     if ($LASTEXITCODE -ne 0) {
-        if ($Format -eq "wix") {
-            $wixToolsRoot = Join-Path ([System.Environment]::GetFolderPath("LocalApplicationData")) ".cargo-packager\WixTools"
-            $lightExe = Join-Path $wixToolsRoot "light.exe"
-            $wixUtilExtension = Join-Path $wixToolsRoot "WixUtilExtension.dll"
-            $wixUiExtension = Join-Path $wixToolsRoot "WixUIExtension.dll"
-            $wixIntermediates = Join-Path $OutputDir ".cargo-packager\wix\x64"
-            $localeFile = Join-Path $wixIntermediates "locale.wxl"
-            $wixObject = Join-Path $wixIntermediates "main.wixobj"
-            $fallbackMsi = Join-Path $wixIntermediates "output-no-validation.msi"
-
-            if (
-                (Test-Path -LiteralPath $lightExe) -and
-                (Test-Path -LiteralPath $wixUtilExtension) -and
-                (Test-Path -LiteralPath $wixUiExtension) -and
-                (Test-Path -LiteralPath $localeFile) -and
-                (Test-Path -LiteralPath $wixObject)
-            ) {
-                Write-Warning "cargo-packager WiX step failed. Trying fallback WiX link with -sval (skip ICE validation)."
-                if (Test-Path -LiteralPath $fallbackMsi) {
-                    Remove-Item -LiteralPath $fallbackMsi -Force
-                }
-
-                Push-Location $wixIntermediates
-                & $lightExe -sval -ext $wixUtilExtension -ext $wixUiExtension -o $fallbackMsi -cultures:en-us -loc $localeFile "*.wixobj"
-                $lightExitCode = $LASTEXITCODE
-                Pop-Location
-
-                if ($lightExitCode -eq 0 -and (Test-Path -LiteralPath $fallbackMsi)) {
-                    $expectedMsiName = "{0}_{1}_x64_en-US.msi" -f $PackageName, $PackageVersion
-                    $expectedMsiPath = Join-Path $OutputDir $expectedMsiName
-                    Move-Item -LiteralPath $fallbackMsi -Destination $expectedMsiPath -Force
-                    Write-Warning "WiX fallback succeeded and produced: $expectedMsiPath"
-                    return
-                }
-            }
-        }
-
         exit $LASTEXITCODE
     }
 }
@@ -354,18 +301,6 @@ function Rename-NoGstreamerArtifacts {
         }
     }
 
-    $msiFile = Get-ChildItem -LiteralPath $OutputDir -File |
-        Where-Object { $_.Name -match "^$escapedPackageName`_$escapedVersion`_.*\.msi$" } |
-        Sort-Object LastWriteTime -Descending |
-        Select-Object -First 1
-    if ($msiFile) {
-        $renamedMsi = if ($msiFile.Name -match "_en-US\.msi$") {
-            $msiFile.Name -replace "_en-US\.msi$", "_no_gstreamer_en-US.msi"
-        } else {
-            $msiFile.BaseName + "_no_gstreamer.msi"
-        }
-        Move-Item -LiteralPath $msiFile.FullName -Destination (Join-Path $OutputDir $renamedMsi) -Force
-    }
 }
 
 Ensure-CargoPackager
@@ -377,10 +312,10 @@ $packageVersion = $package.version
 $outputDir = Join-Path $repoRoot "target\packager"
 New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
 
-# Clean old artifacts for this version so each run outputs exactly four installers.
+# Clean old artifacts for this version so each run outputs exactly two installers.
 $artifactPrefix = "{0}_{1}_" -f $packageName, $packageVersion
 Get-ChildItem -LiteralPath $outputDir -File -ErrorAction SilentlyContinue |
-    Where-Object { $_.Name.StartsWith($artifactPrefix) -and $_.Extension -in ".exe", ".msi" } |
+    Where-Object { $_.Name.StartsWith($artifactPrefix) -and $_.Extension -eq ".exe" } |
     Remove-Item -Force
 
 $configDir = Join-Path $outputDir ".packager-configs"
@@ -389,16 +324,14 @@ $withGstreamerConfig = Join-Path $configDir "packager-with-gstreamer.toml"
 $bundleRoot = Join-Path $outputDir ".with-gstreamer"
 
 Write-PackagerConfig -ConfigPath $noGstreamerConfig -RepoRoot $repoRoot -OutputDir $outputDir -PackageName $packageName -PackageVersion $packageVersion -IncludeGStreamer $false
-Write-Host "Building no-GStreamer installers (NSIS + WiX)..."
-Invoke-PackagerFormat -ConfigPath $noGstreamerConfig -Format "nsis" -OutputDir $outputDir -PackageName $packageName -PackageVersion $packageVersion
-Invoke-PackagerFormat -ConfigPath $noGstreamerConfig -Format "wix" -OutputDir $outputDir -PackageName $packageName -PackageVersion $packageVersion
+Write-Host "Building no-GStreamer installer (NSIS)..."
+Invoke-Packager -ConfigPath $noGstreamerConfig -OutputDir $outputDir
 Rename-NoGstreamerArtifacts -OutputDir $outputDir -PackageName $packageName -PackageVersion $packageVersion
 
 Stage-GStreamerBundle -BundleRoot $bundleRoot
 Write-PackagerConfig -ConfigPath $withGstreamerConfig -RepoRoot $repoRoot -OutputDir $outputDir -PackageName $packageName -PackageVersion $packageVersion -IncludeGStreamer $true
-Write-Host "Building bundled-GStreamer installers (NSIS + WiX)..."
-Invoke-PackagerFormat -ConfigPath $withGstreamerConfig -Format "nsis" -OutputDir $outputDir -PackageName $packageName -PackageVersion $packageVersion
-Invoke-PackagerFormat -ConfigPath $withGstreamerConfig -Format "wix" -OutputDir $outputDir -PackageName $packageName -PackageVersion $packageVersion
+Write-Host "Building bundled-GStreamer installer (NSIS)..."
+Invoke-Packager -ConfigPath $withGstreamerConfig -OutputDir $outputDir
 
 $resolvedOutputDir = [System.IO.Path]::GetFullPath($outputDir)
 Write-Host ""
@@ -407,13 +340,13 @@ Write-Host $resolvedOutputDir
 
 $installers = Get-ChildItem -LiteralPath $resolvedOutputDir -File |
     Where-Object {
-        $_.Extension -in ".exe", ".msi" -and
+        $_.Extension -eq ".exe" -and
         $_.Name.StartsWith($artifactPrefix)
     } |
     Sort-Object Name
 
 if (-not $installers) {
-    Write-Warning "No .exe or .msi installers were found in the output directory."
+    Write-Warning "No .exe installers were found in the output directory."
     exit 0
 }
 

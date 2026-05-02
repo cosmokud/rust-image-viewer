@@ -87,9 +87,8 @@ jobs:
         with:
           name: rust-image-viewer-installers-${{ inputs.tag_to_build }}
           path: |
-            target/packager/*.exe
-            target/packager/*.msi
-            target/release/rust-image-viewer.exe
+            target/packager/*-setup.exe
+            target/packager/*-setup-no-gstreamer.exe
           if-no-files-found: error
 
       - name: Extract Changelog
@@ -112,6 +111,5 @@ jobs:
           fail_on_unmatched_files: true
           make_latest: false
           files: |
-            target/packager/*.exe
-            target/packager/*.msi
-            target/release/rust-image-viewer.exe
+            target/packager/*-setup.exe
+            target/packager/*-setup-no-gstreamer.exe
