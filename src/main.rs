@@ -24735,8 +24735,6 @@ impl ImageViewer {
             let primary_down = ctx.input(|i| i.pointer.button_down(egui::PointerButton::Primary));
             let primary_pressed =
                 ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary));
-            let primary_released =
-                ctx.input(|i| i.pointer.button_released(egui::PointerButton::Primary));
             let secondary_clicked =
                 ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Secondary));
             let middle_pressed =
@@ -24873,7 +24871,9 @@ impl ImageViewer {
             if self.is_resizing && primary_down {
                 self.resize_floating_keep_aspect(ctx, self.resize_direction);
                 ctx.set_cursor_icon(self.get_resize_cursor(self.resize_direction));
-            } else if self.is_resizing && primary_released {
+            } else if self.is_resizing {
+                // Safety: release events can occasionally be missed while dragging near/outside
+                // the window edge. Stop resizing as soon as the button is no longer held.
                 self.is_resizing = false;
                 self.resize_direction = ResizeDirection::None;
                 self.last_mouse_pos = None;
