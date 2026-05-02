@@ -81,6 +81,16 @@ fs_extra = "1.3"
 winres = "0.1"
 directories = "6.0"
 
+[package.metadata.packager]
+product-name = "Rust Image Viewer"
+identifier = "com.cosmokud.rust-image-viewer"
+before-packaging-command = "cargo build --release"
+out-dir = "target/release/packager"
+icons = ["assets/icon.ico"]
+
+[package.metadata.packager.nsis]
+appdata-paths = ["$APPDATA/rust-image-viewer"]
+
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 tempfile = "3.12"
