@@ -38,6 +38,15 @@ fn open_media_reader(path: &Path) -> Result<Box<dyn BufReadSeek>, String> {
     }
 }
 
+fn read_webp_animation_buffer(path: &Path) -> Result<Vec<u8>, String> {
+    std::fs::read(path).map_err(|e| format!("Failed to read WEBP file: {}", e))
+}
+
+fn webp_frame_delay_ms(prev_timestamp: i32, current_timestamp: i32) -> u32 {
+    let delay = current_timestamp.saturating_sub(prev_timestamp);
+    if delay <= 0 { 100 } else { delay as u32 }
+}
+
 fn should_decode_static_with_zune(path: &Path) -> bool {
     extension_matches(path, ZUNE_STATIC_EXTENSIONS)
 }
@@ -511,56 +520,45 @@ impl LoadedImage {
         Some(rx)
     }
 
-    /// Worker function that decodes animated WebP frames and sends them
-    /// through `tx`.  Skips the first frame (caller already has it).
-    /// Silently stops when the receiver is dropped or on unrecoverable errors.
     fn stream_webp_frames(
         path: &Path,
         max_texture_side: Option<u32>,
         filter: FilterType,
         tx: &crossbeam_channel::Sender<ImageFrame>,
     ) {
-        use image::codecs::webp::WebPDecoder;
-        use image::AnimationDecoder;
+        use webp_animation::Decoder;
 
-        let reader = match open_media_reader(path) {
-            Ok(r) => r,
+        if !Self::is_animated_webp(path) {
+            return;
+        }
+
+        let buffer = match read_webp_animation_buffer(path) {
+            Ok(b) => b,
             Err(_) => return,
         };
-        let decoder = match WebPDecoder::new(reader) {
+        let decoder = match Decoder::new(&buffer) {
             Ok(d) => d,
             Err(_) => return,
         };
-
-        let frames_iter = decoder.into_frames();
 
         // Streaming mode is expected to decode the full animation. Keep a very
         // high safety cap to avoid infinite loops on corrupt files.
         const MAX_FRAMES_SAFETY: usize = 20000;
         let mut target_width: Option<u32> = None;
         let mut target_height: Option<u32> = None;
-        let mut frame_index: usize = 0;
+        let mut prev_timestamp: i32 = 0;
 
-        for frame_result in frames_iter {
+        for (frame_index, frame) in decoder.into_iter().enumerate() {
             if frame_index >= MAX_FRAMES_SAFETY {
                 break;
             }
 
-            let frame = match frame_result {
-                Ok(f) => f,
-                Err(_) => {
-                    frame_index += 1;
-                    continue;
-                }
-            };
+            let timestamp = frame.timestamp();
+            let delay_ms = webp_frame_delay_ms(prev_timestamp, timestamp);
+            prev_timestamp = timestamp;
 
-            let (numer, denom) = frame.delay().numer_denom_ms();
-            let delay_ms = if denom > 0 { numer / denom } else { 100 };
-            let delay_ms = if delay_ms == 0 { 100 } else { delay_ms };
-
-            let rgba = frame.into_buffer();
-            let width = rgba.width();
-            let height = rgba.height();
+            let (width, height) = frame.dimensions();
+            let data = frame.data();
 
             if target_width.is_none() {
                 if let Some(max_side) = max_texture_side {
@@ -583,12 +581,12 @@ impl LoadedImage {
             let th = target_height.unwrap_or(height);
 
             let (final_w, final_h, pixels) = if tw != width || th != height {
-                match resize_rgba(width, height, rgba.as_raw(), tw, th, filter) {
+                match resize_rgba(width, height, data, tw, th, filter) {
                     Ok(resized) => (tw, th, resized),
-                    Err(_) => (width, height, rgba.into_raw()),
+                    Err(_) => (width, height, data.to_vec()),
                 }
             } else {
-                (width, height, rgba.into_raw())
+                (width, height, data.to_vec())
             };
 
             // Skip the first frame — the caller already has it.
@@ -604,8 +602,6 @@ impl LoadedImage {
                     return;
                 }
             }
-
-            frame_index += 1;
 
             // No memory budget here; streaming is responsible for full decode.
         }
@@ -631,34 +627,31 @@ impl LoadedImage {
         }
     }
 
-    /// Decode only the very first frame of an animated WebP file.
-    /// Much faster than `load_animated_webp` because it stops after one frame.
     fn load_webp_first_frame(
         path: &Path,
         max_texture_side: Option<u32>,
         filter: FilterType,
     ) -> Result<Self, String> {
-        use image::codecs::webp::WebPDecoder;
-        use image::AnimationDecoder;
+        use webp_animation::Decoder;
 
-        let reader = open_media_reader(path)?;
+        if !Self::is_animated_webp(path) {
+            return Err("WEBP is not animated".to_string());
+        }
+
+        let buffer = read_webp_animation_buffer(path)?;
         let decoder =
-            WebPDecoder::new(reader).map_err(|e| format!("Failed to decode WEBP: {}", e))?;
+            Decoder::new(&buffer).map_err(|e| format!("Failed to decode animated WEBP: {}", e))?;
 
         // Get the first frame from the animation iterator.
         let frame = decoder
-            .into_frames()
+            .into_iter()
             .next()
-            .ok_or_else(|| "No frames in WEBP".to_string())?
-            .map_err(|e| format!("WEBP frame error: {}", e))?;
+            .ok_or_else(|| "No frames in animated WEBP".to_string())?;
 
-        let (numer, denom) = frame.delay().numer_denom_ms();
-        let delay_ms = if denom > 0 { numer / denom } else { 100 };
-        let delay_ms = if delay_ms == 0 { 100 } else { delay_ms };
+        let delay_ms = webp_frame_delay_ms(0, frame.timestamp());
 
-        let rgba = frame.into_buffer();
-        let width = rgba.width();
-        let height = rgba.height();
+        let (width, height) = frame.dimensions();
+        let data = frame.data();
 
         // Downscale if necessary
         let (tw, th) = if let Some(max_side) = max_texture_side {
@@ -676,11 +669,11 @@ impl LoadedImage {
         };
 
         let (final_w, final_h, pixels) = if tw != width || th != height {
-            let resized = resize_rgba(width, height, rgba.as_raw(), tw, th, filter)
+            let resized = resize_rgba(width, height, data, tw, th, filter)
                 .map_err(|e| format!("Failed to resize WEBP first frame: {}", e))?;
             (tw, th, resized)
         } else {
-            (width, height, rgba.into_raw())
+            (width, height, data.to_vec())
         };
 
         Ok(LoadedImage {
@@ -969,23 +962,20 @@ impl LoadedImage {
         }
     }
 
-    /// Load an animated WEBP file.
-    /// Uses the `image` crate's `AnimationDecoder` to extract all frames.
-    /// Falls back gracefully – callers should check `frames.len()` and use
-    /// `load_static` when the file is not actually animated.
     fn load_animated_webp(
         path: &Path,
         max_texture_side: Option<u32>,
         filter: FilterType,
     ) -> Result<Self, String> {
-        use image::codecs::webp::WebPDecoder;
-        use image::AnimationDecoder;
+        use webp_animation::Decoder;
 
-        let reader = open_media_reader(path)?;
+        if !Self::is_animated_webp(path) {
+            return Err("WEBP is not animated".to_string());
+        }
+
+        let buffer = read_webp_animation_buffer(path)?;
         let decoder =
-            WebPDecoder::new(reader).map_err(|e| format!("Failed to decode WEBP: {}", e))?;
-
-        let frames_iter = decoder.into_frames();
+            Decoder::new(&buffer).map_err(|e| format!("Failed to decode animated WEBP: {}", e))?;
 
         let mut frames = Vec::new();
 
@@ -999,27 +989,19 @@ impl LoadedImage {
         // Determine downscale targets once (using the first frame's dimensions later).
         let mut target_width: Option<u32> = None;
         let mut target_height: Option<u32> = None;
+        let mut prev_timestamp: i32 = 0;
 
-        for frame_result in frames_iter {
-            if frames.len() >= MAX_FRAMES_SAFETY {
+        for (frame_index, frame) in decoder.into_iter().enumerate() {
+            if frame_index >= MAX_FRAMES_SAFETY {
                 break;
             }
 
-            // Tolerate individual frame errors – skip the bad frame and
-            // keep going so we don't lose the entire animation.
-            let frame = match frame_result {
-                Ok(f) => f,
-                Err(_) => continue,
-            };
+            let timestamp = frame.timestamp();
+            let delay_ms = webp_frame_delay_ms(prev_timestamp, timestamp);
+            prev_timestamp = timestamp;
 
-            // Extract delay in milliseconds.
-            let (numer, denom) = frame.delay().numer_denom_ms();
-            let delay_ms = if denom > 0 { numer / denom } else { 100 };
-            let delay_ms = if delay_ms == 0 { 100 } else { delay_ms };
-
-            let rgba = frame.into_buffer();
-            let width = rgba.width();
-            let height = rgba.height();
+            let (width, height) = frame.dimensions();
+            let data = frame.data();
 
             // Compute downscale targets on the first frame.
             if target_width.is_none() {
@@ -1043,11 +1025,11 @@ impl LoadedImage {
             let th = target_height.unwrap_or(height);
 
             let (final_w, final_h, pixels) = if tw != width || th != height {
-                let resized = resize_rgba(width, height, rgba.as_raw(), tw, th, filter)
+                let resized = resize_rgba(width, height, data, tw, th, filter)
                     .map_err(|e| format!("Failed to resize animated WEBP frame: {}", e))?;
                 (tw, th, resized)
             } else {
-                (width, height, rgba.into_raw())
+                (width, height, data.to_vec())
             };
 
             total_decoded_bytes += pixels.len();
