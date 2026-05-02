@@ -93,8 +93,19 @@ binaries-dir = "target/release"
 before-packaging-command = "cargo build --release"
 icons = ["assets/icon.ico"]
 
+[[package.metadata.packager.file-associations]]
+extensions = ["jpg", "jpeg", "png", "webp", "gif", "bmp", "psd", "ico", "tiff", "tif"]
+description = "Image File"
+name = "RustImageViewer.Image"
+
+[[package.metadata.packager.file-associations]]
+extensions = ["mp4", "mkv", "webm", "avi", "mov", "wmv", "flv", "m4v", "3gp", "ogv"]
+description = "Video File"
+name = "RustImageViewer.Video"
+
 [package.metadata.packager.nsis]
 install-mode = "currentUser"
+template = "packaging/nsis/installer.nsi"
 appdata-paths = ["$APPDATA/rust-image-viewer", "$LOCALAPPDATA/rust-image-viewer"]
 preinstall-section = '''
 ; Keep current-user install path at AppData\Local\rust-image-viewer instead of product display name.
@@ -105,6 +116,10 @@ Section PreInstallPathOverride
   !endif
 SectionEnd
 '''
+
+[package.metadata.packager.wix]
+template = "packaging/wix/main.wxs"
+languages = ["en-US"]
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

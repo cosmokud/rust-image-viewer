@@ -191,11 +191,15 @@ function Write-PackagerConfig {
     $releaseDirAbs = [System.IO.Path]::GetFullPath((Join-Path $repoRootAbs "target\release"))
     $licensePathAbs = [System.IO.Path]::GetFullPath((Join-Path $repoRootAbs "LICENSE"))
     $iconPathAbs = [System.IO.Path]::GetFullPath((Join-Path $repoRootAbs "assets\icon.ico"))
+    $nsisTemplatePathAbs = [System.IO.Path]::GetFullPath((Join-Path $repoRootAbs "packaging\nsis\installer.nsi"))
+    $wixTemplatePathAbs = [System.IO.Path]::GetFullPath((Join-Path $repoRootAbs "packaging\wix\main.wxs"))
 
     $tomlOutputDir = $outputDirAbs.Replace("\", "/")
     $tomlReleaseDir = $releaseDirAbs.Replace("\", "/")
     $tomlLicensePath = $licensePathAbs.Replace("\", "/")
     $tomlIconPath = $iconPathAbs.Replace("\", "/")
+    $tomlNsisTemplatePath = $nsisTemplatePathAbs.Replace("\", "/")
+    $tomlWixTemplatePath = $wixTemplatePathAbs.Replace("\", "/")
 
     $lines = @(
         "name = ""$PackageName""",
@@ -224,12 +228,23 @@ function Write-PackagerConfig {
         "[[binaries]]",
         "path = ""rust-image-viewer""",
         "main = true",
+        "",
+        "[[file-associations]]",
+        'extensions = ["jpg", "jpeg", "png", "webp", "gif", "bmp", "psd", "ico", "tiff", "tif"]',
+        'description = "Image File"',
+        'name = "RustImageViewer.Image"',
+        "",
+        "[[file-associations]]",
+        'extensions = ["mp4", "mkv", "webm", "avi", "mov", "wmv", "flv", "m4v", "3gp", "ogv"]',
+        'description = "Video File"',
+        'name = "RustImageViewer.Video"',
         ""
     )
 
     $lines += @(
         "[nsis]",
         "installMode = ""currentUser""",
+        "template = ""$tomlNsisTemplatePath""",
         'appdata-paths = ["$APPDATA/rust-image-viewer", "$LOCALAPPDATA/rust-image-viewer"]',
         "preinstall-section = '''",
         '; Keep current-user install path at AppData\Local\rust-image-viewer instead of product display name.',
@@ -242,6 +257,7 @@ function Write-PackagerConfig {
         "'''",
         "",
         "[wix]",
+        "template = ""$tomlWixTemplatePath""",
         "languages = [""en-US""]",
         ""
     )
