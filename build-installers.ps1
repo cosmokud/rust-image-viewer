@@ -40,6 +40,12 @@ if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
 
+Write-Host "Building Windows installer with cargo-packager (WiX MSI)..."
+cargo packager --release --formats wix
+if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
+}
+
 $outputDir = Join-Path $repoRoot "target\packager"
 $resolvedOutputDir = [System.IO.Path]::GetFullPath($outputDir)
 
@@ -53,10 +59,10 @@ if (-not (Test-Path -LiteralPath $resolvedOutputDir)) {
 }
 
 $installers = Get-ChildItem -LiteralPath $resolvedOutputDir -File |
-    Where-Object { $_.Extension -eq ".exe" }
+    Where-Object { $_.Extension -in ".exe", ".msi" }
 
 if (-not $installers) {
-    Write-Warning "No .exe installers were found in the output directory."
+    Write-Warning "No .exe or .msi installers were found in the output directory."
     exit 0
 }
 

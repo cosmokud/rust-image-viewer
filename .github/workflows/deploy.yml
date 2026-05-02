@@ -76,6 +76,7 @@ jobs:
           name: rust-image-viewer-installers-${{ github.ref_name }}
           path: |
             target/packager/*.exe
+            target/packager/*.msi
             target/release/rust-image-viewer.exe
           if-no-files-found: error
 
@@ -99,4 +100,5 @@ jobs:
           fail_on_unmatched_files: true
           files: |
             target/packager/*.exe
+            target/packager/*.msi
             target/release/rust-image-viewer.exe

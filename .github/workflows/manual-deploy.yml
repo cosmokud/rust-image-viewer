@@ -79,6 +79,7 @@ jobs:
           name: rust-image-viewer-installers-${{ inputs.tag_to_build }}
           path: |
             target/packager/*.exe
+            target/packager/*.msi
             target/release/rust-image-viewer.exe
           if-no-files-found: error
 
@@ -103,4 +104,5 @@ jobs:
           make_latest: false
           files: |
             target/packager/*.exe
+            target/packager/*.msi
             target/release/rust-image-viewer.exe
