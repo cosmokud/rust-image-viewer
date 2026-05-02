@@ -20888,12 +20888,22 @@ impl ImageViewer {
             }
         }
 
-        let should_send = ctx
-            .input(|i| i.raw.viewport().inner_rect)
+        let (current_inner_rect, current_outer_rect) =
+            ctx.input(|i| (i.raw.viewport().inner_rect, i.raw.viewport().outer_rect));
+
+        let should_send = current_inner_rect
             .map(|rect| (rect.size() - desired).length() > 0.5)
             .unwrap_or(true);
 
         if should_send {
+            if let (Some(inner_rect), Some(outer_rect)) = (current_inner_rect, current_outer_rect) {
+                // Keep the window center stable while changing inner size so zoom-resize
+                // expands/contracts from center instead of top-left.
+                let inner_to_outer_offset = inner_rect.min - outer_rect.min;
+                let target_inner_min = inner_rect.center() - desired * 0.5;
+                let target_outer_min = target_inner_min - inner_to_outer_offset;
+                self.send_outer_position(ctx, target_outer_min);
+            }
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(desired));
         }
     }
