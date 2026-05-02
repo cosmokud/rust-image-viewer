@@ -2368,6 +2368,9 @@ struct ImageViewer {
     floating_drag_start_outer_pos: Option<egui::Pos2>,
     /// Global screen cursor position when a manual floating-window drag starts.
     floating_drag_start_cursor_screen: Option<egui::Pos2>,
+    /// When true, floating autosize is suppressed while zoomed media exceeds the viewport.
+    /// Set by explicit user window drag/resize while in zoom-inside-window mode.
+    floating_zoom_inside_window_locked: bool,
 
     // ============ PERFORMANCE OPTIMIZATION FIELDS ============
     /// Whether any animation or state change requires a repaint
@@ -2858,6 +2861,7 @@ impl Default for ImageViewer {
             resize_last_size: None,
             floating_drag_start_outer_pos: None,
             floating_drag_start_cursor_screen: None,
+            floating_zoom_inside_window_locked: false,
 
             // Performance optimization fields
             needs_repaint: false,
@@ -10898,7 +10902,28 @@ impl ImageViewer {
         self.floating_drag_start_cursor_screen = None;
     }
 
+    fn floating_zoom_inside_window_active(&self, ctx: &egui::Context) -> bool {
+        if self.is_fullscreen {
+            return false;
+        }
+
+        let Some(display_size) = self.image_display_size_at_zoom() else {
+            return false;
+        };
+
+        ctx.input(|i| i.raw.viewport().inner_rect)
+            .map(|inner_rect| {
+                display_size.x > inner_rect.width() + 0.5
+                    || display_size.y > inner_rect.height() + 0.5
+            })
+            .unwrap_or(false)
+    }
+
     fn drag_floating_window_without_native_snap(&mut self, ctx: &egui::Context) {
+        if self.floating_zoom_inside_window_active(ctx) {
+            self.floating_zoom_inside_window_locked = true;
+        }
+
         let Some(current_cursor_screen) = get_global_cursor_pos() else {
             // Fallback for platforms where global cursor coordinates are unavailable.
             ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
@@ -20945,8 +20970,10 @@ impl ImageViewer {
         let zoom_inside_current_viewport = current_inner_rect
             .map(|rect| desired.x > rect.width() + 0.5 || desired.y > rect.height() + 0.5)
             .unwrap_or(false);
-        if zoom_inside_current_viewport {
+        if zoom_inside_current_viewport && self.floating_zoom_inside_window_locked {
             return;
+        } else if !zoom_inside_current_viewport {
+            self.floating_zoom_inside_window_locked = false;
         }
 
         // Once the floating window reaches display bounds, keep zooming inside the viewport
@@ -24445,8 +24472,10 @@ impl ImageViewer {
             .unwrap_or(false);
 
         if keep_zoom_inside_window_mode {
+            self.floating_zoom_inside_window_locked = true;
             self.zoom_target = self.zoom;
         } else {
+            self.floating_zoom_inside_window_locked = false;
             let new_zoom = self.clamp_zoom(new_h / media_h);
             self.zoom = new_zoom;
             self.zoom_target = new_zoom;
