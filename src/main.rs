@@ -20918,11 +20918,10 @@ impl ImageViewer {
         None
     }
 
-    fn request_floating_autosize(&mut self, ctx: &egui::Context) {
+    fn request_floating_autosize(&mut self, ctx: &egui::Context, zoom_input_this_frame: bool) {
         if self.is_fullscreen
             || self.current_window_is_maximized(ctx)
             || self.is_resizing
-            || self.is_panning
             || self.pending_window_resize.is_some()
             || self.defer_media_view_reset
         {
@@ -20945,28 +20944,20 @@ impl ImageViewer {
                     rect.width() > monitor_bounds.x + 0.5 || rect.height() > monitor_bounds.y + 0.5
                 })
                 .unwrap_or(false);
-            let current_clipping_bounds = current_outer_rect
-                .or(current_inner_rect)
-                .map(|rect| {
-                    rect.min.x < -0.5
-                        || rect.min.y < -0.5
-                        || rect.max.x > monitor_bounds.x + 0.5
-                        || rect.max.y > monitor_bounds.y + 0.5
-                })
-                .unwrap_or(false);
-            let image_fits_current_window = current_inner_rect
-                .map(|rect| desired.x <= rect.width() + 0.5 && desired.y <= rect.height() + 0.5)
-                .unwrap_or(false);
-
             // Manual resize that exceeded the display should not be auto-snapped back.
             // Keep zooming inside the existing window until either:
-            // 1) user double-click resets floating layout, or
-            // 2) media fits in the current window and that window is fully inside the screen.
+            // 1) user manually resizes back within bounds, or
+            // 2) user zooms out enough that desired size fits on-screen again.
             if self.floating_manual_oversize_lock {
-                if image_fits_current_window && !current_exceeds_bounds && !current_clipping_bounds {
+                if !current_exceeds_bounds {
                     self.floating_manual_oversize_lock = false;
-                } else {
+                } else if !zoom_input_this_frame
+                    || desired.x > monitor_bounds.x
+                    || desired.y > monitor_bounds.y
+                {
                     return;
+                } else {
+                    self.floating_manual_oversize_lock = false;
                 }
             }
 
@@ -24424,17 +24415,8 @@ impl ImageViewer {
         let new_pos = egui::pos2(new_x, new_y);
 
         if let Some(monitor_bounds) = self.floating_monitor_bounds(ctx) {
-            let exceeds_bounds =
+            self.floating_manual_oversize_lock =
                 new_size.x > monitor_bounds.x + 0.5 || new_size.y > monitor_bounds.y + 0.5;
-            let clips_bounds = new_pos.x < -0.5
-                || new_pos.y < -0.5
-                || new_pos.x + new_size.x > monitor_bounds.x + 0.5
-                || new_pos.y + new_size.y > monitor_bounds.y + 0.5;
-            self.floating_manual_oversize_lock = if self.floating_manual_oversize_lock {
-                exceeds_bounds || clips_bounds
-            } else {
-                exceeds_bounds
-            };
         }
 
         let new_zoom = self.clamp_zoom(new_h / media_h);
@@ -24537,6 +24519,7 @@ impl ImageViewer {
             let pointer_pos_for_wheel = ctx.input(|i| i.pointer.hover_pos());
             let pointer_over_shortcut_ui_for_wheel =
                 self.pointer_over_shortcut_blocking_ui(pointer_pos_for_wheel, screen_rect);
+            let mut floating_zoom_input_this_frame = false;
 
             const WHEEL_POINTS_PER_LINE: f32 = 50.0;
             const WHEEL_MAX_STEPS_PER_EVENT: f32 = 6.0;
@@ -24639,6 +24622,7 @@ impl ImageViewer {
                                     self.offset * zoom_ratio - cursor_offset * (zoom_ratio - 1.0);
                             }
                             self.zoom_velocity = 0.0;
+                            floating_zoom_input_this_frame = true;
                         }
 
                         handled_modifier_wheel = true;
@@ -24681,6 +24665,7 @@ impl ImageViewer {
                                         - cursor_offset * (zoom_ratio - 1.0);
                                 }
                                 self.zoom_velocity = 0.0;
+                                floating_zoom_input_this_frame = true;
                             }
                         }
                     }
@@ -24970,7 +24955,7 @@ impl ImageViewer {
 
             // Floating mode: autosize the window to match the current zoomed media size.
             // Called after resize handling to avoid fighting with resize on first click frame.
-            self.request_floating_autosize(ctx);
+            self.request_floating_autosize(ctx, floating_zoom_input_this_frame);
 
             // Handle double-click to fit media to screen (fullscreen) or reset zoom (floating)
             if ctx.input(|i| {
@@ -25002,7 +24987,6 @@ impl ImageViewer {
                         self.clear_current_fullscreen_view_memory();
                     } else {
                         // Floating mode: reset to 100% size, or fit to screen if needed.
-                        self.floating_manual_oversize_lock = false;
                         let monitor = self.monitor_size_points(ctx);
                         if let Some((fit_zoom, desired)) =
                             self.floating_layout_size_for_media(img_w, img_h, monitor)
