@@ -10893,8 +10893,35 @@ impl ImageViewer {
         }
     }
 
+    fn snap_window_value_to_physical_pixels(value: f32, pixels_per_point: f32) -> f32 {
+        if !value.is_finite() || !pixels_per_point.is_finite() || pixels_per_point <= 0.0 {
+            return value;
+        }
+
+        (value * pixels_per_point).round() / pixels_per_point
+    }
+
+    fn snap_window_pos_to_physical_pixels(pos: egui::Pos2, pixels_per_point: f32) -> egui::Pos2 {
+        egui::pos2(
+            Self::snap_window_value_to_physical_pixels(pos.x, pixels_per_point),
+            Self::snap_window_value_to_physical_pixels(pos.y, pixels_per_point),
+        )
+    }
+
+    fn snap_window_size_to_physical_pixels(
+        size: egui::Vec2,
+        pixels_per_point: f32,
+    ) -> egui::Vec2 {
+        egui::vec2(
+            Self::snap_window_value_to_physical_pixels(size.x, pixels_per_point),
+            Self::snap_window_value_to_physical_pixels(size.y, pixels_per_point),
+        )
+    }
+
     fn send_outer_position(&mut self, ctx: &egui::Context, pos: egui::Pos2) {
-        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+        let ppp = ctx.pixels_per_point();
+        let snapped = Self::snap_window_pos_to_physical_pixels(pos, ppp);
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(snapped));
     }
 
     fn reset_floating_window_drag_anchor(&mut self) {
@@ -20959,8 +20986,10 @@ impl ImageViewer {
             return;
         };
 
+        let pixels_per_point = ctx.pixels_per_point();
         desired.x = desired.x.max(200.0);
         desired.y = desired.y.max(150.0);
+        desired = Self::snap_window_size_to_physical_pixels(desired, pixels_per_point);
 
         let (current_inner_rect, current_outer_rect) =
             ctx.input(|i| (i.raw.viewport().inner_rect, i.raw.viewport().outer_rect));
@@ -21014,6 +21043,7 @@ impl ImageViewer {
                 desired = Self::fit_size_preserving_aspect(desired, monitor_bounds);
                 desired.x = desired.x.max(1.0);
                 desired.y = desired.y.max(1.0);
+                desired = Self::snap_window_size_to_physical_pixels(desired, pixels_per_point);
             }
         }
 
@@ -21022,6 +21052,15 @@ impl ImageViewer {
             .unwrap_or(true);
 
         if should_send {
+            #[cfg(target_os = "windows")]
+            {
+                // Win11 can visibly jitter when we repeatedly move + resize from a synthetic
+                // center anchor in consecutive wheel-zoom frames. Resize from current origin.
+                let _ = current_outer_rect;
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(desired));
+            }
+
+            #[cfg(not(target_os = "windows"))]
             if let (Some(inner_rect), Some(outer_rect)) = (current_inner_rect, current_outer_rect) {
                 // Keep the window center stable while changing inner size so zoom-resize
                 // expands/contracts from center instead of top-left.
@@ -21030,7 +21069,11 @@ impl ImageViewer {
                 let target_outer_min = target_inner_min - inner_to_outer_offset;
                 self.send_outer_position(ctx, target_outer_min);
             }
-            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(desired));
+
+            #[cfg(not(target_os = "windows"))]
+            {
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(desired));
+            }
         }
     }
 
