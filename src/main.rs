@@ -12288,6 +12288,18 @@ impl ImageViewer {
         Some((width, height))
     }
 
+    fn async_video_output_bounds_for_solo(&self) -> Option<(u32, u32)> {
+        let max_side = self.max_texture_side.max(1);
+        let monitor = get_primary_monitor_size();
+        if monitor.x > 0.0 && monitor.y > 0.0 {
+            let width = (monitor.x.ceil() as u32).clamp(1, max_side);
+            let height = (monitor.y.ceil() as u32).clamp(1, max_side);
+            Some((width, height))
+        } else {
+            self.live_video_output_bounds_for_solo()
+        }
+    }
+
     fn start_async_video_load(&mut self, path: PathBuf) {
         if !gstreamer_runtime_available() {
             self.suppress_video_controls_for_next_video_load = false;
@@ -12323,7 +12335,7 @@ impl ImageViewer {
         };
         let prefer_hardware_decode = self.config.video_prefer_hardware_decode;
         let disable_hardware_decode = self.config.video_disable_hardware_decode;
-        let output_bounds = self.live_video_output_bounds_for_solo();
+        let output_bounds = self.async_video_output_bounds_for_solo();
 
         self.pending_media_load = Some(PendingMediaLoad {
             request_id,
