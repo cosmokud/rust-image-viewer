@@ -21899,16 +21899,15 @@ impl ImageViewer {
 
                     // Reserve a fixed right-side region for window buttons so they never get pushed out.
                     // Left side will collapse its detailed description into "..." when space is tight.
-                    // IMPORTANT: The window buttons must be clickable at y=0.
-                    // If the button rect is vertically centered inside the bar, the top few pixels
-                    // become a "dead zone" where dragging starts instead of clicking.
-                    // Make the hit-rect as tall as the bar.
+                    // Leave a 1px invisible gap on the top/right edges of the button cluster so
+                    // top-edge drag and top-right resize can still be reached like native windows.
                     let button_size = egui::Vec2::new(32.0, bar_height);
                     let buttons_area_w =
                         5.0 + (button_size.x * 4.0) + (ui.spacing().item_spacing.x * 3.0) + 6.0;
+                    let button_edge_gap = 1.0;
                     let buttons_rect = egui::Rect::from_min_max(
-                        egui::pos2(bar_rect.max.x - buttons_area_w, bar_rect.min.y),
-                        bar_rect.max,
+                        egui::pos2(bar_rect.max.x - buttons_area_w, bar_rect.min.y + button_edge_gap),
+                        egui::pos2(bar_rect.max.x - button_edge_gap, bar_rect.max.y),
                     );
 
                     // If the pointer is over the window buttons region, suppress window dragging.
