@@ -20860,6 +20860,19 @@ impl ImageViewer {
         desired.x = desired.x.max(200.0);
         desired.y = desired.y.max(150.0);
 
+        // Once the floating window reaches display bounds, keep zooming inside the viewport
+        // instead of continuing to grow the native window.
+        if let Some(monitor_bounds) = ctx.input(|i| i.raw.viewport().monitor_size) {
+            if monitor_bounds.x > 0.0
+                && monitor_bounds.y > 0.0
+                && (desired.x > monitor_bounds.x || desired.y > monitor_bounds.y)
+            {
+                desired = Self::fit_size_preserving_aspect(desired, monitor_bounds);
+                desired.x = desired.x.max(1.0);
+                desired.y = desired.y.max(1.0);
+            }
+        }
+
         let should_send = ctx
             .input(|i| i.raw.viewport().inner_rect)
             .map(|rect| (rect.size() - desired).length() > 0.5)
