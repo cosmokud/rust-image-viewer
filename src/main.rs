@@ -7453,6 +7453,10 @@ impl ImageViewer {
             .is_some_and(|ext| ext.eq_ignore_ascii_case("gif"))
     }
 
+    fn path_uses_animated_fps_override(path: &Path) -> bool {
+        Self::path_is_webp(path) || Self::path_is_gif(path)
+    }
+
     fn is_video_navigation_candidate_path(path: &Path) -> bool {
         if is_supported_video(path) || Self::path_is_gif(path) {
             return true;
@@ -11376,17 +11380,21 @@ impl ImageViewer {
     }
 
     fn try_handle_video_priority_shortcuts(&mut self, ctx: &egui::Context) -> bool {
-        if !self.solo_video_playback_mode_active() {
+        if self.manga_mode || !self.video_navigation_mode_active() {
             return false;
         }
 
-        let video_playing = self.solo_video_playing_active();
+        let media_playing = if self.solo_video_playback_mode_active() {
+            self.solo_video_playing_active()
+        } else {
+            self.image.as_ref().is_some_and(|img| img.is_animated()) && !self.gif_paused
+        };
         let (prev_pressed, next_pressed, pause_pressed) = ctx.input(|input| {
             let ctrl = input.modifiers.ctrl;
             let shift = input.modifiers.shift;
             let alt = input.modifiers.alt;
 
-            let prev_pressed = video_playing
+            let prev_pressed = media_playing
                 && self
                     .config
                     .video_priority_previous_file_binding
@@ -11394,7 +11402,7 @@ impl ImageViewer {
                     .is_some_and(|binding| {
                         self.binding_triggered(binding, input, ctrl, shift, alt)
                     });
-            let next_pressed = video_playing
+            let next_pressed = media_playing
                 && self
                     .config
                     .video_priority_next_file_binding
@@ -11402,7 +11410,8 @@ impl ImageViewer {
                     .is_some_and(|binding| {
                         self.binding_triggered(binding, input, ctrl, shift, alt)
                     });
-            let pause_pressed = self
+            let pause_pressed = self.solo_video_playback_mode_active()
+                && self
                 .config
                 .video_priority_play_pause_binding
                 .as_ref()
@@ -16687,7 +16696,7 @@ impl ImageViewer {
 
             if let Some(img) = self.manga_animated_images.get_mut(&idx) {
                 let webp_override_delay = webp_fps_override
-                    .filter(|_| Self::path_is_webp(img.path.as_path()))
+                    .filter(|_| Self::path_uses_animated_fps_override(img.path.as_path()))
                     .map(Self::frame_delay_for_fps);
 
                 let frame_changed = if !self.gif_paused && img.frame_count() > 1 {
@@ -21234,7 +21243,7 @@ impl ImageViewer {
             // In manga mode, keep the main image static (first frame only).
             let allow_animation = !self.manga_mode;
             let webp_override_delay = webp_fps_override
-                .filter(|_| Self::path_is_webp(img.path.as_path()))
+                .filter(|_| Self::path_uses_animated_fps_override(img.path.as_path()))
                 .map(Self::frame_delay_for_fps);
 
             // Only update animation if not paused and we have more than one frame.
@@ -23636,7 +23645,7 @@ impl ImageViewer {
         let animated_label = Self::animated_image_label_for_path(
             self.image_list.get(self.current_index).or(Some(&img.path)),
         );
-        let is_webp = Self::path_is_webp(img.path.as_path());
+        let show_fps_controls = Self::path_uses_animated_fps_override(img.path.as_path());
         let mut file_navigation_requested: Option<VideoFileNavigation> = None;
 
         ui.vertical(|ui| {
@@ -23798,7 +23807,7 @@ impl ImageViewer {
                             .color(egui::Color32::from_rgb(76, 175, 80))
                             .size(14.0),
                     );
-                    if is_webp {
+                    if show_fps_controls {
                         ui.add_space(6.0);
                         self.draw_webp_fps_controls(ui, ctx, Self::solo_webp_fps_popup_id());
                     }
@@ -24339,11 +24348,11 @@ impl ImageViewer {
             img.position_fraction() as f32
         };
         let animated_label = Self::animated_image_label_for_path(self.image_list.get(gif_idx));
-        let is_webp = self
+        let show_fps_controls = self
             .image_list
             .get(gif_idx)
-            .is_some_and(|path| Self::path_is_webp(path.as_path()))
-            || Self::path_is_webp(img.path.as_path());
+            .is_some_and(|path| Self::path_uses_animated_fps_override(path.as_path()))
+            || Self::path_uses_animated_fps_override(img.path.as_path());
         let mut file_navigation_requested: Option<VideoFileNavigation> = None;
 
         ui.vertical(|ui| {
@@ -24506,7 +24515,7 @@ impl ImageViewer {
                             .color(egui::Color32::from_rgb(76, 175, 80))
                             .size(14.0),
                     );
-                    if is_webp {
+                    if show_fps_controls {
                         ui.add_space(6.0);
                         self.draw_webp_fps_controls(
                             ui,
