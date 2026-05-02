@@ -20862,7 +20862,22 @@ impl ImageViewer {
 
         // Once the floating window reaches display bounds, keep zooming inside the viewport
         // instead of continuing to grow the native window.
-        if let Some(monitor_bounds) = ctx.input(|i| i.raw.viewport().monitor_size) {
+        let mut monitor_bounds = ctx.input(|i| i.raw.viewport().monitor_size);
+        #[cfg(target_os = "windows")]
+        {
+            // `viewport.monitor_size` can be undersized on some setups; use the primary
+            // monitor dimensions as a safety floor so we don't trigger in-window zoom too early.
+            let primary_bounds = get_primary_monitor_size();
+            monitor_bounds = Some(match monitor_bounds {
+                Some(bounds) => egui::vec2(
+                    bounds.x.max(primary_bounds.x),
+                    bounds.y.max(primary_bounds.y),
+                ),
+                None => primary_bounds,
+            });
+        }
+
+        if let Some(monitor_bounds) = monitor_bounds {
             if monitor_bounds.x > 0.0
                 && monitor_bounds.y > 0.0
                 && (desired.x > monitor_bounds.x || desired.y > monitor_bounds.y)
