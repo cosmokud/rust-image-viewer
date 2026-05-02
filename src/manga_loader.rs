@@ -90,6 +90,8 @@ const DIM_RESULT_CHUNK_SIZE: usize = 64;
 const PRELOAD_RETRY_BASE_DELAY_MS: u64 = 250;
 /// Cap retry backoff so visible items recover quickly once they come into view.
 const PRELOAD_RETRY_MAX_DELAY_MS: u64 = 4000;
+/// Stop retrying media that repeatedly fails to decode; broken videos/GIFs should not spin forever.
+const PRELOAD_RETRY_MAX_ATTEMPTS: u8 = 3;
 /// Texture-side buckets used for masonry/strip LOD requests.
 /// Requests are rounded up to the next bucket to avoid churn from tiny deltas.
 pub const LOD_SIDE_BUCKETS: &[u32] = &[
@@ -885,6 +887,21 @@ impl MangaLoader {
         dims
     }
 
+    fn probe_video_dimensions_fast(path: &std::path::Path) -> (u32, u32) {
+        if let Some((w, h)) = lookup_cached_dimensions(path, CachedMediaKind::Video) {
+            return (w, h);
+        }
+
+        if let Some((w, h)) = probe_video_dimensions_without_gstreamer(path) {
+            if w > 0 && h > 0 {
+                store_cached_dimensions(path, CachedMediaKind::Video, w, h);
+                return (w, h);
+            }
+        }
+
+        Self::fallback_video_dimensions(path).unwrap_or((1920, 1080))
+    }
+
     /// Load a single image on a worker thread.
     /// For video files, this extracts the first frame as a thumbnail placeholder.
     fn load_single_image(req: &LoadRequest) -> Option<DecodedImage> {
@@ -927,9 +944,10 @@ impl MangaLoader {
                         })
                     }
                     None => {
-                        // Fallback: probe dimensions only, no thumbnail
+                        // Fallback: use cheap dimensions only. Do not call the full probe here,
+                        // because that can re-run first-frame extraction for already-failed videos.
                         let (original_width, original_height) =
-                            Self::probe_video_dimensions(&req.path).unwrap_or((1920, 1080)); // Fallback to 1080p
+                            Self::probe_video_dimensions_fast(&req.path);
 
                         Some(DecodedImage {
                             index: req.index,
@@ -1148,6 +1166,28 @@ impl MangaLoader {
         }
     }
 
+    fn video_thumbnail_output_dimensions(
+        source_dimensions: Option<(u32, u32)>,
+        max_texture_side: u32,
+    ) -> Option<(u32, u32)> {
+        let (source_w, source_h) = source_dimensions?;
+        if source_w == 0 || source_h == 0 || max_texture_side == 0 {
+            return None;
+        }
+
+        let scale = (max_texture_side as f64 / source_w as f64)
+            .min(max_texture_side as f64 / source_h as f64)
+            .min(1.0);
+        if scale >= 0.999 {
+            return None;
+        }
+
+        Some((
+            (source_w as f64 * scale).round().max(1.0) as u32,
+            (source_h as f64 * scale).round().max(1.0) as u32,
+        ))
+    }
+
     /// Extract the first frame from a video file as a thumbnail.
     ///
     /// Uses GStreamer to decode just the first frame without loading the entire video.
@@ -1183,10 +1223,9 @@ impl MangaLoader {
             ));
         }
 
-        if !gstreamer_runtime_available() {
-            let (pixels, width, height, original_width, original_height) =
-                extract_video_first_frame_without_gstreamer(path, max_texture_side)?;
-
+        if let Some((pixels, width, height, original_width, original_height)) =
+            extract_video_first_frame_without_gstreamer(path, max_texture_side)
+        {
             store_cached_video_thumbnail(
                 path,
                 max_texture_side,
@@ -1200,6 +1239,10 @@ impl MangaLoader {
             );
 
             return Some((pixels, width, height, original_width, original_height));
+        }
+
+        if !gstreamer_runtime_available() {
+            return None;
         }
 
         use gstreamer as gst;
@@ -1220,12 +1263,23 @@ impl MangaLoader {
         // Build URI from path
         let uri = gst::glib::filename_to_uri(path, None).ok()?.to_string();
 
+        let source_dimensions = Self::probe_video_dimensions_fast(path);
+        let output_dimensions =
+            Self::video_thumbnail_output_dimensions(Some(source_dimensions), max_texture_side);
+        let caps_filter = match output_dimensions {
+            Some((width, height)) if width > 0 && height > 0 => {
+                format!("video/x-raw,format=RGBA,width={},height={}", width, height)
+            }
+            _ => "video/x-raw,format=RGBA".to_string(),
+        };
+
         // Create a minimal pipeline for frame extraction
         // Use decodebin for auto-detection and videoscale/videoconvert for format conversion
         let pipeline_str = format!(
             "uridecodebin uri=\"{}\" name=dec ! videoconvert ! videoscale ! \
-             video/x-raw,format=RGBA ! appsink name=sink max-buffers=1 drop=true",
-            uri.replace("\"", "\\\"")
+             {} ! appsink name=sink max-buffers=1 drop=true",
+            uri.replace("\"", "\\\""),
+            caps_filter
         );
 
         let pipeline = gst::parse::launch(&pipeline_str).ok()?;
@@ -1269,12 +1323,12 @@ impl MangaLoader {
             return None;
         }
 
-        // Wait for state change or timeout (500ms max for responsiveness)
+        // Wait for state change or timeout (short for dense masonry responsiveness)
         let bus = pipeline.bus()?;
         let mut got_frame = false;
 
         // Wait for ASYNC_DONE or ERROR, with timeout
-        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        let deadline = std::time::Instant::now() + Duration::from_millis(250);
         while std::time::Instant::now() < deadline {
             if let Some(msg) = bus.timed_pop(gst::ClockTime::from_mseconds(50)) {
                 match msg.view() {
@@ -1316,8 +1370,7 @@ impl MangaLoader {
             return None;
         }
 
-        let original_width = width;
-        let original_height = height;
+        let (original_width, original_height) = source_dimensions;
 
         // Downscale if needed for GPU texture limits
         let (final_width, final_height, final_pixels) = downscale_rgba_if_needed(
@@ -1472,7 +1525,6 @@ impl MangaLoader {
         let mut requests: Vec<LoadRequest> = Vec::new();
         let generation = self.current_generation;
         let now = Instant::now();
-        let visible_retry_radius = self.visible_page_count.clamp(6, 24);
 
         {
             let loading = self.loading_indices.read();
@@ -1504,8 +1556,7 @@ impl MangaLoader {
 
                 if let Some(retry_state) = retry.get(&idx) {
                     let retry_due = now >= retry_state.next_retry_at;
-                    let can_retry_here = idx.abs_diff(visible_index) <= visible_retry_radius;
-                    if !retry_due && !can_retry_here {
+                    if retry_state.attempts >= PRELOAD_RETRY_MAX_ATTEMPTS || !retry_due {
                         continue;
                     }
                 }
@@ -1830,6 +1881,12 @@ impl MangaLoader {
         }
 
         if self.loading_indices.read().get(&index).copied() == Some(self.current_generation) {
+            return false;
+        }
+
+        if self.retry_state.read().get(&index).is_some_and(|state| {
+            state.attempts >= PRELOAD_RETRY_MAX_ATTEMPTS || Instant::now() < state.next_retry_at
+        }) {
             return false;
         }
 

@@ -3,8 +3,8 @@
 
 #![windows_subsystem = "windows"]
 
-mod async_runtime;
 mod app_dirs;
+mod async_runtime;
 mod config;
 mod folder_travel_cache;
 mod image_loader;
@@ -2606,6 +2606,8 @@ struct ImageViewer {
     /// Video textures for manga mode, keyed by image list index.
     /// Stores the latest frame texture for each video.
     manga_video_textures: HashMap<usize, (egui::TextureHandle, u32, u32)>,
+    /// Videos that failed focused playback startup in this manga session.
+    manga_video_failed: HashSet<usize>,
     /// Index of the currently focused (playing) video in manga mode.
     /// Only one video plays at a time; all others are paused.
     manga_focused_video_index: Option<usize>,
@@ -2992,6 +2994,7 @@ impl Default for ImageViewer {
             // Manga video playback fields
             manga_video_players: HashMap::new(),
             manga_video_textures: HashMap::new(),
+            manga_video_failed: HashSet::new(),
             manga_focused_video_index: None,
             manga_hovered_media_index: None,
             manga_hover_autoplay_resume_at: Instant::now(),
@@ -7351,12 +7354,11 @@ impl ImageViewer {
     }
 
     fn queue_solo_audio_track_switch(&mut self, ctx: &egui::Context, track_index: i32) {
-        self.pending_solo_audio_track_switch =
-            Some((
-                Instant::now() + Self::AUDIO_TRACK_SWITCH_DELAY,
-                self.current_index,
-                track_index,
-            ));
+        self.pending_solo_audio_track_switch = Some((
+            Instant::now() + Self::AUDIO_TRACK_SWITCH_DELAY,
+            self.current_index,
+            track_index,
+        ));
         ctx.request_repaint_after(Self::AUDIO_TRACK_SWITCH_DELAY);
     }
 
@@ -7485,7 +7487,8 @@ impl ImageViewer {
         frame_count: usize,
         total_duration_ms: u64,
     ) -> u32 {
-        let default_fps = Self::animated_media_default_custom_fps(path, frame_count, total_duration_ms);
+        let default_fps =
+            Self::animated_media_default_custom_fps(path, frame_count, total_duration_ms);
         let should_reset_for_new_media = self
             .webp_fps_custom_media_path
             .as_ref()
@@ -7863,13 +7866,7 @@ impl ImageViewer {
                 let wave_center = egui::pos2(rect.center().x + 0.8, rect.center().y);
                 for radius in [3.0, 5.3] {
                     painter.add(egui::epaint::PathShape::line(
-                        Self::video_control_icon_arc_points(
-                            wave_center,
-                            radius,
-                            -0.95,
-                            0.95,
-                            12,
-                        ),
+                        Self::video_control_icon_arc_points(wave_center, radius, -0.95, 0.95, 12),
                         stroke,
                     ));
                 }
@@ -8123,9 +8120,8 @@ impl ImageViewer {
                         );
                         if row.clicked() {
                             if !is_selected {
-                                selected_track = Some(
-                                    VideoSubtitleSelection::Embedded(track.index),
-                                );
+                                selected_track =
+                                    Some(VideoSubtitleSelection::Embedded(track.index));
                             }
                             ui.memory_mut(|mem| mem.close_popup());
                         }
@@ -8719,6 +8715,13 @@ impl ImageViewer {
         } else {
             "GIF"
         }
+    }
+
+    fn is_probably_animated_image_path(path: &Path) -> bool {
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| matches!(ext.to_ascii_lowercase().as_str(), "gif" | "webp"))
+            .unwrap_or(false)
     }
 
     fn current_fab_single_action_index(&self) -> Option<usize> {
@@ -11488,10 +11491,12 @@ impl ImageViewer {
                     });
             let pause_pressed = self.solo_video_playback_mode_active()
                 && self
-                .config
-                .video_priority_play_pause_binding
-                .as_ref()
-                .is_some_and(|binding| self.binding_triggered(binding, input, ctrl, shift, alt));
+                    .config
+                    .video_priority_play_pause_binding
+                    .as_ref()
+                    .is_some_and(|binding| {
+                        self.binding_triggered(binding, input, ctrl, shift, alt)
+                    });
 
             (prev_pressed, next_pressed, pause_pressed)
         });
@@ -12062,6 +12067,7 @@ impl ImageViewer {
         self.clear_pending_manga_video_load();
         self.manga_decoded_mailbox.clear();
         self.manga_video_players.clear();
+        self.manga_video_failed.clear();
         self.manga_focused_video_index = None;
         self.manga_hovered_media_index = None;
         self.manga_hover_autoplay_resume_at = Instant::now();
@@ -12447,6 +12453,7 @@ impl ImageViewer {
 
                     if !player.is_playing() {
                         if let Err(err) = player.play() {
+                            self.manga_video_failed.insert(index);
                             self.video_playback_unavailable_reason = Some(err);
                             self.manga_focused_video_index = None;
                             continue;
@@ -12475,6 +12482,7 @@ impl ImageViewer {
                     result: Err(err),
                     ..
                 } => {
+                    self.manga_video_failed.insert(index);
                     self.video_playback_unavailable_reason =
                         Some(format!("Failed to load video: {}", err));
                     eprintln!(
@@ -13246,9 +13254,11 @@ impl ImageViewer {
                 (self.current_index + len - (step % len)) % len
             };
 
-            if self.image_list.get(candidate).is_some_and(|path| {
-                Self::is_video_navigation_candidate_path(path.as_path())
-            }) {
+            if self
+                .image_list
+                .get(candidate)
+                .is_some_and(|path| Self::is_video_navigation_candidate_path(path.as_path()))
+            {
                 return Some(candidate);
             }
         }
@@ -13265,9 +13275,11 @@ impl ImageViewer {
     }
 
     fn navigate_video_file_to_index(&mut self, target_index: usize) {
-        if !self.image_list.get(target_index).is_some_and(|path| {
-            Self::is_video_navigation_candidate_path(path.as_path())
-        }) {
+        if !self
+            .image_list
+            .get(target_index)
+            .is_some_and(|path| Self::is_video_navigation_candidate_path(path.as_path()))
+        {
             return;
         }
 
@@ -14433,6 +14445,12 @@ impl ImageViewer {
         let max_side = self.max_texture_side.max(1);
         let display_side = self.manga_screen_max_side_for_index(index);
         let target_scale = self.manga_lod_target_scale_factor();
+        let cached_side_floor = self
+            .manga_texture_cache
+            .peek_texture_dimensions(index)
+            .map(|(w, h)| w.max(h).max(1))
+            .unwrap_or(1)
+            .min(max_side);
         let overscan = match media_type {
             MangaMediaType::Video => {
                 if self.is_masonry_mode() {
@@ -14469,12 +14487,19 @@ impl ImageViewer {
             .clamp(1, max_side);
 
         if self.is_masonry_mode() {
-            let fill_cap = if self.masonry_navigation_active_for_heavy_work() {
-                self.masonry_navigation_target_side_cap()
-            } else {
+            let is_playback_media = matches!(
+                media_type,
+                MangaMediaType::Video | MangaMediaType::AnimatedImage
+            );
+            let fill_cap = if is_playback_media || !self.masonry_navigation_active_for_heavy_work()
+            {
                 self.masonry_fill_target_side_cap()
+            } else {
+                self.masonry_navigation_target_side_cap()
             };
-            target_side = target_side.min(fill_cap.max(min_side));
+            target_side = target_side
+                .min(fill_cap.max(min_side))
+                .max(cached_side_floor);
         }
 
         target_side
@@ -16275,6 +16300,14 @@ impl ImageViewer {
             .and_then(|loader| loader.get_media_type(focused_idx))
             .map_or(false, |mt| mt == MangaMediaType::AnimatedImage);
 
+        let focused_is_animated = focused_is_animated
+            || self
+                .image_list
+                .get(focused_idx)
+                .map(|path| Self::is_probably_animated_image_path(path.as_path()))
+                .unwrap_or(false)
+                && !self.manga_anim_failed.contains(&focused_idx);
+
         if focused_is_animated {
             Some(focused_idx)
         } else {
@@ -16315,7 +16348,10 @@ impl ImageViewer {
                 })
                 .is_some_and(|idx| {
                     !self.manga_video_textures.contains_key(&idx)
-                        && self.manga_texture_cache.peek_texture_dimensions(idx).is_none()
+                        && self
+                            .manga_texture_cache
+                            .peek_texture_dimensions(idx)
+                            .is_none()
                 });
 
             if !allow_placeholder_bootstrap {
@@ -16381,6 +16417,12 @@ impl ImageViewer {
         });
 
         if focused_is_video {
+            if self.manga_video_failed.contains(&focused_idx) {
+                self.manga_focused_video_index = None;
+                self.clear_pending_manga_video_load();
+                return;
+            }
+
             let focus_changed = self.manga_focused_video_index != Some(focused_idx);
 
             if focus_changed {
@@ -16404,6 +16446,7 @@ impl ImageViewer {
                 };
 
             if let Some(err) = focus_play_error {
+                self.manga_video_failed.insert(focused_idx);
                 self.video_playback_unavailable_reason = Some(err);
                 self.manga_focused_video_index = None;
                 self.clear_pending_manga_video_load();
@@ -19224,6 +19267,12 @@ impl ImageViewer {
             return false;
         }
 
+        let media_path = self.image_list.get(idx);
+        let probably_animated_by_path = media_path
+            .map(|path| Self::is_probably_animated_image_path(path.as_path()))
+            .unwrap_or(false)
+            && !self.manga_anim_failed.contains(&idx);
+
         let cached_media_type = self
             .manga_loader
             .as_ref()
@@ -19232,8 +19281,9 @@ impl ImageViewer {
         // Check if this item is a video
         let is_video = cached_media_type.map_or(false, |mt| mt == MangaMediaType::Video);
 
-        let is_animated_image =
-            cached_media_type.map_or(false, |mt| mt == MangaMediaType::AnimatedImage);
+        let is_animated_image = cached_media_type
+            .map_or(false, |mt| mt == MangaMediaType::AnimatedImage)
+            || probably_animated_by_path;
 
         // Also check by file extension as a fallback
         let is_video = is_video
@@ -19516,6 +19566,23 @@ impl ImageViewer {
                     egui::FontId::proportional(24.0),
                     egui::Color32::from_gray(80),
                 );
+
+                if is_animated_image {
+                    let icon_bg_rect =
+                        egui::Rect::from_center_size(image_rect.center(), egui::Vec2::splat(60.0));
+                    ui.painter().rect_filled(
+                        icon_bg_rect,
+                        30.0,
+                        egui::Color32::from_rgba_unmultiplied(0, 0, 0, 160),
+                    );
+                    ui.painter().text(
+                        image_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "▶",
+                        egui::FontId::proportional(32.0),
+                        egui::Color32::WHITE,
+                    );
+                }
 
                 self.manga_mark_placeholder_visible(idx);
 
@@ -22250,7 +22317,10 @@ impl ImageViewer {
                         5.0 + (button_size.x * 4.0) + (ui.spacing().item_spacing.x * 3.0) + 6.0;
                     let button_edge_gap = if self.is_fullscreen { 0.0 } else { 2.0 };
                     let buttons_rect = egui::Rect::from_min_max(
-                        egui::pos2(bar_rect.max.x - buttons_area_w, bar_rect.min.y + button_edge_gap),
+                        egui::pos2(
+                            bar_rect.max.x - buttons_area_w,
+                            bar_rect.min.y + button_edge_gap,
+                        ),
                         egui::pos2(bar_rect.max.x - button_edge_gap, bar_rect.max.y),
                     );
 
@@ -23675,8 +23745,11 @@ impl ImageViewer {
         frame_count: usize,
         total_duration_ms: u64,
     ) {
-        let default_custom_fps =
-            self.sync_custom_fps_with_current_media_default(media_path, frame_count, total_duration_ms);
+        let default_custom_fps = self.sync_custom_fps_with_current_media_default(
+            media_path,
+            frame_count,
+            total_duration_ms,
+        );
         self.webp_custom_fps = self.webp_custom_fps.clamp(1, 240);
 
         let old_item_spacing_x = ui.spacing().item_spacing.x;
@@ -23717,13 +23790,22 @@ impl ImageViewer {
         if ui.is_rect_visible(slider_rect) {
             let track_height = 4.0;
             let track_rect = egui::Rect::from_min_max(
-                egui::pos2(slider_rect.left(), slider_rect.center().y - track_height * 0.5),
-                egui::pos2(slider_rect.right(), slider_rect.center().y + track_height * 0.5),
+                egui::pos2(
+                    slider_rect.left(),
+                    slider_rect.center().y - track_height * 0.5,
+                ),
+                egui::pos2(
+                    slider_rect.right(),
+                    slider_rect.center().y + track_height * 0.5,
+                ),
             );
             let t = (self.webp_custom_fps.saturating_sub(1) as f32 / 239.0).clamp(0.0, 1.0);
             let active_rect = egui::Rect::from_min_max(
                 track_rect.left_top(),
-                egui::pos2(track_rect.left() + track_rect.width() * t, track_rect.bottom()),
+                egui::pos2(
+                    track_rect.left() + track_rect.width() * t,
+                    track_rect.bottom(),
+                ),
             );
             let handle_center = egui::pos2(
                 track_rect.left() + track_rect.width() * t,
@@ -24906,10 +24988,11 @@ impl ImageViewer {
         let keep_zoom_inside_window_mode = self
             .image_display_size_at_zoom()
             .and_then(|display_size| {
-                ctx.input(|i| i.raw.viewport().inner_rect).map(|inner_rect| {
-                    display_size.x > inner_rect.width() + 1.0
-                        || display_size.y > inner_rect.height() + 1.0
-                })
+                ctx.input(|i| i.raw.viewport().inner_rect)
+                    .map(|inner_rect| {
+                        display_size.x > inner_rect.width() + 1.0
+                            || display_size.y > inner_rect.height() + 1.0
+                    })
             })
             .unwrap_or(false);
 
