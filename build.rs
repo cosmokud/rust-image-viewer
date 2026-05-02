@@ -312,6 +312,9 @@ fn main() {
             if target.contains("msvc") {
                 let mut res = winres::WindowsResource::new();
                 res.set_icon("assets/icon.ico");
+                res.set("ProductName", "Rust Image Viewer");
+                res.set("FileDescription", "Rust Image Viewer");
+                res.set("LegalCopyright", "Copyright 2026");
                 if let Err(e) = res.compile() {
                     println!("cargo:warning=Failed to embed assets/icon.ico: {}", e);
                 }
