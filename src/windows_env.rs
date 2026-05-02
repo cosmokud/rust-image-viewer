@@ -199,27 +199,6 @@ pub fn set_active_window_maximized(maximize: bool) -> bool {
     true
 }
 
-pub fn set_active_window_bounds(x: i32, y: i32, width: i32, height: i32) -> bool {
-    use winapi::um::winuser::{IsWindow, SetWindowPos, SWP_NOACTIVATE, SWP_NOZORDER};
-
-    if width <= 0 || height <= 0 {
-        return false;
-    }
-
-    let hwnd = active_or_foreground_window();
-    if hwnd.is_null() {
-        return false;
-    }
-
-    unsafe {
-        if IsWindow(hwnd) == 0 {
-            return false;
-        }
-    }
-
-    unsafe { SetWindowPos(hwnd, std::ptr::null_mut(), x, y, width, height, SWP_NOACTIVATE | SWP_NOZORDER) != 0 }
-}
-
 /// Refreshes the process `PATH` from the registry (HKLM + HKCU), merging with the current
 /// process PATH. This makes DLL/plugin discovery resilient when the process is launched from
 /// a parent process with a stale/sanitized environment (e.g., some browsers).
