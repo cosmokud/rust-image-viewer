@@ -313,6 +313,12 @@ pub struct VideoTrackInfo {
     stream_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubtitleFontFallbackProfile {
+    Cjk,
+    Arabic,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VideoSubtitleSelection {
     Off,
@@ -358,6 +364,10 @@ const LOCAL_FILE_SOURCE_BLOCK_SIZE_BYTES: i32 = 256 * 1024;
 const APPSINK_MAX_BUFFERS: u32 = 3;
 const KEYFRAME_SEEK_PREROLL_TIMEOUT_MS: u64 = 20;
 const ACCURATE_SEEK_PREROLL_TIMEOUT_MS: u64 = 75;
+const SUBTITLE_FONT_DESC_FALLBACK_CJK: &str =
+    "Noto Sans CJK JP, Noto Sans CJK SC, Noto Sans CJK KR, Microsoft YaHei, Meiryo, Malgun Gothic, Sans";
+const SUBTITLE_FONT_DESC_FALLBACK_ARABIC: &str =
+    "Noto Naskh Arabic, Noto Sans Arabic, Amiri, Scheherazade New, Tahoma, Arial, Sans";
 
 impl VideoState {
     fn adaptive_capacity_for_dims(width: u32, height: u32) -> usize {
@@ -760,6 +770,7 @@ fn short_language_tag(value: &str) -> Option<String> {
         "it" | "ita" | "italian" => "IT",
         "pt" | "por" | "portuguese" => "PT",
         "ru" | "rus" | "russian" => "RU",
+        "ar" | "ara" | "arabic" => "AR",
         "th" | "tha" | "thai" => "TH",
         "vi" | "vie" | "vietnamese" => "VI",
         "id" | "ind" | "indonesian" => "ID",
@@ -773,6 +784,44 @@ fn short_language_tag(value: &str) -> Option<String> {
     };
 
     Some(tag.to_string())
+}
+
+fn subtitle_font_fallback_profile_for_hint(value: &str) -> Option<SubtitleFontFallbackProfile> {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return None;
+    }
+
+    let primary = normalized
+        .split(['-', '_'])
+        .next()
+        .unwrap_or(normalized.as_str());
+
+    match primary {
+        "ja" | "jp" | "jpn" | "japanese" => Some(SubtitleFontFallbackProfile::Cjk),
+        "zh" | "zho" | "chi" | "chinese" | "cmn" | "yue" | "hans" | "hant" => {
+            Some(SubtitleFontFallbackProfile::Cjk)
+        }
+        "ko" | "kr" | "kor" | "korean" => Some(SubtitleFontFallbackProfile::Cjk),
+        "ar" | "ara" | "arabic" => Some(SubtitleFontFallbackProfile::Arabic),
+        _ => None,
+    }
+}
+
+fn subtitle_font_fallback_profile_from_text(value: &str) -> Option<SubtitleFontFallbackProfile> {
+    for token in value.split(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_') {
+        if let Some(profile) = subtitle_font_fallback_profile_for_hint(token) {
+            return Some(profile);
+        }
+    }
+    subtitle_font_fallback_profile_for_hint(value)
+}
+
+fn subtitle_font_desc_for_profile(profile: SubtitleFontFallbackProfile) -> &'static str {
+    match profile {
+        SubtitleFontFallbackProfile::Cjk => SUBTITLE_FONT_DESC_FALLBACK_CJK,
+        SubtitleFontFallbackProfile::Arabic => SUBTITLE_FONT_DESC_FALLBACK_ARABIC,
+    }
 }
 
 fn push_language_label_parts(parts: &mut Vec<String>, tags: &gst::TagList) {
@@ -1188,6 +1237,7 @@ Ensure your GStreamer installation includes the playback elements (usually from 
             VideoSubtitleSelection::Embedded,
         );
         player.subtitle_track_disabled = !player.subtitle_output_enabled();
+        player.apply_subtitle_font_fallback_for_selection(&player.subtitle_selection);
 
         // Apply initial volume/mute settings
         player.apply_volume();
@@ -1512,6 +1562,45 @@ Ensure your GStreamer installation includes the playback elements (usually from 
         playbin_flag_enabled(self.pipeline.upcast_ref(), PLAY_FLAG_TEXT)
     }
 
+    fn subtitle_font_profile_for_embedded_track(
+        &self,
+        index: i32,
+    ) -> Option<SubtitleFontFallbackProfile> {
+        self.embedded_subtitle_tracks()
+            .into_iter()
+            .find(|track| track.index == index)
+            .and_then(|track| subtitle_font_fallback_profile_from_text(track.label.as_str()))
+    }
+
+    fn subtitle_font_profile_for_external_subtitle(
+        &self,
+        path: &Path,
+    ) -> Option<SubtitleFontFallbackProfile> {
+        let stem = path.file_stem().and_then(|value| value.to_str())?;
+        subtitle_font_fallback_profile_from_text(stem)
+    }
+
+    fn apply_subtitle_font_fallback_for_selection(&self, selection: &VideoSubtitleSelection) {
+        let profile = match selection {
+            VideoSubtitleSelection::Off => None,
+            VideoSubtitleSelection::Embedded(index) => {
+                self.subtitle_font_profile_for_embedded_track(*index)
+            }
+            VideoSubtitleSelection::External(path) => {
+                self.subtitle_font_profile_for_external_subtitle(path)
+            }
+        };
+
+        match profile {
+            Some(profile) => self
+                .pipeline
+                .set_property("subtitle-font-desc", subtitle_font_desc_for_profile(profile)),
+            None => self
+                .pipeline
+                .set_property("subtitle-font-desc", Option::<String>::None),
+        }
+    }
+
     fn current_embedded_subtitle_stream_id(&self) -> Option<String> {
         let VideoSubtitleSelection::Embedded(current_index) = self.current_subtitle_selection()
         else {
@@ -1780,6 +1869,7 @@ Ensure your GStreamer installation includes the playback elements (usually from 
 
         self.suppress_buffering_pause_for_track_switch();
         self.subtitle_selection = selection;
+        self.apply_subtitle_font_fallback_for_selection(&self.subtitle_selection);
         if !self.is_playing {
             if let Some(current_position) = self.position() {
                 let _ = self.seek_to_clock_time(
