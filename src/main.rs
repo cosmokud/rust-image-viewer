@@ -24164,6 +24164,14 @@ impl ImageViewer {
     /// Determine resize direction based on mouse position
     fn get_resize_direction(&self, pos: egui::Pos2, rect: egui::Rect) -> ResizeDirection {
         let border = self.config.resize_border_size;
+        // Top-right corner competes with the title-bar button cluster; give it a
+        // slightly larger hotspot so resize remains reachable in floating mode.
+        let top_right_corner_border = border.max(12.0);
+        if pos.x > rect.max.x - top_right_corner_border
+            && pos.y < rect.min.y + top_right_corner_border
+        {
+            return ResizeDirection::TopRight;
+        }
         let at_left = pos.x < rect.min.x + border;
         let at_right = pos.x > rect.max.x - border;
         let at_top = pos.y < rect.min.y + border;
@@ -24247,6 +24255,8 @@ impl ImageViewer {
         let start_bottom = (start_outer_pos.y + start_inner_size.y).round();
         let start_w = start_right - start_left;
         let start_h = start_bottom - start_top;
+        let start_center_x = start_left + start_w * 0.5;
+        let start_center_y = start_top + start_h * 0.5;
 
         let size_from_width = |w: f32| -> (f32, f32) {
             let w = w.clamp(clamp_min_w, max_size.x);
@@ -24323,11 +24333,11 @@ impl ImageViewer {
         };
 
         let (new_x, new_y) = match direction {
-            ResizeDirection::Right | ResizeDirection::Bottom | ResizeDirection::BottomRight => {
-                (start_left, start_top)
-            }
-            ResizeDirection::Left => (start_right - new_w, start_top),
-            ResizeDirection::Top => (start_left, start_bottom - new_h),
+            ResizeDirection::Right => (start_left, start_center_y - new_h * 0.5),
+            ResizeDirection::Bottom => (start_center_x - new_w * 0.5, start_top),
+            ResizeDirection::BottomRight => (start_left, start_top),
+            ResizeDirection::Left => (start_right - new_w, start_center_y - new_h * 0.5),
+            ResizeDirection::Top => (start_center_x - new_w * 0.5, start_bottom - new_h),
             ResizeDirection::TopLeft => (start_right - new_w, start_bottom - new_h),
             ResizeDirection::TopRight => (start_left, start_bottom - new_h),
             ResizeDirection::BottomLeft => (start_right - new_w, start_top),
@@ -24345,7 +24355,7 @@ impl ImageViewer {
         self.resize_last_size = Some(new_size);
 
         match direction {
-            ResizeDirection::Right | ResizeDirection::Bottom | ResizeDirection::BottomRight => {
+            ResizeDirection::BottomRight => {
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(new_size));
             }
             _ => {
