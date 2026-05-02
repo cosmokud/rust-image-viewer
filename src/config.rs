@@ -2425,3 +2425,46 @@ fn parse_u8_clamped(value: &str) -> Option<u8> {
 
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ini_value<'a>(content: &'a str, key: &str) -> Option<&'a str> {
+        content.lines().find_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty()
+                || trimmed.starts_with(';')
+                || trimmed.starts_with('#')
+                || trimmed.starts_with('[')
+            {
+                return None;
+            }
+
+            let (lhs, rhs) = trimmed.split_once('=')?;
+            if lhs.trim().eq_ignore_ascii_case(key) {
+                Some(rhs.trim())
+            } else {
+                None
+            }
+        })
+    }
+
+    #[test]
+    fn parse_and_render_adds_missing_keys_without_overwriting_existing_values() {
+        let partial = r#"
+[Settings]
+controls_hide_delay = 2.5
+"#;
+
+        let config = Config::parse_ini(partial);
+        let rendered = config.render_ini_from_template();
+
+        // Existing key keeps user value.
+        assert_eq!(ini_value(&rendered, "controls_hide_delay"), Some("2.5"));
+
+        // Missing keys from old config are still injected from template/defaults.
+        assert!(ini_value(&rendered, "bottom_overlay_hide_delay").is_some());
+        assert!(ini_value(&rendered, "single_instance").is_some());
+    }
+}
