@@ -909,11 +909,6 @@ impl MangaLoader {
             .unwrap_or(false)
     }
 
-    fn reliable_video_dimensions(path: &std::path::Path) -> Option<(u32, u32)> {
-        lookup_cached_dimensions(path, CachedMediaKind::Video)
-            .or_else(|| probe_video_dimensions_without_gstreamer(path))
-    }
-
     /// Load a single image on a worker thread.
     /// For video files, this extracts the first frame as a thumbnail placeholder.
     fn load_single_image(req: &LoadRequest) -> Option<DecodedImage> {
@@ -1211,23 +1206,28 @@ impl MangaLoader {
         path: &std::path::Path,
         max_texture_side: u32,
     ) -> Option<(Vec<u8>, u32, u32, u32, u32)> {
-        let is_webm = Self::is_webm_video_path(path);
-        let gstreamer_available = gstreamer_runtime_available();
-        let min_acceptable_side = ((max_texture_side.max(1) as f32) * 0.75).ceil() as u32;
+        let use_gstreamer_for_webm =
+            Self::is_webm_video_path(path) && gstreamer_runtime_available();
 
         if let Some(mut cached) = lookup_cached_video_thumbnail(path, max_texture_side) {
             let cached_side = cached.width.max(cached.height);
-            let cached_is_too_small_for_webm =
-                is_webm && gstreamer_available && cached_side < min_acceptable_side;
-            if !cached_is_too_small_for_webm {
-                if let Some((original_width, original_height)) = Self::reliable_video_dimensions(path)
-                {
-                    if cached.original_width != original_width
-                        || cached.original_height != original_height
+            let cached_is_too_small_for_webm = use_gstreamer_for_webm
+                && cached_side.saturating_mul(4) < max_texture_side.max(1) * 3;
+            if cached_is_too_small_for_webm {
+                // Windows shell thumbnails can be tiny for WebM. Ignore those stale low-LOD
+                // cache entries and let the bounded GStreamer extractor overwrite them.
+            } else {
+                if !gstreamer_runtime_available() {
+                    if let Some((original_width, original_height)) =
+                        probe_video_dimensions_without_gstreamer(path)
                     {
-                        cached.original_width = original_width;
-                        cached.original_height = original_height;
-                        store_cached_video_thumbnail(path, max_texture_side, &cached);
+                        if cached.original_width != original_width
+                            || cached.original_height != original_height
+                        {
+                            cached.original_width = original_width;
+                            cached.original_height = original_height;
+                            store_cached_video_thumbnail(path, max_texture_side, &cached);
+                        }
                     }
                 }
 
@@ -1241,13 +1241,10 @@ impl MangaLoader {
             }
         }
 
-        if let Some((pixels, width, height, original_width, original_height)) =
-            extract_video_first_frame_without_gstreamer(path, max_texture_side)
-        {
-            let extracted_side = width.max(height);
-            let extracted_is_too_small_for_webm =
-                is_webm && gstreamer_available && extracted_side < min_acceptable_side;
-            if !extracted_is_too_small_for_webm {
+        if !use_gstreamer_for_webm {
+            if let Some((pixels, width, height, original_width, original_height)) =
+                extract_video_first_frame_without_gstreamer(path, max_texture_side)
+            {
                 store_cached_video_thumbnail(
                     path,
                     max_texture_side,
@@ -1264,7 +1261,7 @@ impl MangaLoader {
             }
         }
 
-        if !gstreamer_available {
+        if !gstreamer_runtime_available() {
             return None;
         }
 
@@ -1286,9 +1283,9 @@ impl MangaLoader {
         // Build URI from path
         let uri = gst::glib::filename_to_uri(path, None).ok()?.to_string();
 
-        let source_dimensions = Self::reliable_video_dimensions(path);
+        let source_dimensions = Self::probe_video_dimensions_fast(path);
         let output_dimensions =
-            Self::video_thumbnail_output_dimensions(source_dimensions, max_texture_side);
+            Self::video_thumbnail_output_dimensions(Some(source_dimensions), max_texture_side);
         let caps_filter = match output_dimensions {
             Some((width, height)) if width > 0 && height > 0 => {
                 format!("video/x-raw,format=RGBA,width={},height={}", width, height)
@@ -1351,7 +1348,7 @@ impl MangaLoader {
         let mut got_frame = false;
 
         // Wait for ASYNC_DONE or ERROR, with timeout
-        let timeout_ms = if is_webm { 500 } else { 250 };
+        let timeout_ms = if use_gstreamer_for_webm { 500 } else { 250 };
         let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
         while std::time::Instant::now() < deadline {
             if let Some(msg) = bus.timed_pop(gst::ClockTime::from_mseconds(50)) {
@@ -1394,7 +1391,7 @@ impl MangaLoader {
             return None;
         }
 
-        let (original_width, original_height) = source_dimensions.unwrap_or((width, height));
+        let (original_width, original_height) = source_dimensions;
 
         // Downscale if needed for GPU texture limits
         let (final_width, final_height, final_pixels) = downscale_rgba_if_needed(

@@ -14487,19 +14487,12 @@ impl ImageViewer {
             .clamp(1, max_side);
 
         if self.is_masonry_mode() {
-            let masonry_active_preview = matches!(
-                media_type,
-                MangaMediaType::Video | MangaMediaType::AnimatedImage
-            ) && (self.manga_hovered_media_index == Some(index)
-                || self.manga_focused_video_index == Some(index)
-                || self.manga_focused_anim_index == Some(index));
             let is_playback_media = matches!(
                 media_type,
                 MangaMediaType::Video | MangaMediaType::AnimatedImage
             );
-            let fill_cap = if masonry_active_preview {
-                max_side
-            } else if is_playback_media || !self.masonry_navigation_active_for_heavy_work() {
+            let fill_cap = if is_playback_media || !self.masonry_navigation_active_for_heavy_work()
+            {
                 self.masonry_fill_target_side_cap()
             } else {
                 self.masonry_navigation_target_side_cap()
@@ -19385,23 +19378,14 @@ impl ImageViewer {
                     );
                 }
 
-                let aggressive_masonry_video_upgrade = self.is_masonry_mode()
-                    && retry_media_type == MangaMediaType::Video
-                    && (final_retry_dims.0 > tex_w || final_retry_dims.1 > tex_h)
-                    && (final_retry_dims.0.max(final_retry_dims.1)
-                        >= tex_w.max(tex_h).saturating_add(32)
-                        || (final_retry_dims.0 as u64 * final_retry_dims.1 as u64)
-                            > (tex_w as u64 * tex_h as u64).saturating_mul(5) / 4);
-
                 if video_thumbnail_retry_allowed
-                    && (aggressive_masonry_video_upgrade
-                        || self.manga_texture_upgrade_needed(
-                            tex_w,
-                            tex_h,
-                            final_retry_dims.0,
-                            final_retry_dims.1,
-                            retry_media_type,
-                        ))
+                    && self.manga_texture_upgrade_needed(
+                        tex_w,
+                        tex_h,
+                        final_retry_dims.0,
+                        final_retry_dims.1,
+                        retry_media_type,
+                    )
                 {
                     requested_retry |= self.manga_request_retry_for_visible_item(
                         idx,
