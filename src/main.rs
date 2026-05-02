@@ -2373,6 +2373,9 @@ struct ImageViewer {
     floating_zoom_inside_window_locked: bool,
     /// Stable inner-center anchor used during autosize bursts to avoid center jitter.
     floating_autosize_anchor_inner_center: Option<egui::Pos2>,
+    /// Last inner size requested by floating autosize; used to keep image centering in lockstep
+    /// with native window resize updates during wheel-zoom growth.
+    floating_autosize_expected_inner_size: Option<egui::Vec2>,
 
     // ============ PERFORMANCE OPTIMIZATION FIELDS ============
     /// Whether any animation or state change requires a repaint
@@ -2865,6 +2868,7 @@ impl Default for ImageViewer {
             floating_drag_start_cursor_screen: None,
             floating_zoom_inside_window_locked: false,
             floating_autosize_anchor_inner_center: None,
+            floating_autosize_expected_inner_size: None,
 
             // Performance optimization fields
             needs_repaint: false,
@@ -10904,6 +10908,23 @@ impl ImageViewer {
         self.floating_drag_start_outer_pos = None;
         self.floating_drag_start_cursor_screen = None;
         self.floating_autosize_anchor_inner_center = None;
+        self.floating_autosize_expected_inner_size = None;
+    }
+
+    fn floating_monitor_bounds_points(&self, ctx: &egui::Context) -> Option<egui::Vec2> {
+        let mut monitor_bounds = ctx.input(|i| i.raw.viewport().monitor_size);
+        #[cfg(target_os = "windows")]
+        {
+            let primary_bounds = get_primary_monitor_size();
+            monitor_bounds = Some(match monitor_bounds {
+                Some(bounds) => egui::vec2(
+                    bounds.x.max(primary_bounds.x),
+                    bounds.y.max(primary_bounds.y),
+                ),
+                None => primary_bounds,
+            });
+        }
+        monitor_bounds
     }
 
     fn floating_zoom_inside_window_active(&self, ctx: &egui::Context) -> bool {
@@ -10919,6 +10940,22 @@ impl ImageViewer {
             .map(|inner_rect| {
                 display_size.x > inner_rect.width() + 0.5
                     || display_size.y > inner_rect.height() + 0.5
+            })
+            .unwrap_or(false)
+    }
+
+    fn floating_pre_inside_window_resize_phase(&self, ctx: &egui::Context) -> bool {
+        if self.is_fullscreen || self.floating_zoom_inside_window_active(ctx) {
+            return false;
+        }
+
+        ctx.input(|i| i.raw.viewport().inner_rect)
+            .zip(self.floating_monitor_bounds_points(ctx))
+            .map(|(inner_rect, monitor)| {
+                monitor.x > 0.0
+                    && monitor.y > 0.0
+                    && inner_rect.width() < monitor.x - 0.5
+                    && inner_rect.height() < monitor.y - 0.5
             })
             .unwrap_or(false)
     }
@@ -13593,29 +13630,7 @@ impl ImageViewer {
         // In floating mode while the native window can still grow (inside-window zoom not yet
         // active), avoid smoothing to prevent visible image lag/black-bar shimmer during
         // wheel zoom + autosize bursts.
-        let mut monitor_bounds = ctx.input(|i| i.raw.viewport().monitor_size);
-        #[cfg(target_os = "windows")]
-        {
-            let primary_bounds = get_primary_monitor_size();
-            monitor_bounds = Some(match monitor_bounds {
-                Some(bounds) => egui::vec2(
-                    bounds.x.max(primary_bounds.x),
-                    bounds.y.max(primary_bounds.y),
-                ),
-                None => primary_bounds,
-            });
-        }
-        let window_under_monitor = ctx
-            .input(|i| i.raw.viewport().inner_rect)
-            .zip(monitor_bounds)
-            .map(|(inner_rect, monitor)| {
-                monitor.x > 0.0
-                    && monitor.y > 0.0
-                    && inner_rect.width() < monitor.x - 0.5
-                    && inner_rect.height() < monitor.y - 0.5
-            })
-            .unwrap_or(false);
-        if window_under_monitor && !self.floating_zoom_inside_window_active(ctx) {
+        if self.floating_pre_inside_window_resize_phase(ctx) {
             self.zoom = self.zoom_target;
             self.zoom_velocity = 0.0;
             return false;
@@ -20988,11 +21003,13 @@ impl ImageViewer {
             || self.defer_media_view_reset
         {
             self.floating_autosize_anchor_inner_center = None;
+            self.floating_autosize_expected_inner_size = None;
             return;
         }
 
         let Some(mut desired) = self.image_display_size_at_zoom() else {
             self.floating_autosize_anchor_inner_center = None;
+            self.floating_autosize_expected_inner_size = None;
             return;
         };
 
@@ -21009,6 +21026,7 @@ impl ImageViewer {
             .unwrap_or(false);
         if zoom_inside_current_viewport && self.floating_zoom_inside_window_locked {
             self.floating_autosize_anchor_inner_center = None;
+            self.floating_autosize_expected_inner_size = None;
             return;
         } else if !zoom_inside_current_viewport {
             self.floating_zoom_inside_window_locked = false;
@@ -21016,20 +21034,7 @@ impl ImageViewer {
 
         // Once the floating window reaches display bounds, keep zooming inside the viewport
         // instead of continuing to grow the native window.
-        let mut monitor_bounds = ctx.input(|i| i.raw.viewport().monitor_size);
-        #[cfg(target_os = "windows")]
-        {
-            // `viewport.monitor_size` can be undersized on some setups; use the primary
-            // monitor dimensions as a safety floor so we don't trigger in-window zoom too early.
-            let primary_bounds = get_primary_monitor_size();
-            monitor_bounds = Some(match monitor_bounds {
-                Some(bounds) => egui::vec2(
-                    bounds.x.max(primary_bounds.x),
-                    bounds.y.max(primary_bounds.y),
-                ),
-                None => primary_bounds,
-            });
-        }
+        let monitor_bounds = self.floating_monitor_bounds_points(ctx);
 
         if let Some(monitor_bounds) = monitor_bounds {
             if monitor_bounds.x > 0.0
@@ -21047,6 +21052,7 @@ impl ImageViewer {
 
                 if current_window_exceeds_monitor {
                     self.floating_autosize_anchor_inner_center = None;
+                    self.floating_autosize_expected_inner_size = None;
                     return;
                 }
 
@@ -21083,8 +21089,10 @@ impl ImageViewer {
             }
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(desired));
             self.floating_autosize_anchor_inner_center = anchor_center;
+            self.floating_autosize_expected_inner_size = Some(desired);
         } else {
             self.floating_autosize_anchor_inner_center = current_inner_center;
+            self.floating_autosize_expected_inner_size = None;
         }
     }
 
@@ -24726,13 +24734,19 @@ impl ImageViewer {
                             self.zoom = new_zoom;
                             self.zoom_target = new_zoom;
 
-                            let has_offset = self.offset.length() > 0.1;
-                            if old_zoom > 1.0 || self.zoom > 1.0 || has_offset {
-                                let rect_center = screen_rect.center();
-                                let cursor_offset = pos - rect_center;
-                                let zoom_ratio = self.zoom / old_zoom;
-                                self.offset =
-                                    self.offset * zoom_ratio - cursor_offset * (zoom_ratio - 1.0);
+                            if self.floating_pre_inside_window_resize_phase(ctx) {
+                                // Keep image perfectly centered while the native floating window
+                                // is still growing to avoid black-bar bounce.
+                                self.offset = egui::Vec2::ZERO;
+                            } else {
+                                let has_offset = self.offset.length() > 0.1;
+                                if old_zoom > 1.0 || self.zoom > 1.0 || has_offset {
+                                    let rect_center = screen_rect.center();
+                                    let cursor_offset = pos - rect_center;
+                                    let zoom_ratio = self.zoom / old_zoom;
+                                    self.offset = self.offset * zoom_ratio
+                                        - cursor_offset * (zoom_ratio - 1.0);
+                                }
                             }
                             self.zoom_velocity = 0.0;
                         }
@@ -24769,13 +24783,19 @@ impl ImageViewer {
                                 self.zoom = new_zoom;
                                 self.zoom_target = new_zoom;
 
-                                let has_offset = self.offset.length() > 0.1;
-                                if old_zoom > 1.0 || self.zoom > 1.0 || has_offset {
-                                    let rect_center = screen_rect.center();
-                                    let cursor_offset = pos - rect_center;
-                                    let zoom_ratio = self.zoom / old_zoom;
-                                    self.offset = self.offset * zoom_ratio
-                                        - cursor_offset * (zoom_ratio - 1.0);
+                                if self.floating_pre_inside_window_resize_phase(ctx) {
+                                    // Keep image perfectly centered while the native floating
+                                    // window is still growing to avoid black-bar bounce.
+                                    self.offset = egui::Vec2::ZERO;
+                                } else {
+                                    let has_offset = self.offset.length() > 0.1;
+                                    if old_zoom > 1.0 || self.zoom > 1.0 || has_offset {
+                                        let rect_center = screen_rect.center();
+                                        let cursor_offset = pos - rect_center;
+                                        let zoom_ratio = self.zoom / old_zoom;
+                                        self.offset = self.offset * zoom_ratio
+                                            - cursor_offset * (zoom_ratio - 1.0);
+                                    }
                                 }
                                 self.zoom_velocity = 0.0;
                             }
@@ -25199,6 +25219,14 @@ impl ImageViewer {
                             } else {
                                 available.center()
                             }
+                        }
+                    } else if self.floating_pre_inside_window_resize_phase(ctx) {
+                        // During floating wheel-zoom window growth, follow the latest commanded
+                        // inner size center to keep image and window resize visually in lockstep.
+                        if let Some(expected_size) = self.floating_autosize_expected_inner_size {
+                            egui::pos2(expected_size.x / 2.0, expected_size.y / 2.0)
+                        } else {
+                            available.center()
                         }
                     } else {
                         available.center() + self.offset
