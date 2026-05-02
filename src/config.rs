@@ -557,6 +557,9 @@ pub struct Config {
     pub video_prefer_hardware_decode: bool,
     /// Disable hardware decoders and force software decode path.
     pub video_disable_hardware_decode: bool,
+    /// When true, next/previous in video-like playback mode skips to video/animated media only.
+    /// When false, next/previous navigates all files in the list.
+    pub videos_only_navigation: bool,
     /// Priority binding for previous video-file navigation while solo video playback is active.
     pub video_priority_previous_file_binding: Option<InputBinding>,
     /// Priority binding for next video-file navigation while solo video playback is active.
@@ -684,6 +687,7 @@ impl Config {
             video_seek_policy: VideoSeekPolicy::Adaptive,
             video_prefer_hardware_decode: true,
             video_disable_hardware_decode: false,
+            videos_only_navigation: true,
             video_priority_previous_file_binding: Some(InputBinding::Key(egui::Key::PageUp)),
             video_priority_next_file_binding: Some(InputBinding::Key(egui::Key::PageDown)),
             video_priority_play_pause_binding: Some(InputBinding::Key(egui::Key::Space)),
@@ -1574,6 +1578,11 @@ impl Config {
                                 config.video_disable_hardware_decode = v;
                             }
                         }
+                        "videos_only_navigation" => {
+                            if let Some(v) = parse_bool(value) {
+                                config.videos_only_navigation = v;
+                            }
+                        }
                         "priority_previous_file_binding"
                         | "priority_prev_file_binding"
                         | "priority_pageup_binding" => {
@@ -2012,6 +2021,10 @@ impl Config {
         values.insert(
             "disable_hardware_decode",
             bool_to_ini(self.video_disable_hardware_decode).to_string(),
+        );
+        values.insert(
+            "videos_only_navigation",
+            bool_to_ini(self.videos_only_navigation).to_string(),
         );
         values.insert(
             "priority_previous_file_binding",

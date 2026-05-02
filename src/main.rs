@@ -7484,6 +7484,38 @@ impl ImageViewer {
             && (self.anim_stream_rx.is_some() || !self.anim_stream_done)
     }
 
+    fn navigation_tooltip_previous(&self) -> &'static str {
+        if self.config.videos_only_navigation {
+            "Previous file (videos only)"
+        } else {
+            "Previous file"
+        }
+    }
+
+    fn navigation_tooltip_next(&self) -> &'static str {
+        if self.config.videos_only_navigation {
+            "Next file (videos only)"
+        } else {
+            "Next file"
+        }
+    }
+
+    fn navigate_prev_for_video_mode(&mut self) {
+        if self.config.videos_only_navigation {
+            self.navigate_video_file(false);
+        } else {
+            self.prev_image();
+        }
+    }
+
+    fn navigate_next_for_video_mode(&mut self) {
+        if self.config.videos_only_navigation {
+            self.navigate_video_file(true);
+        } else {
+            self.next_image();
+        }
+    }
+
     fn frame_delay_for_fps(fps: u32) -> Duration {
         let clamped = fps.clamp(1, 240);
         Duration::from_secs_f64(1.0 / clamped as f64)
@@ -11421,17 +11453,17 @@ impl ImageViewer {
         });
 
         if prev_pressed {
-            if let Some(target_index) = self.adjacent_video_index(false) {
+            if self.config.videos_only_navigation {
                 self.suppress_video_controls_for_next_video_load = true;
-                self.navigate_video_file_to_index(target_index);
             }
+            self.navigate_prev_for_video_mode();
             return true;
         }
         if next_pressed {
-            if let Some(target_index) = self.adjacent_video_index(true) {
+            if self.config.videos_only_navigation {
                 self.suppress_video_controls_for_next_video_load = true;
-                self.navigate_video_file_to_index(target_index);
             }
+            self.navigate_next_for_video_mode();
             return true;
         }
         if pause_pressed {
@@ -22022,14 +22054,14 @@ impl ImageViewer {
 
             if page_up && !page_up_bound {
                 if self.video_navigation_mode_active() {
-                    self.navigate_video_file(false);
+                    self.navigate_prev_for_video_mode();
                 } else {
                     self.prev_image();
                 }
             }
             if page_down && !page_down_bound {
                 if self.video_navigation_mode_active() {
-                    self.navigate_video_file(true);
+                    self.navigate_next_for_video_mode();
                 } else {
                     self.next_image();
                 }
@@ -23349,7 +23381,7 @@ impl ImageViewer {
                 let prev_btn = Self::video_control_icon_button(
                     ui,
                     VideoControlIcon::Previous,
-                    "Previous file",
+                    self.navigation_tooltip_previous(),
                     None,
                     false,
                 );
@@ -23360,7 +23392,7 @@ impl ImageViewer {
                 let next_btn = Self::video_control_icon_button(
                     ui,
                     VideoControlIcon::Next,
-                    "Next file",
+                    self.navigation_tooltip_next(),
                     None,
                     false,
                 );
@@ -23548,8 +23580,8 @@ impl ImageViewer {
 
         if let Some(navigation) = file_navigation_requested {
             match navigation {
-                VideoFileNavigation::Previous => self.navigate_video_file(false),
-                VideoFileNavigation::Next => self.navigate_video_file(true),
+                VideoFileNavigation::Previous => self.navigate_prev_for_video_mode(),
+                VideoFileNavigation::Next => self.navigate_next_for_video_mode(),
             }
         }
     }
@@ -23764,7 +23796,7 @@ impl ImageViewer {
                 let prev_btn = Self::video_control_icon_button(
                     ui,
                     VideoControlIcon::Previous,
-                    "Previous file",
+                    self.navigation_tooltip_previous(),
                     None,
                     false,
                 );
@@ -23775,7 +23807,7 @@ impl ImageViewer {
                 let next_btn = Self::video_control_icon_button(
                     ui,
                     VideoControlIcon::Next,
-                    "Next file",
+                    self.navigation_tooltip_next(),
                     None,
                     false,
                 );
@@ -23817,8 +23849,8 @@ impl ImageViewer {
 
         if let Some(navigation) = file_navigation_requested {
             match navigation {
-                VideoFileNavigation::Previous => self.navigate_video_file(false),
-                VideoFileNavigation::Next => self.navigate_video_file(true),
+                VideoFileNavigation::Previous => self.navigate_prev_for_video_mode(),
+                VideoFileNavigation::Next => self.navigate_next_for_video_mode(),
             }
         }
     }
@@ -24097,7 +24129,7 @@ impl ImageViewer {
                 let prev_btn = Self::video_control_icon_button(
                     ui,
                     VideoControlIcon::Previous,
-                    "Previous file",
+                    self.navigation_tooltip_previous(),
                     None,
                     false,
                 );
@@ -24108,7 +24140,7 @@ impl ImageViewer {
                 let next_btn = Self::video_control_icon_button(
                     ui,
                     VideoControlIcon::Next,
-                    "Next file",
+                    self.navigation_tooltip_next(),
                     None,
                     false,
                 );
@@ -24303,8 +24335,8 @@ impl ImageViewer {
 
         if let Some(navigation) = file_navigation_requested {
             match navigation {
-                VideoFileNavigation::Previous => self.navigate_video_file(false),
-                VideoFileNavigation::Next => self.navigate_video_file(true),
+                VideoFileNavigation::Previous => self.navigate_prev_for_video_mode(),
+                VideoFileNavigation::Next => self.navigate_next_for_video_mode(),
             }
         }
     }
@@ -24472,7 +24504,7 @@ impl ImageViewer {
                 let prev_btn = Self::video_control_icon_button(
                     ui,
                     VideoControlIcon::Previous,
-                    "Previous file",
+                    self.navigation_tooltip_previous(),
                     None,
                     false,
                 );
@@ -24483,7 +24515,7 @@ impl ImageViewer {
                 let next_btn = Self::video_control_icon_button(
                     ui,
                     VideoControlIcon::Next,
-                    "Next file",
+                    self.navigation_tooltip_next(),
                     None,
                     false,
                 );
@@ -24529,8 +24561,8 @@ impl ImageViewer {
 
         if let Some(navigation) = file_navigation_requested {
             match navigation {
-                VideoFileNavigation::Previous => self.navigate_video_file(false),
-                VideoFileNavigation::Next => self.navigate_video_file(true),
+                VideoFileNavigation::Previous => self.navigate_prev_for_video_mode(),
+                VideoFileNavigation::Next => self.navigate_next_for_video_mode(),
             }
         }
     }
