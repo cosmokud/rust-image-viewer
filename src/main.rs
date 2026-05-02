@@ -2632,6 +2632,13 @@ struct ImageViewer {
     gif_seeking: bool,
     /// Preview frame index while seeking GIF
     gif_seek_preview_frame: Option<usize>,
+    /// Optional playback FPS override for animated WebP only.
+    /// `None` keeps native per-frame timing.
+    webp_fps_override: Option<u32>,
+    /// Custom FPS value used when custom mode is selected.
+    webp_custom_fps: u32,
+    /// Whether to show the custom FPS slider in the animated-image controls bar.
+    webp_show_custom_fps_slider: bool,
 
     // ============ BACKGROUND ANIMATION STREAMING ============
     /// Receiver that yields individual `ImageFrame`s as they are decoded on a
@@ -2994,6 +3001,9 @@ impl Default for ImageViewer {
             gif_paused: false,
             gif_seeking: false,
             gif_seek_preview_frame: None,
+            webp_fps_override: None,
+            webp_custom_fps: 60,
+            webp_show_custom_fps_slider: false,
 
             // Background animation streaming fields
             anim_stream_rx: None,
@@ -7423,6 +7433,43 @@ impl ImageViewer {
         egui::Id::new(("manga_video_subtitle_tracks_popup", video_idx))
     }
 
+    fn solo_webp_fps_popup_id() -> egui::Id {
+        egui::Id::new("solo_webp_fps_popup")
+    }
+
+    fn manga_webp_fps_popup_id(gif_idx: usize) -> egui::Id {
+        egui::Id::new(("manga_webp_fps_popup", gif_idx))
+    }
+
+    fn path_is_webp(path: &Path) -> bool {
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("webp"))
+    }
+
+    fn frame_delay_for_fps(fps: u32) -> Duration {
+        let clamped = fps.clamp(1, 240);
+        Duration::from_secs_f64(1.0 / clamped as f64)
+    }
+
+    fn webp_effective_fps_override(&self) -> Option<u32> {
+        self.webp_fps_override.map(|fps| fps.clamp(1, 240))
+    }
+
+    fn update_animation_with_delay(img: &mut LoadedImage, delay: Duration) -> bool {
+        if !img.is_animated() {
+            return false;
+        }
+
+        if img.last_frame_time.elapsed() >= delay {
+            let next = (img.current_frame_index() + 1) % img.frame_count();
+            img.set_frame(next);
+            true
+        } else {
+            false
+        }
+    }
+
     fn video_track_popup_active(&self, ctx: &egui::Context) -> bool {
         let solo_popup_open = self.video_player.is_some()
             && ctx.memory(|mem| {
@@ -7437,7 +7484,14 @@ impl ImageViewer {
             })
         });
 
-        solo_popup_open || manga_popup_open
+        let solo_webp_popup_open =
+            ctx.memory(|mem| mem.is_popup_open(Self::solo_webp_fps_popup_id()));
+
+        let manga_webp_popup_open = self.manga_focused_anim_index.is_some_and(|gif_idx| {
+            ctx.memory(|mem| mem.is_popup_open(Self::manga_webp_fps_popup_id(gif_idx)))
+        });
+
+        solo_popup_open || manga_popup_open || solo_webp_popup_open || manga_webp_popup_open
     }
 
     fn subtitle_candidate_matches_video_stem(video_stem: &str, candidate_stem: &str) -> bool {
@@ -16590,6 +16644,8 @@ impl ImageViewer {
             ctx.request_repaint_after(Duration::from_millis(16));
         }
 
+        let webp_fps_override = self.webp_effective_fps_override();
+
         // ── Update animation frames for the focused animated image only ──
         for &idx in focused_anim_idx.iter() {
             let target_side = self
@@ -16601,10 +16657,16 @@ impl ImageViewer {
                 .unwrap_or(true);
 
             if let Some(img) = self.manga_animated_images.get_mut(&idx) {
+                let webp_override_delay = webp_fps_override
+                    .filter(|_| Self::path_is_webp(img.path.as_path()))
+                    .map(Self::frame_delay_for_fps);
+
                 let frame_changed = if !self.gif_paused && img.frame_count() > 1 {
                     // If still streaming and on the last frame, hold rather than wrap.
                     if !stream_done && img.current_frame_index() + 1 >= img.frame_count() {
                         false
+                    } else if let Some(delay) = webp_override_delay {
+                        Self::update_animation_with_delay(img, delay)
                     } else {
                         img.update_animation()
                     }
@@ -16662,7 +16724,8 @@ impl ImageViewer {
 
                 // Schedule next repaint for animation.
                 if img.frame_count() > 1 && !self.gif_paused {
-                    let current_delay = Duration::from_millis(img.current_delay_ms() as u64);
+                    let current_delay = webp_override_delay
+                        .unwrap_or_else(|| Duration::from_millis(img.current_delay_ms() as u64));
                     let elapsed = img.last_frame_time.elapsed();
                     if elapsed < current_delay {
                         ctx.request_repaint_after(current_delay - elapsed);
@@ -21135,10 +21198,15 @@ impl ImageViewer {
         let solo_video_upload_filter = self.config.downscale_filter.to_image_filter();
         let solo_video_texture_filter = self.config.texture_filter_video;
 
+        let webp_fps_override = self.webp_effective_fps_override();
+
         // Handle image texture updates
         if let Some(ref mut img) = self.image {
             // In manga mode, keep the main image static (first frame only).
             let allow_animation = !self.manga_mode;
+            let webp_override_delay = webp_fps_override
+                .filter(|_| Self::path_is_webp(img.path.as_path()))
+                .map(Self::frame_delay_for_fps);
 
             // Only update animation if not paused and we have more than one frame.
             let frame_changed = if allow_animation && !self.gif_paused && img.is_animated() {
@@ -21148,6 +21216,8 @@ impl ImageViewer {
                 // looping resumes.
                 if !self.anim_stream_done && img.current_frame_index() + 1 >= img.frame_count() {
                     false // wait for more frames
+                } else if let Some(delay) = webp_override_delay {
+                    Self::update_animation_with_delay(img, delay)
                 } else {
                     img.update_animation()
                 }
@@ -21228,7 +21298,8 @@ impl ImageViewer {
             // Only request repaint for animated images that are not paused
             if allow_animation && img.is_animated() && !self.gif_paused {
                 // Calculate time until next frame to avoid unnecessary repaints
-                let current_delay = Duration::from_millis(img.current_delay_ms() as u64);
+                let current_delay = webp_override_delay
+                    .unwrap_or_else(|| Duration::from_millis(img.current_delay_ms() as u64));
                 let elapsed = img.last_frame_time.elapsed();
                 if elapsed < current_delay {
                     // Schedule repaint for when the next frame is due
@@ -23437,6 +23508,60 @@ impl ImageViewer {
         }
     }
 
+    fn draw_webp_fps_controls(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        popup_id: egui::Id,
+    ) {
+        let fps_button = ui.add(egui::Button::new("FPS").min_size(egui::vec2(40.0, 22.0)));
+        if fps_button.clicked() {
+            ui.memory_mut(|mem| mem.toggle_popup(popup_id));
+        }
+
+        let close_on_click_outside = egui::popup::PopupCloseBehavior::CloseOnClickOutside;
+        let _ = egui::popup::popup_below_widget(
+            ui,
+            popup_id,
+            &fps_button,
+            close_on_click_outside,
+            |ui| {
+                ui.set_min_width(120.0);
+
+                for fps in [120_u32, 90, 60, 30, 24] {
+                    if ui.button(format!("{} FPS", fps)).clicked() {
+                        self.webp_fps_override = Some(fps);
+                        self.webp_show_custom_fps_slider = false;
+                        ui.memory_mut(|mem| mem.close_popup());
+                        ctx.request_repaint();
+                    }
+                }
+
+                if ui.button("Custom").clicked() {
+                    self.webp_custom_fps = self.webp_custom_fps.clamp(1, 240);
+                    self.webp_fps_override = Some(self.webp_custom_fps);
+                    self.webp_show_custom_fps_slider = true;
+                    ui.memory_mut(|mem| mem.close_popup());
+                    ctx.request_repaint();
+                }
+
+                ui.rect_contains_pointer(ui.min_rect())
+            },
+        );
+
+        if self.webp_show_custom_fps_slider {
+            ui.add_space(6.0);
+            let mut custom_fps = self.webp_custom_fps.clamp(1, 240);
+            let slider_response =
+                ui.add(egui::Slider::new(&mut custom_fps, 1..=240).text("FPS"));
+            if slider_response.changed() {
+                self.webp_custom_fps = custom_fps;
+                self.webp_fps_override = Some(custom_fps);
+                ctx.request_repaint();
+            }
+        }
+    }
+
     /// Draw GIF seekbar and controls for non-manga mode
     fn draw_gif_seekbar_inner(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let Some(ref img) = self.image else {
@@ -23467,6 +23592,7 @@ impl ImageViewer {
         let animated_label = Self::animated_image_label_for_path(
             self.image_list.get(self.current_index).or(Some(&img.path)),
         );
+        let is_webp = Self::path_is_webp(img.path.as_path());
 
         ui.vertical(|ui| {
             // === Seek bar (top row) ===
@@ -23603,6 +23729,10 @@ impl ImageViewer {
                             .color(egui::Color32::from_rgb(76, 175, 80))
                             .size(14.0),
                     );
+                    if is_webp {
+                        ui.add_space(6.0);
+                        self.draw_webp_fps_controls(ui, ctx, Self::solo_webp_fps_popup_id());
+                    }
                 });
             });
         });
@@ -24133,6 +24263,11 @@ impl ImageViewer {
             img.position_fraction() as f32
         };
         let animated_label = Self::animated_image_label_for_path(self.image_list.get(gif_idx));
+        let is_webp = self
+            .image_list
+            .get(gif_idx)
+            .is_some_and(|path| Self::path_is_webp(path.as_path()))
+            || Self::path_is_webp(img.path.as_path());
 
         ui.vertical(|ui| {
             // === Seek bar (top row) ===
@@ -24270,6 +24405,14 @@ impl ImageViewer {
                             .color(egui::Color32::from_rgb(76, 175, 80))
                             .size(14.0),
                     );
+                    if is_webp {
+                        ui.add_space(6.0);
+                        self.draw_webp_fps_controls(
+                            ui,
+                            ctx,
+                            Self::manga_webp_fps_popup_id(gif_idx),
+                        );
+                    }
                 });
             });
         });
