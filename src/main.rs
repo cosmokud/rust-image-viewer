@@ -23643,81 +23643,77 @@ impl ImageViewer {
             self.sync_custom_fps_with_current_media_default(media_path, frame_count, total_duration_ms);
         self.webp_custom_fps = self.webp_custom_fps.clamp(1, 240);
 
-        ui.allocate_ui_with_layout(
-            egui::vec2(386.0, 22.0),
-            egui::Layout::left_to_right(egui::Align::Center),
-            |ui| {
-                ui.spacing_mut().item_spacing.x = 4.0;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
 
-                let fps_list_button = ui.add(
-                    egui::Button::new(format!("{} FPS", self.webp_custom_fps))
-                        .min_size(egui::vec2(64.0, 22.0)),
-                );
-                if fps_list_button.clicked() {
-                    ui.memory_mut(|mem| mem.toggle_popup(popup_id));
-                }
+            let mut custom_fps = self.webp_custom_fps.clamp(1, 240);
+            let slider_response = ui.add_sized(
+                [300.0, 22.0],
+                egui::Slider::new(&mut custom_fps, 1..=240)
+                    .smart_aim(false)
+                    .step_by(1.0)
+                    .show_value(false),
+            );
+            if slider_response.changed() {
+                self.webp_custom_fps = custom_fps;
+                self.webp_fps_override = Some(custom_fps);
+                self.webp_show_custom_fps_slider = true;
+                ctx.request_repaint();
+            }
 
-                let mut custom_fps = self.webp_custom_fps.clamp(1, 240);
-                let slider_response = ui.add_sized(
-                    [300.0, 22.0],
-                    egui::Slider::new(&mut custom_fps, 1..=240)
-                        .smart_aim(false)
-                        .step_by(1.0)
-                        .show_value(false),
-                );
-                if slider_response.changed() {
-                    self.webp_custom_fps = custom_fps;
-                    self.webp_fps_override = Some(custom_fps);
-                    self.webp_show_custom_fps_slider = true;
-                    ctx.request_repaint();
-                }
+            let slider_double_clicked = slider_response.double_clicked()
+                || (slider_response.hovered()
+                    && ctx.input(|i| {
+                        i.pointer
+                            .button_double_clicked(egui::PointerButton::Primary)
+                    }));
 
-                let slider_double_clicked = slider_response.double_clicked()
-                    || (slider_response.hovered()
-                        && ctx.input(|i| {
-                            i.pointer
-                                .button_double_clicked(egui::PointerButton::Primary)
-                        }));
+            if slider_double_clicked {
+                self.webp_custom_fps = default_custom_fps;
+                self.webp_fps_override = Some(default_custom_fps);
+                self.webp_show_custom_fps_slider = true;
+                ctx.request_repaint();
+            }
 
-                if slider_double_clicked {
-                    self.webp_custom_fps = default_custom_fps;
-                    self.webp_fps_override = Some(default_custom_fps);
-                    self.webp_show_custom_fps_slider = true;
-                    ctx.request_repaint();
-                }
+            let fps_list_button = ui.add(
+                egui::Button::new(format!("{} FPS", self.webp_custom_fps))
+                    .min_size(egui::vec2(0.0, 22.0)),
+            );
+            if fps_list_button.clicked() {
+                ui.memory_mut(|mem| mem.toggle_popup(popup_id));
+            }
 
-                let close_on_click_outside = egui::popup::PopupCloseBehavior::CloseOnClickOutside;
-                let _ = egui::popup::popup_below_widget(
-                    ui,
-                    popup_id,
-                    &fps_list_button,
-                    close_on_click_outside,
-                    |ui| {
-                        ui.set_min_width(120.0);
+            let close_on_click_outside = egui::popup::PopupCloseBehavior::CloseOnClickOutside;
+            let _ = egui::popup::popup_below_widget(
+                ui,
+                popup_id,
+                &fps_list_button,
+                close_on_click_outside,
+                |ui| {
+                    ui.set_min_width(120.0);
 
-                        for fps in [120_u32, 90, 60, 30, 24] {
-                            if ui.button(format!("{} FPS", fps)).clicked() {
-                                self.webp_custom_fps = fps;
-                                self.webp_fps_override = Some(fps);
-                                self.webp_show_custom_fps_slider = true;
-                                ui.memory_mut(|mem| mem.close_popup());
-                                ctx.request_repaint();
-                            }
-                        }
-
-                        if ui.button("Default").clicked() {
-                            self.webp_fps_override = None;
-                            self.webp_custom_fps = default_custom_fps;
+                    for fps in [120_u32, 90, 60, 30, 24] {
+                        if ui.button(format!("{} FPS", fps)).clicked() {
+                            self.webp_custom_fps = fps;
+                            self.webp_fps_override = Some(fps);
                             self.webp_show_custom_fps_slider = true;
                             ui.memory_mut(|mem| mem.close_popup());
                             ctx.request_repaint();
                         }
+                    }
 
-                        ui.rect_contains_pointer(ui.min_rect())
-                    },
-                );
-            },
-        );
+                    if ui.button("Default").clicked() {
+                        self.webp_fps_override = None;
+                        self.webp_custom_fps = default_custom_fps;
+                        self.webp_show_custom_fps_slider = true;
+                        ui.memory_mut(|mem| mem.close_popup());
+                        ctx.request_repaint();
+                    }
+
+                    ui.rect_contains_pointer(ui.min_rect())
+                },
+            );
+        });
     }
 
     /// Draw GIF seekbar and controls for non-manga mode
