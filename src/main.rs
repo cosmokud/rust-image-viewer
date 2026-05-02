@@ -2363,6 +2363,9 @@ struct ImageViewer {
     resize_start_cursor_screen: Option<egui::Pos2>,
     /// Last commanded window size during resize (for stable content rendering)
     resize_last_size: Option<egui::Vec2>,
+    /// Floating-only guard: manual edge/corner resize exceeded screen bounds, so keep
+    /// window size fixed and zoom inside until the user brings it back within bounds.
+    floating_manual_oversize_lock: bool,
 
     // ============ PERFORMANCE OPTIMIZATION FIELDS ============
     /// Whether any animation or state change requires a repaint
@@ -2851,6 +2854,7 @@ impl Default for ImageViewer {
             resize_start_inner_size: None,
             resize_start_cursor_screen: None,
             resize_last_size: None,
+            floating_manual_oversize_lock: false,
 
             // Performance optimization fields
             needs_repaint: false,
@@ -5880,6 +5884,7 @@ impl ImageViewer {
         self.zoom_velocity = 0.0;
         self.zoom = 1.0;
         self.zoom_target = 1.0;
+        self.floating_manual_oversize_lock = false;
         self.current_rotation_steps = 0;
         self.reset_precise_rotation();
         self.flip_horizontal = false;
@@ -10886,6 +10891,19 @@ impl ImageViewer {
         ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
     }
 
+    fn drag_floating_window_by_pointer_delta(&mut self, ctx: &egui::Context) {
+        let delta = ctx.input(|i| i.pointer.delta());
+        if delta.length_sq() <= f32::EPSILON {
+            return;
+        }
+
+        let outer_min = ctx
+            .input(|i| i.raw.viewport().outer_rect)
+            .map(|rect| rect.min)
+            .unwrap_or(egui::Pos2::ZERO);
+        self.send_outer_position(ctx, outer_min + delta);
+    }
+
     fn apply_manga_pan_step(&mut self, direction: f32, multiplier: f32) {
         let scroll_amount = self.config.manga_arrow_scroll_speed * 0.5 * multiplier;
         if self.manga_add_scroll_target_delta(direction * scroll_amount) {
@@ -13138,6 +13156,25 @@ impl ImageViewer {
             .unwrap_or(self.screen_size)
     }
 
+    fn floating_monitor_bounds(&self, ctx: &egui::Context) -> Option<egui::Vec2> {
+        let mut monitor_bounds = ctx.input(|i| i.raw.viewport().monitor_size);
+        #[cfg(target_os = "windows")]
+        {
+            // `viewport.monitor_size` can be undersized on some setups; use the primary
+            // monitor dimensions as a safety floor so we don't trigger in-window zoom too early.
+            let primary_bounds = get_primary_monitor_size();
+            monitor_bounds = Some(match monitor_bounds {
+                Some(bounds) => egui::vec2(
+                    bounds.x.max(primary_bounds.x),
+                    bounds.y.max(primary_bounds.y),
+                ),
+                None => primary_bounds,
+            });
+        }
+
+        monitor_bounds.filter(|bounds| bounds.x > 0.0 && bounds.y > 0.0)
+    }
+
     fn center_window_on_monitor(&mut self, ctx: &egui::Context, inner_size: egui::Vec2) {
         let monitor = self.monitor_size_points(ctx);
         let x = (monitor.x - inner_size.x) * 0.5;
@@ -13420,6 +13457,7 @@ impl ImageViewer {
 
     fn apply_floating_layout_for_current_image(&mut self, ctx: &egui::Context) {
         self.offset = egui::Vec2::ZERO;
+        self.floating_manual_oversize_lock = false;
 
         let Some((media_w_u, media_h_u)) = self.media_display_dimensions() else {
             return;
@@ -20884,6 +20922,7 @@ impl ImageViewer {
         if self.is_fullscreen
             || self.current_window_is_maximized(ctx)
             || self.is_resizing
+            || self.is_panning
             || self.pending_window_resize.is_some()
             || self.defer_media_view_reset
         {
@@ -20897,36 +20936,48 @@ impl ImageViewer {
         desired.x = desired.x.max(200.0);
         desired.y = desired.y.max(150.0);
 
-        // Once the floating window reaches display bounds, keep zooming inside the viewport
-        // instead of continuing to grow the native window.
-        let mut monitor_bounds = ctx.input(|i| i.raw.viewport().monitor_size);
-        #[cfg(target_os = "windows")]
-        {
-            // `viewport.monitor_size` can be undersized on some setups; use the primary
-            // monitor dimensions as a safety floor so we don't trigger in-window zoom too early.
-            let primary_bounds = get_primary_monitor_size();
-            monitor_bounds = Some(match monitor_bounds {
-                Some(bounds) => egui::vec2(
-                    bounds.x.max(primary_bounds.x),
-                    bounds.y.max(primary_bounds.y),
-                ),
-                None => primary_bounds,
-            });
-        }
+        let (current_inner_rect, current_outer_rect) =
+            ctx.input(|i| (i.raw.viewport().inner_rect, i.raw.viewport().outer_rect));
 
-        if let Some(monitor_bounds) = monitor_bounds {
-            if monitor_bounds.x > 0.0
-                && monitor_bounds.y > 0.0
-                && (desired.x > monitor_bounds.x || desired.y > monitor_bounds.y)
-            {
+        if let Some(monitor_bounds) = self.floating_monitor_bounds(ctx) {
+            let current_exceeds_bounds = current_inner_rect
+                .map(|rect| {
+                    rect.width() > monitor_bounds.x + 0.5 || rect.height() > monitor_bounds.y + 0.5
+                })
+                .unwrap_or(false);
+            let current_clipping_bounds = current_outer_rect
+                .or(current_inner_rect)
+                .map(|rect| {
+                    rect.min.x < -0.5
+                        || rect.min.y < -0.5
+                        || rect.max.x > monitor_bounds.x + 0.5
+                        || rect.max.y > monitor_bounds.y + 0.5
+                })
+                .unwrap_or(false);
+            let image_fits_current_window = current_inner_rect
+                .map(|rect| desired.x <= rect.width() + 0.5 && desired.y <= rect.height() + 0.5)
+                .unwrap_or(false);
+
+            // Manual resize that exceeded the display should not be auto-snapped back.
+            // Keep zooming inside the existing window until either:
+            // 1) user double-click resets floating layout, or
+            // 2) media fits in the current window and that window is fully inside the screen.
+            if self.floating_manual_oversize_lock {
+                if image_fits_current_window && !current_exceeds_bounds && !current_clipping_bounds {
+                    self.floating_manual_oversize_lock = false;
+                } else {
+                    return;
+                }
+            }
+
+            // Once floating autosize hits display bounds, keep zooming inside viewport
+            // instead of growing the native window further.
+            if desired.x > monitor_bounds.x || desired.y > monitor_bounds.y {
                 desired = Self::fit_size_preserving_aspect(desired, monitor_bounds);
                 desired.x = desired.x.max(1.0);
                 desired.y = desired.y.max(1.0);
             }
         }
-
-        let (current_inner_rect, current_outer_rect) =
-            ctx.input(|i| (i.raw.viewport().inner_rect, i.raw.viewport().outer_rect));
 
         let should_send = current_inner_rect
             .map(|rect| (rect.size() - desired).length() > 0.5)
@@ -24372,6 +24423,20 @@ impl ImageViewer {
         let new_size = egui::Vec2::new(new_w, new_h);
         let new_pos = egui::pos2(new_x, new_y);
 
+        if let Some(monitor_bounds) = self.floating_monitor_bounds(ctx) {
+            let exceeds_bounds =
+                new_size.x > monitor_bounds.x + 0.5 || new_size.y > monitor_bounds.y + 0.5;
+            let clips_bounds = new_pos.x < -0.5
+                || new_pos.y < -0.5
+                || new_pos.x + new_size.x > monitor_bounds.x + 0.5
+                || new_pos.y + new_size.y > monitor_bounds.y + 0.5;
+            self.floating_manual_oversize_lock = if self.floating_manual_oversize_lock {
+                exceeds_bounds || clips_bounds
+            } else {
+                exceeds_bounds
+            };
+        }
+
         let new_zoom = self.clamp_zoom(new_h / media_h);
         self.zoom = new_zoom;
         self.zoom_target = new_zoom;
@@ -24811,14 +24876,14 @@ impl ImageViewer {
                                     self.remember_current_fullscreen_view_state();
                                 } else if in_title_bar {
                                     // In floating mode, dragging from title bar always moves window
-                                    ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                                    self.drag_floating_window_by_pointer_delta(ctx);
                                 } else if floating_image_exceeds_window {
                                     // In floating mode when zoomed past 100%, pan image inside window
                                     let delta = ctx.input(|i| i.pointer.delta());
                                     self.offset += delta;
                                 } else {
                                     // In floating mode at/below 100%, drag the window
-                                    ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                                    self.drag_floating_window_by_pointer_delta(ctx);
                                 }
                             }
                         }
@@ -24937,6 +25002,7 @@ impl ImageViewer {
                         self.clear_current_fullscreen_view_memory();
                     } else {
                         // Floating mode: reset to 100% size, or fit to screen if needed.
+                        self.floating_manual_oversize_lock = false;
                         let monitor = self.monitor_size_points(ctx);
                         if let Some((fit_zoom, desired)) =
                             self.floating_layout_size_for_media(img_w, img_h, monitor)
