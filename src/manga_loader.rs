@@ -902,13 +902,6 @@ impl MangaLoader {
         Self::fallback_video_dimensions(path).unwrap_or((1920, 1080))
     }
 
-    fn is_webm_video_path(path: &std::path::Path) -> bool {
-        path.extension()
-            .and_then(|ext| ext.to_str())
-            .map(|ext| ext.eq_ignore_ascii_case("webm"))
-            .unwrap_or(false)
-    }
-
     /// Load a single image on a worker thread.
     /// For video files, this extracts the first frame as a thumbnail placeholder.
     fn load_single_image(req: &LoadRequest) -> Option<DecodedImage> {
@@ -1206,59 +1199,46 @@ impl MangaLoader {
         path: &std::path::Path,
         max_texture_side: u32,
     ) -> Option<(Vec<u8>, u32, u32, u32, u32)> {
-        let use_gstreamer_for_webm =
-            Self::is_webm_video_path(path) && gstreamer_runtime_available();
-
         if let Some(mut cached) = lookup_cached_video_thumbnail(path, max_texture_side) {
-            let cached_side = cached.width.max(cached.height);
-            let cached_is_too_small_for_webm = use_gstreamer_for_webm
-                && cached_side.saturating_mul(4) < max_texture_side.max(1) * 3;
-            if cached_is_too_small_for_webm {
-                // Windows shell thumbnails can be tiny for WebM. Ignore those stale low-LOD
-                // cache entries and let the bounded GStreamer extractor overwrite them.
-            } else {
-                if !gstreamer_runtime_available() {
-                    if let Some((original_width, original_height)) =
-                        probe_video_dimensions_without_gstreamer(path)
+            if !gstreamer_runtime_available() {
+                if let Some((original_width, original_height)) =
+                    probe_video_dimensions_without_gstreamer(path)
+                {
+                    if cached.original_width != original_width
+                        || cached.original_height != original_height
                     {
-                        if cached.original_width != original_width
-                            || cached.original_height != original_height
-                        {
-                            cached.original_width = original_width;
-                            cached.original_height = original_height;
-                            store_cached_video_thumbnail(path, max_texture_side, &cached);
-                        }
+                        cached.original_width = original_width;
+                        cached.original_height = original_height;
+                        store_cached_video_thumbnail(path, max_texture_side, &cached);
                     }
                 }
-
-                return Some((
-                    cached.pixels,
-                    cached.width,
-                    cached.height,
-                    cached.original_width,
-                    cached.original_height,
-                ));
             }
+
+            return Some((
+                cached.pixels,
+                cached.width,
+                cached.height,
+                cached.original_width,
+                cached.original_height,
+            ));
         }
 
-        if !use_gstreamer_for_webm {
-            if let Some((pixels, width, height, original_width, original_height)) =
-                extract_video_first_frame_without_gstreamer(path, max_texture_side)
-            {
-                store_cached_video_thumbnail(
-                    path,
-                    max_texture_side,
-                    &CachedVideoThumbnail {
-                        pixels: pixels.clone(),
-                        width,
-                        height,
-                        original_width,
-                        original_height,
-                    },
-                );
+        if let Some((pixels, width, height, original_width, original_height)) =
+            extract_video_first_frame_without_gstreamer(path, max_texture_side)
+        {
+            store_cached_video_thumbnail(
+                path,
+                max_texture_side,
+                &CachedVideoThumbnail {
+                    pixels: pixels.clone(),
+                    width,
+                    height,
+                    original_width,
+                    original_height,
+                },
+            );
 
-                return Some((pixels, width, height, original_width, original_height));
-            }
+            return Some((pixels, width, height, original_width, original_height));
         }
 
         if !gstreamer_runtime_available() {
@@ -1348,8 +1328,7 @@ impl MangaLoader {
         let mut got_frame = false;
 
         // Wait for ASYNC_DONE or ERROR, with timeout
-        let timeout_ms = if use_gstreamer_for_webm { 500 } else { 250 };
-        let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
+        let deadline = std::time::Instant::now() + Duration::from_millis(250);
         while std::time::Instant::now() < deadline {
             if let Some(msg) = bus.timed_pop(gst::ClockTime::from_mseconds(50)) {
                 match msg.view() {
