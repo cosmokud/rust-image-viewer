@@ -10913,8 +10913,8 @@ impl ImageViewer {
 
         ctx.input(|i| i.raw.viewport().inner_rect)
             .map(|inner_rect| {
-                display_size.x > inner_rect.width() + 0.5
-                    || display_size.y > inner_rect.height() + 0.5
+                display_size.x > inner_rect.width() + 1.0
+                    || display_size.y > inner_rect.height() + 1.0
             })
             .unwrap_or(false)
     }
@@ -20968,7 +20968,7 @@ impl ImageViewer {
         // While the zoomed media already exceeds the current floating viewport, keep this
         // "zoom inside window" mode stable and do not autosize the native window.
         let zoom_inside_current_viewport = current_inner_rect
-            .map(|rect| desired.x > rect.width() + 0.5 || desired.y > rect.height() + 0.5)
+            .map(|rect| desired.x > rect.width() + 1.0 || desired.y > rect.height() + 1.0)
             .unwrap_or(false);
         if zoom_inside_current_viewport && self.floating_zoom_inside_window_locked {
             return;
@@ -24465,8 +24465,8 @@ impl ImageViewer {
             .image_display_size_at_zoom()
             .and_then(|display_size| {
                 ctx.input(|i| i.raw.viewport().inner_rect).map(|inner_rect| {
-                    display_size.x > inner_rect.width() + 0.5
-                        || display_size.y > inner_rect.height() + 0.5
+                    display_size.x > inner_rect.width() + 1.0
+                        || display_size.y > inner_rect.height() + 1.0
                 })
             })
             .unwrap_or(false);
@@ -24476,7 +24476,7 @@ impl ImageViewer {
             self.zoom_target = self.zoom;
         } else {
             self.floating_zoom_inside_window_locked = false;
-            let new_zoom = self.clamp_zoom(new_h / media_h);
+            let new_zoom = self.clamp_zoom((new_w / media_w).min(new_h / media_h));
             self.zoom = new_zoom;
             self.zoom_target = new_zoom;
             self.offset = egui::Vec2::ZERO;
