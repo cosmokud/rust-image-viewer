@@ -317,6 +317,9 @@ pub struct VideoTrackInfo {
 enum SubtitleFontFallbackProfile {
     Cjk,
     Arabic,
+    Hebrew,
+    Thai,
+    Vietnamese,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -368,6 +371,12 @@ const SUBTITLE_FONT_DESC_FALLBACK_CJK: &str =
     "Noto Sans CJK JP, Noto Sans CJK SC, Noto Sans CJK KR, Microsoft YaHei, Meiryo, Malgun Gothic, Sans";
 const SUBTITLE_FONT_DESC_FALLBACK_ARABIC: &str =
     "Noto Naskh Arabic, Noto Sans Arabic, Amiri, Scheherazade New, Tahoma, Arial, Sans";
+const SUBTITLE_FONT_DESC_FALLBACK_HEBREW: &str =
+    "Noto Sans Hebrew, Noto Serif Hebrew, Rubik, Arial Hebrew, Arial, Sans";
+const SUBTITLE_FONT_DESC_FALLBACK_THAI: &str =
+    "Noto Sans Thai, Noto Serif Thai, Leelawadee UI, Leelawadee, Tahoma, Sans";
+const SUBTITLE_FONT_DESC_FALLBACK_VIETNAMESE: &str =
+    "Noto Sans, Be Vietnam Pro, Arial, Tahoma, Segoe UI, Sans";
 
 impl VideoState {
     fn adaptive_capacity_for_dims(width: u32, height: u32) -> usize {
@@ -771,6 +780,7 @@ fn short_language_tag(value: &str) -> Option<String> {
         "pt" | "por" | "portuguese" => "PT",
         "ru" | "rus" | "russian" => "RU",
         "ar" | "ara" | "arabic" => "AR",
+        "he" | "heb" | "hebrew" => "HE",
         "th" | "tha" | "thai" => "TH",
         "vi" | "vie" | "vietnamese" => "VI",
         "id" | "ind" | "indonesian" => "ID",
@@ -804,6 +814,9 @@ fn subtitle_font_fallback_profile_for_hint(value: &str) -> Option<SubtitleFontFa
         }
         "ko" | "kr" | "kor" | "korean" => Some(SubtitleFontFallbackProfile::Cjk),
         "ar" | "ara" | "arabic" => Some(SubtitleFontFallbackProfile::Arabic),
+        "he" | "heb" | "hebrew" => Some(SubtitleFontFallbackProfile::Hebrew),
+        "th" | "tha" | "thai" => Some(SubtitleFontFallbackProfile::Thai),
+        "vi" | "vie" | "vietnamese" | "vn" => Some(SubtitleFontFallbackProfile::Vietnamese),
         _ => None,
     }
 }
@@ -821,6 +834,9 @@ fn subtitle_font_desc_for_profile(profile: SubtitleFontFallbackProfile) -> &'sta
     match profile {
         SubtitleFontFallbackProfile::Cjk => SUBTITLE_FONT_DESC_FALLBACK_CJK,
         SubtitleFontFallbackProfile::Arabic => SUBTITLE_FONT_DESC_FALLBACK_ARABIC,
+        SubtitleFontFallbackProfile::Hebrew => SUBTITLE_FONT_DESC_FALLBACK_HEBREW,
+        SubtitleFontFallbackProfile::Thai => SUBTITLE_FONT_DESC_FALLBACK_THAI,
+        SubtitleFontFallbackProfile::Vietnamese => SUBTITLE_FONT_DESC_FALLBACK_VIETNAMESE,
     }
 }
 
