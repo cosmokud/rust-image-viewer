@@ -20939,6 +20939,15 @@ impl ImageViewer {
         let (current_inner_rect, current_outer_rect) =
             ctx.input(|i| (i.raw.viewport().inner_rect, i.raw.viewport().outer_rect));
 
+        // While the zoomed media already exceeds the current floating viewport, keep this
+        // "zoom inside window" mode stable and do not autosize the native window.
+        let zoom_inside_current_viewport = current_inner_rect
+            .map(|rect| desired.x > rect.width() + 0.5 || desired.y > rect.height() + 0.5)
+            .unwrap_or(false);
+        if zoom_inside_current_viewport {
+            return;
+        }
+
         // Once the floating window reaches display bounds, keep zooming inside the viewport
         // instead of continuing to grow the native window.
         let mut monitor_bounds = ctx.input(|i| i.raw.viewport().monitor_size);
@@ -24424,11 +24433,25 @@ impl ImageViewer {
         let new_size = egui::Vec2::new(new_w, new_h);
         let new_pos = egui::pos2(new_x, new_y);
 
-        let new_zoom = self.clamp_zoom(new_h / media_h);
-        self.zoom = new_zoom;
-        self.zoom_target = new_zoom;
+        let keep_zoom_inside_window_mode = self
+            .image_display_size_at_zoom()
+            .and_then(|display_size| {
+                ctx.input(|i| i.raw.viewport().inner_rect).map(|inner_rect| {
+                    display_size.x > inner_rect.width() + 0.5
+                        || display_size.y > inner_rect.height() + 0.5
+                })
+            })
+            .unwrap_or(false);
+
+        if keep_zoom_inside_window_mode {
+            self.zoom_target = self.zoom;
+        } else {
+            let new_zoom = self.clamp_zoom(new_h / media_h);
+            self.zoom = new_zoom;
+            self.zoom_target = new_zoom;
+            self.offset = egui::Vec2::ZERO;
+        }
         self.zoom_velocity = 0.0;
-        self.offset = egui::Vec2::ZERO;
         self.resize_last_size = Some(new_size);
 
         match direction {
