@@ -13590,6 +13590,37 @@ impl ImageViewer {
             return false;
         }
 
+        // In floating mode while the native window can still grow (inside-window zoom not yet
+        // active), avoid smoothing to prevent visible image lag/black-bar shimmer during
+        // wheel zoom + autosize bursts.
+        let mut monitor_bounds = ctx.input(|i| i.raw.viewport().monitor_size);
+        #[cfg(target_os = "windows")]
+        {
+            let primary_bounds = get_primary_monitor_size();
+            monitor_bounds = Some(match monitor_bounds {
+                Some(bounds) => egui::vec2(
+                    bounds.x.max(primary_bounds.x),
+                    bounds.y.max(primary_bounds.y),
+                ),
+                None => primary_bounds,
+            });
+        }
+        let window_under_monitor = ctx
+            .input(|i| i.raw.viewport().inner_rect)
+            .zip(monitor_bounds)
+            .map(|(inner_rect, monitor)| {
+                monitor.x > 0.0
+                    && monitor.y > 0.0
+                    && inner_rect.width() < monitor.x - 0.5
+                    && inner_rect.height() < monitor.y - 0.5
+            })
+            .unwrap_or(false);
+        if window_under_monitor && !self.floating_zoom_inside_window_active(ctx) {
+            self.zoom = self.zoom_target;
+            self.zoom_velocity = 0.0;
+            return false;
+        }
+
         let error = self.zoom_target - self.zoom;
 
         // Snap threshold - if we're very close, just snap to target
@@ -24691,8 +24722,9 @@ impl ImageViewer {
                         } else {
                             // In floating mode, follow cursor when zoomed past 100%
                             let old_zoom = self.zoom;
-                            self.zoom_target = self.clamp_zoom(self.zoom_target * factor);
-                            self.zoom = self.clamp_zoom(self.zoom * factor);
+                            let new_zoom = self.clamp_zoom(self.zoom * factor);
+                            self.zoom = new_zoom;
+                            self.zoom_target = new_zoom;
 
                             let has_offset = self.offset.length() > 0.1;
                             if old_zoom > 1.0 || self.zoom > 1.0 || has_offset {
@@ -24733,8 +24765,9 @@ impl ImageViewer {
                                 self.zoom_velocity = 0.0;
                             } else {
                                 let old_zoom = self.zoom;
-                                self.zoom_target = self.clamp_zoom(self.zoom_target * factor);
-                                self.zoom = self.clamp_zoom(self.zoom * factor);
+                                let new_zoom = self.clamp_zoom(self.zoom * factor);
+                                self.zoom = new_zoom;
+                                self.zoom_target = new_zoom;
 
                                 let has_offset = self.offset.length() > 0.1;
                                 if old_zoom > 1.0 || self.zoom > 1.0 || has_offset {
