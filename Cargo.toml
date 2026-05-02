@@ -83,13 +83,15 @@ directories = "6.0"
 
 [package.metadata.packager]
 product-name = "Rust Image Viewer"
-identifier = "com.cosmokud.rust-image-viewer"
+identifier = "dev.rust-image-viewer.app"
+publisher = "Rust Image Viewer Contributors"
+description = "High-performance image and video viewer for Windows 10/11"
+license-file = "LICENSE"
+formats = ["nsis", "wix"]
+out-dir = "target/packager"
+binaries-dir = "target/release"
 before-packaging-command = "cargo build --release"
-out-dir = "target/release/packager"
 icons = ["assets/icon.ico"]
-
-[package.metadata.packager.nsis]
-appdata-paths = ["$APPDATA/rust-image-viewer"]
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

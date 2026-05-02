@@ -40,7 +40,7 @@ if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
 
-$outputDir = Join-Path $repoRoot "target\release\packager"
+$outputDir = Join-Path $repoRoot "target\packager"
 $resolvedOutputDir = [System.IO.Path]::GetFullPath($outputDir)
 
 Write-Host ""
