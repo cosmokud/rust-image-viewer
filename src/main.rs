@@ -8986,7 +8986,20 @@ impl ImageViewer {
         activated
     }
 
+    fn window_allows_keyboard_shortcuts(&self, ctx: &egui::Context) -> bool {
+        ctx.input(|input| {
+            let viewport = input.raw.viewport();
+            viewport.focused.unwrap_or(true) && !viewport.minimized.unwrap_or(false)
+        })
+    }
+
     fn try_handle_global_marked_file_shortcuts(&mut self, ctx: &egui::Context) -> bool {
+        if !self.window_allows_keyboard_shortcuts(ctx) {
+            // Keep edge detection aligned while unfocused/minimized to avoid paste on refocus.
+            self.paste_shortcut_ctrl_v_was_down = windows_ctrl_v_shortcut_down();
+            return false;
+        }
+
         // Use key-down edge detection as a fallback for frames where Ctrl+V key_pressed
         // is consumed by other UI code before this global shortcut pass.
         let ctrl_v_down_in_egui = ctx.input(|input| {
@@ -21134,6 +21147,11 @@ impl ImageViewer {
 
     /// Handle keyboard and mouse input
     fn handle_input(&mut self, ctx: &egui::Context) {
+        if !self.window_allows_keyboard_shortcuts(ctx) {
+            self.paste_shortcut_ctrl_v_was_down = windows_ctrl_v_shortcut_down();
+            return;
+        }
+
         if self.try_handle_global_marked_file_shortcuts(ctx) {
             return;
         }
