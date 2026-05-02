@@ -23651,7 +23651,7 @@ impl ImageViewer {
 
                 let fps_list_button = ui.add(
                     egui::Button::new(format!("{} FPS", self.webp_custom_fps))
-                        .min_size(egui::vec2(78.0, 22.0)),
+                        .min_size(egui::vec2(64.0, 22.0)),
                 );
                 if fps_list_button.clicked() {
                     ui.memory_mut(|mem| mem.toggle_popup(popup_id));
@@ -23914,7 +23914,7 @@ impl ImageViewer {
                             .size(14.0),
                     );
                     if show_fps_controls {
-                        ui.add_space(6.0);
+                        ui.add_space(2.0);
                         self.draw_webp_fps_controls(
                             ui,
                             ctx,
@@ -24630,7 +24630,7 @@ impl ImageViewer {
                             .size(14.0),
                     );
                     if show_fps_controls {
-                        ui.add_space(6.0);
+                        ui.add_space(2.0);
                         self.draw_webp_fps_controls(
                             ui,
                             ctx,
