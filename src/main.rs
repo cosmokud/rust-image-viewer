@@ -2371,12 +2371,6 @@ struct ImageViewer {
     /// When true, floating autosize is suppressed while zoomed media exceeds the viewport.
     /// Set by explicit user window drag/resize while in zoom-inside-window mode.
     floating_zoom_inside_window_locked: bool,
-    /// Stable inner-center anchor used during autosize bursts to avoid center jitter.
-    floating_autosize_anchor_inner_center: Option<egui::Pos2>,
-    /// Last inner size requested by floating autosize; used to keep image centering in lockstep
-    /// with native window resize updates during wheel-zoom growth.
-    floating_autosize_expected_inner_size: Option<egui::Vec2>,
-
     // ============ PERFORMANCE OPTIMIZATION FIELDS ============
     /// Whether any animation or state change requires a repaint
     needs_repaint: bool,
@@ -2867,9 +2861,6 @@ impl Default for ImageViewer {
             floating_drag_start_outer_pos: None,
             floating_drag_start_cursor_screen: None,
             floating_zoom_inside_window_locked: false,
-            floating_autosize_anchor_inner_center: None,
-            floating_autosize_expected_inner_size: None,
-
             // Performance optimization fields
             needs_repaint: false,
             last_activity_time: Instant::now(),
@@ -10907,8 +10898,6 @@ impl ImageViewer {
     fn reset_floating_window_drag_anchor(&mut self) {
         self.floating_drag_start_outer_pos = None;
         self.floating_drag_start_cursor_screen = None;
-        self.floating_autosize_anchor_inner_center = None;
-        self.floating_autosize_expected_inner_size = None;
     }
 
     fn floating_monitor_bounds_points(&self, ctx: &egui::Context) -> Option<egui::Vec2> {
@@ -21002,14 +20991,10 @@ impl ImageViewer {
             || self.pending_window_resize.is_some()
             || self.defer_media_view_reset
         {
-            self.floating_autosize_anchor_inner_center = None;
-            self.floating_autosize_expected_inner_size = None;
             return;
         }
 
         let Some(mut desired) = self.image_display_size_at_zoom() else {
-            self.floating_autosize_anchor_inner_center = None;
-            self.floating_autosize_expected_inner_size = None;
             return;
         };
 
@@ -21025,8 +21010,6 @@ impl ImageViewer {
             .map(|rect| desired.x > rect.width() + 0.5 || desired.y > rect.height() + 0.5)
             .unwrap_or(false);
         if zoom_inside_current_viewport && self.floating_zoom_inside_window_locked {
-            self.floating_autosize_anchor_inner_center = None;
-            self.floating_autosize_expected_inner_size = None;
             return;
         } else if !zoom_inside_current_viewport {
             self.floating_zoom_inside_window_locked = false;
@@ -21051,8 +21034,6 @@ impl ImageViewer {
                     .unwrap_or(false);
 
                 if current_window_exceeds_monitor {
-                    self.floating_autosize_anchor_inner_center = None;
-                    self.floating_autosize_expected_inner_size = None;
                     return;
                 }
 
@@ -21062,37 +21043,20 @@ impl ImageViewer {
             }
         }
 
-        // Quantize to pixel units to avoid subpixel oscillation when issuing viewport commands.
-        desired.x = desired.x.round();
-        desired.y = desired.y.round();
-        let current_inner_center = current_inner_rect.map(|r| r.center());
-
         let should_send = current_inner_rect
-            .map(|rect| (rect.size() - desired).length() > 0.9)
+            .map(|rect| (rect.size() - desired).length() > 0.5)
             .unwrap_or(true);
 
         if should_send {
-            let anchor_center = self
-                .floating_autosize_anchor_inner_center
-                .or(current_inner_center);
             if let (Some(inner_rect), Some(outer_rect)) = (current_inner_rect, current_outer_rect) {
                 // Keep the window center stable while changing inner size so zoom-resize
                 // expands/contracts from center instead of top-left.
                 let inner_to_outer_offset = inner_rect.min - outer_rect.min;
-                let target_inner_min = anchor_center.unwrap_or(inner_rect.center()) - desired * 0.5;
+                let target_inner_min = inner_rect.center() - desired * 0.5;
                 let target_outer_min = target_inner_min - inner_to_outer_offset;
-                let target_outer_min =
-                    egui::pos2(target_outer_min.x.round(), target_outer_min.y.round());
-                if (target_outer_min - outer_rect.min).length() > 0.9 {
-                    self.send_outer_position(ctx, target_outer_min);
-                }
+                self.send_outer_position(ctx, target_outer_min);
             }
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(desired));
-            self.floating_autosize_anchor_inner_center = anchor_center;
-            self.floating_autosize_expected_inner_size = Some(desired);
-        } else {
-            self.floating_autosize_anchor_inner_center = current_inner_center;
-            self.floating_autosize_expected_inner_size = None;
         }
     }
 
@@ -25219,14 +25183,6 @@ impl ImageViewer {
                             } else {
                                 available.center()
                             }
-                        }
-                    } else if self.floating_pre_inside_window_resize_phase(ctx) {
-                        // During floating wheel-zoom window growth, follow the latest commanded
-                        // inner size center to keep image and window resize visually in lockstep.
-                        if let Some(expected_size) = self.floating_autosize_expected_inner_size {
-                            egui::pos2(expected_size.x / 2.0, expected_size.y / 2.0)
-                        } else {
-                            available.center()
                         }
                     } else {
                         available.center() + self.offset
