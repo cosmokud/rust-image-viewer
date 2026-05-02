@@ -25094,9 +25094,25 @@ impl ImageViewer {
                     let center = if self.is_resizing {
                         if let Some(commanded_size) = self.resize_last_size {
                             // Use the commanded size as the stable reference for centering
-                            egui::pos2(commanded_size.x / 2.0, commanded_size.y / 2.0)
+                            let base_center =
+                                egui::pos2(commanded_size.x / 2.0, commanded_size.y / 2.0);
+                            let keep_pan_offset = !self.is_fullscreen
+                                && (display_size.x > commanded_size.x + 0.5
+                                    || display_size.y > commanded_size.y + 0.5);
+                            if keep_pan_offset {
+                                base_center + self.offset
+                            } else {
+                                base_center
+                            }
                         } else {
-                            available.center()
+                            let keep_pan_offset = !self.is_fullscreen
+                                && (display_size.x > available.width() + 0.5
+                                    || display_size.y > available.height() + 0.5);
+                            if keep_pan_offset {
+                                available.center() + self.offset
+                            } else {
+                                available.center()
+                            }
                         }
                     } else {
                         available.center() + self.offset
