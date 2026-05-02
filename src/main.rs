@@ -21028,6 +21028,26 @@ impl ImageViewer {
                 let inner_to_outer_offset = inner_rect.min - outer_rect.min;
                 let target_inner_min = inner_rect.center() - desired * 0.5;
                 let target_outer_min = target_inner_min - inner_to_outer_offset;
+
+                #[cfg(target_os = "windows")]
+                {
+                    let pixels_per_point = ctx.pixels_per_point();
+                    if pixels_per_point > 0.0 {
+                        let outer_frame = outer_rect.size() - inner_rect.size();
+                        let target_outer_size = desired + outer_frame;
+                        let to_physical = |value: f32| (value * pixels_per_point).round() as i32;
+
+                        if crate::windows_env::set_active_window_bounds(
+                            to_physical(target_outer_min.x),
+                            to_physical(target_outer_min.y),
+                            to_physical(target_outer_size.x).max(1),
+                            to_physical(target_outer_size.y).max(1),
+                        ) {
+                            return;
+                        }
+                    }
+                }
+
                 self.send_outer_position(ctx, target_outer_min);
             }
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(desired));
