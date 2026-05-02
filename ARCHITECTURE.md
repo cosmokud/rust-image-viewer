@@ -42,6 +42,7 @@ The architecture is intentionally biased toward "what helps the next visible fra
 | `src/single_instance.rs`   | Windows single-instance mutex and IPC handoff                                                                    | Lets secondary launches reuse the primary window                                    |
 | `src/windows_env.rs`       | Windows PATH refresh and maximize helpers                                                                        | Makes GStreamer discovery and native window transitions more reliable               |
 | `assets/config.ini`        | Canonical config template                                                                                        | Source of truth for user-facing configuration                                       |
+| `.github/workflows/*.yml`  | Tag-gated release automation and manual tagged deploy workflow                                                   | Prevents accidental overwrite and keeps release publishing reproducible             |
 | `benches/perf_baseline.rs` | Criterion benchmarks for scan, GIF, and spatial-query performance                                                | Used to catch performance regressions                                               |
 
 Two structural observations are important:
@@ -130,7 +131,7 @@ The per-frame order is deliberate:
 5. Update FPS diagnostics.
 6. Lazily install Windows CJK fonts only if needed for the current filename.
 7. Apply startup fullscreen mode exactly once if configured.
-8. Track floating-window position.
+8. Track floating-window position, including manual oversize/drag context so zoom-resize interactions preserve expected centering behavior.
 9. Process drag-and-drop open requests.
 10. Process input.
 11. Update textures before layout decisions. This is critical for video because the first frame also reveals the real dimensions.
@@ -638,6 +639,8 @@ This keeps the focused video path responsive without growing queues indefinitely
 Local file playback enables playbin buffering plus bounded ring buffers so brief disk stalls do not force full-file prefetching. The appsink caps its internal queue and drops stale buffers to keep frame delivery responsive.
 
 Seeking clears queued frames, marks a seek-in-progress flag to ignore stale samples, and primes a preroll frame so paused scrubs show the right image quickly. When possible, solo playback passes output bounds so GStreamer scales toward the viewport instead of decoding full-resolution frames.
+
+Audio/subtitle track switching is coordinated to avoid mid-transition thrash: selection updates can be deferred until the pipeline is in a safe state, and track labels are normalized with language-aware handling so menu state remains stable across multilingual media.
 
 ### 10.6 Focus policy in strip and masonry
 

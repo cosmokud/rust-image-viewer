@@ -2,6 +2,31 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.3.8] - 2026-05-02
+
+### Highlights
+
+- Stabilized floating window behavior during drag, zoom, and resize so manual sizing and centering stay predictable.
+- Improved video playback transition quality with safer output sizing and reduced stutter during audio-track changes.
+- Hardened release automation with stricter tag/release checks and a dedicated manual deploy workflow.
+
+### Added
+
+- Language-aware subtitle/audio labeling support (including script fallback profiles) for more reliable track presentation.
+- Deferred audio-track switching path to reduce playback disruption while changing tracks.
+- Manual release workflow support for tagged builds (`manual-deploy.yml`) with guardrails for duplicate releases.
+
+### Changed
+
+- Floating window resize/zoom/autosize behavior to preserve pan/center intent and avoid unintended native snap/oversize regressions.
+- Solo video output-bound calculations and texture-dimension handoff to keep aspect transitions stable.
+- Deployment pipeline flow: removed legacy nightly/installer script path and standardized tag-driven release creation.
+
+### Fixed
+
+- Window-size jitter and unexpected resize jumps while interacting with zoom in floating mode.
+- Several track-selection and subtitle-state edge cases during video playback transitions.
+
 ## [v0.3.7] - 2026-04-28
 
 ### Highlights
