@@ -16306,16 +16306,30 @@ impl ImageViewer {
         }
 
         if self.is_masonry_mode() && Instant::now() < self.manga_hover_autoplay_resume_at {
-            if self.manga_focused_video_index.is_some() {
-                for player in self.manga_video_players.values_mut() {
-                    if player.is_playing() {
-                        let _ = player.pause();
+            let allow_placeholder_bootstrap = self
+                .manga_hovered_media_index
+                .filter(|&idx| {
+                    self.image_list
+                        .get(idx)
+                        .is_some_and(|path| is_supported_video(path))
+                })
+                .is_some_and(|idx| {
+                    !self.manga_video_textures.contains_key(&idx)
+                        && self.manga_texture_cache.peek_texture_dimensions(idx).is_none()
+                });
+
+            if !allow_placeholder_bootstrap {
+                if self.manga_focused_video_index.is_some() {
+                    for player in self.manga_video_players.values_mut() {
+                        if player.is_playing() {
+                            let _ = player.pause();
+                        }
                     }
+                    self.manga_focused_video_index = None;
                 }
-                self.manga_focused_video_index = None;
+                self.clear_pending_manga_video_load();
+                return;
             }
-            self.clear_pending_manga_video_load();
-            return;
         }
 
         let focused_idx = if self.is_masonry_mode() {
@@ -16658,10 +16672,18 @@ impl ImageViewer {
                 && !self.manga_anim_failed.contains(&idx)
             {
                 if let Some(path) = self.image_list.get(idx).cloned() {
-                    let target_side = self.manga_target_texture_side_for_dynamic_media(
-                        idx,
-                        MangaMediaType::AnimatedImage,
-                    );
+                    let cached_side_floor = self
+                        .manga_texture_cache
+                        .peek_texture_dimensions(idx)
+                        .map(|(w, h)| w.max(h).max(1))
+                        .unwrap_or(1)
+                        .min(self.max_texture_side.max(1));
+                    let target_side = self
+                        .manga_target_texture_side_for_dynamic_media(
+                            idx,
+                            MangaMediaType::AnimatedImage,
+                        )
+                        .max(cached_side_floor);
 
                     if LoadedImage::is_animated_webp(&path) {
                         if let Some(rx) = LoadedImage::start_streaming_webp(
@@ -16762,8 +16784,15 @@ impl ImageViewer {
 
         // ── Update animation frames for the focused animated image only ──
         for &idx in focused_anim_idx.iter() {
+            let cached_side_floor = self
+                .manga_texture_cache
+                .peek_texture_dimensions(idx)
+                .map(|(w, h)| w.max(h).max(1))
+                .unwrap_or(1)
+                .min(self.max_texture_side.max(1));
             let target_side = self
-                .manga_target_texture_side_for_dynamic_media(idx, MangaMediaType::AnimatedImage);
+                .manga_target_texture_side_for_dynamic_media(idx, MangaMediaType::AnimatedImage)
+                .max(cached_side_floor);
             let stream_done = self
                 .manga_anim_stream_done
                 .get(&idx)
@@ -16880,8 +16909,15 @@ impl ImageViewer {
         idx: usize,
         stream_done: bool,
     ) {
-        let target_side =
-            self.manga_target_texture_side_for_dynamic_media(idx, MangaMediaType::AnimatedImage);
+        let cached_side_floor = self
+            .manga_texture_cache
+            .peek_texture_dimensions(idx)
+            .map(|(w, h)| w.max(h).max(1))
+            .unwrap_or(1)
+            .min(self.max_texture_side.max(1));
+        let target_side = self
+            .manga_target_texture_side_for_dynamic_media(idx, MangaMediaType::AnimatedImage)
+            .max(cached_side_floor);
         let reset_filter = if self.manga_should_force_triangle_filters() {
             FilterType::Triangle
         } else {

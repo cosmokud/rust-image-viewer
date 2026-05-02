@@ -1836,16 +1836,10 @@ impl MangaLoader {
         let target_texture_side =
             self.limit_target_texture_side_for_index(index, target_texture_side, max_texture_side);
 
-        if self
-            .loaded_levels
-            .read()
-            .get(&index)
-            .is_some_and(|side| *side >= target_texture_side)
-        {
-            return false;
-        }
-
         // Visible placeholder takes precedence over potentially stale loaded bookkeeping.
+        // The UI only calls this for in-view placeholders or explicit quality upgrades, so
+        // we intentionally bypass loaded-side short-circuits here to avoid wedging tiles
+        // after cache eviction/downgrade races.
         self.loaded_levels.write().remove(&index);
 
         let (request_downscale_filter, request_gif_filter) = if force_triangle_filters {
