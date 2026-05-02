@@ -7447,6 +7447,39 @@ impl ImageViewer {
             .is_some_and(|ext| ext.eq_ignore_ascii_case("webp"))
     }
 
+    fn path_is_gif(path: &Path) -> bool {
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("gif"))
+    }
+
+    fn is_video_navigation_candidate_path(path: &Path) -> bool {
+        if is_supported_video(path) || Self::path_is_gif(path) {
+            return true;
+        }
+
+        if Self::path_is_webp(path) {
+            return LoadedImage::is_animated_webp(path);
+        }
+
+        false
+    }
+
+    fn video_navigation_mode_active(&self) -> bool {
+        if self.video_player.is_some() || self.is_video_playback_preview_mode() {
+            return true;
+        }
+
+        if self.image.as_ref().is_some_and(|img| img.is_animated()) {
+            return true;
+        }
+
+        self.image_list
+            .get(self.current_index)
+            .is_some_and(|path| Self::path_is_webp(path.as_path()))
+            && (self.anim_stream_rx.is_some() || !self.anim_stream_done)
+    }
+
     fn frame_delay_for_fps(fps: u32) -> Duration {
         let clamped = fps.clamp(1, 240);
         Duration::from_secs_f64(1.0 / clamped as f64)
@@ -13128,11 +13161,9 @@ impl ImageViewer {
                 (self.current_index + len - (step % len)) % len
             };
 
-            if self
-                .image_list
-                .get(candidate)
-                .is_some_and(|path| is_supported_video(path))
-            {
+            if self.image_list.get(candidate).is_some_and(|path| {
+                Self::is_video_navigation_candidate_path(path.as_path())
+            }) {
                 return Some(candidate);
             }
         }
@@ -13149,11 +13180,9 @@ impl ImageViewer {
     }
 
     fn navigate_video_file_to_index(&mut self, target_index: usize) {
-        if !self
-            .image_list
-            .get(target_index)
-            .is_some_and(|path| is_supported_video(path))
-        {
+        if !self.image_list.get(target_index).is_some_and(|path| {
+            Self::is_video_navigation_candidate_path(path.as_path())
+        }) {
             return;
         }
 
@@ -21983,10 +22012,18 @@ impl ImageViewer {
                 .any_action_uses_binding(&InputBinding::Key(egui::Key::End));
 
             if page_up && !page_up_bound {
-                self.prev_image();
+                if self.video_navigation_mode_active() {
+                    self.navigate_video_file(false);
+                } else {
+                    self.prev_image();
+                }
             }
             if page_down && !page_down_bound {
-                self.next_image();
+                if self.video_navigation_mode_active() {
+                    self.navigate_video_file(true);
+                } else {
+                    self.next_image();
+                }
             }
             if prev_mouse_repeat {
                 self.prev_image();
@@ -23545,6 +23582,13 @@ impl ImageViewer {
                     ctx.request_repaint();
                 }
 
+                if ui.button("Default").clicked() {
+                    self.webp_fps_override = None;
+                    self.webp_show_custom_fps_slider = false;
+                    ui.memory_mut(|mem| mem.close_popup());
+                    ctx.request_repaint();
+                }
+
                 ui.rect_contains_pointer(ui.min_rect())
             },
         );
@@ -23593,6 +23637,7 @@ impl ImageViewer {
             self.image_list.get(self.current_index).or(Some(&img.path)),
         );
         let is_webp = Self::path_is_webp(img.path.as_path());
+        let mut file_navigation_requested: Option<VideoFileNavigation> = None;
 
         ui.vertical(|ui| {
             // === Seek bar (top row) ===
@@ -23705,6 +23750,30 @@ impl ImageViewer {
                     self.gif_paused = !self.gif_paused;
                 }
 
+                ui.add_space(4.0);
+
+                let prev_btn = Self::video_control_icon_button(
+                    ui,
+                    VideoControlIcon::Previous,
+                    "Previous file",
+                    None,
+                    false,
+                );
+                if prev_btn.clicked() {
+                    file_navigation_requested = Some(VideoFileNavigation::Previous);
+                }
+
+                let next_btn = Self::video_control_icon_button(
+                    ui,
+                    VideoControlIcon::Next,
+                    "Next file",
+                    None,
+                    false,
+                );
+                if next_btn.clicked() {
+                    file_navigation_requested = Some(VideoFileNavigation::Next);
+                }
+
                 ui.add_space(8.0);
 
                 // Frame display
@@ -23736,6 +23805,13 @@ impl ImageViewer {
                 });
             });
         });
+
+        if let Some(navigation) = file_navigation_requested {
+            match navigation {
+                VideoFileNavigation::Previous => self.navigate_video_file(false),
+                VideoFileNavigation::Next => self.navigate_video_file(true),
+            }
+        }
     }
 
     /// Draw video/GIF controls bar for manga reading mode at the bottom of the screen.
@@ -24268,6 +24344,7 @@ impl ImageViewer {
             .get(gif_idx)
             .is_some_and(|path| Self::path_is_webp(path.as_path()))
             || Self::path_is_webp(img.path.as_path());
+        let mut file_navigation_requested: Option<VideoFileNavigation> = None;
 
         ui.vertical(|ui| {
             // === Seek bar (top row) ===
@@ -24381,6 +24458,30 @@ impl ImageViewer {
                     self.gif_paused = !self.gif_paused;
                 }
 
+                ui.add_space(4.0);
+
+                let prev_btn = Self::video_control_icon_button(
+                    ui,
+                    VideoControlIcon::Previous,
+                    "Previous file",
+                    None,
+                    false,
+                );
+                if prev_btn.clicked() {
+                    file_navigation_requested = Some(VideoFileNavigation::Previous);
+                }
+
+                let next_btn = Self::video_control_icon_button(
+                    ui,
+                    VideoControlIcon::Next,
+                    "Next file",
+                    None,
+                    false,
+                );
+                if next_btn.clicked() {
+                    file_navigation_requested = Some(VideoFileNavigation::Next);
+                }
+
                 ui.add_space(8.0);
 
                 // Frame display
@@ -24416,6 +24517,13 @@ impl ImageViewer {
                 });
             });
         });
+
+        if let Some(navigation) = file_navigation_requested {
+            match navigation {
+                VideoFileNavigation::Previous => self.navigate_video_file(false),
+                VideoFileNavigation::Next => self.navigate_video_file(true),
+            }
+        }
     }
 
     /// Determine resize direction based on mouse position
