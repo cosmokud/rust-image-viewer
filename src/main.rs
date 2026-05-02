@@ -20897,6 +20897,9 @@ impl ImageViewer {
         desired.x = desired.x.max(200.0);
         desired.y = desired.y.max(150.0);
 
+        let (current_inner_rect, current_outer_rect) =
+            ctx.input(|i| (i.raw.viewport().inner_rect, i.raw.viewport().outer_rect));
+
         // Once the floating window reaches display bounds, keep zooming inside the viewport
         // instead of continuing to grow the native window.
         let mut monitor_bounds = ctx.input(|i| i.raw.viewport().monitor_size);
@@ -20919,14 +20922,24 @@ impl ImageViewer {
                 && monitor_bounds.y > 0.0
                 && (desired.x > monitor_bounds.x || desired.y > monitor_bounds.y)
             {
+                // If the user has manually oversized the floating window beyond monitor bounds,
+                // keep that size and only continue zooming inside the current viewport.
+                let current_window_exceeds_monitor = current_inner_rect
+                    .map(|rect| {
+                        let size = rect.size();
+                        size.x > monitor_bounds.x + 0.5 || size.y > monitor_bounds.y + 0.5
+                    })
+                    .unwrap_or(false);
+
+                if current_window_exceeds_monitor {
+                    return;
+                }
+
                 desired = Self::fit_size_preserving_aspect(desired, monitor_bounds);
                 desired.x = desired.x.max(1.0);
                 desired.y = desired.y.max(1.0);
             }
         }
-
-        let (current_inner_rect, current_outer_rect) =
-            ctx.input(|i| (i.raw.viewport().inner_rect, i.raw.viewport().outer_rect));
 
         let should_send = current_inner_rect
             .map(|rect| (rect.size() - desired).length() > 0.5)
