@@ -3,8 +3,8 @@
 
 #![windows_subsystem = "windows"]
 
-mod async_runtime;
 mod app_dirs;
+mod async_runtime;
 mod config;
 mod folder_travel_cache;
 mod image_loader;
@@ -7334,12 +7334,11 @@ impl ImageViewer {
     }
 
     fn queue_solo_audio_track_switch(&mut self, ctx: &egui::Context, track_index: i32) {
-        self.pending_solo_audio_track_switch =
-            Some((
-                Instant::now() + Self::AUDIO_TRACK_SWITCH_DELAY,
-                self.current_index,
-                track_index,
-            ));
+        self.pending_solo_audio_track_switch = Some((
+            Instant::now() + Self::AUDIO_TRACK_SWITCH_DELAY,
+            self.current_index,
+            track_index,
+        ));
         ctx.request_repaint_after(Self::AUDIO_TRACK_SWITCH_DELAY);
     }
 
@@ -7694,13 +7693,7 @@ impl ImageViewer {
                 let wave_center = egui::pos2(rect.center().x + 0.8, rect.center().y);
                 for radius in [3.0, 5.3] {
                     painter.add(egui::epaint::PathShape::line(
-                        Self::video_control_icon_arc_points(
-                            wave_center,
-                            radius,
-                            -0.95,
-                            0.95,
-                            12,
-                        ),
+                        Self::video_control_icon_arc_points(wave_center, radius, -0.95, 0.95, 12),
                         stroke,
                     ));
                 }
@@ -7954,9 +7947,8 @@ impl ImageViewer {
                         );
                         if row.clicked() {
                             if !is_selected {
-                                selected_track = Some(
-                                    VideoSubtitleSelection::Embedded(track.index),
-                                );
+                                selected_track =
+                                    Some(VideoSubtitleSelection::Embedded(track.index));
                             }
                             ui.memory_mut(|mem| mem.close_popup());
                         }
@@ -10933,22 +10925,6 @@ impl ImageViewer {
             .unwrap_or(false)
     }
 
-    fn floating_pre_inside_window_resize_phase(&self, ctx: &egui::Context) -> bool {
-        if self.is_fullscreen || self.floating_zoom_inside_window_active(ctx) {
-            return false;
-        }
-
-        ctx.input(|i| i.raw.viewport().inner_rect)
-            .zip(self.floating_monitor_bounds_points(ctx))
-            .map(|(inner_rect, monitor)| {
-                monitor.x > 0.0
-                    && monitor.y > 0.0
-                    && inner_rect.width() < monitor.x - 0.5
-                    && inner_rect.height() < monitor.y - 0.5
-            })
-            .unwrap_or(false)
-    }
-
     fn drag_floating_window_without_native_snap(&mut self, ctx: &egui::Context) {
         if self.floating_zoom_inside_window_active(ctx) {
             self.floating_zoom_inside_window_locked = true;
@@ -13612,15 +13588,6 @@ impl ImageViewer {
         // While resizing, treat window size as the source of truth.
         if self.is_resizing {
             self.zoom_target = self.zoom;
-            self.zoom_velocity = 0.0;
-            return false;
-        }
-
-        // In floating mode while the native window can still grow (inside-window zoom not yet
-        // active), avoid smoothing to prevent visible image lag/black-bar shimmer during
-        // wheel zoom + autosize bursts.
-        if self.floating_pre_inside_window_resize_phase(ctx) {
-            self.zoom = self.zoom_target;
             self.zoom_velocity = 0.0;
             return false;
         }
@@ -20697,6 +20664,45 @@ impl ImageViewer {
         }
     }
 
+    fn floating_autosize_target_inner_size(
+        &self,
+        ctx: &egui::Context,
+        mut desired: egui::Vec2,
+        current_inner_rect: Option<egui::Rect>,
+    ) -> Option<egui::Vec2> {
+        desired.x = desired.x.max(200.0);
+        desired.y = desired.y.max(150.0);
+
+        // Once the floating window reaches display bounds, keep zooming inside the viewport
+        // instead of continuing to grow the native window.
+        if let Some(monitor_bounds) = self.floating_monitor_bounds_points(ctx) {
+            if monitor_bounds.x > 0.0
+                && monitor_bounds.y > 0.0
+                && (desired.x > monitor_bounds.x || desired.y > monitor_bounds.y)
+            {
+                let current_window_exceeds_monitor = current_inner_rect
+                    .map(|rect| {
+                        let size = rect.size();
+                        size.x > monitor_bounds.x + 0.5 || size.y > monitor_bounds.y + 0.5
+                    })
+                    .unwrap_or(false);
+
+                if current_window_exceeds_monitor {
+                    return None;
+                }
+
+                desired = Self::fit_size_preserving_aspect(desired, monitor_bounds);
+                desired.x = desired.x.max(1.0);
+                desired.y = desired.y.max(1.0);
+            }
+        }
+
+        // Native viewport commands are point-sized; subpoint targets can cause command churn.
+        desired.x = desired.x.round();
+        desired.y = desired.y.round();
+        Some(desired)
+    }
+
     fn current_media_rect(&self, screen_rect: egui::Rect) -> Option<egui::Rect> {
         let display_size = self.image_display_size_at_zoom()?;
         if display_size.x <= 0.0 || display_size.y <= 0.0 {
@@ -20994,12 +21000,9 @@ impl ImageViewer {
             return;
         }
 
-        let Some(mut desired) = self.image_display_size_at_zoom() else {
+        let Some(display_desired) = self.image_display_size_at_zoom() else {
             return;
         };
-
-        desired.x = desired.x.max(200.0);
-        desired.y = desired.y.max(150.0);
 
         let (current_inner_rect, current_outer_rect) =
             ctx.input(|i| (i.raw.viewport().inner_rect, i.raw.viewport().outer_rect));
@@ -21007,7 +21010,9 @@ impl ImageViewer {
         // While the zoomed media already exceeds the current floating viewport, keep this
         // "zoom inside window" mode stable and do not autosize the native window.
         let zoom_inside_current_viewport = current_inner_rect
-            .map(|rect| desired.x > rect.width() + 0.5 || desired.y > rect.height() + 0.5)
+            .map(|rect| {
+                display_desired.x > rect.width() + 0.5 || display_desired.y > rect.height() + 0.5
+            })
             .unwrap_or(false);
         if zoom_inside_current_viewport && self.floating_zoom_inside_window_locked {
             return;
@@ -21015,36 +21020,14 @@ impl ImageViewer {
             self.floating_zoom_inside_window_locked = false;
         }
 
-        // Once the floating window reaches display bounds, keep zooming inside the viewport
-        // instead of continuing to grow the native window.
-        let monitor_bounds = self.floating_monitor_bounds_points(ctx);
-
-        if let Some(monitor_bounds) = monitor_bounds {
-            if monitor_bounds.x > 0.0
-                && monitor_bounds.y > 0.0
-                && (desired.x > monitor_bounds.x || desired.y > monitor_bounds.y)
-            {
-                // If the user has manually oversized the floating window beyond monitor bounds,
-                // keep that size and only continue zooming inside the current viewport.
-                let current_window_exceeds_monitor = current_inner_rect
-                    .map(|rect| {
-                        let size = rect.size();
-                        size.x > monitor_bounds.x + 0.5 || size.y > monitor_bounds.y + 0.5
-                    })
-                    .unwrap_or(false);
-
-                if current_window_exceeds_monitor {
-                    return;
-                }
-
-                desired = Self::fit_size_preserving_aspect(desired, monitor_bounds);
-                desired.x = desired.x.max(1.0);
-                desired.y = desired.y.max(1.0);
-            }
-        }
+        let Some(desired) =
+            self.floating_autosize_target_inner_size(ctx, display_desired, current_inner_rect)
+        else {
+            return;
+        };
 
         let should_send = current_inner_rect
-            .map(|rect| (rect.size() - desired).length() > 0.5)
+            .map(|rect| (rect.size() - desired).length() > 0.9)
             .unwrap_or(true);
 
         if should_send {
@@ -21054,7 +21037,11 @@ impl ImageViewer {
                 let inner_to_outer_offset = inner_rect.min - outer_rect.min;
                 let target_inner_min = inner_rect.center() - desired * 0.5;
                 let target_outer_min = target_inner_min - inner_to_outer_offset;
-                self.send_outer_position(ctx, target_outer_min);
+                let target_outer_min =
+                    egui::pos2(target_outer_min.x.round(), target_outer_min.y.round());
+                if (target_outer_min - outer_rect.min).length() > 0.9 {
+                    self.send_outer_position(ctx, target_outer_min);
+                }
             }
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(desired));
         }
@@ -22047,7 +22034,10 @@ impl ImageViewer {
                         5.0 + (button_size.x * 4.0) + (ui.spacing().item_spacing.x * 3.0) + 6.0;
                     let button_edge_gap = if self.is_fullscreen { 0.0 } else { 2.0 };
                     let buttons_rect = egui::Rect::from_min_max(
-                        egui::pos2(bar_rect.max.x - buttons_area_w, bar_rect.min.y + button_edge_gap),
+                        egui::pos2(
+                            bar_rect.max.x - buttons_area_w,
+                            bar_rect.min.y + button_edge_gap,
+                        ),
                         egui::pos2(bar_rect.max.x - button_edge_gap, bar_rect.max.y),
                     );
 
@@ -24490,10 +24480,11 @@ impl ImageViewer {
         let keep_zoom_inside_window_mode = self
             .image_display_size_at_zoom()
             .and_then(|display_size| {
-                ctx.input(|i| i.raw.viewport().inner_rect).map(|inner_rect| {
-                    display_size.x > inner_rect.width() + 0.5
-                        || display_size.y > inner_rect.height() + 0.5
-                })
+                ctx.input(|i| i.raw.viewport().inner_rect)
+                    .map(|inner_rect| {
+                        display_size.x > inner_rect.width() + 0.5
+                            || display_size.y > inner_rect.height() + 0.5
+                    })
             })
             .unwrap_or(false);
 
@@ -24694,23 +24685,16 @@ impl ImageViewer {
                         } else {
                             // In floating mode, follow cursor when zoomed past 100%
                             let old_zoom = self.zoom;
-                            let new_zoom = self.clamp_zoom(self.zoom * factor);
-                            self.zoom = new_zoom;
-                            self.zoom_target = new_zoom;
+                            self.zoom_target = self.clamp_zoom(self.zoom_target * factor);
+                            self.zoom = self.clamp_zoom(self.zoom * factor);
 
-                            if self.floating_pre_inside_window_resize_phase(ctx) {
-                                // Keep image perfectly centered while the native floating window
-                                // is still growing to avoid black-bar bounce.
-                                self.offset = egui::Vec2::ZERO;
-                            } else {
-                                let has_offset = self.offset.length() > 0.1;
-                                if old_zoom > 1.0 || self.zoom > 1.0 || has_offset {
-                                    let rect_center = screen_rect.center();
-                                    let cursor_offset = pos - rect_center;
-                                    let zoom_ratio = self.zoom / old_zoom;
-                                    self.offset = self.offset * zoom_ratio
-                                        - cursor_offset * (zoom_ratio - 1.0);
-                                }
+                            let has_offset = self.offset.length() > 0.1;
+                            if old_zoom > 1.0 || self.zoom > 1.0 || has_offset {
+                                let rect_center = screen_rect.center();
+                                let cursor_offset = pos - rect_center;
+                                let zoom_ratio = self.zoom / old_zoom;
+                                self.offset =
+                                    self.offset * zoom_ratio - cursor_offset * (zoom_ratio - 1.0);
                             }
                             self.zoom_velocity = 0.0;
                         }
@@ -24743,23 +24727,16 @@ impl ImageViewer {
                                 self.zoom_velocity = 0.0;
                             } else {
                                 let old_zoom = self.zoom;
-                                let new_zoom = self.clamp_zoom(self.zoom * factor);
-                                self.zoom = new_zoom;
-                                self.zoom_target = new_zoom;
+                                self.zoom_target = self.clamp_zoom(self.zoom_target * factor);
+                                self.zoom = self.clamp_zoom(self.zoom * factor);
 
-                                if self.floating_pre_inside_window_resize_phase(ctx) {
-                                    // Keep image perfectly centered while the native floating
-                                    // window is still growing to avoid black-bar bounce.
-                                    self.offset = egui::Vec2::ZERO;
-                                } else {
-                                    let has_offset = self.offset.length() > 0.1;
-                                    if old_zoom > 1.0 || self.zoom > 1.0 || has_offset {
-                                        let rect_center = screen_rect.center();
-                                        let cursor_offset = pos - rect_center;
-                                        let zoom_ratio = self.zoom / old_zoom;
-                                        self.offset = self.offset * zoom_ratio
-                                            - cursor_offset * (zoom_ratio - 1.0);
-                                    }
+                                let has_offset = self.offset.length() > 0.1;
+                                if old_zoom > 1.0 || self.zoom > 1.0 || has_offset {
+                                    let rect_center = screen_rect.center();
+                                    let cursor_offset = pos - rect_center;
+                                    let zoom_ratio = self.zoom / old_zoom;
+                                    self.offset = self.offset * zoom_ratio
+                                        - cursor_offset * (zoom_ratio - 1.0);
                                 }
                                 self.zoom_velocity = 0.0;
                             }
@@ -25150,7 +25127,7 @@ impl ImageViewer {
 
                     let base_display_size =
                         egui::Vec2::new(img_w as f32 * self.zoom, img_h as f32 * self.zoom);
-                    let display_size = if precise_rotation_degrees.abs() < 0.01 {
+                    let mut display_size = if precise_rotation_degrees.abs() < 0.01 {
                         base_display_size
                     } else {
                         rotated_bounding_size(
@@ -25158,6 +25135,40 @@ impl ImageViewer {
                             precise_rotation_degrees.to_radians(),
                         )
                     };
+
+                    let floating_autosize_catching_up = if !self.is_fullscreen
+                        && !self.is_resizing
+                        && !self.current_window_is_maximized(ctx)
+                        && self.pending_window_resize.is_none()
+                        && !self.defer_media_view_reset
+                    {
+                        let current_inner_rect = ctx.input(|i| i.raw.viewport().inner_rect);
+                        let zoom_inside_current_viewport = current_inner_rect
+                            .map(|rect| {
+                                display_size.x > rect.width() + 0.5
+                                    || display_size.y > rect.height() + 0.5
+                            })
+                            .unwrap_or(false);
+
+                        if zoom_inside_current_viewport && self.floating_zoom_inside_window_locked {
+                            false
+                        } else {
+                            self.floating_autosize_target_inner_size(
+                                ctx,
+                                display_size,
+                                current_inner_rect,
+                            )
+                            .map(|target| (available.size() - target).length() > 0.9)
+                            .unwrap_or(false)
+                        }
+                    } else {
+                        false
+                    };
+
+                    if floating_autosize_catching_up {
+                        display_size =
+                            Self::fit_size_preserving_aspect(display_size, available.size());
+                    }
 
                     // During resize, use the commanded size to compute center to avoid jitter
                     // from frame timing mismatches when window position changes.
@@ -25184,6 +25195,8 @@ impl ImageViewer {
                                 available.center()
                             }
                         }
+                    } else if floating_autosize_catching_up {
+                        available.center()
                     } else {
                         available.center() + self.offset
                     };
