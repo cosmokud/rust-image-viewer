@@ -12,6 +12,8 @@ use parking_lot::Mutex;
 use redb::backends::FileBackend;
 use redb::{Database, DatabaseError, ReadableTable, StorageBackend, TableDefinition};
 
+use crate::app_dirs;
+
 const METADATA_TABLE: TableDefinition<&str, &str> = TableDefinition::new("media_dimensions");
 const VIDEO_THUMBNAIL_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("video_first_frame_rgba");
@@ -1032,15 +1034,14 @@ pub fn metadata_cache_stats() -> MetadataCacheStats {
 fn default_cache_path() -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     {
-        if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
-            let base_dir = PathBuf::from(local_app_data).join("rust-image-viewer");
+        if let Some(base_dir) = app_dirs::app_local_data_dir() {
             if std::fs::create_dir_all(&base_dir).is_ok() {
                 return Some(base_dir.join("metadata_cache.redb"));
             }
         }
     }
 
-    let base_dir = std::env::temp_dir().join("rust-image-viewer");
+    let base_dir = std::env::temp_dir().join(app_dirs::APP_DIR_NAME);
     if std::fs::create_dir_all(&base_dir).is_ok() {
         return Some(base_dir.join("metadata_cache.redb"));
     }

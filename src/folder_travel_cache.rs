@@ -10,6 +10,8 @@ use parking_lot::Mutex;
 use redb::backends::FileBackend;
 use redb::{Database, DatabaseError, StorageBackend, TableDefinition};
 
+use crate::app_dirs;
+
 const FOLDER_TRAVEL_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("folder_travel_positions");
 const CACHE_FILE_NAME: &str = "folder_travel_cache.redb";
@@ -183,15 +185,14 @@ fn decode_position_record(raw: &[u8]) -> Option<FolderTravelPosition> {
 fn default_cache_path() -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     {
-        if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
-            let base_dir = PathBuf::from(local_app_data).join("rust-image-viewer");
+        if let Some(base_dir) = app_dirs::app_local_data_dir() {
             if std::fs::create_dir_all(&base_dir).is_ok() {
                 return Some(base_dir.join(CACHE_FILE_NAME));
             }
         }
     }
 
-    let base_dir = std::env::temp_dir().join("rust-image-viewer");
+    let base_dir = std::env::temp_dir().join(app_dirs::APP_DIR_NAME);
     if std::fs::create_dir_all(&base_dir).is_ok() {
         return Some(base_dir.join(CACHE_FILE_NAME));
     }

@@ -6,6 +6,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
+use crate::app_dirs;
+
 const DEFAULT_CONFIG_TEMPLATE: &str = include_str!("../assets/config.ini");
 const CONFIG_FILE_NAME: &str = "config.ini";
 const LEGACY_CONFIG_FILE_NAME: &str = "rust-image-viewer-config.ini";
@@ -986,21 +988,16 @@ impl Config {
     /// Get the configuration directory in AppData/Roaming.
     /// Creates the directory if it doesn't exist.
     fn config_dir() -> PathBuf {
-        // Use APPDATA environment variable on Windows (AppData/Roaming)
-        // Falls back to executable directory if APPDATA is not set
-        let base_dir = if cfg!(target_os = "windows") {
-            std::env::var("APPDATA")
-                .ok()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| {
-                    std::env::current_exe()
-                        .ok()
-                        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-                        .unwrap_or_else(|| PathBuf::from("."))
-                })
+        let config_dir = if cfg!(target_os = "windows") {
+            app_dirs::app_config_dir().unwrap_or_else(|| {
+                std::env::current_exe()
+                    .ok()
+                    .and_then(|p| p.parent().map(|p| p.join(app_dirs::APP_DIR_NAME)))
+                    .unwrap_or_else(|| PathBuf::from(".").join(app_dirs::APP_DIR_NAME))
+            })
         } else {
             // On Unix-like systems, use ~/.config
-            std::env::var("XDG_CONFIG_HOME")
+            let base_dir = std::env::var("XDG_CONFIG_HOME")
                 .ok()
                 .map(PathBuf::from)
                 .or_else(|| {
@@ -1008,10 +1005,9 @@ impl Config {
                         .ok()
                         .map(|h| PathBuf::from(h).join(".config"))
                 })
-                .unwrap_or_else(|| PathBuf::from("."))
+                .unwrap_or_else(|| PathBuf::from("."));
+            base_dir.join(app_dirs::APP_DIR_NAME)
         };
-
-        let config_dir = base_dir.join("rust-image-viewer");
 
         // Create directory if it doesn't exist
         let _ = fs::create_dir_all(&config_dir);

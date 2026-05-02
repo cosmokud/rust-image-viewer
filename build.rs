@@ -4,11 +4,14 @@
 use std::collections::HashMap;
 use std::env;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+use directories::BaseDirs;
 
 const DEFAULT_CONFIG_TEMPLATE_PATH: &str = "assets/config.ini";
 const RUNTIME_CONFIG_FILE_NAME: &str = "config.ini";
 const LEGACY_CONFIG_FILE_NAME: &str = "rust-image-viewer-config.ini";
+const APP_DIR_NAME: &str = "rust-image-viewer";
 const FALLBACK_CONFIG_VERSION: &str = "0.0.0";
 
 type IniValues = HashMap<String, HashMap<String, String>>;
@@ -202,12 +205,15 @@ fn copy_default_config_to_target(src_config: &Path) {
     }
 }
 
+fn appdata_config_dir() -> Option<PathBuf> {
+    BaseDirs::new().map(|dirs| dirs.config_dir().join(APP_DIR_NAME))
+}
+
 fn sync_appdata_config(src_config: &Path) {
-    let Ok(appdata_dir) = env::var("APPDATA") else {
+    let Some(app_config_dir) = appdata_config_dir() else {
         return;
     };
 
-    let app_config_dir = Path::new(&appdata_dir).join("rust-image-viewer");
     let app_config = app_config_dir.join(RUNTIME_CONFIG_FILE_NAME);
     let legacy_app_config = app_config_dir.join(LEGACY_CONFIG_FILE_NAME);
 
@@ -299,7 +305,6 @@ fn main() {
     println!("cargo:rerun-if-changed={}", DEFAULT_CONFIG_TEMPLATE_PATH);
     println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-env-changed=APPDATA");
     println!("cargo:rerun-if-env-changed=CARGO_PKG_VERSION");
 
     // Embed Windows icon into PE resources when building for windows-msvc

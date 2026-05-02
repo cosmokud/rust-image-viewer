@@ -19,6 +19,8 @@ use parking_lot::Mutex;
 use rayon::prelude::*;
 use std::collections::VecDeque;
 
+use crate::app_dirs;
+
 #[cfg(target_os = "windows")]
 fn configure_gstreamer_env_windows() {
     use std::ffi::OsStr;
@@ -121,13 +123,10 @@ fn configure_gstreamer_env_windows() {
     fn appdata_prefixes() -> Vec<PathBuf> {
         let mut prefixes = Vec::new();
 
-        let Ok(appdata) = std::env::var("APPDATA") else {
-            return prefixes;
-        };
-
-        let app_root = PathBuf::from(appdata).join("rust-image-viewer");
-        prefixes.push(app_root.join("gstreamer"));
-        prefixes.push(app_root.join("app").join("gstreamer"));
+        if let Some(app_root) = app_dirs::app_config_dir() {
+            prefixes.push(app_root.join("gstreamer"));
+            prefixes.push(app_root.join("app").join("gstreamer"));
+        }
 
         prefixes
     }
@@ -212,10 +211,8 @@ fn configure_gstreamer_env_windows() {
     // Ensure the registry path is writable (some setups can end up pointing at a non-writable
     // location, which breaks plugin discovery and makes factories "disappear").
     if std::env::var_os("GST_REGISTRY").is_none() {
-        if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
-            let dir = PathBuf::from(local_app_data)
-                .join("rust-image-viewer")
-                .join("gstreamer");
+        if let Some(local_data_dir) = app_dirs::app_local_data_dir() {
+            let dir = local_data_dir.join("gstreamer");
             let _ = std::fs::create_dir_all(&dir);
             std::env::set_var("GST_REGISTRY", dir.join("registry.x86_64.bin"));
         }

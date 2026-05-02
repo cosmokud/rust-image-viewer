@@ -4,6 +4,7 @@
 #![windows_subsystem = "windows"]
 
 mod async_runtime;
+mod app_dirs;
 mod config;
 mod folder_travel_cache;
 mod image_loader;
