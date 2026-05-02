@@ -31,6 +31,7 @@ The architecture is intentionally biased toward "what helps the next visible fra
 | `build.rs`                 | Build-time config-template sync, Windows icon embedding, delay-loaded GStreamer DLL linkage                      | Keeps runtime config in sync and reduces image-only startup baggage on Windows/MSVC |
 | `src/main.rs`              | Main application state, UI loop, solo mode, Long Strip, Masonry, window transitions, async coordinator glue      | This is the orchestration center of the app                                         |
 | `src/config.rs`            | INI parsing, defaults, action-first shortcut model, save/load, quality and behavior settings                     | Configuration affects nearly every subsystem                                        |
+| `src/app_dirs.rs`          | OS-aware app config/local-data directory resolution via `directories::BaseDirs`                                   | Centralizes storage paths and fallback behavior across config and cache subsystems  |
 | `src/async_runtime.rs`     | Shared Tokio runtime with thread fallback                                                                        | Standardizes background execution without blocking the UI thread                    |
 | `src/image_loader.rs`      | Static image decode, GIF handling, animated WebP helpers, directory enumeration                                  | Owns the image hot path                                                             |
 | `src/video_player.rs`      | GStreamer live playback and frame extraction                                                                     | Owns the focused video path                                                         |
@@ -62,6 +63,8 @@ Two structural observations are important:
 4. Reads the command line and exits immediately if no media path was passed. This viewer intentionally does not create an empty shell window.
 5. Loads configuration early with `Config::load()`.
 6. Applies the configured metadata cache size limit via `configure_metadata_cache_size_limit()`.
+
+Path resolution for persisted state is centralized: config and cache paths are derived from `src/app_dirs.rs` (`BaseDirs::config_dir()` / `BaseDirs::data_local_dir()` + `rust-image-viewer`) before falling back to executable-adjacent or temp-directory locations.
 
 ### 3.2 Single-instance handoff
 
@@ -464,7 +467,7 @@ The app is fast because it uses several targeted caches rather than one global c
 
 Backed by `redb`, stored by default at:
 
-- `%LOCALAPPDATA%\rust-image-viewer\metadata_cache.redb` on Windows
+- OS local-data directory from `directories::BaseDirs` + `rust-image-viewer` (`%LOCALAPPDATA%\rust-image-viewer\metadata_cache.redb` on Windows)
 - temp-directory fallback if needed
 
 Tables:

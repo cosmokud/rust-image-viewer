@@ -15,12 +15,15 @@ All notable changes to this project will be documented in this file.
 - Language-aware subtitle/audio labeling support (including script fallback profiles) for more reliable track presentation.
 - Deferred audio-track switching path to reduce playback disruption while changing tracks.
 - Manual release workflow support for tagged builds (`manual-deploy.yml`) with guardrails for duplicate releases.
+- `src/app_dirs.rs` helper module to centralize OS-aware app config/local-data path resolution using the `directories` crate.
 
 ### Changed
 
 - Floating window resize/zoom/autosize behavior to preserve pan/center intent and avoid unintended native snap/oversize regressions.
 - Solo video output-bound calculations and texture-dimension handoff to keep aspect transitions stable.
 - Deployment pipeline flow: removed legacy nightly/installer script path and standardized tag-driven release creation.
+- Config, metadata cache, and folder-travel cache path resolution now use `directories::BaseDirs` (with executable/temp fallbacks) instead of direct `APPDATA`/`LOCALAPPDATA` env-var reads.
+- Windows build metadata resources were expanded for product identity/version presentation.
 
 ### Fixed
 

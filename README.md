@@ -267,7 +267,8 @@ Bindings are action-first and context-aware. The same input can legally belong t
 ### Custom shortcut model
 
 - The canonical template is `assets/config.ini`.
-- Your runtime config is normally created at `%APPDATA%\rust-image-viewer\config.ini`.
+- Your runtime config is normally created under the OS config directory via `directories::BaseDirs` (`%APPDATA%\rust-image-viewer\config.ini` on Windows).
+- If the OS config directory cannot be resolved, the app falls back to an app-local folder next to the executable, then `./rust-image-viewer`.
 - Legacy `rust-image-viewer-config.ini` and `setting.ini` files are migrated automatically.
 - Leaving a shortcut value empty disables the default binding for that action.
 - Older fullscreen defaults that used middle-click are migrated to the newer `f`, `f11`, `f12`, `enter` set.
@@ -485,7 +486,7 @@ That keeps branch-to-branch comparisons honest.
 
 ### Cache issues
 
-1. If metadata or thumbnails seem stale, delete `%LOCALAPPDATA%\rust-image-viewer\metadata_cache.redb`.
+1. If metadata or thumbnails seem stale, delete the metadata cache file in the app local-data directory (`%LOCALAPPDATA%\rust-image-viewer\metadata_cache.redb` on Windows).
 2. If you want to cap disk usage more aggressively, lower `metadata_cache_max_size_mb`.
 
 ### Build issues
