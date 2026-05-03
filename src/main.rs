@@ -16672,14 +16672,18 @@ impl ImageViewer {
                 }
             }
 
-            if self.is_masonry_mode()
-                && !self.masonry_authoritative_dimension_lock_active()
-                && video_dimensions_changed
-            {
-                self.masonry_queue_dimension_updates(std::iter::once(focused_idx));
-                if !self.masonry_navigation_active_for_heavy_work() {
-                    let force_flush = !self.masonry_metadata_preload_active;
-                    self.masonry_flush_pending_dimension_updates(force_flush);
+            if video_dimensions_changed {
+                if self.is_masonry_mode() && !self.masonry_authoritative_dimension_lock_active() {
+                    self.masonry_queue_dimension_updates(std::iter::once(focused_idx));
+                    if !self.masonry_navigation_active_for_heavy_work() {
+                        let force_flush = !self.masonry_metadata_preload_active;
+                        self.masonry_flush_pending_dimension_updates(force_flush);
+                    }
+                } else if !self.is_masonry_mode() {
+                    // Strip mode uses cached page-height offsets for placement.
+                    // If video playback reports better dimensions than the initial probe,
+                    // force a layout rebuild so width/height stay in sync (no stretch/squash).
+                    self.invalidate_manga_layout_cache();
                 }
             }
         }
