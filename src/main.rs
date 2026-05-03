@@ -2659,6 +2659,8 @@ struct ImageViewer {
     webp_show_custom_fps_slider: bool,
     /// Tracks which animated media path initialized the current custom FPS value.
     webp_fps_custom_media_path: Option<PathBuf>,
+    /// Fast memoized WEBP animation probes for strip/masonry placeholder overlays.
+    webp_animation_probe_cache: HashMap<PathBuf, (FileStamp, bool)>,
 
     // ============ BACKGROUND ANIMATION STREAMING ============
     /// Receiver that yields individual `ImageFrame`s as they are decoded on a
@@ -3026,6 +3028,7 @@ impl Default for ImageViewer {
             webp_custom_fps: Self::ANIMATED_IMAGE_CUSTOM_DEFAULT_FPS,
             webp_show_custom_fps_slider: true,
             webp_fps_custom_media_path: None,
+            webp_animation_probe_cache: HashMap::new(),
 
             // Background animation streaming fields
             anim_stream_rx: None,
@@ -8733,11 +8736,31 @@ impl ImageViewer {
         }
     }
 
-    fn is_probably_animated_image_path(path: &Path) -> bool {
-        path.extension()
-            .and_then(|ext| ext.to_str())
-            .map(|ext| matches!(ext.to_ascii_lowercase().as_str(), "gif" | "webp"))
-            .unwrap_or(false)
+    fn is_probably_animated_image_path(&mut self, path: &Path) -> bool {
+        if Self::path_is_gif(path) {
+            return true;
+        }
+
+        if !Self::path_is_webp(path) {
+            return false;
+        }
+
+        let Some(stamp) = file_stamp_for_path(path) else {
+            return false;
+        };
+
+        if let Some((cached_stamp, cached_is_animated)) =
+            self.webp_animation_probe_cache.get(path)
+        {
+            if *cached_stamp == stamp {
+                return *cached_is_animated;
+            }
+        }
+
+        let is_animated = LoadedImage::is_animated_webp(path);
+        self.webp_animation_probe_cache
+            .insert(path.to_path_buf(), (stamp, is_animated));
+        is_animated
     }
 
     fn current_fab_single_action_index(&self) -> Option<usize> {
@@ -16339,13 +16362,12 @@ impl ImageViewer {
             .and_then(|loader| loader.get_media_type(focused_idx))
             .map_or(false, |mt| mt == MangaMediaType::AnimatedImage);
 
-        let focused_is_animated = focused_is_animated
-            || self
-                .image_list
-                .get(focused_idx)
-                .map(|path| Self::is_probably_animated_image_path(path.as_path()))
-                .unwrap_or(false)
-                && !self.manga_anim_failed.contains(&focused_idx);
+        let focused_path = self.image_list.get(focused_idx).cloned();
+        let focused_by_path = focused_path
+            .as_ref()
+            .is_some_and(|path| self.is_probably_animated_image_path(path.as_path()))
+            && !self.manga_anim_failed.contains(&focused_idx);
+        let focused_is_animated = focused_is_animated || focused_by_path;
 
         if focused_is_animated {
             Some(focused_idx)
@@ -19306,10 +19328,10 @@ impl ImageViewer {
             return false;
         }
 
-        let media_path = self.image_list.get(idx);
+        let media_path = self.image_list.get(idx).cloned();
         let probably_animated_by_path = media_path
-            .map(|path| Self::is_probably_animated_image_path(path.as_path()))
-            .unwrap_or(false)
+            .as_ref()
+            .is_some_and(|path| self.is_probably_animated_image_path(path.as_path()))
             && !self.manga_anim_failed.contains(&idx);
 
         let cached_media_type = self
