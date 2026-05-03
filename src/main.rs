@@ -16620,14 +16620,22 @@ impl ImageViewer {
 
                 // Get new frame if available
                 if let Some(frame) = player.get_frame() {
-                    // Update dimensions in loader if changed
-                    if frame.width > 0 && frame.height > 0 {
+                    // Update layout dimensions from source/original video size (not decoded frame size).
+                    // Decoded frames may be output-bounded/downscaled, which would otherwise shrink
+                    // strip layout dimensions and cause cascading reflow/squash at low zoom.
+                    let (source_w, source_h) = player.dimensions();
+                    let (layout_w, layout_h) = if source_w > 0 && source_h > 0 {
+                        (source_w, source_h)
+                    } else {
+                        (frame.width, frame.height)
+                    };
+                    if layout_w > 0 && layout_h > 0 {
                         if !self.masonry_authoritative_dimension_lock_active() {
                             if let Some(ref mut loader) = self.manga_loader {
                                 video_dimensions_changed = loader.update_video_dimensions(
                                     focused_idx,
-                                    frame.width,
-                                    frame.height,
+                                    layout_w,
+                                    layout_h,
                                 );
                             }
                         }
