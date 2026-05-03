@@ -1883,6 +1883,7 @@ struct MangaFocusedVideoLoadRequest {
     prefer_hardware_decode: bool,
     disable_hardware_decode: bool,
     output_bounds: Option<(u32, u32)>,
+    autoplay: bool,
 }
 
 struct MangaFocusedVideoLoadResult {
@@ -1891,6 +1892,7 @@ struct MangaFocusedVideoLoadResult {
     path: PathBuf,
     result: Result<VideoPlayer, String>,
     worker_elapsed: Duration,
+    autoplay: bool,
 }
 
 struct MangaFocusedVideoLoadCoordinator {
@@ -1971,7 +1973,9 @@ fn process_manga_focused_video_load_request(
         output_dimensions,
     )
     .and_then(|mut player| {
-        player.play()?;
+        if request.autoplay {
+            player.play()?;
+        }
         Ok(player)
     });
 
@@ -1981,6 +1985,7 @@ fn process_manga_focused_video_load_request(
         path: request.path,
         result,
         worker_elapsed: started_at.elapsed(),
+        autoplay: request.autoplay,
     }
 }
 
@@ -12375,6 +12380,7 @@ impl ImageViewer {
         path: PathBuf,
         muted: bool,
         initial_volume: f64,
+        autoplay: bool,
     ) {
         if !gstreamer_runtime_available() {
             self.clear_pending_manga_video_load();
@@ -12414,6 +12420,7 @@ impl ImageViewer {
                 prefer_hardware_decode: self.config.video_prefer_hardware_decode,
                 disable_hardware_decode: self.config.video_disable_hardware_decode,
                 output_bounds,
+                autoplay,
             });
     }
 
@@ -12481,6 +12488,7 @@ impl ImageViewer {
             match result {
                 MangaFocusedVideoLoadResult {
                     index,
+                    autoplay,
                     result: Ok(mut player),
                     ..
                 } => {
@@ -12490,7 +12498,7 @@ impl ImageViewer {
                         self.manga_video_user_volume,
                     );
 
-                    if !player.is_playing() {
+                    if autoplay && !player.is_playing() {
                         if let Err(err) = player.play() {
                             self.manga_video_failed.insert(index);
                             self.video_playback_unavailable_reason = Some(err);
@@ -16539,7 +16547,13 @@ impl ImageViewer {
             if !self.manga_video_load_pending_for_index(focused_idx) {
                 // Ensure GStreamer is initialized before background startup work.
                 self.gstreamer_initialized = true;
-                self.start_async_manga_focused_video_load(focused_idx, path, muted, volume);
+                self.start_async_manga_focused_video_load(
+                    focused_idx,
+                    path,
+                    muted,
+                    volume,
+                    true,
+                );
             }
 
             return;
@@ -16590,7 +16604,6 @@ impl ImageViewer {
     }
 
     /// Poll video frames for manga mode and update textures.
-
     fn manga_update_video_textures(&mut self, ctx: &egui::Context) {
         if !self.manga_mode {
             return;
@@ -16605,9 +16618,11 @@ impl ImageViewer {
                 self.manga_target_texture_side_for_dynamic_media(focused_idx, MangaMediaType::Video);
             let mut video_dimensions_changed = false;
             let mut focused_audio_state: Option<(bool, f64)> = None;
+            let mut focused_is_playing = false;
 
             if let Some(player) = self.manga_video_players.get_mut(&focused_idx) {
                 focused_audio_state = Some((player.is_muted(), player.volume()));
+                focused_is_playing = player.is_playing();
 
                 // Update duration cache
                 player.update_duration();
@@ -16679,7 +16694,11 @@ impl ImageViewer {
                 }
             }
 
-            if !self.is_masonry_mode() && !self.manga_video_load_pending_for_index(focused_idx) {
+            // Avoid re-LOD/reload churn while the focused video is actively playing.
+            if !self.is_masonry_mode()
+                && !focused_is_playing
+                && !self.manga_video_load_pending_for_index(focused_idx)
+            {
                 let live_texture_dims = self
                     .manga_video_textures
                     .get(&focused_idx)
@@ -16700,13 +16719,13 @@ impl ImageViewer {
                         MangaMediaType::Video,
                     ) {
                         if let Some(path) = self.image_list.get(focused_idx).cloned() {
-                            self.manga_video_players.remove(&focused_idx);
                             self.gstreamer_initialized = true;
                             self.start_async_manga_focused_video_load(
                                 focused_idx,
                                 path,
                                 muted,
                                 volume,
+                                false,
                             );
                             self.perf_metrics
                                 .increment_counter("manga_video_live_quality_reload", 1);
