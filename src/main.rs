@@ -14487,12 +14487,19 @@ impl ImageViewer {
             .clamp(1, max_side);
 
         if self.is_masonry_mode() {
+            let masonry_active_preview = matches!(
+                media_type,
+                MangaMediaType::Video | MangaMediaType::AnimatedImage
+            ) && (self.manga_hovered_media_index == Some(index)
+                || self.manga_focused_video_index == Some(index)
+                || self.manga_focused_anim_index == Some(index));
             let is_playback_media = matches!(
                 media_type,
                 MangaMediaType::Video | MangaMediaType::AnimatedImage
             );
-            let fill_cap = if is_playback_media || !self.masonry_navigation_active_for_heavy_work()
-            {
+            let fill_cap = if masonry_active_preview {
+                max_side
+            } else if is_playback_media || !self.masonry_navigation_active_for_heavy_work() {
                 self.masonry_fill_target_side_cap()
             } else {
                 self.masonry_navigation_target_side_cap()
@@ -14633,6 +14640,11 @@ impl ImageViewer {
         image_rect: egui::Rect,
         media_type: MangaMediaType,
     ) -> (u32, u32) {
+        if self.is_masonry_mode() && media_type == MangaMediaType::Video {
+            let side = self.manga_bucket_side_covering_rect(index, image_rect);
+            return (side, side);
+        }
+
         if media_type != MangaMediaType::StaticImage {
             let side = self.manga_retry_target_side_for_rect(index, image_rect);
             return (side, side);
@@ -14696,10 +14708,21 @@ impl ImageViewer {
         let existing_pixels = existing_width as u64 * existing_height as u64;
         let desired_pixels = desired_width as u64 * desired_height as u64;
 
-        if self.is_masonry_mode() && media_type == MangaMediaType::StaticImage {
-            return desired_width > existing_width
-                || desired_height > existing_height
-                || desired_pixels > existing_pixels;
+        if self.is_masonry_mode() {
+            if media_type == MangaMediaType::StaticImage {
+                return desired_width > existing_width
+                    || desired_height > existing_height
+                    || desired_pixels > existing_pixels;
+            }
+
+            if media_type == MangaMediaType::Video {
+                let side_growth = desired_side.saturating_sub(existing_side);
+                let meaningful_pixel_growth =
+                    desired_pixels > existing_pixels.saturating_mul(11) / 10;
+                return desired_pixels > existing_pixels
+                    && (desired_width > existing_width || desired_height > existing_height)
+                    && (side_growth >= 16 || meaningful_pixel_growth);
+            }
         }
 
         let (ratio, delta) = if self.is_masonry_mode() {
