@@ -20601,8 +20601,9 @@ impl ImageViewer {
             let navigation_active = masonry_navigation_active_for_visible_retry;
 
             if navigation_active {
-                self.manga_hover_autoplay_resume_at = Instant::now()
-                    + Duration::from_millis(self.config.manga_hover_autoplay_resume_delay_ms);
+                // Keep hover autoplay immediate in masonry so scroll-driven hover updates
+                // behave the same as direct mouse movement.
+                self.manga_hover_autoplay_resume_at = Instant::now();
                 self.masonry_navigation_was_active = true;
                 self.masonry_quality_refine_due_at = None;
                 self.masonry_quality_refine_frames_remaining = 0;
