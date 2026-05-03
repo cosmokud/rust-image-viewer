@@ -16590,6 +16590,7 @@ impl ImageViewer {
     }
 
     /// Poll video frames for manga mode and update textures.
+
     fn manga_update_video_textures(&mut self, ctx: &egui::Context) {
         if !self.manga_mode {
             return;
@@ -16600,10 +16601,14 @@ impl ImageViewer {
 
         // Only update the focused video's texture (to save resources)
         if let Some(focused_idx) = self.manga_focused_video_index {
-            let target_side = self
-                .manga_target_texture_side_for_dynamic_media(focused_idx, MangaMediaType::Video);
+            let target_side =
+                self.manga_target_texture_side_for_dynamic_media(focused_idx, MangaMediaType::Video);
             let mut video_dimensions_changed = false;
+            let mut focused_audio_state: Option<(bool, f64)> = None;
+
             if let Some(player) = self.manga_video_players.get_mut(&focused_idx) {
+                focused_audio_state = Some((player.is_muted(), player.volume()));
+
                 // Update duration cache
                 player.update_duration();
 
@@ -16632,11 +16637,8 @@ impl ImageViewer {
                     if layout_w > 0 && layout_h > 0 {
                         if !self.masonry_authoritative_dimension_lock_active() {
                             if let Some(ref mut loader) = self.manga_loader {
-                                video_dimensions_changed = loader.update_video_dimensions(
-                                    focused_idx,
-                                    layout_w,
-                                    layout_h,
-                                );
+                                video_dimensions_changed =
+                                    loader.update_video_dimensions(focused_idx, layout_w, layout_h);
                             }
                         }
                     }
@@ -16652,10 +16654,8 @@ impl ImageViewer {
                             self.config.downscale_filter.to_image_filter()
                         },
                     );
-                    let color_image = egui::ColorImage::from_rgba_unmultiplied(
-                        [w as usize, h as usize],
-                        pixels.as_ref(),
-                    );
+                    let color_image =
+                        egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], pixels.as_ref());
 
                     // Live video textures are updated every frame; generating mipmaps here is
                     // expensive and the video sink already outputs near-display resolution.
@@ -16674,8 +16674,43 @@ impl ImageViewer {
                             texture_options,
                         );
 
-                        self.manga_video_textures
-                            .insert(focused_idx, (texture, w, h));
+                        self.manga_video_textures.insert(focused_idx, (texture, w, h));
+                    }
+                }
+            }
+
+            if !self.is_masonry_mode() && !self.manga_video_load_pending_for_index(focused_idx) {
+                let live_texture_dims = self
+                    .manga_video_textures
+                    .get(&focused_idx)
+                    .map(|(_, w, h)| (*w, *h));
+                if let (Some((muted, volume)), Some((tex_w, tex_h))) =
+                    (focused_audio_state, live_texture_dims)
+                {
+                    let desired_dims = self.manga_bucket_dimensions_for_side(
+                        focused_idx,
+                        target_side,
+                        self.manga_strip_item_current_display_size(focused_idx),
+                    );
+                    if self.manga_texture_upgrade_needed(
+                        tex_w,
+                        tex_h,
+                        desired_dims.0,
+                        desired_dims.1,
+                        MangaMediaType::Video,
+                    ) {
+                        if let Some(path) = self.image_list.get(focused_idx).cloned() {
+                            self.manga_video_players.remove(&focused_idx);
+                            self.gstreamer_initialized = true;
+                            self.start_async_manga_focused_video_load(
+                                focused_idx,
+                                path,
+                                muted,
+                                volume,
+                            );
+                            self.perf_metrics
+                                .increment_counter("manga_video_live_quality_reload", 1);
+                        }
                     }
                 }
             }
