@@ -120,6 +120,8 @@ Download the latest release from the [Releases](https://github.com/cosmokud/rust
 The app is portable in the sense that you can place the executable folder anywhere. Use Windows `Open with` or file associations to launch media directly into it.
 
 Release automation now targets NSIS-style installer artifacts and a guarded manual tagged deploy path; legacy nightly/WiX workflow paths were removed.
+Current tagged release workflows also publish the portable `target/release/rust-image-viewer.exe` artifact alongside installer executables.
+The NSIS installer includes a migration path for legacy WiX/MSI installs: it detects older entries and can force uninstall before continuing to prevent conflicting side-by-side installs.
 
 ### Windows SmartScreen / Smart App Control
 

@@ -43,12 +43,15 @@ The architecture is intentionally biased toward "what helps the next visible fra
 | `src/single_instance.rs`   | Windows single-instance mutex and IPC handoff                                                                    | Lets secondary launches reuse the primary window                                    |
 | `src/windows_env.rs`       | Windows PATH refresh and maximize helpers                                                                        | Makes GStreamer discovery and native window transitions more reliable               |
 | `assets/config.ini`        | Canonical config template                                                                                        | Source of truth for user-facing configuration                                       |
+| `build-installers.ps1`     | Windows packaging orchestrator for prebuilt binary + NSIS output variants                                       | Standardizes release packaging inputs/outputs across local and CI builds            |
+| `packaging/nsis/installer.nsi` | NSIS template including upgrade/migration logic (legacy WiX/MSI detection and uninstall path)               | Defines installer/uninstaller behavior and cross-generation upgrade safety           |
 | `.github/workflows/*.yml`  | Tag-gated release automation and manual tagged deploy workflow                                                   | Prevents accidental overwrite and keeps release publishing reproducible             |
 
 Two structural observations are important:
 
 - The app is intentionally centralized in `src/main.rs`. That is normal here because `egui` is immediate-mode and most performance-sensitive state transitions need to be coordinated in one place.
 - Multi-item fullscreen browsing is called "manga mode" in the codebase. It has two layouts: `LongStrip` and `Masonry`.
+- Windows packaging is NSIS-first in the current tree; legacy WiX-era installs are handled as migration targets during NSIS installation.
 
 ## 3. Startup to first paint
 

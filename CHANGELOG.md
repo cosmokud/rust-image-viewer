@@ -20,6 +20,7 @@ All notable changes to this project will be documented in this file.
 - `src/app_dirs.rs` helper module to centralize OS-aware app config/local-data path resolution using the `directories` crate.
 - Manual tagged release workflow support (`manual-deploy.yml`) with release/tag guardrails.
 - INI configuration parsing/rendering tests for config safety.
+- Legacy WiX/MSI install detection in the NSIS installer, including automatic migration-path uninstall handling before NSIS install continues.
 
 ### Changed
 
@@ -30,11 +31,13 @@ All notable changes to this project will be documented in this file.
 - Deployment pipeline flow now removes legacy nightly/WiX paths, standardizes tag-driven release creation, and aligns installer output handling.
 - Config, metadata cache, and folder-travel cache path resolution now use `directories::BaseDirs` (with executable/temp fallbacks) instead of direct `APPDATA`/`LOCALAPPDATA` reads.
 - Windows build metadata resources and packaging metadata were expanded for product identity/version presentation.
+- NSIS finish-page behavior was simplified by removing the post-install "run app now" action wiring.
 
 ### Fixed
 
 - Window-size jitter and unexpected resize jumps while interacting with zoom in floating mode.
 - Several track-selection and subtitle-state edge cases during video playback transitions.
+- Installer upgrade path now better handles legacy WiX-based installs by forcing uninstall earlier and reducing side-by-side install conflicts.
 
 ## [v0.3.7] - 2026-04-28
 
