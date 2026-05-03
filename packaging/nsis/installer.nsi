@@ -515,8 +515,6 @@ FunctionEnd
 !define MUI_FINISHPAGE_SHOWREADME
 !define MUI_FINISHPAGE_SHOWREADME_TEXT "$(createDesktop)"
 !define MUI_FINISHPAGE_SHOWREADME_FUNCTION CreateDesktopShortcut
-; Show run app after installation.
-!define MUI_FINISHPAGE_RUN "$INSTDIR\${MAINBINARYNAME}.exe"
 !define MUI_PAGE_CUSTOMFUNCTION_PRE SkipIfPassive
 !insertmacro MUI_PAGE_FINISH
 
