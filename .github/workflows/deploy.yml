@@ -87,10 +87,14 @@ jobs:
         shell: bash
         run: |
           TAG_NAME="${{ github.ref_name }}"
-          VERSION="${TAG_NAME#v}"
+          VERSION="${TAG_NAME}"
 
           # Extract changelog section for the current version
-          awk '/^## \['"$VERSION"'\]/{flag=1; next} /^## \[/{flag=0} flag' CHANGELOG.md > release_notes.md
+          awk -v version="$VERSION" '
+            index($0, "## [" version "]") == 1 { flag=1; next }
+            /^## \[/ { if (flag) exit; }
+            flag { print }
+          ' CHANGELOG.md > release_notes.md
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2

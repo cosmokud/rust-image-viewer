@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.3.9-rc.1] - 2026-05-03
+
+### Highlights
+
+- Release workflow polish for pre-release tags and streamlined Windows release binary generation.
+- Deploy/test workflow naming and tag handling were cleaned up for clearer release operations.
+
+### Added
+
+- A dedicated `cargo build --release` step in deploy and manual-deploy workflows before installer packaging.
+
+### Changed
+
+- Refined the installer build script release-binary helper to streamline artifact generation for installer builds.
+- Renamed the workflow display name from `Deploy Test` to `Test` for clearer action history.
+- Updated deploy workflow tag filtering behavior by removing an exclusion pattern that blocked version-tag releases.
+
 ## [v0.3.8] - 2026-05-02
 
 ### Highlights
