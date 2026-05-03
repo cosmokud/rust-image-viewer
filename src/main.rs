@@ -20588,6 +20588,15 @@ impl ImageViewer {
             }
         }
 
+        // Re-evaluate hover target after scroll/zoom/pan updates so masonry hover-preview
+        // tracks content motion even when the physical cursor did not move this frame.
+        if !title_ui_blocking && !pointer_over_shortcut_ui && !over_controls {
+            self.manga_hovered_media_index =
+                pointer_pos.and_then(|pos| self.manga_index_at_screen_pos(pos));
+        } else {
+            self.manga_hovered_media_index = None;
+        }
+
         if self.is_masonry_mode() {
             let navigation_active = masonry_navigation_active_for_visible_retry;
 
@@ -20610,6 +20619,16 @@ impl ImageViewer {
                     self.manga_preload_cooldown = 0;
                     self.manga_update_preload_queue();
                     animation_active = true;
+                }
+
+                // Keep one wake-up scheduled at hover-autoplay resume time so masonry
+                // hover preview can start after scroll settles without requiring mouse motion.
+                let now = Instant::now();
+                if now < self.manga_hover_autoplay_resume_at {
+                    ctx.request_repaint_after(
+                        self.manga_hover_autoplay_resume_at
+                            .saturating_duration_since(now),
+                    );
                 }
             }
         }
