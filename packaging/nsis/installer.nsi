@@ -38,6 +38,8 @@ ${StrLoc}
 !define DISPLAYLANGUAGESELECTOR "{{display_language_selector}}"
 !define UNINSTKEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCTNAME}"
 !define MANUPRODUCTKEY "Software\${MANUFACTURER}\${PRODUCTNAME}"
+!define LEGACYWIXDISPLAYNAME "Rust Image Viewer"
+!define LEGACYWIXPUBLISHER "cosmokud"
 !define UNINSTALLERSIGNCOMMAND "{{uninstaller_sign_cmd}}"
 !define ESTIMATEDSIZE "{{estimated_size}}"
 
@@ -129,22 +131,88 @@ VIAddVersionKey "ProductVersion" "${VERSION}"
 ; 4. Custom page to ask user if he wants to reinstall/uninstall
 ;    only if a previous installtion was detected
 Var ReinstallPageCheck
+Var LegacyWixDetected
+Var LegacyWixUninstallString
+Var LegacyWixInstallLocation
+Var LegacyWixDisplayVersion
+Var LegacyWixProductCode
 {{#if file_associations}}
 Var RegisterFileAssociationsCheckbox
 Var RegisterFileAssociationsState
 {{/if}}
 Page custom PageReinstall PageLeaveReinstall
+Function DetectLegacyWixInstall
+  StrCpy $LegacyWixDetected 0
+  StrCpy $LegacyWixUninstallString ""
+  StrCpy $LegacyWixInstallLocation ""
+  StrCpy $LegacyWixDisplayVersion ""
+  StrCpy $LegacyWixProductCode ""
+
+  StrCpy $R6 0
+  legacy_wix_enum_native:
+    EnumRegKey $R7 HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall" $R6
+    StrCmp $R7 "" legacy_wix_enum_wow_start
+    ReadRegStr $R8 HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\$R7" "DisplayName"
+    StrCmp $R8 "${LEGACYWIXDISPLAYNAME}" 0 legacy_wix_enum_native_next
+    ReadRegStr $R9 HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\$R7" "Publisher"
+    StrCmp $R9 "${LEGACYWIXPUBLISHER}" 0 legacy_wix_enum_native_next
+    ReadRegStr $R8 HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\$R7" "UninstallString"
+    StrCmp $R8 "" legacy_wix_enum_native_next
+    StrCpy $LegacyWixDetected 1
+    StrCpy $LegacyWixUninstallString "$R8"
+    ReadRegStr $LegacyWixInstallLocation HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\$R7" "InstallLocation"
+    ReadRegStr $LegacyWixDisplayVersion HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\$R7" "DisplayVersion"
+    StrCpy $LegacyWixProductCode "$R7"
+    Return
+  legacy_wix_enum_native_next:
+    IntOp $R6 $R6 + 1
+    Goto legacy_wix_enum_native
+
+  legacy_wix_enum_wow_start:
+    StrCpy $R6 0
+  legacy_wix_enum_wow:
+    EnumRegKey $R7 HKCU "Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall" $R6
+    StrCmp $R7 "" legacy_wix_not_found
+    ReadRegStr $R8 HKCU "Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\$R7" "DisplayName"
+    StrCmp $R8 "${LEGACYWIXDISPLAYNAME}" 0 legacy_wix_enum_wow_next
+    ReadRegStr $R9 HKCU "Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\$R7" "Publisher"
+    StrCmp $R9 "${LEGACYWIXPUBLISHER}" 0 legacy_wix_enum_wow_next
+    ReadRegStr $R8 HKCU "Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\$R7" "UninstallString"
+    StrCmp $R8 "" legacy_wix_enum_wow_next
+    StrCpy $LegacyWixDetected 1
+    StrCpy $LegacyWixUninstallString "$R8"
+    ReadRegStr $LegacyWixInstallLocation HKCU "Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\$R7" "InstallLocation"
+    ReadRegStr $LegacyWixDisplayVersion HKCU "Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\$R7" "DisplayVersion"
+    StrCpy $LegacyWixProductCode "$R7"
+    Return
+  legacy_wix_enum_wow_next:
+    IntOp $R6 $R6 + 1
+    Goto legacy_wix_enum_wow
+
+  legacy_wix_not_found:
+FunctionEnd
 Function PageReinstall
   ; Check if there is an existing installation, if not, abort the reinstall page
   ReadRegStr $R0 SHCTX "${UNINSTKEY}" ""
   ReadRegStr $R1 SHCTX "${UNINSTKEY}" "UninstallString"
-  ${IfThen} "$R0$R1" == "" ${|} Abort ${|}
+  StrCpy $LegacyWixDetected 0
+  ${If} "$R0$R1" == ""
+    Call DetectLegacyWixInstall
+    ${If} $LegacyWixDetected == 0
+      Abort
+    ${EndIf}
+  ${EndIf}
 
   ; Compare this installar version with the existing installation
   ; and modify the messages presented to the user accordingly
   compare_version:
   StrCpy $R4 "$(older)"
-  ReadRegStr $R0 SHCTX "${UNINSTKEY}" "DisplayVersion"
+  ${If} $LegacyWixDetected == 1
+    StrCpy $R0 "$LegacyWixDisplayVersion"
+    StrCpy $R1 "$LegacyWixUninstallString"
+  ${Else}
+    ReadRegStr $R0 SHCTX "${UNINSTKEY}" "DisplayVersion"
+  ${EndIf}
   ${IfThen} $R0 == "" ${|} StrCpy $R4 "$(unknown)" ${|}
 
   nsis_tauri_utils::SemverCompare "${VERSION}" $R0
@@ -235,9 +303,24 @@ Function PageLeaveReinstall
     HideWindow
     ClearErrors
 
-    ReadRegStr $4 SHCTX "${MANUPRODUCTKEY}" ""
-    ReadRegStr $R1 SHCTX "${UNINSTKEY}" "UninstallString"
-    ExecWait '$R1 /P _?=$4' $0
+    ${If} $LegacyWixDetected == 1
+      StrCpy $R1 "$LegacyWixUninstallString"
+      StrCpy $4 "$LegacyWixInstallLocation"
+    ${Else}
+      ReadRegStr $4 SHCTX "${MANUPRODUCTKEY}" ""
+      ReadRegStr $R1 SHCTX "${UNINSTKEY}" "UninstallString"
+    ${EndIf}
+
+    ${If} $LegacyWixDetected == 1
+      StrCpy $R0 $LegacyWixProductCode 1
+      ${If} $R0 == "{"
+        ExecWait '"$SYSDIR\msiexec.exe" /x "$LegacyWixProductCode"' $0
+      ${Else}
+        ExecWait '$R1' $0
+      ${EndIf}
+    ${Else}
+      ExecWait '$R1 /P _?=$4' $0
+    ${EndIf}
 
     BringToFront
 
@@ -253,6 +336,9 @@ Function PageLeaveReinstall
       MessageBox MB_ICONEXCLAMATION "$(unableToUninstall)"
       Abort
     ${Else}
+      ${If} $LegacyWixDetected == 1
+        Goto reinst_done
+      ${EndIf}
       StrCpy $0 $R1 1
       ${IfThen} $0 == '"' ${|} StrCpy $R1 $R1 -1 1 ${|} ; Strip quotes from UninstallString
       Delete $R1
