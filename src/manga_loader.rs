@@ -902,6 +902,33 @@ impl MangaLoader {
         Self::fallback_video_dimensions(path).unwrap_or((1920, 1080))
     }
 
+    fn is_webm_video_path(path: &std::path::Path) -> bool {
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("webm"))
+            .unwrap_or(false)
+    }
+
+    fn webm_thumbnail_too_small_for_request(
+        path: &std::path::Path,
+        width: u32,
+        height: u32,
+        original_width: u32,
+        original_height: u32,
+        requested_side: u32,
+    ) -> bool {
+        if !Self::is_webm_video_path(path) || !gstreamer_runtime_available() {
+            return false;
+        }
+
+        let expected_side = requested_side
+            .max(1)
+            .min(original_width.max(original_height).max(1));
+        let thumbnail_side = width.max(height);
+
+        expected_side >= 128 && thumbnail_side.saturating_mul(4) < expected_side.saturating_mul(3)
+    }
+
     /// Load a single image on a worker thread.
     /// For video files, this extracts the first frame as a thumbnail placeholder.
     fn load_single_image(req: &LoadRequest) -> Option<DecodedImage> {
@@ -1200,7 +1227,16 @@ impl MangaLoader {
         max_texture_side: u32,
     ) -> Option<(Vec<u8>, u32, u32, u32, u32)> {
         if let Some(mut cached) = lookup_cached_video_thumbnail(path, max_texture_side) {
-            if !gstreamer_runtime_available() {
+            let cached_too_small = Self::webm_thumbnail_too_small_for_request(
+                path,
+                cached.width,
+                cached.height,
+                cached.original_width,
+                cached.original_height,
+                max_texture_side,
+            );
+
+            if !cached_too_small && !gstreamer_runtime_available() {
                 if let Some((original_width, original_height)) =
                     probe_video_dimensions_without_gstreamer(path)
                 {
@@ -1214,31 +1250,45 @@ impl MangaLoader {
                 }
             }
 
-            return Some((
-                cached.pixels,
-                cached.width,
-                cached.height,
-                cached.original_width,
-                cached.original_height,
-            ));
+            if !cached_too_small {
+                return Some((
+                    cached.pixels,
+                    cached.width,
+                    cached.height,
+                    cached.original_width,
+                    cached.original_height,
+                ));
+            }
         }
 
         if let Some((pixels, width, height, original_width, original_height)) =
             extract_video_first_frame_without_gstreamer(path, max_texture_side)
         {
-            store_cached_video_thumbnail(
+            if Self::webm_thumbnail_too_small_for_request(
                 path,
+                width,
+                height,
+                original_width,
+                original_height,
                 max_texture_side,
-                &CachedVideoThumbnail {
-                    pixels: pixels.clone(),
-                    width,
-                    height,
-                    original_width,
-                    original_height,
-                },
-            );
+            ) {
+                // Windows shell WEBM thumbnails can be much smaller than the requested
+                // masonry LOD. Let the existing GStreamer path try next.
+            } else {
+                store_cached_video_thumbnail(
+                    path,
+                    max_texture_side,
+                    &CachedVideoThumbnail {
+                        pixels: pixels.clone(),
+                        width,
+                        height,
+                        original_width,
+                        original_height,
+                    },
+                );
 
-            return Some((pixels, width, height, original_width, original_height));
+                return Some((pixels, width, height, original_width, original_height));
+            }
         }
 
         if !gstreamer_runtime_available() {
