@@ -7,23 +7,29 @@ All notable changes to this project will be documented in this file.
 ### Highlights
 
 - Stabilized floating window behavior during drag, zoom, and resize so manual sizing and centering stay predictable.
-- Improved video playback transition quality with safer output sizing and reduced stutter during audio-track changes.
-- Hardened release automation with stricter tag/release checks and a dedicated manual deploy workflow.
+- Added animated WebP playback with per-media GIF/WebP FPS override controls, plus videos-only navigation support for video-like media.
+- Improved video playback transition quality with safer output sizing, better WebM probing/thumbnail handling, and reduced stutter during audio-track changes.
+- Hardened release packaging/deploy flows around NSIS/manual workflow paths and centralized OS-aware app config/data path resolution.
 
 ### Added
 
+- Animated WebP playback path with frame streaming support, plus GIF/WebP FPS override controls (preset and slider paths).
+- `videos_only_navigation` option so next/previous in video-like playback can skip non-video-like files.
 - Language-aware subtitle/audio labeling support (including script fallback profiles) for more reliable track presentation.
 - Deferred audio-track switching path to reduce playback disruption while changing tracks.
-- Manual release workflow support for tagged builds (`manual-deploy.yml`) with guardrails for duplicate releases.
 - `src/app_dirs.rs` helper module to centralize OS-aware app config/local-data path resolution using the `directories` crate.
+- Manual tagged release workflow support (`manual-deploy.yml`) with release/tag guardrails.
+- INI configuration parsing/rendering tests for config safety.
 
 ### Changed
 
 - Floating window resize/zoom/autosize behavior to preserve pan/center intent and avoid unintended native snap/oversize regressions.
 - Solo video output-bound calculations and texture-dimension handoff to keep aspect transitions stable.
-- Deployment pipeline flow: removed legacy nightly/installer script path and standardized tag-driven release creation.
-- Config, metadata cache, and folder-travel cache path resolution now use `directories::BaseDirs` (with executable/temp fallbacks) instead of direct `APPDATA`/`LOCALAPPDATA` env-var reads.
-- Windows build metadata resources were expanded for product identity/version presentation.
+- Masonry hover autoplay/preview handling for smoother focus recovery and more consistent scroll-driven behavior.
+- Manga video placeholder/retry/dimension flows for WebM/video thumbnails were refined for safer stale-result handling and fallback behavior.
+- Deployment pipeline flow now removes legacy nightly/WiX paths, standardizes tag-driven release creation, and aligns installer output handling.
+- Config, metadata cache, and folder-travel cache path resolution now use `directories::BaseDirs` (with executable/temp fallbacks) instead of direct `APPDATA`/`LOCALAPPDATA` reads.
+- Windows build metadata resources and packaging metadata were expanded for product identity/version presentation.
 
 ### Fixed
 

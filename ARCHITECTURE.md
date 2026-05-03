@@ -44,7 +44,6 @@ The architecture is intentionally biased toward "what helps the next visible fra
 | `src/windows_env.rs`       | Windows PATH refresh and maximize helpers                                                                        | Makes GStreamer discovery and native window transitions more reliable               |
 | `assets/config.ini`        | Canonical config template                                                                                        | Source of truth for user-facing configuration                                       |
 | `.github/workflows/*.yml`  | Tag-gated release automation and manual tagged deploy workflow                                                   | Prevents accidental overwrite and keeps release publishing reproducible             |
-| `benches/perf_baseline.rs` | Criterion benchmarks for scan, GIF, and spatial-query performance                                                | Used to catch performance regressions                                               |
 
 Two structural observations are important:
 
@@ -645,6 +644,8 @@ Seeking clears queued frames, marks a seek-in-progress flag to ignore stale samp
 
 Audio/subtitle track switching is coordinated to avoid mid-transition thrash: selection updates can be deferred until the pipeline is in a safe state, and track labels are normalized with language-aware handling so menu state remains stable across multilingual media.
 
+For video-like playback navigation (videos, GIF, animated WebP), `videos_only_navigation` can scope next/previous traversal to video-like entries only.
+
 ### 10.6 Focus policy in strip and masonry
 
 The viewer does not try to run every video tile live.
@@ -700,18 +701,9 @@ The overlay reports metrics such as:
 - `tracing` and `tracing-subscriber` drive runtime logging
 - `RIV_PUFFIN` can enable `puffin` scopes
 
-### 12.3 Benchmarks
+### 12.3 Regression verification
 
-`benches/perf_baseline.rs` covers:
-
-- directory scan performance
-- directory index cache hit/miss behavior
-- GIF decode throughput
-- strip R-tree queries
-- masonry R-tree queries
-- spatial-index rebuild cost
-
-For this project, performance work is not "done" until it can be observed.
+Regression checking is currently centered on runtime diagnostics (`show_fps` overlay metrics plus tracing/profiling) and targeted config/parser tests. The old Criterion benchmark harness was removed from the active tree.
 
 ## 13. Performance engineering catalogue
 
@@ -811,13 +803,9 @@ The viewer's speed comes from many cooperating techniques rather than one big tr
 | `winres`       | Embeds the Windows icon resource into the binary                                                                 |
 | `fs_extra`     | Declared build dependency for build-time file operations; not currently central to the active build script logic |
 
-### 14.6 Dev and benchmarking dependencies
+### 14.6 Dev dependencies
 
-| Crate       | Role in this project                                      |
-| ----------- | --------------------------------------------------------- |
-| `criterion` | Reproducible benchmarks with HTML reports                 |
-| `tempfile`  | Temporary datasets and fixture creation for benchmarks    |
-| `pprof`     | Non-Windows benchmark profiling and flamegraph generation |
+No dedicated benchmark-only crate stack is active in the current tree; validation is driven by runtime diagnostics and test coverage.
 
 One extra code-level note: directory enumeration is natural-sorted in `src/image_loader.rs` so that file names like `page_2` sort before `page_10`.
 

@@ -60,6 +60,8 @@ This project is intentionally optimized for one job: opening media fast, navigat
 - GStreamer-backed video playback with `playbin3` fallback to `playbin`.
 - Play / pause, seek, mute, volume, looping, and hover-driven controls.
 - Deferred audio-track switching to reduce playback stutter during active transitions.
+- `videos_only_navigation` mode for next/previous in video-like playback (videos, GIF, animated WebP).
+- GIF/animated-WebP FPS override controls with presets and slider for playback-rate tuning.
 - Adaptive seek policy support:
   - `adaptive` = keyframe while dragging, accurate on release
   - `accurate` = always frame-accurate seeks
@@ -116,6 +118,8 @@ This project is intentionally optimized for one job: opening media fast, navigat
 Download the latest release from the [Releases](https://github.com/cosmokud/rust-image-viewer/releases) page.
 
 The app is portable in the sense that you can place the executable folder anywhere. Use Windows `Open with` or file associations to launch media directly into it.
+
+Release automation now targets NSIS-style installer artifacts and a guarded manual tagged deploy path; legacy nightly/WiX workflow paths were removed.
 
 ### Windows SmartScreen / Smart App Control
 
@@ -366,6 +370,7 @@ Delete `config.ini` if you want to regenerate it from the current defaults.
 | `seek_policy`             | `adaptive` | `adaptive`, `accurate`, or `keyframe`.                                                  |
 | `prefer_hardware_decode`  | `true`     | Prefer D3D11 decoders when available on Windows.                                        |
 | `disable_hardware_decode` | `false`    | Disable hardware decoders completely. Overrides `prefer_hardware_decode`.               |
+| `videos_only_navigation`  | `true`     | In video-like playback mode, next/previous skip non-video-like files when enabled.      |
 
 ### Persisted video state
 
