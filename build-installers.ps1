@@ -54,7 +54,7 @@ function Resolve-PackageInfo {
     return $package
 }
 
-function Ensure-PrebuiltReleaseBinary {
+function Build-ReleaseBinary {
     param(
         [Parameter(Mandatory = $true)]
         [string]$RepoRoot,
@@ -64,17 +64,23 @@ function Ensure-PrebuiltReleaseBinary {
     )
 
     $binaryPath = Join-Path $RepoRoot ("target\release\{0}.exe" -f $BinaryName)
+    Write-Host "Building release binary once for both installer variants..."
+    cargo build --release
+    if ($LASTEXITCODE -ne 0) {
+        exit $LASTEXITCODE
+    }
+
     if (-not (Test-Path -LiteralPath $binaryPath)) {
         throw @"
-Missing prebuilt release binary:
+Release build completed, but expected binary is missing:
 $binaryPath
 
-Build it once before running this packaging script:
+Expected after running:
 cargo build --release
 "@
     }
 
-    Write-Host "Using prebuilt release binary:"
+    Write-Host "Using release binary for both installers:"
     Write-Host (" - " + $binaryPath)
 }
 
@@ -332,7 +338,7 @@ Ensure-CargoPackager
 $package = Resolve-PackageInfo
 $packageName = $package.name
 $packageVersion = $package.version
-Ensure-PrebuiltReleaseBinary -RepoRoot $repoRoot -BinaryName "rust-image-viewer"
+Build-ReleaseBinary -RepoRoot $repoRoot -BinaryName "rust-image-viewer"
 
 $outputDir = Join-Path $repoRoot "target\packager"
 New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
