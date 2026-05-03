@@ -1,6 +1,6 @@
 [package]
 name = "rust-image-viewer"
-version = "0.3.9-rc.1"
+version = "0.3.9-rc.2"
 edition = "2021"
 authors = ["Image Viewer"]
 description = "High-performance image and video viewer for Windows 10/11"

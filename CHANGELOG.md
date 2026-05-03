@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.3.9-rc.2] - 2026-05-03
+
+### Highlights
+
+- Corrective pre-release cut to align project version metadata and release notes after `v0.3.9-rc.1`.
+
+### Changed
+
+- Bumped crate/package version to `0.3.9-rc.2` for the next release-candidate cycle.
+- Added this `v0.3.9-rc.2` changelog entry based on the current commit state after `v0.3.9-rc.1`.
+
 ## [v0.3.9-rc.1] - 2026-05-03
 
 ### Highlights
