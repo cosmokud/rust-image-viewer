@@ -54,6 +54,30 @@ function Resolve-PackageInfo {
     return $package
 }
 
+function Ensure-PrebuiltReleaseBinary {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RepoRoot,
+
+        [Parameter(Mandatory = $true)]
+        [string]$BinaryName
+    )
+
+    $binaryPath = Join-Path $RepoRoot ("target\release\{0}.exe" -f $BinaryName)
+    if (-not (Test-Path -LiteralPath $binaryPath)) {
+        throw @"
+Missing prebuilt release binary:
+$binaryPath
+
+Build it once before running this packaging script:
+cargo build --release
+"@
+    }
+
+    Write-Host "Using prebuilt release binary:"
+    Write-Host (" - " + $binaryPath)
+}
+
 function Resolve-GStreamerPrefix {
     param(
         [string]$CandidateRoot
@@ -211,7 +235,7 @@ function Write-PackagerConfig {
         "formats = [""nsis""]",
         "out-dir = ""$tomlOutputDir""",
         "binaries-dir = ""$tomlReleaseDir""",
-        "before-packaging-command = ""cargo build --release""",
+        "before-packaging-command = ""echo using prebuilt target/release binary""",
         ""
     )
 
@@ -269,7 +293,7 @@ function Invoke-Packager {
         [string]$OutputDir
     )
 
-    cargo packager --release --config $ConfigPath --formats nsis
+    cargo packager --config $ConfigPath --formats nsis
     if ($LASTEXITCODE -ne 0) {
         exit $LASTEXITCODE
     }
@@ -308,6 +332,7 @@ Ensure-CargoPackager
 $package = Resolve-PackageInfo
 $packageName = $package.name
 $packageVersion = $package.version
+Ensure-PrebuiltReleaseBinary -RepoRoot $repoRoot -BinaryName "rust-image-viewer"
 
 $outputDir = Join-Path $repoRoot "target\packager"
 New-Item -ItemType Directory -Path $outputDir -Force | Out-Null

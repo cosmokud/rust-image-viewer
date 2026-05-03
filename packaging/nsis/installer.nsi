@@ -40,6 +40,7 @@ ${StrLoc}
 !define MANUPRODUCTKEY "Software\${MANUFACTURER}\${PRODUCTNAME}"
 !define LEGACYWIXDISPLAYNAME "Rust Image Viewer"
 !define LEGACYWIXPUBLISHER "cosmokud"
+!define LEGACYWIXINSTALLDIRHINT "rust-image-viewer"
 !define UNINSTALLERSIGNCOMMAND "{{uninstaller_sign_cmd}}"
 !define ESTIMATEDSIZE "{{estimated_size}}"
 
@@ -149,47 +150,175 @@ Function DetectLegacyWixInstall
   StrCpy $LegacyWixProductCode ""
 
   StrCpy $R6 0
-  legacy_wix_enum_native:
+  legacy_wix_enum_hkcu_native:
     EnumRegKey $R7 HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall" $R6
-    StrCmp $R7 "" legacy_wix_enum_wow_start
-    ReadRegStr $R8 HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\$R7" "DisplayName"
-    StrCmp $R8 "${LEGACYWIXDISPLAYNAME}" 0 legacy_wix_enum_native_next
-    ReadRegStr $R9 HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\$R7" "Publisher"
-    StrCmp $R9 "${LEGACYWIXPUBLISHER}" 0 legacy_wix_enum_native_next
+    StrCmp $R7 "" legacy_wix_enum_hkcu_wow_start
     ReadRegStr $R8 HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\$R7" "UninstallString"
-    StrCmp $R8 "" legacy_wix_enum_native_next
+    StrCmp $R8 "" legacy_wix_enum_hkcu_native_next
+    ${StrLoc} $R2 "$R8" "MsiExec" ">"
+    StrCpy $R1 $R7 1
+    StrCmp $R1 "{" legacy_wix_hkcu_native_is_msi 0
+    StrCmp $R2 "" legacy_wix_enum_hkcu_native_next 0
+  legacy_wix_hkcu_native_is_msi:
+    ReadRegStr $R5 HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\$R7" "DisplayName"
+    ReadRegStr $R4 HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\$R7" "Publisher"
+    ReadRegStr $R3 HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\$R7" "InstallLocation"
+    ${StrLoc} $R2 "$R5" "${LEGACYWIXDISPLAYNAME}" ">"
+    StrCmp $R2 "" +2 0
+      Goto legacy_wix_match_hkcu_native
+    ${StrLoc} $R2 "$R4" "${LEGACYWIXPUBLISHER}" ">"
+    StrCmp $R2 "" +2 0
+      Goto legacy_wix_match_hkcu_native
+    ${StrLoc} $R2 "$R3" "${LEGACYWIXINSTALLDIRHINT}" ">"
+    StrCmp $R2 "" +2 0
+      Goto legacy_wix_match_hkcu_native
+    Goto legacy_wix_enum_hkcu_native_next
+  legacy_wix_match_hkcu_native:
     StrCpy $LegacyWixDetected 1
     StrCpy $LegacyWixUninstallString "$R8"
     ReadRegStr $LegacyWixInstallLocation HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\$R7" "InstallLocation"
     ReadRegStr $LegacyWixDisplayVersion HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\$R7" "DisplayVersion"
     StrCpy $LegacyWixProductCode "$R7"
     Return
-  legacy_wix_enum_native_next:
+  legacy_wix_enum_hkcu_native_next:
     IntOp $R6 $R6 + 1
-    Goto legacy_wix_enum_native
+    Goto legacy_wix_enum_hkcu_native
 
-  legacy_wix_enum_wow_start:
+  legacy_wix_enum_hkcu_wow_start:
     StrCpy $R6 0
-  legacy_wix_enum_wow:
+  legacy_wix_enum_hkcu_wow:
     EnumRegKey $R7 HKCU "Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall" $R6
-    StrCmp $R7 "" legacy_wix_not_found
-    ReadRegStr $R8 HKCU "Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\$R7" "DisplayName"
-    StrCmp $R8 "${LEGACYWIXDISPLAYNAME}" 0 legacy_wix_enum_wow_next
-    ReadRegStr $R9 HKCU "Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\$R7" "Publisher"
-    StrCmp $R9 "${LEGACYWIXPUBLISHER}" 0 legacy_wix_enum_wow_next
+    StrCmp $R7 "" legacy_wix_enum_hklm_native_start
     ReadRegStr $R8 HKCU "Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\$R7" "UninstallString"
-    StrCmp $R8 "" legacy_wix_enum_wow_next
+    StrCmp $R8 "" legacy_wix_enum_hkcu_wow_next
+    ${StrLoc} $R2 "$R8" "MsiExec" ">"
+    StrCpy $R1 $R7 1
+    StrCmp $R1 "{" legacy_wix_hkcu_wow_is_msi 0
+    StrCmp $R2 "" legacy_wix_enum_hkcu_wow_next 0
+  legacy_wix_hkcu_wow_is_msi:
+    ReadRegStr $R5 HKCU "Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\$R7" "DisplayName"
+    ReadRegStr $R4 HKCU "Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\$R7" "Publisher"
+    ReadRegStr $R3 HKCU "Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\$R7" "InstallLocation"
+    ${StrLoc} $R2 "$R5" "${LEGACYWIXDISPLAYNAME}" ">"
+    StrCmp $R2 "" +2 0
+      Goto legacy_wix_match_hkcu_wow
+    ${StrLoc} $R2 "$R4" "${LEGACYWIXPUBLISHER}" ">"
+    StrCmp $R2 "" +2 0
+      Goto legacy_wix_match_hkcu_wow
+    ${StrLoc} $R2 "$R3" "${LEGACYWIXINSTALLDIRHINT}" ">"
+    StrCmp $R2 "" +2 0
+      Goto legacy_wix_match_hkcu_wow
+    Goto legacy_wix_enum_hkcu_wow_next
+  legacy_wix_match_hkcu_wow:
     StrCpy $LegacyWixDetected 1
     StrCpy $LegacyWixUninstallString "$R8"
     ReadRegStr $LegacyWixInstallLocation HKCU "Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\$R7" "InstallLocation"
     ReadRegStr $LegacyWixDisplayVersion HKCU "Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\$R7" "DisplayVersion"
     StrCpy $LegacyWixProductCode "$R7"
     Return
-  legacy_wix_enum_wow_next:
+  legacy_wix_enum_hkcu_wow_next:
     IntOp $R6 $R6 + 1
-    Goto legacy_wix_enum_wow
+    Goto legacy_wix_enum_hkcu_wow
+
+  legacy_wix_enum_hklm_native_start:
+    StrCpy $R6 0
+  legacy_wix_enum_hklm_native:
+    EnumRegKey $R7 HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall" $R6
+    StrCmp $R7 "" legacy_wix_enum_hklm_wow_start
+    ReadRegStr $R8 HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\$R7" "UninstallString"
+    StrCmp $R8 "" legacy_wix_enum_hklm_native_next
+    ${StrLoc} $R2 "$R8" "MsiExec" ">"
+    StrCpy $R1 $R7 1
+    StrCmp $R1 "{" legacy_wix_hklm_native_is_msi 0
+    StrCmp $R2 "" legacy_wix_enum_hklm_native_next 0
+  legacy_wix_hklm_native_is_msi:
+    ReadRegStr $R5 HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\$R7" "DisplayName"
+    ReadRegStr $R4 HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\$R7" "Publisher"
+    ReadRegStr $R3 HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\$R7" "InstallLocation"
+    ${StrLoc} $R2 "$R5" "${LEGACYWIXDISPLAYNAME}" ">"
+    StrCmp $R2 "" +2 0
+      Goto legacy_wix_match_hklm_native
+    ${StrLoc} $R2 "$R4" "${LEGACYWIXPUBLISHER}" ">"
+    StrCmp $R2 "" +2 0
+      Goto legacy_wix_match_hklm_native
+    ${StrLoc} $R2 "$R3" "${LEGACYWIXINSTALLDIRHINT}" ">"
+    StrCmp $R2 "" +2 0
+      Goto legacy_wix_match_hklm_native
+    Goto legacy_wix_enum_hklm_native_next
+  legacy_wix_match_hklm_native:
+    StrCpy $LegacyWixDetected 1
+    StrCpy $LegacyWixUninstallString "$R8"
+    ReadRegStr $LegacyWixInstallLocation HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\$R7" "InstallLocation"
+    ReadRegStr $LegacyWixDisplayVersion HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\$R7" "DisplayVersion"
+    StrCpy $LegacyWixProductCode "$R7"
+    Return
+  legacy_wix_enum_hklm_native_next:
+    IntOp $R6 $R6 + 1
+    Goto legacy_wix_enum_hklm_native
+
+  legacy_wix_enum_hklm_wow_start:
+    StrCpy $R6 0
+  legacy_wix_enum_hklm_wow:
+    EnumRegKey $R7 HKLM "Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall" $R6
+    StrCmp $R7 "" legacy_wix_not_found
+    ReadRegStr $R8 HKLM "Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\$R7" "UninstallString"
+    StrCmp $R8 "" legacy_wix_enum_hklm_wow_next
+    ${StrLoc} $R2 "$R8" "MsiExec" ">"
+    StrCpy $R1 $R7 1
+    StrCmp $R1 "{" legacy_wix_hklm_wow_is_msi 0
+    StrCmp $R2 "" legacy_wix_enum_hklm_wow_next 0
+  legacy_wix_hklm_wow_is_msi:
+    ReadRegStr $R5 HKLM "Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\$R7" "DisplayName"
+    ReadRegStr $R4 HKLM "Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\$R7" "Publisher"
+    ReadRegStr $R3 HKLM "Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\$R7" "InstallLocation"
+    ${StrLoc} $R2 "$R5" "${LEGACYWIXDISPLAYNAME}" ">"
+    StrCmp $R2 "" +2 0
+      Goto legacy_wix_match_hklm_wow
+    ${StrLoc} $R2 "$R4" "${LEGACYWIXPUBLISHER}" ">"
+    StrCmp $R2 "" +2 0
+      Goto legacy_wix_match_hklm_wow
+    ${StrLoc} $R2 "$R3" "${LEGACYWIXINSTALLDIRHINT}" ">"
+    StrCmp $R2 "" +2 0
+      Goto legacy_wix_match_hklm_wow
+    Goto legacy_wix_enum_hklm_wow_next
+  legacy_wix_match_hklm_wow:
+    StrCpy $LegacyWixDetected 1
+    StrCpy $LegacyWixUninstallString "$R8"
+    ReadRegStr $LegacyWixInstallLocation HKLM "Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\$R7" "InstallLocation"
+    ReadRegStr $LegacyWixDisplayVersion HKLM "Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\$R7" "DisplayVersion"
+    StrCpy $LegacyWixProductCode "$R7"
+    Return
+  legacy_wix_enum_hklm_wow_next:
+    IntOp $R6 $R6 + 1
+    Goto legacy_wix_enum_hklm_wow
 
   legacy_wix_not_found:
+FunctionEnd
+Function ForceUninstallLegacyWix
+  ClearErrors
+  StrCpy $0 2
+
+  StrCpy $R0 $LegacyWixProductCode 1
+  ${If} $R0 == "{"
+    ExecWait '"$SYSDIR\msiexec.exe" /x "$LegacyWixProductCode" /passive /norestart' $0
+  ${Else}
+    ExecWait '$LegacyWixUninstallString /passive /norestart' $0
+  ${EndIf}
+
+  ${IfThen} ${Errors} ${|} StrCpy $0 2 ${|}
+
+  ${If} $0 == 0
+  ${OrIf} $0 == 1605
+  ${OrIf} $0 == 1614
+  ${OrIf} $0 == 1641
+  ${OrIf} $0 == 3010
+    Call DetectLegacyWixInstall
+    ${If} $LegacyWixDetected == 1
+      StrCpy $0 1603
+    ${Else}
+      StrCpy $0 0
+    ${EndIf}
+  ${EndIf}
 FunctionEnd
 Function PageReinstall
   ; Check if there is an existing installation, if not, abort the reinstall page
@@ -304,21 +433,10 @@ Function PageLeaveReinstall
     ClearErrors
 
     ${If} $LegacyWixDetected == 1
-      StrCpy $R1 "$LegacyWixUninstallString"
-      StrCpy $4 "$LegacyWixInstallLocation"
+      Call ForceUninstallLegacyWix
     ${Else}
       ReadRegStr $4 SHCTX "${MANUPRODUCTKEY}" ""
       ReadRegStr $R1 SHCTX "${UNINSTKEY}" "UninstallString"
-    ${EndIf}
-
-    ${If} $LegacyWixDetected == 1
-      StrCpy $R0 $LegacyWixProductCode 1
-      ${If} $R0 == "{"
-        ExecWait '"$SYSDIR\msiexec.exe" /x "$LegacyWixProductCode"' $0
-      ${Else}
-        ExecWait '$R1' $0
-      ${EndIf}
-    ${Else}
       ExecWait '$R1 /P _?=$4' $0
     ${EndIf}
 
@@ -472,6 +590,18 @@ Function .onInit
   !endif
 
   !insertmacro SetContext
+
+  ; Migration path: force-remove legacy WiX MSI before continuing with NSIS install.
+  Call DetectLegacyWixInstall
+  ${If} $LegacyWixDetected == 1
+    Call ForceUninstallLegacyWix
+    ${If} $0 <> 0
+      IfSilent legacy_msi_uninstall_fail_silent 0
+        MessageBox MB_ICONSTOP|MB_OK "Failed to uninstall legacy MSI install (exit code $0). Please uninstall 'Rust Image Viewer' manually, then rerun this installer."
+      legacy_msi_uninstall_fail_silent:
+      Abort
+    ${EndIf}
+  ${EndIf}
 
   ${If} $INSTDIR == ""
     ; Set default install location
