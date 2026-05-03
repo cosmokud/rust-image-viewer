@@ -33,6 +33,86 @@ pub fn probe_video_dimensions_without_gstreamer(path: &Path) -> Option<(u32, u32
     }
 }
 
+/// Probe video dimensions through GStreamer preroll.
+///
+/// This is slower than Windows shell metadata, but more reliable for WEBM files whose
+/// shell thumbnail/dimension data may be tiny or incomplete.
+pub fn probe_video_dimensions_with_gstreamer(path: &Path) -> Option<(u32, u32)> {
+    use gstreamer as gst;
+    use gstreamer::prelude::*;
+    use gstreamer_app as gst_app;
+    use gstreamer_video as gst_video;
+    use parking_lot::Mutex;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    static GST_INIT: std::sync::OnceLock<Result<(), ()>> = std::sync::OnceLock::new();
+    let init_result = GST_INIT.get_or_init(|| gst::init().map_err(|_| ()));
+    if init_result.is_err() {
+        return None;
+    }
+
+    let uri = gst::glib::filename_to_uri(path, None).ok()?.to_string();
+    let pipeline_str = format!(
+        "uridecodebin uri=\"{}\" name=dec ! videoconvert ! video/x-raw,format=RGBA ! appsink name=sink max-buffers=1 drop=true",
+        uri.replace("\"", "\\\"")
+    );
+
+    let pipeline = gst::parse::launch(&pipeline_str).ok()?;
+    let pipeline = pipeline.downcast::<gst::Pipeline>().ok()?;
+    let appsink = pipeline
+        .by_name("sink")?
+        .dynamic_cast::<gst_app::AppSink>()
+        .ok()?;
+
+    let dimensions: Arc<Mutex<Option<(u32, u32)>>> = Arc::new(Mutex::new(None));
+    let dimensions_clone = Arc::clone(&dimensions);
+    appsink.set_callbacks(
+        gst_app::AppSinkCallbacks::builder()
+            .new_preroll(move |sink| {
+                if let Ok(sample) = sink.pull_preroll() {
+                    if let Some(caps) = sample.caps() {
+                        if let Ok(video_info) = gst_video::VideoInfo::from_caps(caps) {
+                            let width = video_info.width();
+                            let height = video_info.height();
+                            if width > 0 && height > 0 {
+                                *dimensions_clone.lock() = Some((width, height));
+                            }
+                        }
+                    }
+                }
+                Ok(gst::FlowSuccess::Ok)
+            })
+            .build(),
+    );
+
+    if pipeline.set_state(gst::State::Paused).is_err() {
+        let _ = pipeline.set_state(gst::State::Null);
+        return None;
+    }
+
+    let bus = pipeline.bus()?;
+    let deadline = std::time::Instant::now() + Duration::from_millis(1500);
+    while std::time::Instant::now() < deadline {
+        if dimensions.lock().is_some() {
+            break;
+        }
+
+        if let Some(msg) = bus.timed_pop(gst::ClockTime::from_mseconds(50)) {
+            match msg.view() {
+                gst::MessageView::AsyncDone(_) => break,
+                gst::MessageView::Error(_) => break,
+                gst::MessageView::Eos(_) => break,
+                _ => {}
+            }
+        }
+    }
+
+    let _ = pipeline.set_state(gst::State::Null);
+    let probed_dimensions = *dimensions.lock();
+    probed_dimensions
+}
+
 #[cfg(target_os = "windows")]
 fn with_com_apartment<T>(f: impl FnOnce() -> Option<T>) -> Option<T> {
     use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
