@@ -224,14 +224,18 @@ fn apply_decoder_preference_windows(
     prefer_hardware_decode: bool,
     disable_hardware_decode: bool,
     enable_cuda_decode: bool,
+    enable_d3d12_decode: bool,
 ) {
-    const HW_DECODE_RANKS: &str =
+    const D3D12_DECODE_RANKS: &str =
+        "d3d12h264dec:1024,d3d12h265dec:1024,d3d12vp8dec:1024,d3d12vp9dec:1024,d3d12av1dec:1024,d3d12mpeg2dec:1024";
+    const D3D11_DECODE_RANKS: &str =
         "d3d11h264dec:512,d3d11h265dec:512,d3d11vp8dec:512,d3d11vp9dec:512,d3d11av1dec:512,d3d11mpeg2dec:512,\
 avdec_h264:0,avdec_h265:0,avdec_hevc:0,avdec_vp8:0,avdec_vp9:0,avdec_av1:0,avdec_mpeg2video:0";
     const CUDA_DECODE_RANKS: &str =
         "nvh264dec:300,nvh265dec:300,nvvp9dec:300,nvav1dec:300,cudah264dec:300,cudah265dec:300";
     const DISABLE_HW_DECODE_RANKS: &str =
-        "d3d11h264dec:0,d3d11h265dec:0,d3d11vp8dec:0,d3d11vp9dec:0,d3d11av1dec:0,d3d11mpeg2dec:0";
+        "d3d12h264dec:0,d3d12h265dec:0,d3d12vp8dec:0,d3d12vp9dec:0,d3d12av1dec:0,d3d12mpeg2dec:0,\
+d3d11h264dec:0,d3d11h265dec:0,d3d11vp8dec:0,d3d11vp9dec:0,d3d11av1dec:0,d3d11mpeg2dec:0";
 
     if disable_hardware_decode {
         std::env::set_var("GST_PLUGIN_FEATURE_RANK", DISABLE_HW_DECODE_RANKS);
@@ -244,7 +248,10 @@ avdec_h264:0,avdec_h265:0,avdec_hevc:0,avdec_vp8:0,avdec_vp9:0,avdec_av1:0,avdec
 
     let mut rank_overrides = Vec::new();
     if prefer_hardware_decode {
-        rank_overrides.push(HW_DECODE_RANKS);
+        if enable_d3d12_decode && detect_video_acceleration_capabilities().d3d12_available {
+            rank_overrides.push(D3D12_DECODE_RANKS);
+        }
+        rank_overrides.push(D3D11_DECODE_RANKS);
     }
     if enable_cuda_decode {
         rank_overrides.push(CUDA_DECODE_RANKS);
@@ -260,12 +267,14 @@ fn apply_decoder_preference_windows(
     _prefer_hardware_decode: bool,
     _disable_hardware_decode: bool,
     _enable_cuda_decode: bool,
+    _enable_d3d12_decode: bool,
 ) {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct VideoAccelerationCapabilities {
     pub hardware_decode_available: bool,
+    pub d3d12_available: bool,
     pub cuda_available: bool,
 }
 
@@ -290,14 +299,26 @@ fn detect_cuda_driver_available() -> bool {
         || std::env::var_os("CUDA_HOME").is_some()
 }
 
+#[cfg(target_os = "windows")]
+fn detect_d3d12_decode_available() -> bool {
+    try_load_library_windows("gstd3d12-1.0-0.dll")
+}
+
+#[cfg(not(target_os = "windows"))]
+fn detect_d3d12_decode_available() -> bool {
+    false
+}
+
 pub fn detect_video_acceleration_capabilities() -> VideoAccelerationCapabilities {
     static CAPS: OnceLock<VideoAccelerationCapabilities> = OnceLock::new();
     *CAPS.get_or_init(|| {
         let hardware_decode_available = gstreamer_runtime_available();
+        let d3d12_available = hardware_decode_available && detect_d3d12_decode_available();
         let cuda_available = hardware_decode_available && detect_cuda_driver_available();
 
         VideoAccelerationCapabilities {
             hardware_decode_available,
+            d3d12_available,
             cuda_available,
         }
     })
@@ -1363,6 +1384,7 @@ impl VideoPlayer {
         prefer_hardware_decode: bool,
         disable_hardware_decode: bool,
         enable_cuda_decode: bool,
+        enable_d3d12_decode: bool,
         source_dimensions: Option<(u32, u32)>,
         output_dimensions: Option<(u32, u32)>,
     ) -> Result<Self, String> {
@@ -1370,6 +1392,7 @@ impl VideoPlayer {
             prefer_hardware_decode,
             disable_hardware_decode,
             enable_cuda_decode,
+            enable_d3d12_decode,
         );
         Self::ensure_init()?;
 

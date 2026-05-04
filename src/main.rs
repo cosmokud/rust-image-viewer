@@ -1266,6 +1266,7 @@ enum MediaLoadRequest {
         prefer_hardware_decode: bool,
         disable_hardware_decode: bool,
         enable_cuda_decode: bool,
+        enable_d3d12_decode: bool,
         output_bounds: Option<(u32, u32)>,
     },
 }
@@ -1417,6 +1418,7 @@ fn process_media_load_request(request: MediaLoadRequest) -> MediaLoadResult {
             prefer_hardware_decode,
             disable_hardware_decode,
             enable_cuda_decode,
+            enable_d3d12_decode,
             output_bounds,
         } => {
             let source_dimensions = cached_or_probe_video_dimensions(&path);
@@ -1429,6 +1431,7 @@ fn process_media_load_request(request: MediaLoadRequest) -> MediaLoadResult {
                 prefer_hardware_decode,
                 disable_hardware_decode,
                 enable_cuda_decode,
+                enable_d3d12_decode,
                 source_dimensions,
                 output_dimensions,
             )
@@ -1898,6 +1901,7 @@ struct MangaFocusedVideoLoadRequest {
     prefer_hardware_decode: bool,
     disable_hardware_decode: bool,
     enable_cuda_decode: bool,
+    enable_d3d12_decode: bool,
     output_bounds: Option<(u32, u32)>,
     autoplay: bool,
     seamless_lod_refresh: bool,
@@ -1989,6 +1993,7 @@ fn process_manga_focused_video_load_request(
         request.prefer_hardware_decode,
         request.disable_hardware_decode,
         request.enable_cuda_decode,
+        request.enable_d3d12_decode,
         source_dimensions,
         output_dimensions,
     )
@@ -7007,11 +7012,18 @@ impl ImageViewer {
 
         let decode_text = {
             let caps = detect_video_acceleration_capabilities();
-            let (prefer_hardware_decode, disable_hardware_decode, enable_cuda_decode) =
+            let (
+                prefer_hardware_decode,
+                disable_hardware_decode,
+                enable_cuda_decode,
+                enable_d3d12_decode,
+            ) =
                 self.effective_video_decoder_preferences();
 
             let active_decode = if disable_hardware_decode || !caps.hardware_decode_available {
                 "SW"
+            } else if enable_d3d12_decode {
+                "HW+D3D12"
             } else if enable_cuda_decode {
                 "HW+CUDA"
             } else if prefer_hardware_decode {
@@ -12266,19 +12278,23 @@ impl ImageViewer {
             && detect_video_acceleration_capabilities().cuda_available
     }
 
-    fn effective_video_decoder_preferences(&self) -> (bool, bool, bool) {
+    fn effective_video_decoder_preferences(&self) -> (bool, bool, bool, bool) {
         if !self.use_hardware_acceleration_enabled() {
-            return (false, true, false);
+            return (false, true, false, false);
         }
 
         let disable_hardware_decode = self.config.video_disable_hardware_decode;
         let prefer_hardware_decode = self.config.video_prefer_hardware_decode;
         let enable_cuda_decode = !disable_hardware_decode && self.use_cuda_decode_enabled();
+        let enable_d3d12_decode = !disable_hardware_decode
+            && self.config.enable_d3d12
+            && detect_video_acceleration_capabilities().d3d12_available;
 
         (
             prefer_hardware_decode,
             disable_hardware_decode,
             enable_cuda_decode,
+            enable_d3d12_decode,
         )
     }
 
@@ -12573,7 +12589,12 @@ impl ImageViewer {
             started_at: Instant::now(),
         });
 
-        let (prefer_hardware_decode, disable_hardware_decode, enable_cuda_decode) =
+        let (
+            prefer_hardware_decode,
+            disable_hardware_decode,
+            enable_cuda_decode,
+            enable_d3d12_decode,
+        ) =
             self.effective_video_decoder_preferences();
         self.manga_video_load_coordinator
             .submit(MangaFocusedVideoLoadRequest {
@@ -12585,6 +12606,7 @@ impl ImageViewer {
                 prefer_hardware_decode,
                 disable_hardware_decode,
                 enable_cuda_decode,
+                enable_d3d12_decode,
                 output_bounds,
                 autoplay,
                 seamless_lod_refresh,
@@ -12877,7 +12899,12 @@ impl ImageViewer {
         } else {
             self.config.video_default_volume
         };
-        let (prefer_hardware_decode, disable_hardware_decode, enable_cuda_decode) =
+        let (
+            prefer_hardware_decode,
+            disable_hardware_decode,
+            enable_cuda_decode,
+            enable_d3d12_decode,
+        ) =
             self.effective_video_decoder_preferences();
         let output_bounds = self.async_video_output_bounds_for_solo();
 
@@ -12896,6 +12923,7 @@ impl ImageViewer {
             prefer_hardware_decode,
             disable_hardware_decode,
             enable_cuda_decode,
+            enable_d3d12_decode,
             output_bounds,
         });
     }

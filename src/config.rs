@@ -581,6 +581,8 @@ pub struct Config {
     pub vsync: bool,
     /// Master switch for hardware acceleration features.
     pub use_hardware_acceleration: bool,
+    /// Prefer GStreamer D3D12 video decoders on Windows when available.
+    pub enable_d3d12: bool,
     /// Enable CUDA acceleration path when runtime support is available.
     pub enable_cuda: bool,
 
@@ -703,6 +705,7 @@ impl Config {
             single_instance: true,
             vsync: true,
             use_hardware_acceleration: true,
+            enable_d3d12: true,
             enable_cuda: true,
             metadata_cache_max_size_mb: 1024,
             masonry_metadata_ram_cache_limit_mb: 2048,
@@ -1699,6 +1702,11 @@ impl Config {
                                 config.enable_cuda = v;
                             }
                         }
+                        "enable_d3d12" | "d3d12" | "d3d12_acceleration" => {
+                            if let Some(v) = parse_bool(value) {
+                                config.enable_d3d12 = v;
+                            }
+                        }
                         "show_fps" | "show_fps_overlay" | "fps_overlay" => {
                             if let Some(v) = parse_bool(value) {
                                 config.show_fps = v;
@@ -1879,6 +1887,7 @@ impl Config {
             "use_hardware_acceleration",
             bool_to_ini(self.use_hardware_acceleration).to_string(),
         );
+        values.insert("enable_d3d12", bool_to_ini(self.enable_d3d12).to_string());
         values.insert("enable_cuda", bool_to_ini(self.enable_cuda).to_string());
         values.insert(
             "metadata_cache_max_size_mb",
