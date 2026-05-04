@@ -14,6 +14,7 @@ use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 use gstreamer_video as gst_video;
+use gstreamer_video::prelude::*;
 use image_simd::u16x8;
 use parking_lot::Mutex;
 use rayon::prelude::*;
@@ -226,11 +227,12 @@ fn apply_decoder_preference_windows(
     enable_cuda_decode: bool,
 ) {
     const HW_DECODE_RANKS: &str =
-        "d3d11h264dec:300,d3d11h265dec:300,d3d11vp9dec:300,d3d11av1dec:300";
+        "d3d11h264dec:512,d3d11h265dec:512,d3d11vp8dec:512,d3d11vp9dec:512,d3d11av1dec:512,d3d11mpeg2dec:512,\
+avdec_h264:0,avdec_h265:0,avdec_hevc:0,avdec_vp8:0,avdec_vp9:0,avdec_av1:0,avdec_mpeg2video:0";
     const CUDA_DECODE_RANKS: &str =
         "nvh264dec:300,nvh265dec:300,nvvp9dec:300,nvav1dec:300,cudah264dec:300,cudah265dec:300";
     const DISABLE_HW_DECODE_RANKS: &str =
-        "d3d11h264dec:0,d3d11h265dec:0,d3d11vp9dec:0,d3d11av1dec:0";
+        "d3d11h264dec:0,d3d11h265dec:0,d3d11vp8dec:0,d3d11vp9dec:0,d3d11av1dec:0,d3d11mpeg2dec:0";
 
     if disable_hardware_decode {
         std::env::set_var("GST_PLUGIN_FEATURE_RANK", DISABLE_HW_DECODE_RANKS);
@@ -1186,7 +1188,8 @@ fn process_video_sample(sample: gst::Sample, state: &VideoState) {
 /// Video player using GStreamer
 pub struct VideoPlayer {
     pipeline: gst::Pipeline,
-    video_sink: gst_app::AppSink,
+    video_sink: Option<gst_app::AppSink>,
+    video_overlay: Option<gst_video::VideoOverlay>,
     state: Arc<VideoState>,
     volume_element: Option<gst::Element>,
     duration: Option<Duration>,
@@ -1202,6 +1205,50 @@ pub struct VideoPlayer {
     subtitle_selection: VideoSubtitleSelection,
     stream_collection: Option<gst::StreamCollection>,
     selected_stream_ids: Vec<String>,
+}
+
+#[cfg(target_os = "windows")]
+fn create_native_d3d11_video_overlay_sink() -> Option<(gst::Element, gst_video::VideoOverlay)> {
+    let sink = gst::ElementFactory::make("d3d11videosink")
+        .name("d3d11videosink")
+        .build()
+        .ok()?;
+
+    set_optional_bool_property(&sink, "sync", true);
+    set_optional_bool_property(&sink, "force-aspect-ratio", true);
+
+    let overlay = sink
+        .clone()
+        .dynamic_cast::<gst_video::VideoOverlay>()
+        .ok()?;
+    if let Some(hwnd) = active_or_foreground_hwnd_for_overlay() {
+        unsafe {
+            overlay.set_window_handle(hwnd);
+        }
+        overlay.handle_events(false);
+    }
+    Some((sink, overlay))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn create_native_d3d11_video_overlay_sink() -> Option<(gst::Element, gst_video::VideoOverlay)> {
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn active_or_foreground_hwnd_for_overlay() -> Option<usize> {
+    use winapi::um::winuser::{GetActiveWindow, GetForegroundWindow};
+
+    let hwnd = unsafe {
+        let active = GetActiveWindow();
+        if !active.is_null() {
+            active
+        } else {
+            GetForegroundWindow()
+        }
+    };
+
+    (!hwnd.is_null()).then_some(hwnd as usize)
 }
 
 impl VideoPlayer {
@@ -1294,62 +1341,81 @@ Ensure your GStreamer installation includes the playback elements (usually from 
             .downcast::<gst::Pipeline>()
             .map_err(|_| "Failed to cast to Pipeline")?;
 
-        // Create appsink for video frames
-        // Explicitly request sRGB RGBA output. This nudges GStreamer into producing full-range RGB
-        // and avoids washed-out output when input colorimetry/range metadata is incomplete.
-        let video_caps_string = match output_dimensions {
-            Some((width, height)) if width > 0 && height > 0 => format!(
-                "video/x-raw,format=RGBA,colorimetry=sRGB,width={},height={},pixel-aspect-ratio=1/1",
-                width, height
-            ),
-            _ => "video/x-raw,format=RGBA,colorimetry=sRGB".to_string(),
+        let use_native_d3d11_overlay =
+            cfg!(target_os = "windows") && prefer_hardware_decode && !disable_hardware_decode;
+        let mut video_overlay = None;
+        let appsink = if use_native_d3d11_overlay {
+            if let Some((native_sink, overlay)) = create_native_d3d11_video_overlay_sink() {
+                pipeline.set_property("video-sink", &native_sink);
+                video_overlay = Some(overlay);
+                None
+            } else {
+                None
+            }
+        } else {
+            None
         };
-        let video_caps = gst::Caps::from_str(&video_caps_string)
-            .map_err(|e| format!("Failed to create video caps: {}", e))?;
-        let appsink = gst_app::AppSink::builder()
-            .name("videosink")
-            .caps(&video_caps)
-            .max_buffers(APPSINK_MAX_BUFFERS)
-            .drop(true)
-            .wait_on_eos(false)
-            .enable_last_sample(false)
-            .qos(true)
-            .sync(true)
-            .build();
-        appsink.set_drop_out_of_segment(true);
 
-        // Create a bin to hold the appsink with video conversion
-        let video_bin = gst::Bin::new();
+        let appsink = if appsink.is_none() && video_overlay.is_none() {
+            // CPU fallback path for platforms without D3D11 overlay support.
+            // Explicitly request sRGB RGBA output. This nudges GStreamer into producing
+            // full-range RGB and avoids washed-out output when metadata is incomplete.
+            let video_caps_string = match output_dimensions {
+                Some((width, height)) if width > 0 && height > 0 => format!(
+                    "video/x-raw,format=RGBA,colorimetry=sRGB,width={},height={},pixel-aspect-ratio=1/1",
+                    width, height
+                ),
+                _ => "video/x-raw,format=RGBA,colorimetry=sRGB".to_string(),
+            };
+            let video_caps = gst::Caps::from_str(&video_caps_string)
+                .map_err(|e| format!("Failed to create video caps: {}", e))?;
+            let appsink = gst_app::AppSink::builder()
+                .name("videosink")
+                .caps(&video_caps)
+                .max_buffers(APPSINK_MAX_BUFFERS)
+                .drop(true)
+                .wait_on_eos(false)
+                .enable_last_sample(false)
+                .qos(true)
+                .sync(true)
+                .build();
+            appsink.set_drop_out_of_segment(true);
 
-        let videoconvert = gst::ElementFactory::make("videoconvert")
-            .build()
-            .map_err(|e| format!("Failed to create videoconvert: {}", e))?;
+            // Create a bin to hold the appsink with video conversion.
+            let video_bin = gst::Bin::new();
 
-        let videoscale = gst::ElementFactory::make("videoscale")
-            .build()
-            .map_err(|e| format!("Failed to create videoscale: {}", e))?;
+            let videoconvert = gst::ElementFactory::make("videoconvert")
+                .build()
+                .map_err(|e| format!("Failed to create videoconvert: {}", e))?;
 
-        video_bin
-            .add_many([&videoscale, &videoconvert, appsink.upcast_ref()])
-            .map_err(|e| format!("Failed to add elements to bin: {}", e))?;
+            let videoscale = gst::ElementFactory::make("videoscale")
+                .build()
+                .map_err(|e| format!("Failed to create videoscale: {}", e))?;
 
-        gst::Element::link_many([&videoscale, &videoconvert, appsink.upcast_ref()])
-            .map_err(|e| format!("Failed to link video elements: {}", e))?;
+            video_bin
+                .add_many([&videoscale, &videoconvert, appsink.upcast_ref()])
+                .map_err(|e| format!("Failed to add elements to bin: {}", e))?;
 
-        // Create ghost pad for the bin
-        let pad = videoscale
-            .static_pad("sink")
-            .ok_or("Failed to get sink pad")?;
-        let ghost_pad = gst::GhostPad::with_target(&pad)
-            .map_err(|e| format!("Failed to create ghost pad: {}", e))?;
-        ghost_pad
-            .set_active(true)
-            .map_err(|e| format!("Failed to activate ghost pad: {}", e))?;
-        video_bin
-            .add_pad(&ghost_pad)
-            .map_err(|e| format!("Failed to add ghost pad: {}", e))?;
+            gst::Element::link_many([&videoscale, &videoconvert, appsink.upcast_ref()])
+                .map_err(|e| format!("Failed to link video elements: {}", e))?;
 
-        pipeline.set_property("video-sink", &video_bin);
+            let pad = videoscale
+                .static_pad("sink")
+                .ok_or("Failed to get sink pad")?;
+            let ghost_pad = gst::GhostPad::with_target(&pad)
+                .map_err(|e| format!("Failed to create ghost pad: {}", e))?;
+            ghost_pad
+                .set_active(true)
+                .map_err(|e| format!("Failed to activate ghost pad: {}", e))?;
+            video_bin
+                .add_pad(&ghost_pad)
+                .map_err(|e| format!("Failed to add ghost pad: {}", e))?;
+
+            pipeline.set_property("video-sink", &video_bin);
+            Some(appsink)
+        } else {
+            appsink
+        };
 
         // Set up audio with volume control
         let volume = gst::ElementFactory::make("volume")
@@ -1400,34 +1466,36 @@ Ensure your GStreamer installation includes the playback elements (usually from 
             needs_range_expand: AtomicI8::new(RANGE_EXPAND_UNKNOWN),
         });
 
-        // Set up appsink callbacks.
-        // NOTE: In PAUSED state (e.g. when the user pauses or when seeking while paused),
-        // playbin/appsink typically delivers the next frame as a *preroll* buffer, not a
-        // regular sample. To show the exact frame when seeking while paused, handle BOTH.
-
-        let state_clone = Arc::clone(&state);
-        let state_clone_preroll = Arc::clone(&state);
-        appsink.set_callbacks(
-            gst_app::AppSinkCallbacks::builder()
-                .new_sample(move |sink| {
-                    let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
-                    if !state_clone.seek_in_progress() {
-                        process_video_sample(sample, state_clone.as_ref());
-                    }
-                    Ok(gst::FlowSuccess::Ok)
-                })
-                .new_preroll(move |sink| {
-                    if let Ok(sample) = sink.pull_preroll() {
-                        process_video_sample(sample, state_clone_preroll.as_ref());
-                    }
-                    Ok(gst::FlowSuccess::Ok)
-                })
-                .build(),
-        );
+        if let Some(appsink) = appsink.as_ref() {
+            // Set up appsink callbacks.
+            // NOTE: In PAUSED state (e.g. when the user pauses or when seeking while paused),
+            // playbin/appsink typically delivers the next frame as a *preroll* buffer, not a
+            // regular sample. To show the exact frame when seeking while paused, handle BOTH.
+            let state_clone = Arc::clone(&state);
+            let state_clone_preroll = Arc::clone(&state);
+            appsink.set_callbacks(
+                gst_app::AppSinkCallbacks::builder()
+                    .new_sample(move |sink| {
+                        let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                        if !state_clone.seek_in_progress() {
+                            process_video_sample(sample, state_clone.as_ref());
+                        }
+                        Ok(gst::FlowSuccess::Ok)
+                    })
+                    .new_preroll(move |sink| {
+                        if let Ok(sample) = sink.pull_preroll() {
+                            process_video_sample(sample, state_clone_preroll.as_ref());
+                        }
+                        Ok(gst::FlowSuccess::Ok)
+                    })
+                    .build(),
+            );
+        }
 
         let player = VideoPlayer {
             pipeline,
             video_sink: appsink,
+            video_overlay,
             state,
             volume_element: volume,
             duration: None,
@@ -1597,6 +1665,9 @@ Ensure your GStreamer installation includes the playback elements (usually from 
         if self.is_playing {
             return;
         }
+        let Some(video_sink) = self.video_sink.as_ref() else {
+            return;
+        };
 
         let timeout = Self::seek_preroll_timeout(mode);
         let timeout_clock_time = Self::duration_to_clock_time(timeout);
@@ -1605,13 +1676,13 @@ Ensure your GStreamer installation includes the playback elements (usually from 
         // before pulling the frame that should be visible at the target timestamp.
         let _ = self.pipeline.state(timeout_clock_time);
 
-        if let Some(sample) = self.video_sink.try_pull_preroll(timeout_clock_time) {
+        if let Some(sample) = video_sink.try_pull_preroll(timeout_clock_time) {
             self.state.clear_frames();
             process_video_sample(sample, self.state.as_ref());
             return;
         }
 
-        if let Some(sample) = self.video_sink.try_pull_preroll(gst::ClockTime::ZERO) {
+        if let Some(sample) = video_sink.try_pull_preroll(gst::ClockTime::ZERO) {
             self.state.clear_frames();
             process_video_sample(sample, self.state.as_ref());
         }
@@ -1710,6 +1781,35 @@ Ensure your GStreamer installation includes the playback elements (usually from 
     /// Get current volume
     pub fn volume(&self) -> f64 {
         self.volume
+    }
+
+    /// True when video is presented by GStreamer's native D3D11 sink instead of CPU RGBA frames.
+    pub fn uses_native_video_overlay(&self) -> bool {
+        self.video_overlay.is_some()
+    }
+
+    /// Attach the native video overlay to a platform window handle.
+    ///
+    /// On Windows this is an HWND cast to `usize`. The sink owns presentation;
+    /// egui should leave the corresponding rectangle unpainted.
+    pub fn set_native_video_overlay_window_handle(&self, handle: usize) {
+        if let Some(overlay) = self.video_overlay.as_ref() {
+            unsafe {
+                overlay.set_window_handle(handle);
+            }
+            overlay.handle_events(false);
+        }
+    }
+
+    /// Move/resize the native video overlay in window-client pixels.
+    pub fn set_native_video_overlay_rect(&self, x: i32, y: i32, width: i32, height: i32) {
+        if width <= 0 || height <= 0 {
+            return;
+        }
+        if let Some(overlay) = self.video_overlay.as_ref() {
+            let _ = overlay.set_render_rectangle(x, y, width, height);
+            overlay.expose();
+        }
     }
 
     fn legacy_audio_tracks(&self) -> Vec<VideoTrackInfo> {
