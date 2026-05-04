@@ -2040,10 +2040,6 @@ fn process_manga_focused_video_load_request(
         }
         if let Some(seconds) = request.resume_position_secs {
             let _ = player.seek_to_time_with_mode(seconds, VideoSeekMode::Accurate);
-        } else {
-            // Startup policy for manga placeholders: always align playback with the
-            // placeholder thumbnail by forcing an accurate seek to the first frame.
-            let _ = player.seek_to_time_with_mode(0.0, VideoSeekMode::Accurate);
         }
         if !request.autoplay && player.is_playing() {
             let _ = player.pause();
@@ -2723,6 +2719,9 @@ struct ImageViewer {
     /// Video textures for manga mode, keyed by image list index.
     /// Stores the latest frame texture for each video.
     manga_video_textures: HashMap<usize, (egui::TextureHandle, u32, u32)>,
+    /// Path paired with each live manga video texture. Index-only ownership is
+    /// unsafe during strip/fullscreen/strip churn because list slots can be reused.
+    manga_video_texture_paths: HashMap<usize, PathBuf>,
     /// Videos that failed focused playback startup in this manga session.
     manga_video_failed: HashSet<usize>,
     /// Index of the currently focused (playing) video in manga mode.
@@ -3122,6 +3121,7 @@ impl Default for ImageViewer {
             manga_video_preview_resume_secs: HashMap::new(),
             manga_video_preview_resume_by_path: HashMap::new(),
             manga_video_textures: HashMap::new(),
+            manga_video_texture_paths: HashMap::new(),
             manga_video_failed: HashSet::new(),
             manga_focused_video_index: None,
             manga_hovered_media_index: None,
@@ -5320,6 +5320,8 @@ impl ImageViewer {
                 .get(*index)
                 .is_some_and(|path| path_is_targeted(path))
         });
+        self.manga_video_texture_paths
+            .retain(|index, path| image_list.get(*index) == Some(path) && !path_is_targeted(path));
         if removed_focused_manga_video {
             self.manga_focused_video_index = None;
         }
@@ -6786,7 +6788,8 @@ impl ImageViewer {
                 let overlay_interval = Duration::from_millis(
                     self.config.show_fps_update_interval_ms.clamp(50, 10_000),
                 );
-                if now.saturating_duration_since(self.fps_overlay_last_update_at) >= overlay_interval
+                if now.saturating_duration_since(self.fps_overlay_last_update_at)
+                    >= overlay_interval
                     || self.fps_overlay_smoothed <= 0.0
                 {
                     self.fps_overlay_smoothed = self.fps_smoothed;
@@ -7105,8 +7108,7 @@ impl ImageViewer {
                 disable_hardware_decode,
                 enable_cuda_decode,
                 enable_d3d12_decode,
-            ) =
-                self.effective_video_decoder_preferences();
+            ) = self.effective_video_decoder_preferences();
 
             let active_decode = if disable_hardware_decode || !caps.hardware_decode_available {
                 "SW"
@@ -7586,7 +7588,7 @@ impl ImageViewer {
 
         if let Some(err) = toggle_error {
             self.manga_video_players.remove(&index);
-            self.manga_video_textures.remove(&index);
+            self.remove_manga_video_texture(index);
             self.manga_video_preview_resume_secs.remove(&index);
             if self.manga_focused_video_index == Some(index) {
                 self.manga_focused_video_index = None;
@@ -8973,8 +8975,7 @@ impl ImageViewer {
             return false;
         };
 
-        if let Some((cached_stamp, cached_is_animated)) =
-            self.webp_animation_probe_cache.get(path)
+        if let Some((cached_stamp, cached_is_animated)) = self.webp_animation_probe_cache.get(path)
         {
             if *cached_stamp == stamp {
                 return *cached_is_animated;
@@ -9884,7 +9885,9 @@ impl ImageViewer {
             FolderPlaceholderThumbnailMediaKind::Video => self
                 .config
                 .texture_filter_video
-                .to_egui_options_with_mipmap(self.mipmap_video_thumbnail_enabled() && allow_mipmaps),
+                .to_egui_options_with_mipmap(
+                    self.mipmap_video_thumbnail_enabled() && allow_mipmaps,
+                ),
             FolderPlaceholderThumbnailMediaKind::AnimatedImage => {
                 self.config.texture_filter_animated.to_egui_options()
             }
@@ -11986,9 +11989,11 @@ impl ImageViewer {
             _ => None,
         };
 
-        self.strip_entry_placeholder_index = placeholder_path
-            .as_ref()
-            .and_then(|path| self.image_list.iter().position(|candidate| candidate == path));
+        self.strip_entry_placeholder_index = placeholder_path.as_ref().and_then(|path| {
+            self.image_list
+                .iter()
+                .position(|candidate| candidate == path)
+        });
         self.strip_entry_placeholder_path = placeholder_path;
     }
 
@@ -11998,6 +12003,22 @@ impl ImageViewer {
                 .strip_entry_placeholder_path
                 .as_ref()
                 .is_some_and(|path| self.image_list.get(index) == Some(path))
+    }
+
+    fn manga_video_texture_matches(&self, index: usize) -> bool {
+        self.manga_video_texture_paths
+            .get(&index)
+            .is_some_and(|path| self.image_list.get(index) == Some(path))
+    }
+
+    fn remove_manga_video_texture(&mut self, index: usize) {
+        self.manga_video_textures.remove(&index);
+        self.manga_video_texture_paths.remove(&index);
+    }
+
+    fn clear_manga_video_textures(&mut self) {
+        self.manga_video_textures.clear();
+        self.manga_video_texture_paths.clear();
     }
 
     fn manga_media_type_for_current_media(
@@ -12686,7 +12707,7 @@ impl ImageViewer {
         if !gstreamer_runtime_available() {
             self.clear_pending_manga_video_load();
             self.manga_video_players.remove(&index);
-            self.manga_video_textures.remove(&index);
+            self.remove_manga_video_texture(index);
             self.manga_video_preview_resume_secs.remove(&index);
             if self.manga_focused_video_index == Some(index) {
                 self.manga_focused_video_index = None;
@@ -12720,8 +12741,7 @@ impl ImageViewer {
             disable_hardware_decode,
             enable_cuda_decode,
             enable_d3d12_decode,
-        ) =
-            self.effective_video_decoder_preferences();
+        ) = self.effective_video_decoder_preferences();
         self.manga_video_load_coordinator
             .submit(MangaFocusedVideoLoadRequest {
                 request_id,
@@ -12868,8 +12888,10 @@ impl ImageViewer {
 
                     if !self.is_masonry_mode() {
                         if let Some(frame) = player.get_frame() {
-                            let target_side =
-                                self.manga_target_texture_side_for_dynamic_media(index, MangaMediaType::Video);
+                            let target_side = self.manga_target_texture_side_for_dynamic_media(
+                                index,
+                                MangaMediaType::Video,
+                            );
                             let (w, h, pixels) = downscale_rgba_if_needed(
                                 frame.width,
                                 frame.height,
@@ -12881,7 +12903,8 @@ impl ImageViewer {
                                 [w as usize, h as usize],
                                 pixels.as_ref(),
                             );
-                            let texture_options = self.config.texture_filter_video.to_egui_options();
+                            let texture_options =
+                                self.config.texture_filter_video.to_egui_options();
 
                             if let Some((texture, stored_w, stored_h)) =
                                 self.manga_video_textures.get_mut(&index)
@@ -12896,6 +12919,9 @@ impl ImageViewer {
                                     texture_options,
                                 );
                                 self.manga_video_textures.insert(index, (texture, w, h));
+                            }
+                            if let Some(path) = self.image_list.get(index).cloned() {
+                                self.manga_video_texture_paths.insert(index, path);
                             }
                         }
                     }
@@ -13030,8 +13056,7 @@ impl ImageViewer {
             disable_hardware_decode,
             enable_cuda_decode,
             enable_d3d12_decode,
-        ) =
-            self.effective_video_decoder_preferences();
+        ) = self.effective_video_decoder_preferences();
         let output_bounds = self.async_video_output_bounds_for_solo();
         let resume_position_secs = self
             .manga_video_preview_resume_by_path
@@ -13288,7 +13313,8 @@ impl ImageViewer {
             get_media_type(path)
         };
         self.current_media_type = media_type;
-        self.current_video_path = matches!(media_type, Some(MediaType::Video)).then(|| path.clone());
+        self.current_video_path =
+            matches!(media_type, Some(MediaType::Video)).then(|| path.clone());
 
         let mut used_mode_switch_placeholder = false;
         let transition_placeholder = self
@@ -14463,7 +14489,7 @@ impl ImageViewer {
         // but stop active runtime workloads while in solo fullscreen.
         self.reset_masonry_metadata_preload();
         self.clear_manga_runtime_workloads();
-        self.manga_video_textures.clear();
+        self.clear_manga_video_textures();
         self.manga_animated_images.clear();
         self.manga_anim_failed.clear();
         self.manga_anim_seekbar_total_frames.clear();
@@ -14482,7 +14508,11 @@ impl ImageViewer {
             return;
         }
 
-        let Some(current_path) = self.current_video_path.clone().or_else(|| self.current_media_path()) else {
+        let Some(current_path) = self
+            .current_video_path
+            .clone()
+            .or_else(|| self.current_media_path())
+        else {
             return;
         };
         let Some(index) = self
@@ -16438,12 +16468,10 @@ impl ImageViewer {
             return;
         };
 
-        if target_media_type == MediaType::Video {
+        if target_media_type == MediaType::Video && self.manga_video_texture_matches(index) {
             if let Some((texture, w, h)) = self.manga_video_textures.get(&index) {
                 if *w > 0 && *h > 0 {
-                    let dims = self
-                        .manga_item_source_dimensions(index)
-                        .unwrap_or((*w, *h));
+                    let dims = self.manga_item_source_dimensions(index).unwrap_or((*w, *h));
                     self.pending_mode_switch_placeholder = Some(ModeSwitchPlaceholder {
                         texture: texture.clone(),
                         dims,
@@ -16575,7 +16603,6 @@ impl ImageViewer {
         Some((idx, fraction, screen_y))
     }
 
-
     /// Re-apply a previously captured anchor at a specific screen Y position after zoom.
     ///
     /// Places the same fractional position of the same image at the same screen Y position.
@@ -16659,7 +16686,7 @@ impl ImageViewer {
             self.manga_video_preview_resume_secs.clear();
             self.manga_video_preview_resume_by_path.clear();
         }
-        self.manga_video_textures.clear();
+        self.clear_manga_video_textures();
 
         // Clear animated images and streaming state
         self.manga_animated_images.clear();
@@ -16979,7 +17006,7 @@ impl ImageViewer {
                 }
             }
             self.manga_video_preview_resume_secs.remove(&idx);
-            self.manga_video_textures.remove(&idx);
+            self.remove_manga_video_texture(idx);
             if self
                 .pending_manga_video_load
                 .as_ref()
@@ -17020,7 +17047,7 @@ impl ImageViewer {
                     let _ = player.pause();
                 }
             }
-            self.manga_video_textures.remove(&idx);
+            self.remove_manga_video_texture(idx);
         }
     }
 
@@ -17119,6 +17146,7 @@ impl ImageViewer {
             }
 
             let focus_changed = self.manga_focused_video_index != Some(focused_idx);
+            let resume_position = self.manga_resume_position_for_index(focused_idx);
 
             if focus_changed {
                 // Pause all other videos
@@ -17132,6 +17160,20 @@ impl ImageViewer {
 
             let focus_play_error =
                 if let Some(player) = self.manga_video_players.get_mut(&focused_idx) {
+                    if focus_changed {
+                        if let Some(position) = resume_position {
+                            let resume_secs = position.as_secs_f64();
+                            let current_secs = player
+                                .position()
+                                .map(|position| position.as_secs_f64())
+                                .unwrap_or(0.0);
+                            if resume_secs > 0.25 && current_secs <= 0.25 {
+                                let _ = player
+                                    .seek_to_time_with_mode(resume_secs, VideoSeekMode::Accurate);
+                            }
+                        }
+                    }
+
                     if focus_changed && !player.is_playing() {
                         player.play().err()
                     } else {
@@ -17179,7 +17221,6 @@ impl ImageViewer {
             if !self.manga_video_load_pending_for_index(focused_idx) {
                 // Ensure GStreamer is initialized before background startup work.
                 self.gstreamer_initialized = true;
-                let resume_position = self.manga_resume_position_for_index(focused_idx);
                 self.start_async_manga_focused_video_load(
                     focused_idx,
                     path,
@@ -17205,7 +17246,7 @@ impl ImageViewer {
 
             if !self.is_masonry_mode() {
                 self.manga_video_players.clear();
-                self.manga_video_textures.clear();
+                self.clear_manga_video_textures();
             }
 
             self.clear_pending_manga_video_load();
@@ -17268,7 +17309,7 @@ impl ImageViewer {
                         self.manga_record_video_preview_resume_secs(idx, position);
                     }
                 }
-                self.manga_video_textures.remove(&idx);
+                self.remove_manga_video_texture(idx);
             } else {
                 break;
             }
@@ -17290,6 +17331,7 @@ impl ImageViewer {
                 self.max_texture_side.max(1)
             };
             let mut video_dimensions_changed = false;
+            let mut focused_position_to_record = None;
 
             if let Some(player) = self.manga_video_players.get_mut(&focused_idx) {
                 // Update duration cache
@@ -17304,6 +17346,8 @@ impl ImageViewer {
 
                 // Get new frame if available
                 if let Some(frame) = player.get_frame() {
+                    focused_position_to_record = player.position();
+
                     // Update layout dimensions from source/original video size (not decoded frame size).
                     // Decoded frames may be output-bounded/downscaled, which would otherwise shrink
                     // strip layout dimensions and cause cascading reflow/squash at low zoom.
@@ -17355,9 +17399,17 @@ impl ImageViewer {
                             texture_options,
                         );
 
-                        self.manga_video_textures.insert(focused_idx, (texture, w, h));
+                        self.manga_video_textures
+                            .insert(focused_idx, (texture, w, h));
+                    }
+                    if let Some(path) = self.image_list.get(focused_idx).cloned() {
+                        self.manga_video_texture_paths.insert(focused_idx, path);
                     }
                 }
+            }
+
+            if let Some(position) = focused_position_to_record {
+                self.manga_record_video_preview_resume_secs(focused_idx, position);
             }
 
             if video_dimensions_changed {
@@ -17610,8 +17662,7 @@ impl ImageViewer {
                     } else {
                         None
                     }
-                })
-            {
+                }) {
                 self.sync_custom_fps_with_current_media_default(
                     path.as_path(),
                     frame_count,
@@ -18139,9 +18190,11 @@ impl ImageViewer {
             return loader_dims;
         }
 
-        if let Some((_, w, h)) = self.manga_video_textures.get(&index) {
-            if *w > 0 && *h > 0 {
-                return Some((*w as f32, *h as f32));
+        if self.manga_video_texture_matches(index) {
+            if let Some((_, w, h)) = self.manga_video_textures.get(&index) {
+                if *w > 0 && *h > 0 {
+                    return Some((*w as f32, *h as f32));
+                }
             }
         }
 
@@ -20137,6 +20190,10 @@ impl ImageViewer {
 
         if is_video {
             // Video item: prioritize live video texture, fall back to first-frame thumbnail
+            if !self.manga_video_texture_matches(idx) {
+                self.remove_manga_video_texture(idx);
+            }
+
             if let Some((texture, _tex_w, _tex_h)) = self.manga_video_textures.get(&idx) {
                 // Live video frame available - use it
                 ui.painter().image(
@@ -20277,7 +20334,7 @@ impl ImageViewer {
 
             if video_load_pending
                 && self.manga_focused_video_index == Some(idx)
-                && !self.manga_video_textures.contains_key(&idx)
+                && !self.manga_video_texture_matches(idx)
             {
                 let time = ui.input(|i| i.time);
                 paint_loading_spinner(ui.painter(), image_rect, time);
@@ -20635,10 +20692,12 @@ impl ImageViewer {
             pointer_pos.map_or(false, |p| p.y > screen_height - controls_bar_height);
 
         if self.is_masonry_mode() {
-            let masonry_hover_blocked =
-                title_ui_blocking || self.file_action_menu.is_some() || self.any_modal_dialog_open();
+            let masonry_hover_blocked = title_ui_blocking
+                || self.file_action_menu.is_some()
+                || self.any_modal_dialog_open();
             if !masonry_hover_blocked {
-                let hover_candidate = pointer_pos.and_then(|pos| self.manga_index_at_screen_pos(pos));
+                let hover_candidate =
+                    pointer_pos.and_then(|pos| self.manga_index_at_screen_pos(pos));
                 if let Some(idx) = hover_candidate {
                     self.manga_hovered_media_index = Some(idx);
                 }
@@ -21383,10 +21442,12 @@ impl ImageViewer {
         // Re-evaluate hover target after scroll/zoom/pan updates so masonry hover-preview
         // tracks content motion even when the physical cursor did not move this frame.
         if self.is_masonry_mode() {
-            let masonry_hover_blocked =
-                title_ui_blocking || self.file_action_menu.is_some() || self.any_modal_dialog_open();
+            let masonry_hover_blocked = title_ui_blocking
+                || self.file_action_menu.is_some()
+                || self.any_modal_dialog_open();
             if !masonry_hover_blocked {
-                let hover_candidate = pointer_pos.and_then(|pos| self.manga_index_at_screen_pos(pos));
+                let hover_candidate =
+                    pointer_pos.and_then(|pos| self.manga_index_at_screen_pos(pos));
                 if masonry_navigation_active_for_visible_retry {
                     if let Some(idx) = hover_candidate {
                         self.manga_hovered_media_index = Some(idx);
@@ -22483,6 +22544,10 @@ impl ImageViewer {
             } else if self.is_seeking {
                 needs_repaint = true;
             }
+        }
+
+        if self.video_player.is_some() {
+            self.sync_solo_video_position_to_manga_resume();
         }
 
         if activate_deferred_video_swap {
@@ -25441,7 +25506,7 @@ impl ImageViewer {
 
         if let Some(err) = resume_error {
             self.manga_video_players.remove(&video_idx);
-            self.manga_video_textures.remove(&video_idx);
+            self.remove_manga_video_texture(video_idx);
             self.manga_video_preview_resume_secs.remove(&video_idx);
             if self.manga_focused_video_index == Some(video_idx) {
                 self.manga_focused_video_index = None;
