@@ -59,6 +59,7 @@ use video_thumbnail::{
     probe_video_dimensions_without_gstreamer,
 };
 
+use bytes::Bytes;
 use eframe::egui;
 use fast_image_resize as fir;
 use image::imageops::FilterType;
@@ -285,6 +286,37 @@ fn downscale_rgba_if_needed<'a>(
 
     let resized = image::imageops::resize(&img, new_w, new_h, filter);
     (new_w, new_h, Cow::Owned(resized.into_raw()))
+}
+
+fn try_color_image_from_opaque_rgba_bytes(
+    size: [usize; 2],
+    pixels: Bytes,
+) -> Result<egui::ColorImage, Bytes> {
+    let expected_len = size[0].saturating_mul(size[1]).saturating_mul(4);
+    if expected_len != pixels.len() {
+        return Err(pixels);
+    }
+
+    let pixels_mut = match pixels.try_into_mut() {
+        Ok(pixels_mut) => pixels_mut,
+        Err(pixels) => return Err(pixels),
+    };
+    let pixels_vec: Vec<u8> = pixels_mut.into();
+    if pixels_vec.capacity() % std::mem::size_of::<egui::Color32>() != 0 {
+        return Err(Bytes::from(pixels_vec));
+    }
+
+    // Video frames negotiated as RGBA are opaque. Color32 has the same byte layout
+    // for opaque sRGBA, so this avoids egui's per-pixel conversion loop.
+    debug_assert_eq!(std::mem::size_of::<egui::Color32>(), 4);
+    debug_assert_eq!(std::mem::align_of::<egui::Color32>(), 1);
+    let mut pixels_vec = std::mem::ManuallyDrop::new(pixels_vec);
+    let color_len = pixels_vec.len() / 4;
+    let color_cap = pixels_vec.capacity() / 4;
+    let color_ptr = pixels_vec.as_mut_ptr() as *mut egui::Color32;
+    let pixels = unsafe { Vec::from_raw_parts(color_ptr, color_len, color_cap) };
+
+    Ok(egui::ColorImage { size, pixels })
 }
 
 fn cached_or_probe_video_dimensions(path: &Path) -> Option<(u32, u32)> {
@@ -22152,17 +22184,35 @@ impl ImageViewer {
             if let Some(frame) = player.get_frame() {
                 activate_deferred_video_swap = self.defer_media_view_reset;
 
-                let (w, h, pixels) = downscale_rgba_if_needed(
-                    frame.width,
-                    frame.height,
-                    &frame.pixels,
-                    current_video_target_side,
-                    solo_video_upload_filter,
-                );
-                let color_image = egui::ColorImage::from_rgba_unmultiplied(
-                    [w as usize, h as usize],
-                    pixels.as_ref(),
-                );
+                let no_downscale = frame.width <= current_video_target_side
+                    && frame.height <= current_video_target_side;
+                let (w, h, color_image) = if no_downscale {
+                    let size = [frame.width as usize, frame.height as usize];
+                    match try_color_image_from_opaque_rgba_bytes(size, frame.pixels) {
+                        Ok(color_image) => (frame.width, frame.height, color_image),
+                        Err(pixels) => (
+                            frame.width,
+                            frame.height,
+                            egui::ColorImage::from_rgba_unmultiplied(size, &pixels),
+                        ),
+                    }
+                } else {
+                    let (w, h, pixels) = downscale_rgba_if_needed(
+                        frame.width,
+                        frame.height,
+                        &frame.pixels,
+                        current_video_target_side,
+                        solo_video_upload_filter,
+                    );
+                    (
+                        w,
+                        h,
+                        egui::ColorImage::from_rgba_unmultiplied(
+                            [w as usize, h as usize],
+                            pixels.as_ref(),
+                        ),
+                    )
+                };
 
                 // Live video frames change continuously, so per-frame mipmap generation is wasted
                 // work. Thumbnails still use the manga_mipmap_video_thumbnails setting elsewhere.
@@ -22181,9 +22231,9 @@ impl ImageViewer {
 
             // Only request repaint for active video playback or when seeking
             if player.is_playing() {
-                // Keep solo video polling near high-refresh cadence (about 144 Hz).
-                // 16ms hard-caps frame delivery near 60 FPS even when decode/upload can run faster.
-                ctx.request_repaint_after(Duration::from_millis(7));
+                // Do not use a 7ms timer here: 7ms mathematically caps the UI below 144 Hz.
+                // Immediate repaint lets the platform frame pacing hit high-refresh monitors.
+                ctx.request_repaint();
             } else if self.is_seeking {
                 needs_repaint = true;
             }

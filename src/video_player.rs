@@ -1467,19 +1467,32 @@ Ensure your GStreamer installation includes the playback elements (usually from 
             .build()
             .map_err(|e| format!("Failed to create videoconvert: {}", e))?;
 
-        let videoscale = gst::ElementFactory::make("videoscale")
-            .build()
-            .map_err(|e| format!("Failed to create videoscale: {}", e))?;
+        let first_video_element = if output_dimensions.is_some() {
+            let videoscale = gst::ElementFactory::make("videoscale")
+                .build()
+                .map_err(|e| format!("Failed to create videoscale: {}", e))?;
 
-        video_bin
-            .add_many([&videoscale, &videoconvert, appsink.upcast_ref()])
-            .map_err(|e| format!("Failed to add elements to bin: {}", e))?;
+            video_bin
+                .add_many([&videoscale, &videoconvert, appsink.upcast_ref()])
+                .map_err(|e| format!("Failed to add elements to bin: {}", e))?;
 
-        gst::Element::link_many([&videoscale, &videoconvert, appsink.upcast_ref()])
-            .map_err(|e| format!("Failed to link video elements: {}", e))?;
+            gst::Element::link_many([&videoscale, &videoconvert, appsink.upcast_ref()])
+                .map_err(|e| format!("Failed to link video elements: {}", e))?;
+
+            videoscale
+        } else {
+            video_bin
+                .add_many([&videoconvert, appsink.upcast_ref()])
+                .map_err(|e| format!("Failed to add elements to bin: {}", e))?;
+
+            gst::Element::link_many([&videoconvert, appsink.upcast_ref()])
+                .map_err(|e| format!("Failed to link video elements: {}", e))?;
+
+            videoconvert.clone()
+        };
 
         // Create ghost pad for the bin.
-        let pad = videoscale
+        let pad = first_video_element
             .static_pad("sink")
             .ok_or("Failed to get sink pad")?;
         let ghost_pad = gst::GhostPad::with_target(&pad)
