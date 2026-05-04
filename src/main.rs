@@ -1798,7 +1798,7 @@ fn extract_video_first_frame_thumbnail(
         frame_data.lock().is_some()
     };
 
-    let _ = wait_for_frame(250);
+    let _ = wait_for_frame(300);
     let pre_seek_frame = frame_data.lock().clone();
     *frame_data.lock() = None;
     let seeked_to_zero = pipeline
@@ -1807,11 +1807,14 @@ fn extract_video_first_frame_thumbnail(
             gst::ClockTime::ZERO,
         )
         .is_ok();
-    let got_seek_frame = seeked_to_zero && wait_for_frame(750);
-    let extracted_frame = if got_seek_frame {
-        frame_data.lock().clone().or(pre_seek_frame)
+    let extracted_frame = if seeked_to_zero {
+        if wait_for_frame(3000) {
+            frame_data.lock().clone()
+        } else {
+            None
+        }
     } else {
-        pre_seek_frame.or_else(|| frame_data.lock().clone())
+        pre_seek_frame
     };
 
     let _ = pipeline.set_state(gst::State::Null);

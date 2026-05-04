@@ -22,7 +22,7 @@ const STATIC_THUMBNAIL_TABLE: TableDefinition<&str, &[u8]> =
 const LEGACY_THUMBNAIL_HEADER_BYTES: usize = 40;
 const THUMBNAIL_HEADER_BYTES: usize = 48;
 const THUMBNAIL_SCHEMA_TAG: u64 = 0x4341_4348_5454_4c31;
-const VIDEO_THUMBNAIL_KEY_TAG: &str = "v2";
+const VIDEO_THUMBNAIL_KEY_TAG: &str = "v3";
 
 const DIMENSION_CACHE_TTL_SECS: u64 = 60 * 60 * 24 * 30;
 const THUMBNAIL_CACHE_TTL_SECS: u64 = 60 * 60 * 24 * 14;

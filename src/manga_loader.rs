@@ -1228,8 +1228,8 @@ impl MangaLoader {
         path: &std::path::Path,
         max_texture_side: u32,
     ) -> Option<(Vec<u8>, u32, u32, u32, u32)> {
-        let use_gstreamer_webm = Self::is_webm_video_path(path) && gstreamer_runtime_available();
-        let cache_texture_side = if use_gstreamer_webm {
+        let gstreamer_available = gstreamer_runtime_available();
+        let cache_texture_side = if gstreamer_available && Self::is_webm_video_path(path) {
             Self::webm_gstreamer_thumbnail_cache_side(max_texture_side)
         } else {
             max_texture_side
@@ -1259,7 +1259,7 @@ impl MangaLoader {
             ));
         }
 
-        if !use_gstreamer_webm {
+        if !gstreamer_available {
             if let Some((pixels, width, height, original_width, original_height)) =
                 extract_video_first_frame_without_gstreamer(path, max_texture_side)
             {
@@ -1277,9 +1277,6 @@ impl MangaLoader {
 
                 return Some((pixels, width, height, original_width, original_height));
             }
-        }
-
-        if !gstreamer_runtime_available() {
             return None;
         }
 
@@ -1385,7 +1382,7 @@ impl MangaLoader {
             frame_data.lock().is_some()
         };
 
-        let _ = wait_for_frame(250);
+        let _ = wait_for_frame(300);
         let pre_seek_frame = frame_data.lock().clone();
         *frame_data.lock() = None;
         let seeked_to_zero = pipeline
@@ -1394,11 +1391,14 @@ impl MangaLoader {
                 gst::ClockTime::ZERO,
             )
             .is_ok();
-        let got_seek_frame = seeked_to_zero && wait_for_frame(750);
-        let extracted_frame = if got_seek_frame {
-            frame_data.lock().clone().or(pre_seek_frame)
+        let extracted_frame = if seeked_to_zero {
+            if wait_for_frame(3000) {
+                frame_data.lock().clone()
+            } else {
+                None
+            }
         } else {
-            pre_seek_frame.or_else(|| frame_data.lock().clone())
+            pre_seek_frame
         };
 
         // Cleanup pipeline
