@@ -2616,6 +2616,8 @@ struct ImageViewer {
     manga_preload_cooldown: u32,
     /// Last frame when preload queue was updated (throttle updates)
     manga_last_preload_update: std::time::Instant,
+    /// Last strip background placeholder tick while focused video playback is active.
+    manga_last_strip_playback_background_tick: std::time::Instant,
     /// Last scroll position for detecting large jumps
     manga_last_scroll_position: f32,
     /// Adaptive target cache capacity for manga/masonry textures.
@@ -3030,6 +3032,7 @@ impl Default for ImageViewer {
 
             manga_preload_cooldown: 0,
             manga_last_preload_update: Instant::now(),
+            manga_last_strip_playback_background_tick: Instant::now(),
             manga_last_scroll_position: 0.0,
             manga_cache_target_capacity: 64,
             manga_target_texture_side: 4096,
@@ -3134,6 +3137,8 @@ impl ImageViewer {
     const MANGA_TTV_SAMPLE_CAP: usize = 240;
     const MANGA_TTV_PENDING_MAX_AGE: Duration = Duration::from_secs(30);
     const MANGA_PLACEHOLDER_STALL_RETRY_MS: u64 = 900;
+    const MANGA_STRIP_PLAYBACK_PRELOAD_INTERVAL_MS: u64 = 120;
+    const MANGA_STRIP_PLAYBACK_BACKGROUND_TICK_MS: u64 = 80;
     const MANGA_PAGE_NAV_REPEAT_INITIAL_DELAY_MS: u64 = 260;
     const MANGA_PAGE_NAV_REPEAT_INTERVAL_MS: u64 = 45;
     const FPS_OVERLAY_IDLE_POLL_MS: u64 = 500;
@@ -6740,6 +6745,10 @@ impl ImageViewer {
         pending_loads: usize,
         pending_decoded: usize,
     ) -> usize {
+        if self.manga_strip_focused_video_playing() {
+            return 1;
+        }
+
         let mut limit = Self::MANGA_UPLOAD_BATCH_BASE;
 
         if self.is_masonry_mode() {
@@ -16708,6 +16717,20 @@ impl ImageViewer {
         }
     }
 
+    fn manga_strip_focused_video_playing(&self) -> bool {
+        if !self.manga_mode || self.is_masonry_mode() {
+            return false;
+        }
+
+        let Some(focused_idx) = self.manga_focused_video_index else {
+            return false;
+        };
+
+        self.manga_video_players
+            .get(&focused_idx)
+            .is_some_and(|player| player.is_playing())
+    }
+
     /// Update manga video playback based on current scroll position.
     /// Ensures only one video plays at a time (the focused one).
     fn manga_update_video_focus(&mut self) {
@@ -17456,10 +17479,14 @@ impl ImageViewer {
             return;
         }
 
-        // Throttle updates to prevent cache churn during rapid scrolling
-        // Only update every 50ms minimum
-        const MIN_UPDATE_INTERVAL: Duration = Duration::from_millis(50);
-        if self.manga_last_preload_update.elapsed() < MIN_UPDATE_INTERVAL {
+        // Throttle updates to prevent cache churn during rapid scrolling.
+        // While a long-strip video is actively playing, reduce placeholder churn.
+        let min_update_interval = if self.manga_strip_focused_video_playing() {
+            Duration::from_millis(Self::MANGA_STRIP_PLAYBACK_PRELOAD_INTERVAL_MS)
+        } else {
+            Duration::from_millis(50)
+        };
+        if self.manga_last_preload_update.elapsed() < min_update_interval {
             return;
         }
         let prev_scroll_pos = self.manga_last_scroll_position;
@@ -19536,10 +19563,19 @@ impl ImageViewer {
             Self::MANGA_DYNAMIC_TARGET_MIN_SIDE
         }
         .min(max_side);
+        let strip_placeholder_during_playback = !is_masonry
+            && self.manga_strip_focused_video_playing()
+            && Some(index) != self.manga_focused_video_index;
 
         if quality_upgrade && defer_visible_quality {
             self.perf_metrics
                 .increment_counter("manga_upgrade_deferred_nav", 1);
+            return false;
+        }
+
+        if strip_placeholder_during_playback && quality_upgrade {
+            self.perf_metrics
+                .increment_counter("manga_upgrade_deferred_strip_playback", 1);
             return false;
         }
 
@@ -19554,6 +19590,12 @@ impl ImageViewer {
             }
         } else {
             max_side
+        };
+
+        let preload_floor_side = if strip_placeholder_during_playback {
+            min_target_side
+        } else {
+            self.manga_target_texture_side.min(max_side)
         };
 
         // During active masonry navigation, prioritize fast placeholder fill over texture quality.
@@ -19577,7 +19619,7 @@ impl ImageViewer {
             side
         } else {
             desired_target_side
-                .max(self.manga_target_texture_side.min(max_side))
+                .max(preload_floor_side)
                 .clamp(min_target_side, max_side)
         };
         let (downscale_filter, gif_filter) = self.manga_decode_filters_for_strip_mode();
@@ -20973,7 +21015,20 @@ impl ImageViewer {
         } else {
             self.manga_capture_scroll_anchor()
         };
-        let dims_updated = self.manga_process_pending_loads(ctx);
+        let strip_playback_priority_mode = self.manga_strip_focused_video_playing();
+        let should_tick_strip_background = !strip_playback_priority_mode
+            || self.manga_navigation_active_for_heavy_work()
+            || self.manga_last_strip_playback_background_tick.elapsed()
+                >= Duration::from_millis(Self::MANGA_STRIP_PLAYBACK_BACKGROUND_TICK_MS);
+        let dims_updated = if should_tick_strip_background {
+            let updated = self.manga_process_pending_loads(ctx);
+            if strip_playback_priority_mode {
+                self.manga_last_strip_playback_background_tick = Instant::now();
+            }
+            updated
+        } else {
+            false
+        };
         if dims_updated {
             if !freeze_for_help {
                 if self.is_masonry_mode() {
