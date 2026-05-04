@@ -2448,6 +2448,8 @@ struct ImageViewer {
     fps_smoothed: f32,
     /// Most recent frame delta time in seconds
     fps_last_dt_s: f32,
+    /// Primary monitor refresh rate used to keep FPS overlay vsync-aware.
+    fps_display_refresh_hz: Option<f32>,
 
     /// Whether we've installed extra Windows fonts for CJK filename rendering.
     /// These font files can be quite large, so we install them lazily only when needed.
@@ -2945,6 +2947,7 @@ impl Default for ImageViewer {
             fps_last_frame_was_active: false,
             fps_smoothed: 0.0,
             fps_last_dt_s: 0.0,
+            fps_display_refresh_hz: get_primary_monitor_refresh_hz(),
 
             windows_cjk_fonts_installed: false,
             pending_windows_cjk_font_load: None,
@@ -6643,7 +6646,7 @@ impl ImageViewer {
         }
     }
 
-    fn update_fps_stats(&mut self, frame_was_active: bool) {
+    fn update_fps_stats(&mut self, frame_was_active: bool, frame_dt_hint_s: Option<f32>) {
         let now = Instant::now();
         let dt = now.saturating_duration_since(self.fps_last_frame_at);
         self.fps_last_frame_at = now;
@@ -6651,9 +6654,25 @@ impl ImageViewer {
         if frame_was_active {
             self.fps_last_active_frame_at = now;
 
-            let dt_s = dt.as_secs_f32();
+            let mut dt_s = dt.as_secs_f32();
             // Guard against huge dt (e.g., debugging breakpoints / system sleep)
             if dt_s.is_finite() && dt_s > 0.0 && dt_s < 1.0 {
+                if self.config.vsync {
+                    let monitor_floor = self
+                        .fps_display_refresh_hz
+                        .filter(|hz| hz.is_finite() && *hz >= 24.0 && *hz <= 1000.0)
+                        .map(|hz| (1.0 / hz).clamp(0.001, 0.1));
+                    let hint_floor = frame_dt_hint_s
+                        .filter(|hint| hint.is_finite() && *hint > 0.0 && *hint < 1.0)
+                        .map(|hint| hint.clamp(0.001, 0.1));
+
+                    if let Some(floor_dt_s) = monitor_floor.or(hint_floor) {
+                        // Egui can issue multiple update callbacks inside one swap interval.
+                        // For vsync-on diagnostics, keep FPS tied to display cadence.
+                        dt_s = dt_s.max(floor_dt_s);
+                    }
+                }
+
                 self.fps_last_dt_s = dt_s;
                 let fps = 1.0 / dt_s;
                 if self.fps_smoothed <= 0.0 {
@@ -26405,7 +26424,8 @@ impl eframe::App for ImageViewer {
         // Update FPS stats for the debug overlay (and for general diagnostics).
         // Use the previous frame's activity classification so low-rate overlay polls
         // do not skew FPS downward.
-        self.update_fps_stats(self.fps_last_frame_was_active);
+        let fps_frame_dt_hint_s = ctx.input(|i| Some(i.stable_dt));
+        self.update_fps_stats(self.fps_last_frame_was_active, fps_frame_dt_hint_s);
 
         // Lazily install large CJK fonts only when we actually have a filename that needs them.
         self.ensure_windows_cjk_fonts_if_needed(ctx);
@@ -27092,6 +27112,35 @@ fn get_primary_monitor_size() -> egui::Vec2 {
 #[cfg(not(target_os = "windows"))]
 fn get_primary_monitor_size() -> egui::Vec2 {
     egui::Vec2::new(1920.0, 1080.0)
+}
+
+#[cfg(target_os = "windows")]
+fn get_primary_monitor_refresh_hz() -> Option<f32> {
+    use std::mem::{size_of, zeroed};
+    use std::ptr::null;
+    use winapi::um::wingdi::DEVMODEW;
+    use winapi::um::winuser::{EnumDisplaySettingsW, ENUM_CURRENT_SETTINGS};
+
+    unsafe {
+        let mut dev_mode: DEVMODEW = zeroed();
+        dev_mode.dmSize = size_of::<DEVMODEW>() as u16;
+
+        if EnumDisplaySettingsW(null(), ENUM_CURRENT_SETTINGS, &mut dev_mode) == 0 {
+            return None;
+        }
+
+        let hz = dev_mode.dmDisplayFrequency as f32;
+        if hz.is_finite() && hz >= 24.0 && hz <= 1000.0 {
+            Some(hz)
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn get_primary_monitor_refresh_hz() -> Option<f32> {
+    None
 }
 
 /// Get the global cursor position in screen coordinates using Windows API.
