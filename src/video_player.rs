@@ -427,8 +427,7 @@ const LOCAL_FILE_BUFFER_DURATION_NS: i64 = 10_000_000_000;
 const LOCAL_FILE_BUFFER_SIZE_BYTES: i32 = 50 * 1024 * 1024;
 const LOCAL_FILE_RING_BUFFER_MAX_SIZE_BYTES: u64 = 96 * 1024 * 1024;
 const LOCAL_FILE_SOURCE_BLOCK_SIZE_BYTES: i32 = 256 * 1024;
-const APPSINK_MAX_BUFFERS: u32 = 2;
-const RANGE_EXPAND_MAX_PIXELS: u64 = 2560u64 * 1440u64;
+const APPSINK_MAX_BUFFERS: u32 = 3;
 const KEYFRAME_SEEK_PREROLL_TIMEOUT_MS: u64 = 20;
 const ACCURATE_SEEK_PREROLL_TIMEOUT_MS: u64 = 75;
 const SUBTITLE_FONT_DESC_FALLBACK_CJK: &str =
@@ -1037,7 +1036,7 @@ fn process_video_sample(sample: gst::Sample, state: &VideoState) {
         }
     };
 
-    if should_expand && (width as u64).saturating_mul(height as u64) <= RANGE_EXPAND_MAX_PIXELS {
+    if should_expand {
         expand_limited_range_rgba_in_place(data.as_mut());
     }
 
@@ -1185,57 +1184,33 @@ Ensure your GStreamer installation includes the playback elements (usually from 
             .wait_on_eos(false)
             .enable_last_sample(false)
             .qos(true)
-            .sync(false)
+            .sync(true)
             .build();
         appsink.set_drop_out_of_segment(true);
 
         // Create a bin to hold the appsink with video conversion
         let video_bin = gst::Bin::new();
 
-        // Aggressive Windows path: keep conversion/scaling on D3D11 and only download once.
-        // Fall back to the cross-platform software chain when D3D11 elements are unavailable.
-        let sink_pad = if cfg!(target_os = "windows")
-            && gst::ElementFactory::find("d3d11convert").is_some()
-            && gst::ElementFactory::find("d3d11download").is_some()
-        {
-            let d3d11convert = gst::ElementFactory::make("d3d11convert")
-                .build()
-                .map_err(|e| format!("Failed to create d3d11convert: {}", e))?;
-            let d3d11download = gst::ElementFactory::make("d3d11download")
-                .build()
-                .map_err(|e| format!("Failed to create d3d11download: {}", e))?;
+        let videoconvert = gst::ElementFactory::make("videoconvert")
+            .build()
+            .map_err(|e| format!("Failed to create videoconvert: {}", e))?;
 
-            video_bin
-                .add_many([&d3d11convert, &d3d11download, appsink.upcast_ref()])
-                .map_err(|e| format!("Failed to add d3d11 elements to bin: {}", e))?;
+        let videoscale = gst::ElementFactory::make("videoscale")
+            .build()
+            .map_err(|e| format!("Failed to create videoscale: {}", e))?;
 
-            gst::Element::link_many([&d3d11convert, &d3d11download, appsink.upcast_ref()])
-                .map_err(|e| format!("Failed to link d3d11 video elements: {}", e))?;
+        video_bin
+            .add_many([&videoscale, &videoconvert, appsink.upcast_ref()])
+            .map_err(|e| format!("Failed to add elements to bin: {}", e))?;
 
-            d3d11convert
-                .static_pad("sink")
-                .ok_or("Failed to get d3d11convert sink pad")?
-        } else {
-            let videoconvert = gst::ElementFactory::make("videoconvert")
-                .build()
-                .map_err(|e| format!("Failed to create videoconvert: {}", e))?;
-
-            let videoscale = gst::ElementFactory::make("videoscale")
-                .build()
-                .map_err(|e| format!("Failed to create videoscale: {}", e))?;
-
-            video_bin
-                .add_many([&videoscale, &videoconvert, appsink.upcast_ref()])
-                .map_err(|e| format!("Failed to add elements to bin: {}", e))?;
-
-            gst::Element::link_many([&videoscale, &videoconvert, appsink.upcast_ref()])
-                .map_err(|e| format!("Failed to link video elements: {}", e))?;
-
-            videoscale.static_pad("sink").ok_or("Failed to get sink pad")?
-        };
+        gst::Element::link_many([&videoscale, &videoconvert, appsink.upcast_ref()])
+            .map_err(|e| format!("Failed to link video elements: {}", e))?;
 
         // Create ghost pad for the bin
-        let ghost_pad = gst::GhostPad::with_target(&sink_pad)
+        let pad = videoscale
+            .static_pad("sink")
+            .ok_or("Failed to get sink pad")?;
+        let ghost_pad = gst::GhostPad::with_target(&pad)
             .map_err(|e| format!("Failed to create ghost pad: {}", e))?;
         ghost_pad
             .set_active(true)
