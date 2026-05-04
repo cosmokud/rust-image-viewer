@@ -12631,7 +12631,7 @@ impl ImageViewer {
 
                     self.manga_video_players.insert(index, player);
                     self.error_message = None;
-                    self.manga_evict_distant_video_players(index);
+                    self.manga_evict_distant_video_players(index, None);
                     applied_any = true;
                 }
                 MangaFocusedVideoLoadResult {
@@ -16553,12 +16553,12 @@ impl ImageViewer {
         Some(indices.into_iter().collect())
     }
 
-    fn manga_prune_hidden_video_preview_state(&mut self) {
+    fn manga_prune_hidden_video_preview_state(&mut self) -> Option<HashSet<usize>> {
         if !self.manga_mode || self.image_list.is_empty() {
-            return;
+            return None;
         }
         if self.is_masonry_mode() && self.manga_navigation_active_for_heavy_work() {
-            return;
+            return None;
         }
 
         let mut tracked_indices: HashSet<usize> = self
@@ -16568,7 +16568,7 @@ impl ImageViewer {
             .collect();
         tracked_indices.extend(self.manga_video_players.keys().copied());
         if tracked_indices.is_empty() {
-            return;
+            return None;
         }
 
         // Use the spatial index visible-set query (R-tree) so tiny scroll deltas
@@ -16580,7 +16580,7 @@ impl ImageViewer {
             .filter(|idx| !visible_indices.contains(idx))
             .collect();
         if hidden_indices.is_empty() {
-            return;
+            return Some(visible_indices);
         }
 
         let mut cleared_focused = false;
@@ -16607,6 +16607,8 @@ impl ImageViewer {
         if cleared_focused {
             self.manga_focused_video_index = None;
         }
+
+        Some(visible_indices)
     }
 
     fn manga_strip_retain_only_focused_video(&mut self, focused_idx: usize) {
@@ -16657,7 +16659,7 @@ impl ImageViewer {
             return;
         }
 
-        self.manga_prune_hidden_video_preview_state();
+        let visible_indices_for_preview = self.manga_prune_hidden_video_preview_state();
 
         let focused_idx = if self.is_masonry_mode() {
             if let Some(hovered_idx) = self.manga_hovered_media_index {
@@ -16757,7 +16759,10 @@ impl ImageViewer {
                 }
 
                 // Evict video players that are far from view.
-                self.manga_evict_distant_video_players(focused_idx);
+                self.manga_evict_distant_video_players(
+                    focused_idx,
+                    visible_indices_for_preview.as_ref(),
+                );
                 return;
             }
 
@@ -16814,7 +16819,11 @@ impl ImageViewer {
     }
 
     /// Evict video players that are far from the current view to conserve resources.
-    fn manga_evict_distant_video_players(&mut self, focused_idx: usize) {
+    fn manga_evict_distant_video_players(
+        &mut self,
+        focused_idx: usize,
+        visible_indices_hint: Option<&HashSet<usize>>,
+    ) {
         if !self.is_masonry_mode() {
             self.manga_strip_retain_only_focused_video(focused_idx);
             return;
@@ -16824,7 +16833,14 @@ impl ImageViewer {
             return;
         }
 
-        let visible_indices = self.manga_visible_indices_set_for_preview_tracking();
+        let computed_visible_indices = if visible_indices_hint.is_none() {
+            Some(self.manga_visible_indices_set_for_preview_tracking())
+        } else {
+            None
+        };
+        let visible_indices = visible_indices_hint
+            .or(computed_visible_indices.as_ref())
+            .expect("visible indices must be available");
 
         // Calculate distances and sort by distance from focused
         let mut indexed_distances: Vec<(usize, usize)> = self
@@ -16872,7 +16888,6 @@ impl ImageViewer {
                 self.max_texture_side.max(1)
             };
             let mut video_dimensions_changed = false;
-            let mut resume_position_to_store = None;
 
             if let Some(player) = self.manga_video_players.get_mut(&focused_idx) {
                 // Update duration cache
@@ -16884,8 +16899,6 @@ impl ImageViewer {
                         let _ = player.restart();
                     }
                 }
-
-                resume_position_to_store = player.position();
 
                 // Get new frame if available
                 if let Some(frame) = player.get_frame() {
@@ -16943,10 +16956,6 @@ impl ImageViewer {
                         self.manga_video_textures.insert(focused_idx, (texture, w, h));
                     }
                 }
-            }
-
-            if let Some(position) = resume_position_to_store {
-                self.manga_record_video_preview_resume_secs(focused_idx, position);
             }
 
             if video_dimensions_changed {
