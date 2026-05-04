@@ -17379,8 +17379,6 @@ impl ImageViewer {
             ctx.request_repaint_after(Duration::from_millis(16));
         }
 
-        let webp_fps_override = self.webp_effective_fps_override();
-
         // ── Update animation frames for the focused animated image only ──
         for &idx in focused_anim_idx.iter() {
             let cached_side_floor = self
@@ -17398,11 +17396,27 @@ impl ImageViewer {
                 .copied()
                 .unwrap_or(true);
 
-            if let Some(img) = self.manga_animated_images.get_mut(&idx) {
-                let webp_override_delay = webp_fps_override
-                    .filter(|_| Self::path_uses_animated_fps_override(img.path.as_path()))
-                    .map(Self::frame_delay_for_fps);
+            let webp_override_delay = if let Some((path, frame_count, total_duration_ms)) =
+                self.manga_animated_images.get(&idx).and_then(|img| {
+                    if Self::path_uses_animated_fps_override(img.path.as_path()) {
+                        Some((img.path.clone(), img.frame_count(), img.total_duration_ms()))
+                    } else {
+                        None
+                    }
+                })
+            {
+                self.sync_custom_fps_with_current_media_default(
+                    path.as_path(),
+                    frame_count,
+                    total_duration_ms as u64,
+                );
+                self.webp_effective_fps_override()
+                    .map(Self::frame_delay_for_fps)
+            } else {
+                None
+            };
 
+            if let Some(img) = self.manga_animated_images.get_mut(&idx) {
                 let frame_changed = if !self.gif_paused && img.frame_count() > 1 {
                     // If still streaming and on the last frame, hold rather than wrap.
                     if !stream_done && img.current_frame_index() + 1 >= img.frame_count() {
@@ -22053,6 +22067,20 @@ impl ImageViewer {
         let solo_video_upload_filter = self.config.downscale_filter.to_image_filter();
         let solo_video_texture_filter = self.config.texture_filter_video;
         let solo_static_mipmaps_enabled = self.mipmap_static_enabled();
+
+        if let Some((path, frame_count, total_duration_ms)) = self.image.as_ref().and_then(|img| {
+            if Self::path_uses_animated_fps_override(img.path.as_path()) {
+                Some((img.path.clone(), img.frame_count(), img.total_duration_ms()))
+            } else {
+                None
+            }
+        }) {
+            self.sync_custom_fps_with_current_media_default(
+                path.as_path(),
+                frame_count,
+                total_duration_ms as u64,
+            );
+        }
 
         let webp_fps_override = self.webp_effective_fps_override();
 
