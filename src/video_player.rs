@@ -220,9 +220,15 @@ fn configure_gstreamer_env_windows() {
 }
 
 #[cfg(target_os = "windows")]
-fn apply_decoder_preference_windows(prefer_hardware_decode: bool, disable_hardware_decode: bool) {
+fn apply_decoder_preference_windows(
+    prefer_hardware_decode: bool,
+    disable_hardware_decode: bool,
+    enable_cuda_decode: bool,
+) {
     const HW_DECODE_RANKS: &str =
         "d3d11h264dec:300,d3d11h265dec:300,d3d11vp9dec:300,d3d11av1dec:300";
+    const CUDA_DECODE_RANKS: &str =
+        "nvh264dec:300,nvh265dec:300,nvvp9dec:300,nvav1dec:300,cudah264dec:300,cudah265dec:300";
     const DISABLE_HW_DECODE_RANKS: &str =
         "d3d11h264dec:0,d3d11h265dec:0,d3d11vp9dec:0,d3d11av1dec:0";
 
@@ -231,13 +237,73 @@ fn apply_decoder_preference_windows(prefer_hardware_decode: bool, disable_hardwa
         return;
     }
 
-    if prefer_hardware_decode && std::env::var_os("GST_PLUGIN_FEATURE_RANK").is_none() {
-        std::env::set_var("GST_PLUGIN_FEATURE_RANK", HW_DECODE_RANKS);
+    if std::env::var_os("GST_PLUGIN_FEATURE_RANK").is_some() {
+        return;
+    }
+
+    let mut rank_overrides = Vec::new();
+    if prefer_hardware_decode {
+        rank_overrides.push(HW_DECODE_RANKS);
+    }
+    if enable_cuda_decode {
+        rank_overrides.push(CUDA_DECODE_RANKS);
+    }
+
+    if !rank_overrides.is_empty() {
+        std::env::set_var("GST_PLUGIN_FEATURE_RANK", rank_overrides.join(","));
     }
 }
 
 #[cfg(not(target_os = "windows"))]
-fn apply_decoder_preference_windows(_prefer_hardware_decode: bool, _disable_hardware_decode: bool) {
+fn apply_decoder_preference_windows(
+    _prefer_hardware_decode: bool,
+    _disable_hardware_decode: bool,
+    _enable_cuda_decode: bool,
+) {
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct VideoAccelerationCapabilities {
+    pub hardware_decode_available: bool,
+    pub cuda_available: bool,
+}
+
+#[cfg(target_os = "windows")]
+fn detect_cuda_driver_available() -> bool {
+    try_load_library_windows("nvcuda.dll")
+}
+
+#[cfg(not(target_os = "windows"))]
+fn detect_cuda_driver_available() -> bool {
+    const CUDA_DRIVER_CANDIDATES: &[&str] = &[
+        "/usr/lib/x86_64-linux-gnu/libcuda.so.1",
+        "/usr/lib64/libcuda.so.1",
+        "/usr/lib/wsl/lib/libcuda.so.1",
+        "/usr/local/cuda/lib64/libcuda.so.1",
+    ];
+
+    CUDA_DRIVER_CANDIDATES
+        .iter()
+        .any(|candidate| Path::new(candidate).exists())
+        || std::env::var_os("CUDA_PATH").is_some()
+        || std::env::var_os("CUDA_HOME").is_some()
+}
+
+pub fn detect_video_acceleration_capabilities() -> VideoAccelerationCapabilities {
+    static CAPS: OnceLock<VideoAccelerationCapabilities> = OnceLock::new();
+    *CAPS.get_or_init(|| {
+        let hardware_decode_available = gstreamer_runtime_available();
+        let cuda_available = hardware_decode_available && detect_cuda_driver_available();
+
+        VideoAccelerationCapabilities {
+            hardware_decode_available,
+            cuda_available,
+        }
+    })
+}
+
+pub fn cuda_acceleration_available() -> bool {
+    detect_video_acceleration_capabilities().cuda_available
 }
 
 #[cfg(target_os = "windows")]
@@ -1047,10 +1113,15 @@ impl VideoPlayer {
         initial_volume: f64,
         prefer_hardware_decode: bool,
         disable_hardware_decode: bool,
+        enable_cuda_decode: bool,
         source_dimensions: Option<(u32, u32)>,
         output_dimensions: Option<(u32, u32)>,
     ) -> Result<Self, String> {
-        apply_decoder_preference_windows(prefer_hardware_decode, disable_hardware_decode);
+        apply_decoder_preference_windows(
+            prefer_hardware_decode,
+            disable_hardware_decode,
+            enable_cuda_decode,
+        );
         Self::ensure_init()?;
 
         // Build a correct file:// URI (including percent-encoding for spaces, etc.).

@@ -27,7 +27,11 @@ fn parse_ini_values(content: &str) -> IniValues {
         }
 
         if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            current_section = trimmed[1..trimmed.len() - 1].trim().to_lowercase();
+            let mut section = trimmed[1..trimmed.len() - 1].trim().to_lowercase();
+            if matches!(section.as_str(), "quality" | "image_quality" | "filters") {
+                section = "performance".to_string();
+            }
+            current_section = section;
             values.entry(current_section.clone()).or_default();
             continue;
         }

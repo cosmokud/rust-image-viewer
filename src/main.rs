@@ -51,8 +51,8 @@ use perf_metrics::PerfMetrics;
 #[cfg(target_os = "windows")]
 use single_instance::{FileReceiver, SingleInstanceResult};
 use video_player::{
-    format_duration, gstreamer_runtime_available, VideoPlayer, VideoSeekMode,
-    VideoSubtitleSelection, VideoTrackInfo,
+    detect_video_acceleration_capabilities, format_duration, gstreamer_runtime_available,
+    VideoPlayer, VideoSeekMode, VideoSubtitleSelection, VideoTrackInfo,
 };
 use video_thumbnail::{
     extract_video_first_frame_without_gstreamer, probe_video_dimensions_with_gstreamer,
@@ -1265,6 +1265,7 @@ enum MediaLoadRequest {
         initial_volume: f64,
         prefer_hardware_decode: bool,
         disable_hardware_decode: bool,
+        enable_cuda_decode: bool,
         output_bounds: Option<(u32, u32)>,
     },
 }
@@ -1415,6 +1416,7 @@ fn process_media_load_request(request: MediaLoadRequest) -> MediaLoadResult {
             initial_volume,
             prefer_hardware_decode,
             disable_hardware_decode,
+            enable_cuda_decode,
             output_bounds,
         } => {
             let source_dimensions = cached_or_probe_video_dimensions(&path);
@@ -1426,6 +1428,7 @@ fn process_media_load_request(request: MediaLoadRequest) -> MediaLoadResult {
                 initial_volume,
                 prefer_hardware_decode,
                 disable_hardware_decode,
+                enable_cuda_decode,
                 source_dimensions,
                 output_dimensions,
             )
@@ -1894,6 +1897,7 @@ struct MangaFocusedVideoLoadRequest {
     initial_volume: f64,
     prefer_hardware_decode: bool,
     disable_hardware_decode: bool,
+    enable_cuda_decode: bool,
     output_bounds: Option<(u32, u32)>,
     autoplay: bool,
     seamless_lod_refresh: bool,
@@ -1984,6 +1988,7 @@ fn process_manga_focused_video_load_request(
         request.initial_volume,
         request.prefer_hardware_decode,
         request.disable_hardware_decode,
+        request.enable_cuda_decode,
         source_dimensions,
         output_dimensions,
     )
@@ -6370,7 +6375,7 @@ impl ImageViewer {
         let mipmap_allowed_by_size = min_side >= self.config.manga_mipmap_min_side.max(1);
         let meaningfully_minified =
             (min_side as f32) >= self.solo_current_display_min_side() * 1.15;
-        let enable_mipmap = self.config.manga_mipmap_video_thumbnails
+        let enable_mipmap = self.mipmap_video_thumbnail_enabled()
             && mipmap_allowed_by_size
             && meaningfully_minified;
 
@@ -9701,16 +9706,14 @@ impl ImageViewer {
             FolderPlaceholderThumbnailMediaKind::Video => self
                 .config
                 .texture_filter_video
-                .to_egui_options_with_mipmap(
-                    self.config.manga_mipmap_video_thumbnails && allow_mipmaps,
-                ),
+                .to_egui_options_with_mipmap(self.mipmap_video_thumbnail_enabled() && allow_mipmaps),
             FolderPlaceholderThumbnailMediaKind::AnimatedImage => {
                 self.config.texture_filter_animated.to_egui_options()
             }
             FolderPlaceholderThumbnailMediaKind::StaticImage => self
                 .config
                 .texture_filter_static
-                .to_egui_options_with_mipmap(allow_mipmaps),
+                .to_egui_options_with_mipmap(self.mipmap_static_enabled() && allow_mipmaps),
         }
     }
 
@@ -9828,7 +9831,8 @@ impl ImageViewer {
                         self.config
                             .texture_filter_static
                             .to_egui_options_with_mipmap(
-                                min_side >= self.config.manga_mipmap_min_side.max(1),
+                                self.mipmap_static_enabled()
+                                    && min_side >= self.config.manga_mipmap_min_side.max(1),
                             )
                     };
                     (cached.pixels, cached.width, cached.height, texture_options)
@@ -9849,7 +9853,8 @@ impl ImageViewer {
                         self.config
                             .texture_filter_static
                             .to_egui_options_with_mipmap(
-                                min_side >= self.config.manga_mipmap_min_side.max(1),
+                                self.mipmap_static_enabled()
+                                    && min_side >= self.config.manga_mipmap_min_side.max(1),
                             )
                     };
                     (
@@ -12170,6 +12175,44 @@ impl ImageViewer {
         }
     }
 
+    fn use_hardware_acceleration_enabled(&self) -> bool {
+        if !self.config.use_hardware_acceleration {
+            return false;
+        }
+
+        detect_video_acceleration_capabilities().hardware_decode_available
+    }
+
+    fn use_cuda_decode_enabled(&self) -> bool {
+        self.use_hardware_acceleration_enabled()
+            && self.config.enable_cuda
+            && detect_video_acceleration_capabilities().cuda_available
+    }
+
+    fn effective_video_decoder_preferences(&self) -> (bool, bool, bool) {
+        if !self.use_hardware_acceleration_enabled() {
+            return (false, true, false);
+        }
+
+        let disable_hardware_decode = self.config.video_disable_hardware_decode;
+        let prefer_hardware_decode = self.config.video_prefer_hardware_decode;
+        let enable_cuda_decode = !disable_hardware_decode && self.use_cuda_decode_enabled();
+
+        (
+            prefer_hardware_decode,
+            disable_hardware_decode,
+            enable_cuda_decode,
+        )
+    }
+
+    fn mipmap_static_enabled(&self) -> bool {
+        self.config.manga_mipmap_static && self.config.use_hardware_acceleration
+    }
+
+    fn mipmap_video_thumbnail_enabled(&self) -> bool {
+        self.config.manga_mipmap_video_thumbnails && self.config.use_hardware_acceleration
+    }
+
     /// Create new viewer with an image path
     /// `start_visible`: true if window was created visible (images), false if hidden (videos)
     #[cfg(target_os = "windows")]
@@ -12453,6 +12496,8 @@ impl ImageViewer {
             started_at: Instant::now(),
         });
 
+        let (prefer_hardware_decode, disable_hardware_decode, enable_cuda_decode) =
+            self.effective_video_decoder_preferences();
         self.manga_video_load_coordinator
             .submit(MangaFocusedVideoLoadRequest {
                 request_id,
@@ -12460,8 +12505,9 @@ impl ImageViewer {
                 path,
                 muted,
                 initial_volume,
-                prefer_hardware_decode: self.config.video_prefer_hardware_decode,
-                disable_hardware_decode: self.config.video_disable_hardware_decode,
+                prefer_hardware_decode,
+                disable_hardware_decode,
+                enable_cuda_decode,
                 output_bounds,
                 autoplay,
                 seamless_lod_refresh,
@@ -12754,8 +12800,8 @@ impl ImageViewer {
         } else {
             self.config.video_default_volume
         };
-        let prefer_hardware_decode = self.config.video_prefer_hardware_decode;
-        let disable_hardware_decode = self.config.video_disable_hardware_decode;
+        let (prefer_hardware_decode, disable_hardware_decode, enable_cuda_decode) =
+            self.effective_video_decoder_preferences();
         let output_bounds = self.async_video_output_bounds_for_solo();
 
         self.pending_media_load = Some(PendingMediaLoad {
@@ -12772,6 +12818,7 @@ impl ImageViewer {
             initial_volume,
             prefer_hardware_decode,
             disable_hardware_decode,
+            enable_cuda_decode,
             output_bounds,
         });
     }
@@ -17802,7 +17849,7 @@ impl ImageViewer {
 
         match media_type {
             MangaMediaType::StaticImage => {
-                let enable_mipmap = self.config.manga_mipmap_static
+                let enable_mipmap = self.mipmap_static_enabled()
                     && mipmap_allowed_by_size
                     && !navigation_blocks_mipmaps;
                 self.config
@@ -17810,7 +17857,7 @@ impl ImageViewer {
                     .to_egui_options_with_mipmap(enable_mipmap)
             }
             MangaMediaType::Video => {
-                let enable_mipmap = self.config.manga_mipmap_video_thumbnails
+                let enable_mipmap = self.mipmap_video_thumbnail_enabled()
                     && mipmap_allowed_by_size
                     && !navigation_blocks_mipmaps;
                 self.config
@@ -17848,7 +17895,7 @@ impl ImageViewer {
 
         match media_type {
             MangaMediaType::StaticImage => {
-                let enable_mipmap = self.config.manga_mipmap_static
+                let enable_mipmap = self.mipmap_static_enabled()
                     && mipmap_allowed_by_size
                     && meaningfully_minified
                     && !navigation_blocks_mipmaps;
@@ -17857,7 +17904,7 @@ impl ImageViewer {
                     .to_egui_options_with_mipmap(enable_mipmap)
             }
             MangaMediaType::Video => {
-                let enable_mipmap = self.config.manga_mipmap_video_thumbnails
+                let enable_mipmap = self.mipmap_video_thumbnail_enabled()
                     && mipmap_allowed_by_size
                     && meaningfully_minified
                     && !navigation_blocks_mipmaps;
@@ -21822,6 +21869,7 @@ impl ImageViewer {
             .unwrap_or(self.max_texture_side.max(1));
         let solo_video_upload_filter = self.config.downscale_filter.to_image_filter();
         let solo_video_texture_filter = self.config.texture_filter_video;
+        let solo_static_mipmaps_enabled = self.mipmap_static_enabled();
 
         let webp_fps_override = self.webp_effective_fps_override();
 
@@ -21861,7 +21909,7 @@ impl ImageViewer {
                 self.image_texture_dims
                     .map(|(texture_w, texture_h)| {
                         let min_side = texture_w.min(texture_h);
-                        self.config.manga_mipmap_static
+                        solo_static_mipmaps_enabled
                             && min_side >= self.config.manga_mipmap_min_side.max(1)
                             && (min_side as f32) >= solo_current_display_min_side * 1.15
                     })
@@ -21902,7 +21950,7 @@ impl ImageViewer {
                     self.config.texture_filter_animated.to_egui_options()
                 } else {
                     let min_side = w.min(h);
-                    let enable_mipmap = self.config.manga_mipmap_static
+                    let enable_mipmap = solo_static_mipmaps_enabled
                         && min_side >= self.config.manga_mipmap_min_side.max(1)
                         && (min_side as f32) >= solo_current_display_min_side * 1.15;
                     self.image_texture_mipmap_enabled = enable_mipmap;

@@ -7,6 +7,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use crate::app_dirs;
+use crate::video_player::cuda_acceleration_available;
 
 const DEFAULT_CONFIG_TEMPLATE: &str = include_str!("../assets/config.ini");
 const CONFIG_FILE_NAME: &str = "config.ini";
@@ -576,6 +577,10 @@ pub struct Config {
 
     /// Enable VSync for swapchain presentation to reduce screen tearing.
     pub vsync: bool,
+    /// Master switch for hardware acceleration features.
+    pub use_hardware_acceleration: bool,
+    /// Enable CUDA acceleration path when runtime support is available.
+    pub enable_cuda: bool,
 
     /// Maximum size for metadata_cache.redb in MiB.
     /// This covers persistent metadata plus image/video thumbnails,
@@ -586,7 +591,7 @@ pub struct Config {
     /// Default is 2048 (2 GiB).
     pub masonry_metadata_ram_cache_limit_mb: u64,
 
-    // ============ IMAGE QUALITY SETTINGS ============
+    // ============ PERFORMANCE SETTINGS ============
     /// Filter for upscaling images (making them larger)
     pub upscale_filter: ImageFilter,
     /// Filter for downscaling images (making them smaller)
@@ -694,6 +699,8 @@ impl Config {
             startup_window_mode: StartupWindowMode::Floating,
             single_instance: true,
             vsync: true,
+            use_hardware_acceleration: true,
+            enable_cuda: true,
             metadata_cache_max_size_mb: 1024,
             masonry_metadata_ram_cache_limit_mb: 2048,
             // Image quality defaults
@@ -1116,6 +1123,7 @@ impl Config {
                 in_settings_section = section.eq_ignore_ascii_case("settings");
                 in_video_section = section.eq_ignore_ascii_case("video");
                 in_quality_section = section.eq_ignore_ascii_case("quality")
+                    || section.eq_ignore_ascii_case("performance")
                     || section.eq_ignore_ascii_case("image_quality")
                     || section.eq_ignore_ascii_case("filters");
                 in_state_section = section.eq_ignore_ascii_case("state")
@@ -1615,7 +1623,7 @@ impl Config {
                 }
             }
 
-            // Parse key=value pairs in quality section
+            // Parse key=value pairs in performance section
             if in_quality_section {
                 if let Some((key, value)) = line.split_once('=') {
                     let key = key.trim().to_lowercase();
@@ -1667,6 +1675,18 @@ impl Config {
                         "manga_mipmap_min_side" | "manga_mipmap_min_size" => {
                             if let Ok(v) = value.parse::<u32>() {
                                 config.manga_mipmap_min_side = v.clamp(1, 4096);
+                            }
+                        }
+                        "use_hardware_acceleration"
+                        | "hardware_acceleration"
+                        | "gpu_acceleration" => {
+                            if let Some(v) = parse_bool(value) {
+                                config.use_hardware_acceleration = v;
+                            }
+                        }
+                        "enable_cuda" | "cuda" | "cuda_acceleration" => {
+                            if let Some(v) = parse_bool(value) {
+                                config.enable_cuda = v;
                             }
                         }
                         _ => {}
@@ -1758,6 +1778,12 @@ impl Config {
 
             if let Some((lhs, rhs)) = line_body.split_once('=') {
                 let key = lhs.trim();
+                if key.eq_ignore_ascii_case("enable_cuda") {
+                    if let Some(comment) = self.cuda_enable_runtime_comment() {
+                        rendered.push_str(comment);
+                        rendered.push_str(line_ending);
+                    }
+                }
                 if let Some(value) = values.get(key) {
                     let spacing_end = rhs
                         .char_indices()
@@ -1783,6 +1809,14 @@ impl Config {
         }
 
         rendered
+    }
+
+    fn cuda_enable_runtime_comment(&self) -> Option<&'static str> {
+        if self.use_hardware_acceleration && self.enable_cuda && cuda_acceleration_available() {
+            Some("; CUDA runtime detected on this machine. `enable_cuda` lets the app prefer CUDA-capable decode paths.")
+        } else {
+            None
+        }
     }
 
     fn ini_value_replacements(&self) -> HashMap<&'static str, String> {
@@ -1815,6 +1849,11 @@ impl Config {
             bool_to_ini(self.single_instance).to_string(),
         );
         values.insert("vsync", bool_to_ini(self.vsync).to_string());
+        values.insert(
+            "use_hardware_acceleration",
+            bool_to_ini(self.use_hardware_acceleration).to_string(),
+        );
+        values.insert("enable_cuda", bool_to_ini(self.enable_cuda).to_string());
         values.insert(
             "metadata_cache_max_size_mb",
             format!("{}", self.metadata_cache_max_size_mb),
