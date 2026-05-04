@@ -3300,6 +3300,38 @@ impl ImageViewer {
             && self.masonry_authoritative_dimension_folder.is_some()
     }
 
+    fn manga_dimension_cache_covers_current_list(&self) -> bool {
+        let Some(loader) = self.manga_loader.as_ref() else {
+            return false;
+        };
+
+        let mut required_entries = 0usize;
+        for (idx, path) in self.image_list.iter().enumerate() {
+            if self.is_folder_navigation_entry_path(path.as_path()) {
+                continue;
+            }
+
+            required_entries += 1;
+            let Some((width, height, _)) = loader.dimension_cache.get(&idx).copied() else {
+                return false;
+            };
+            if width == 0 || height == 0 {
+                return false;
+            }
+        }
+
+        required_entries > 0
+    }
+
+    fn mark_manga_dimension_cache_current_if_complete(&mut self) -> bool {
+        if self.manga_dimension_cache_covers_current_list() {
+            self.manga_dimension_cache_list_signature = self.image_list_signature;
+            true
+        } else {
+            false
+        }
+    }
+
     fn current_masonry_metadata_folder_key(&self) -> Option<PathBuf> {
         self.current_media_path()
             .filter(|path| !self.is_folder_navigation_entry_path(path.as_path()))
@@ -3407,12 +3439,16 @@ impl ImageViewer {
             .filter(|path| !self.is_folder_navigation_entry_path(path.as_path()))
             .count();
 
-        if total_non_folder_entries > 0 && restored_entries.len() >= total_non_folder_entries {
+        let restored_all_entries =
+            total_non_folder_entries > 0 && restored_entries.len() >= total_non_folder_entries;
+        if restored_all_entries {
             self.masonry_authoritative_dimension_signature = self.image_list_signature;
             self.masonry_authoritative_dimension_folder = Some(folder);
         }
 
-        self.manga_dimension_cache_list_signature = self.image_list_signature;
+        if restored_all_entries || self.manga_dimension_cache_covers_current_list() {
+            self.manga_dimension_cache_list_signature = self.image_list_signature;
+        }
         if self.manga_layout_mode == MangaLayoutMode::Masonry {
             self.mark_masonry_runtime_cache_resident();
         }
@@ -3604,14 +3640,18 @@ impl ImageViewer {
             loader.dimension_cache.insert(*idx, *dims);
         }
 
-        if total_non_folder_entries > 0 && restored_entries.len() >= total_non_folder_entries {
+        let restored_all_entries =
+            total_non_folder_entries > 0 && restored_entries.len() >= total_non_folder_entries;
+        if restored_all_entries {
             self.masonry_authoritative_dimension_signature = self.image_list_signature;
             self.masonry_authoritative_dimension_folder = self
                 .current_masonry_metadata_folder_key()
                 .or(snapshot_folder_key);
         }
 
-        self.manga_dimension_cache_list_signature = self.image_list_signature;
+        if restored_all_entries || self.manga_dimension_cache_covers_current_list() {
+            self.manga_dimension_cache_list_signature = self.image_list_signature;
+        }
         restored_entries.len()
     }
 
@@ -4674,9 +4714,7 @@ impl ImageViewer {
                     loader.cache_all_dimensions(&self.image_list);
                 }
                 self.restore_masonry_folder_metadata_snapshot();
-                if !self.image_list.is_empty() {
-                    self.manga_dimension_cache_list_signature = self.image_list_signature;
-                }
+                self.mark_manga_dimension_cache_current_if_complete();
                 self.maybe_begin_masonry_metadata_preload(true);
             } else {
                 self.reset_masonry_metadata_preload();
@@ -5129,9 +5167,7 @@ impl ImageViewer {
             self.ensure_manga_loader();
             if self.manga_layout_mode == MangaLayoutMode::Masonry {
                 self.restore_masonry_folder_metadata_snapshot();
-                if !self.image_list.is_empty() {
-                    self.manga_dimension_cache_list_signature = self.image_list_signature;
-                }
+                self.mark_manga_dimension_cache_current_if_complete();
             }
             self.manga_update_preload_queue();
         }
@@ -11958,6 +11994,26 @@ impl ImageViewer {
 
         if let Some(ref mut loader) = self.manga_loader {
             let new_entry = (w, h, manga_media_type);
+
+            if media_type == MediaType::Video {
+                if let Some((cached_w, cached_h, MangaMediaType::Video)) =
+                    loader.dimension_cache.get(&self.current_index).copied()
+                {
+                    let cached_pixels = cached_w as u64 * cached_h as u64;
+                    let new_pixels = w as u64 * h as u64;
+                    let cached_aspect = cached_w as f32 / cached_h.max(1) as f32;
+                    let new_aspect = w as f32 / h.max(1) as f32;
+
+                    if cached_w > 0
+                        && cached_h > 0
+                        && new_pixels < cached_pixels
+                        && (cached_aspect - new_aspect).abs() <= 0.01
+                    {
+                        return false;
+                    }
+                }
+            }
+
             let changed =
                 loader.dimension_cache.get(&self.current_index).copied() != Some(new_entry);
             loader.dimension_cache.insert(self.current_index, new_entry);
@@ -12545,9 +12601,7 @@ impl ImageViewer {
                     self.ensure_manga_loader();
                     if self.manga_layout_mode == MangaLayoutMode::Masonry {
                         self.restore_masonry_folder_metadata_snapshot();
-                        if !self.image_list.is_empty() {
-                            self.manga_dimension_cache_list_signature = self.image_list_signature;
-                        }
+                        self.mark_manga_dimension_cache_current_if_complete();
                     }
                     self.manga_update_preload_queue();
                 }
@@ -14358,9 +14412,7 @@ impl ImageViewer {
                 }
             }
             self.restore_masonry_folder_metadata_snapshot();
-            if !self.image_list.is_empty() {
-                self.manga_dimension_cache_list_signature = self.image_list_signature;
-            }
+            self.mark_manga_dimension_cache_current_if_complete();
         }
         let current_dims_changed = self.cache_current_media_dimensions_for_manga(
             current_media_dims,
@@ -15607,9 +15659,7 @@ impl ImageViewer {
         let restored_masonry_session = if layout_mode == MangaLayoutMode::Masonry {
             self.mark_masonry_runtime_cache_resident();
             self.restore_masonry_folder_metadata_snapshot();
-            if !self.image_list.is_empty() {
-                self.manga_dimension_cache_list_signature = self.image_list_signature;
-            }
+            self.mark_manga_dimension_cache_current_if_complete();
             let restored = self.try_restore_masonry_mode_session_snapshot(target_path.clone());
             if restored {
                 self.hydrate_masonry_dimensions_from_session_snapshot();
@@ -15662,6 +15712,19 @@ impl ImageViewer {
             .as_ref()
             .and_then(|loader| loader.get_dimensions(index))
             .and_then(|(w, h)| if w > 0 && h > 0 { Some((w, h)) } else { None })
+    }
+
+    fn manga_item_source_dimensions(&self, index: usize) -> Option<(u32, u32)> {
+        self.manga_loader
+            .as_ref()
+            .and_then(|loader| loader.get_dimensions(index))
+            .and_then(|(w, h)| if w > 0 && h > 0 { Some((w, h)) } else { None })
+            .or_else(|| {
+                self.masonry_layout_items.get(index).and_then(|item| {
+                    (item.source_width > 0 && item.source_height > 0)
+                        .then_some((item.source_width, item.source_height))
+                })
+            })
     }
 
     fn masonry_slot_aspect_ratio(&self, index: usize) -> f32 {
@@ -16077,9 +16140,7 @@ impl ImageViewer {
                 }
                 masonry_authoritative_ready = self.masonry_authoritative_dimension_lock_active();
             }
-            if !self.image_list.is_empty() {
-                self.manga_dimension_cache_list_signature = self.image_list_signature;
-            }
+            self.mark_manga_dimension_cache_current_if_complete();
 
             // Ensure the currently viewed item has accurate dimensions immediately.
             // This prevents stretched/overlap artifacts while entering strip mode,
@@ -16266,9 +16327,12 @@ impl ImageViewer {
         if target_media_type == MediaType::Video {
             if let Some((texture, w, h)) = self.manga_video_textures.get(&index) {
                 if *w > 0 && *h > 0 {
+                    let dims = self
+                        .manga_item_source_dimensions(index)
+                        .unwrap_or((*w, *h));
                     self.pending_mode_switch_placeholder = Some(ModeSwitchPlaceholder {
                         texture: texture.clone(),
-                        dims: (*w, *h),
+                        dims,
                         media_type: MediaType::Video,
                     });
                     return;
@@ -16287,9 +16351,10 @@ impl ImageViewer {
             );
 
             if compatible && w > 0 && h > 0 {
+                let dims = self.manga_item_source_dimensions(index).unwrap_or((w, h));
                 self.pending_mode_switch_placeholder = Some(ModeSwitchPlaceholder {
                     texture,
-                    dims: (w, h),
+                    dims,
                     media_type: target_media_type,
                 });
             }
