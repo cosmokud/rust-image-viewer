@@ -420,6 +420,7 @@ pub struct VideoFrame {
     pub pixels: Bytes,
     pub width: u32,
     pub height: u32,
+    pub pts: Option<Duration>,
 }
 
 /// Borrowed Direct3D 11 texture metadata for a GStreamer D3D11-backed sample.
@@ -1318,6 +1319,7 @@ fn process_video_sample(sample: gst::Sample, state: &VideoState) {
         pixels: data.freeze(),
         width,
         height,
+        pts: buffer.pts().map(|pts| Duration::from_nanos(pts.nseconds())),
     };
 
     state.push_frame(frame);
@@ -1337,6 +1339,7 @@ pub struct VideoPlayer {
     volume: f64, // 0.0 to 1.0
     original_width: u32,
     original_height: u32,
+    last_frame_pts: Option<Duration>,
     audio_track_disabled: bool,
     subtitle_track_disabled: bool,
     subtitle_selection: VideoSubtitleSelection,
@@ -1592,6 +1595,7 @@ Ensure your GStreamer installation includes the playback elements (usually from 
             volume: initial_volume.clamp(0.0, 1.0),
             original_width: source_dimensions.map_or(0, |(width, _)| width),
             original_height: source_dimensions.map_or(0, |(_, height)| height),
+            last_frame_pts: None,
             audio_track_disabled: false,
             subtitle_track_disabled: false,
             subtitle_selection: VideoSubtitleSelection::Off,
@@ -1830,6 +1834,11 @@ Ensure your GStreamer installation includes the playback elements (usually from 
         self.pipeline
             .query_position::<gst::ClockTime>()
             .map(|pos| Duration::from_nanos(pos.nseconds()))
+    }
+
+    /// Position of the newest frame returned to the renderer, falling back to pipeline time.
+    pub fn displayed_position(&self) -> Option<Duration> {
+        self.last_frame_pts.or_else(|| self.position())
     }
 
     /// Get total duration
@@ -2284,6 +2293,9 @@ Ensure your GStreamer installation includes the playback elements (usually from 
         let latest = self.state.pop_latest_frame();
 
         if let Some(frame) = latest {
+            if frame.pts.is_some() {
+                self.last_frame_pts = frame.pts;
+            }
             if self.original_width == 0
                 && self.original_height == 0
                 && frame.width > 0

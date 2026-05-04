@@ -1470,10 +1470,11 @@ fn process_media_load_request(request: MediaLoadRequest) -> MediaLoadResult {
                 output_dimensions,
             )
             .and_then(|mut player| {
-                player.play()?;
                 if let Some(seconds) = resume_position_secs {
+                    let _ = player.pause();
                     let _ = player.seek_to_time_with_mode(seconds, VideoSeekMode::Accurate);
                 }
+                player.play()?;
                 Ok(player)
             });
 
@@ -2035,11 +2036,12 @@ fn process_manga_focused_video_load_request(
         output_dimensions,
     )
     .and_then(|mut player| {
+        if let Some(seconds) = request.resume_position_secs {
+            let _ = player.pause();
+            let _ = player.seek_to_time_with_mode(seconds, VideoSeekMode::Accurate);
+        }
         if request.resume_position_secs.is_some() || request.autoplay {
             player.play()?;
-        }
-        if let Some(seconds) = request.resume_position_secs {
-            let _ = player.seek_to_time_with_mode(seconds, VideoSeekMode::Accurate);
         }
         if !request.autoplay && player.is_playing() {
             let _ = player.pause();
@@ -2710,6 +2712,8 @@ struct ImageViewer {
     /// Video players for manga mode, keyed by image list index.
     /// Only the focused video is actively playing; others are paused or not yet created.
     manga_video_players: HashMap<usize, VideoPlayer>,
+    /// Path paired with each manga video player. Prevents index reuse from controlling the wrong decoder.
+    manga_video_player_paths: HashMap<usize, PathBuf>,
     /// RAM-only last known playback position (seconds) for previewed videos.
     /// Entries are kept only while the corresponding item remains visible.
     manga_video_preview_resume_secs: HashMap<usize, f64>,
@@ -3118,6 +3122,7 @@ impl Default for ImageViewer {
 
             // Manga video playback fields
             manga_video_players: HashMap::new(),
+            manga_video_player_paths: HashMap::new(),
             manga_video_preview_resume_secs: HashMap::new(),
             manga_video_preview_resume_by_path: HashMap::new(),
             manga_video_textures: HashMap::new(),
@@ -3208,6 +3213,8 @@ impl ImageViewer {
     const MANGA_STRIP_PLAYBACK_BACKGROUND_TICK_MS: u64 = 80;
     const MANGA_PAGE_NAV_REPEAT_INITIAL_DELAY_MS: u64 = 260;
     const MANGA_PAGE_NAV_REPEAT_INTERVAL_MS: u64 = 45;
+    const VIDEO_RESUME_MIN_SECONDS: f64 = 0.25;
+    const VIDEO_RESUME_SEEK_EPSILON_SECONDS: f64 = 0.50;
     const FPS_IDLE_RESET_AFTER_MS: u64 = 350;
     const FOLDER_PLACEHOLDER_STAMP_CACHE_TTL: Duration = Duration::from_secs(2);
     const FOLDER_PLACEHOLDER_PREVIEW_SCAN_PENDING_SOFT_LIMIT: usize = 32;
@@ -5297,17 +5304,20 @@ impl ImageViewer {
         }
 
         let image_list = &self.image_list;
+        let player_paths = &self.manga_video_player_paths;
         let focused_manga_video = self.manga_focused_video_index;
         let mut removed_focused_manga_video = false;
         self.manga_video_players.retain(|index, _| {
             let should_remove = image_list
                 .get(*index)
-                .is_some_and(|path| path_is_targeted(path));
+                .is_none_or(|path| player_paths.get(index) != Some(path) || path_is_targeted(path));
             if should_remove && Some(*index) == focused_manga_video {
                 removed_focused_manga_video = true;
             }
             !should_remove
         });
+        self.manga_video_player_paths
+            .retain(|index, path| image_list.get(*index) == Some(path) && !path_is_targeted(path));
         self.manga_video_preview_resume_secs.retain(|index, _| {
             !image_list
                 .get(*index)
@@ -7587,7 +7597,7 @@ impl ImageViewer {
             .and_then(|player| player.toggle_play_pause().err());
 
         if let Some(err) = toggle_error {
-            self.manga_video_players.remove(&index);
+            self.remove_manga_video_player(index);
             self.remove_manga_video_texture(index);
             self.manga_video_preview_resume_secs.remove(&index);
             if self.manga_focused_video_index == Some(index) {
@@ -12011,6 +12021,22 @@ impl ImageViewer {
             .is_some_and(|path| self.image_list.get(index) == Some(path))
     }
 
+    fn manga_video_player_matches(&self, index: usize) -> bool {
+        self.manga_video_player_paths
+            .get(&index)
+            .is_some_and(|path| self.image_list.get(index) == Some(path))
+    }
+
+    fn remove_manga_video_player(&mut self, index: usize) -> Option<VideoPlayer> {
+        self.manga_video_player_paths.remove(&index);
+        self.manga_video_players.remove(&index)
+    }
+
+    fn clear_manga_video_players(&mut self) {
+        self.manga_video_players.clear();
+        self.manga_video_player_paths.clear();
+    }
+
     fn remove_manga_video_texture(&mut self, index: usize) {
         self.manga_video_textures.remove(&index);
         self.manga_video_texture_paths.remove(&index);
@@ -12390,7 +12416,7 @@ impl ImageViewer {
     fn clear_manga_runtime_workloads(&mut self) {
         self.clear_pending_manga_video_load();
         self.manga_decoded_mailbox.clear();
-        self.manga_video_players.clear();
+        self.clear_manga_video_players();
         self.manga_video_failed.clear();
         self.manga_focused_video_index = None;
         self.manga_hovered_media_index = None;
@@ -12706,7 +12732,7 @@ impl ImageViewer {
     ) {
         if !gstreamer_runtime_available() {
             self.clear_pending_manga_video_load();
-            self.manga_video_players.remove(&index);
+            self.remove_manga_video_player(index);
             self.remove_manga_video_texture(index);
             self.manga_video_preview_resume_secs.remove(&index);
             if self.manga_focused_video_index == Some(index) {
@@ -12824,15 +12850,23 @@ impl ImageViewer {
             match result {
                 MangaFocusedVideoLoadResult {
                     index,
+                    path,
                     autoplay,
                     seamless_lod_refresh,
                     result: Ok(mut player),
                     ..
                 } => {
+                    if self.manga_video_players.contains_key(&index)
+                        && !self.manga_video_player_matches(index)
+                    {
+                        self.remove_manga_video_player(index);
+                        self.remove_manga_video_texture(index);
+                    }
+
                     let mut synchronized_state = false;
-                    if seamless_lod_refresh {
+                    if seamless_lod_refresh && self.manga_video_player_matches(index) {
                         if let Some(current_player) = self.manga_video_players.get_mut(&index) {
-                            let current_position = current_player.position();
+                            let current_position = current_player.displayed_position();
                             let current_was_playing = current_player.is_playing();
                             let current_muted = current_player.is_muted();
                             let current_volume = current_player.volume();
@@ -12877,17 +12911,9 @@ impl ImageViewer {
 
                     // Re-check resume position at apply-time to cover races where
                     // fullscreen/preview position was recorded after this async load started.
-                    if let Some(position) = self.manga_resume_position_for_index(index) {
-                        let resume_secs = position.as_secs_f64();
-                        let current_secs = player
-                            .position()
-                            .map(|position| position.as_secs_f64())
-                            .unwrap_or(0.0);
-                        if resume_secs > 0.25 && current_secs <= 0.25 {
-                            let _ = player.seek_to_time_with_mode(resume_secs, VideoSeekMode::Accurate);
-                        }
-                    }
-                    if let Some(position) = player.position() {
+                    let resume_position = self.manga_resume_position_for_index(index);
+                    Self::seek_video_player_to_resume_position(&mut player, resume_position);
+                    if let Some(position) = player.displayed_position() {
                         self.manga_record_video_preview_resume_secs(index, position);
                     }
 
@@ -12904,6 +12930,7 @@ impl ImageViewer {
 
                     if !self.is_masonry_mode() {
                         if let Some(frame) = player.get_frame() {
+                            let displayed_position = frame.pts;
                             let target_side = self.manga_target_texture_side_for_dynamic_media(
                                 index,
                                 MangaMediaType::Video,
@@ -12939,9 +12966,13 @@ impl ImageViewer {
                             if let Some(path) = self.image_list.get(index).cloned() {
                                 self.manga_video_texture_paths.insert(index, path);
                             }
+                            if let Some(position) = displayed_position {
+                                self.manga_record_video_preview_resume_secs(index, position);
+                            }
                         }
                     }
 
+                    self.manga_video_player_paths.insert(index, path);
                     self.manga_video_players.insert(index, player);
                     self.error_message = None;
                     self.manga_evict_distant_video_players(index, None);
@@ -13233,10 +13264,11 @@ impl ImageViewer {
                                         })
                                 })
                                 .filter(|secs| secs.is_finite() && *secs >= 0.0);
-                            if let Some(seconds) = resume_position_secs {
-                                let _ =
-                                    player.seek_to_time_with_mode(seconds, VideoSeekMode::Accurate);
-                            }
+                            let resume_position = resume_position_secs.map(Duration::from_secs_f64);
+                            Self::seek_video_player_to_resume_position(
+                                &mut player,
+                                resume_position,
+                            );
 
                             let dims = player.dimensions();
                             if dims.0 > 0 && dims.1 > 0 {
@@ -14512,8 +14544,12 @@ impl ImageViewer {
     }
 
     fn sync_manga_video_position_to_resume(&mut self, index: usize) {
+        if !self.manga_video_player_matches(index) {
+            return;
+        }
+
         if let Some(player) = self.manga_video_players.get(&index) {
-            if let Some(position) = player.position() {
+            if let Some(position) = player.displayed_position() {
                 self.manga_record_video_preview_resume_secs(index, position);
             }
         }
@@ -14540,7 +14576,7 @@ impl ImageViewer {
         };
 
         if let Some(player) = self.video_player.as_ref() {
-            if let Some(position) = player.position() {
+            if let Some(position) = player.displayed_position() {
                 self.manga_record_video_preview_resume_secs(index, position);
             }
         }
@@ -14997,8 +15033,12 @@ impl ImageViewer {
         let display_side = self.manga_screen_max_side_for_index(index);
         let target_scale = self.manga_lod_target_scale_factor();
         let cached_side_floor = self
-            .manga_texture_cache
-            .peek_texture_dimensions(index)
+            .image_list
+            .get(index)
+            .and_then(|path| {
+                self.manga_texture_cache
+                    .peek_texture_dimensions_for_path(index, path)
+            })
             .map(|(w, h)| w.max(h).max(1))
             .unwrap_or(1)
             .min(max_side);
@@ -16499,7 +16539,10 @@ impl ImageViewer {
         }
 
         if let Some((texture, w, h, manga_media_type)) =
-            self.manga_texture_cache.get_texture_handle_info(index)
+            self.image_list.get(index).and_then(|path| {
+                self.manga_texture_cache
+                    .get_texture_handle_info_for_path(index, path)
+            })
         {
             let compatible = matches!(
                 (target_media_type, manga_media_type),
@@ -16892,6 +16935,35 @@ impl ImageViewer {
         }
     }
 
+    fn video_resume_seek_needed(current: Option<Duration>, target: Duration) -> bool {
+        let target_secs = target.as_secs_f64();
+        if !target_secs.is_finite() || target_secs <= Self::VIDEO_RESUME_MIN_SECONDS {
+            return false;
+        }
+
+        let Some(current_secs) = current
+            .map(|position| position.as_secs_f64())
+            .filter(|secs| secs.is_finite())
+        else {
+            return true;
+        };
+
+        (current_secs - target_secs).abs() > Self::VIDEO_RESUME_SEEK_EPSILON_SECONDS
+    }
+
+    fn seek_video_player_to_resume_position(
+        player: &mut VideoPlayer,
+        resume_position: Option<Duration>,
+    ) {
+        let Some(position) = resume_position else {
+            return;
+        };
+
+        if Self::video_resume_seek_needed(player.displayed_position(), position) {
+            let _ = player.seek_to_time_with_mode(position.as_secs_f64(), VideoSeekMode::Accurate);
+        }
+    }
+
     fn manga_record_video_preview_resume_secs(&mut self, index: usize, position: Duration) {
         let secs = position.as_secs_f64();
         if !secs.is_finite() || secs < 0.0 {
@@ -16901,7 +16973,7 @@ impl ImageViewer {
         if let Some(previous) = self.manga_video_preview_resume_secs.get(&index).copied() {
             // Guard against transient query_position() drops to zero while preserving
             // normal forward playback progression.
-            if secs <= 0.001 && previous > 0.25 {
+            if secs <= 0.001 && previous > Self::VIDEO_RESUME_MIN_SECONDS {
                 return;
             }
         }
@@ -16911,7 +16983,7 @@ impl ImageViewer {
             .and_then(|path| self.manga_video_preview_resume_by_path.get(path))
             .copied()
         {
-            if secs <= 0.001 && previous > 0.25 {
+            if secs <= 0.001 && previous > Self::VIDEO_RESUME_MIN_SECONDS {
                 return;
             }
         }
@@ -17001,7 +17073,13 @@ impl ImageViewer {
 
         let hidden_indices: Vec<usize> = tracked_indices
             .into_iter()
-            .filter(|idx| !visible_indices.contains(idx))
+            .filter(|idx| {
+                !visible_indices.contains(idx)
+                    || (self.manga_video_players.contains_key(idx)
+                        && !self.manga_video_player_matches(*idx))
+                    || (self.manga_video_texture_paths.contains_key(idx)
+                        && !self.manga_video_texture_matches(*idx))
+            })
             .collect();
         if hidden_indices.is_empty() {
             return Some(visible_indices);
@@ -17009,9 +17087,12 @@ impl ImageViewer {
 
         let mut cleared_focused = false;
         for idx in hidden_indices {
-            if let Some(mut player) = self.manga_video_players.remove(&idx) {
-                if let Some(position) = player.position() {
-                    self.manga_record_video_preview_resume_secs(idx, position);
+            let record_position = self.manga_video_player_matches(idx);
+            if let Some(mut player) = self.remove_manga_video_player(idx) {
+                if record_position {
+                    if let Some(position) = player.displayed_position() {
+                        self.manga_record_video_preview_resume_secs(idx, position);
+                    }
                 }
                 if player.is_playing() {
                     let _ = player.pause();
@@ -17051,9 +17132,12 @@ impl ImageViewer {
             .collect();
 
         for idx in stale_indices {
-            if let Some(mut player) = self.manga_video_players.remove(&idx) {
-                if let Some(position) = player.position() {
-                    self.manga_record_video_preview_resume_secs(idx, position);
+            let record_position = self.manga_video_player_matches(idx);
+            if let Some(mut player) = self.remove_manga_video_player(idx) {
+                if record_position {
+                    if let Some(position) = player.displayed_position() {
+                        self.manga_record_video_preview_resume_secs(idx, position);
+                    }
                 }
                 if player.is_playing() {
                     let _ = player.pause();
@@ -17159,6 +17243,12 @@ impl ImageViewer {
 
             let focus_changed = self.manga_focused_video_index != Some(focused_idx);
             let resume_position = self.manga_resume_position_for_index(focused_idx);
+            if self.manga_video_players.contains_key(&focused_idx)
+                && !self.manga_video_player_matches(focused_idx)
+            {
+                self.remove_manga_video_player(focused_idx);
+                self.remove_manga_video_texture(focused_idx);
+            }
 
             if focus_changed {
                 // Pause all other videos
@@ -17173,17 +17263,7 @@ impl ImageViewer {
             let focus_play_error =
                 if let Some(player) = self.manga_video_players.get_mut(&focused_idx) {
                     if focus_changed {
-                        if let Some(position) = resume_position {
-                            let resume_secs = position.as_secs_f64();
-                            let current_secs = player
-                                .position()
-                                .map(|position| position.as_secs_f64())
-                                .unwrap_or(0.0);
-                            if resume_secs > 0.25 && current_secs <= 0.25 {
-                                let _ = player
-                                    .seek_to_time_with_mode(resume_secs, VideoSeekMode::Accurate);
-                            }
-                        }
+                        Self::seek_video_player_to_resume_position(player, resume_position);
                     }
 
                     if focus_changed && !player.is_playing() {
@@ -17257,7 +17337,7 @@ impl ImageViewer {
             }
 
             if !self.is_masonry_mode() {
-                self.manga_video_players.clear();
+                self.clear_manga_video_players();
                 self.clear_manga_video_textures();
             }
 
@@ -17316,9 +17396,12 @@ impl ImageViewer {
         // Visible previewed videos must stay alive in RAM for seamless hover resume.
         while self.manga_video_players.len() > self.manga_max_video_players {
             if let Some((idx, _)) = indexed_distances.pop() {
-                if let Some(player) = self.manga_video_players.remove(&idx) {
-                    if let Some(position) = player.position() {
-                        self.manga_record_video_preview_resume_secs(idx, position);
+                let record_position = self.manga_video_player_matches(idx);
+                if let Some(player) = self.remove_manga_video_player(idx) {
+                    if record_position {
+                        if let Some(position) = player.displayed_position() {
+                            self.manga_record_video_preview_resume_secs(idx, position);
+                        }
                     }
                 }
                 self.remove_manga_video_texture(idx);
@@ -17358,7 +17441,7 @@ impl ImageViewer {
 
                 // Get new frame if available
                 if let Some(frame) = player.get_frame() {
-                    focused_position_to_record = player.position();
+                    focused_position_to_record = frame.pts.or_else(|| player.position());
 
                     // Update layout dimensions from source/original video size (not decoded frame size).
                     // Decoded frames may be output-bounded/downscaled, which would otherwise shrink
@@ -17544,7 +17627,7 @@ impl ImageViewer {
                 if let Some(path) = self.image_list.get(idx).cloned() {
                     let cached_side_floor = self
                         .manga_texture_cache
-                        .peek_texture_dimensions(idx)
+                        .peek_texture_dimensions_for_path(idx, path.as_path())
                         .map(|(w, h)| w.max(h).max(1))
                         .unwrap_or(1)
                         .min(self.max_texture_side.max(1));
@@ -17653,8 +17736,12 @@ impl ImageViewer {
         // ── Update animation frames for the focused animated image only ──
         for &idx in focused_anim_idx.iter() {
             let cached_side_floor = self
-                .manga_texture_cache
-                .peek_texture_dimensions(idx)
+                .image_list
+                .get(idx)
+                .and_then(|path| {
+                    self.manga_texture_cache
+                        .peek_texture_dimensions_for_path(idx, path)
+                })
                 .map(|(w, h)| w.max(h).max(1))
                 .unwrap_or(1)
                 .min(self.max_texture_side.max(1));
@@ -17700,7 +17787,11 @@ impl ImageViewer {
                     false
                 };
 
-                if frame_changed || !self.manga_texture_cache.contains(idx) {
+                let cache_entry_matches = self
+                    .image_list
+                    .get(idx)
+                    .is_some_and(|path| self.manga_texture_cache.contains_for_path(idx, path));
+                if frame_changed || !cache_entry_matches {
                     let frame = img.current_frame_data();
 
                     let (w, h, pixels) = downscale_rgba_if_needed(
@@ -17717,12 +17808,18 @@ impl ImageViewer {
                     );
 
                     let texture_options = self.config.texture_filter_animated.to_egui_options();
-                    if let Some((mut texture, _, _, _)) =
-                        self.manga_texture_cache.get_texture_handle_info(idx)
-                    {
+                    let entry_path = self.image_list.get(idx).cloned();
+                    if let Some((mut texture, _, _, _)) = entry_path.as_ref().and_then(|path| {
+                        self.manga_texture_cache
+                            .get_texture_handle_info_for_path(idx, path)
+                    }) {
                         texture.set(color_image, texture_options);
-                        self.manga_texture_cache.update_texture(idx, texture, w, h);
-                    } else {
+                        if let Some(path) = entry_path.as_deref() {
+                            let _ = self
+                                .manga_texture_cache
+                                .update_texture(idx, path, texture, w, h);
+                        }
+                    } else if let Some(path) = entry_path {
                         let texture = ctx.load_texture(
                             format!("manga_anim_{}", idx),
                             color_image,
@@ -17731,6 +17828,7 @@ impl ImageViewer {
 
                         let evicted = self.manga_texture_cache.insert_with_type(
                             idx,
+                            path,
                             texture,
                             w,
                             h,
@@ -17793,8 +17891,12 @@ impl ImageViewer {
         stream_done: bool,
     ) {
         let cached_side_floor = self
-            .manga_texture_cache
-            .peek_texture_dimensions(idx)
+            .image_list
+            .get(idx)
+            .and_then(|path| {
+                self.manga_texture_cache
+                    .peek_texture_dimensions_for_path(idx, path)
+            })
             .map(|(w, h)| w.max(h).max(1))
             .unwrap_or(1)
             .min(self.max_texture_side.max(1));
@@ -17826,16 +17928,23 @@ impl ImageViewer {
             let color_image =
                 egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], pixels.as_ref());
             let texture_options = self.config.texture_filter_animated.to_egui_options();
-            if let Some((mut texture, _, _, _)) =
-                self.manga_texture_cache.get_texture_handle_info(idx)
-            {
+            let entry_path = self.image_list.get(idx).cloned();
+            if let Some((mut texture, _, _, _)) = entry_path.as_ref().and_then(|path| {
+                self.manga_texture_cache
+                    .get_texture_handle_info_for_path(idx, path)
+            }) {
                 texture.set(color_image, texture_options);
-                self.manga_texture_cache.update_texture(idx, texture, w, h);
-            } else {
+                if let Some(path) = entry_path.as_deref() {
+                    let _ = self
+                        .manga_texture_cache
+                        .update_texture(idx, path, texture, w, h);
+                }
+            } else if let Some(path) = entry_path {
                 let texture =
                     ctx.load_texture(format!("manga_anim_{}", idx), color_image, texture_options);
                 let evicted = self.manga_texture_cache.insert_with_type(
                     idx,
+                    path,
                     texture,
                     w,
                     h,
@@ -18211,7 +18320,7 @@ impl ImageViewer {
         }
 
         self.manga_texture_cache
-            .peek_texture_dimensions(index)
+            .peek_texture_dimensions_for_path(index, self.image_list.get(index)?.as_path())
             .and_then(|(w, h)| {
                 if w > 0 && h > 0 {
                     Some((w as f32, h as f32))
@@ -18513,8 +18622,9 @@ impl ImageViewer {
             self.manga_record_target_side_sample(decoded.requested_side);
 
             // Keep current texture unless the decoded payload is a meaningful quality upgrade.
-            if let Some((_, existing_w, existing_h)) =
-                self.manga_texture_cache.get_texture_info(decoded.index)
+            if let Some((_, existing_w, existing_h)) = self
+                .manga_texture_cache
+                .get_texture_info_for_path(decoded.index, decoded.path.as_path())
             {
                 if !self.manga_texture_upgrade_needed(
                     existing_w,
@@ -18560,6 +18670,7 @@ impl ImageViewer {
             // Insert into cache with media type (this may evict old entries)
             let evicted = self.manga_texture_cache.insert_with_type(
                 decoded.index,
+                decoded.path.clone(),
                 texture,
                 decoded.width,
                 decoded.height,
@@ -20022,8 +20133,13 @@ impl ImageViewer {
         let (downscale_filter, gif_filter) = self.manga_decode_filters_for_strip_mode();
         let force_triangle_filters = self.manga_should_force_triangle_filters();
         let current_texture_dims = self
-            .manga_texture_cache
-            .get_texture_info(index)
+            .image_list
+            .get(index)
+            .cloned()
+            .and_then(|path| {
+                self.manga_texture_cache
+                    .get_texture_info_for_path(index, path.as_path())
+            })
             .map(|(_, tex_w, tex_h)| (tex_w, tex_h))
             .unwrap_or((0, 0));
         let desired_texture_dims = self.manga_bucket_dimensions_for_side(
@@ -20269,7 +20385,10 @@ impl ImageViewer {
                     );
                 }
             } else if let Some((texture_id, tex_w, tex_h)) =
-                self.manga_texture_cache.get_texture_info(idx)
+                self.image_list.get(idx).and_then(|path| {
+                    self.manga_texture_cache
+                        .get_texture_info_for_path(idx, path)
+                })
             {
                 // First-frame thumbnail from texture cache - use it as a preview
                 ui.painter().image(
@@ -20353,8 +20472,10 @@ impl ImageViewer {
             }
         } else {
             // Image item: use regular texture cache
-            if let Some((texture_id, tex_w, tex_h)) = self.manga_texture_cache.get_texture_info(idx)
-            {
+            if let Some((texture_id, tex_w, tex_h)) = self.image_list.get(idx).and_then(|path| {
+                self.manga_texture_cache
+                    .get_texture_info_for_path(idx, path)
+            }) {
                 ui.painter().image(
                     texture_id,
                     image_rect,
@@ -22262,6 +22383,7 @@ impl ImageViewer {
     fn update_texture(&mut self, ctx: &egui::Context) -> bool {
         let mut needs_repaint = false;
         let mut activate_deferred_video_swap = false;
+        let mut solo_displayed_video_position = None;
 
         // In manga mode, animated WebPs are handled per-item; don't stream/play the
         // fullscreen animation pipeline.
@@ -22502,6 +22624,7 @@ impl ImageViewer {
             // Get new frame if available
             if let Some(frame) = player.get_frame() {
                 activate_deferred_video_swap = self.defer_media_view_reset;
+                solo_displayed_video_position = frame.pts;
 
                 let no_downscale = frame.width <= current_video_target_side
                     && frame.height <= current_video_target_side;
@@ -22558,7 +22681,23 @@ impl ImageViewer {
             }
         }
 
-        if self.video_player.is_some() {
+        if let Some(position) = solo_displayed_video_position {
+            if matches!(self.current_media_type, Some(MediaType::Video)) {
+                if let Some(current_path) = self
+                    .current_video_path
+                    .clone()
+                    .or_else(|| self.current_media_path())
+                {
+                    if let Some(index) = self
+                        .image_list
+                        .iter()
+                        .position(|path| path == &current_path)
+                    {
+                        self.manga_record_video_preview_resume_secs(index, position);
+                    }
+                }
+            }
+        } else if self.video_player.is_some() {
             self.sync_solo_video_position_to_manga_resume();
         }
 
@@ -25159,6 +25298,10 @@ impl ImageViewer {
         let mut subtitle_selection_requested: Option<VideoSubtitleSelection> = None;
         let mut resume_error: Option<String> = None;
 
+        if !self.manga_video_player_matches(video_idx) {
+            return;
+        }
+
         let current_video_path = self.image_list.get(video_idx).cloned();
         let Some(player) = self.manga_video_players.get_mut(&video_idx) else {
             return;
@@ -25517,7 +25660,7 @@ impl ImageViewer {
         });
 
         if let Some(err) = resume_error {
-            self.manga_video_players.remove(&video_idx);
+            self.remove_manga_video_player(video_idx);
             self.remove_manga_video_texture(video_idx);
             self.manga_video_preview_resume_secs.remove(&video_idx);
             if self.manga_focused_video_index == Some(video_idx) {

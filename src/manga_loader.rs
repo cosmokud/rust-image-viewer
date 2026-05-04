@@ -20,7 +20,7 @@
 
 use std::borrow::Cow;
 use std::num::NonZeroUsize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -2180,6 +2180,7 @@ pub struct MangaTextureCache {
 
 #[derive(Clone)]
 struct MangaTextureEntry {
+    path: PathBuf,
     texture: egui::TextureHandle,
     width: u32,
     height: u32,
@@ -2259,38 +2260,50 @@ impl MangaTextureCache {
         // LruCache updates recency on access, so no per-frame bookkeeping is needed.
     }
 
-    /// Get texture ID and dimensions from cache (avoids borrow issues).
-    /// Returns (texture_id, width, height) if found.
-    pub fn get_texture_info(&mut self, index: usize) -> Option<(egui::TextureId, u32, u32)> {
+    pub fn get_texture_info_for_path(
+        &mut self,
+        index: usize,
+        path: &Path,
+    ) -> Option<(egui::TextureId, u32, u32)> {
         if let Some(entry) = self.pinned_entries.get(&index) {
-            return Some((entry.texture.id(), entry.width, entry.height));
+            return (entry.path.as_path() == path).then_some((
+                entry.texture.id(),
+                entry.width,
+                entry.height,
+            ));
         }
 
-        self.unpinned_entries
-            .get(&index)
-            .map(|entry| (entry.texture.id(), entry.width, entry.height))
+        self.unpinned_entries.get(&index).and_then(|entry| {
+            (entry.path.as_path() == path).then_some((
+                entry.texture.id(),
+                entry.width,
+                entry.height,
+            ))
+        })
     }
 
-    /// Peek texture dimensions without mutating LRU recency state.
-    pub fn peek_texture_dimensions(&self, index: usize) -> Option<(u32, u32)> {
+    pub fn peek_texture_dimensions_for_path(
+        &self,
+        index: usize,
+        path: &Path,
+    ) -> Option<(u32, u32)> {
         self.pinned_entries
             .get(&index)
-            .map(|entry| (entry.width, entry.height))
+            .and_then(|entry| (entry.path.as_path() == path).then_some((entry.width, entry.height)))
             .or_else(|| {
-                self.unpinned_entries
-                    .peek(&index)
-                    .map(|entry| (entry.width, entry.height))
+                self.unpinned_entries.peek(&index).and_then(|entry| {
+                    (entry.path.as_path() == path).then_some((entry.width, entry.height))
+                })
             })
     }
 
-    /// Get a cloned texture handle, dimensions, and media type from cache.
-    /// Returns (texture_handle, width, height, media_type) if found.
-    pub fn get_texture_handle_info(
+    pub fn get_texture_handle_info_for_path(
         &mut self,
         index: usize,
+        path: &Path,
     ) -> Option<(egui::TextureHandle, u32, u32, MangaMediaType)> {
         if let Some(entry) = self.pinned_entries.get(&index) {
-            return Some((
+            return (entry.path.as_path() == path).then_some((
                 entry.texture.clone(),
                 entry.width,
                 entry.height,
@@ -2298,19 +2311,24 @@ impl MangaTextureCache {
             ));
         }
 
-        self.unpinned_entries.get(&index).map(|entry| {
-            (
+        self.unpinned_entries.get(&index).and_then(|entry| {
+            (entry.path.as_path() == path).then_some((
                 entry.texture.clone(),
                 entry.width,
                 entry.height,
                 entry.media_type,
-            )
+            ))
         })
     }
 
-    /// Check if an index is in the cache without updating access time.
-    pub fn contains(&self, index: usize) -> bool {
-        self.pinned_entries.contains_key(&index) || self.unpinned_entries.contains(&index)
+    pub fn contains_for_path(&self, index: usize, path: &Path) -> bool {
+        self.pinned_entries
+            .get(&index)
+            .is_some_and(|entry| entry.path.as_path() == path)
+            || self
+                .unpinned_entries
+                .peek(&index)
+                .is_some_and(|entry| entry.path.as_path() == path)
     }
 
     /// Insert a texture into the cache with explicit media type.
@@ -2318,12 +2336,14 @@ impl MangaTextureCache {
     pub fn insert_with_type(
         &mut self,
         index: usize,
+        path: PathBuf,
         texture: egui::TextureHandle,
         width: u32,
         height: u32,
         media_type: MangaMediaType,
     ) -> Vec<usize> {
         let entry = MangaTextureEntry {
+            path,
             texture,
             width,
             height,
@@ -2346,22 +2366,32 @@ impl MangaTextureCache {
     pub fn update_texture(
         &mut self,
         index: usize,
+        path: &Path,
         texture: egui::TextureHandle,
         width: u32,
         height: u32,
-    ) {
+    ) -> bool {
         if let Some(entry) = self.pinned_entries.get_mut(&index) {
+            if entry.path.as_path() != path {
+                return false;
+            }
             entry.texture = texture;
             entry.width = width;
             entry.height = height;
-            return;
+            return true;
         }
 
         if let Some(entry) = self.unpinned_entries.get_mut(&index) {
+            if entry.path.as_path() != path {
+                return false;
+            }
             entry.texture = texture;
             entry.width = width;
             entry.height = height;
+            return true;
         }
+
+        false
     }
 
     /// Remove an entry from the cache.
