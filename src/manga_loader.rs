@@ -1028,7 +1028,7 @@ impl MangaLoader {
                 let downscale_filter = req.downscale_filter;
                 let gif_filter = req.gif_filter;
 
-                let img = if is_animated_webp {
+                let mut img = if is_animated_webp {
                     LoadedImage::load_first_frame_only(
                         &req.path,
                         Some(effective_texture_side),
@@ -1045,6 +1045,7 @@ impl MangaLoader {
                     )
                     .ok()?
                 };
+                img.reset_animation_to_first_frame();
 
                 // Determine if this is an animated image.
                 // For animated WebP, we loaded only the first frame, but we still
@@ -1244,7 +1245,7 @@ impl MangaLoader {
                     {
                         cached.original_width = original_width;
                         cached.original_height = original_height;
-                        store_cached_video_thumbnail(path, max_texture_side, &cached);
+                        store_cached_video_thumbnail(path, cache_texture_side, &cached);
                     }
                 }
             }
@@ -1360,48 +1361,51 @@ impl MangaLoader {
             return None;
         }
 
-        // Wait for state change or timeout (short for dense masonry responsiveness)
         let bus = pipeline.bus()?;
-        let mut got_frame = false;
+        let wait_for_frame = |timeout_ms: u64| -> bool {
+            let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
+            while std::time::Instant::now() < deadline {
+                if frame_data.lock().is_some() {
+                    return true;
+                }
 
-        // Wait for ASYNC_DONE or ERROR, with timeout
-        let deadline = std::time::Instant::now() + Duration::from_millis(250);
-        while std::time::Instant::now() < deadline {
-            if let Some(msg) = bus.timed_pop(gst::ClockTime::from_mseconds(50)) {
-                match msg.view() {
-                    gst::MessageView::AsyncDone(_) => {
-                        got_frame = true;
-                        break;
+                if let Some(msg) = bus.timed_pop(gst::ClockTime::from_mseconds(50)) {
+                    match msg.view() {
+                        gst::MessageView::Error(_) => return false,
+                        gst::MessageView::AsyncDone(_) | gst::MessageView::Eos(_) => {
+                            if frame_data.lock().is_some() {
+                                return true;
+                            }
+                        }
+                        _ => {}
                     }
-                    gst::MessageView::Error(_) => {
-                        break;
-                    }
-                    gst::MessageView::Eos(_) => {
-                        break;
-                    }
-                    _ => {}
                 }
             }
 
-            // Check if we already got frame data
-            if frame_data.lock().is_some() {
-                got_frame = true;
-                break;
-            }
-        }
+            frame_data.lock().is_some()
+        };
+
+        let _ = wait_for_frame(250);
+        let pre_seek_frame = frame_data.lock().clone();
+        *frame_data.lock() = None;
+        let seeked_to_zero = pipeline
+            .seek_simple(
+                gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
+                gst::ClockTime::ZERO,
+            )
+            .is_ok();
+        let got_seek_frame = seeked_to_zero && wait_for_frame(750);
+        let extracted_frame = if got_seek_frame {
+            frame_data.lock().clone().or(pre_seek_frame)
+        } else {
+            pre_seek_frame.or_else(|| frame_data.lock().clone())
+        };
 
         // Cleanup pipeline
         let _ = pipeline.set_state(gst::State::Null);
 
-        if !got_frame {
-            return None;
-        }
-
         // Extract the frame data
-        let (pixels, width, height) = {
-            let data = frame_data.lock();
-            data.clone()?
-        };
+        let (pixels, width, height) = extracted_frame?;
 
         if pixels.is_empty() || width == 0 || height == 0 {
             return None;

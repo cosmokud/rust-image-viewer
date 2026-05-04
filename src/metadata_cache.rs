@@ -22,6 +22,7 @@ const STATIC_THUMBNAIL_TABLE: TableDefinition<&str, &[u8]> =
 const LEGACY_THUMBNAIL_HEADER_BYTES: usize = 40;
 const THUMBNAIL_HEADER_BYTES: usize = 48;
 const THUMBNAIL_SCHEMA_TAG: u64 = 0x4341_4348_5454_4c31;
+const VIDEO_THUMBNAIL_KEY_TAG: &str = "v2";
 
 const DIMENSION_CACHE_TTL_SECS: u64 = 60 * 60 * 24 * 30;
 const THUMBNAIL_CACHE_TTL_SECS: u64 = 60 * 60 * 24 * 14;
@@ -1194,7 +1195,12 @@ fn cache_key(path: &Path) -> String {
 }
 
 fn thumbnail_key(path: &Path, max_texture_side: u32) -> String {
-    format!("{}#ts{}", cache_key(path), max_texture_side.max(1))
+    format!(
+        "{}#vthumb{}#ts{}",
+        cache_key(path),
+        VIDEO_THUMBNAIL_KEY_TAG,
+        max_texture_side.max(1)
+    )
 }
 
 fn static_thumbnail_key(path: &Path, max_texture_side: u32) -> String {

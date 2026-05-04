@@ -1637,13 +1637,14 @@ fn load_solo_probe_image(
         }
     }
 
-    let image = LoadedImage::load_first_frame_only(
+    let mut image = LoadedImage::load_first_frame_only(
         path,
         Some(max_texture_side),
         downscale_filter,
         gif_filter,
     )
     .ok()?;
+    image.reset_animation_to_first_frame();
 
     let is_animated_webp = LoadedImage::is_animated_webp(path);
     let frame = image.current_frame_data().clone();
@@ -1774,34 +1775,48 @@ fn extract_video_first_frame_thumbnail(
     }
 
     let bus = pipeline.bus()?;
-    let deadline = Instant::now() + Duration::from_millis(500);
-    let mut got_frame = false;
+    let wait_for_frame = |timeout_ms: u64| -> bool {
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        while Instant::now() < deadline {
+            if frame_data.lock().is_some() {
+                return true;
+            }
 
-    while Instant::now() < deadline {
-        if let Some(msg) = bus.timed_pop(gst::ClockTime::from_mseconds(50)) {
-            match msg.view() {
-                gst::MessageView::AsyncDone(_) | gst::MessageView::Eos(_) => {
-                    got_frame = true;
-                    break;
+            if let Some(msg) = bus.timed_pop(gst::ClockTime::from_mseconds(50)) {
+                match msg.view() {
+                    gst::MessageView::Error(_) => return false,
+                    gst::MessageView::AsyncDone(_) | gst::MessageView::Eos(_) => {
+                        if frame_data.lock().is_some() {
+                            return true;
+                        }
+                    }
+                    _ => {}
                 }
-                gst::MessageView::Error(_) => break,
-                _ => {}
             }
         }
 
-        if frame_data.lock().is_some() {
-            got_frame = true;
-            break;
-        }
-    }
+        frame_data.lock().is_some()
+    };
+
+    let _ = wait_for_frame(250);
+    let pre_seek_frame = frame_data.lock().clone();
+    *frame_data.lock() = None;
+    let seeked_to_zero = pipeline
+        .seek_simple(
+            gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
+            gst::ClockTime::ZERO,
+        )
+        .is_ok();
+    let got_seek_frame = seeked_to_zero && wait_for_frame(750);
+    let extracted_frame = if got_seek_frame {
+        frame_data.lock().clone().or(pre_seek_frame)
+    } else {
+        pre_seek_frame.or_else(|| frame_data.lock().clone())
+    };
 
     let _ = pipeline.set_state(gst::State::Null);
 
-    if !got_frame {
-        return None;
-    }
-
-    let (pixels, width, height) = frame_data.lock().clone()?;
+    let (pixels, width, height) = extracted_frame?;
     if pixels.is_empty() || width == 0 || height == 0 {
         return None;
     }
@@ -1981,6 +1996,10 @@ fn process_manga_focused_video_load_request(
         }
         if let Some(seconds) = request.resume_position_secs {
             let _ = player.seek_to_time_with_mode(seconds, VideoSeekMode::Accurate);
+        } else {
+            // Startup policy for manga placeholders: always align playback with the
+            // placeholder thumbnail by forcing an accurate seek to the first frame.
+            let _ = player.seek_to_time_with_mode(0.0, VideoSeekMode::Accurate);
         }
         if !request.autoplay && player.is_playing() {
             let _ = player.pause();
@@ -16889,6 +16908,16 @@ impl ImageViewer {
         }
 
         if prev_focused != focused_anim_idx {
+            if let Some(new_idx) = focused_anim_idx {
+                let stream_done = self
+                    .manga_anim_stream_done
+                    .get(&new_idx)
+                    .copied()
+                    .unwrap_or(true);
+                self.manga_reset_anim_to_first_frame(ctx, new_idx, stream_done);
+                needs_repaint = true;
+            }
+
             if let Some(prev_idx) = prev_focused {
                 if !streams_to_drop.contains(&prev_idx) {
                     let stream_done = self
