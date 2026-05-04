@@ -3103,8 +3103,6 @@ impl ImageViewer {
     const MANGA_TEXTURE_UPGRADE_MIN_RATIO: f32 = 1.12;
     const MANGA_TEXTURE_UPGRADE_MASONRY_MIN_DELTA_SIDE: u32 = 96;
     const MANGA_TEXTURE_UPGRADE_MASONRY_MIN_RATIO: f32 = 1.24;
-    const MANGA_VIDEO_LOD_DOWNSCALE_MIN_DELTA_SIDE: u32 = 96;
-    const MANGA_VIDEO_LOD_DOWNSCALE_MIN_RATIO: f32 = 1.18;
     const AUDIO_TRACK_SWITCH_DELAY: Duration = Duration::from_millis(90);
     const MASONRY_QUALITY_REFINE_SETTLE_MS: u64 = 45;
     const MASONRY_QUALITY_REFINE_MAX_FRAMES: u8 = 12;
@@ -12413,9 +12411,16 @@ impl ImageViewer {
             .next_manga_video_load_request_id
             .saturating_add(1)
             .max(1);
-        let target_side =
-            self.manga_target_texture_side_for_dynamic_media(index, MangaMediaType::Video);
-        let output_bounds = Some((target_side, target_side));
+        let output_bounds = if self.is_masonry_mode() {
+            let target_side =
+                self.manga_target_texture_side_for_dynamic_media(index, MangaMediaType::Video);
+            Some((target_side, target_side))
+        } else {
+            // Long-strip video playback keeps decoder output at source resolution and
+            // only adjusts the uploaded texture per frame. This avoids LOD churn and
+            // prevents getting stuck in low-res after zoom extremes.
+            None
+        };
 
         self.pending_manga_video_load = Some(PendingMangaFocusedVideoLoad {
             request_id,
@@ -14885,41 +14890,6 @@ impl ImageViewer {
         desired_pixels > existing_pixels && desired_side >= ratio_threshold.max(delta_threshold)
     }
 
-    fn manga_video_lod_reload_needed(
-        &self,
-        existing_width: u32,
-        existing_height: u32,
-        desired_width: u32,
-        desired_height: u32,
-    ) -> bool {
-        let existing_width = existing_width.max(1);
-        let existing_height = existing_height.max(1);
-        let desired_width = desired_width.max(1);
-        let desired_height = desired_height.max(1);
-
-        if self.manga_texture_upgrade_needed(
-            existing_width,
-            existing_height,
-            desired_width,
-            desired_height,
-            MangaMediaType::Video,
-        ) {
-            return true;
-        }
-
-        let existing_side = existing_width.max(existing_height);
-        let desired_side = desired_width.max(desired_height);
-        if desired_side >= existing_side {
-            return false;
-        }
-
-        let ratio_threshold =
-            (desired_side as f32 * Self::MANGA_VIDEO_LOD_DOWNSCALE_MIN_RATIO).ceil() as u32;
-        let delta_threshold =
-            desired_side.saturating_add(Self::MANGA_VIDEO_LOD_DOWNSCALE_MIN_DELTA_SIDE);
-        existing_side >= ratio_threshold.max(delta_threshold)
-    }
-
     fn manga_use_rtree_backend(&self) -> bool {
         match self.config.manga_virtualization_backend {
             MangaVirtualizationBackend::Linear => false,
@@ -16646,7 +16616,9 @@ impl ImageViewer {
                 }
 
                 self.manga_focused_video_index = Some(focused_idx);
-                self.clear_pending_manga_video_load();
+                if !self.manga_video_load_pending_for_index(focused_idx) {
+                    self.clear_pending_manga_video_load();
+                }
 
                 // Evict video players that are far from view.
                 self.manga_evict_distant_video_players(focused_idx);
@@ -16736,15 +16708,8 @@ impl ImageViewer {
             let target_side =
                 self.manga_target_texture_side_for_dynamic_media(focused_idx, MangaMediaType::Video);
             let mut video_dimensions_changed = false;
-            let mut focused_audio_state: Option<(bool, f64)> = None;
-            let mut focused_is_playing = false;
-            let mut focused_position: Option<Duration> = None;
 
             if let Some(player) = self.manga_video_players.get_mut(&focused_idx) {
-                focused_audio_state = Some((player.is_muted(), player.volume()));
-                focused_is_playing = player.is_playing();
-                focused_position = player.position();
-
                 // Update duration cache
                 player.update_duration();
 
@@ -16811,47 +16776,6 @@ impl ImageViewer {
                         );
 
                         self.manga_video_textures.insert(focused_idx, (texture, w, h));
-                    }
-                }
-            }
-
-            if !self.is_masonry_mode() && !self.manga_video_load_pending_for_index(focused_idx) {
-                let live_texture_dims = self
-                    .manga_video_textures
-                    .get(&focused_idx)
-                    .map(|(_, w, h)| (*w, *h));
-                if let (Some((muted, volume)), Some((tex_w, tex_h))) =
-                    (focused_audio_state, live_texture_dims)
-                {
-                    let desired_dims = self.manga_bucket_dimensions_for_side(
-                        focused_idx,
-                        target_side,
-                        self.manga_strip_item_current_display_size(focused_idx),
-                    );
-                    if self.manga_video_lod_reload_needed(
-                        tex_w,
-                        tex_h,
-                        desired_dims.0,
-                        desired_dims.1,
-                    ) {
-                        if let Some(path) = self.image_list.get(focused_idx).cloned() {
-                            let seamless_lod_refresh = focused_is_playing;
-                            let load_muted = if seamless_lod_refresh { true } else { muted };
-                            let load_volume = if seamless_lod_refresh { 0.0 } else { volume };
-
-                            self.gstreamer_initialized = true;
-                            self.start_async_manga_focused_video_load(
-                                focused_idx,
-                                path,
-                                load_muted,
-                                load_volume,
-                                focused_is_playing,
-                                seamless_lod_refresh,
-                                focused_position,
-                            );
-                            self.perf_metrics
-                                .increment_counter("manga_video_live_quality_reload", 1);
-                        }
                     }
                 }
             }
