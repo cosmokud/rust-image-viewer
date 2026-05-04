@@ -14891,13 +14891,21 @@ impl ImageViewer {
     }
 
     fn manga_use_rtree_backend(&self) -> bool {
-        match self.config.manga_virtualization_backend {
+        let use_rtree = match self.config.manga_virtualization_backend {
             MangaVirtualizationBackend::Linear => false,
             MangaVirtualizationBackend::RTree => true,
             MangaVirtualizationBackend::Auto => {
                 self.image_list.len() >= Self::MANGA_VIRTUALIZATION_AUTO_RTREE_MIN_ITEMS
             }
+        };
+
+        // Mirror masonry's smooth-navigation behavior: avoid rebuilding strip
+        // spatial indices while the user is actively zooming/panning/scrolling.
+        if !self.is_masonry_mode() && self.manga_navigation_active_for_heavy_work() {
+            return false;
         }
+
+        use_rtree
     }
 
     fn manga_ensure_masonry_spatial_index(&mut self) -> Option<&MangaSpatialIndex> {
@@ -15257,9 +15265,41 @@ impl ImageViewer {
     }
 
     fn invalidate_manga_layout_cache_for_zoom(&mut self) {
-        if !self.is_masonry_mode() {
-            self.invalidate_manga_layout_cache();
+        if self.is_masonry_mode() {
+            return;
         }
+
+        let len = self.image_list.len();
+        let screen_y = self.screen_size.y.round();
+        let zoom = (self.zoom * 10_000.0).round() / 10_000.0;
+        let cached_zoom = self.manga_total_height_cache_zoom.max(0.0001);
+
+        let can_rescale_cached_layout = self.manga_total_height_cache_valid
+            && len > 0
+            && self.manga_layout_offsets.len() == len.saturating_add(1)
+            && self.manga_total_height_cache_len == len
+            && (self.manga_total_height_cache_screen_y - screen_y).abs() <= 1e-6
+            && zoom.is_finite()
+            && cached_zoom.is_finite()
+            && (zoom - cached_zoom).abs() > 1e-6;
+
+        if can_rescale_cached_layout {
+            let ratio = zoom / cached_zoom;
+            if ratio.is_finite() && ratio > 0.0 {
+                for y in &mut self.manga_layout_offsets {
+                    *y *= ratio;
+                }
+                self.manga_total_height_cache = (self.manga_total_height_cache * ratio).max(0.0);
+                self.manga_total_height_cache_zoom = zoom;
+                self.manga_total_height_cache_screen_y = screen_y;
+                self.manga_total_height_cache_len = len;
+                self.manga_total_height_cache_valid = true;
+                self.manga_strip_spatial_index = None;
+                return;
+            }
+        }
+
+        self.invalidate_manga_layout_cache();
     }
 
     fn toggle_long_strip_mode(&mut self) {
@@ -16137,37 +16177,6 @@ impl ImageViewer {
         Some((idx, fraction, screen_y))
     }
 
-    fn manga_capture_anchor_at_screen_pos(
-        &mut self,
-        screen_pos: egui::Pos2,
-    ) -> Option<(usize, f32, f32, f32, f32)> {
-        if !self.manga_mode || self.is_masonry_mode() || self.image_list.is_empty() {
-            return None;
-        }
-
-        let screen_y = screen_pos.y.clamp(0.0, self.screen_size.y.max(1.0));
-        let target_y = self.manga_scroll_offset.max(0.0) + screen_y;
-        let idx = self.manga_index_at_y(target_y);
-        if idx >= self.image_list.len() {
-            return None;
-        }
-
-        let start_y = self.manga_page_start_y(idx);
-        let page_height = self.manga_page_height_cached(idx).max(0.0001);
-        let y_fraction = ((target_y - start_y) / page_height).clamp(0.0, 1.0);
-
-        let page_width = self.manga_get_image_display_width(idx).max(0.0001);
-        let page_left = (self.screen_size.x - page_width) * 0.5 + self.offset.x;
-        let x_fraction = (screen_pos.x - page_left) / page_width;
-
-        Some((
-            idx,
-            y_fraction,
-            screen_y,
-            x_fraction,
-            screen_pos.x.clamp(0.0, self.screen_size.x.max(1.0)),
-        ))
-    }
 
     /// Re-apply a previously captured anchor at a specific screen Y position after zoom.
     ///
@@ -16196,34 +16205,6 @@ impl ImageViewer {
 
         self.manga_scroll_offset = new_offset;
         self.manga_scroll_target = new_offset;
-        self.manga_scroll_velocity = 0.0;
-    }
-
-    fn manga_apply_anchor_at_screen_pos(&mut self, anchor: (usize, f32, f32, f32, f32)) {
-        if !self.manga_mode || self.is_masonry_mode() || self.image_list.is_empty() {
-            return;
-        }
-
-        let (anchor_idx, anchor_y_fraction, screen_y, anchor_x_fraction, screen_x) = anchor;
-        if anchor_idx >= self.image_list.len() {
-            return;
-        }
-
-        let total_height = self.manga_total_height();
-        let start_y = self.manga_page_start_y(anchor_idx);
-        let page_height = self.manga_page_height_cached(anchor_idx).max(0.0001);
-        let anchor_abs_y = start_y + anchor_y_fraction.clamp(0.0, 1.0) * page_height;
-
-        let max_scroll = (total_height - self.screen_size.y).max(0.0);
-        let new_offset_y = (anchor_abs_y - screen_y).clamp(0.0, max_scroll);
-
-        let page_width = self.manga_get_image_display_width(anchor_idx).max(0.0001);
-        let centered_left = (self.screen_size.x - page_width) * 0.5;
-        let new_offset_x = screen_x - centered_left - anchor_x_fraction * page_width;
-
-        self.offset.x = new_offset_x;
-        self.manga_scroll_offset = new_offset_y;
-        self.manga_scroll_target = new_offset_y;
         self.manga_scroll_velocity = 0.0;
     }
 
@@ -19148,27 +19129,12 @@ impl ImageViewer {
         };
 
         if (new_zoom - old_zoom).abs() > 0.0001 {
+            let center_pos = egui::pos2(self.screen_size.x * 0.5, self.screen_size.y * 0.5);
             if self.is_masonry_mode() {
-                let center_pos = egui::pos2(self.screen_size.x * 0.5, self.screen_size.y * 0.5);
                 if self.apply_masonry_zoom_at_screen_pos(new_zoom, center_pos) {
                     self.manga_finish_direct_zoom_change();
                 }
-            } else {
-                // CRITICAL FIX: Use index-based anchoring for stable zooming with varying image sizes.
-                // Capture which image is at the center and the fractional position within it BEFORE zoom.
-                let center_anchor = self.manga_capture_center_anchor();
-
-                // Apply the new zoom level
-                self.zoom = new_zoom;
-                self.zoom_target = new_zoom;
-                self.zoom_velocity = 0.0;
-                self.invalidate_manga_layout_cache_for_zoom();
-
-                // Re-apply the anchor to keep the same image position at the center
-                if let Some(anchor) = center_anchor {
-                    self.manga_apply_center_anchor(anchor);
-                }
-
+            } else if self.apply_strip_zoom_at_screen_pos(new_zoom, center_pos) {
                 self.manga_finish_direct_zoom_change();
             }
         }
@@ -19192,6 +19158,38 @@ impl ImageViewer {
             self.offset = self.offset * zoom_ratio;
             self.remember_current_fullscreen_view_state();
         }
+    }
+
+    /// Apply pointer-anchored zoom for long-strip mode using screen-space cursor position.
+    /// Keeps the content point under the cursor stable while zooming.
+    fn apply_strip_zoom_at_screen_pos(&mut self, new_zoom: f32, anchor_screen: egui::Pos2) -> bool {
+        if !self.manga_mode || self.is_masonry_mode() {
+            return false;
+        }
+
+        let old_zoom = self.zoom.max(0.0001);
+        let new_zoom = self.clamp_zoom(new_zoom);
+        if (new_zoom - old_zoom).abs() <= 0.0001 {
+            return false;
+        }
+
+        let content_x = (anchor_screen.x - self.offset.x) / old_zoom;
+        let content_y = (anchor_screen.y + self.manga_scroll_offset) / old_zoom;
+
+        self.zoom = new_zoom;
+        self.zoom_target = new_zoom;
+        self.zoom_velocity = 0.0;
+        self.invalidate_manga_layout_cache_for_zoom();
+
+        self.offset.x = anchor_screen.x - content_x * new_zoom;
+
+        let max_scroll = (self.manga_total_height() - self.screen_size.y).max(0.0);
+        let new_scroll = (content_y * new_zoom - anchor_screen.y).clamp(0.0, max_scroll);
+        self.manga_scroll_offset = new_scroll;
+        self.manga_scroll_target = new_scroll;
+        self.manga_scroll_velocity = 0.0;
+
+        true
     }
 
     /// Apply pointer-anchored zoom for masonry mode using screen-space cursor position.
@@ -20360,41 +20358,24 @@ impl ImageViewer {
                 let new_zoom = self.clamp_zoom(self.zoom * factor);
 
                 if (new_zoom - old_zoom).abs() > 0.0001 {
-                    if self.is_masonry_mode() {
+                    let anchor = pointer_pos
+                        .map(|p| {
+                            egui::pos2(
+                                (p.x - screen_rect.min.x).clamp(0.0, screen_width),
+                                (p.y - screen_rect.min.y).clamp(0.0, screen_height),
+                            )
+                        })
+                        .unwrap_or(egui::pos2(screen_width * 0.5, screen_height * 0.5));
+
+                    let applied = if self.is_masonry_mode() {
                         // Masonry: follow cursor position (X+Y) like normal image-mode zooming.
-                        let anchor = pointer_pos
-                            .map(|p| {
-                                egui::pos2(
-                                    (p.x - screen_rect.min.x).clamp(0.0, screen_width),
-                                    (p.y - screen_rect.min.y).clamp(0.0, screen_height),
-                                )
-                            })
-                            .unwrap_or(egui::pos2(screen_width * 0.5, screen_height * 0.5));
-
-                        if self.apply_masonry_zoom_at_screen_pos(new_zoom, anchor) {
-                            self.manga_finish_direct_zoom_change();
-                        }
+                        self.apply_masonry_zoom_at_screen_pos(new_zoom, anchor)
                     } else {
-                        let anchor_pos = pointer_pos
-                            .map(|p| {
-                                egui::pos2(
-                                    (p.x - screen_rect.min.x).clamp(0.0, screen_width),
-                                    (p.y - screen_rect.min.y).clamp(0.0, screen_height),
-                                )
-                            })
-                            .unwrap_or(egui::pos2(screen_width * 0.5, screen_height * 0.5));
-                        let anchor = self.manga_capture_anchor_at_screen_pos(anchor_pos);
+                        // Long strip: use the same pointer-anchored content-space zoom flow.
+                        self.apply_strip_zoom_at_screen_pos(new_zoom, anchor)
+                    };
 
-                        self.zoom = new_zoom;
-                        self.zoom_target = new_zoom;
-                        self.zoom_velocity = 0.0;
-                        self.invalidate_manga_layout_cache_for_zoom();
-
-                        // Re-apply the anchor to keep the same content point under the cursor.
-                        if let Some(a) = anchor {
-                            self.manga_apply_anchor_at_screen_pos(a);
-                        }
-
+                    if applied {
                         self.manga_finish_direct_zoom_change();
                     }
 
