@@ -16490,9 +16490,27 @@ impl ImageViewer {
 
     fn manga_record_video_preview_resume_secs(&mut self, index: usize, position: Duration) {
         let secs = position.as_secs_f64();
-        if secs.is_finite() && secs >= 0.0 {
-            self.manga_video_preview_resume_secs.insert(index, secs);
+        if !secs.is_finite() || secs < 0.0 {
+            return;
         }
+
+        if let Some(previous) = self.manga_video_preview_resume_secs.get(&index).copied() {
+            // Guard against transient query_position() drops to zero while preserving
+            // normal forward playback progression.
+            if secs <= 0.001 && previous > 0.25 {
+                return;
+            }
+        }
+
+        self.manga_video_preview_resume_secs.insert(index, secs);
+    }
+
+    fn manga_visible_indices_set_for_preview_tracking(&mut self) -> HashSet<usize> {
+        if let Some(indices) = self.manga_collect_visible_indices_for_preview_tracking_rtree() {
+            return indices;
+        }
+
+        self.manga_collect_visible_indices().into_iter().collect()
     }
 
     fn manga_resume_position_for_index(&self, index: usize) -> Option<Duration> {
@@ -16555,10 +16573,7 @@ impl ImageViewer {
 
         // Use the spatial index visible-set query (R-tree) so tiny scroll deltas
         // or transient layout jitter do not incorrectly reset preview state.
-        let Some(visible_indices) = self.manga_collect_visible_indices_for_preview_tracking_rtree()
-        else {
-            return;
-        };
+        let visible_indices = self.manga_visible_indices_set_for_preview_tracking();
 
         let hidden_indices: Vec<usize> = tracked_indices
             .into_iter()
@@ -16809,6 +16824,8 @@ impl ImageViewer {
             return;
         }
 
+        let visible_indices = self.manga_visible_indices_set_for_preview_tracking();
+
         // Calculate distances and sort by distance from focused
         let mut indexed_distances: Vec<(usize, usize)> = self
             .manga_video_players
@@ -16817,21 +16834,23 @@ impl ImageViewer {
                 let dist = idx.abs_diff(focused_idx);
                 (idx, dist)
             })
+            .filter(|(idx, _)| {
+                Some(*idx) != self.manga_focused_video_index && !visible_indices.contains(idx)
+            })
             .collect();
 
         indexed_distances.sort_by_key(|&(_, dist)| dist);
 
-        // Remove the furthest players until we're under the limit
+        // Remove the furthest *non-visible* players until we're under the limit.
+        // Visible previewed videos must stay alive in RAM for seamless hover resume.
         while self.manga_video_players.len() > self.manga_max_video_players {
             if let Some((idx, _)) = indexed_distances.pop() {
-                if Some(idx) != self.manga_focused_video_index {
-                    if let Some(player) = self.manga_video_players.remove(&idx) {
-                        if let Some(position) = player.position() {
-                            self.manga_record_video_preview_resume_secs(idx, position);
-                        }
+                if let Some(player) = self.manga_video_players.remove(&idx) {
+                    if let Some(position) = player.position() {
+                        self.manga_record_video_preview_resume_secs(idx, position);
                     }
-                    self.manga_video_textures.remove(&idx);
                 }
+                self.manga_video_textures.remove(&idx);
             } else {
                 break;
             }
