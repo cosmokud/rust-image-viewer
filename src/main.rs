@@ -1176,15 +1176,6 @@ struct PendingVideoThumbnailPlaceholder {
     thumbnail: CachedVideoThumbnail,
 }
 
-#[derive(Clone)]
-struct VideoTrackUiSnapshot {
-    captured_at: Instant,
-    audio_tracks: Vec<VideoTrackInfo>,
-    current_audio_track: Option<i32>,
-    embedded_subtitle_tracks: Vec<VideoTrackInfo>,
-    current_subtitle_selection: VideoSubtitleSelection,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FolderPlaceholderThumbnailMediaKind {
     StaticImage,
@@ -2416,10 +2407,6 @@ struct ImageViewer {
     pending_solo_audio_track_switch: Option<(Instant, usize, i32)>,
     /// Deferred manga-video audio switches keyed by image-list index.
     pending_manga_audio_track_switches: HashMap<usize, (Instant, i32)>,
-    /// Cached solo-video track metadata for UI rendering while controls are visible.
-    solo_video_track_ui_snapshot: Option<(usize, VideoTrackUiSnapshot)>,
-    /// Cached focused manga-video track metadata for UI rendering while controls are visible.
-    manga_video_track_ui_snapshot: Option<(usize, VideoTrackUiSnapshot)>,
     // ============ RESIZE STATE FIELDS ============
     /// Initial window outer position when resize started (in screen coordinates)
     resize_start_outer_pos: Option<egui::Pos2>,
@@ -2945,8 +2932,6 @@ impl Default for ImageViewer {
             is_volume_dragging: false,
             pending_solo_audio_track_switch: None,
             pending_manga_audio_track_switches: HashMap::new(),
-            solo_video_track_ui_snapshot: None,
-            manga_video_track_ui_snapshot: None,
             // Resize state fields
             resize_start_outer_pos: None,
             resize_start_inner_size: None,
@@ -3159,7 +3144,6 @@ impl ImageViewer {
     const MANGA_TEXTURE_UPGRADE_MASONRY_MIN_DELTA_SIDE: u32 = 96;
     const MANGA_TEXTURE_UPGRADE_MASONRY_MIN_RATIO: f32 = 1.24;
     const AUDIO_TRACK_SWITCH_DELAY: Duration = Duration::from_millis(90);
-    const VIDEO_TRACK_UI_CACHE_TTL: Duration = Duration::from_millis(250);
     const MASONRY_QUALITY_REFINE_SETTLE_MS: u64 = 45;
     const MASONRY_QUALITY_REFINE_MAX_FRAMES: u8 = 12;
     const MANGA_TTV_SAMPLE_CAP: usize = 240;
@@ -7546,8 +7530,6 @@ impl ImageViewer {
                 if let Some(player) = self.video_player.as_mut() {
                     if let Err(err) = player.set_audio_track(track_index) {
                         tracing::warn!("failed to switch audio track: {}", err);
-                    } else {
-                        self.solo_video_track_ui_snapshot = None;
                     }
                 }
             }
@@ -7575,12 +7557,6 @@ impl ImageViewer {
             if let Some(player) = self.manga_video_players.get_mut(&video_idx) {
                 if let Err(err) = player.set_audio_track(track_index) {
                     tracing::warn!("failed to switch manga audio track: {}", err);
-                } else if self
-                    .manga_video_track_ui_snapshot
-                    .as_ref()
-                    .is_some_and(|(cached_idx, _)| *cached_idx == video_idx)
-                {
-                    self.manga_video_track_ui_snapshot = None;
                 }
             }
         }
@@ -7588,54 +7564,6 @@ impl ImageViewer {
         if let Some(delay) = next_repaint_after {
             ctx.request_repaint_after(delay);
         }
-    }
-
-    fn build_video_track_ui_snapshot(player: &VideoPlayer) -> VideoTrackUiSnapshot {
-        VideoTrackUiSnapshot {
-            captured_at: Instant::now(),
-            audio_tracks: player.audio_tracks(),
-            current_audio_track: player.current_audio_track_index(),
-            embedded_subtitle_tracks: player.embedded_subtitle_tracks(),
-            current_subtitle_selection: player.current_subtitle_selection(),
-        }
-    }
-
-    fn solo_video_track_ui_snapshot(&mut self, force_refresh: bool) -> Option<VideoTrackUiSnapshot> {
-        let now = Instant::now();
-        if let Some((media_index, snapshot)) = self.solo_video_track_ui_snapshot.as_ref() {
-            if !force_refresh
-                && *media_index == self.current_index
-                && now.saturating_duration_since(snapshot.captured_at) <= Self::VIDEO_TRACK_UI_CACHE_TTL
-            {
-                return Some(snapshot.clone());
-            }
-        }
-
-        let player = self.video_player.as_ref()?;
-        let snapshot = Self::build_video_track_ui_snapshot(player);
-        self.solo_video_track_ui_snapshot = Some((self.current_index, snapshot.clone()));
-        Some(snapshot)
-    }
-
-    fn manga_video_track_ui_snapshot(
-        &mut self,
-        video_idx: usize,
-        force_refresh: bool,
-    ) -> Option<VideoTrackUiSnapshot> {
-        let now = Instant::now();
-        if let Some((cached_idx, snapshot)) = self.manga_video_track_ui_snapshot.as_ref() {
-            if !force_refresh
-                && *cached_idx == video_idx
-                && now.saturating_duration_since(snapshot.captured_at) <= Self::VIDEO_TRACK_UI_CACHE_TTL
-            {
-                return Some(snapshot.clone());
-            }
-        }
-
-        let player = self.manga_video_players.get(&video_idx)?;
-        let snapshot = Self::build_video_track_ui_snapshot(player);
-        self.manga_video_track_ui_snapshot = Some((video_idx, snapshot.clone()));
-        Some(snapshot)
     }
 
     fn solo_video_audio_popup_id() -> egui::Id {
@@ -21671,10 +21599,6 @@ impl ImageViewer {
         pos: egui::Pos2,
         screen_rect: egui::Rect,
     ) -> bool {
-        if self.marked_files.is_empty() && self.prepared_clipboard_paths.is_empty() {
-            return false;
-        }
-
         let (item_rect, visual) = if self.manga_mode && self.is_fullscreen {
             let Some(index) = self.manga_index_at_screen_pos(pos) else {
                 return false;
@@ -24018,11 +23942,6 @@ impl ImageViewer {
         ui.vertical(|ui| {
             // === Seek bar (top row) ===
             let current_video_path = self.image_list.get(self.current_index).cloned();
-            let force_track_refresh = ctx.memory(|mem| {
-                mem.is_popup_open(Self::solo_video_audio_popup_id())
-                    || mem.is_popup_open(Self::solo_video_subtitle_popup_id())
-            });
-            let track_snapshot = self.solo_video_track_ui_snapshot(force_track_refresh);
             let Some(player) = self.video_player.as_mut() else {
                 return;
             };
@@ -24030,17 +23949,10 @@ impl ImageViewer {
             let position_fraction = player.position_fraction() as f32;
             let duration = player.duration();
             let position = player.position();
-            let (audio_tracks, current_audio_track, embedded_subtitle_tracks, current_subtitle_selection) =
-                track_snapshot
-                    .map(|snapshot| {
-                        (
-                            snapshot.audio_tracks,
-                            snapshot.current_audio_track,
-                            snapshot.embedded_subtitle_tracks,
-                            snapshot.current_subtitle_selection,
-                        )
-                    })
-                    .unwrap_or_else(|| (Vec::new(), None, Vec::new(), VideoSubtitleSelection::Off));
+            let audio_tracks = player.audio_tracks();
+            let current_audio_track = player.current_audio_track_index();
+            let embedded_subtitle_tracks = player.embedded_subtitle_tracks();
+            let current_subtitle_selection = player.current_subtitle_selection();
             let current_audio_button_label =
                 Self::current_audio_button_label(&audio_tracks, current_audio_track);
             let current_subtitle_button_label = Self::current_subtitle_button_label(
@@ -24392,8 +24304,6 @@ impl ImageViewer {
             if let Some(player) = self.video_player.as_mut() {
                 if let Err(err) = player.set_subtitle_selection(selection) {
                     tracing::warn!("failed to switch subtitle track: {}", err);
-                } else {
-                    self.solo_video_track_ui_snapshot = None;
                 }
             }
         }
@@ -24849,11 +24759,6 @@ impl ImageViewer {
         let mut resume_error: Option<String> = None;
 
         let current_video_path = self.image_list.get(video_idx).cloned();
-        let force_track_refresh = ctx.memory(|mem| {
-            mem.is_popup_open(Self::manga_video_audio_popup_id(video_idx))
-                || mem.is_popup_open(Self::manga_video_subtitle_popup_id(video_idx))
-        });
-        let track_snapshot = self.manga_video_track_ui_snapshot(video_idx, force_track_refresh);
         let Some(player) = self.manga_video_players.get_mut(&video_idx) else {
             return;
         };
@@ -24861,17 +24766,10 @@ impl ImageViewer {
         let position_fraction = player.position_fraction() as f32;
         let duration = player.duration();
         let position = player.position();
-        let (audio_tracks, current_audio_track, embedded_subtitle_tracks, current_subtitle_selection) =
-            track_snapshot
-                .map(|snapshot| {
-                    (
-                        snapshot.audio_tracks,
-                        snapshot.current_audio_track,
-                        snapshot.embedded_subtitle_tracks,
-                        snapshot.current_subtitle_selection,
-                    )
-                })
-                .unwrap_or_else(|| (Vec::new(), None, Vec::new(), VideoSubtitleSelection::Off));
+        let audio_tracks = player.audio_tracks();
+        let current_audio_track = player.current_audio_track_index();
+        let embedded_subtitle_tracks = player.embedded_subtitle_tracks();
+        let current_subtitle_selection = player.current_subtitle_selection();
         let current_audio_button_label =
             Self::current_audio_button_label(&audio_tracks, current_audio_track);
         let current_subtitle_button_label = Self::current_subtitle_button_label(
@@ -25240,12 +25138,6 @@ impl ImageViewer {
             if let Some(player) = self.manga_video_players.get_mut(&video_idx) {
                 if let Err(err) = player.set_subtitle_selection(selection) {
                     tracing::warn!("failed to switch manga subtitle track: {}", err);
-                } else if self
-                    .manga_video_track_ui_snapshot
-                    .as_ref()
-                    .is_some_and(|(cached_idx, _)| *cached_idx == video_idx)
-                {
-                    self.manga_video_track_ui_snapshot = None;
                 }
             }
         }

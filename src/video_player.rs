@@ -1190,69 +1190,27 @@ Ensure your GStreamer installation includes the playback elements (usually from 
 
         // Create a bin to hold the appsink with video conversion
         let video_bin = gst::Bin::new();
-        let build_software_video_chain =
-            || -> Result<gst::Pad, String> {
-                let videoconvert = gst::ElementFactory::make("videoconvert")
-                    .build()
-                    .map_err(|e| format!("Failed to create videoconvert: {}", e))?;
-                let videoscale = gst::ElementFactory::make("videoscale")
-                    .build()
-                    .map_err(|e| format!("Failed to create videoscale: {}", e))?;
 
-                video_bin
-                    .add_many([&videoscale, &videoconvert, appsink.upcast_ref()])
-                    .map_err(|e| format!("Failed to add elements to bin: {}", e))?;
-                gst::Element::link_many([&videoscale, &videoconvert, appsink.upcast_ref()])
-                    .map_err(|e| format!("Failed to link video elements: {}", e))?;
+        let videoconvert = gst::ElementFactory::make("videoconvert")
+            .build()
+            .map_err(|e| format!("Failed to create videoconvert: {}", e))?;
 
-                videoscale
-                    .static_pad("sink")
-                    .ok_or("Failed to get sink pad".to_string())
-            };
+        let videoscale = gst::ElementFactory::make("videoscale")
+            .build()
+            .map_err(|e| format!("Failed to create videoscale: {}", e))?;
 
-        // Windows VRAM-first fast path:
-        // decode -> d3d11scale/colorconvert (GPU) -> d3d11download (single readback) -> appsink
-        // If unavailable for any reason, we fall back to the original software chain.
-        let sink_pad = if cfg!(target_os = "windows")
-            && gst::ElementFactory::find("d3d11scale").is_some()
-            && gst::ElementFactory::find("d3d11colorconvert").is_some()
-            && gst::ElementFactory::find("d3d11download").is_some()
-        {
-            let d3d11scale = gst::ElementFactory::make("d3d11scale")
-                .build()
-                .map_err(|e| format!("Failed to create d3d11scale: {}", e))?;
-            let d3d11colorconvert = gst::ElementFactory::make("d3d11colorconvert")
-                .build()
-                .map_err(|e| format!("Failed to create d3d11colorconvert: {}", e))?;
-            let d3d11download = gst::ElementFactory::make("d3d11download")
-                .build()
-                .map_err(|e| format!("Failed to create d3d11download: {}", e))?;
+        video_bin
+            .add_many([&videoscale, &videoconvert, appsink.upcast_ref()])
+            .map_err(|e| format!("Failed to add elements to bin: {}", e))?;
 
-            video_bin
-                .add_many([
-                    &d3d11scale,
-                    &d3d11colorconvert,
-                    &d3d11download,
-                    appsink.upcast_ref(),
-                ])
-                .map_err(|e| format!("Failed to add d3d11 elements to bin: {}", e))?;
-            gst::Element::link_many([
-                &d3d11scale,
-                &d3d11colorconvert,
-                &d3d11download,
-                appsink.upcast_ref(),
-            ])
-            .map_err(|e| format!("Failed to link d3d11 video elements: {}", e))?;
-
-            d3d11scale
-                .static_pad("sink")
-                .ok_or("Failed to get d3d11scale sink pad".to_string())?
-        } else {
-            build_software_video_chain()?
-        };
+        gst::Element::link_many([&videoscale, &videoconvert, appsink.upcast_ref()])
+            .map_err(|e| format!("Failed to link video elements: {}", e))?;
 
         // Create ghost pad for the bin
-        let ghost_pad = gst::GhostPad::with_target(&sink_pad)
+        let pad = videoscale
+            .static_pad("sink")
+            .ok_or("Failed to get sink pad")?;
+        let ghost_pad = gst::GhostPad::with_target(&pad)
             .map_err(|e| format!("Failed to create ghost pad: {}", e))?;
         ghost_pad
             .set_active(true)
