@@ -27355,17 +27355,7 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         // Keep the renderer lightweight at idle. This viewer renders 2D UI + a single image/video
         // texture; MSAA and a depth buffer are not required for perceptible quality.
-        renderer: eframe::Renderer::Wgpu,
-        wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
-            supported_backends: eframe::wgpu::Backends::DX12,
-            present_mode: if config.vsync {
-                eframe::wgpu::PresentMode::AutoVsync
-            } else {
-                eframe::wgpu::PresentMode::AutoNoVsync
-            },
-            desired_maximum_frame_latency: Some(1),
-            ..Default::default()
-        },
+        renderer: eframe::Renderer::Glow,
         // Configurable via [Settings].vsync in config.ini (default: true).
         // Keep enabled by default for smoother presentation and no tearing.
         vsync: config.vsync,

@@ -226,14 +226,12 @@ fn apply_decoder_preference_windows(
     enable_cuda_decode: bool,
 ) {
     const HW_DECODE_RANKS: &str =
-        "d3d12h264dec:1024,d3d12h265dec:1024,d3d12vp8dec:1024,d3d12vp9dec:1024,d3d12av1dec:1024,d3d12mpeg2dec:1024,\
-d3d11h264dec:512,d3d11h265dec:512,d3d11vp8dec:512,d3d11vp9dec:512,d3d11av1dec:512,d3d11mpeg2dec:512,\
+        "d3d11h264dec:512,d3d11h265dec:512,d3d11vp8dec:512,d3d11vp9dec:512,d3d11av1dec:512,d3d11mpeg2dec:512,\
 avdec_h264:0,avdec_h265:0,avdec_hevc:0,avdec_vp8:0,avdec_vp9:0,avdec_av1:0,avdec_mpeg2video:0";
     const CUDA_DECODE_RANKS: &str =
         "nvh264dec:300,nvh265dec:300,nvvp9dec:300,nvav1dec:300,cudah264dec:300,cudah265dec:300";
     const DISABLE_HW_DECODE_RANKS: &str =
-        "d3d12h264dec:0,d3d12h265dec:0,d3d12vp8dec:0,d3d12vp9dec:0,d3d12av1dec:0,d3d12mpeg2dec:0,\
-d3d11h264dec:0,d3d11h265dec:0,d3d11vp8dec:0,d3d11vp9dec:0,d3d11av1dec:0,d3d11mpeg2dec:0";
+        "d3d11h264dec:0,d3d11h265dec:0,d3d11vp8dec:0,d3d11vp9dec:0,d3d11av1dec:0,d3d11mpeg2dec:0";
 
     if disable_hardware_decode {
         std::env::set_var("GST_PLUGIN_FEATURE_RANK", DISABLE_HW_DECODE_RANKS);

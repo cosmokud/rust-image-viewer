@@ -1044,14 +1044,12 @@ dependencies = [
  "objc2-foundation 0.2.2",
  "parking_lot",
  "percent-encoding",
- "pollster",
  "raw-window-handle",
  "static_assertions",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
  "web-time",
- "wgpu",
  "winapi",
  "windows-sys 0.52.0",
  "winit",
@@ -3409,10 +3407,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pollster"
-version = "0.3.0"
-
-[[package]]
 name = "portable-atomic"
 version = "1.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4856,7 +4850,6 @@ dependencies = [
  "document-features",
  "js-sys",
  "log",
- "naga",
  "parking_lot",
  "profiling",
  "raw-window-handle",
@@ -4905,7 +4898,6 @@ dependencies = [
  "arrayvec",
  "ash",
  "bitflags 2.10.0",
- "block",
  "cfg_aliases 0.1.1",
  "core-graphics-types",
  "glow 0.13.1",
