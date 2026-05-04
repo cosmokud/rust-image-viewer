@@ -1884,6 +1884,8 @@ struct MangaFocusedVideoLoadRequest {
     disable_hardware_decode: bool,
     output_bounds: Option<(u32, u32)>,
     autoplay: bool,
+    seamless_lod_refresh: bool,
+    resume_position_secs: Option<f64>,
 }
 
 struct MangaFocusedVideoLoadResult {
@@ -1893,6 +1895,7 @@ struct MangaFocusedVideoLoadResult {
     result: Result<VideoPlayer, String>,
     worker_elapsed: Duration,
     autoplay: bool,
+    seamless_lod_refresh: bool,
 }
 
 struct MangaFocusedVideoLoadCoordinator {
@@ -1973,8 +1976,14 @@ fn process_manga_focused_video_load_request(
         output_dimensions,
     )
     .and_then(|mut player| {
-        if request.autoplay {
+        if request.resume_position_secs.is_some() || request.autoplay {
             player.play()?;
+        }
+        if let Some(seconds) = request.resume_position_secs {
+            let _ = player.seek_to_time_with_mode(seconds, VideoSeekMode::Accurate);
+        }
+        if !request.autoplay && player.is_playing() {
+            let _ = player.pause();
         }
         Ok(player)
     });
@@ -1986,6 +1995,7 @@ fn process_manga_focused_video_load_request(
         result,
         worker_elapsed: started_at.elapsed(),
         autoplay: request.autoplay,
+        seamless_lod_refresh: request.seamless_lod_refresh,
     }
 }
 
@@ -3093,6 +3103,8 @@ impl ImageViewer {
     const MANGA_TEXTURE_UPGRADE_MIN_RATIO: f32 = 1.12;
     const MANGA_TEXTURE_UPGRADE_MASONRY_MIN_DELTA_SIDE: u32 = 96;
     const MANGA_TEXTURE_UPGRADE_MASONRY_MIN_RATIO: f32 = 1.24;
+    const MANGA_VIDEO_LOD_DOWNSCALE_MIN_DELTA_SIDE: u32 = 96;
+    const MANGA_VIDEO_LOD_DOWNSCALE_MIN_RATIO: f32 = 1.18;
     const AUDIO_TRACK_SWITCH_DELAY: Duration = Duration::from_millis(90);
     const MASONRY_QUALITY_REFINE_SETTLE_MS: u64 = 45;
     const MASONRY_QUALITY_REFINE_MAX_FRAMES: u8 = 12;
@@ -12381,6 +12393,8 @@ impl ImageViewer {
         muted: bool,
         initial_volume: f64,
         autoplay: bool,
+        seamless_lod_refresh: bool,
+        resume_position: Option<Duration>,
     ) {
         if !gstreamer_runtime_available() {
             self.clear_pending_manga_video_load();
@@ -12421,6 +12435,8 @@ impl ImageViewer {
                 disable_hardware_decode: self.config.video_disable_hardware_decode,
                 output_bounds,
                 autoplay,
+                seamless_lod_refresh,
+                resume_position_secs: resume_position.map(|pos| pos.as_secs_f64()),
             });
     }
 
@@ -12489,21 +12505,53 @@ impl ImageViewer {
                 MangaFocusedVideoLoadResult {
                     index,
                     autoplay,
+                    seamless_lod_refresh,
                     result: Ok(mut player),
                     ..
                 } => {
-                    Self::apply_video_audio_overrides(
-                        &mut player,
-                        self.manga_video_user_muted,
-                        self.manga_video_user_volume,
-                    );
+                    let mut synchronized_state = false;
+                    if seamless_lod_refresh {
+                        if let Some(current_player) = self.manga_video_players.get_mut(&index) {
+                            let current_position = current_player.position();
+                            let current_was_playing = current_player.is_playing();
+                            let current_muted = current_player.is_muted();
+                            let current_volume = current_player.volume();
 
-                    if autoplay && !player.is_playing() {
-                        if let Err(err) = player.play() {
-                            self.manga_video_failed.insert(index);
-                            self.video_playback_unavailable_reason = Some(err);
-                            self.manga_focused_video_index = None;
-                            continue;
+                            if let Some(position) = current_position {
+                                let _ = player.seek_to_time_with_mode(
+                                    position.as_secs_f64(),
+                                    VideoSeekMode::Accurate,
+                                );
+                            }
+
+                            if current_was_playing {
+                                if !player.is_playing() {
+                                    let _ = player.play();
+                                }
+                            } else if player.is_playing() {
+                                let _ = player.pause();
+                            }
+
+                            player.set_muted(current_muted);
+                            player.set_volume(current_volume);
+                            synchronized_state = true;
+                        }
+                    }
+
+                    if !synchronized_state {
+                        Self::apply_video_audio_overrides(
+                            &mut player,
+                            self.manga_video_user_muted,
+                            self.manga_video_user_volume,
+                        );
+
+                        if autoplay && !player.is_playing() {
+                            if let Err(err) = player.play() {
+                                self.manga_video_failed.insert(index);
+                                self.video_playback_unavailable_reason = Some(err);
+                                self.manga_focused_video_index = None;
+                                continue;
+                            }
                         }
                     }
 
@@ -12514,6 +12562,40 @@ impl ImageViewer {
                                 if loader.update_video_dimensions(index, dims.0, dims.1) {
                                     pending_dimension_updates.push(index);
                                 }
+                            }
+                        }
+                    }
+
+                    if !self.is_masonry_mode() {
+                        if let Some(frame) = player.get_frame() {
+                            let target_side =
+                                self.manga_target_texture_side_for_dynamic_media(index, MangaMediaType::Video);
+                            let (w, h, pixels) = downscale_rgba_if_needed(
+                                frame.width,
+                                frame.height,
+                                &frame.pixels,
+                                target_side,
+                                self.config.downscale_filter.to_image_filter(),
+                            );
+                            let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                                [w as usize, h as usize],
+                                pixels.as_ref(),
+                            );
+                            let texture_options = self.config.texture_filter_video.to_egui_options();
+
+                            if let Some((texture, stored_w, stored_h)) =
+                                self.manga_video_textures.get_mut(&index)
+                            {
+                                texture.set(color_image, texture_options);
+                                *stored_w = w;
+                                *stored_h = h;
+                            } else {
+                                let texture = ctx.load_texture(
+                                    format!("manga_video_{}", index),
+                                    color_image,
+                                    texture_options,
+                                );
+                                self.manga_video_textures.insert(index, (texture, w, h));
                             }
                         }
                     }
@@ -14803,6 +14885,41 @@ impl ImageViewer {
         desired_pixels > existing_pixels && desired_side >= ratio_threshold.max(delta_threshold)
     }
 
+    fn manga_video_lod_reload_needed(
+        &self,
+        existing_width: u32,
+        existing_height: u32,
+        desired_width: u32,
+        desired_height: u32,
+    ) -> bool {
+        let existing_width = existing_width.max(1);
+        let existing_height = existing_height.max(1);
+        let desired_width = desired_width.max(1);
+        let desired_height = desired_height.max(1);
+
+        if self.manga_texture_upgrade_needed(
+            existing_width,
+            existing_height,
+            desired_width,
+            desired_height,
+            MangaMediaType::Video,
+        ) {
+            return true;
+        }
+
+        let existing_side = existing_width.max(existing_height);
+        let desired_side = desired_width.max(desired_height);
+        if desired_side >= existing_side {
+            return false;
+        }
+
+        let ratio_threshold =
+            (desired_side as f32 * Self::MANGA_VIDEO_LOD_DOWNSCALE_MIN_RATIO).ceil() as u32;
+        let delta_threshold =
+            desired_side.saturating_add(Self::MANGA_VIDEO_LOD_DOWNSCALE_MIN_DELTA_SIDE);
+        existing_side >= ratio_threshold.max(delta_threshold)
+    }
+
     fn manga_use_rtree_backend(&self) -> bool {
         match self.config.manga_virtualization_backend {
             MangaVirtualizationBackend::Linear => false,
@@ -16553,6 +16670,8 @@ impl ImageViewer {
                     muted,
                     volume,
                     true,
+                    false,
+                    None,
                 );
             }
 
@@ -16619,10 +16738,12 @@ impl ImageViewer {
             let mut video_dimensions_changed = false;
             let mut focused_audio_state: Option<(bool, f64)> = None;
             let mut focused_is_playing = false;
+            let mut focused_position: Option<Duration> = None;
 
             if let Some(player) = self.manga_video_players.get_mut(&focused_idx) {
                 focused_audio_state = Some((player.is_muted(), player.volume()));
                 focused_is_playing = player.is_playing();
+                focused_position = player.position();
 
                 // Update duration cache
                 player.update_duration();
@@ -16694,11 +16815,7 @@ impl ImageViewer {
                 }
             }
 
-            // Avoid re-LOD/reload churn while the focused video is actively playing.
-            if !self.is_masonry_mode()
-                && !focused_is_playing
-                && !self.manga_video_load_pending_for_index(focused_idx)
-            {
+            if !self.is_masonry_mode() && !self.manga_video_load_pending_for_index(focused_idx) {
                 let live_texture_dims = self
                     .manga_video_textures
                     .get(&focused_idx)
@@ -16711,21 +16828,26 @@ impl ImageViewer {
                         target_side,
                         self.manga_strip_item_current_display_size(focused_idx),
                     );
-                    if self.manga_texture_upgrade_needed(
+                    if self.manga_video_lod_reload_needed(
                         tex_w,
                         tex_h,
                         desired_dims.0,
                         desired_dims.1,
-                        MangaMediaType::Video,
                     ) {
                         if let Some(path) = self.image_list.get(focused_idx).cloned() {
+                            let seamless_lod_refresh = focused_is_playing;
+                            let load_muted = if seamless_lod_refresh { true } else { muted };
+                            let load_volume = if seamless_lod_refresh { 0.0 } else { volume };
+
                             self.gstreamer_initialized = true;
                             self.start_async_manga_focused_video_load(
                                 focused_idx,
                                 path,
-                                muted,
-                                volume,
-                                false,
+                                load_muted,
+                                load_volume,
+                                focused_is_playing,
+                                seamless_lod_refresh,
+                                focused_position,
                             );
                             self.perf_metrics
                                 .increment_counter("manga_video_live_quality_reload", 1);
