@@ -11918,7 +11918,14 @@ impl ImageViewer {
     ) {
         self.strip_entry_placeholder_index = match current_media_type {
             Some(MediaType::Image) if self.texture.is_some() => Some(self.current_index),
-            Some(MediaType::Video) if self.video_texture.is_some() => Some(self.current_index),
+            Some(MediaType::Video)
+                if self.video_texture.is_some()
+                    && !self.retained_media_placeholder_visible
+                    && !self.defer_media_view_reset
+                    && !self.pending_media_layout =>
+            {
+                Some(self.current_index)
+            }
             _ => None,
         };
     }
@@ -11955,9 +11962,38 @@ impl ImageViewer {
 
         let manga_media_type =
             Self::manga_media_type_for_current_media(media_type, current_image_is_animated);
+        let existing_entry = self
+            .manga_loader
+            .as_ref()
+            .and_then(|loader| loader.dimension_cache.get(&self.current_index).copied());
+
+        // For videos, avoid poisoning strip/masonry layout with transient solo texture sizes
+        // (e.g. retained placeholders or output-bounded decoded frames). Prefer authoritative
+        // player/source dimensions, then previously cached video dimensions, and only then
+        // fall back to the currently displayed dimensions.
+        let resolved_dims = if media_type == MediaType::Video {
+            self.video_player
+                .as_ref()
+                .map(|player| player.dimensions())
+                .filter(|(vw, vh)| *vw > 0 && *vh > 0)
+                .or_else(|| {
+                    existing_entry.and_then(|(ew, eh, mt)| {
+                        (mt == MangaMediaType::Video && ew > 0 && eh > 0).then_some((ew, eh))
+                    })
+                })
+                .or(Some((w, h)))
+        } else {
+            Some((w, h))
+        };
+
+        let Some((resolved_w, resolved_h)) =
+            resolved_dims.filter(|(dw, dh)| *dw > 0 && *dh > 0)
+        else {
+            return false;
+        };
 
         if let Some(ref mut loader) = self.manga_loader {
-            let new_entry = (w, h, manga_media_type);
+            let new_entry = (resolved_w, resolved_h, manga_media_type);
             let changed =
                 loader.dimension_cache.get(&self.current_index).copied() != Some(new_entry);
             loader.dimension_cache.insert(self.current_index, new_entry);
@@ -13182,8 +13218,12 @@ impl ImageViewer {
                     None
                 }
             });
+        let delay_video_mode_switch_swap = used_mode_switch_placeholder
+            && media_type == Some(MediaType::Video)
+            && transition_placeholder.is_some();
         let keep_current_view_until_swap =
-            retain_visible_media_until_ready && transition_placeholder.is_some();
+            (retain_visible_media_until_ready && transition_placeholder.is_some())
+                || delay_video_mode_switch_swap;
 
         // Clear previous media state.
         // When a placeholder was captured above we immediately restore it after clearing
