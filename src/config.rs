@@ -454,6 +454,8 @@ pub struct Config {
     pub double_click_grace_period: f64,
     /// Show an FPS overlay in the top-right corner (debug)
     pub show_fps: bool,
+    /// How often the FPS overlay values refresh (milliseconds).
+    pub show_fps_update_interval_ms: u64,
     /// Size of the resize border in pixels
     pub resize_border_size: f32,
     /// Background color as RGB (0-255)
@@ -644,6 +646,7 @@ impl Config {
             cursor_idle_hide_delay: 3.0,
             double_click_grace_period: 0.35,
             show_fps: false,
+            show_fps_update_interval_ms: 500,
             resize_border_size: 6.0,
             background_rgb: [0, 0, 0],
             marked_file_border_rgb: [94, 214, 255],
@@ -1199,6 +1202,13 @@ impl Config {
                                 config.show_fps = v;
                             }
                         }
+                        "show_fps_update_interval_ms"
+                        | "fps_update_interval_ms"
+                        | "fps_overlay_update_interval_ms" => {
+                            if let Ok(v) = value.parse::<u64>() {
+                                config.show_fps_update_interval_ms = v.clamp(50, 10_000);
+                            }
+                        }
                         "background_rgb" => {
                             if let Some(rgb) = parse_rgb_triplet(value) {
                                 config.background_rgb = rgb;
@@ -1689,6 +1699,18 @@ impl Config {
                                 config.enable_cuda = v;
                             }
                         }
+                        "show_fps" | "show_fps_overlay" | "fps_overlay" => {
+                            if let Some(v) = parse_bool(value) {
+                                config.show_fps = v;
+                            }
+                        }
+                        "show_fps_update_interval_ms"
+                        | "fps_update_interval_ms"
+                        | "fps_overlay_update_interval_ms" => {
+                            if let Ok(v) = value.parse::<u64>() {
+                                config.show_fps_update_interval_ms = v.clamp(50, 10_000);
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -1839,6 +1861,10 @@ impl Config {
             format_with_optional_trailing_zero_f64(self.double_click_grace_period),
         );
         values.insert("show_fps", bool_to_ini(self.show_fps).to_string());
+        values.insert(
+            "show_fps_update_interval_ms",
+            format!("{}", self.show_fps_update_interval_ms),
+        );
         values.insert("resize_border_size", format!("{}", self.resize_border_size));
         values.insert(
             "startup_window_mode",

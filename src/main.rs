@@ -2448,6 +2448,12 @@ struct ImageViewer {
     fps_smoothed: f32,
     /// Most recent frame delta time in seconds
     fps_last_dt_s: f32,
+    /// Throttled FPS value shown by the overlay.
+    fps_overlay_smoothed: f32,
+    /// Throttled frame delta shown by the overlay.
+    fps_overlay_last_dt_s: f32,
+    /// Last time we refreshed overlay FPS numbers.
+    fps_overlay_last_update_at: Instant,
     /// Primary monitor refresh rate used to keep FPS overlay vsync-aware.
     fps_display_refresh_hz: Option<f32>,
 
@@ -2947,6 +2953,9 @@ impl Default for ImageViewer {
             fps_last_frame_was_active: false,
             fps_smoothed: 0.0,
             fps_last_dt_s: 0.0,
+            fps_overlay_smoothed: 0.0,
+            fps_overlay_last_dt_s: 0.0,
+            fps_overlay_last_update_at: Instant::now(),
             fps_display_refresh_hz: get_primary_monitor_refresh_hz(),
 
             windows_cjk_fonts_installed: false,
@@ -3144,8 +3153,6 @@ impl ImageViewer {
     const MANGA_STRIP_PLAYBACK_BACKGROUND_TICK_MS: u64 = 80;
     const MANGA_PAGE_NAV_REPEAT_INITIAL_DELAY_MS: u64 = 260;
     const MANGA_PAGE_NAV_REPEAT_INTERVAL_MS: u64 = 45;
-    const FPS_OVERLAY_IDLE_POLL_MS: u64 = 500;
-    const FPS_OVERLAY_ACTIVE_POLL_MS: u64 = 120;
     const FPS_IDLE_RESET_AFTER_MS: u64 = 350;
     const FOLDER_PLACEHOLDER_STAMP_CACHE_TTL: Duration = Duration::from_secs(2);
     const FOLDER_PLACEHOLDER_PREVIEW_SCAN_PENDING_SOFT_LIMIT: usize = 32;
@@ -6682,6 +6689,17 @@ impl ImageViewer {
                     let alpha = 0.10;
                     self.fps_smoothed = (1.0 - alpha) * self.fps_smoothed + alpha * fps;
                 }
+
+                let overlay_interval = Duration::from_millis(
+                    self.config.show_fps_update_interval_ms.clamp(50, 10_000),
+                );
+                if now.saturating_duration_since(self.fps_overlay_last_update_at) >= overlay_interval
+                    || self.fps_overlay_smoothed <= 0.0
+                {
+                    self.fps_overlay_smoothed = self.fps_smoothed;
+                    self.fps_overlay_last_dt_s = self.fps_last_dt_s;
+                    self.fps_overlay_last_update_at = now;
+                }
             }
             return;
         }
@@ -6692,6 +6710,9 @@ impl ImageViewer {
         {
             self.fps_smoothed = 0.0;
             self.fps_last_dt_s = 0.0;
+            self.fps_overlay_smoothed = 0.0;
+            self.fps_overlay_last_dt_s = 0.0;
+            self.fps_overlay_last_update_at = now;
         }
     }
 
@@ -6972,13 +6993,13 @@ impl ImageViewer {
             return;
         }
 
-        let fps = if self.fps_smoothed.is_finite() {
-            self.fps_smoothed.max(0.0)
+        let fps = if self.fps_overlay_smoothed.is_finite() {
+            self.fps_overlay_smoothed.max(0.0)
         } else {
             0.0
         };
-        let mut text = if fps > 0.0 && self.fps_last_dt_s > 0.0 {
-            let ms = (self.fps_last_dt_s * 1000.0).max(0.0);
+        let mut text = if fps > 0.0 && self.fps_overlay_last_dt_s > 0.0 {
+            let ms = (self.fps_overlay_last_dt_s * 1000.0).max(0.0);
             format!("{fps:.0} FPS  ({ms:.1} ms)")
         } else {
             "0 FPS  (idle)".to_string()
@@ -27037,13 +27058,8 @@ impl eframe::App for ImageViewer {
             };
 
             if self.config.show_fps {
-                // Keep FPS/debug stats visible without turning idle mode into
-                // a continuous 60 FPS redraw loop.
-                let fps_overlay_poll_ms = if self.is_idle {
-                    Self::FPS_OVERLAY_IDLE_POLL_MS
-                } else {
-                    Self::FPS_OVERLAY_ACTIVE_POLL_MS
-                };
+                // Poll FPS overlay on the configured cadence.
+                let fps_overlay_poll_ms = self.config.show_fps_update_interval_ms.clamp(50, 10_000);
                 schedule_min(Duration::from_millis(fps_overlay_poll_ms));
             }
 
