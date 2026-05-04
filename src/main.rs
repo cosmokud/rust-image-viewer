@@ -2642,9 +2642,6 @@ struct ImageViewer {
     /// Index of the currently focused (playing) video in manga mode.
     /// Only one video plays at a time; all others are paused.
     manga_focused_video_index: Option<usize>,
-    /// Cooldown gate for seamless focused-video LOD refreshes in long-strip mode.
-    /// Prevents rapid restart thrash when target side jitters around a threshold.
-    manga_video_lod_refresh_cooldown_until: Instant,
     /// Hovered media index in masonry mode, updated from pointer position.
     /// Used for hover-driven video autoplay selection.
     manga_hovered_media_index: Option<usize>,
@@ -3032,7 +3029,6 @@ impl Default for ImageViewer {
             manga_video_textures: HashMap::new(),
             manga_video_failed: HashSet::new(),
             manga_focused_video_index: None,
-            manga_video_lod_refresh_cooldown_until: Instant::now(),
             manga_hovered_media_index: None,
             manga_hover_autoplay_resume_at: Instant::now(),
             manga_max_video_players: 3, // Keep at most 3 video players alive
@@ -12415,7 +12411,12 @@ impl ImageViewer {
             .next_manga_video_load_request_id
             .saturating_add(1)
             .max(1);
-        let output_bounds = self.manga_video_output_bounds_for_index(index);
+        let output_bounds = if self.is_masonry_mode() {
+            self.manga_video_output_bounds_for_index(index)
+        } else {
+            // Long-strip focused playback stays at source quality.
+            None
+        };
 
         self.pending_manga_video_load = Some(PendingMangaFocusedVideoLoad {
             request_id,
@@ -16459,6 +16460,28 @@ impl ImageViewer {
         }
     }
 
+    fn manga_strip_retain_only_focused_video(&mut self, focused_idx: usize) {
+        if self.is_masonry_mode() {
+            return;
+        }
+
+        let stale_indices: Vec<usize> = self
+            .manga_video_players
+            .keys()
+            .copied()
+            .filter(|&idx| idx != focused_idx)
+            .collect();
+
+        for idx in stale_indices {
+            if let Some(mut player) = self.manga_video_players.remove(&idx) {
+                if player.is_playing() {
+                    let _ = player.pause();
+                }
+            }
+            self.manga_video_textures.remove(&idx);
+        }
+    }
+
     /// Update manga video playback based on current scroll position.
     /// Ensures only one video plays at a time (the focused one).
     fn manga_update_video_focus(&mut self) {
@@ -16577,6 +16600,7 @@ impl ImageViewer {
                     }
                 }
             }
+            self.manga_strip_retain_only_focused_video(focused_idx);
 
             let focus_play_error =
                 if let Some(player) = self.manga_video_players.get_mut(&focused_idx) {
@@ -16647,6 +16671,11 @@ impl ImageViewer {
                 self.manga_focused_video_index = None;
             }
 
+            if !self.is_masonry_mode() {
+                self.manga_video_players.clear();
+                self.manga_video_textures.clear();
+            }
+
             self.clear_pending_manga_video_load();
         }
     }
@@ -16655,86 +16684,17 @@ impl ImageViewer {
         if !self.manga_mode || self.is_masonry_mode() {
             return;
         }
-
-        let now = Instant::now();
-        if now < self.manga_video_lod_refresh_cooldown_until {
-            return;
-        }
-
-        let Some(focused_idx) = self.manga_focused_video_index else {
-            return;
-        };
-
-        if self.manga_video_failed.contains(&focused_idx)
-            || self.manga_video_load_pending_for_index(focused_idx)
-        {
-            return;
-        }
-
-        let Some((_, existing_w, existing_h)) = self.manga_video_textures.get(&focused_idx) else {
-            return;
-        };
-        let existing_w = (*existing_w).max(1);
-        let existing_h = (*existing_h).max(1);
-
-        let Some((bound_w, bound_h)) = self.manga_video_output_bounds_for_index(focused_idx) else {
-            return;
-        };
-        let desired_side = bound_w.max(bound_h).max(1);
-        let desired_dims = self.manga_bucket_dimensions_for_side(
-            focused_idx,
-            desired_side,
-            egui::vec2(existing_w as f32, existing_h as f32),
-        );
-
-        let needs_upgrade = self.manga_texture_upgrade_needed(
-            existing_w,
-            existing_h,
-            desired_dims.0,
-            desired_dims.1,
-            MangaMediaType::Video,
-        );
-        let existing_side = existing_w.max(existing_h).max(1);
-        let desired_side = desired_dims.0.max(desired_dims.1).max(1);
-        let side_delta = existing_side.abs_diff(desired_side);
-        let side_ratio = existing_side as f32 / desired_side as f32;
-        let needs_downgrade = desired_side < existing_side && (side_delta >= 160 || side_ratio >= 1.45);
-
-        if !needs_upgrade && !needs_downgrade {
-            return;
-        }
-
-        let Some(path) = self.image_list.get(focused_idx).cloned() else {
-            return;
-        };
-
-        let (autoplay, resume_position, muted, volume) =
-            if let Some(player) = self.manga_video_players.get(&focused_idx) {
-                (
-                    player.is_playing(),
-                    player.position(),
-                    player.is_muted(),
-                    player.volume(),
-                )
-            } else {
-                return;
-            };
-
-        self.gstreamer_initialized = true;
-        self.start_async_manga_focused_video_load(
-            focused_idx,
-            path,
-            muted,
-            volume,
-            autoplay,
-            true,
-            resume_position,
-        );
-        self.manga_video_lod_refresh_cooldown_until = now + Duration::from_millis(180);
+        // Long-strip policy: keep focused playback at source quality and do not
+        // restart the decoder for zoom-driven LOD swaps.
     }
 
     /// Evict video players that are far from the current view to conserve resources.
     fn manga_evict_distant_video_players(&mut self, focused_idx: usize) {
+        if !self.is_masonry_mode() {
+            self.manga_strip_retain_only_focused_video(focused_idx);
+            return;
+        }
+
         if self.manga_video_players.len() <= self.manga_max_video_players {
             return;
         }
@@ -16775,8 +16735,12 @@ impl ImageViewer {
 
         // Only update the focused video's texture (to save resources)
         if let Some(focused_idx) = self.manga_focused_video_index {
-            let target_side =
-                self.manga_target_texture_side_for_dynamic_media(focused_idx, MangaMediaType::Video);
+            let upload_side = if self.is_masonry_mode() {
+                self.manga_target_texture_side_for_dynamic_media(focused_idx, MangaMediaType::Video)
+            } else {
+                // Long-strip focused playback keeps highest available quality.
+                self.max_texture_side.max(1)
+            };
             let mut video_dimensions_changed = false;
 
             if let Some(player) = self.manga_video_players.get_mut(&focused_idx) {
@@ -16818,7 +16782,7 @@ impl ImageViewer {
                         frame.width,
                         frame.height,
                         &frame.pixels,
-                        target_side,
+                        upload_side,
                         if self.manga_should_force_triangle_filters() {
                             FilterType::Triangle
                         } else {
@@ -20860,8 +20824,8 @@ impl ImageViewer {
             // Update video focus - ensures only one video plays at a time (the focused one)
             self.manga_update_video_focus();
 
-            // In long-strip mode, refresh focused-video decode LOD with hysteresis so
-            // zooming stays smooth without decoder restart thrash.
+            // Long-strip playback keeps source-quality decode; this hook is intentionally
+            // a no-op there and remains available for masonry-specific policy.
             self.manga_maybe_refresh_focused_video_lod();
 
             // Apply any completed focused-video startup before texture polling.
