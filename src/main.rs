@@ -1300,6 +1300,7 @@ enum MediaLoadRequest {
         enable_cuda_decode: bool,
         enable_d3d12_decode: bool,
         output_bounds: Option<(u32, u32)>,
+        resume_position_secs: Option<f64>,
     },
 }
 
@@ -1452,6 +1453,7 @@ fn process_media_load_request(request: MediaLoadRequest) -> MediaLoadResult {
             enable_cuda_decode,
             enable_d3d12_decode,
             output_bounds,
+            resume_position_secs,
         } => {
             let source_dimensions = cached_or_probe_video_dimensions(&path);
             let output_dimensions =
@@ -1469,6 +1471,9 @@ fn process_media_load_request(request: MediaLoadRequest) -> MediaLoadResult {
             )
             .and_then(|mut player| {
                 player.play()?;
+                if let Some(seconds) = resume_position_secs {
+                    let _ = player.seek_to_time_with_mode(seconds, VideoSeekMode::Accurate);
+                }
                 Ok(player)
             });
 
@@ -2405,6 +2410,9 @@ struct ImageViewer {
     /// Index allowed to reuse the pre-strip solo texture/video as a temporary fallback.
     /// This prevents stale fullscreen frames from showing on unrelated items while scrolling.
     strip_entry_placeholder_index: Option<usize>,
+    /// Path paired with `strip_entry_placeholder_index`; guards against index reuse after
+    /// list refreshes while returning from solo fullscreen.
+    strip_entry_placeholder_path: Option<PathBuf>,
     /// Most recent reason why video playback is unavailable for the current solo video.
     /// When set, we keep preview/zoom active but block play attempts.
     video_playback_unavailable_reason: Option<String>,
@@ -2952,6 +2960,7 @@ impl Default for ImageViewer {
             retained_media_placeholder_visible: false,
             defer_media_view_reset: false,
             strip_entry_placeholder_index: None,
+            strip_entry_placeholder_path: None,
             video_playback_unavailable_reason: None,
             video_playback_popup_until: None,
             show_video_controls: false,
@@ -11957,6 +11966,17 @@ impl ImageViewer {
             Some(MediaType::Video) if self.video_texture.is_some() => Some(self.current_index),
             _ => None,
         };
+        self.strip_entry_placeholder_path = self
+            .strip_entry_placeholder_index
+            .and_then(|idx| self.image_list.get(idx).cloned());
+    }
+
+    fn strip_entry_placeholder_matches(&self, index: usize) -> bool {
+        self.strip_entry_placeholder_index == Some(index)
+            && self
+                .strip_entry_placeholder_path
+                .as_ref()
+                .is_some_and(|path| self.image_list.get(index) == Some(path))
     }
 
     fn manga_media_type_for_current_media(
@@ -12329,7 +12349,6 @@ impl ImageViewer {
         self.clear_pending_manga_video_load();
         self.manga_decoded_mailbox.clear();
         self.manga_video_players.clear();
-        self.manga_video_preview_resume_secs.clear();
         self.manga_video_failed.clear();
         self.manga_focused_video_index = None;
         self.manga_hovered_media_index = None;
@@ -12993,6 +13012,12 @@ impl ImageViewer {
         ) =
             self.effective_video_decoder_preferences();
         let output_bounds = self.async_video_output_bounds_for_solo();
+        let resume_position_secs = self
+            .image_list
+            .iter()
+            .position(|candidate| candidate == &path)
+            .and_then(|idx| self.manga_video_preview_resume_secs.get(&idx).copied())
+            .filter(|secs| secs.is_finite() && *secs >= 0.0);
 
         self.pending_media_load = Some(PendingMediaLoad {
             request_id,
@@ -13011,6 +13036,7 @@ impl ImageViewer {
             enable_cuda_decode,
             enable_d3d12_decode,
             output_bounds,
+            resume_position_secs,
         });
     }
 
@@ -14391,6 +14417,38 @@ impl ImageViewer {
         self.manga_anim_seekbar_total_frames.clear();
     }
 
+    fn sync_manga_video_position_to_resume(&mut self, index: usize) {
+        if let Some(player) = self.manga_video_players.get(&index) {
+            if let Some(position) = player.position() {
+                self.manga_record_video_preview_resume_secs(index, position);
+            }
+        }
+    }
+
+    fn sync_solo_video_position_to_manga_resume(&mut self) {
+        if !matches!(self.current_media_type, Some(MediaType::Video)) {
+            return;
+        }
+
+        let index = self.current_index.min(self.image_list.len().saturating_sub(1));
+        let Some(current_path) = self.current_media_path() else {
+            return;
+        };
+        if !self
+            .image_list
+            .get(index)
+            .is_some_and(|path| path == &current_path)
+        {
+            return;
+        }
+
+        if let Some(player) = self.video_player.as_ref() {
+            if let Some(position) = player.position() {
+                self.manga_record_video_preview_resume_secs(index, position);
+            }
+        }
+    }
+
     fn enter_manga_mode_from_preserved_strip_cache(&mut self) {
         let current_media_dims = self.media_display_dimensions().or(self.video_texture_dims);
         let current_media_type = self.current_media_type;
@@ -14437,6 +14495,7 @@ impl ImageViewer {
         }
 
         self.sync_current_index_to_visible_media();
+        self.sync_solo_video_position_to_manga_resume();
         self.reset_gif_seek_interaction_state();
         self.strip_open_force_fit_path = None;
 
@@ -16045,6 +16104,9 @@ impl ImageViewer {
         }
 
         let target_media_type = get_media_type(&path);
+        if matches!(target_media_type, Some(MediaType::Video)) {
+            self.sync_manga_video_position_to_resume(index);
+        }
         self.prepare_mode_switch_placeholder_from_manga_index(index, target_media_type);
 
         self.activate_strip_return_context(return_mode, index);
@@ -16511,6 +16573,7 @@ impl ImageViewer {
         self.masonry_runtime_cache_signature = 0;
         self.clear_masonry_authoritative_dimension_lock();
         self.strip_entry_placeholder_index = None;
+        self.strip_entry_placeholder_path = None;
         self.manga_ttv_pending.clear();
         self.manga_ttv_samples_ms.clear();
         self.manga_upload_batch_limit = Self::MANGA_UPLOAD_BATCH_BASE;
@@ -16540,6 +16603,7 @@ impl ImageViewer {
 
         // Clear manga video players and textures
         self.clear_manga_runtime_workloads();
+        self.manga_video_preview_resume_secs.clear();
         self.manga_video_textures.clear();
 
         // Clear animated images and streaming state
@@ -20015,6 +20079,37 @@ impl ImageViewer {
                         egui::Color32::WHITE,
                     );
                 }
+            } else if self.strip_entry_placeholder_matches(idx) {
+                // Immediate fallback when entering strip mode from solo-video fullscreen.
+                // Keeps only the strip-entry frame visible until manga cache catches up.
+                if let Some(texture) = self.video_texture.as_ref() {
+                    ui.painter().image(
+                        texture.id(),
+                        image_rect,
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        egui::Color32::WHITE,
+                    );
+                } else {
+                    ui.painter()
+                        .rect_filled(image_rect, 0.0, egui::Color32::from_gray(25));
+                    ui.painter().text(
+                        image_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "🎬",
+                        egui::FontId::proportional(32.0),
+                        egui::Color32::from_gray(100),
+                    );
+                }
+
+                if video_thumbnail_retry_allowed {
+                    requested_retry |= self.manga_request_retry_for_visible_item(
+                        idx,
+                        fill_retry_target_side,
+                        false,
+                        retry_media_type,
+                        navigation_active_for_visible_retry,
+                    );
+                }
             } else if let Some((texture_id, tex_w, tex_h)) =
                 self.manga_texture_cache.get_texture_info(idx)
             {
@@ -20062,37 +20157,6 @@ impl ImageViewer {
                         idx,
                         final_retry_target_side,
                         true,
-                        retry_media_type,
-                        navigation_active_for_visible_retry,
-                    );
-                }
-            } else if self.strip_entry_placeholder_index == Some(idx) {
-                // Immediate fallback when entering strip mode from solo-video fullscreen.
-                // Keeps only the strip-entry frame visible until manga cache catches up.
-                if let Some(texture) = self.video_texture.as_ref() {
-                    ui.painter().image(
-                        texture.id(),
-                        image_rect,
-                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                        egui::Color32::WHITE,
-                    );
-                } else {
-                    ui.painter()
-                        .rect_filled(image_rect, 0.0, egui::Color32::from_gray(25));
-                    ui.painter().text(
-                        image_rect.center(),
-                        egui::Align2::CENTER_CENTER,
-                        "🎬",
-                        egui::FontId::proportional(32.0),
-                        egui::Color32::from_gray(100),
-                    );
-                }
-
-                if video_thumbnail_retry_allowed {
-                    requested_retry |= self.manga_request_retry_for_visible_item(
-                        idx,
-                        fill_retry_target_side,
-                        false,
                         retry_media_type,
                         navigation_active_for_visible_retry,
                     );
