@@ -14,7 +14,6 @@ use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 use gstreamer_video as gst_video;
-use gstreamer_video::prelude::*;
 use image_simd::u16x8;
 use parking_lot::Mutex;
 use rayon::prelude::*;
@@ -227,12 +226,14 @@ fn apply_decoder_preference_windows(
     enable_cuda_decode: bool,
 ) {
     const HW_DECODE_RANKS: &str =
-        "d3d11h264dec:512,d3d11h265dec:512,d3d11vp8dec:512,d3d11vp9dec:512,d3d11av1dec:512,d3d11mpeg2dec:512,\
+        "d3d12h264dec:1024,d3d12h265dec:1024,d3d12vp8dec:1024,d3d12vp9dec:1024,d3d12av1dec:1024,d3d12mpeg2dec:1024,\
+d3d11h264dec:512,d3d11h265dec:512,d3d11vp8dec:512,d3d11vp9dec:512,d3d11av1dec:512,d3d11mpeg2dec:512,\
 avdec_h264:0,avdec_h265:0,avdec_hevc:0,avdec_vp8:0,avdec_vp9:0,avdec_av1:0,avdec_mpeg2video:0";
     const CUDA_DECODE_RANKS: &str =
         "nvh264dec:300,nvh265dec:300,nvvp9dec:300,nvav1dec:300,cudah264dec:300,cudah265dec:300";
     const DISABLE_HW_DECODE_RANKS: &str =
-        "d3d11h264dec:0,d3d11h265dec:0,d3d11vp8dec:0,d3d11vp9dec:0,d3d11av1dec:0,d3d11mpeg2dec:0";
+        "d3d12h264dec:0,d3d12h265dec:0,d3d12vp8dec:0,d3d12vp9dec:0,d3d12av1dec:0,d3d12mpeg2dec:0,\
+d3d11h264dec:0,d3d11h265dec:0,d3d11vp8dec:0,d3d11vp9dec:0,d3d11av1dec:0,d3d11mpeg2dec:0";
 
     if disable_hardware_decode {
         std::env::set_var("GST_PLUGIN_FEATURE_RANK", DISABLE_HW_DECODE_RANKS);
@@ -529,6 +530,124 @@ fn load_d3d11_memory_api() -> Option<D3D11MemoryApi> {
         get_native_type: unsafe { symbol(module, "gst_d3d11_memory_get_native_type")? },
         get_resource_handle: unsafe { symbol(module, "gst_d3d11_memory_get_resource_handle")? },
         get_subresource_index: unsafe { symbol(module, "gst_d3d11_memory_get_subresource_index")? },
+    })
+}
+
+/// Borrowed Direct3D 12 texture metadata for a GStreamer D3D12-backed sample.
+///
+/// The resource pointer is owned by the underlying GStreamer buffer. Keep the
+/// `gst::Sample` alive until the renderer has finished using this frame.
+#[cfg(target_os = "windows")]
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy)]
+pub struct VideoD3D12Frame {
+    pub resource: *mut std::ffi::c_void,
+    pub subresource_index: u32,
+    pub width: u32,
+    pub height: u32,
+    pub format: gst_video::VideoFormat,
+}
+
+/// Appsink caps for a strict Windows D3D12 zero-copy video path.
+///
+/// This is staged for a future renderer import path. It rejects system-memory
+/// frames and must not be combined with `Buffer::map_readable()`.
+#[cfg(target_os = "windows")]
+#[allow(dead_code)]
+pub fn d3d12_zero_copy_video_caps(
+    output_dimensions: Option<(u32, u32)>,
+) -> Result<gst::Caps, String> {
+    let caps = match output_dimensions {
+        Some((width, height)) if width > 0 && height > 0 => format!(
+            "video/x-raw(memory:D3D12Memory),format=BGRA,width={},height={},pixel-aspect-ratio=1/1",
+            width, height
+        ),
+        _ => "video/x-raw(memory:D3D12Memory),format=BGRA".to_string(),
+    };
+
+    gst::Caps::from_str(&caps).map_err(|e| format!("Failed to create D3D12 caps: {}", e))
+}
+
+/// Extract the native ID3D12Resource pointer from a D3D12 appsink sample.
+///
+/// Returns `None` for system-memory buffers or when the GStreamer D3D12 helper
+/// DLL is unavailable. This function intentionally avoids mapping the buffer.
+#[cfg(target_os = "windows")]
+#[allow(dead_code)]
+pub fn extract_d3d12_frame_from_sample(sample: &gst::Sample) -> Option<VideoD3D12Frame> {
+    let buffer = sample.buffer()?;
+    let caps = sample.caps()?;
+    let video_info = gst_video::VideoInfo::from_caps(caps).ok()?;
+    let api = d3d12_memory_api()?;
+
+    for idx in 0..buffer.n_memory() {
+        let memory = buffer.peek_memory(idx);
+        let memory_ptr = memory.as_mut_ptr();
+
+        let is_d3d12 = unsafe { (api.is_d3d12_memory)(memory_ptr) } != 0;
+        if !is_d3d12 {
+            continue;
+        }
+
+        let resource = unsafe { (api.get_resource_handle)(memory_ptr) };
+        if resource.is_null() {
+            continue;
+        }
+
+        let subresource_index = unsafe { (api.get_subresource_index)(memory_ptr) };
+        return Some(VideoD3D12Frame {
+            resource,
+            subresource_index,
+            width: video_info.width(),
+            height: video_info.height(),
+            format: video_info.format(),
+        });
+    }
+
+    None
+}
+
+#[cfg(target_os = "windows")]
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+struct D3D12MemoryApi {
+    is_d3d12_memory: unsafe extern "C" fn(*mut gst::ffi::GstMemory) -> gst::glib::ffi::gboolean,
+    get_resource_handle: unsafe extern "C" fn(*mut gst::ffi::GstMemory) -> *mut std::ffi::c_void,
+    get_subresource_index: unsafe extern "C" fn(*mut gst::ffi::GstMemory) -> u32,
+}
+
+#[cfg(target_os = "windows")]
+#[allow(dead_code)]
+fn d3d12_memory_api() -> Option<D3D12MemoryApi> {
+    static API: OnceLock<Option<D3D12MemoryApi>> = OnceLock::new();
+    *API.get_or_init(load_d3d12_memory_api)
+}
+
+#[cfg(target_os = "windows")]
+#[allow(dead_code)]
+fn load_d3d12_memory_api() -> Option<D3D12MemoryApi> {
+    use std::ffi::CString;
+    use winapi::um::libloaderapi::{GetProcAddress, LoadLibraryA};
+
+    unsafe fn symbol<T>(module: winapi::shared::minwindef::HMODULE, name: &str) -> Option<T> {
+        let c_name = CString::new(name).ok()?;
+        let ptr = unsafe { GetProcAddress(module, c_name.as_ptr()) };
+        if ptr.is_null() {
+            return None;
+        }
+        Some(unsafe { std::mem::transmute_copy(&ptr) })
+    }
+
+    let dll = CString::new("gstd3d12-1.0-0.dll").ok()?;
+    let module = unsafe { LoadLibraryA(dll.as_ptr()) };
+    if module.is_null() {
+        return None;
+    }
+
+    Some(D3D12MemoryApi {
+        is_d3d12_memory: unsafe { symbol(module, "gst_is_d3d12_memory")? },
+        get_resource_handle: unsafe { symbol(module, "gst_d3d12_memory_get_resource_handle")? },
+        get_subresource_index: unsafe { symbol(module, "gst_d3d12_memory_get_subresource_index")? },
     })
 }
 
@@ -1188,8 +1307,7 @@ fn process_video_sample(sample: gst::Sample, state: &VideoState) {
 /// Video player using GStreamer
 pub struct VideoPlayer {
     pipeline: gst::Pipeline,
-    video_sink: Option<gst_app::AppSink>,
-    video_overlay: Option<gst_video::VideoOverlay>,
+    video_sink: gst_app::AppSink,
     state: Arc<VideoState>,
     volume_element: Option<gst::Element>,
     duration: Option<Duration>,
@@ -1205,50 +1323,6 @@ pub struct VideoPlayer {
     subtitle_selection: VideoSubtitleSelection,
     stream_collection: Option<gst::StreamCollection>,
     selected_stream_ids: Vec<String>,
-}
-
-#[cfg(target_os = "windows")]
-fn create_native_d3d11_video_overlay_sink() -> Option<(gst::Element, gst_video::VideoOverlay)> {
-    let sink = gst::ElementFactory::make("d3d11videosink")
-        .name("d3d11videosink")
-        .build()
-        .ok()?;
-
-    set_optional_bool_property(&sink, "sync", true);
-    set_optional_bool_property(&sink, "force-aspect-ratio", true);
-
-    let overlay = sink
-        .clone()
-        .dynamic_cast::<gst_video::VideoOverlay>()
-        .ok()?;
-    if let Some(hwnd) = active_or_foreground_hwnd_for_overlay() {
-        unsafe {
-            overlay.set_window_handle(hwnd);
-        }
-        overlay.handle_events(false);
-    }
-    Some((sink, overlay))
-}
-
-#[cfg(not(target_os = "windows"))]
-fn create_native_d3d11_video_overlay_sink() -> Option<(gst::Element, gst_video::VideoOverlay)> {
-    None
-}
-
-#[cfg(target_os = "windows")]
-fn active_or_foreground_hwnd_for_overlay() -> Option<usize> {
-    use winapi::um::winuser::{GetActiveWindow, GetForegroundWindow};
-
-    let hwnd = unsafe {
-        let active = GetActiveWindow();
-        if !active.is_null() {
-            active
-        } else {
-            GetForegroundWindow()
-        }
-    };
-
-    (!hwnd.is_null()).then_some(hwnd as usize)
 }
 
 impl VideoPlayer {
@@ -1341,81 +1415,62 @@ Ensure your GStreamer installation includes the playback elements (usually from 
             .downcast::<gst::Pipeline>()
             .map_err(|_| "Failed to cast to Pipeline")?;
 
-        let use_native_d3d11_overlay =
-            cfg!(target_os = "windows") && prefer_hardware_decode && !disable_hardware_decode;
-        let mut video_overlay = None;
-        let appsink = if use_native_d3d11_overlay {
-            if let Some((native_sink, overlay)) = create_native_d3d11_video_overlay_sink() {
-                pipeline.set_property("video-sink", &native_sink);
-                video_overlay = Some(overlay);
-                None
-            } else {
-                None
-            }
-        } else {
-            None
+        // Create appsink for video frames.
+        // Explicitly request sRGB RGBA output. This nudges GStreamer into producing full-range RGB
+        // and avoids washed-out output when input colorimetry/range metadata is incomplete.
+        let video_caps_string = match output_dimensions {
+            Some((width, height)) if width > 0 && height > 0 => format!(
+                "video/x-raw,format=RGBA,colorimetry=sRGB,width={},height={},pixel-aspect-ratio=1/1",
+                width, height
+            ),
+            _ => "video/x-raw,format=RGBA,colorimetry=sRGB".to_string(),
         };
+        let video_caps = gst::Caps::from_str(&video_caps_string)
+            .map_err(|e| format!("Failed to create video caps: {}", e))?;
+        let appsink = gst_app::AppSink::builder()
+            .name("videosink")
+            .caps(&video_caps)
+            .max_buffers(APPSINK_MAX_BUFFERS)
+            .drop(true)
+            .wait_on_eos(false)
+            .enable_last_sample(false)
+            .qos(true)
+            .sync(true)
+            .build();
+        appsink.set_drop_out_of_segment(true);
 
-        let appsink = if appsink.is_none() && video_overlay.is_none() {
-            // CPU fallback path for platforms without D3D11 overlay support.
-            // Explicitly request sRGB RGBA output. This nudges GStreamer into producing
-            // full-range RGB and avoids washed-out output when metadata is incomplete.
-            let video_caps_string = match output_dimensions {
-                Some((width, height)) if width > 0 && height > 0 => format!(
-                    "video/x-raw,format=RGBA,colorimetry=sRGB,width={},height={},pixel-aspect-ratio=1/1",
-                    width, height
-                ),
-                _ => "video/x-raw,format=RGBA,colorimetry=sRGB".to_string(),
-            };
-            let video_caps = gst::Caps::from_str(&video_caps_string)
-                .map_err(|e| format!("Failed to create video caps: {}", e))?;
-            let appsink = gst_app::AppSink::builder()
-                .name("videosink")
-                .caps(&video_caps)
-                .max_buffers(APPSINK_MAX_BUFFERS)
-                .drop(true)
-                .wait_on_eos(false)
-                .enable_last_sample(false)
-                .qos(true)
-                .sync(true)
-                .build();
-            appsink.set_drop_out_of_segment(true);
+        // Create a bin to hold the appsink with video conversion.
+        let video_bin = gst::Bin::new();
 
-            // Create a bin to hold the appsink with video conversion.
-            let video_bin = gst::Bin::new();
+        let videoconvert = gst::ElementFactory::make("videoconvert")
+            .build()
+            .map_err(|e| format!("Failed to create videoconvert: {}", e))?;
 
-            let videoconvert = gst::ElementFactory::make("videoconvert")
-                .build()
-                .map_err(|e| format!("Failed to create videoconvert: {}", e))?;
+        let videoscale = gst::ElementFactory::make("videoscale")
+            .build()
+            .map_err(|e| format!("Failed to create videoscale: {}", e))?;
 
-            let videoscale = gst::ElementFactory::make("videoscale")
-                .build()
-                .map_err(|e| format!("Failed to create videoscale: {}", e))?;
+        video_bin
+            .add_many([&videoscale, &videoconvert, appsink.upcast_ref()])
+            .map_err(|e| format!("Failed to add elements to bin: {}", e))?;
 
-            video_bin
-                .add_many([&videoscale, &videoconvert, appsink.upcast_ref()])
-                .map_err(|e| format!("Failed to add elements to bin: {}", e))?;
+        gst::Element::link_many([&videoscale, &videoconvert, appsink.upcast_ref()])
+            .map_err(|e| format!("Failed to link video elements: {}", e))?;
 
-            gst::Element::link_many([&videoscale, &videoconvert, appsink.upcast_ref()])
-                .map_err(|e| format!("Failed to link video elements: {}", e))?;
+        // Create ghost pad for the bin.
+        let pad = videoscale
+            .static_pad("sink")
+            .ok_or("Failed to get sink pad")?;
+        let ghost_pad = gst::GhostPad::with_target(&pad)
+            .map_err(|e| format!("Failed to create ghost pad: {}", e))?;
+        ghost_pad
+            .set_active(true)
+            .map_err(|e| format!("Failed to activate ghost pad: {}", e))?;
+        video_bin
+            .add_pad(&ghost_pad)
+            .map_err(|e| format!("Failed to add ghost pad: {}", e))?;
 
-            let pad = videoscale
-                .static_pad("sink")
-                .ok_or("Failed to get sink pad")?;
-            let ghost_pad = gst::GhostPad::with_target(&pad)
-                .map_err(|e| format!("Failed to create ghost pad: {}", e))?;
-            ghost_pad
-                .set_active(true)
-                .map_err(|e| format!("Failed to activate ghost pad: {}", e))?;
-            video_bin
-                .add_pad(&ghost_pad)
-                .map_err(|e| format!("Failed to add ghost pad: {}", e))?;
-
-            pipeline.set_property("video-sink", &video_bin);
-            Some(appsink)
-        } else {
-            appsink
-        };
+        pipeline.set_property("video-sink", &video_bin);
 
         // Set up audio with volume control
         let volume = gst::ElementFactory::make("volume")
@@ -1466,36 +1521,33 @@ Ensure your GStreamer installation includes the playback elements (usually from 
             needs_range_expand: AtomicI8::new(RANGE_EXPAND_UNKNOWN),
         });
 
-        if let Some(appsink) = appsink.as_ref() {
-            // Set up appsink callbacks.
-            // NOTE: In PAUSED state (e.g. when the user pauses or when seeking while paused),
-            // playbin/appsink typically delivers the next frame as a *preroll* buffer, not a
-            // regular sample. To show the exact frame when seeking while paused, handle BOTH.
-            let state_clone = Arc::clone(&state);
-            let state_clone_preroll = Arc::clone(&state);
-            appsink.set_callbacks(
-                gst_app::AppSinkCallbacks::builder()
-                    .new_sample(move |sink| {
-                        let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
-                        if !state_clone.seek_in_progress() {
-                            process_video_sample(sample, state_clone.as_ref());
-                        }
-                        Ok(gst::FlowSuccess::Ok)
-                    })
-                    .new_preroll(move |sink| {
-                        if let Ok(sample) = sink.pull_preroll() {
-                            process_video_sample(sample, state_clone_preroll.as_ref());
-                        }
-                        Ok(gst::FlowSuccess::Ok)
-                    })
-                    .build(),
-            );
-        }
+        // Set up appsink callbacks.
+        // NOTE: In PAUSED state (e.g. when the user pauses or when seeking while paused),
+        // playbin/appsink typically delivers the next frame as a *preroll* buffer, not a
+        // regular sample. To show the exact frame when seeking while paused, handle BOTH.
+        let state_clone = Arc::clone(&state);
+        let state_clone_preroll = Arc::clone(&state);
+        appsink.set_callbacks(
+            gst_app::AppSinkCallbacks::builder()
+                .new_sample(move |sink| {
+                    let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                    if !state_clone.seek_in_progress() {
+                        process_video_sample(sample, state_clone.as_ref());
+                    }
+                    Ok(gst::FlowSuccess::Ok)
+                })
+                .new_preroll(move |sink| {
+                    if let Ok(sample) = sink.pull_preroll() {
+                        process_video_sample(sample, state_clone_preroll.as_ref());
+                    }
+                    Ok(gst::FlowSuccess::Ok)
+                })
+                .build(),
+        );
 
         let player = VideoPlayer {
             pipeline,
             video_sink: appsink,
-            video_overlay,
             state,
             volume_element: volume,
             duration: None,
@@ -1665,9 +1717,6 @@ Ensure your GStreamer installation includes the playback elements (usually from 
         if self.is_playing {
             return;
         }
-        let Some(video_sink) = self.video_sink.as_ref() else {
-            return;
-        };
 
         let timeout = Self::seek_preroll_timeout(mode);
         let timeout_clock_time = Self::duration_to_clock_time(timeout);
@@ -1676,13 +1725,13 @@ Ensure your GStreamer installation includes the playback elements (usually from 
         // before pulling the frame that should be visible at the target timestamp.
         let _ = self.pipeline.state(timeout_clock_time);
 
-        if let Some(sample) = video_sink.try_pull_preroll(timeout_clock_time) {
+        if let Some(sample) = self.video_sink.try_pull_preroll(timeout_clock_time) {
             self.state.clear_frames();
             process_video_sample(sample, self.state.as_ref());
             return;
         }
 
-        if let Some(sample) = video_sink.try_pull_preroll(gst::ClockTime::ZERO) {
+        if let Some(sample) = self.video_sink.try_pull_preroll(gst::ClockTime::ZERO) {
             self.state.clear_frames();
             process_video_sample(sample, self.state.as_ref());
         }
@@ -1781,35 +1830,6 @@ Ensure your GStreamer installation includes the playback elements (usually from 
     /// Get current volume
     pub fn volume(&self) -> f64 {
         self.volume
-    }
-
-    /// True when video is presented by GStreamer's native D3D11 sink instead of CPU RGBA frames.
-    pub fn uses_native_video_overlay(&self) -> bool {
-        self.video_overlay.is_some()
-    }
-
-    /// Attach the native video overlay to a platform window handle.
-    ///
-    /// On Windows this is an HWND cast to `usize`. The sink owns presentation;
-    /// egui should leave the corresponding rectangle unpainted.
-    pub fn set_native_video_overlay_window_handle(&self, handle: usize) {
-        if let Some(overlay) = self.video_overlay.as_ref() {
-            unsafe {
-                overlay.set_window_handle(handle);
-            }
-            overlay.handle_events(false);
-        }
-    }
-
-    /// Move/resize the native video overlay in window-client pixels.
-    pub fn set_native_video_overlay_rect(&self, x: i32, y: i32, width: i32, height: i32) {
-        if width <= 0 || height <= 0 {
-            return;
-        }
-        if let Some(overlay) = self.video_overlay.as_ref() {
-            let _ = overlay.set_render_rectangle(x, y, width, height);
-            overlay.expose();
-        }
     }
 
     fn legacy_audio_tracks(&self) -> Vec<VideoTrackInfo> {

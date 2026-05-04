@@ -160,12 +160,6 @@ fn active_or_foreground_window() -> winapi::shared::windef::HWND {
     }
 }
 
-#[cfg(windows)]
-pub fn active_or_foreground_window_handle() -> Option<usize> {
-    let hwnd = active_or_foreground_window();
-    (!hwnd.is_null()).then_some(hwnd as usize)
-}
-
 pub fn active_window_is_maximized() -> Option<bool> {
     use winapi::um::winuser::{IsWindow, IsZoomed};
 

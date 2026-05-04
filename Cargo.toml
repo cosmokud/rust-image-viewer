@@ -19,7 +19,7 @@ mimalloc-allocator = ["dep:mimalloc"]
 
 [dependencies]
 # GUI framework
-eframe = { version = "0.29" }
+eframe = { version = "0.29", features = ["wgpu"] }
 egui = "0.29"
 # egui_extras is optional - we use our own optimized image loader
 # Keeping it as optional dependency in case needed for future features
@@ -138,3 +138,6 @@ codegen-units = 4
 [[bin]]
 name = "rust-image-viewer"
 path = "src/main.rs"
+
+[patch.crates-io]
+pollster = { path = "vendor/pollster" }

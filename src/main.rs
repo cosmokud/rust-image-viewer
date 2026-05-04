@@ -19844,13 +19844,6 @@ impl ImageViewer {
             && self.manga_video_load_pending_for_index(idx);
 
         if is_video {
-            if let Some(player) = self.manga_video_players.get(&idx) {
-                if player.uses_native_video_overlay() {
-                    self.sync_native_video_overlay_player_rect(ui.ctx(), player, image_rect);
-                    return requested_retry;
-                }
-            }
-
             // Video item: prioritize live video texture, fall back to first-frame thumbnail
             if let Some((texture, _tex_w, _tex_h)) = self.manga_video_textures.get(&idx) {
                 // Live video frame available - use it
@@ -21540,50 +21533,6 @@ impl ImageViewer {
         };
 
         Some(egui::Rect::from_center_size(center, display_size))
-    }
-
-    #[cfg(target_os = "windows")]
-    fn sync_native_video_overlay_rect(&self, ctx: &egui::Context, rect: egui::Rect) {
-        let Some(player) = self.video_player.as_ref() else {
-            return;
-        };
-        self.sync_native_video_overlay_player_rect(ctx, player, rect);
-    }
-
-    #[cfg(target_os = "windows")]
-    fn sync_native_video_overlay_player_rect(
-        &self,
-        ctx: &egui::Context,
-        player: &VideoPlayer,
-        rect: egui::Rect,
-    ) {
-        if !player.uses_native_video_overlay() {
-            return;
-        }
-        let Some(hwnd) = windows_env::active_or_foreground_window_handle() else {
-            return;
-        };
-
-        let pixels_per_point = ctx.pixels_per_point();
-        let x = (rect.min.x * pixels_per_point).round() as i32;
-        let y = (rect.min.y * pixels_per_point).round() as i32;
-        let width = (rect.width() * pixels_per_point).round().max(1.0) as i32;
-        let height = (rect.height() * pixels_per_point).round().max(1.0) as i32;
-
-        player.set_native_video_overlay_window_handle(hwnd);
-        player.set_native_video_overlay_rect(x, y, width, height);
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    fn sync_native_video_overlay_rect(&self, _ctx: &egui::Context, _rect: egui::Rect) {}
-
-    #[cfg(not(target_os = "windows"))]
-    fn sync_native_video_overlay_player_rect(
-        &self,
-        _ctx: &egui::Context,
-        _player: &VideoPlayer,
-        _rect: egui::Rect,
-    ) {
     }
 
     fn point_over_current_media(&self, pos: egui::Pos2, screen_rect: egui::Rect) -> bool {
@@ -26259,20 +26208,7 @@ impl ImageViewer {
                     (None, None)
                 };
 
-                let native_video_overlay_active =
-                    matches!(self.current_media_type, Some(MediaType::Video))
-                        && self
-                            .video_player
-                            .as_ref()
-                            .is_some_and(|player| player.uses_native_video_overlay());
-
-                if native_video_overlay_active {
-                    if let Some(video_rect) = self.current_media_rect(ctx.screen_rect()) {
-                        self.sync_native_video_overlay_rect(ctx, video_rect);
-                        ctx.request_repaint_after(Duration::from_millis(16));
-                    }
-                } else if let (Some(texture), Some((img_w, img_h))) = (active_texture, display_dims)
-                {
+                if let (Some(texture), Some((img_w, img_h))) = (active_texture, display_dims) {
                     let available = ui.available_rect_before_wrap();
                     let precise_rotation_degrees = self.current_precise_rotation_angle_degrees();
                     let flip_horizontal = !self.manga_mode && self.flip_horizontal;
@@ -27419,7 +27355,17 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         // Keep the renderer lightweight at idle. This viewer renders 2D UI + a single image/video
         // texture; MSAA and a depth buffer are not required for perceptible quality.
-        renderer: eframe::Renderer::Glow,
+        renderer: eframe::Renderer::Wgpu,
+        wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
+            supported_backends: eframe::wgpu::Backends::DX12,
+            present_mode: if config.vsync {
+                eframe::wgpu::PresentMode::AutoVsync
+            } else {
+                eframe::wgpu::PresentMode::AutoNoVsync
+            },
+            desired_maximum_frame_latency: Some(1),
+            ..Default::default()
+        },
         // Configurable via [Settings].vsync in config.ini (default: true).
         // Keep enabled by default for smoother presentation and no tearing.
         vsync: config.vsync,
