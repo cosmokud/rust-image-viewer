@@ -26990,8 +26990,13 @@ impl eframe::App for ImageViewer {
         } else if manga_background_work_pending {
             ctx.request_repaint_after(Duration::from_millis(66));
         } else if manga_video_playing {
-            let interval = Duration::from_millis(16);
-            ctx.request_repaint_after(interval);
+            if self.manga_mode && !self.is_masonry_mode() {
+                // Long-strip focused video playback should run near high-refresh cadence.
+                // 16ms caps it around 60 FPS and makes 120/144 FPS sources feel stuttery.
+                ctx.request_repaint_after(Duration::from_millis(7));
+            } else {
+                ctx.request_repaint_after(Duration::from_millis(16));
+            }
         } else if video_playing {
             ctx.request_repaint_after(Duration::from_millis(16));
         } else if self.video_player.is_some() {
