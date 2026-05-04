@@ -2390,6 +2390,10 @@ struct ImageViewer {
     // ============ VIDEO-SPECIFIC FIELDS ============
     /// Current video player (None if viewing an image)
     video_player: Option<VideoPlayer>,
+    /// Path currently owned by `video_player` / `video_texture`.
+    /// Video loads don't have a `LoadedImage`, so this is the authoritative
+    /// solo-video identity during fullscreen/floating -> strip returns.
+    current_video_path: Option<PathBuf>,
     /// Video texture for rendering video frames
     video_texture: Option<egui::TextureHandle>,
     /// Dimensions corresponding to the current `video_texture`.
@@ -2713,6 +2717,9 @@ struct ImageViewer {
     /// RAM-only last known playback position (seconds) for previewed videos.
     /// Entries are kept only while the corresponding item remains visible.
     manga_video_preview_resume_secs: HashMap<usize, f64>,
+    /// Path-keyed preview playback positions survive temporary index churn while
+    /// switching between strip/masonry previews and solo video playback.
+    manga_video_preview_resume_by_path: HashMap<PathBuf, f64>,
     /// Video textures for manga mode, keyed by image list index.
     /// Stores the latest frame texture for each video.
     manga_video_textures: HashMap<usize, (egui::TextureHandle, u32, u32)>,
@@ -2952,6 +2959,7 @@ impl Default for ImageViewer {
             strip_open_force_fit_path: None,
             // Video-specific fields
             video_player: None,
+            current_video_path: None,
             video_texture: None,
             video_texture_dims: None,
             current_media_type: None,
@@ -3112,6 +3120,7 @@ impl Default for ImageViewer {
             // Manga video playback fields
             manga_video_players: HashMap::new(),
             manga_video_preview_resume_secs: HashMap::new(),
+            manga_video_preview_resume_by_path: HashMap::new(),
             manga_video_textures: HashMap::new(),
             manga_video_failed: HashSet::new(),
             manga_focused_video_index: None,
@@ -5304,6 +5313,8 @@ impl ImageViewer {
                 .get(*index)
                 .is_some_and(|path| path_is_targeted(path))
         });
+        self.manga_video_preview_resume_by_path
+            .retain(|path, _| !path_is_targeted(path));
         self.manga_video_textures.retain(|index, _| {
             !image_list
                 .get(*index)
@@ -7385,6 +7396,7 @@ impl ImageViewer {
 
     fn set_video_playback_unavailable_for_path(&mut self, path: &PathBuf, reason: String) {
         self.video_player = None;
+        self.current_video_path = Some(path.clone());
         self.pending_media_layout = false;
         let normalized_reason = if !gstreamer_runtime_available() {
             Self::gstreamer_missing_video_error_text().to_string()
@@ -11961,14 +11973,23 @@ impl ImageViewer {
         &mut self,
         current_media_type: Option<MediaType>,
     ) {
-        self.strip_entry_placeholder_index = match current_media_type {
-            Some(MediaType::Image) if self.texture.is_some() => Some(self.current_index),
-            Some(MediaType::Video) if self.video_texture.is_some() => Some(self.current_index),
+        let placeholder_path = match current_media_type {
+            Some(MediaType::Image) if self.texture.is_some() => self
+                .image
+                .as_ref()
+                .map(|img| img.path.clone())
+                .or_else(|| self.current_media_path()),
+            Some(MediaType::Video) if self.video_texture.is_some() => self
+                .current_video_path
+                .clone()
+                .or_else(|| self.current_media_path()),
             _ => None,
         };
-        self.strip_entry_placeholder_path = self
-            .strip_entry_placeholder_index
-            .and_then(|idx| self.image_list.get(idx).cloned());
+
+        self.strip_entry_placeholder_index = placeholder_path
+            .as_ref()
+            .and_then(|path| self.image_list.iter().position(|candidate| candidate == path));
+        self.strip_entry_placeholder_path = placeholder_path;
     }
 
     fn strip_entry_placeholder_matches(&self, index: usize) -> bool {
@@ -13013,10 +13034,15 @@ impl ImageViewer {
             self.effective_video_decoder_preferences();
         let output_bounds = self.async_video_output_bounds_for_solo();
         let resume_position_secs = self
-            .image_list
-            .iter()
-            .position(|candidate| candidate == &path)
-            .and_then(|idx| self.manga_video_preview_resume_secs.get(&idx).copied())
+            .manga_video_preview_resume_by_path
+            .get(&path)
+            .copied()
+            .or_else(|| {
+                self.image_list
+                    .iter()
+                    .position(|candidate| candidate == &path)
+                    .and_then(|idx| self.manga_video_preview_resume_secs.get(&idx).copied())
+            })
             .filter(|secs| secs.is_finite() && *secs >= 0.0);
 
         self.pending_media_load = Some(PendingMediaLoad {
@@ -13154,11 +13180,16 @@ impl ImageViewer {
                     match result {
                         Ok(mut player) => {
                             let resume_position_secs = self
-                                .image_list
-                                .iter()
-                                .position(|candidate| candidate == &path)
-                                .and_then(|idx| {
-                                    self.manga_video_preview_resume_secs.get(&idx).copied()
+                                .manga_video_preview_resume_by_path
+                                .get(&path)
+                                .copied()
+                                .or_else(|| {
+                                    self.image_list
+                                        .iter()
+                                        .position(|candidate| candidate == &path)
+                                        .and_then(|idx| {
+                                            self.manga_video_preview_resume_secs.get(&idx).copied()
+                                        })
                                 })
                                 .filter(|secs| secs.is_finite() && *secs >= 0.0);
                             if let Some(seconds) = resume_position_secs {
@@ -13177,6 +13208,7 @@ impl ImageViewer {
                             }
 
                             self.video_player = Some(player);
+                            self.current_video_path = Some(path.clone());
                             self.error_message = None;
                             self.clear_video_playback_unavailable_state();
                             if !suppress_controls_reveal {
@@ -13256,6 +13288,7 @@ impl ImageViewer {
             get_media_type(path)
         };
         self.current_media_type = media_type;
+        self.current_video_path = matches!(media_type, Some(MediaType::Video)).then(|| path.clone());
 
         let mut used_mode_switch_placeholder = false;
         let transition_placeholder = self
@@ -13926,12 +13959,18 @@ impl ImageViewer {
     }
 
     fn sync_current_index_to_visible_media(&mut self) {
-        let visible_path = self
-            .image
-            .as_ref()
-            .map(|img| &img.path)
-            .or(self.pending_file_size_probe_path.as_ref())
-            .or(self.current_file_size_label_path.as_ref());
+        let visible_path = if matches!(self.current_media_type, Some(MediaType::Video)) {
+            self.current_video_path
+                .as_ref()
+                .or(self.pending_file_size_probe_path.as_ref())
+                .or(self.current_file_size_label_path.as_ref())
+        } else {
+            self.image
+                .as_ref()
+                .map(|img| &img.path)
+                .or(self.pending_file_size_probe_path.as_ref())
+                .or(self.current_file_size_label_path.as_ref())
+        };
 
         let Some(visible_path) = visible_path else {
             return;
@@ -14443,17 +14482,16 @@ impl ImageViewer {
             return;
         }
 
-        let index = self.current_index.min(self.image_list.len().saturating_sub(1));
-        let Some(current_path) = self.current_media_path() else {
+        let Some(current_path) = self.current_video_path.clone().or_else(|| self.current_media_path()) else {
             return;
         };
-        if !self
+        let Some(index) = self
             .image_list
-            .get(index)
-            .is_some_and(|path| path == &current_path)
-        {
+            .iter()
+            .position(|path| path == &current_path)
+        else {
             return;
-        }
+        };
 
         if let Some(player) = self.video_player.as_ref() {
             if let Some(position) = player.position() {
@@ -16619,6 +16657,7 @@ impl ImageViewer {
         self.clear_manga_runtime_workloads();
         if !preserve_dimensions {
             self.manga_video_preview_resume_secs.clear();
+            self.manga_video_preview_resume_by_path.clear();
         }
         self.manga_video_textures.clear();
 
@@ -16827,8 +16866,21 @@ impl ImageViewer {
                 return;
             }
         }
+        if let Some(previous) = self
+            .image_list
+            .get(index)
+            .and_then(|path| self.manga_video_preview_resume_by_path.get(path))
+            .copied()
+        {
+            if secs <= 0.001 && previous > 0.25 {
+                return;
+            }
+        }
 
         self.manga_video_preview_resume_secs.insert(index, secs);
+        if let Some(path) = self.image_list.get(index).cloned() {
+            self.manga_video_preview_resume_by_path.insert(path, secs);
+        }
     }
 
     fn manga_visible_indices_set_for_preview_tracking(&mut self) -> HashSet<usize> {
@@ -16840,9 +16892,16 @@ impl ImageViewer {
     }
 
     fn manga_resume_position_for_index(&self, index: usize) -> Option<Duration> {
-        self.manga_video_preview_resume_secs.get(&index).and_then(|secs| {
-            if secs.is_finite() && *secs >= 0.0 {
-                Some(Duration::from_secs_f64(*secs))
+        let secs = self
+            .image_list
+            .get(index)
+            .and_then(|path| self.manga_video_preview_resume_by_path.get(path))
+            .copied()
+            .or_else(|| self.manga_video_preview_resume_secs.get(&index).copied());
+
+        secs.and_then(|secs| {
+            if secs.is_finite() && secs >= 0.0 {
+                Some(Duration::from_secs_f64(secs))
             } else {
                 None
             }
@@ -16911,12 +16970,15 @@ impl ImageViewer {
 
         let mut cleared_focused = false;
         for idx in hidden_indices {
-            self.manga_video_preview_resume_secs.remove(&idx);
             if let Some(mut player) = self.manga_video_players.remove(&idx) {
+                if let Some(position) = player.position() {
+                    self.manga_record_video_preview_resume_secs(idx, position);
+                }
                 if player.is_playing() {
                     let _ = player.pause();
                 }
             }
+            self.manga_video_preview_resume_secs.remove(&idx);
             self.manga_video_textures.remove(&idx);
             if self
                 .pending_manga_video_load

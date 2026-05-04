@@ -230,7 +230,9 @@ fn main() {
     let src_config = Path::new(DEFAULT_CONFIG_TEMPLATE_PATH);
 
     copy_default_config_to_target(src_config);
-    sync_appdata_config(src_config);
+    if env::var_os("RIV_SYNC_APPDATA_CONFIG_AT_BUILD").is_some() {
+        sync_appdata_config(src_config);
+    }
 
     println!("cargo:rerun-if-changed={}", DEFAULT_CONFIG_TEMPLATE_PATH);
     println!("cargo:rerun-if-changed=Cargo.toml");
