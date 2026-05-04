@@ -22132,8 +22132,9 @@ impl ImageViewer {
 
             // Only request repaint for active video playback or when seeking
             if player.is_playing() {
-                // For video, request repaint at roughly 60fps to poll for new frames
-                ctx.request_repaint_after(Duration::from_millis(16));
+                // Keep solo video polling near high-refresh cadence (about 144 Hz).
+                // 16ms hard-caps frame delivery near 60 FPS even when decode/upload can run faster.
+                ctx.request_repaint_after(Duration::from_millis(7));
             } else if self.is_seeking {
                 needs_repaint = true;
             }
@@ -26990,7 +26991,7 @@ impl eframe::App for ImageViewer {
         // - Visible manga placeholders / queued uploads: poll near 60fps
         // - Off-screen/background manga decode only: poll slowly
         // - Waiting for video dims: poll at 60fps
-        // - Idle with video playing: poll at video framerate
+        // - Idle with video playing: poll near high-refresh cadence
         // - Time-based auto-hide UI: repaint once at its deadline
         // - Fully idle: push repaint far into the future (event loop will still wake on input)
         if any_animation_active {
@@ -27018,7 +27019,9 @@ impl eframe::App for ImageViewer {
                 ctx.request_repaint_after(Duration::from_millis(16));
             }
         } else if video_playing {
-            ctx.request_repaint_after(Duration::from_millis(16));
+            // Solo video playback should match the same high-refresh pacing used by
+            // long-strip focused video mode when hardware permits.
+            ctx.request_repaint_after(Duration::from_millis(7));
         } else if self.video_player.is_some() {
             if let Some(delay) = cursor_idle_repaint_after {
                 ctx.request_repaint_after(delay);
