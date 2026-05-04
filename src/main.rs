@@ -2642,6 +2642,9 @@ struct ImageViewer {
     /// Index of the currently focused (playing) video in manga mode.
     /// Only one video plays at a time; all others are paused.
     manga_focused_video_index: Option<usize>,
+    /// Cooldown gate for seamless focused-video LOD refreshes in long-strip mode.
+    /// Prevents rapid restart thrash when target side jitters around a threshold.
+    manga_video_lod_refresh_cooldown_until: Instant,
     /// Hovered media index in masonry mode, updated from pointer position.
     /// Used for hover-driven video autoplay selection.
     manga_hovered_media_index: Option<usize>,
@@ -3029,6 +3032,7 @@ impl Default for ImageViewer {
             manga_video_textures: HashMap::new(),
             manga_video_failed: HashSet::new(),
             manga_focused_video_index: None,
+            manga_video_lod_refresh_cooldown_until: Instant::now(),
             manga_hovered_media_index: None,
             manga_hover_autoplay_resume_at: Instant::now(),
             manga_max_video_players: 3, // Keep at most 3 video players alive
@@ -12411,16 +12415,7 @@ impl ImageViewer {
             .next_manga_video_load_request_id
             .saturating_add(1)
             .max(1);
-        let output_bounds = if self.is_masonry_mode() {
-            let target_side =
-                self.manga_target_texture_side_for_dynamic_media(index, MangaMediaType::Video);
-            Some((target_side, target_side))
-        } else {
-            // Long-strip video playback keeps decoder output at source resolution and
-            // only adjusts the uploaded texture per frame. This avoids LOD churn and
-            // prevents getting stuck in low-res after zoom extremes.
-            None
-        };
+        let output_bounds = self.manga_video_output_bounds_for_index(index);
 
         self.pending_manga_video_load = Some(PendingMangaFocusedVideoLoad {
             request_id,
@@ -14646,6 +14641,18 @@ impl ImageViewer {
         target_side
     }
 
+    fn manga_video_output_bounds_for_index(&mut self, index: usize) -> Option<(u32, u32)> {
+        if index >= self.image_list.len() {
+            return None;
+        }
+
+        let max_side = self.max_texture_side.max(1);
+        let target_side = self
+            .manga_target_texture_side_for_dynamic_media(index, MangaMediaType::Video)
+            .clamp(1, max_side);
+        Some((target_side, target_side))
+    }
+
     fn manga_clamp_target_side_to_source(&self, index: usize, target_side: u32) -> u32 {
         self.manga_loader
             .as_ref()
@@ -16642,6 +16649,88 @@ impl ImageViewer {
 
             self.clear_pending_manga_video_load();
         }
+    }
+
+    fn manga_maybe_refresh_focused_video_lod(&mut self) {
+        if !self.manga_mode || self.is_masonry_mode() {
+            return;
+        }
+
+        let now = Instant::now();
+        if now < self.manga_video_lod_refresh_cooldown_until {
+            return;
+        }
+
+        let Some(focused_idx) = self.manga_focused_video_index else {
+            return;
+        };
+
+        if self.manga_video_failed.contains(&focused_idx)
+            || self.manga_video_load_pending_for_index(focused_idx)
+        {
+            return;
+        }
+
+        let Some((_, existing_w, existing_h)) = self.manga_video_textures.get(&focused_idx) else {
+            return;
+        };
+        let existing_w = (*existing_w).max(1);
+        let existing_h = (*existing_h).max(1);
+
+        let Some((bound_w, bound_h)) = self.manga_video_output_bounds_for_index(focused_idx) else {
+            return;
+        };
+        let desired_side = bound_w.max(bound_h).max(1);
+        let desired_dims = self.manga_bucket_dimensions_for_side(
+            focused_idx,
+            desired_side,
+            egui::vec2(existing_w as f32, existing_h as f32),
+        );
+
+        let needs_upgrade = self.manga_texture_upgrade_needed(
+            existing_w,
+            existing_h,
+            desired_dims.0,
+            desired_dims.1,
+            MangaMediaType::Video,
+        );
+        let existing_side = existing_w.max(existing_h).max(1);
+        let desired_side = desired_dims.0.max(desired_dims.1).max(1);
+        let side_delta = existing_side.abs_diff(desired_side);
+        let side_ratio = existing_side as f32 / desired_side as f32;
+        let needs_downgrade = desired_side < existing_side && (side_delta >= 160 || side_ratio >= 1.45);
+
+        if !needs_upgrade && !needs_downgrade {
+            return;
+        }
+
+        let Some(path) = self.image_list.get(focused_idx).cloned() else {
+            return;
+        };
+
+        let (autoplay, resume_position, muted, volume) =
+            if let Some(player) = self.manga_video_players.get(&focused_idx) {
+                (
+                    player.is_playing(),
+                    player.position(),
+                    player.is_muted(),
+                    player.volume(),
+                )
+            } else {
+                return;
+            };
+
+        self.gstreamer_initialized = true;
+        self.start_async_manga_focused_video_load(
+            focused_idx,
+            path,
+            muted,
+            volume,
+            autoplay,
+            true,
+            resume_position,
+        );
+        self.manga_video_lod_refresh_cooldown_until = now + Duration::from_millis(180);
     }
 
     /// Evict video players that are far from the current view to conserve resources.
@@ -19173,18 +19262,34 @@ impl ImageViewer {
             return false;
         }
 
-        let content_x = (anchor_screen.x - self.offset.x) / old_zoom;
-        let content_y = (anchor_screen.y + self.manga_scroll_offset) / old_zoom;
+        let anchor_screen_x = anchor_screen.x;
+        let anchor_screen_y = anchor_screen.y.clamp(0.0, self.screen_size.y.max(1.0));
+        let anchor_abs_y = self.manga_scroll_offset.max(0.0) + anchor_screen_y;
+        let anchor_idx = self
+            .manga_index_at_y(anchor_abs_y)
+            .min(self.image_list.len().saturating_sub(1));
+        let page_start_y = self.manga_page_start_y(anchor_idx);
+        let page_height = self.manga_page_height_cached(anchor_idx).max(0.0001);
+        let page_fraction_y = ((anchor_abs_y - page_start_y) / page_height).clamp(0.0, 1.0);
+
+        let page_width = self.manga_get_image_display_width(anchor_idx).max(0.0001);
+        let page_left = (self.screen_size.x - page_width) * 0.5 + self.offset.x;
+        let page_fraction_x = ((anchor_screen_x - page_left) / page_width).clamp(0.0, 1.0);
 
         self.zoom = new_zoom;
         self.zoom_target = new_zoom;
         self.zoom_velocity = 0.0;
         self.invalidate_manga_layout_cache_for_zoom();
 
-        self.offset.x = anchor_screen.x - content_x * new_zoom;
+        let new_page_width = self.manga_get_image_display_width(anchor_idx).max(0.0001);
+        let centered_left = (self.screen_size.x - new_page_width) * 0.5;
+        self.offset.x = anchor_screen_x - page_fraction_x * new_page_width - centered_left;
 
+        let new_page_start_y = self.manga_page_start_y(anchor_idx);
+        let new_page_height = self.manga_page_height_cached(anchor_idx).max(0.0001);
+        let new_anchor_abs_y = new_page_start_y + page_fraction_y * new_page_height;
         let max_scroll = (self.manga_total_height() - self.screen_size.y).max(0.0);
-        let new_scroll = (content_y * new_zoom - anchor_screen.y).clamp(0.0, max_scroll);
+        let new_scroll = (new_anchor_abs_y - anchor_screen_y).clamp(0.0, max_scroll);
         self.manga_scroll_offset = new_scroll;
         self.manga_scroll_target = new_scroll;
         self.manga_scroll_velocity = 0.0;
@@ -20754,6 +20859,10 @@ impl ImageViewer {
         if gstreamer_available {
             // Update video focus - ensures only one video plays at a time (the focused one)
             self.manga_update_video_focus();
+
+            // In long-strip mode, refresh focused-video decode LOD with hysteresis so
+            // zooming stays smooth without decoder restart thrash.
+            self.manga_maybe_refresh_focused_video_lod();
 
             // Apply any completed focused-video startup before texture polling.
             self.poll_pending_manga_video_load(ctx);
@@ -26624,11 +26733,7 @@ impl eframe::App for ImageViewer {
         } else if manga_background_work_pending {
             ctx.request_repaint_after(Duration::from_millis(66));
         } else if manga_video_playing {
-            let interval = if self.manga_mode && !self.is_masonry_mode() {
-                Duration::from_millis(33)
-            } else {
-                Duration::from_millis(16)
-            };
+            let interval = Duration::from_millis(16);
             ctx.request_repaint_after(interval);
         } else if video_playing {
             ctx.request_repaint_after(Duration::from_millis(16));
