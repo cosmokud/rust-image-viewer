@@ -164,6 +164,37 @@ function Copy-MatchingFiles {
     return $copied
 }
 
+function Assert-GStreamerD3D12Runtime {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$GStreamerPrefix
+    )
+
+    $requiredFiles = @(
+        "bin\gstd3d12-1.0-0.dll",
+        "lib\gstreamer-1.0\gstd3d12.dll"
+    )
+
+    $missing = @()
+    foreach ($relativePath in $requiredFiles) {
+        $path = Join-Path $GStreamerPrefix $relativePath
+        if (-not (Test-Path -LiteralPath $path)) {
+            $missing += $relativePath
+        }
+    }
+
+    if ($missing.Count -gt 0) {
+        throw @"
+Detected GStreamer prefix is missing D3D12 runtime files:
+$($missing -join "`n")
+
+Install a recent 64-bit MSVC GStreamer runtime with the D3D12 plugin enabled,
+then rerun this script. The bundled-GStreamer installer needs these files for
+[Performance] enable_d3d12 = true to work on machines without system GStreamer.
+"@
+    }
+}
+
 function Stage-GStreamerBundle {
     param(
         [Parameter(Mandatory = $true)]
@@ -176,6 +207,7 @@ function Stage-GStreamerBundle {
     New-Item -ItemType Directory -Path $BundleRoot -Force | Out-Null
 
     $gstPrefix = Resolve-GStreamerPrefix -CandidateRoot $null
+    Assert-GStreamerD3D12Runtime -GStreamerPrefix $gstPrefix
     $gstStageRoot = Join-Path $BundleRoot "gstreamer"
 
     $binCount = Copy-MatchingFiles -SourceDir (Join-Path $gstPrefix "bin") -DestinationDir (Join-Path $gstStageRoot "bin") -Patterns @("*.dll", "gst-plugin-scanner.exe") -Required
