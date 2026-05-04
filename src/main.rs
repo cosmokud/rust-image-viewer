@@ -6956,6 +6956,34 @@ impl ImageViewer {
             "0 FPS  (idle)".to_string()
         };
 
+        let decode_text = {
+            let caps = detect_video_acceleration_capabilities();
+            let (prefer_hardware_decode, disable_hardware_decode, enable_cuda_decode) =
+                self.effective_video_decoder_preferences();
+
+            let active_decode = if disable_hardware_decode || !caps.hardware_decode_available {
+                "SW"
+            } else if enable_cuda_decode {
+                "HW+CUDA"
+            } else if prefer_hardware_decode {
+                "HW"
+            } else {
+                "AUTO"
+            };
+
+            format!(
+                " | DEC {} (hw:{} cuda:{})",
+                active_decode,
+                if caps.hardware_decode_available {
+                    "on"
+                } else {
+                    "off"
+                },
+                if caps.cuda_available { "on" } else { "off" },
+            )
+        };
+        text.push_str(&decode_text);
+
         if self.manga_mode {
             if let Some((p50, p95, samples)) = self.manga_ttv_percentiles_ms() {
                 text.push_str(&format!(
