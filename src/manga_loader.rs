@@ -114,6 +114,7 @@ pub enum MangaMediaType {
 #[derive(Clone)]
 pub struct DecodedImage {
     pub index: usize,
+    pub path: PathBuf,
     pub pixels: Vec<u8>,
     pub width: u32,
     pub height: u32,
@@ -970,6 +971,7 @@ impl MangaLoader {
 
                         Some(DecodedImage {
                             index: req.index,
+                            path: req.path.clone(),
                             pixels: pixels.into_owned(),
                             width,
                             height,
@@ -990,6 +992,7 @@ impl MangaLoader {
 
                         Some(DecodedImage {
                             index: req.index,
+                            path: req.path.clone(),
                             pixels: Vec::new(),
                             width: 0,
                             height: 0,
@@ -1023,6 +1026,7 @@ impl MangaLoader {
                     {
                         return Some(DecodedImage {
                             index: req.index,
+                            path: req.path.clone(),
                             pixels: cached.pixels,
                             width: cached.width,
                             height: cached.height,
@@ -1104,6 +1108,7 @@ impl MangaLoader {
 
                 Some(DecodedImage {
                     index: req.index,
+                    path: req.path.clone(),
                     pixels,
                     width,
                     height,

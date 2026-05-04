@@ -13152,7 +13152,20 @@ impl ImageViewer {
                     }
 
                     match result {
-                        Ok(player) => {
+                        Ok(mut player) => {
+                            let resume_position_secs = self
+                                .image_list
+                                .iter()
+                                .position(|candidate| candidate == &path)
+                                .and_then(|idx| {
+                                    self.manga_video_preview_resume_secs.get(&idx).copied()
+                                })
+                                .filter(|secs| secs.is_finite() && *secs >= 0.0);
+                            if let Some(seconds) = resume_position_secs {
+                                let _ =
+                                    player.seek_to_time_with_mode(seconds, VideoSeekMode::Accurate);
+                            }
+
                             let dims = player.dimensions();
                             if dims.0 > 0 && dims.1 > 0 {
                                 store_cached_dimensions(
@@ -16131,6 +16144,7 @@ impl ImageViewer {
         if !self.manga_mode {
             self.pending_masonry_solo_reentry = None;
             self.sync_current_index_to_visible_media();
+            self.sync_solo_video_position_to_manga_resume();
             let preferred_masonry_path = if self.manga_layout_mode == MangaLayoutMode::Masonry {
                 self.current_media_path()
             } else {
@@ -16603,7 +16617,9 @@ impl ImageViewer {
 
         // Clear manga video players and textures
         self.clear_manga_runtime_workloads();
-        self.manga_video_preview_resume_secs.clear();
+        if !preserve_dimensions {
+            self.manga_video_preview_resume_secs.clear();
+        }
         self.manga_video_textures.clear();
 
         // Clear animated images and streaming state
@@ -18350,6 +18366,17 @@ impl ImageViewer {
 
         // Upload decoded images to GPU as textures
         for decoded in decoded_images {
+            if !self
+                .image_list
+                .get(decoded.index)
+                .is_some_and(|path| path == &decoded.path)
+            {
+                if let Some(loader) = self.manga_loader.as_mut() {
+                    loader.reset_index_state(decoded.index);
+                }
+                continue;
+            }
+
             self.perf_metrics
                 .record_duration("manga_decode_queue_wait_ms", decoded.queue_wait);
             self.perf_metrics
