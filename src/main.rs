@@ -12875,6 +12875,22 @@ impl ImageViewer {
                         }
                     }
 
+                    // Re-check resume position at apply-time to cover races where
+                    // fullscreen/preview position was recorded after this async load started.
+                    if let Some(position) = self.manga_resume_position_for_index(index) {
+                        let resume_secs = position.as_secs_f64();
+                        let current_secs = player
+                            .position()
+                            .map(|position| position.as_secs_f64())
+                            .unwrap_or(0.0);
+                        if resume_secs > 0.25 && current_secs <= 0.25 {
+                            let _ = player.seek_to_time_with_mode(resume_secs, VideoSeekMode::Accurate);
+                        }
+                    }
+                    if let Some(position) = player.position() {
+                        self.manga_record_video_preview_resume_secs(index, position);
+                    }
+
                     let dims = player.dimensions();
                     if dims.0 > 0 && dims.1 > 0 {
                         if !self.masonry_authoritative_dimension_lock_active() {
@@ -16682,10 +16698,6 @@ impl ImageViewer {
 
         // Clear manga video players and textures
         self.clear_manga_runtime_workloads();
-        if !preserve_dimensions {
-            self.manga_video_preview_resume_secs.clear();
-            self.manga_video_preview_resume_by_path.clear();
-        }
         self.clear_manga_video_textures();
 
         // Clear animated images and streaming state
@@ -20405,7 +20417,7 @@ impl ImageViewer {
                         navigation_active_for_visible_retry,
                     );
                 }
-            } else if self.strip_entry_placeholder_index == Some(idx) {
+            } else if self.strip_entry_placeholder_matches(idx) {
                 // Immediate fallback when entering strip mode from solo-image fullscreen.
                 // Keeps only the strip-entry image visible while manga textures are still loading.
                 if let Some(texture) = self.texture.as_ref() {
