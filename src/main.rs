@@ -288,23 +288,17 @@ fn downscale_rgba_if_needed<'a>(
 }
 
 fn cached_or_probe_video_dimensions(path: &Path) -> Option<(u32, u32)> {
-    let use_gstreamer_webm = path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| ext.eq_ignore_ascii_case("webm"))
-        .unwrap_or(false)
-        && gstreamer_runtime_available();
-    if use_gstreamer_webm {
+    if let Some(dims) = lookup_cached_dimensions(path, CachedMediaKind::Video) {
+        return Some(dims);
+    }
+
+    if gstreamer_runtime_available() {
         if let Some(dims) = probe_video_dimensions_with_gstreamer(path) {
             if dims.0 > 0 && dims.1 > 0 {
                 store_cached_dimensions(path, CachedMediaKind::Video, dims.0, dims.1);
                 return Some(dims);
             }
         }
-    }
-
-    if let Some(dims) = lookup_cached_dimensions(path, CachedMediaKind::Video) {
-        return Some(dims);
     }
 
     let dims = probe_video_dimensions_without_gstreamer(path)?;

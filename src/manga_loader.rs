@@ -589,7 +589,25 @@ impl MangaLoader {
                     .dimension_cache
                     .get(&idx)
                     .map_or(true, |(old_w, old_h, old_mt)| {
-                        *old_w != w || *old_h != h || *old_mt != mt
+                        if *old_w == w && *old_h == h && *old_mt == mt {
+                            return false;
+                        }
+
+                        // Ignore tiny video-size jitter from probes to avoid
+                        // perpetual masonry relayout churn.
+                        if *old_mt == MangaMediaType::Video && mt == MangaMediaType::Video {
+                            let width_delta = old_w.abs_diff(w);
+                            let height_delta = old_h.abs_diff(h);
+                            if width_delta <= 2 && height_delta <= 2 {
+                                let old_aspect = *old_w as f32 / (*old_h).max(1) as f32;
+                                let new_aspect = w as f32 / h.max(1) as f32;
+                                if (old_aspect - new_aspect).abs() <= 0.003 {
+                                    return false;
+                                }
+                            }
+                        }
+
+                        true
                     });
 
                 if changed {
@@ -889,17 +907,17 @@ impl MangaLoader {
     }
 
     fn probe_video_dimensions_fast(path: &std::path::Path) -> (u32, u32) {
-        if Self::is_webm_video_path(path) && gstreamer_runtime_available() {
+        if let Some((w, h)) = lookup_cached_dimensions(path, CachedMediaKind::Video) {
+            return (w, h);
+        }
+
+        if gstreamer_runtime_available() {
             if let Some((w, h)) = probe_video_dimensions_with_gstreamer(path) {
                 if w > 0 && h > 0 {
                     store_cached_dimensions(path, CachedMediaKind::Video, w, h);
                     return (w, h);
                 }
             }
-        }
-
-        if let Some((w, h)) = lookup_cached_dimensions(path, CachedMediaKind::Video) {
-            return (w, h);
         }
 
         if let Some((w, h)) = probe_video_dimensions_without_gstreamer(path) {
@@ -1132,22 +1150,24 @@ impl MangaLoader {
     ///
     /// Uses a lightweight first-frame probe, then falls back to filename heuristics.
     fn probe_video_dimensions(path: &std::path::Path) -> Option<(u32, u32)> {
-        if Self::is_webm_video_path(path) && gstreamer_runtime_available() {
+        if let Some((w, h)) = lookup_cached_dimensions(path, CachedMediaKind::Video) {
+            return Some((w, h));
+        }
+
+        if gstreamer_runtime_available() {
             if let Some((w, h)) = probe_video_dimensions_with_gstreamer(path) {
                 if w > 0 && h > 0 {
                     store_cached_dimensions(path, CachedMediaKind::Video, w, h);
                     return Some((w, h));
                 }
             }
-        } else if !gstreamer_runtime_available() {
-            if let Some((w, h)) = probe_video_dimensions_without_gstreamer(path) {
+        }
+
+        if let Some((w, h)) = probe_video_dimensions_without_gstreamer(path) {
+            if w > 0 && h > 0 {
                 store_cached_dimensions(path, CachedMediaKind::Video, w, h);
                 return Some((w, h));
             }
-        }
-
-        if let Some((w, h)) = lookup_cached_dimensions(path, CachedMediaKind::Video) {
-            return Some((w, h));
         }
 
         let probed = Self::extract_video_first_frame(path, 256)
