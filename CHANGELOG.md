@@ -2,6 +2,33 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.3.9-rc.3] - 2026-05-04
+
+### Highlights
+
+- Manga video previews now autoplay on focus/hover and resume from the last preview position while items stay visible.
+- Manga video layout sizing now uses source dimensions to avoid low-zoom reflow and keep masonry/strip geometry synchronized with playback.
+- WebP animation probes and thumbnail caching were optimized to reduce repeated work during dense browsing.
+
+### Added
+
+- RAM-only resume-position tracking for manga video previews, pruned via spatial-index visibility to keep hover resume stable.
+- Autoplay support in manga focused-video startup, including resume-seek on load when a preview position is available.
+
+### Changed
+
+- Focused manga video load policy was reworked to synchronize state during LOD refresh (position, mute, volume) and drop the short-lived cooldown in favor of source-quality long-strip playback without zoom-driven restarts.
+- Video dimension probing now prioritizes cached metadata and fast probes before heavier extraction, with masonry queuing dimension updates when real sizes are known.
+- Video thumbnail cache key tag bumped to `v3`, and first-frame extraction wait windows were adjusted for more reliable thumbnails.
+- Manga loader now prefers the persistent static-thumbnail pyramid for definitively static formats and avoids repeat video probes after failed thumbnail extraction.
+- Pointer-anchored zooming in manga layouts now invalidates layout caches more selectively for smoother low-zoom navigation.
+- TODO list refreshed to remove completed tasks and clarify known bugs.
+
+### Fixed
+
+- Cascading layout reflow/squash when video output bounds downscale frames at low zoom.
+- Stale hover preview resume state during dense masonry navigation by basing pruning on spatial-index visibility.
+
 ## [v0.3.9-rc.2] - 2026-05-03
 
 ### Highlights

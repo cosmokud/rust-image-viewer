@@ -432,6 +432,8 @@ Masonry layout caching:
 
 Masonry layout rebuilds are measured separately from spatial-index rebuilds because both can become meaningful costs in huge folders.
 
+Video items use source-dimension probes (cached or playback-reported) for layout bounds. Downscaled output frames are ignored for layout sizing so low-zoom output bounds do not cascade reflow/squash. Masonry queues video dimension updates through the loader and flushes them once navigation settles.
+
 ## 7. Visible-item query architecture
 
 ### 7.1 Linear scan fallback
@@ -484,6 +486,7 @@ Validation and bounds:
 - dimension TTL: `30 days`
 - static thumbnail TTL: `30 days`
 - video thumbnail TTL: `14 days`
+- video thumbnail key tag: `v3`
 - prune interval: `60 s`
 - writer queue capacity: `512`
 - default size limit: `1024 MiB`, configurable from `config.ini`
@@ -590,6 +593,8 @@ Animated WebP is intentionally split into two phases:
 
 This is used both in solo mode and in manga mode to avoid paying full animation cost before the user actually needs it.
 
+Animated WebP detection is memoized per file stamp in `webp_animation_probe_cache`, which keeps strip/masonry placeholder overlays from repeatedly probing the same file during dense browsing.
+
 ## 10. Video architecture
 
 ### 10.1 Live playback pipeline
@@ -621,8 +626,8 @@ The viewer can also prefer or disable D3D11 hardware decoders through `GST_PLUGI
 
 The app uses two video-preview paths:
 
-- lightweight dimension probing through `gstreamer-pbutils::Discoverer` with a `250 ms` timeout
-- temporary first-frame extraction pipeline for thumbnail placeholders, with a roughly `500 ms` collection budget
+- lightweight dimension probing via GStreamer preroll (about `1500 ms` cap) or Windows shell metadata when GStreamer is unavailable
+- first-frame extraction pipeline for thumbnail placeholders that waits about `300 ms` for preroll, seeks to time 0 accurately, then waits up to `3000 ms` for a frame
 
 Those results feed both the persistent cache and the placeholder systems in solo and multi-item modes.
 
@@ -658,6 +663,9 @@ Instead:
 - videos use first-frame thumbnails until focus is warranted
 - only one focused video is actively playing at a time in manga mode
 - Masonry can choose focus by hover, with a configurable autoplay-resume delay after interaction settles
+- visible preview videos keep a RAM-only resume-position map, pruned via spatial-index visibility so hover resumes without jitter resets
+- focused video loads can resume from the last preview position and keep playback state (mute/volume) when refreshing output bounds
+- Long Strip keeps focused playback at source quality and avoids zoom-driven restarts.
 
 That policy is essential for dense mixed-media folders.
 

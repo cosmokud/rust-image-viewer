@@ -24,6 +24,7 @@ This project is intentionally optimized for one job: opening media fast, navigat
 - Windows cut/copy/paste for marked files with optional auto-unmark after paste.
 - Static images, animated GIF, animated WebP, and video playback in one app.
 - Two fullscreen multi-item layouts: Long Strip and Masonry.
+- Manga-mode video previews now autoplay on focus/hover and resume from the last preview position, with steadier layout sizing during zoom.
 - Context-aware shortcut system where the same input can map to different actions in different modes.
 - Persistent metadata and thumbnail caching, plus in-memory decode and texture caches.
 - R-tree viewport virtualization, LOD bucketing, mipmapping, batch uploads, and bounded worker queues for dense layouts.
@@ -68,6 +69,7 @@ This project is intentionally optimized for one job: opening media fast, navigat
   - `keyframe` = fastest seeks, less precise
 - Optional hardware-decoder preference on Windows, with a config switch to force software decode.
 - Improved multilingual subtitle/audio track labeling and selection behavior.
+- Manga-mode video previews can autoplay on focus/hover and resume from the last preview position while items remain visible.
 - In Long Strip / Masonry, videos use first-frame thumbnails until a focused live player is needed.
 
 ### Long Strip and Masonry
@@ -75,10 +77,10 @@ This project is intentionally optimized for one job: opening media fast, navigat
 - Long Strip: continuous vertical reading layout for the current folder.
 - Masonry: dense multi-column layout with configurable `masonry_items_per_row`.
 - Bottom-right mode buttons for toggling `Masonry` and `Long Strip` while fullscreen.
-- Inertial scrolling, drag panning, Ctrl+wheel zoom, and a configurable middle-click freehand autoscroll ball.
+- Inertial scrolling, drag panning, pointer-anchored Ctrl+wheel zoom, and a configurable middle-click freehand autoscroll ball.
 - Masonry freehand autoscroll keeps visible-item prioritization and visible-quality recovery aligned with the moving viewport.
 - Video first-frame thumbnails and animated media support inside multi-item layouts.
-- Hover-based autoplay in Masonry after a configurable settle delay.
+- Hover-based autoplay in Masonry after a configurable settle delay, with resume-aware previews that stay warm while visible.
 - Solo fullscreen quick-open from Long Strip / Masonry with preserved return context and warm-cache reuse.
 
 ## Supported Formats
