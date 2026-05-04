@@ -14255,13 +14255,14 @@ impl ImageViewer {
             .is_some_and(|state| self.should_reuse_masonry_cache_on_return(state));
         let preserve_resident_masonry_cache =
             layout_mode == MangaLayoutMode::Masonry && self.has_resident_masonry_runtime_cache();
+        let reuse_strip_cache = layout_mode == MangaLayoutMode::LongStrip;
 
         self.manga_layout_mode = layout_mode;
         if layout_mode == MangaLayoutMode::Masonry {
             self.mark_masonry_runtime_cache_resident();
         }
 
-        if reuse_masonry_cache || preserve_resident_masonry_cache {
+        if reuse_masonry_cache || preserve_resident_masonry_cache || reuse_strip_cache {
             self.enter_manga_mode_from_preserved_strip_cache();
         } else {
             if layout_mode == MangaLayoutMode::Masonry {
@@ -15810,11 +15811,9 @@ impl ImageViewer {
         self.reset_masonry_metadata_preload();
         self.manga_mode = false;
         set_metadata_cache_enabled(false);
-        if return_mode == MangaLayoutMode::Masonry || self.has_resident_masonry_runtime_cache() {
-            self.manga_suspend_runtime_for_solo_fullscreen();
-        } else {
-            self.manga_clear_cache();
-        }
+        // Preserve strip runtime caches for fast return from solo fullscreen.
+        // Active workloads are still suspended to avoid hidden playback work.
+        self.manga_suspend_runtime_for_solo_fullscreen();
         self.load_image(&path);
     }
 
@@ -16254,8 +16253,6 @@ impl ImageViewer {
         self.manga_update_current_index();
         if self.is_masonry_mode() {
             self.masonry_note_zoom_interaction();
-        } else {
-            self.manga_update_preload_queue();
         }
     }
 
@@ -19013,22 +19010,11 @@ impl ImageViewer {
                             self.manga_finish_direct_zoom_change();
                         }
                     } else {
-                        // CRITICAL FIX: Use index-based anchoring for stable zooming with varying image sizes.
-                        // Capture which image is at the center and the fractional position within it BEFORE zoom.
-                        let center_anchor = self.manga_capture_center_anchor();
-
-                        // Apply the new zoom level
-                        self.zoom = new_zoom;
-                        self.zoom_target = new_zoom;
-                        self.zoom_velocity = 0.0;
-                        self.invalidate_manga_layout_cache_for_zoom();
-
-                        // Re-apply the anchor to keep the same image position at the center
-                        if let Some(anchor) = center_anchor {
-                            self.manga_apply_center_anchor(anchor);
+                        let center_pos =
+                            egui::pos2(self.screen_size.x * 0.5, self.screen_size.y * 0.5);
+                        if self.apply_strip_zoom_at_screen_pos(new_zoom, center_pos) {
+                            self.manga_finish_direct_zoom_change();
                         }
-
-                        self.manga_finish_direct_zoom_change();
                     }
                 } else {
                     // Non-manga mode: simple ratio-based offset adjustment
@@ -19248,19 +19234,14 @@ impl ImageViewer {
                                             self.manga_finish_direct_zoom_change();
                                         }
                                     } else {
-                                        // CRITICAL FIX: Use index-based anchoring for stable zooming with varying image sizes.
-                                        let center_anchor = self.manga_capture_center_anchor();
-
-                                        self.zoom = new_zoom;
-                                        self.zoom_target = new_zoom;
-                                        self.zoom_velocity = 0.0;
-                                        self.invalidate_manga_layout_cache_for_zoom();
-
-                                        if let Some(anchor) = center_anchor {
-                                            self.manga_apply_center_anchor(anchor);
+                                        let center_pos = egui::pos2(
+                                            self.screen_size.x * 0.5,
+                                            self.screen_size.y * 0.5,
+                                        );
+                                        if self.apply_strip_zoom_at_screen_pos(new_zoom, center_pos)
+                                        {
+                                            self.manga_finish_direct_zoom_change();
                                         }
-
-                                        self.manga_finish_direct_zoom_change();
                                     }
                                 } else {
                                     self.zoom = new_zoom;
