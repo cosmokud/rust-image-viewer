@@ -1782,6 +1782,7 @@ Ensure your GStreamer installation includes the playback elements (usually from 
     ) -> Result<(), String> {
         self.state.begin_seek();
         self.state.clear_frames();
+        self.last_frame_pts = None;
 
         let seek_result = self
             .pipeline

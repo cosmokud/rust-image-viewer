@@ -12935,17 +12935,35 @@ impl ImageViewer {
                                 index,
                                 MangaMediaType::Video,
                             );
-                            let (w, h, pixels) = downscale_rgba_if_needed(
-                                frame.width,
-                                frame.height,
-                                &frame.pixels,
-                                target_side,
-                                self.config.downscale_filter.to_image_filter(),
-                            );
-                            let color_image = egui::ColorImage::from_rgba_unmultiplied(
-                                [w as usize, h as usize],
-                                pixels.as_ref(),
-                            );
+                            let no_downscale =
+                                frame.width <= target_side && frame.height <= target_side;
+                            let (w, h, color_image) = if no_downscale {
+                                let size = [frame.width as usize, frame.height as usize];
+                                match try_color_image_from_opaque_rgba_bytes(size, frame.pixels) {
+                                    Ok(color_image) => (frame.width, frame.height, color_image),
+                                    Err(pixels) => (
+                                        frame.width,
+                                        frame.height,
+                                        egui::ColorImage::from_rgba_unmultiplied(size, &pixels),
+                                    ),
+                                }
+                            } else {
+                                let (w, h, pixels) = downscale_rgba_if_needed(
+                                    frame.width,
+                                    frame.height,
+                                    &frame.pixels,
+                                    target_side,
+                                    self.config.downscale_filter.to_image_filter(),
+                                );
+                                (
+                                    w,
+                                    h,
+                                    egui::ColorImage::from_rgba_unmultiplied(
+                                        [w as usize, h as usize],
+                                        pixels.as_ref(),
+                                    ),
+                                )
+                            };
                             let texture_options =
                                 self.config.texture_filter_video.to_egui_options();
 
@@ -14543,15 +14561,26 @@ impl ImageViewer {
         self.manga_anim_seekbar_total_frames.clear();
     }
 
+    fn latest_video_position_from_player(player: &mut VideoPlayer) -> Option<Duration> {
+        player
+            .get_frame()
+            .and_then(|frame| frame.pts)
+            .or_else(|| player.displayed_position())
+            .or_else(|| player.position())
+    }
+
     fn sync_manga_video_position_to_resume(&mut self, index: usize) {
         if !self.manga_video_player_matches(index) {
             return;
         }
 
-        if let Some(player) = self.manga_video_players.get(&index) {
-            if let Some(position) = player.displayed_position() {
-                self.manga_record_video_preview_resume_secs(index, position);
-            }
+        let position = self
+            .manga_video_players
+            .get_mut(&index)
+            .and_then(Self::latest_video_position_from_player);
+
+        if let Some(position) = position {
+            self.manga_record_video_preview_resume_secs(index, position);
         }
     }
 
@@ -14575,11 +14604,58 @@ impl ImageViewer {
             return;
         };
 
-        if let Some(player) = self.video_player.as_ref() {
-            if let Some(position) = player.displayed_position() {
-                self.manga_record_video_preview_resume_secs(index, position);
-            }
+        let position = self
+            .video_player
+            .as_mut()
+            .and_then(Self::latest_video_position_from_player);
+
+        if let Some(position) = position {
+            self.manga_record_video_preview_resume_secs(index, position);
         }
+    }
+
+    fn capture_solo_video_texture_for_manga_return(
+        &self,
+    ) -> Option<(PathBuf, egui::TextureHandle, u32, u32)> {
+        if !matches!(self.current_media_type, Some(MediaType::Video)) {
+            return None;
+        }
+
+        let path = self
+            .current_video_path
+            .clone()
+            .or_else(|| self.current_media_path())?;
+        let texture = self.video_texture.as_ref()?.clone();
+        let (width, height) = self.video_texture_dims?;
+        if width == 0 || height == 0 {
+            return None;
+        }
+
+        Some((path, texture, width, height))
+    }
+
+    fn install_manga_video_texture_for_path(
+        &mut self,
+        path: PathBuf,
+        texture: egui::TextureHandle,
+        width: u32,
+        height: u32,
+    ) {
+        if width == 0 || height == 0 || !is_supported_video(&path) {
+            return;
+        }
+
+        let Some(index) = self
+            .image_list
+            .iter()
+            .position(|candidate| candidate == &path)
+        else {
+            return;
+        };
+
+        self.manga_video_textures
+            .insert(index, (texture, width, height));
+        self.manga_video_texture_paths.insert(index, path);
     }
 
     fn enter_manga_mode_from_preserved_strip_cache(&mut self) {
@@ -14629,6 +14705,7 @@ impl ImageViewer {
 
         self.sync_current_index_to_visible_media();
         self.sync_solo_video_position_to_manga_resume();
+        let return_video_texture = self.capture_solo_video_texture_for_manga_return();
         self.reset_gif_seek_interaction_state();
         self.strip_open_force_fit_path = None;
 
@@ -14729,6 +14806,10 @@ impl ImageViewer {
             self.manga_update_current_index();
             self.manga_update_preload_queue();
             self.pending_masonry_solo_reentry = None;
+        }
+
+        if let Some((path, texture, width, height)) = return_video_texture {
+            self.install_manga_video_texture_for_path(path, texture, width, height);
         }
 
         self.clear_strip_return_context();
@@ -16971,9 +17052,9 @@ impl ImageViewer {
         }
 
         if let Some(previous) = self.manga_video_preview_resume_secs.get(&index).copied() {
-            // Guard against transient query_position() drops to zero while preserving
+            // Guard against transient preroll/query-position drops to the start while preserving
             // normal forward playback progression.
-            if secs <= 0.001 && previous > Self::VIDEO_RESUME_MIN_SECONDS {
+            if secs <= Self::VIDEO_RESUME_MIN_SECONDS && previous > Self::VIDEO_RESUME_MIN_SECONDS {
                 return;
             }
         }
@@ -16983,7 +17064,7 @@ impl ImageViewer {
             .and_then(|path| self.manga_video_preview_resume_by_path.get(path))
             .copied()
         {
-            if secs <= 0.001 && previous > Self::VIDEO_RESUME_MIN_SECONDS {
+            if secs <= Self::VIDEO_RESUME_MIN_SECONDS && previous > Self::VIDEO_RESUME_MIN_SECONDS {
                 return;
             }
         }
@@ -17090,7 +17171,7 @@ impl ImageViewer {
             let record_position = self.manga_video_player_matches(idx);
             if let Some(mut player) = self.remove_manga_video_player(idx) {
                 if record_position {
-                    if let Some(position) = player.displayed_position() {
+                    if let Some(position) = Self::latest_video_position_from_player(&mut player) {
                         self.manga_record_video_preview_resume_secs(idx, position);
                     }
                 }
@@ -17135,7 +17216,7 @@ impl ImageViewer {
             let record_position = self.manga_video_player_matches(idx);
             if let Some(mut player) = self.remove_manga_video_player(idx) {
                 if record_position {
-                    if let Some(position) = player.displayed_position() {
+                    if let Some(position) = Self::latest_video_position_from_player(&mut player) {
                         self.manga_record_video_preview_resume_secs(idx, position);
                     }
                 }
@@ -17397,9 +17478,10 @@ impl ImageViewer {
         while self.manga_video_players.len() > self.manga_max_video_players {
             if let Some((idx, _)) = indexed_distances.pop() {
                 let record_position = self.manga_video_player_matches(idx);
-                if let Some(player) = self.remove_manga_video_player(idx) {
+                if let Some(mut player) = self.remove_manga_video_player(idx) {
                     if record_position {
-                        if let Some(position) = player.displayed_position() {
+                        if let Some(position) = Self::latest_video_position_from_player(&mut player)
+                        {
                             self.manga_record_video_preview_resume_secs(idx, position);
                         }
                     }
@@ -17461,21 +17543,38 @@ impl ImageViewer {
                         }
                     }
 
-                    let (w, h, pixels) = downscale_rgba_if_needed(
-                        frame.width,
-                        frame.height,
-                        &frame.pixels,
-                        upload_side,
-                        if self.manga_should_force_triangle_filters() {
-                            FilterType::Triangle
-                        } else {
-                            self.config.downscale_filter.to_image_filter()
-                        },
-                    );
-                    let color_image = egui::ColorImage::from_rgba_unmultiplied(
-                        [w as usize, h as usize],
-                        pixels.as_ref(),
-                    );
+                    let no_downscale = frame.width <= upload_side && frame.height <= upload_side;
+                    let (w, h, color_image) = if no_downscale {
+                        let size = [frame.width as usize, frame.height as usize];
+                        match try_color_image_from_opaque_rgba_bytes(size, frame.pixels) {
+                            Ok(color_image) => (frame.width, frame.height, color_image),
+                            Err(pixels) => (
+                                frame.width,
+                                frame.height,
+                                egui::ColorImage::from_rgba_unmultiplied(size, &pixels),
+                            ),
+                        }
+                    } else {
+                        let (w, h, pixels) = downscale_rgba_if_needed(
+                            frame.width,
+                            frame.height,
+                            &frame.pixels,
+                            upload_side,
+                            if self.manga_should_force_triangle_filters() {
+                                FilterType::Triangle
+                            } else {
+                                self.config.downscale_filter.to_image_filter()
+                            },
+                        );
+                        (
+                            w,
+                            h,
+                            egui::ColorImage::from_rgba_unmultiplied(
+                                [w as usize, h as usize],
+                                pixels.as_ref(),
+                            ),
+                        )
+                    };
 
                     // Live video textures are updated every frame; generating mipmaps here is
                     // expensive and the video sink already outputs near-display resolution.
@@ -24708,7 +24807,7 @@ impl ImageViewer {
                         player.toggle_mute();
                         self.config
                             .update_video_state(player.is_muted(), player.volume());
-                        self.config.sync_disk_file_with_template();
+                        self.pending_idle_config_sync = true;
                     }
 
                     // Volume slider
@@ -24762,7 +24861,7 @@ impl ImageViewer {
                             }
                             self.config
                                 .update_video_state(player.is_muted(), player.volume());
-                            self.config.sync_disk_file_with_template();
+                            self.pending_idle_config_sync = true;
                         }
                     }
                     if vol_response.drag_stopped() {
@@ -25540,7 +25639,7 @@ impl ImageViewer {
                         self.manga_video_user_muted = Some(player.is_muted());
                         self.config
                             .update_video_state(player.is_muted(), player.volume());
-                        self.config.sync_disk_file_with_template();
+                        self.pending_idle_config_sync = true;
                     }
 
                     // Volume slider
@@ -25593,7 +25692,7 @@ impl ImageViewer {
                             }
                             self.config
                                 .update_video_state(player.is_muted(), player.volume());
-                            self.config.sync_disk_file_with_template();
+                            self.pending_idle_config_sync = true;
                         }
                     }
                     if vol_response.drag_stopped() {
@@ -27154,6 +27253,10 @@ impl eframe::App for ImageViewer {
 
         // Process viewport commands
         if self.should_exit {
+            if self.pending_idle_config_sync {
+                self.pending_idle_config_sync = false;
+                self.config.sync_disk_file_with_template();
+            }
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
 
