@@ -195,6 +195,7 @@ Placeholder sources:
 - the currently visible solo image or video frame when next/previous navigation should not flash blank
 - a cached video first-frame thumbnail while the live `VideoPlayer` is still starting
 - a cached static image thumbnail when a full image decode is not ready yet
+- during seamless video handoffs, the active video texture (solo or masonry) is reused and first-frame thumbnails are suppressed
 
 This is why the user can often move between items without seeing a blank frame even when the destination media is not fully loaded yet.
 
@@ -650,6 +651,8 @@ This keeps the focused video path responsive without growing queues indefinitely
 Local file playback enables playbin buffering plus bounded ring buffers so brief disk stalls do not force full-file prefetching. The appsink caps its internal queue and drops stale buffers to keep frame delivery responsive.
 
 Seeking clears queued frames, marks a seek-in-progress flag to ignore stale samples, and primes a preroll frame so paused scrubs show the right image quickly. When possible, solo playback passes output bounds so GStreamer scales toward the viewport instead of decoding full-resolution frames.
+
+Seeks wait briefly for pending pipeline state transitions (such as initial PAUSED) before issuing the seek, which reduces transient failures during startup and mode switches.
 
 Audio/subtitle track switching is coordinated to avoid mid-transition thrash: selection updates can be deferred until the pipeline is in a safe state, and track labels are normalized with language-aware handling so menu state remains stable across multilingual media.
 

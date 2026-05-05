@@ -26,6 +26,7 @@ This project is intentionally optimized for one job: opening media fast, navigat
 - Optional hardware-accelerated video decode on Windows with D3D12/D3D11/CUDA preference and capability status readouts.
 - Two fullscreen multi-item layouts: Long Strip and Masonry.
 - Manga-mode video previews now autoplay on focus/hover and resume from the last preview position, with steadier layout sizing during zoom.
+- Seamless video handoffs reuse the active frame to avoid first-frame flashes when switching modes.
 - Context-aware shortcut system where the same input can map to different actions in different modes.
 - Persistent metadata and thumbnail caching, plus in-memory decode and texture caches.
 - R-tree viewport virtualization, LOD bucketing, mipmapping, batch uploads, and bounded worker queues for dense layouts.
@@ -70,6 +71,7 @@ This project is intentionally optimized for one job: opening media fast, navigat
   - `keyframe` = fastest seeks, less precise
 - Optional hardware-decoder preference on Windows (D3D12/D3D11 with optional CUDA), with a config switch to force software decode.
 - Decode capability status is surfaced in the video playback UI.
+- Seamless mode switches keep the currently visible video frame instead of falling back to a first-frame thumbnail.
 - Improved multilingual subtitle/audio track labeling and selection behavior.
 - Manga-mode video previews can autoplay on focus/hover and resume from the last preview position while items remain visible.
 - In Long Strip / Masonry, videos use first-frame thumbnails until a focused live player is needed.

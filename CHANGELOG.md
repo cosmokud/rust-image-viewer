@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.3.9-rc.5] - 2026-05-05
+
+### Highlights
+
+- Seamless video transitions now reuse the active frame across mode switches to avoid thumbnail flashes.
+- Resume positions are captured more reliably when video players are recycled or playback becomes unavailable.
+- Video seeks wait for pipeline state stabilization to reduce playback glitches.
+
+### Changed
+
+- Manga video resume positions now come from the path-keyed preview cache during focused load requests.
+- Mode-switch placeholders avoid drawing first-frame thumbnails when resuming or performing seamless handoffs.
+- Resume-seek injection during viewer initialization was removed to avoid unintended playback jumps.
+- Removed outdated TODO note about GIF high-FPS rendering in dense layouts.
+
+### Fixed
+
+- Improved video seek stability by waiting for pending pipeline state transitions before issuing seeks.
+
 ## [v0.3.9-rc.4] - 2026-05-05
 
 ### Highlights
