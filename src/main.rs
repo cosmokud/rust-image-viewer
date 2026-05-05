@@ -5307,12 +5307,22 @@ impl ImageViewer {
         let player_paths = &self.manga_video_player_paths;
         let focused_manga_video = self.manga_focused_video_index;
         let mut removed_focused_manga_video = false;
-        self.manga_video_players.retain(|index, _| {
+        self.manga_video_players.retain(|index, player| {
             let should_remove = image_list
                 .get(*index)
                 .is_none_or(|path| player_paths.get(index) != Some(path) || path_is_targeted(path));
-            if should_remove && Some(*index) == focused_manga_video {
-                removed_focused_manga_video = true;
+            
+            if should_remove {
+                // Save the timestamp to RAM before destroying the list player
+                if let Some(path) = player_paths.get(index) {
+                    if let Some(current_pos) = player.position() {
+                        self.manga_video_preview_resume_by_path.insert(path.clone(), current_pos.as_secs_f64());
+                    }
+                }
+                
+                if Some(*index) == focused_manga_video {
+                    removed_focused_manga_video = true;
+                }
             }
             !should_remove
         });
@@ -7407,6 +7417,24 @@ impl ImageViewer {
     }
 
     fn set_video_playback_unavailable_for_path(&mut self, path: &PathBuf, reason: String) {
+        if let Some(player) = &self.video_player {
+            if let Some(path) = &self.current_video_path {
+                // Note: Use your actual method for fetching position, e.g., player.position_secs()
+                // Assuming it returns an f64 representing seconds:
+                if let Some(current_pos) = player.position() { 
+                    self.manga_video_preview_resume_by_path.insert(path.clone(), current_pos.as_secs_f64());
+                }
+            }
+        }
+        if let Some(player) = &self.video_player {
+            if let Some(path) = &self.current_video_path {
+                // Note: Use your actual method for fetching position, e.g., player.position_secs()
+                // Assuming it returns an f64 representing seconds:
+                if let Some(current_pos) = player.position() { 
+                    self.manga_video_preview_resume_by_path.insert(path.clone(), current_pos.as_secs_f64());
+                }
+            }
+        }
         self.video_player = None;
         self.current_video_path = Some(path.clone());
         self.pending_media_layout = false;
@@ -7448,6 +7476,14 @@ impl ImageViewer {
         if let Some(path) = self.image_list.get(self.current_index).cloned() {
             self.set_video_playback_unavailable_for_path(&path, reason);
         } else {
+            if let Some(player) = &mut self.video_player {
+                if let Some(path) = &self.current_video_path {
+                    // Grab the exact frame as a Duration, then convert to f64 seconds
+                    if let Some(current_pos) = player.position() { 
+                        self.manga_video_preview_resume_by_path.insert(path.clone(), current_pos.as_secs_f64());
+                    }
+                }
+            }
             self.video_player = None;
             self.pending_media_layout = false;
             self.video_playback_unavailable_reason = Some(reason);
@@ -12762,6 +12798,8 @@ impl ImageViewer {
             started_at: Instant::now(),
         });
 
+        let saved_position = self.manga_video_preview_resume_by_path.get(&path).copied();
+        
         let (
             prefer_hardware_decode,
             disable_hardware_decode,
@@ -12782,7 +12820,7 @@ impl ImageViewer {
                 output_bounds,
                 autoplay,
                 seamless_lod_refresh,
-                resume_position_secs: resume_position.map(|pos| pos.as_secs_f64()),
+                resume_position_secs: saved_position,
             });
     }
 
@@ -13142,6 +13180,9 @@ impl ImageViewer {
             started_at: Instant::now(),
         });
 
+
+        let saved_position = self.manga_video_preview_resume_by_path.get(&path).copied();
+
         self.media_load_coordinator.submit(MediaLoadRequest::Video {
             request_id,
             path,
@@ -13152,7 +13193,7 @@ impl ImageViewer {
             enable_cuda_decode,
             enable_d3d12_decode,
             output_bounds,
-            resume_position_secs,
+            resume_position_secs: saved_position,
         });
     }
 

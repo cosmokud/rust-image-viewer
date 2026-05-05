@@ -1784,6 +1784,11 @@ Ensure your GStreamer installation includes the playback elements (usually from 
         self.state.clear_frames();
         self.last_frame_pts = None;
 
+        // FIX: Wait for the pipeline to finish any pending state changes 
+        // (like reaching PAUSED on initial load) before seeking.
+        // If it's already playing/paused, this returns instantly so scrubbing stays smooth!
+        let _ = self.pipeline.state(gst::ClockTime::from_mseconds(500));
+
         let seek_result = self
             .pipeline
             .seek_simple(Self::seek_flags_for_mode(mode), target)
