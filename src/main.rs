@@ -6054,13 +6054,23 @@ impl ImageViewer {
                 })
             }
             MediaType::Video => {
-                let texture = self.video_texture.as_ref()?.clone();
-                let dims = self.video_texture_dims.or_else(|| {
-                    self.video_player.as_ref().and_then(|player| {
-                        let dims = player.dimensions();
-                        (dims.0 > 0 && dims.1 > 0).then_some(dims)
-                    })
-                })?;
+                // FIX: If we have an active fullscreen video texture, use it.
+                // OTHERWISE, if we are in manga/masonry mode, pull the active hovered video texture!
+                let (texture, dims) = if let Some(tex) = self.video_texture.as_ref() {
+                    let d = self.video_texture_dims.or_else(|| {
+                        self.video_player.as_ref().and_then(|player| {
+                            let dims = player.dimensions();
+                            (dims.0 > 0 && dims.1 > 0).then_some(dims)
+                        })
+                    })?;
+                    (tex.clone(), d)
+                } else if self.manga_mode {
+                    // Grab the exact frame the masonry video was just playing!
+                    let (tex, w, h) = self.manga_video_textures.get(&self.current_index)?;
+                    (tex.clone(), (*w, *h))
+                } else {
+                    return None;
+                };
 
                 Some(ModeSwitchPlaceholder {
                     texture,
@@ -6742,13 +6752,18 @@ impl ImageViewer {
                         continue;
                     };
 
+        // FIX: Check if we are seamlessly transitioning or resuming
+                    let is_retaining = self.retained_media_placeholder_visible || self.pending_mode_switch_placeholder.is_some();
+                    let is_resuming = self.manga_video_preview_resume_by_path.contains_key(&path);
+
                     let current_matches = self.current_media_type == Some(MediaType::Video)
                         && self
                             .image_list
                             .get(self.current_index)
                             .is_some_and(|current| current == &path)
-                        && (self.video_texture.is_none()
-                            || self.retained_media_placeholder_visible);
+                        && self.video_texture.is_none()
+                        && !is_retaining // Don't draw 1st frame over our seamless handoff!
+                        && !is_resuming; // Don't draw 1st frame if we are jumping to a saved time!
                     if current_matches {
                         self.pending_video_thumbnail_placeholder =
                             Some(PendingVideoThumbnailPlaceholder {
@@ -13182,6 +13197,11 @@ impl ImageViewer {
 
 
         let saved_position = self.manga_video_preview_resume_by_path.get(&path).copied();
+
+        // FIX: Destroy the 1st-frame thumbnail so the UI is forced to use our seamless masonry frame!
+        if saved_position.is_some() || self.pending_mode_switch_placeholder.is_some() {
+            self.pending_video_thumbnail_placeholder = None;
+        }
 
         self.media_load_coordinator.submit(MediaLoadRequest::Video {
             request_id,
