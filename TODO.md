@@ -11,9 +11,10 @@
 
 ## Performance
 
-- Optimze how metadata preloading works, make sure it's only caching important informations like resolution, media type, etc.
+- Optimize how metadata preloading and caching works, make sure it's only caching important informations like resolution, media type, etc, not generated thumbnails.
+- Optimize metadata probing for .WEBP files.
 
-## Known Bugs
+## Known Issues
 
 - **Fatal**: Clicking the arrow buttons in the breadcrumb address bar **crashes** the app.
 - The **"Masonry Warming Up"** modal does not appear consistently when navigating folders in Masonry mode. (Note: The core functionality remains intact; only the visual progress indicator is affected.)
