@@ -23,6 +23,7 @@ This project is intentionally optimized for one job: opening media fast, navigat
 - Breadcrumb address bar with back/forward/up navigation and a folder-history popup in fullscreen manga modes.
 - Windows cut/copy/paste for marked files with optional auto-unmark after paste.
 - Static images, animated GIF, animated WebP, and video playback in one app.
+- Optional hardware-accelerated video decode on Windows with D3D12/D3D11/CUDA preference and capability status readouts.
 - Two fullscreen multi-item layouts: Long Strip and Masonry.
 - Manga-mode video previews now autoplay on focus/hover and resume from the last preview position, with steadier layout sizing during zoom.
 - Context-aware shortcut system where the same input can map to different actions in different modes.
@@ -67,7 +68,8 @@ This project is intentionally optimized for one job: opening media fast, navigat
   - `adaptive` = keyframe while dragging, accurate on release
   - `accurate` = always frame-accurate seeks
   - `keyframe` = fastest seeks, less precise
-- Optional hardware-decoder preference on Windows, with a config switch to force software decode.
+- Optional hardware-decoder preference on Windows (D3D12/D3D11 with optional CUDA), with a config switch to force software decode.
+- Decode capability status is surfaced in the video playback UI.
 - Improved multilingual subtitle/audio track labeling and selection behavior.
 - Manga-mode video previews can autoplay on focus/hover and resume from the last preview position while items remain visible.
 - In Long Strip / Masonry, videos use first-frame thumbnails until a focused live player is needed.
@@ -150,6 +152,8 @@ Image viewing works without GStreamer, but video playback requires a GStreamer r
 4. Make sure the GStreamer binaries and plugins are discoverable.
 
 The app also tries to improve Windows-side discovery by refreshing `PATH` from the registry, probing common GStreamer install locations, and configuring plugin-scanner / registry paths automatically.
+
+D3D12/CUDA decode paths are opportunistic: if the runtime plugins or GPU drivers are unavailable, the app falls back to D3D11 or software decode automatically.
 
 ### Build from source
 
@@ -372,7 +376,7 @@ Delete `config.ini` if you want to regenerate it from the current defaults.
 | `default_volume`          | `remember` | Initial video volume (0.0 to 1.0) or `remember` to reuse the last stored volume.        |
 | `loop`                    | `true`     | Restart videos automatically at end-of-stream.                                          |
 | `seek_policy`             | `adaptive` | `adaptive`, `accurate`, or `keyframe`.                                                  |
-| `prefer_hardware_decode`  | `true`     | Prefer D3D11 decoders when available on Windows.                                        |
+| `prefer_hardware_decode`  | `true`     | Prefer hardware decoders on Windows (D3D12/D3D11 when available).                       |
 | `disable_hardware_decode` | `false`    | Disable hardware decoders completely. Overrides `prefer_hardware_decode`.               |
 | `videos_only_navigation`  | `true`     | In video-like playback mode, next/previous skip non-video-like files when enabled.      |
 
@@ -384,6 +388,16 @@ These values are updated automatically and used when `muted_by_default` or `defa
 | -------------- | ------- | --------------------------------- |
 | `muted_state`  | `true`  | Last muted state for video audio  |
 | `volume_state` | `0.0`   | Last volume level for video audio |
+
+### Performance settings
+
+| Key                           | Default | Meaning                                                             |
+| ----------------------------- | ------- | ------------------------------------------------------------------- |
+| `show_fps`                    | `false` | Enable the top-right FPS/diagnostics overlay.                       |
+| `show_fps_update_interval_ms` | `500`   | Refresh cadence for overlay FPS values in milliseconds.             |
+| `use_hardware_acceleration`   | `true`  | Master switch for hardware-accelerated paths where available.       |
+| `enable_d3d12`                | `true`  | Prefer GStreamer D3D12 decoders when available (fallback to D3D11). |
+| `enable_cuda`                 | `true`  | Enable CUDA decoder preference when runtime support is available.   |
 
 ### Quality settings
 
@@ -417,7 +431,7 @@ For the full startup flow, module-by-module design, cache hierarchy, optimizatio
 
 ### FPS / diagnostics overlay
 
-Set `show_fps = true` to enable the top-right overlay.
+Set `show_fps = true` to enable the top-right overlay. Use `show_fps_update_interval_ms` to control refresh cadence; the overlay uses the primary monitor refresh rate when available.
 
 Useful labels:
 
@@ -465,8 +479,9 @@ That keeps branch-to-branch comparisons honest.
 
 1. `Failed to create video pipeline` usually means the GStreamer playback elements were not found. Install the runtime and verify plugin discovery.
 2. If decode is unstable on your system, set `disable_hardware_decode = true`.
-3. If you want hardware decode but it is not being selected, keep `prefer_hardware_decode = true` and verify a compatible Windows decoder is available.
-4. If the app was launched from an environment with a stale `PATH`, restart it after installing GStreamer so the refreshed environment and plugin registry can be rebuilt.
+3. If you want hardware decode but it is not being selected, keep `prefer_hardware_decode = true`, enable `enable_d3d12`/`enable_cuda` as needed, and verify a compatible Windows decoder is available.
+4. If the decode capability status shows unavailable, check the GStreamer runtime and GPU drivers, then restart the app to refresh plugin discovery.
+5. If the app was launched from an environment with a stale `PATH`, restart it after installing GStreamer so the refreshed environment and plugin registry can be rebuilt.
 
 ### Config file issues
 

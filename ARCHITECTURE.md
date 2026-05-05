@@ -26,26 +26,26 @@ The architecture is intentionally biased toward "what helps the next visible fra
 
 ## 2. Codebase map
 
-| Path                           | Responsibility                                                                                                   | Why it matters                                                                      |
-| ------------------------------ | ---------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
-| `build.rs`                     | Build-time config-template sync, Windows icon embedding, delay-loaded GStreamer DLL linkage                      | Keeps runtime config in sync and reduces image-only startup baggage on Windows/MSVC |
-| `src/main.rs`                  | Main application state, UI loop, solo mode, Long Strip, Masonry, window transitions, async coordinator glue      | This is the orchestration center of the app                                         |
-| `src/config.rs`                | INI parsing, defaults, action-first shortcut model, save/load, quality and behavior settings                     | Configuration affects nearly every subsystem                                        |
-| `src/app_dirs.rs`              | OS-aware app config/local-data directory resolution via `directories::BaseDirs`                                  | Centralizes storage paths and fallback behavior across config and cache subsystems  |
-| `src/async_runtime.rs`         | Shared Tokio runtime with thread fallback                                                                        | Standardizes background execution without blocking the UI thread                    |
-| `src/image_loader.rs`          | Static image decode, GIF handling, animated WebP helpers, directory enumeration                                  | Owns the image hot path                                                             |
-| `src/video_player.rs`          | GStreamer live playback and frame extraction                                                                     | Owns the focused video path                                                         |
-| `src/media_index.rs`           | Same-directory media list cache                                                                                  | Removes repeated rescans during next/previous navigation                            |
-| `src/metadata_cache.rs`        | Persistent dimensions and thumbnail cache backed by `redb`                                                       | Makes warm opens and repeat browsing cheaper across sessions                        |
-| `src/manga_loader.rs`          | Background dimension probing, prioritized strip/masonry decode, LOD bookkeeping, retry logic, texture-cache type | Owns multi-item throughput                                                          |
-| `src/manga_spatial.rs`         | `rstar` spatial index wrapper                                                                                    | Keeps visibility queries from scaling linearly in huge folders                      |
-| `src/perf_metrics.rs`          | Rolling p50/p95-style runtime metrics                                                                            | Feeds the in-app diagnostics overlay                                                |
-| `src/single_instance.rs`       | Windows single-instance mutex and IPC handoff                                                                    | Lets secondary launches reuse the primary window                                    |
-| `src/windows_env.rs`           | Windows PATH refresh and maximize helpers                                                                        | Makes GStreamer discovery and native window transitions more reliable               |
-| `assets/config.ini`            | Canonical config template                                                                                        | Source of truth for user-facing configuration                                       |
-| `build-installers.ps1`         | Windows packaging orchestrator for prebuilt binary + NSIS output variants                                        | Standardizes release packaging inputs/outputs across local and CI builds            |
-| `packaging/nsis/installer.nsi` | NSIS template including upgrade/migration logic (legacy WiX/MSI detection and uninstall path)                    | Defines installer/uninstaller behavior and cross-generation upgrade safety          |
-| `.github/workflows/*.yml`      | Tag-gated release automation and manual tagged deploy workflow                                                   | Prevents accidental overwrite and keeps release publishing reproducible             |
+| Path                           | Responsibility                                                                                                                                          | Why it matters                                                                      |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
+| `build.rs`                     | Build-time config-template sync, optional AppData sync (`RIV_SYNC_APPDATA_CONFIG_AT_BUILD`), Windows icon embedding, delay-loaded GStreamer DLL linkage | Keeps runtime config in sync and reduces image-only startup baggage on Windows/MSVC |
+| `src/main.rs`                  | Main application state, UI loop, solo mode, Long Strip, Masonry, window transitions, async coordinator glue                                             | This is the orchestration center of the app                                         |
+| `src/config.rs`                | INI parsing, defaults, action-first shortcut model, save/load, quality and behavior settings                                                            | Configuration affects nearly every subsystem                                        |
+| `src/app_dirs.rs`              | OS-aware app config/local-data directory resolution via `directories::BaseDirs`                                                                         | Centralizes storage paths and fallback behavior across config and cache subsystems  |
+| `src/async_runtime.rs`         | Shared Tokio runtime with thread fallback                                                                                                               | Standardizes background execution without blocking the UI thread                    |
+| `src/image_loader.rs`          | Static image decode, GIF handling, animated WebP helpers, directory enumeration                                                                         | Owns the image hot path                                                             |
+| `src/video_player.rs`          | GStreamer live playback and frame extraction                                                                                                            | Owns the focused video path                                                         |
+| `src/media_index.rs`           | Same-directory media list cache                                                                                                                         | Removes repeated rescans during next/previous navigation                            |
+| `src/metadata_cache.rs`        | Persistent dimensions and thumbnail cache backed by `redb`                                                                                              | Makes warm opens and repeat browsing cheaper across sessions                        |
+| `src/manga_loader.rs`          | Background dimension probing, prioritized strip/masonry decode, LOD bookkeeping, retry logic, texture-cache type                                        | Owns multi-item throughput                                                          |
+| `src/manga_spatial.rs`         | `rstar` spatial index wrapper                                                                                                                           | Keeps visibility queries from scaling linearly in huge folders                      |
+| `src/perf_metrics.rs`          | Rolling p50/p95-style runtime metrics                                                                                                                   | Feeds the in-app diagnostics overlay                                                |
+| `src/single_instance.rs`       | Windows single-instance mutex and IPC handoff                                                                                                           | Lets secondary launches reuse the primary window                                    |
+| `src/windows_env.rs`           | Windows PATH refresh and maximize helpers                                                                                                               | Makes GStreamer discovery and native window transitions more reliable               |
+| `assets/config.ini`            | Canonical config template                                                                                                                               | Source of truth for user-facing configuration                                       |
+| `build-installers.ps1`         | Windows packaging orchestrator for prebuilt binary + NSIS output variants                                                                               | Standardizes release packaging inputs/outputs across local and CI builds            |
+| `packaging/nsis/installer.nsi` | NSIS template including upgrade/migration logic (legacy WiX/MSI detection and uninstall path)                                                           | Defines installer/uninstaller behavior and cross-generation upgrade safety          |
+| `.github/workflows/*.yml`      | Tag-gated release automation and manual tagged deploy workflow                                                                                          | Prevents accidental overwrite and keeps release publishing reproducible             |
 
 Two structural observations are important:
 
@@ -606,6 +606,7 @@ Important steps:
 - build a correct file URI with `glib::filename_to_uri`
 - prefer `playbin3`, fall back to `playbin`
 - attach a custom video sink bin with `videoconvert -> videoscale -> appsink`
+- on Windows, optionally negotiate D3D11 appsink caps for zero-copy textures and extract native texture handles when supported
 - request RGBA + sRGB colorimetry
 - attach an audio bin with volume control and `autoaudiosink`
 
@@ -620,7 +621,7 @@ Before live playback, the video subsystem tries to make GStreamer discovery resi
 - set `GST_PLUGIN_SCANNER` if needed
 - ensure `GST_REGISTRY` points at a writable per-user path
 
-The viewer can also prefer or disable D3D11 hardware decoders through `GST_PLUGIN_FEATURE_RANK`.
+The viewer can prefer or disable hardware decoders through `GST_PLUGIN_FEATURE_RANK`. On Windows it ranks D3D12 first when available, falls back to D3D11, and can optionally raise CUDA decoders. Capability detection checks for the runtime plus D3D12/CUDA support and feeds the in-app status readout.
 
 ### 10.3 First-frame extraction for placeholders
 
@@ -693,6 +694,8 @@ On Windows, native maximize/restore transitions can be used as part of fullscree
 ### 12.1 Runtime diagnostics
 
 `src/perf_metrics.rs` stores duration samples in `hdrhistogram` windows so the overlay can show percentile-style behavior instead of averages only.
+
+Overlay FPS values are throttled via `show_fps_update_interval_ms` and can use the primary monitor refresh rate for steadier readouts.
 
 The overlay reports metrics such as:
 

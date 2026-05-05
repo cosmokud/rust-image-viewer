@@ -2,6 +2,36 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.3.9-rc.4] - 2026-05-05
+
+### Highlights
+
+- Windows video decoding now prefers D3D12 when available with an optional CUDA path, plus in-app capability status readouts.
+- FPS overlay refresh is throttled and monitor-aware for steadier diagnostics.
+- Video resume and preview handling are more stable across seek and mode transitions.
+
+### Added
+
+- Performance config switches: `show_fps_update_interval_ms`, `use_hardware_acceleration`, `enable_d3d12`, `enable_cuda`.
+- Video decode capability detection for D3D12 and CUDA availability.
+- D3D11 zero-copy appsink path for decoder-backed video frames when supported.
+
+### Changed
+
+- Decoder ranking now considers D3D12 first, then D3D11, with optional CUDA ranking; hardware decode can be fully disabled.
+- FPS overlay uses the primary monitor refresh rate when smoothing display.
+- Manga preview resume positions are stored by path to survive index churn during strip/masonry navigation.
+- Build-time AppData config sync is now opt-in via `RIV_SYNC_APPDATA_CONFIG_AT_BUILD`.
+
+### Fixed
+
+- Video resume seeks now ignore tiny offsets and reset PTS on accurate seeks to avoid timing glitches.
+- Manga video preview textures now clear and rebind more safely during mode switches.
+
+### Known issues
+
+- GIFs with very high custom FPS can render too quickly in dense strip/masonry layouts.
+
 ## [v0.3.9-rc.3] - 2026-05-04
 
 ### Highlights
