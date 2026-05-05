@@ -12779,7 +12779,6 @@ impl ImageViewer {
         initial_volume: f64,
         autoplay: bool,
         seamless_lod_refresh: bool,
-        resume_position: Option<Duration>,
     ) {
         if !gstreamer_runtime_available() {
             self.clear_pending_manga_video_load();
@@ -13176,17 +13175,6 @@ impl ImageViewer {
             enable_d3d12_decode,
         ) = self.effective_video_decoder_preferences();
         let output_bounds = self.async_video_output_bounds_for_solo();
-        let resume_position_secs = self
-            .manga_video_preview_resume_by_path
-            .get(&path)
-            .copied()
-            .or_else(|| {
-                self.image_list
-                    .iter()
-                    .position(|candidate| candidate == &path)
-                    .and_then(|idx| self.manga_video_preview_resume_secs.get(&idx).copied())
-            })
-            .filter(|secs| secs.is_finite() && *secs >= 0.0);
 
         self.pending_media_load = Some(PendingMediaLoad {
             request_id,
@@ -17462,7 +17450,6 @@ impl ImageViewer {
                     volume,
                     true,
                     false,
-                    resume_position,
                 );
             }
 
