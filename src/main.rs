@@ -3226,7 +3226,7 @@ impl ImageViewer {
     const ANIMATED_IMAGE_CUSTOM_DEFAULT_FPS: u32 = 30;
     const ANIMATED_GIF_CUSTOM_DEFAULT_FPS: u32 = 12;
     const ANIMATED_IMAGE_CUSTOM_MAX_FPS: u32 = 240;
-    const MEDIA_SLIDER_WHEEL_GUARD_DURATION: Duration = Duration::from_millis(140);
+    const MEDIA_SLIDER_WHEEL_GUARD_DURATION: Duration = Duration::from_millis(500);
 
     fn folder_navigation_ui_enabled(&self) -> bool {
         self.manga_mode && self.is_fullscreen
