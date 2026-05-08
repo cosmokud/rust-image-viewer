@@ -16,7 +16,4 @@
 
 ## Known Issues
 
-- **Fatal**: Clicking the arrow buttons in the breadcrumb address bar **crashes** the app.
-- The **"Masonry Warming Up"** modal does not appear consistently when navigating folders in Masonry mode. (Note: The core functionality remains intact; only the visual progress indicator is affected.)
-- 'Open Current File Location' spawns two windows instead of one.
 - In rare cases, the video bar will be stuck indefinitely (very hard to reproduce).
