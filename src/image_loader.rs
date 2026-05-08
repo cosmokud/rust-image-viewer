@@ -3,7 +3,7 @@
 //! Optimized for low memory usage while maintaining functionality.
 
 use std::fs::File;
-use std::io::{BufRead, BufReader, Cursor, Seek};
+use std::io::{BufRead, BufReader, Cursor, Read, Seek};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -611,20 +611,27 @@ impl LoadedImage {
     /// Check whether a WebP file contains animation without fully decoding it.
     /// This is cheap — it only reads the file header, not any frame data.
     pub fn is_animated_webp(path: &Path) -> bool {
-        use image::codecs::webp::WebPDecoder;
-
         if !extension_is(path, "webp") {
             return false;
         }
 
-        let reader = match open_media_reader(path) {
-            Ok(r) => r,
+        // WebP animation is signaled by VP8X feature bit 0x02 at byte 20.
+        // Read only the first 21 bytes instead of initializing a full decoder.
+        let mut file = match File::open(path) {
+            Ok(f) => f,
             Err(_) => return false,
         };
-        match WebPDecoder::new(reader) {
-            Ok(dec) => dec.has_animation(),
-            Err(_) => false,
+        let mut header = [0u8; 21];
+        if file.read_exact(&mut header).is_err() {
+            return false;
         }
+        if &header[0..4] != b"RIFF" || &header[8..12] != b"WEBP" {
+            return false;
+        }
+        if &header[12..16] != b"VP8X" {
+            return false;
+        }
+        (header[20] & 0x02) != 0
     }
 
     fn load_webp_first_frame(
