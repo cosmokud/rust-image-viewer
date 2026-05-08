@@ -28,7 +28,7 @@ This project is intentionally optimized for one job: opening media fast, navigat
 - Manga-mode video previews now autoplay on focus/hover and resume from the last preview position, with steadier layout sizing during zoom.
 - Seamless video handoffs reuse the active frame to avoid first-frame flashes when switching modes.
 - Context-aware shortcut system where the same input can map to different actions in different modes.
-- Persistent metadata and thumbnail caching, plus in-memory decode and texture caches.
+- Persistent metadata caching (dimensions, file type, animation), plus in-memory decode and texture caches.
 - R-tree viewport virtualization, LOD bucketing, mipmapping, batch uploads, and bounded worker queues for dense layouts.
 - Built-in FPS / diagnostics overlay for runtime diagnostics.
 
@@ -43,6 +43,7 @@ This project is intentionally optimized for one job: opening media fast, navigat
 - Smart initial sizing: open at 100% when possible, otherwise fit to the screen.
 - Drag and drop support.
 - Single-instance mode that forwards file-open requests from secondary launches to the primary window.
+- Folder scans include symlinked files and directories for navigation.
 - Breadcrumb address bar for fullscreen manga modes with back/forward/up navigation and history popup.
 - Windows cut/copy/paste for marked files; paste into the current folder via Ctrl+V or the menu.
 - Title bar menu entry for `Edit Settings`, which opens the active `config.ini` in the default editor.
@@ -64,7 +65,8 @@ This project is intentionally optimized for one job: opening media fast, navigat
 - Play / pause, seek, mute, volume, looping, and hover-driven controls.
 - Deferred audio-track switching to reduce playback stutter during active transitions.
 - `videos_only_navigation` mode for next/previous in video-like playback (videos, GIF, animated WebP).
-- GIF/animated-WebP FPS override controls with presets and slider for playback-rate tuning.
+- GIF/animated-WebP FPS override controls with presets, slider, and manual input for playback-rate tuning.
+- Volume and FPS sliders support scroll-wheel adjustments with a guard against accidental changes.
 - Adaptive seek policy support:
   - `adaptive` = keyframe while dragging, accurate on release
   - `accurate` = always frame-accurate seeks
@@ -425,7 +427,7 @@ Supported filter values:
 
 ## Performance Architecture
 
-Performance here comes from layering several smaller systems: metadata-first opening, persistent and in-memory caches, latest-only async coordinators, bounded worker queues, R-tree viewport queries, LOD-bucketed texture requests, selective mipmaps, and adaptive upload/caching policy for Long Strip and Masonry.
+Performance here comes from layering several smaller systems: metadata-first opening, persistent metadata cache plus in-memory caches, latest-only async coordinators, bounded worker queues, R-tree viewport queries, LOD-bucketed texture requests, selective mipmaps, and adaptive upload/caching policy for Long Strip and Masonry.
 
 For the full startup flow, module-by-module design, cache hierarchy, optimization catalogue, and third-party crate map, see [ARCHITECTURE.md](ARCHITECTURE.md).
 
@@ -493,7 +495,7 @@ That keeps branch-to-branch comparisons honest.
 
 ### Cache issues
 
-1. If metadata or thumbnails seem stale, delete the metadata cache file in the app local-data directory (`%LOCALAPPDATA%\rust-image-viewer\metadata_cache.redb` on Windows).
+1. If metadata seems stale, delete the metadata cache file in the app local-data directory (`%LOCALAPPDATA%\rust-image-viewer\metadata_cache.redb` on Windows). The app also resets the cache automatically when it detects an old schema or corruption.
 2. If you want to cap disk usage more aggressively, lower `metadata_cache_max_size_mb`.
 
 ### Crash logs

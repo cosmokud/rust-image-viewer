@@ -2,6 +2,31 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.3.9-rc.7] - 2026-05-10
+
+### Highlights
+
+- Metadata cache records were simplified (dimensions + file type + animation flag) with automatic reset on old schema or corruption.
+- Animated GIF/WebP FPS overrides now include manual input and safer slider/wheel interaction.
+- Directory scans now include symlinked files and folders for navigation.
+
+### Added
+
+- Manual FPS input for animated image playback overrides.
+- Symlink-aware directory enumeration for media lists.
+
+### Changed
+
+- Metadata cache file type and animation detection now read headers only, and the old thumbnail schema is retired.
+- Masonry metadata warmup defers its first tick to avoid heavy work before the first paint.
+- Slider UI now uses smoother visuals and a scroll-wheel guard for volume and FPS controls.
+- Windows CJK font loading now revalidates the active path before queuing the font load.
+
+### Fixed
+
+- Corrupted or legacy metadata cache files are deleted and recreated on open.
+- WebP animation detection avoids full decode by inspecting header chunks.
+
 ## [v0.3.9-rc.6] - 2026-05-09
 
 ### Highlights
@@ -170,25 +195,15 @@ All notable changes to this project will be documented in this file.
 
 - Added a fullscreen breadcrumb address bar with back/forward/up navigation and a hoverable folder-history popup for fast folder travel in manga modes.
 - Added Windows cut/copy/paste for marked files, including Ctrl+V handling and optional auto-unmark after paste.
-- Improved video playback stability with buffered local playback, seek-friendly frame delivery, and bounded output sizing.
-
-### Added
 
 - Folder navigation history tracking with a back-history popup and truncated path labels.
 - Breadcrumb segment menus for quick jumps into child folders.
-- Windows clipboard paste into the current folder plus the `auto_unmark_after_paste` setting.
-- `remember` options for video mute/volume and persisted `[State]` values in `config.ini`.
 
 ### Changed
-
-- Video playback buffering and seek behavior (appsink buffering limits, preroll priming, and keyframe snap).
-- Directory scanning and navigation ordering to avoid child-folder scans and keep folder entries stable.
-- Folder placeholder loading indicator now uses a static hourglass.
 
 ### Fixed
 
 - Directory resolution and refresh after paste/delete operations.
-- Shortcut handling for Ctrl+V paste detection on Windows.
 
 ## [v0.3.6] - 2026-04-23
 

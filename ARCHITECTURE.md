@@ -36,7 +36,7 @@ The architecture is intentionally biased toward "what helps the next visible fra
 | `src/image_loader.rs`          | Static image decode, GIF handling, animated WebP helpers, directory enumeration                                                                         | Owns the image hot path                                                             |
 | `src/video_player.rs`          | GStreamer live playback and frame extraction                                                                                                            | Owns the focused video path                                                         |
 | `src/media_index.rs`           | Same-directory media list cache                                                                                                                         | Removes repeated rescans during next/previous navigation                            |
-| `src/metadata_cache.rs`        | Persistent dimensions and thumbnail cache backed by `redb`                                                                                              | Makes warm opens and repeat browsing cheaper across sessions                        |
+| `src/metadata_cache.rs`        | Persistent metadata cache (dimensions, file type, animation) backed by `redb`                                                                           | Makes warm opens and repeat browsing cheaper across sessions                        |
 | `src/manga_loader.rs`          | Background dimension probing, prioritized strip/masonry decode, LOD bookkeeping, retry logic, texture-cache type                                        | Owns multi-item throughput                                                          |
 | `src/manga_spatial.rs`         | `rstar` spatial index wrapper                                                                                                                           | Keeps visibility queries from scaling linearly in huge folders                      |
 | `src/perf_metrics.rs`          | Rolling p50/p95-style runtime metrics                                                                                                                   | Feeds the in-app diagnostics overlay                                                |
@@ -196,7 +196,7 @@ Placeholder sources:
 - a mode-switch placeholder captured from the current texture when leaving strip/masonry for solo view
 - the currently visible solo image or video frame when next/previous navigation should not flash blank
 - a cached video first-frame thumbnail while the live `VideoPlayer` is still starting
-- a cached static image thumbnail when a full image decode is not ready yet
+- a cached decoded-image entry when one exists before the full decode is ready
 - during seamless video handoffs, the active video texture (solo or masonry) is reused and first-frame thumbnails are suppressed
 
 This is why the user can often move between items without seeing a blank frame even when the destination media is not fully loaded yet.
@@ -208,8 +208,9 @@ For `MediaType::Image`, `load_media_internal()` computes a target texture side b
 It then tries, in order:
 
 1. `decoded_image_cache` in `src/main.rs`
-2. persistent static thumbnail cache from `src/metadata_cache.rs`
-3. asynchronous first-frame decode through `MediaLoadCoordinator`
+2. asynchronous first-frame decode through `MediaLoadCoordinator`
+
+The persistent metadata cache only stores dimensions, file type, and animation flags; it no longer stores thumbnails.
 
 Important details:
 
@@ -241,7 +242,7 @@ What it does:
 - computes ahead/behind probe counts from the current expected visible-item equivalent
 - biases around the current file rather than the whole folder
 - avoids probing GIFs for the single-frame image cache path
-- prewarms image first-frame caches and video thumbnail caches for nearby neighbors
+- prewarms image decodes and video thumbnail extraction for nearby neighbors
 
 This is one of the reasons rapid next/previous navigation feels faster on warm folders.
 
@@ -481,27 +482,16 @@ Backed by `redb`, stored by default at:
 
 Tables:
 
-- media dimensions
-- video first-frame RGBA thumbnails
-- static-image RGBA thumbnails keyed by texture-side bucket
+- media dimensions (width, height, file type code, animated flag)
 
 Validation and bounds:
 
-- file fingerprint: size + modified seconds + modified nanoseconds
-- dimension TTL: `30 days`
-- static thumbnail TTL: `30 days`
-- video thumbnail TTL: `14 days`
-- video thumbnail key tag: `v3`
+- old thumbnail tables or invalid records trigger cache deletion and rebuild
+- corrupted stores are deleted and recreated on open
 - prune interval: `60 s`
+- max entries: `80,000`
 - writer queue capacity: `512`
 - default size limit: `1024 MiB`, configurable from `config.ini`
-
-There is also a short-lived in-memory fingerprint cache:
-
-- TTL: `750 ms`
-- cap: `4096` entries
-
-That small cache exists specifically to cut repeated `metadata()` syscalls during hot navigation bursts.
 
 ### 8.2 Solo decoded-image cache (`src/main.rs`)
 
@@ -734,14 +724,12 @@ The viewer's speed comes from many cooperating techniques rather than one big tr
 | Technique                             | Where                                  | What it does                                                                  | Why it exists                                                    |
 | ------------------------------------- | -------------------------------------- | ----------------------------------------------------------------------------- | ---------------------------------------------------------------- |
 | Delay-loaded GStreamer DLLs           | `build.rs`                             | Defers Windows/MSVC video DLL mapping until first real video use              | Keeps image-only startup and idle memory lower                   |
-| Metadata-first open                   | `src/main.rs`, `src/metadata_cache.rs` | Uses cached dimensions and thumbnails before full decode                      | Produces faster first paint and fewer synchronous probes         |
+| Metadata-first open                   | `src/main.rs`, `src/metadata_cache.rs` | Uses cached dimensions and file-type hints before full decode                 | Produces faster first paint and fewer synchronous probes         |
 | Latest-only media coordinator         | `src/main.rs`                          | Collapses solo media load requests to the newest one                          | Prevents stale navigation backlog                                |
 | Latest-only solo probe coordinator    | `src/main.rs`                          | Keeps neighbor prewarming aligned with the newest current item                | Prevents wasted preprobe work                                    |
 | Latest-only focused-video coordinator | `src/main.rs`                          | Ensures only the current manga-focused video finishes startup                 | Avoids stale video-player creation                               |
 | Directory index LRU                   | `src/media_index.rs`                   | Reuses same-folder media lists                                                | Removes repeated directory rescans                               |
-| Persistent dimension cache            | `src/metadata_cache.rs`                | Stores dimensions with fingerprint validation                                 | Avoids repeated header or discoverer probes                      |
-| Persistent thumbnail pyramid          | `src/metadata_cache.rs`                | Stores static-image and video first-frame thumbnails per texture-side bucket  | Avoids repeated decode+resize across sessions                    |
-| Fingerprint micro-cache               | `src/metadata_cache.rs`                | Reuses recent file metadata lookups for `750 ms`                              | Cuts repeated filesystem syscalls during hot navigation          |
+| Persistent dimension cache            | `src/metadata_cache.rs`                | Stores dimensions with file type and animation flags, pruning invalid entries | Avoids repeated header or discoverer probes                      |
 | Solo decoded-image cache              | `src/main.rs`                          | Keeps warm first-frame decodes for recent solo items                          | Makes back/forward navigation very cheap                         |
 | Directional look-ahead / look-behind  | `src/manga_loader.rs`                  | Prefetches more in the current movement direction                             | Matches user behavior better than symmetric windows              |
 | Large-jump cancellation               | `src/manga_loader.rs`                  | Cancels outdated strip/masonry work on far jumps                              | Optimizes destination latency                                    |
@@ -812,7 +800,7 @@ The viewer's speed comes from many cooperating techniques rather than one big tr
 | `hdrhistogram`      | Percentile-friendly runtime metric windows                                 |
 | `jwalk`             | Fast directory walking for media enumeration                               |
 | `smallvec`          | Small stack-backed vectors in drawing and geometry helper code             |
-| `redb`              | Persistent on-disk metadata and thumbnail cache                            |
+| `redb`              | Persistent on-disk metadata cache                                          |
 | `moka`              | In-memory solo decoded-image cache with weighted capacity control          |
 | `rstar`             | R-tree implementation for viewport virtualization                          |
 
