@@ -2430,6 +2430,11 @@ struct ImageViewer {
     seek_was_playing: bool,
     /// Whether user is dragging the volume slider
     is_volume_dragging: bool,
+    /// Smoothed visual value used to animate the volume slider thumb.
+    volume_slider_visual: f32,
+    /// Short guard window after wheel-adjusting FPS/volume sliders to avoid accidental
+    /// main-view zoom when the pointer leaves the bar quickly.
+    media_slider_wheel_guard_until: Option<Instant>,
     /// Deferred solo-video audio switch to reduce visible stutter on large files.
     pending_solo_audio_track_switch: Option<(Instant, usize, i32)>,
     /// Deferred manga-video audio switches keyed by image-list index.
@@ -2974,6 +2979,8 @@ impl Default for ImageViewer {
             last_seek_sent_at: Instant::now(),
             seek_was_playing: false,
             is_volume_dragging: false,
+            volume_slider_visual: 0.0,
+            media_slider_wheel_guard_until: None,
             pending_solo_audio_track_switch: None,
             pending_manga_audio_track_switches: HashMap::new(),
             // Resize state fields
@@ -3219,6 +3226,7 @@ impl ImageViewer {
     const ANIMATED_IMAGE_CUSTOM_DEFAULT_FPS: u32 = 30;
     const ANIMATED_GIF_CUSTOM_DEFAULT_FPS: u32 = 12;
     const ANIMATED_IMAGE_CUSTOM_MAX_FPS: u32 = 240;
+    const MEDIA_SLIDER_WHEEL_GUARD_DURATION: Duration = Duration::from_millis(140);
 
     fn folder_navigation_ui_enabled(&self) -> bool {
         self.manga_mode && self.is_fullscreen
@@ -8708,6 +8716,16 @@ impl ImageViewer {
         }
 
         false
+    }
+
+    fn media_slider_wheel_guard_active(&self) -> bool {
+        self.media_slider_wheel_guard_until
+            .is_some_and(|until| Instant::now() < until)
+    }
+
+    fn arm_media_slider_wheel_guard(&mut self) {
+        self.media_slider_wheel_guard_until =
+            Some(Instant::now() + Self::MEDIA_SLIDER_WHEEL_GUARD_DURATION);
     }
 
     fn title_bar_ui_blocking(&self) -> bool {
@@ -20978,11 +20996,13 @@ impl ImageViewer {
 
             (normal, ctrl, shift)
         });
-        let (wheel_steps, wheel_steps_ctrl, wheel_steps_shift) = if masonry_preload_input_blocked {
-            (0.0, 0.0, 0.0)
-        } else {
-            (raw_wheel_steps, raw_wheel_steps_ctrl, raw_wheel_steps_shift)
-        };
+        let slider_wheel_guard_active = self.media_slider_wheel_guard_active();
+        let (wheel_steps, wheel_steps_ctrl, wheel_steps_shift) =
+            if masonry_preload_input_blocked || slider_wheel_guard_active {
+                (0.0, 0.0, 0.0)
+            } else {
+                (raw_wheel_steps, raw_wheel_steps_ctrl, raw_wheel_steps_shift)
+            };
 
         // In manga fullscreen mode, the wheel is owned by our custom inertial scroller.
         // Remove wheel events so other widgets don't accidentally react to them in the same frame.
@@ -22931,6 +22951,7 @@ impl ImageViewer {
         let mut right_click_navigated = false;
         let mut ctrl_secondary_single_file_menu_pos: Option<egui::Pos2> = None;
         let mut goto_bound_folder_traverse_requested = false;
+        let slider_wheel_guard_active = self.media_slider_wheel_guard_active();
 
         ctx.input(|input| {
             let ctrl = input.modifiers.ctrl;
@@ -23101,6 +23122,7 @@ impl ImageViewer {
                         InputBinding::ScrollUp => {
                             if !manga_fullscreen
                                 && !pointer_over_shortcut_ui
+                                && !slider_wheel_guard_active
                                 && input.smooth_scroll_delta.y > 0.0
                             {
                                 if action != Action::ZoomIn && action != Action::ZoomOut {
@@ -23111,6 +23133,7 @@ impl ImageViewer {
                         InputBinding::ScrollDown => {
                             if !manga_fullscreen
                                 && !pointer_over_shortcut_ui
+                                && !slider_wheel_guard_active
                                 && input.smooth_scroll_delta.y < 0.0
                             {
                                 if action != Action::ZoomIn && action != Action::ZoomOut {
@@ -24921,6 +24944,22 @@ impl ImageViewer {
 
                     // Volume slider
                     let volume = player.volume() as f32;
+                    if !self.volume_slider_visual.is_finite() {
+                        self.volume_slider_visual = volume;
+                    }
+                    if self.is_volume_dragging {
+                        self.volume_slider_visual = volume;
+                    } else {
+                        let dt = ctx.input(|i| i.stable_dt).clamp(0.0, 0.1);
+                        let blend = (1.0 - (-14.0 * dt).exp()).clamp(0.0, 1.0);
+                        self.volume_slider_visual += (volume - self.volume_slider_visual) * blend;
+                        if (volume - self.volume_slider_visual).abs() < 0.0005 {
+                            self.volume_slider_visual = volume;
+                        } else {
+                            ctx.request_repaint();
+                        }
+                    }
+                    let volume_visual = self.volume_slider_visual.clamp(0.0, 1.0);
                     let vol_slider_width = 80.0;
                     let vol_slider_height = 4.0;
                     let (vol_rect, vol_response) = ui.allocate_exact_size(
@@ -24941,7 +24980,7 @@ impl ImageViewer {
                         .rect_filled(vol_bar, 2.0, egui::Color32::from_gray(60));
 
                     // Volume level
-                    let vol_width = vol_bar.width() * volume;
+                    let vol_width = vol_bar.width() * volume_visual;
                     if vol_width > 0.0 {
                         let vol_progress = egui::Rect::from_min_size(
                             vol_bar.min,
@@ -24971,6 +25010,7 @@ impl ImageViewer {
                             self.config
                                 .update_video_state(player.is_muted(), player.volume());
                             self.pending_idle_config_sync = true;
+                            self.volume_slider_visual = new_vol;
                         }
                     }
                     if vol_response.hovered() {
@@ -25003,7 +25043,7 @@ impl ImageViewer {
                         });
                         if wheel_steps != 0.0 {
                             let current_volume = player.volume();
-                            let step = 0.005f64;
+                            let step = 0.05f64;
                             let next_volume =
                                 (current_volume + wheel_steps as f64 * step).clamp(0.0, 1.0);
                             if (next_volume - current_volume).abs() > f64::EPSILON {
@@ -25014,6 +25054,7 @@ impl ImageViewer {
                                 self.config
                                     .update_video_state(player.is_muted(), player.volume());
                                 self.pending_idle_config_sync = true;
+                                self.arm_media_slider_wheel_guard();
                                 ctx.request_repaint();
                             }
                         }
@@ -25159,10 +25200,13 @@ impl ImageViewer {
         }
         if slider_response.hovered() {
             let wheel_delta = ctx.input(|i| i.smooth_scroll_delta.y);
-            if wheel_delta > 0.0 {
-                custom_fps = custom_fps.saturating_add(1).min(max_custom_fps);
-            } else if wheel_delta < 0.0 {
-                custom_fps = custom_fps.saturating_sub(1).max(1);
+            if wheel_delta != 0.0 {
+                self.arm_media_slider_wheel_guard();
+                if wheel_delta > 0.0 {
+                    custom_fps = custom_fps.saturating_add(1).min(max_custom_fps);
+                } else {
+                    custom_fps = custom_fps.saturating_sub(1).max(1);
+                }
             }
         }
 
@@ -26525,6 +26569,7 @@ impl ImageViewer {
             let pointer_pos_for_wheel = ctx.input(|i| i.pointer.hover_pos());
             let pointer_over_shortcut_ui_for_wheel =
                 self.pointer_over_shortcut_blocking_ui(pointer_pos_for_wheel, screen_rect);
+            let slider_wheel_guard_active = self.media_slider_wheel_guard_active();
 
             const WHEEL_POINTS_PER_LINE: f32 = 50.0;
             const WHEEL_MAX_STEPS_PER_EVENT: f32 = 6.0;
@@ -26577,7 +26622,10 @@ impl ImageViewer {
             };
 
             let mut handled_modifier_wheel = false;
-            if !title_ui_blocking && !pointer_over_shortcut_ui_for_wheel {
+            if !title_ui_blocking
+                && !pointer_over_shortcut_ui_for_wheel
+                && !slider_wheel_guard_active
+            {
                 if regular_ctrl_scroll_pan_bound && wheel_steps_ctrl_effective != 0.0 {
                     let pan_step = self.modifier_wheel_pan_step(
                         wheel_steps_ctrl_effective,
@@ -26641,6 +26689,7 @@ impl ImageViewer {
                 && !shift_held
                 && !alt_held
                 && !pointer_over_shortcut_ui_for_wheel
+                && !slider_wheel_guard_active
             {
                 let scroll_delta = ctx.input(|i| i.smooth_scroll_delta.y);
                 if scroll_delta != 0.0 {
