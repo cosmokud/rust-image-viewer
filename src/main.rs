@@ -24404,8 +24404,13 @@ impl ImageViewer {
                                                         .color(egui::Color32::from_gray(150)),
                                                 );
                                             } else {
+                                                let visible_rows = 10.0;
+                                                let row_height =
+                                                    ui.spacing().interact_size.y.max(18.0);
+                                                let list_height = row_height * visible_rows;
                                                 egui::ScrollArea::vertical()
-                                                    .max_height(280.0)
+                                                    .max_height(list_height)
+                                                    .min_scrolled_height(list_height)
                                                     .show(ui, |ui| {
                                                         for child in child_dirs {
                                                             let child_name = child
