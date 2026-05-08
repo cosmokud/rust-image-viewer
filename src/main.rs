@@ -8804,9 +8804,9 @@ impl ImageViewer {
         self.needs_repaint = true;
     }
 
-    fn filename_needs_cjk_fonts(filename: &str) -> bool {
+    fn text_needs_cjk_fonts(text: &str) -> bool {
         // Check common CJK Unicode blocks (Han, Hiragana, Katakana, Hangul).
-        filename.chars().any(|ch| {
+        text.chars().any(|ch| {
             let c = ch as u32;
             (0x3400..=0x4DBF).contains(&c) // CJK Unified Ideographs Extension A
                 || (0x4E00..=0x9FFF).contains(&c) // CJK Unified Ideographs
@@ -8817,6 +8817,10 @@ impl ImageViewer {
                 || (0x1100..=0x11FF).contains(&c) // Hangul Jamo
                 || (0xAC00..=0xD7AF).contains(&c) // Hangul Syllables
         })
+    }
+
+    fn path_needs_cjk_fonts(path: &Path) -> bool {
+        Self::text_needs_cjk_fonts(path.as_os_str().to_string_lossy().as_ref())
     }
 
     fn ensure_windows_cjk_fonts_if_needed(&mut self, ctx: &egui::Context) {
@@ -8848,16 +8852,9 @@ impl ImageViewer {
                 return;
             };
 
-            let filename = path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
-
-            if filename.is_empty() {
-                return;
-            }
-
-            if Self::filename_needs_cjk_fonts(&filename) {
+            // Include parent directories, not just filename: breadcrumbs and child-folder popups
+            // can contain CJK even when the current file name is ASCII.
+            if Self::path_needs_cjk_fonts(path.as_path()) {
                 let (tx, rx) = crossbeam_channel::bounded::<Vec<(String, Vec<u8>)>>(1);
                 self.pending_windows_cjk_font_load = Some(rx);
                 crate::async_runtime::spawn_blocking_or_thread(
