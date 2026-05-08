@@ -23099,14 +23099,20 @@ impl ImageViewer {
                             }
                         }
                         InputBinding::ScrollUp => {
-                            if !manga_fullscreen && input.smooth_scroll_delta.y > 0.0 {
+                            if !manga_fullscreen
+                                && !pointer_over_shortcut_ui
+                                && input.smooth_scroll_delta.y > 0.0
+                            {
                                 if action != Action::ZoomIn && action != Action::ZoomOut {
                                     actions_to_run.push(action);
                                 }
                             }
                         }
                         InputBinding::ScrollDown => {
-                            if !manga_fullscreen && input.smooth_scroll_delta.y < 0.0 {
+                            if !manga_fullscreen
+                                && !pointer_over_shortcut_ui
+                                && input.smooth_scroll_delta.y < 0.0
+                            {
                                 if action != Action::ZoomIn && action != Action::ZoomOut {
                                     actions_to_run.push(action);
                                 }
@@ -24967,6 +24973,28 @@ impl ImageViewer {
                             self.pending_idle_config_sync = true;
                         }
                     }
+                    if vol_response.hovered() {
+                        let wheel_delta = ctx.input(|i| i.smooth_scroll_delta.y);
+                        if wheel_delta != 0.0 {
+                            let current_volume = player.volume();
+                            let step = 0.02f64;
+                            let next_volume = if wheel_delta > 0.0 {
+                                (current_volume + step).clamp(0.0, 1.0)
+                            } else {
+                                (current_volume - step).clamp(0.0, 1.0)
+                            };
+                            if (next_volume - current_volume).abs() > f64::EPSILON {
+                                player.set_volume(next_volume);
+                                if player.is_muted() && next_volume > 0.0 {
+                                    player.set_muted(false);
+                                }
+                                self.config
+                                    .update_video_state(player.is_muted(), player.volume());
+                                self.pending_idle_config_sync = true;
+                                ctx.request_repaint();
+                            }
+                        }
+                    }
                     if vol_response.drag_stopped() || (self.is_volume_dragging && !primary_down) {
                         self.is_volume_dragging = false;
                     }
@@ -25104,6 +25132,14 @@ impl ImageViewer {
                 let t = ((pos.x - slider_rect.left()) / slider_rect.width()).clamp(0.0, 1.0);
                 custom_fps =
                     (1.0 + t * (max_custom_fps.saturating_sub(1)) as f32).round() as u32;
+            }
+        }
+        if slider_response.hovered() {
+            let wheel_delta = ctx.input(|i| i.smooth_scroll_delta.y);
+            if wheel_delta > 0.0 {
+                custom_fps = custom_fps.saturating_add(1).min(max_custom_fps);
+            } else if wheel_delta < 0.0 {
+                custom_fps = custom_fps.saturating_sub(1).max(1);
             }
         }
 
@@ -26581,6 +26617,7 @@ impl ImageViewer {
                 && !ctrl_held
                 && !shift_held
                 && !alt_held
+                && !pointer_over_shortcut_ui_for_wheel
             {
                 let scroll_delta = ctx.input(|i| i.smooth_scroll_delta.y);
                 if scroll_delta != 0.0 {
