@@ -24974,15 +24974,38 @@ impl ImageViewer {
                         }
                     }
                     if vol_response.hovered() {
-                        let wheel_delta = ctx.input(|i| i.smooth_scroll_delta.y);
-                        if wheel_delta != 0.0 {
+                        const VOLUME_WHEEL_POINTS_PER_STEP: f32 = 50.0;
+                        const VOLUME_WHEEL_MAX_STEPS_PER_EVENT: f32 = 3.0;
+                        let wheel_steps = ctx.input(|i| {
+                            i.raw
+                                .events
+                                .iter()
+                                .filter_map(|event| {
+                                    let egui::Event::MouseWheel { unit, delta, .. } = event else {
+                                        return None;
+                                    };
+                                    if !delta.y.is_finite() || delta.y == 0.0 {
+                                        return None;
+                                    }
+                                    let steps = match unit {
+                                        egui::MouseWheelUnit::Line => delta.y,
+                                        egui::MouseWheelUnit::Page => delta.y * 3.0,
+                                        egui::MouseWheelUnit::Point => {
+                                            delta.y / VOLUME_WHEEL_POINTS_PER_STEP
+                                        }
+                                    };
+                                    Some(steps.clamp(
+                                        -VOLUME_WHEEL_MAX_STEPS_PER_EVENT,
+                                        VOLUME_WHEEL_MAX_STEPS_PER_EVENT,
+                                    ))
+                                })
+                                .sum::<f32>()
+                        });
+                        if wheel_steps != 0.0 {
                             let current_volume = player.volume();
-                            let step = 0.02f64;
-                            let next_volume = if wheel_delta > 0.0 {
-                                (current_volume + step).clamp(0.0, 1.0)
-                            } else {
-                                (current_volume - step).clamp(0.0, 1.0)
-                            };
+                            let step = 0.005f64;
+                            let next_volume =
+                                (current_volume + wheel_steps as f64 * step).clamp(0.0, 1.0);
                             if (next_volume - current_volume).abs() > f64::EPSILON {
                                 player.set_volume(next_volume);
                                 if player.is_muted() && next_volume > 0.0 {
