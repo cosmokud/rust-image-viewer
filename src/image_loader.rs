@@ -322,8 +322,12 @@ pub fn get_media_in_directory(path: &Path) -> Vec<PathBuf> {
         .filter_map(|entry| {
             let file_type = entry.file_type();
             let path = entry.path();
-            let is_folder = file_type.is_dir();
-            if is_folder || (file_type.is_file() && is_supported_media(&path)) {
+            // `jwalk` reports symlinks as symlinks even when they point to directories/files.
+            // Resolve the target kind so symlinked folders participate in traversal entries.
+            let is_symlink = file_type.is_symlink();
+            let is_folder = file_type.is_dir() || (is_symlink && path.is_dir());
+            let is_file = file_type.is_file() || (is_symlink && path.is_file());
+            if is_folder || (is_file && is_supported_media(&path)) {
                 Some(MediaDirectoryEntry {
                     path,
                     is_folder,
@@ -1362,5 +1366,70 @@ pub mod natord {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::get_media_in_directory;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[cfg(unix)]
+    fn create_dir_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn create_dir_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_dir(target, link)
+    }
+
+    fn unique_temp_dir(prefix: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        path.push(format!("{}_{}_{}", prefix, std::process::id(), stamp));
+        path
+    }
+
+    #[test]
+    fn get_media_in_directory_includes_symlinked_folders() {
+        let root = unique_temp_dir("riv_symlinked_folder_scan");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create root temp dir");
+
+        let target = root.join("real-folder");
+        fs::create_dir_all(&target).expect("create target folder");
+
+        let symlink = root.join("linked-folder");
+        match create_dir_symlink(&target, &symlink) {
+            Ok(()) => {}
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported
+                ) =>
+            {
+                let _ = fs::remove_dir_all(&root);
+                return;
+            }
+            Err(err) => {
+                let _ = fs::remove_dir_all(&root);
+                panic!("failed to create directory symlink: {err}");
+            }
+        }
+
+        let entries = get_media_in_directory(&root);
+        assert!(
+            entries.iter().any(|entry| entry == &symlink),
+            "expected symlinked directory in listing, got: {:?}",
+            entries
+        );
+
+        let _ = fs::remove_dir_all(&root);
     }
 }
