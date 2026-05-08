@@ -532,22 +532,6 @@ fn sh_open_folder_and_select_item(path: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(target_os = "windows")]
-const EXPLORER_SELECT_RETRY_ATTEMPTS: usize = 5;
-#[cfg(target_os = "windows")]
-const EXPLORER_SELECT_RETRY_DELAY: Duration = Duration::from_millis(300);
-
-#[cfg(target_os = "windows")]
-fn spawn_explorer_select_retries(path: PathBuf) {
-    // Explorer can open a new folder window asynchronously and drop the first
-    // selection signal. Re-issuing selection a few times avoids that race.
-    std::thread::spawn(move || {
-        for _ in 1..EXPLORER_SELECT_RETRY_ATTEMPTS {
-            std::thread::sleep(EXPLORER_SELECT_RETRY_DELAY);
-            let _ = sh_open_folder_and_select_item(path.as_path());
-        }
-    });
-}
-
 fn reveal_path_in_file_explorer(path: &Path) -> std::io::Result<()> {
     #[cfg(target_os = "windows")]
     {
@@ -582,18 +566,12 @@ fn reveal_path_in_file_explorer(path: &Path) -> std::io::Result<()> {
                 .map(|_| ());
         }
 
-        let retry_path = resolved_path.clone();
         match sh_open_folder_and_select_item(&resolved_path) {
-            Ok(_) => {
-                spawn_explorer_select_retries(retry_path);
-                Ok(())
-            }
+            Ok(_) => Ok(()),
             Err(select_err) => std::process::Command::new("explorer.exe")
                 .arg(&target_dir)
                 .spawn()
-                .map(|_| {
-                    spawn_explorer_select_retries(resolved_path.clone());
-                })
+                .map(|_| ())
                 .map_err(|folder_err| {
                     std::io::Error::new(
                         std::io::ErrorKind::Other,
@@ -2658,6 +2636,8 @@ struct ImageViewer {
     masonry_metadata_preload_cursor: usize,
     /// Item to restore once startup metadata warmup finishes rebuilding the masonry layout.
     masonry_metadata_preload_restore_index: Option<usize>,
+    /// Keep the warmup overlay visible briefly so fast scans still show progress feedback.
+    masonry_metadata_preload_overlay_hold_until: Option<Instant>,
     /// Deferred folder-travel restore payload applied after masonry metadata warmup completes.
     pending_masonry_folder_travel_restore: Option<(usize, f32)>,
     /// True if masonry was actively scrolling/panning/zooming on the previous frame.
@@ -3094,6 +3074,7 @@ impl Default for ImageViewer {
             masonry_metadata_preload_loaded: 0,
             masonry_metadata_preload_cursor: 0,
             masonry_metadata_preload_restore_index: None,
+            masonry_metadata_preload_overlay_hold_until: None,
             pending_masonry_folder_travel_restore: None,
             masonry_navigation_was_active: false,
             masonry_quality_refine_due_at: None,
@@ -12182,6 +12163,7 @@ impl ImageViewer {
         self.masonry_metadata_preload_loaded = 0;
         self.masonry_metadata_preload_cursor = 0;
         self.masonry_metadata_preload_restore_index = None;
+        self.masonry_metadata_preload_overlay_hold_until = None;
         self.pending_masonry_folder_travel_restore = None;
     }
 
@@ -12208,8 +12190,12 @@ impl ImageViewer {
 
         if !self.masonry_metadata_preload_active {
             self.masonry_metadata_preload_restore_index = None;
+            self.masonry_metadata_preload_overlay_hold_until = None;
             return;
         }
+
+        self.masonry_metadata_preload_overlay_hold_until =
+            Some(Instant::now() + Duration::from_millis(220));
 
         self.manga_scrollbar_dragging = false;
         self.is_panning = false;
@@ -12219,6 +12205,15 @@ impl ImageViewer {
         self.stop_manga_autoscroll();
 
         self.tick_masonry_metadata_preload();
+    }
+
+    fn masonry_metadata_overlay_visible(&self) -> bool {
+        if self.masonry_metadata_preload_active {
+            return true;
+        }
+
+        self.masonry_metadata_preload_overlay_hold_until
+            .is_some_and(|hold_until| Instant::now() < hold_until)
     }
 
     fn maybe_begin_masonry_metadata_preload(&mut self, allow_startup_preload: bool) {
@@ -12377,7 +12372,7 @@ impl ImageViewer {
     }
 
     fn draw_masonry_metadata_loading_overlay(&self, ctx: &egui::Context) {
-        if !self.masonry_metadata_preload_active {
+        if !self.masonry_metadata_overlay_visible() {
             return;
         }
 
@@ -22080,7 +22075,7 @@ impl ImageViewer {
                 }
             });
 
-        if self.is_masonry_mode() && self.masonry_metadata_preload_active {
+        if self.is_masonry_mode() && self.masonry_metadata_overlay_visible() {
             self.draw_masonry_metadata_loading_overlay(ctx);
         }
 
@@ -24353,12 +24348,12 @@ impl ImageViewer {
                                     breadcrumb_ui_hovered = true;
                                 }
 
-                                let popup_id = ui.make_persistent_id((
-                                    "breadcrumb_segment_children_popup",
-                                    segment_path,
+                                let popup_id = ui.make_persistent_id(format!(
+                                    "breadcrumb_segment_children_popup:{}",
+                                    segment_path.display()
                                 ));
                                 if arrow_response.clicked() || arrow_response.secondary_clicked() {
-                                    ui.memory_mut(|mem| mem.toggle_popup(popup_id));
+                                    ui.memory_mut(|mem| mem.open_popup(popup_id));
                                 }
 
                                 let close_on_click_outside =
@@ -24749,7 +24744,7 @@ impl ImageViewer {
             }
 
             // On mouse release, finalize seek and restore prior play state.
-            if self.is_seeking && primary_released {
+            if self.is_seeking && (primary_released || !primary_down) {
                 let final_fraction = Self::active_seek_pointer_fraction(ctx, bar_inner)
                     .or(self.seek_preview_fraction)
                     .or(self.seek_last_requested_fraction);
@@ -24912,7 +24907,9 @@ impl ImageViewer {
                             self.pending_idle_config_sync = true;
                         }
                     }
-                    if vol_response.drag_stopped() {
+                    if vol_response.drag_stopped()
+                        || (self.is_volume_dragging && !primary_down)
+                    {
                         self.is_volume_dragging = false;
                     }
 
@@ -25260,7 +25257,7 @@ impl ImageViewer {
                 }
             }
 
-            if self.gif_seeking && primary_released {
+            if self.gif_seeking && (primary_released || !primary_down) {
                 self.gif_seeking = false;
                 self.gif_seek_preview_frame = None;
             }
@@ -25575,7 +25572,7 @@ impl ImageViewer {
                 }
             }
 
-            if self.manga_video_seeking && primary_released {
+            if self.manga_video_seeking && (primary_released || !primary_down) {
                 let final_fraction = Self::active_seek_pointer_fraction(ctx, bar_inner)
                     .or(self.manga_video_seek_preview_fraction)
                     .or(self.manga_video_seek_last_requested_fraction);
@@ -25743,7 +25740,9 @@ impl ImageViewer {
                             self.pending_idle_config_sync = true;
                         }
                     }
-                    if vol_response.drag_stopped() {
+                    if vol_response.drag_stopped()
+                        || (self.manga_video_volume_dragging && !primary_down)
+                    {
                         self.manga_video_volume_dragging = false;
                     }
 
@@ -25981,7 +25980,7 @@ impl ImageViewer {
                 }
             }
 
-            if self.gif_seeking && primary_released {
+            if self.gif_seeking && (primary_released || !primary_down) {
                 self.gif_seeking = false;
                 self.gif_seek_preview_frame = None;
             }
