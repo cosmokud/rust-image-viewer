@@ -9,7 +9,7 @@ use std::time::UNIX_EPOCH;
 
 use parking_lot::Mutex;
 use redb::backends::FileBackend;
-use redb::{Database, DatabaseError, ReadableTable, StorageBackend, TableDefinition};
+use redb::{Database, DatabaseError, ReadableTable, StorageBackend, TableDefinition, TableHandle};
 
 use crate::app_dirs;
 
@@ -761,39 +761,71 @@ fn open_database_with_size_limit(path: &Path, max_size_bytes: u64) -> Option<Dat
         }
     }
 
+    match create_database_with_size_limit(path, max_size_bytes, false) {
+        Ok(db) if database_uses_old_schema(&db) => {
+            drop(db);
+            let _ = std::fs::remove_file(path);
+            create_database_with_size_limit(path, max_size_bytes, true).ok()
+        }
+        Ok(db) => Some(db),
+        Err(DatabaseError::Storage(redb::StorageError::Corrupted(_))) if path.exists() => {
+            let _ = std::fs::remove_file(path);
+            create_database_with_size_limit(path, max_size_bytes, true).ok()
+        }
+        Err(_) => None,
+    }
+}
+
+fn create_database_with_size_limit(
+    path: &Path,
+    max_size_bytes: u64,
+    truncate: bool,
+) -> Result<Database, DatabaseError> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
-        .truncate(false)
+        .truncate(truncate)
         .open(path)
-        .ok()?;
+        .map_err(redb::StorageError::from)?;
     let current_len = file.metadata().ok().map(|m| m.len()).unwrap_or(0);
 
-    let base_backend = FileBackend::new(file).ok()?;
+    let base_backend = FileBackend::new(file)?;
     let limited_backend = SizeLimitedFileBackend::new(base_backend, max_size_bytes, current_len);
+    Database::builder().create_with_backend(limited_backend)
+}
 
-    match Database::builder().create_with_backend(limited_backend) {
-        Ok(db) => Some(db),
-        Err(DatabaseError::Storage(redb::StorageError::Corrupted(_))) if path.exists() => {
-            let _ = std::fs::remove_file(path);
-            let recreated_file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(path)
-                .ok()?;
-            let recreated_len = recreated_file.metadata().ok().map(|m| m.len()).unwrap_or(0);
-            let recreated_backend = FileBackend::new(recreated_file).ok()?;
-            let limited_backend =
-                SizeLimitedFileBackend::new(recreated_backend, max_size_bytes, recreated_len);
-            Database::builder()
-                .create_with_backend(limited_backend)
-                .ok()
+fn database_uses_old_schema(db: &Database) -> bool {
+    let Ok(read_txn) = db.begin_read() else {
+        return false;
+    };
+
+    if let Ok(tables) = read_txn.list_tables() {
+        for table in tables {
+            let name = table.name();
+            if name == "video_first_frame_rgba" || name == "image_thumbnail_rgba" {
+                return true;
+            }
         }
-        Err(_) => None,
     }
+
+    let Ok(table) = read_txn.open_table(METADATA_TABLE) else {
+        return false;
+    };
+    let Ok(iter) = table.iter() else {
+        return true;
+    };
+
+    for item in iter {
+        let Ok((_, value)) = item else {
+            return true;
+        };
+        if decode_record(value.value()).is_none() {
+            return true;
+        }
+    }
+
+    false
 }
 
 pub fn configure_metadata_cache_size_limit(max_size_mb: u64) {
@@ -962,6 +994,7 @@ fn decode_record(raw: &str) -> Option<CachedRecord> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use redb::ReadableTableMetadata;
 
     #[test]
     fn metadata_record_encodes_only_placeholder_columns() {
@@ -1020,5 +1053,65 @@ mod tests {
 
         store_cached_video_thumbnail(path, 128, &thumbnail);
         assert!(lookup_cached_video_thumbnail(path, 128).is_none());
+    }
+
+    #[test]
+    fn old_dimension_schema_deletes_database_on_open() {
+        let path = temp_cache_path("old-dimension-schema");
+        {
+            let db = open_database_with_size_limit(path.as_path(), 0).unwrap();
+            let write_txn = db.begin_write().unwrap();
+            {
+                let mut table = write_txn.open_table(METADATA_TABLE).unwrap();
+                table
+                    .insert("D:/Images/Cats/Angora/2121.jpg", "1,2,3,320,240,1,123")
+                    .unwrap();
+            }
+            write_txn.commit().unwrap();
+        }
+
+        let db = open_database_with_size_limit(path.as_path(), 0).unwrap();
+        assert!(!database_uses_old_schema(&db));
+        let read_txn = db.begin_read().unwrap();
+        let table = read_txn.open_table(METADATA_TABLE);
+        assert!(table.is_err() || table.unwrap().is_empty().unwrap());
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn old_thumbnail_table_deletes_database_on_open() {
+        const OLD_THUMBNAIL_TABLE: TableDefinition<&str, &[u8]> =
+            TableDefinition::new("video_first_frame_rgba");
+
+        let path = temp_cache_path("old-thumbnail-table");
+        {
+            let db = open_database_with_size_limit(path.as_path(), 0).unwrap();
+            let write_txn = db.begin_write().unwrap();
+            {
+                let mut table = write_txn.open_table(OLD_THUMBNAIL_TABLE).unwrap();
+                table.insert("thumb", &[1_u8, 2, 3, 4][..].as_ref()).unwrap();
+            }
+            write_txn.commit().unwrap();
+        }
+
+        let db = open_database_with_size_limit(path.as_path(), 0).unwrap();
+        let read_txn = db.begin_read().unwrap();
+        let tables: Vec<String> = read_txn
+            .list_tables()
+            .unwrap()
+            .map(|table| table.name().to_string())
+            .collect();
+        assert!(!tables.iter().any(|name| name == "video_first_frame_rgba"));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn temp_cache_path(test_name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "riv-metadata-cache-{}-{}.redb",
+            std::process::id(),
+            test_name
+        ))
     }
 }
