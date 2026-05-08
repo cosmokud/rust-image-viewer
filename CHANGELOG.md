@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.3.9-rc.6] - 2026-05-09
+
+### Highlights
+
+- Breadcrumb navigation now supports child-folder popups with steadier scrolling and clearer empty-folder handling.
+- Masonry warmup overlays stay visible briefly so fast scans still show progress feedback.
+- Video seek/volume interactions are more resilient when the pointer is released outside the control.
+
+### Added
+
+- Panic-report hook that writes a crash log to `%TEMP%\rust-image-viewer\panic.log`.
+
+### Changed
+
+- Breadcrumb child-folder popup tracking is now centralized per active segment for cleaner focus behavior.
+- Explorer reveal no longer retries selection to avoid spawning multiple windows.
+
+### Fixed
+
+- Seek and volume drags now finalize if the primary pointer is released outside the control.
+
 ## [v0.3.9-rc.5] - 2026-05-05
 
 ### Highlights

@@ -496,6 +496,10 @@ That keeps branch-to-branch comparisons honest.
 1. If metadata or thumbnails seem stale, delete the metadata cache file in the app local-data directory (`%LOCALAPPDATA%\rust-image-viewer\metadata_cache.redb` on Windows).
 2. If you want to cap disk usage more aggressively, lower `metadata_cache_max_size_mb`.
 
+### Crash logs
+
+If the app panics, a crash report is written to `%TEMP%\rust-image-viewer\panic.log` on Windows.
+
 ### Build issues
 
 1. `pkg-config` errors usually mean `PKG_CONFIG_PATH` is not pointing at GStreamer's `pkgconfig` directory.

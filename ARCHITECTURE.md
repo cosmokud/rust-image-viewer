@@ -152,6 +152,8 @@ Fullscreen manga modes can show a breadcrumb bar under the title bar. It exposes
 
 Breadcrumb segments can open child-folder menus so you can jump directly into sibling subfolders without leaving fullscreen. When a folder jump occurs, the viewer records the current folder travel position (and persists Masonry metadata snapshots) so returning to a folder restores scroll context and warm state.
 
+Child-folder popups are tracked per active breadcrumb segment so only one menu is open at a time, with a fixed-height scroll area to keep the list predictable.
+
 ## 5. Solo media pipeline
 
 Solo mode is the path used for floating window viewing and single-item fullscreen.
@@ -300,6 +302,8 @@ How it works:
 - Masonry can defer layout invalidation while the user is actively navigating, then flush pending dimension updates once motion settles
 
 That is why the layout can become correct earlier than full-quality textures do.
+
+The Masonry metadata warmup overlay can stay visible briefly after preload finishes so fast scans still surface visible progress feedback.
 
 ### 6.5 Directional look-ahead / look-behind prefetch
 
@@ -717,6 +721,7 @@ The overlay reports metrics such as:
 
 - `tracing` and `tracing-subscriber` drive runtime logging
 - `RIV_PUFFIN` can enable `puffin` scopes
+- a panic hook writes crash reports to `%TEMP%\rust-image-viewer\panic.log` on Windows
 
 ### 12.3 Regression verification
 
