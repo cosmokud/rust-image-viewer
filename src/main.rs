@@ -2640,6 +2640,8 @@ struct ImageViewer {
     masonry_metadata_preload_restore_index: Option<usize>,
     /// Keep the warmup overlay visible briefly so fast scans still show progress feedback.
     masonry_metadata_preload_overlay_hold_until: Option<Instant>,
+    /// Defer first warm-up tick so folder travel can paint destination + overlay first.
+    masonry_metadata_preload_defer_first_tick: bool,
     /// Deferred folder-travel restore payload applied after masonry metadata warmup completes.
     pending_masonry_folder_travel_restore: Option<(usize, f32)>,
     /// True if masonry was actively scrolling/panning/zooming on the previous frame.
@@ -3078,6 +3080,7 @@ impl Default for ImageViewer {
             masonry_metadata_preload_cursor: 0,
             masonry_metadata_preload_restore_index: None,
             masonry_metadata_preload_overlay_hold_until: None,
+            masonry_metadata_preload_defer_first_tick: false,
             pending_masonry_folder_travel_restore: None,
             masonry_navigation_was_active: false,
             masonry_quality_refine_due_at: None,
@@ -5308,15 +5311,16 @@ impl ImageViewer {
             let should_remove = image_list
                 .get(*index)
                 .is_none_or(|path| player_paths.get(index) != Some(path) || path_is_targeted(path));
-            
+
             if should_remove {
                 // Save the timestamp to RAM before destroying the list player
                 if let Some(path) = player_paths.get(index) {
                     if let Some(current_pos) = player.position() {
-                        self.manga_video_preview_resume_by_path.insert(path.clone(), current_pos.as_secs_f64());
+                        self.manga_video_preview_resume_by_path
+                            .insert(path.clone(), current_pos.as_secs_f64());
                     }
                 }
-                
+
                 if Some(*index) == focused_manga_video {
                     removed_focused_manga_video = true;
                 }
@@ -6749,8 +6753,9 @@ impl ImageViewer {
                         continue;
                     };
 
-        // FIX: Check if we are seamlessly transitioning or resuming
-                    let is_retaining = self.retained_media_placeholder_visible || self.pending_mode_switch_placeholder.is_some();
+                    // FIX: Check if we are seamlessly transitioning or resuming
+                    let is_retaining = self.retained_media_placeholder_visible
+                        || self.pending_mode_switch_placeholder.is_some();
                     let is_resuming = self.manga_video_preview_resume_by_path.contains_key(&path);
 
                     let current_matches = self.current_media_type == Some(MediaType::Video)
@@ -7433,8 +7438,9 @@ impl ImageViewer {
             if let Some(path) = &self.current_video_path {
                 // Note: Use your actual method for fetching position, e.g., player.position_secs()
                 // Assuming it returns an f64 representing seconds:
-                if let Some(current_pos) = player.position() { 
-                    self.manga_video_preview_resume_by_path.insert(path.clone(), current_pos.as_secs_f64());
+                if let Some(current_pos) = player.position() {
+                    self.manga_video_preview_resume_by_path
+                        .insert(path.clone(), current_pos.as_secs_f64());
                 }
             }
         }
@@ -7442,8 +7448,9 @@ impl ImageViewer {
             if let Some(path) = &self.current_video_path {
                 // Note: Use your actual method for fetching position, e.g., player.position_secs()
                 // Assuming it returns an f64 representing seconds:
-                if let Some(current_pos) = player.position() { 
-                    self.manga_video_preview_resume_by_path.insert(path.clone(), current_pos.as_secs_f64());
+                if let Some(current_pos) = player.position() {
+                    self.manga_video_preview_resume_by_path
+                        .insert(path.clone(), current_pos.as_secs_f64());
                 }
             }
         }
@@ -7491,8 +7498,9 @@ impl ImageViewer {
             if let Some(player) = &mut self.video_player {
                 if let Some(path) = &self.current_video_path {
                     // Grab the exact frame as a Duration, then convert to f64 seconds
-                    if let Some(current_pos) = player.position() { 
-                        self.manga_video_preview_resume_by_path.insert(path.clone(), current_pos.as_secs_f64());
+                    if let Some(current_pos) = player.position() {
+                        self.manga_video_preview_resume_by_path
+                            .insert(path.clone(), current_pos.as_secs_f64());
                     }
                 }
             }
@@ -12180,6 +12188,7 @@ impl ImageViewer {
         self.masonry_metadata_preload_cursor = 0;
         self.masonry_metadata_preload_restore_index = None;
         self.masonry_metadata_preload_overlay_hold_until = None;
+        self.masonry_metadata_preload_defer_first_tick = false;
         self.pending_masonry_folder_travel_restore = None;
     }
 
@@ -12207,11 +12216,13 @@ impl ImageViewer {
         if !self.masonry_metadata_preload_active {
             self.masonry_metadata_preload_restore_index = None;
             self.masonry_metadata_preload_overlay_hold_until = None;
+            self.masonry_metadata_preload_defer_first_tick = false;
             return;
         }
 
         self.masonry_metadata_preload_overlay_hold_until =
             Some(Instant::now() + Duration::from_millis(220));
+        self.masonry_metadata_preload_defer_first_tick = true;
 
         self.manga_scrollbar_dragging = false;
         self.is_panning = false;
@@ -12219,8 +12230,6 @@ impl ImageViewer {
         self.manga_hovered_media_index = None;
         self.stop_manga_wheel_scroll();
         self.stop_manga_autoscroll();
-
-        self.tick_masonry_metadata_preload();
     }
 
     fn masonry_metadata_overlay_visible(&self) -> bool {
@@ -12327,6 +12336,11 @@ impl ImageViewer {
             .min(self.image_list.len());
         if total == 0 {
             self.reset_masonry_metadata_preload();
+            return;
+        }
+
+        if self.masonry_metadata_preload_defer_first_tick {
+            self.masonry_metadata_preload_defer_first_tick = false;
             return;
         }
 
@@ -12824,7 +12838,7 @@ impl ImageViewer {
         });
 
         let saved_position = self.manga_video_preview_resume_by_path.get(&path).copied();
-        
+
         let (
             prefer_hardware_decode,
             disable_hardware_decode,
@@ -13193,7 +13207,6 @@ impl ImageViewer {
             kind: PendingMediaLoadKind::Video,
             started_at: Instant::now(),
         });
-
 
         let saved_position = self.manga_video_preview_resume_by_path.get(&path).copied();
 
@@ -24347,8 +24360,8 @@ impl ImageViewer {
                                 if segment_response.contains_pointer() {
                                     breadcrumb_ui_hovered = true;
                                 }
-                                let segment_clicked =
-                                    segment_response.clicked() || segment_response.secondary_clicked();
+                                let segment_clicked = segment_response.clicked()
+                                    || segment_response.secondary_clicked();
 
                                 let popup_frame_margin_x =
                                     egui::Frame::popup(ui.style()).total_margin().sum().x;
@@ -24951,9 +24964,7 @@ impl ImageViewer {
                             self.pending_idle_config_sync = true;
                         }
                     }
-                    if vol_response.drag_stopped()
-                        || (self.is_volume_dragging && !primary_down)
-                    {
+                    if vol_response.drag_stopped() || (self.is_volume_dragging && !primary_down) {
                         self.is_volume_dragging = false;
                     }
 

@@ -586,30 +586,30 @@ impl MangaLoader {
             }
 
             for (idx, w, h, mt) in res.items {
-                let changed = self
-                    .dimension_cache
-                    .get(&idx)
-                    .map_or(true, |(old_w, old_h, old_mt)| {
-                        if *old_w == w && *old_h == h && *old_mt == mt {
-                            return false;
-                        }
+                let changed =
+                    self.dimension_cache
+                        .get(&idx)
+                        .map_or(true, |(old_w, old_h, old_mt)| {
+                            if *old_w == w && *old_h == h && *old_mt == mt {
+                                return false;
+                            }
 
-                        // Ignore tiny video-size jitter from probes to avoid
-                        // perpetual masonry relayout churn.
-                        if *old_mt == MangaMediaType::Video && mt == MangaMediaType::Video {
-                            let width_delta = old_w.abs_diff(w);
-                            let height_delta = old_h.abs_diff(h);
-                            if width_delta <= 2 && height_delta <= 2 {
-                                let old_aspect = *old_w as f32 / (*old_h).max(1) as f32;
-                                let new_aspect = w as f32 / h.max(1) as f32;
-                                if (old_aspect - new_aspect).abs() <= 0.003 {
-                                    return false;
+                            // Ignore tiny video-size jitter from probes to avoid
+                            // perpetual masonry relayout churn.
+                            if *old_mt == MangaMediaType::Video && mt == MangaMediaType::Video {
+                                let width_delta = old_w.abs_diff(w);
+                                let height_delta = old_h.abs_diff(h);
+                                if width_delta <= 2 && height_delta <= 2 {
+                                    let old_aspect = *old_w as f32 / (*old_h).max(1) as f32;
+                                    let new_aspect = w as f32 / h.max(1) as f32;
+                                    if (old_aspect - new_aspect).abs() <= 0.003 {
+                                        return false;
+                                    }
                                 }
                             }
-                        }
 
-                        true
-                    });
+                            true
+                        });
 
                 if changed {
                     self.dimension_cache.insert(idx, (w, h, mt));
@@ -905,6 +905,12 @@ impl MangaLoader {
         }
 
         dims
+    }
+
+    fn path_is_webp(path: &std::path::Path) -> bool {
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("webp"))
     }
 
     fn probe_video_dimensions_fast(path: &std::path::Path) -> (u32, u32) {
@@ -1806,13 +1812,16 @@ impl MangaLoader {
             }
         }
 
-        // Cache first batch synchronously for immediate layout
+        // Cache first batch synchronously for immediate layout. WebP stays async:
+        // animated WebP folders can contain many costly headers, and folder travel
+        // must paint the destination before masonry warm-up does heavier work.
         let initial_probe_items: Vec<(usize, PathBuf)> = image_list
             .iter()
             .enumerate()
             .filter(|(idx, path)| {
                 !self.dimension_cache.contains_key(idx)
                     && (is_supported_video(path) || is_supported_image(path))
+                    && !Self::path_is_webp(path)
             })
             .take(INITIAL_CACHE_COUNT)
             .map(|(idx, path)| (idx, path.clone()))

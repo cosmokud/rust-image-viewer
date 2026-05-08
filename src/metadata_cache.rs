@@ -904,8 +904,8 @@ fn detect_file_type_from_header(header: &[u8]) -> Option<CachedFileType> {
         return Some(CachedFileType::Ogv);
     }
     if header.starts_with(&[
-        0x30, 0x26, 0xb2, 0x75, 0x8e, 0x66, 0xcf, 0x11, 0xa6, 0xd9, 0x00, 0xaa, 0x00, 0x62,
-        0xce, 0x6c,
+        0x30, 0x26, 0xb2, 0x75, 0x8e, 0x66, 0xcf, 0x11, 0xa6, 0xd9, 0x00, 0xaa, 0x00, 0x62, 0xce,
+        0x6c,
     ]) {
         return Some(CachedFileType::Wmv);
     }
@@ -954,11 +954,41 @@ fn gif_is_animated(path: &Path) -> Option<bool> {
 }
 
 fn webp_is_animated(path: &Path) -> Option<bool> {
-    use image::codecs::webp::WebPDecoder;
-
     let file = File::open(path).ok()?;
-    let reader = std::io::BufReader::new(file);
-    WebPDecoder::new(reader).ok().map(|decoder| decoder.has_animation())
+    let mut limited = file.take(64 * 1024);
+    let mut header = Vec::with_capacity(4096);
+    limited.read_to_end(&mut header).ok()?;
+    webp_header_is_animated(&header)
+}
+
+fn webp_header_is_animated(header: &[u8]) -> Option<bool> {
+    if header.len() < 12 || !header.starts_with(b"RIFF") || header.get(8..12) != Some(b"WEBP") {
+        return None;
+    }
+
+    let mut cursor = 12usize;
+    while cursor.checked_add(8)? <= header.len() {
+        let chunk = header.get(cursor..cursor + 4)?;
+        let size =
+            u32::from_le_bytes(header.get(cursor + 4..cursor + 8)?.try_into().ok()?) as usize;
+        let payload_start = cursor + 8;
+        let payload_end = payload_start.checked_add(size)?;
+        if payload_end > header.len() {
+            break;
+        }
+
+        if chunk == b"VP8X" {
+            let flags = *header.get(payload_start)?;
+            return Some((flags & 0b0000_0010) != 0);
+        }
+        if chunk == b"ANIM" || chunk == b"ANMF" {
+            return Some(true);
+        }
+
+        cursor = payload_end + (size & 1);
+    }
+
+    Some(false)
 }
 
 fn encode_record(record: CachedRecord) -> String {
@@ -1041,6 +1071,36 @@ mod tests {
     }
 
     #[test]
+    fn detects_animated_webp_from_vp8x_header_without_decoding() {
+        let header = [
+            b"RIFF".as_slice(),
+            &30_u32.to_le_bytes(),
+            b"WEBP",
+            b"VP8X",
+            &10_u32.to_le_bytes(),
+            &[0b0000_0010, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        ]
+        .concat();
+
+        assert_eq!(webp_header_is_animated(&header), Some(true));
+    }
+
+    #[test]
+    fn detects_static_webp_from_vp8x_header_without_decoding() {
+        let header = [
+            b"RIFF".as_slice(),
+            &30_u32.to_le_bytes(),
+            b"WEBP",
+            b"VP8X",
+            &10_u32.to_le_bytes(),
+            &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        ]
+        .concat();
+
+        assert_eq!(webp_header_is_animated(&header), Some(false));
+    }
+
+    #[test]
     fn thumbnail_cache_public_api_is_noop() {
         let thumbnail = CachedVideoThumbnail {
             pixels: vec![1, 2, 3, 4],
@@ -1090,7 +1150,9 @@ mod tests {
             let write_txn = db.begin_write().unwrap();
             {
                 let mut table = write_txn.open_table(OLD_THUMBNAIL_TABLE).unwrap();
-                table.insert("thumb", &[1_u8, 2, 3, 4][..].as_ref()).unwrap();
+                table
+                    .insert("thumb", &[1_u8, 2, 3, 4][..].as_ref())
+                    .unwrap();
             }
             write_txn.commit().unwrap();
         }
