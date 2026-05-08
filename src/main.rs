@@ -2293,6 +2293,8 @@ struct ImageViewer {
     folder_navigation_history_index: Option<usize>,
     /// Grace timeout for closing the back-history hover popup while transitioning pointer focus.
     breadcrumb_back_history_popup_hover_deadline: Option<Instant>,
+    /// Path whose breadcrumb separator currently owns the child-folder popup.
+    breadcrumb_child_popup_path: Option<PathBuf>,
     /// Time when controls were last shown
     controls_show_time: Instant,
     /// Error message to display
@@ -2913,6 +2915,7 @@ impl Default for ImageViewer {
             folder_navigation_history: Vec::new(),
             folder_navigation_history_index: None,
             breadcrumb_back_history_popup_hover_deadline: None,
+            breadcrumb_child_popup_path: None,
             controls_show_time: Instant::now(),
             error_message: None,
             image_changed: false,
@@ -4668,6 +4671,14 @@ impl ImageViewer {
                 modified_at,
             });
 
+        if files.is_empty() {
+            self.error_message = Some(format!(
+                "No supported media files found in folder: {}",
+                directory.display()
+            ));
+            return false;
+        }
+
         if history_navigation == FolderHistoryNavigationKind::Record {
             self.record_folder_navigation_to_directory(directory);
         }
@@ -4692,7 +4703,12 @@ impl ImageViewer {
                     .find(|candidate| Self::is_up_navigation_entry_path(candidate.as_path()))
                     .cloned()
             })
-            .unwrap_or_else(|| files[0].clone());
+            .unwrap_or_else(|| {
+                files
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| directory.to_path_buf())
+            });
 
         self.error_message = None;
         self.show_controls = true;
@@ -24311,6 +24327,8 @@ impl ImageViewer {
                                 return;
                             }
 
+                            let child_popup_id =
+                                ui.make_persistent_id("breadcrumb_segment_children_popup");
                             for (index, (segment_label, segment_path)) in
                                 segments.iter().enumerate()
                             {
@@ -24329,98 +24347,119 @@ impl ImageViewer {
                                 if segment_response.contains_pointer() {
                                     breadcrumb_ui_hovered = true;
                                 }
+                                let segment_clicked =
+                                    segment_response.clicked() || segment_response.secondary_clicked();
 
-                                if segment_response.clicked()
-                                    || segment_response.secondary_clicked()
-                                {
-                                    breadcrumb_target_directory = Some(segment_path.clone());
-                                }
-
+                                let popup_frame_margin_x =
+                                    egui::Frame::popup(ui.style()).total_margin().sum().x;
+                                let arrow_anchor_min_width = (popup_frame_margin_x + 1.0).max(18.0);
                                 let arrow_response = ui.add(
                                     egui::Button::new(
                                         egui::RichText::new(">")
                                             .color(egui::Color32::from_gray(150)),
                                     )
+                                    // popup_below_widget derives popup width from the anchor width.
+                                    // Keep this wider than popup frame margins to avoid negative widths.
+                                    .min_size(egui::vec2(arrow_anchor_min_width, 18.0))
                                     .frame(false),
                                 );
 
                                 if arrow_response.contains_pointer() {
                                     breadcrumb_ui_hovered = true;
                                 }
+                                let arrow_clicked =
+                                    arrow_response.clicked() || arrow_response.secondary_clicked();
 
-                                let popup_id = ui.make_persistent_id(format!(
-                                    "breadcrumb_segment_children_popup:{}",
-                                    segment_path.display()
-                                ));
-                                if arrow_response.clicked() || arrow_response.secondary_clicked() {
-                                    ui.memory_mut(|mem| mem.open_popup(popup_id));
+                                if arrow_clicked {
+                                    self.breadcrumb_child_popup_path = Some(segment_path.clone());
+                                    ui.memory_mut(|mem| mem.open_popup(child_popup_id));
                                 }
 
-                                let close_on_click_outside =
-                                    egui::popup::PopupCloseBehavior::CloseOnClickOutside;
-                                egui::popup::popup_below_widget(
-                                    ui,
-                                    popup_id,
-                                    &arrow_response,
-                                    close_on_click_outside,
-                                    |ui| {
-                                        breadcrumb_popup_active = true;
-                                        ui.set_min_width(240.0);
+                                if segment_clicked && !arrow_clicked {
+                                    breadcrumb_target_directory = Some(segment_path.clone());
+                                }
 
-                                        let child_dirs = Self::breadcrumb_child_directories(
-                                            segment_path.as_path(),
-                                        );
-                                        let mut close_popup = false;
-
-                                        if child_dirs.is_empty() {
-                                            ui.label(
-                                                egui::RichText::new("No subfolders")
-                                                    .color(egui::Color32::from_gray(150)),
-                                            );
-                                        } else {
-                                            egui::ScrollArea::vertical().max_height(280.0).show(
-                                                ui,
-                                                |ui| {
-                                                    for child in child_dirs {
-                                                        let child_name = child
-                                                            .file_name()
-                                                            .map(|name| {
-                                                                name.to_string_lossy().to_string()
-                                                            })
-                                                            .filter(|name| !name.is_empty())
-                                                            .unwrap_or_else(|| {
-                                                                child.display().to_string()
-                                                            });
-
-                                                        let row =
-                                                            ui.selectable_label(false, child_name);
-                                                        if row.contains_pointer() {
-                                                            breadcrumb_ui_hovered = true;
-                                                        }
-                                                        if row.clicked() || row.secondary_clicked()
-                                                        {
-                                                            breadcrumb_target_directory =
-                                                                Some(child.clone());
-                                                            close_popup = true;
-                                                        }
-                                                    }
-                                                },
-                                            );
-                                        }
-
-                                        if close_popup {
-                                            ui.memory_mut(|mem| mem.close_popup());
-                                        }
-
-                                        if ui.rect_contains_pointer(ui.min_rect()) {
-                                            breadcrumb_ui_hovered = true;
+                                let popup_for_segment =
+                                    self.breadcrumb_child_popup_path.as_ref() == Some(segment_path);
+                                if popup_for_segment {
+                                    let close_on_click_outside =
+                                        egui::popup::PopupCloseBehavior::CloseOnClickOutside;
+                                    let popup_hovered = egui::popup::popup_below_widget(
+                                        ui,
+                                        child_popup_id,
+                                        &arrow_response,
+                                        close_on_click_outside,
+                                        |ui| {
                                             breadcrumb_popup_active = true;
-                                        }
-                                    },
-                                );
+                                            ui.set_min_width(240.0);
 
-                                if ui.memory(|mem| mem.is_popup_open(popup_id)) {
+                                            let child_dirs = Self::breadcrumb_child_directories(
+                                                segment_path.as_path(),
+                                            );
+                                            let mut close_popup = false;
+
+                                            if child_dirs.is_empty() {
+                                                ui.label(
+                                                    egui::RichText::new("No subfolders")
+                                                        .color(egui::Color32::from_gray(150)),
+                                                );
+                                            } else {
+                                                egui::ScrollArea::vertical()
+                                                    .max_height(280.0)
+                                                    .show(ui, |ui| {
+                                                        for child in child_dirs {
+                                                            let child_name = child
+                                                                .file_name()
+                                                                .map(|name| {
+                                                                    name.to_string_lossy()
+                                                                        .to_string()
+                                                                })
+                                                                .filter(|name| !name.is_empty())
+                                                                .unwrap_or_else(|| {
+                                                                    child.display().to_string()
+                                                                });
+
+                                                            let row = ui.selectable_label(
+                                                                false, child_name,
+                                                            );
+                                                            if row.contains_pointer() {
+                                                                breadcrumb_ui_hovered = true;
+                                                            }
+                                                            if row.clicked()
+                                                                || row.secondary_clicked()
+                                                            {
+                                                                breadcrumb_target_directory =
+                                                                    Some(child.clone());
+                                                                close_popup = true;
+                                                            }
+                                                        }
+                                                    });
+                                            }
+
+                                            if close_popup {
+                                                ui.memory_mut(|mem| mem.close_popup());
+                                            }
+
+                                            let hovered = ui.rect_contains_pointer(ui.min_rect());
+                                            if hovered {
+                                                breadcrumb_ui_hovered = true;
+                                                breadcrumb_popup_active = true;
+                                            }
+                                            hovered
+                                        },
+                                    )
+                                    .unwrap_or(false);
+
+                                    if popup_hovered {
+                                        breadcrumb_ui_hovered = true;
+                                        breadcrumb_popup_active = true;
+                                    }
+                                }
+
+                                if ui.memory(|mem| mem.is_popup_open(child_popup_id)) {
                                     breadcrumb_popup_active = true;
+                                } else if popup_for_segment {
+                                    self.breadcrumb_child_popup_path = None;
                                 }
 
                                 ui.add_space(2.0);
@@ -27902,8 +27941,47 @@ fn init_runtime_diagnostics() {
     });
 }
 
+fn install_panic_report_hook() {
+    static INIT: OnceLock<()> = OnceLock::new();
+
+    INIT.get_or_init(|| {
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |panic_info| {
+            let payload = if let Some(msg) = panic_info.payload().downcast_ref::<&str>() {
+                (*msg).to_string()
+            } else if let Some(msg) = panic_info.payload().downcast_ref::<String>() {
+                msg.clone()
+            } else {
+                "<non-string panic payload>".to_string()
+            };
+
+            let location = panic_info
+                .location()
+                .map(|loc| format!("{}:{}:{}", loc.file(), loc.line(), loc.column()))
+                .unwrap_or_else(|| "<unknown location>".to_string());
+
+            let current_thread = std::thread::current();
+            let thread_name = current_thread.name().unwrap_or("unnamed");
+            let backtrace = std::backtrace::Backtrace::force_capture();
+            let timestamp = format!("{:?}", std::time::SystemTime::now());
+
+            let panic_report = format!(
+                "[{timestamp}] thread='{thread_name}'\nlocation: {location}\npayload: {payload}\n\nbacktrace:\n{backtrace}\n"
+            );
+
+            let log_dir = std::env::temp_dir().join("rust-image-viewer");
+            if std::fs::create_dir_all(&log_dir).is_ok() {
+                let _ = std::fs::write(log_dir.join("panic.log"), panic_report);
+            }
+
+            previous_hook(panic_info);
+        }));
+    });
+}
+
 fn main() -> eframe::Result<()> {
     init_runtime_diagnostics();
+    install_panic_report_hook();
     let _ = async_runtime::init_runtime();
 
     #[cfg(target_os = "windows")]
