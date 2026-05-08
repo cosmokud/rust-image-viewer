@@ -1,12 +1,11 @@
-//! Persistent metadata cache for media dimensions and video thumbnails.
+//! Persistent metadata cache for placeholder-critical media metadata.
 
-use std::collections::HashMap;
-use std::fs::OpenOptions;
-use std::io;
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::UNIX_EPOCH;
 
 use parking_lot::Mutex;
 use redb::backends::FileBackend;
@@ -15,28 +14,12 @@ use redb::{Database, DatabaseError, ReadableTable, StorageBackend, TableDefiniti
 use crate::app_dirs;
 
 const METADATA_TABLE: TableDefinition<&str, &str> = TableDefinition::new("media_dimensions");
-const VIDEO_THUMBNAIL_TABLE: TableDefinition<&str, &[u8]> =
-    TableDefinition::new("video_first_frame_rgba");
-const STATIC_THUMBNAIL_TABLE: TableDefinition<&str, &[u8]> =
-    TableDefinition::new("image_thumbnail_rgba");
-const LEGACY_THUMBNAIL_HEADER_BYTES: usize = 40;
-const THUMBNAIL_HEADER_BYTES: usize = 48;
-const THUMBNAIL_SCHEMA_TAG: u64 = 0x4341_4348_5454_4c31;
-const VIDEO_THUMBNAIL_KEY_TAG: &str = "v3";
 
-const DIMENSION_CACHE_TTL_SECS: u64 = 60 * 60 * 24 * 30;
-const THUMBNAIL_CACHE_TTL_SECS: u64 = 60 * 60 * 24 * 14;
-const STATIC_THUMBNAIL_CACHE_TTL_SECS: u64 = 60 * 60 * 24 * 30;
 const DIMENSION_CACHE_MAX_ENTRIES: usize = 80_000;
-const THUMBNAIL_CACHE_MAX_ENTRIES: usize = 4_000;
-const STATIC_THUMBNAIL_CACHE_MAX_ENTRIES: usize = 12_000;
 const PRUNE_INTERVAL_SECS: u64 = 60;
 const CACHE_WRITE_QUEUE_CAPACITY: usize = 512;
 const METADATA_CACHE_DEFAULT_MAX_SIZE_BYTES: u64 = 1024 * 1024 * 1024;
 const BYTES_PER_MIB: u64 = 1024 * 1024;
-const FINGERPRINT_CACHE_TTL: Duration = Duration::from_millis(750);
-const FINGERPRINT_CACHE_MAX_ENTRIES: usize = 4096;
-
 static DIMENSION_HITS: AtomicU64 = AtomicU64::new(0);
 static DIMENSION_MISSES: AtomicU64 = AtomicU64::new(0);
 static THUMBNAIL_HITS: AtomicU64 = AtomicU64::new(0);
@@ -85,42 +68,135 @@ pub enum CachedMediaKind {
 }
 
 impl CachedMediaKind {
-    fn code(self) -> u8 {
+    fn matches_file_type(self, file_type: CachedFileType) -> bool {
+        file_type.media_kind() == self
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CachedFileType {
+    Jpeg,
+    Png,
+    Gif,
+    Bmp,
+    Webp,
+    Psd,
+    Ico,
+    Tiff,
+    Mp4,
+    Mkv,
+    Webm,
+    Avi,
+    Mov,
+    Wmv,
+    Flv,
+    M4v,
+    ThreeGp,
+    Ogv,
+}
+
+impl CachedFileType {
+    pub fn code(self) -> u16 {
         match self {
-            CachedMediaKind::Image => 1,
-            CachedMediaKind::Video => 2,
+            CachedFileType::Jpeg => 1,
+            CachedFileType::Png => 2,
+            CachedFileType::Gif => 3,
+            CachedFileType::Bmp => 4,
+            CachedFileType::Webp => 5,
+            CachedFileType::Psd => 6,
+            CachedFileType::Ico => 7,
+            CachedFileType::Tiff => 8,
+            CachedFileType::Mp4 => 100,
+            CachedFileType::Mkv => 101,
+            CachedFileType::Webm => 102,
+            CachedFileType::Avi => 103,
+            CachedFileType::Mov => 104,
+            CachedFileType::Wmv => 105,
+            CachedFileType::Flv => 106,
+            CachedFileType::M4v => 107,
+            CachedFileType::ThreeGp => 108,
+            CachedFileType::Ogv => 109,
         }
     }
 
-    fn from_code(code: u8) -> Option<Self> {
+    pub fn from_code(code: u16) -> Option<Self> {
         match code {
-            1 => Some(CachedMediaKind::Image),
-            2 => Some(CachedMediaKind::Video),
+            1 => Some(CachedFileType::Jpeg),
+            2 => Some(CachedFileType::Png),
+            3 => Some(CachedFileType::Gif),
+            4 => Some(CachedFileType::Bmp),
+            5 => Some(CachedFileType::Webp),
+            6 => Some(CachedFileType::Psd),
+            7 => Some(CachedFileType::Ico),
+            8 => Some(CachedFileType::Tiff),
+            100 => Some(CachedFileType::Mp4),
+            101 => Some(CachedFileType::Mkv),
+            102 => Some(CachedFileType::Webm),
+            103 => Some(CachedFileType::Avi),
+            104 => Some(CachedFileType::Mov),
+            105 => Some(CachedFileType::Wmv),
+            106 => Some(CachedFileType::Flv),
+            107 => Some(CachedFileType::M4v),
+            108 => Some(CachedFileType::ThreeGp),
+            109 => Some(CachedFileType::Ogv),
             _ => None,
         }
     }
+
+    #[allow(dead_code)]
+    pub fn extension(self) -> &'static str {
+        match self {
+            CachedFileType::Jpeg => "jpg",
+            CachedFileType::Png => "png",
+            CachedFileType::Gif => "gif",
+            CachedFileType::Bmp => "bmp",
+            CachedFileType::Webp => "webp",
+            CachedFileType::Psd => "psd",
+            CachedFileType::Ico => "ico",
+            CachedFileType::Tiff => "tiff",
+            CachedFileType::Mp4 => "mp4",
+            CachedFileType::Mkv => "mkv",
+            CachedFileType::Webm => "webm",
+            CachedFileType::Avi => "avi",
+            CachedFileType::Mov => "mov",
+            CachedFileType::Wmv => "wmv",
+            CachedFileType::Flv => "flv",
+            CachedFileType::M4v => "m4v",
+            CachedFileType::ThreeGp => "3gp",
+            CachedFileType::Ogv => "ogv",
+        }
+    }
+
+    fn media_kind(self) -> CachedMediaKind {
+        match self {
+            CachedFileType::Jpeg
+            | CachedFileType::Png
+            | CachedFileType::Gif
+            | CachedFileType::Bmp
+            | CachedFileType::Webp
+            | CachedFileType::Psd
+            | CachedFileType::Ico
+            | CachedFileType::Tiff => CachedMediaKind::Image,
+            CachedFileType::Mp4
+            | CachedFileType::Mkv
+            | CachedFileType::Webm
+            | CachedFileType::Avi
+            | CachedFileType::Mov
+            | CachedFileType::Wmv
+            | CachedFileType::Flv
+            | CachedFileType::M4v
+            | CachedFileType::ThreeGp
+            | CachedFileType::Ogv => CachedMediaKind::Video,
+        }
+    }
 }
 
-#[derive(Clone, Copy)]
-struct FileFingerprint {
-    size_bytes: u64,
-    modified_secs: u64,
-    modified_nanos: u32,
-}
-
-#[derive(Clone, Copy)]
-struct CachedFingerprintEntry {
-    fingerprint: FileFingerprint,
-    cached_at: Instant,
-}
-
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct CachedRecord {
-    fingerprint: FileFingerprint,
     width: u32,
     height: u32,
-    media_kind: CachedMediaKind,
-    cached_at_secs: u64,
+    file_type: CachedFileType,
+    animated: bool,
 }
 
 #[derive(Clone)]
@@ -148,16 +224,6 @@ enum CacheWriteOp {
         width: u32,
         height: u32,
     },
-    VideoThumbnail {
-        path: PathBuf,
-        max_texture_side: u32,
-        thumbnail: CachedVideoThumbnail,
-    },
-    StaticThumbnail {
-        path: PathBuf,
-        max_texture_side: u32,
-        thumbnail: CachedImageThumbnail,
-    },
 }
 
 pub struct MetadataCache {
@@ -184,29 +250,13 @@ impl MetadataCache {
         expected_kind: CachedMediaKind,
     ) -> Option<(u32, u32)> {
         let key = cache_key(path);
-        let fingerprint = fingerprint(path)?;
 
         let read_txn = self.db.begin_read().ok()?;
         let table = read_txn.open_table(METADATA_TABLE).ok()?;
         let raw = table.get(key.as_str()).ok()??;
         let record = decode_record(raw.value())?;
 
-        let now_secs = unix_now_secs();
-        if record.cached_at_secs > 0
-            && now_secs.saturating_sub(record.cached_at_secs) > DIMENSION_CACHE_TTL_SECS
-        {
-            DIMENSION_EXPIRED.fetch_add(1, Ordering::Relaxed);
-            return None;
-        }
-
-        if record.media_kind != expected_kind {
-            return None;
-        }
-
-        if record.fingerprint.size_bytes != fingerprint.size_bytes
-            || record.fingerprint.modified_secs != fingerprint.modified_secs
-            || record.fingerprint.modified_nanos != fingerprint.modified_nanos
-        {
+        if !expected_kind.matches_file_type(record.file_type) {
             return None;
         }
 
@@ -228,15 +278,9 @@ impl MetadataCache {
             return vec![None; items.len()];
         };
 
-        let now_secs = unix_now_secs();
         let mut results = Vec::with_capacity(items.len());
 
         for (path, expected_kind) in items {
-            let Some(fingerprint) = fingerprint(path.as_path()) else {
-                results.push(None);
-                continue;
-            };
-
             let key = cache_key(path.as_path());
             let raw = match table.get(key.as_str()) {
                 Ok(Some(raw)) => raw,
@@ -250,18 +294,7 @@ impl MetadataCache {
                 continue;
             };
 
-            if record.cached_at_secs > 0
-                && now_secs.saturating_sub(record.cached_at_secs) > DIMENSION_CACHE_TTL_SECS
-            {
-                DIMENSION_EXPIRED.fetch_add(1, Ordering::Relaxed);
-                results.push(None);
-                continue;
-            }
-
-            if &record.media_kind != expected_kind
-                || record.fingerprint.size_bytes != fingerprint.size_bytes
-                || record.fingerprint.modified_secs != fingerprint.modified_secs
-                || record.fingerprint.modified_nanos != fingerprint.modified_nanos
+            if !expected_kind.matches_file_type(record.file_type)
                 || record.width == 0
                 || record.height == 0
             {
@@ -287,16 +320,19 @@ impl MetadataCache {
         }
 
         let key = cache_key(path);
-        let Some(fingerprint) = fingerprint(path) else {
+        let Some(file_type) = detect_file_type(path) else {
             return;
         };
+        if !media_kind.matches_file_type(file_type) {
+            return;
+        };
+        let animated = detect_animated(path, file_type);
 
         let encoded = encode_record(CachedRecord {
-            fingerprint,
             width,
             height,
-            media_kind,
-            cached_at_secs: unix_now_secs(),
+            file_type,
+            animated,
         });
 
         let estimated_write_bytes = key.len().saturating_add(encoded.len()).saturating_add(512);
@@ -325,208 +361,9 @@ impl MetadataCache {
         self.maybe_prune_tables();
     }
 
-    pub fn lookup_video_thumbnail(
-        &self,
-        path: &Path,
-        max_texture_side: u32,
-    ) -> Option<CachedVideoThumbnail> {
-        let key = thumbnail_key(path, max_texture_side);
-        let fingerprint = fingerprint(path)?;
-
-        let read_txn = self.db.begin_read().ok()?;
-        let table = read_txn.open_table(VIDEO_THUMBNAIL_TABLE).ok()?;
-        let raw = table.get(key.as_str()).ok()??;
-        let (cached_fingerprint, cached_at_secs, thumbnail) = decode_thumbnail_record(raw.value())?;
-
-        let now_secs = unix_now_secs();
-        if cached_at_secs > 0 && now_secs.saturating_sub(cached_at_secs) > THUMBNAIL_CACHE_TTL_SECS
-        {
-            THUMBNAIL_EXPIRED.fetch_add(1, Ordering::Relaxed);
-            return None;
-        }
-
-        if cached_fingerprint.size_bytes != fingerprint.size_bytes
-            || cached_fingerprint.modified_secs != fingerprint.modified_secs
-            || cached_fingerprint.modified_nanos != fingerprint.modified_nanos
-        {
-            return None;
-        }
-
-        let expected_len = (thumbnail.width as usize)
-            .saturating_mul(thumbnail.height as usize)
-            .saturating_mul(4);
-        if thumbnail.pixels.len() != expected_len {
-            return None;
-        }
-
-        Some(thumbnail)
-    }
-
-    pub fn store_video_thumbnail(
-        &mut self,
-        path: &Path,
-        max_texture_side: u32,
-        thumbnail: &CachedVideoThumbnail,
-    ) {
-        if thumbnail.width == 0
-            || thumbnail.height == 0
-            || thumbnail.original_width == 0
-            || thumbnail.original_height == 0
-        {
-            return;
-        }
-
-        let expected_len = (thumbnail.width as usize)
-            .saturating_mul(thumbnail.height as usize)
-            .saturating_mul(4);
-        if thumbnail.pixels.len() != expected_len {
-            return;
-        }
-
-        let key = thumbnail_key(path, max_texture_side);
-        let Some(file_fingerprint) = fingerprint(path) else {
-            return;
-        };
-
-        let encoded = encode_thumbnail_record(file_fingerprint, unix_now_secs(), thumbnail);
-
-        let estimated_write_bytes = key.len().saturating_add(encoded.len()).saturating_add(1024);
-        if self.should_skip_write_due_to_size_limit(estimated_write_bytes) {
-            self.maybe_prune_tables();
-            if self.should_skip_write_due_to_size_limit(estimated_write_bytes) {
-                return;
-            }
-        }
-
-        let Ok(write_txn) = self.db.begin_write() else {
-            return;
-        };
-
-        {
-            let Ok(mut table) = write_txn.open_table(VIDEO_THUMBNAIL_TABLE) else {
-                return;
-            };
-
-            if table.insert(key.as_str(), encoded.as_slice()).is_err() {
-                return;
-            }
-        }
-
-        let _ = write_txn.commit();
-        self.maybe_prune_tables();
-    }
-
-    pub fn lookup_static_thumbnail(
-        &self,
-        path: &Path,
-        max_texture_side: u32,
-    ) -> Option<CachedImageThumbnail> {
-        let key = static_thumbnail_key(path, max_texture_side);
-        let fingerprint = fingerprint(path)?;
-
-        let read_txn = self.db.begin_read().ok()?;
-        let table = read_txn.open_table(STATIC_THUMBNAIL_TABLE).ok()?;
-        let raw = table.get(key.as_str()).ok()??;
-        let (cached_fingerprint, cached_at_secs, thumbnail) = decode_thumbnail_record(raw.value())?;
-
-        let now_secs = unix_now_secs();
-        if cached_at_secs > 0
-            && now_secs.saturating_sub(cached_at_secs) > STATIC_THUMBNAIL_CACHE_TTL_SECS
-        {
-            STATIC_THUMBNAIL_EXPIRED.fetch_add(1, Ordering::Relaxed);
-            return None;
-        }
-
-        if cached_fingerprint.size_bytes != fingerprint.size_bytes
-            || cached_fingerprint.modified_secs != fingerprint.modified_secs
-            || cached_fingerprint.modified_nanos != fingerprint.modified_nanos
-        {
-            return None;
-        }
-
-        let expected_len = (thumbnail.width as usize)
-            .saturating_mul(thumbnail.height as usize)
-            .saturating_mul(4);
-        if thumbnail.pixels.len() != expected_len {
-            return None;
-        }
-
-        Some(CachedImageThumbnail {
-            pixels: thumbnail.pixels,
-            width: thumbnail.width,
-            height: thumbnail.height,
-            original_width: thumbnail.original_width,
-            original_height: thumbnail.original_height,
-        })
-    }
-
-    pub fn store_static_thumbnail(
-        &mut self,
-        path: &Path,
-        max_texture_side: u32,
-        thumbnail: &CachedImageThumbnail,
-    ) {
-        if thumbnail.width == 0
-            || thumbnail.height == 0
-            || thumbnail.original_width == 0
-            || thumbnail.original_height == 0
-        {
-            return;
-        }
-
-        let expected_len = (thumbnail.width as usize)
-            .saturating_mul(thumbnail.height as usize)
-            .saturating_mul(4);
-        if thumbnail.pixels.len() != expected_len {
-            return;
-        }
-
-        let key = static_thumbnail_key(path, max_texture_side);
-        let Some(file_fingerprint) = fingerprint(path) else {
-            return;
-        };
-
-        let encoded = encode_thumbnail_record(
-            file_fingerprint,
-            unix_now_secs(),
-            &CachedVideoThumbnail {
-                pixels: thumbnail.pixels.clone(),
-                width: thumbnail.width,
-                height: thumbnail.height,
-                original_width: thumbnail.original_width,
-                original_height: thumbnail.original_height,
-            },
-        );
-
-        let estimated_write_bytes = key.len().saturating_add(encoded.len()).saturating_add(1024);
-        if self.should_skip_write_due_to_size_limit(estimated_write_bytes) {
-            self.maybe_prune_tables();
-            if self.should_skip_write_due_to_size_limit(estimated_write_bytes) {
-                return;
-            }
-        }
-
-        let Ok(write_txn) = self.db.begin_write() else {
-            return;
-        };
-
-        {
-            let Ok(mut table) = write_txn.open_table(STATIC_THUMBNAIL_TABLE) else {
-                return;
-            };
-
-            if table.insert(key.as_str(), encoded.as_slice()).is_err() {
-                return;
-            }
-        }
-
-        let _ = write_txn.commit();
-        self.maybe_prune_tables();
-    }
-
     fn maybe_prune_tables(&mut self) {
-        let now_secs = unix_now_secs();
         let last_prune_secs = LAST_PRUNE_SECS.load(Ordering::Relaxed);
+        let now_secs = unix_now_secs();
         let prune_due_to_interval = now_secs.saturating_sub(last_prune_secs) >= PRUNE_INTERVAL_SECS;
         let prune_due_to_size = self.cache_needs_size_prune();
 
@@ -536,16 +373,14 @@ impl MetadataCache {
 
         LAST_PRUNE_SECS.store(now_secs, Ordering::Relaxed);
 
-        self.prune_dimension_table(now_secs);
-        self.prune_thumbnail_table(now_secs);
-        self.prune_static_thumbnail_table(now_secs);
+        self.prune_dimension_table();
 
         if prune_due_to_size {
             self.prune_to_size_limit();
         }
     }
 
-    fn prune_dimension_table(&self, now_secs: u64) {
+    fn prune_dimension_table(&self) {
         let Ok(write_txn) = self.db.begin_write() else {
             return;
         };
@@ -574,13 +409,10 @@ impl MetadataCache {
                         continue;
                     };
 
-                    let is_expired = record.cached_at_secs > 0
-                        && now_secs.saturating_sub(record.cached_at_secs)
-                            > DIMENSION_CACHE_TTL_SECS;
-                    if is_expired {
+                    if record.width == 0 || record.height == 0 {
                         expired.push(key_owned);
                     } else {
-                        retained.push((record.cached_at_secs, key_owned));
+                        retained.push(key_owned);
                     }
                 }
 
@@ -595,137 +427,12 @@ impl MetadataCache {
             }
 
             if retained_entries.len() > DIMENSION_CACHE_MAX_ENTRIES {
-                retained_entries.sort_unstable_by_key(|(cached_at_secs, _)| *cached_at_secs);
+                retained_entries.sort_unstable();
                 let remove_count = retained_entries.len() - DIMENSION_CACHE_MAX_ENTRIES;
-                for (_, key) in retained_entries.into_iter().take(remove_count) {
+                for key in retained_entries.into_iter().take(remove_count) {
                     let _ = table.remove(key.as_str());
                 }
                 DIMENSION_EVICTED.fetch_add(remove_count as u64, Ordering::Relaxed);
-            }
-        }
-
-        let _ = write_txn.commit();
-    }
-
-    fn prune_thumbnail_table(&self, now_secs: u64) {
-        let Ok(write_txn) = self.db.begin_write() else {
-            return;
-        };
-
-        {
-            let Ok(mut table) = write_txn.open_table(VIDEO_THUMBNAIL_TABLE) else {
-                return;
-            };
-
-            let (expired_keys, mut retained_entries) = {
-                let mut expired = Vec::new();
-                let mut retained = Vec::new();
-
-                let Ok(iter) = table.iter() else {
-                    return;
-                };
-
-                for item in iter {
-                    let Ok((key, value)) = item else {
-                        continue;
-                    };
-
-                    let key_owned = key.value().to_string();
-                    let Some((_, cached_at_secs, _)) = decode_thumbnail_record(value.value())
-                    else {
-                        expired.push(key_owned);
-                        continue;
-                    };
-
-                    let is_expired = cached_at_secs > 0
-                        && now_secs.saturating_sub(cached_at_secs) > THUMBNAIL_CACHE_TTL_SECS;
-                    if is_expired {
-                        expired.push(key_owned);
-                    } else {
-                        retained.push((cached_at_secs, key_owned));
-                    }
-                }
-
-                (expired, retained)
-            };
-
-            if !expired_keys.is_empty() {
-                THUMBNAIL_EXPIRED.fetch_add(expired_keys.len() as u64, Ordering::Relaxed);
-                for key in &expired_keys {
-                    let _ = table.remove(key.as_str());
-                }
-            }
-
-            if retained_entries.len() > THUMBNAIL_CACHE_MAX_ENTRIES {
-                retained_entries.sort_unstable_by_key(|(cached_at_secs, _)| *cached_at_secs);
-                let remove_count = retained_entries.len() - THUMBNAIL_CACHE_MAX_ENTRIES;
-                for (_, key) in retained_entries.into_iter().take(remove_count) {
-                    let _ = table.remove(key.as_str());
-                }
-                THUMBNAIL_EVICTED.fetch_add(remove_count as u64, Ordering::Relaxed);
-            }
-        }
-
-        let _ = write_txn.commit();
-    }
-
-    fn prune_static_thumbnail_table(&self, now_secs: u64) {
-        let Ok(write_txn) = self.db.begin_write() else {
-            return;
-        };
-
-        {
-            let Ok(mut table) = write_txn.open_table(STATIC_THUMBNAIL_TABLE) else {
-                return;
-            };
-
-            let (expired_keys, mut retained_entries) = {
-                let mut expired = Vec::new();
-                let mut retained = Vec::new();
-
-                let Ok(iter) = table.iter() else {
-                    return;
-                };
-
-                for item in iter {
-                    let Ok((key, value)) = item else {
-                        continue;
-                    };
-
-                    let key_owned = key.value().to_string();
-                    let Some((_, cached_at_secs, _)) = decode_thumbnail_record(value.value())
-                    else {
-                        expired.push(key_owned);
-                        continue;
-                    };
-
-                    let is_expired = cached_at_secs > 0
-                        && now_secs.saturating_sub(cached_at_secs)
-                            > STATIC_THUMBNAIL_CACHE_TTL_SECS;
-                    if is_expired {
-                        expired.push(key_owned);
-                    } else {
-                        retained.push((cached_at_secs, key_owned));
-                    }
-                }
-
-                (expired, retained)
-            };
-
-            if !expired_keys.is_empty() {
-                STATIC_THUMBNAIL_EXPIRED.fetch_add(expired_keys.len() as u64, Ordering::Relaxed);
-                for key in &expired_keys {
-                    let _ = table.remove(key.as_str());
-                }
-            }
-
-            if retained_entries.len() > STATIC_THUMBNAIL_CACHE_MAX_ENTRIES {
-                retained_entries.sort_unstable_by_key(|(cached_at_secs, _)| *cached_at_secs);
-                let remove_count = retained_entries.len() - STATIC_THUMBNAIL_CACHE_MAX_ENTRIES;
-                for (_, key) in retained_entries.into_iter().take(remove_count) {
-                    let _ = table.remove(key.as_str());
-                }
-                STATIC_THUMBNAIL_EVICTED.fetch_add(remove_count as u64, Ordering::Relaxed);
             }
         }
 
@@ -823,16 +530,6 @@ fn cache_write_loop(
                     width,
                     height,
                 } => cache.store_dimensions(path.as_path(), media_kind, width, height),
-                CacheWriteOp::VideoThumbnail {
-                    path,
-                    max_texture_side,
-                    thumbnail,
-                } => cache.store_video_thumbnail(path.as_path(), max_texture_side, &thumbnail),
-                CacheWriteOp::StaticThumbnail {
-                    path,
-                    max_texture_side,
-                    thumbnail,
-                } => cache.store_static_thumbnail(path.as_path(), max_texture_side, &thumbnail),
             }
         }
     }
@@ -915,23 +612,8 @@ pub fn lookup_cached_video_thumbnail(
     path: &Path,
     max_texture_side: u32,
 ) -> Option<CachedVideoThumbnail> {
-    if !metadata_cache_access_enabled() {
-        return None;
-    }
-
-    let Some(cache) = global_cache_handle() else {
-        THUMBNAIL_MISSES.fetch_add(1, Ordering::Relaxed);
-        return None;
-    };
-
-    let result = cache.lock().lookup_video_thumbnail(path, max_texture_side);
-    if result.is_some() {
-        THUMBNAIL_HITS.fetch_add(1, Ordering::Relaxed);
-    } else {
-        THUMBNAIL_MISSES.fetch_add(1, Ordering::Relaxed);
-    }
-
-    result
+    let _ = (path, max_texture_side);
+    None
 }
 
 pub fn store_cached_video_thumbnail(
@@ -939,49 +621,15 @@ pub fn store_cached_video_thumbnail(
     max_texture_side: u32,
     thumbnail: &CachedVideoThumbnail,
 ) {
-    if !metadata_cache_access_enabled() {
-        return;
-    }
-
-    if let Some(tx) = cache_write_tx() {
-        let op = CacheWriteOp::VideoThumbnail {
-            path: path.to_path_buf(),
-            max_texture_side,
-            thumbnail: thumbnail.clone(),
-        };
-        if tx.try_send(op).is_ok() {
-            return;
-        }
-    }
-
-    if let Some(cache) = global_cache_handle() {
-        cache
-            .lock()
-            .store_video_thumbnail(path, max_texture_side, thumbnail);
-    }
+    let _ = (path, max_texture_side, thumbnail);
 }
 
 pub fn lookup_cached_static_thumbnail(
     path: &Path,
     max_texture_side: u32,
 ) -> Option<CachedImageThumbnail> {
-    if !metadata_cache_access_enabled() {
-        return None;
-    }
-
-    let Some(cache) = global_cache_handle() else {
-        STATIC_THUMBNAIL_MISSES.fetch_add(1, Ordering::Relaxed);
-        return None;
-    };
-
-    let result = cache.lock().lookup_static_thumbnail(path, max_texture_side);
-    if result.is_some() {
-        STATIC_THUMBNAIL_HITS.fetch_add(1, Ordering::Relaxed);
-    } else {
-        STATIC_THUMBNAIL_MISSES.fetch_add(1, Ordering::Relaxed);
-    }
-
-    result
+    let _ = (path, max_texture_side);
+    None
 }
 
 pub fn store_cached_static_thumbnail(
@@ -989,26 +637,7 @@ pub fn store_cached_static_thumbnail(
     max_texture_side: u32,
     thumbnail: &CachedImageThumbnail,
 ) {
-    if !metadata_cache_access_enabled() {
-        return;
-    }
-
-    if let Some(tx) = cache_write_tx() {
-        let op = CacheWriteOp::StaticThumbnail {
-            path: path.to_path_buf(),
-            max_texture_side,
-            thumbnail: thumbnail.clone(),
-        };
-        if tx.try_send(op).is_ok() {
-            return;
-        }
-    }
-
-    if let Some(cache) = global_cache_handle() {
-        cache
-            .lock()
-            .store_static_thumbnail(path, max_texture_side, thumbnail);
-    }
+    let _ = (path, max_texture_side, thumbnail);
 }
 
 pub fn metadata_cache_stats() -> MetadataCacheStats {
@@ -1194,70 +823,6 @@ fn cache_key(path: &Path) -> String {
     }
 }
 
-fn thumbnail_key(path: &Path, max_texture_side: u32) -> String {
-    format!(
-        "{}#vthumb{}#ts{}",
-        cache_key(path),
-        VIDEO_THUMBNAIL_KEY_TAG,
-        max_texture_side.max(1)
-    )
-}
-
-fn static_thumbnail_key(path: &Path, max_texture_side: u32) -> String {
-    format!("{}#imgts{}", cache_key(path), max_texture_side.max(1))
-}
-
-fn fingerprint_cache() -> &'static Mutex<HashMap<PathBuf, CachedFingerprintEntry>> {
-    static CACHE: OnceLock<Mutex<HashMap<PathBuf, CachedFingerprintEntry>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn fingerprint_cache_prune(cache: &mut HashMap<PathBuf, CachedFingerprintEntry>, now: Instant) {
-    cache.retain(|_, entry| now.duration_since(entry.cached_at) <= FINGERPRINT_CACHE_TTL);
-
-    while cache.len() >= FINGERPRINT_CACHE_MAX_ENTRIES {
-        let Some(oldest_key) = cache
-            .iter()
-            .min_by_key(|(_, entry)| entry.cached_at)
-            .map(|(path, _)| path.clone())
-        else {
-            break;
-        };
-        cache.remove(&oldest_key);
-    }
-}
-
-fn fingerprint(path: &Path) -> Option<FileFingerprint> {
-    let now = Instant::now();
-    if let Some(entry) = fingerprint_cache().lock().get(path).copied() {
-        if now.duration_since(entry.cached_at) <= FINGERPRINT_CACHE_TTL {
-            return Some(entry.fingerprint);
-        }
-    }
-
-    let metadata = std::fs::metadata(path).ok()?;
-    let modified = metadata.modified().ok()?;
-    let duration = modified.duration_since(UNIX_EPOCH).ok()?;
-
-    let fingerprint = FileFingerprint {
-        size_bytes: metadata.len(),
-        modified_secs: duration.as_secs(),
-        modified_nanos: duration.subsec_nanos(),
-    };
-
-    let mut cache = fingerprint_cache().lock();
-    fingerprint_cache_prune(&mut cache, now);
-    cache.insert(
-        path.to_path_buf(),
-        CachedFingerprintEntry {
-            fingerprint,
-            cached_at: now,
-        },
-    );
-
-    Some(fingerprint)
-}
-
 fn unix_now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1265,121 +830,195 @@ fn unix_now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+fn detect_file_type(path: &Path) -> Option<CachedFileType> {
+    let mut file = File::open(path).ok()?;
+    let mut header = [0_u8; 512];
+    let len = file.read(&mut header).ok()?;
+    detect_file_type_from_header(&header[..len])
+}
+
+fn detect_file_type_from_header(header: &[u8]) -> Option<CachedFileType> {
+    if header.starts_with(&[0xff, 0xd8, 0xff]) {
+        return Some(CachedFileType::Jpeg);
+    }
+    if header.starts_with(&[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']) {
+        return Some(CachedFileType::Png);
+    }
+    if header.starts_with(b"GIF87a") || header.starts_with(b"GIF89a") {
+        return Some(CachedFileType::Gif);
+    }
+    if header.starts_with(b"BM") {
+        return Some(CachedFileType::Bmp);
+    }
+    if header.len() >= 12 && header.starts_with(b"RIFF") && header.get(8..12) == Some(b"WEBP") {
+        return Some(CachedFileType::Webp);
+    }
+    if header.starts_with(b"8BPS") {
+        return Some(CachedFileType::Psd);
+    }
+    if header.starts_with(&[0, 0, 1, 0]) {
+        return Some(CachedFileType::Ico);
+    }
+    if header.starts_with(b"II*\0") || header.starts_with(b"MM\0*") {
+        return Some(CachedFileType::Tiff);
+    }
+    if header.len() >= 12 && header.starts_with(b"RIFF") && header.get(8..12) == Some(b"AVI ") {
+        return Some(CachedFileType::Avi);
+    }
+    if header.starts_with(b"FLV") {
+        return Some(CachedFileType::Flv);
+    }
+    if header.starts_with(b"OggS") {
+        return Some(CachedFileType::Ogv);
+    }
+    if header.starts_with(&[
+        0x30, 0x26, 0xb2, 0x75, 0x8e, 0x66, 0xcf, 0x11, 0xa6, 0xd9, 0x00, 0xaa, 0x00, 0x62,
+        0xce, 0x6c,
+    ]) {
+        return Some(CachedFileType::Wmv);
+    }
+    if header.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]) {
+        let ascii = String::from_utf8_lossy(header).to_ascii_lowercase();
+        if ascii.contains("webm") {
+            return Some(CachedFileType::Webm);
+        }
+        return Some(CachedFileType::Mkv);
+    }
+    if header.len() >= 12 && header.get(4..8) == Some(b"ftyp") {
+        return match header.get(8..12) {
+            Some(b"qt  ") => Some(CachedFileType::Mov),
+            Some(b"M4V ") | Some(b"m4v ") => Some(CachedFileType::M4v),
+            Some(brand) if brand.starts_with(b"3g") => Some(CachedFileType::ThreeGp),
+            _ => Some(CachedFileType::Mp4),
+        };
+    }
+
+    None
+}
+
+fn detect_animated(path: &Path, file_type: CachedFileType) -> bool {
+    match file_type {
+        CachedFileType::Gif => gif_is_animated(path).unwrap_or(true),
+        CachedFileType::Webp => webp_is_animated(path).unwrap_or(true),
+        _ => true,
+    }
+}
+
+fn gif_is_animated(path: &Path) -> Option<bool> {
+    let file = File::open(path).ok()?;
+    let mut options = gif::DecodeOptions::new();
+    options.set_color_output(gif::ColorOutput::Indexed);
+    let mut reader = options.read_info(file).ok()?;
+    let mut frame_count = 0_u8;
+
+    while reader.read_next_frame().ok()?.is_some() {
+        frame_count = frame_count.saturating_add(1);
+        if frame_count > 1 {
+            return Some(true);
+        }
+    }
+
+    Some(frame_count > 1)
+}
+
+fn webp_is_animated(path: &Path) -> Option<bool> {
+    use image::codecs::webp::WebPDecoder;
+
+    let file = File::open(path).ok()?;
+    let reader = std::io::BufReader::new(file);
+    WebPDecoder::new(reader).ok().map(|decoder| decoder.has_animation())
+}
+
 fn encode_record(record: CachedRecord) -> String {
     format!(
-        "{},{},{},{},{},{},{}",
-        record.fingerprint.size_bytes,
-        record.fingerprint.modified_secs,
-        record.fingerprint.modified_nanos,
+        "{},{},{},{}",
         record.width,
         record.height,
-        record.media_kind.code(),
-        record.cached_at_secs
+        record.file_type.code(),
+        u8::from(record.animated)
     )
 }
 
 fn decode_record(raw: &str) -> Option<CachedRecord> {
     let mut parts = raw.split(',');
 
-    let size_bytes = parts.next()?.parse::<u64>().ok()?;
-    let modified_secs = parts.next()?.parse::<u64>().ok()?;
-    let modified_nanos = parts.next()?.parse::<u32>().ok()?;
     let width = parts.next()?.parse::<u32>().ok()?;
     let height = parts.next()?.parse::<u32>().ok()?;
-    let media_kind = CachedMediaKind::from_code(parts.next()?.parse::<u8>().ok()?)?;
-    let cached_at_secs = parts
-        .next()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(0);
+    let file_type = CachedFileType::from_code(parts.next()?.parse::<u16>().ok()?)?;
+    let animated = parts.next()?.parse::<u8>().ok()? != 0;
+
+    if parts.next().is_some() {
+        return None;
+    }
 
     Some(CachedRecord {
-        fingerprint: FileFingerprint {
-            size_bytes,
-            modified_secs,
-            modified_nanos,
-        },
         width,
         height,
-        media_kind,
-        cached_at_secs,
+        file_type,
+        animated,
     })
 }
 
-fn encode_thumbnail_record(
-    fingerprint: FileFingerprint,
-    cached_at_secs: u64,
-    thumbnail: &CachedVideoThumbnail,
-) -> Vec<u8> {
-    let mut out = Vec::with_capacity(THUMBNAIL_HEADER_BYTES + thumbnail.pixels.len());
-    out.extend_from_slice(&fingerprint.size_bytes.to_le_bytes());
-    out.extend_from_slice(&fingerprint.modified_secs.to_le_bytes());
-    out.extend_from_slice(&fingerprint.modified_nanos.to_le_bytes());
-    out.extend_from_slice(&(cached_at_secs ^ THUMBNAIL_SCHEMA_TAG).to_le_bytes());
-    out.extend_from_slice(&thumbnail.width.to_le_bytes());
-    out.extend_from_slice(&thumbnail.height.to_le_bytes());
-    out.extend_from_slice(&thumbnail.original_width.to_le_bytes());
-    out.extend_from_slice(&thumbnail.original_height.to_le_bytes());
-    out.extend_from_slice(&(thumbnail.pixels.len() as u32).to_le_bytes());
-    out.extend_from_slice(&thumbnail.pixels);
-    out
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn decode_thumbnail_record(raw: &[u8]) -> Option<(FileFingerprint, u64, CachedVideoThumbnail)> {
-    if raw.len() < LEGACY_THUMBNAIL_HEADER_BYTES {
-        return None;
+    #[test]
+    fn metadata_record_encodes_only_placeholder_columns() {
+        let record = CachedRecord {
+            width: 320,
+            height: 240,
+            file_type: CachedFileType::Png,
+            animated: false,
+        };
+
+        let encoded = encode_record(record);
+
+        assert_eq!(encoded, "320,240,2,0");
+        assert_eq!(decode_record(&encoded).unwrap(), record);
     }
 
-    let size_bytes = u64::from_le_bytes(raw.get(0..8)?.try_into().ok()?);
-    let modified_secs = u64::from_le_bytes(raw.get(8..16)?.try_into().ok()?);
-    let modified_nanos = u32::from_le_bytes(raw.get(16..20)?.try_into().ok()?);
-    let file_fingerprint = FileFingerprint {
-        size_bytes,
-        modified_secs,
-        modified_nanos,
-    };
-
-    let now_secs = unix_now_secs();
-    let max_future_secs = now_secs.saturating_add(60 * 60 * 24 * 365 * 10);
-
-    if raw.len() >= THUMBNAIL_HEADER_BYTES {
-        let tagged_cached_at = u64::from_le_bytes(raw.get(20..28)?.try_into().ok()?);
-        let cached_at_secs = tagged_cached_at ^ THUMBNAIL_SCHEMA_TAG;
-        if cached_at_secs > 0 && cached_at_secs <= max_future_secs {
-            if let Some((thumbnail, expected_total)) = parse_thumbnail_payload(raw, 28) {
-                if expected_total == raw.len() {
-                    return Some((file_fingerprint, cached_at_secs, thumbnail));
-                }
-            }
-        }
+    #[test]
+    fn file_type_codes_round_trip_to_real_extensions() {
+        assert_eq!(CachedFileType::from_code(1).unwrap().extension(), "jpg");
+        assert_eq!(CachedFileType::from_code(2).unwrap().extension(), "png");
+        assert_eq!(CachedFileType::from_code(5).unwrap().extension(), "webp");
+        assert_eq!(CachedFileType::from_code(100).unwrap().extension(), "mp4");
+        assert!(CachedFileType::from_code(255).is_none());
     }
 
-    let (thumbnail, expected_total) = parse_thumbnail_payload(raw, 20)?;
-    if expected_total != raw.len() {
-        return None;
+    #[test]
+    fn detects_png_by_signature_even_when_extension_is_jpg() {
+        let path = std::env::temp_dir().join(format!(
+            "riv-metadata-cache-{}-wrong.jpg",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            [
+                0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n', 0, 0, 0, 0,
+            ],
+        )
+        .unwrap();
+
+        let detected = detect_file_type(path.as_path());
+
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(detected, Some(CachedFileType::Png));
     }
 
-    Some((file_fingerprint, 0, thumbnail))
-}
+    #[test]
+    fn thumbnail_cache_public_api_is_noop() {
+        let thumbnail = CachedVideoThumbnail {
+            pixels: vec![1, 2, 3, 4],
+            width: 1,
+            height: 1,
+            original_width: 1,
+            original_height: 1,
+        };
+        let path = Path::new("unused.jpg");
 
-fn parse_thumbnail_payload(raw: &[u8], start: usize) -> Option<(CachedVideoThumbnail, usize)> {
-    let width = u32::from_le_bytes(raw.get(start..start + 4)?.try_into().ok()?);
-    let height = u32::from_le_bytes(raw.get(start + 4..start + 8)?.try_into().ok()?);
-    let original_width = u32::from_le_bytes(raw.get(start + 8..start + 12)?.try_into().ok()?);
-    let original_height = u32::from_le_bytes(raw.get(start + 12..start + 16)?.try_into().ok()?);
-    let pixel_len = u32::from_le_bytes(raw.get(start + 16..start + 20)?.try_into().ok()?) as usize;
-
-    let pixel_start = start + 20;
-    let pixel_end = pixel_start.checked_add(pixel_len)?;
-    let pixels = raw.get(pixel_start..pixel_end)?.to_vec();
-
-    Some((
-        CachedVideoThumbnail {
-            pixels,
-            width,
-            height,
-            original_width,
-            original_height,
-        },
-        pixel_end,
-    ))
+        store_cached_video_thumbnail(path, 128, &thumbnail);
+        assert!(lookup_cached_video_thumbnail(path, 128).is_none());
+    }
 }
