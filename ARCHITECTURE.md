@@ -150,6 +150,8 @@ This ordering keeps the app biased toward "consume async results, upload what ma
 
 Fullscreen manga modes can show a breadcrumb bar under the title bar. It exposes back/forward/up navigation plus clickable path segments. The viewer maintains a bounded folder history (256 entries) so traversal feels Explorer-like, and hovering the back icon opens a popup of recent folders (up to 10 entries, labels trimmed to 3 segments).
 
+The breadcrumb bar can be shown/hidden via a folder toggle icon in the title bar, and the preference persists in config state (`show_breadcrumb_bar`). The toggle icon is an embedded SVG asset so it scales cleanly on high-DPI displays.
+
 Breadcrumb segments can open child-folder menus so you can jump directly into sibling subfolders without leaving fullscreen. When a folder jump occurs, the viewer records the current folder travel position (and persists Masonry metadata snapshots) so returning to a folder restores scroll context and warm state.
 
 Child-folder popups are tracked per active breadcrumb segment so only one menu is open at a time, with a fixed-height scroll area to keep the list predictable.

@@ -627,8 +627,7 @@ pub struct Config {
     pub enable_cuda: bool,
 
     /// Maximum size for metadata_cache.redb in MiB.
-    /// This covers persistent metadata plus image/video thumbnails,
-    /// including folder-placeholder preview thumbnails.
+    /// This covers persistent metadata (dimensions, file type, animation).
     /// 0 disables the size limit.
     pub metadata_cache_max_size_mb: u64,
     /// Maximum RAM budget for per-folder masonry metadata preload snapshots in MiB.

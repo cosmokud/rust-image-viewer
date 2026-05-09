@@ -20,8 +20,9 @@ This project is intentionally optimized for one job: opening media fast, navigat
 
 - Borderless floating window with custom title bar, auto-hide controls, native-feeling fullscreen / maximize transitions, and steadier drag/zoom/resize behavior on Windows.
 - Fast single-file viewing plus fast folder navigation, including natural-sort media lists and optional single-instance reuse.
-- Breadcrumb address bar with back/forward/up navigation and a folder-history popup in fullscreen manga modes.
+- Breadcrumb address bar with back/forward/up navigation, a folder-history popup, and a hide/show toggle in fullscreen manga modes.
 - Windows cut/copy/paste for marked files with optional auto-unmark after paste.
+- Marking shortcuts for hovered files in floating, Long Strip, and Masonry modes.
 - Static images, animated GIF, animated WebP, and video playback in one app.
 - Optional hardware-accelerated video decode on Windows with D3D12/D3D11/CUDA preference and capability status readouts.
 - Two fullscreen multi-item layouts: Long Strip and Masonry.
@@ -44,7 +45,7 @@ This project is intentionally optimized for one job: opening media fast, navigat
 - Drag and drop support.
 - Single-instance mode that forwards file-open requests from secondary launches to the primary window.
 - Folder scans include symlinked files and directories for navigation.
-- Breadcrumb address bar for fullscreen manga modes with back/forward/up navigation and history popup.
+- Breadcrumb address bar for fullscreen manga modes with back/forward/up navigation, history popup, and a visibility toggle.
 - Windows cut/copy/paste for marked files; paste into the current folder via Ctrl+V or the menu.
 - Title bar menu entry for `Edit Settings`, which opens the active `config.ini` in the default editor.
 - CJK filename support through lazy Windows font loading.
@@ -204,6 +205,7 @@ When you open one file, the viewer builds the media list for its directory and e
 - Floating / solo fullscreen mode is optimized for one current item at a time.
 - Long Strip and Masonry are fullscreen-only multi-item layouts.
 - Keyboard copy / cut actions prefer marked files first; without marks, Long Strip and Masonry target the hovered item.
+- Space marks the hovered item; Ctrl+left-click toggles marks in the active mode.
 - Right-click is contextual by design:
   - floating / solo fullscreen side zones and black bars navigate previous / next
   - right-click on the current media toggles fullscreen when bound to `goto_file`
@@ -230,6 +232,8 @@ Bindings are action-first and context-aware. The same input can legally belong t
 | Side-zone / black-bar previous-next navigation | `mouse_right`                     |
 | Toggle fullscreen on current media             | `mouse_right`                     |
 | Freehand autoscroll                            | `mouse_middle`                    |
+| Mark hovered file                              | `space`                           |
+| Toggle mark on hovered file                    | `ctrl+mouse_left`                 |
 | Next item                                      | `right`, `pagedown`, `mouse5`     |
 | Previous item                                  | `left`, `pageup`, `mouse4`        |
 | Rotate clockwise                               | `up`                              |
@@ -248,6 +252,8 @@ Bindings are action-first and context-aware. The same input can legally belong t
 | Drag-pan strip                       | `mouse_left`           |
 | Open clicked item in solo fullscreen | `mouse_right`          |
 | Freehand autoscroll                  | `mouse_middle`         |
+| Mark hovered item                    | `space`                |
+| Toggle mark on hovered item          | `ctrl+mouse_left`      |
 | Continuous pan up                    | `up`                   |
 | Continuous pan down                  | `down`                 |
 | Fit-aware next page                  | `right`                |
@@ -267,6 +273,8 @@ Bindings are action-first and context-aware. The same input can legally belong t
 | Drag-pan masonry                     | `mouse_left`                             |
 | Open clicked item in solo fullscreen | `mouse_right`                            |
 | Freehand autoscroll                  | `mouse_middle`                           |
+| Mark hovered item                    | `space`                                  |
+| Toggle mark on hovered item          | `ctrl+mouse_left`                        |
 | Pan up / down                        | `up`, `down`                             |
 | Faster pan up / down                 | `left`, `right`                          |
 | Fastest pan up / down                | `pageup`, `pagedown`, `mouse4`, `mouse5` |
@@ -331,7 +339,7 @@ Delete `config.ini` if you want to regenerate it from the current defaults.
 | `startup_window_mode`                 | `floating` | `floating` or `fullscreen`.                                                                                    |
 | `single_instance`                     | `true`     | Reuse one window and forward file-open requests into it.                                                       |
 | `vsync`                               | `true`     | Enable swapchain vsync to reduce tearing.                                                                      |
-| `metadata_cache_max_size_mb`          | `1024`     | Max on-disk size of `metadata_cache.redb` in MiB. `0` disables the size cap.                                   |
+| `metadata_cache_max_size_mb`          | `1024`     | Max on-disk size of `metadata_cache.redb` in MiB. `0` disables the size cap. Stores dimensions, type, animation. |
 | `background_rgb`                      | `0, 0, 0`  | Background color as one RGB triplet.                                                                           |
 | `background_r`                        | `0`        | Alternative per-channel background override.                                                                   |
 | `background_g`                        | `0`        | Alternative per-channel background override.                                                                   |
@@ -384,7 +392,7 @@ Delete `config.ini` if you want to regenerate it from the current defaults.
 | `disable_hardware_decode` | `false`    | Disable hardware decoders completely. Overrides `prefer_hardware_decode`.               |
 | `videos_only_navigation`  | `true`     | In video-like playback mode, next/previous skip non-video-like files when enabled.      |
 
-### Persisted video state
+### Persisted state
 
 These values are updated automatically and used when `muted_by_default` or `default_volume` are set to `remember`.
 
@@ -392,6 +400,7 @@ These values are updated automatically and used when `muted_by_default` or `defa
 | -------------- | ------- | --------------------------------- |
 | `muted_state`  | `true`  | Last muted state for video audio  |
 | `volume_state` | `0.0`   | Last volume level for video audio |
+| `show_breadcrumb_bar` | `true`  | Persisted breadcrumb bar visibility |
 
 ### Performance settings
 

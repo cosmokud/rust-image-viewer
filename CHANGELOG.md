@@ -2,6 +2,53 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.3.9] - 2026-05-10
+
+### Highlights
+
+- Windows video decoding now prefers D3D12 with optional CUDA and capability status readouts, plus new hardware-acceleration switches.
+- Animated WebP playback (streaming frames) and GIF/WebP FPS overrides with presets, slider, manual input, and wheel-guarded adjustments.
+- Fullscreen breadcrumb navigation with history, child-folder popups, and a persistent show/hide toggle.
+- Marked-file workflows across modes with keyboard shortcuts, bulk cut/copy/paste/delete/rename, and optional auto-unmark after paste.
+- Metadata cache simplified to dimensions/type/animation with automatic reset on old schema or corruption, plus faster WebP header detection.
+
+### Added
+
+- D3D12 and CUDA decoder preference support with in-app capability status.
+- Performance toggles: `show_fps_update_interval_ms`, `use_hardware_acceleration`, `enable_d3d12`, `enable_cuda`.
+- Animated WebP playback with progressive frame streaming in solo view.
+- GIF/WebP FPS override UI with presets, slider, and manual input.
+- Breadcrumb address bar with back/forward/up navigation, history popups, and child-folder menus.
+- Marking shortcuts for hovered files in floating, Long Strip, and Masonry modes.
+- `videos_only_navigation` to limit next/previous to video-like media in playback mode.
+- Panic crash log output to `%TEMP%\rust-image-viewer\panic.log` on Windows.
+- Symlink-aware directory enumeration so linked folders/files appear in navigation lists.
+
+### Changed
+
+- Hardware decoder selection now ranks D3D12 first, then D3D11, with optional CUDA ranking and a full software fallback.
+- FPS overlay refresh is throttled and aligned with the primary monitor refresh rate.
+- Video resume positions now use path-keyed preview caches for stable strip/masonry focus recovery.
+- Seamless video transitions reuse the active frame to avoid first-frame thumbnail flashes.
+- Video seek policy waits for pipeline state stabilization for smoother accurate seeks.
+- Metadata cache schema now stores only dimensions, file type, and animation flag; old thumbnail tables are retired.
+- WebP animation detection reads header chunks instead of full decode.
+- Masonry metadata warmup defers its first tick to avoid heavy work before first paint.
+- Slider visuals are smoother and scroll-wheel adjustment is guarded for volume and FPS controls.
+- Breadcrumb child-folder popup tracking is centralized per active segment, and the bar visibility is persisted in config state.
+- Breadcrumb toggle icons now use embedded SVG assets for crisp scaling.
+- Explorer reveal no longer retries selection to avoid spawning multiple windows.
+- AppData config sync at build time is now opt-in via `RIV_SYNC_APPDATA_CONFIG_AT_BUILD`.
+- Release workflows were refined for tag gating and simplified Windows deploy paths.
+
+### Fixed
+
+- Seek and volume drags now finalize if the pointer is released outside the control.
+- Video resume seeks ignore tiny offsets and reset PTS on accurate seeks for stability.
+- Stale hover preview resume state during dense masonry navigation by pruning via spatial-index visibility.
+- Layout reflow/squash when video output bounds downscale frames at low zoom.
+- Corrupted or legacy metadata cache files are deleted and recreated on open.
+
 ## [v0.3.9-rc.7] - 2026-05-10
 
 ### Highlights
