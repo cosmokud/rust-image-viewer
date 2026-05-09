@@ -590,6 +590,8 @@ pub struct Config {
     pub state_muted: bool,
     /// Persisted volume state from last video session
     pub state_volume: f64,
+    /// Persisted breadcrumb address bar visibility from last session
+    pub state_show_breadcrumb_bar: bool,
     /// Whether videos loop by default
     pub video_loop: bool,
     /// Seek policy for scrub interactions: adaptive, accurate, or keyframe.
@@ -737,6 +739,7 @@ impl Config {
             video_volume_remember: false,
             state_muted: true,
             state_volume: 0.0,
+            state_show_breadcrumb_bar: true,
             video_loop: true,
             video_seek_policy: VideoSeekPolicy::Adaptive,
             video_prefer_hardware_decode: true,
@@ -1827,6 +1830,11 @@ impl Config {
                                 config.state_volume = v.clamp(0.0, 1.0);
                             }
                         }
+                        "show_breadcrumb_bar" | "breadcrumb_bar" | "breadcrumb" => {
+                            if let Some(v) = parse_bool(value) {
+                                config.state_show_breadcrumb_bar = v;
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -2226,6 +2234,10 @@ impl Config {
         values.insert(
             "volume_state",
             format_with_optional_trailing_zero_f64(self.state_volume),
+        );
+        values.insert(
+            "show_breadcrumb_bar",
+            bool_to_ini(self.state_show_breadcrumb_bar).to_string(),
         );
 
         values.insert("upscale_filter", self.upscale_filter.as_str().to_string());

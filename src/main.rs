@@ -89,6 +89,7 @@ use eframe::glow::HasContext;
 
 const GSTREAMER_MISSING_VIDEO_ERROR_TEXT: &str =
     "Cannot open video files because the GStreamer library is not installed. Please install GStreamer to enable video playback.";
+const TITLEBAR_CONTROL_ICON_COLOR: egui::Color32 = egui::Color32::WHITE;
 
 /// Paint a smooth, semi-transparent loading spinner in the bottom-right corner
 /// of the given rectangle.  The spinner is a rotating arc that indicates
@@ -2810,6 +2811,7 @@ struct ImageViewer {
 impl Default for ImageViewer {
     fn default() -> Self {
         let config = Config::load();
+        let show_breadcrumb_bar = config.state_show_breadcrumb_bar;
         let (
             folder_placeholder_preview_scan_request_tx,
             folder_placeholder_preview_scan_request_rx,
@@ -2921,7 +2923,7 @@ impl Default for ImageViewer {
             pending_idle_config_sync: true,
             is_fullscreen: false,
             show_controls: false,
-            show_breadcrumb_bar: true,
+            show_breadcrumb_bar,
             folder_navigation_history: Vec::new(),
             folder_navigation_history_index: None,
             breadcrumb_back_history_popup_hover_deadline: None,
@@ -9358,6 +9360,17 @@ impl ImageViewer {
                 painter.circle_filled(egui::pos2(rect.center().x, rect.bottom() - 3.5), 1.3, color);
             }
         }
+    }
+
+    fn paint_breadcrumb_toggle_folder_icon(
+        ui: &egui::Ui,
+        rect: egui::Rect,
+        tint: egui::Color32,
+    ) {
+        egui::Image::new(egui::include_image!("../assets/breadcrumb_toggle_folder.svg"))
+            .fit_to_exact_size(rect.size())
+            .tint(tint)
+            .paint_at(ui, rect);
     }
 
     fn menu_action_row(
@@ -23749,20 +23762,21 @@ impl ImageViewer {
 
                                     let icon_rect = toggle_rect.shrink2(egui::vec2(4.0, 4.0));
                                     let icon_color = if self.show_breadcrumb_bar {
-                                        egui::Color32::WHITE
+                                        TITLEBAR_CONTROL_ICON_COLOR
                                     } else {
-                                        egui::Color32::from_gray(170)
+                                        TITLEBAR_CONTROL_ICON_COLOR.gamma_multiply(170.0 / 255.0)
                                     };
-                                    Self::paint_menu_action_icon(
-                                        ui.painter(),
+                                    Self::paint_breadcrumb_toggle_folder_icon(
+                                        ui,
                                         icon_rect,
-                                        MenuActionIcon::OpenLocation,
                                         icon_color,
                                     );
                                 }
 
                                 if toggle_resp.clicked() {
                                     self.show_breadcrumb_bar = !self.show_breadcrumb_bar;
+                                    self.config.state_show_breadcrumb_bar = self.show_breadcrumb_bar;
+                                    self.pending_idle_config_sync = true;
                                     self.show_controls = true;
                                     self.controls_show_time = Instant::now();
                                 }
@@ -23925,7 +23939,8 @@ impl ImageViewer {
                                     };
                                     ui.painter().rect_filled(rect, 4.0, bg);
 
-                                    let stroke = egui::Stroke::new(1.6, egui::Color32::WHITE);
+                                    let stroke =
+                                        egui::Stroke::new(1.6, TITLEBAR_CONTROL_ICON_COLOR);
                                     // Keep icons visually consistent while using a taller hit-rect.
                                     let pad_x = 10.0;
                                     let pad_y = 11.0;
@@ -28370,9 +28385,7 @@ fn main() -> eframe::Result<()> {
         "Image & Video Viewer",
         options,
         Box::new(move |cc| {
-            // Skip installing extra image loaders - we use our own optimized loader
-            // egui_extras loaders add overhead and we don't need them
-            // egui_extras::install_image_loaders(&cc.egui_ctx);
+            egui_extras::install_image_loaders(&cc.egui_ctx);
             #[cfg(target_os = "windows")]
             {
                 Ok(Box::new(ImageViewer::new(

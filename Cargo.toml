@@ -21,9 +21,8 @@ mimalloc-allocator = ["dep:mimalloc"]
 # GUI framework
 eframe = { version = "0.29" }
 egui = "0.29"
-# egui_extras is optional - we use our own optimized image loader
-# Keeping it as optional dependency in case needed for future features
-egui_extras = { version = "0.29", features = ["image"], optional = true }
+# egui_extras powers SVG/icon loaders for egui::Image::include_image usage.
+egui_extras = { version = "0.29", features = ["image", "svg"] }
 
 # Image handling
 image = { version = "0.25", default-features = false, features = ["webp", "ico", "tiff"] }
