@@ -6,4 +6,4 @@
 
 ## Known Issues
 
-- In rare cases, the video bar will be stuck indefinitely (very hard to reproduce).
+- In a rare case the video bar will stuck indefinitely (very hard to reproduce).

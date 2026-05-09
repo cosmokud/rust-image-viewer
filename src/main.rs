@@ -651,6 +651,7 @@ struct MarkSelectionBoxState {
     anchor: egui::Pos2,
     current: egui::Pos2,
     preview_indices: Vec<usize>,
+    drag_started: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -21279,6 +21280,7 @@ impl ImageViewer {
                     anchor: pos,
                     current: pos,
                     preview_indices: Vec::new(),
+                    drag_started: false,
                 });
                 self.is_panning = false;
                 self.last_mouse_pos = None;
@@ -21292,10 +21294,18 @@ impl ImageViewer {
             if let Some(selection) = self.mark_selection_box.as_mut() {
                 if primary_down {
                     selection.current = pos;
-                    selection_rect = Some(egui::Rect::from_two_pos(
-                        selection.anchor,
-                        selection.current,
-                    ));
+                    let rect = egui::Rect::from_two_pos(selection.anchor, selection.current);
+                    const MARK_SELECTION_MIN_DRAG_DISTANCE: f32 = 3.0;
+                    let drag_distance_sq = (selection.current - selection.anchor).length_sq();
+                    if selection.drag_started
+                        || drag_distance_sq
+                            >= MARK_SELECTION_MIN_DRAG_DISTANCE * MARK_SELECTION_MIN_DRAG_DISTANCE
+                    {
+                        selection.drag_started = true;
+                        selection_rect = Some(rect);
+                    } else {
+                        selection.preview_indices.clear();
+                    }
                 }
             }
 
@@ -21311,7 +21321,11 @@ impl ImageViewer {
 
         let finalize_mark_selection = self.mark_selection_box.as_ref().and_then(|selection| {
             if primary_released || !primary_down || !ctrl_held {
-                Some(selection.preview_indices.clone())
+                if selection.drag_started {
+                    Some(selection.preview_indices.clone())
+                } else {
+                    Some(Vec::new())
+                }
             } else {
                 None
             }
