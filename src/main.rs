@@ -25,7 +25,8 @@ mod windows_env;
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use config::{
-    Action, Config, InputBinding, MangaVirtualizationBackend, StartupWindowMode, VideoSeekPolicy,
+    Action, Config, InputBinding, MangaVirtualizationBackend, ShortcutModifier, StartupWindowMode,
+    VideoSeekPolicy,
 };
 use folder_travel_cache::{
     lookup_folder_travel_position, store_folder_travel_position, FolderTravelLayoutMode,
@@ -4791,19 +4792,53 @@ impl ImageViewer {
         self.manga_index_at_screen_pos(pos)
     }
 
+    fn active_mark_shortcuts(&self) -> (Option<egui::Key>, Option<ShortcutModifier>) {
+        if self.manga_mode && self.is_fullscreen {
+            if self.is_masonry_mode() {
+                (
+                    self.config.masonry_mark_file,
+                    self.config.masonry_toggle_mark_file,
+                )
+            } else {
+                (self.config.manga_mark_file, self.config.manga_toggle_mark_file)
+            }
+        } else {
+            (self.config.mark_file, self.config.toggle_mark_file)
+        }
+    }
+
+    fn shortcut_modifier_matches_input(
+        modifier: ShortcutModifier,
+        modifiers: egui::Modifiers,
+    ) -> bool {
+        match modifier {
+            ShortcutModifier::Ctrl => modifiers.ctrl && !modifiers.shift && !modifiers.alt,
+            ShortcutModifier::Shift => !modifiers.ctrl && modifiers.shift && !modifiers.alt,
+            ShortcutModifier::Alt => !modifiers.ctrl && !modifiers.shift && modifiers.alt,
+        }
+    }
+
+    fn is_markable_index(&self, index: usize) -> bool {
+        self.image_list
+            .get(index)
+            .is_some_and(|path| !Self::is_up_navigation_entry_path(path.as_path()))
+    }
+
     fn mark_target_index_from_pointer(&mut self, ctx: &egui::Context) -> Option<usize> {
         if self.image_list.is_empty() {
             return None;
         }
 
-        if let Some(index) = self.hovered_manga_index_from_pointer(ctx) {
-            return Some(index);
-        }
+        let target_index = if let Some(index) = self.hovered_manga_index_from_pointer(ctx) {
+            Some(index)
+        } else {
+            Some(
+                self.current_index
+                    .min(self.image_list.len().saturating_sub(1)),
+            )
+        };
 
-        Some(
-            self.current_index
-                .min(self.image_list.len().saturating_sub(1)),
-        )
+        target_index.filter(|index| self.is_markable_index(*index))
     }
 
     fn is_path_marked(&self, path: &Path) -> bool {
@@ -4860,6 +4895,9 @@ impl ImageViewer {
         let Some(path) = self.image_list.get(index).cloned() else {
             return false;
         };
+        if Self::is_up_navigation_entry_path(path.as_path()) {
+            return false;
+        }
 
         if !self.marked_files.insert(path.clone()) {
             self.marked_files.remove(&path);
@@ -4879,6 +4917,9 @@ impl ImageViewer {
 
         for index in indices {
             if let Some(path) = self.image_list.get(*index).cloned() {
+                if Self::is_up_navigation_entry_path(path.as_path()) {
+                    continue;
+                }
                 if !seen_paths.insert(path.clone()) {
                     continue;
                 }
@@ -4903,6 +4944,9 @@ impl ImageViewer {
     fn mark_all_files(&mut self) -> usize {
         let mut added = 0usize;
         for path in &self.image_list {
+            if Self::is_up_navigation_entry_path(path.as_path()) {
+                continue;
+            }
             if self.marked_files.insert(path.clone()) {
                 added = added.saturating_add(1);
             }
@@ -9666,18 +9710,17 @@ impl ImageViewer {
         }
     }
     fn try_handle_ctrl_primary_mark_shortcut(&mut self, ctx: &egui::Context) -> bool {
-        if self.manga_mode
-            || self.image_list.is_empty()
-            || self.any_modal_dialog_open()
-            || self.file_action_menu.is_some()
-        {
+        if self.image_list.is_empty() || self.any_modal_dialog_open() || self.file_action_menu.is_some() {
             return false;
         }
+        let (_, toggle_modifier) = self.active_mark_shortcuts();
+        let Some(toggle_modifier) = toggle_modifier else {
+            return false;
+        };
+        let manga_fullscreen = self.manga_mode && self.is_fullscreen;
 
         let target_index = ctx.input(|input| {
-            if !input.modifiers.ctrl
-                || input.modifiers.shift
-                || input.modifiers.alt
+            if !Self::shortcut_modifier_matches_input(toggle_modifier, input.modifiers)
                 || !input.pointer.button_clicked(egui::PointerButton::Primary)
             {
                 return None;
@@ -9690,15 +9733,20 @@ impl ImageViewer {
             if self.pointer_over_shortcut_blocking_ui(Some(pointer_pos), input.screen_rect) {
                 return None;
             }
-            if !self.point_over_current_media(pointer_pos, input.screen_rect) {
+            if !manga_fullscreen && !self.point_over_current_media(pointer_pos, input.screen_rect) {
                 return None;
             }
 
-            Some(
-                self.current_index
-                    .min(self.image_list.len().saturating_sub(1)),
-            )
-        });
+            if manga_fullscreen {
+                self.manga_index_at_screen_pos(pointer_pos)
+            } else {
+                Some(
+                    self.current_index
+                        .min(self.image_list.len().saturating_sub(1)),
+                )
+            }
+        })
+        .filter(|index| self.is_markable_index(*index));
 
         if let Some(index) = target_index {
             self.toggle_mark_for_index(index);
@@ -22935,9 +22983,15 @@ impl ImageViewer {
         }
 
         let screen_width = ctx.screen_rect().width();
-        let space_pressed_for_mark = ctx.input(|input| input.key_pressed(egui::Key::Space));
+        let (mark_file_key, _) = self.active_mark_shortcuts();
+        let mark_file_pressed = ctx.input(|input| {
+            !input.modifiers.ctrl
+                && !input.modifiers.shift
+                && !input.modifiers.alt
+                && mark_file_key.is_some_and(|key| input.key_pressed(key))
+        });
 
-        if space_pressed_for_mark {
+        if mark_file_pressed {
             if let Some(index) = self.mark_target_index_from_pointer(ctx) {
                 self.toggle_mark_for_index(index);
             }
@@ -23082,7 +23136,7 @@ impl ImageViewer {
                 for binding in bindings {
                     match binding {
                         InputBinding::Key(key) => {
-                            if space_pressed_for_mark && *key == egui::Key::Space {
+                            if mark_file_pressed && Some(*key) == mark_file_key {
                                 continue;
                             }
                             if !ctrl && !shift && !alt && input.key_pressed(*key) {

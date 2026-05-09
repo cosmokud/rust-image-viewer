@@ -145,6 +145,32 @@ pub enum InputBinding {
     KeyWithAlt(egui::Key),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShortcutModifier {
+    Ctrl,
+    Shift,
+    Alt,
+}
+
+impl ShortcutModifier {
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "ctrl" | "control" => Some(Self::Ctrl),
+            "shift" => Some(Self::Shift),
+            "alt" => Some(Self::Alt),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Ctrl => "ctrl",
+            Self::Shift => "shift",
+            Self::Alt => "alt",
+        }
+    }
+}
+
 /// All configurable actions in the viewer
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Action {
@@ -474,6 +500,18 @@ pub struct Config {
     pub confirm_delete_to_recycle_bin: bool,
     /// When true, successful paste clears current marked-file selection by default.
     pub auto_unmark_after_paste: bool,
+    /// Floating/fullscreen mark shortcut key.
+    pub mark_file: Option<egui::Key>,
+    /// Floating/fullscreen mark toggle click modifier (held with primary click).
+    pub toggle_mark_file: Option<ShortcutModifier>,
+    /// Long-strip mark shortcut key.
+    pub manga_mark_file: Option<egui::Key>,
+    /// Long-strip mark toggle click modifier (held with primary click).
+    pub manga_toggle_mark_file: Option<ShortcutModifier>,
+    /// Masonry mark shortcut key.
+    pub masonry_mark_file: Option<egui::Key>,
+    /// Masonry mark toggle click modifier (held with primary click).
+    pub masonry_toggle_mark_file: Option<ShortcutModifier>,
     /// Floating-mode zoom animation speed. Higher = faster. 0 = instant snap.
     pub zoom_animation_speed: f32,
     /// Degrees added or removed per Ctrl+Up / Ctrl+Down precise-rotation input.
@@ -657,6 +695,12 @@ impl Config {
             maximize_to_borderless_fullscreen: true,
             confirm_delete_to_recycle_bin: true,
             auto_unmark_after_paste: true,
+            mark_file: Some(egui::Key::Space),
+            toggle_mark_file: Some(ShortcutModifier::Ctrl),
+            manga_mark_file: Some(egui::Key::Space),
+            manga_toggle_mark_file: Some(ShortcutModifier::Ctrl),
+            masonry_mark_file: Some(egui::Key::Space),
+            masonry_toggle_mark_file: Some(ShortcutModifier::Ctrl),
             zoom_animation_speed: 20.0,
             precise_rotation_step_degrees: 2.0,
             zoom_step: 1.02,
@@ -1151,6 +1195,48 @@ impl Config {
                         let bindings = parse_binding_list(value);
                         config.replace_action_bindings(Action::MangaGotoFile, &bindings);
                         config.replace_action_bindings(Action::MasonryGotoFile, &bindings);
+                        continue;
+                    }
+
+                    if key.eq_ignore_ascii_case("mark_file") {
+                        if let Some(mark_key) = parse_optional_mark_key(value) {
+                            config.mark_file = mark_key;
+                        }
+                        continue;
+                    }
+
+                    if key.eq_ignore_ascii_case("toggle_mark_file") {
+                        if let Some(modifier) = parse_optional_shortcut_modifier(value) {
+                            config.toggle_mark_file = modifier;
+                        }
+                        continue;
+                    }
+
+                    if key.eq_ignore_ascii_case("manga_mark_file") {
+                        if let Some(mark_key) = parse_optional_mark_key(value) {
+                            config.manga_mark_file = mark_key;
+                        }
+                        continue;
+                    }
+
+                    if key.eq_ignore_ascii_case("manga_toggle_mark_file") {
+                        if let Some(modifier) = parse_optional_shortcut_modifier(value) {
+                            config.manga_toggle_mark_file = modifier;
+                        }
+                        continue;
+                    }
+
+                    if key.eq_ignore_ascii_case("masonry_mark_file") {
+                        if let Some(mark_key) = parse_optional_mark_key(value) {
+                            config.masonry_mark_file = mark_key;
+                        }
+                        continue;
+                    }
+
+                    if key.eq_ignore_ascii_case("masonry_toggle_mark_file") {
+                        if let Some(modifier) = parse_optional_shortcut_modifier(value) {
+                            config.masonry_toggle_mark_file = modifier;
+                        }
                         continue;
                     }
 
@@ -1949,6 +2035,30 @@ impl Config {
             bool_to_ini(self.auto_unmark_after_paste).to_string(),
         );
         values.insert(
+            "mark_file",
+            optional_mark_key_to_string(self.mark_file.as_ref()),
+        );
+        values.insert(
+            "toggle_mark_file",
+            optional_shortcut_modifier_to_string(self.toggle_mark_file.as_ref()),
+        );
+        values.insert(
+            "manga_mark_file",
+            optional_mark_key_to_string(self.manga_mark_file.as_ref()),
+        );
+        values.insert(
+            "manga_toggle_mark_file",
+            optional_shortcut_modifier_to_string(self.manga_toggle_mark_file.as_ref()),
+        );
+        values.insert(
+            "masonry_mark_file",
+            optional_mark_key_to_string(self.masonry_mark_file.as_ref()),
+        );
+        values.insert(
+            "masonry_toggle_mark_file",
+            optional_shortcut_modifier_to_string(self.masonry_toggle_mark_file.as_ref()),
+        );
+        values.insert(
             "zoom_animation_speed",
             format!("{}", self.zoom_animation_speed),
         );
@@ -2377,6 +2487,18 @@ fn optional_binding_to_string(binding: Option<&InputBinding>) -> String {
         .unwrap_or_else(|| "none".to_string())
 }
 
+fn optional_mark_key_to_string(key: Option<&egui::Key>) -> String {
+    key.map(key_to_string)
+        .unwrap_or_else(|| "none".to_string())
+}
+
+fn optional_shortcut_modifier_to_string(modifier: Option<&ShortcutModifier>) -> String {
+    modifier
+        .map(ShortcutModifier::as_str)
+        .unwrap_or("none")
+        .to_string()
+}
+
 fn key_to_string(key: &egui::Key) -> String {
     format!("{:?}", key).to_lowercase()
 }
@@ -2469,6 +2591,30 @@ fn parse_optional_binding(value: &str) -> Option<Option<InputBinding>> {
     }
 
     parse_input_binding(value).map(Some)
+}
+
+fn parse_optional_mark_key(value: &str) -> Option<Option<egui::Key>> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("none")
+        || value.eq_ignore_ascii_case("off")
+        || value.eq_ignore_ascii_case("disabled")
+    {
+        return Some(None);
+    }
+
+    parse_key(value).map(Some)
+}
+
+fn parse_optional_shortcut_modifier(value: &str) -> Option<Option<ShortcutModifier>> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("none")
+        || value.eq_ignore_ascii_case("off")
+        || value.eq_ignore_ascii_case("disabled")
+    {
+        return Some(None);
+    }
+
+    ShortcutModifier::from_str(value).map(Some)
 }
 
 fn parse_rgb_triplet(value: &str) -> Option<[u8; 3]> {
