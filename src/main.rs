@@ -4427,6 +4427,50 @@ impl ImageViewer {
         segments
     }
 
+    #[cfg(target_os = "windows")]
+    fn windows_drive_root_label(path: &Path) -> Option<String> {
+        use std::path::{Component, Prefix};
+
+        let mut components = path.components();
+        let Some(Component::Prefix(prefix_component)) = components.next() else {
+            return None;
+        };
+        let drive_letter = match prefix_component.kind() {
+            Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => letter as char,
+            _ => return None,
+        };
+        let Some(Component::RootDir) = components.next() else {
+            return None;
+        };
+        if components.next().is_some() {
+            return None;
+        }
+
+        Some(format!("{}:", drive_letter.to_ascii_uppercase()))
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn windows_drive_root_label(_path: &Path) -> Option<String> {
+        None
+    }
+
+    #[cfg(target_os = "windows")]
+    fn windows_available_drive_roots() -> Vec<PathBuf> {
+        let mut drives = Vec::new();
+        for drive in b'A'..=b'Z' {
+            let path = PathBuf::from(format!("{}:\\", drive as char));
+            if path.is_dir() {
+                drives.push(path);
+            }
+        }
+        drives
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn windows_available_drive_roots() -> Vec<PathBuf> {
+        Vec::new()
+    }
+
     fn breadcrumb_child_directories(path: &Path) -> Vec<PathBuf> {
         let mut children: Vec<PathBuf> = fs::read_dir(path)
             .ok()
@@ -4435,6 +4479,16 @@ impl ImageViewer {
             .map(|entry| entry.path())
             .filter(|child| child.is_dir())
             .collect();
+
+        let drive_roots = if Self::windows_drive_root_label(path).is_some() {
+            Self::windows_available_drive_roots()
+        } else {
+            Vec::new()
+        };
+        if !drive_roots.is_empty() {
+            children.retain(|child| Self::windows_drive_root_label(child).is_none());
+            children.splice(0..0, drive_roots);
+        }
 
         children.sort_by(|a, b| {
             let a_name = a
