@@ -34,8 +34,8 @@ use folder_travel_cache::{
 };
 use hashbrown::{HashMap, HashSet};
 use image_loader::{
-    get_media_in_directory, get_media_type, is_supported_video, probe_image_dimensions, ImageFrame,
-    LoadedImage, MediaType, FOLDER_UP_ENTRY_NAME,
+    get_media_in_directory, get_media_type, is_supported_video, probe_image_dimensions,
+    resolve_folder_shortcut_target, ImageFrame, LoadedImage, MediaType, FOLDER_UP_ENTRY_NAME,
 };
 use manga_loader::{
     DecodedImage, MangaLoader, MangaMediaType, MangaTextureCache, LOD_SIDE_BUCKETS,
@@ -3987,6 +3987,8 @@ impl ImageViewer {
             current_directory.parent().map(Path::to_path_buf)
         } else if path.is_dir() {
             Some(path.to_path_buf())
+        } else if let Some(target_directory) = resolve_folder_shortcut_target(path) {
+            Some(target_directory)
         } else {
             None
         }

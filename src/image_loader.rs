@@ -7,6 +7,9 @@ use std::io::{BufRead, BufReader, Cursor, Read, Seek};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "windows")]
+use std::os::windows::ffi::OsStrExt;
+
 use fast_image_resize as fir;
 use image::imageops::FilterType;
 use jwalk::WalkDir;
@@ -15,6 +18,19 @@ use rayon::slice::ParallelSliceMut;
 use zune_core::colorspace::ColorSpace;
 use zune_core::options::DecoderOptions;
 use zune_image::image::Image as ZuneImage;
+
+#[cfg(target_os = "windows")]
+use windows::{
+    core::{Interface, PCWSTR},
+    Win32::{
+        Foundation::RPC_E_CHANGED_MODE,
+        System::Com::{
+            CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, IPersistFile,
+            CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, STGM_READ,
+        },
+        UI::Shell::{IShellLinkW, ShellLink, SHGetPathFromIDListEx, GPFIDL_DEFAULT},
+    },
+};
 
 // Keep a generous decode budget so very large static images can load at full quality.
 // Header-based probing and dimension checks still guard against invalid/corrupt inputs.
@@ -67,6 +83,75 @@ fn extension_is(path: &Path, candidate: &str) -> bool {
         .and_then(|ext| ext.to_str())
         .map(|ext| ext.eq_ignore_ascii_case(candidate))
         .unwrap_or(false)
+}
+
+#[cfg(target_os = "windows")]
+fn resolve_windows_folder_shortcut_target(path: &Path) -> Option<PathBuf> {
+    if !path.is_file() || !extension_is(path, "lnk") {
+        return None;
+    }
+
+    let mut should_uninitialize = false;
+    let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+    if hr.is_ok() {
+        should_uninitialize = true;
+    } else if hr != RPC_E_CHANGED_MODE {
+        return None;
+    }
+
+    let resolved = (|| {
+        let shell_link: IShellLinkW =
+            unsafe { CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER) }.ok()?;
+        let persist_file: IPersistFile = shell_link.cast().ok()?;
+
+        let wide_path: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        unsafe { persist_file.Load(PCWSTR(wide_path.as_ptr()), STGM_READ) }.ok()?;
+
+        let pidl = unsafe { shell_link.GetIDList() }.ok()?;
+        let mut raw_target = vec![0_u16; 32_768];
+        let resolved = unsafe { SHGetPathFromIDListEx(pidl as *const _, &mut raw_target, GPFIDL_DEFAULT) }.as_bool();
+        unsafe {
+            CoTaskMemFree(Some(pidl as *const core::ffi::c_void));
+        }
+        if !resolved {
+            return None;
+        }
+
+        let target_len = raw_target.iter().position(|ch| *ch == 0).unwrap_or(0);
+        if target_len == 0 {
+            return None;
+        }
+
+        let target = PathBuf::from(String::from_utf16_lossy(&raw_target[..target_len]));
+        if target.is_dir() {
+            Some(target)
+        } else {
+            None
+        }
+    })();
+
+    if should_uninitialize {
+        unsafe {
+            CoUninitialize();
+        }
+    }
+
+    resolved
+}
+
+#[cfg(not(target_os = "windows"))]
+fn resolve_windows_folder_shortcut_target(_path: &Path) -> Option<PathBuf> {
+    None
+}
+
+/// Resolve a Windows `.lnk` shortcut that targets a directory.
+/// Returns `None` when the path is not a supported folder shortcut.
+pub fn resolve_folder_shortcut_target(path: &Path) -> Option<PathBuf> {
+    resolve_windows_folder_shortcut_target(path)
 }
 
 fn image_filter_to_fir(filter: FilterType) -> fir::FilterType {
@@ -325,7 +410,10 @@ pub fn get_media_in_directory(path: &Path) -> Vec<PathBuf> {
             // `jwalk` reports symlinks as symlinks even when they point to directories/files.
             // Resolve the target kind so symlinked folders participate in traversal entries.
             let is_symlink = file_type.is_symlink();
-            let is_folder = file_type.is_dir() || (is_symlink && path.is_dir());
+            let is_folder_shortcut = (file_type.is_file() || (is_symlink && path.is_file()))
+                && resolve_folder_shortcut_target(path.as_path()).is_some();
+            let is_folder =
+                file_type.is_dir() || (is_symlink && path.is_dir()) || is_folder_shortcut;
             let is_file = file_type.is_file() || (is_symlink && path.is_file());
             if is_folder || (is_file && is_supported_media(&path)) {
                 Some(MediaDirectoryEntry {
