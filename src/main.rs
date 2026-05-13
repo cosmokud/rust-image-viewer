@@ -2377,6 +2377,8 @@ struct ImageViewer {
     current_video_path: Option<PathBuf>,
     /// Video texture for rendering video frames
     video_texture: Option<egui::TextureHandle>,
+    /// Path that produced `video_texture`; prevents stale cross-video reuse.
+    video_texture_source_path: Option<PathBuf>,
     /// Dimensions corresponding to the current `video_texture`.
     /// Used to keep showing the last frame while a new video is loading.
     video_texture_dims: Option<(u32, u32)>,
@@ -2960,6 +2962,7 @@ impl Default for ImageViewer {
             video_player: None,
             current_video_path: None,
             video_texture: None,
+            video_texture_source_path: None,
             video_texture_dims: None,
             current_media_type: None,
             pending_video_thumbnail_placeholder: None,
@@ -5148,6 +5151,7 @@ impl ImageViewer {
         self.texture = None;
         self.image_texture_dims = None;
         self.video_texture = None;
+        self.video_texture_source_path = None;
         self.video_texture_dims = None;
         self.current_media_type = None;
         self.current_index = 0;
@@ -6156,6 +6160,7 @@ impl ImageViewer {
             if let Some(texture) = self.video_texture.take() {
                 drop(texture);
             }
+            self.video_texture_source_path = None;
             self.video_texture_dims = None;
         }
     }
@@ -12171,6 +12176,28 @@ impl ImageViewer {
                 .is_some_and(|path| self.image_list.get(index) == Some(path))
     }
 
+    fn strip_entry_video_texture_matches_placeholder_path(&self) -> bool {
+        self.video_texture_source_path
+            .as_ref()
+            .and_then(|texture_path| {
+                self.strip_entry_placeholder_path
+                    .as_ref()
+                    .map(|placeholder_path| texture_path == placeholder_path)
+            })
+            .unwrap_or(false)
+    }
+
+    fn strip_entry_image_texture_matches_placeholder_path(&self) -> bool {
+        self.image
+            .as_ref()
+            .and_then(|img| {
+                self.strip_entry_placeholder_path
+                    .as_ref()
+                    .map(|placeholder_path| &img.path == placeholder_path)
+            })
+            .unwrap_or(false)
+    }
+
     fn manga_video_texture_matches(&self, index: usize) -> bool {
         self.manga_video_texture_paths
             .get(&index)
@@ -13586,6 +13613,7 @@ impl ImageViewer {
         if let Some(texture) = self.video_texture.take() {
             drop(texture);
         }
+        self.video_texture_source_path = None;
         self.video_texture_dims = None;
         if let Some(texture) = self.texture.take() {
             drop(texture);
@@ -13602,6 +13630,8 @@ impl ImageViewer {
                 }
                 MediaType::Video => {
                     self.video_texture = Some(placeholder.texture);
+                    self.video_texture_source_path =
+                        self.current_video_path.clone().or_else(|| self.current_media_path());
                     self.video_texture_dims = Some(placeholder.dims);
                 }
             }
@@ -14794,17 +14824,25 @@ impl ImageViewer {
             return None;
         }
 
-        let path = self
+        let current_path = self
             .current_video_path
             .clone()
             .or_else(|| self.current_media_path())?;
+        let source_path = self
+            .video_texture_source_path
+            .clone()
+            .unwrap_or_else(|| current_path.clone());
+        if source_path != current_path {
+            return None;
+        }
+
         let texture = self.video_texture.as_ref()?.clone();
         let (width, height) = self.video_texture_dims?;
         if width == 0 || height == 0 {
             return None;
         }
 
-        Some((path, texture, width, height))
+        Some((source_path, texture, width, height))
     }
 
     fn install_manga_video_texture_for_path(
@@ -20628,13 +20666,25 @@ impl ImageViewer {
             } else if self.strip_entry_placeholder_matches(idx) {
                 // Immediate fallback when entering strip mode from solo-video fullscreen.
                 // Keeps only the strip-entry frame visible until manga cache catches up.
-                if let Some(texture) = self.video_texture.as_ref() {
-                    ui.painter().image(
-                        texture.id(),
-                        image_rect,
-                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                        egui::Color32::WHITE,
-                    );
+                if self.strip_entry_video_texture_matches_placeholder_path() {
+                    if let Some(texture) = self.video_texture.as_ref() {
+                        ui.painter().image(
+                            texture.id(),
+                            image_rect,
+                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                            egui::Color32::WHITE,
+                        );
+                    } else {
+                        ui.painter()
+                            .rect_filled(image_rect, 0.0, egui::Color32::from_gray(25));
+                        ui.painter().text(
+                            image_rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            "🎬",
+                            egui::FontId::proportional(32.0),
+                            egui::Color32::from_gray(100),
+                        );
+                    }
                 } else {
                     ui.painter()
                         .rect_filled(image_rect, 0.0, egui::Color32::from_gray(25));
@@ -20813,13 +20863,25 @@ impl ImageViewer {
             } else if self.strip_entry_placeholder_matches(idx) {
                 // Immediate fallback when entering strip mode from solo-image fullscreen.
                 // Keeps only the strip-entry image visible while manga textures are still loading.
-                if let Some(texture) = self.texture.as_ref() {
-                    ui.painter().image(
-                        texture.id(),
-                        image_rect,
-                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                        egui::Color32::WHITE,
-                    );
+                if self.strip_entry_image_texture_matches_placeholder_path() {
+                    if let Some(texture) = self.texture.as_ref() {
+                        ui.painter().image(
+                            texture.id(),
+                            image_rect,
+                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                            egui::Color32::WHITE,
+                        );
+                    } else {
+                        ui.painter()
+                            .rect_filled(image_rect, 0.0, egui::Color32::from_gray(30));
+                        ui.painter().text(
+                            image_rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            "⏳",
+                            egui::FontId::proportional(24.0),
+                            egui::Color32::from_gray(80),
+                        );
+                    }
                 } else {
                     ui.painter()
                         .rect_filled(image_rect, 0.0, egui::Color32::from_gray(30));
@@ -22735,6 +22797,7 @@ impl ImageViewer {
                 .is_some_and(|placeholder| Some(&placeholder.path) == current_path.as_ref());
             if should_upload_placeholder {
                 if let Some(placeholder) = self.pending_video_thumbnail_placeholder.take() {
+                    let placeholder_path = placeholder.path.clone();
                     let color_image = egui::ColorImage::from_rgba_unmultiplied(
                         [
                             placeholder.thumbnail.width as usize,
@@ -22750,6 +22813,7 @@ impl ImageViewer {
                             placeholder.thumbnail.height,
                         ),
                     ));
+                    self.video_texture_source_path = Some(placeholder_path);
                     self.video_texture_dims =
                         Some((placeholder.thumbnail.width, placeholder.thumbnail.height));
                     self.retained_media_placeholder_visible = false;
@@ -22953,6 +23017,9 @@ impl ImageViewer {
                 } else {
                     self.video_texture =
                         Some(ctx.load_texture("video", color_image, texture_options));
+                }
+                if self.video_texture_source_path.as_ref() != current_video_path.as_ref() {
+                    self.video_texture_source_path = current_video_path.clone();
                 }
                 self.video_texture_dims = Some((w, h));
                 needs_repaint = true;
