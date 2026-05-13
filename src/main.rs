@@ -9122,6 +9122,23 @@ impl ImageViewer {
         is_animated
     }
 
+    fn current_image_is_animated_for_mode_switch(
+        &mut self,
+        current_media_type: Option<MediaType>,
+    ) -> bool {
+        if current_media_type != Some(MediaType::Image) {
+            return false;
+        }
+
+        if let Some(path) = self.current_media_path() {
+            if Self::path_is_gif(path.as_path()) || Self::path_is_webp(path.as_path()) {
+                return self.is_probably_animated_image_path(path.as_path());
+            }
+        }
+
+        self.image.as_ref().is_some_and(|img| img.is_animated())
+    }
+
     fn current_fab_single_action_index(&self) -> Option<usize> {
         if self.manga_mode || self.image_list.is_empty() {
             None
@@ -14817,7 +14834,8 @@ impl ImageViewer {
     fn enter_manga_mode_from_preserved_strip_cache(&mut self) {
         let current_media_dims = self.media_display_dimensions().or(self.video_texture_dims);
         let current_media_type = self.current_media_type;
-        let current_image_is_animated = self.image.as_ref().is_some_and(|img| img.is_animated());
+        let current_image_is_animated =
+            self.current_image_is_animated_for_mode_switch(current_media_type);
         let current_path = self.current_media_path();
 
         self.prepare_enter_manga_mode_state(current_media_type);
@@ -16527,7 +16545,7 @@ impl ImageViewer {
             let current_media_dims = self.media_display_dimensions().or(self.video_texture_dims);
             let current_media_type = self.current_media_type;
             let current_image_is_animated =
-                self.image.as_ref().is_some_and(|img| img.is_animated());
+                self.current_image_is_animated_for_mode_switch(current_media_type);
 
             self.manga_ttv_pending.clear();
             self.manga_ttv_samples_ms.clear();
