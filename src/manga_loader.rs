@@ -623,6 +623,65 @@ impl MangaLoader {
         updated
     }
 
+    /// Seed conservative fallback dimensions for uncached items in `[start, end)`.
+    ///
+    /// This is a recovery path for rare probe stalls: it keeps masonry warm-up moving
+    /// while higher-fidelity dimensions can still arrive later from decode/probe results.
+    pub fn seed_fallback_dimensions_for_range(
+        &mut self,
+        image_list: &[PathBuf],
+        start: usize,
+        end: usize,
+        max_items: usize,
+    ) -> usize {
+        if max_items == 0 || image_list.is_empty() {
+            return 0;
+        }
+
+        let end = end.min(image_list.len());
+        if start >= end {
+            return 0;
+        }
+
+        let mut seeded = 0usize;
+
+        for idx in start..end {
+            if seeded >= max_items {
+                break;
+            }
+
+            let Some(path) = image_list.get(idx) else {
+                self.dim_pending.remove(&idx);
+                continue;
+            };
+
+            let is_video = is_supported_video(path);
+            let is_image = is_supported_image(path);
+
+            if !is_video && !is_image {
+                self.dim_pending.remove(&idx);
+                continue;
+            }
+
+            if self.dimension_cache.contains_key(&idx) {
+                self.dim_pending.remove(&idx);
+                continue;
+            }
+
+            let fallback = if is_video {
+                (1920, 1080, MangaMediaType::Video)
+            } else {
+                (1200, 1600, MangaMediaType::StaticImage)
+            };
+
+            self.dimension_cache.insert(idx, fallback);
+            self.dim_pending.remove(&idx);
+            seeded = seeded.saturating_add(1);
+        }
+
+        seeded
+    }
+
     /// Coordinator loop that processes requests in parallel using Rayon.
     fn coordinator_loop(
         request_rx: Receiver<LoadRequest>,

@@ -2652,6 +2652,8 @@ struct ImageViewer {
     masonry_metadata_preload_overlay_hold_until: Option<Instant>,
     /// Defer first warm-up tick so folder travel can paint destination + overlay first.
     masonry_metadata_preload_defer_first_tick: bool,
+    /// Timestamp when masonry metadata warm-up last stopped making progress.
+    masonry_metadata_preload_stall_since: Option<Instant>,
     /// Deferred folder-travel restore payload applied after masonry metadata warmup completes.
     pending_masonry_folder_travel_restore: Option<(usize, f32)>,
     /// True if masonry was actively scrolling/panning/zooming on the previous frame.
@@ -3097,6 +3099,7 @@ impl Default for ImageViewer {
             masonry_metadata_preload_restore_index: None,
             masonry_metadata_preload_overlay_hold_until: None,
             masonry_metadata_preload_defer_first_tick: false,
+            masonry_metadata_preload_stall_since: None,
             pending_masonry_folder_travel_restore: None,
             masonry_navigation_was_active: false,
             masonry_quality_refine_due_at: None,
@@ -12316,6 +12319,7 @@ impl ImageViewer {
         self.masonry_metadata_preload_restore_index = None;
         self.masonry_metadata_preload_overlay_hold_until = None;
         self.masonry_metadata_preload_defer_first_tick = false;
+        self.masonry_metadata_preload_stall_since = None;
         self.pending_masonry_folder_travel_restore = None;
     }
 
@@ -12350,11 +12354,19 @@ impl ImageViewer {
         self.masonry_metadata_preload_overlay_hold_until =
             Some(Instant::now() + Duration::from_millis(220));
         self.masonry_metadata_preload_defer_first_tick = true;
+        self.masonry_metadata_preload_stall_since = None;
 
         self.manga_scrollbar_dragging = false;
         self.is_panning = false;
         self.last_mouse_pos = None;
         self.manga_hovered_media_index = None;
+        self.manga_zoom_plus_held = false;
+        self.manga_zoom_minus_held = false;
+        self.manga_video_seeking = false;
+        self.manga_video_volume_dragging = false;
+        self.gif_seeking = false;
+        self.manga_scroll_target = self.manga_scroll_offset;
+        self.manga_scroll_velocity = 0.0;
         self.stop_manga_wheel_scroll();
         self.stop_manga_autoscroll();
     }
@@ -12472,6 +12484,8 @@ impl ImageViewer {
         }
 
         let navigation_active = self.masonry_navigation_active_for_heavy_work();
+        let mut allow_preload_step = !navigation_active;
+        let now = Instant::now();
         let preload_cursor = self
             .masonry_metadata_preload_cursor
             .min(total.saturating_sub(1));
@@ -12484,13 +12498,13 @@ impl ImageViewer {
             .filter(|path| self.is_folder_navigation_entry_path(path.as_path()))
             .count();
 
-        let (loaded_count, pending_probe_count, pending_result_count) = {
+        let (mut loaded_count, mut pending_probe_count, mut pending_result_count) = {
             let Some(loader) = self.manga_loader.as_mut() else {
                 self.reset_masonry_metadata_preload();
                 return;
             };
 
-            if !navigation_active {
+            if allow_preload_step {
                 loader.request_dimensions_range_background(
                     &self.image_list,
                     preload_cursor,
@@ -12508,7 +12522,61 @@ impl ImageViewer {
             )
         };
 
-        if !navigation_active {
+        let previous_loaded = self.masonry_metadata_preload_loaded.min(total);
+        let mut progress_advanced = loaded_count > previous_loaded;
+
+        if progress_advanced || loaded_count >= total {
+            self.masonry_metadata_preload_stall_since = None;
+        } else {
+            let stall_since = self.masonry_metadata_preload_stall_since.get_or_insert(now);
+            let stall_elapsed = now.saturating_duration_since(*stall_since);
+            if stall_elapsed >= Duration::from_millis(900) {
+                allow_preload_step = true;
+
+                let (next_loaded, next_pending_probe, next_pending_result, fallback_seeded) = {
+                    let Some(loader) = self.manga_loader.as_mut() else {
+                        self.reset_masonry_metadata_preload();
+                        return;
+                    };
+
+                    loader.request_dimensions_range_background(
+                        &self.image_list,
+                        preload_cursor,
+                        preload_end,
+                    );
+                    let fallback_seeded = loader.seed_fallback_dimensions_for_range(
+                        &self.image_list,
+                        preload_cursor,
+                        preload_end,
+                        24,
+                    );
+
+                    (
+                        loader
+                            .cached_dimensions_count(total)
+                            .saturating_add(folder_ready)
+                            .min(total),
+                        loader.pending_dimension_probe_count(),
+                        loader.pending_dimension_results_count(),
+                        fallback_seeded,
+                    )
+                };
+
+                loaded_count = next_loaded;
+                pending_probe_count = next_pending_probe;
+                pending_result_count = next_pending_result;
+                progress_advanced = loaded_count > previous_loaded || fallback_seeded > 0;
+
+                if progress_advanced {
+                    self.masonry_metadata_preload_stall_since = None;
+                } else {
+                    // Keep retry cadence bounded instead of retrying every frame.
+                    self.masonry_metadata_preload_stall_since = Some(now);
+                }
+            }
+        }
+
+        if allow_preload_step {
             self.masonry_metadata_preload_cursor =
                 if preload_end >= total { 0 } else { preload_end };
         }
@@ -12521,6 +12589,7 @@ impl ImageViewer {
         if scan_complete {
             self.masonry_metadata_preload_loaded = total;
             self.masonry_metadata_preload_active = false;
+            self.masonry_metadata_preload_stall_since = None;
             self.manga_update_preload_queue();
             if self.masonry_pending_dimension_updates.is_empty() {
                 self.restore_masonry_scroll_after_metadata_preload();
