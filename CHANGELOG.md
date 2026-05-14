@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [v0.3.9] - 2026-05-10
+## [v0.3.9] - 2026-05-14
 
 ### Highlights
 
@@ -14,6 +14,8 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Windows folder shortcuts (`.lnk`) now resolve to their target directories during navigation scans.
+- Breadcrumb child-folder menus show available Windows drive roots when browsing a drive root.
 - D3D12 and CUDA decoder preference support with in-app capability status.
 - Performance toggles: `show_fps_update_interval_ms`, `use_hardware_acceleration`, `enable_d3d12`, `enable_cuda`.
 - Animated WebP playback with progressive frame streaming in solo view.
@@ -26,6 +28,7 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- Masonry metadata warmup now detects probe stalls and seeds fallback dimensions to keep layout progress moving.
 - Hardware decoder selection now ranks D3D12 first, then D3D11, with optional CUDA ranking and a full software fallback.
 - FPS overlay refresh is throttled and aligned with the primary monitor refresh rate.
 - Video resume positions now use path-keyed preview caches for stable strip/masonry focus recovery.
@@ -43,6 +46,7 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Solo video textures now track their source path to prevent stale frames from appearing on unrelated videos.
 - Seek and volume drags now finalize if the pointer is released outside the control.
 - Video resume seeks ignore tiny offsets and reset PTS on accurate seeks for stability.
 - Stale hover preview resume state during dense masonry navigation by pruning via spatial-index visibility.

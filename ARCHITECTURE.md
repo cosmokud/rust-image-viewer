@@ -152,6 +152,8 @@ Fullscreen manga modes can show a breadcrumb bar under the title bar. It exposes
 
 The breadcrumb bar can be shown/hidden via a folder toggle icon in the title bar, and the preference persists in config state (`show_breadcrumb_bar`). The toggle icon is an embedded SVG asset so it scales cleanly on high-DPI displays.
 
+On Windows, breadcrumb child-folder popups also surface available drive roots when the current segment is a drive root, keeping root-to-root navigation fast.
+
 Breadcrumb segments can open child-folder menus so you can jump directly into sibling subfolders without leaving fullscreen. When a folder jump occurs, the viewer records the current folder travel position (and persists Masonry metadata snapshots) so returning to a folder restores scroll context and warm state.
 
 Child-folder popups are tracked per active breadcrumb segment so only one menu is open at a time, with a fixed-height scroll area to keep the list predictable.
@@ -235,6 +237,8 @@ When the live player finishes:
 - discovered dimensions are stored in the persistent metadata cache
 - fullscreen or floating layout is reapplied once real dimensions exist
 
+To prevent stale video frames from leaking across rapid navigation, the solo video texture tracks the source path and refuses to reuse a texture that originated from a different file.
+
 ### 5.6 Solo neighbor probing
 
 Solo mode also pre-probes nearby files through `SoloProbeCoordinator`.
@@ -305,6 +309,8 @@ How it works:
 - Masonry can defer layout invalidation while the user is actively navigating, then flush pending dimension updates once motion settles
 
 That is why the layout can become correct earlier than full-quality textures do.
+
+If the metadata warmup stalls (for example, probe work that stops progressing), the loader seeds conservative fallback dimensions for a bounded batch so the warmup overlay can continue. Later probes still replace those fallback sizes once real dimensions arrive.
 
 The Masonry metadata warmup overlay can stay visible briefly after preload finishes so fast scans still surface visible progress feedback.
 
@@ -819,7 +825,7 @@ The viewer's speed comes from many cooperating techniques rather than one big tr
 
 No dedicated benchmark-only crate stack is active in the current tree; validation is driven by runtime diagnostics and test coverage.
 
-One extra code-level note: directory enumeration is natural-sorted in `src/image_loader.rs` so that file names like `page_2` sort before `page_10`.
+One extra code-level note: directory enumeration is natural-sorted in `src/image_loader.rs` so that file names like `page_2` sort before `page_10`. On Windows, `.lnk` shortcuts that target folders are resolved so they participate in navigation lists.
 
 ## 15. Practical reading order for contributors
 

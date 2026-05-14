@@ -20,7 +20,7 @@ This project is intentionally optimized for one job: opening media fast, navigat
 
 - Borderless floating window with custom title bar, auto-hide controls, native-feeling fullscreen / maximize transitions, and steadier drag/zoom/resize behavior on Windows.
 - Fast single-file viewing plus fast folder navigation, including natural-sort media lists and optional single-instance reuse.
-- Breadcrumb address bar with back/forward/up navigation, a folder-history popup, and a hide/show toggle in fullscreen manga modes.
+- Breadcrumb address bar with back/forward/up navigation, a folder-history popup, a hide/show toggle, and Windows drive-root entries in fullscreen manga modes.
 - Windows cut/copy/paste for marked files with optional auto-unmark after paste.
 - Marking shortcuts for hovered files in floating, Long Strip, and Masonry modes.
 - Static images, animated GIF, animated WebP, and video playback in one app.
@@ -45,7 +45,8 @@ This project is intentionally optimized for one job: opening media fast, navigat
 - Drag and drop support.
 - Single-instance mode that forwards file-open requests from secondary launches to the primary window.
 - Folder scans include symlinked files and directories for navigation.
-- Breadcrumb address bar for fullscreen manga modes with back/forward/up navigation, history popup, and a visibility toggle.
+- Windows folder shortcuts (`.lnk`) are treated as navigable folders.
+- Breadcrumb address bar for fullscreen manga modes with back/forward/up navigation, history popup, visibility toggle, and Windows drive-root entries.
 - Windows cut/copy/paste for marked files; paste into the current folder via Ctrl+V or the menu.
 - Title bar menu entry for `Edit Settings`, which opens the active `config.ini` in the default editor.
 - CJK filename support through lazy Windows font loading.
