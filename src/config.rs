@@ -266,19 +266,28 @@ impl Action {
             "manga_scroll_down" => Some(Action::MangaScrollDown),
             "manga_zoom_in" | "manga_zoomin" => Some(Action::MangaZoomIn),
             "manga_zoom_out" | "manga_zoomout" => Some(Action::MangaZoomOut),
-            "masonry_pan" => Some(Action::MasonryPan),
-            "masonry_goto_file" | "masonry_go_to_file" => Some(Action::MasonryGotoFile),
-            "masonry_freehand_autoscroll" => Some(Action::MasonryFreehandAutoscroll),
-            "masonry_pan_up" => Some(Action::MasonryPanUp),
-            "masonry_pan_down" => Some(Action::MasonryPanDown),
-            "masonry_pan_up_2" => Some(Action::MasonryPanUp2),
-            "masonry_pan_down_2" => Some(Action::MasonryPanDown2),
-            "masonry_pan_up_3" => Some(Action::MasonryPanUp3),
-            "masonry_pan_down_3" => Some(Action::MasonryPanDown3),
-            "masonry_scroll_up" => Some(Action::MasonryScrollUp),
-            "masonry_scroll_down" => Some(Action::MasonryScrollDown),
-            "masonry_zoom_in" | "masony_zoom_in" => Some(Action::MasonryZoomIn),
-            "masonry_zoom_out" | "masony_zoom_out" => Some(Action::MasonryZoomOut),
+            "masonry_pan" | "gallery_pan" => Some(Action::MasonryPan),
+            "masonry_goto_file"
+            | "masonry_go_to_file"
+            | "gallery_goto_file"
+            | "gallery_go_to_file" => Some(Action::MasonryGotoFile),
+            "masonry_freehand_autoscroll" | "gallery_freehand_autoscroll" => {
+                Some(Action::MasonryFreehandAutoscroll)
+            }
+            "masonry_pan_up" | "gallery_pan_up" => Some(Action::MasonryPanUp),
+            "masonry_pan_down" | "gallery_pan_down" => Some(Action::MasonryPanDown),
+            "masonry_pan_up_2" | "gallery_pan_up_2" => Some(Action::MasonryPanUp2),
+            "masonry_pan_down_2" | "gallery_pan_down_2" => Some(Action::MasonryPanDown2),
+            "masonry_pan_up_3" | "gallery_pan_up_3" => Some(Action::MasonryPanUp3),
+            "masonry_pan_down_3" | "gallery_pan_down_3" => Some(Action::MasonryPanDown3),
+            "masonry_scroll_up" | "gallery_scroll_up" => Some(Action::MasonryScrollUp),
+            "masonry_scroll_down" | "gallery_scroll_down" => Some(Action::MasonryScrollDown),
+            "masonry_zoom_in" | "masony_zoom_in" | "gallery_zoom_in" => {
+                Some(Action::MasonryZoomIn)
+            }
+            "masonry_zoom_out" | "masony_zoom_out" | "gallery_zoom_out" => {
+                Some(Action::MasonryZoomOut)
+            }
             _ => None,
         }
     }
@@ -1228,14 +1237,18 @@ impl Config {
                         continue;
                     }
 
-                    if key.eq_ignore_ascii_case("masonry_mark_file") {
+                    if key.eq_ignore_ascii_case("masonry_mark_file")
+                        || key.eq_ignore_ascii_case("gallery_mark_file")
+                    {
                         if let Some(mark_key) = parse_optional_mark_key(value) {
                             config.masonry_mark_file = mark_key;
                         }
                         continue;
                     }
 
-                    if key.eq_ignore_ascii_case("masonry_toggle_mark_file") {
+                    if key.eq_ignore_ascii_case("masonry_toggle_mark_file")
+                        || key.eq_ignore_ascii_case("gallery_toggle_mark_file")
+                    {
                         if let Some(modifier) = parse_optional_shortcut_modifier(value) {
                             config.masonry_toggle_mark_file = modifier;
                         }
@@ -2062,7 +2075,15 @@ impl Config {
             optional_mark_key_to_string(self.masonry_mark_file.as_ref()),
         );
         values.insert(
+            "gallery_mark_file",
+            optional_mark_key_to_string(self.masonry_mark_file.as_ref()),
+        );
+        values.insert(
             "masonry_toggle_mark_file",
+            optional_shortcut_modifier_to_string(self.masonry_toggle_mark_file.as_ref()),
+        );
+        values.insert(
+            "gallery_toggle_mark_file",
             optional_shortcut_modifier_to_string(self.masonry_toggle_mark_file.as_ref()),
         );
         values.insert(
@@ -2406,6 +2427,55 @@ impl Config {
         );
         values.insert(
             "masonry_zoom_out",
+            self.action_bindings_csv(Action::MasonryZoomOut),
+        );
+        values.insert("gallery_pan", self.action_bindings_csv(Action::MasonryPan));
+        values.insert(
+            "gallery_goto_file",
+            self.action_bindings_csv(Action::MasonryGotoFile),
+        );
+        values.insert(
+            "gallery_freehand_autoscroll",
+            self.action_bindings_csv(Action::MasonryFreehandAutoscroll),
+        );
+        values.insert(
+            "gallery_pan_up",
+            self.action_bindings_csv(Action::MasonryPanUp),
+        );
+        values.insert(
+            "gallery_pan_down",
+            self.action_bindings_csv(Action::MasonryPanDown),
+        );
+        values.insert(
+            "gallery_pan_up_2",
+            self.action_bindings_csv(Action::MasonryPanUp2),
+        );
+        values.insert(
+            "gallery_pan_down_2",
+            self.action_bindings_csv(Action::MasonryPanDown2),
+        );
+        values.insert(
+            "gallery_pan_up_3",
+            self.action_bindings_csv(Action::MasonryPanUp3),
+        );
+        values.insert(
+            "gallery_pan_down_3",
+            self.action_bindings_csv(Action::MasonryPanDown3),
+        );
+        values.insert(
+            "gallery_scroll_up",
+            self.action_bindings_csv(Action::MasonryScrollUp),
+        );
+        values.insert(
+            "gallery_scroll_down",
+            self.action_bindings_csv(Action::MasonryScrollDown),
+        );
+        values.insert(
+            "gallery_zoom_in",
+            self.action_bindings_csv(Action::MasonryZoomIn),
+        );
+        values.insert(
+            "gallery_zoom_out",
             self.action_bindings_csv(Action::MasonryZoomOut),
         );
 
