@@ -873,6 +873,7 @@ enum ResizeDirection {
 enum MangaLayoutMode {
     LongStrip,
     Masonry,
+    Gallery,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3483,7 +3484,7 @@ impl ImageViewer {
         if restored_all_entries || self.manga_dimension_cache_covers_current_list() {
             self.manga_dimension_cache_list_signature = self.image_list_signature;
         }
-        if self.manga_layout_mode == MangaLayoutMode::Masonry {
+        if Self::layout_mode_is_grid(self.manga_layout_mode) {
             self.mark_masonry_runtime_cache_resident();
         }
 
@@ -5250,7 +5251,7 @@ impl ImageViewer {
             return;
         };
 
-        if self.manga_mode && self.manga_layout_mode == MangaLayoutMode::Masonry {
+        if self.manga_mode && self.is_true_masonry_mode() {
             self.persist_current_masonry_folder_metadata_snapshot();
         }
 
@@ -5312,7 +5313,7 @@ impl ImageViewer {
         if self.manga_mode {
             self.manga_clear_cache();
             self.ensure_manga_loader();
-            if self.manga_layout_mode == MangaLayoutMode::Masonry {
+            if Self::layout_mode_is_grid(self.manga_layout_mode) {
                 self.restore_masonry_folder_metadata_snapshot();
                 self.mark_manga_dimension_cache_current_if_complete();
             }
@@ -6152,7 +6153,7 @@ impl ImageViewer {
     }
 
     fn can_reuse_preserved_masonry_layout(&self) -> bool {
-        self.manga_layout_mode == MangaLayoutMode::Masonry
+        Self::layout_mode_is_grid(self.manga_layout_mode)
             && self.masonry_layout_valid
             && !self.masonry_layout_items.is_empty()
             && self.masonry_layout_list_signature == self.image_list_signature
@@ -12360,7 +12361,7 @@ impl ImageViewer {
         self.reset_gif_seek_interaction_state();
         self.reset_masonry_metadata_preload();
         self.manga_mode = true;
-        set_metadata_cache_enabled(true);
+        set_metadata_cache_enabled(Self::layout_mode_uses_metadata_cache(self.manga_layout_mode));
         self.stop_fullscreen_video_playback();
         self.reset_fullscreen_anim_stream_state();
         self.reset_manga_video_user_preferences();
@@ -12925,9 +12926,7 @@ impl ImageViewer {
         }
 
         let scanned_directory = result.directory.clone();
-        let mut files = self
-            .media_directory_index
-            .apply_directory_scan_result(result);
+        let mut files = self.media_directory_index.apply_directory_scan_result(result);
 
         match scan_kind {
             PendingMediaDirectoryScanKind::InitialLoad => {
@@ -12968,7 +12967,7 @@ impl ImageViewer {
                     return;
                 }
 
-                if self.manga_mode && self.manga_layout_mode == MangaLayoutMode::Masonry {
+                if self.manga_mode && self.is_true_masonry_mode() {
                     self.persist_current_masonry_folder_metadata_snapshot();
                 }
 
@@ -13014,7 +13013,7 @@ impl ImageViewer {
                 if self.manga_mode {
                     self.manga_clear_cache();
                     self.ensure_manga_loader();
-                    if self.manga_layout_mode == MangaLayoutMode::Masonry {
+                    if Self::layout_mode_is_grid(self.manga_layout_mode) {
                         self.restore_masonry_folder_metadata_snapshot();
                         self.mark_manga_dimension_cache_current_if_complete();
                     }
@@ -14475,7 +14474,7 @@ impl ImageViewer {
     }
 
     fn capture_pending_masonry_solo_reentry(&mut self, index: usize) {
-        if self.manga_layout_mode != MangaLayoutMode::Masonry {
+        if !Self::layout_mode_is_grid(self.manga_layout_mode) {
             self.pending_masonry_solo_reentry = None;
             return;
         }
@@ -14785,8 +14784,24 @@ impl ImageViewer {
 
     // ============ MANGA READING MODE METHODS ============
 
-    fn is_masonry_mode(&self) -> bool {
+    fn layout_mode_is_grid(layout_mode: MangaLayoutMode) -> bool {
+        matches!(layout_mode, MangaLayoutMode::Masonry | MangaLayoutMode::Gallery)
+    }
+
+    fn layout_mode_uses_metadata_cache(layout_mode: MangaLayoutMode) -> bool {
+        layout_mode != MangaLayoutMode::Gallery
+    }
+
+    fn is_true_masonry_mode(&self) -> bool {
         self.manga_mode && self.manga_layout_mode == MangaLayoutMode::Masonry
+    }
+
+    fn is_gallery_mode(&self) -> bool {
+        self.manga_mode && self.manga_layout_mode == MangaLayoutMode::Gallery
+    }
+
+    fn is_masonry_mode(&self) -> bool {
+        self.manga_mode && Self::layout_mode_is_grid(self.manga_layout_mode)
     }
 
     fn clear_strip_return_context(&mut self) {
@@ -14808,15 +14823,15 @@ impl ImageViewer {
         self.strip_return_mode = Some(layout_mode);
         self.strip_return_button_only = false;
         self.strip_return_preserve_masonry_cache =
-            layout_mode == MangaLayoutMode::Masonry && self.manga_mode;
+            Self::layout_mode_is_grid(layout_mode) && self.manga_mode;
         self.strip_return_masonry_list_snapshot =
-            if layout_mode == MangaLayoutMode::Masonry && self.manga_mode {
+            if Self::layout_mode_is_grid(layout_mode) && self.manga_mode {
                 Some(self.image_list.clone())
             } else {
                 None
             };
         self.strip_return_masonry_state =
-            if layout_mode == MangaLayoutMode::Masonry && self.manga_mode {
+            if Self::layout_mode_is_grid(layout_mode) && self.manga_mode {
                 Some(MasonryReturnState {
                     zoom: self.zoom,
                     zoom_target: self.zoom_target,
@@ -15002,7 +15017,7 @@ impl ImageViewer {
         let current_path = self.current_media_path();
 
         self.prepare_enter_manga_mode_state(current_media_type);
-        if self.manga_layout_mode == MangaLayoutMode::Masonry {
+        if Self::layout_mode_is_grid(self.manga_layout_mode) {
             if let Some(snapshot) = self.strip_return_masonry_list_snapshot.clone() {
                 self.set_image_list_raw(snapshot);
                 if let Some(path) = current_path.as_ref() {
@@ -15046,21 +15061,21 @@ impl ImageViewer {
         self.reset_gif_seek_interaction_state();
         self.strip_open_force_fit_path = None;
 
-        if layout_mode == MangaLayoutMode::Masonry {
+        if Self::layout_mode_is_grid(layout_mode) {
             if !self.refresh_media_list_before_masonry_entry() {
                 self.clear_strip_return_context();
                 return;
             }
         }
 
-        let restore_masonry_state = if layout_mode == MangaLayoutMode::Masonry {
+        let restore_masonry_state = if Self::layout_mode_is_grid(layout_mode) {
             self.strip_return_masonry_state
         } else {
             None
         };
 
         let current_viewed_path = self.current_media_path();
-        if layout_mode == MangaLayoutMode::Masonry {
+        if Self::layout_mode_is_grid(layout_mode) {
             if let (Some(state), Some(snapshot)) = (
                 restore_masonry_state,
                 self.strip_return_masonry_list_snapshot.clone(),
@@ -15096,18 +15111,18 @@ impl ImageViewer {
         let reuse_masonry_cache = restore_masonry_state
             .is_some_and(|state| self.should_reuse_masonry_cache_on_return(state));
         let preserve_resident_masonry_cache =
-            layout_mode == MangaLayoutMode::Masonry && self.has_resident_masonry_runtime_cache();
+            Self::layout_mode_is_grid(layout_mode) && self.has_resident_masonry_runtime_cache();
         let reuse_strip_cache = layout_mode == MangaLayoutMode::LongStrip;
 
         self.manga_layout_mode = layout_mode;
-        if layout_mode == MangaLayoutMode::Masonry {
+        if Self::layout_mode_is_grid(layout_mode) {
             self.mark_masonry_runtime_cache_resident();
         }
 
         if reuse_masonry_cache || preserve_resident_masonry_cache || reuse_strip_cache {
             self.enter_manga_mode_from_preserved_strip_cache();
         } else {
-            if layout_mode == MangaLayoutMode::Masonry {
+            if Self::layout_mode_is_grid(layout_mode) {
                 self.clear_manga_runtime_cache(true);
             }
             self.toggle_manga_mode();
@@ -16197,6 +16212,10 @@ impl ImageViewer {
         self.toggle_strip_mode(MangaLayoutMode::Masonry);
     }
 
+    fn toggle_gallery_mode(&mut self) {
+        self.toggle_strip_mode(MangaLayoutMode::Gallery);
+    }
+
     fn set_masonry_items_per_row(&mut self, items_per_row: usize) {
         let items_per_row = items_per_row.clamp(2, 10);
         if self.masonry_items_per_row == items_per_row {
@@ -16224,7 +16243,7 @@ impl ImageViewer {
     fn toggle_strip_mode(&mut self, layout_mode: MangaLayoutMode) {
         self.pending_masonry_solo_reentry = None;
 
-        if layout_mode == MangaLayoutMode::Masonry && !self.manga_mode {
+        if Self::layout_mode_is_grid(layout_mode) && !self.manga_mode {
             if !self.refresh_media_list_before_masonry_entry() {
                 return;
             }
@@ -16232,7 +16251,7 @@ impl ImageViewer {
 
         if !self.manga_mode {
             self.manga_layout_mode = layout_mode;
-            if layout_mode == MangaLayoutMode::Masonry {
+            if Self::layout_mode_is_grid(layout_mode) {
                 self.mark_masonry_runtime_cache_resident();
             }
             self.toggle_manga_mode();
@@ -16251,12 +16270,14 @@ impl ImageViewer {
         self.set_current_index_clamped(target_index);
         let target_path = self.current_media_path();
 
-        if self.manga_layout_mode == MangaLayoutMode::Masonry {
+        if Self::layout_mode_is_grid(self.manga_layout_mode) {
             self.capture_masonry_mode_session_snapshot();
-            self.persist_current_masonry_folder_metadata_snapshot();
+            if self.is_true_masonry_mode() {
+                self.persist_current_masonry_folder_metadata_snapshot();
+            }
         }
 
-        let follow_current_viewed_item_on_restore = if layout_mode == MangaLayoutMode::Masonry {
+        let follow_current_viewed_item_on_restore = if Self::layout_mode_is_grid(layout_mode) {
             self.masonry_mode_session_snapshot
                 .as_ref()
                 .is_some_and(|snapshot| {
@@ -16269,8 +16290,8 @@ impl ImageViewer {
         };
 
         self.manga_layout_mode = layout_mode;
-        set_metadata_cache_enabled(true);
-        let restored_masonry_session = if layout_mode == MangaLayoutMode::Masonry {
+        set_metadata_cache_enabled(Self::layout_mode_uses_metadata_cache(layout_mode));
+        let restored_masonry_session = if Self::layout_mode_is_grid(layout_mode) {
             self.mark_masonry_runtime_cache_resident();
             self.restore_masonry_folder_metadata_snapshot();
             self.mark_manga_dimension_cache_current_if_complete();
@@ -16282,15 +16303,15 @@ impl ImageViewer {
         } else {
             false
         };
-        let masonry_authoritative_ready = layout_mode == MangaLayoutMode::Masonry
-            && self.masonry_authoritative_dimension_lock_active();
+        let masonry_authoritative_ready =
+            layout_mode == MangaLayoutMode::Masonry && self.masonry_authoritative_dimension_lock_active();
 
-        if layout_mode != MangaLayoutMode::Masonry || !restored_masonry_session {
+        if !Self::layout_mode_is_grid(layout_mode) || !restored_masonry_session {
             self.invalidate_manga_layout_cache();
             self.offset = egui::Vec2::ZERO;
 
             let max_scroll = (self.manga_total_height() - self.screen_size.y).max(0.0);
-            let scroll_to = if layout_mode == MangaLayoutMode::Masonry {
+            let scroll_to = if Self::layout_mode_is_grid(layout_mode) {
                 self.masonry_scroll_offset_for_index_centered(target_index)
                     .unwrap_or_else(|| {
                         self.manga_get_scroll_offset_for_index(target_index)
@@ -16309,9 +16330,11 @@ impl ImageViewer {
             self.scroll_strip_to_current_index();
         }
 
-        if layout_mode == MangaLayoutMode::Masonry {
+        if Self::layout_mode_is_grid(layout_mode) {
             self.manga_update_current_index();
-            self.persist_current_masonry_folder_metadata_snapshot();
+            if self.is_true_masonry_mode() {
+                self.persist_current_masonry_folder_metadata_snapshot();
+            }
         }
 
         let allow_startup_preload = layout_mode == MangaLayoutMode::Masonry
@@ -16426,6 +16449,7 @@ impl ImageViewer {
         let used_width = column_width * columns as f32 + total_gutter;
         let start_x = ((self.screen_size.x - used_width) * 0.5).max(0.0);
 
+        let gallery_mode = self.is_gallery_mode();
         let mut column_heights = vec![TOP_PADDING; columns];
         self.masonry_layout_items.clear();
         self.masonry_layout_items
@@ -16443,10 +16467,19 @@ impl ImageViewer {
 
             let x = start_x + target_col as f32 * (column_width + GUTTER);
             let y = column_heights[target_col];
-            let (source_width, source_height) =
-                self.masonry_slot_source_dimensions(idx).unwrap_or((0, 0));
-            let aspect_ratio = self.masonry_slot_aspect_ratio(idx);
-            let height = (column_width * aspect_ratio).max(20.0);
+
+            let (source_width, source_height, height) = if gallery_mode {
+                (0, 0, column_width.max(20.0))
+            } else {
+                let (source_width, source_height) =
+                    self.masonry_slot_source_dimensions(idx).unwrap_or((0, 0));
+                let aspect_ratio = self.masonry_slot_aspect_ratio(idx);
+                (
+                    source_width,
+                    source_height,
+                    (column_width * aspect_ratio).max(20.0),
+                )
+            };
 
             self.masonry_layout_items[idx] = MasonryItemLayout {
                 x,
@@ -16520,6 +16553,12 @@ impl ImageViewer {
     where
         I: IntoIterator<Item = usize>,
     {
+        if self.is_gallery_mode() {
+            self.masonry_pending_dimension_updates.clear();
+            self.masonry_layout_invalidation_deferred = false;
+            return;
+        }
+
         for idx in updated_indices {
             self.masonry_pending_dimension_updates.insert(idx);
         }
@@ -16653,7 +16692,7 @@ impl ImageViewer {
         }
 
         self.strip_open_force_fit_path = Some(path.clone());
-        if return_mode == MangaLayoutMode::Masonry {
+        if Self::layout_mode_is_grid(return_mode) {
             self.mark_masonry_runtime_cache_resident();
             self.capture_masonry_mode_session_snapshot();
         }
@@ -16687,23 +16726,23 @@ impl ImageViewer {
             self.pending_masonry_solo_reentry = None;
             self.sync_current_index_to_visible_media();
             self.sync_solo_video_position_to_manga_resume();
-            let preferred_masonry_path = if self.manga_layout_mode == MangaLayoutMode::Masonry {
+            let entering_grid = Self::layout_mode_is_grid(self.manga_layout_mode);
+            let preferred_masonry_path = if entering_grid {
                 self.current_media_path()
             } else {
                 None
             };
-            let follow_current_viewed_item_on_restore =
-                if self.manga_layout_mode == MangaLayoutMode::Masonry {
-                    self.masonry_mode_session_snapshot
-                        .as_ref()
-                        .is_some_and(|snapshot| {
-                            preferred_masonry_path
-                                .as_ref()
-                                .is_some_and(|path| snapshot.current_path.as_ref() != Some(path))
-                        })
-                } else {
-                    false
-                };
+            let follow_current_viewed_item_on_restore = if entering_grid {
+                self.masonry_mode_session_snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| {
+                        preferred_masonry_path
+                            .as_ref()
+                            .is_some_and(|path| snapshot.current_path.as_ref() != Some(path))
+                    })
+            } else {
+                false
+            };
 
             let current_media_dims = self.media_display_dimensions().or(self.video_texture_dims);
             let current_media_type = self.current_media_type;
@@ -16725,14 +16764,14 @@ impl ImageViewer {
                 self.refresh_media_list_after_path_mutation(Some(anchor_path));
             }
 
-            let restored_masonry_session = if self.manga_layout_mode == MangaLayoutMode::Masonry {
+            let restored_masonry_session = if entering_grid {
                 self.try_restore_masonry_mode_session_snapshot(preferred_masonry_path.clone())
             } else {
                 false
             };
             let mut masonry_authoritative_ready = false;
 
-            if self.manga_layout_mode == MangaLayoutMode::Masonry {
+            if entering_grid {
                 self.mark_masonry_runtime_cache_resident();
             }
 
@@ -16747,11 +16786,13 @@ impl ImageViewer {
             // Warm the active list from in-memory state or persistent metadata cache before
             // falling back to background probes for the remaining misses.
             if let Some(ref mut loader) = self.manga_loader {
-                if !reuse_preserved_masonry_layout {
+                if !reuse_preserved_masonry_layout
+                    && self.manga_layout_mode != MangaLayoutMode::Gallery
+                {
                     loader.cache_all_dimensions(&self.image_list);
                 }
             }
-            if self.manga_layout_mode == MangaLayoutMode::Masonry {
+            if entering_grid {
                 self.restore_masonry_folder_metadata_snapshot();
                 if restored_masonry_session {
                     self.hydrate_masonry_dimensions_from_session_snapshot();
@@ -16777,7 +16818,7 @@ impl ImageViewer {
                 self.invalidate_manga_layout_cache();
             }
 
-            if self.manga_layout_mode == MangaLayoutMode::Masonry {
+            if entering_grid {
                 if !restored_masonry_session {
                     let new_zoom = self.clamp_zoom(1.0);
                     self.zoom = new_zoom;
@@ -16814,7 +16855,7 @@ impl ImageViewer {
                     .min(self.image_list.len().saturating_sub(1));
                 self.set_current_index_clamped(target_index);
                 let max_scroll = (self.manga_total_height() - self.screen_size.y).max(0.0);
-                let scroll_to = if self.manga_layout_mode == MangaLayoutMode::Masonry {
+                let scroll_to = if entering_grid {
                     self.masonry_scroll_offset_for_index_centered(target_index)
                         .unwrap_or_else(|| {
                             self.manga_get_scroll_offset_for_index(target_index)
@@ -16838,9 +16879,11 @@ impl ImageViewer {
             let allow_startup_preload = self.manga_layout_mode == MangaLayoutMode::Masonry
                 && (!restored_masonry_session || !masonry_authoritative_ready);
             self.maybe_begin_masonry_metadata_preload(allow_startup_preload);
-            if self.manga_layout_mode == MangaLayoutMode::Masonry {
+            if entering_grid {
                 self.manga_update_current_index();
-                self.persist_current_masonry_folder_metadata_snapshot();
+                if self.is_true_masonry_mode() {
+                    self.persist_current_masonry_folder_metadata_snapshot();
+                }
             }
 
             self.manga_update_preload_queue();
@@ -16857,16 +16900,15 @@ impl ImageViewer {
 
         self.stop_manga_wheel_scroll();
         self.stop_manga_autoscroll();
-        if self.manga_layout_mode == MangaLayoutMode::Masonry {
+        if Self::layout_mode_is_grid(self.manga_layout_mode) {
             self.capture_masonry_mode_session_snapshot();
         }
-        if self.manga_layout_mode == MangaLayoutMode::Masonry
-            || self.has_resident_masonry_runtime_cache()
-        {
+        if self.is_true_masonry_mode() || self.has_resident_masonry_runtime_cache() {
             self.persist_current_masonry_folder_metadata_snapshot();
         }
-        let keep_resident_masonry_cache = self.manga_layout_mode == MangaLayoutMode::Masonry
-            || self.has_resident_masonry_runtime_cache();
+        let keep_resident_masonry_cache =
+            Self::layout_mode_is_grid(self.manga_layout_mode)
+                || self.has_resident_masonry_runtime_cache();
         self.manga_mode = false;
         set_metadata_cache_enabled(false);
         if keep_resident_masonry_cache {
@@ -16883,7 +16925,7 @@ impl ImageViewer {
 
     /// Get the scroll offset to show a specific image at the top
     fn manga_get_scroll_offset_for_index(&mut self, target_index: usize) -> f32 {
-        if self.manga_layout_mode == MangaLayoutMode::Masonry {
+        if Self::layout_mode_is_grid(self.manga_layout_mode) {
             self.masonry_ensure_layout_cache();
             if let Some(item) = self.masonry_layout_items.get(target_index) {
                 return (item.y * self.zoom.max(0.0001)).max(0.0);
@@ -19859,7 +19901,7 @@ impl ImageViewer {
         let screen_rect = ctx.screen_rect();
         let button_size = egui::Vec2::new(130.0, 32.0);
         let button_spacing = 8.0;
-        let stack_height = button_size.y * 2.0 + button_spacing;
+        let stack_height = button_size.y * 3.0 + button_spacing * 2.0;
         let scrollbar_padding = Self::BOTTOM_RIGHT_OVERLAY_SCROLLBAR_PADDING; // Padding to avoid scrollbar
         let margin = Self::BOTTOM_RIGHT_OVERLAY_MARGIN;
 
@@ -19886,6 +19928,7 @@ impl ImageViewer {
         );
 
         let masonry_on = self.manga_mode && self.manga_layout_mode == MangaLayoutMode::Masonry;
+        let gallery_on = self.manga_mode && self.manga_layout_mode == MangaLayoutMode::Gallery;
         let long_strip_on = self.manga_mode && self.manga_layout_mode == MangaLayoutMode::LongStrip;
 
         egui::Area::new(egui::Id::new("manga_toggle_button"))
@@ -19893,11 +19936,12 @@ impl ImageViewer {
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
                 let buttons = [
-                    ("Masonry", masonry_on, true),
-                    ("Long Strip", long_strip_on, false),
+                    ("Gallery", gallery_on, MangaLayoutMode::Gallery),
+                    ("Masonry", masonry_on, MangaLayoutMode::Masonry),
+                    ("Long Strip", long_strip_on, MangaLayoutMode::LongStrip),
                 ];
 
-                for (idx, (name, is_on, is_masonry)) in buttons.iter().enumerate() {
+                for (idx, (name, is_on, target_layout)) in buttons.iter().enumerate() {
                     let label = if *is_on {
                         format!("{}: ON", name)
                     } else {
@@ -19922,25 +19966,19 @@ impl ImageViewer {
                     );
 
                     if response.clicked() {
-                        let target_layout = if *is_masonry {
-                            MangaLayoutMode::Masonry
-                        } else {
-                            MangaLayoutMode::LongStrip
-                        };
-
                         // When solo fullscreen was opened from strip mode, route button-based
                         // returns through the same strip-return path as center right-click.
                         if self.is_fullscreen
                             && !self.manga_mode
                             && self.strip_return_mode.is_some()
                         {
-                            self.strip_return_mode = Some(target_layout);
+                            self.strip_return_mode = Some(*target_layout);
                             self.return_to_strip_mode_from_fullscreen_toggle();
                         } else if self.manga_mode && *is_on {
                             // Toggling OFF the currently active strip layout should preserve
                             // exact strip position for immediate ON re-entry (no cumulative drift).
                             self.stop_manga_autoscroll();
-                            let target_index = if target_layout == MangaLayoutMode::Masonry {
+                            let target_index = if Self::layout_mode_is_grid(*target_layout) {
                                 self.pending_masonry_solo_reentry_index()
                                     .unwrap_or_else(|| self.manga_visible_index())
                             } else {
@@ -19949,16 +19987,16 @@ impl ImageViewer {
                             self.open_strip_item_in_solo_fullscreen(target_index, true);
                         } else {
                             self.clear_strip_return_context();
-                            if target_layout == MangaLayoutMode::Masonry {
-                                self.toggle_masonry_mode();
-                            } else {
-                                self.toggle_long_strip_mode();
+                            match target_layout {
+                                MangaLayoutMode::Masonry => self.toggle_masonry_mode(),
+                                MangaLayoutMode::Gallery => self.toggle_gallery_mode(),
+                                MangaLayoutMode::LongStrip => self.toggle_long_strip_mode(),
                             }
                         }
                         self.touch_bottom_overlays();
                     }
 
-                    if idx == 0 {
+                    if idx + 1 != buttons.len() {
                         ui.add_space(button_spacing);
                     }
                 }
@@ -20107,7 +20145,7 @@ impl ImageViewer {
                             ui.painter().text(
                                 rows_label_rect.center(),
                                 egui::Align2::CENTER_CENTER,
-                                "Rows",
+                                "Cols",
                                 egui::FontId::proportional(12.0),
                                 egui::Color32::from_rgb(220, 220, 220),
                             );
@@ -20680,6 +20718,17 @@ impl ImageViewer {
         } else {
             image_rect
         };
+        let gallery_mode = self.is_gallery_mode();
+        let gallery_fit_rect = |rect: egui::Rect, width: u32, height: u32| -> egui::Rect {
+            if !gallery_mode || width == 0 || height == 0 {
+                return rect;
+            }
+            let fitted = Self::fit_size_preserving_aspect(
+                egui::vec2(width as f32, height as f32),
+                rect.size(),
+            );
+            egui::Rect::from_center_size(rect.center(), fitted)
+        };
         let mut requested_retry = false;
 
         let folder_entry = self.image_list.get(idx).cloned().and_then(|path| {
@@ -20757,11 +20806,12 @@ impl ImageViewer {
                 self.remove_manga_video_texture(idx);
             }
 
-            if let Some((texture, _tex_w, _tex_h)) = self.manga_video_textures.get(&idx) {
+            if let Some((texture, tex_w, tex_h)) = self.manga_video_textures.get(&idx) {
                 // Live video frame available - use it
+                let draw_rect = gallery_fit_rect(image_rect, *tex_w, *tex_h);
                 ui.painter().image(
                     texture.id(),
-                    image_rect,
+                    draw_rect,
                     egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                     egui::Color32::WHITE,
                 );
@@ -20793,9 +20843,13 @@ impl ImageViewer {
                 // Keeps only the strip-entry frame visible until manga cache catches up.
                 if self.strip_entry_video_texture_matches_placeholder_path() {
                     if let Some(texture) = self.video_texture.as_ref() {
+                        let draw_rect = self
+                            .video_texture_dims
+                            .map(|(w, h)| gallery_fit_rect(image_rect, w, h))
+                            .unwrap_or(image_rect);
                         ui.painter().image(
                             texture.id(),
-                            image_rect,
+                            draw_rect,
                             egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                             egui::Color32::WHITE,
                         );
@@ -20838,9 +20892,10 @@ impl ImageViewer {
                 })
             {
                 // First-frame thumbnail from texture cache - use it as a preview
+                let draw_rect = gallery_fit_rect(image_rect, tex_w, tex_h);
                 ui.painter().image(
                     texture_id,
-                    image_rect,
+                    draw_rect,
                     egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                     egui::Color32::WHITE,
                 );
@@ -20923,9 +20978,10 @@ impl ImageViewer {
                 self.manga_texture_cache
                     .get_texture_info_for_path(idx, path)
             }) {
+                let draw_rect = gallery_fit_rect(image_rect, tex_w, tex_h);
                 ui.painter().image(
                     texture_id,
-                    image_rect,
+                    draw_rect,
                     egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                     egui::Color32::WHITE,
                 );
@@ -20990,9 +21046,13 @@ impl ImageViewer {
                 // Keeps only the strip-entry image visible while manga textures are still loading.
                 if self.strip_entry_image_texture_matches_placeholder_path() {
                     if let Some(texture) = self.texture.as_ref() {
+                        let draw_rect = self
+                            .image_texture_dims
+                            .map(|(w, h)| gallery_fit_rect(image_rect, w, h))
+                            .unwrap_or(image_rect);
                         ui.painter().image(
                             texture.id(),
-                            image_rect,
+                            draw_rect,
                             egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                             egui::Color32::WHITE,
                         );
@@ -27900,18 +27960,16 @@ impl eframe::App for ImageViewer {
                             target_media_type,
                         );
 
-                        if self.manga_layout_mode == MangaLayoutMode::Masonry {
+                        if Self::layout_mode_is_grid(self.manga_layout_mode) {
                             self.capture_masonry_mode_session_snapshot();
                         }
-                        if self.manga_layout_mode == MangaLayoutMode::Masonry
-                            || self.has_resident_masonry_runtime_cache()
-                        {
+                        if self.is_true_masonry_mode() || self.has_resident_masonry_runtime_cache() {
                             self.persist_current_masonry_folder_metadata_snapshot();
                         }
 
-                        let keep_resident_masonry_cache = self.manga_layout_mode
-                            == MangaLayoutMode::Masonry
-                            || self.has_resident_masonry_runtime_cache();
+                        let keep_resident_masonry_cache =
+                            Self::layout_mode_is_grid(self.manga_layout_mode)
+                                || self.has_resident_masonry_runtime_cache();
                         self.manga_mode = false;
                         set_metadata_cache_enabled(false);
                         if keep_resident_masonry_cache {
