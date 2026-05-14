@@ -3809,15 +3809,19 @@ impl ImageViewer {
         self.image_list_signature = new_signature;
     }
 
-    fn set_image_list(&mut self, files: Vec<PathBuf>) {
-        let files = if self.folder_navigation_ui_enabled() {
+    fn normalize_image_list_for_folder_navigation(&self, files: Vec<PathBuf>) -> Vec<PathBuf> {
+        if self.folder_navigation_ui_enabled() {
             files
         } else {
             files
                 .into_iter()
                 .filter(|path| !self.is_folder_navigation_entry_path(path.as_path()))
                 .collect()
-        };
+        }
+    }
+
+    fn set_image_list(&mut self, files: Vec<PathBuf>) {
+        let files = self.normalize_image_list_for_folder_navigation(files);
 
         self.folder_placeholder_thumbnail_cache
             .retain(|directory, _| directory.exists());
@@ -3830,6 +3834,44 @@ impl ImageViewer {
         self.folder_placeholder_stamp_cache.clear();
 
         self.set_image_list_raw(files);
+    }
+
+    fn try_append_new_entries_in_strip_mode(&mut self, scanned_files: &[PathBuf]) -> bool {
+        if !self.manga_mode || self.image_list.is_empty() {
+            return false;
+        }
+
+        let scanned_files =
+            self.normalize_image_list_for_folder_navigation(scanned_files.to_vec());
+        if scanned_files.is_empty() {
+            return false;
+        }
+
+        let current_set: HashSet<PathBuf> = self.image_list.iter().cloned().collect();
+        let scanned_set: HashSet<PathBuf> = scanned_files.iter().cloned().collect();
+        let has_removals = self
+            .image_list
+            .iter()
+            .any(|path| !scanned_set.contains(path));
+        if has_removals {
+            return false;
+        }
+
+        let appended: Vec<PathBuf> = scanned_files
+            .into_iter()
+            .filter(|path| !current_set.contains(path))
+            .collect();
+
+        if appended.is_empty() {
+            return true;
+        }
+
+        let mut updated = self.image_list.clone();
+        updated.extend(appended);
+        self.set_image_list_raw(updated);
+        self.invalidate_manga_layout_cache();
+        self.manga_update_preload_queue();
+        true
     }
 
     fn begin_media_directory_scan(
@@ -12968,6 +13010,14 @@ impl ImageViewer {
                     });
 
                 if current_directory.as_deref() != Some(scanned_directory.as_path()) {
+                    return;
+                }
+
+                if self.try_append_new_entries_in_strip_mode(&files) {
+                    self.clear_stale_marked_files();
+                    self.clear_stale_prepared_clipboard_paths();
+                    self.modal_thumbnail_cache.retain(|path, _| path.exists());
+                    ctx.request_repaint();
                     return;
                 }
 
