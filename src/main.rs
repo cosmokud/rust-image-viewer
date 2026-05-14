@@ -982,6 +982,7 @@ struct MasonryModeSessionSnapshot {
     layout_len: usize,
     layout_list_signature: u64,
     layout_valid: bool,
+    layout_is_gallery: bool,
 }
 
 impl MasonryFolderMetadataRamCache {
@@ -3518,6 +3519,7 @@ impl ImageViewer {
             layout_len: self.masonry_layout_len,
             layout_list_signature: self.masonry_layout_list_signature,
             layout_valid: self.masonry_layout_valid,
+            layout_is_gallery: self.is_gallery_mode(),
         });
     }
 
@@ -3582,7 +3584,9 @@ impl ImageViewer {
             );
         }
 
+        let expected_gallery_layout = self.manga_layout_mode == MangaLayoutMode::Gallery;
         let compatible_layout = snapshot.layout_valid
+            && snapshot.layout_is_gallery == expected_gallery_layout
             && snapshot.image_list_signature == self.image_list_signature
             && snapshot.layout_list_signature == self.image_list_signature
             && snapshot.layout_len == self.image_list.len()
