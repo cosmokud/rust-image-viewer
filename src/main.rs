@@ -1167,6 +1167,7 @@ enum SoloProbeRequest {
         max_texture_side: u32,
         downscale_filter: FilterType,
         gif_filter: FilterType,
+        texture_preload: bool,
     },
     Video {
         path: PathBuf,
@@ -1187,6 +1188,7 @@ enum SoloProbeResult {
     Image {
         path: PathBuf,
         max_texture_side: u32,
+        texture_preload: bool,
         cached: Option<CachedDecodedImage>,
     },
     Video {
@@ -1440,6 +1442,7 @@ fn process_solo_probe_request(request: SoloProbeRequest) -> SoloProbeResult {
             max_texture_side,
             downscale_filter,
             gif_filter,
+            texture_preload,
         } => SoloProbeResult::Image {
             cached: load_solo_probe_image(
                 path.as_path(),
@@ -1449,6 +1452,7 @@ fn process_solo_probe_request(request: SoloProbeRequest) -> SoloProbeResult {
             ),
             path,
             max_texture_side,
+            texture_preload,
         },
         SoloProbeRequest::Video {
             path,
@@ -1974,8 +1978,8 @@ fn process_manga_focused_video_load_request(
     }
 }
 
-const DECODED_IMAGE_CACHE_MAX_BYTES: u64 = 192 * 1024 * 1024;
-const DECODED_IMAGE_CACHE_SKIP_ENTRY_BYTES: usize = 24 * 1024 * 1024;
+const DECODED_IMAGE_CACHE_MAX_BYTES: u64 = 384 * 1024 * 1024;
+const DECODED_IMAGE_CACHE_SKIP_ENTRY_BYTES: usize = 96 * 1024 * 1024;
 const STATIC_THUMBNAIL_CACHE_SKIP_ENTRY_BYTES: usize = 96 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1998,6 +2002,15 @@ struct CachedDecodedImage {
     original_width: u32,
     original_height: u32,
     is_animated_webp: bool,
+}
+
+#[derive(Clone)]
+struct CachedSoloImageTexture {
+    stamp: FileStamp,
+    texture: egui::TextureHandle,
+    width: u32,
+    height: u32,
+    mipmap_enabled: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2102,6 +2115,10 @@ struct ImageViewer {
     image_list_signature: u64,
     /// Decoded-image cache for fast back/forward navigation in image mode.
     decoded_image_cache: moka::sync::Cache<String, Arc<CachedDecodedImage>>,
+    /// Texture-ready image neighbors for fullscreen solo navigation.
+    solo_image_texture_cache: HashMap<String, CachedSoloImageTexture>,
+    /// LRU order for the texture-ready image neighbor cache.
+    solo_image_texture_cache_order: VecDeque<String>,
     /// Cached directory index used to avoid rescanning unchanged folders on every navigation step.
     media_directory_index: MediaDirectoryIndex,
     /// Pending async directory scan for the currently loaded media path.
@@ -2808,6 +2825,8 @@ impl Default for ImageViewer {
                     frame_bytes.saturating_add(256)
                 })
                 .build(),
+            solo_image_texture_cache: HashMap::new(),
+            solo_image_texture_cache_order: VecDeque::new(),
             media_directory_index: MediaDirectoryIndex::default(),
             pending_media_directory_scan: None,
             pending_media_directory_target: None,
@@ -3140,9 +3159,11 @@ impl ImageViewer {
     const MANGA_CACHE_MAX_ENTRIES: usize = 1024;
     const MANGA_STRIP_LOOK_AHEAD_MULTIPLIER: f32 = 2.0;
     const MANGA_STRIP_LOOK_BEHIND_MULTIPLIER: f32 = 1.0;
-    const SOLO_FULLSCREEN_PRELOAD_NEUTRAL_DEPTH: usize = 3;
-    const SOLO_FULLSCREEN_PRELOAD_MOMENTUM_DEPTH: usize = 6;
-    const SOLO_FULLSCREEN_PRELOAD_OPPOSITE_DEPTH: usize = 3;
+    const SOLO_FULLSCREEN_PRELOAD_NEUTRAL_DEPTH: usize = 6;
+    const SOLO_FULLSCREEN_PRELOAD_MOMENTUM_DEPTH: usize = 12;
+    const SOLO_FULLSCREEN_TEXTURE_READY_NEUTRAL_DEPTH: usize = 2;
+    const SOLO_FULLSCREEN_TEXTURE_READY_MOMENTUM_DEPTH: usize = 4;
+    const SOLO_IMAGE_TEXTURE_CACHE_MAX_ENTRIES: usize = 8;
     const SOLO_PRELOAD_MOMENTUM_LINGER: Duration = Duration::from_millis(1200);
     const MANGA_DYNAMIC_TARGET_MIN_SIDE: u32 = 192;
     const MANGA_DYNAMIC_TARGET_OVERSCAN: f32 = 1.35;
@@ -3744,6 +3765,8 @@ impl ImageViewer {
         if self.image_list_signature != new_signature {
             self.masonry_runtime_cache_signature = 0;
             self.clear_masonry_authoritative_dimension_lock();
+            self.solo_image_texture_cache.clear();
+            self.solo_image_texture_cache_order.clear();
         }
 
         self.image_list = files;
@@ -6242,6 +6265,133 @@ impl ImageViewer {
         }
     }
 
+    fn remove_solo_image_texture_cache_entry(&mut self, key: &str) {
+        self.solo_image_texture_cache.remove(key);
+        self.solo_image_texture_cache_order
+            .retain(|cached_key| cached_key != key);
+    }
+
+    fn touch_solo_image_texture_cache_entry(&mut self, key: &str) {
+        self.solo_image_texture_cache_order
+            .retain(|cached_key| cached_key != key);
+        self.solo_image_texture_cache_order
+            .push_back(key.to_owned());
+    }
+
+    fn insert_solo_image_texture_cache_entry(
+        &mut self,
+        key: String,
+        entry: CachedSoloImageTexture,
+    ) {
+        if !self.solo_image_texture_cache.contains_key(&key) {
+            while self.solo_image_texture_cache.len() >= Self::SOLO_IMAGE_TEXTURE_CACHE_MAX_ENTRIES
+            {
+                let old_key = self
+                    .solo_image_texture_cache_order
+                    .pop_front()
+                    .or_else(|| self.solo_image_texture_cache.keys().next().cloned());
+                let Some(old_key) = old_key else {
+                    break;
+                };
+                self.solo_image_texture_cache.remove(&old_key);
+            }
+        }
+
+        self.solo_image_texture_cache.insert(key.clone(), entry);
+        self.touch_solo_image_texture_cache_entry(&key);
+    }
+
+    fn cached_solo_image_texture_entry(
+        &mut self,
+        path: &PathBuf,
+        key: &str,
+    ) -> Option<(egui::TextureHandle, (u32, u32), bool)> {
+        let Some(current_stamp) = file_stamp_for_path(path) else {
+            self.remove_solo_image_texture_cache_entry(key);
+            return None;
+        };
+
+        let Some(entry) = self.solo_image_texture_cache.get(key) else {
+            return None;
+        };
+        if entry.stamp != current_stamp {
+            self.remove_solo_image_texture_cache_entry(key);
+            return None;
+        }
+
+        let texture = entry.texture.clone();
+        let dims = (entry.width, entry.height);
+        let mipmap_enabled = entry.mipmap_enabled;
+        self.touch_solo_image_texture_cache_entry(key);
+
+        Some((texture, dims, mipmap_enabled))
+    }
+
+    fn preload_solo_image_texture(
+        &mut self,
+        ctx: &egui::Context,
+        path: &PathBuf,
+        max_texture_side: u32,
+        cached: &CachedDecodedImage,
+    ) {
+        if cached.is_animated_webp {
+            return;
+        }
+
+        let key = decoded_image_cache_key(path, max_texture_side);
+        if self.cached_solo_image_texture_entry(path, &key).is_some() {
+            return;
+        }
+
+        let Some(stamp) = file_stamp_for_path(path) else {
+            return;
+        };
+        if stamp != cached.stamp {
+            return;
+        }
+
+        let frame = &cached.first_frame;
+        if frame.width == 0 || frame.height == 0 || frame.pixels.is_empty() {
+            return;
+        }
+
+        let (w, h, pixels) = downscale_rgba_if_needed(
+            frame.width,
+            frame.height,
+            &frame.pixels,
+            max_texture_side,
+            self.config.downscale_filter.to_image_filter(),
+        );
+        let color_image =
+            egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], pixels.as_ref());
+        let display_size = self.solo_expected_display_size_for_path(path, MediaType::Image, false);
+        let display_min_side = display_size.x.min(display_size.y).max(1.0);
+        let min_side = w.min(h);
+        let mipmap_enabled = self.mipmap_static_enabled()
+            && min_side >= self.config.manga_mipmap_min_side.max(1)
+            && (min_side as f32) >= display_min_side * 1.15;
+        let texture_options = self
+            .config
+            .texture_filter_static
+            .to_egui_options_with_mipmap(mipmap_enabled);
+        let texture = ctx.load_texture(
+            format!("solo-image-preload:{key}"),
+            color_image,
+            texture_options,
+        );
+
+        self.insert_solo_image_texture_cache_entry(
+            key,
+            CachedSoloImageTexture {
+                stamp,
+                texture,
+                width: w,
+                height: h,
+                mipmap_enabled,
+            },
+        );
+    }
+
     fn try_load_image_from_decoded_cache(
         &mut self,
         path: &PathBuf,
@@ -6259,6 +6409,7 @@ impl ImageViewer {
             .unwrap_or(false);
         if path_is_gif {
             self.decoded_image_cache.invalidate(&key);
+            self.remove_solo_image_texture_cache_entry(&key);
             self.perf_metrics
                 .increment_counter("decoded_image_cache_miss", 1);
             return false;
@@ -6271,6 +6422,7 @@ impl ImageViewer {
         };
 
         let Some(current_stamp) = file_stamp_for_path(path) else {
+            self.remove_solo_image_texture_cache_entry(&key);
             self.perf_metrics
                 .increment_counter("decoded_image_cache_miss", 1);
             return false;
@@ -6278,6 +6430,7 @@ impl ImageViewer {
 
         if cached.stamp != current_stamp {
             self.decoded_image_cache.invalidate(&key);
+            self.remove_solo_image_texture_cache_entry(&key);
             self.perf_metrics
                 .increment_counter("decoded_image_cache_miss", 1);
             return false;
@@ -6287,6 +6440,11 @@ impl ImageViewer {
             .increment_counter("decoded_image_cache_hit", 1);
 
         self.consume_deferred_media_view_reset();
+        let cached_texture = if cached.is_animated_webp {
+            None
+        } else {
+            self.cached_solo_image_texture_entry(path, &key)
+        };
 
         self.image = Some(LoadedImage::from_single_frame(
             path.clone(),
@@ -6295,7 +6453,20 @@ impl ImageViewer {
             cached.original_height,
         ));
         self.retained_media_placeholder_visible = false;
-        self.texture_frame = usize::MAX;
+        if let Some((texture, dims, mipmap_enabled)) = cached_texture {
+            self.texture = Some(texture);
+            self.image_texture_dims = Some(dims);
+            self.image_texture_mipmap_enabled = mipmap_enabled;
+            self.texture_frame = 0;
+            self.perf_metrics
+                .increment_counter("solo_image_texture_cache_hit", 1);
+        } else {
+            self.texture_frame = usize::MAX;
+            if !cached.is_animated_webp {
+                self.perf_metrics
+                    .increment_counter("solo_image_texture_cache_miss", 1);
+            }
+        }
         self.image_changed = true;
         self.pending_media_layout = false;
         self.error_message = None;
@@ -6328,6 +6499,7 @@ impl ImageViewer {
             .unwrap_or(false);
         if path_is_gif {
             self.decoded_image_cache.invalidate(&key);
+            self.remove_solo_image_texture_cache_entry(&key);
             return false;
         }
 
@@ -6337,11 +6509,13 @@ impl ImageViewer {
 
         let Some(current_stamp) = file_stamp_for_path(path) else {
             self.decoded_image_cache.invalidate(&key);
+            self.remove_solo_image_texture_cache_entry(&key);
             return false;
         };
 
         if cached.stamp != current_stamp {
             self.decoded_image_cache.invalidate(&key);
+            self.remove_solo_image_texture_cache_entry(&key);
             return false;
         }
 
@@ -6733,6 +6907,50 @@ impl ImageViewer {
         offsets
     }
 
+    fn solo_fullscreen_decode_depths(
+        momentum: SoloPreloadMomentum,
+        base_behind_count: usize,
+        base_ahead_count: usize,
+        max_neighbor_count: usize,
+    ) -> (usize, usize) {
+        let target_depth = match momentum {
+            SoloPreloadMomentum::Neutral => Self::SOLO_FULLSCREEN_PRELOAD_NEUTRAL_DEPTH,
+            SoloPreloadMomentum::Forward | SoloPreloadMomentum::Backward => {
+                Self::SOLO_FULLSCREEN_PRELOAD_MOMENTUM_DEPTH
+            }
+        };
+
+        (
+            base_behind_count.max(target_depth).min(max_neighbor_count),
+            base_ahead_count.max(target_depth).min(max_neighbor_count),
+        )
+    }
+
+    fn solo_fullscreen_texture_ready_depths(
+        momentum: SoloPreloadMomentum,
+        max_neighbor_count: usize,
+    ) -> (usize, usize) {
+        let target_depth = match momentum {
+            SoloPreloadMomentum::Neutral => Self::SOLO_FULLSCREEN_TEXTURE_READY_NEUTRAL_DEPTH,
+            SoloPreloadMomentum::Forward | SoloPreloadMomentum::Backward => {
+                Self::SOLO_FULLSCREEN_TEXTURE_READY_MOMENTUM_DEPTH
+            }
+        };
+        let target_depth = target_depth.min(max_neighbor_count);
+
+        (target_depth, target_depth)
+    }
+
+    fn solo_offset_within_depths(offset: isize, behind_count: usize, ahead_count: usize) -> bool {
+        if offset > 0 {
+            (offset as usize) <= ahead_count
+        } else if offset < 0 {
+            offset.unsigned_abs() <= behind_count
+        } else {
+            false
+        }
+    }
+
     fn schedule_solo_probe_window(
         &mut self,
         current_path: &PathBuf,
@@ -6750,26 +6968,23 @@ impl ImageViewer {
         let max_neighbor_count = self.image_list.len().saturating_sub(1);
 
         let (mut probe_behind_count, mut probe_ahead_count) = if self.is_fullscreen {
-            match momentum {
-                SoloPreloadMomentum::Neutral => (
-                    base_probe_behind_count.max(Self::SOLO_FULLSCREEN_PRELOAD_NEUTRAL_DEPTH),
-                    base_probe_ahead_count.max(Self::SOLO_FULLSCREEN_PRELOAD_NEUTRAL_DEPTH),
-                ),
-                SoloPreloadMomentum::Forward => (
-                    base_probe_behind_count.max(Self::SOLO_FULLSCREEN_PRELOAD_OPPOSITE_DEPTH),
-                    base_probe_ahead_count.max(Self::SOLO_FULLSCREEN_PRELOAD_MOMENTUM_DEPTH),
-                ),
-                SoloPreloadMomentum::Backward => (
-                    base_probe_behind_count.max(Self::SOLO_FULLSCREEN_PRELOAD_MOMENTUM_DEPTH),
-                    base_probe_ahead_count.max(Self::SOLO_FULLSCREEN_PRELOAD_OPPOSITE_DEPTH),
-                ),
-            }
+            Self::solo_fullscreen_decode_depths(
+                momentum,
+                base_probe_behind_count,
+                base_probe_ahead_count,
+                max_neighbor_count,
+            )
         } else {
             (base_probe_behind_count, base_probe_ahead_count)
         };
 
         probe_behind_count = probe_behind_count.min(max_neighbor_count);
         probe_ahead_count = probe_ahead_count.min(max_neighbor_count);
+        let (texture_ready_behind_count, texture_ready_ahead_count) = if self.is_fullscreen {
+            Self::solo_fullscreen_texture_ready_depths(momentum, max_neighbor_count)
+        } else {
+            (0, 0)
+        };
 
         let offsets = if self.is_fullscreen {
             Self::build_solo_probe_offsets(momentum, probe_ahead_count, probe_behind_count)
@@ -6849,6 +7064,11 @@ impl ImageViewer {
                         max_texture_side: target_side,
                         downscale_filter,
                         gif_filter,
+                        texture_preload: Self::solo_offset_within_depths(
+                            offset,
+                            texture_ready_behind_count,
+                            texture_ready_ahead_count,
+                        ),
                     });
                 }
                 MediaType::Video => {
@@ -6885,16 +7105,25 @@ impl ImageViewer {
                 SoloProbeResult::Image {
                     path,
                     max_texture_side,
+                    texture_preload,
                     cached,
                 } => {
                     let Some(cached) = cached else {
                         continue;
                     };
 
-                    self.decoded_image_cache.insert(
-                        decoded_image_cache_key(&path, max_texture_side),
-                        Arc::new(cached),
-                    );
+                    let cache_key = decoded_image_cache_key(&path, max_texture_side);
+                    let cached = Arc::new(cached);
+                    self.decoded_image_cache
+                        .insert(cache_key, Arc::clone(&cached));
+                    if texture_preload {
+                        self.preload_solo_image_texture(
+                            ctx,
+                            &path,
+                            max_texture_side,
+                            cached.as_ref(),
+                        );
+                    }
 
                     let current_matches = self.current_media_type == Some(MediaType::Image)
                         && self
@@ -28870,5 +29099,45 @@ mod tests {
 
         assert_eq!(forward.as_slice(), &[1, 2, -1, 3, 4, -2, 5, -3]);
         assert_eq!(backward.as_slice(), &[-1, -2, 1, -3, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn solo_fullscreen_decode_depths_are_wide_and_symmetric() {
+        assert_eq!(
+            ImageViewer::solo_fullscreen_decode_depths(SoloPreloadMomentum::Neutral, 0, 0, 99),
+            (6, 6)
+        );
+        assert_eq!(
+            ImageViewer::solo_fullscreen_decode_depths(SoloPreloadMomentum::Forward, 0, 0, 99),
+            (12, 12)
+        );
+        assert_eq!(
+            ImageViewer::solo_fullscreen_decode_depths(SoloPreloadMomentum::Backward, 0, 0, 99),
+            (12, 12)
+        );
+        assert_eq!(
+            ImageViewer::solo_fullscreen_decode_depths(SoloPreloadMomentum::Forward, 0, 0, 4),
+            (4, 4)
+        );
+    }
+
+    #[test]
+    fn solo_fullscreen_texture_ready_depths_are_smaller_and_symmetric() {
+        assert_eq!(
+            ImageViewer::solo_fullscreen_texture_ready_depths(SoloPreloadMomentum::Neutral, 99),
+            (2, 2)
+        );
+        assert_eq!(
+            ImageViewer::solo_fullscreen_texture_ready_depths(SoloPreloadMomentum::Forward, 99),
+            (4, 4)
+        );
+        assert_eq!(
+            ImageViewer::solo_fullscreen_texture_ready_depths(SoloPreloadMomentum::Backward, 99),
+            (4, 4)
+        );
+        assert_eq!(
+            ImageViewer::solo_fullscreen_texture_ready_depths(SoloPreloadMomentum::Backward, 3),
+            (3, 3)
+        );
     }
 }
