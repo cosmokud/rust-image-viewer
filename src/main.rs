@@ -13882,8 +13882,8 @@ impl ImageViewer {
                             &loaded.image,
                             loaded.is_animated_webp,
                         );
+                        self.clear_current_image_texture_upload();
                         self.image = Some(loaded.image);
-                        self.texture_frame = usize::MAX;
                         self.image_changed = true;
                         self.pending_media_layout = false;
                         self.error_message = None;
