@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [v0.4.1-rc.1] - 2026-05-15
+## [v0.4.1-rc.2] - 2026-05-15
 
 ### Rendering And Resize Pipeline
 
@@ -22,6 +22,38 @@ All notable changes to this project will be documented in this file.
 - Manga worker decoding still produces CPU RGBA buffers and the UI thread still owns texture uploads.
 - The refactor keeps worker-side downscale behavior unchanged while making the CPU resize stage easier to profile, replace, or bypass when a GPU-backed scaling path is introduced.
 - No public configuration, shortcut, cache schema, or media-format behavior changed in this release candidate.
+
+## [v0.4.1-rc.1] - 2026-05-14
+
+### Highlights
+
+- Added fullscreen Gallery layout mode alongside the existing Long Strip and Masonry reading layouts.
+- Added Gallery-specific shortcut names and default bindings while preserving the existing Masonry action implementation paths.
+- Improved fullscreen solo-view preloading so next/previous navigation momentum biases neighbor probing in the direction the user is moving.
+- Refactored folder-navigation image-list handling so synthetic folder entries are normalized consistently and new folder entries can be merged without rebuilding unrelated state.
+
+### Added
+
+- `MangaLayoutMode::Gallery` as a first-class fullscreen layout option.
+- `layout_is_gallery` in the Masonry/Gallery session snapshot so cached layout metadata is restored only for the matching layout family.
+- Gallery shortcut aliases for pan, open item, freehand autoscroll, mark, toggle mark, directional pan, wheel scroll, and zoom actions.
+- A new `GALLERY SHORTCUTS` section in `assets/config.ini` with defaults for mouse, wheel, keyboard, and modifier-driven Gallery controls.
+- Solo fullscreen preload momentum tracking with a short linger window, allowing preload probes to favor the navigation direction after repeated next/previous movement.
+
+### Changed
+
+- Shared Masonry action parsing now accepts Gallery action names such as `gallery_pan`, `gallery_goto_file`, `gallery_scroll_down`, and `gallery_zoom_in`.
+- Folder-navigation media lists now pass through one normalization path before being stored, reducing duplicated filtering around synthetic folder entries.
+- Folder metadata snapshot persistence and restoration now apply to the Gallery layout where the same cached folder-dimension data is valid.
+- Package version bumped from `0.3.9` to `0.4.1-rc.1` in `Cargo.toml` and `Cargo.lock`.
+
+### Changed Files
+
+- `Cargo.toml`
+- `Cargo.lock`
+- `assets/config.ini`
+- `src/config.rs`
+- `src/main.rs`
 
 ## [v0.3.9] - 2026-05-14
 
