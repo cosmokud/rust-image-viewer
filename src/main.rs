@@ -2259,6 +2259,8 @@ struct ImageViewer {
     pending_media_layout: bool,
     /// Screen size
     screen_size: egui::Vec2,
+    /// Last valid monitor size reported by the viewport.
+    last_known_monitor_size: egui::Vec2,
     /// Request to exit
     should_exit: bool,
     /// Request fullscreen toggle
@@ -2894,6 +2896,7 @@ impl Default for ImageViewer {
             image_changed: false,
             pending_media_layout: false,
             screen_size: egui::Vec2::new(1920.0, 1080.0),
+            last_known_monitor_size: egui::Vec2::new(1920.0, 1080.0),
             should_exit: false,
             toggle_fullscreen: false,
             toggle_fullscreen_force_borderless: false,
@@ -6689,7 +6692,17 @@ impl ImageViewer {
     }
 
     fn solo_viewport_size_for_lod(&self) -> egui::Vec2 {
-        egui::vec2(self.screen_size.x.max(1.0), self.screen_size.y.max(1.0))
+        let viewport = if self.is_fullscreen {
+            self.screen_size
+        } else {
+            Self::floating_monitor_bounds_for_layout(
+                None,
+                self.screen_size,
+                self.last_known_monitor_size,
+            )
+        };
+
+        egui::vec2(viewport.x.max(1.0), viewport.y.max(1.0))
     }
 
     fn solo_expected_display_size_for_path(
@@ -13275,7 +13288,9 @@ impl ImageViewer {
         // Get screen size from monitor info if available
         #[cfg(target_os = "windows")]
         {
-            viewer.screen_size = get_primary_monitor_size();
+            let primary_monitor = get_primary_monitor_size();
+            viewer.screen_size = primary_monitor;
+            viewer.last_known_monitor_size = primary_monitor;
         }
 
         if let Some(path) = path {
@@ -14684,9 +14699,38 @@ impl ImageViewer {
         self.load_image_retaining_visible_media(&path);
     }
 
+    fn valid_layout_bounds(size: egui::Vec2) -> Option<egui::Vec2> {
+        (size.x.is_finite() && size.y.is_finite() && size.x > 0.0 && size.y > 0.0)
+            .then_some(size)
+    }
+
+    fn floating_monitor_bounds_for_layout(
+        viewport_monitor: Option<egui::Vec2>,
+        current_viewport: egui::Vec2,
+        last_known_monitor: egui::Vec2,
+    ) -> egui::Vec2 {
+        viewport_monitor
+            .and_then(Self::valid_layout_bounds)
+            .or_else(|| Self::valid_layout_bounds(last_known_monitor))
+            .or_else(|| Self::valid_layout_bounds(current_viewport))
+            .unwrap_or(egui::vec2(1.0, 1.0))
+    }
+
+    fn refresh_last_known_monitor_size(&mut self, ctx: &egui::Context) {
+        if let Some(monitor) =
+            ctx.input(|i| i.raw.viewport().monitor_size)
+                .and_then(Self::valid_layout_bounds)
+        {
+            self.last_known_monitor_size = monitor;
+        }
+    }
+
     fn monitor_size_points(&self, ctx: &egui::Context) -> egui::Vec2 {
-        ctx.input(|i| i.raw.viewport().monitor_size)
-            .unwrap_or(self.screen_size)
+        Self::floating_monitor_bounds_for_layout(
+            ctx.input(|i| i.raw.viewport().monitor_size),
+            self.screen_size,
+            self.last_known_monitor_size,
+        )
     }
 
     fn center_window_on_monitor(&mut self, ctx: &egui::Context, inner_size: egui::Vec2) {
@@ -14696,8 +14740,7 @@ impl ImageViewer {
         self.send_outer_position(ctx, egui::pos2(x.max(0.0), y));
     }
 
-    fn floating_layout_size_for_media(
-        &self,
+    fn floating_layout_size_for_media_bounds(
         media_w: f32,
         media_h: f32,
         monitor: egui::Vec2,
@@ -14714,6 +14757,15 @@ impl ImageViewer {
 
         let size = egui::Vec2::new((media_w * zoom).max(200.0), (media_h * zoom).max(150.0));
         Some((zoom, size))
+    }
+
+    fn floating_layout_size_for_media(
+        &self,
+        media_w: f32,
+        media_h: f32,
+        monitor: egui::Vec2,
+    ) -> Option<(f32, egui::Vec2)> {
+        Self::floating_layout_size_for_media_bounds(media_w, media_h, monitor)
     }
 
     fn prepare_single_instance_media_handoff(&mut self, ctx: &egui::Context) {
@@ -28116,6 +28168,7 @@ impl eframe::App for ImageViewer {
         self.poll_pending_audio_track_switches(ctx);
         self.poll_pending_file_size_probe(ctx);
         self.ensure_current_file_size_label();
+        self.refresh_last_known_monitor_size(ctx);
 
         // Keep our cached screen size in sync with the real viewport.
         // Manga mode uses this for layout/scroll math; if it drifts from `ctx.screen_rect()`,
@@ -29333,5 +29386,19 @@ mod tests {
             ImageViewer::pending_image_display_dimensions(true, stale_texture_dims, None),
             stale_texture_dims
         );
+    }
+
+    #[test]
+    fn floating_navigation_fit_uses_last_known_monitor_when_viewport_monitor_missing() {
+        let old_window = egui::vec2(420.0, 315.0);
+        let monitor = egui::vec2(1920.0, 1080.0);
+        let bounds = ImageViewer::floating_monitor_bounds_for_layout(None, old_window, monitor);
+
+        let (_, size) =
+            ImageViewer::floating_layout_size_for_media_bounds(4000.0, 6000.0, bounds).unwrap();
+
+        assert_eq!(bounds, monitor);
+        assert!((size.x - 720.0).abs() <= f32::EPSILON);
+        assert!((size.y - 1080.0).abs() <= f32::EPSILON);
     }
 }

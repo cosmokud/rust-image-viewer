@@ -772,6 +772,8 @@ impl LoadedImage {
         downscale_filter: FilterType,
     ) -> Result<Self, String> {
         let (mut width, mut height, mut pixels) = open_image_with_reasonable_limits(path)?;
+        let source_width = width;
+        let source_height = height;
 
         if let Some(max_side) = max_texture_side {
             if max_side > 0 && (width > max_side || height > max_side) {
@@ -809,8 +811,8 @@ impl LoadedImage {
             frames: vec![frame],
             current_frame: 0,
             last_frame_time: Instant::now(),
-            original_width: width,
-            original_height: height,
+            original_width: source_width,
+            original_height: source_height,
             animation_storage: AnimationStorage::FullyDecoded,
         })
     }
@@ -1433,7 +1435,8 @@ pub mod natord {
 
 #[cfg(test)]
 mod tests {
-    use super::{get_media_in_directory, static_zune_decoder_options};
+    use super::{get_media_in_directory, static_zune_decoder_options, LoadedImage};
+    use image::imageops::FilterType;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1502,5 +1505,28 @@ mod tests {
             static_zune_decoder_options(Path::new("sample.JPG"), 512 * 1024 * 1024, 2000, 3000);
 
         assert_eq!(options.jpeg_get_out_colorspace(), ColorSpace::RGBA);
+    }
+
+    #[test]
+    fn downscaled_static_load_keeps_source_display_dimensions() {
+        let root = unique_temp_dir("image_loader_lod_display_dims");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("large.png");
+        let image = image::RgbImage::from_pixel(40, 60, image::Rgb([180, 80, 40]));
+        image.save(&path).unwrap();
+
+        let loaded = LoadedImage::load_with_max_texture_side(
+            &path,
+            Some(20),
+            FilterType::Triangle,
+            FilterType::Nearest,
+        )
+        .unwrap();
+        let frame = loaded.current_frame_data();
+
+        assert_eq!((frame.width, frame.height), (13, 20));
+        assert_eq!(loaded.display_dimensions(), (40, 60));
+
+        let _ = fs::remove_dir_all(&root);
     }
 }
