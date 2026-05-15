@@ -1252,6 +1252,13 @@ enum SoloProbeRequest {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SoloPreloadMomentum {
+    Neutral,
+    Forward,
+    Backward,
+}
+
 enum SoloProbeResult {
     Image {
         path: PathBuf,
@@ -2701,6 +2708,10 @@ struct ImageViewer {
     prev_image_mouse_repeat_at: Option<Instant>,
     /// Next repeat deadline while holding a mouse-bound next-image action in solo mode.
     next_image_mouse_repeat_at: Option<Instant>,
+    /// Solo fullscreen navigation momentum used to bias neighbor preload direction.
+    solo_preload_momentum: SoloPreloadMomentum,
+    /// Expiry timestamp for solo fullscreen preload momentum.
+    solo_preload_momentum_until: Option<Instant>,
     /// Next repeat deadline while holding a mouse-bound previous-image action in long-strip mode.
     manga_prev_image_mouse_repeat_at: Option<Instant>,
     /// Next repeat deadline while holding a mouse-bound next-image action in long-strip mode.
@@ -3125,6 +3136,8 @@ impl Default for ImageViewer {
             manga_arrow_right_was_down: false,
             prev_image_mouse_repeat_at: None,
             next_image_mouse_repeat_at: None,
+            solo_preload_momentum: SoloPreloadMomentum::Neutral,
+            solo_preload_momentum_until: None,
             manga_prev_image_mouse_repeat_at: None,
             manga_next_image_mouse_repeat_at: None,
 
@@ -3203,6 +3216,10 @@ impl ImageViewer {
     const MANGA_CACHE_MAX_ENTRIES: usize = 1024;
     const MANGA_STRIP_LOOK_AHEAD_MULTIPLIER: f32 = 2.0;
     const MANGA_STRIP_LOOK_BEHIND_MULTIPLIER: f32 = 1.0;
+    const SOLO_FULLSCREEN_PRELOAD_NEUTRAL_DEPTH: usize = 3;
+    const SOLO_FULLSCREEN_PRELOAD_MOMENTUM_DEPTH: usize = 6;
+    const SOLO_FULLSCREEN_PRELOAD_OPPOSITE_DEPTH: usize = 3;
+    const SOLO_PRELOAD_MOMENTUM_LINGER: Duration = Duration::from_millis(1200);
     const MANGA_DYNAMIC_TARGET_MIN_SIDE: u32 = 192;
     const MANGA_DYNAMIC_TARGET_OVERSCAN: f32 = 1.35;
     const MANGA_MASONRY_DYNAMIC_TARGET_DENSE_MIN_SIDE: u32 = 64;
@@ -6704,6 +6721,92 @@ impl ImageViewer {
         Some((self.current_index as isize + offset).rem_euclid(len as isize) as usize)
     }
 
+    fn set_solo_preload_momentum(&mut self, momentum: SoloPreloadMomentum) {
+        self.solo_preload_momentum = momentum;
+        if momentum == SoloPreloadMomentum::Neutral {
+            self.solo_preload_momentum_until = None;
+            return;
+        }
+
+        self.solo_preload_momentum_until = Some(Instant::now() + Self::SOLO_PRELOAD_MOMENTUM_LINGER);
+    }
+
+    fn current_solo_preload_momentum(&mut self) -> SoloPreloadMomentum {
+        if !self.is_fullscreen {
+            self.solo_preload_momentum = SoloPreloadMomentum::Neutral;
+            self.solo_preload_momentum_until = None;
+            return SoloPreloadMomentum::Neutral;
+        }
+
+        let Some(until) = self.solo_preload_momentum_until else {
+            return SoloPreloadMomentum::Neutral;
+        };
+
+        if Instant::now() > until {
+            self.solo_preload_momentum = SoloPreloadMomentum::Neutral;
+            self.solo_preload_momentum_until = None;
+            return SoloPreloadMomentum::Neutral;
+        }
+
+        self.solo_preload_momentum
+    }
+
+    fn build_solo_probe_offsets(
+        &self,
+        momentum: SoloPreloadMomentum,
+        probe_ahead_count: usize,
+        probe_behind_count: usize,
+    ) -> Vec<isize> {
+        let mut offsets = Vec::with_capacity(probe_ahead_count.saturating_add(probe_behind_count));
+        match momentum {
+            SoloPreloadMomentum::Neutral => {
+                let max_depth = probe_ahead_count.max(probe_behind_count);
+                for step in 1..=max_depth {
+                    if step <= probe_ahead_count {
+                        offsets.push(step as isize);
+                    }
+                    if step <= probe_behind_count {
+                        offsets.push(-(step as isize));
+                    }
+                }
+            }
+            SoloPreloadMomentum::Forward => {
+                let mut forward_step = 1;
+                let mut backward_step = 1;
+                while forward_step <= probe_ahead_count || backward_step <= probe_behind_count {
+                    for _ in 0..2 {
+                        if forward_step <= probe_ahead_count {
+                            offsets.push(forward_step as isize);
+                            forward_step += 1;
+                        }
+                    }
+                    if backward_step <= probe_behind_count {
+                        offsets.push(-(backward_step as isize));
+                        backward_step += 1;
+                    }
+                }
+            }
+            SoloPreloadMomentum::Backward => {
+                let mut backward_step = 1;
+                let mut forward_step = 1;
+                while backward_step <= probe_behind_count || forward_step <= probe_ahead_count {
+                    for _ in 0..2 {
+                        if backward_step <= probe_behind_count {
+                            offsets.push(-(backward_step as isize));
+                            backward_step += 1;
+                        }
+                    }
+                    if forward_step <= probe_ahead_count {
+                        offsets.push(forward_step as isize);
+                        forward_step += 1;
+                    }
+                }
+            }
+        }
+
+        offsets
+    }
+
     fn schedule_solo_probe_window(
         &mut self,
         current_path: &PathBuf,
@@ -6715,11 +6818,47 @@ impl ImageViewer {
 
         let downscale_filter = self.config.downscale_filter.to_image_filter();
         let gif_filter = self.config.gif_resize_filter.to_image_filter();
-        let (mut probe_behind_count, mut probe_ahead_count) =
+        let (base_probe_behind_count, base_probe_ahead_count) =
             self.solo_probe_window_counts_for_path(current_path, current_media_type);
+        let momentum = self.current_solo_preload_momentum();
         let max_neighbor_count = self.image_list.len().saturating_sub(1);
+
+        let (mut probe_behind_count, mut probe_ahead_count) = if self.is_fullscreen {
+            match momentum {
+                SoloPreloadMomentum::Neutral => (
+                    base_probe_behind_count.max(Self::SOLO_FULLSCREEN_PRELOAD_NEUTRAL_DEPTH),
+                    base_probe_ahead_count.max(Self::SOLO_FULLSCREEN_PRELOAD_NEUTRAL_DEPTH),
+                ),
+                SoloPreloadMomentum::Forward => (
+                    base_probe_behind_count.max(Self::SOLO_FULLSCREEN_PRELOAD_OPPOSITE_DEPTH),
+                    base_probe_ahead_count.max(Self::SOLO_FULLSCREEN_PRELOAD_MOMENTUM_DEPTH),
+                ),
+                SoloPreloadMomentum::Backward => (
+                    base_probe_behind_count.max(Self::SOLO_FULLSCREEN_PRELOAD_MOMENTUM_DEPTH),
+                    base_probe_ahead_count.max(Self::SOLO_FULLSCREEN_PRELOAD_OPPOSITE_DEPTH),
+                ),
+            }
+        } else {
+            (base_probe_behind_count, base_probe_ahead_count)
+        };
+
         probe_behind_count = probe_behind_count.min(max_neighbor_count);
         probe_ahead_count = probe_ahead_count.min(max_neighbor_count);
+
+        let offsets = if self.is_fullscreen {
+            self.build_solo_probe_offsets(momentum, probe_ahead_count, probe_behind_count)
+        } else {
+            let mut legacy_offsets =
+                Vec::with_capacity(probe_ahead_count.saturating_add(probe_behind_count));
+            for offset in 1..=probe_ahead_count as isize {
+                legacy_offsets.push(offset);
+            }
+            for offset in 1..=probe_behind_count as isize {
+                legacy_offsets.push(-offset);
+            }
+            legacy_offsets
+        };
+
         let mut queued_indices = HashSet::new();
         let mut requests = Vec::with_capacity(probe_ahead_count + probe_behind_count + 1);
 
@@ -6742,68 +6881,8 @@ impl ImageViewer {
             }
         }
 
-        for offset in 1..=probe_ahead_count as isize {
+        for offset in offsets {
             let Some(index) = self.solo_wrapped_index_with_offset(offset) else {
-                continue;
-            };
-            if !queued_indices.insert(index) {
-                continue;
-            }
-
-            let Some(path) = self.image_list.get(index).cloned() else {
-                continue;
-            };
-            let Some(media_type) = get_media_type(&path) else {
-                continue;
-            };
-
-            match media_type {
-                MediaType::Image => {
-                    let extension = path
-                        .extension()
-                        .and_then(|ext| ext.to_str())
-                        .map(|ext| ext.to_ascii_lowercase());
-                    if extension.as_deref() == Some("gif") {
-                        continue;
-                    }
-
-                    let target_side =
-                        self.solo_target_texture_side_for_path(&path, media_type, false);
-                    if self.has_valid_decoded_image_cache_entry(&path, target_side) {
-                        continue;
-                    }
-
-                    let may_be_animated_by_ext = matches!(extension.as_deref(), Some("webp"));
-                    if !may_be_animated_by_ext
-                        && lookup_cached_static_thumbnail(&path, target_side).is_some()
-                    {
-                        continue;
-                    }
-
-                    requests.push(SoloProbeRequest::Image {
-                        path,
-                        max_texture_side: target_side,
-                        downscale_filter,
-                        gif_filter,
-                    });
-                }
-                MediaType::Video => {
-                    let target_side =
-                        self.solo_target_texture_side_for_path(&path, media_type, false);
-                    if lookup_cached_video_thumbnail(&path, target_side).is_some() {
-                        continue;
-                    }
-
-                    requests.push(SoloProbeRequest::Video {
-                        path,
-                        max_texture_side: target_side,
-                    });
-                }
-            }
-        }
-
-        for offset in 1..=probe_behind_count as isize {
-            let Some(index) = self.solo_wrapped_index_with_offset(-offset) else {
                 continue;
             };
             if !queued_indices.insert(index) {
@@ -6909,6 +6988,9 @@ impl ImageViewer {
                                 pending.kind == PendingMediaLoadKind::Image && pending.path == path
                             }) {
                                 self.pending_media_load = None;
+                            }
+                            if !self.defer_directory_work_for_fast_startup() {
+                                self.schedule_solo_probe_window(&path, Some(MediaType::Image));
                             }
                             request_repaint = true;
                         }
@@ -13614,6 +13696,9 @@ impl ImageViewer {
                         self.pending_media_layout = false;
                         self.error_message = None;
                         self.clear_video_playback_unavailable_state();
+                        if !self.defer_directory_work_for_fast_startup() {
+                            self.schedule_solo_probe_window(&path, Some(MediaType::Image));
+                        }
 
                         if loaded.is_animated_webp {
                             if let Some(rx) = LoadedImage::start_streaming_webp(
@@ -13692,6 +13777,10 @@ impl ImageViewer {
                                 self.image_changed = true;
                                 self.pending_media_layout = true;
                             }
+
+                            if !self.defer_directory_work_for_fast_startup() {
+                                self.schedule_solo_probe_window(&path, Some(MediaType::Video));
+                            }
                         }
                         Err(err) => {
                             if self.retained_media_placeholder_visible {
@@ -13735,6 +13824,9 @@ impl ImageViewer {
 
     fn load_media_internal(&mut self, path: &PathBuf, retain_visible_media_until_ready: bool) {
         let load_media_start = Instant::now();
+        if !retain_visible_media_until_ready {
+            self.set_solo_preload_momentum(SoloPreloadMomentum::Neutral);
+        }
 
         self.reset_masonry_metadata_preload();
         self.clear_pending_media_load();
@@ -13966,7 +14058,11 @@ impl ImageViewer {
             }
         }
 
-        if media_type.is_some() && !is_folder_entry && !defer_directory_work_for_fast_startup {
+        if media_type.is_some()
+            && !is_folder_entry
+            && !defer_directory_work_for_fast_startup
+            && self.pending_media_load.is_none()
+        {
             self.schedule_solo_probe_window(path, media_type);
         }
 
@@ -14172,6 +14268,7 @@ impl ImageViewer {
 
         // Save current view state before navigating (fullscreen only)
         self.save_current_fullscreen_view_state();
+        self.set_solo_preload_momentum(SoloPreloadMomentum::Forward);
 
         self.set_current_index_clamped(if self.current_index + 1 >= self.image_list.len() {
             0
@@ -14260,6 +14357,7 @@ impl ImageViewer {
 
         // Save current view state before navigating (fullscreen only)
         self.save_current_fullscreen_view_state();
+        self.set_solo_preload_momentum(SoloPreloadMomentum::Backward);
 
         self.set_current_index_clamped(if self.current_index == 0 {
             self.image_list.len() - 1
