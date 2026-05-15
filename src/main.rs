@@ -1181,6 +1181,8 @@ enum SoloPreloadMomentum {
     Backward,
 }
 
+type SoloProbeOffsets = SmallVec<[isize; 16]>;
+
 enum SoloProbeResult {
     Image {
         path: PathBuf,
@@ -6677,12 +6679,11 @@ impl ImageViewer {
     }
 
     fn build_solo_probe_offsets(
-        &self,
         momentum: SoloPreloadMomentum,
         probe_ahead_count: usize,
         probe_behind_count: usize,
-    ) -> Vec<isize> {
-        let mut offsets = Vec::with_capacity(probe_ahead_count.saturating_add(probe_behind_count));
+    ) -> SoloProbeOffsets {
+        let mut offsets = SoloProbeOffsets::new();
         match momentum {
             SoloPreloadMomentum::Neutral => {
                 let max_depth = probe_ahead_count.max(probe_behind_count);
@@ -6771,10 +6772,9 @@ impl ImageViewer {
         probe_ahead_count = probe_ahead_count.min(max_neighbor_count);
 
         let offsets = if self.is_fullscreen {
-            self.build_solo_probe_offsets(momentum, probe_ahead_count, probe_behind_count)
+            Self::build_solo_probe_offsets(momentum, probe_ahead_count, probe_behind_count)
         } else {
-            let mut legacy_offsets =
-                Vec::with_capacity(probe_ahead_count.saturating_add(probe_behind_count));
+            let mut legacy_offsets = SoloProbeOffsets::new();
             for offset in 1..=probe_ahead_count as isize {
                 legacy_offsets.push(offset);
             }
@@ -28849,5 +28849,26 @@ fn build_fallback_icon() -> egui::IconData {
         rgba,
         width: w as u32,
         height: h as u32,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ImageViewer, SoloPreloadMomentum};
+
+    #[test]
+    fn solo_probe_offsets_interleave_without_momentum() {
+        let offsets = ImageViewer::build_solo_probe_offsets(SoloPreloadMomentum::Neutral, 3, 2);
+
+        assert_eq!(offsets.as_slice(), &[1, -1, 2, -2, 3]);
+    }
+
+    #[test]
+    fn solo_probe_offsets_bias_toward_navigation_momentum() {
+        let forward = ImageViewer::build_solo_probe_offsets(SoloPreloadMomentum::Forward, 5, 3);
+        let backward = ImageViewer::build_solo_probe_offsets(SoloPreloadMomentum::Backward, 5, 3);
+
+        assert_eq!(forward.as_slice(), &[1, 2, -1, 3, 4, -2, 5, -3]);
+        assert_eq!(backward.as_slice(), &[-1, -2, 1, -3, 2, 3, 4, 5]);
     }
 }
