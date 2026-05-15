@@ -6775,6 +6775,19 @@ impl ImageViewer {
         self.solo_quantize_target_texture_side(target, source_dims)
     }
 
+    fn solo_image_load_texture_side(
+        is_fullscreen: bool,
+        fullscreen_lod_side: u32,
+        max_texture_side: u32,
+    ) -> u32 {
+        let max_texture_side = max_texture_side.max(1);
+        if is_fullscreen && fullscreen_lod_side > 0 {
+            fullscreen_lod_side.min(max_texture_side).max(1)
+        } else {
+            max_texture_side
+        }
+    }
+
     fn solo_visible_item_equivalent_for_path(
         &self,
         path: &PathBuf,
@@ -7077,7 +7090,7 @@ impl ImageViewer {
                     }
 
                     let target_side =
-                        self.solo_target_texture_side_for_path(&path, media_type, false);
+                        self.solo_target_texture_side_for_path(&path, media_type, true);
                     if self.has_valid_decoded_image_cache_entry(&path, target_side) {
                         continue;
                     }
@@ -14222,9 +14235,16 @@ impl ImageViewer {
                 // in the background so the animation begins playing progressively.
                 let downscale_filter = self.config.downscale_filter.to_image_filter();
                 let gif_filter = self.config.gif_resize_filter.to_image_filter();
-                // Solo mode should decode up to the GPU limit so deep zoom can recover detail
-                // instead of being locked to the initial viewport-sized LOD.
-                let max_tex = self.max_texture_side.max(1);
+                let fullscreen_lod_side = if self.is_fullscreen {
+                    self.solo_target_texture_side_for_path(path, MediaType::Image, true)
+                } else {
+                    0
+                };
+                let max_tex = Self::solo_image_load_texture_side(
+                    self.is_fullscreen,
+                    fullscreen_lod_side,
+                    self.max_texture_side,
+                );
 
                 if self.try_load_image_from_decoded_cache(path, max_tex, gif_filter) {
                     if !defer_directory_work_for_fast_startup {
@@ -29196,5 +29216,21 @@ mod tests {
             &frame
         ));
         assert!(!ImageViewer::solo_texture_dims_match_frame(None, &frame));
+    }
+
+    #[test]
+    fn solo_fullscreen_image_load_uses_preload_lod() {
+        assert_eq!(
+            ImageViewer::solo_image_load_texture_side(true, 2048, 8192),
+            2048
+        );
+        assert_eq!(
+            ImageViewer::solo_image_load_texture_side(false, 2048, 8192),
+            8192
+        );
+        assert_eq!(
+            ImageViewer::solo_image_load_texture_side(true, 0, 8192),
+            8192
+        );
     }
 }

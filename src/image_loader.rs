@@ -37,6 +37,7 @@ use windows::{
 // Header-based probing and dimension checks still guard against invalid/corrupt inputs.
 const DEFAULT_MAX_DECODE_ALLOC_BYTES: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
 const ZUNE_STATIC_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "bmp", "psd"];
+const ZUNE_JPEG_EXTENSIONS: &[&str] = &["jpg", "jpeg"];
 const WEBP_STREAM_CHANNEL_CAPACITY: usize = 96;
 const GIF_FRAME_WINDOW_SIZE: usize = 72;
 const GIF_WINDOW_MODE_THRESHOLD_BYTES: usize = 96 * 1024 * 1024;
@@ -70,6 +71,31 @@ fn webp_frame_delay_ms(prev_timestamp: i32, current_timestamp: i32) -> u32 {
 
 fn should_decode_static_with_zune(path: &Path) -> bool {
     extension_matches(path, ZUNE_STATIC_EXTENSIONS)
+}
+
+fn static_zune_decoder_options(
+    path: &Path,
+    max_alloc_usize: usize,
+    width: u32,
+    height: u32,
+) -> DecoderOptions {
+    let mut options = DecoderOptions::new_fast()
+        .inflate_set_limit(max_alloc_usize)
+        // For static loading we only need the first frame (if any).
+        .png_set_decode_animated(false);
+
+    if extension_matches(path, ZUNE_JPEG_EXTENSIONS) {
+        options = options.jpeg_set_out_colorspace(ColorSpace::RGBA);
+    }
+
+    if width > 0 {
+        options = options.set_max_width(width as usize);
+    }
+    if height > 0 {
+        options = options.set_max_height(height as usize);
+    }
+
+    options
 }
 
 fn extension_matches(path: &Path, candidates: &[&str]) -> bool {
@@ -189,17 +215,7 @@ fn decode_static_with_zune_limits(path: &Path) -> Result<(u32, u32, Vec<u8>), St
     let max_alloc = estimated.clamp(256 * 1024 * 1024, DEFAULT_MAX_DECODE_ALLOC_BYTES);
     let max_alloc_usize = usize::try_from(max_alloc).unwrap_or(usize::MAX);
 
-    let mut options = DecoderOptions::new_fast()
-        .inflate_set_limit(max_alloc_usize)
-        // For static loading we only need the first frame (if any).
-        .png_set_decode_animated(false);
-
-    if w > 0 {
-        options = options.set_max_width(w as usize);
-    }
-    if h > 0 {
-        options = options.set_max_height(h as usize);
-    }
+    let options = static_zune_decoder_options(path, max_alloc_usize, w, h);
 
     let reader = open_media_reader(path)?;
     let mut img = ZuneImage::read(reader, options)
@@ -1417,10 +1433,11 @@ pub mod natord {
 
 #[cfg(test)]
 mod tests {
-    use super::get_media_in_directory;
+    use super::{get_media_in_directory, static_zune_decoder_options};
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
+    use zune_core::colorspace::ColorSpace;
 
     #[cfg(unix)]
     fn create_dir_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
@@ -1477,5 +1494,13 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn static_zune_decoder_options_request_jpeg_rgba() {
+        let options =
+            static_zune_decoder_options(Path::new("sample.JPG"), 512 * 1024 * 1024, 2000, 3000);
+
+        assert_eq!(options.jpeg_get_out_colorspace(), ColorSpace::RGBA);
     }
 }
