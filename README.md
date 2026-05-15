@@ -8,6 +8,8 @@ A high-performance, borderless image and video viewer for Windows, built with Ru
 
 This project is intentionally optimized for one job: opening media fast, navigating large folders fast, and keeping dense Long Strip / Masonry layouts responsive. It is not trying to be a DAM, editor, cataloger, or full video player. Think of it as a QuickLook-style viewer with unusually aggressive performance work under the hood.
 
+The RGBA resize path is centralized in `src/image_resize.rs`: static images, animated frames, manga pages, and video thumbnails share the same FIR-first resize helper and bounded texture-limit downscale helper before egui texture upload. No-op downscale stays allocation-free by borrowing the decoded pixel slice, malformed RGBA buffers fail without panicking, and the single boundary keeps future GPU-backed scaling work isolated from decode and upload ownership.
+
 [floating.webm](https://github.com/user-attachments/assets/09a10ba9-53e3-4eea-a79a-323ec6b11ffb)
 
 [masonry.webm](https://github.com/user-attachments/assets/2886cffc-f607-4beb-a39e-292abf2bc448)
@@ -24,6 +26,7 @@ This project is intentionally optimized for one job: opening media fast, navigat
 - Windows cut/copy/paste for marked files with optional auto-unmark after paste.
 - Marking shortcuts for hovered files in floating, Long Strip, and Masonry modes.
 - Static images, animated GIF, animated WebP, and video playback in one app.
+- Shared RGBA resize and texture-limit downscale pipeline with FIR-first filtering, `image::imageops::resize` fallback, allocation-free no-op paths, and one choke point for future GPU scaling.
 - Optional hardware-accelerated video decode on Windows with D3D12/D3D11/CUDA preference and capability status readouts.
 - Two fullscreen multi-item layouts: Long Strip and Masonry.
 - Manga-mode video previews now autoplay on focus/hover and resume from the last preview position, with steadier layout sizing during zoom.
@@ -520,18 +523,3 @@ If the app panics, a crash report is written to `%TEMP%\rust-image-viewer\panic.
 ## License
 
 MIT License. See [LICENSE](LICENSE) for details.
-
-## v0.4.1-rc.2 Resize And Texture Pipeline Notes
-
-The RGBA resize path is centralized in `src/image_resize.rs`. Static image decode, animated frame decode, manga image loading, and video thumbnail extraction now share the same FIR-first resize helper and the same bounded downscale helper before pixels are uploaded as egui textures.
-
-The helper keeps the existing performance shape:
-
-1. If the decoded frame already fits the current GPU texture-side limit, it returns a borrowed slice and performs no allocation.
-2. If downscale is required, it uses `fast_image_resize` convolution filters mapped from the configured `image::imageops::FilterType`.
-3. If FIR rejects the buffer layout, it falls back to `image::imageops::resize` and returns an owned RGBA buffer.
-4. If the source buffer cannot form a valid RGBA image in the fallback path, it preserves the original dimensions and borrowed pixels instead of panicking.
-
-This is still a CPU resize stage. The important architecture change is the choke point: future GPU scaling work can target one module instead of three duplicated local helpers. That keeps a future texture-backed pipeline easier to reason about, profile, test, and roll back.
-
-Thread ownership remains unchanged. Decode and manga preload workers produce bounded RGBA buffers; the main egui thread owns texture creation and replacement. This avoids cross-thread GPU handle ownership changes in the release candidate while still reducing duplicated CPU-side image manipulation code.
