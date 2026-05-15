@@ -18,7 +18,6 @@
 //! - **Memory-efficient caching**: LRU-style eviction keeps memory bounded
 //!   while maximizing cache hit rate.
 
-use std::borrow::Cow;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -26,7 +25,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, TrySendError};
-use fast_image_resize as fir;
 use hashbrown::{HashMap, HashSet};
 use image::imageops::FilterType;
 use lru::LruCache;
@@ -37,6 +35,7 @@ use crate::image_loader::{
     get_media_type, is_supported_image, is_supported_video, probe_image_dimensions, LoadedImage,
     MediaType,
 };
+use crate::image_resize::downscale_rgba_if_needed;
 use crate::metadata_cache::{
     lookup_cached_dimensions, lookup_cached_dimensions_batch, lookup_cached_static_thumbnail,
     lookup_cached_video_thumbnail, store_cached_dimensions, store_cached_static_thumbnail,
@@ -2165,72 +2164,6 @@ impl Drop for MangaLoader {
         // Signal shutdown to coordinator thread
         self.shutdown.store(true, Ordering::Release);
     }
-}
-
-/// Downscale RGBA pixel data if it exceeds the maximum texture size.
-/// Uses Cow to avoid unnecessary allocations when no downscaling is needed.
-fn image_filter_to_fir(filter: FilterType) -> fir::FilterType {
-    match filter {
-        FilterType::Nearest => fir::FilterType::Box,
-        FilterType::Triangle => fir::FilterType::Bilinear,
-        FilterType::CatmullRom => fir::FilterType::CatmullRom,
-        FilterType::Gaussian => fir::FilterType::Gaussian,
-        FilterType::Lanczos3 => fir::FilterType::Lanczos3,
-    }
-}
-
-fn resize_rgba_with_fir(
-    width: u32,
-    height: u32,
-    pixels: &[u8],
-    new_w: u32,
-    new_h: u32,
-    filter: FilterType,
-) -> Option<Vec<u8>> {
-    let src = fir::images::ImageRef::new(width, height, pixels, fir::PixelType::U8x4).ok()?;
-    let mut dst = fir::images::Image::new(new_w, new_h, fir::PixelType::U8x4);
-
-    let options = fir::ResizeOptions::new()
-        .resize_alg(fir::ResizeAlg::Convolution(image_filter_to_fir(filter)));
-
-    let mut resizer = fir::Resizer::new();
-    resizer.resize(&src, &mut dst, Some(&options)).ok()?;
-
-    Some(dst.into_vec())
-}
-
-fn downscale_rgba_if_needed<'a>(
-    width: u32,
-    height: u32,
-    pixels: &'a [u8],
-    max_texture_side: u32,
-    filter: FilterType,
-) -> (u32, u32, Cow<'a, [u8]>) {
-    if max_texture_side == 0 {
-        return (width, height, Cow::Borrowed(pixels));
-    }
-
-    if width <= max_texture_side && height <= max_texture_side {
-        return (width, height, Cow::Borrowed(pixels));
-    }
-
-    // Preserve aspect ratio; clamp to at least 1x1.
-    let scale =
-        (max_texture_side as f64 / width as f64).min(max_texture_side as f64 / height as f64);
-    let new_w = ((width as f64) * scale).round().max(1.0) as u32;
-    let new_h = ((height as f64) * scale).round().max(1.0) as u32;
-
-    if let Some(resized) = resize_rgba_with_fir(width, height, pixels, new_w, new_h, filter) {
-        return (new_w, new_h, Cow::Owned(resized));
-    }
-
-    // Convert to an owned buffer for resizing.
-    let Some(img) = image::RgbaImage::from_raw(width, height, pixels.to_vec()) else {
-        return (width, height, Cow::Borrowed(pixels));
-    };
-
-    let resized = image::imageops::resize(&img, new_w, new_h, filter);
-    (new_w, new_h, Cow::Owned(resized.into_raw()))
 }
 
 /// LRU-style texture cache for manga mode.

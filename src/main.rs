@@ -8,6 +8,7 @@ mod async_runtime;
 mod config;
 mod folder_travel_cache;
 mod image_loader;
+mod image_resize;
 mod manga_loader;
 mod manga_spatial;
 mod media_index;
@@ -37,6 +38,7 @@ use image_loader::{
     get_media_in_directory, get_media_type, is_supported_video, probe_image_dimensions,
     resolve_folder_shortcut_target, ImageFrame, LoadedImage, MediaType, FOLDER_UP_ENTRY_NAME,
 };
+use image_resize::downscale_rgba_if_needed;
 use manga_loader::{
     DecodedImage, MangaLoader, MangaMediaType, MangaTextureCache, LOD_SIDE_BUCKETS,
 };
@@ -62,11 +64,9 @@ use video_thumbnail::{
 
 use bytes::Bytes;
 use eframe::egui;
-use fast_image_resize as fir;
 use image::imageops::FilterType;
 use parking_lot::Mutex;
 use smallvec::SmallVec;
-use std::borrow::Cow;
 use std::collections::{hash_map::DefaultHasher, VecDeque};
 use std::fs;
 use std::hash::{Hash, Hasher};
@@ -210,84 +210,6 @@ fn paint_rotated_texture(
         .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
 
     painter.add(egui::Shape::mesh(mesh));
-}
-
-/// Downscale RGBA pixel data if it exceeds the maximum texture size.
-/// Uses Cow to avoid unnecessary allocations when no downscaling is needed.
-/// Uses Triangle filter (faster than Lanczos3) for better performance.
-fn image_filter_to_fir(filter: FilterType) -> fir::FilterType {
-    match filter {
-        FilterType::Nearest => fir::FilterType::Box,
-        FilterType::Triangle => fir::FilterType::Bilinear,
-        FilterType::CatmullRom => fir::FilterType::CatmullRom,
-        FilterType::Gaussian => fir::FilterType::Gaussian,
-        FilterType::Lanczos3 => fir::FilterType::Lanczos3,
-    }
-}
-
-fn resize_rgba_with_fir(
-    width: u32,
-    height: u32,
-    pixels: &[u8],
-    new_w: u32,
-    new_h: u32,
-    filter: FilterType,
-) -> Option<Vec<u8>> {
-    let src = fir::images::ImageRef::new(width, height, pixels, fir::PixelType::U8x4).ok()?;
-    let mut dst = fir::images::Image::new(new_w, new_h, fir::PixelType::U8x4);
-
-    let options = fir::ResizeOptions::new()
-        .resize_alg(fir::ResizeAlg::Convolution(image_filter_to_fir(filter)));
-
-    let mut resizer = fir::Resizer::new();
-    resizer.resize(&src, &mut dst, Some(&options)).ok()?;
-    Some(dst.into_vec())
-}
-
-fn downscale_rgba_if_needed<'a>(
-    width: u32,
-    height: u32,
-    pixels: &'a [u8],
-    max_texture_side: u32,
-    filter: image::imageops::FilterType,
-) -> (u32, u32, Cow<'a, [u8]>) {
-    use image::imageops::FilterType;
-
-    if max_texture_side == 0 {
-        return (width, height, Cow::Borrowed(pixels));
-    }
-
-    if width <= max_texture_side && height <= max_texture_side {
-        return (width, height, Cow::Borrowed(pixels));
-    }
-
-    // Preserve aspect ratio; clamp to at least 1x1.
-    let scale =
-        (max_texture_side as f64 / width as f64).min(max_texture_side as f64 / height as f64);
-    let new_w = ((width as f64) * scale).round().max(1.0) as u32;
-    let new_h = ((height as f64) * scale).round().max(1.0) as u32;
-
-    let filter = match filter {
-        // Be defensive: always downscaling here, so avoid an accidental "upscale"-only filter.
-        // (All current variants are valid for both directions, but keep this guard for future changes.)
-        FilterType::Nearest
-        | FilterType::Triangle
-        | FilterType::CatmullRom
-        | FilterType::Gaussian
-        | FilterType::Lanczos3 => filter,
-    };
-
-    if let Some(resized) = resize_rgba_with_fir(width, height, pixels, new_w, new_h, filter) {
-        return (new_w, new_h, Cow::Owned(resized));
-    }
-
-    // Convert to an owned buffer only for the fallback resize path.
-    let Some(img) = image::RgbaImage::from_raw(width, height, pixels.to_vec()) else {
-        return (width, height, Cow::Borrowed(pixels));
-    };
-
-    let resized = image::imageops::resize(&img, new_w, new_h, filter);
-    (new_w, new_h, Cow::Owned(resized.into_raw()))
 }
 
 fn try_color_image_from_opaque_rgba_bytes(
@@ -3858,8 +3780,7 @@ impl ImageViewer {
             return false;
         }
 
-        let scanned_files =
-            self.normalize_image_list_for_folder_navigation(scanned_files.to_vec());
+        let scanned_files = self.normalize_image_list_for_folder_navigation(scanned_files.to_vec());
         if scanned_files.is_empty() {
             return false;
         }
@@ -4929,7 +4850,10 @@ impl ImageViewer {
                     self.config.masonry_toggle_mark_file,
                 )
             } else {
-                (self.config.manga_mark_file, self.config.manga_toggle_mark_file)
+                (
+                    self.config.manga_mark_file,
+                    self.config.manga_toggle_mark_file,
+                )
             }
         } else {
             (self.config.mark_file, self.config.toggle_mark_file)
@@ -6728,7 +6652,8 @@ impl ImageViewer {
             return;
         }
 
-        self.solo_preload_momentum_until = Some(Instant::now() + Self::SOLO_PRELOAD_MOMENTUM_LINGER);
+        self.solo_preload_momentum_until =
+            Some(Instant::now() + Self::SOLO_PRELOAD_MOMENTUM_LINGER);
     }
 
     fn current_solo_preload_momentum(&mut self) -> SoloPreloadMomentum {
@@ -9573,15 +9498,13 @@ impl ImageViewer {
         }
     }
 
-    fn paint_breadcrumb_toggle_folder_icon(
-        ui: &egui::Ui,
-        rect: egui::Rect,
-        tint: egui::Color32,
-    ) {
-        egui::Image::new(egui::include_image!("../assets/breadcrumb_toggle_folder.svg"))
-            .fit_to_exact_size(rect.size())
-            .tint(tint)
-            .paint_at(ui, rect);
+    fn paint_breadcrumb_toggle_folder_icon(ui: &egui::Ui, rect: egui::Rect, tint: egui::Color32) {
+        egui::Image::new(egui::include_image!(
+            "../assets/breadcrumb_toggle_folder.svg"
+        ))
+        .fit_to_exact_size(rect.size())
+        .tint(tint)
+        .paint_at(ui, rect);
     }
 
     fn menu_action_row(
@@ -9934,7 +9857,10 @@ impl ImageViewer {
         }
     }
     fn try_handle_ctrl_primary_mark_shortcut(&mut self, ctx: &egui::Context) -> bool {
-        if self.image_list.is_empty() || self.any_modal_dialog_open() || self.file_action_menu.is_some() {
+        if self.image_list.is_empty()
+            || self.any_modal_dialog_open()
+            || self.file_action_menu.is_some()
+        {
             return false;
         }
         let (_, toggle_modifier) = self.active_mark_shortcuts();
@@ -9943,34 +9869,37 @@ impl ImageViewer {
         };
         let manga_fullscreen = self.manga_mode && self.is_fullscreen;
 
-        let target_index = ctx.input(|input| {
-            if !Self::shortcut_modifier_matches_input(toggle_modifier, input.modifiers)
-                || !input.pointer.button_clicked(egui::PointerButton::Primary)
-            {
-                return None;
-            }
+        let target_index = ctx
+            .input(|input| {
+                if !Self::shortcut_modifier_matches_input(toggle_modifier, input.modifiers)
+                    || !input.pointer.button_clicked(egui::PointerButton::Primary)
+                {
+                    return None;
+                }
 
-            let pointer_pos = input
-                .pointer
-                .interact_pos()
-                .or_else(|| input.pointer.hover_pos())?;
-            if self.pointer_over_shortcut_blocking_ui(Some(pointer_pos), input.screen_rect) {
-                return None;
-            }
-            if !manga_fullscreen && !self.point_over_current_media(pointer_pos, input.screen_rect) {
-                return None;
-            }
+                let pointer_pos = input
+                    .pointer
+                    .interact_pos()
+                    .or_else(|| input.pointer.hover_pos())?;
+                if self.pointer_over_shortcut_blocking_ui(Some(pointer_pos), input.screen_rect) {
+                    return None;
+                }
+                if !manga_fullscreen
+                    && !self.point_over_current_media(pointer_pos, input.screen_rect)
+                {
+                    return None;
+                }
 
-            if manga_fullscreen {
-                self.manga_index_at_screen_pos(pointer_pos)
-            } else {
-                Some(
-                    self.current_index
-                        .min(self.image_list.len().saturating_sub(1)),
-                )
-            }
-        })
-        .filter(|index| self.is_markable_index(*index));
+                if manga_fullscreen {
+                    self.manga_index_at_screen_pos(pointer_pos)
+                } else {
+                    Some(
+                        self.current_index
+                            .min(self.image_list.len().saturating_sub(1)),
+                    )
+                }
+            })
+            .filter(|index| self.is_markable_index(*index));
 
         if let Some(index) = target_index {
             self.toggle_mark_for_index(index);
@@ -12489,7 +12418,9 @@ impl ImageViewer {
         self.reset_gif_seek_interaction_state();
         self.reset_masonry_metadata_preload();
         self.manga_mode = true;
-        set_metadata_cache_enabled(Self::layout_mode_uses_metadata_cache(self.manga_layout_mode));
+        set_metadata_cache_enabled(Self::layout_mode_uses_metadata_cache(
+            self.manga_layout_mode,
+        ));
         self.stop_fullscreen_video_playback();
         self.reset_fullscreen_anim_stream_state();
         self.reset_manga_video_user_preferences();
@@ -13054,7 +12985,9 @@ impl ImageViewer {
         }
 
         let scanned_directory = result.directory.clone();
-        let mut files = self.media_directory_index.apply_directory_scan_result(result);
+        let mut files = self
+            .media_directory_index
+            .apply_directory_scan_result(result);
 
         match scan_kind {
             PendingMediaDirectoryScanKind::InitialLoad => {
@@ -13900,8 +13833,10 @@ impl ImageViewer {
                 }
                 MediaType::Video => {
                     self.video_texture = Some(placeholder.texture);
-                    self.video_texture_source_path =
-                        self.current_video_path.clone().or_else(|| self.current_media_path());
+                    self.video_texture_source_path = self
+                        .current_video_path
+                        .clone()
+                        .or_else(|| self.current_media_path());
                     self.video_texture_dims = Some(placeholder.dims);
                 }
             }
@@ -14937,7 +14872,10 @@ impl ImageViewer {
     // ============ MANGA READING MODE METHODS ============
 
     fn layout_mode_is_grid(layout_mode: MangaLayoutMode) -> bool {
-        matches!(layout_mode, MangaLayoutMode::Masonry | MangaLayoutMode::Gallery)
+        matches!(
+            layout_mode,
+            MangaLayoutMode::Masonry | MangaLayoutMode::Gallery
+        )
     }
 
     fn layout_mode_uses_metadata_cache(layout_mode: MangaLayoutMode) -> bool {
@@ -16455,8 +16393,8 @@ impl ImageViewer {
         } else {
             false
         };
-        let masonry_authoritative_ready =
-            layout_mode == MangaLayoutMode::Masonry && self.masonry_authoritative_dimension_lock_active();
+        let masonry_authoritative_ready = layout_mode == MangaLayoutMode::Masonry
+            && self.masonry_authoritative_dimension_lock_active();
 
         if !Self::layout_mode_is_grid(layout_mode) || !restored_masonry_session {
             self.invalidate_manga_layout_cache();
@@ -17058,9 +16996,8 @@ impl ImageViewer {
         if self.is_true_masonry_mode() || self.has_resident_masonry_runtime_cache() {
             self.persist_current_masonry_folder_metadata_snapshot();
         }
-        let keep_resident_masonry_cache =
-            Self::layout_mode_is_grid(self.manga_layout_mode)
-                || self.has_resident_masonry_runtime_cache();
+        let keep_resident_masonry_cache = Self::layout_mode_is_grid(self.manga_layout_mode)
+            || self.has_resident_masonry_runtime_cache();
         self.manga_mode = false;
         set_metadata_cache_enabled(false);
         if keep_resident_masonry_cache {
@@ -24203,15 +24140,14 @@ impl ImageViewer {
                                         TITLEBAR_CONTROL_ICON_COLOR.gamma_multiply(170.0 / 255.0)
                                     };
                                     Self::paint_breadcrumb_toggle_folder_icon(
-                                        ui,
-                                        icon_rect,
-                                        icon_color,
+                                        ui, icon_rect, icon_color,
                                     );
                                 }
 
                                 if toggle_resp.clicked() {
                                     self.show_breadcrumb_bar = !self.show_breadcrumb_bar;
-                                    self.config.state_show_breadcrumb_bar = self.show_breadcrumb_bar;
+                                    self.config.state_show_breadcrumb_bar =
+                                        self.show_breadcrumb_bar;
                                     self.pending_idle_config_sync = true;
                                     self.show_controls = true;
                                     self.controls_show_time = Instant::now();
@@ -25699,8 +25635,7 @@ impl ImageViewer {
         {
             if let Some(pos) = slider_response.interact_pointer_pos() {
                 let t = ((pos.x - slider_rect.left()) / slider_rect.width()).clamp(0.0, 1.0);
-                custom_fps =
-                    (1.0 + t * (max_custom_fps.saturating_sub(1)) as f32).round() as u32;
+                custom_fps = (1.0 + t * (max_custom_fps.saturating_sub(1)) as f32).round() as u32;
             }
         }
         if slider_response.hovered() {
@@ -28115,7 +28050,8 @@ impl eframe::App for ImageViewer {
                         if Self::layout_mode_is_grid(self.manga_layout_mode) {
                             self.capture_masonry_mode_session_snapshot();
                         }
-                        if self.is_true_masonry_mode() || self.has_resident_masonry_runtime_cache() {
+                        if self.is_true_masonry_mode() || self.has_resident_masonry_runtime_cache()
+                        {
                             self.persist_current_masonry_folder_metadata_snapshot();
                         }
 

@@ -10,7 +10,6 @@ use std::time::{Duration, Instant};
 #[cfg(target_os = "windows")]
 use std::os::windows::ffi::OsStrExt;
 
-use fast_image_resize as fir;
 use image::imageops::FilterType;
 use jwalk::WalkDir;
 use memmap2::MmapOptions;
@@ -18,6 +17,8 @@ use rayon::slice::ParallelSliceMut;
 use zune_core::colorspace::ColorSpace;
 use zune_core::options::DecoderOptions;
 use zune_image::image::Image as ZuneImage;
+
+use crate::image_resize::resize_rgba;
 
 #[cfg(target_os = "windows")]
 use windows::{
@@ -28,7 +29,7 @@ use windows::{
             CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, IPersistFile,
             CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, STGM_READ,
         },
-        UI::Shell::{IShellLinkW, ShellLink, SHGetPathFromIDListEx, GPFIDL_DEFAULT},
+        UI::Shell::{IShellLinkW, SHGetPathFromIDListEx, ShellLink, GPFIDL_DEFAULT},
     },
 };
 
@@ -60,7 +61,11 @@ fn read_webp_animation_buffer(path: &Path) -> Result<Vec<u8>, String> {
 
 fn webp_frame_delay_ms(prev_timestamp: i32, current_timestamp: i32) -> u32 {
     let delay = current_timestamp.saturating_sub(prev_timestamp);
-    if delay <= 0 { 100 } else { delay as u32 }
+    if delay <= 0 {
+        100
+    } else {
+        delay as u32
+    }
 }
 
 fn should_decode_static_with_zune(path: &Path) -> bool {
@@ -113,7 +118,9 @@ fn resolve_windows_folder_shortcut_target(path: &Path) -> Option<PathBuf> {
 
         let pidl = unsafe { shell_link.GetIDList() }.ok()?;
         let mut raw_target = vec![0_u16; 32_768];
-        let resolved = unsafe { SHGetPathFromIDListEx(pidl as *const _, &mut raw_target, GPFIDL_DEFAULT) }.as_bool();
+        let resolved =
+            unsafe { SHGetPathFromIDListEx(pidl as *const _, &mut raw_target, GPFIDL_DEFAULT) }
+                .as_bool();
         unsafe {
             CoTaskMemFree(Some(pidl as *const core::ffi::c_void));
         }
@@ -152,55 +159,6 @@ fn resolve_windows_folder_shortcut_target(_path: &Path) -> Option<PathBuf> {
 /// Returns `None` when the path is not a supported folder shortcut.
 pub fn resolve_folder_shortcut_target(path: &Path) -> Option<PathBuf> {
     resolve_windows_folder_shortcut_target(path)
-}
-
-fn image_filter_to_fir(filter: FilterType) -> fir::FilterType {
-    match filter {
-        FilterType::Nearest => fir::FilterType::Box,
-        FilterType::Triangle => fir::FilterType::Bilinear,
-        FilterType::CatmullRom => fir::FilterType::CatmullRom,
-        FilterType::Gaussian => fir::FilterType::Gaussian,
-        FilterType::Lanczos3 => fir::FilterType::Lanczos3,
-    }
-}
-
-fn resize_rgba_with_fir(
-    width: u32,
-    height: u32,
-    pixels: &[u8],
-    new_w: u32,
-    new_h: u32,
-    filter: FilterType,
-) -> Option<Vec<u8>> {
-    let src = fir::images::ImageRef::new(width, height, pixels, fir::PixelType::U8x4).ok()?;
-    let mut dst = fir::images::Image::new(new_w, new_h, fir::PixelType::U8x4);
-
-    let options = fir::ResizeOptions::new()
-        .resize_alg(fir::ResizeAlg::Convolution(image_filter_to_fir(filter)));
-
-    let mut resizer = fir::Resizer::new();
-    resizer.resize(&src, &mut dst, Some(&options)).ok()?;
-    Some(dst.into_vec())
-}
-
-fn resize_rgba(
-    width: u32,
-    height: u32,
-    pixels: &[u8],
-    new_w: u32,
-    new_h: u32,
-    filter: FilterType,
-) -> Result<Vec<u8>, String> {
-    if let Some(resized) = resize_rgba_with_fir(width, height, pixels, new_w, new_h, filter) {
-        return Ok(resized);
-    }
-
-    // Fallback path when FIR cannot handle the provided buffer alignment/layout.
-    let Some(img) = image::RgbaImage::from_raw(width, height, pixels.to_vec()) else {
-        return Err("Failed to build RGBA image for resizing".to_string());
-    };
-
-    Ok(image::imageops::resize(&img, new_w, new_h, filter).into_raw())
 }
 
 /// Fast image dimension probe using header-only parsing.

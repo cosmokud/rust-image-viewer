@@ -520,3 +520,18 @@ If the app panics, a crash report is written to `%TEMP%\rust-image-viewer\panic.
 ## License
 
 MIT License. See [LICENSE](LICENSE) for details.
+
+## v0.4.1-rc.2 Resize And Texture Pipeline Notes
+
+The RGBA resize path is centralized in `src/image_resize.rs`. Static image decode, animated frame decode, manga image loading, and video thumbnail extraction now share the same FIR-first resize helper and the same bounded downscale helper before pixels are uploaded as egui textures.
+
+The helper keeps the existing performance shape:
+
+1. If the decoded frame already fits the current GPU texture-side limit, it returns a borrowed slice and performs no allocation.
+2. If downscale is required, it uses `fast_image_resize` convolution filters mapped from the configured `image::imageops::FilterType`.
+3. If FIR rejects the buffer layout, it falls back to `image::imageops::resize` and returns an owned RGBA buffer.
+4. If the source buffer cannot form a valid RGBA image in the fallback path, it preserves the original dimensions and borrowed pixels instead of panicking.
+
+This is still a CPU resize stage. The important architecture change is the choke point: future GPU scaling work can target one module instead of three duplicated local helpers. That keeps a future texture-backed pipeline easier to reason about, profile, test, and roll back.
+
+Thread ownership remains unchanged. Decode and manga preload workers produce bounded RGBA buffers; the main egui thread owns texture creation and replacement. This avoids cross-thread GPU handle ownership changes in the release candidate while still reducing duplicated CPU-side image manipulation code.

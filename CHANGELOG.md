@@ -593,3 +593,24 @@ All notable changes to this project will be documented in this file.
 
 - Images: JPEG, PNG, WebP, GIF (including animated), BMP, ICO, TIFF.
 - Videos: MP4, MKV, WebM, AVI, MOV, WMV, FLV, M4V, 3GP, OGV.
+
+## v0.4.1-rc.2
+
+### Rendering And Resize Pipeline
+
+- Added a shared `src/image_resize.rs` module for RGBA resize and texture-limit downscaling.
+- Consolidated the repeated `fast_image_resize` convolution path previously duplicated in `src/main.rs`, `src/image_loader.rs`, and `src/manga_loader.rs`.
+- Preserved the fast FIR path first, with the existing `image::imageops::resize` fallback for layouts that FIR rejects.
+- Kept no-op downscale allocation-free by returning borrowed pixel slices when the decoded image already fits within the active texture limit.
+
+### Memory Safety And Regression Coverage
+
+- Added unit coverage for invalid RGBA buffer handling so malformed pixel lengths fail without panicking.
+- Added unit coverage for the no-op downscale borrow path to guard against accidental allocations in the common case.
+- Centralized future GPU-offload decisions behind one resize boundary, reducing the chance that static image, animated image, manga, and video-thumbnail paths diverge.
+
+### Threading And Upload Flow Notes
+
+- Manga worker decoding still produces CPU RGBA buffers and the UI thread still owns texture uploads.
+- The refactor keeps worker-side downscale behavior unchanged while making the CPU resize stage easier to profile, replace, or bypass when a GPU-backed scaling path is introduced.
+- No public configuration, shortcut, cache schema, or media-format behavior changed in this release candidate.

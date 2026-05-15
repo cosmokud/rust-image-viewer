@@ -842,3 +842,31 @@ If you are new to the codebase, this is the shortest useful reading path:
 9. `build.rs`
 
 That path covers the actual latency-critical architecture without getting lost in UI detail too early.
+
+## 16. v0.4.1-rc.2 shared RGBA resize boundary
+
+`src/image_resize.rs` is the shared CPU resize boundary for RGBA buffers. It owns three responsibilities:
+
+1. Mapping `image::imageops::FilterType` into `fast_image_resize` convolution filters.
+2. Running FIR-based RGBA resize for the fast path.
+3. Returning borrowed pixels when downscale is unnecessary, or owned pixels only when resize work is required.
+
+The module is intentionally small. It exists to remove duplicated resize code from `src/main.rs`, `src/image_loader.rs`, and `src/manga_loader.rs` without changing decode, preload, or texture-upload ownership.
+
+Current data flow:
+
+1. Decode path produces an RGBA byte slice.
+2. Caller asks `image_resize::downscale_rgba_if_needed` to enforce the active texture-side limit.
+3. The helper borrows when the image already fits.
+4. The helper uses FIR for downscale when possible.
+5. The helper falls back to `image::imageops::resize` when FIR cannot accept the supplied buffer.
+6. The UI path uploads the resulting RGBA data to egui textures.
+
+This boundary is the preferred future integration point for GPU-backed scaling. A GPU pipeline should preserve the same external contract: no allocation on no-op paths, explicit owned data only when new pixels are produced, and no panics for malformed or undersized RGBA buffers. Keeping that contract stable protects manga preloading, animated frame upload, static texture refresh, and video-thumbnail extraction from behavioral drift.
+
+Threading constraints remain deliberate:
+
+- Worker threads may decode, bound, and resize CPU RGBA buffers.
+- The main egui thread owns texture creation, replacement, and GPU resource lifetime.
+- Cross-thread messages should continue to carry data or metadata, not live GPU handles.
+- Texture-limit enforcement should happen before upload so oversized frames cannot force backend-specific texture allocation failures.
