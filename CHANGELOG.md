@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [v0.4.1-rc.2] - 2026-05-15
+## [v0.4.1-rc.1] - 2026-05-15
 
 ### Rendering And Resize Pipeline
 
