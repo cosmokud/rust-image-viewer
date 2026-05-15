@@ -6175,6 +6175,13 @@ impl ImageViewer {
             && self.manga_dimension_cache_list_signature == self.image_list_signature
     }
 
+    fn retain_visible_media_placeholder_for_swap(
+        is_fullscreen: bool,
+        target_media_type: Option<MediaType>,
+    ) -> bool {
+        is_fullscreen || matches!(target_media_type, Some(MediaType::Video))
+    }
+
     fn capture_current_media_placeholder(
         &self,
         target_media_type: Option<MediaType>,
@@ -14143,7 +14150,12 @@ impl ImageViewer {
                 matches_target
             })
             .or_else(|| {
-                if retain_visible_media_until_ready {
+                if retain_visible_media_until_ready
+                    && Self::retain_visible_media_placeholder_for_swap(
+                        self.is_fullscreen,
+                        media_type,
+                    )
+                {
                     self.capture_current_media_placeholder(media_type)
                 } else {
                     None
@@ -14332,6 +14344,9 @@ impl ImageViewer {
                     return;
                 }
 
+                if !self.is_fullscreen {
+                    self.pending_media_layout = true;
+                }
                 self.start_async_image_load(path.clone(), max_tex, downscale_filter, gif_filter);
             }
             None => {
@@ -29273,7 +29288,7 @@ fn build_fallback_icon() -> egui::IconData {
 
 #[cfg(test)]
 mod tests {
-    use super::{ImageFrame, ImageViewer, SoloPreloadMomentum};
+    use super::{ImageFrame, ImageViewer, MediaType, SoloPreloadMomentum};
 
     #[test]
     fn solo_probe_offsets_interleave_without_momentum() {
@@ -29400,5 +29415,21 @@ mod tests {
         assert_eq!(bounds, monitor);
         assert!((size.x - 720.0).abs() <= f32::EPSILON);
         assert!((size.y - 1080.0).abs() <= f32::EPSILON);
+    }
+
+    #[test]
+    fn floating_image_navigation_does_not_retain_previous_texture_placeholder() {
+        assert!(!ImageViewer::retain_visible_media_placeholder_for_swap(
+            false,
+            Some(MediaType::Image)
+        ));
+        assert!(ImageViewer::retain_visible_media_placeholder_for_swap(
+            true,
+            Some(MediaType::Image)
+        ));
+        assert!(ImageViewer::retain_visible_media_placeholder_for_swap(
+            false,
+            Some(MediaType::Video)
+        ));
     }
 }
