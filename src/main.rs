@@ -6775,14 +6775,10 @@ impl ImageViewer {
         self.solo_quantize_target_texture_side(target, source_dims)
     }
 
-    fn solo_image_load_texture_side(
-        is_fullscreen: bool,
-        fullscreen_lod_side: u32,
-        max_texture_side: u32,
-    ) -> u32 {
+    fn solo_image_load_texture_side(target_lod_side: u32, max_texture_side: u32) -> u32 {
         let max_texture_side = max_texture_side.max(1);
-        if is_fullscreen && fullscreen_lod_side > 0 {
-            fullscreen_lod_side.min(max_texture_side).max(1)
+        if target_lod_side > 0 {
+            target_lod_side.min(max_texture_side).max(1)
         } else {
             max_texture_side
         }
@@ -6969,7 +6965,7 @@ impl ImageViewer {
         )
     }
 
-    fn solo_fullscreen_texture_ready_depths(
+    fn solo_image_texture_ready_depths(
         momentum: SoloPreloadMomentum,
         max_neighbor_count: usize,
     ) -> (usize, usize) {
@@ -7023,11 +7019,8 @@ impl ImageViewer {
 
         probe_behind_count = probe_behind_count.min(max_neighbor_count);
         probe_ahead_count = probe_ahead_count.min(max_neighbor_count);
-        let (texture_ready_behind_count, texture_ready_ahead_count) = if self.is_fullscreen {
-            Self::solo_fullscreen_texture_ready_depths(momentum, max_neighbor_count)
-        } else {
-            (0, 0)
-        };
+        let (texture_ready_behind_count, texture_ready_ahead_count) =
+            Self::solo_image_texture_ready_depths(momentum, max_neighbor_count);
 
         let offsets = if self.is_fullscreen {
             Self::build_solo_probe_offsets(momentum, probe_ahead_count, probe_behind_count)
@@ -7230,6 +7223,72 @@ impl ImageViewer {
         }
 
         if request_repaint {
+            ctx.request_repaint();
+        }
+    }
+
+    fn preload_cached_solo_image_textures_for_current_neighbors(&mut self, ctx: &egui::Context) {
+        const MAX_TEXTURE_UPLOADS_PER_FRAME: usize = 2;
+
+        if self.manga_mode || self.image_list.len() <= 1 {
+            return;
+        }
+
+        let max_neighbor_count = self.image_list.len().saturating_sub(1);
+        let (behind_count, ahead_count) = Self::solo_image_texture_ready_depths(
+            self.current_solo_preload_momentum(),
+            max_neighbor_count,
+        );
+        let mut uploads = 0usize;
+
+        for offset in Self::build_solo_probe_offsets(
+            self.current_solo_preload_momentum(),
+            ahead_count,
+            behind_count,
+        ) {
+            if uploads >= MAX_TEXTURE_UPLOADS_PER_FRAME {
+                break;
+            }
+
+            let Some(index) = self.solo_wrapped_index_with_offset(offset) else {
+                continue;
+            };
+            let Some(path) = self.image_list.get(index).cloned() else {
+                continue;
+            };
+            if !matches!(get_media_type(&path), Some(MediaType::Image)) {
+                continue;
+            }
+
+            let extension = path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext.to_ascii_lowercase());
+            if extension.as_deref() == Some("gif") {
+                continue;
+            }
+
+            let target_side = self.solo_target_texture_side_for_path(&path, MediaType::Image, true);
+            if !self.has_valid_decoded_image_cache_entry(&path, target_side) {
+                continue;
+            }
+
+            let key = decoded_image_cache_key(&path, target_side);
+            let Some(cached) = self.decoded_image_cache.get(&key) else {
+                continue;
+            };
+            if self
+                .cached_solo_image_texture_entry_for_frame(&path, &key, &cached.first_frame)
+                .is_some()
+            {
+                continue;
+            }
+
+            self.preload_solo_image_texture(ctx, &path, target_side, cached.as_ref());
+            uploads = uploads.saturating_add(1);
+        }
+
+        if uploads > 0 {
             ctx.request_repaint();
         }
     }
@@ -14235,16 +14294,10 @@ impl ImageViewer {
                 // in the background so the animation begins playing progressively.
                 let downscale_filter = self.config.downscale_filter.to_image_filter();
                 let gif_filter = self.config.gif_resize_filter.to_image_filter();
-                let fullscreen_lod_side = if self.is_fullscreen {
-                    self.solo_target_texture_side_for_path(path, MediaType::Image, true)
-                } else {
-                    0
-                };
-                let max_tex = Self::solo_image_load_texture_side(
-                    self.is_fullscreen,
-                    fullscreen_lod_side,
-                    self.max_texture_side,
-                );
+                let target_lod_side =
+                    self.solo_target_texture_side_for_path(path, MediaType::Image, true);
+                let max_tex =
+                    Self::solo_image_load_texture_side(target_lod_side, self.max_texture_side);
 
                 if self.try_load_image_from_decoded_cache(path, max_tex, gif_filter) {
                     if !defer_directory_work_for_fast_startup {
@@ -22882,11 +22935,37 @@ impl ImageViewer {
                 self.video_texture_dims
             }
         } else if matches!(self.current_media_type, Some(MediaType::Image)) {
-            self.image_texture_dims
+            Self::pending_image_display_dimensions(
+                self.retained_media_placeholder_visible,
+                self.image_texture_dims,
+                self.current_image_cached_dimensions(),
+            )
         } else if matches!(self.current_media_type, Some(MediaType::Video)) {
             self.video_texture_dims
         } else {
             None
+        }
+    }
+
+    fn current_image_cached_dimensions(&self) -> Option<(u32, u32)> {
+        if !matches!(self.current_media_type, Some(MediaType::Image)) {
+            return None;
+        }
+
+        self.image_list
+            .get(self.current_index)
+            .and_then(|path| lookup_cached_dimensions(path, CachedMediaKind::Image))
+    }
+
+    fn pending_image_display_dimensions(
+        retained_placeholder_visible: bool,
+        texture_dims: Option<(u32, u32)>,
+        current_header_dims: Option<(u32, u32)>,
+    ) -> Option<(u32, u32)> {
+        if retained_placeholder_visible {
+            current_header_dims.or(texture_dims)
+        } else {
+            current_header_dims
         }
     }
 
@@ -28027,6 +28106,7 @@ impl eframe::App for ImageViewer {
 
         self.poll_pending_media_directory_scan(ctx);
         self.poll_pending_solo_probe(ctx);
+        self.preload_cached_solo_image_textures_for_current_neighbors(ctx);
         self.poll_pending_media_load(ctx);
         self.poll_pending_folder_placeholder_preview_scans(ctx);
         self.poll_pending_folder_placeholder_thumbnail_loads(ctx);
@@ -29179,21 +29259,21 @@ mod tests {
     }
 
     #[test]
-    fn solo_fullscreen_texture_ready_depths_are_smaller_and_symmetric() {
+    fn solo_image_texture_ready_depths_are_smaller_and_symmetric() {
         assert_eq!(
-            ImageViewer::solo_fullscreen_texture_ready_depths(SoloPreloadMomentum::Neutral, 99),
+            ImageViewer::solo_image_texture_ready_depths(SoloPreloadMomentum::Neutral, 99),
             (2, 2)
         );
         assert_eq!(
-            ImageViewer::solo_fullscreen_texture_ready_depths(SoloPreloadMomentum::Forward, 99),
+            ImageViewer::solo_image_texture_ready_depths(SoloPreloadMomentum::Forward, 99),
             (4, 4)
         );
         assert_eq!(
-            ImageViewer::solo_fullscreen_texture_ready_depths(SoloPreloadMomentum::Backward, 99),
+            ImageViewer::solo_image_texture_ready_depths(SoloPreloadMomentum::Backward, 99),
             (4, 4)
         );
         assert_eq!(
-            ImageViewer::solo_fullscreen_texture_ready_depths(SoloPreloadMomentum::Backward, 3),
+            ImageViewer::solo_image_texture_ready_depths(SoloPreloadMomentum::Backward, 3),
             (3, 3)
         );
     }
@@ -29219,18 +29299,39 @@ mod tests {
     }
 
     #[test]
-    fn solo_fullscreen_image_load_uses_preload_lod() {
+    fn solo_image_load_uses_preload_lod_for_fullscreen_and_floating() {
+        assert_eq!(ImageViewer::solo_image_load_texture_side(2048, 8192), 2048);
+        assert_eq!(ImageViewer::solo_image_load_texture_side(0, 8192), 8192);
+    }
+
+    #[test]
+    fn pending_image_display_dimensions_ignore_stale_texture_without_placeholder() {
+        let stale_texture_dims = Some((4000, 1700));
+        let current_header_dims = Some((2000, 3000));
+
         assert_eq!(
-            ImageViewer::solo_image_load_texture_side(true, 2048, 8192),
-            2048
+            ImageViewer::pending_image_display_dimensions(
+                false,
+                stale_texture_dims,
+                current_header_dims
+            ),
+            current_header_dims
         );
         assert_eq!(
-            ImageViewer::solo_image_load_texture_side(false, 2048, 8192),
-            8192
+            ImageViewer::pending_image_display_dimensions(false, stale_texture_dims, None),
+            None
         );
         assert_eq!(
-            ImageViewer::solo_image_load_texture_side(true, 0, 8192),
-            8192
+            ImageViewer::pending_image_display_dimensions(
+                true,
+                stale_texture_dims,
+                current_header_dims
+            ),
+            current_header_dims
+        );
+        assert_eq!(
+            ImageViewer::pending_image_display_dimensions(true, stale_texture_dims, None),
+            stale_texture_dims
         );
     }
 }
