@@ -6301,6 +6301,19 @@ impl ImageViewer {
         self.touch_solo_image_texture_cache_entry(&key);
     }
 
+    fn solo_texture_dims_match_frame(texture_dims: Option<(u32, u32)>, frame: &ImageFrame) -> bool {
+        texture_dims.is_some_and(|(width, height)| width == frame.width && height == frame.height)
+    }
+
+    fn clear_current_image_texture_upload(&mut self) {
+        if let Some(texture) = self.texture.take() {
+            drop(texture);
+        }
+        self.image_texture_dims = None;
+        self.image_texture_mipmap_enabled = false;
+        self.texture_frame = usize::MAX;
+    }
+
     fn cached_solo_image_texture_entry(
         &mut self,
         path: &PathBuf,
@@ -6327,6 +6340,21 @@ impl ImageViewer {
         Some((texture, dims, mipmap_enabled))
     }
 
+    fn cached_solo_image_texture_entry_for_frame(
+        &mut self,
+        path: &PathBuf,
+        key: &str,
+        frame: &ImageFrame,
+    ) -> Option<(egui::TextureHandle, (u32, u32), bool)> {
+        let entry = self.cached_solo_image_texture_entry(path, key)?;
+        if !Self::solo_texture_dims_match_frame(Some(entry.1), frame) {
+            self.remove_solo_image_texture_cache_entry(key);
+            return None;
+        }
+
+        Some(entry)
+    }
+
     fn preload_solo_image_texture(
         &mut self,
         ctx: &egui::Context,
@@ -6339,7 +6367,14 @@ impl ImageViewer {
         }
 
         let key = decoded_image_cache_key(path, max_texture_side);
-        if self.cached_solo_image_texture_entry(path, &key).is_some() {
+        let frame = &cached.first_frame;
+        if frame.width == 0 || frame.height == 0 || frame.pixels.is_empty() {
+            return;
+        }
+        if self
+            .cached_solo_image_texture_entry_for_frame(path, &key, frame)
+            .is_some()
+        {
             return;
         }
 
@@ -6347,11 +6382,6 @@ impl ImageViewer {
             return;
         };
         if stamp != cached.stamp {
-            return;
-        }
-
-        let frame = &cached.first_frame;
-        if frame.width == 0 || frame.height == 0 || frame.pixels.is_empty() {
             return;
         }
 
@@ -6443,7 +6473,7 @@ impl ImageViewer {
         let cached_texture = if cached.is_animated_webp {
             None
         } else {
-            self.cached_solo_image_texture_entry(path, &key)
+            self.cached_solo_image_texture_entry_for_frame(path, &key, &cached.first_frame)
         };
 
         self.image = Some(LoadedImage::from_single_frame(
@@ -6461,7 +6491,7 @@ impl ImageViewer {
             self.perf_metrics
                 .increment_counter("solo_image_texture_cache_hit", 1);
         } else {
-            self.texture_frame = usize::MAX;
+            self.clear_current_image_texture_upload();
             if !cached.is_animated_webp {
                 self.perf_metrics
                     .increment_counter("solo_image_texture_cache_miss", 1);
@@ -6569,7 +6599,7 @@ impl ImageViewer {
             cached.original_height,
         ));
         self.retained_media_placeholder_visible = false;
-        self.texture_frame = usize::MAX;
+        self.clear_current_image_texture_upload();
         self.image_changed = true;
         self.pending_media_layout = false;
         self.error_message = None;
@@ -27758,11 +27788,18 @@ impl ImageViewer {
                     (Some(texture), dims)
                 } else if let Some(ref texture) = self.texture {
                     // Image mode
-                    let dims = self
-                        .image
-                        .as_ref()
-                        .map(|img| img.display_dimensions())
-                        .or(self.image_texture_dims);
+                    let dims = if self.retained_media_placeholder_visible {
+                        self.image_texture_dims
+                    } else if let Some(img) = self.image.as_ref() {
+                        let frame = img.current_frame_data();
+                        if Self::solo_texture_dims_match_frame(self.image_texture_dims, frame) {
+                            Some(img.display_dimensions())
+                        } else {
+                            None
+                        }
+                    } else {
+                        self.image_texture_dims
+                    };
                     (Some(texture), dims)
                 } else {
                     (None, None)
@@ -29083,7 +29120,7 @@ fn build_fallback_icon() -> egui::IconData {
 
 #[cfg(test)]
 mod tests {
-    use super::{ImageViewer, SoloPreloadMomentum};
+    use super::{ImageFrame, ImageViewer, SoloPreloadMomentum};
 
     #[test]
     fn solo_probe_offsets_interleave_without_momentum() {
@@ -29139,5 +29176,25 @@ mod tests {
             ImageViewer::solo_fullscreen_texture_ready_depths(SoloPreloadMomentum::Backward, 3),
             (3, 3)
         );
+    }
+
+    #[test]
+    fn solo_texture_dims_must_match_loaded_frame() {
+        let frame = ImageFrame {
+            pixels: Vec::new(),
+            width: 1600,
+            height: 900,
+            delay_ms: 0,
+        };
+
+        assert!(ImageViewer::solo_texture_dims_match_frame(
+            Some((1600, 900)),
+            &frame
+        ));
+        assert!(!ImageViewer::solo_texture_dims_match_frame(
+            Some((900, 1600)),
+            &frame
+        ));
+        assert!(!ImageViewer::solo_texture_dims_match_frame(None, &frame));
     }
 }
