@@ -878,10 +878,9 @@ fn get_playbin_flags(playbin: &gst::Element) -> Option<u64> {
     // "flags" is a GLib flags type. Read it via g_value_get_flags so we don't
     // depend on integer Value conversions that can fail for custom flags types.
     let bits = unsafe {
-        gst::glib::gobject_ffi::g_value_get_flags(gst::glib::translate::ToGlibPtr::to_glib_none(
-            &property,
+        gst::glib::gobject_ffi::g_value_get_flags(
+            gst::glib::translate::ToGlibPtr::to_glib_none(&property).0,
         )
-        .0)
     };
     Some(bits as u64)
 }
@@ -1122,7 +1121,13 @@ fn short_language_tag(value: &str) -> Option<String> {
             return Some(primary.to_ascii_uppercase());
         }
         _ if primary.len() == 3 && primary.chars().all(|c| c.is_ascii_alphabetic()) => {
-            return Some(primary.chars().take(2).collect::<String>().to_ascii_uppercase());
+            return Some(
+                primary
+                    .chars()
+                    .take(2)
+                    .collect::<String>()
+                    .to_ascii_uppercase(),
+            );
         }
         _ => return None,
     };
@@ -1784,7 +1789,7 @@ Ensure your GStreamer installation includes the playback elements (usually from 
         self.state.clear_frames();
         self.last_frame_pts = None;
 
-        // FIX: Wait for the pipeline to finish any pending state changes 
+        // FIX: Wait for the pipeline to finish any pending state changes
         // (like reaching PAUSED on initial load) before seeking.
         // If it's already playing/paused, this returns instantly so scrubbing stays smooth!
         let _ = self.pipeline.state(gst::ClockTime::from_mseconds(500));
@@ -1975,9 +1980,10 @@ Ensure your GStreamer installation includes the playback elements (usually from 
         };
 
         match profile {
-            Some(profile) => self
-                .pipeline
-                .set_property("subtitle-font-desc", subtitle_font_desc_for_profile(profile)),
+            Some(profile) => self.pipeline.set_property(
+                "subtitle-font-desc",
+                subtitle_font_desc_for_profile(profile),
+            ),
             None => self
                 .pipeline
                 .set_property("subtitle-font-desc", Option::<String>::None),
@@ -2107,7 +2113,10 @@ Ensure your GStreamer installation includes the playback elements (usually from 
         enable_playbin_flags(self.pipeline.upcast_ref(), PLAY_FLAG_AUDIO);
         if uses_legacy_selection {
             set_optional_i32_or_u32_property(self.pipeline.upcast_ref(), "current-audio", index);
-        } else if let Some(track) = self.audio_tracks().into_iter().find(|track| track.index == index)
+        } else if let Some(track) = self
+            .audio_tracks()
+            .into_iter()
+            .find(|track| track.index == index)
         {
             if let Some(stream_id) = track.stream_id {
                 let subtitle_stream_id = self.current_embedded_subtitle_stream_id();
@@ -2203,7 +2212,10 @@ Ensure your GStreamer installation includes the playback elements (usually from 
                 self.pipeline.set_property("suburi", Option::<String>::None);
                 disable_playbin_flags(self.pipeline.upcast_ref(), PLAY_FLAG_TEXT);
                 if uses_legacy_selection {
-                    clear_optional_track_selection_property(self.pipeline.upcast_ref(), "current-text");
+                    clear_optional_track_selection_property(
+                        self.pipeline.upcast_ref(),
+                        "current-text",
+                    );
                 } else {
                     let audio_stream_id = self.current_audio_stream_id();
                     let _ = self.apply_playbin3_stream_selection(audio_stream_id.as_deref(), None);
@@ -2218,7 +2230,11 @@ Ensure your GStreamer installation includes the playback elements (usually from 
                 enable_playbin_flags(self.pipeline.upcast_ref(), PLAY_FLAG_TEXT);
                 self.pipeline.set_property("suburi", Option::<String>::None);
                 if uses_legacy_selection {
-                    set_optional_i32_or_u32_property(self.pipeline.upcast_ref(), "current-text", *index);
+                    set_optional_i32_or_u32_property(
+                        self.pipeline.upcast_ref(),
+                        "current-text",
+                        *index,
+                    );
                 } else if let Some(track) = self
                     .embedded_subtitle_tracks()
                     .into_iter()
@@ -2242,7 +2258,10 @@ Ensure your GStreamer installation includes the playback elements (usually from 
                 enable_playbin_flags(self.pipeline.upcast_ref(), PLAY_FLAG_TEXT);
                 self.pipeline.set_property("suburi", subtitle_uri.as_str());
                 if uses_legacy_selection {
-                    clear_optional_track_selection_property(self.pipeline.upcast_ref(), "current-text");
+                    clear_optional_track_selection_property(
+                        self.pipeline.upcast_ref(),
+                        "current-text",
+                    );
                 } else {
                     let audio_stream_id = self.current_audio_stream_id();
                     let _ = self.apply_playbin3_stream_selection(audio_stream_id.as_deref(), None);

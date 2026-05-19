@@ -267,9 +267,7 @@ impl Action {
             "manga_zoom_in" | "manga_zoomin" => Some(Action::MangaZoomIn),
             "manga_zoom_out" | "manga_zoomout" => Some(Action::MangaZoomOut),
             "masonry_pan" | "gallery_pan" => Some(Action::MasonryPan),
-            "masonry_goto_file"
-            | "masonry_go_to_file"
-            | "gallery_goto_file"
+            "masonry_goto_file" | "masonry_go_to_file" | "gallery_goto_file"
             | "gallery_go_to_file" => Some(Action::MasonryGotoFile),
             "masonry_freehand_autoscroll" | "gallery_freehand_autoscroll" => {
                 Some(Action::MasonryFreehandAutoscroll)
@@ -282,9 +280,7 @@ impl Action {
             "masonry_pan_down_3" | "gallery_pan_down_3" => Some(Action::MasonryPanDown3),
             "masonry_scroll_up" | "gallery_scroll_up" => Some(Action::MasonryScrollUp),
             "masonry_scroll_down" | "gallery_scroll_down" => Some(Action::MasonryScrollDown),
-            "masonry_zoom_in" | "masony_zoom_in" | "gallery_zoom_in" => {
-                Some(Action::MasonryZoomIn)
-            }
+            "masonry_zoom_in" | "masony_zoom_in" | "gallery_zoom_in" => Some(Action::MasonryZoomIn),
             "masonry_zoom_out" | "masony_zoom_out" | "gallery_zoom_out" => {
                 Some(Action::MasonryZoomOut)
             }
@@ -625,6 +621,8 @@ pub struct Config {
     /// Single instance mode: when true, opening a file reuses the existing window
     /// instead of creating a new one
     pub single_instance: bool,
+    /// Show full media path in native window title. If false, show filename only.
+    pub window_title_show_full_path: bool,
 
     /// Enable VSync for swapchain presentation to reduce screen tearing.
     pub vsync: bool,
@@ -758,6 +756,7 @@ impl Config {
             video_priority_play_pause_binding: Some(InputBinding::Key(egui::Key::Space)),
             startup_window_mode: StartupWindowMode::Floating,
             single_instance: true,
+            window_title_show_full_path: true,
             vsync: true,
             use_hardware_acceleration: true,
             enable_d3d12: true,
@@ -1625,6 +1624,14 @@ impl Config {
                                 config.single_instance = v;
                             }
                         }
+                        "window_title_show_full_path"
+                        | "show_full_path_in_title"
+                        | "title_show_full_path"
+                        | "window_title_full_path" => {
+                            if let Some(v) = parse_bool(value) {
+                                config.window_title_show_full_path = v;
+                            }
+                        }
                         "vsync" | "v_sync" | "enable_vsync" => {
                             if let Some(v) = parse_bool(value) {
                                 config.vsync = v;
@@ -1987,6 +1994,10 @@ impl Config {
         values.insert(
             "single_instance",
             bool_to_ini(self.single_instance).to_string(),
+        );
+        values.insert(
+            "window_title_show_full_path",
+            bool_to_ini(self.window_title_show_full_path).to_string(),
         );
         values.insert("vsync", bool_to_ini(self.vsync).to_string());
         values.insert(
@@ -2569,8 +2580,7 @@ fn optional_binding_to_string(binding: Option<&InputBinding>) -> String {
 }
 
 fn optional_mark_key_to_string(key: Option<&egui::Key>) -> String {
-    key.map(key_to_string)
-        .unwrap_or_else(|| "none".to_string())
+    key.map(key_to_string).unwrap_or_else(|| "none".to_string())
 }
 
 fn optional_shortcut_modifier_to_string(modifier: Option<&ShortcutModifier>) -> String {

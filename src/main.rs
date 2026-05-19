@@ -9411,11 +9411,142 @@ impl ImageViewer {
     }
 
     fn compute_window_title_for_path(&self, path: &PathBuf) -> String {
-        let filename = path.file_name().unwrap_or_default().to_string_lossy();
-        if filename.is_empty() {
-            "Image & Video Viewer".to_string()
+        if self.config.window_title_show_full_path {
+            let full_path = path.to_string_lossy();
+            if full_path.is_empty() {
+                "Image & Video Viewer".to_string()
+            } else {
+                full_path.to_string()
+            }
         } else {
-            format!("Image & Video Viewer - {}", filename)
+            let filename = path.file_name().unwrap_or_default().to_string_lossy();
+            if filename.is_empty() {
+                "Image & Video Viewer".to_string()
+            } else {
+                filename.to_string()
+            }
+        }
+    }
+
+    fn window_title_char_budget(ctx: &egui::Context) -> usize {
+        const FALLBACK_CHARS: usize = 96;
+        const MIN_CHARS: usize = 24;
+        const MAX_CHARS: usize = 260;
+        const RESERVED_CHROME_WIDTH_PX: f32 = 220.0;
+        const AVG_TITLE_CHAR_WIDTH_PX: f32 = 7.2;
+
+        let estimated = ctx
+            .input(|i| i.raw.viewport().inner_rect)
+            .and_then(|inner_rect| {
+                let available_width = inner_rect.width() - RESERVED_CHROME_WIDTH_PX;
+                if available_width.is_finite() && available_width > 0.0 {
+                    Some((available_width / AVG_TITLE_CHAR_WIDTH_PX).floor() as usize)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(FALLBACK_CHARS);
+
+        estimated.clamp(MIN_CHARS, MAX_CHARS)
+    }
+
+    fn take_last_chars(text: &str, char_count: usize) -> String {
+        if char_count == 0 {
+            return String::new();
+        }
+
+        let total_chars = text.chars().count();
+        if total_chars <= char_count {
+            return text.to_string();
+        }
+
+        text.chars().skip(total_chars - char_count).collect()
+    }
+
+    fn truncate_with_prefix_ellipsis(text: &str, max_chars: usize) -> String {
+        if text.chars().count() <= max_chars {
+            return text.to_string();
+        }
+
+        if max_chars <= 3 {
+            return "...".chars().take(max_chars).collect();
+        }
+
+        let tail = Self::take_last_chars(text, max_chars - 3);
+        format!("...{}", tail)
+    }
+
+    fn truncate_with_suffix_ellipsis(text: &str, max_chars: usize) -> String {
+        if text.chars().count() <= max_chars {
+            return text.to_string();
+        }
+
+        if max_chars <= 3 {
+            return "...".chars().take(max_chars).collect();
+        }
+
+        let prefix: String = text.chars().take(max_chars - 3).collect();
+        format!("{}...", prefix)
+    }
+
+    fn truncate_path_for_window_title(path_text: &str, max_chars: usize) -> String {
+        if path_text.chars().count() <= max_chars {
+            return path_text.to_string();
+        }
+
+        let separator = if path_text.contains('\\') {
+            '\\'
+        } else if path_text.contains('/') {
+            '/'
+        } else {
+            return Self::truncate_with_prefix_ellipsis(path_text, max_chars);
+        };
+
+        let prefix = format!("...{}", separator);
+        let prefix_len = prefix.chars().count();
+        if max_chars <= prefix_len {
+            return Self::truncate_with_prefix_ellipsis(path_text, max_chars);
+        }
+
+        let max_tail_chars = max_chars - prefix_len;
+        let segments: Vec<&str> = path_text
+            .split(separator)
+            .filter(|segment| !segment.is_empty())
+            .collect();
+
+        let mut tail = String::new();
+        for segment in segments.iter().rev() {
+            let candidate = if tail.is_empty() {
+                (*segment).to_string()
+            } else {
+                format!("{}{}{}", segment, separator, tail)
+            };
+
+            if candidate.chars().count() > max_tail_chars {
+                break;
+            }
+
+            tail = candidate;
+        }
+
+        if tail.is_empty() {
+            tail = Self::take_last_chars(path_text, max_tail_chars);
+        }
+
+        format!("{}{}", prefix, tail)
+    }
+
+    fn truncate_window_title_for_viewport(&self, ctx: &egui::Context, title: String) -> String {
+        let max_chars = Self::window_title_char_budget(ctx);
+        if title.chars().count() <= max_chars {
+            return title;
+        }
+
+        if self.config.window_title_show_full_path && (title.contains('\\') || title.contains('/'))
+        {
+            Self::truncate_path_for_window_title(&title, max_chars)
+        } else {
+            Self::truncate_with_suffix_ellipsis(&title, max_chars)
         }
     }
 
@@ -11942,6 +12073,7 @@ impl ImageViewer {
 
     fn apply_pending_window_title(&mut self, ctx: &egui::Context) {
         if let Some(title) = self.pending_window_title.take() {
+            let title = self.truncate_window_title_for_viewport(ctx, title);
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
         }
     }
@@ -14775,8 +14907,7 @@ impl ImageViewer {
     }
 
     fn valid_layout_bounds(size: egui::Vec2) -> Option<egui::Vec2> {
-        (size.x.is_finite() && size.y.is_finite() && size.x > 0.0 && size.y > 0.0)
-            .then_some(size)
+        (size.x.is_finite() && size.y.is_finite() && size.x > 0.0 && size.y > 0.0).then_some(size)
     }
 
     fn floating_monitor_bounds_for_layout(
@@ -14792,9 +14923,9 @@ impl ImageViewer {
     }
 
     fn refresh_last_known_monitor_size(&mut self, ctx: &egui::Context) {
-        if let Some(monitor) =
-            ctx.input(|i| i.raw.viewport().monitor_size)
-                .and_then(Self::valid_layout_bounds)
+        if let Some(monitor) = ctx
+            .input(|i| i.raw.viewport().monitor_size)
+            .and_then(Self::valid_layout_bounds)
         {
             self.last_known_monitor_size = monitor;
         }
