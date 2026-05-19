@@ -24799,11 +24799,31 @@ impl ImageViewer {
                                     .file_name()
                                     .map(|n| n.to_string_lossy().to_string())
                                     .unwrap_or_else(|| "Unknown".to_string());
+                                let mut title_text = filename.clone();
+                                if self.config.window_title_show_full_path {
+                                    let full_path = path.to_string_lossy().to_string();
+                                    if !full_path.is_empty() && full_path != filename {
+                                        // Keep room for the details segment first; truncate path context before details.
+                                        const DETAILS_PRIORITY_WIDTH_RESERVE: f32 = 240.0;
+                                        const MIN_PATH_WIDTH: f32 = 110.0;
+                                        let available_for_title = ui.available_width();
+                                        let path_width_budget = if available_for_title
+                                            > DETAILS_PRIORITY_WIDTH_RESERVE + MIN_PATH_WIDTH
+                                        {
+                                            available_for_title - DETAILS_PRIORITY_WIDTH_RESERVE
+                                        } else {
+                                            available_for_title
+                                        };
+                                        title_text = self.truncate_window_title_for_ui_width(
+                                            full_path,
+                                            path_width_budget,
+                                        );
+                                    }
+                                }
 
                                 let resp = ui.add(
                                     egui::Label::new(
-                                        egui::RichText::new(filename.clone())
-                                            .color(egui::Color32::WHITE),
+                                        egui::RichText::new(title_text).color(egui::Color32::WHITE),
                                     )
                                     .selectable(true)
                                     .truncate(),
@@ -24901,36 +24921,6 @@ impl ImageViewer {
                                                 .color(egui::Color32::GRAY),
                                             )
                                             .selectable(true),
-                                        );
-                                        over_title_text |= resp.contains_pointer();
-                                        started_title_text_drag |=
-                                            resp.drag_started() || resp.dragged();
-                                    }
-                                }
-
-                                // Lowest-priority title segment: full path only when enough room remains.
-                                if self.config.window_title_show_full_path
-                                    && ui.available_width() >= 120.0
-                                {
-                                    let full_path = path.to_string_lossy().to_string();
-                                    let filename_for_compare = path
-                                        .file_name()
-                                        .map(|n| n.to_string_lossy().to_string())
-                                        .unwrap_or_default();
-                                    if !full_path.is_empty() && full_path != filename_for_compare {
-                                        ui.add_space(8.0);
-                                        let full_path_text = self
-                                            .truncate_window_title_for_ui_width(
-                                                full_path,
-                                                ui.available_width(),
-                                            );
-                                        let resp = ui.add(
-                                            egui::Label::new(
-                                                egui::RichText::new(full_path_text)
-                                                    .color(egui::Color32::from_gray(160)),
-                                            )
-                                            .selectable(true)
-                                            .truncate(),
                                         );
                                         over_title_text |= resp.contains_pointer();
                                         started_title_text_drag |=
