@@ -9428,26 +9428,30 @@ impl ImageViewer {
         }
     }
 
-    fn window_title_char_budget(ctx: &egui::Context) -> usize {
-        const FALLBACK_CHARS: usize = 96;
+    fn title_char_budget_from_width(width_px: f32, fallback: usize) -> usize {
         const MIN_CHARS: usize = 24;
         const MAX_CHARS: usize = 260;
-        const RESERVED_CHROME_WIDTH_PX: f32 = 220.0;
         const AVG_TITLE_CHAR_WIDTH_PX: f32 = 7.2;
 
-        let estimated = ctx
-            .input(|i| i.raw.viewport().inner_rect)
-            .and_then(|inner_rect| {
-                let available_width = inner_rect.width() - RESERVED_CHROME_WIDTH_PX;
-                if available_width.is_finite() && available_width > 0.0 {
-                    Some((available_width / AVG_TITLE_CHAR_WIDTH_PX).floor() as usize)
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(FALLBACK_CHARS);
+        let estimated = if width_px.is_finite() && width_px > 0.0 {
+            (width_px / AVG_TITLE_CHAR_WIDTH_PX).floor() as usize
+        } else {
+            fallback
+        };
 
         estimated.clamp(MIN_CHARS, MAX_CHARS)
+    }
+
+    fn window_title_char_budget(ctx: &egui::Context) -> usize {
+        const FALLBACK_CHARS: usize = 96;
+        const RESERVED_CHROME_WIDTH_PX: f32 = 220.0;
+
+        let available_width = ctx
+            .input(|i| i.raw.viewport().inner_rect)
+            .map(|inner_rect| inner_rect.width() - RESERVED_CHROME_WIDTH_PX)
+            .unwrap_or(-1.0);
+
+        Self::title_char_budget_from_width(available_width, FALLBACK_CHARS)
     }
 
     fn take_last_chars(text: &str, char_count: usize) -> String {
@@ -9536,8 +9540,7 @@ impl ImageViewer {
         format!("{}{}", prefix, tail)
     }
 
-    fn truncate_window_title_for_viewport(&self, ctx: &egui::Context, title: String) -> String {
-        let max_chars = Self::window_title_char_budget(ctx);
+    fn truncate_window_title_for_char_budget(&self, title: String, max_chars: usize) -> String {
         if title.chars().count() <= max_chars {
             return title;
         }
@@ -9548,6 +9551,16 @@ impl ImageViewer {
         } else {
             Self::truncate_with_suffix_ellipsis(&title, max_chars)
         }
+    }
+
+    fn truncate_window_title_for_viewport(&self, ctx: &egui::Context, title: String) -> String {
+        let max_chars = Self::window_title_char_budget(ctx);
+        self.truncate_window_title_for_char_budget(title, max_chars)
+    }
+
+    fn truncate_window_title_for_ui_width(&self, title: String, width_px: f32) -> String {
+        let max_chars = Self::title_char_budget_from_width(width_px, 96);
+        self.truncate_window_title_for_char_budget(title, max_chars)
     }
 
     fn format_file_size(bytes: u64) -> String {
@@ -24782,14 +24795,14 @@ impl ImageViewer {
                             let current_path = self.image_list.get(self.current_index).cloned();
                             let details_path = current_path.clone();
                             if let Some(path) = current_path.as_ref() {
-                                let filename = path
-                                    .file_name()
-                                    .map(|n| n.to_string_lossy().to_string())
-                                    .unwrap_or_else(|| "Unknown".to_string());
+                                let title_text = self.truncate_window_title_for_ui_width(
+                                    self.compute_window_title_for_path(path),
+                                    ui.available_width(),
+                                );
 
                                 let resp = ui.add(
                                     egui::Label::new(
-                                        egui::RichText::new(filename).color(egui::Color32::WHITE),
+                                        egui::RichText::new(title_text).color(egui::Color32::WHITE),
                                     )
                                     .selectable(true)
                                     .truncate(),
