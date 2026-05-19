@@ -27,7 +27,7 @@ static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use config::{
     Action, Config, InputBinding, MangaVirtualizationBackend, ShortcutModifier, StartupWindowMode,
-    VideoSeekPolicy,
+    VideoSeekPolicy, WindowTitlePathMode,
 };
 use folder_travel_cache::{
     lookup_folder_travel_position, store_folder_travel_position, FolderTravelLayoutMode,
@@ -9410,8 +9410,20 @@ impl ImageViewer {
         }
     }
 
+    fn in_floating_mode(&self) -> bool {
+        !self.is_fullscreen && !self.manga_mode
+    }
+
+    fn should_show_full_path_in_window_title(&self) -> bool {
+        match self.config.window_title_show_full_path {
+            WindowTitlePathMode::FullPath => true,
+            WindowTitlePathMode::Filename => false,
+            WindowTitlePathMode::Auto => !self.in_floating_mode(),
+        }
+    }
+
     fn compute_window_title_for_path(&self, path: &PathBuf) -> String {
-        if self.config.window_title_show_full_path {
+        if self.should_show_full_path_in_window_title() {
             let full_path = path.to_string_lossy();
             if full_path.is_empty() {
                 "Image & Video Viewer".to_string()
@@ -9545,7 +9557,8 @@ impl ImageViewer {
             return title;
         }
 
-        if self.config.window_title_show_full_path && (title.contains('\\') || title.contains('/'))
+        if self.should_show_full_path_in_window_title()
+            && (title.contains('\\') || title.contains('/'))
         {
             Self::truncate_path_for_window_title(&title, max_chars)
         } else {
@@ -24800,7 +24813,7 @@ impl ImageViewer {
                                     .map(|n| n.to_string_lossy().to_string())
                                     .unwrap_or_else(|| "Unknown".to_string());
                                 let mut title_text = filename.clone();
-                                if self.config.window_title_show_full_path {
+                                if self.should_show_full_path_in_window_title() {
                                     let full_path = path.to_string_lossy().to_string();
                                     if !full_path.is_empty() && full_path != filename {
                                         // Keep room for the details segment first; truncate path context before details.
@@ -28763,6 +28776,10 @@ impl eframe::App for ImageViewer {
             self.toggle_fullscreen = false;
             self.toggle_fullscreen_force_borderless = false;
             self.toggle_fullscreen_from_titlebar = false;
+
+            if let Some(path) = self.current_media_path() {
+                self.pending_window_title = Some(self.compute_window_title_for_path(&path));
+            }
         }
 
         let fullscreen_animation_active = false;

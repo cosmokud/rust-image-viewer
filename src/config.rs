@@ -621,8 +621,8 @@ pub struct Config {
     /// Single instance mode: when true, opening a file reuses the existing window
     /// instead of creating a new one
     pub single_instance: bool,
-    /// Show full media path in native window title. If false, show filename only.
-    pub window_title_show_full_path: bool,
+    /// Native window title path mode: auto, full path, or filename only.
+    pub window_title_show_full_path: WindowTitlePathMode,
 
     /// Enable VSync for swapchain presentation to reduce screen tearing.
     pub vsync: bool,
@@ -681,6 +681,39 @@ impl StartupWindowMode {
         match self {
             Self::Floating => "floating",
             Self::Fullscreen => "fullscreen",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowTitlePathMode {
+    /// Show filename in floating mode and full path in other modes.
+    Auto,
+    /// Always show full path.
+    FullPath,
+    /// Always show filename only.
+    Filename,
+}
+
+impl WindowTitlePathMode {
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "true" | "1" | "yes" | "y" | "on" | "full_path" | "fullpath" | "path" | "full" => {
+                Some(Self::FullPath)
+            }
+            "false" | "0" | "no" | "n" | "off" | "filename" | "file_name" | "file" | "name" => {
+                Some(Self::Filename)
+            }
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::FullPath => "true",
+            Self::Filename => "false",
         }
     }
 }
@@ -756,7 +789,7 @@ impl Config {
             video_priority_play_pause_binding: Some(InputBinding::Key(egui::Key::Space)),
             startup_window_mode: StartupWindowMode::Floating,
             single_instance: true,
-            window_title_show_full_path: true,
+            window_title_show_full_path: WindowTitlePathMode::Auto,
             vsync: true,
             use_hardware_acceleration: true,
             enable_d3d12: true,
@@ -1628,8 +1661,8 @@ impl Config {
                         | "show_full_path_in_title"
                         | "title_show_full_path"
                         | "window_title_full_path" => {
-                            if let Some(v) = parse_bool(value) {
-                                config.window_title_show_full_path = v;
+                            if let Some(mode) = WindowTitlePathMode::from_str(value) {
+                                config.window_title_show_full_path = mode;
                             }
                         }
                         "vsync" | "v_sync" | "enable_vsync" => {
@@ -1997,7 +2030,7 @@ impl Config {
         );
         values.insert(
             "window_title_show_full_path",
-            bool_to_ini(self.window_title_show_full_path).to_string(),
+            self.window_title_show_full_path.as_str().to_string(),
         );
         values.insert("vsync", bool_to_ini(self.vsync).to_string());
         values.insert(
