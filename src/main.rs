@@ -2598,6 +2598,8 @@ struct ImageViewer {
     masonry_metadata_preload_loaded: usize,
     /// Cursor used to warm remaining masonry dimensions progressively in the background.
     masonry_metadata_preload_cursor: usize,
+    /// Image-list signature paired with the current masonry metadata warm-up state.
+    masonry_metadata_preload_list_signature: u64,
     /// Item to restore once startup metadata warmup finishes rebuilding the masonry layout.
     masonry_metadata_preload_restore_index: Option<usize>,
     /// Keep the warmup overlay visible briefly so fast scans still show progress feedback.
@@ -3055,6 +3057,7 @@ impl Default for ImageViewer {
             masonry_metadata_preload_total: 0,
             masonry_metadata_preload_loaded: 0,
             masonry_metadata_preload_cursor: 0,
+            masonry_metadata_preload_list_signature: 0,
             masonry_metadata_preload_restore_index: None,
             masonry_metadata_preload_overlay_hold_until: None,
             masonry_metadata_preload_defer_first_tick: false,
@@ -12767,7 +12770,11 @@ impl ImageViewer {
         self.stop_manga_wheel_scroll();
         self.stop_manga_autoscroll();
         self.reset_gif_seek_interaction_state();
-        self.reset_masonry_metadata_preload();
+        if self.manga_layout_mode == MangaLayoutMode::Masonry {
+            self.pause_masonry_metadata_preload();
+        } else {
+            self.reset_masonry_metadata_preload();
+        }
         self.manga_mode = true;
         set_metadata_cache_enabled(Self::layout_mode_uses_metadata_cache(
             self.manga_layout_mode,
@@ -12783,6 +12790,7 @@ impl ImageViewer {
         self.masonry_metadata_preload_total = 0;
         self.masonry_metadata_preload_loaded = 0;
         self.masonry_metadata_preload_cursor = 0;
+        self.masonry_metadata_preload_list_signature = 0;
         self.masonry_metadata_preload_restore_index = None;
         self.masonry_metadata_preload_overlay_hold_until = None;
         self.masonry_metadata_preload_defer_first_tick = false;
@@ -12790,22 +12798,63 @@ impl ImageViewer {
         self.pending_masonry_folder_travel_restore = None;
     }
 
+    fn pause_masonry_metadata_preload(&mut self) {
+        let total = self.masonry_metadata_preload_total;
+        let can_resume = total > 0
+            && self.masonry_metadata_preload_loaded < total
+            && self.masonry_metadata_preload_list_signature == self.image_list_signature;
+
+        self.masonry_metadata_preload_active = false;
+        self.masonry_metadata_preload_overlay_hold_until = None;
+        self.masonry_metadata_preload_defer_first_tick = false;
+        self.masonry_metadata_preload_stall_since = None;
+
+        if !can_resume {
+            self.masonry_metadata_preload_total = 0;
+            self.masonry_metadata_preload_loaded = 0;
+            self.masonry_metadata_preload_cursor = 0;
+            self.masonry_metadata_preload_list_signature = 0;
+            self.masonry_metadata_preload_restore_index = None;
+            self.pending_masonry_folder_travel_restore = None;
+        }
+    }
+
     fn begin_masonry_metadata_preload(&mut self) {
-        self.masonry_metadata_preload_total = self.image_list.len();
-        self.masonry_metadata_preload_loaded = 0;
-        self.masonry_metadata_preload_restore_index = if self.image_list.is_empty() {
-            None
+        let total = self.image_list.len();
+        let resume_preload = self.masonry_metadata_preload_total == total
+            && self.masonry_metadata_preload_loaded < total
+            && self.masonry_metadata_preload_list_signature == self.image_list_signature;
+
+        self.masonry_metadata_preload_total = total;
+        self.masonry_metadata_preload_list_signature = self.image_list_signature;
+
+        if resume_preload {
+            self.masonry_metadata_preload_loaded = self.masonry_metadata_preload_loaded.min(total);
+            self.masonry_metadata_preload_cursor = self
+                .masonry_metadata_preload_cursor
+                .min(total.saturating_sub(1));
+            self.masonry_metadata_preload_restore_index = self
+                .masonry_metadata_preload_restore_index
+                .map(|index| index.min(total.saturating_sub(1)))
+                .or_else(|| Some(self.current_index.min(total.saturating_sub(1))));
         } else {
-            Some(
-                self.current_index
-                    .min(self.image_list.len().saturating_sub(1)),
-            )
-        };
-        let preload_window = 96usize.max(self.masonry_items_per_row.clamp(2, 10) * 48);
-        self.masonry_metadata_preload_cursor = self
-            .current_index
-            .min(self.masonry_metadata_preload_total.saturating_sub(1))
-            .saturating_sub(preload_window / 2);
+            self.masonry_metadata_preload_loaded = 0;
+            self.masonry_metadata_preload_restore_index = if self.image_list.is_empty() {
+                None
+            } else {
+                Some(
+                    self.current_index
+                        .min(self.image_list.len().saturating_sub(1)),
+                )
+            };
+            let preload_window = 96usize.max(self.masonry_items_per_row.clamp(2, 10) * 48);
+            self.masonry_metadata_preload_cursor = self
+                .current_index
+                .min(self.masonry_metadata_preload_total.saturating_sub(1))
+                .saturating_sub(preload_window / 2);
+            self.pending_masonry_folder_travel_restore = None;
+        }
+
         self.masonry_metadata_preload_active = self.manga_mode
             && self.is_masonry_mode()
             && self.masonry_metadata_preload_total > 0
@@ -12848,8 +12897,12 @@ impl ImageViewer {
     }
 
     fn maybe_begin_masonry_metadata_preload(&mut self, allow_startup_preload: bool) {
-        if self.manga_layout_mode != MangaLayoutMode::Masonry || self.image_list.is_empty() {
+        if self.image_list.is_empty() {
             self.reset_masonry_metadata_preload();
+            return;
+        }
+        if self.manga_layout_mode != MangaLayoutMode::Masonry {
+            self.pause_masonry_metadata_preload();
             return;
         }
 
@@ -14114,7 +14167,14 @@ impl ImageViewer {
             self.set_solo_preload_momentum(SoloPreloadMomentum::Neutral);
         }
 
-        self.reset_masonry_metadata_preload();
+        if !self.manga_mode
+            && self.manga_layout_mode == MangaLayoutMode::Masonry
+            && self.has_resident_masonry_runtime_cache()
+        {
+            self.pause_masonry_metadata_preload();
+        } else {
+            self.reset_masonry_metadata_preload();
+        }
         self.clear_pending_media_load();
         self.pending_video_thumbnail_placeholder = None;
         self.clear_video_playback_unavailable_state();
@@ -15385,7 +15445,11 @@ impl ImageViewer {
 
         // Keep texture/dimension caches alive for fast strip restore,
         // but stop active runtime workloads while in solo fullscreen.
-        self.reset_masonry_metadata_preload();
+        if self.manga_layout_mode == MangaLayoutMode::Masonry {
+            self.pause_masonry_metadata_preload();
+        } else {
+            self.reset_masonry_metadata_preload();
+        }
         self.clear_manga_runtime_workloads();
         self.clear_manga_video_textures();
         self.manga_animated_images.clear();
@@ -17199,8 +17263,10 @@ impl ImageViewer {
         self.reset_gif_seek_interaction_state();
         if return_mode == MangaLayoutMode::Masonry {
             self.persist_current_masonry_folder_metadata_snapshot();
+            self.pause_masonry_metadata_preload();
+        } else {
+            self.reset_masonry_metadata_preload();
         }
-        self.reset_masonry_metadata_preload();
         self.manga_mode = false;
         set_metadata_cache_enabled(false);
         // Preserve strip runtime caches for fast return from solo fullscreen.
