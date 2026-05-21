@@ -129,6 +129,8 @@ The `eframe::App::update()` implementation in `src/main.rs` is the heartbeat of 
 
 The per-frame order is deliberate:
 
+If an exit request is pending, the frame short-circuits immediately by issuing a close command and skipping the rest of the work.
+
 1. Poll single-instance incoming file-open requests.
 2. Poll background completions:
    - directory scans
@@ -175,7 +177,7 @@ Opening a file in solo mode follows this sequence:
 2. Clear any active pending media load.
 3. Clear any pending video-thumbnail placeholder.
 4. Start an async file-size probe so title-bar file-size text does not call `std::fs::metadata()` every frame.
-5. Update the native window title.
+5. Update the native window title (filename/full path/auto) and truncate to the available title-bar width.
 6. Determine `MediaType` up front.
 7. Optionally capture a placeholder texture from the currently visible media.
 8. Drop old image/video textures and decode state, but restore the placeholder immediately if the transition should keep the current visible frame on screen.
@@ -214,6 +216,8 @@ This is why the user can often move between items without seeing a blank frame e
 
 For `MediaType::Image`, `load_media_internal()` computes a target texture side based on expected display size and LOD bucket selection.
 
+Target sizing is quantized to the shared LOD buckets, clamped to source dimensions and the active GPU `MAX_TEXTURE_SIZE`, so small zoom changes do not thrash uploads.
+
 It then tries, in order:
 
 1. `decoded_image_cache` in `src/main.rs`
@@ -227,6 +231,8 @@ Important details:
 - capacity is `192 MiB`
 - single entries larger than `24 MiB` are skipped to avoid cache pollution
 - keys include file stamp plus target texture-side bucket
+- a small LRU of solo image textures caches GPU uploads keyed by path + target side; neighbor preloads can populate it for fast next/previous swaps
+- non-animated solo images can request a higher LOD refresh when zoom or viewport size demands it, and refresh work is skipped if it would not improve the current texture
 - GIFs are not restored from this cache because a single cached frame would destroy animation semantics
 - animated WebP is special-cased: the first frame is shown immediately and the rest of the animation streams in afterward
 
@@ -318,6 +324,8 @@ That is why the layout can become correct earlier than full-quality textures do.
 If the metadata warmup stalls (for example, probe work that stops progressing), the loader seeds conservative fallback dimensions for a bounded batch so the warmup overlay can continue. Later probes still replace those fallback sizes once real dimensions arrive.
 
 The Masonry metadata warmup overlay can stay visible briefly after preload finishes so fast scans still surface visible progress feedback.
+
+Warmup can pause when leaving Masonry (or when a preserved Masonry cache is kept alive during solo view). If the image-list signature is unchanged, the warmup resumes rather than restarting, and focus-loss handling clears transient interaction latches so background preloading keeps moving.
 
 ### 6.5 Directional look-ahead / look-behind prefetch
 

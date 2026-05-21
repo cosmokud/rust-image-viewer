@@ -21,6 +21,7 @@ The RGBA resize path is centralized in `src/image_resize.rs`: static images, ani
 ## Highlights
 
 - Borderless floating window with custom title bar, auto-hide controls, native-feeling fullscreen / maximize transitions, and steadier drag/zoom/resize behavior on Windows.
+- Configurable window title path mode (auto/full path/filename) with smart truncation for narrow title bars.
 - Fast single-file viewing plus fast folder navigation, including natural-sort media lists and optional single-instance reuse.
 - Breadcrumb address bar with back/forward/up navigation, a folder-history popup, a hide/show toggle, and Windows drive-root entries in fullscreen manga modes.
 - Windows cut/copy/paste for marked files with optional auto-unmark after paste.
@@ -47,6 +48,7 @@ The RGBA resize path is centralized in `src/image_resize.rs`: static images, ani
 - Smart initial sizing: open at 100% when possible, otherwise fit to the screen.
 - Drag and drop support.
 - Single-instance mode that forwards file-open requests from secondary launches to the primary window.
+- Configurable window title path mode: auto (filename in floating, full path in fullscreen), always-full-path, or filename-only, with smart truncation to fit the title bar width.
 - Folder scans include symlinked files and directories for navigation.
 - Windows folder shortcuts (`.lnk`) are treated as navigable folders.
 - Breadcrumb address bar for fullscreen manga modes with back/forward/up navigation, history popup, visibility toggle, and Windows drive-root entries.
@@ -342,6 +344,7 @@ Delete `config.ini` if you want to regenerate it from the current defaults.
 | `resize_border_size`                  | `6`        | Hit area for floating-window resize borders.                                                                     |
 | `startup_window_mode`                 | `floating` | `floating` or `fullscreen`.                                                                                      |
 | `single_instance`                     | `true`     | Reuse one window and forward file-open requests into it.                                                         |
+| `window_title_show_full_path`         | `auto`     | `auto` = filename in floating, full path in fullscreen/masonry/long strip. `true` = always full path. `false` = filename only. |
 | `vsync`                               | `true`     | Enable swapchain vsync to reduce tearing.                                                                        |
 | `metadata_cache_max_size_mb`          | `1024`     | Max on-disk size of `metadata_cache.redb` in MiB. `0` disables the size cap. Stores dimensions, type, animation. |
 | `background_rgb`                      | `0, 0, 0`  | Background color as one RGB triplet.                                                                             |

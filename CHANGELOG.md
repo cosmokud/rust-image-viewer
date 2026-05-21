@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.4.1-rc.3] - 2026-05-21
+
+### Highlights
+
+- Added configurable window-title path mode (`window_title_show_full_path = auto|true|false`) with smarter truncation for narrow title bars. Auto shows filename in floating mode and full path in fullscreen/masonry/long strip.
+- Solo image loading now targets quantized texture-side LODs, prewarms neighbor textures, and refreshes higher-resolution textures when zoom or viewport size demands it.
+- Masonry metadata warmup can pause and resume across mode transitions to avoid unnecessary preload churn while preserving progress.
+
+### Changed
+
+- Added a short-circuit exit path so close requests skip additional per-frame work.
+- Masonry metadata warmup clears transient interaction latches on focus loss to keep background preloading moving.
+
 ## [v0.4.1-rc.2] - 2026-05-15
 
 ### Rendering And Resize Pipeline
