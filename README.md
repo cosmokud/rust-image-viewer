@@ -335,30 +335,30 @@ Delete `config.ini` if you want to regenerate it from the current defaults.
 
 ### General settings
 
-| Key                                   | Default    | Meaning                                                                                                          |
-| ------------------------------------- | ---------- | ---------------------------------------------------------------------------------------------------------------- |
-| `controls_hide_delay`                 | `0.5`      | Delay before the top controls / title bar hide.                                                                  |
-| `bottom_overlay_hide_delay`           | `0.5`      | Delay before bottom overlays hide. Affects video controls, mode buttons, and zoom HUD.                           |
-| `double_click_grace_period`           | `0.35`     | Double-click timing window in seconds.                                                                           |
-| `show_fps`                            | `false`    | Enables the top-right diagnostics overlay.                                                                       |
-| `resize_border_size`                  | `6`        | Hit area for floating-window resize borders.                                                                     |
-| `startup_window_mode`                 | `floating` | `floating` or `fullscreen`.                                                                                      |
-| `single_instance`                     | `true`     | Reuse one window and forward file-open requests into it.                                                         |
+| Key                                   | Default    | Meaning                                                                                                                        |
+| ------------------------------------- | ---------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| `controls_hide_delay`                 | `0.5`      | Delay before the top controls / title bar hide.                                                                                |
+| `bottom_overlay_hide_delay`           | `0.5`      | Delay before bottom overlays hide. Affects video controls, mode buttons, and zoom HUD.                                         |
+| `double_click_grace_period`           | `0.35`     | Double-click timing window in seconds.                                                                                         |
+| `show_fps`                            | `false`    | Enables the top-right diagnostics overlay.                                                                                     |
+| `resize_border_size`                  | `6`        | Hit area for floating-window resize borders.                                                                                   |
+| `startup_window_mode`                 | `floating` | `floating` or `fullscreen`.                                                                                                    |
+| `single_instance`                     | `true`     | Reuse one window and forward file-open requests into it.                                                                       |
 | `window_title_show_full_path`         | `auto`     | `auto` = filename in floating, full path in fullscreen/masonry/long strip. `true` = always full path. `false` = filename only. |
-| `vsync`                               | `true`     | Enable swapchain vsync to reduce tearing.                                                                        |
-| `metadata_cache_max_size_mb`          | `1024`     | Max on-disk size of `metadata_cache.redb` in MiB. `0` disables the size cap. Stores dimensions, type, animation. |
-| `background_rgb`                      | `0, 0, 0`  | Background color as one RGB triplet.                                                                             |
-| `background_r`                        | `0`        | Alternative per-channel background override.                                                                     |
-| `background_g`                        | `0`        | Alternative per-channel background override.                                                                     |
-| `background_b`                        | `0`        | Alternative per-channel background override.                                                                     |
-| `fullscreen_reset_fit_on_enter`       | `true`     | Reset and fit media when entering fullscreen.                                                                    |
-| `fullscreen_native_window_transition` | `true`     | Use Windows maximize / restore animations during fullscreen transitions.                                         |
-| `maximize_to_borderless_fullscreen`   | `true`     | Make the title-bar maximize action enter borderless fullscreen instead of a separate maximized floating state.   |
-| `auto_unmark_after_paste`             | `true`     | Clear current marked-file selection after a successful paste operation.                                          |
-| `zoom_animation_speed`                | `20`       | Speed of floating zoom animation. `0` disables the animation.                                                    |
-| `precise_rotation_step_degrees`       | `2.0`      | Degrees added per `Ctrl+Up` / `Ctrl+Down`.                                                                       |
-| `zoom_step`                           | `1.02`     | Scroll-wheel zoom multiplier.                                                                                    |
-| `max_zoom_percent`                    | `1000`     | Maximum zoom level, stored as percent.                                                                           |
+| `vsync`                               | `true`     | Enable swapchain vsync to reduce tearing.                                                                                      |
+| `metadata_cache_max_size_mb`          | `1024`     | Max on-disk size of `metadata_cache.redb` in MiB. `0` disables the size cap. Stores dimensions, type, animation.               |
+| `background_rgb`                      | `0, 0, 0`  | Background color as one RGB triplet.                                                                                           |
+| `background_r`                        | `0`        | Alternative per-channel background override.                                                                                   |
+| `background_g`                        | `0`        | Alternative per-channel background override.                                                                                   |
+| `background_b`                        | `0`        | Alternative per-channel background override.                                                                                   |
+| `fullscreen_reset_fit_on_enter`       | `true`     | Reset and fit media when entering fullscreen.                                                                                  |
+| `fullscreen_native_window_transition` | `true`     | Use Windows maximize / restore animations during fullscreen transitions.                                                       |
+| `maximize_to_borderless_fullscreen`   | `true`     | Make the title-bar maximize action enter borderless fullscreen instead of a separate maximized floating state.                 |
+| `auto_unmark_after_paste`             | `true`     | Clear current marked-file selection after a successful paste operation.                                                        |
+| `zoom_animation_speed`                | `20`       | Speed of floating zoom animation. `0` disables the animation.                                                                  |
+| `precise_rotation_step_degrees`       | `2.0`      | Degrees added per `Ctrl+Up` / `Ctrl+Down`.                                                                                     |
+| `zoom_step`                           | `1.02`     | Scroll-wheel zoom multiplier.                                                                                                  |
+| `max_zoom_percent`                    | `1000`     | Maximum zoom level, stored as percent.                                                                                         |
 
 ### Long Strip and Masonry settings
 
