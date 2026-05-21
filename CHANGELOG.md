@@ -58,15 +58,6 @@ All notable changes to this project will be documented in this file.
 - Shared Masonry action parsing now accepts Gallery action names such as `gallery_pan`, `gallery_goto_file`, `gallery_scroll_down`, and `gallery_zoom_in`.
 - Folder-navigation media lists now pass through one normalization path before being stored, reducing duplicated filtering around synthetic folder entries.
 - Folder metadata snapshot persistence and restoration now apply to the Gallery layout where the same cached folder-dimension data is valid.
-- Package version bumped from `0.3.9` to `0.4.1-rc.1` in `Cargo.toml` and `Cargo.lock`.
-
-### Changed Files
-
-- `Cargo.toml`
-- `Cargo.lock`
-- `assets/config.ini`
-- `src/config.rs`
-- `src/main.rs`
 
 ## [v0.3.9] - 2026-05-14
 
