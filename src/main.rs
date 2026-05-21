@@ -1089,6 +1089,7 @@ struct PendingMediaLoad {
     request_id: u64,
     path: PathBuf,
     kind: PendingMediaLoadKind,
+    max_texture_side: Option<u32>,
     started_at: Instant,
 }
 
@@ -6811,6 +6812,83 @@ impl ImageViewer {
         }
     }
 
+    fn solo_image_lod_refresh_target_side(
+        current_texture_dims: Option<(u32, u32)>,
+        desired_target_side: u32,
+        pending_target_side: Option<u32>,
+    ) -> Option<u32> {
+        let desired_target_side = desired_target_side.max(1);
+        if pending_target_side.is_some_and(|pending| pending >= desired_target_side) {
+            return None;
+        }
+
+        let current_side = current_texture_dims
+            .map(|(width, height)| width.max(height))
+            .unwrap_or(0);
+        (current_side < desired_target_side).then_some(desired_target_side)
+    }
+
+    fn maybe_refresh_current_solo_image_lod(&mut self) {
+        if self.manga_mode || self.current_media_type != Some(MediaType::Image) {
+            return;
+        }
+
+        let Some(path) = self.image_list.get(self.current_index).cloned() else {
+            return;
+        };
+
+        let Some((current_texture_dims, is_animated)) = self.image.as_ref().and_then(|img| {
+            if img.path != path {
+                return None;
+            }
+
+            let frame = img.current_frame_data();
+            Some((
+                self.image_texture_dims
+                    .or(Some((frame.width, frame.height))),
+                img.is_animated(),
+            ))
+        }) else {
+            return;
+        };
+
+        if is_animated {
+            return;
+        }
+
+        let target_side = self.solo_target_texture_side_for_path(&path, MediaType::Image, true);
+        let pending_target_side = self.pending_media_load.as_ref().and_then(|pending| {
+            (pending.kind == PendingMediaLoadKind::Image && pending.path == path)
+                .then_some(pending.max_texture_side)
+                .flatten()
+        });
+        let Some(refresh_side) = Self::solo_image_lod_refresh_target_side(
+            current_texture_dims,
+            target_side,
+            pending_target_side,
+        ) else {
+            return;
+        };
+
+        let downscale_filter = self.config.downscale_filter.to_image_filter();
+        let gif_filter = self.config.gif_resize_filter.to_image_filter();
+        if self.try_load_image_from_decoded_cache(&path, refresh_side, gif_filter) {
+            if self.pending_media_load.as_ref().is_some_and(|pending| {
+                pending.kind == PendingMediaLoadKind::Image
+                    && pending.path == path
+                    && pending.max_texture_side.unwrap_or(0) < refresh_side
+            }) {
+                self.pending_media_load = None;
+            }
+            if !self.defer_directory_work_for_fast_startup() {
+                self.schedule_solo_probe_window(&path, Some(MediaType::Image));
+            }
+            return;
+        }
+
+        self.start_async_image_load(path, refresh_side, downscale_filter, gif_filter);
+    }
+
     fn solo_visible_item_equivalent_for_path(
         &self,
         path: &PathBuf,
@@ -12312,6 +12390,7 @@ impl ImageViewer {
                     self.zoom_target = self.zoom;
                     self.zoom_velocity = 0.0;
                     self.remember_current_fullscreen_view_state();
+                    self.maybe_refresh_current_solo_image_lod();
                 } else {
                     self.zoom_target = (self.zoom_target * step).min(self.max_zoom_factor());
                     self.zoom_velocity = 0.0;
@@ -12326,6 +12405,7 @@ impl ImageViewer {
                     self.zoom_target = self.zoom;
                     self.zoom_velocity = 0.0;
                     self.remember_current_fullscreen_view_state();
+                    self.maybe_refresh_current_solo_image_lod();
                 } else {
                     self.zoom_target = (self.zoom_target / step).max(0.1);
                     self.zoom_velocity = 0.0;
@@ -14016,6 +14096,7 @@ impl ImageViewer {
             request_id,
             path: path.clone(),
             kind: PendingMediaLoadKind::Image,
+            max_texture_side: Some(max_texture_side),
             started_at: Instant::now(),
         });
 
@@ -14093,6 +14174,7 @@ impl ImageViewer {
             request_id,
             path: path.clone(),
             kind: PendingMediaLoadKind::Video,
+            max_texture_side: output_bounds.map(|(width, height)| width.max(height)),
             started_at: Instant::now(),
         });
 
@@ -15375,6 +15457,7 @@ impl ImageViewer {
         if error.abs() < SNAP_THRESHOLD && self.zoom_velocity.abs() < VELOCITY_THRESHOLD {
             self.zoom = self.zoom_target;
             self.zoom_velocity = 0.0;
+            self.maybe_refresh_current_solo_image_lod();
             return false; // Animation complete, no repaint needed
         }
 
@@ -15393,6 +15476,7 @@ impl ImageViewer {
         if speed <= 0.0 {
             self.zoom = self.zoom_target;
             self.zoom_velocity = 0.0;
+            self.maybe_refresh_current_solo_image_lod();
             return false;
         }
 
@@ -15487,6 +15571,7 @@ impl ImageViewer {
         } else {
             self.offset = egui::Vec2::ZERO;
         }
+        self.maybe_refresh_current_solo_image_lod();
     }
 
     // ============ MANGA READING MODE METHODS ============
@@ -20821,6 +20906,7 @@ impl ImageViewer {
                     self.zoom_velocity = 0.0;
                     self.offset = self.offset * zoom_ratio;
                     self.remember_current_fullscreen_view_state();
+                    self.maybe_refresh_current_solo_image_lod();
                 }
             }
 
@@ -21143,6 +21229,7 @@ impl ImageViewer {
             self.zoom_velocity = 0.0;
             self.offset = self.offset * zoom_ratio;
             self.remember_current_fullscreen_view_state();
+            self.maybe_refresh_current_solo_image_lod();
         }
     }
 
@@ -27614,6 +27701,7 @@ impl ImageViewer {
 
         // Smooth zoom animation (floating mode)
         if self.tick_floating_zoom_animation(ctx) {
+            self.maybe_refresh_current_solo_image_lod();
             animation_active = true;
         }
 
@@ -27788,6 +27876,7 @@ impl ImageViewer {
                                     self.offset * zoom_ratio - cursor_offset * (zoom_ratio - 1.0);
                             }
                             self.zoom_velocity = 0.0;
+                            self.maybe_refresh_current_solo_image_lod();
                         }
 
                         handled_modifier_wheel = true;
@@ -27832,6 +27921,7 @@ impl ImageViewer {
                                         - cursor_offset * (zoom_ratio - 1.0);
                                 }
                                 self.zoom_velocity = 0.0;
+                                self.maybe_refresh_current_solo_image_lod();
                             }
                         }
                     }
@@ -29637,6 +29727,22 @@ mod tests {
     fn solo_image_load_uses_preload_lod_for_fullscreen_and_floating() {
         assert_eq!(ImageViewer::solo_image_load_texture_side(2048, 8192), 2048);
         assert_eq!(ImageViewer::solo_image_load_texture_side(0, 8192), 8192);
+    }
+
+    #[test]
+    fn solo_image_lod_refresh_requests_higher_texture_when_zoom_outgrows_current_lod() {
+        assert_eq!(
+            ImageViewer::solo_image_lod_refresh_target_side(Some((1365, 2048)), 8192, None),
+            Some(8192)
+        );
+        assert_eq!(
+            ImageViewer::solo_image_lod_refresh_target_side(Some((5461, 8192)), 8192, None),
+            None
+        );
+        assert_eq!(
+            ImageViewer::solo_image_lod_refresh_target_side(Some((1365, 2048)), 8192, Some(8192)),
+            None
+        );
     }
 
     #[test]
