@@ -3297,6 +3297,10 @@ impl ImageViewer {
         self.config.sync_disk_file_with_template();
     }
 
+    fn should_short_circuit_frame_for_exit(&self) -> bool {
+        self.should_exit
+    }
+
     fn masonry_authoritative_dimension_lock_active(&self) -> bool {
         self.is_masonry_mode()
             && self.masonry_authoritative_dimension_signature != 0
@@ -28392,10 +28396,24 @@ impl ImageViewer {
     }
 }
 
+impl Drop for ImageViewer {
+    fn drop(&mut self) {
+        if self.pending_idle_config_sync {
+            self.pending_idle_config_sync = false;
+            self.config.sync_disk_file_with_template();
+        }
+    }
+}
+
 impl eframe::App for ImageViewer {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Reset per-frame repaint tracking
         self.needs_repaint = false;
+
+        if self.should_short_circuit_frame_for_exit() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
 
         // ============ SINGLE INSTANCE: CHECK FOR INCOMING FILES ============
         // Check if another instance sent us a file path to open
@@ -28521,6 +28539,10 @@ impl eframe::App for ImageViewer {
                 self.should_exit = true;
             }
         }
+        if self.should_short_circuit_frame_for_exit() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
 
         // Input can switch media, which updates the title.
         self.apply_pending_window_title(ctx);
@@ -28619,11 +28641,8 @@ impl eframe::App for ImageViewer {
 
         // Process viewport commands
         if self.should_exit {
-            if self.pending_idle_config_sync {
-                self.pending_idle_config_sync = false;
-                self.config.sync_disk_file_with_template();
-            }
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
         }
 
         if self.toggle_fullscreen {
@@ -29679,5 +29698,13 @@ mod tests {
             false,
             Some(MediaType::Video)
         ));
+    }
+
+    #[test]
+    fn exit_request_short_circuits_remaining_frame_work() {
+        let mut viewer = ImageViewer::default();
+        viewer.should_exit = true;
+
+        assert!(viewer.should_short_circuit_frame_for_exit());
     }
 }
