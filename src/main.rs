@@ -15782,6 +15782,10 @@ impl ImageViewer {
         )
     }
 
+    fn manga_preview_video_controls_visible_for_layout(layout_mode: MangaLayoutMode) -> bool {
+        !Self::layout_mode_is_grid(layout_mode)
+    }
+
     fn layout_mode_uses_metadata_cache(layout_mode: MangaLayoutMode) -> bool {
         layout_mode != MangaLayoutMode::Gallery
     }
@@ -26956,6 +26960,10 @@ impl ImageViewer {
             return;
         }
 
+        if !Self::manga_preview_video_controls_visible_for_layout(self.manga_layout_mode) {
+            return;
+        }
+
         if !self.show_video_controls {
             return;
         }
@@ -29943,6 +29951,21 @@ mod tests {
         assert_eq!(
             ImageViewer::solo_image_texture_ready_depths(SoloPreloadMomentum::Backward, 3),
             (3, 3)
+        );
+    }
+
+    #[test]
+    fn manga_preview_video_controls_are_hidden_for_grid_layouts() {
+        assert!(
+            !ImageViewer::manga_preview_video_controls_visible_for_layout(MangaLayoutMode::Masonry)
+        );
+        assert!(
+            !ImageViewer::manga_preview_video_controls_visible_for_layout(MangaLayoutMode::Gallery)
+        );
+        assert!(
+            ImageViewer::manga_preview_video_controls_visible_for_layout(
+                MangaLayoutMode::LongStrip
+            )
         );
     }
 
