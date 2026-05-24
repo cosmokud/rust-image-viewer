@@ -495,6 +495,8 @@ pub struct Config {
     pub marked_file_border_rgb: [u8; 3],
     /// Reset image to center and fit-to-screen when switching between floating and fullscreen.
     pub fullscreen_reset_fit_on_mode_switch: bool,
+    /// Reset long-strip zoom/scroll when returning from solo fullscreen.
+    pub manga_long_strip_reset_fit_on_fullscreen_exit: bool,
     /// On Windows, use native maximize/restore-down animation for fullscreen transitions.
     pub fullscreen_native_window_transition: bool,
     /// When true, title-bar maximize actions use borderless fullscreen instead of a separate
@@ -731,7 +733,8 @@ impl Config {
             resize_border_size: 6.0,
             background_rgb: [0, 0, 0],
             marked_file_border_rgb: [94, 214, 255],
-            fullscreen_reset_fit_on_mode_switch: false,
+            fullscreen_reset_fit_on_mode_switch: true,
+            manga_long_strip_reset_fit_on_fullscreen_exit: true,
             fullscreen_native_window_transition: true,
             maximize_to_borderless_fullscreen: true,
             confirm_delete_to_recycle_bin: true,
@@ -1388,6 +1391,11 @@ impl Config {
                         "fullscreen_reset_fit_on_mode_switch" => {
                             if let Some(v) = parse_bool(value) {
                                 config.fullscreen_reset_fit_on_mode_switch = v;
+                            }
+                        }
+                        "manga_long_strip_reset_fit_on_fullscreen_exit" => {
+                            if let Some(v) = parse_bool(value) {
+                                config.manga_long_strip_reset_fit_on_fullscreen_exit = v;
                             }
                         }
                         "fullscreen_native_window_transition"
@@ -2083,6 +2091,10 @@ impl Config {
             bool_to_ini(self.fullscreen_reset_fit_on_mode_switch).to_string(),
         );
         values.insert(
+            "manga_long_strip_reset_fit_on_fullscreen_exit",
+            bool_to_ini(self.manga_long_strip_reset_fit_on_fullscreen_exit).to_string(),
+        );
+        values.insert(
             "fullscreen_native_window_transition",
             bool_to_ini(self.fullscreen_native_window_transition).to_string(),
         );
@@ -2775,17 +2787,36 @@ mod tests {
     use super::{default_config_ini, Config};
 
     #[test]
-    fn fullscreen_reset_fit_on_mode_switch_defaults_false() {
+    fn fullscreen_reset_fit_on_mode_switch_defaults_true() {
         let config = Config::default();
 
-        assert!(!config.fullscreen_reset_fit_on_mode_switch);
-        assert!(default_config_ini().contains("fullscreen_reset_fit_on_mode_switch = false"));
+        assert!(config.fullscreen_reset_fit_on_mode_switch);
+        assert!(default_config_ini().contains("fullscreen_reset_fit_on_mode_switch = true"));
     }
 
     #[test]
-    fn fullscreen_reset_fit_on_mode_switch_parses_true() {
-        let config = Config::parse_ini("[settings]\nfullscreen_reset_fit_on_mode_switch = true\n");
+    fn fullscreen_reset_fit_on_mode_switch_parses_false() {
+        let config = Config::parse_ini("[settings]\nfullscreen_reset_fit_on_mode_switch = false\n");
 
-        assert!(config.fullscreen_reset_fit_on_mode_switch);
+        assert!(!config.fullscreen_reset_fit_on_mode_switch);
+    }
+
+    #[test]
+    fn manga_long_strip_reset_fit_on_fullscreen_exit_defaults_true() {
+        let config = Config::default();
+
+        assert!(config.manga_long_strip_reset_fit_on_fullscreen_exit);
+        assert!(
+            default_config_ini().contains("manga_long_strip_reset_fit_on_fullscreen_exit = true")
+        );
+    }
+
+    #[test]
+    fn manga_long_strip_reset_fit_on_fullscreen_exit_parses_false() {
+        let config = Config::parse_ini(
+            "[settings]\nmanga_long_strip_reset_fit_on_fullscreen_exit = false\n",
+        );
+
+        assert!(!config.manga_long_strip_reset_fit_on_fullscreen_exit);
     }
 }

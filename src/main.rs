@@ -14859,6 +14859,52 @@ impl ImageViewer {
         self.is_fullscreen && !self.manga_mode && !self.config.fullscreen_reset_fit_on_mode_switch
     }
 
+    fn should_reset_long_strip_on_fullscreen_return(&self) -> bool {
+        self.is_fullscreen
+            && !self.manga_mode
+            && self.manga_layout_mode == MangaLayoutMode::LongStrip
+            && self.config.manga_long_strip_reset_fit_on_fullscreen_exit
+    }
+
+    fn long_strip_fit_zoom_for_media_height(&self, img_h: f32) -> Option<f32> {
+        if img_h <= 0.0 {
+            return None;
+        }
+
+        let screen_h = self.screen_size.y.max(1.0);
+        let base_scale = if img_h > screen_h {
+            screen_h / img_h
+        } else {
+            1.0
+        };
+        let desired_total_scale = screen_h / img_h;
+        Some(self.clamp_zoom(desired_total_scale / base_scale))
+    }
+
+    fn reset_long_strip_view_to_current_media(&mut self) {
+        if let Some((_w, h)) = self.media_display_dimensions() {
+            if let Some(new_zoom) = self.long_strip_fit_zoom_for_media_height(h as f32) {
+                self.zoom = new_zoom;
+                self.zoom_target = new_zoom;
+                self.zoom_velocity = 0.0;
+            }
+        }
+
+        self.offset = egui::Vec2::ZERO;
+        let target_index = self
+            .current_index
+            .min(self.image_list.len().saturating_sub(1));
+        self.set_current_index_clamped(target_index);
+        let max_scroll = (self.manga_total_height() - self.screen_size.y).max(0.0);
+        let scroll_to = self
+            .manga_get_scroll_offset_for_index(target_index)
+            .clamp(0.0, max_scroll);
+        self.manga_scroll_offset = scroll_to;
+        self.manga_scroll_target = scroll_to;
+        self.manga_scroll_velocity = 0.0;
+        self.stop_manga_wheel_scroll();
+    }
+
     /// Restore the saved view state for a given image path (fullscreen only).
     /// Returns true if state was restored, false if no saved state exists.
     fn restore_fullscreen_view_state(&mut self, path: &PathBuf) -> bool {
@@ -16065,6 +16111,7 @@ impl ImageViewer {
         if Self::layout_mode_is_grid(layout_mode) {
             self.mark_masonry_runtime_cache_resident();
         }
+        let reset_long_strip_on_return = self.should_reset_long_strip_on_fullscreen_return();
 
         if reuse_masonry_cache || preserve_resident_masonry_cache || reuse_strip_cache {
             self.enter_manga_mode_from_preserved_strip_cache();
@@ -16075,7 +16122,12 @@ impl ImageViewer {
             self.toggle_manga_mode();
         }
 
-        if let Some(state) = restore_masonry_state {
+        if reset_long_strip_on_return && self.manga_mode {
+            self.reset_long_strip_view_to_current_media();
+            self.manga_update_current_index();
+            self.manga_update_preload_queue();
+            self.pending_masonry_solo_reentry = None;
+        } else if let Some(state) = restore_masonry_state {
             if self.is_masonry_mode() {
                 self.zoom = self.clamp_zoom(state.zoom);
                 self.zoom_target = self.clamp_zoom(state.zoom_target);
@@ -29820,7 +29872,7 @@ fn build_fallback_icon() -> egui::IconData {
 
 #[cfg(test)]
 mod tests {
-    use super::{ImageFrame, ImageViewer, MediaType, SoloPreloadMomentum};
+    use super::{ImageFrame, ImageViewer, MangaLayoutMode, MediaType, SoloPreloadMomentum};
 
     #[test]
     fn startup_window_without_file_is_500x500_and_visible() {
@@ -30011,6 +30063,7 @@ mod tests {
     #[test]
     fn floating_fullscreen_entry_preserves_zoom_and_pan() {
         let mut viewer = ImageViewer::default();
+        viewer.config.fullscreen_reset_fit_on_mode_switch = false;
         viewer.zoom = 2.5;
         viewer.zoom_target = 2.75;
         viewer.offset = egui::vec2(120.0, -80.0);
@@ -30064,18 +30117,53 @@ mod tests {
     }
 
     #[test]
-    fn fullscreen_floating_exit_preserves_view_state_by_default() {
+    fn fullscreen_floating_exit_reset_fit_setting_controls_preservation() {
         let mut viewer = ImageViewer::default();
         viewer.is_fullscreen = true;
 
-        assert!(viewer.should_preserve_fullscreen_floating_view_state());
-
-        viewer.config.fullscreen_reset_fit_on_mode_switch = true;
         assert!(!viewer.should_preserve_fullscreen_floating_view_state());
 
         viewer.config.fullscreen_reset_fit_on_mode_switch = false;
+        assert!(viewer.should_preserve_fullscreen_floating_view_state());
+
         viewer.manga_mode = true;
         assert!(!viewer.should_preserve_fullscreen_floating_view_state());
+    }
+
+    #[test]
+    fn long_strip_fullscreen_return_reset_fit_setting_defaults_on() {
+        let mut viewer = ImageViewer::default();
+        viewer.is_fullscreen = true;
+        viewer.manga_layout_mode = MangaLayoutMode::LongStrip;
+
+        assert!(viewer.should_reset_long_strip_on_fullscreen_return());
+
+        viewer.config.manga_long_strip_reset_fit_on_fullscreen_exit = false;
+        assert!(!viewer.should_reset_long_strip_on_fullscreen_return());
+
+        viewer.config.manga_long_strip_reset_fit_on_fullscreen_exit = true;
+        viewer.manga_layout_mode = MangaLayoutMode::Masonry;
+        assert!(!viewer.should_reset_long_strip_on_fullscreen_return());
+
+        viewer.manga_layout_mode = MangaLayoutMode::LongStrip;
+        viewer.manga_mode = true;
+        assert!(!viewer.should_reset_long_strip_on_fullscreen_return());
+    }
+
+    #[test]
+    fn long_strip_fit_zoom_matches_normal_entry_fit() {
+        let mut viewer = ImageViewer::default();
+        viewer.screen_size = egui::vec2(1000.0, 1000.0);
+
+        assert_eq!(
+            viewer.long_strip_fit_zoom_for_media_height(2000.0),
+            Some(1.0)
+        );
+        assert_eq!(
+            viewer.long_strip_fit_zoom_for_media_height(500.0),
+            Some(2.0)
+        );
+        assert_eq!(viewer.long_strip_fit_zoom_for_media_height(0.0), None);
     }
 
     #[test]

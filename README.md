@@ -351,7 +351,8 @@ Delete `config.ini` if you want to regenerate it from the current defaults.
 | `background_r`                        | `0`        | Alternative per-channel background override.                                                                                   |
 | `background_g`                        | `0`        | Alternative per-channel background override.                                                                                   |
 | `background_b`                        | `0`        | Alternative per-channel background override.                                                                                   |
-| `fullscreen_reset_fit_on_mode_switch` | `false`    | Reset and fit media when switching between floating and fullscreen. `false` preserves zoom/pan.                                |
+| `fullscreen_reset_fit_on_mode_switch` | `true`     | Reset and fit media when switching between floating and fullscreen. `false` preserves zoom/pan.                                |
+| `manga_long_strip_reset_fit_on_fullscreen_exit` | `true` | Reset and fit long-strip view when returning from solo fullscreen. `false` keeps fullscreen zoom/pan.                         |
 | `fullscreen_native_window_transition` | `true`     | Use Windows maximize / restore animations during fullscreen transitions.                                                       |
 | `maximize_to_borderless_fullscreen`   | `true`     | Make the title-bar maximize action enter borderless fullscreen instead of a separate maximized floating state.                 |
 | `auto_unmark_after_paste`             | `true`     | Clear current marked-file selection after a successful paste operation.                                                        |
