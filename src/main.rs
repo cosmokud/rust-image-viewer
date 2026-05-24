@@ -1071,6 +1071,13 @@ impl Default for FullscreenViewState {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct FloatingFullscreenViewState {
+    zoom: f32,
+    zoom_target: f32,
+    offset: egui::Vec2,
+}
+
 #[derive(Clone)]
 struct ModeSwitchPlaceholder {
     texture: egui::TextureHandle,
@@ -2305,6 +2312,8 @@ struct ImageViewer {
     pending_window_resize: Option<(egui::Vec2, egui::Pos2, u8)>,
     /// Apply fullscreen layout once a native maximize request has landed.
     pending_fullscreen_layout: bool,
+    /// Floating zoom/pan captured for the next fullscreen entry layout.
+    pending_floating_fullscreen_view_state: Option<FloatingFullscreenViewState>,
     /// Apply a fit-to-window layout once a native maximize request has landed.
     pending_maximized_layout: bool,
 
@@ -2919,6 +2928,7 @@ impl Default for ImageViewer {
             image_rotated: false,
             pending_window_resize: None,
             pending_fullscreen_layout: false,
+            pending_floating_fullscreen_view_state: None,
             pending_maximized_layout: false,
             fullscreen_view_states: HashMap::new(),
             current_fullscreen_view_has_memory: false,
@@ -14810,6 +14820,40 @@ impl ImageViewer {
         self.fullscreen_view_states.remove(&path);
     }
 
+    fn capture_floating_fullscreen_view_state(
+        &mut self,
+        entering_fullscreen: bool,
+        entering_titlebar_strip: bool,
+    ) {
+        if entering_fullscreen
+            && !self.is_fullscreen
+            && !self.manga_mode
+            && !entering_titlebar_strip
+        {
+            self.pending_floating_fullscreen_view_state = Some(FloatingFullscreenViewState {
+                zoom: self.zoom,
+                zoom_target: self.zoom_target,
+                offset: self.offset,
+            });
+        } else {
+            self.pending_floating_fullscreen_view_state = None;
+        }
+    }
+
+    fn apply_pending_floating_fullscreen_view_state(&mut self) -> bool {
+        let Some(state) = self.pending_floating_fullscreen_view_state.take() else {
+            return false;
+        };
+
+        self.zoom = state.zoom;
+        self.zoom_target = state.zoom_target;
+        self.zoom_velocity = 0.0;
+        self.offset = state.offset;
+        self.current_fullscreen_view_has_memory = true;
+        self.reset_precise_rotation();
+        true
+    }
+
     /// Restore the saved view state for a given image path (fullscreen only).
     /// Returns true if state was restored, false if no saved state exists.
     fn restore_fullscreen_view_state(&mut self, path: &PathBuf) -> bool {
@@ -15490,6 +15534,10 @@ impl ImageViewer {
         // Strip or masonry quick-open into solo fullscreen is intentionally different: it should
         // start from a fresh fit-to-screen layout instead of restoring a prior zoom or pan.
         if !force_fit {
+            if self.apply_pending_floating_fullscreen_view_state() {
+                return;
+            }
+
             if let Some(path) = current_path.as_ref() {
                 if self.restore_fullscreen_view_state(path) {
                     // State was restored, don't apply default layout
@@ -28863,6 +28911,10 @@ impl eframe::App for ImageViewer {
             {
                 self.return_to_strip_mode_from_fullscreen_toggle();
             } else {
+                self.capture_floating_fullscreen_view_state(
+                    entering_fullscreen,
+                    entering_titlebar_strip,
+                );
                 self.is_fullscreen = entering_fullscreen;
 
                 if entering_fullscreen {
@@ -28888,7 +28940,7 @@ impl eframe::App for ImageViewer {
                         self.pending_fullscreen_layout = false;
 
                         if !entering_titlebar_strip {
-                            // Requirement: when moving from floating -> fullscreen, always fit vertically and center.
+                            // Floating -> fullscreen preserves zoom/pan; other fullscreen entries keep existing layout rules.
                             self.apply_fullscreen_layout_for_current_image(ctx);
                         }
 
@@ -29943,6 +29995,48 @@ mod tests {
             false,
             Some(MediaType::Video)
         ));
+    }
+
+    #[test]
+    fn floating_fullscreen_entry_preserves_zoom_and_pan() {
+        let mut viewer = ImageViewer::default();
+        viewer.zoom = 2.5;
+        viewer.zoom_target = 2.75;
+        viewer.offset = egui::vec2(120.0, -80.0);
+
+        viewer.capture_floating_fullscreen_view_state(true, false);
+
+        viewer.zoom = 1.0;
+        viewer.zoom_target = 1.0;
+        viewer.offset = egui::Vec2::ZERO;
+
+        assert!(viewer.apply_pending_floating_fullscreen_view_state());
+        assert_eq!(viewer.zoom, 2.5);
+        assert_eq!(viewer.zoom_target, 2.75);
+        assert_eq!(viewer.offset, egui::vec2(120.0, -80.0));
+    }
+
+    #[test]
+    fn floating_fullscreen_entry_capture_ignores_non_floating_modes() {
+        let mut viewer = ImageViewer::default();
+        viewer.zoom = 2.5;
+        viewer.zoom_target = 2.75;
+        viewer.offset = egui::vec2(120.0, -80.0);
+        viewer.manga_mode = true;
+
+        viewer.capture_floating_fullscreen_view_state(true, false);
+
+        assert!(!viewer.apply_pending_floating_fullscreen_view_state());
+
+        viewer.manga_mode = false;
+        viewer.capture_floating_fullscreen_view_state(true, true);
+
+        assert!(!viewer.apply_pending_floating_fullscreen_view_state());
+
+        viewer.is_fullscreen = true;
+        viewer.capture_floating_fullscreen_view_state(true, false);
+
+        assert!(!viewer.apply_pending_floating_fullscreen_view_state());
     }
 
     #[test]
