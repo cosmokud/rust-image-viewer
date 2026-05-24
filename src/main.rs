@@ -6198,10 +6198,10 @@ impl ImageViewer {
     }
 
     fn retain_visible_media_placeholder_for_swap(
-        is_fullscreen: bool,
+        _is_fullscreen: bool,
         target_media_type: Option<MediaType>,
     ) -> bool {
-        is_fullscreen || matches!(target_media_type, Some(MediaType::Video))
+        matches!(target_media_type, Some(MediaType::Video))
     }
 
     fn capture_current_media_placeholder(
@@ -29805,12 +29805,12 @@ mod tests {
     }
 
     #[test]
-    fn floating_image_navigation_does_not_retain_previous_texture_placeholder() {
+    fn image_navigation_does_not_retain_previous_texture_placeholder() {
         assert!(!ImageViewer::retain_visible_media_placeholder_for_swap(
             false,
             Some(MediaType::Image)
         ));
-        assert!(ImageViewer::retain_visible_media_placeholder_for_swap(
+        assert!(!ImageViewer::retain_visible_media_placeholder_for_swap(
             true,
             Some(MediaType::Image)
         ));
