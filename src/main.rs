@@ -3298,8 +3298,16 @@ impl ImageViewer {
         self.config.sync_disk_file_with_template();
     }
 
-    fn should_short_circuit_frame_for_exit(&self) -> bool {
+    fn should_short_circuit_frame_for_exit(&self, viewport_close_requested: bool) -> bool {
         self.should_exit
+            || (viewport_close_requested
+                && !self.pending_exit_confirmation
+                && !self.has_marked_files())
+    }
+
+    fn send_fast_close_viewport_commands(ctx: &egui::Context) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
 
     fn masonry_authoritative_dimension_lock_active(&self) -> bool {
@@ -11543,7 +11551,7 @@ impl ImageViewer {
             self.pending_exit_confirmation = false;
             self.clear_all_marks();
             self.should_exit = true;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            Self::send_fast_close_viewport_commands(ctx);
         }
     }
 
@@ -28500,8 +28508,19 @@ impl eframe::App for ImageViewer {
         // Reset per-frame repaint tracking
         self.needs_repaint = false;
 
-        if self.should_short_circuit_frame_for_exit() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        let viewport_close_requested = ctx.input(|input| input.viewport().close_requested());
+        if viewport_close_requested {
+            if self.pending_exit_confirmation || self.has_marked_files() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                if !self.pending_exit_confirmation {
+                    self.request_app_exit();
+                }
+            } else {
+                self.should_exit = true;
+            }
+        }
+        if self.should_short_circuit_frame_for_exit(viewport_close_requested) {
+            Self::send_fast_close_viewport_commands(ctx);
             return;
         }
 
@@ -28618,19 +28637,8 @@ impl eframe::App for ImageViewer {
             self.handle_input(ctx);
         }
 
-        let viewport_close_requested = ctx.input(|input| input.viewport().close_requested());
-        if viewport_close_requested {
-            if self.pending_exit_confirmation || self.has_marked_files() {
-                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                if !self.pending_exit_confirmation {
-                    self.request_app_exit();
-                }
-            } else {
-                self.should_exit = true;
-            }
-        }
-        if self.should_short_circuit_frame_for_exit() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        if self.should_short_circuit_frame_for_exit(false) {
+            Self::send_fast_close_viewport_commands(ctx);
             return;
         }
 
@@ -28731,7 +28739,7 @@ impl eframe::App for ImageViewer {
 
         // Process viewport commands
         if self.should_exit {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            Self::send_fast_close_viewport_commands(ctx);
             return;
         }
 
@@ -29811,6 +29819,13 @@ mod tests {
         let mut viewer = ImageViewer::default();
         viewer.should_exit = true;
 
-        assert!(viewer.should_short_circuit_frame_for_exit());
+        assert!(viewer.should_short_circuit_frame_for_exit(false));
+    }
+
+    #[test]
+    fn native_close_request_without_marks_short_circuits_remaining_frame_work() {
+        let viewer = ImageViewer::default();
+
+        assert!(viewer.should_short_circuit_frame_for_exit(true));
     }
 }
