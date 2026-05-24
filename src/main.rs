@@ -1090,6 +1090,7 @@ struct PendingMediaLoad {
     path: PathBuf,
     kind: PendingMediaLoadKind,
     max_texture_side: Option<u32>,
+    preserve_view_on_complete: bool,
     started_at: Instant,
 }
 
@@ -6459,6 +6460,7 @@ impl ImageViewer {
         path: &PathBuf,
         max_texture_side: u32,
         gif_filter: FilterType,
+        preserve_view_on_complete: bool,
     ) -> bool {
         let key = decoded_image_cache_key(path, max_texture_side);
 
@@ -6501,7 +6503,9 @@ impl ImageViewer {
         self.perf_metrics
             .increment_counter("decoded_image_cache_hit", 1);
 
-        self.consume_deferred_media_view_reset();
+        if !preserve_view_on_complete {
+            self.consume_deferred_media_view_reset();
+        }
         let cached_texture = if cached.is_animated_webp {
             None
         } else {
@@ -6529,8 +6533,11 @@ impl ImageViewer {
                     .increment_counter("solo_image_texture_cache_miss", 1);
             }
         }
-        self.image_changed = true;
-        self.pending_media_layout = false;
+        self.image_changed =
+            Self::solo_image_load_completion_should_apply_layout(preserve_view_on_complete);
+        if !preserve_view_on_complete {
+            self.pending_media_layout = false;
+        }
         self.error_message = None;
 
         if cached.is_animated_webp {
@@ -6841,6 +6848,10 @@ impl ImageViewer {
         Some(self.solo_quantize_target_texture_side(target, Some(source_dims)))
     }
 
+    fn solo_image_load_completion_should_apply_layout(preserve_view_on_complete: bool) -> bool {
+        !preserve_view_on_complete
+    }
+
     fn solo_image_load_texture_side(target_lod_side: u32, max_texture_side: u32) -> u32 {
         let max_texture_side = max_texture_side.max(1);
         if target_lod_side > 0 {
@@ -6918,7 +6929,13 @@ impl ImageViewer {
 
         let downscale_filter = self.config.downscale_filter.to_image_filter();
         let gif_filter = self.config.gif_resize_filter.to_image_filter();
-        if self.try_load_image_from_decoded_cache(&path, refresh_side, gif_filter) {
+        let preserve_view_on_complete = !self.is_fullscreen;
+        if self.try_load_image_from_decoded_cache(
+            &path,
+            refresh_side,
+            gif_filter,
+            preserve_view_on_complete,
+        ) {
             if self.pending_media_load.as_ref().is_some_and(|pending| {
                 pending.kind == PendingMediaLoadKind::Image
                     && pending.path == path
@@ -6932,7 +6949,13 @@ impl ImageViewer {
             return;
         }
 
-        self.start_async_image_load(path, refresh_side, downscale_filter, gif_filter);
+        self.start_async_image_load_with_view_policy(
+            path,
+            refresh_side,
+            downscale_filter,
+            gif_filter,
+            preserve_view_on_complete,
+        );
     }
 
     fn solo_visible_item_equivalent_for_path(
@@ -7324,6 +7347,7 @@ impl ImageViewer {
                             &path,
                             max_texture_side,
                             gif_filter,
+                            false,
                         ) {
                             if self.pending_media_load.as_ref().is_some_and(|pending| {
                                 pending.kind == PendingMediaLoadKind::Image && pending.path == path
@@ -14135,6 +14159,23 @@ impl ImageViewer {
         downscale_filter: FilterType,
         gif_filter: FilterType,
     ) {
+        self.start_async_image_load_with_view_policy(
+            path,
+            max_texture_side,
+            downscale_filter,
+            gif_filter,
+            false,
+        );
+    }
+
+    fn start_async_image_load_with_view_policy(
+        &mut self,
+        path: PathBuf,
+        max_texture_side: u32,
+        downscale_filter: FilterType,
+        gif_filter: FilterType,
+        preserve_view_on_complete: bool,
+    ) {
         let request_id = self.next_media_load_request_id;
         self.next_media_load_request_id = self.next_media_load_request_id.saturating_add(1).max(1);
 
@@ -14143,6 +14184,7 @@ impl ImageViewer {
             path: path.clone(),
             kind: PendingMediaLoadKind::Image,
             max_texture_side: Some(max_texture_side),
+            preserve_view_on_complete,
             started_at: Instant::now(),
         });
 
@@ -14221,6 +14263,7 @@ impl ImageViewer {
             path: path.clone(),
             kind: PendingMediaLoadKind::Video,
             max_texture_side: output_bounds.map(|(width, height)| width.max(height)),
+            preserve_view_on_complete: false,
             started_at: Instant::now(),
         });
 
@@ -14301,7 +14344,9 @@ impl ImageViewer {
             match result {
                 MediaLoadResult::Image { path, result, .. } => match result {
                     Ok(loaded) => {
-                        self.consume_deferred_media_view_reset();
+                        if !pending.preserve_view_on_complete {
+                            self.consume_deferred_media_view_reset();
+                        }
                         self.retained_media_placeholder_visible = false;
                         let (display_w, display_h) = loaded.image.display_dimensions();
                         if display_w > 0 && display_h > 0 {
@@ -14321,8 +14366,12 @@ impl ImageViewer {
                         );
                         self.clear_current_image_texture_upload();
                         self.image = Some(loaded.image);
-                        self.image_changed = true;
-                        self.pending_media_layout = false;
+                        self.image_changed = Self::solo_image_load_completion_should_apply_layout(
+                            pending.preserve_view_on_complete,
+                        );
+                        if !pending.preserve_view_on_complete {
+                            self.pending_media_layout = false;
+                        }
                         self.error_message = None;
                         self.clear_video_playback_unavailable_state();
                         if !self.defer_directory_work_for_fast_startup() {
@@ -14676,7 +14725,7 @@ impl ImageViewer {
                 let max_tex =
                     Self::solo_image_load_texture_side(target_lod_side, self.max_texture_side);
 
-                if self.try_load_image_from_decoded_cache(path, max_tex, gif_filter) {
+                if self.try_load_image_from_decoded_cache(path, max_tex, gif_filter, false) {
                     if !defer_directory_work_for_fast_startup {
                         self.schedule_solo_probe_window(path, media_type);
                     }
@@ -29797,6 +29846,14 @@ mod tests {
             ImageViewer::floating_solo_lod_display_size_for_zoom((8000, 12000), 0.09, 4.0),
             egui::vec2(32000.0, 48000.0)
         );
+    }
+
+    #[test]
+    fn solo_lod_refresh_completion_does_not_request_layout_when_preserving_view() {
+        assert!(!ImageViewer::solo_image_load_completion_should_apply_layout(true));
+        assert!(ImageViewer::solo_image_load_completion_should_apply_layout(
+            false
+        ));
     }
 
     #[test]
