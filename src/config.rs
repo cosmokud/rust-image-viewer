@@ -493,8 +493,8 @@ pub struct Config {
     pub background_rgb: [u8; 3],
     /// Border color for marked items as RGB (0-255)
     pub marked_file_border_rgb: [u8; 3],
-    /// When entering fullscreen, reset image to center and fit-to-screen.
-    pub fullscreen_reset_fit_on_enter: bool,
+    /// Reset image to center and fit-to-screen when switching between floating and fullscreen.
+    pub fullscreen_reset_fit_on_mode_switch: bool,
     /// On Windows, use native maximize/restore-down animation for fullscreen transitions.
     pub fullscreen_native_window_transition: bool,
     /// When true, title-bar maximize actions use borderless fullscreen instead of a separate
@@ -731,7 +731,7 @@ impl Config {
             resize_border_size: 6.0,
             background_rgb: [0, 0, 0],
             marked_file_border_rgb: [94, 214, 255],
-            fullscreen_reset_fit_on_enter: true,
+            fullscreen_reset_fit_on_mode_switch: false,
             fullscreen_native_window_transition: true,
             maximize_to_borderless_fullscreen: true,
             confirm_delete_to_recycle_bin: true,
@@ -1385,9 +1385,9 @@ impl Config {
                                 config.marked_file_border_rgb[2] = v;
                             }
                         }
-                        "fullscreen_reset_fit_on_enter" => {
+                        "fullscreen_reset_fit_on_mode_switch" => {
                             if let Some(v) = parse_bool(value) {
-                                config.fullscreen_reset_fit_on_enter = v;
+                                config.fullscreen_reset_fit_on_mode_switch = v;
                             }
                         }
                         "fullscreen_native_window_transition"
@@ -2079,8 +2079,8 @@ impl Config {
             format!("{}", self.marked_file_border_rgb[2]),
         );
         values.insert(
-            "fullscreen_reset_fit_on_enter",
-            bool_to_ini(self.fullscreen_reset_fit_on_enter).to_string(),
+            "fullscreen_reset_fit_on_mode_switch",
+            bool_to_ini(self.fullscreen_reset_fit_on_mode_switch).to_string(),
         );
         values.insert(
             "fullscreen_native_window_transition",
@@ -2768,4 +2768,24 @@ fn parse_u8_clamped(value: &str) -> Option<u8> {
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{default_config_ini, Config};
+
+    #[test]
+    fn fullscreen_reset_fit_on_mode_switch_defaults_false() {
+        let config = Config::default();
+
+        assert!(!config.fullscreen_reset_fit_on_mode_switch);
+        assert!(default_config_ini().contains("fullscreen_reset_fit_on_mode_switch = false"));
+    }
+
+    #[test]
+    fn fullscreen_reset_fit_on_mode_switch_parses_true() {
+        let config = Config::parse_ini("[settings]\nfullscreen_reset_fit_on_mode_switch = true\n");
+
+        assert!(config.fullscreen_reset_fit_on_mode_switch);
+    }
 }

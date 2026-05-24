@@ -14829,6 +14829,7 @@ impl ImageViewer {
             && !self.is_fullscreen
             && !self.manga_mode
             && !entering_titlebar_strip
+            && !self.config.fullscreen_reset_fit_on_mode_switch
         {
             self.pending_floating_fullscreen_view_state = Some(FloatingFullscreenViewState {
                 zoom: self.zoom,
@@ -14852,6 +14853,10 @@ impl ImageViewer {
         self.current_fullscreen_view_has_memory = true;
         self.reset_precise_rotation();
         true
+    }
+
+    fn should_preserve_fullscreen_floating_view_state(&self) -> bool {
+        self.is_fullscreen && !self.manga_mode && !self.config.fullscreen_reset_fit_on_mode_switch
     }
 
     /// Restore the saved view state for a given image path (fullscreen only).
@@ -28911,6 +28916,8 @@ impl eframe::App for ImageViewer {
             {
                 self.return_to_strip_mode_from_fullscreen_toggle();
             } else {
+                let preserve_fullscreen_floating_view_state =
+                    !entering_fullscreen && self.should_preserve_fullscreen_floating_view_state();
                 self.capture_floating_fullscreen_view_state(
                     entering_fullscreen,
                     entering_titlebar_strip,
@@ -29014,18 +29021,22 @@ impl eframe::App for ImageViewer {
                     self.saved_fullscreen_entry_index = None;
                     self.pending_window_resize = None;
                     self.pending_maximized_layout = false;
-                    self.force_floating_layout_once = true;
+                    self.force_floating_layout_once = !preserve_fullscreen_floating_view_state;
 
                     if use_native_transition && window_was_maximized {
-                        self.pending_media_layout = true;
+                        self.pending_media_layout = !preserve_fullscreen_floating_view_state;
                         self.request_native_maximize = Some(false);
                     } else if self.media_display_dimensions().is_some() {
-                        self.apply_floating_layout_for_current_image(ctx);
+                        if preserve_fullscreen_floating_view_state {
+                            self.request_floating_autosize(ctx);
+                        } else {
+                            self.apply_floating_layout_for_current_image(ctx);
+                        }
                         self.force_floating_layout_once = false;
                         self.pending_media_layout = false;
                     } else {
-                        self.pending_media_layout =
-                            matches!(self.current_media_type, Some(MediaType::Video));
+                        self.pending_media_layout = !preserve_fullscreen_floating_view_state
+                            && matches!(self.current_media_type, Some(MediaType::Video));
                     }
                 }
             }
@@ -30037,6 +30048,34 @@ mod tests {
         viewer.capture_floating_fullscreen_view_state(true, false);
 
         assert!(!viewer.apply_pending_floating_fullscreen_view_state());
+    }
+
+    #[test]
+    fn floating_fullscreen_entry_reset_fit_setting_skips_capture() {
+        let mut viewer = ImageViewer::default();
+        viewer.zoom = 2.5;
+        viewer.zoom_target = 2.75;
+        viewer.offset = egui::vec2(120.0, -80.0);
+        viewer.config.fullscreen_reset_fit_on_mode_switch = true;
+
+        viewer.capture_floating_fullscreen_view_state(true, false);
+
+        assert!(!viewer.apply_pending_floating_fullscreen_view_state());
+    }
+
+    #[test]
+    fn fullscreen_floating_exit_preserves_view_state_by_default() {
+        let mut viewer = ImageViewer::default();
+        viewer.is_fullscreen = true;
+
+        assert!(viewer.should_preserve_fullscreen_floating_view_state());
+
+        viewer.config.fullscreen_reset_fit_on_mode_switch = true;
+        assert!(!viewer.should_preserve_fullscreen_floating_view_state());
+
+        viewer.config.fullscreen_reset_fit_on_mode_switch = false;
+        viewer.manga_mode = true;
+        assert!(!viewer.should_preserve_fullscreen_floating_view_state());
     }
 
     #[test]
