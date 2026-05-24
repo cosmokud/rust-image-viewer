@@ -6817,6 +6817,30 @@ impl ImageViewer {
         self.solo_quantize_target_texture_side(target, source_dims)
     }
 
+    fn floating_solo_lod_display_size_for_zoom(
+        source_dims: (u32, u32),
+        zoom: f32,
+        zoom_target: f32,
+    ) -> egui::Vec2 {
+        let scale = zoom.max(zoom_target).max(0.0001);
+        egui::vec2(
+            (source_dims.0 as f32 * scale).max(1.0),
+            (source_dims.1 as f32 * scale).max(1.0),
+        )
+    }
+
+    fn floating_solo_target_texture_side_for_current_zoom(&self, path: &PathBuf) -> Option<u32> {
+        let source_dims = self
+            .solo_known_media_dimensions(path, MediaType::Image, true)
+            .or_else(|| self.image.as_ref().map(|img| img.display_dimensions()))?;
+        let display_size =
+            Self::floating_solo_lod_display_size_for_zoom(source_dims, self.zoom, self.zoom_target);
+        let target = self
+            .manga_strip_target_texture_side_from_display_side(display_size.x.max(display_size.y));
+
+        Some(self.solo_quantize_target_texture_side(target, Some(source_dims)))
+    }
+
     fn solo_image_load_texture_side(target_lod_side: u32, max_texture_side: u32) -> u32 {
         let max_texture_side = max_texture_side.max(1);
         if target_lod_side > 0 {
@@ -6870,7 +6894,15 @@ impl ImageViewer {
             return;
         }
 
-        let target_side = self.solo_target_texture_side_for_path(&path, MediaType::Image, true);
+        let target_side = if self.is_fullscreen {
+            self.solo_target_texture_side_for_path(&path, MediaType::Image, true)
+        } else {
+            let Some(target_side) = self.floating_solo_target_texture_side_for_current_zoom(&path)
+            else {
+                return;
+            };
+            target_side
+        };
         let pending_target_side = self.pending_media_load.as_ref().and_then(|pending| {
             (pending.kind == PendingMediaLoadKind::Image && pending.path == path)
                 .then_some(pending.max_texture_side)
@@ -29756,6 +29788,14 @@ mod tests {
         assert_eq!(
             ImageViewer::solo_image_lod_refresh_target_side(Some((1365, 2048)), 8192, Some(8192)),
             None
+        );
+    }
+
+    #[test]
+    fn floating_solo_lod_display_size_uses_zoom_target_for_refresh() {
+        assert_eq!(
+            ImageViewer::floating_solo_lod_display_size_for_zoom((8000, 12000), 0.09, 4.0),
+            egui::vec2(32000.0, 48000.0)
         );
     }
 
