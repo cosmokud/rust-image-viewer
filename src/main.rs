@@ -14779,10 +14779,7 @@ impl ImageViewer {
     /// Save the current view state for the current image (fullscreen only).
     /// This allows restoring zoom, pan, and rotation when returning to this image.
     fn save_current_fullscreen_view_state(&mut self) {
-        if !self.is_fullscreen
-            || (!self.config.fullscreen_remember_view_state_in_ram
-                && !self.current_fullscreen_view_has_memory)
-        {
+        if !self.is_fullscreen || !self.config.fullscreen_remember_view_state_in_ram {
             return;
         }
 
@@ -14821,6 +14818,13 @@ impl ImageViewer {
         };
 
         self.fullscreen_view_states.remove(&path);
+    }
+
+    fn clear_fullscreen_view_states_for_exit_if_needed(&mut self) {
+        if !self.config.fullscreen_remember_view_state_in_ram {
+            self.fullscreen_view_states.clear();
+        }
+        self.current_fullscreen_view_has_memory = false;
     }
 
     fn capture_floating_fullscreen_view_state(
@@ -14911,7 +14915,7 @@ impl ImageViewer {
     /// Restore the saved view state for a given image path (fullscreen only).
     /// Returns true if state was restored, false if no saved state exists.
     fn restore_fullscreen_view_state(&mut self, path: &PathBuf) -> bool {
-        if !self.is_fullscreen {
+        if !self.is_fullscreen || !self.config.fullscreen_remember_view_state_in_ram {
             return false;
         }
 
@@ -15585,18 +15589,16 @@ impl ImageViewer {
             .is_some_and(|path| self.strip_open_force_fit_path.as_ref() == Some(path));
 
         // Check if we have a saved view state for this image (fullscreen per-image memory).
-        // Strip or masonry quick-open into solo fullscreen is intentionally different: it should
-        // start from a fresh fit-to-screen layout instead of restoring a prior zoom or pan.
+        if let Some(path) = current_path.as_ref() {
+            if self.restore_fullscreen_view_state(path) {
+                // State was restored, don't apply default layout
+                return;
+            }
+        }
+
         if !force_fit {
             if self.apply_pending_floating_fullscreen_view_state() {
                 return;
-            }
-
-            if let Some(path) = current_path.as_ref() {
-                if self.restore_fullscreen_view_state(path) {
-                    // State was restored, don't apply default layout
-                    return;
-                }
             }
         }
 
@@ -29067,10 +29069,7 @@ impl eframe::App for ImageViewer {
                         }
                     }
 
-                    // Clear the per-image fullscreen view state cache when exiting fullscreen
-                    // (since it's only meant for fullscreen mode comparisons within a session)
-                    self.fullscreen_view_states.clear();
-                    self.current_fullscreen_view_has_memory = false;
+                    self.clear_fullscreen_view_states_for_exit_if_needed();
                     self.reset_precise_rotation();
                     self.strip_open_force_fit_path = None;
                     self.saved_fullscreen_entry_index = None;
@@ -29875,7 +29874,10 @@ fn build_fallback_icon() -> egui::IconData {
 
 #[cfg(test)]
 mod tests {
-    use super::{ImageFrame, ImageViewer, MangaLayoutMode, MediaType, SoloPreloadMomentum};
+    use super::{
+        FullscreenViewState, ImageFrame, ImageViewer, MangaLayoutMode, MediaType,
+        SoloPreloadMomentum,
+    };
 
     #[test]
     fn startup_window_without_file_is_500x500_and_visible() {
@@ -30190,7 +30192,7 @@ mod tests {
     }
 
     #[test]
-    fn fullscreen_remember_view_state_in_ram_false_keeps_selective_save_behavior() {
+    fn fullscreen_remember_view_state_in_ram_false_disables_save() {
         let mut viewer = ImageViewer::default();
         let path = std::path::PathBuf::from("sample.png");
         viewer.image_list = vec![path.clone()];
@@ -30205,7 +30207,7 @@ mod tests {
         viewer.current_fullscreen_view_has_memory = true;
         viewer.save_current_fullscreen_view_state();
 
-        assert!(viewer.fullscreen_view_states.contains_key(&path));
+        assert!(!viewer.fullscreen_view_states.contains_key(&path));
     }
 
     #[test]
@@ -30220,6 +30222,66 @@ mod tests {
         viewer.save_current_fullscreen_view_state();
 
         assert!(!viewer.fullscreen_view_states.contains_key(&path));
+    }
+
+    #[test]
+    fn fullscreen_remember_view_state_in_ram_controls_restore() {
+        let mut viewer = ImageViewer::default();
+        let path = std::path::PathBuf::from("sample.png");
+        viewer.is_fullscreen = true;
+        viewer.config.fullscreen_remember_view_state_in_ram = true;
+        viewer.fullscreen_view_states.insert(
+            path.clone(),
+            FullscreenViewState {
+                zoom: 2.5,
+                zoom_target: 2.75,
+                offset: egui::vec2(120.0, -80.0),
+                precise_rotation_degrees: 0.0,
+                precise_rotation_target_degrees: 0.0,
+                rotation_steps: 0,
+                flip_horizontal: false,
+                flip_vertical: false,
+            },
+        );
+
+        assert!(viewer.restore_fullscreen_view_state(&path));
+        assert_eq!(viewer.zoom, 2.5);
+        assert_eq!(viewer.zoom_target, 2.75);
+        assert_eq!(viewer.offset, egui::vec2(120.0, -80.0));
+
+        viewer.config.fullscreen_remember_view_state_in_ram = false;
+        viewer.zoom = 1.0;
+        viewer.zoom_target = 1.0;
+        viewer.offset = egui::Vec2::ZERO;
+
+        assert!(!viewer.restore_fullscreen_view_state(&path));
+        assert_eq!(viewer.zoom, 1.0);
+        assert_eq!(viewer.zoom_target, 1.0);
+        assert_eq!(viewer.offset, egui::Vec2::ZERO);
+    }
+
+    #[test]
+    fn fullscreen_remember_view_state_in_ram_keeps_cache_on_exit_only_when_enabled() {
+        let mut viewer = ImageViewer::default();
+        let path = std::path::PathBuf::from("sample.png");
+        viewer.config.fullscreen_remember_view_state_in_ram = true;
+        viewer.current_fullscreen_view_has_memory = true;
+        viewer
+            .fullscreen_view_states
+            .insert(path.clone(), FullscreenViewState::default());
+
+        viewer.clear_fullscreen_view_states_for_exit_if_needed();
+
+        assert!(viewer.fullscreen_view_states.contains_key(&path));
+        assert!(!viewer.current_fullscreen_view_has_memory);
+
+        viewer.config.fullscreen_remember_view_state_in_ram = false;
+        viewer.current_fullscreen_view_has_memory = true;
+
+        viewer.clear_fullscreen_view_states_for_exit_if_needed();
+
+        assert!(!viewer.fullscreen_view_states.contains_key(&path));
+        assert!(!viewer.current_fullscreen_view_has_memory);
     }
 
     #[test]
