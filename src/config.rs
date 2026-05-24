@@ -497,6 +497,8 @@ pub struct Config {
     pub fullscreen_reset_fit_on_mode_switch: bool,
     /// Reset long-strip zoom/scroll when returning from solo fullscreen.
     pub manga_long_strip_reset_fit_on_fullscreen_exit: bool,
+    /// Always remember fullscreen per-media zoom/pan in RAM while fullscreen is active.
+    pub fullscreen_remember_view_state_in_ram: bool,
     /// On Windows, use native maximize/restore-down animation for fullscreen transitions.
     pub fullscreen_native_window_transition: bool,
     /// When true, title-bar maximize actions use borderless fullscreen instead of a separate
@@ -735,6 +737,7 @@ impl Config {
             marked_file_border_rgb: [94, 214, 255],
             fullscreen_reset_fit_on_mode_switch: true,
             manga_long_strip_reset_fit_on_fullscreen_exit: true,
+            fullscreen_remember_view_state_in_ram: true,
             fullscreen_native_window_transition: true,
             maximize_to_borderless_fullscreen: true,
             confirm_delete_to_recycle_bin: true,
@@ -1396,6 +1399,11 @@ impl Config {
                         "manga_long_strip_reset_fit_on_fullscreen_exit" => {
                             if let Some(v) = parse_bool(value) {
                                 config.manga_long_strip_reset_fit_on_fullscreen_exit = v;
+                            }
+                        }
+                        "fullscreen_remember_view_state_in_ram" => {
+                            if let Some(v) = parse_bool(value) {
+                                config.fullscreen_remember_view_state_in_ram = v;
                             }
                         }
                         "fullscreen_native_window_transition"
@@ -2093,6 +2101,10 @@ impl Config {
         values.insert(
             "manga_long_strip_reset_fit_on_fullscreen_exit",
             bool_to_ini(self.manga_long_strip_reset_fit_on_fullscreen_exit).to_string(),
+        );
+        values.insert(
+            "fullscreen_remember_view_state_in_ram",
+            bool_to_ini(self.fullscreen_remember_view_state_in_ram).to_string(),
         );
         values.insert(
             "fullscreen_native_window_transition",
@@ -2818,5 +2830,21 @@ mod tests {
         );
 
         assert!(!config.manga_long_strip_reset_fit_on_fullscreen_exit);
+    }
+
+    #[test]
+    fn fullscreen_remember_view_state_in_ram_defaults_true() {
+        let config = Config::default();
+
+        assert!(config.fullscreen_remember_view_state_in_ram);
+        assert!(default_config_ini().contains("fullscreen_remember_view_state_in_ram = true"));
+    }
+
+    #[test]
+    fn fullscreen_remember_view_state_in_ram_parses_false() {
+        let config =
+            Config::parse_ini("[settings]\nfullscreen_remember_view_state_in_ram = false\n");
+
+        assert!(!config.fullscreen_remember_view_state_in_ram);
     }
 }

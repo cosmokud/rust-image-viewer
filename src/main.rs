@@ -14779,7 +14779,10 @@ impl ImageViewer {
     /// Save the current view state for the current image (fullscreen only).
     /// This allows restoring zoom, pan, and rotation when returning to this image.
     fn save_current_fullscreen_view_state(&mut self) {
-        if !self.is_fullscreen || !self.current_fullscreen_view_has_memory {
+        if !self.is_fullscreen
+            || (!self.config.fullscreen_remember_view_state_in_ram
+                && !self.current_fullscreen_view_has_memory)
+        {
             return;
         }
 
@@ -30164,6 +30167,59 @@ mod tests {
             Some(2.0)
         );
         assert_eq!(viewer.long_strip_fit_zoom_for_media_height(0.0), None);
+    }
+
+    #[test]
+    fn fullscreen_remember_view_state_in_ram_saves_without_explicit_memory_flag() {
+        let mut viewer = ImageViewer::default();
+        let path = std::path::PathBuf::from("sample.png");
+        viewer.image_list = vec![path.clone()];
+        viewer.is_fullscreen = true;
+        viewer.config.fullscreen_remember_view_state_in_ram = true;
+        viewer.zoom = 2.5;
+        viewer.zoom_target = 2.75;
+        viewer.offset = egui::vec2(120.0, -80.0);
+        viewer.current_fullscreen_view_has_memory = false;
+
+        viewer.save_current_fullscreen_view_state();
+
+        let state = viewer.fullscreen_view_states.get(&path).unwrap();
+        assert_eq!(state.zoom, 2.5);
+        assert_eq!(state.zoom_target, 2.75);
+        assert_eq!(state.offset, egui::vec2(120.0, -80.0));
+    }
+
+    #[test]
+    fn fullscreen_remember_view_state_in_ram_false_keeps_selective_save_behavior() {
+        let mut viewer = ImageViewer::default();
+        let path = std::path::PathBuf::from("sample.png");
+        viewer.image_list = vec![path.clone()];
+        viewer.is_fullscreen = true;
+        viewer.config.fullscreen_remember_view_state_in_ram = false;
+        viewer.current_fullscreen_view_has_memory = false;
+
+        viewer.save_current_fullscreen_view_state();
+
+        assert!(!viewer.fullscreen_view_states.contains_key(&path));
+
+        viewer.current_fullscreen_view_has_memory = true;
+        viewer.save_current_fullscreen_view_state();
+
+        assert!(viewer.fullscreen_view_states.contains_key(&path));
+    }
+
+    #[test]
+    fn fullscreen_remember_view_state_in_ram_stays_fullscreen_only() {
+        let mut viewer = ImageViewer::default();
+        let path = std::path::PathBuf::from("sample.png");
+        viewer.image_list = vec![path.clone()];
+        viewer.is_fullscreen = false;
+        viewer.config.fullscreen_remember_view_state_in_ram = true;
+        viewer.current_fullscreen_view_has_memory = true;
+
+        viewer.save_current_fullscreen_view_state();
+
+        assert!(!viewer.fullscreen_view_states.contains_key(&path));
     }
 
     #[test]
