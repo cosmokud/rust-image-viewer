@@ -3305,9 +3305,15 @@ impl ImageViewer {
                 && !self.has_marked_files())
     }
 
+    fn close_viewport_commands() -> [egui::ViewportCommand; 1] {
+        [egui::ViewportCommand::Close]
+    }
+
     fn send_fast_close_viewport_commands(ctx: &egui::Context) {
-        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        for command in Self::close_viewport_commands() {
+            ctx.send_viewport_cmd(command);
+        }
+        ctx.request_repaint();
     }
 
     fn masonry_authoritative_dimension_lock_active(&self) -> bool {
@@ -29827,5 +29833,12 @@ mod tests {
         let viewer = ImageViewer::default();
 
         assert!(viewer.should_short_circuit_frame_for_exit(true));
+    }
+
+    #[test]
+    fn close_viewport_commands_do_not_hide_window_before_close() {
+        let commands = ImageViewer::close_viewport_commands();
+
+        assert_eq!(commands, [egui::ViewportCommand::Close]);
     }
 }
