@@ -29466,6 +29466,15 @@ fn install_panic_report_hook() {
     });
 }
 
+fn startup_window_for_no_file(screen_size: egui::Vec2) -> (egui::Vec2, egui::Pos2, bool) {
+    let size = egui::Vec2::new(500.0, 500.0);
+    let pos = egui::Pos2::new(
+        ((screen_size.x - size.x) * 0.5).max(0.0),
+        ((screen_size.y - size.y) * 0.5).max(0.0),
+    );
+    (size, pos, true)
+}
+
 fn main() -> eframe::Result<()> {
     init_runtime_diagnostics();
     install_panic_report_hook();
@@ -29482,13 +29491,11 @@ fn main() -> eframe::Result<()> {
         None
     };
 
-    // NO FILE = NO WINDOW. Exit immediately if no file is provided.
-    let Some(file_path) = image_path else {
-        // No file provided, exit without creating any window
-        return Ok(());
-    };
-
-    tracing::info!(target: "startup", file = %file_path.display(), "launch request received");
+    if let Some(file_path) = image_path.as_ref() {
+        tracing::info!(target: "startup", file = %file_path.display(), "launch request received");
+    } else {
+        tracing::info!(target: "startup", "launch request received without media file");
+    }
 
     // Load config early to check single_instance setting
     let config = Config::load();
@@ -29499,90 +29506,104 @@ fn main() -> eframe::Result<()> {
     // Try to become the primary instance or send the file to an existing instance
     #[cfg(target_os = "windows")]
     let (file_receiver, _lock) = {
-        let (receiver, callback) = FileReceiver::new();
-        match single_instance::try_acquire_lock(config.single_instance, Some(&file_path), callback)
-        {
-            SingleInstanceResult::Primary(lock) => {
-                tracing::debug!(target: "single_instance", "acquired primary instance lock");
-                // We are the primary instance - proceed with window creation
-                (Some(receiver), Some(lock))
+        if let Some(file_path) = image_path.as_ref() {
+            let (receiver, callback) = FileReceiver::new();
+            match single_instance::try_acquire_lock(
+                config.single_instance,
+                Some(file_path),
+                callback,
+            ) {
+                SingleInstanceResult::Primary(lock) => {
+                    tracing::debug!(target: "single_instance", "acquired primary instance lock");
+                    // We are the primary instance - proceed with window creation
+                    (Some(receiver), Some(lock))
+                }
+                SingleInstanceResult::Secondary => {
+                    tracing::debug!(target: "single_instance", "secondary instance forwarded request");
+                    // Another instance is running and we sent our file path to it
+                    // Exit this instance
+                    return Ok(());
+                }
+                SingleInstanceResult::Disabled => {
+                    tracing::debug!(target: "single_instance", "single-instance mode disabled or unavailable");
+                    // Single instance mode is disabled, proceed normally
+                    (None, None)
+                }
             }
-            SingleInstanceResult::Secondary => {
-                tracing::debug!(target: "single_instance", "secondary instance forwarded request");
-                // Another instance is running and we sent our file path to it
-                // Exit this instance
-                return Ok(());
-            }
-            SingleInstanceResult::Disabled => {
-                tracing::debug!(target: "single_instance", "single-instance mode disabled or unavailable");
-                // Single instance mode is disabled, proceed normally
-                (None, None)
-            }
+        } else {
+            tracing::debug!(target: "single_instance", "no media file provided; skipping file handoff");
+            (None, None)
         }
     };
 
     #[cfg(not(target_os = "windows"))]
     let file_receiver: Option<FileReceiver> = None;
 
+    let startup_path = image_path;
+
     // Determine media type and calculate initial window size BEFORE creating the window.
     // This prevents the flash of a default-sized window.
-    let media_type = get_media_type(&file_path);
     let screen_size = get_primary_monitor_size();
 
     // For images, we can get dimensions immediately from the file header.
     // For videos, we start hidden and show once GStreamer decodes the first frame.
-    let (initial_size, initial_pos, start_visible) = match media_type {
-        Some(MediaType::Image) => {
-            // Startup sizing intentionally bypasses metadata_cache.redb to keep single-file
-            // launches independent from cache size.
-            let (img_w, img_h) = probe_image_dimensions(&file_path).unwrap_or((800, 600));
-            let img_w = img_w as f32;
-            let img_h = img_h as f32;
+    let (initial_size, initial_pos, start_visible) = if let Some(file_path) = startup_path.as_ref()
+    {
+        match get_media_type(file_path) {
+            Some(MediaType::Image) => {
+                // Startup sizing intentionally bypasses metadata_cache.redb to keep single-file
+                // launches independent from cache size.
+                let (img_w, img_h) = probe_image_dimensions(file_path).unwrap_or((800, 600));
+                let img_w = img_w as f32;
+                let img_h = img_h as f32;
 
-            // Calculate window size: fit to screen if needed, otherwise use image size
-            let fit_zoom = if img_h > screen_size.y || img_w > screen_size.x {
-                (screen_size.y / img_h).min(screen_size.x / img_w).min(1.0)
-            } else {
-                1.0
-            };
+                // Calculate window size: fit to screen if needed, otherwise use image size
+                let fit_zoom = if img_h > screen_size.y || img_w > screen_size.x {
+                    (screen_size.y / img_h).min(screen_size.x / img_w).min(1.0)
+                } else {
+                    1.0
+                };
 
-            let size =
-                egui::Vec2::new((img_w * fit_zoom).max(200.0), (img_h * fit_zoom).max(150.0));
+                let size =
+                    egui::Vec2::new((img_w * fit_zoom).max(200.0), (img_h * fit_zoom).max(150.0));
 
-            // Calculate centered position for images
-            let pos = egui::Pos2::new(
-                ((screen_size.x - size.x) * 0.5).max(0.0),
-                ((screen_size.y - size.y) * 0.5).max(0.0),
-            );
-            (size, pos, true) // Images: show window immediately with correct size
-        }
-        Some(MediaType::Video) => {
-            if !gstreamer_runtime_available() {
-                // Missing runtime: show immediately with placeholder text in floating mode.
-                let size = egui::Vec2::new(800.0, 600.0);
+                // Calculate centered position for images
+                let pos = egui::Pos2::new(
+                    ((screen_size.x - size.x) * 0.5).max(0.0),
+                    ((screen_size.y - size.y) * 0.5).max(0.0),
+                );
+                (size, pos, true) // Images: show window immediately with correct size
+            }
+            Some(MediaType::Video) => {
+                if !gstreamer_runtime_available() {
+                    // Missing runtime: show immediately with placeholder text in floating mode.
+                    let size = egui::Vec2::new(800.0, 600.0);
+                    let pos = egui::Pos2::new(
+                        ((screen_size.x - size.x) * 0.5).max(0.0),
+                        ((screen_size.y - size.y) * 0.5).max(0.0),
+                    );
+                    (size, pos, true)
+                } else {
+                    // Videos: position window OFF-SCREEN initially
+                    // This completely hides the window until the first frame is ready.
+                    // The window will be moved on-screen once video dimensions and first frame are available.
+                    let size = egui::Vec2::new(800.0, 600.0);
+                    let off_screen_pos = egui::Pos2::new(-10000.0, -10000.0);
+                    (size, off_screen_pos, false)
+                }
+            }
+            None => {
+                // Unknown file type, show error window
+                let size = egui::Vec2::new(400.0, 200.0);
                 let pos = egui::Pos2::new(
                     ((screen_size.x - size.x) * 0.5).max(0.0),
                     ((screen_size.y - size.y) * 0.5).max(0.0),
                 );
                 (size, pos, true)
-            } else {
-                // Videos: position window OFF-SCREEN initially
-                // This completely hides the window until the first frame is ready.
-                // The window will be moved on-screen once video dimensions and first frame are available.
-                let size = egui::Vec2::new(800.0, 600.0);
-                let off_screen_pos = egui::Pos2::new(-10000.0, -10000.0);
-                (size, off_screen_pos, false)
             }
         }
-        None => {
-            // Unknown file type, show error window
-            let size = egui::Vec2::new(400.0, 200.0);
-            let pos = egui::Pos2::new(
-                ((screen_size.x - size.x) * 0.5).max(0.0),
-                ((screen_size.y - size.y) * 0.5).max(0.0),
-            );
-            (size, pos, true)
-        }
+    } else {
+        startup_window_for_no_file(screen_size)
     };
 
     // Configure native options
@@ -29646,18 +29667,14 @@ fn main() -> eframe::Result<()> {
             {
                 Ok(Box::new(ImageViewer::new(
                     cc,
-                    Some(file_path),
+                    startup_path,
                     start_visible,
                     file_receiver,
                 )))
             }
             #[cfg(not(target_os = "windows"))]
             {
-                Ok(Box::new(ImageViewer::new(
-                    cc,
-                    Some(file_path),
-                    start_visible,
-                )))
+                Ok(Box::new(ImageViewer::new(cc, startup_path, start_visible)))
             }
         }),
     )
@@ -29741,6 +29758,17 @@ fn build_fallback_icon() -> egui::IconData {
 #[cfg(test)]
 mod tests {
     use super::{ImageFrame, ImageViewer, MediaType, SoloPreloadMomentum};
+
+    #[test]
+    fn startup_window_without_file_is_500x500_and_visible() {
+        let screen_size = egui::Vec2::new(1920.0, 1080.0);
+
+        let (size, pos, start_visible) = super::startup_window_for_no_file(screen_size);
+
+        assert_eq!(size, egui::Vec2::new(500.0, 500.0));
+        assert_eq!(pos, egui::Pos2::new(710.0, 290.0));
+        assert!(start_visible);
+    }
 
     #[test]
     fn solo_probe_offsets_interleave_without_momentum() {
