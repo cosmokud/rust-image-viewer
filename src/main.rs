@@ -14836,6 +14836,7 @@ impl ImageViewer {
             && !self.is_fullscreen
             && !self.manga_mode
             && !entering_titlebar_strip
+            && self.current_fullscreen_view_has_memory
             && !self.config.fullscreen_reset_fit_on_mode_switch
         {
             self.pending_floating_fullscreen_view_state = Some(FloatingFullscreenViewState {
@@ -30089,9 +30090,30 @@ mod tests {
     }
 
     #[test]
-    fn floating_fullscreen_entry_preserves_zoom_and_pan() {
+    fn floating_fullscreen_entry_starts_from_fit_without_fullscreen_memory() {
         let mut viewer = ImageViewer::default();
         viewer.config.fullscreen_reset_fit_on_mode_switch = false;
+        viewer.zoom = 2.5;
+        viewer.zoom_target = 2.75;
+        viewer.offset = egui::vec2(120.0, -80.0);
+
+        viewer.capture_floating_fullscreen_view_state(true, false);
+
+        viewer.zoom = 1.0;
+        viewer.zoom_target = 1.0;
+        viewer.offset = egui::Vec2::ZERO;
+
+        assert!(!viewer.apply_pending_floating_fullscreen_view_state());
+        assert_eq!(viewer.zoom, 1.0);
+        assert_eq!(viewer.zoom_target, 1.0);
+        assert_eq!(viewer.offset, egui::Vec2::ZERO);
+    }
+
+    #[test]
+    fn floating_fullscreen_entry_preserves_existing_fullscreen_memory() {
+        let mut viewer = ImageViewer::default();
+        viewer.config.fullscreen_reset_fit_on_mode_switch = false;
+        viewer.current_fullscreen_view_has_memory = true;
         viewer.zoom = 2.5;
         viewer.zoom_target = 2.75;
         viewer.offset = egui::vec2(120.0, -80.0);
@@ -30148,6 +30170,7 @@ mod tests {
     fn fullscreen_floating_exit_reset_fit_setting_controls_preservation() {
         let mut viewer = ImageViewer::default();
         viewer.is_fullscreen = true;
+        viewer.config.fullscreen_reset_fit_on_mode_switch = true;
 
         assert!(!viewer.should_preserve_fullscreen_floating_view_state());
 
