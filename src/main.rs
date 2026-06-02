@@ -6834,7 +6834,7 @@ impl ImageViewer {
         self.solo_quantize_target_texture_side(target, source_dims)
     }
 
-    fn floating_solo_lod_display_size_for_zoom(
+    fn solo_lod_display_size_for_zoom(
         source_dims: (u32, u32),
         zoom: f32,
         zoom_target: f32,
@@ -6846,16 +6846,23 @@ impl ImageViewer {
         )
     }
 
-    fn floating_solo_target_texture_side_for_current_zoom(&self, path: &PathBuf) -> Option<u32> {
+    fn solo_target_texture_side_for_current_zoom(&self, path: &PathBuf) -> Option<u32> {
         let source_dims = self
             .solo_known_media_dimensions(path, MediaType::Image, true)
             .or_else(|| self.image.as_ref().map(|img| img.display_dimensions()))?;
+        Some(self.solo_target_texture_side_for_current_zoom_with_dimensions(source_dims))
+    }
+
+    fn solo_target_texture_side_for_current_zoom_with_dimensions(
+        &self,
+        source_dims: (u32, u32),
+    ) -> u32 {
         let display_size =
-            Self::floating_solo_lod_display_size_for_zoom(source_dims, self.zoom, self.zoom_target);
+            Self::solo_lod_display_size_for_zoom(source_dims, self.zoom, self.zoom_target);
         let target = self
             .manga_strip_target_texture_side_from_display_side(display_size.x.max(display_size.y));
 
-        Some(self.solo_quantize_target_texture_side(target, Some(source_dims)))
+        self.solo_quantize_target_texture_side(target, Some(source_dims))
     }
 
     fn solo_image_load_completion_should_apply_layout(preserve_view_on_complete: bool) -> bool {
@@ -6915,14 +6922,8 @@ impl ImageViewer {
             return;
         }
 
-        let target_side = if self.is_fullscreen {
-            self.solo_target_texture_side_for_path(&path, MediaType::Image, true)
-        } else {
-            let Some(target_side) = self.floating_solo_target_texture_side_for_current_zoom(&path)
-            else {
-                return;
-            };
-            target_side
+        let Some(target_side) = self.solo_target_texture_side_for_current_zoom(&path) else {
+            return;
         };
         let pending_target_side = self.pending_media_load.as_ref().and_then(|pending| {
             (pending.kind == PendingMediaLoadKind::Image && pending.path == path)
@@ -30015,8 +30016,32 @@ mod tests {
     #[test]
     fn floating_solo_lod_display_size_uses_zoom_target_for_refresh() {
         assert_eq!(
-            ImageViewer::floating_solo_lod_display_size_for_zoom((8000, 12000), 0.09, 4.0),
+            ImageViewer::solo_lod_display_size_for_zoom((8000, 12000), 0.09, 4.0),
             egui::vec2(32000.0, 48000.0)
+        );
+    }
+
+    #[test]
+    fn fullscreen_solo_lod_display_size_uses_live_zoom_target_for_refresh() {
+        assert_eq!(
+            ImageViewer::solo_lod_display_size_for_zoom((8000, 16000), 0.09, 4.0),
+            egui::vec2(32000.0, 64000.0)
+        );
+    }
+
+    #[test]
+    fn fullscreen_solo_lod_refresh_target_uses_live_zoom_when_ram_memory_is_disabled() {
+        let mut viewer = ImageViewer::default();
+        viewer.is_fullscreen = true;
+        viewer.config.fullscreen_remember_view_state_in_ram = false;
+        viewer.max_texture_side = 8192;
+        viewer.zoom = 0.09;
+        viewer.zoom_target = 4.0;
+
+        assert!(viewer.fullscreen_view_states.is_empty());
+        assert_eq!(
+            viewer.solo_target_texture_side_for_current_zoom_with_dimensions((8000, 16000)),
+            8192
         );
     }
 
