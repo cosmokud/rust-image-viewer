@@ -67,7 +67,7 @@ Two structural observations are important:
 1. Initializes diagnostics with `init_runtime_diagnostics()`.
 2. Attempts to initialize the shared Tokio runtime through `src/async_runtime.rs`.
 3. On Windows, merges the process `PATH` with registry-backed machine and user `PATH` values through `windows_env::refresh_process_path_from_registry()`. This helps when the app is launched from a parent process with a stale or sanitized environment.
-4. Reads the command line and exits immediately if no media path was passed. This viewer intentionally does not create an empty shell window.
+4. Reads the command line. If no media path is passed, it continues with a small default window (500x500) so drag-and-drop can still start a session.
 5. Loads configuration early with `Config::load()`.
 6. Applies the configured metadata cache size limit via `configure_metadata_cache_size_limit()`.
 
@@ -93,7 +93,8 @@ That matters because it avoids a flash of a default-sized window.
 
 Behavior by media type:
 
-- Image: try `lookup_cached_dimensions(path, CachedMediaKind::Image)`. If dimensions are known, the window is sized to 100% display or fit-to-screen. If not, startup falls back to a conservative default instead of synchronously probing the file header in `main()`.
+- No file: use a centered 500x500 window, visible immediately, so drag-and-drop can still start a session.
+- Image: probe header dimensions immediately, size to 100% display or fit-to-screen, and center the window. Startup sizing intentionally bypasses `metadata_cache.redb`.
 - Video: start hidden and off-screen at `(-10000, -10000)` with a placeholder size. The real on-screen placement waits for actual video dimensions or first-frame readiness.
 - Unknown file: show a small centered error window.
 
@@ -148,7 +149,7 @@ If an exit request is pending, the frame short-circuits immediately by issuing a
 10. Process input.
 11. Update textures before layout decisions. This is critical for video because the first frame also reveals the real dimensions.
 12. Apply floating, maximized, or fullscreen layout when media or dimensions changed.
-13. Process fullscreen / maximize / restore / close viewport commands.
+13. Process fullscreen / maximize / restore / close viewport commands, routing close requests through a centralized helper so confirmation prompts and fast-close paths stay consistent.
 14. Draw the current mode.
 
 This ordering keeps the app biased toward "consume async results, upload what matters, then draw the correct geometry once."
@@ -231,8 +232,10 @@ Important details:
 - capacity is `192 MiB`
 - single entries larger than `24 MiB` are skipped to avoid cache pollution
 - keys include file stamp plus target texture-side bucket
+- floating-mode LOD sizing considers the live zoom target so animated zoom changes choose stable buckets
 - a small LRU of solo image textures caches GPU uploads keyed by path + target side; neighbor preloads can populate it for fast next/previous swaps
 - non-animated solo images can request a higher LOD refresh when zoom or viewport size demands it, and refresh work is skipped if it would not improve the current texture
+- LOD refresh completion can preserve the current view when requested so floating-mode refreshes do not reset zoom/pan
 - GIFs are not restored from this cache because a single cached frame would destroy animation semantics
 - animated WebP is special-cased: the first frame is shown immediately and the rest of the animation streams in afterward
 
@@ -562,6 +565,11 @@ Important rule:
 
 - state is only remembered after explicit user interaction, not just automatic fit operations
 
+Additional behavior:
+
+- the cache is RAM-only and can be disabled via `fullscreen_remember_view_state_in_ram`; when disabled, entries are cleared on fullscreen exit
+- mode switches can preserve zoom/pan when `fullscreen_reset_fit_on_mode_switch` is disabled
+
 That prevents stale auto-fit states from coming back as fake user intent.
 
 ## 9. Image and animation architecture
@@ -704,6 +712,7 @@ Transition state in `src/main.rs` preserves the right thing for the right mode:
 - retained media placeholders during quick-open and return transitions
 - masonry runtime cache signatures so warm masonry state can survive temporary solo detours
 - special title-bar restore behavior separate from generic fullscreen toggles
+- optional Long Strip reset-to-fit on return from solo fullscreen (`manga_long_strip_reset_fit_on_fullscreen_exit`)
 
 On Windows, native maximize/restore transitions can be used as part of fullscreen entry and exit so the result feels closer to a native app than a simple instant borderless snap.
 

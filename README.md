@@ -21,8 +21,10 @@ The RGBA resize path is centralized in `src/image_resize.rs`: static images, ani
 ## Highlights
 
 - Borderless floating window with custom title bar, auto-hide controls, native-feeling fullscreen / maximize transitions, and steadier drag/zoom/resize behavior on Windows.
+- Fullscreen view-state memory in RAM with configurable zoom/pan preservation between floating and fullscreen.
 - Configurable window title path mode (auto/full path/filename) with smart truncation for narrow title bars.
 - Fast single-file viewing plus fast folder navigation, including natural-sort media lists and optional single-instance reuse.
+- Launching without a file opens a ready-to-drop window for drag-and-drop starts.
 - Breadcrumb address bar with back/forward/up navigation, a folder-history popup, a hide/show toggle, and Windows drive-root entries in fullscreen manga modes.
 - Windows cut/copy/paste for marked files with optional auto-unmark after paste.
 - Marking shortcuts for hovered files in floating, Long Strip, and Masonry modes.
@@ -46,6 +48,7 @@ The RGBA resize path is centralized in `src/image_resize.rs`: static images, ani
 - Optional borderless fullscreen behavior for the custom maximize button and fullscreen shortcuts.
 - Floating drag/resize behavior tuned to reduce accidental snap-style jumps and keep zoomed centering more predictable.
 - Smart initial sizing: open at 100% when possible, otherwise fit to the screen.
+- Launching without a file opens a 500x500 window ready for drag-and-drop.
 - Drag and drop support.
 - Single-instance mode that forwards file-open requests from secondary launches to the primary window.
 - Configurable window title path mode: auto (filename in floating, full path in fullscreen), always-full-path, or filename-only, with smart truncation to fit the title bar width.
@@ -62,7 +65,7 @@ The RGBA resize path is centralized in `src/image_resize.rs`: static images, ani
 - 90 degree rotation with `Up` / `Down`.
 - Fine rotation in fullscreen with `Ctrl+Up` / `Ctrl+Down` using a configurable step size.
 - Double-click reset / fit behavior.
-- Per-image fullscreen view memory for zoom, pan, and rotation, but only after explicit user interaction so automatic fit transitions do not create stale remembered states.
+- Per-image fullscreen view memory (RAM, configurable) for zoom, pan, and rotation, captured only after explicit user interaction so automatic fit transitions do not create stale remembered states.
 - Animated GIF playback with play / pause and scrubbing.
 - Animated WebP support, including progressive frame streaming in the solo-view path.
 
@@ -94,6 +97,8 @@ The RGBA resize path is centralized in `src/image_resize.rs`: static images, ani
 - Masonry freehand autoscroll keeps visible-item prioritization and visible-quality recovery aligned with the moving viewport.
 - Video first-frame thumbnails and animated media support inside multi-item layouts.
 - Hover-based autoplay in Masonry after a configurable settle delay, with resume-aware previews that stay warm while visible.
+- Manga video control bar appears only in Long Strip; grid layouts keep previews without the controls.
+- Long Strip can reset to a fitted view when returning from solo fullscreen (configurable).
 - Solo fullscreen quick-open from Long Strip / Masonry with preserved return context and warm-cache reuse.
 
 ## Supported Formats
@@ -205,6 +210,7 @@ rust-image-viewer.exe path\to\video.mp4
 ```
 
 When you open one file, the viewer builds the media list for its directory and enables previous / next navigation across the supported files in that folder.
+Launching without a path opens a 500x500 window ready for drag-and-drop.
 
 ### Interaction model
 
@@ -353,7 +359,7 @@ Delete `config.ini` if you want to regenerate it from the current defaults.
 | `background_b`                        | `0`        | Alternative per-channel background override.                                                                                   |
 | `fullscreen_reset_fit_on_mode_switch` | `true`     | Reset and fit media when switching between floating and fullscreen. `false` preserves zoom/pan.                                |
 | `manga_long_strip_reset_fit_on_fullscreen_exit` | `true` | Reset and fit long-strip view when returning from solo fullscreen. `false` keeps fullscreen zoom/pan.                         |
-| `fullscreen_remember_view_state_in_ram` | `true`   | In fullscreen, remember opened image/video zoom and pan in RAM for the current fullscreen session.                             |
+| `fullscreen_remember_view_state_in_ram` | `true`   | In fullscreen, remember opened image/video zoom and pan in RAM for the current fullscreen session; disable to clear on exit.   |
 | `fullscreen_native_window_transition` | `true`     | Use Windows maximize / restore animations during fullscreen transitions.                                                       |
 | `maximize_to_borderless_fullscreen`   | `true`     | Make the title-bar maximize action enter borderless fullscreen instead of a separate maximized floating state.                 |
 | `auto_unmark_after_paste`             | `true`     | Clear current marked-file selection after a successful paste operation.                                                        |

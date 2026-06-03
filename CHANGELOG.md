@@ -2,6 +2,31 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.4.1-rc.4] - 2026-06-03
+
+### Highlights
+
+- Fullscreen view-state memory in RAM with configurable zoom/pan preservation between floating and fullscreen.
+- Long Strip can reset to a fitted view when returning from solo fullscreen (`manga_long_strip_reset_fit_on_fullscreen_exit`).
+- Launching without a file now opens a 500x500 window ready for drag-and-drop.
+- Solo image LOD targeting now uses live zoom targets in floating mode to reduce refresh churn.
+- Manga video preview controls are hidden in grid layouts (Masonry/Gallery) while remaining in Long Strip.
+
+### Changed
+
+- Viewport close handling is centralized with confirmation-aware close commands.
+- Solo image load completion can preserve the current view when LOD refreshes finish in floating mode.
+- Fullscreen exit clears cached view states when RAM view memory is disabled.
+
+### Fixed
+
+- Retained media placeholder rules were tightened to avoid stale or blank frames during swaps.
+
+### Maintenance
+
+- Added unit coverage for fullscreen view-state memory, floating fullscreen view transfers, startup window sizing, and live zoom LOD sizing.
+- Removed outdated package-version notes from the changelog.
+
 ## [v0.4.1-rc.3] - 2026-05-21
 
 ### Highlights
