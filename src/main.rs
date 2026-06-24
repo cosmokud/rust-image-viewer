@@ -1279,6 +1279,10 @@ impl MediaLoadCoordinator {
         let _ = self.wake_tx.try_send(());
     }
 
+    fn cancel_pending(&self) {
+        *self.latest_request.lock() = None;
+    }
+
     fn try_recv(&self) -> Result<MediaLoadResult, crossbeam_channel::TryRecvError> {
         self.result_rx.try_recv()
     }
@@ -1305,6 +1309,10 @@ impl SoloProbeCoordinator {
     fn submit_batch(&self, batch: Vec<SoloProbeRequest>) {
         *self.latest_batch.lock() = Some(batch);
         let _ = self.wake_tx.try_send(());
+    }
+
+    fn cancel_pending(&self) {
+        *self.latest_batch.lock() = None;
     }
 
     fn try_recv(&self) -> Result<SoloProbeResult, crossbeam_channel::TryRecvError> {
@@ -1911,6 +1919,10 @@ impl MangaFocusedVideoLoadCoordinator {
     fn submit(&self, request: MangaFocusedVideoLoadRequest) {
         *self.latest_request.lock() = Some(request);
         let _ = self.wake_tx.try_send(());
+    }
+
+    fn cancel_pending(&self) {
+        *self.latest_request.lock() = None;
     }
 
     fn try_recv(&self) -> Result<MangaFocusedVideoLoadResult, crossbeam_channel::TryRecvError> {
@@ -3314,6 +3326,40 @@ impl ImageViewer {
             || (viewport_close_requested
                 && !self.pending_exit_confirmation
                 && !self.has_marked_files())
+    }
+
+    fn begin_fast_app_exit(&mut self) {
+        if self.should_exit {
+            return;
+        }
+
+        self.discard_runtime_work_for_exit();
+        #[cfg(not(test))]
+        metadata_cache::request_metadata_cache_shutdown();
+        self.should_exit = true;
+    }
+
+    fn discard_runtime_work_for_exit(&mut self) {
+        self.media_load_coordinator.cancel_pending();
+        self.solo_probe_coordinator.cancel_pending();
+        self.manga_video_load_coordinator.cancel_pending();
+
+        self.clear_pending_media_load();
+        self.clear_manga_runtime_workloads();
+        self.reset_masonry_metadata_preload();
+
+        if let Some(loader) = self.manga_loader.as_mut() {
+            loader.cancel_pending_loads();
+        }
+        self.manga_loader = None;
+        self.manga_texture_cache.clear();
+        self.manga_decoded_mailbox.clear();
+
+        self.image = None;
+        self.texture = None;
+        self.video_texture = None;
+        self.pending_video_thumbnail_placeholder = None;
+        self.retained_media_placeholder_visible = false;
     }
 
     fn close_viewport_commands() -> [egui::ViewportCommand; 1] {
@@ -4991,7 +5037,7 @@ impl ImageViewer {
             self.show_controls = true;
             self.controls_show_time = Instant::now();
         } else {
-            self.should_exit = true;
+            self.begin_fast_app_exit();
         }
     }
 
@@ -11623,7 +11669,7 @@ impl ImageViewer {
         } else if confirm {
             self.pending_exit_confirmation = false;
             self.clear_all_marks();
-            self.should_exit = true;
+            self.begin_fast_app_exit();
             Self::send_fast_close_viewport_commands(ctx);
         }
     }
@@ -28723,7 +28769,7 @@ impl eframe::App for ImageViewer {
                     self.request_app_exit();
                 }
             } else {
-                self.should_exit = true;
+                self.begin_fast_app_exit();
             }
         }
         if self.should_short_circuit_frame_for_exit(viewport_close_requested) {
@@ -29885,7 +29931,7 @@ fn build_fallback_icon() -> egui::IconData {
 #[cfg(test)]
 mod tests {
     use super::{
-        FullscreenViewState, ImageFrame, ImageViewer, MangaLayoutMode, MediaType,
+        FullscreenViewState, ImageFrame, ImageViewer, MangaLayoutMode, MangaLoader, MediaType,
         SoloPreloadMomentum,
     };
 
@@ -30361,6 +30407,17 @@ mod tests {
         viewer.should_exit = true;
 
         assert!(viewer.should_short_circuit_frame_for_exit(false));
+    }
+
+    #[test]
+    fn fast_exit_prepares_runtime_work_before_setting_exit() {
+        let mut viewer = ImageViewer::default();
+        viewer.manga_loader = Some(MangaLoader::new());
+
+        viewer.begin_fast_app_exit();
+
+        assert!(viewer.should_exit);
+        assert!(viewer.manga_loader.is_none());
     }
 
     #[test]

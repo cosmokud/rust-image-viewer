@@ -3,7 +3,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::UNIX_EPOCH;
 
@@ -36,6 +36,8 @@ static LAST_PRUNE_SECS: AtomicU64 = AtomicU64::new(0);
 static METADATA_CACHE_MAX_SIZE_BYTES: AtomicU64 =
     AtomicU64::new(METADATA_CACHE_DEFAULT_MAX_SIZE_BYTES);
 static METADATA_CACHE_ENABLED: AtomicBool = AtomicBool::new(false);
+static CACHE_WRITE_SHUTDOWN: AtomicBool = AtomicBool::new(false);
+static CACHE_WRITE_ACTIVE: AtomicUsize = AtomicUsize::new(0);
 
 fn metadata_cache_access_enabled() -> bool {
     METADATA_CACHE_ENABLED.load(Ordering::Relaxed)
@@ -224,6 +226,7 @@ enum CacheWriteOp {
         width: u32,
         height: u32,
     },
+    Shutdown,
 }
 
 pub struct MetadataCache {
@@ -511,10 +514,14 @@ fn cache_write_loop(
     rx: crossbeam_channel::Receiver<CacheWriteOp>,
 ) {
     while let Ok(first_op) = rx.recv() {
+        if CACHE_WRITE_SHUTDOWN.load(Ordering::Acquire) {
+            break;
+        }
+
         let mut pending: Vec<CacheWriteOp> = Vec::with_capacity(32);
         pending.push(first_op);
 
-        while pending.len() < 64 {
+        while pending.len() < 64 && !CACHE_WRITE_SHUTDOWN.load(Ordering::Acquire) {
             match rx.try_recv() {
                 Ok(op) => pending.push(op),
                 Err(_) => break,
@@ -523,15 +530,44 @@ fn cache_write_loop(
 
         let mut cache = cache.lock();
         for op in pending {
+            if CACHE_WRITE_SHUTDOWN.load(Ordering::Acquire) {
+                break;
+            }
+
             match op {
                 CacheWriteOp::Dimensions {
                     path,
                     media_kind,
                     width,
                     height,
-                } => cache.store_dimensions(path.as_path(), media_kind, width, height),
+                } => {
+                    run_cache_write_active(|| {
+                        cache.store_dimensions(path.as_path(), media_kind, width, height);
+                    });
+                }
+                CacheWriteOp::Shutdown => break,
             }
         }
+    }
+}
+
+fn run_cache_write_active(write: impl FnOnce()) {
+    CACHE_WRITE_ACTIVE.fetch_add(1, Ordering::AcqRel);
+    if !CACHE_WRITE_SHUTDOWN.load(Ordering::Acquire) {
+        write();
+    }
+    CACHE_WRITE_ACTIVE.fetch_sub(1, Ordering::AcqRel);
+}
+
+pub fn request_metadata_cache_shutdown() {
+    CACHE_WRITE_SHUTDOWN.store(true, Ordering::Release);
+
+    if let Some(Some(tx)) = CACHE_WRITE_TX.get() {
+        let _ = tx.try_send(CacheWriteOp::Shutdown);
+    }
+
+    while CACHE_WRITE_ACTIVE.load(Ordering::Acquire) != 0 {
+        std::thread::yield_now();
     }
 }
 
@@ -589,6 +625,10 @@ pub fn store_cached_dimensions(path: &Path, media_kind: CachedMediaKind, width: 
         return;
     }
 
+    if CACHE_WRITE_SHUTDOWN.load(Ordering::Acquire) {
+        return;
+    }
+
     if let Some(tx) = cache_write_tx() {
         let op = CacheWriteOp::Dimensions {
             path: path.to_path_buf(),
@@ -602,9 +642,10 @@ pub fn store_cached_dimensions(path: &Path, media_kind: CachedMediaKind, width: 
     }
 
     if let Some(cache) = global_cache_handle() {
-        cache
-            .lock()
-            .store_dimensions(path, media_kind, width, height);
+        let mut cache = cache.lock();
+        run_cache_write_active(|| {
+            cache.store_dimensions(path, media_kind, width, height);
+        });
     }
 }
 
@@ -622,6 +663,37 @@ pub fn store_cached_video_thumbnail(
     thumbnail: &CachedVideoThumbnail,
 ) {
     let _ = (path, max_texture_side, thumbnail);
+}
+
+#[cfg(test)]
+pub(crate) fn reset_cache_write_shutdown_for_test() {
+    CACHE_WRITE_SHUTDOWN.store(false, Ordering::Release);
+    CACHE_WRITE_ACTIVE.store(0, Ordering::Release);
+}
+
+#[cfg(test)]
+fn begin_cache_write_for_test() {
+    CACHE_WRITE_ACTIVE.fetch_add(1, Ordering::AcqRel);
+}
+
+#[cfg(test)]
+fn finish_cache_write_for_test() {
+    CACHE_WRITE_ACTIVE.fetch_sub(1, Ordering::AcqRel);
+}
+
+#[cfg(test)]
+fn metadata_cache_shutdown_requested_for_test() -> bool {
+    CACHE_WRITE_SHUTDOWN.load(Ordering::Acquire)
+}
+
+#[cfg(test)]
+fn active_cache_writes_for_test() -> usize {
+    CACHE_WRITE_ACTIVE.load(Ordering::Acquire)
+}
+
+#[cfg(test)]
+fn metadata_cache_accepts_dimension_writes_for_test() -> bool {
+    !CACHE_WRITE_SHUTDOWN.load(Ordering::Acquire)
 }
 
 pub fn lookup_cached_static_thumbnail(
@@ -1025,6 +1097,9 @@ fn decode_record(raw: &str) -> Option<CachedRecord> {
 mod tests {
     use super::*;
     use redb::ReadableTableMetadata;
+    use std::sync::Mutex as StdMutex;
+
+    static CACHE_SHUTDOWN_TEST_LOCK: StdMutex<()> = StdMutex::new(());
 
     #[test]
     fn metadata_record_encodes_only_placeholder_columns() {
@@ -1113,6 +1188,33 @@ mod tests {
 
         store_cached_video_thumbnail(path, 128, &thumbnail);
         assert!(lookup_cached_video_thumbnail(path, 128).is_none());
+    }
+
+    #[test]
+    fn metadata_cache_shutdown_waits_for_active_write_only() {
+        let _guard = CACHE_SHUTDOWN_TEST_LOCK.lock().unwrap();
+        reset_cache_write_shutdown_for_test();
+
+        begin_cache_write_for_test();
+        let shutdown = std::thread::spawn(request_metadata_cache_shutdown);
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        assert!(metadata_cache_shutdown_requested_for_test());
+        assert_eq!(active_cache_writes_for_test(), 1);
+
+        finish_cache_write_for_test();
+        shutdown.join().unwrap();
+        assert!(metadata_cache_shutdown_requested_for_test());
+        assert_eq!(active_cache_writes_for_test(), 0);
+    }
+
+    #[test]
+    fn metadata_cache_shutdown_drops_future_dimension_writes() {
+        let _guard = CACHE_SHUTDOWN_TEST_LOCK.lock().unwrap();
+        reset_cache_write_shutdown_for_test();
+        request_metadata_cache_shutdown();
+
+        assert!(!metadata_cache_accepts_dimension_writes_for_test());
     }
 
     #[test]
