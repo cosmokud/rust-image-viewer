@@ -17216,9 +17216,7 @@ impl ImageViewer {
         self.manga_layout_offsets.clear();
         self.manga_strip_spatial_index = None;
         self.masonry_spatial_index = None;
-        // Do NOT zero masonry_layout_list_signature — it must stay valid so that
-        // masonry_ensure_layout_cache can distinguish "dimensions changed" from
-        // "list contents changed".  Only the layout-valid flag is toggled here.
+        self.masonry_layout_list_signature = 0;
         self.masonry_layout_valid = false;
         self.masonry_layout_invalidation_deferred = false;
         self.masonry_pending_dimension_updates.clear();
@@ -17465,99 +17463,6 @@ impl ImageViewer {
         egui::Rect::from_center_size(slot_rect.center(), display_size)
     }
 
-    /// Reflow masonry item heights and Y-positions in place, preserving column assignments.
-    ///
-    /// Called when image dimensions change but the list contents, screen size, and items-per-row
-    /// are unchanged.  Unlike a full rebuild (which uses the greedy shortest-column algorithm
-    /// and may reassign every item to a different column), this keeps every item in its current
-    /// column and only adjusts heights + Y offsets.  This prevents the visual "jumping" that
-    /// occurred when late-arriving dimension metadata caused a complete column reassignment.
-    fn masonry_reflow_dimensions_in_place(&mut self) {
-        const SIDE_PADDING: f32 = 16.0;
-        const TOP_PADDING: f32 = 10.0;
-        const BOTTOM_PADDING: f32 = 10.0;
-        const GUTTER: f32 = 12.0;
-
-        let len = self.image_list.len();
-        let available_width = (self.screen_size.x - SIDE_PADDING * 2.0).max(20.0);
-        let columns = self.masonry_items_per_row.clamp(2, 10);
-        let total_gutter = GUTTER * (columns.saturating_sub(1) as f32);
-        let column_width = ((available_width - total_gutter) / columns as f32).max(1.0);
-        let used_width = column_width * columns as f32 + total_gutter;
-        let start_x = ((self.screen_size.x - used_width) * 0.5).max(0.0);
-        let col_step = column_width + GUTTER;
-
-        // Collect (col, new_height, source_w, source_h) for every item up-front so we
-        // don't hold a mutable borrow on masonry_layout_items while borrowing self to
-        // query the loader for dimension metadata.
-        struct ItemReflow {
-            col: usize,
-            height: f32,
-            source_width: u32,
-            source_height: u32,
-        }
-
-        let mut reflow = Vec::with_capacity(len);
-        for idx in 0..len {
-            let item = &self.masonry_layout_items[idx];
-            let col = if col_step > 0.0 {
-                ((item.x - start_x) / col_step).round() as usize
-            } else {
-                0
-            };
-            let col = col.min(columns - 1);
-
-            let (height, source_width, source_height) =
-                if let Some((sw, sh)) = self.masonry_slot_source_dimensions(idx) {
-                    let aspect_ratio = (sh as f32 / sw as f32).clamp(0.2, 5.0);
-                    ((column_width * aspect_ratio).max(20.0), sw, sh)
-                } else {
-                    // Keep existing height when dimensions are still unknown.
-                    (item.height, item.source_width, item.source_height)
-                };
-
-            reflow.push(ItemReflow {
-                col,
-                height,
-                source_width,
-                source_height,
-            });
-        }
-
-        // Now apply the computed heights / positions without borrowing self.
-        let mut column_heights = vec![TOP_PADDING; columns];
-        for idx in 0..len {
-            let r = &reflow[idx];
-            let item = &mut self.masonry_layout_items[idx];
-            item.x = start_x + r.col as f32 * col_step;
-            item.width = column_width;
-            item.height = r.height;
-            item.source_width = r.source_width;
-            item.source_height = r.source_height;
-            item.y = column_heights[r.col];
-            column_heights[r.col] = item.y + item.height + GUTTER;
-        }
-
-        // Compute total content height.
-        let mut content_bottom = TOP_PADDING;
-        for h in column_heights {
-            if h > content_bottom {
-                content_bottom = h;
-            }
-        }
-        if len > 0 {
-            content_bottom = (content_bottom - GUTTER).max(TOP_PADDING);
-        }
-
-        self.masonry_layout_total_height = (content_bottom + BOTTOM_PADDING).max(0.0);
-        self.masonry_layout_screen_x = self.screen_size.x.round();
-        self.masonry_layout_items_per_row = columns;
-        self.masonry_layout_len = len;
-        self.masonry_layout_list_signature = self.image_list_signature;
-        self.masonry_layout_valid = true;
-        self.masonry_spatial_index = None;
-    }
-
     fn masonry_ensure_layout_cache(&mut self) {
         if self.image_list.is_empty() {
             self.masonry_layout_items.clear();
@@ -17583,25 +17488,6 @@ impl ImageViewer {
             || self.masonry_layout_list_signature != self.image_list_signature;
 
         if !needs_recompute {
-            return;
-        }
-
-        // When the only reason we entered this block is that the layout was invalidated
-        // (dimensions changed) but everything else — screen size, items-per-row, list length,
-        // list contents — is identical, do an in-place reflow instead of a full rebuild.
-        // The full rebuild uses a greedy shortest-column algorithm that can reassign every
-        // item to a different column when aspect ratios change, causing visible "jumping".
-        let dimension_update_only = !self.masonry_layout_valid
-            && (self.masonry_layout_screen_x - screen_x).abs() <= 1e-6
-            && self.masonry_layout_items_per_row == items_per_row
-            && self.masonry_layout_len == len
-            && self.masonry_layout_list_signature == self.image_list_signature
-            && !self.masonry_layout_items.is_empty()
-            && self.masonry_layout_items.len() == len
-            && !self.is_gallery_mode();
-
-        if dimension_update_only {
-            self.masonry_reflow_dimensions_in_place();
             return;
         }
 
