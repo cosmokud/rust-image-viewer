@@ -2,6 +2,33 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.4.1-rc.5] - 2026-08-12
+
+### Highlights
+
+- Closing the app now follows a fast-exit flow: pending loads/probes are cancelled, runtime caches are discarded, and the metadata-cache writer is shut down cleanly before the window closes.
+- All blocking GStreamer calls (state changes, seeks, element queries) are bounded by hard timeouts, so a wedged hardware decoder can never freeze the UI thread or the media-load worker.
+- Playback loads that time out automatically retry with the next hardware-decoder tier demoted (D3D12 → D3D11 → CUDA → software) for the rest of the session.
+- Unstable AV1 hardware decoders are demoted proactively (startup rank override, live re-application after every `gst::init`, and stall detection during playback), keeping navigation snappy on affected NVIDIA driver configurations.
+
+### Changed
+
+- Exit requests (window close, confirmed exit, shortcut) now route through `begin_fast_app_exit`, which cancels pending media-load/probe work, drops runtime caches, and triggers metadata-cache shutdown instead of just toggling the exit flag.
+- Decoder-rank preferences from `config.ini` are applied before any GStreamer initialization, and the AV1 stability demotion is re-applied on live feature objects after every `gst::init` so thumbnail-probe workers cannot bypass it.
+- Hardware-decoder tier demotion is tracked process-wide (`DEMOTED_HARDWARE_TIERS`) by the load-time fallback, while the stall-detection path demotes the AV1 hardware decoders directly.
+- Position and duration queries are rate-limited and served from a short TTL cache; once a pipeline is detected as wedged, per-frame queries stop spawning helper threads.
+
+### Fixed
+
+- A hung hardware decoder (e.g. `d3d12av1dec` on some NVIDIA driver configurations) could block `set_state`/`seek`/queries indefinitely, freezing video navigation; these calls now time out, mark the player wedged, and report a "Timed out" error.
+- GStreamer thumbnail/probe pipelines (first-frame extraction, dimension probing, manga thumbnails) used unbounded blocking calls; they now use the same timeout-wrapped state changes and seeks.
+- A playing pipeline that delivers no frame for ~3 s (after a 3 s start grace, excluding buffering, EOS, and in-progress seeks) is treated as a stalled hardware decoder: the AV1 hardware decoders are demoted immediately and again at drop time, so the next AV1 file loads without a state-change timeout delay.
+
+### Maintenance
+
+- Added unit coverage for the fast-exit preparation, metadata-cache shutdown waiting/flagging, GStreamer timeout behavior, timeout-error classification, and decoder tier/AV1 demotion list ordering.
+- Reverted an experimental in-place masonry reflow for dimension-only updates; masonry layout rebuilding behavior is unchanged.
+
 ## [v0.4.1-rc.4] - 2026-06-03
 
 ### Highlights

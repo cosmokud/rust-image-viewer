@@ -31,6 +31,8 @@ The RGBA resize path is centralized in `src/image_resize.rs`: static images, ani
 - Static images, animated GIF, animated WebP, and video playback in one app.
 - Shared RGBA resize and texture-limit downscale pipeline with FIR-first filtering, `image::imageops::resize` fallback, allocation-free no-op paths, and one choke point for future GPU scaling.
 - Optional hardware-accelerated video decode on Windows with D3D12/D3D11/CUDA preference and capability status readouts.
+- Hardened video playback: every blocking GStreamer call runs under a hard timeout with automatic decoder-tier fallback (D3D12 → D3D11 → CUDA → software) and proactive AV1 stability demotion, so a wedged hardware decoder can never freeze the UI.
+- Fast app exit that cancels pending loads/probes and shuts down the metadata cache cleanly when closing.
 - Two fullscreen multi-item layouts: Long Strip and Masonry.
 - Manga-mode video previews now autoplay on focus/hover and resume from the last preview position, with steadier layout sizing during zoom.
 - Seamless video handoffs reuse the active frame to avoid first-frame flashes when switching modes.
@@ -51,6 +53,7 @@ The RGBA resize path is centralized in `src/image_resize.rs`: static images, ani
 - Launching without a file opens a 500x500 window ready for drag-and-drop.
 - Drag and drop support.
 - Single-instance mode that forwards file-open requests from secondary launches to the primary window.
+- Fast exit on close: pending loads/probes are cancelled, runtime caches are discarded, and the metadata-cache writer shuts down cleanly before the window closes.
 - Configurable window title path mode: auto (filename in floating, full path in fullscreen), always-full-path, or filename-only, with smart truncation to fit the title bar width.
 - Folder scans include symlinked files and directories for navigation.
 - Windows folder shortcuts (`.lnk`) are treated as navigable folders.
@@ -82,6 +85,8 @@ The RGBA resize path is centralized in `src/image_resize.rs`: static images, ani
   - `accurate` = always frame-accurate seeks
   - `keyframe` = fastest seeks, less precise
 - Optional hardware-decoder preference on Windows (D3D12/D3D11 with optional CUDA), with a config switch to force software decode.
+- All blocking GStreamer calls (state changes, seeks, element queries) run under hard timeouts, so a wedged hardware decoder can never freeze the UI or the media-load worker; a timed-out load reports a clear error and retries with the next decoder tier demoted for the rest of the session.
+- Unstable AV1 hardware decoders are demoted proactively — decoder-rank prefs apply before any GStreamer init, the AV1 stability demotion is re-applied after every `gst::init`, and stall detection demotes the AV1 hardware decoders shortly after a playing pipeline stops delivering frames.
 - Decode capability status is surfaced in the video playback UI.
 - Seamless mode switches keep the currently visible video frame instead of falling back to a first-frame thumbnail.
 - Improved multilingual subtitle/audio track labeling and selection behavior.
@@ -510,6 +515,7 @@ That keeps branch-to-branch comparisons honest.
 3. If you want hardware decode but it is not being selected, keep `prefer_hardware_decode = true`, enable `enable_d3d12`/`enable_cuda` as needed, and verify a compatible Windows decoder is available.
 4. If the decode capability status shows unavailable, check the GStreamer runtime and GPU drivers, then restart the app to refresh plugin discovery.
 5. If the app was launched from an environment with a stale `PATH`, restart it after installing GStreamer so the refreshed environment and plugin registry can be rebuilt.
+6. If a hardware decoder hangs (playback stops delivering frames or loads time out with a "Timed out" error), the app demotes the offending decoder tier for the rest of the session and retries down to software decoding; restart the app to reset the demotion.
 
 ### Config file issues
 

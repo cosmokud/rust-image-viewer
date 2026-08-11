@@ -130,7 +130,7 @@ The `eframe::App::update()` implementation in `src/main.rs` is the heartbeat of 
 
 The per-frame order is deliberate:
 
-If an exit request is pending, the frame short-circuits immediately by issuing a close command and skipping the rest of the work.
+If an exit request is pending, the frame short-circuits immediately by issuing a close command and skipping the rest of the work. Exit requests (window close, confirmed exit, shortcut) are routed through `ImageViewer::begin_fast_app_exit`, which cancels pending media-load/probe work via `cancel_pending` on the coordinators, discards runtime caches (manga loader, texture caches, decoded mailbox, current media placeholders), and triggers the metadata-cache writer shutdown before setting the exit flag — so quitting is fast and the cache file is left consistent.
 
 1. Poll single-instance incoming file-open requests.
 2. Poll background completions:
@@ -517,6 +517,11 @@ Validation and bounds:
 - writer queue capacity: `512`
 - default size limit: `1024 MiB`, configurable from `config.ini`
 
+Shutdown behavior:
+
+- the write loop honors a shutdown signal (`CACHE_WRITE_SHUTDOWN` flag, `CACHE_WRITE_ACTIVE` counter, and a `Shutdown` write-op)
+- `request_metadata_cache_shutdown()` sets the flag, pokes the writer with the shutdown op, and waits for in-flight writes to finish, so the fast app-exit path never leaves the cache file mid-write
+
 ### 8.2 Solo decoded-image cache (`src/main.rs`)
 
 This is a `moka` cache for warm solo navigation.
@@ -649,7 +654,7 @@ The viewer can prefer or disable hardware decoders through `GST_PLUGIN_FEATURE_R
 
 All blocking GStreamer calls (`set_state`, seeks, element queries) run on helper threads with hard timeouts, so a wedged hardware decoder can never freeze the UI thread or the media-load worker: the load fails with a "Timed out" error, the offending decoder tier (D3D12 → D3D11 → CUDA) is demoted for the rest of the session, and playback is retried down to software decoding.
 
-To keep navigation delay-free, the player also watches itself: if it is playing but delivers no frame for ~2s, the AV1 hardware decoders are demoted immediately (and at drop time), so the next AV1 file loads without waiting for a state-change timeout.
+To keep navigation delay-free, the player also watches itself: if it is playing but delivers no frame for ~3 s (after a 3 s start grace, excluding buffering, EOS, and in-progress seeks), the AV1 hardware decoders are demoted immediately (and at drop time for actively polled players), so the next AV1 file loads without waiting for a state-change timeout.
 
 ### 10.3 First-frame extraction for placeholders
 
