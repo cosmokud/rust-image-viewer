@@ -645,7 +645,9 @@ Before live playback, the video subsystem tries to make GStreamer discovery resi
 - set `GST_PLUGIN_SCANNER` if needed
 - ensure `GST_REGISTRY` points at a writable per-user path
 
-The viewer can prefer or disable hardware decoders through `GST_PLUGIN_FEATURE_RANK`. On Windows it ranks D3D12 first when available, falls back to D3D11, and can optionally raise CUDA decoders. Capability detection checks for the runtime plus D3D12/CUDA support and feeds the in-app status readout.
+The viewer can prefer or disable hardware decoders through `GST_PLUGIN_FEATURE_RANK`. On Windows it ranks D3D12 first when available, falls back to D3D11, and can optionally raise CUDA decoders; the D3D12 AV1 decoder is deliberately ranked below the D3D11 one because it has been observed to hang the pipeline on some NVIDIA driver configurations. Capability detection checks for the runtime plus D3D12/CUDA support and feeds the in-app status readout.
+
+All blocking GStreamer calls (`set_state`, seeks, element queries) run on helper threads with hard timeouts, so a wedged hardware decoder can never freeze the UI thread or the media-load worker: the load fails with a "Timed out" error, the offending decoder tier (D3D12 → D3D11 → CUDA) is demoted for the rest of the session, and playback is retried down to software decoding.
 
 ### 10.3 First-frame extraction for placeholders
 

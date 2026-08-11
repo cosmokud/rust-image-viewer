@@ -54,8 +54,9 @@ use perf_metrics::PerfMetrics;
 #[cfg(target_os = "windows")]
 use single_instance::{FileReceiver, SingleInstanceResult};
 use video_player::{
-    detect_video_acceleration_capabilities, format_duration, gstreamer_runtime_available,
-    VideoPlayer, VideoSeekMode, VideoSubtitleSelection, VideoTrackInfo,
+    create_video_player_with_fallback, detect_video_acceleration_capabilities, format_duration,
+    gstreamer_runtime_available, run_gst_with_timeout, VideoPlayer, VideoSeekMode,
+    VideoSubtitleSelection, VideoTrackInfo,
 };
 use video_thumbnail::{
     extract_video_first_frame_without_gstreamer, probe_video_dimensions_with_gstreamer,
@@ -1391,7 +1392,7 @@ fn process_media_load_request(request: MediaLoadRequest) -> MediaLoadResult {
             let source_dimensions = cached_or_probe_video_dimensions(&path);
             let output_dimensions =
                 video_output_dimensions_for_bounds(source_dimensions, output_bounds);
-            let result = VideoPlayer::new(
+            let result = create_video_player_with_fallback(
                 &path,
                 muted,
                 initial_volume,
@@ -1401,15 +1402,15 @@ fn process_media_load_request(request: MediaLoadRequest) -> MediaLoadResult {
                 enable_d3d12_decode,
                 source_dimensions,
                 output_dimensions,
-            )
-            .and_then(|mut player| {
-                if let Some(seconds) = resume_position_secs {
-                    let _ = player.pause();
-                    let _ = player.seek_to_time_with_mode(seconds, VideoSeekMode::Accurate);
-                }
-                player.play()?;
-                Ok(player)
-            });
+                |player| {
+                    if let Some(seconds) = resume_position_secs {
+                        let _ = player.pause();
+                        let _ = player.seek_to_time_with_mode(seconds, VideoSeekMode::Accurate);
+                    }
+                    player.play()?;
+                    Ok(())
+                },
+            );
 
             MediaLoadResult::Video {
                 request_id,
@@ -1742,8 +1743,20 @@ fn extract_video_first_frame_thumbnail(
             .build(),
     );
 
-    if pipeline.set_state(gst::State::Paused).is_err() {
-        let _ = pipeline.set_state(gst::State::Null);
+    let pipeline_paused = pipeline.clone();
+    if run_gst_with_timeout(
+        "thumb-paused",
+        Duration::from_secs(8),
+        move || pipeline_paused.set_state(gst::State::Paused),
+    )
+    .map_or(true, |result| result.is_err())
+    {
+        let pipeline_null = pipeline.clone();
+        let _ = run_gst_with_timeout(
+            "thumb-null",
+            Duration::from_secs(1),
+            move || pipeline_null.set_state(gst::State::Null),
+        );
         return None;
     }
 
@@ -1774,12 +1787,20 @@ fn extract_video_first_frame_thumbnail(
     let _ = wait_for_frame(300);
     let pre_seek_frame = frame_data.lock().clone();
     *frame_data.lock() = None;
-    let seeked_to_zero = pipeline
-        .seek_simple(
-            gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
-            gst::ClockTime::ZERO,
-        )
-        .is_ok();
+    let pipeline_seek = pipeline.clone();
+    let seeked_to_zero = run_gst_with_timeout(
+        "thumb-seek",
+        Duration::from_secs(2),
+        move || {
+            pipeline_seek
+                .seek_simple(
+                    gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
+                    gst::ClockTime::ZERO,
+                )
+                .is_ok()
+        },
+    )
+    .unwrap_or(false);
     let extracted_frame = if seeked_to_zero {
         if wait_for_frame(3000) {
             frame_data.lock().clone()
@@ -1790,7 +1811,12 @@ fn extract_video_first_frame_thumbnail(
         pre_seek_frame
     };
 
-    let _ = pipeline.set_state(gst::State::Null);
+    let pipeline_null = pipeline.clone();
+    let _ = run_gst_with_timeout(
+        "thumb-null",
+        Duration::from_secs(1),
+        move || pipeline_null.set_state(gst::State::Null),
+    );
 
     let (pixels, width, height) = extracted_frame?;
     if pixels.is_empty() || width == 0 || height == 0 {
@@ -1963,7 +1989,7 @@ fn process_manga_focused_video_load_request(
     let source_dimensions = cached_or_probe_video_dimensions(&request.path);
     let output_dimensions =
         video_output_dimensions_for_bounds(source_dimensions, request.output_bounds);
-    let result = VideoPlayer::new(
+    let result = create_video_player_with_fallback(
         &request.path,
         request.muted,
         request.initial_volume,
@@ -1973,20 +1999,20 @@ fn process_manga_focused_video_load_request(
         request.enable_d3d12_decode,
         source_dimensions,
         output_dimensions,
-    )
-    .and_then(|mut player| {
-        if let Some(seconds) = request.resume_position_secs {
-            let _ = player.pause();
-            let _ = player.seek_to_time_with_mode(seconds, VideoSeekMode::Accurate);
-        }
-        if request.resume_position_secs.is_some() || request.autoplay {
-            player.play()?;
-        }
-        if !request.autoplay && player.is_playing() {
-            let _ = player.pause();
-        }
-        Ok(player)
-    });
+        |player| {
+            if let Some(seconds) = request.resume_position_secs {
+                let _ = player.pause();
+                let _ = player.seek_to_time_with_mode(seconds, VideoSeekMode::Accurate);
+            }
+            if request.resume_position_secs.is_some() || request.autoplay {
+                player.play()?;
+            }
+            if !request.autoplay && player.is_playing() {
+                let _ = player.pause();
+            }
+            Ok(())
+        },
+    );
 
     MangaFocusedVideoLoadResult {
         request_id: request.request_id,

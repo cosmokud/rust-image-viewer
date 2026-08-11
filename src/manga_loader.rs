@@ -1377,6 +1377,8 @@ impl MangaLoader {
         use std::sync::Arc;
         use std::time::Duration;
 
+        use crate::video_player::run_gst_with_timeout;
+
         // Initialize GStreamer if needed (static check to avoid repeated init)
         static GST_INIT: std::sync::OnceLock<Result<(), ()>> = std::sync::OnceLock::new();
         let init_result = GST_INIT.get_or_init(|| gst::init().map_err(|_| ()));
@@ -1442,8 +1444,20 @@ impl MangaLoader {
         );
 
         // Set to PAUSED to get the first frame (preroll)
-        if pipeline.set_state(gst::State::Paused).is_err() {
-            let _ = pipeline.set_state(gst::State::Null);
+        let pipeline_paused = pipeline.clone();
+        if run_gst_with_timeout(
+            "manga-thumb-paused",
+            Duration::from_secs(8),
+            move || pipeline_paused.set_state(gst::State::Paused),
+        )
+        .map_or(true, |result| result.is_err())
+        {
+            let pipeline_null = pipeline.clone();
+            let _ = run_gst_with_timeout(
+                "manga-thumb-null",
+                Duration::from_secs(1),
+                move || pipeline_null.set_state(gst::State::Null),
+            );
             return None;
         }
 
@@ -1474,12 +1488,20 @@ impl MangaLoader {
         let _ = wait_for_frame(300);
         let pre_seek_frame = frame_data.lock().clone();
         *frame_data.lock() = None;
-        let seeked_to_zero = pipeline
-            .seek_simple(
-                gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
-                gst::ClockTime::ZERO,
-            )
-            .is_ok();
+        let pipeline_seek = pipeline.clone();
+        let seeked_to_zero = run_gst_with_timeout(
+            "manga-thumb-seek",
+            Duration::from_secs(2),
+            move || {
+                pipeline_seek
+                    .seek_simple(
+                        gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
+                        gst::ClockTime::ZERO,
+                    )
+                    .is_ok()
+            },
+        )
+        .unwrap_or(false);
         let extracted_frame = if seeked_to_zero {
             if wait_for_frame(3000) {
                 frame_data.lock().clone()
@@ -1491,7 +1513,12 @@ impl MangaLoader {
         };
 
         // Cleanup pipeline
-        let _ = pipeline.set_state(gst::State::Null);
+        let pipeline_null = pipeline.clone();
+        let _ = run_gst_with_timeout(
+            "manga-thumb-null",
+            Duration::from_secs(1),
+            move || pipeline_null.set_state(gst::State::Null),
+        );
 
         // Extract the frame data
         let (pixels, width, height) = extracted_frame?;

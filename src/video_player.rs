@@ -3,6 +3,7 @@
 
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicI8, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -236,6 +237,12 @@ avdec_h264:0,avdec_h265:0,avdec_hevc:0,avdec_vp8:0,avdec_vp9:0,avdec_av1:0,avdec
     const DISABLE_HW_DECODE_RANKS: &str =
         "d3d12h264dec:0,d3d12h265dec:0,d3d12vp8dec:0,d3d12vp9dec:0,d3d12av1dec:0,d3d12mpeg2dec:0,\
 d3d11h264dec:0,d3d11h265dec:0,d3d11vp8dec:0,d3d11vp9dec:0,d3d11av1dec:0,d3d11mpeg2dec:0";
+    // The D3D12 AV1 decoder (d3d12av1dec) has been observed to hang the entire GStreamer
+    // pipeline on some NVIDIA driver configurations, freezing video navigation. Prefer the
+    // more battle-tested D3D11 AV1 decoder whenever both are present; D3D12 remains
+    // available (rank PRIMARY) as a fallback. GST_PLUGIN_FEATURE_RANK is applied in order
+    // with later entries winning, so this is appended after the D3D12 ranks.
+    const AV1_D3D12_STABILITY_RANK: &str = "d3d12av1dec:256";
 
     if disable_hardware_decode {
         std::env::set_var("GST_PLUGIN_FEATURE_RANK", DISABLE_HW_DECODE_RANKS);
@@ -252,6 +259,14 @@ d3d11h264dec:0,d3d11h265dec:0,d3d11vp8dec:0,d3d11vp9dec:0,d3d11av1dec:0,d3d11mpe
             rank_overrides.push(D3D12_DECODE_RANKS);
         }
         rank_overrides.push(D3D11_DECODE_RANKS);
+        // The D3D12 AV1 decoder (d3d12av1dec) has been observed to hang the entire
+        // GStreamer pipeline on some NVIDIA driver configurations, freezing video
+        // navigation. Prefer the more battle-tested D3D11 AV1 decoder whenever both are
+        // present; D3D12 remains available (rank PRIMARY) as a fallback.
+        // GST_PLUGIN_FEATURE_RANK is applied in order with later entries winning, so this
+        // is appended after the D3D12 ranks. Only applied in the hardware-preferred mode
+        // to avoid surprising users who explicitly chose software decoding.
+        rank_overrides.push(AV1_D3D12_STABILITY_RANK);
     }
     if enable_cuda_decode {
         rank_overrides.push(CUDA_DECODE_RANKS);
@@ -269,6 +284,118 @@ fn apply_decoder_preference_windows(
     _enable_cuda_decode: bool,
     _enable_d3d12_decode: bool,
 ) {
+}
+
+const D3D12_DECODER_FACTORIES: &[&str] = &[
+    "d3d12h264dec",
+    "d3d12h265dec",
+    "d3d12vp8dec",
+    "d3d12vp9dec",
+    "d3d12av1dec",
+    "d3d12mpeg2dec",
+];
+
+const D3D11_DECODER_FACTORIES: &[&str] = &[
+    "d3d11h264dec",
+    "d3d11h265dec",
+    "d3d11vp8dec",
+    "d3d11vp9dec",
+    "d3d11av1dec",
+    "d3d11mpeg2dec",
+];
+
+const CUDA_DECODER_FACTORIES: &[&str] = &[
+    "nvh264dec",
+    "nvh265dec",
+    "nvvp9dec",
+    "nvav1dec",
+    "cudah264dec",
+    "cudah265dec",
+];
+
+/// Runtime-demote a decoder factory so `decodebin`/`playbin` stop autoplugging it.
+///
+/// Unlike the `GST_PLUGIN_FEATURE_RANK` environment variable (which is only consulted
+/// while the registry is loaded, i.e. before `gst::init`), this mutates the live feature
+/// objects and therefore affects every pipeline created afterwards in this process.
+fn demote_decoder_factory(factory_name: &str) {
+    let Some(factory) = gst::ElementFactory::find(factory_name) else {
+        return;
+    };
+    factory.set_rank(gst::Rank::NONE);
+}
+
+/// True when the error indicates a GStreamer call that hit its timeout bound (a wedged
+/// pipeline), as opposed to an ordinary playback error (corrupt file, missing codec...).
+fn is_timeout_like_error(err: &str) -> bool {
+    err.contains("Timed out") || err.contains("unresponsive") || err.contains("decoder hang")
+}
+
+/// Create and start a video player, retrying with progressively demoted hardware
+/// decoders when a load times out.
+///
+/// Hardware decoders (notably `d3d12av1dec`/`d3d11av1dec` on some NVIDIA driver
+/// combinations) can hang the GStreamer streaming thread. Without a fallback, one
+/// wedged decoder would block the media-load worker forever, making next/previous
+/// navigation appear dead. Each attempt is bounded by the player's internal timeouts;
+/// when an attempt fails with a timeout, the corresponding hardware tier is demoted
+/// for the rest of the session and playback is retried (d3d12 → d3d11 → CUDA → software).
+pub fn create_video_player_with_fallback<F>(
+    path: &Path,
+    muted: bool,
+    initial_volume: f64,
+    prefer_hardware_decode: bool,
+    disable_hardware_decode: bool,
+    enable_cuda_decode: bool,
+    enable_d3d12_decode: bool,
+    source_dimensions: Option<(u32, u32)>,
+    output_dimensions: Option<(u32, u32)>,
+    start: F,
+) -> Result<VideoPlayer, String>
+where
+    F: Fn(&mut VideoPlayer) -> Result<(), String> + Copy,
+{
+    let mut tiers_demoted: u8 = 0;
+
+    loop {
+        let attempt = VideoPlayer::new(
+            path,
+            muted,
+            initial_volume,
+            prefer_hardware_decode,
+            disable_hardware_decode,
+            enable_cuda_decode,
+            enable_d3d12_decode,
+            source_dimensions,
+            output_dimensions,
+        )
+        .and_then(|mut player| {
+            start(&mut player)?;
+            Ok(player)
+        });
+
+        match attempt {
+            Ok(player) => return Ok(player),
+            Err(err) => {
+                let timeout_like = is_timeout_like_error(&err);
+                // Ordinary failures (corrupt file, missing codec, ...) will not be fixed
+                // by switching decoders; report them immediately.
+                if !timeout_like || disable_hardware_decode || tiers_demoted >= 3 {
+                    return Err(err);
+                }
+
+                let tier_factories = match tiers_demoted {
+                    0 => D3D12_DECODER_FACTORIES,
+                    1 => D3D11_DECODER_FACTORIES,
+                    _ => CUDA_DECODER_FACTORIES,
+                };
+                for factory in tier_factories {
+                    demote_decoder_factory(factory);
+                }
+                tiers_demoted += 1;
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -701,6 +828,15 @@ const LOCAL_FILE_SOURCE_BLOCK_SIZE_BYTES: i32 = 256 * 1024;
 const APPSINK_MAX_BUFFERS: u32 = 3;
 const KEYFRAME_SEEK_PREROLL_TIMEOUT_MS: u64 = 20;
 const ACCURATE_SEEK_PREROLL_TIMEOUT_MS: u64 = 75;
+// Bounds for blocking GStreamer calls. A wedged decoder (e.g. d3d12av1dec with a
+// driver-side hang) can make `gst_element_set_state`/`gst_element_seek`/queries
+// block forever, which would permanently freeze the media-load worker thread and
+// make file navigation appear dead while the UI stays responsive. Every blocking
+// call therefore runs on a helper thread with a hard timeout.
+const STATE_CHANGE_TIMEOUT: Duration = Duration::from_secs(5);
+const UI_STATE_CHANGE_TIMEOUT: Duration = Duration::from_secs(1);
+const SEEK_TIMEOUT: Duration = Duration::from_secs(3);
+const QUERY_TIMEOUT: Duration = Duration::from_millis(250);
 const SUBTITLE_FONT_DESC_FALLBACK_CJK: &str =
     "Noto Sans CJK JP, Noto Sans CJK SC, Noto Sans CJK KR, Microsoft YaHei, Meiryo, Malgun Gothic, Sans";
 const SUBTITLE_FONT_DESC_FALLBACK_ARABIC: &str =
@@ -801,6 +937,59 @@ impl VideoState {
 
     fn seek_in_progress(&self) -> bool {
         self.seek_in_progress.load(Ordering::Acquire)
+    }
+}
+
+/// Run a blocking GStreamer call on a helper thread and wait at most `timeout`.
+///
+/// GStreamer's `gst_element_set_state`/`gst_element_seek`/element queries can block
+/// indefinitely when a decoder hangs (seen with hardware AV1 decoders). Running them
+/// on a detached helper thread with a bounded wait keeps the caller (UI thread or the
+/// media-load worker) from freezing. If the timeout fires the helper thread is
+/// abandoned — it is stuck inside GStreamer and there is nothing safe we can do to
+/// wake it, but the pipeline it belongs to is unusable anyway.
+pub(crate) fn run_gst_with_timeout<T: Send + 'static>(
+    thread_name: &str,
+    timeout: Duration,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    // Hold the closure in a shared cell so we can still run it inline if spawning
+    // the helper thread fails (the 'static requirement prevents borrowing it).
+    let f_cell = Arc::new(std::sync::Mutex::new(Some(f)));
+    let f_cell_thread = Arc::clone(&f_cell);
+    let spawned = std::thread::Builder::new()
+        .name(format!("riv-gst-{thread_name}"))
+        .spawn(move || {
+            let f = f_cell_thread
+                .lock()
+                .expect("gst timeout cell poisoned")
+                .take()
+                .expect("gst closure executed twice");
+            let result = f();
+            let _ = result_tx.send(result);
+        });
+    let Ok(handle) = spawned else {
+        // Thread creation failure: fall back to running the call inline. This is
+        // extremely rare and blocking inline is still better than failing outright.
+        let f = f_cell
+            .lock()
+            .expect("gst timeout cell poisoned")
+            .take()
+            .expect("gst closure executed twice");
+        return Some(f());
+    };
+
+    match result_rx.recv_timeout(timeout) {
+        Ok(result) => {
+            let _ = handle.join();
+            Some(result)
+        }
+        Err(_) => {
+            // Call did not return in time; the GStreamer pipeline is wedged.
+            // Detach the helper thread and report the timeout to the caller.
+            None
+        }
     }
 }
 
@@ -1345,6 +1534,14 @@ pub struct VideoPlayer {
     original_width: u32,
     original_height: u32,
     last_frame_pts: Option<Duration>,
+    // TTL cache for position queries: querying a GStreamer pipeline can block (wedged
+    // decoder), so we run queries on a helper thread and reuse the last good value for
+    // a short interval to keep per-frame UI polling cheap.
+    last_position: Cell<Option<(Instant, Option<Duration>)>>,
+    // Set once a blocking GStreamer call has timed out: the pipeline is wedged and will
+    // not recover. Stops the per-frame position query from spawning (and leaking) helper
+    // threads until this player is replaced.
+    wedged: AtomicBool,
     audio_track_disabled: bool,
     subtitle_track_disabled: bool,
     subtitle_selection: VideoSubtitleSelection,
@@ -1601,6 +1798,8 @@ Ensure your GStreamer installation includes the playback elements (usually from 
             original_width: source_dimensions.map_or(0, |(width, _)| width),
             original_height: source_dimensions.map_or(0, |(_, height)| height),
             last_frame_pts: None,
+            last_position: Cell::new(None),
+            wedged: AtomicBool::new(false),
             audio_track_disabled: false,
             subtitle_track_disabled: false,
             subtitle_selection: VideoSubtitleSelection::Off,
@@ -1624,7 +1823,24 @@ Ensure your GStreamer installation includes the playback elements (usually from 
 
     /// Start playback
     pub fn play(&mut self) -> Result<(), String> {
-        if let Err(err) = self.pipeline.set_state(gst::State::Playing) {
+        let pipeline = self.pipeline.clone();
+        let state_result = run_gst_with_timeout(
+            "state-playing",
+            STATE_CHANGE_TIMEOUT,
+            move || pipeline.set_state(gst::State::Playing),
+        );
+        let result = match state_result {
+            Some(result) => result,
+            None => {
+                self.wedged.store(true, Ordering::Release);
+                return Err(
+                    "Timed out while starting playback: the video pipeline is unresponsive \
+                     (a hardware decoder hang). Try disabling hardware acceleration."
+                        .to_string(),
+                );
+            }
+        };
+        if let Err(err) = result {
             // State-change errors are often just a symptom. Try to extract the *real* reason
             // from the bus (missing demuxer/decoder, invalid URI, missing device/sink, etc.).
             let details = self.drain_bus_error_string();
@@ -1690,9 +1906,24 @@ Ensure your GStreamer installation includes the playback elements (usually from 
 
     /// Pause playback
     pub fn pause(&mut self) -> Result<(), String> {
-        self.pipeline
-            .set_state(gst::State::Paused)
-            .map_err(|e| format!("Failed to pause playback: {}", e))?;
+        let pipeline = self.pipeline.clone();
+        let state_result = run_gst_with_timeout(
+            "state-paused",
+            STATE_CHANGE_TIMEOUT,
+            move || pipeline.set_state(gst::State::Paused),
+        );
+        let result = match state_result {
+            Some(result) => result,
+            None => {
+                self.wedged.store(true, Ordering::Release);
+                return Err(
+                    "Timed out while pausing: the video pipeline is unresponsive (a hardware \
+                     decoder hang)."
+                        .to_string(),
+                );
+            }
+        };
+        result.map_err(|e| format!("Failed to pause playback: {}", e))?;
         self.is_playing = false;
         self.buffering_paused = false;
         self.buffering_pause_suppressed_until = None;
@@ -1720,7 +1951,10 @@ Ensure your GStreamer installation includes the playback elements (usually from 
 
         self.buffering_pause_suppressed_until = Some(Instant::now() + Duration::from_secs(1));
         if self.buffering_paused {
-            let _ = self.pipeline.set_state(gst::State::Playing);
+            let pipeline = self.pipeline.clone();
+            let _ = run_gst_with_timeout("state-unpause", UI_STATE_CHANGE_TIMEOUT, move || {
+                pipeline.set_state(gst::State::Playing)
+            });
             self.buffering_paused = false;
         }
     }
@@ -1794,10 +2028,21 @@ Ensure your GStreamer installation includes the playback elements (usually from 
         // If it's already playing/paused, this returns instantly so scrubbing stays smooth!
         let _ = self.pipeline.state(gst::ClockTime::from_mseconds(500));
 
-        let seek_result = self
-            .pipeline
-            .seek_simple(Self::seek_flags_for_mode(mode), target)
-            .map_err(|e| format!("Failed to seek: {}", e));
+        let pipeline = self.pipeline.clone();
+        let seek_result = run_gst_with_timeout("seek", SEEK_TIMEOUT, move || {
+            pipeline.seek_simple(Self::seek_flags_for_mode(mode), target)
+        });
+        let seek_result = match seek_result {
+            Some(result) => result.map_err(|e| format!("Failed to seek: {}", e)),
+            None => {
+                self.wedged.store(true, Ordering::Release);
+                Err(
+                    "Timed out while seeking: the video pipeline is unresponsive (a hardware \
+                     decoder hang)."
+                        .to_string(),
+                )
+            }
+        };
 
         self.state.end_seek();
 
@@ -1842,9 +2087,36 @@ Ensure your GStreamer installation includes the playback elements (usually from 
 
     /// Get current playback position in seconds
     pub fn position(&self) -> Option<Duration> {
-        self.pipeline
-            .query_position::<gst::ClockTime>()
-            .map(|pos| Duration::from_nanos(pos.nseconds()))
+        const QUERY_MIN_INTERVAL: Duration = Duration::from_millis(100);
+
+        let now = Instant::now();
+        if let Some((queried_at, cached)) = self.last_position.get() {
+            if now.duration_since(queried_at) < QUERY_MIN_INTERVAL {
+                return cached;
+            }
+        }
+
+        // A previously timed-out call means the pipeline is wedged: skip the (leaking)
+        // helper thread entirely and keep serving the last known position.
+        if self.wedged.load(Ordering::Acquire) {
+            return self.last_position.get().map(|(_, cached)| cached).flatten();
+        }
+
+        let pipeline = self.pipeline.clone();
+        // `None` here means the query timed out (helper thread abandoned), NOT that the
+        // pipeline reported no position — those come back as `Some(None)`.
+        let query_result = run_gst_with_timeout("query-position", QUERY_TIMEOUT, move || {
+            pipeline
+                .query_position::<gst::ClockTime>()
+                .map(|pos| Duration::from_nanos(pos.nseconds()))
+        });
+        if query_result.is_none() {
+            // Query timed out: the pipeline is wedged. Stop spawning helper threads.
+            self.wedged.store(true, Ordering::Release);
+        }
+        let result = query_result.flatten();
+        self.last_position.set(Some((now, result)));
+        result
     }
 
     /// Position of the newest frame returned to the renderer, falling back to pipeline time.
@@ -1859,11 +2131,17 @@ Ensure your GStreamer installation includes the playback elements (usually from 
 
     /// Update cached duration (call periodically)
     pub fn update_duration(&mut self) {
-        if self.duration.is_none() {
-            self.duration = self
-                .pipeline
-                .query_duration::<gst::ClockTime>()
-                .map(|dur| Duration::from_nanos(dur.nseconds()));
+        if self.duration.is_none() && !self.wedged.load(Ordering::Acquire) {
+            let pipeline = self.pipeline.clone();
+            let query_result = run_gst_with_timeout("query-duration", QUERY_TIMEOUT, move || {
+                pipeline
+                    .query_duration::<gst::ClockTime>()
+                    .map(|dur| Duration::from_nanos(dur.nseconds()))
+            });
+            if query_result.is_none() {
+                self.wedged.store(true, Ordering::Release);
+            }
+            self.duration = query_result.flatten();
         }
     }
 
@@ -2376,16 +2654,31 @@ Ensure your GStreamer installation includes the playback elements (usually from 
                         if percent >= 100 {
                             self.buffering_pause_suppressed_until = None;
                             if self.is_playing && self.buffering_paused {
-                                let _ = self.pipeline.set_state(gst::State::Playing);
+                                let pipeline = self.pipeline.clone();
+                                let _ = run_gst_with_timeout(
+                                    "state-unpause",
+                                    UI_STATE_CHANGE_TIMEOUT,
+                                    move || pipeline.set_state(gst::State::Playing),
+                                );
                                 self.buffering_paused = false;
                             }
                         } else if self.buffering_pause_suppressed() {
                             if self.buffering_paused {
-                                let _ = self.pipeline.set_state(gst::State::Playing);
+                                let pipeline = self.pipeline.clone();
+                                let _ = run_gst_with_timeout(
+                                    "state-unpause",
+                                    UI_STATE_CHANGE_TIMEOUT,
+                                    move || pipeline.set_state(gst::State::Playing),
+                                );
                                 self.buffering_paused = false;
                             }
                         } else if self.is_playing && !self.buffering_paused {
-                            let _ = self.pipeline.set_state(gst::State::Paused);
+                            let pipeline = self.pipeline.clone();
+                            let _ = run_gst_with_timeout(
+                                "state-pause",
+                                UI_STATE_CHANGE_TIMEOUT,
+                                move || pipeline.set_state(gst::State::Paused),
+                            );
                             self.buffering_paused = true;
                         }
                     }
@@ -2420,9 +2713,16 @@ impl Drop for VideoPlayer {
             .spawn(shutdown)
             .is_err()
         {
-            // Extremely rare fallback: if thread creation fails, preserve previous behavior.
-            let _ = self.pipeline.set_state(gst::State::Ready);
-            let _ = self.pipeline.set_state(gst::State::Null);
+            // Extremely rare fallback: if thread creation fails, run the teardown inline
+            // but keep it bounded so a wedged pipeline cannot freeze the dropping thread.
+            let pipeline_ready = self.pipeline.clone();
+            let _ = run_gst_with_timeout("state-ready", STATE_CHANGE_TIMEOUT, move || {
+                pipeline_ready.set_state(gst::State::Ready)
+            });
+            let pipeline_null = self.pipeline.clone();
+            let _ = run_gst_with_timeout("state-null", STATE_CHANGE_TIMEOUT, move || {
+                pipeline_null.set_state(gst::State::Null)
+            });
         }
     }
 }
@@ -2438,5 +2738,73 @@ pub fn format_duration(duration: Duration) -> String {
         format!("{}:{:02}:{:02}", hours, minutes, seconds)
     } else {
         format!("{}:{:02}", minutes, seconds)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gst_timeout_returns_result_when_call_finishes() {
+        let result = run_gst_with_timeout("test-fast", Duration::from_millis(500), || 42u32);
+        assert_eq!(result, Some(42));
+    }
+
+    #[test]
+    fn gst_timeout_returns_none_when_call_exceeds_timeout() {
+        let start = Instant::now();
+        let result = run_gst_with_timeout("test-slow", Duration::from_millis(100), || {
+            std::thread::sleep(Duration::from_millis(2000));
+            42u32
+        });
+        assert!(result.is_none(), "expected the timed-out call to report None");
+        // Must return shortly after the timeout, without waiting for the closure.
+        assert!(start.elapsed() < Duration::from_millis(1000));
+    }
+
+    #[test]
+    fn gst_timeout_does_not_leak_inner_value() {
+        // Even when the closure never finishes, the caller must not observe a value.
+        let result = run_gst_with_timeout("test-slow-value", Duration::from_millis(50), || {
+            std::thread::sleep(Duration::from_millis(5000));
+            "unreachable"
+        });
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn timeout_like_error_matches_wedge_messages_only() {
+        // Timeout errors produced by play()/pause()/seek() must trigger the decoder
+        // fallback tiers.
+        assert!(is_timeout_like_error(
+            "Timed out while starting playback: the video pipeline is unresponsive (a hardware decoder hang)."
+        ));
+        assert!(is_timeout_like_error(
+            "Timed out while seeking: the video pipeline is unresponsive (a hardware decoder hang)."
+        ));
+        assert!(is_timeout_like_error(
+            "Timed out while pausing: the video pipeline is unresponsive (a hardware decoder hang)."
+        ));
+        // Ordinary failures must NOT trigger the fallback (no pointless retries).
+        assert!(!is_timeout_like_error(
+            "Failed to start playback: Could not open resource for reading (No such file or directory)"
+        ));
+        assert!(!is_timeout_like_error(
+            "Failed to create video pipeline. Tried `playbin`"
+        ));
+        assert!(!is_timeout_like_error("GStreamer runtime was not found"));
+    }
+
+    #[test]
+    fn decoder_fallback_tier_order_is_stable() {
+        // Guard against accidentally reordering the demotion tiers: d3d12 first, then
+        // d3d11, then CUDA/software. Any timeout beyond the tiers must not recurse.
+        assert_eq!(D3D12_DECODER_FACTORIES.len(), 6);
+        assert_eq!(D3D11_DECODER_FACTORIES.len(), 6);
+        assert_eq!(CUDA_DECODER_FACTORIES.len(), 6);
+        assert!(D3D12_DECODER_FACTORIES.contains(&"d3d12av1dec"));
+        assert!(D3D11_DECODER_FACTORIES.contains(&"d3d11av1dec"));
+        assert!(CUDA_DECODER_FACTORIES.contains(&"nvav1dec"));
     }
 }

@@ -46,6 +46,8 @@ pub fn probe_video_dimensions_with_gstreamer(path: &Path) -> Option<(u32, u32)> 
     use std::sync::Arc;
     use std::time::Duration;
 
+    use crate::video_player::run_gst_with_timeout;
+
     static GST_INIT: std::sync::OnceLock<Result<(), ()>> = std::sync::OnceLock::new();
     let init_result = GST_INIT.get_or_init(|| gst::init().map_err(|_| ()));
     if init_result.is_err() {
@@ -86,8 +88,20 @@ pub fn probe_video_dimensions_with_gstreamer(path: &Path) -> Option<(u32, u32)> 
             .build(),
     );
 
-    if pipeline.set_state(gst::State::Paused).is_err() {
-        let _ = pipeline.set_state(gst::State::Null);
+    let pipeline_paused = pipeline.clone();
+    if run_gst_with_timeout(
+        "probe-paused",
+        Duration::from_secs(8),
+        move || pipeline_paused.set_state(gst::State::Paused),
+    )
+    .map_or(true, |result| result.is_err())
+    {
+        let pipeline_null = pipeline.clone();
+        let _ = run_gst_with_timeout(
+            "probe-null",
+            Duration::from_secs(1),
+            move || pipeline_null.set_state(gst::State::Null),
+        );
         return None;
     }
 
@@ -108,7 +122,12 @@ pub fn probe_video_dimensions_with_gstreamer(path: &Path) -> Option<(u32, u32)> 
         }
     }
 
-    let _ = pipeline.set_state(gst::State::Null);
+    let pipeline_null = pipeline.clone();
+    let _ = run_gst_with_timeout(
+        "probe-null",
+        Duration::from_secs(1),
+        move || pipeline_null.set_state(gst::State::Null),
+    );
     let probed_dimensions = *dimensions.lock();
     probed_dimensions
 }
