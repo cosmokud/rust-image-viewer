@@ -49,7 +49,13 @@ pub fn probe_video_dimensions_with_gstreamer(path: &Path) -> Option<(u32, u32)> 
     use crate::video_player::run_gst_with_timeout;
 
     static GST_INIT: std::sync::OnceLock<Result<(), ()>> = std::sync::OnceLock::new();
-    let init_result = GST_INIT.get_or_init(|| gst::init().map_err(|_| ()));
+    let init_result = GST_INIT.get_or_init(|| {
+        let result = gst::init().map_err(|_| ());
+        if result.is_ok() {
+            crate::video_player::apply_av1_decoder_stability_ranks();
+        }
+        result
+    });
     if init_result.is_err() {
         return None;
     }

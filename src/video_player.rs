@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::cell::Cell;
-use std::sync::atomic::{AtomicBool, AtomicI8, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI8, AtomicU32, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -221,7 +221,7 @@ fn configure_gstreamer_env_windows() {
 }
 
 #[cfg(target_os = "windows")]
-fn apply_decoder_preference_windows(
+pub(crate) fn apply_decoder_preference_windows(
     prefer_hardware_decode: bool,
     disable_hardware_decode: bool,
     enable_cuda_decode: bool,
@@ -278,7 +278,7 @@ d3d11h264dec:0,d3d11h265dec:0,d3d11vp8dec:0,d3d11vp9dec:0,d3d11av1dec:0,d3d11mpe
 }
 
 #[cfg(not(target_os = "windows"))]
-fn apply_decoder_preference_windows(
+pub(crate) fn apply_decoder_preference_windows(
     _prefer_hardware_decode: bool,
     _disable_hardware_decode: bool,
     _enable_cuda_decode: bool,
@@ -325,6 +325,58 @@ fn demote_decoder_factory(factory_name: &str) {
     factory.set_rank(gst::Rank::NONE);
 }
 
+/// Runtime counterpart of the `AV1_D3D12_STABILITY_RANK` env entry: demotes
+/// `d3d12av1dec` below `d3d11av1dec` on the live feature objects.
+///
+/// This exists because `GST_PLUGIN_FEATURE_RANK` is only applied during `gst::init()`,
+/// which can already have happened (e.g. by a thumbnail-probe worker) before the app
+/// configuration was applied. Demoting the live feature works regardless of init order.
+/// If the user explicitly forced a lower rank (e.g. software-only), it is left alone.
+pub(crate) fn apply_av1_decoder_stability_ranks() {
+    static APPLIED: OnceLock<()> = OnceLock::new();
+    APPLIED.get_or_init(|| {
+        let Some(factory) = gst::ElementFactory::find("d3d12av1dec") else {
+            return;
+        };
+        if factory.rank() > gst::Rank::PRIMARY {
+            factory.set_rank(gst::Rank::PRIMARY);
+        }
+    });
+}
+
+/// Tracks which hardware-decoder tiers have been demoted for the rest of the process
+/// (0 = D3D12, 1 = D3D11, 2 = CUDA). Shared by the load-time fallback and the
+/// stall-detection path so both make the same, session-persistent demotions.
+static DEMOTED_HARDWARE_TIERS: AtomicU8 = AtomicU8::new(0);
+
+/// Demote the next hardware-decoder tier (D3D12 → D3D11 → CUDA). Returns false when
+/// every tier is already demoted (i.e. only software decoders remain).
+fn demote_next_hardware_tier() -> bool {
+    let tier = DEMOTED_HARDWARE_TIERS.fetch_add(1, Ordering::SeqCst);
+    let factories = match tier {
+        0 => D3D12_DECODER_FACTORIES,
+        1 => D3D11_DECODER_FACTORIES,
+        2 => CUDA_DECODER_FACTORIES,
+        _ => return false,
+    };
+    for factory in factories {
+        demote_decoder_factory(factory);
+    }
+    true
+}
+
+/// AV1-specific hardware decoders on Windows. A stall on an AV1 file is most likely one
+/// of these, so they are demoted to software (dav1d) without touching the D3D12/D3D11
+/// H.264/H.265/VP8/VP9 decoders that work fine on the affected machines. (On non-Windows
+/// platforms these factories do not exist and the demotion is a no-op.)
+const AV1_HARDWARE_DECODER_FACTORIES: &[&str] = &["d3d12av1dec", "d3d11av1dec", "nvav1dec"];
+
+fn demote_av1_hardware_tiers() {
+    for factory in AV1_HARDWARE_DECODER_FACTORIES {
+        demote_decoder_factory(factory);
+    }
+}
+
 /// True when the error indicates a GStreamer call that hit its timeout bound (a wedged
 /// pipeline), as opposed to an ordinary playback error (corrupt file, missing codec...).
 fn is_timeout_like_error(err: &str) -> bool {
@@ -355,8 +407,6 @@ pub fn create_video_player_with_fallback<F>(
 where
     F: Fn(&mut VideoPlayer) -> Result<(), String> + Copy,
 {
-    let mut tiers_demoted: u8 = 0;
-
     loop {
         let attempt = VideoPlayer::new(
             path,
@@ -380,19 +430,14 @@ where
                 let timeout_like = is_timeout_like_error(&err);
                 // Ordinary failures (corrupt file, missing codec, ...) will not be fixed
                 // by switching decoders; report them immediately.
-                if !timeout_like || disable_hardware_decode || tiers_demoted >= 3 {
+                if !timeout_like || disable_hardware_decode {
                     return Err(err);
                 }
-
-                let tier_factories = match tiers_demoted {
-                    0 => D3D12_DECODER_FACTORIES,
-                    1 => D3D11_DECODER_FACTORIES,
-                    _ => CUDA_DECODER_FACTORIES,
-                };
-                for factory in tier_factories {
-                    demote_decoder_factory(factory);
+                if !demote_next_hardware_tier() {
+                    // Every hardware tier is already demoted (only software remains) and
+                    // it still timed out — nothing left to try.
+                    return Err(err);
                 }
-                tiers_demoted += 1;
             }
         }
     }
@@ -837,6 +882,14 @@ const STATE_CHANGE_TIMEOUT: Duration = Duration::from_secs(5);
 const UI_STATE_CHANGE_TIMEOUT: Duration = Duration::from_secs(1);
 const SEEK_TIMEOUT: Duration = Duration::from_secs(3);
 const QUERY_TIMEOUT: Duration = Duration::from_millis(250);
+// Stall detection: a playing pipeline that delivers no frame for this long is almost
+// certainly a wedged hardware decoder (a freeze, not a slow start). Detecting it early
+// lets us demote the broken AV1 decoder BEFORE the user navigates, so the next file
+// loads without a state-change timeout delay.
+const STALL_DETECTION_NO_FRAME_TIMEOUT: Duration = Duration::from_secs(3);
+// Grace period after play() begins before stall detection kicks in, to avoid flagging
+// legitimate startup/buffering transients.
+const STALL_DETECTION_START_GRACE: Duration = Duration::from_secs(3);
 const SUBTITLE_FONT_DESC_FALLBACK_CJK: &str =
     "Noto Sans CJK JP, Noto Sans CJK SC, Noto Sans CJK KR, Microsoft YaHei, Meiryo, Malgun Gothic, Sans";
 const SUBTITLE_FONT_DESC_FALLBACK_ARABIC: &str =
@@ -1542,6 +1595,17 @@ pub struct VideoPlayer {
     // not recover. Stops the per-frame position query from spawning (and leaking) helper
     // threads until this player is replaced.
     wedged: AtomicBool,
+    // Timestamps used by `mark_wedged_if_stalled` to detect a frozen decoder while the
+    // pipeline is nominally playing.
+    last_frame_at: Cell<Option<Instant>>,
+    play_started_at: Cell<Option<Instant>>,
+    // When get_frame() was last called. Only actively-polled players (the solo video and
+    // the focused manga video) may use `last_frame_at` for drop-time stall detection;
+    // grid previews are polled once at load time and would otherwise look "stalled".
+    last_polled_at: Cell<Option<Instant>>,
+    // Set when the pipeline reaches end-of-stream: no more frames arrive by design, so
+    // stall detection must not fire (and must reset when playback restarts/seeks).
+    eos_seen: bool,
     audio_track_disabled: bool,
     subtitle_track_disabled: bool,
     subtitle_selection: VideoSubtitleSelection,
@@ -1567,6 +1631,11 @@ impl VideoPlayer {
                 gst::init()
                     .map_err(|e| format!("Failed to initialize GStreamer: {}", e))
                     .and_then(|_| {
+                        // The GST_PLUGIN_FEATURE_RANK env var may have been applied after
+                        // an earlier gst::init() (probe workers); re-apply the AV1 stability
+                        // demotion on the live feature objects regardless of init order.
+                        apply_av1_decoder_stability_ranks();
+
                         // Provide an early, actionable error if playback elements are missing.
                         // (We still try both names at actual pipeline creation time.)
                         let has_playbin = gst::ElementFactory::find("playbin").is_some()
@@ -1800,6 +1869,10 @@ Ensure your GStreamer installation includes the playback elements (usually from 
             last_frame_pts: None,
             last_position: Cell::new(None),
             wedged: AtomicBool::new(false),
+            last_frame_at: Cell::new(None),
+            play_started_at: Cell::new(None),
+            last_polled_at: Cell::new(None),
+            eos_seen: false,
             audio_track_disabled: false,
             subtitle_track_disabled: false,
             subtitle_selection: VideoSubtitleSelection::Off,
@@ -1853,6 +1926,9 @@ Ensure your GStreamer installation includes the playback elements (usually from 
         self.is_playing = true;
         self.buffering_paused = false;
         self.buffering_pause_suppressed_until = None;
+        self.eos_seen = false;
+        self.last_frame_at.set(None);
+        self.play_started_at.set(Some(Instant::now()));
 
         // Try to get duration after starting
         self.update_duration();
@@ -1927,6 +2003,7 @@ Ensure your GStreamer installation includes the playback elements (usually from 
         self.is_playing = false;
         self.buffering_paused = false;
         self.buffering_pause_suppressed_until = None;
+        self.last_frame_at.set(None);
         Ok(())
     }
 
@@ -2022,6 +2099,8 @@ Ensure your GStreamer installation includes the playback elements (usually from 
         self.state.begin_seek();
         self.state.clear_frames();
         self.last_frame_pts = None;
+        self.eos_seen = false;
+        self.last_frame_at.set(None);
 
         // FIX: Wait for the pipeline to finish any pending state changes
         // (like reaching PAUSED on initial load) before seeking.
@@ -2593,9 +2672,11 @@ Ensure your GStreamer installation includes the playback elements (usually from 
     /// Get the latest video frame if updated
     /// Takes ownership of the freshest frame and drops stale queued frames.
     pub fn get_frame(&mut self) -> Option<VideoFrame> {
+        self.last_polled_at.set(Some(Instant::now()));
         let latest = self.state.pop_latest_frame();
 
         if let Some(frame) = latest {
+            self.last_frame_at.set(Some(Instant::now()));
             if frame.pts.is_some() {
                 self.last_frame_pts = frame.pts;
             }
@@ -2611,6 +2692,47 @@ Ensure your GStreamer installation includes the playback elements (usually from 
         }
 
         None
+    }
+
+    /// Detect a frozen decoder on the currently playing pipeline and demote the AV1
+    /// hardware decoders immediately, so the NEXT file loads without waiting for a
+    /// state-change timeout. Call once per UI frame while the video is visible.
+    ///
+    /// A hardware-decoder hang freezes frame delivery completely, so "no frame for a
+    /// while while playing" is a reliable signal once the guards (pause, buffering,
+    /// track-switch suppression, seek, EOS, slow start) are excluded.
+    pub fn mark_wedged_if_stalled(&mut self) {
+        if self.wedged.load(Ordering::Acquire) {
+            return;
+        }
+        if !self.is_playing
+            || self.buffering_paused
+            || self.eos_seen
+            || self.buffering_pause_suppressed_until.is_some()
+            || self.state.seek_in_progress()
+        {
+            return;
+        }
+
+        let now = Instant::now();
+        let Some(started_at) = self.play_started_at.get() else {
+            return;
+        };
+        if now.duration_since(started_at) < STALL_DETECTION_START_GRACE {
+            return;
+        }
+        let Some(last_frame_at) = self.last_frame_at.get() else {
+            // No frame since play()/pause()/seek() yet — allow time to deliver one.
+            return;
+        };
+        if now.duration_since(last_frame_at) < STALL_DETECTION_NO_FRAME_TIMEOUT {
+            return;
+        }
+
+        // No frames while playing: the decoder (or its GPU device) is wedged.
+        // Demote the AV1 hardware decoders so subsequent loads skip the broken path.
+        self.wedged.store(true, Ordering::Release);
+        demote_av1_hardware_tiers();
     }
 
     /// Get video dimensions
@@ -2637,7 +2759,10 @@ Ensure your GStreamer installation includes the playback elements (usually from 
                 };
 
                 match msg.view() {
-                    gst::MessageView::Eos(_) => return true,
+                    gst::MessageView::Eos(_) => {
+                        self.eos_seen = true;
+                        return true;
+                    }
                     gst::MessageView::StreamCollection(collection) => {
                         self.stream_collection = Some(collection.stream_collection());
                     }
@@ -2701,6 +2826,30 @@ Ensure your GStreamer installation includes the playback elements (usually from 
 
 impl Drop for VideoPlayer {
     fn drop(&mut self) {
+        // If this player froze while playing, demote the AV1 hardware decoders NOW so the
+        // next navigation does not have to wait for a state-change timeout. Covers the
+        // race where the user navigates before the per-frame stall detection fired.
+        // Only trust the frame timestamps when this player is actively polled (solo or
+        // focused manga video): grid previews are polled once at load time and would
+        // otherwise look "stalled" while decoding perfectly fine.
+        let recently_polled = self
+            .last_polled_at
+            .get()
+            .is_some_and(|at| at.elapsed() < STALL_DETECTION_NO_FRAME_TIMEOUT);
+        let stalled_while_playing = self.wedged.load(Ordering::Acquire)
+            || (recently_polled
+                && self.is_playing
+                && !self.buffering_paused
+                && !self.eos_seen
+                && self.buffering_pause_suppressed_until.is_none()
+                && self
+                    .last_frame_at
+                    .get()
+                    .is_some_and(|at| at.elapsed() > STALL_DETECTION_NO_FRAME_TIMEOUT));
+        if stalled_while_playing {
+            demote_av1_hardware_tiers();
+        }
+
         let pipeline = self.pipeline.clone();
         let shutdown = move || {
             // Some decoders/drivers can block during teardown. Keep this work off the UI thread.
@@ -2806,5 +2955,30 @@ mod tests {
         assert!(D3D12_DECODER_FACTORIES.contains(&"d3d12av1dec"));
         assert!(D3D11_DECODER_FACTORIES.contains(&"d3d11av1dec"));
         assert!(CUDA_DECODER_FACTORIES.contains(&"nvav1dec"));
+
+        // AV1-specific demotion list must cover every AV1 hardware decoder.
+        assert_eq!(AV1_HARDWARE_DECODER_FACTORIES.len(), 3);
+        assert!(AV1_HARDWARE_DECODER_FACTORIES.contains(&"d3d12av1dec"));
+        assert!(AV1_HARDWARE_DECODER_FACTORIES.contains(&"d3d11av1dec"));
+        assert!(AV1_HARDWARE_DECODER_FACTORIES.contains(&"nvav1dec"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn decoder_rank_env_appends_av1_stability_override_last() {
+        // GST_PLUGIN_FEATURE_RANK is applied in order with later entries winning, so the
+        // d3d12av1dec stability demotion must come after the D3D12 ranks.
+        let d3d12_available = detect_video_acceleration_capabilities().d3d12_available;
+        std::env::remove_var("GST_PLUGIN_FEATURE_RANK");
+        apply_decoder_preference_windows(true, false, false, true);
+        let ranks = std::env::var("GST_PLUGIN_FEATURE_RANK")
+            .expect("ranks must be set in hardware-preferred mode");
+        if d3d12_available {
+            assert!(ranks.contains("d3d12av1dec:1024"), "ranks: {ranks}");
+        }
+        assert!(
+            ranks.ends_with("d3d12av1dec:256"),
+            "stability override must be last: {ranks}"
+        );
     }
 }

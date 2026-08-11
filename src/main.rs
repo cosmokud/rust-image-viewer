@@ -1701,7 +1701,13 @@ fn extract_video_first_frame_thumbnail(
     use gstreamer_video as gst_video;
 
     static GST_INIT: OnceLock<Result<(), ()>> = OnceLock::new();
-    let init_result = GST_INIT.get_or_init(|| gst::init().map_err(|_| ()));
+    let init_result = GST_INIT.get_or_init(|| {
+        let result = gst::init().map_err(|_| ());
+        if result.is_ok() {
+            video_player::apply_av1_decoder_stability_ranks();
+        }
+        result
+    });
     if init_result.is_err() {
         return None;
     }
@@ -2820,9 +2826,43 @@ struct ImageViewer {
     file_receiver: Option<FileReceiver>,
 }
 
+/// Apply the decoder-rank preferences from the configuration BEFORE any GStreamer
+/// initialization can happen (GST_PLUGIN_FEATURE_RANK is only consulted during
+/// `gst::init()`, so a late application is silently ignored).
+fn apply_decoder_preferences_from_config(config: &Config) {
+    let hardware_available = detect_video_acceleration_capabilities().hardware_decode_available;
+    if !config.use_hardware_acceleration || !hardware_available {
+        video_player::apply_decoder_preference_windows(false, true, false, false);
+        return;
+    }
+
+    let disable_hardware_decode = config.video_disable_hardware_decode;
+    let prefer_hardware_decode = config.video_prefer_hardware_decode;
+    let enable_cuda_decode = !disable_hardware_decode
+        && config.enable_cuda
+        && detect_video_acceleration_capabilities().cuda_available;
+    let enable_d3d12_decode = !disable_hardware_decode
+        && config.enable_d3d12
+        && detect_video_acceleration_capabilities().d3d12_available;
+    video_player::apply_decoder_preference_windows(
+        prefer_hardware_decode,
+        disable_hardware_decode,
+        enable_cuda_decode,
+        enable_d3d12_decode,
+    );
+}
+
 impl Default for ImageViewer {
     fn default() -> Self {
         let config = Config::load();
+
+        // Apply the decoder-rank preferences BEFORE anything can call gst::init().
+        // GST_PLUGIN_FEATURE_RANK is only read while GStreamer initializes, so applying
+        // it lazily inside VideoPlayer::new (after probe workers may already have run
+        // gst::init) silently disables the whole hardware-preference system — including
+        // the d3d12av1dec stability demotion that prevents AV1 pipeline hangs.
+        apply_decoder_preferences_from_config(&config);
+
         let show_breadcrumb_bar = config.state_show_breadcrumb_bar;
         let (
             folder_placeholder_preview_scan_request_tx,
@@ -18972,6 +19012,10 @@ impl ImageViewer {
             let mut focused_position_to_record = None;
 
             if let Some(player) = self.manga_video_players.get_mut(&focused_idx) {
+                // Detect a frozen decoder early and demote the AV1 hardware decoders so
+                // the next load starts without a state-change timeout delay.
+                player.mark_wedged_if_stalled();
+
                 // Update duration cache
                 player.update_duration();
 
@@ -24257,6 +24301,10 @@ impl ImageViewer {
 
         // Handle video frame updates
         if let Some(ref mut player) = self.video_player {
+            // Detect a frozen decoder early and demote the AV1 hardware decoders so the
+            // next navigation loads without a state-change timeout delay.
+            player.mark_wedged_if_stalled();
+
             // Update duration cache
             player.update_duration();
 

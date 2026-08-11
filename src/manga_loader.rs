@@ -1381,7 +1381,13 @@ impl MangaLoader {
 
         // Initialize GStreamer if needed (static check to avoid repeated init)
         static GST_INIT: std::sync::OnceLock<Result<(), ()>> = std::sync::OnceLock::new();
-        let init_result = GST_INIT.get_or_init(|| gst::init().map_err(|_| ()));
+        let init_result = GST_INIT.get_or_init(|| {
+            let result = gst::init().map_err(|_| ());
+            if result.is_ok() {
+                crate::video_player::apply_av1_decoder_stability_ranks();
+            }
+            result
+        });
         if init_result.is_err() {
             return None;
         }

@@ -645,9 +645,11 @@ Before live playback, the video subsystem tries to make GStreamer discovery resi
 - set `GST_PLUGIN_SCANNER` if needed
 - ensure `GST_REGISTRY` points at a writable per-user path
 
-The viewer can prefer or disable hardware decoders through `GST_PLUGIN_FEATURE_RANK`. On Windows it ranks D3D12 first when available, falls back to D3D11, and can optionally raise CUDA decoders; the D3D12 AV1 decoder is deliberately ranked below the D3D11 one because it has been observed to hang the pipeline on some NVIDIA driver configurations. Capability detection checks for the runtime plus D3D12/CUDA support and feeds the in-app status readout.
+The viewer can prefer or disable hardware decoders through `GST_PLUGIN_FEATURE_RANK`. On Windows it ranks D3D12 first when available, falls back to D3D11, and can optionally raise CUDA decoders; the D3D12 AV1 decoder is deliberately ranked below the D3D11 one because it has been observed to hang the pipeline on some NVIDIA driver configurations. The ranks are applied at app startup (before any GStreamer initialization) and re-applied on the live feature objects after every `gst::init`, because the environment variable is only consulted during initialization and probe workers may initialize GStreamer first.
 
 All blocking GStreamer calls (`set_state`, seeks, element queries) run on helper threads with hard timeouts, so a wedged hardware decoder can never freeze the UI thread or the media-load worker: the load fails with a "Timed out" error, the offending decoder tier (D3D12 → D3D11 → CUDA) is demoted for the rest of the session, and playback is retried down to software decoding.
+
+To keep navigation delay-free, the player also watches itself: if it is playing but delivers no frame for ~2s, the AV1 hardware decoders are demoted immediately (and at drop time), so the next AV1 file loads without waiting for a state-change timeout.
 
 ### 10.3 First-frame extraction for placeholders
 
