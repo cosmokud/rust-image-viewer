@@ -15947,7 +15947,42 @@ impl ImageViewer {
         self.maybe_refresh_current_solo_image_lod();
     }
 
-    // ============ MANGA READING MODE METHODS ============
+    /// Apply a multiplicative zoom coming from wheel input.
+    ///
+    /// Fullscreen keeps the point under the cursor fixed and allows panning; floating mode keeps
+    /// the media centered until it grows past the window, then follows the cursor too. Keeping
+    /// this in one place keeps both wheel paths (plain wheel and Ctrl+wheel) identical.
+    fn apply_pointer_zoom_factor(
+        &mut self,
+        pointer_pos: egui::Pos2,
+        factor: f32,
+        screen_rect: egui::Rect,
+    ) {
+        if !factor.is_finite() || factor <= 0.0 || (factor - 1.0).abs() <= f32::EPSILON {
+            return;
+        }
+
+        if self.is_fullscreen {
+            self.zoom_at(pointer_pos, factor, screen_rect);
+            self.zoom_target = self.zoom;
+            self.zoom_velocity = 0.0;
+            return;
+        }
+
+        let old_zoom = self.zoom;
+        self.zoom_target = self.clamp_zoom(self.zoom_target * factor);
+        self.zoom = self.clamp_zoom(self.zoom * factor);
+
+        let has_offset = self.offset.length() > 0.1;
+        if old_zoom > 1.0 || self.zoom > 1.0 || has_offset {
+            let rect_center = screen_rect.center();
+            let cursor_offset = pointer_pos - rect_center;
+            let zoom_ratio = self.zoom / old_zoom;
+            self.offset = self.offset * zoom_ratio - cursor_offset * (zoom_ratio - 1.0);
+        }
+        self.zoom_velocity = 0.0;
+        self.maybe_refresh_current_solo_image_lod();
+    }
 
     fn layout_mode_is_grid(layout_mode: MangaLayoutMode) -> bool {
         matches!(
@@ -28165,29 +28200,7 @@ impl ImageViewer {
                             self.config.zoom_step,
                             wheel_steps_ctrl_effective,
                         );
-
-                        if self.is_fullscreen {
-                            self.zoom_at(pos, factor, screen_rect);
-                            self.zoom_target = self.zoom;
-                            self.zoom_velocity = 0.0;
-                        } else {
-                            // In floating mode, follow cursor when zoomed past 100%
-                            let old_zoom = self.zoom;
-                            self.zoom_target = self.clamp_zoom(self.zoom_target * factor);
-                            self.zoom = self.clamp_zoom(self.zoom * factor);
-
-                            let has_offset = self.offset.length() > 0.1;
-                            if old_zoom > 1.0 || self.zoom > 1.0 || has_offset {
-                                let rect_center = screen_rect.center();
-                                let cursor_offset = pos - rect_center;
-                                let zoom_ratio = self.zoom / old_zoom;
-                                self.offset =
-                                    self.offset * zoom_ratio - cursor_offset * (zoom_ratio - 1.0);
-                            }
-                            self.zoom_velocity = 0.0;
-                            self.maybe_refresh_current_solo_image_lod();
-                        }
-
+                        self.apply_pointer_zoom_factor(pos, factor, screen_rect);
                         handled_modifier_wheel = true;
                     }
                 }
@@ -28213,26 +28226,7 @@ impl ImageViewer {
                     // not on the empty title bar area.
                     if !title_ui_blocking {
                         let factor = zoom_factor_for_steps(self.config.zoom_step, wheel.normal);
-                        if self.is_fullscreen {
-                            self.zoom_at(pos, factor, screen_rect);
-                            self.zoom_target = self.zoom;
-                            self.zoom_velocity = 0.0;
-                        } else {
-                            let old_zoom = self.zoom;
-                            self.zoom_target = self.clamp_zoom(self.zoom_target * factor);
-                            self.zoom = self.clamp_zoom(self.zoom * factor);
-
-                            let has_offset = self.offset.length() > 0.1;
-                            if old_zoom > 1.0 || self.zoom > 1.0 || has_offset {
-                                let rect_center = screen_rect.center();
-                                let cursor_offset = pos - rect_center;
-                                let zoom_ratio = self.zoom / old_zoom;
-                                self.offset =
-                                    self.offset * zoom_ratio - cursor_offset * (zoom_ratio - 1.0);
-                            }
-                            self.zoom_velocity = 0.0;
-                            self.maybe_refresh_current_solo_image_lod();
-                        }
+                        self.apply_pointer_zoom_factor(pos, factor, screen_rect);
                     }
                 }
             }
