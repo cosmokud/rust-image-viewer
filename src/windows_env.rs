@@ -160,6 +160,48 @@ fn active_or_foreground_window() -> winapi::shared::windef::HWND {
     }
 }
 
+/// Monitor geometry in physical pixels, as reported by Windows.
+///
+/// Everything egui touches is in logical points, so callers divide these by the window's
+/// `pixels_per_point` when they need points.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MonitorRect {
+    pub left: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
+}
+
+/// Work area (monitor minus taskbar) of the monitor containing the physical screen point
+/// `x, y`. Used to clamp floating-window geometry so the title bar and window buttons always
+/// stay reachable, including on multi-monitor and scaled-DPI setups.
+pub fn monitor_work_area_physical_at(x: i32, y: i32) -> Option<MonitorRect> {
+    use winapi::shared::windef::POINT;
+    use winapi::um::winuser::{
+        GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    };
+
+    unsafe {
+        let monitor = MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST);
+        if monitor.is_null() {
+            return None;
+        }
+
+        let mut info: MONITORINFO = std::mem::zeroed();
+        info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(monitor, &mut info) == 0 {
+            return None;
+        }
+
+        Some(MonitorRect {
+            left: info.rcWork.left,
+            top: info.rcWork.top,
+            right: info.rcWork.right,
+            bottom: info.rcWork.bottom,
+        })
+    }
+}
+
 pub fn active_window_is_maximized() -> Option<bool> {
     use winapi::um::winuser::{IsWindow, IsZoomed};
 
