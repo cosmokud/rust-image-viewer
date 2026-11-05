@@ -1,9 +1,9 @@
 //! Video player module using GStreamer for video playback.
 //! Supports MP4, MKV, WEBM and other popular video formats.
 
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicI8, AtomicU32, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -1897,11 +1897,9 @@ Ensure your GStreamer installation includes the playback elements (usually from 
     /// Start playback
     pub fn play(&mut self) -> Result<(), String> {
         let pipeline = self.pipeline.clone();
-        let state_result = run_gst_with_timeout(
-            "state-playing",
-            STATE_CHANGE_TIMEOUT,
-            move || pipeline.set_state(gst::State::Playing),
-        );
+        let state_result = run_gst_with_timeout("state-playing", STATE_CHANGE_TIMEOUT, move || {
+            pipeline.set_state(gst::State::Playing)
+        });
         let result = match state_result {
             Some(result) => result,
             None => {
@@ -1983,11 +1981,9 @@ Ensure your GStreamer installation includes the playback elements (usually from 
     /// Pause playback
     pub fn pause(&mut self) -> Result<(), String> {
         let pipeline = self.pipeline.clone();
-        let state_result = run_gst_with_timeout(
-            "state-paused",
-            STATE_CHANGE_TIMEOUT,
-            move || pipeline.set_state(gst::State::Paused),
-        );
+        let state_result = run_gst_with_timeout("state-paused", STATE_CHANGE_TIMEOUT, move || {
+            pipeline.set_state(gst::State::Paused)
+        });
         let result = match state_result {
             Some(result) => result,
             None => {
@@ -2907,7 +2903,10 @@ mod tests {
             std::thread::sleep(Duration::from_millis(2000));
             42u32
         });
-        assert!(result.is_none(), "expected the timed-out call to report None");
+        assert!(
+            result.is_none(),
+            "expected the timed-out call to report None"
+        );
         // Must return shortly after the timeout, without waiting for the closure.
         assert!(start.elapsed() < Duration::from_millis(1000));
     }

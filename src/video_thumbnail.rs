@@ -95,19 +95,15 @@ pub fn probe_video_dimensions_with_gstreamer(path: &Path) -> Option<(u32, u32)> 
     );
 
     let pipeline_paused = pipeline.clone();
-    if run_gst_with_timeout(
-        "probe-paused",
-        Duration::from_secs(8),
-        move || pipeline_paused.set_state(gst::State::Paused),
-    )
+    if run_gst_with_timeout("probe-paused", Duration::from_secs(8), move || {
+        pipeline_paused.set_state(gst::State::Paused)
+    })
     .map_or(true, |result| result.is_err())
     {
         let pipeline_null = pipeline.clone();
-        let _ = run_gst_with_timeout(
-            "probe-null",
-            Duration::from_secs(1),
-            move || pipeline_null.set_state(gst::State::Null),
-        );
+        let _ = run_gst_with_timeout("probe-null", Duration::from_secs(1), move || {
+            pipeline_null.set_state(gst::State::Null)
+        });
         return None;
     }
 
@@ -129,11 +125,9 @@ pub fn probe_video_dimensions_with_gstreamer(path: &Path) -> Option<(u32, u32)> 
     }
 
     let pipeline_null = pipeline.clone();
-    let _ = run_gst_with_timeout(
-        "probe-null",
-        Duration::from_secs(1),
-        move || pipeline_null.set_state(gst::State::Null),
-    );
+    let _ = run_gst_with_timeout("probe-null", Duration::from_secs(1), move || {
+        pipeline_null.set_state(gst::State::Null)
+    });
     let probed_dimensions = *dimensions.lock();
     probed_dimensions
 }

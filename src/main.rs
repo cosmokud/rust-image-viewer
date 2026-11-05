@@ -1750,19 +1750,15 @@ fn extract_video_first_frame_thumbnail(
     );
 
     let pipeline_paused = pipeline.clone();
-    if run_gst_with_timeout(
-        "thumb-paused",
-        Duration::from_secs(8),
-        move || pipeline_paused.set_state(gst::State::Paused),
-    )
+    if run_gst_with_timeout("thumb-paused", Duration::from_secs(8), move || {
+        pipeline_paused.set_state(gst::State::Paused)
+    })
     .map_or(true, |result| result.is_err())
     {
         let pipeline_null = pipeline.clone();
-        let _ = run_gst_with_timeout(
-            "thumb-null",
-            Duration::from_secs(1),
-            move || pipeline_null.set_state(gst::State::Null),
-        );
+        let _ = run_gst_with_timeout("thumb-null", Duration::from_secs(1), move || {
+            pipeline_null.set_state(gst::State::Null)
+        });
         return None;
     }
 
@@ -1794,18 +1790,14 @@ fn extract_video_first_frame_thumbnail(
     let pre_seek_frame = frame_data.lock().clone();
     *frame_data.lock() = None;
     let pipeline_seek = pipeline.clone();
-    let seeked_to_zero = run_gst_with_timeout(
-        "thumb-seek",
-        Duration::from_secs(2),
-        move || {
-            pipeline_seek
-                .seek_simple(
-                    gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
-                    gst::ClockTime::ZERO,
-                )
-                .is_ok()
-        },
-    )
+    let seeked_to_zero = run_gst_with_timeout("thumb-seek", Duration::from_secs(2), move || {
+        pipeline_seek
+            .seek_simple(
+                gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
+                gst::ClockTime::ZERO,
+            )
+            .is_ok()
+    })
     .unwrap_or(false);
     let extracted_frame = if seeked_to_zero {
         if wait_for_frame(3000) {
@@ -1818,11 +1810,9 @@ fn extract_video_first_frame_thumbnail(
     };
 
     let pipeline_null = pipeline.clone();
-    let _ = run_gst_with_timeout(
-        "thumb-null",
-        Duration::from_secs(1),
-        move || pipeline_null.set_state(gst::State::Null),
-    );
+    let _ = run_gst_with_timeout("thumb-null", Duration::from_secs(1), move || {
+        pipeline_null.set_state(gst::State::Null)
+    });
 
     let (pixels, width, height) = extracted_frame?;
     if pixels.is_empty() || width == 0 || height == 0 {
