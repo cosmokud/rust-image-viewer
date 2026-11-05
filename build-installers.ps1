@@ -7,6 +7,10 @@ Set-Location $repoRoot
 # name `target` under it, so a machine-local shared target dir is opted out of here.
 $env:CARGO_TARGET_DIR = Join-Path $repoRoot "target"
 
+# GStreamer prefix resolution and the GPL plugin exclusion list live here so the
+# attribution generator reports exactly what this script stages.
+. (Join-Path $repoRoot "scripts\gstreamer-runtime.ps1")
+
 function Ensure-CargoPackager {
     if (-not (Get-Command cargo-packager -ErrorAction SilentlyContinue)) {
         Write-Host "cargo-packager not found. Installing with cargo..."
@@ -88,47 +92,6 @@ cargo build --release
     Write-Host (" - " + $binaryPath)
 }
 
-function Resolve-GStreamerPrefix {
-    param(
-        [string]$CandidateRoot
-    )
-
-    $roots = @()
-    if ($CandidateRoot) {
-        $roots += $CandidateRoot
-    }
-    if ($env:GSTREAMER_1_0_ROOT_X86_64) {
-        $roots += $env:GSTREAMER_1_0_ROOT_X86_64
-    }
-    if ($env:GSTREAMER_1_0_ROOT_MSVC_X86_64) {
-        $roots += $env:GSTREAMER_1_0_ROOT_MSVC_X86_64
-    }
-
-    foreach ($root in $roots) {
-        try {
-            $resolved = (Resolve-Path -LiteralPath $root).Path
-            if (Test-Path -LiteralPath (Join-Path $resolved "bin\gstreamer-1.0-0.dll")) {
-                return $resolved
-            }
-        }
-        catch {
-        }
-    }
-
-    $gstInspectCmd = Get-Command "gst-inspect-1.0.exe" -ErrorAction SilentlyContinue
-    if (-not $gstInspectCmd) {
-        throw "gst-inspect-1.0.exe was not found on PATH. Install/setup GStreamer first."
-    }
-
-    $gstBinDir = Split-Path -Parent $gstInspectCmd.Source
-    $gstPrefix = Split-Path -Parent $gstBinDir
-    if (-not (Test-Path -LiteralPath (Join-Path $gstPrefix "bin\gstreamer-1.0-0.dll"))) {
-        throw "Detected GStreamer prefix is missing bin\gstreamer-1.0-0.dll: $gstPrefix"
-    }
-
-    return $gstPrefix
-}
-
 function Copy-MatchingFiles {
     param(
         [Parameter(Mandatory = $true)]
@@ -139,6 +102,8 @@ function Copy-MatchingFiles {
 
         [Parameter(Mandatory = $true)]
         [string[]]$Patterns,
+
+        [string[]]$Exclude = @(),
 
         [switch]$Required
     )
@@ -155,6 +120,7 @@ function Copy-MatchingFiles {
     $copied = 0
     foreach ($pattern in $Patterns) {
         Get-ChildItem -LiteralPath $SourceDir -Filter $pattern -File -ErrorAction SilentlyContinue |
+            Where-Object { $Exclude -notcontains $_.Name } |
             ForEach-Object {
                 Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $DestinationDir $_.Name) -Force
                 $copied += 1
@@ -199,6 +165,57 @@ then rerun this script. The bundled-GStreamer installer needs these files for
     }
 }
 
+function Assert-StagedGStreamerBundle {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$PluginDir,
+
+        [Parameter(Mandatory = $true)]
+        [string]$BinDir
+    )
+
+    # What src/video_player.rs builds: playbin/decodebin over the d3d12 decoder, with the
+    # pixel/audio converters and sinks behind it. The GPL exclusion must not take any of
+    # these with it.
+    $requiredFiles = @(
+        "gstplayback.dll",
+        "gsttypefindfunctions.dll",
+        "gstcoreelements.dll",
+        "gstapp.dll",
+        "gstautodetect.dll",
+        "gstaudioconvert.dll",
+        "gstaudioresample.dll",
+        "gstvideoconvertscale.dll",
+        "gstd3d12.dll"
+    )
+
+    $problems = @()
+    foreach ($name in $requiredFiles) {
+        if (-not (Test-Path -LiteralPath (Join-Path $PluginDir $name))) {
+            $problems += $name
+        }
+    }
+    foreach ($name in $GStreamerExcludedPluginDlls) {
+        if (Test-Path -LiteralPath (Join-Path $PluginDir $name)) {
+            $problems += "$name (excluded GPL plugin was staged anyway)"
+        }
+    }
+    foreach ($name in $GStreamerExcludedLibraryDlls) {
+        if (Test-Path -LiteralPath (Join-Path $BinDir $name)) {
+            $problems += "$name (excluded GPL library was staged anyway)"
+        }
+    }
+
+    if ($problems.Count -gt 0) {
+        throw @"
+Staged GStreamer bundle does not hold the plugins the player needs:
+$($problems -join "`n")
+
+Check the exclusion list in scripts\gstreamer-runtime.ps1 and the installed runtime.
+"@
+    }
+}
+
 function Stage-GStreamerBundle {
     param(
         [Parameter(Mandatory = $true)]
@@ -214,8 +231,17 @@ function Stage-GStreamerBundle {
     Assert-GStreamerD3D12Runtime -GStreamerPrefix $gstPrefix
     $gstStageRoot = Join-Path $BundleRoot "gstreamer"
 
-    $binCount = Copy-MatchingFiles -SourceDir (Join-Path $gstPrefix "bin") -DestinationDir (Join-Path $gstStageRoot "bin") -Patterns @("*.dll", "gst-plugin-scanner.exe") -Required
-    $pluginCount = Copy-MatchingFiles -SourceDir (Join-Path $gstPrefix "lib\gstreamer-1.0") -DestinationDir (Join-Path $gstStageRoot "lib\gstreamer-1.0") -Patterns @("*.dll") -Required
+    $pluginSourceDir = Join-Path $gstPrefix "lib\gstreamer-1.0"
+    $stagedPluginDir = Join-Path $gstStageRoot "lib\gstreamer-1.0"
+
+    $binSourceDir = Join-Path $gstPrefix "bin"
+    $stagedBinDir = Join-Path $gstStageRoot "bin"
+
+    $binCount = Copy-MatchingFiles -SourceDir $binSourceDir -DestinationDir $stagedBinDir -Patterns @("*.dll", "gst-plugin-scanner.exe") -Exclude $GStreamerExcludedLibraryDlls -Required
+    # GPL plugins are left out of the copy (list and reasoning in
+    # scripts\gstreamer-runtime.ps1): the player needs no encoders, and an LGPL-only
+    # runtime is what an MIT-licensed installer can redistribute.
+    $pluginCount = Copy-MatchingFiles -SourceDir $pluginSourceDir -DestinationDir $stagedPluginDir -Patterns @("*.dll") -Exclude $GStreamerExcludedPluginDlls -Required
     $scannerCount = Copy-MatchingFiles -SourceDir (Join-Path $gstPrefix "libexec\gstreamer-1.0") -DestinationDir (Join-Path $gstStageRoot "libexec\gstreamer-1.0") -Patterns @("gst-plugin-scanner.exe")
     $schemaCount = Copy-MatchingFiles -SourceDir (Join-Path $gstPrefix "share\glib-2.0\schemas") -DestinationDir (Join-Path $gstStageRoot "share\glib-2.0\schemas") -Patterns @("*.compiled", "*.xml")
 
@@ -223,10 +249,25 @@ function Stage-GStreamerBundle {
         throw "gst-plugin-scanner.exe is missing from both libexec and bin locations."
     }
 
+    $excludedCount = 0
+    foreach ($excludedDll in $GStreamerExcludedPluginDlls) {
+        if (Test-Path -LiteralPath (Join-Path $pluginSourceDir $excludedDll)) {
+            $excludedCount += 1
+        }
+    }
+    $excludedLibraryCount = 0
+    foreach ($excludedDll in $GStreamerExcludedLibraryDlls) {
+        if (Test-Path -LiteralPath (Join-Path $binSourceDir $excludedDll)) {
+            $excludedLibraryCount += 1
+        }
+    }
+
+    Assert-StagedGStreamerBundle -PluginDir $stagedPluginDir -BinDir $stagedBinDir
+
     Write-Host "Staged bundled GStreamer runtime:"
     Write-Host (" - Prefix: " + $gstPrefix)
-    Write-Host (" - Bin files: " + $binCount)
-    Write-Host (" - Plugin files: " + $pluginCount)
+    Write-Host (" - Bin files: " + $binCount + " (" + $excludedLibraryCount + " GPL libraries excluded)")
+    Write-Host (" - Plugin files: " + $pluginCount + " (" + $excludedCount + " GPL plugins excluded)")
     Write-Host (" - Scanner files: " + $scannerCount)
     Write-Host (" - Schema files: " + $schemaCount)
 }
@@ -265,6 +306,8 @@ function Write-PackagerConfig {
     $tomlIconPath = $iconPathAbs.Replace("\", "/")
     $tomlNsisTemplatePath = $nsisTemplatePathAbs.Replace("\", "/")
 
+    $resources = @()
+
     $lines = @(
         "name = ""$PackageName""",
         "version = ""$PackageVersion""",
@@ -284,7 +327,32 @@ function Write-PackagerConfig {
     if ($IncludeGStreamer) {
         $gstResourcePathAbs = [System.IO.Path]::GetFullPath((Join-Path $outputDirAbs ".with-gstreamer\gstreamer"))
         $tomlGstResourcePath = $gstResourcePathAbs.Replace("\", "/")
-        $lines += "resources = [{ src = ""$tomlGstResourcePath"", target = ""gstreamer"" }]"
+        $resources += "{ src = ""$tomlGstResourcePath"", target = ""gstreamer"" }"
+    }
+
+    # Notices installed beside the exe: THIRD-PARTY.md links into LICENSES/ and
+    # licenses-extra/, so all three travel together. Skipped when absent, so packaging
+    # works on a checkout that has not run generate-attribution.ps1.
+    $noticeResources = @(
+        @{ Path = (Join-Path $repoRootAbs "THIRD-PARTY.md"); Target = "THIRD-PARTY.md" },
+        @{ Path = (Join-Path $repoRootAbs "LICENSE"); Target = "LICENSE" },
+        @{ Path = (Join-Path $repoRootAbs "LICENSES"); Target = "LICENSES" },
+        @{ Path = (Join-Path $repoRootAbs "licenses-extra"); Target = "licenses-extra" }
+    )
+    foreach ($noticeResource in $noticeResources) {
+        if (-not (Test-Path -LiteralPath $noticeResource.Path)) {
+            continue
+        }
+        $resourcePath = $noticeResource.Path.Replace("\", "/")
+        $resources += "{ src = ""$resourcePath"", target = ""$($noticeResource.Target)"" }"
+    }
+
+    if ($resources.Count -gt 0) {
+        $lines += "resources = ["
+        foreach ($resource in $resources) {
+            $lines += "  $resource,"
+        }
+        $lines += "]"
         $lines += ""
     }
 

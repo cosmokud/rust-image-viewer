@@ -515,6 +515,12 @@ FunctionEnd
 !define MUI_FINISHPAGE_SHOWREADME
 !define MUI_FINISHPAGE_SHOWREADME_TEXT "$(createDesktop)"
 !define MUI_FINISHPAGE_SHOWREADME_FUNCTION CreateDesktopShortcut
+; Third-party notices are installed beside the exe. Nothing here fails to compile when
+; the packager did not ship them (build-installers.ps1 skips what is missing); the
+; function just opens nothing.
+!define MUI_FINISHPAGE_RUN
+!define MUI_FINISHPAGE_RUN_TEXT "View third-party licenses"
+!define MUI_FINISHPAGE_RUN_FUNCTION ShowThirdPartyNotices
 !define MUI_PAGE_CUSTOMFUNCTION_PRE SkipIfPassive
 !insertmacro MUI_PAGE_FINISH
 
@@ -886,4 +892,11 @@ Function CreateStartMenuShortcut
   CreateDirectory "$SMPROGRAMS\$AppStartMenuFolder"
   CreateShortcut "$SMPROGRAMS\$AppStartMenuFolder\${PRODUCTNAME}.lnk" "$INSTDIR\${MAINBINARYNAME}.exe"
   ApplicationID::Set "$SMPROGRAMS\$AppStartMenuFolder\${PRODUCTNAME}.lnk" "${IDENTIFIER}"
+FunctionEnd
+
+Function ShowThirdPartyNotices
+  ${If} ${FileExists} "$INSTDIR\THIRD-PARTY.md"
+    ; notepad, because a .md file has no default handler of its own on a clean Windows
+    ExecShell "open" "$SYSDIR\notepad.exe" '"$INSTDIR\THIRD-PARTY.md"'
+  ${EndIf}
 FunctionEnd

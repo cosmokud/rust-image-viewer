@@ -15,6 +15,17 @@ $GStreamerExcludedPluginDlls = @(
     "gstx265.dll"     # x265     H.265 encoder
 )
 
+# The support libraries only those plugins loaded. Leaving them in bin/ after dropping the
+# plugins would still ship GPL binaries (x264 and x265 are GPL-2.0+, dvdread and dvdnav
+# GPL-2.0-or-later), and nothing else in the runtime imports them: avcodec-61.dll does not.
+# Verified by scanning every staged DLL's imports for these names.
+$GStreamerExcludedLibraryDlls = @(
+    "x264-164.dll"  # x264
+    "x265.dll"      # x265
+    "dvdnav-4.dll"  # libdvdnav
+    "dvdread-8.dll" # libdvdread
+)
+
 function Resolve-GStreamerPrefix {
     param(
         [string]$CandidateRoot
