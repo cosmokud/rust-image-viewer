@@ -3,6 +3,10 @@ $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $repoRoot
 
+# Packaging stays with this checkout: the generated packager config and `out-dir`
+# name `target` under it, so a machine-local shared target dir is opted out of here.
+$env:CARGO_TARGET_DIR = Join-Path $repoRoot "target"
+
 function Ensure-CargoPackager {
     if (-not (Get-Command cargo-packager -ErrorAction SilentlyContinue)) {
         Write-Host "cargo-packager not found. Installing with cargo..."

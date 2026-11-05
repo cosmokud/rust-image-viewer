@@ -1,2 +1,6 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+# Hooks are shell scripts git runs itself, so the shebang line must not gain a
+# carriage return: a Windows clone carrying `core.autocrlf` would otherwise
+# fail every hook with `bad interpreter` before it runs a line.
+.githooks/* text eol=lf

@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use directories::BaseDirs;
 
@@ -237,6 +238,24 @@ fn main() {
     println!("cargo:rerun-if-changed={}", DEFAULT_CONFIG_TEMPLATE_PATH);
     println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=src");
+    // A release build links over rust-image-viewer.exe, which Windows will not allow
+    // while the app is up: the link fails with "Access is denied" and the build has
+    // to be run again. Ending a running copy here, before the crate is linked, is
+    // what lets `cargo build --release` replace the binary in one pass. Watching
+    // `src` above is what brings this script back for the rebuilds that need it.
+    #[cfg(target_os = "windows")]
+    if env::var("PROFILE").as_deref() == Ok("release") {
+        stop_running_app();
+    }
+    // The commit this build is of, stamped into the executable so a binary can be
+    // told from the one another checkout linked over it at the shared target dir
+    // (see `scripts/build-release.ps1`). Asked for here, where every recompile of
+    // this crate passes through, and `cargo:rerun-if-changed=src` above is what
+    // brings the script back for one: the file the stamp is written into is
+    // relinked with the crate, so the two can never disagree.
+    let commit = the_commit();
+    println!("cargo:rustc-env=RIV_COMMIT={commit}");
 
     // Embed Windows icon into PE resources when building for windows-msvc
     // This makes Explorer and shortcuts show the app icon
@@ -251,6 +270,10 @@ fn main() {
                 res.set("ProductName", "Rust Image Viewer");
                 res.set("FileDescription", "Rust Image Viewer");
                 res.set("LegalCopyright", "Copyright 2026");
+                // Read back as `(Get-Item <exe>).VersionInfo.Comments`, which is how the
+                // build tells a binary of this checkout from one another checkout left
+                // at the same path.
+                res.set("Comments", commit.as_str());
                 if let Err(e) = res.compile() {
                     println!("cargo:warning=Failed to embed assets/icon.ico: {}", e);
                 }
@@ -287,5 +310,45 @@ fn main() {
                 // Non-MSVC Windows targets don't use winres in the same way; skip silently.
             }
         }
+    }
+}
+
+/// The commit this build is of, or `"unknown"` where git cannot say: a source tarball has no
+/// git and still has to build, and a stamp nobody can read has to compare unequal to every
+/// HEAD.
+fn the_commit() -> String {
+    let commit = Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .current_dir(env::var("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"))
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+        .unwrap_or_default();
+    if commit.is_empty() {
+        "unknown".to_owned()
+    } else {
+        commit
+    }
+}
+
+/// Ends a running copy of the app so a release build can replace its binary.
+/// Nothing is reported when the app is not running, which is the usual case.
+#[cfg(target_os = "windows")]
+fn stop_running_app() {
+    use std::os::windows::process::CommandExt;
+    /// CREATE_NO_WINDOW, so a build started from an IDE shows no console flash.
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let image = concat!(env!("CARGO_PKG_NAME"), ".exe");
+    let stopped = Command::new("taskkill")
+        .args(["/F", "/IM", image])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .status()
+        .is_ok_and(|status| status.success());
+    if stopped {
+        println!("cargo:warning=Stopped the running {image} before rebuilding");
     }
 }

@@ -1,0 +1,28 @@
+#!/bin/sh
+# The tree this pushes, and every message behind it. prepare-commit-msg covers a
+# message written with -m or -F and cannot be bypassed; this covers the thing it
+# cannot see, which is a tracked file.
+#
+# It reads this checkout's working tree, not the tree of the ref being pushed.
+# Pushing a branch other than the one checked out is therefore checked against
+# the wrong tree, and the workflows are what catch that.
+
+set -eu
+
+# Each shape is two quoted halves that the shell joins, so that this file does not
+# match the guard that reads it: a pattern written whole is a literal string, and a
+# literal string written whole is found in the very line that writes it.
+SHAPES=$(printf '%s\n' \
+  '/Us''ers/' \
+  '/hom''e/')
+
+# A profile directory is named after the account that owns it, so a tracked file
+# that spells one out hands that name to every clone of this branch. A drive letter
+# is not a shape this gate can ask about: URLs carry one, so the pattern that would
+# match a path matches a thousand links as well.
+if git grep -I -n -E "$SHAPES"; then
+  echo "" >&2
+  echo "The push is stopped: a tracked file above names a profile directory." >&2
+  echo "Write it as <user>, or use a made-up directory instead." >&2
+  exit 1
+fi

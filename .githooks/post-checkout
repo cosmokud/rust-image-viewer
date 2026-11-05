@@ -1,0 +1,49 @@
+#!/bin/sh
+# The shared cargo target dir is machine-local, so it cannot live in a committed
+# file without leaking a drive letter into every clone. Instead it arrives from
+# `git config riv.targetDir` and is handed to cargo as .cargo/target-dir.local.toml,
+# which .cargo/config.toml includes. Unset means this hook writes nothing and cargo
+# uses the usual per-checkout target/, which is what other machines and CI get.
+#
+# Every checkout builds into that one dir, so a dependency is compiled once and
+# stored once instead of once per worktree. Cargo's artifact and fingerprint names
+# carry no part of a checkout's path, so this package — the one thing that dir
+# cannot share — keeps one fingerprint that any checkout's build calls fresh, and
+# the artifact path is shared as well: the binary left there is whoever linked last.
+# Cargo never looks at that artifact's mtime, so nothing about a switch invalidates
+# it. Touching src/main.rs below dirties this package through the
+# `cargo:rerun-if-changed=src` that build.rs already prints, so the next build in
+# this checkout recompiles and relinks its own binary instead of leaving another
+# checkout's behind at the path the app is launched from.
+
+set -eu
+
+target=$(git config --get riv.targetDir) || exit 0
+[ -n "$target" ] || exit 0
+
+# TOML wants forward slashes; accept a path pasted from Explorer.
+target=$(printf '%s' "$target" | tr '\\' '/')
+
+# Windows is the only host this tree builds on, and cargo there wants a value with a drive
+# letter: a path that starts at / is not a target dir to it but a relative one, and cargo
+# would quietly build into a `/x` folder inside the checkout. So a value of the wrong shape
+# is left unwritten, and cargo falls back to the usual per-checkout target/.
+case "$target" in
+  [A-Za-z]:/*) ;;
+  *)
+    echo "riv.targetDir is '$target', which is not a path this system can build into." >&2
+    echo "Nothing written; cargo will use this checkout's own target/." >&2
+    exit 0
+    ;;
+esac
+
+root=$(git rev-parse --show-toplevel) || exit 0
+root=$(printf '%s' "$root" | tr '\\' '/')
+
+mkdir -p "$root/.cargo"
+printf '# Written by .githooks/post-checkout. Machine-local, never committed.\n[build]\ntarget-dir = "%s"\n' "$target" > "$root/.cargo/target-dir.local.toml"
+
+# See the header: a shared fingerprint needs dirtying, and the artifact's mtime does not count.
+if [ -f "$root/src/main.rs" ]; then
+  touch "$root/src/main.rs"
+fi
