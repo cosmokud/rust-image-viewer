@@ -330,14 +330,18 @@ function Write-PackagerConfig {
         $resources += "{ src = ""$tomlGstResourcePath"", target = ""gstreamer"" }"
     }
 
-    # Notices installed beside the exe: THIRD-PARTY.md links into LICENSES/ and
-    # licenses-extra/, so all three travel together. Skipped when absent, so packaging
-    # works on a checkout that has not run generate-attribution.ps1.
+    # Notices installed beside the exe: THIRD-PARTY.md links into LICENSES/,
+    # licenses-extra/ and NOTICES/, so all of them travel together. NOTICES/ carries the
+    # NOTICE files dependencies ship (moka's Apache-2.0 files), which section 4(d) of that
+    # license requires a redistributor to pass on; without it the installed manifest holds
+    # a link that resolves to nothing. Skipped when absent, so packaging works on a
+    # checkout that has not run generate-attribution.ps1.
     $noticeResources = @(
         @{ Path = (Join-Path $repoRootAbs "THIRD-PARTY.md"); Target = "THIRD-PARTY.md" },
         @{ Path = (Join-Path $repoRootAbs "LICENSE"); Target = "LICENSE" },
         @{ Path = (Join-Path $repoRootAbs "LICENSES"); Target = "LICENSES" },
-        @{ Path = (Join-Path $repoRootAbs "licenses-extra"); Target = "licenses-extra" }
+        @{ Path = (Join-Path $repoRootAbs "licenses-extra"); Target = "licenses-extra" },
+        @{ Path = (Join-Path $repoRootAbs "NOTICES"); Target = "NOTICES" }
     )
     foreach ($noticeResource in $noticeResources) {
         if (-not (Test-Path -LiteralPath $noticeResource.Path)) {
