@@ -30356,6 +30356,20 @@ mod tests {
     }
 
     #[test]
+    fn floating_window_clamp_handles_a_display_left_of_the_primary() {
+        // Secondary monitor placed left of the primary, so its coordinates are negative.
+        let display =
+            egui::Rect::from_min_size(egui::pos2(-1920.0, 0.0), egui::vec2(1920.0, 1080.0));
+        let size = egui::vec2(1200.0, 900.0);
+
+        let clamped = super::clamp_floating_window_pos(display, size, egui::pos2(500.0, 0.0));
+
+        // Right edge stays on the secondary display's right edge (x = 0).
+        assert!((clamped.x + size.x - display.max.x).abs() < 0.001);
+        assert!(clamped.x >= display.min.x - size.x);
+    }
+
+    #[test]
     fn wheel_notch_and_trackpad_pixel_scroll_normalize_to_one_step() {
         let events = vec![
             egui::Event::MouseWheel {
