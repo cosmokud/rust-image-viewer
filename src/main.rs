@@ -15400,6 +15400,12 @@ impl ImageViewer {
             return;
         }
 
+        // A hidden startup window (video: parked off-screen until the first frame is decoded)
+        // must keep its intentional position.
+        if !self.startup_window_shown {
+            return;
+        }
+
         let Some(outer) = ctx.input(|i| i.raw.viewport().outer_rect) else {
             return;
         };
@@ -15411,7 +15417,9 @@ impl ImageViewer {
         };
 
         let corrected = clamp_floating_window_pos(display, outer.size(), outer.min);
-        if (corrected - outer.min).length() > 0.5 {
+        // Tolerance covers physical-pixel rounding of the logical position: without it the guard
+        // could re-send the same command every frame on a fractional DPI scale.
+        if (corrected - outer.min).length() > 2.0 {
             self.send_outer_position(ctx, corrected);
         }
     }
@@ -28006,6 +28014,28 @@ impl ImageViewer {
                 }
             }
             ResizeDirection::None => return,
+        };
+
+        // Growing a right-hand edge must not push the window's right side (where the window
+        // buttons live) past the display's right edge, or Close becomes unclickable.
+        let (new_w, new_h) = if matches!(
+            direction,
+            ResizeDirection::Right | ResizeDirection::BottomRight | ResizeDirection::TopRight
+        ) {
+            let monitor_size = ctx.input(|i| i.raw.viewport().monitor_size);
+            match display_bounds_points(ctx, Some(current_cursor_screen), monitor_size) {
+                Some(display) => {
+                    let max_w = (display.max.x - start_left).max(clamp_min_w);
+                    if new_w > max_w {
+                        size_from_width(max_w)
+                    } else {
+                        (new_w, new_h)
+                    }
+                }
+                None => (new_w, new_h),
+            }
+        } else {
+            (new_w, new_h)
         };
 
         let (new_x, new_y) = match direction {
