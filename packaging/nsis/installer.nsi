@@ -521,6 +521,8 @@ FunctionEnd
 !define MUI_FINISHPAGE_RUN
 !define MUI_FINISHPAGE_RUN_TEXT "View third-party licenses"
 !define MUI_FINISHPAGE_RUN_FUNCTION ShowThirdPartyNotices
+; Opening Notepad must be opted into, not the default for every install.
+!define MUI_FINISHPAGE_RUN_NOTCHECKED
 !define MUI_PAGE_CUSTOMFUNCTION_PRE SkipIfPassive
 !insertmacro MUI_PAGE_FINISH
 
