@@ -29771,7 +29771,7 @@ impl eframe::App for ImageViewer {
             }
         }
 
-        // Handle file drops (disabled while the help modal is open).
+        // Handle file drops (disabled while a settings/help modal is open).
         if !self.settings_modal_open() {
             ctx.input(|i| {
                 if !i.raw.dropped_files.is_empty() {
@@ -29810,7 +29810,7 @@ impl eframe::App for ImageViewer {
         // Debounced config.ini write for motion-setting slider drags.
         self.flush_pending_motion_settings_save(ctx);
 
-        // Handle input (disabled while the help modal is open).
+        // Handle input (disabled while a settings/help modal is open).
         if !self.settings_modal_open() {
             self.handle_input(ctx);
         }
