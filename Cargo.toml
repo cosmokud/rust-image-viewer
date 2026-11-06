@@ -10,7 +10,7 @@ repository = "https://github.com/cosmokud/rust-image-viewer"
 homepage = "https://github.com/cosmokud/rust-image-viewer"
 keywords = ["image", "video", "viewer", "egui", "gstreamer"]
 categories = ["multimedia", "graphics", "gui"]
-rust-version = "1.76"
+rust-version = "1.99"
 build = "build.rs"
 
 [features]

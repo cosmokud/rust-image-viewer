@@ -19,7 +19,7 @@ Development is mainly done on Windows 10/11.
 
 You will usually need:
 
-- Rust 1.76+
+- Rust 1.99+
 - A Windows machine
 - GStreamer 64-bit MSVC runtime (for video playback)
 - GStreamer development package (if building from source)

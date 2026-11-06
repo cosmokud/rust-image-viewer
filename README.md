@@ -1,7 +1,7 @@
 # rust-image-viewer
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
-![Rust](https://img.shields.io/badge/rust-1.76%2B-orange.svg)
+![Rust](https://img.shields.io/badge/rust-1.99%2B-orange.svg)
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-lightgrey.svg)
 
 A high-performance, borderless image and video viewer for Windows, built with Rust, egui, and GStreamer.
@@ -194,7 +194,7 @@ cargo build --profile release-fast
 
 Build requirements:
 
-- Rust 1.76+
+- Rust 1.99+
 - Windows 10/11
 - GStreamer MSVC runtime + development packages for video support
 - `PKG_CONFIG_PATH` pointing at GStreamer's `pkgconfig` directory if it is not auto-detected
