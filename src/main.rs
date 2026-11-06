@@ -13,6 +13,7 @@ mod manga_loader;
 mod manga_spatial;
 mod media_index;
 mod metadata_cache;
+mod motion_presets;
 mod perf_metrics;
 #[cfg(target_os = "windows")]
 mod single_instance;
@@ -577,6 +578,58 @@ struct MarkSelectionBoxState {
     drag_started: bool,
 }
 
+/// State for the "Motion & Input Settings" modal: live feel settings + INI presets.
+struct MotionSettingsModal {
+    open: bool,
+    /// Skips one outside-click close check right after opening (mirrors the help modal).
+    skip_outside_click_once: bool,
+    /// Preset marked in the list; Load/Overwrite/Rename/Delete act on it.
+    selected: Option<String>,
+    presets: Vec<motion_presets::PresetEntry>,
+    /// Mirror of the live config values owned by the slider/drag-value widgets.
+    values: [f64; motion_presets::SETTINGS.len()],
+    new_name: String,
+    /// `(old_name, draft_name)` while an inline rename is pending.
+    rename: Option<(String, String)>,
+    /// Name awaiting a second click on delete.
+    pending_delete: Option<String>,
+    status: Option<(String, Instant)>,
+    status_is_error: bool,
+    /// Debounces slider drags into one config.ini write.
+    save_due_at: Option<Instant>,
+}
+
+impl Default for MotionSettingsModal {
+    fn default() -> Self {
+        Self {
+            open: false,
+            skip_outside_click_once: false,
+            selected: None,
+            presets: Vec::new(),
+            values: [0.0; motion_presets::SETTINGS.len()],
+            new_name: String::new(),
+            rename: None,
+            pending_delete: None,
+            status: None,
+            status_is_error: false,
+            save_due_at: None,
+        }
+    }
+}
+
+/// Left-column preset actions resolved after the modal is drawn (avoids re-borrowing
+/// `self` while the egui closure is alive).
+enum MotionPresetAction {
+    Load(String),
+    Overwrite(String),
+    BeginRename(String),
+    Rename(String, String),
+    CancelRename,
+    ConfirmDelete(String),
+    CancelDelete,
+    Create,
+}
+
 #[derive(Clone, Debug)]
 struct DeleteModalItemInfo {
     path: PathBuf,
@@ -612,6 +665,7 @@ enum MenuActionIcon {
     Rename,
     OpenLocation,
     Config,
+    Motion,
     Help,
 }
 
@@ -2213,6 +2267,8 @@ struct ImageViewer {
     shortcuts_help_modal_open: bool,
     /// Skips one outside-click close check right after opening the shortcuts/help modal.
     shortcuts_help_modal_skip_outside_click_once: bool,
+    /// Motion & input feel settings dialog state.
+    motion_settings: MotionSettingsModal,
     /// Tracks Ctrl+V hold state so paste triggers once per key press even if key_pressed is swallowed.
     paste_shortcut_ctrl_v_was_down: bool,
     /// Cached thumbnail textures used by delete/rename dialogs.
@@ -2845,6 +2901,8 @@ fn apply_decoder_preferences_from_config(config: &Config) {
 impl Default for ImageViewer {
     fn default() -> Self {
         let config = Config::load();
+        // Built-ins are regenerated whenever their bytes drift from the embedded template.
+        let _ = motion_presets::ensure_builtin_presets();
 
         // Apply the decoder-rank preferences BEFORE anything can call gst::init().
         // GST_PLUGIN_FEATURE_RANK is only read while GStreamer initializes, so applying
@@ -2935,6 +2993,7 @@ impl Default for ImageViewer {
             pending_exit_confirmation: false,
             shortcuts_help_modal_open: false,
             shortcuts_help_modal_skip_outside_click_once: false,
+            motion_settings: MotionSettingsModal::default(),
             paste_shortcut_ctrl_v_was_down: false,
             modal_thumbnail_cache: HashMap::new(),
             folder_placeholder_preview_scan_pending: HashSet::new(),
@@ -5078,12 +5137,17 @@ impl ImageViewer {
         !self.marked_files.is_empty()
     }
 
+    /// True when any of the two read-only/feel dialogs that swallow viewer input is open.
+    fn settings_modal_open(&self) -> bool {
+        self.shortcuts_help_modal_open || self.motion_settings.open
+    }
+
     fn any_modal_dialog_open(&self) -> bool {
         self.rename_overlay.is_some()
             || self.pending_single_delete_target.is_some()
             || !self.pending_marked_delete_targets.is_empty()
             || self.pending_exit_confirmation
-            || self.shortcuts_help_modal_open
+            || self.settings_modal_open()
     }
 
     fn request_app_exit(&mut self) {
@@ -10265,6 +10329,25 @@ impl ImageViewer {
                     );
                 }
             }
+            MenuActionIcon::Motion => {
+                // 3 rails with a knob dot on each.
+                let knob_x = [0.32_f32, 0.68, 0.45];
+                for (idx, y_frac) in [0.26_f32, 0.5, 0.74].into_iter().enumerate() {
+                    let y = rect.top() + rect.height() * y_frac;
+                    painter.line_segment(
+                        [
+                            egui::pos2(rect.left() + 2.0, y),
+                            egui::pos2(rect.right() - 2.0, y),
+                        ],
+                        stroke,
+                    );
+                    painter.circle_filled(
+                        egui::pos2(rect.left() + rect.width() * knob_x[idx], y),
+                        2.1,
+                        color,
+                    );
+                }
+            }
             MenuActionIcon::Help => {
                 painter.circle_stroke(rect.center(), 6.0, stroke);
                 painter.line_segment(
@@ -12337,7 +12420,7 @@ impl ImageViewer {
                                         ui,
                                         "Three-stripes title-bar menu",
                                         "Quick command center",
-                                        "Contains current-file actions, marked-file actions, this Help dialog, and Edit config.ini.",
+                                        "Contains current-file actions, marked-file actions, this Help dialog, the Motion & Input Settings dialog (live mouse/scroll/zoom/pan/autoscroll feel, with presets), and Edit config.ini.",
                                     );
 
                                     ui.add_space(8.0);
@@ -12378,6 +12461,699 @@ impl ImageViewer {
         if close_modal {
             self.shortcuts_help_modal_open = false;
             self.shortcuts_help_modal_skip_outside_click_once = false;
+        }
+    }
+
+    fn motion_values_from_config(config: &Config) -> [f64; motion_presets::SETTINGS.len()] {
+        let mut values = [0.0; motion_presets::SETTINGS.len()];
+        for (id, value) in motion_presets::capture(config) {
+            values[id] = value;
+        }
+        values
+    }
+
+    fn open_motion_settings_modal(&mut self) {
+        self.motion_settings.open = true;
+        self.motion_settings.skip_outside_click_once = true;
+        self.motion_settings.rename = None;
+        self.motion_settings.pending_delete = None;
+        self.motion_settings.status = None;
+        self.motion_settings.status_is_error = false;
+        self.motion_settings.save_due_at = None;
+        self.motion_settings.values = Self::motion_values_from_config(&self.config);
+        self.refresh_motion_presets();
+        if self.motion_settings.selected.is_none() {
+            self.motion_settings.selected = self
+                .motion_settings
+                .presets
+                .iter()
+                .find(|entry| entry.builtin)
+                .map(|entry| entry.name.clone());
+        }
+    }
+
+    fn refresh_motion_presets(&mut self) {
+        let _ = motion_presets::ensure_builtin_presets();
+        self.motion_settings.presets = motion_presets::list_presets();
+    }
+
+    fn set_motion_status(&mut self, message: String, is_error: bool) {
+        self.motion_settings.status = Some((message, Instant::now()));
+        self.motion_settings.status_is_error = is_error;
+    }
+
+    /// Runs after the debounce window so slider drags produce one `config.ini` write.
+    fn flush_pending_motion_settings_save(&mut self, ctx: &egui::Context) {
+        let Some(due_at) = self.motion_settings.save_due_at else {
+            return;
+        };
+        let now = Instant::now();
+        if now >= due_at {
+            self.motion_settings.save_due_at = None;
+            self.config.save();
+        } else {
+            // Nothing else schedules frames while the viewer is idle.
+            ctx.request_repaint_after(due_at - now);
+        }
+    }
+
+    fn apply_motion_preset_action(&mut self, action: MotionPresetAction) {
+        match action {
+            MotionPresetAction::Load(name) => {
+                let Some(path) = self
+                    .motion_settings
+                    .presets
+                    .iter()
+                    .find(|entry| entry.name == name)
+                    .map(|entry| entry.path.clone())
+                else {
+                    return;
+                };
+                match motion_presets::load_preset_values(&path) {
+                    Ok(values) => {
+                        let missing = motion_presets::SETTINGS.len().saturating_sub(values.len());
+                        motion_presets::apply_values(&mut self.config, &values);
+                        self.motion_settings.values = Self::motion_values_from_config(&self.config);
+                        self.motion_settings.selected = Some(name.clone());
+                        self.config.save();
+                        self.motion_settings.save_due_at = None;
+                        if missing > 0 {
+                            self.set_motion_status(
+                                format!(
+                                    "Loaded '{name}' ({missing} key(s) missing, those left unchanged)."
+                                ),
+                                true,
+                            );
+                        } else {
+                            self.set_motion_status(format!("Loaded preset '{name}'."), false);
+                        }
+                    }
+                    Err(err) => self.set_motion_status(
+                        format!("Could not load '{}': {err}", path.display()),
+                        true,
+                    ),
+                }
+            }
+            MotionPresetAction::Overwrite(name) => {
+                let values = motion_presets::capture(&self.config);
+                match motion_presets::save_preset(&name, &values) {
+                    Ok(path) => {
+                        self.refresh_motion_presets();
+                        self.set_motion_status(format!("Saved '{}'.", path.display()), false);
+                    }
+                    Err(err) => {
+                        self.set_motion_status(format!("Could not save '{name}': {err}"), true)
+                    }
+                }
+            }
+            MotionPresetAction::BeginRename(name) => {
+                self.motion_settings.pending_delete = None;
+                self.motion_settings.rename = Some((name.clone(), name));
+            }
+            MotionPresetAction::Rename(old, new) => {
+                match motion_presets::sanitize_preset_name(&new) {
+                    Ok(clean) => {
+                        self.motion_settings.rename = None;
+                        if clean == old {
+                            return;
+                        }
+                        match motion_presets::rename_preset(&old, &clean) {
+                            Ok(()) => {
+                                self.motion_settings.selected = Some(clean.clone());
+                                self.refresh_motion_presets();
+                                self.set_motion_status(
+                                    format!("Renamed '{old}' to '{clean}'."),
+                                    false,
+                                );
+                            }
+                            Err(err) => {
+                                self.set_motion_status(format!("Could not rename: {err}"), true)
+                            }
+                        }
+                    }
+                    Err(err) => self.set_motion_status(err, true),
+                }
+            }
+            MotionPresetAction::CancelRename => self.motion_settings.rename = None,
+            MotionPresetAction::ConfirmDelete(name) => {
+                self.motion_settings.pending_delete = None;
+                match motion_presets::delete_preset(&name) {
+                    Ok(()) => {
+                        if self.motion_settings.selected.as_deref() == Some(name.as_str()) {
+                            self.motion_settings.selected = self
+                                .motion_settings
+                                .presets
+                                .iter()
+                                .find(|entry| entry.builtin)
+                                .map(|entry| entry.name.clone());
+                        }
+                        self.refresh_motion_presets();
+                        self.set_motion_status(format!("Deleted preset '{name}'."), false);
+                    }
+                    Err(err) => self.set_motion_status(format!("Could not delete: {err}"), true),
+                }
+            }
+            MotionPresetAction::CancelDelete => self.motion_settings.pending_delete = None,
+            MotionPresetAction::Create => {
+                let raw = self.motion_settings.new_name.clone();
+                match motion_presets::sanitize_preset_name(&raw) {
+                    Ok(name) => {
+                        if motion_presets::presets_dir()
+                            .join(format!("{name}.ini"))
+                            .exists()
+                        {
+                            self.set_motion_status(
+                                format!(
+                                    "Preset '{name}' already exists; select it and use Overwrite."
+                                ),
+                                true,
+                            );
+                            return;
+                        }
+                        let values = motion_presets::capture(&self.config);
+                        match motion_presets::save_preset(&name, &values) {
+                            Ok(path) => {
+                                self.motion_settings.new_name.clear();
+                                self.motion_settings.selected = Some(name);
+                                self.refresh_motion_presets();
+                                self.set_motion_status(
+                                    format!("Created '{}'.", path.display()),
+                                    false,
+                                );
+                            }
+                            Err(err) => self
+                                .set_motion_status(format!("Could not create preset: {err}"), true),
+                        }
+                    }
+                    Err(err) => self.set_motion_status(err, true),
+                }
+            }
+        }
+    }
+
+    fn draw_motion_settings_modal(&mut self, ctx: &egui::Context) {
+        if !self.motion_settings.open {
+            return;
+        }
+
+        if let Some((_, created_at)) = self.motion_settings.status.as_ref() {
+            if created_at.elapsed() > Duration::from_secs(4) {
+                self.motion_settings.status = None;
+            }
+        }
+
+        let mut close_modal = ctx.input(|input| input.key_pressed(egui::Key::Escape));
+        let mut action: Option<MotionPresetAction> = None;
+        let screen_rect = ctx.screen_rect();
+
+        egui::Area::new(egui::Id::new("motion_settings_backdrop"))
+            .fixed_pos(screen_rect.min)
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, screen_rect.size());
+                ui.painter().rect_filled(
+                    rect,
+                    0.0,
+                    egui::Color32::from_rgba_unmultiplied(4, 8, 13, 214),
+                );
+            });
+
+        let modal_size = egui::vec2(
+            (screen_rect.width() - 60.0).clamp(680.0, 1080.0),
+            (screen_rect.height() - 44.0).clamp(480.0, 820.0),
+        );
+        let modal_pos = screen_rect.center() - modal_size * 0.5;
+        let presets_dir_label = motion_presets::presets_dir().display().to_string();
+        let body_height = (modal_size.y - 214.0).max(240.0);
+        // Explicit widths: the nested layouts' available_width is not the column width here.
+        let right_column_width = (modal_size.x - 250.0 - 64.0).max(360.0);
+        let slider_width = (right_column_width - 150.0 - 78.0 - 28.0).max(120.0);
+
+        let modal_response = egui::Area::new(egui::Id::new("motion_settings_modal"))
+            .fixed_pos(modal_pos)
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                ui.set_min_size(modal_size);
+                egui::Frame::none()
+                    .fill(egui::Color32::from_rgba_unmultiplied(16, 23, 31, 252))
+                    .stroke(egui::Stroke::new(
+                        1.0_f32,
+                        egui::Color32::from_rgba_unmultiplied(166, 207, 255, 62),
+                    ))
+                    .rounding(18.0)
+                    .inner_margin(egui::Margin::same(18.0))
+                    .show(ui, |ui| {
+                        ui.vertical(|ui| {
+                            ui.horizontal(|ui| {
+                                ui.vertical(|ui| {
+                                    ui.label(
+                                        egui::RichText::new("Motion & Input Settings")
+                                            .color(egui::Color32::WHITE)
+                                            .strong()
+                                            .size(22.0),
+                                    );
+                                    ui.add_space(2.0);
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "Mouse, scroll, zoom, pan, inertia and autoscroll feel. Changes apply live and are written to config.ini.",
+                                        )
+                                        .color(egui::Color32::from_rgb(170, 190, 212))
+                                        .size(12.5),
+                                    );
+                                    ui.add_space(4.0);
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "Presets: {presets_dir_label}"
+                                        ))
+                                        .monospace()
+                                        .color(egui::Color32::from_rgb(128, 165, 198))
+                                        .size(11.0),
+                                    );
+                                });
+
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        let close_button = ui.add(
+                                            egui::Button::new(
+                                                egui::RichText::new("Close")
+                                                    .color(egui::Color32::WHITE),
+                                            )
+                                            .min_size(egui::vec2(88.0, 30.0))
+                                            .fill(egui::Color32::from_rgba_unmultiplied(
+                                                255, 255, 255, 24,
+                                            ))
+                                            .stroke(egui::Stroke::new(
+                                                1.0_f32,
+                                                egui::Color32::from_rgba_unmultiplied(
+                                                    255, 255, 255, 56,
+                                                ),
+                                            ))
+                                            .rounding(7.0),
+                                        );
+                                        if close_button.clicked() {
+                                            close_modal = true;
+                                        }
+                                    },
+                                );
+                            });
+
+                            ui.add_space(10.0);
+                            ui.separator();
+                            ui.add_space(8.0);
+
+                            let presets = self.motion_settings.presets.clone();
+                            let selected = self.motion_settings.selected.clone();
+                            let selected_is_builtin =
+                                selected.as_deref().is_some_and(motion_presets::is_builtin);
+                            let has_selection = selected.is_some();
+
+                            ui.horizontal_top(|ui| {
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(250.0, body_height),
+                                    egui::Layout::top_down(egui::Align::Min),
+                                    |ui| {
+                                        ui.label(
+                                            egui::RichText::new("Presets")
+                                                .strong()
+                                                .size(14.0)
+                                                .color(egui::Color32::from_rgb(
+                                                    198, 222, 255,
+                                                )),
+                                        );
+                                        egui::ScrollArea::vertical()
+                                            .id_salt("motion_settings_preset_list")
+                                            .max_height((body_height - 330.0).max(88.0))
+                                            .auto_shrink([false, false])
+                                            .show(ui, |ui| {
+                                                if presets.is_empty() {
+                                                    ui.label(
+                                                        egui::RichText::new("No presets found.")
+                                                            .size(12.0)
+                                                            .color(egui::Color32::from_rgb(
+                                                                170, 190, 212,
+                                                            )),
+                                                    );
+                                                }
+                                                for entry in presets.iter() {
+                                                    let is_selected = selected.as_deref()
+                                                        == Some(entry.name.as_str());
+                                                    // Badge inline: a second widget wraps badly in the narrow column.
+                                                    let label = if entry.builtin {
+                                                        format!("{}   BUILT-IN", entry.name)
+                                                    } else {
+                                                        entry.name.clone()
+                                                    };
+                                                    if ui
+                                                        .selectable_label(
+                                                            is_selected,
+                                                            egui::RichText::new(label).size(13.0),
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        self.motion_settings.selected =
+                                                            Some(entry.name.clone());
+                                                        self.motion_settings.pending_delete =
+                                                            None;
+                                                        self.motion_settings.rename = None;
+                                                    }
+                                                }
+                                            });
+
+                                        ui.add_space(6.0);
+                                        ui.horizontal(|ui| {
+                                            if ui
+                                                .add_enabled(
+                                                    has_selection,
+                                                    egui::Button::new("Load"),
+                                                )
+                                                .clicked()
+                                            {
+                                                if let Some(name) = selected.clone() {
+                                                    action = Some(MotionPresetAction::Load(name));
+                                                }
+                                            }
+                                            if ui
+                                                .add_enabled(
+                                                    has_selection && !selected_is_builtin,
+                                                    egui::Button::new("Overwrite"),
+                                                )
+                                                .clicked()
+                                            {
+                                                if let Some(name) = selected.clone() {
+                                                    action = Some(MotionPresetAction::Overwrite(
+                                                        name,
+                                                    ));
+                                                }
+                                            }
+                                        });
+                                        ui.horizontal(|ui| {
+                                            if ui
+                                                .add_enabled(
+                                                    has_selection && !selected_is_builtin,
+                                                    egui::Button::new("Rename"),
+                                                )
+                                                .clicked()
+                                            {
+                                                if let Some(name) = selected.clone() {
+                                                    action =
+                                                        Some(MotionPresetAction::BeginRename(name));
+                                                }
+                                            }
+                                            if ui
+                                                .add_enabled(
+                                                    has_selection && !selected_is_builtin,
+                                                    egui::Button::new("Delete"),
+                                                )
+                                                .clicked()
+                                            {
+                                                // First click only arms the confirmation below.
+                                                self.motion_settings.rename = None;
+                                                self.motion_settings.pending_delete =
+                                                    selected.clone();
+                                            }
+                                        });
+
+                                        if let Some((old_name, mut draft)) =
+                                            self.motion_settings.rename.clone()
+                                        {
+                                            ui.add_space(6.0);
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "Rename '{old_name}'"
+                                                ))
+                                                .size(12.0)
+                                                .color(egui::Color32::from_rgb(170, 190, 212)),
+                                            );
+                                            ui.add(
+                                                egui::TextEdit::singleline(&mut draft)
+                                                    .desired_width(212.0),
+                                            );
+                                            self.motion_settings.rename =
+                                                Some((old_name.clone(), draft.clone()));
+                                            ui.horizontal(|ui| {
+                                                if ui.button("Confirm").clicked() {
+                                                    action = Some(MotionPresetAction::Rename(
+                                                        old_name.clone(),
+                                                        draft.clone(),
+                                                    ));
+                                                }
+                                                if ui.button("Cancel").clicked() {
+                                                    action =
+                                                        Some(MotionPresetAction::CancelRename);
+                                                }
+                                            });
+                                        }
+
+                                        if let Some(target) =
+                                            self.motion_settings.pending_delete.clone()
+                                        {
+                                            ui.add_space(6.0);
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "Delete '{target}'?"
+                                                ))
+                                                .size(12.0)
+                                                .color(egui::Color32::from_rgb(
+                                                    255, 170, 170,
+                                                )),
+                                            );
+                                            ui.horizontal(|ui| {
+                                                if ui.button("Confirm delete").clicked() {
+                                                    action = Some(
+                                                        MotionPresetAction::ConfirmDelete(
+                                                            target.clone(),
+                                                        ),
+                                                    );
+                                                }
+                                                if ui.button("Cancel").clicked() {
+                                                    action =
+                                                        Some(MotionPresetAction::CancelDelete);
+                                                }
+                                            });
+                                        }
+
+                                        ui.add_space(8.0);
+                                        ui.separator();
+                                        ui.add_space(4.0);
+                                        ui.label(
+                                            egui::RichText::new("Save current as new preset")
+                                                .size(12.0)
+                                                .color(egui::Color32::from_rgb(170, 190, 212)),
+                                        );
+                                        ui.add(
+                                            egui::TextEdit::singleline(
+                                                &mut self.motion_settings.new_name,
+                                            )
+                                            .hint_text("preset name")
+                                            .desired_width(212.0),
+                                        );
+                                        let can_create = !self
+                                            .motion_settings
+                                            .new_name
+                                            .trim()
+                                            .is_empty();
+                                        if ui
+                                            .add_enabled(
+                                                can_create,
+                                                egui::Button::new("Create preset"),
+                                            )
+                                            .clicked()
+                                        {
+                                            action = Some(MotionPresetAction::Create);
+                                        }
+                                    },
+                                );
+
+                                ui.separator();
+
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(right_column_width, body_height),
+                                    egui::Layout::top_down(egui::Align::Min),
+                                    |ui| {
+                                        egui::ScrollArea::vertical()
+                                            .id_salt("motion_settings_values")
+                                            .max_height(body_height)
+                                            .auto_shrink([false, false])
+                                            .show(ui, |ui| {
+                                                ui.set_min_width(ui.available_width());
+                                                let mut current_group: Option<&str> = None;
+                                                for setting in motion_presets::SETTINGS.iter() {
+                                                    if current_group != Some(setting.group) {
+                                                        if current_group.is_some() {
+                                                            ui.add_space(10.0);
+                                                        }
+                                                        ui.label(
+                                                            egui::RichText::new(setting.group)
+                                                                .strong()
+                                                                .size(14.0)
+                                                                .color(
+                                                                    egui::Color32::from_rgb(
+                                                                        198, 222, 255,
+                                                                    ),
+                                                                ),
+                                                        );
+                                                        ui.add_space(2.0);
+                                                        current_group = Some(setting.group);
+                                                    }
+
+                                                    ui.horizontal(|ui| {
+                                                        ui.spacing_mut().slider_width = slider_width;
+                                                        let index = setting.id;
+                                                        let label = ui.add_sized(
+                                                            egui::vec2(150.0, 20.0),
+                                                            egui::Label::new(
+                                                                egui::RichText::new(setting.label)
+                                                                    .size(12.5),
+                                                            )
+                                                            .truncate(),
+                                                        );
+                                                        label.on_hover_text(format!(
+                                                            "{}\nkey: {}",
+                                                            setting.help, setting.key
+                                                        ));
+                                                        let step = if setting.decimals == 0 {
+                                                            1.0
+                                                        } else {
+                                                            10f64.powi(-(setting.decimals as i32))
+                                                        };
+                                                        let before =
+                                                            self.motion_settings.values[index];
+                                                        let slider_response = ui.add(
+                                                            egui::Slider::new(
+                                                                &mut self.motion_settings.values
+                                                                    [index],
+                                                                setting.min..=setting.max,
+                                                            )
+                                                            .show_value(false)
+                                                            .fixed_decimals(setting.decimals),
+                                                        );
+                                                        ui.add_space(4.0);
+                                                        let drag_response = ui.add_sized(
+                                                            [78.0, 20.0],
+                                                            egui::DragValue::new(
+                                                                &mut self.motion_settings.values
+                                                                    [index],
+                                                            )
+                                                            .range(setting.min..=setting.max)
+                                                            .speed(step)
+                                                            .fixed_decimals(setting.decimals),
+                                                        );
+                                                        let changed = slider_response.changed()
+                                                            || drag_response.changed();
+                                                        // Release and keyboard edits write at once: the idle
+                                                        // viewer runs no frames, so a timer-only debounce
+                                                        // could leave the last drag unsaved.
+                                                        let write_now = slider_response.drag_stopped()
+                                                            || drag_response.drag_stopped()
+                                                            || (changed
+                                                                && !ui.input(|i| i.pointer.any_down()));
+                                                        if changed && !write_now {
+                                                            self.motion_settings.save_due_at =
+                                                                Some(
+                                                                    Instant::now()
+                                                                        + Duration::from_millis(300),
+                                                                );
+                                                        }
+                                                        if changed {
+                                                            let requested = self
+                                                                .motion_settings
+                                                                .values[index];
+                                                            if requested != before {
+                                                                motion_presets::set(
+                                                                    &mut self.config,
+                                                                    index,
+                                                                    requested,
+                                                                );
+                                                                for (id, value) in
+                                                                    motion_presets::capture(
+                                                                        &self.config,
+                                                                    )
+                                                                {
+                                                                    self.motion_settings
+                                                                        .values[id] = value;
+                                                                }
+                                                            }
+                                                        }
+                                                        if write_now {
+                                                            self.motion_settings.save_due_at = None;
+                                                            self.config.save();
+                                                        }
+                                                    });
+                                                }
+                                            });
+                                    },
+                                );
+                            });
+
+                            ui.add_space(8.0);
+                            ui.separator();
+                            ui.add_space(4.0);
+                            let status = self.motion_settings.status.clone();
+                            let status_is_error = self.motion_settings.status_is_error;
+                            match status {
+                                Some((message, _)) => {
+                                    let color = if status_is_error {
+                                        egui::Color32::from_rgb(255, 150, 150)
+                                    } else {
+                                        egui::Color32::from_rgb(150, 220, 180)
+                                    };
+                                    ui.label(
+                                        egui::RichText::new(message).color(color).size(12.0),
+                                    );
+                                }
+                                None => {
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "Sliders and number boxes apply live; config.ini is saved 300 ms after the last change.",
+                                        )
+                                        .color(egui::Color32::from_rgb(140, 160, 182))
+                                        .size(11.5),
+                                    );
+                                }
+                            }
+                        });
+                    });
+            });
+
+        let modal_rect = modal_response.response.rect;
+        if self.motion_settings.skip_outside_click_once {
+            self.motion_settings.skip_outside_click_once = false;
+        } else {
+            let clicked_outside_modal = ctx.input(|input| {
+                let primary_clicked = input.pointer.button_clicked(egui::PointerButton::Primary);
+                let secondary_clicked =
+                    input.pointer.button_clicked(egui::PointerButton::Secondary);
+                let pointer_pos = input
+                    .pointer
+                    .interact_pos()
+                    .or_else(|| input.pointer.hover_pos());
+
+                (primary_clicked || secondary_clicked)
+                    && pointer_pos.is_some_and(|pos| !modal_rect.contains(pos))
+            });
+            if clicked_outside_modal {
+                close_modal = true;
+            }
+        }
+
+        if let Some(action) = action {
+            self.apply_motion_preset_action(action);
+            ctx.request_repaint();
+        }
+
+        // The debounce deadline is set during drawing, after this frame's flush: without an
+        // explicit wake-up the idle viewer never draws the frame that would save.
+        if let Some(due_at) = self.motion_settings.save_due_at {
+            ctx.request_repaint_after(due_at.saturating_duration_since(Instant::now()));
+        }
+
+        if close_modal {
+            self.flush_pending_motion_settings_save(ctx);
+            self.motion_settings.open = false;
+            self.motion_settings.skip_outside_click_once = false;
+            self.motion_settings.rename = None;
+            self.motion_settings.pending_delete = None;
         }
     }
 
@@ -22327,7 +23103,7 @@ impl ImageViewer {
             return false;
         }
 
-        let freeze_for_help = self.shortcuts_help_modal_open;
+        let freeze_for_help = self.settings_modal_open();
 
         self.manga_prune_ttv_pending();
 
@@ -22349,7 +23125,7 @@ impl ImageViewer {
         let mut masonry_scrollbar_moved_this_frame = false;
         let mut masonry_autoscroll_moved_this_frame = false;
         let mut masonry_scroll_animation_moved_this_frame = false;
-        let masonry_preload_input_blocked = self.shortcuts_help_modal_open
+        let masonry_preload_input_blocked = self.settings_modal_open()
             || (self.is_masonry_mode() && self.masonry_metadata_preload_active);
         let mode_scroll_up_action = if self.is_masonry_mode() {
             Action::MasonryScrollUp
@@ -25626,6 +26402,23 @@ impl ImageViewer {
                                     if self
                                         .menu_action_row(
                                             ui,
+                                            "Motion & input settings",
+                                            MenuActionIcon::Motion,
+                                        )
+                                        .clicked()
+                                    {
+                                        self.open_motion_settings_modal();
+                                        self.file_action_menu = None;
+                                        self.show_controls = true;
+                                        self.controls_show_time = Instant::now();
+                                        close_popup = true;
+                                    }
+
+                                    ui.separator();
+
+                                    if self
+                                        .menu_action_row(
+                                            ui,
                                             "Edit config.ini",
                                             MenuActionIcon::Config,
                                         )
@@ -28115,7 +28908,7 @@ impl ImageViewer {
 
         let mut pointer_pos = ctx.input(|i| i.pointer.hover_pos());
 
-        if self.shortcuts_help_modal_open {
+        if self.settings_modal_open() {
             self.is_panning = false;
             self.is_resizing = false;
             self.resize_direction = ResizeDirection::None;
@@ -28979,7 +29772,7 @@ impl eframe::App for ImageViewer {
         }
 
         // Handle file drops (disabled while the help modal is open).
-        if !self.shortcuts_help_modal_open {
+        if !self.settings_modal_open() {
             ctx.input(|i| {
                 if !i.raw.dropped_files.is_empty() {
                     if let Some(path) = i.raw.dropped_files[0].path.clone() {
@@ -29001,7 +29794,7 @@ impl eframe::App for ImageViewer {
         // Run this before input so the input handler can properly suppress actions over the video bar.
         let _ = self.update_bottom_overlays_visibility(ctx);
 
-        if self.shortcuts_help_modal_open {
+        if self.settings_modal_open() {
             self.stop_manga_wheel_scroll();
             self.stop_manga_autoscroll();
             self.manga_scroll_target = self.manga_scroll_offset;
@@ -29014,8 +29807,11 @@ impl eframe::App for ImageViewer {
             self.last_mouse_pos = None;
         }
 
+        // Debounced config.ini write for motion-setting slider drags.
+        self.flush_pending_motion_settings_save(ctx);
+
         // Handle input (disabled while the help modal is open).
-        if !self.shortcuts_help_modal_open {
+        if !self.settings_modal_open() {
             self.handle_input(ctx);
         }
 
@@ -29355,7 +30151,7 @@ impl eframe::App for ImageViewer {
         // Draw controls overlay (top bar for title/buttons) BEFORE the main view.
         // This ensures title-bar hover/selection state is available to suppress gestures
         // (drag/pan/double-click) in the same frame.
-        if !skip_drawing && !self.shortcuts_help_modal_open {
+        if !skip_drawing && !self.settings_modal_open() {
             self.draw_controls(ctx);
         } else {
             self.mouse_over_window_buttons = false;
@@ -29372,14 +30168,14 @@ impl eframe::App for ImageViewer {
         };
 
         // Draw video controls overlay (bottom bar for video playback controls)
-        if !skip_drawing && !self.shortcuts_help_modal_open {
+        if !skip_drawing && !self.settings_modal_open() {
             self.draw_video_controls(ctx);
             // Also draw manga mode video controls if in manga mode
             self.draw_manga_video_controls(ctx);
         }
 
         // Draw manga mode toggle button and zoom HUD (bottom-right in fullscreen)
-        if !skip_drawing && !self.shortcuts_help_modal_open {
+        if !skip_drawing && !self.settings_modal_open() {
             self.draw_manga_zoom_bar(ctx);
             self.draw_manga_toggle_button(ctx);
         }
@@ -29392,6 +30188,7 @@ impl eframe::App for ImageViewer {
             self.draw_rename_modal(ctx);
             self.draw_exit_confirmation_modal(ctx);
             self.draw_shortcuts_help_modal(ctx);
+            self.draw_motion_settings_modal(ctx);
         }
 
         let (hide_idle_cursor, cursor_idle_repaint_after) = if skip_drawing {

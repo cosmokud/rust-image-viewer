@@ -4,3 +4,6 @@
 # carriage return: a Windows clone carrying `core.autocrlf` would otherwise
 # fail every hook with `bad interpreter` before it runs a line.
 .githooks/* text eol=lf
+# Embedded with include_str! and compared byte-for-byte against the writer output, so a
+# CRLF checkout would break the drift test and rewrite the files every startup.
+assets/presets/*.ini text eol=lf

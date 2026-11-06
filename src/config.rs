@@ -1097,7 +1097,7 @@ impl Config {
 
     /// Get the configuration directory in AppData/Roaming.
     /// Creates the directory if it doesn't exist.
-    fn config_dir() -> PathBuf {
+    pub(crate) fn config_dir() -> PathBuf {
         let config_dir = if cfg!(target_os = "windows") {
             app_dirs::app_config_dir().unwrap_or_else(|| {
                 std::env::current_exe()
