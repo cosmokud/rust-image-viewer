@@ -9512,6 +9512,25 @@ impl ImageViewer {
             Some(Instant::now() + Self::MEDIA_SLIDER_WHEEL_GUARD_DURATION);
     }
 
+    /// Right-hand strip of the title bar that holds the window buttons.
+    ///
+    /// Deliberately generous: wider than the button cluster, full bar height and out to the very
+    /// right edge, so no pixel of a button is left outside it. A press in here must never start a
+    /// window drag or resize - both move the window under the cursor and the button click is
+    /// lost (the window-drag branch is the one that shows the four-arrow move cursor).
+    fn title_bar_buttons_pointer_zone(&self, screen_rect: egui::Rect) -> egui::Rect {
+        const ZONE_WIDTH: f32 = 200.0;
+
+        let width = ZONE_WIDTH.min(screen_rect.width());
+        egui::Rect::from_min_max(
+            egui::pos2(screen_rect.max.x - width, screen_rect.min.y),
+            egui::pos2(
+                screen_rect.max.x,
+                screen_rect.min.y + Self::TITLE_BAR_HEIGHT,
+            ),
+        )
+    }
+
     fn title_bar_ui_blocking(&self) -> bool {
         self.mouse_over_window_buttons
             || self.mouse_over_title_text
@@ -25187,13 +25206,13 @@ impl ImageViewer {
                         egui::pos2(bar_rect.max.x - button_edge_gap, bar_rect.max.y),
                     );
 
-                    // If the pointer is over the window buttons region, suppress window dragging.
-                    // Be inclusive on the max edge so the very last pixel doesn't fall through.
+                    // If the pointer is over the window buttons region, suppress window dragging
+                    // and resize. The zone is a superset of the drawn cluster: full bar height and
+                    // out to the right edge, so no pixel of a button can start a drag.
                     if let Some(pos) = mouse_pos {
-                        self.mouse_over_window_buttons = pos.x >= buttons_rect.min.x
-                            && pos.x <= buttons_rect.max.x
-                            && pos.y >= buttons_rect.min.y
-                            && pos.y <= buttons_rect.max.y;
+                        self.mouse_over_window_buttons = self
+                            .title_bar_buttons_pointer_zone(screen_rect)
+                            .contains(pos);
                     }
                     let left_rect = egui::Rect::from_min_max(
                         bar_rect.min,
@@ -28316,6 +28335,14 @@ impl ImageViewer {
             let over_title_bar =
                 self.show_controls && pointer_pos.map_or(false, |p| p.y <= title_bar_height);
 
+            // Never start a window drag from the title-bar button strip, even when the bar is
+            // hidden (auto-hide means `over_title_bar` is false then, which used to turn a press
+            // on a button into a window drag: the four-arrow move cursor, and a lost click).
+            let over_title_bar_buttons = pointer_pos.map_or(false, |pos| {
+                self.title_bar_buttons_pointer_zone(screen_rect)
+                    .contains(pos)
+            });
+
             // Determine if we're over a resize edge (only in floating mode)
             let hover_resize_direction = if !self.is_fullscreen {
                 if let Some(pos) = pointer_pos {
@@ -28450,6 +28477,7 @@ impl ImageViewer {
                     && !self.gif_seeking
                     && !self.manga_video_seeking
                     && !self.mouse_over_window_buttons
+                    && !over_title_bar_buttons
                     && !self.title_bar_menu_active
                     && !self.title_text_dragging
                     && !pointer_over_shortcut_ui
