@@ -119,7 +119,7 @@ fn paint_loading_spinner(painter: &egui::Painter, rect: egui::Rect, time: f64) {
         center,
         radius,
         egui::Stroke::new(
-            2.0_f32,
+            2.0,
             egui::Color32::from_rgba_unmultiplied(255, 255, 255, 35),
         ),
     );
@@ -136,7 +136,7 @@ fn paint_loading_spinner(painter: &egui::Painter, rect: egui::Rect, time: f64) {
         })
         .collect();
     let stroke = egui::Stroke::new(
-        2.5_f32,
+        2.5,
         egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200),
     );
     painter.add(egui::Shape::line(points.to_vec(), stroke));
@@ -2446,13 +2446,13 @@ struct ImageViewer {
     resize_start_outer_pos: Option<egui::Pos2>,
     /// Initial window inner size when resize started
     resize_start_inner_size: Option<egui::Vec2>,
-    /// Global screen cursor position when resize started (physical pixels from GetCursorPos)
+    /// Global screen cursor position when resize started (from Windows API GetCursorPos)
     resize_start_cursor_screen: Option<egui::Pos2>,
     /// Last commanded window size during resize (for stable content rendering)
     resize_last_size: Option<egui::Vec2>,
     /// Initial window outer position when a manual floating-window drag starts.
     floating_drag_start_outer_pos: Option<egui::Pos2>,
-    /// Global screen cursor position when a manual floating-window drag starts (physical pixels).
+    /// Global screen cursor position when a manual floating-window drag starts.
     floating_drag_start_cursor_screen: Option<egui::Pos2>,
     /// When true, floating autosize is suppressed while zoomed media exceeds the viewport.
     /// Set by explicit user window drag/resize while in zoom-inside-window mode.
@@ -4363,7 +4363,7 @@ impl ImageViewer {
     }
 
     fn paint_folder_entry_icon(painter: &egui::Painter, body: egui::Rect, is_up_entry: bool) {
-        let stroke = egui::Stroke::new(2.0_f32, egui::Color32::WHITE);
+        let stroke = egui::Stroke::new(2.0, egui::Color32::WHITE);
         let center = body.center();
         if is_up_entry {
             let shaft_top = egui::pos2(center.x, center.y - body.height() * 0.18);
@@ -4491,7 +4491,7 @@ impl ImageViewer {
                     6.0,
                     egui::Color32::from_rgba_unmultiplied(0, 0, 0, 160),
                 );
-                let stroke = egui::Stroke::new(1.8_f32, egui::Color32::WHITE);
+                let stroke = egui::Stroke::new(1.8, egui::Color32::WHITE);
                 let shaft_top =
                     egui::pos2(badge.center().x, badge.center().y - badge.height() * 0.28);
                 let shaft_bottom =
@@ -4523,7 +4523,7 @@ impl ImageViewer {
                 preview_rect,
                 4.0,
                 egui::Stroke::new(
-                    1.0_f32,
+                    1.0,
                     egui::Color32::from_rgba_unmultiplied(255, 255, 255, 26),
                 ),
             );
@@ -6278,13 +6278,13 @@ impl ImageViewer {
         };
         let overlay_rect = rect.shrink(1.5);
 
-        painter.rect_stroke(overlay_rect, 0.0, egui::Stroke::new(2.0_f32, border_color));
+        painter.rect_stroke(overlay_rect, 0.0, egui::Stroke::new(2.0, border_color));
         paint_mark_chip(
             painter,
             overlay_rect,
             label,
             chip_fill,
-            egui::Stroke::new(1.0_f32, border_color),
+            egui::Stroke::new(1.0, border_color),
             egui::Color32::WHITE,
         );
     }
@@ -8412,7 +8412,7 @@ impl ImageViewer {
             panel_rect,
             14.0,
             egui::Stroke::new(
-                1.4_f32,
+                1.4,
                 egui::Color32::from_rgba_unmultiplied(252, 127, 38, (235.0 * fade) as u8),
             ),
         );
@@ -8971,7 +8971,7 @@ impl ImageViewer {
                     egui::Stroke::NONE,
                 ));
 
-                let stroke = egui::Stroke::new(1.5_f32, color);
+                let stroke = egui::Stroke::new(1.5, color);
                 let wave_center = egui::pos2(rect.center().x + 0.8, rect.center().y);
                 for radius in [3.0, 5.3] {
                     painter.add(egui::epaint::PathShape::line(
@@ -8985,7 +8985,7 @@ impl ImageViewer {
                     rect.center() + egui::vec2(0.0, -1.0),
                     egui::vec2(rect.width() - 2.0, rect.height() - 5.0),
                 );
-                let stroke = egui::Stroke::new(1.4_f32, color);
+                let stroke = egui::Stroke::new(1.4, color);
                 painter.rect_stroke(bubble_rect, 4.0, stroke);
 
                 let tail_tip = egui::pos2(bubble_rect.left() + 5.0, bubble_rect.bottom() + 3.0);
@@ -10050,7 +10050,7 @@ impl ImageViewer {
         icon: MenuActionIcon,
         color: egui::Color32,
     ) {
-        let stroke = egui::Stroke::new(1.8_f32, color);
+        let stroke = egui::Stroke::new(1.8, color);
         match icon {
             MenuActionIcon::Mark => {
                 painter.rect_stroke(rect.shrink(2.0), 4.0, stroke);
@@ -10322,7 +10322,7 @@ impl ImageViewer {
 
             ui.painter().rect_filled(rect, 8.0, fill);
             ui.painter()
-                .rect_stroke(rect, 8.0, egui::Stroke::new(1.0_f32, stroke_color));
+                .rect_stroke(rect, 8.0, egui::Stroke::new(1.0, stroke_color));
 
             let icon_rect = egui::Rect::from_center_size(
                 egui::pos2(rect.left() + 17.0, rect.center().y),
@@ -10713,7 +10713,7 @@ impl ImageViewer {
                 egui::Frame::none()
                     .fill(egui::Color32::from_rgba_unmultiplied(18, 22, 28, 244))
                     .stroke(egui::Stroke::new(
-                        1.0_f32,
+                        1.0,
                         egui::Color32::from_rgba_unmultiplied(255, 255, 255, 36),
                     ))
                     .rounding(14.0)
@@ -11164,7 +11164,7 @@ impl ImageViewer {
             rect,
             12.0,
             egui::Stroke::new(
-                1.0_f32,
+                1.0,
                 egui::Color32::from_rgba_unmultiplied(255, 255, 255, 28),
             ),
         );
@@ -11224,7 +11224,7 @@ impl ImageViewer {
                 file_size_label,
                 egui::Color32::from_rgba_unmultiplied(58, 76, 98, 180),
                 egui::Stroke::new(
-                    1.0_f32,
+                    1.0,
                     egui::Color32::from_rgba_unmultiplied(130, 168, 196, 180),
                 ),
                 egui::Color32::from_rgb(222, 233, 243),
@@ -11234,7 +11234,7 @@ impl ImageViewer {
                 dimensions_label,
                 egui::Color32::from_rgba_unmultiplied(72, 68, 38, 180),
                 egui::Stroke::new(
-                    1.0_f32,
+                    1.0,
                     egui::Color32::from_rgba_unmultiplied(224, 192, 108, 180),
                 ),
                 egui::Color32::from_rgb(245, 225, 171),
@@ -11253,7 +11253,7 @@ impl ImageViewer {
         egui::Frame::none()
             .fill(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 10))
             .stroke(egui::Stroke::new(
-                1.0_f32,
+                1.0,
                 egui::Color32::from_rgba_unmultiplied(255, 255, 255, 24),
             ))
             .rounding(14.0)
@@ -11371,7 +11371,7 @@ impl ImageViewer {
                 egui::Frame::none()
                     .fill(egui::Color32::from_rgba_unmultiplied(18, 22, 28, 252))
                     .stroke(egui::Stroke::new(
-                        1.0_f32,
+                        1.0,
                         egui::Color32::from_rgba_unmultiplied(255, 255, 255, 40),
                     ))
                     .rounding(18.0)
@@ -11419,7 +11419,7 @@ impl ImageViewer {
                                     )
                                     .min_size(egui::vec2(170.0, 32.0))
                                     .fill(egui::Color32::from_rgb(176, 52, 52))
-                                    .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(132, 36, 36)))
+                                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(132, 36, 36)))
                                     .rounding(4.0),
                                 );
                                 if delete_button.clicked() {
@@ -11431,7 +11431,7 @@ impl ImageViewer {
                                         .min_size(egui::vec2(100.0, 32.0))
                                         .fill(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 24))
                                         .stroke(egui::Stroke::new(
-                                            1.0_f32,
+                                            1.0,
                                             egui::Color32::from_rgba_unmultiplied(255, 255, 255, 48),
                                         ))
                                         .rounding(4.0),
@@ -11514,7 +11514,7 @@ impl ImageViewer {
                 egui::Frame::none()
                     .fill(egui::Color32::from_rgba_unmultiplied(18, 22, 28, 252))
                     .stroke(egui::Stroke::new(
-                        1.0_f32,
+                        1.0,
                         egui::Color32::from_rgba_unmultiplied(255, 255, 255, 40),
                     ))
                     .rounding(18.0)
@@ -11578,7 +11578,7 @@ impl ImageViewer {
                                         .min_size(egui::vec2(132.0, 32.0))
                                         .fill(egui::Color32::from_rgb(48, 122, 198))
                                         .stroke(egui::Stroke::new(
-                                            1.0_f32,
+                                            1.0,
                                             egui::Color32::from_rgb(38, 92, 162),
                                         ))
                                         .rounding(6.0),
@@ -11594,7 +11594,7 @@ impl ImageViewer {
                                                 255, 255, 255, 24,
                                             ))
                                             .stroke(egui::Stroke::new(
-                                                1.0_f32,
+                                                1.0,
                                                 egui::Color32::from_rgba_unmultiplied(
                                                     255, 255, 255, 48,
                                                 ),
@@ -11663,7 +11663,7 @@ impl ImageViewer {
                 egui::Frame::none()
                     .fill(egui::Color32::from_rgba_unmultiplied(18, 22, 28, 252))
                     .stroke(egui::Stroke::new(
-                        1.0_f32,
+                        1.0,
                         egui::Color32::from_rgba_unmultiplied(255, 255, 255, 40),
                     ))
                     .rounding(18.0)
@@ -11696,7 +11696,7 @@ impl ImageViewer {
                                 )
                                 .min_size(egui::vec2(128.0, 32.0))
                                 .fill(egui::Color32::from_rgb(176, 52, 52))
-                                .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(132, 36, 36)))
+                                .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(132, 36, 36)))
                                 .rounding(6.0),
                             );
                             if exit_button.clicked() || exit_button.is_pointer_button_down_on() {
@@ -11708,7 +11708,7 @@ impl ImageViewer {
                                     .min_size(egui::vec2(100.0, 32.0))
                                     .fill(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 24))
                                     .stroke(egui::Stroke::new(
-                                        1.0_f32,
+                                        1.0,
                                         egui::Color32::from_rgba_unmultiplied(255, 255, 255, 48),
                                     ))
                                     .rounding(6.0),
@@ -11821,7 +11821,7 @@ impl ImageViewer {
             egui::Frame::none()
                 .fill(egui::Color32::from_rgba_unmultiplied(62, 138, 222, 28))
                 .stroke(egui::Stroke::new(
-                    1.0_f32,
+                    1.0,
                     egui::Color32::from_rgba_unmultiplied(127, 188, 255, 94),
                 ))
                 .rounding(8.0)
@@ -12146,7 +12146,7 @@ impl ImageViewer {
                 egui::Frame::none()
                     .fill(egui::Color32::from_rgba_unmultiplied(16, 23, 31, 252))
                     .stroke(egui::Stroke::new(
-                        1.0_f32,
+                        1.0,
                         egui::Color32::from_rgba_unmultiplied(166, 207, 255, 62),
                     ))
                     .rounding(18.0)
@@ -12194,7 +12194,7 @@ impl ImageViewer {
                                                 255, 255, 255, 24,
                                             ))
                                             .stroke(egui::Stroke::new(
-                                                1.0_f32,
+                                                1.0,
                                                 egui::Color32::from_rgba_unmultiplied(
                                                     255, 255, 255, 56,
                                                 ),
@@ -12398,13 +12398,6 @@ impl ImageViewer {
         ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
     }
 
-    /// Window outer size in points, falling back to the inner size when unknown.
-    fn current_outer_size(&self, ctx: &egui::Context) -> egui::Vec2 {
-        ctx.input(|i| i.raw.viewport().outer_rect)
-            .map(|rect| rect.size())
-            .unwrap_or_else(|| ctx.screen_rect().size())
-    }
-
     fn reset_floating_window_drag_anchor(&mut self) {
         self.floating_drag_start_outer_pos = None;
         self.floating_drag_start_cursor_screen = None;
@@ -12415,7 +12408,7 @@ impl ImageViewer {
             return false;
         }
 
-        let Some(display_size) = self.image_display_size_at(self.zoom_target) else {
+        let Some(display_size) = self.image_display_size_at_zoom() else {
             return false;
         };
 
@@ -12432,7 +12425,7 @@ impl ImageViewer {
             self.floating_zoom_inside_window_locked = true;
         }
 
-        let Some(current_cursor_screen) = get_global_cursor_pos_physical() else {
+        let Some(current_cursor_screen) = get_global_cursor_pos() else {
             // Fallback for platforms where global cursor coordinates are unavailable.
             ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
             return;
@@ -12454,20 +12447,8 @@ impl ImageViewer {
             }
         };
 
-        // Windows reports the cursor in physical pixels, while `OuterPosition` takes logical
-        // points. Without this conversion the window moves faster than the cursor on scaled
-        // displays (1.25x/1.5x/2x) and drifts away from the grab point.
-        let points_per_physical_px = 1.0 / ctx.pixels_per_point().max(0.01);
-        let delta = (current_cursor_screen - start_cursor_screen) * points_per_physical_px;
-        let desired = start_outer_pos + delta;
-        // Never park the window where its title bar or window buttons are unreachable; the
-        // previous behaviour could drag the close button off screen with no way back.
-        let new_pos = clamp_outer_pos_on_display(
-            ctx,
-            Some(current_cursor_screen),
-            desired,
-            self.current_outer_size(ctx),
-        );
+        let delta = current_cursor_screen - start_cursor_screen;
+        let new_pos = start_outer_pos + delta;
         self.send_outer_position(ctx, new_pos);
     }
 
@@ -12675,7 +12656,7 @@ impl ImageViewer {
             anchor,
             18.0,
             egui::Stroke::new(
-                1.6_f32,
+                1.6,
                 egui::Color32::from_rgba_unmultiplied(210, 210, 210, 190),
             ),
         );
@@ -12690,7 +12671,7 @@ impl ImageViewer {
                 egui::pos2(anchor.x + 7.0, anchor.y),
             ],
             egui::Stroke::new(
-                1.2_f32,
+                1.2,
                 egui::Color32::from_rgba_unmultiplied(210, 210, 210, 180),
             ),
         );
@@ -12700,7 +12681,7 @@ impl ImageViewer {
                 egui::pos2(anchor.x, anchor.y + 7.0),
             ],
             egui::Stroke::new(
-                1.2_f32,
+                1.2,
                 egui::Color32::from_rgba_unmultiplied(210, 210, 210, 180),
             ),
         );
@@ -12713,7 +12694,7 @@ impl ImageViewer {
                 let tip = anchor + direction * len.min(44.0);
                 let perp = egui::vec2(-direction.y, direction.x);
                 let stroke = egui::Stroke::new(
-                    2.0_f32,
+                    2.0,
                     egui::Color32::from_rgba_unmultiplied(arrow_r, arrow_g, arrow_b, arrow_alpha),
                 );
 
@@ -13596,7 +13577,7 @@ impl ImageViewer {
                     panel_rect,
                     18.0,
                     egui::Stroke::new(
-                        1.0_f32,
+                        1.0,
                         egui::Color32::from_rgba_unmultiplied(130, 188, 255, 72),
                     ),
                 );
@@ -15371,66 +15352,11 @@ impl ImageViewer {
         )
     }
 
-    /// Safety net: if the native window ends up positioned so that its title bar (and therefore
-    /// the Close/Maximize/Minimize buttons) is unreachable - a scaled display, a DPI change at
-    /// runtime, or an unplugged monitor - pull it back onto the display.
-    ///
-    /// Only the position is corrected; an intentionally oversized window keeps its size (it is
-    /// right-aligned instead, so the window buttons stay visible).
-    fn enforce_floating_window_on_display(&mut self, ctx: &egui::Context) {
-        if self.is_fullscreen
-            || self.is_resizing
-            || self.is_panning
-            || self.pending_window_resize.is_some()
-            || self.pending_fullscreen_layout
-            || self.pending_maximized_layout
-            || self.floating_drag_start_outer_pos.is_some()
-            || self.current_window_is_maximized(ctx)
-        {
-            return;
-        }
-
-        // A hidden startup window (video: parked off-screen until the first frame is decoded)
-        // must keep its intentional position.
-        if !self.startup_window_shown {
-            return;
-        }
-
-        let Some(outer) = ctx.input(|i| i.raw.viewport().outer_rect) else {
-            return;
-        };
-
-        let display =
-            display_bounds_points(ctx, None, ctx.input(|i| i.raw.viewport().monitor_size));
-        let Some(display) = display else {
-            return;
-        };
-
-        let corrected = clamp_floating_window_pos(display, outer.size(), outer.min);
-        // Compare in whole physical pixels: a fractional scale otherwise leaves an unrepresentable
-        // position, so the same correction is re-sent every frame and the window vibrates.
-        let points_per_px = ctx.pixels_per_point().max(0.01);
-        let corrected = egui::pos2(
-            (corrected.x * points_per_px).round() / points_per_px,
-            (corrected.y * points_per_px).round() / points_per_px,
-        );
-        // Tolerance covers physical-pixel rounding of the logical position.
-        if (corrected - outer.min).length() > 2.0 {
-            self.send_outer_position(ctx, corrected);
-        }
-    }
-
     fn center_window_on_monitor(&mut self, ctx: &egui::Context, inner_size: egui::Vec2) {
-        let outer_size = self.current_outer_size(ctx).max(inner_size);
-        let display =
-            display_bounds_points(ctx, None, ctx.input(|i| i.raw.viewport().monitor_size))
-                .unwrap_or_else(|| {
-                    egui::Rect::from_min_size(egui::Pos2::ZERO, self.monitor_size_points(ctx))
-                });
-        let x = display.min.x + (display.width() - outer_size.x) * 0.5;
-        let y = display.min.y + (display.height() - outer_size.y) * 0.5;
-        let pos = clamp_floating_window_pos(display, outer_size, egui::pos2(x, y));
-        self.send_outer_position(ctx, pos);
+        let monitor = self.monitor_size_points(ctx);
+        let x = (monitor.x - inner_size.x) * 0.5;
+        let y = (monitor.y - inner_size.y) * 0.5;
+        self.send_outer_position(ctx, egui::pos2(x.max(0.0), y));
     }
 
     fn floating_layout_size_for_media_bounds(
@@ -15951,46 +15877,7 @@ impl ImageViewer {
         self.maybe_refresh_current_solo_image_lod();
     }
 
-    /// Apply a multiplicative zoom coming from wheel input.
-    ///
-    /// Fullscreen keeps the point under the cursor fixed and allows panning; floating mode keeps
-    /// the media centered until it grows past the window, then follows the cursor too. Keeping
-    /// this in one place keeps both wheel paths (plain wheel and Ctrl+wheel) identical.
-    fn apply_pointer_zoom_factor(
-        &mut self,
-        pointer_pos: egui::Pos2,
-        factor: f32,
-        screen_rect: egui::Rect,
-    ) {
-        if !factor.is_finite() || factor <= 0.0 || (factor - 1.0).abs() <= f32::EPSILON {
-            return;
-        }
-
-        if self.is_fullscreen {
-            self.zoom_at(pointer_pos, factor, screen_rect);
-            self.zoom_target = self.zoom;
-            self.zoom_velocity = 0.0;
-            return;
-        }
-
-        // Accumulate on the target only: `tick_floating_zoom_animation` springs `zoom` toward it,
-        // so a notch eases in instead of jumping instantly.
-        let old_zoom = self.zoom_target;
-        self.zoom_target = self.clamp_zoom(self.zoom_target * factor);
-        if self.config.zoom_animation_speed <= 0.0 {
-            // No animator will apply the target, so stay instant.
-            self.zoom = self.zoom_target;
-        }
-
-        let has_offset = self.offset.length() > 0.1;
-        if old_zoom > 1.0 || self.zoom_target > 1.0 || has_offset {
-            let rect_center = screen_rect.center();
-            let cursor_offset = pointer_pos - rect_center;
-            let zoom_ratio = self.zoom_target / old_zoom;
-            self.offset = self.offset * zoom_ratio - cursor_offset * (zoom_ratio - 1.0);
-        }
-        self.zoom_velocity = 0.0;
-    }
+    // ============ MANGA READING MODE METHODS ============
 
     fn layout_mode_is_grid(layout_mode: MangaLayoutMode) -> bool {
         matches!(
@@ -22508,12 +22395,53 @@ impl ImageViewer {
         // Wheel normalization (mouse vs trackpad):
         // - Mouse wheels are usually "line" deltas (1.0 per notch)
         // - Trackpads are usually "point" deltas (many small pixel-ish deltas)
-        // Both are normalized into "wheel steps" so wheel momentum tuning stays consistent.
-        let points_per_line = POINTS_PER_WHEEL_LINE;
-        let wheel =
-            ctx.input(|i| wheel_steps_from_events(&i.raw.events, points_per_line, screen_height));
-        let (raw_wheel_steps, raw_wheel_steps_ctrl, raw_wheel_steps_shift) =
-            (wheel.normal, wheel.ctrl, wheel.shift);
+        // We normalize both into "wheel steps" so wheel momentum tuning stays consistent.
+        const MANGA_WHEEL_POINTS_PER_LINE: f32 = 50.0;
+        const MANGA_WHEEL_MAX_STEPS_PER_EVENT: f32 = 6.0;
+        let (raw_wheel_steps, raw_wheel_steps_ctrl, raw_wheel_steps_shift) = ctx.input(|i| {
+            let mut normal = 0.0f32;
+            let mut ctrl = 0.0f32;
+            let mut shift = 0.0f32;
+
+            for e in &i.raw.events {
+                let egui::Event::MouseWheel {
+                    unit,
+                    delta,
+                    modifiers,
+                } = e
+                else {
+                    continue;
+                };
+
+                // egui uses +Y for "scroll up".
+                let dy = delta.y;
+                if !dy.is_finite() || dy == 0.0 {
+                    continue;
+                }
+
+                let mut steps = match unit {
+                    egui::MouseWheelUnit::Line => dy,
+                    egui::MouseWheelUnit::Page => {
+                        dy * (screen_height / MANGA_WHEEL_POINTS_PER_LINE).max(1.0)
+                    }
+                    egui::MouseWheelUnit::Point => dy / MANGA_WHEEL_POINTS_PER_LINE,
+                };
+                steps = steps.clamp(
+                    -MANGA_WHEEL_MAX_STEPS_PER_EVENT,
+                    MANGA_WHEEL_MAX_STEPS_PER_EVENT,
+                );
+
+                if modifiers.ctrl {
+                    ctrl += steps;
+                } else if modifiers.shift {
+                    shift += steps;
+                } else {
+                    normal += steps;
+                }
+            }
+
+            (normal, ctrl, shift)
+        });
         let slider_wheel_guard_active = self.media_slider_wheel_guard_active();
         let (wheel_steps, wheel_steps_ctrl, wheel_steps_shift) =
             if masonry_preload_input_blocked || slider_wheel_guard_active {
@@ -22524,7 +22452,7 @@ impl ImageViewer {
 
         // In manga fullscreen mode, the wheel is owned by our custom inertial scroller.
         // Remove wheel events so other widgets don't accidentally react to them in the same frame.
-        if !wheel.is_zero() {
+        if raw_wheel_steps != 0.0 || raw_wheel_steps_ctrl != 0.0 || raw_wheel_steps_shift != 0.0 {
             ctx.input_mut(|i| {
                 i.raw
                     .events
@@ -22931,8 +22859,9 @@ impl ImageViewer {
                 // Use the same step-based algorithm as normal wheel zoom.
                 // `zoom_delta` can be device/platform-dependent and may feel jumpy; only use it
                 // to determine direction when raw Ctrl-wheel steps aren't available.
-                let factor =
-                    zoom_factor_for_steps(self.config.zoom_step, wheel_steps_ctrl_effective);
+                let step = self.config.zoom_step;
+                let zoom_in = wheel_steps_ctrl_effective > 0.0;
+                let factor = if zoom_in { step } else { 1.0 / step };
 
                 let old_zoom = self.zoom.max(0.0001);
                 let new_zoom = self.clamp_zoom(self.zoom * factor);
@@ -23650,7 +23579,7 @@ impl ImageViewer {
                         selection_rect,
                         12.0,
                         egui::Stroke::new(
-                            1.5_f32,
+                            1.5,
                             egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200),
                         ),
                     );
@@ -23739,14 +23668,8 @@ impl ImageViewer {
     }
 
     fn image_display_size_at_zoom(&self) -> Option<egui::Vec2> {
-        self.image_display_size_at(self.zoom)
-    }
-
-    /// Media size at an arbitrary zoom: autosize asks for `zoom` (several steps of the spring, so the
-    /// window follows it) and the "zoom inside the window" lock asks for `zoom_target`.
-    fn image_display_size_at(&self, zoom: f32) -> Option<egui::Vec2> {
         let (img_w, img_h) = self.media_display_dimensions()?;
-        let base_size = egui::Vec2::new(img_w as f32 * zoom, img_h as f32 * zoom);
+        let base_size = egui::Vec2::new(img_w as f32 * self.zoom, img_h as f32 * self.zoom);
         let rotation_degrees = self.current_precise_rotation_angle_degrees();
         if rotation_degrees.abs() < 0.01 {
             Some(base_size)
@@ -24055,7 +23978,7 @@ impl ImageViewer {
             return;
         }
 
-        let Some(mut desired) = self.image_display_size_at(self.zoom) else {
+        let Some(mut desired) = self.image_display_size_at_zoom() else {
             return;
         };
 
@@ -24065,16 +23988,10 @@ impl ImageViewer {
         let (current_inner_rect, current_outer_rect) =
             ctx.input(|i| (i.raw.viewport().inner_rect, i.raw.viewport().outer_rect));
 
-        // "Zoom inside the window" is a question about what the wheel asked for, not about the size the
-        // spring happens to be passing, so the lock does not flap mid-animation.
-        let wanted_size = self
-            .image_display_size_at(self.zoom_target)
-            .unwrap_or(desired);
-
         // While the zoomed media already exceeds the current floating viewport, keep this
         // "zoom inside window" mode stable and do not autosize the native window.
         let zoom_inside_current_viewport = current_inner_rect
-            .map(|rect| wanted_size.x > rect.width() + 1.0 || wanted_size.y > rect.height() + 1.0)
+            .map(|rect| desired.x > rect.width() + 1.0 || desired.y > rect.height() + 1.0)
             .unwrap_or(false);
         if zoom_inside_current_viewport && self.floating_zoom_inside_window_locked {
             return;
@@ -24084,12 +24001,20 @@ impl ImageViewer {
 
         // Once the floating window reaches display bounds, keep zooming inside the viewport
         // instead of continuing to grow the native window.
-        //
-        // Everything below is in logical points. Mixing in the physical `GetSystemMetrics` size
-        // here (as this used to) let the window grow to the physical-resolution size on scaled
-        // displays - e.g. a 1920x1080-point window on a 150% 1920x1080 panel that is only
-        // 1280x720 points - which pushed the title-bar window buttons off screen.
-        let monitor_bounds = Some(self.monitor_size_points(ctx));
+        let mut monitor_bounds = ctx.input(|i| i.raw.viewport().monitor_size);
+        #[cfg(target_os = "windows")]
+        {
+            // `viewport.monitor_size` can be undersized on some setups; use the primary
+            // monitor dimensions as a safety floor so we don't trigger in-window zoom too early.
+            let primary_bounds = get_primary_monitor_size();
+            monitor_bounds = Some(match monitor_bounds {
+                Some(bounds) => egui::vec2(
+                    bounds.x.max(primary_bounds.x),
+                    bounds.y.max(primary_bounds.y),
+                ),
+                None => primary_bounds,
+            });
+        }
 
         if let Some(monitor_bounds) = monitor_bounds {
             if monitor_bounds.x > 0.0
@@ -24120,49 +24045,14 @@ impl ImageViewer {
             .unwrap_or(true);
 
         if should_send {
-            let mut outer_rect_target: Option<(egui::Pos2, egui::Vec2)> = None;
             if let (Some(inner_rect), Some(outer_rect)) = (current_inner_rect, current_outer_rect) {
                 // Keep the window center stable while changing inner size so zoom-resize
                 // expands/contracts from center instead of top-left.
                 let inner_to_outer_offset = inner_rect.min - outer_rect.min;
                 let target_inner_min = inner_rect.center() - desired * 0.5;
                 let target_outer_min = target_inner_min - inner_to_outer_offset;
-                let new_outer_size = outer_rect.size() + (desired - inner_rect.size());
-                let target_outer_min =
-                    clamp_outer_pos_on_display(ctx, None, target_outer_min, new_outer_size);
-                outer_rect_target = Some((target_outer_min, new_outer_size));
+                self.send_outer_position(ctx, target_outer_min);
             }
-
-            #[cfg(target_os = "windows")]
-            if let Some((pos, size)) = outer_rect_target {
-                let points_per_px = ctx.pixels_per_point().max(0.01);
-                let wanted_rect = outer_rect_physical(pos, size, points_per_px);
-                let current_rect = current_outer_rect
-                    .map(|rect| outer_rect_physical(rect.min, rect.size(), points_per_px));
-
-                // Sub-pixel zoom must not move the window at all: nothing to send while the rounded
-                // box is the box the window already has.
-                if current_rect == Some(wanted_rect) {
-                    return;
-                }
-
-                // One move+resize call. Windows applies OuterPosition and InnerSize in separate
-                // frames, which paints one frame at the new position with the old size.
-                if crate::windows_env::set_active_window_outer_rect(
-                    wanted_rect[0],
-                    wanted_rect[1],
-                    wanted_rect[2] - wanted_rect[0],
-                    wanted_rect[3] - wanted_rect[1],
-                ) {
-                    return;
-                }
-            }
-
-            #[cfg(not(target_os = "windows"))]
-            if let Some((pos, _)) = outer_rect_target {
-                self.send_outer_position(ctx, pos);
-            }
-
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(desired));
         }
     }
@@ -25503,7 +25393,7 @@ impl ImageViewer {
                                     ui.painter().rect_filled(rect, 4.0, bg);
 
                                     let stroke =
-                                        egui::Stroke::new(1.6_f32, TITLEBAR_CONTROL_ICON_COLOR);
+                                        egui::Stroke::new(1.6, TITLEBAR_CONTROL_ICON_COLOR);
                                     // Keep icons visually consistent while using a taller hit-rect.
                                     let pad_x = 10.0;
                                     let pad_y = 11.0;
@@ -25756,7 +25646,7 @@ impl ImageViewer {
                                  icon: BreadcrumbNavIcon,
                                  stroke_color: egui::Color32| {
                                     let icon_rect = rect.shrink2(egui::vec2(5.0, 4.0));
-                                    let stroke = egui::Stroke::new(1.7_f32, stroke_color);
+                                    let stroke = egui::Stroke::new(1.7, stroke_color);
                                     match icon {
                                         BreadcrumbNavIcon::Back => {
                                             let left = icon_rect.left() + 1.0;
@@ -26646,11 +26536,32 @@ impl ImageViewer {
                         }
                     }
                     if vol_response.hovered() {
-                        let points_per_line = POINTS_PER_WHEEL_LINE;
-                        let events_height = ctx.screen_rect().height();
+                        const VOLUME_WHEEL_POINTS_PER_STEP: f32 = 50.0;
+                        const VOLUME_WHEEL_MAX_STEPS_PER_EVENT: f32 = 3.0;
                         let wheel_steps = ctx.input(|i| {
-                            wheel_steps_from_events(&i.raw.events, points_per_line, events_height)
-                                .normal
+                            i.raw
+                                .events
+                                .iter()
+                                .filter_map(|event| {
+                                    let egui::Event::MouseWheel { unit, delta, .. } = event else {
+                                        return None;
+                                    };
+                                    if !delta.y.is_finite() || delta.y == 0.0 {
+                                        return None;
+                                    }
+                                    let steps = match unit {
+                                        egui::MouseWheelUnit::Line => delta.y,
+                                        egui::MouseWheelUnit::Page => delta.y * 3.0,
+                                        egui::MouseWheelUnit::Point => {
+                                            delta.y / VOLUME_WHEEL_POINTS_PER_STEP
+                                        }
+                                    };
+                                    Some(steps.clamp(
+                                        -VOLUME_WHEEL_MAX_STEPS_PER_EVENT,
+                                        VOLUME_WHEEL_MAX_STEPS_PER_EVENT,
+                                    ))
+                                })
+                                .sum::<f32>()
                         });
                         if wheel_steps != 0.0 {
                             let current_volume = player.volume();
@@ -27933,7 +27844,7 @@ impl ImageViewer {
         let media_h = media_h_u as f32;
         let aspect = media_w / media_h;
 
-        let Some(current_cursor_screen) = get_global_cursor_pos_physical() else {
+        let Some(current_cursor_screen) = get_global_cursor_pos() else {
             return;
         };
 
@@ -27961,10 +27872,7 @@ impl ImageViewer {
             }
         };
 
-        // Cursor deltas are physical pixels; window geometry is in logical points. Converting
-        // here keeps the resize edge glued to the cursor on scaled displays.
-        let delta =
-            (current_cursor_screen - start_cursor_screen) / ctx.pixels_per_point().max(0.01);
+        let delta = current_cursor_screen - start_cursor_screen;
 
         let clamp_min_w: f32 = 200.0;
         let clamp_min_h: f32 = 150.0;
@@ -28053,28 +27961,6 @@ impl ImageViewer {
             ResizeDirection::None => return,
         };
 
-        // Growing a right-hand edge must not push the window's right side (where the window
-        // buttons live) past the display's right edge, or Close becomes unclickable.
-        let (new_w, new_h) = if matches!(
-            direction,
-            ResizeDirection::Right | ResizeDirection::BottomRight | ResizeDirection::TopRight
-        ) {
-            let monitor_size = ctx.input(|i| i.raw.viewport().monitor_size);
-            match display_bounds_points(ctx, Some(current_cursor_screen), monitor_size) {
-                Some(display) => {
-                    let max_w = (display.max.x - start_left).max(clamp_min_w);
-                    if new_w > max_w {
-                        size_from_width(max_w)
-                    } else {
-                        (new_w, new_h)
-                    }
-                }
-                None => (new_w, new_h),
-            }
-        } else {
-            (new_w, new_h)
-        };
-
         let (new_x, new_y) = match direction {
             ResizeDirection::Right => (start_left, start_center_y - new_h * 0.5),
             ResizeDirection::Bottom => (start_center_x - new_w * 0.5, start_top),
@@ -28119,8 +28005,6 @@ impl ImageViewer {
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(new_size));
             }
             _ => {
-                let new_pos =
-                    clamp_outer_pos_on_display(ctx, Some(current_cursor_screen), new_pos, new_size);
                 self.send_outer_position(ctx, new_pos);
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(new_size));
             }
@@ -28213,12 +28097,43 @@ impl ImageViewer {
                 self.pointer_over_shortcut_blocking_ui(pointer_pos_for_wheel, screen_rect);
             let slider_wheel_guard_active = self.media_slider_wheel_guard_active();
 
-            let points_per_line = POINTS_PER_WHEEL_LINE;
-            let wheel = ctx.input(|i| {
-                wheel_steps_from_events(&i.raw.events, points_per_line, screen_rect.height())
+            const WHEEL_POINTS_PER_LINE: f32 = 50.0;
+            const WHEEL_MAX_STEPS_PER_EVENT: f32 = 6.0;
+            let (wheel_steps_ctrl, wheel_steps_shift) = ctx.input(|i| {
+                let mut ctrl_steps = 0.0f32;
+                let mut shift_steps = 0.0f32;
+
+                for e in &i.raw.events {
+                    let egui::Event::MouseWheel {
+                        unit,
+                        delta,
+                        modifiers,
+                    } = e
+                    else {
+                        continue;
+                    };
+
+                    let dy = delta.y;
+                    if !dy.is_finite() || dy == 0.0 {
+                        continue;
+                    }
+
+                    let mut steps = match unit {
+                        egui::MouseWheelUnit::Line => dy,
+                        egui::MouseWheelUnit::Page => dy,
+                        egui::MouseWheelUnit::Point => dy / WHEEL_POINTS_PER_LINE,
+                    };
+                    steps = steps.clamp(-WHEEL_MAX_STEPS_PER_EVENT, WHEEL_MAX_STEPS_PER_EVENT);
+
+                    if modifiers.ctrl {
+                        ctrl_steps += steps;
+                    } else if modifiers.shift {
+                        shift_steps += steps;
+                    }
+                }
+
+                (ctrl_steps, shift_steps)
             });
-            let wheel_steps_ctrl = wheel.ctrl;
-            let wheel_steps_shift = wheel.shift;
 
             let wheel_steps_ctrl_effective = if wheel_steps_ctrl != 0.0 {
                 wheel_steps_ctrl
@@ -28263,37 +28178,77 @@ impl ImageViewer {
                     handled_modifier_wheel = true;
                 } else if regular_ctrl_scroll_zoom_bound && wheel_steps_ctrl_effective != 0.0 {
                     if let Some(pos) = pointer_pos_for_wheel {
-                        let factor = zoom_factor_for_steps(
-                            self.config.zoom_step,
-                            wheel_steps_ctrl_effective,
-                        );
-                        self.apply_pointer_zoom_factor(pos, factor, screen_rect);
+                        let step = self.config.zoom_step;
+                        let zoom_in = wheel_steps_ctrl_effective > 0.0;
+                        let factor = if zoom_in { step } else { 1.0 / step };
+
+                        if self.is_fullscreen {
+                            self.zoom_at(pos, factor, screen_rect);
+                            self.zoom_target = self.zoom;
+                            self.zoom_velocity = 0.0;
+                        } else {
+                            // In floating mode, follow cursor when zoomed past 100%
+                            let old_zoom = self.zoom;
+                            self.zoom_target = self.clamp_zoom(self.zoom_target * factor);
+                            self.zoom = self.clamp_zoom(self.zoom * factor);
+
+                            let has_offset = self.offset.length() > 0.1;
+                            if old_zoom > 1.0 || self.zoom > 1.0 || has_offset {
+                                let rect_center = screen_rect.center();
+                                let cursor_offset = pos - rect_center;
+                                let zoom_ratio = self.zoom / old_zoom;
+                                self.offset =
+                                    self.offset * zoom_ratio - cursor_offset * (zoom_ratio - 1.0);
+                            }
+                            self.zoom_velocity = 0.0;
+                            self.maybe_refresh_current_solo_image_lod();
+                        }
+
                         handled_modifier_wheel = true;
                     }
                 }
             }
 
             // Regular unmodified wheel zoom.
-            //
-            // The old implementation applied one `zoom_step` per frame for as long as egui's
-            // smoothed scroll delta stayed non-zero, so a single notch zoomed ~2.4x more on a
-            // 144 Hz panel than on a 60 Hz laptop. Using the raw event steps makes one notch
-            // exactly one `zoom_step` on every refresh rate and every display scale.
             if !handled_modifier_wheel
                 && regular_scroll_zoom_bound
                 && !ctrl_held
                 && !shift_held
                 && !alt_held
-                && wheel.normal != 0.0
                 && !pointer_over_shortcut_ui_for_wheel
                 && !slider_wheel_guard_active
             {
-                if let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) {
-                    // Only suppress zoom when the pointer is on the title *text* (or window buttons),
-                    // not on the empty title bar area.
-                    if !title_ui_blocking {
-                        let factor = zoom_factor_for_steps(self.config.zoom_step, wheel.normal);
-                        self.apply_pointer_zoom_factor(pos, factor, screen_rect);
+                let scroll_delta = ctx.input(|i| i.smooth_scroll_delta.y);
+                if scroll_delta != 0.0 {
+                    if let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) {
+                        // Only suppress zoom when the pointer is on the title *text* (or window buttons),
+                        // not on the empty title bar area.
+                        if title_ui_blocking {
+                            // Intentionally ignore scroll for zoom while selecting/copying title text.
+                        } else {
+                            let step = self.config.zoom_step;
+                            let factor = if scroll_delta > 0.0 { step } else { 1.0 / step };
+                            if self.is_fullscreen {
+                                self.zoom_at(pos, factor, screen_rect);
+                                self.zoom_target = self.zoom;
+                                self.zoom_velocity = 0.0;
+                            } else {
+                                let old_zoom = self.zoom;
+                                self.zoom_target = self.clamp_zoom(self.zoom_target * factor);
+                                self.zoom = self.clamp_zoom(self.zoom * factor);
+
+                                let has_offset = self.offset.length() > 0.1;
+                                if old_zoom > 1.0 || self.zoom > 1.0 || has_offset {
+                                    let rect_center = screen_rect.center();
+                                    let cursor_offset = pos - rect_center;
+                                    let zoom_ratio = self.zoom / old_zoom;
+                                    self.offset = self.offset * zoom_ratio
+                                        - cursor_offset * (zoom_ratio - 1.0);
+                                }
+                                self.zoom_velocity = 0.0;
+                                self.maybe_refresh_current_solo_image_lod();
+                            }
+                        }
                     }
                 }
             }
@@ -28922,10 +28877,6 @@ impl eframe::App for ImageViewer {
         // Manga mode uses this for layout/scroll math; if it drifts from `ctx.screen_rect()`,
         // you can get clamping oscillations and visible jitter.
         self.screen_size = ctx.screen_rect().size();
-
-        // Safety net for scaled displays / monitor changes: keep the floating window where its
-        // title bar and window buttons stay clickable.
-        self.enforce_floating_window_on_display(ctx);
 
         // PERFORMANCE: Check if window is minimized to reduce resource usage
         let is_minimized = ctx.input(|i| i.raw.viewport().minimized.unwrap_or(false));
@@ -29622,45 +29573,7 @@ impl eframe::App for ImageViewer {
     }
 }
 
-/// Minimum width of a floating window that must stay on the display.
-const FLOATING_WINDOW_MIN_VISIBLE_EDGE: f32 = 120.0;
-/// Top strip of a floating window (the title bar) that must stay on the display.
-const FLOATING_WINDOW_MIN_VISIBLE_TITLE_BAR: f32 = ImageViewer::TITLE_BAR_HEIGHT;
-
-/// Windows reports monitor geometry in physical pixels, while every egui window and UI
-/// coordinate is a logical point. This is the only place the two are converted, so a scaled
-/// display (125%/150%/200%) gets window sizes and positions that match the visible desktop.
-#[cfg(target_os = "windows")]
-fn system_dpi_scale_factor() -> f32 {
-    use winapi::um::wingdi::{GetDeviceCaps, LOGPIXELSY};
-    use winapi::um::winuser::{GetDC, ReleaseDC};
-
-    unsafe {
-        let hdc = GetDC(std::ptr::null_mut());
-        if hdc.is_null() {
-            return 1.0;
-        }
-        let dpi = GetDeviceCaps(hdc, LOGPIXELSY);
-        let _ = ReleaseDC(std::ptr::null_mut(), hdc);
-        if dpi > 0 {
-            (dpi as f32 / 96.0).clamp(0.5, 4.0)
-        } else {
-            1.0
-        }
-    }
-}
-
-#[cfg(not(target_os = "windows"))]
-#[allow(dead_code)]
-fn system_dpi_scale_factor() -> f32 {
-    1.0
-}
-
-/// Primary monitor size in egui logical points.
-///
-/// `GetSystemMetrics` returns physical pixels because winit makes this process per-monitor DPI
-/// aware, so the raw values must be divided by the system scale factor before they reach egui's
-/// window geometry APIs (which are all in points).
+/// Get primary monitor size on Windows
 #[cfg(target_os = "windows")]
 fn get_primary_monitor_size() -> egui::Vec2 {
     use winapi::um::winuser::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
@@ -29668,83 +29581,13 @@ fn get_primary_monitor_size() -> egui::Vec2 {
     unsafe {
         let width = GetSystemMetrics(SM_CXSCREEN) as f32;
         let height = GetSystemMetrics(SM_CYSCREEN) as f32;
-        let scale = system_dpi_scale_factor();
-        egui::Vec2::new(width / scale, height / scale)
+        egui::Vec2::new(width, height)
     }
 }
 
 #[cfg(not(target_os = "windows"))]
 fn get_primary_monitor_size() -> egui::Vec2 {
     egui::Vec2::new(1920.0, 1080.0)
-}
-
-/// Primary monitor work area (desktop minus taskbar) in egui logical points.
-#[cfg(target_os = "windows")]
-fn primary_monitor_work_area() -> Option<egui::Rect> {
-    let work = crate::windows_env::monitor_work_area_physical_at(0, 0)?;
-    let scale = system_dpi_scale_factor();
-    Some(egui::Rect::from_min_max(
-        egui::pos2(work.left as f32 / scale, work.top as f32 / scale),
-        egui::pos2(work.right as f32 / scale, work.bottom as f32 / scale),
-    ))
-}
-
-#[cfg(not(target_os = "windows"))]
-#[allow(dead_code)]
-fn primary_monitor_work_area() -> Option<egui::Rect> {
-    None
-}
-
-/// Clamp a floating window position so the window never loses its title bar or its
-/// top-right window buttons (close/maximize/minimize).
-///
-/// Rules, all in logical points:
-/// - the top edge never goes above the display, so the title bar stays reachable;
-/// - the right edge never goes past the display's right edge, so the window buttons stay on
-///   screen (this is what made the close button unclickable on scaled laptop panels, where the
-///   window could grow past the visible desktop);
-/// - the left edge may hang off screen, but at least `FLOATING_WINDOW_MIN_VISIBLE_EDGE` points
-///   stay visible;
-/// - the window is never pushed below the display's bottom edge.
-fn clamp_floating_window_pos(
-    display: egui::Rect,
-    window_size: egui::Vec2,
-    desired: egui::Pos2,
-) -> egui::Pos2 {
-    let size = egui::vec2(window_size.x.max(1.0), window_size.y.max(1.0));
-    let display = egui::Rect::from_min_max(
-        display.min,
-        egui::pos2(
-            display.max.x.max(display.min.x + 1.0),
-            display.max.y.max(display.min.y + 1.0),
-        ),
-    );
-
-    let min_visible_x = FLOATING_WINDOW_MIN_VISIBLE_EDGE.min(size.x);
-    let min_visible_y = FLOATING_WINDOW_MIN_VISIBLE_TITLE_BAR.min(size.y);
-
-    let max_x = display.max.x - size.x;
-    let min_x = display.min.x - (size.x - min_visible_x);
-    let max_y = display.max.y - min_visible_y;
-    let min_y = display.min.y;
-
-    egui::pos2(
-        desired.x.clamp(min_x.min(max_x), max_x.max(min_x)),
-        desired.y.clamp(min_y.min(max_y), max_y.max(min_y)),
-    )
-}
-
-/// Clamp the pre-window startup size/position pair (see [`clamp_floating_window_pos`]).
-fn clamp_startup_window_geometry(
-    size: egui::Vec2,
-    pos: egui::Pos2,
-    display: egui::Rect,
-) -> (egui::Vec2, egui::Pos2) {
-    let size = egui::vec2(
-        size.x.clamp(200.0, display.width().max(200.0)),
-        size.y.clamp(150.0, display.height().max(150.0)),
-    );
-    (size, clamp_floating_window_pos(display, size, pos))
 }
 
 #[cfg(target_os = "windows")]
@@ -29776,13 +29619,10 @@ fn get_primary_monitor_refresh_hz() -> Option<f32> {
     None
 }
 
-/// Get the global cursor position in **physical** screen pixels using the Windows API.
+/// Get the global cursor position in screen coordinates using Windows API.
 /// This is completely independent of window position and has no frame delay.
-///
-/// Callers must convert to logical points (`/ ctx.pixels_per_point()`) before combining it with
-/// egui window geometry, which is in points.
 #[cfg(target_os = "windows")]
-fn get_global_cursor_pos_physical() -> Option<egui::Pos2> {
+fn get_global_cursor_pos() -> Option<egui::Pos2> {
     use winapi::shared::windef::POINT;
     use winapi::um::winuser::GetCursorPos;
 
@@ -29797,167 +29637,9 @@ fn get_global_cursor_pos_physical() -> Option<egui::Pos2> {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn get_global_cursor_pos_physical() -> Option<egui::Pos2> {
+fn get_global_cursor_pos() -> Option<egui::Pos2> {
     // Fallback for non-Windows: return None and let the caller handle it
     None
-}
-
-/// Clamp an outer window position (logical points) onto the display hosting the window, using
-/// `anchor_physical` (physical screen pixels, e.g. the cursor) when available.
-fn clamp_outer_pos_on_display(
-    ctx: &egui::Context,
-    anchor_physical: Option<egui::Pos2>,
-    desired: egui::Pos2,
-    outer_size: egui::Vec2,
-) -> egui::Pos2 {
-    let points_per_px = ctx.pixels_per_point().max(0.01);
-    let anchor = anchor_physical.or_else(|| {
-        ctx.input(|i| i.raw.viewport().outer_rect)
-            .map(|rect| rect.center() * points_per_px)
-    });
-    let monitor_size = ctx.input(|i| i.raw.viewport().monitor_size);
-    match display_bounds_points(ctx, anchor, monitor_size) {
-        Some(display) => clamp_floating_window_pos(display, outer_size, desired),
-        None => desired,
-    }
-}
-
-/// An outer window rect as whole physical pixels: one rounding per edge, a tie taken *outward* (left
-/// and top down, right and bottom up) so a tie leaves the box a pixel wider instead of shifting it.
-/// Rounding position and size separately is two roundings of one rect, and shifts the box half a pixel
-/// on the frames whose ideal size is odd.
-fn outer_rect_physical(pos: egui::Pos2, size: egui::Vec2, pixels_per_point: f32) -> [i32; 4] {
-    let left = (pos.x * pixels_per_point - 0.5).ceil();
-    let top = (pos.y * pixels_per_point - 0.5).ceil();
-    let right = ((pos.x + size.x) * pixels_per_point + 0.5).floor();
-    let bottom = ((pos.y + size.y) * pixels_per_point + 0.5).floor();
-
-    [left as i32, top as i32, right as i32, bottom as i32]
-}
-
-/// Wheel input normalized into device-independent "steps", where `1.0` is one physical
-/// mouse-wheel notch.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-struct WheelSteps {
-    /// Unmodified wheel.
-    normal: f32,
-    /// Wheel with Ctrl held.
-    ctrl: f32,
-    /// Wheel with Shift held.
-    shift: f32,
-}
-
-impl WheelSteps {
-    fn is_zero(&self) -> bool {
-        self.normal == 0.0 && self.ctrl == 0.0 && self.shift == 0.0
-    }
-}
-
-/// Points per wheel line used to normalize point/page deltas into steps: the value the pre-normalization
-/// code hard-coded, and not egui's `line_scroll_speed` (40, which made trackpad flicks 25% weaker).
-const POINTS_PER_WHEEL_LINE: f32 = 50.0;
-
-/// Largest number of steps a single wheel event may contribute (guards against runaway
-/// pixel-delta events on some precision touchpads).
-const WHEEL_MAX_STEPS_PER_EVENT: f32 = 6.0;
-
-/// Normalize raw wheel events into [`WheelSteps`].
-///
-/// egui reports a wheel notch as `LineDelta` (1.0 per notch), trackpads and smooth-scroll mice
-/// as `PixelDelta` in points, and some devices as whole pages (one page == one viewport height).
-/// Converting everything through `points_per_line` (see [`POINTS_PER_WHEEL_LINE`]) means a notch, a
-/// trackpad flick and a page keep their relative feel, and the result never depends on the display's
-/// DPI scale or the refresh rate.
-fn wheel_steps_from_events(
-    events: &[egui::Event],
-    points_per_line: f32,
-    page_height_points: f32,
-) -> WheelSteps {
-    let points_per_line = points_per_line.max(1.0);
-    let page_height_points = page_height_points.max(points_per_line);
-    let mut steps = WheelSteps::default();
-
-    for event in events {
-        let egui::Event::MouseWheel {
-            unit,
-            delta,
-            modifiers,
-        } = event
-        else {
-            continue;
-        };
-
-        let dy = delta.y;
-        if !dy.is_finite() || dy == 0.0 {
-            continue;
-        }
-
-        let event_steps = match unit {
-            egui::MouseWheelUnit::Line => dy,
-            egui::MouseWheelUnit::Point => dy / points_per_line,
-            egui::MouseWheelUnit::Page => dy * page_height_points / points_per_line,
-        }
-        .clamp(-WHEEL_MAX_STEPS_PER_EVENT, WHEEL_MAX_STEPS_PER_EVENT);
-
-        if modifiers.ctrl {
-            steps.ctrl += event_steps;
-        } else if modifiers.shift {
-            steps.shift += event_steps;
-        } else {
-            steps.normal += event_steps;
-        }
-    }
-
-    steps
-}
-
-/// Zoom factor for a wheel delta expressed in [`WheelSteps`].
-///
-/// Applying `zoom_step^steps` (instead of adding one step per frame the smoothed scroll delta is
-/// non-zero) makes a notch a fixed `zoom_step` on every refresh rate and keeps fractional
-/// (high-resolution wheel/trackpad) steps proportional to how far the user actually scrolled.
-fn zoom_factor_for_steps(zoom_step: f32, steps: f32) -> f32 {
-    let step = zoom_step.max(1.0);
-    if !steps.is_finite() || steps == 0.0 {
-        return 1.0;
-    }
-    step.powf(steps.clamp(-WHEEL_MAX_STEPS_PER_EVENT, WHEEL_MAX_STEPS_PER_EVENT))
-}
-
-/// Center of the native window in physical screen pixels (the coordinate space used by
-/// `GetCursorPos` and monitor metrics).
-fn window_center_physical(ctx: &egui::Context) -> Option<egui::Pos2> {
-    let points_per_px = ctx.pixels_per_point().max(0.01);
-    ctx.input(|i| i.raw.viewport().outer_rect)
-        .map(|rect| rect.center() * points_per_px)
-}
-
-/// Display bounds (logical points, taskbar excluded) for the monitor holding `anchor`
-/// (physical screen pixels). When no anchor is given the monitor hosting this window is used.
-/// Falls back to `monitor_size_points` (origin based).
-fn display_bounds_points(
-    ctx: &egui::Context,
-    anchor_physical: Option<egui::Pos2>,
-    monitor_size_points: Option<egui::Vec2>,
-) -> Option<egui::Rect> {
-    #[cfg(target_os = "windows")]
-    if let Some(anchor) = anchor_physical.or_else(|| window_center_physical(ctx)) {
-        if let Some(work) = crate::windows_env::monitor_work_area_physical_at(
-            anchor.x.round() as i32,
-            anchor.y.round() as i32,
-        ) {
-            let scale = ctx.pixels_per_point().max(0.01);
-            return Some(egui::Rect::from_min_max(
-                egui::pos2(work.left as f32 / scale, work.top as f32 / scale),
-                egui::pos2(work.right as f32 / scale, work.bottom as f32 / scale),
-            ));
-        }
-    }
-
-    let _ = anchor_physical;
-    monitor_size_points
-        .filter(|size| size.x > 1.0 && size.y > 1.0)
-        .map(|size| egui::Rect::from_min_size(egui::Pos2::ZERO, size))
 }
 
 fn init_runtime_diagnostics() {
@@ -30098,14 +29780,7 @@ fn main() -> eframe::Result<()> {
 
     // Determine media type and calculate initial window size BEFORE creating the window.
     // This prevents the flash of a default-sized window.
-    //
-    // All of this math is in egui logical points: `get_primary_monitor_size` converts the raw
-    // Windows physical-pixel metrics, and `with_inner_size`/`with_position` below expect points.
-    // Feeding physical pixels into them (as this used to do) oversizes the window on any scaled
-    // display, which pushed the title-bar window buttons - including Close - off screen.
-    let primary_display = primary_monitor_work_area()
-        .unwrap_or_else(|| egui::Rect::from_min_size(egui::Pos2::ZERO, get_primary_monitor_size()));
-    let screen_size = primary_display.size();
+    let screen_size = get_primary_monitor_size();
 
     // For images, we can get dimensions immediately from the file header.
     // For videos, we start hidden and show once GStreamer decodes the first frame.
@@ -30166,15 +29841,6 @@ fn main() -> eframe::Result<()> {
         }
     } else {
         startup_window_for_no_file(screen_size)
-    };
-
-    // Never start with a window that is larger than the display or placed so that its title
-    // bar/window buttons land off screen. Hidden startup windows (video: parked off-screen until
-    // the first frame is ready) keep their intentional off-screen position.
-    let (initial_size, initial_pos) = if start_visible {
-        clamp_startup_window_geometry(initial_size, initial_pos, primary_display)
-    } else {
-        (initial_size, initial_pos)
     };
 
     // Configure native options
@@ -30342,200 +30008,6 @@ mod tests {
         assert_eq!(size, egui::Vec2::new(500.0, 500.0));
         assert_eq!(pos, egui::Pos2::new(710.0, 290.0));
         assert!(start_visible);
-    }
-
-    /// A 1920x1080 panel at 150% scaling is a 1280x720 point desktop: the startup geometry used
-    /// to be computed from physical pixels, which placed the window (and its Close button) past
-    /// the visible desktop.
-    #[test]
-    fn startup_geometry_stays_inside_a_scaled_display() {
-        let display = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 720.0));
-        // 4000x3000 photo fitted against the *physical* 1920x1080 metric.
-        let size = egui::vec2(1440.0, 1080.0);
-        let pos = egui::pos2(240.0, 0.0);
-
-        let (size, pos) = super::clamp_startup_window_geometry(size, pos, display);
-
-        assert!(size.x <= display.width() + 0.001);
-        assert!(size.y <= display.height() + 0.001);
-        assert!(pos.x >= display.min.x);
-        assert!(pos.y >= display.min.y);
-        assert!(pos.x + size.x <= display.max.x + 0.001);
-        assert!(pos.y + size.y <= display.max.y + 0.001);
-    }
-
-    #[test]
-    fn floating_window_clamp_keeps_close_button_reachable() {
-        let display = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 720.0));
-        let size = egui::vec2(1000.0, 800.0);
-
-        // Dragged far past the right edge and above the top edge.
-        let clamped = super::clamp_floating_window_pos(display, size, egui::pos2(5000.0, -500.0));
-
-        assert!(clamped.x + size.x <= display.max.x + 0.001);
-        assert!(clamped.y >= display.min.y);
-    }
-
-    #[test]
-    fn floating_window_clamp_allows_partial_left_overhang() {
-        let display = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 720.0));
-        let size = egui::vec2(1000.0, 800.0);
-
-        let clamped = super::clamp_floating_window_pos(display, size, egui::pos2(-100_000.0, 0.0));
-
-        // Left overhang is allowed, but a grabbable strip always stays visible.
-        assert!(clamped.x + size.x >= display.min.x + super::FLOATING_WINDOW_MIN_VISIBLE_EDGE);
-        assert!(clamped.x + size.x <= display.max.x + 0.001);
-    }
-
-    #[test]
-    fn floating_window_clamp_keeps_title_bar_on_screen_bottom() {
-        let display = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 720.0));
-        let size = egui::vec2(800.0, 600.0);
-
-        let clamped = super::clamp_floating_window_pos(display, size, egui::pos2(0.0, 100_000.0));
-
-        assert!(clamped.y <= display.max.y - super::FLOATING_WINDOW_MIN_VISIBLE_TITLE_BAR);
-    }
-
-    #[test]
-    fn floating_window_clamp_handles_a_display_left_of_the_primary() {
-        // Secondary monitor placed left of the primary, so its coordinates are negative.
-        let display =
-            egui::Rect::from_min_size(egui::pos2(-1920.0, 0.0), egui::vec2(1920.0, 1080.0));
-        let size = egui::vec2(1200.0, 900.0);
-
-        let clamped = super::clamp_floating_window_pos(display, size, egui::pos2(500.0, 0.0));
-
-        // Right edge stays on the secondary display's right edge (x = 0).
-        assert!((clamped.x + size.x - display.max.x).abs() < 0.001);
-        assert!(clamped.x >= display.min.x - size.x);
-    }
-
-    #[test]
-    fn wheel_notch_and_trackpad_pixel_scroll_normalize_to_one_step() {
-        let events = vec![
-            egui::Event::MouseWheel {
-                unit: egui::MouseWheelUnit::Line,
-                delta: egui::vec2(0.0, 1.0),
-                modifiers: egui::Modifiers::default(),
-            },
-            egui::Event::MouseWheel {
-                unit: egui::MouseWheelUnit::Point,
-                delta: egui::vec2(0.0, 40.0),
-                modifiers: egui::Modifiers::default(),
-            },
-        ];
-
-        let wheel = super::wheel_steps_from_events(&events, 40.0, 1080.0);
-
-        assert!((wheel.normal - 2.0).abs() < 1e-5);
-        assert_eq!(wheel.ctrl, 0.0);
-        assert_eq!(wheel.shift, 0.0);
-    }
-
-    #[test]
-    fn wheel_page_and_modifiers_are_split_into_their_own_buckets() {
-        let events = vec![
-            egui::Event::MouseWheel {
-                unit: egui::MouseWheelUnit::Page,
-                delta: egui::vec2(0.0, 1.0),
-                modifiers: egui::Modifiers {
-                    ctrl: true,
-                    ..egui::Modifiers::default()
-                },
-            },
-            egui::Event::MouseWheel {
-                unit: egui::MouseWheelUnit::Point,
-                delta: egui::vec2(0.0, -20.0),
-                modifiers: egui::Modifiers {
-                    shift: true,
-                    ..egui::Modifiers::default()
-                },
-            },
-        ];
-
-        let wheel = super::wheel_steps_from_events(&events, 40.0, 1080.0);
-
-        assert_eq!(wheel.normal, 0.0);
-        // A page is capped by the per-event guard, a quarter line becomes -0.5 steps.
-        assert!(wheel.ctrl > 0.0);
-        assert!((wheel.shift + 0.5).abs() < 1e-5);
-    }
-
-    #[test]
-    fn zoom_factor_is_one_step_per_notch_regardless_of_frame_rate() {
-        let step = 1.02;
-
-        assert!((super::zoom_factor_for_steps(step, 1.0) - step).abs() < 1e-6);
-        assert!((super::zoom_factor_for_steps(step, 2.0) - step * step).abs() < 1e-6);
-        assert!((super::zoom_factor_for_steps(step, -1.0) - 1.0 / step).abs() < 1e-6);
-        assert!((super::zoom_factor_for_steps(step, 0.5) - step.sqrt()).abs() < 1e-6);
-        assert_eq!(super::zoom_factor_for_steps(step, 0.0), 1.0);
-    }
-
-    #[test]
-    fn one_notch_in_and_one_notch_out_leave_the_zoom_where_it_was() {
-        let step = 1.10;
-        let zoom =
-            super::zoom_factor_for_steps(step, 1.0) * super::zoom_factor_for_steps(step, -1.0);
-
-        assert!((zoom - 1.0).abs() < 1e-4, "zoom came back as {zoom}");
-    }
-
-    #[test]
-    fn wheel_accumulates_on_the_asked_for_zoom_not_the_drawn_one() {
-        let step = 1.10;
-
-        // Four notches from a fast wheel: nothing drawn between them.
-        let mut fast = 1.0_f32;
-        for _ in 0..4 {
-            fast *= super::zoom_factor_for_steps(step, 1.0);
-        }
-
-        // Four notches from a slow wheel, with a drawn value lagging behind the target each time.
-        let mut slow_target = 1.0_f32;
-        let mut drawn = 1.0_f32;
-        for _ in 0..4 {
-            slow_target *= super::zoom_factor_for_steps(step, 1.0);
-            drawn += (slow_target - drawn) * 0.3;
-        }
-
-        assert!((fast - slow_target).abs() < 1e-4, "{fast} vs {slow_target}");
-        assert!((fast - step.powf(4.0)).abs() < 1e-4);
-        // The lagging drawn value is behind the target mid-travel and catches it up afterwards.
-        assert!(drawn < slow_target);
-    }
-
-    #[test]
-    fn outer_rect_rounds_each_edge_once_and_takes_a_tie_outward() {
-        // 1.0 ppp: the whole rect is its own edges, ties (the .5) widen the box a pixel.
-        assert_eq!(
-            super::outer_rect_physical(egui::pos2(10.5, 20.5), egui::vec2(100.0, 50.0), 1.0),
-            [10, 20, 111, 71]
-        );
-
-        // 1.5 ppp: the box is 150x75 physical pixels, placed at the rounded edges.
-        assert_eq!(
-            super::outer_rect_physical(egui::pos2(10.0, 20.0), egui::vec2(100.0, 50.0), 1.5),
-            [15, 30, 165, 105]
-        );
-    }
-
-    #[test]
-    fn sub_pixel_zoom_does_not_move_the_window() {
-        // A quarter of a pixel of growth at 1.5 ppp rounds to the rect the window already has, which
-        // is what keeps a spring from issuing a SetWindowPos per frame on a sub-pixel travel.
-        let pos = egui::pos2(100.0, 100.0);
-        let before = super::outer_rect_physical(pos, egui::vec2(200.0, 100.0), 1.5);
-        let after = super::outer_rect_physical(pos, egui::vec2(200.15, 100.1), 1.5);
-
-        assert_eq!(before, after);
-        // ... and a whole pixel of growth does move it.
-        assert_ne!(
-            before,
-            super::outer_rect_physical(pos, egui::vec2(201.0, 101.0), 1.5)
-        );
     }
 
     #[test]

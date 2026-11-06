@@ -750,7 +750,7 @@ impl Config {
             masonry_toggle_mark_file: Some(ShortcutModifier::Ctrl),
             zoom_animation_speed: 20.0,
             precise_rotation_step_degrees: 2.0,
-            zoom_step: 1.10,
+            zoom_step: 1.02,
             max_zoom_percent: 1000.0,
             ctrl_scroll_up_pan_speed_px_per_step: 20.0,
             ctrl_scroll_down_pan_speed_px_per_step: 20.0,
