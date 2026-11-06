@@ -12472,12 +12472,7 @@ impl ImageViewer {
     }
 
     fn apply_manga_pan_step(&mut self, direction: f32, multiplier: f32) {
-        // Scale the configured step (authored for a 3440x1440 desktop) to the current viewport so
-        // a key/page pan covers the same fraction of the screen on any resolution or DPI scale.
-        let scroll_amount = self.config.manga_arrow_scroll_speed
-            * 0.5
-            * multiplier
-            * viewport_size_scale(self.screen_size.y);
+        let scroll_amount = self.config.manga_arrow_scroll_speed * 0.5 * multiplier;
         if self.manga_add_scroll_target_delta(direction * scroll_amount) {
             self.manga_update_preload_queue();
         }
@@ -12501,11 +12496,6 @@ impl ImageViewer {
             self.config.ctrl_scroll_down_pan_speed_px_per_step
         };
 
-        // Both axes are normalized to the viewport so a wheel step always covers the same
-        // fraction of the screen, no matter the resolution or DPI scale (and no matter whether
-        // the vertical span is the screen height on a 3440x1440 desktop or a 1080p laptop).
-        let resolution_scale = viewport_size_scale(viewport_span.max(1.0));
-
         if horizontal {
             // Normalize horizontal wheel-pan by viewport width so it feels consistent across
             // different resolutions and independent of image dimensions.
@@ -12513,7 +12503,7 @@ impl ImageViewer {
             let scale = (configured / baseline_config).max(0.05);
             (viewport_span.max(1.0) * 0.08 * scale).max(0.1)
         } else {
-            (configured * resolution_scale).max(0.1)
+            configured.max(0.1)
         }
     }
 
@@ -20945,8 +20935,7 @@ impl ImageViewer {
         let impulse_per_step = self
             .config
             .manga_wheel_impulse_per_step
-            .clamp(50.0, 20000.0)
-            * viewport_size_scale(self.screen_size.y);
+            .clamp(50.0, 20000.0);
         let max_velocity = self
             .config
             .manga_wheel_max_velocity
@@ -21286,18 +21275,15 @@ impl ImageViewer {
 
         // Calculate zoom change from held buttons BEFORE drawing UI
         let mut zoom_delta_from_hold: f32 = 0.0;
-        // Frame-rate independent: the previous values were "per frame at 60 fps", so a 144 Hz
-        // panel zoomed 2.4x faster than a 60 Hz laptop for the same button hold.
-        let frame_dt = ctx.input(|i| i.stable_dt).clamp(0.0, 0.05);
 
-        if is_holding_button && primary_down && frame_dt > 0.0 {
+        if is_holding_button && primary_down {
             // Calculate acceleration based on hold duration
             let hold_duration = self.manga_zoom_hold_start.elapsed().as_secs_f32();
 
-            // Slower zoom: starts at 30% per second, increases to 120% after 1 second
-            let base_speed_per_second = 0.3;
+            // Slower zoom: starts at 0.5% per frame, increases to 2% after 1 second
+            let base_speed = 0.005; // 0.5% per frame at 60fps = 30% per second
             let acceleration = (hold_duration * 2.0).min(3.0); // Up to 3x acceleration
-            let speed = base_speed_per_second * (1.0 + acceleration) * frame_dt;
+            let speed = base_speed * (1.0 + acceleration);
 
             if self.manga_zoom_plus_held {
                 zoom_delta_from_hold = speed;
@@ -22513,7 +22499,7 @@ impl ImageViewer {
         // - Mouse wheels are usually "line" deltas (1.0 per notch)
         // - Trackpads are usually "point" deltas (many small pixel-ish deltas)
         // Both are normalized into "wheel steps" so wheel momentum tuning stays consistent.
-        let points_per_line = ctx.options(|o| o.line_scroll_speed);
+        let points_per_line = POINTS_PER_WHEEL_LINE;
         let wheel =
             ctx.input(|i| wheel_steps_from_events(&i.raw.events, points_per_line, screen_height));
         let (raw_wheel_steps, raw_wheel_steps_ctrl, raw_wheel_steps_shift) =
@@ -26609,7 +26595,7 @@ impl ImageViewer {
                         }
                     }
                     if vol_response.hovered() {
-                        let points_per_line = ctx.options(|o| o.line_scroll_speed);
+                        let points_per_line = POINTS_PER_WHEEL_LINE;
                         let events_height = ctx.screen_rect().height();
                         let wheel_steps = ctx.input(|i| {
                             wheel_steps_from_events(&i.raw.events, points_per_line, events_height)
@@ -28176,7 +28162,7 @@ impl ImageViewer {
                 self.pointer_over_shortcut_blocking_ui(pointer_pos_for_wheel, screen_rect);
             let slider_wheel_guard_active = self.media_slider_wheel_guard_active();
 
-            let points_per_line = ctx.options(|o| o.line_scroll_speed);
+            let points_per_line = POINTS_PER_WHEEL_LINE;
             let wheel = ctx.input(|i| {
                 wheel_steps_from_events(&i.raw.events, points_per_line, screen_rect.height())
             });
@@ -29803,6 +29789,10 @@ impl WheelSteps {
     }
 }
 
+/// Points per wheel line used to normalize point/page deltas into steps: the value the pre-normalization
+/// code hard-coded, and not egui's `line_scroll_speed` (40, which made trackpad flicks 25% weaker).
+const POINTS_PER_WHEEL_LINE: f32 = 50.0;
+
 /// Largest number of steps a single wheel event may contribute (guards against runaway
 /// pixel-delta events on some precision touchpads).
 const WHEEL_MAX_STEPS_PER_EVENT: f32 = 6.0;
@@ -29811,9 +29801,9 @@ const WHEEL_MAX_STEPS_PER_EVENT: f32 = 6.0;
 ///
 /// egui reports a wheel notch as `LineDelta` (1.0 per notch), trackpads and smooth-scroll mice
 /// as `PixelDelta` in points, and some devices as whole pages (one page == one viewport height).
-/// Converting everything through `points_per_line` (egui's own `line_scroll_speed`, 40 points by
-/// default) means a notch, a trackpad flick and a page keep their relative feel, and the result
-/// never depends on the display's DPI scale or the refresh rate.
+/// Converting everything through `points_per_line` (see [`POINTS_PER_WHEEL_LINE`]) means a notch, a
+/// trackpad flick and a page keep their relative feel, and the result never depends on the display's
+/// DPI scale or the refresh rate.
 fn wheel_steps_from_events(
     events: &[egui::Event],
     points_per_line: f32,
@@ -29855,17 +29845,6 @@ fn wheel_steps_from_events(
     }
 
     steps
-}
-
-/// Reference display height in logical points used to normalize scroll/pan distances.
-///
-/// Absolute speeds (pan pixels per step, strip wheel impulse per step) are authored for a
-/// 3440x1440 desktop; scaling them by the actual viewport height keeps the same gesture covering
-/// the same fraction of the screen on a 1080p laptop, a 4K panel or a scaled 150% display.
-const REFERENCE_VIEWPORT_HEIGHT_POINTS: f32 = 1440.0;
-
-fn viewport_size_scale(viewport_height_points: f32) -> f32 {
-    (viewport_height_points / REFERENCE_VIEWPORT_HEIGHT_POINTS).clamp(0.4, 2.5)
 }
 
 /// Zoom factor for a wheel delta expressed in [`WheelSteps`].
@@ -30429,15 +30408,6 @@ mod tests {
         assert!((super::zoom_factor_for_steps(step, -1.0) - 1.0 / step).abs() < 1e-6);
         assert!((super::zoom_factor_for_steps(step, 0.5) - step.sqrt()).abs() < 1e-6);
         assert_eq!(super::zoom_factor_for_steps(step, 0.0), 1.0);
-    }
-
-    #[test]
-    fn viewport_size_scale_keeps_1440p_as_the_reference() {
-        assert!((super::viewport_size_scale(1440.0) - 1.0).abs() < 1e-6);
-        assert!((super::viewport_size_scale(720.0) - 0.5).abs() < 1e-6);
-        // Clamped at both ends so odd viewports cannot produce extreme speeds.
-        assert!((super::viewport_size_scale(10.0) - 0.4).abs() < 1e-6);
-        assert!((super::viewport_size_scale(100_000.0) - 2.5).abs() < 1e-6);
     }
 
     #[test]
