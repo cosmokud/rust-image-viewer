@@ -119,7 +119,7 @@ fn paint_loading_spinner(painter: &egui::Painter, rect: egui::Rect, time: f64) {
         center,
         radius,
         egui::Stroke::new(
-            2.0,
+            2.0_f32,
             egui::Color32::from_rgba_unmultiplied(255, 255, 255, 35),
         ),
     );
@@ -136,7 +136,7 @@ fn paint_loading_spinner(painter: &egui::Painter, rect: egui::Rect, time: f64) {
         })
         .collect();
     let stroke = egui::Stroke::new(
-        2.5,
+        2.5_f32,
         egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200),
     );
     painter.add(egui::Shape::line(points.to_vec(), stroke));
@@ -4363,7 +4363,7 @@ impl ImageViewer {
     }
 
     fn paint_folder_entry_icon(painter: &egui::Painter, body: egui::Rect, is_up_entry: bool) {
-        let stroke = egui::Stroke::new(2.0, egui::Color32::WHITE);
+        let stroke = egui::Stroke::new(2.0_f32, egui::Color32::WHITE);
         let center = body.center();
         if is_up_entry {
             let shaft_top = egui::pos2(center.x, center.y - body.height() * 0.18);
@@ -4491,7 +4491,7 @@ impl ImageViewer {
                     6.0,
                     egui::Color32::from_rgba_unmultiplied(0, 0, 0, 160),
                 );
-                let stroke = egui::Stroke::new(1.8, egui::Color32::WHITE);
+                let stroke = egui::Stroke::new(1.8_f32, egui::Color32::WHITE);
                 let shaft_top =
                     egui::pos2(badge.center().x, badge.center().y - badge.height() * 0.28);
                 let shaft_bottom =
@@ -4523,7 +4523,7 @@ impl ImageViewer {
                 preview_rect,
                 4.0,
                 egui::Stroke::new(
-                    1.0,
+                    1.0_f32,
                     egui::Color32::from_rgba_unmultiplied(255, 255, 255, 26),
                 ),
             );
@@ -6278,13 +6278,13 @@ impl ImageViewer {
         };
         let overlay_rect = rect.shrink(1.5);
 
-        painter.rect_stroke(overlay_rect, 0.0, egui::Stroke::new(2.0, border_color));
+        painter.rect_stroke(overlay_rect, 0.0, egui::Stroke::new(2.0_f32, border_color));
         paint_mark_chip(
             painter,
             overlay_rect,
             label,
             chip_fill,
-            egui::Stroke::new(1.0, border_color),
+            egui::Stroke::new(1.0_f32, border_color),
             egui::Color32::WHITE,
         );
     }
@@ -8412,7 +8412,7 @@ impl ImageViewer {
             panel_rect,
             14.0,
             egui::Stroke::new(
-                1.4,
+                1.4_f32,
                 egui::Color32::from_rgba_unmultiplied(252, 127, 38, (235.0 * fade) as u8),
             ),
         );
@@ -8971,7 +8971,7 @@ impl ImageViewer {
                     egui::Stroke::NONE,
                 ));
 
-                let stroke = egui::Stroke::new(1.5, color);
+                let stroke = egui::Stroke::new(1.5_f32, color);
                 let wave_center = egui::pos2(rect.center().x + 0.8, rect.center().y);
                 for radius in [3.0, 5.3] {
                     painter.add(egui::epaint::PathShape::line(
@@ -8985,7 +8985,7 @@ impl ImageViewer {
                     rect.center() + egui::vec2(0.0, -1.0),
                     egui::vec2(rect.width() - 2.0, rect.height() - 5.0),
                 );
-                let stroke = egui::Stroke::new(1.4, color);
+                let stroke = egui::Stroke::new(1.4_f32, color);
                 painter.rect_stroke(bubble_rect, 4.0, stroke);
 
                 let tail_tip = egui::pos2(bubble_rect.left() + 5.0, bubble_rect.bottom() + 3.0);
@@ -10050,7 +10050,7 @@ impl ImageViewer {
         icon: MenuActionIcon,
         color: egui::Color32,
     ) {
-        let stroke = egui::Stroke::new(1.8, color);
+        let stroke = egui::Stroke::new(1.8_f32, color);
         match icon {
             MenuActionIcon::Mark => {
                 painter.rect_stroke(rect.shrink(2.0), 4.0, stroke);
@@ -10322,7 +10322,7 @@ impl ImageViewer {
 
             ui.painter().rect_filled(rect, 8.0, fill);
             ui.painter()
-                .rect_stroke(rect, 8.0, egui::Stroke::new(1.0, stroke_color));
+                .rect_stroke(rect, 8.0, egui::Stroke::new(1.0_f32, stroke_color));
 
             let icon_rect = egui::Rect::from_center_size(
                 egui::pos2(rect.left() + 17.0, rect.center().y),
@@ -10713,7 +10713,7 @@ impl ImageViewer {
                 egui::Frame::none()
                     .fill(egui::Color32::from_rgba_unmultiplied(18, 22, 28, 244))
                     .stroke(egui::Stroke::new(
-                        1.0,
+                        1.0_f32,
                         egui::Color32::from_rgba_unmultiplied(255, 255, 255, 36),
                     ))
                     .rounding(14.0)
@@ -11164,7 +11164,7 @@ impl ImageViewer {
             rect,
             12.0,
             egui::Stroke::new(
-                1.0,
+                1.0_f32,
                 egui::Color32::from_rgba_unmultiplied(255, 255, 255, 28),
             ),
         );
@@ -11224,7 +11224,7 @@ impl ImageViewer {
                 file_size_label,
                 egui::Color32::from_rgba_unmultiplied(58, 76, 98, 180),
                 egui::Stroke::new(
-                    1.0,
+                    1.0_f32,
                     egui::Color32::from_rgba_unmultiplied(130, 168, 196, 180),
                 ),
                 egui::Color32::from_rgb(222, 233, 243),
@@ -11234,7 +11234,7 @@ impl ImageViewer {
                 dimensions_label,
                 egui::Color32::from_rgba_unmultiplied(72, 68, 38, 180),
                 egui::Stroke::new(
-                    1.0,
+                    1.0_f32,
                     egui::Color32::from_rgba_unmultiplied(224, 192, 108, 180),
                 ),
                 egui::Color32::from_rgb(245, 225, 171),
@@ -11253,7 +11253,7 @@ impl ImageViewer {
         egui::Frame::none()
             .fill(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 10))
             .stroke(egui::Stroke::new(
-                1.0,
+                1.0_f32,
                 egui::Color32::from_rgba_unmultiplied(255, 255, 255, 24),
             ))
             .rounding(14.0)
@@ -11371,7 +11371,7 @@ impl ImageViewer {
                 egui::Frame::none()
                     .fill(egui::Color32::from_rgba_unmultiplied(18, 22, 28, 252))
                     .stroke(egui::Stroke::new(
-                        1.0,
+                        1.0_f32,
                         egui::Color32::from_rgba_unmultiplied(255, 255, 255, 40),
                     ))
                     .rounding(18.0)
@@ -11419,7 +11419,7 @@ impl ImageViewer {
                                     )
                                     .min_size(egui::vec2(170.0, 32.0))
                                     .fill(egui::Color32::from_rgb(176, 52, 52))
-                                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(132, 36, 36)))
+                                    .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(132, 36, 36)))
                                     .rounding(4.0),
                                 );
                                 if delete_button.clicked() {
@@ -11431,7 +11431,7 @@ impl ImageViewer {
                                         .min_size(egui::vec2(100.0, 32.0))
                                         .fill(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 24))
                                         .stroke(egui::Stroke::new(
-                                            1.0,
+                                            1.0_f32,
                                             egui::Color32::from_rgba_unmultiplied(255, 255, 255, 48),
                                         ))
                                         .rounding(4.0),
@@ -11514,7 +11514,7 @@ impl ImageViewer {
                 egui::Frame::none()
                     .fill(egui::Color32::from_rgba_unmultiplied(18, 22, 28, 252))
                     .stroke(egui::Stroke::new(
-                        1.0,
+                        1.0_f32,
                         egui::Color32::from_rgba_unmultiplied(255, 255, 255, 40),
                     ))
                     .rounding(18.0)
@@ -11578,7 +11578,7 @@ impl ImageViewer {
                                         .min_size(egui::vec2(132.0, 32.0))
                                         .fill(egui::Color32::from_rgb(48, 122, 198))
                                         .stroke(egui::Stroke::new(
-                                            1.0,
+                                            1.0_f32,
                                             egui::Color32::from_rgb(38, 92, 162),
                                         ))
                                         .rounding(6.0),
@@ -11594,7 +11594,7 @@ impl ImageViewer {
                                                 255, 255, 255, 24,
                                             ))
                                             .stroke(egui::Stroke::new(
-                                                1.0,
+                                                1.0_f32,
                                                 egui::Color32::from_rgba_unmultiplied(
                                                     255, 255, 255, 48,
                                                 ),
@@ -11663,7 +11663,7 @@ impl ImageViewer {
                 egui::Frame::none()
                     .fill(egui::Color32::from_rgba_unmultiplied(18, 22, 28, 252))
                     .stroke(egui::Stroke::new(
-                        1.0,
+                        1.0_f32,
                         egui::Color32::from_rgba_unmultiplied(255, 255, 255, 40),
                     ))
                     .rounding(18.0)
@@ -11696,7 +11696,7 @@ impl ImageViewer {
                                 )
                                 .min_size(egui::vec2(128.0, 32.0))
                                 .fill(egui::Color32::from_rgb(176, 52, 52))
-                                .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(132, 36, 36)))
+                                .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(132, 36, 36)))
                                 .rounding(6.0),
                             );
                             if exit_button.clicked() || exit_button.is_pointer_button_down_on() {
@@ -11708,7 +11708,7 @@ impl ImageViewer {
                                     .min_size(egui::vec2(100.0, 32.0))
                                     .fill(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 24))
                                     .stroke(egui::Stroke::new(
-                                        1.0,
+                                        1.0_f32,
                                         egui::Color32::from_rgba_unmultiplied(255, 255, 255, 48),
                                     ))
                                     .rounding(6.0),
@@ -11821,7 +11821,7 @@ impl ImageViewer {
             egui::Frame::none()
                 .fill(egui::Color32::from_rgba_unmultiplied(62, 138, 222, 28))
                 .stroke(egui::Stroke::new(
-                    1.0,
+                    1.0_f32,
                     egui::Color32::from_rgba_unmultiplied(127, 188, 255, 94),
                 ))
                 .rounding(8.0)
@@ -12146,7 +12146,7 @@ impl ImageViewer {
                 egui::Frame::none()
                     .fill(egui::Color32::from_rgba_unmultiplied(16, 23, 31, 252))
                     .stroke(egui::Stroke::new(
-                        1.0,
+                        1.0_f32,
                         egui::Color32::from_rgba_unmultiplied(166, 207, 255, 62),
                     ))
                     .rounding(18.0)
@@ -12194,7 +12194,7 @@ impl ImageViewer {
                                                 255, 255, 255, 24,
                                             ))
                                             .stroke(egui::Stroke::new(
-                                                1.0,
+                                                1.0_f32,
                                                 egui::Color32::from_rgba_unmultiplied(
                                                     255, 255, 255, 56,
                                                 ),
@@ -12685,7 +12685,7 @@ impl ImageViewer {
             anchor,
             18.0,
             egui::Stroke::new(
-                1.6,
+                1.6_f32,
                 egui::Color32::from_rgba_unmultiplied(210, 210, 210, 190),
             ),
         );
@@ -12700,7 +12700,7 @@ impl ImageViewer {
                 egui::pos2(anchor.x + 7.0, anchor.y),
             ],
             egui::Stroke::new(
-                1.2,
+                1.2_f32,
                 egui::Color32::from_rgba_unmultiplied(210, 210, 210, 180),
             ),
         );
@@ -12710,7 +12710,7 @@ impl ImageViewer {
                 egui::pos2(anchor.x, anchor.y + 7.0),
             ],
             egui::Stroke::new(
-                1.2,
+                1.2_f32,
                 egui::Color32::from_rgba_unmultiplied(210, 210, 210, 180),
             ),
         );
@@ -12723,7 +12723,7 @@ impl ImageViewer {
                 let tip = anchor + direction * len.min(44.0);
                 let perp = egui::vec2(-direction.y, direction.x);
                 let stroke = egui::Stroke::new(
-                    2.0,
+                    2.0_f32,
                     egui::Color32::from_rgba_unmultiplied(arrow_r, arrow_g, arrow_b, arrow_alpha),
                 );
 
@@ -13606,7 +13606,7 @@ impl ImageViewer {
                     panel_rect,
                     18.0,
                     egui::Stroke::new(
-                        1.0,
+                        1.0_f32,
                         egui::Color32::from_rgba_unmultiplied(130, 188, 255, 72),
                     ),
                 );
@@ -23654,7 +23654,7 @@ impl ImageViewer {
                         selection_rect,
                         12.0,
                         egui::Stroke::new(
-                            1.5,
+                            1.5_f32,
                             egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200),
                         ),
                     );
@@ -25466,7 +25466,7 @@ impl ImageViewer {
                                     ui.painter().rect_filled(rect, 4.0, bg);
 
                                     let stroke =
-                                        egui::Stroke::new(1.6, TITLEBAR_CONTROL_ICON_COLOR);
+                                        egui::Stroke::new(1.6_f32, TITLEBAR_CONTROL_ICON_COLOR);
                                     // Keep icons visually consistent while using a taller hit-rect.
                                     let pad_x = 10.0;
                                     let pad_y = 11.0;
@@ -25719,7 +25719,7 @@ impl ImageViewer {
                                  icon: BreadcrumbNavIcon,
                                  stroke_color: egui::Color32| {
                                     let icon_rect = rect.shrink2(egui::vec2(5.0, 4.0));
-                                    let stroke = egui::Stroke::new(1.7, stroke_color);
+                                    let stroke = egui::Stroke::new(1.7_f32, stroke_color);
                                     match icon {
                                         BreadcrumbNavIcon::Back => {
                                             let left = icon_rect.left() + 1.0;
