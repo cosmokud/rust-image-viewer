@@ -29,5 +29,9 @@ docs/
 
 # Machine-local cargo config holding the shared absolute target dir (never commit)
 /.cargo/target-dir.local.toml
+/.tmp
+/.scratch
+pi-session*.html
+
 # Machine-local release profile (thin LTO on a workstation, never commit)
 /.cargo/release-profile.local.toml
