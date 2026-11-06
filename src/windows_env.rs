@@ -241,11 +241,85 @@ pub fn set_active_window_maximized(maximize: bool) -> bool {
     true
 }
 
+/// The process's own top-level window, resolved once and kept.
+///
+/// `active_or_foreground_window` cannot be the first answer here: on a thread with no active window
+/// (the app is not focused) it falls through to `GetForegroundWindow`, which is another process's
+/// window and not ours to move. This asks the window manager for one of ours instead.
+///
+/// Nothing is cached when none matches yet - an early frame may run before the window exists.
+fn own_top_level_window() -> winapi::shared::windef::HWND {
+    use winapi::shared::windef::HWND;
+
+    static OWN_WINDOW: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+    if let Some(&hwnd) = OWN_WINDOW.get() {
+        return hwnd as HWND;
+    }
+
+    let found = find_own_top_level_window();
+    if found.is_null() {
+        return found;
+    }
+
+    let _ = OWN_WINDOW.set(found as usize);
+    found
+}
+
+/// The largest visible, captioned window this process owns, or null when it has none.
+fn find_own_top_level_window() -> winapi::shared::windef::HWND {
+    use winapi::shared::minwindef::{BOOL, LPARAM};
+    use winapi::shared::windef::{HWND, RECT};
+    use winapi::um::processthreadsapi::GetCurrentProcessId;
+    use winapi::um::winuser::{
+        EnumWindows, GetWindowLongW, GetWindowRect, GetWindowThreadProcessId, IsWindowVisible,
+        GWL_STYLE, WS_CAPTION,
+    };
+
+    // Areas are compared on windows of one process, so a signed 64-bit product is ample.
+    type Best = (HWND, i64);
+
+    unsafe extern "system" fn largest_own_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let best = &mut *(lparam as *mut Best);
+
+        let mut owner_pid = 0u32;
+        GetWindowThreadProcessId(hwnd, &mut owner_pid);
+        if owner_pid != GetCurrentProcessId()
+            || IsWindowVisible(hwnd) == 0
+            || GetWindowLongW(hwnd, GWL_STYLE) & WS_CAPTION as i32 != WS_CAPTION as i32
+        {
+            return 1;
+        }
+
+        let mut rect: RECT = std::mem::zeroed();
+        if GetWindowRect(hwnd, &mut rect) == 0 {
+            return 1;
+        }
+
+        let area = (rect.right - rect.left) as i64 * (rect.bottom - rect.top) as i64;
+        if area > best.1 {
+            *best = (hwnd, area);
+        }
+
+        1
+    }
+
+    let mut best: Best = (std::ptr::null_mut(), i64::MIN);
+    unsafe {
+        EnumWindows(Some(largest_own_window), &mut best as *mut Best as LPARAM);
+    }
+
+    best.0
+}
+
 /// Move and resize the window in one call.
 ///
 /// Separate `OuterPosition`/`InnerSize` viewport commands are applied in different frames, so one
 /// frame paints the new position with the old size - a jump of half the size delta, then a jump
 /// back. `SetWindowPos` moves and resizes atomically, so no intermediate rect is ever painted.
+///
+/// The process's own window is preferred over the active/foreground one: the latter is another
+/// process's window whenever this app is not focused.
 ///
 /// Returns false when the window handle cannot be resolved, so callers can fall back.
 pub fn set_active_window_outer_rect(x: i32, y: i32, width: i32, height: i32) -> bool {
@@ -255,7 +329,10 @@ pub fn set_active_window_outer_rect(x: i32, y: i32, width: i32, height: i32) -> 
         SWP_NOZORDER,
     };
 
-    let hwnd = active_or_foreground_window();
+    let mut hwnd = own_top_level_window();
+    if hwnd.is_null() {
+        hwnd = active_or_foreground_window();
+    }
     if hwnd.is_null() {
         return false;
     }
@@ -265,8 +342,7 @@ pub fn set_active_window_outer_rect(x: i32, y: i32, width: i32, height: i32) -> 
             return false;
         }
 
-        // The foreground fallback can resolve to another process's window when this app is not
-        // focused; moving that window would be a visible bug.
+        // Whichever handle was taken, it is only ours to move if this process owns it.
         let mut owner_pid = 0u32;
         GetWindowThreadProcessId(hwnd, &mut owner_pid);
         if owner_pid != GetCurrentProcessId() {
