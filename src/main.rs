@@ -93,6 +93,15 @@ const GSTREAMER_MISSING_VIDEO_ERROR_TEXT: &str =
     "Cannot open video files because the GStreamer library is not installed. Please install GStreamer to enable video playback.";
 const TITLEBAR_CONTROL_ICON_COLOR: egui::Color32 = egui::Color32::WHITE;
 
+/// Settings/help modal palette: opaque and alpha variants of the same chrome tones.
+fn ui_rgb(r: u8, g: u8, b: u8) -> egui::Color32 {
+    egui::Color32::from_rgb(r, g, b)
+}
+
+fn ui_rgba(r: u8, g: u8, b: u8, a: u8) -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(r, g, b, a)
+}
+
 /// Paint a smooth, semi-transparent loading spinner in the bottom-right corner
 /// of the given rectangle.  The spinner is a rotating arc that indicates
 /// background frame decoding is in progress.
@@ -578,16 +587,94 @@ struct MarkSelectionBoxState {
     drag_started: bool,
 }
 
-/// State for the "Motion & Input Settings" modal: live feel settings + INI presets.
-struct MotionSettingsModal {
+/// Tab strip slot: every registry tab plus the read-only Help page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SettingsTabSlot {
+    Tab(settings_registry::SettingsTab),
+    Help,
+}
+
+impl SettingsTabSlot {
+    /// Strip order. Must list every `SettingsTab` exactly once (unit-tested).
+    const ALL: [Self; 11] = [
+        Self::Tab(settings_registry::SettingsTab::General),
+        Self::Tab(settings_registry::SettingsTab::Appearance),
+        Self::Tab(settings_registry::SettingsTab::ZoomScroll),
+        Self::Tab(settings_registry::SettingsTab::Motion),
+        Self::Tab(settings_registry::SettingsTab::Autoscroll),
+        Self::Tab(settings_registry::SettingsTab::Window),
+        Self::Tab(settings_registry::SettingsTab::Files),
+        Self::Tab(settings_registry::SettingsTab::Video),
+        Self::Tab(settings_registry::SettingsTab::Performance),
+        Self::Tab(settings_registry::SettingsTab::Shortcuts),
+        Self::Help,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Tab(settings_registry::SettingsTab::General) => "GENERAL",
+            Self::Tab(settings_registry::SettingsTab::Appearance) => "APPEARANCE",
+            Self::Tab(settings_registry::SettingsTab::ZoomScroll) => "ZOOM & SCROLL",
+            Self::Tab(settings_registry::SettingsTab::Motion) => "MOTION",
+            Self::Tab(settings_registry::SettingsTab::Autoscroll) => "AUTOSCROLL",
+            Self::Tab(settings_registry::SettingsTab::Window) => "WINDOW",
+            Self::Tab(settings_registry::SettingsTab::Files) => "FILES",
+            Self::Tab(settings_registry::SettingsTab::Video) => "VIDEO",
+            Self::Tab(settings_registry::SettingsTab::Performance) => "PERFORMANCE",
+            Self::Tab(settings_registry::SettingsTab::Shortcuts) => "SHORTCUTS",
+            Self::Help => "HELP",
+        }
+    }
+}
+
+fn settings_matches(query: &str, key: &str, label: &str, group: &str, help: &str) -> bool {
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() {
+        return false;
+    }
+    [key, label, group, help]
+        .iter()
+        .any(|haystack| haystack.to_lowercase().contains(&needle))
+}
+
+/// Matching ids in `SETTINGS` order, which is also tab/group order.
+fn settings_search_results(query: &str) -> Vec<usize> {
+    if query.trim().is_empty() {
+        return Vec::new();
+    }
+    settings_registry::SETTINGS
+        .iter()
+        .filter(|setting| {
+            settings_matches(
+                query,
+                setting.key,
+                setting.label,
+                setting.group,
+                setting.help,
+            )
+        })
+        .map(|setting| setting.id)
+        .collect()
+}
+
+/// State for the tabbed Settings modal: every registry setting, presets and the help page.
+struct SettingsModal {
     open: bool,
-    /// Skips one outside-click close check right after opening (mirrors the help modal).
+    /// Skips one outside-click close check right after opening.
     skip_outside_click_once: bool,
+    tab: SettingsTabSlot,
+    search: String,
+    /// Set by Ctrl+F; consumed by the search field when it is drawn.
+    focus_search: bool,
     /// Preset marked in the list; Load/Overwrite/Rename/Delete act on it.
     selected: Option<String>,
     presets: Vec<settings_registry::PresetEntry>,
-    /// Mirror of the live config values owned by the slider/drag-value widgets.
+    /// Values parsed from the selected preset file; the `modified` badge diffs the live config.
+    selected_preset_values: Option<Vec<(usize, settings_registry::SettingValue)>>,
+    /// Mirror of the live config values owned by the slider/toggle widgets.
     values: [f64; settings_registry::SETTINGS.len()],
+    /// Raw INI text mirror for Rgb/Key/Modifier/Binding/BindingList rows.
+    texts: Vec<String>,
     new_name: String,
     /// `(old_name, draft_name)` while an inline rename is pending.
     rename: Option<(String, String)>,
@@ -599,14 +686,19 @@ struct MotionSettingsModal {
     save_due_at: Option<Instant>,
 }
 
-impl Default for MotionSettingsModal {
+impl Default for SettingsModal {
     fn default() -> Self {
         Self {
             open: false,
             skip_outside_click_once: false,
+            tab: SettingsTabSlot::Tab(settings_registry::SettingsTab::General),
+            search: String::new(),
+            focus_search: false,
             selected: None,
             presets: Vec::new(),
+            selected_preset_values: None,
             values: [0.0; settings_registry::SETTINGS.len()],
+            texts: Vec::new(),
             new_name: String::new(),
             rename: None,
             pending_delete: None,
@@ -617,16 +709,15 @@ impl Default for MotionSettingsModal {
     }
 }
 
-/// Left-column preset actions resolved after the modal is drawn (avoids re-borrowing
-/// `self` while the egui closure is alive).
-enum MotionPresetAction {
+/// Preset actions resolved after the modal is drawn (avoids re-borrowing `self` while the
+/// egui closure is alive).
+enum SettingsPresetAction {
     Load(String),
     Overwrite(String),
     BeginRename(String),
     Rename(String, String),
     CancelRename,
     ConfirmDelete(String),
-    CancelDelete,
     Create,
 }
 
@@ -2263,12 +2354,8 @@ struct ImageViewer {
     pending_marked_delete_targets: Vec<PathBuf>,
     /// Whether an exit confirmation modal is waiting on user input because marks remain.
     pending_exit_confirmation: bool,
-    /// Whether the shortcuts/help modal is currently open.
-    shortcuts_help_modal_open: bool,
-    /// Skips one outside-click close check right after opening the shortcuts/help modal.
-    shortcuts_help_modal_skip_outside_click_once: bool,
-    /// Motion & input feel settings dialog state.
-    motion_settings: MotionSettingsModal,
+    /// Settings dialog state: every config.ini setting, presets and the help page.
+    settings: SettingsModal,
     /// Tracks Ctrl+V hold state so paste triggers once per key press even if key_pressed is swallowed.
     paste_shortcut_ctrl_v_was_down: bool,
     /// Cached thumbnail textures used by delete/rename dialogs.
@@ -2991,9 +3078,7 @@ impl Default for ImageViewer {
             pending_single_delete_target: None,
             pending_marked_delete_targets: Vec::new(),
             pending_exit_confirmation: false,
-            shortcuts_help_modal_open: false,
-            shortcuts_help_modal_skip_outside_click_once: false,
-            motion_settings: MotionSettingsModal::default(),
+            settings: SettingsModal::default(),
             paste_shortcut_ctrl_v_was_down: false,
             modal_thumbnail_cache: HashMap::new(),
             folder_placeholder_preview_scan_pending: HashSet::new(),
@@ -5137,9 +5222,9 @@ impl ImageViewer {
         !self.marked_files.is_empty()
     }
 
-    /// True when any of the two read-only/feel dialogs that swallow viewer input is open.
+    /// True while the settings dialog that swallows viewer input is open.
     fn settings_modal_open(&self) -> bool {
-        self.shortcuts_help_modal_open || self.motion_settings.open
+        self.settings.open
     }
 
     fn any_modal_dialog_open(&self) -> bool {
@@ -11998,33 +12083,8 @@ impl ImageViewer {
         }
     }
 
-    fn draw_shortcuts_help_modal(&mut self, ctx: &egui::Context) {
-        if !self.shortcuts_help_modal_open {
-            return;
-        }
-
-        let mut close_modal = ctx.input(|input| input.key_pressed(egui::Key::Escape));
-        let screen_rect = ctx.screen_rect();
-
-        egui::Area::new(egui::Id::new("shortcuts_help_backdrop"))
-            .fixed_pos(screen_rect.min)
-            .order(egui::Order::Foreground)
-            .show(ctx, |ui| {
-                let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, screen_rect.size());
-                ui.painter().rect_filled(
-                    rect,
-                    0.0,
-                    egui::Color32::from_rgba_unmultiplied(4, 8, 13, 214),
-                );
-            });
-
-        let modal_size = egui::vec2(
-            (screen_rect.width() - 60.0).clamp(560.0, 960.0),
-            (screen_rect.height() - 44.0).clamp(440.0, 780.0),
-        );
-        let modal_pos = screen_rect.center() - modal_size * 0.5;
-        let config_path_label = Config::config_path().display().to_string();
-
+    /// Settings > Help page: quick gestures plus every configurable action binding.
+    fn draw_help_tab(&mut self, ui: &mut egui::Ui) {
         let general_rows: &[(Action, &'static str, &'static str)] = &[
             (
                 Action::ToggleFullscreen,
@@ -12240,232 +12300,124 @@ impl ImageViewer {
             ),
         ];
 
-        let modal_response = egui::Area::new(egui::Id::new("shortcuts_help_modal"))
-            .fixed_pos(modal_pos)
-            .order(egui::Order::Foreground)
-            .show(ctx, |ui| {
-                ui.set_min_size(modal_size);
-                egui::Frame::none()
-                    .fill(egui::Color32::from_rgba_unmultiplied(16, 23, 31, 252))
-                    .stroke(egui::Stroke::new(
-                        1.0_f32,
-                        egui::Color32::from_rgba_unmultiplied(166, 207, 255, 62),
-                    ))
-                    .rounding(18.0)
-                    .inner_margin(egui::Margin::same(18.0))
-                    .show(ui, |ui| {
-                        ui.vertical(|ui| {
-                            ui.horizontal(|ui| {
-                                ui.vertical(|ui| {
-                                    ui.label(
-                                        egui::RichText::new("Shortcuts & Features")
-                                            .color(egui::Color32::WHITE)
-                                            .strong()
-                                            .size(22.0),
-                                    );
-                                    ui.add_space(2.0);
-                                    ui.label(
-                                        egui::RichText::new(
-                                            "All bindings below reflect your current config.ini, plus built-in mouse gestures and context menu capabilities.",
-                                        )
-                                        .color(egui::Color32::from_rgb(170, 190, 212))
-                                        .size(12.5),
-                                    );
-                                    ui.add_space(4.0);
-                                    ui.label(
-                                        egui::RichText::new(format!(
-                                            "Config source: {}",
-                                            config_path_label
-                                        ))
-                                        .monospace()
-                                        .color(egui::Color32::from_rgb(128, 165, 198))
-                                        .size(11.0),
-                                    );
-                                });
+        Self::draw_shortcuts_help_section_header(
+            ui,
+            "Quick Gestures (Built-in)",
+            "These are always available and not tied to configurable action names.",
+        );
+        Self::draw_shortcuts_help_row(
+            ui,
+            "Space",
+            "Mark/unmark current target",
+            "Marks hovered strip/masonry item when available, otherwise the current solo file.",
+        );
+        Self::draw_shortcuts_help_row(
+            ui,
+            "Ctrl + Left Click",
+            "Toggle mark for current media",
+            "Quickly mark/unmark the current media under pointer focus.",
+        );
+        Self::draw_shortcuts_help_row(
+            ui,
+            "Ctrl + Right Click",
+            "Open file actions context menu",
+            "Spawns the right-click file action menu for the current file.",
+        );
+        Self::draw_shortcuts_help_row(
+            ui,
+            "Ctrl + Drag (strip/masonry)",
+            "Marquee mark selection",
+            "Drag a selection box to mark or unmark multiple files in strip and masonry modes.",
+        );
+        Self::draw_shortcuts_help_row(
+            ui,
+            "Right Click (center media area)",
+            "Toggle GIF/video play-pause",
+            "When not consumed by edge navigation or fullscreen actions, center right-click toggles playback.",
+        );
+        Self::draw_shortcuts_help_row(
+            ui,
+            "Ctrl + C / Ctrl + X / Delete",
+            "Marked-file keyboard actions",
+            "Copy, cut, or delete marked files (falls back to current file target when no marks are active).",
+        );
 
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        let close_button = ui.add(
-                                            egui::Button::new(
-                                                egui::RichText::new("Close")
-                                                    .color(egui::Color32::WHITE),
-                                            )
-                                            .min_size(egui::vec2(88.0, 30.0))
-                                            .fill(egui::Color32::from_rgba_unmultiplied(
-                                                255, 255, 255, 24,
-                                            ))
-                                            .stroke(egui::Stroke::new(
-                                                1.0_f32,
-                                                egui::Color32::from_rgba_unmultiplied(
-                                                    255, 255, 255, 56,
-                                                ),
-                                            ))
-                                            .rounding(7.0),
-                                        );
-                                        if close_button.clicked() {
-                                            close_modal = true;
-                                        }
-                                    },
-                                );
-                            });
+        ui.add_space(8.0);
+        ui.separator();
 
-                            ui.add_space(10.0);
-                            ui.separator();
-                            ui.add_space(8.0);
+        Self::draw_shortcuts_help_section_header(
+            ui,
+            "General Viewer Actions",
+            "Floating and fullscreen controls for image/video viewing.",
+        );
+        self.draw_shortcuts_help_action_rows(ui, general_rows);
 
-                            egui::ScrollArea::vertical()
-                                .max_height((modal_size.y - 152.0).max(220.0))
-                                .auto_shrink([false, false])
-                                .show(ui, |ui| {
-                                    Self::draw_shortcuts_help_section_header(
-                                        ui,
-                                        "Quick Gestures (Built-in)",
-                                        "These are always available and not tied to configurable action names.",
-                                    );
-                                    Self::draw_shortcuts_help_row(
-                                        ui,
-                                        "Space",
-                                        "Mark/unmark current target",
-                                        "Marks hovered strip/masonry item when available, otherwise the current solo file.",
-                                    );
-                                    Self::draw_shortcuts_help_row(
-                                        ui,
-                                        "Ctrl + Left Click",
-                                        "Toggle mark for current media",
-                                        "Quickly mark/unmark the current media under pointer focus.",
-                                    );
-                                    Self::draw_shortcuts_help_row(
-                                        ui,
-                                        "Ctrl + Right Click",
-                                        "Open file actions context menu",
-                                        "Spawns the right-click file action menu for the current file.",
-                                    );
-                                    Self::draw_shortcuts_help_row(
-                                        ui,
-                                        "Ctrl + Drag (strip/masonry)",
-                                        "Marquee mark selection",
-                                        "Drag a selection box to mark or unmark multiple files in strip and masonry modes.",
-                                    );
-                                    Self::draw_shortcuts_help_row(
-                                        ui,
-                                        "Right Click (center media area)",
-                                        "Toggle GIF/video play-pause",
-                                        "When not consumed by edge navigation or fullscreen actions, center right-click toggles playback.",
-                                    );
-                                    Self::draw_shortcuts_help_row(
-                                        ui,
-                                        "Ctrl + C / Ctrl + X / Delete",
-                                        "Marked-file keyboard actions",
-                                        "Copy, cut, or delete marked files (falls back to current file target when no marks are active).",
-                                    );
+        ui.add_space(8.0);
+        ui.separator();
 
-                                    ui.add_space(8.0);
-                                    ui.separator();
+        Self::draw_shortcuts_help_section_header(
+            ui,
+            "Manga Strip Actions",
+            "Bindings active in fullscreen strip reading mode.",
+        );
+        self.draw_shortcuts_help_action_rows(ui, manga_rows);
 
-                                    Self::draw_shortcuts_help_section_header(
-                                        ui,
-                                        "General Viewer Actions",
-                                        "Floating and fullscreen controls for image/video viewing.",
-                                    );
-                                    self.draw_shortcuts_help_action_rows(ui, general_rows);
+        ui.add_space(8.0);
+        ui.separator();
 
-                                    ui.add_space(8.0);
-                                    ui.separator();
+        Self::draw_shortcuts_help_section_header(
+            ui,
+            "Masonry Actions",
+            "Bindings active in masonry grid mode.",
+        );
+        self.draw_shortcuts_help_action_rows(ui, masonry_rows);
 
-                                    Self::draw_shortcuts_help_section_header(
-                                        ui,
-                                        "Manga Strip Actions",
-                                        "Bindings active in fullscreen strip reading mode.",
-                                    );
-                                    self.draw_shortcuts_help_action_rows(ui, manga_rows);
+        ui.add_space(8.0);
+        ui.separator();
 
-                                    ui.add_space(8.0);
-                                    ui.separator();
+        Self::draw_shortcuts_help_section_header(
+            ui,
+            "Menu & Workflow Features",
+            "Commands available from context menus and title-bar controls.",
+        );
+        Self::draw_shortcuts_help_row(
+            ui,
+            "Right-click menu",
+            "Single-file actions",
+            "Mark/Unmark, Cut, Copy, Delete, Rename, and Open file location for the selected file.",
+        );
+        Self::draw_shortcuts_help_row(
+            ui,
+            "Right-click menu",
+            "Marked-file bulk actions",
+            "Cut/Copy/Delete/Rename marked files, plus Mark All and Unmark All.",
+        );
+        Self::draw_shortcuts_help_row(
+            ui,
+            "Open file location",
+            "Reveal file in OS explorer",
+            "Selects the file in Windows Explorer (or opens containing folder on other platforms).",
+        );
+        Self::draw_shortcuts_help_row(
+            ui,
+            "Three-stripes title-bar menu",
+            "Quick command center",
+            "Contains current-file actions, marked-file actions, this Help page, the Settings dialog (every config.ini setting plus presets), and Edit config.ini.",
+        );
 
-                                    Self::draw_shortcuts_help_section_header(
-                                        ui,
-                                        "Masonry Actions",
-                                        "Bindings active in masonry grid mode.",
-                                    );
-                                    self.draw_shortcuts_help_action_rows(ui, masonry_rows);
+        ui.add_space(8.0);
+        ui.separator();
 
-                                    ui.add_space(8.0);
-                                    ui.separator();
-
-                                    Self::draw_shortcuts_help_section_header(
-                                        ui,
-                                        "Menu & Workflow Features",
-                                        "Commands available from context menus and title-bar controls.",
-                                    );
-                                    Self::draw_shortcuts_help_row(
-                                        ui,
-                                        "Right-click menu",
-                                        "Single-file actions",
-                                        "Mark/Unmark, Cut, Copy, Delete, Rename, and Open file location for the selected file.",
-                                    );
-                                    Self::draw_shortcuts_help_row(
-                                        ui,
-                                        "Right-click menu",
-                                        "Marked-file bulk actions",
-                                        "Cut/Copy/Delete/Rename marked files, plus Mark All and Unmark All.",
-                                    );
-                                    Self::draw_shortcuts_help_row(
-                                        ui,
-                                        "Open file location",
-                                        "Reveal file in OS explorer",
-                                        "Selects the file in Windows Explorer (or opens containing folder on other platforms).",
-                                    );
-                                    Self::draw_shortcuts_help_row(
-                                        ui,
-                                        "Three-stripes title-bar menu",
-                                        "Quick command center",
-                                        "Contains current-file actions, marked-file actions, this Help dialog, the Motion & Input Settings dialog (live mouse/scroll/zoom/pan/autoscroll feel, with presets), and Edit config.ini.",
-                                    );
-
-                                    ui.add_space(8.0);
-                                    ui.separator();
-
-                                    Self::draw_shortcuts_help_section_header(
-                                        ui,
-                                        "AppData config.ini Bindings",
-                                        "Complete action list loaded from your user config file.",
-                                    );
-                                    self.draw_shortcuts_help_config_rows(ui);
-                                });
-                        });
-                    });
-            });
-
-        let modal_rect = modal_response.response.rect;
-        if self.shortcuts_help_modal_skip_outside_click_once {
-            self.shortcuts_help_modal_skip_outside_click_once = false;
-        } else {
-            let clicked_outside_modal = ctx.input(|input| {
-                let primary_clicked = input.pointer.button_clicked(egui::PointerButton::Primary);
-                let secondary_clicked =
-                    input.pointer.button_clicked(egui::PointerButton::Secondary);
-                let pointer_pos = input
-                    .pointer
-                    .interact_pos()
-                    .or_else(|| input.pointer.hover_pos());
-
-                (primary_clicked || secondary_clicked)
-                    && pointer_pos.is_some_and(|pos| !modal_rect.contains(pos))
-            });
-            if clicked_outside_modal {
-                close_modal = true;
-            }
-        }
-
-        if close_modal {
-            self.shortcuts_help_modal_open = false;
-            self.shortcuts_help_modal_skip_outside_click_once = false;
-        }
+        Self::draw_shortcuts_help_section_header(
+            ui,
+            "AppData config.ini Bindings",
+            "Complete action list loaded from your user config file.",
+        );
+        self.draw_shortcuts_help_config_rows(ui);
     }
 
-    /// Numeric mirror of every registry entry for the modal's sliders.
-    fn motion_values_from_config(config: &Config) -> [f64; settings_registry::SETTINGS.len()] {
+    /// Numeric mirror of every registry entry for the modal's sliders and toggles.
+    fn settings_values_from_config(config: &Config) -> [f64; settings_registry::SETTINGS.len()] {
         let mut values = [0.0; settings_registry::SETTINGS.len()];
         for setting in settings_registry::SETTINGS {
             values[setting.id] = settings_registry::get_num(config, setting.id);
@@ -12473,44 +12425,95 @@ impl ImageViewer {
         values
     }
 
-    fn open_motion_settings_modal(&mut self) {
-        self.motion_settings.open = true;
-        self.motion_settings.skip_outside_click_once = true;
-        self.motion_settings.rename = None;
-        self.motion_settings.pending_delete = None;
-        self.motion_settings.status = None;
-        self.motion_settings.status_is_error = false;
-        self.motion_settings.save_due_at = None;
-        self.motion_settings.values = Self::motion_values_from_config(&self.config);
-        self.refresh_motion_presets();
-        if self.motion_settings.selected.is_none() {
-            self.motion_settings.selected = self
-                .motion_settings
+    fn settings_text_value(config: &Config, id: usize) -> String {
+        match settings_registry::get(config, id) {
+            settings_registry::SettingValue::Text(text) => text,
+            settings_registry::SettingValue::Bool(value) => value.to_string(),
+            settings_registry::SettingValue::Num(value) => {
+                settings_registry::format_value(value, 2)
+            }
+        }
+    }
+
+    /// Raw INI text mirror for the Rgb/Key/Modifier/Binding/BindingList editors.
+    fn settings_texts_from_config(config: &Config) -> Vec<String> {
+        settings_registry::SETTINGS
+            .iter()
+            .map(|setting| Self::settings_text_value(config, setting.id))
+            .collect()
+    }
+
+    fn refresh_settings_mirrors(&mut self) {
+        self.settings.values = Self::settings_values_from_config(&self.config);
+        self.settings.texts = Self::settings_texts_from_config(&self.config);
+    }
+
+    fn set_settings_status(&mut self, message: String, is_error: bool) {
+        self.settings.status = Some((message, Instant::now()));
+        self.settings.status_is_error = is_error;
+    }
+
+    fn open_settings_modal(&mut self, tab: SettingsTabSlot) {
+        self.settings.open = true;
+        self.settings.skip_outside_click_once = true;
+        self.settings.tab = tab;
+        self.settings.search.clear();
+        self.settings.focus_search = false;
+        self.settings.rename = None;
+        self.settings.pending_delete = None;
+        self.settings.status = None;
+        self.settings.status_is_error = false;
+        self.settings.save_due_at = None;
+        self.refresh_settings_mirrors();
+        self.refresh_settings_presets();
+        if self.settings.selected.is_none() {
+            self.settings.selected = self
+                .settings
                 .presets
                 .iter()
                 .find(|entry| entry.builtin)
                 .map(|entry| entry.name.clone());
+            self.load_selected_preset_values();
         }
     }
 
-    fn refresh_motion_presets(&mut self) {
+    fn refresh_settings_presets(&mut self) {
         let _ = settings_registry::ensure_builtin_presets();
-        self.motion_settings.presets = settings_registry::list_presets();
+        self.settings.presets = settings_registry::list_presets();
+        self.load_selected_preset_values();
     }
 
-    fn set_motion_status(&mut self, message: String, is_error: bool) {
-        self.motion_settings.status = Some((message, Instant::now()));
-        self.motion_settings.status_is_error = is_error;
+    /// Caches the selected preset's file values so the `modified` badge costs no disk read.
+    fn load_selected_preset_values(&mut self) {
+        self.settings.selected_preset_values = self.settings.selected.as_ref().and_then(|name| {
+            let entry = self
+                .settings
+                .presets
+                .iter()
+                .find(|entry| &entry.name == name)?;
+            let content = std::fs::read_to_string(&entry.path).ok()?;
+            Some(settings_registry::parse_preset(&content).0)
+        });
+    }
+
+    /// True when the live config differs from the selected preset file.
+    fn selected_preset_modified(&self) -> bool {
+        let Some(values) = self.settings.selected_preset_values.as_ref() else {
+            return false;
+        };
+        values
+            .iter()
+            .any(|(id, value)| settings_registry::get(&self.config, *id) != *value)
     }
 
     /// Runs after the debounce window so slider drags produce one `config.ini` write.
-    fn flush_pending_motion_settings_save(&mut self, ctx: &egui::Context) {
-        let Some(due_at) = self.motion_settings.save_due_at else {
+    fn flush_pending_settings_save(&mut self, ctx: &egui::Context) {
+        let Some(due_at) = self.settings.save_due_at else {
             return;
         };
         let now = Instant::now();
         if now >= due_at {
-            self.motion_settings.save_due_at = None;
+            self.settings.save_due_at = None;
             self.config.save();
         } else {
             // Nothing else schedules frames while the viewer is idle.
@@ -12518,11 +12521,21 @@ impl ImageViewer {
         }
     }
 
-    fn apply_motion_preset_action(&mut self, action: MotionPresetAction) {
+    /// Writes `config.ini` now (pointer released / keyboard edit) or debounces a drag.
+    fn finish_settings_edit(&mut self, write_now: bool) {
+        if write_now {
+            self.settings.save_due_at = None;
+            self.config.save();
+        } else {
+            self.settings.save_due_at = Some(Instant::now() + Duration::from_millis(300));
+        }
+    }
+
+    fn apply_settings_preset_action(&mut self, action: SettingsPresetAction) {
         match action {
-            MotionPresetAction::Load(name) => {
+            SettingsPresetAction::Load(name) => {
                 let Some(path) = self
-                    .motion_settings
+                    .settings
                     .presets
                     .iter()
                     .find(|entry| entry.name == name)
@@ -12533,7 +12546,7 @@ impl ImageViewer {
                 let content = match std::fs::read_to_string(&path) {
                     Ok(content) => content,
                     Err(err) => {
-                        self.set_motion_status(
+                        self.set_settings_status(
                             format!("Could not load '{}': {err}", path.display()),
                             true,
                         );
@@ -12551,14 +12564,15 @@ impl ImageViewer {
                 if needs_setter {
                     self.set_masonry_items_per_row(self.config.masonry_items_per_row);
                 }
-                self.motion_settings.values = Self::motion_values_from_config(&self.config);
-                self.motion_settings.selected = Some(name.clone());
+                self.refresh_settings_mirrors();
+                self.settings.selected = Some(name.clone());
+                self.load_selected_preset_values();
                 self.config.save();
-                self.motion_settings.save_due_at = None;
+                self.settings.save_due_at = None;
                 if warnings.is_empty() {
-                    self.set_motion_status(format!("Loaded preset '{name}'."), false);
+                    self.set_settings_status(format!("Loaded preset '{name}'"), false);
                 } else {
-                    self.set_motion_status(
+                    self.set_settings_status(
                         format!(
                             "Loaded '{name}' with {} warning(s): {}",
                             warnings.len(),
@@ -12568,75 +12582,74 @@ impl ImageViewer {
                     );
                 }
             }
-            MotionPresetAction::Overwrite(name) => {
+            SettingsPresetAction::Overwrite(name) => {
                 let values = settings_registry::capture(&self.config);
                 match settings_registry::save_preset(&name, &values) {
-                    Ok(path) => {
-                        self.refresh_motion_presets();
-                        self.set_motion_status(format!("Saved '{}'.", path.display()), false);
+                    Ok(_) => {
+                        self.refresh_settings_presets();
+                        self.set_settings_status(format!("Overwrote preset '{name}'"), false);
                     }
                     Err(err) => {
-                        self.set_motion_status(format!("Could not save '{name}': {err}"), true)
+                        self.set_settings_status(format!("Could not save '{name}': {err}"), true)
                     }
                 }
             }
-            MotionPresetAction::BeginRename(name) => {
-                self.motion_settings.pending_delete = None;
-                self.motion_settings.rename = Some((name.clone(), name));
+            SettingsPresetAction::BeginRename(name) => {
+                self.settings.pending_delete = None;
+                self.settings.rename = Some((name.clone(), name));
             }
-            MotionPresetAction::Rename(old, new) => {
+            SettingsPresetAction::Rename(old, new) => {
                 match settings_registry::sanitize_preset_name(&new) {
                     Ok(clean) => {
-                        self.motion_settings.rename = None;
+                        self.settings.rename = None;
                         if clean == old {
                             return;
                         }
                         match settings_registry::rename_preset(&old, &clean) {
                             Ok(()) => {
-                                self.motion_settings.selected = Some(clean.clone());
-                                self.refresh_motion_presets();
-                                self.set_motion_status(
-                                    format!("Renamed '{old}' to '{clean}'."),
+                                self.settings.selected = Some(clean.clone());
+                                self.refresh_settings_presets();
+                                self.set_settings_status(
+                                    format!("Renamed '{old}' to '{clean}'"),
                                     false,
                                 );
                             }
                             Err(err) => {
-                                self.set_motion_status(format!("Could not rename: {err}"), true)
+                                self.set_settings_status(format!("Could not rename: {err}"), true)
                             }
                         }
                     }
-                    Err(err) => self.set_motion_status(err, true),
+                    Err(err) => self.set_settings_status(err, true),
                 }
             }
-            MotionPresetAction::CancelRename => self.motion_settings.rename = None,
-            MotionPresetAction::ConfirmDelete(name) => {
-                self.motion_settings.pending_delete = None;
+            SettingsPresetAction::CancelRename => self.settings.rename = None,
+            SettingsPresetAction::ConfirmDelete(name) => {
+                self.settings.pending_delete = None;
                 match settings_registry::delete_preset(&name) {
                     Ok(()) => {
-                        if self.motion_settings.selected.as_deref() == Some(name.as_str()) {
-                            self.motion_settings.selected = self
-                                .motion_settings
+                        if self.settings.selected.as_deref() == Some(name.as_str()) {
+                            self.settings.selected = self
+                                .settings
                                 .presets
                                 .iter()
                                 .find(|entry| entry.builtin)
                                 .map(|entry| entry.name.clone());
                         }
-                        self.refresh_motion_presets();
-                        self.set_motion_status(format!("Deleted preset '{name}'."), false);
+                        self.refresh_settings_presets();
+                        self.set_settings_status(format!("Deleted preset '{name}'"), false);
                     }
-                    Err(err) => self.set_motion_status(format!("Could not delete: {err}"), true),
+                    Err(err) => self.set_settings_status(format!("Could not delete: {err}"), true),
                 }
             }
-            MotionPresetAction::CancelDelete => self.motion_settings.pending_delete = None,
-            MotionPresetAction::Create => {
-                let raw = self.motion_settings.new_name.clone();
+            SettingsPresetAction::Create => {
+                let raw = self.settings.new_name.clone();
                 match settings_registry::sanitize_preset_name(&raw) {
                     Ok(name) => {
                         if settings_registry::presets_dir()
                             .join(format!("{name}.ini"))
                             .exists()
                         {
-                            self.set_motion_status(
+                            self.set_settings_status(
                                 format!(
                                     "Preset '{name}' already exists; select it and use Overwrite."
                                 ),
@@ -12646,41 +12659,939 @@ impl ImageViewer {
                         }
                         let values = settings_registry::capture(&self.config);
                         match settings_registry::save_preset(&name, &values) {
-                            Ok(path) => {
-                                self.motion_settings.new_name.clear();
-                                self.motion_settings.selected = Some(name);
-                                self.refresh_motion_presets();
-                                self.set_motion_status(
-                                    format!("Created '{}'.", path.display()),
-                                    false,
-                                );
+                            Ok(_) => {
+                                self.settings.new_name.clear();
+                                self.settings.selected = Some(name.clone());
+                                self.refresh_settings_presets();
+                                self.set_settings_status(format!("Created preset '{name}'"), false);
                             }
-                            Err(err) => self
-                                .set_motion_status(format!("Could not create preset: {err}"), true),
+                            Err(err) => self.set_settings_status(
+                                format!("Could not create preset: {err}"),
+                                true,
+                            ),
                         }
                     }
-                    Err(err) => self.set_motion_status(err, true),
+                    Err(err) => self.set_settings_status(err, true),
                 }
             }
         }
     }
 
-    fn draw_motion_settings_modal(&mut self, ctx: &egui::Context) {
-        if !self.motion_settings.open {
-            return;
-        }
+    fn draw_settings_badge(
+        ui: &mut egui::Ui,
+        text: &str,
+        fill: egui::Color32,
+        color: egui::Color32,
+    ) {
+        egui::Frame::none()
+            .fill(fill)
+            .rounding(4.0)
+            .inner_margin(egui::Margin::symmetric(5.0, 1.0))
+            .show(ui, |ui| {
+                ui.label(egui::RichText::new(text).size(9.0).color(color));
+            });
+    }
 
-        if let Some((_, created_at)) = self.motion_settings.status.as_ref() {
-            if created_at.elapsed() > Duration::from_secs(4) {
-                self.motion_settings.status = None;
+    /// Custom track + knob slider; drag maps pointer x to the value, Shift makes it 4x finer.
+    fn draw_settings_slider(
+        ui: &mut egui::Ui,
+        value: &mut f64,
+        min: f64,
+        max: f64,
+        width: f32,
+    ) -> (egui::Response, bool) {
+        let (rect, response) =
+            ui.allocate_exact_size(egui::vec2(width, 22.0), egui::Sense::click_and_drag());
+        let track_left = rect.left() + 10.0;
+        let track_right = (rect.right() - 10.0).max(track_left + 1.0);
+        let span = max - min;
+        let normalized = |value: f64| {
+            if span > 0.0 {
+                ((value - min) / span).clamp(0.0, 1.0)
+            } else {
+                0.0
+            }
+        };
+        let mut changed = false;
+        if let Some(pointer) = response.interact_pointer_pos() {
+            if response.dragged() || response.clicked() {
+                let target = (((pointer.x - track_left) / (track_right - track_left)) as f64)
+                    .clamp(0.0, 1.0);
+                let current = normalized(*value);
+                // Shift: the value trails the pointer instead of snapping to it (4x finer).
+                let next = if ui.input(|i| i.modifiers.shift) {
+                    current + (target - current) * 0.25
+                } else {
+                    target
+                };
+                let next_value = min + next * span;
+                if (next_value - *value).abs() > span * 1e-6 {
+                    *value = next_value;
+                    changed = true;
+                }
             }
         }
 
-        let mut close_modal = ctx.input(|input| input.key_pressed(egui::Key::Escape));
-        let mut action: Option<MotionPresetAction> = None;
+        let t = normalized(*value) as f32;
+        let y = rect.center().y;
+        let knob = egui::pos2(track_left + (track_right - track_left) * t, y);
+        let painter = ui.painter();
+        painter.rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(track_left, y - 2.0),
+                egui::pos2(track_right, y + 2.0),
+            ),
+            2.0,
+            ui_rgba(255, 255, 255, 32),
+        );
+        if knob.x > track_left {
+            painter.rect_filled(
+                egui::Rect::from_min_max(
+                    egui::pos2(track_left, y - 2.0),
+                    egui::pos2(knob.x, y + 2.0),
+                ),
+                2.0,
+                ui_rgb(94, 214, 255),
+            );
+        }
+        let radius = if response.hovered() || response.dragged() {
+            9.5
+        } else {
+            8.0
+        };
+        painter.circle_stroke(
+            knob,
+            radius + 1.5,
+            egui::Stroke::new(3.0_f32, ui_rgba(94, 214, 255, 140)),
+        );
+        painter.circle_filled(knob, radius, egui::Color32::WHITE);
+        (response, changed)
+    }
+
+    fn draw_settings_toggle(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
+        let (rect, response) = ui.allocate_exact_size(egui::vec2(40.0, 20.0), egui::Sense::click());
+        if response.clicked() {
+            *on = !*on;
+        }
+        let t = ui
+            .ctx()
+            .animate_value_with_time(response.id, if *on { 1.0 } else { 0.0 }, 0.12);
+        let painter = ui.painter();
+        painter.rect_filled(
+            rect,
+            10.0,
+            if *on {
+                ui_rgb(94, 214, 255)
+            } else {
+                ui_rgba(255, 255, 255, 24)
+            },
+        );
+        painter.circle_filled(
+            egui::pos2(
+                egui::lerp((rect.left() + 10.0)..=(rect.right() - 10.0), t),
+                rect.center().y,
+            ),
+            8.0,
+            egui::Color32::WHITE,
+        );
+        response.on_hover_cursor(egui::CursorIcon::PointingHand)
+    }
+
+    /// Float/Int row: slider + DragValue, clamped and mirrored through the registry.
+    fn draw_settings_number_control(
+        &mut self,
+        ui: &mut egui::Ui,
+        setting: &'static settings_registry::Setting,
+        min: f64,
+        max: f64,
+        decimals: usize,
+        controls_width: f32,
+    ) -> (bool, bool) {
+        let id = setting.id;
+        let mut value = self.settings.values[id];
+        let step = 10f64.powi(-(decimals as i32)) * 5.0;
+        let number_box_width = 84.0_f32.min((controls_width * 0.45).max(56.0));
+        let drag_response = ui
+            .scope(|ui| {
+                let widgets = &mut ui.style_mut().visuals.widgets;
+                widgets.inactive.weak_bg_fill = ui_rgba(255, 255, 255, 10);
+                widgets.inactive.bg_fill = ui_rgba(255, 255, 255, 10);
+                widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, ui_rgba(255, 255, 255, 30));
+                widgets.inactive.rounding = egui::Rounding::same(8.0);
+                widgets.hovered.weak_bg_fill = ui_rgba(255, 255, 255, 22);
+                widgets.hovered.bg_fill = ui_rgba(255, 255, 255, 22);
+                widgets.hovered.rounding = egui::Rounding::same(8.0);
+                widgets.active.rounding = egui::Rounding::same(8.0);
+                ui.style_mut()
+                    .text_styles
+                    .insert(egui::TextStyle::Button, egui::FontId::monospace(12.0));
+                ui.add_sized(
+                    [number_box_width, 22.0],
+                    egui::DragValue::new(&mut value)
+                        .fixed_decimals(decimals)
+                        .range(min..=max)
+                        .speed(step),
+                )
+            })
+            .inner;
+        ui.add_space(8.0);
+        let slider_width = (controls_width - number_box_width - 8.0).max(56.0);
+        let (slider_response, slider_changed) =
+            Self::draw_settings_slider(ui, &mut value, min, max, slider_width);
+        if !slider_changed && !drag_response.changed() {
+            return (false, false);
+        }
+        // Release and keyboard edits write at once: the idle viewer runs no frames, so a
+        // timer-only debounce could leave the last drag unsaved.
+        let write_now = slider_response.drag_stopped()
+            || drag_response.drag_stopped()
+            || !ui.input(|i| i.pointer.any_down());
+        match settings_registry::set_num(&mut self.config, id, value) {
+            Ok(()) => {
+                // Registry clamps and keeps paired keys ordered, so remirror every number.
+                self.settings.values = Self::settings_values_from_config(&self.config);
+                if settings_registry::needs_app_setter(setting.key) {
+                    self.set_masonry_items_per_row(self.config.masonry_items_per_row);
+                }
+                (true, write_now)
+            }
+            Err(err) => {
+                self.set_settings_status(err, true);
+                (false, false)
+            }
+        }
+    }
+
+    /// One settings row; `Some(write_now)` when `config` changed.
+    fn draw_setting_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        setting: &'static settings_registry::Setting,
+    ) -> Option<bool> {
+        let id = setting.id;
+        let mut tooltip = format!("{}\n\nkey: {}", setting.help, setting.key);
+        let hint = setting.status_hint();
+        if !hint.is_empty() {
+            tooltip.push('\n');
+            tooltip.push_str(hint);
+        }
+        let row_width = ui.available_width();
+        // 172-wide label slot, narrowed only when the modal is too narrow to hold both halves.
+        let label_slot = 172.0_f32.min((row_width - 180.0).max(96.0));
+        let mut badge_width = 0.0_f32;
+        if setting.applies == settings_registry::Applies::Restart {
+            badge_width += 50.0;
+        }
+        if setting.unused {
+            badge_width += 46.0;
+        }
+        let mut changed = false;
+        let mut write_now = false;
+
+        let row = ui.horizontal(|ui| {
+            ui.set_min_height(30.0);
+            ui.spacing_mut().item_spacing.x = 6.0;
+            ui.add_sized(
+                [(label_slot - badge_width - 4.0).max(40.0), 20.0],
+                egui::Label::new(
+                    egui::RichText::new(setting.label)
+                        .size(13.0)
+                        .color(ui_rgb(226, 236, 246)),
+                )
+                .truncate(),
+            );
+            if setting.applies == settings_registry::Applies::Restart {
+                Self::draw_settings_badge(
+                    ui,
+                    "restart",
+                    ui_rgba(255, 196, 120, 30),
+                    ui_rgb(255, 206, 150),
+                );
+            }
+            if setting.unused {
+                Self::draw_settings_badge(
+                    ui,
+                    "unused",
+                    ui_rgba(255, 255, 255, 18),
+                    ui_rgb(150, 166, 182),
+                );
+            }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let controls = ui.available_width().max(80.0);
+                match setting.kind {
+                    settings_registry::SettingKind::Int { min, max } => {
+                        let (row_changed, row_write_now) = self.draw_settings_number_control(
+                            ui, setting, min as f64, max as f64, 0, controls,
+                        );
+                        changed |= row_changed;
+                        write_now |= row_write_now;
+                    }
+                    settings_registry::SettingKind::Float { min, max, decimals } => {
+                        let (row_changed, row_write_now) = self.draw_settings_number_control(
+                            ui, setting, min, max, decimals, controls,
+                        );
+                        changed |= row_changed;
+                        write_now |= row_write_now;
+                    }
+                    settings_registry::SettingKind::Bool => {
+                        let before = self.settings.values[id] != 0.0;
+                        let mut on = before;
+                        if Self::draw_settings_toggle(ui, &mut on).clicked() && on != before {
+                            match settings_registry::set(
+                                &mut self.config,
+                                id,
+                                &settings_registry::SettingValue::Bool(on),
+                            ) {
+                                Ok(()) => {
+                                    self.settings.values =
+                                        Self::settings_values_from_config(&self.config);
+                                    changed = true;
+                                    write_now = true;
+                                }
+                                Err(err) => self.set_settings_status(err, true),
+                            }
+                        }
+                    }
+                    settings_registry::SettingKind::Enum { values } => {
+                        let current = Self::settings_text_value(&self.config, id);
+                        let mut draft = current.clone();
+                        ui.scope(|ui| {
+                            let widgets = &mut ui.style_mut().visuals.widgets;
+                            widgets.inactive.weak_bg_fill = ui_rgba(255, 255, 255, 10);
+                            widgets.inactive.bg_fill = ui_rgba(255, 255, 255, 10);
+                            widgets.inactive.bg_stroke =
+                                egui::Stroke::new(1.0_f32, ui_rgba(255, 255, 255, 30));
+                            widgets.inactive.rounding = egui::Rounding::same(8.0);
+                            widgets.hovered.weak_bg_fill = ui_rgba(255, 255, 255, 22);
+                            widgets.hovered.bg_fill = ui_rgba(255, 255, 255, 22);
+                            widgets.hovered.rounding = egui::Rounding::same(8.0);
+                            widgets.active.rounding = egui::Rounding::same(8.0);
+                            egui::ComboBox::from_id_salt(("settings_enum", id))
+                                .width(170.0_f32.min(controls.max(90.0)))
+                                .selected_text(egui::RichText::new(&current).size(12.0))
+                                .show_ui(ui, |ui| {
+                                    for entry in values {
+                                        ui.selectable_value(
+                                            &mut draft,
+                                            (*entry).to_string(),
+                                            *entry,
+                                        );
+                                    }
+                                });
+                        });
+                        if draft != current {
+                            match settings_registry::set(
+                                &mut self.config,
+                                id,
+                                &settings_registry::SettingValue::Text(draft),
+                            ) {
+                                Ok(()) => {
+                                    self.settings.texts[id] =
+                                        Self::settings_text_value(&self.config, id);
+                                    changed = true;
+                                    write_now = true;
+                                }
+                                Err(err) => self.set_settings_status(err, true),
+                            }
+                        }
+                    }
+                    settings_registry::SettingKind::Rgb => {
+                        let mut rgb = [0u8; 3];
+                        for (slot, part) in rgb.iter_mut().zip(self.settings.texts[id].split(',')) {
+                            *slot = part.trim().parse::<u8>().unwrap_or(0);
+                        }
+                        if ui.color_edit_button_srgb(&mut rgb).changed() {
+                            let text = format!("{}, {}, {}", rgb[0], rgb[1], rgb[2]);
+                            match settings_registry::set(
+                                &mut self.config,
+                                id,
+                                &settings_registry::SettingValue::Text(text),
+                            ) {
+                                Ok(()) => {
+                                    self.settings.texts[id] =
+                                        Self::settings_text_value(&self.config, id);
+                                    changed = true;
+                                    write_now = true;
+                                }
+                                Err(err) => self.set_settings_status(err, true),
+                            }
+                        }
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "#{:02X}{:02X}{:02X}",
+                                rgb[0], rgb[1], rgb[2]
+                            ))
+                            .monospace()
+                            .size(11.5)
+                            .color(ui_rgba(200, 220, 240, 200)),
+                        );
+                    }
+                    settings_registry::SettingKind::Key
+                    | settings_registry::SettingKind::Modifier
+                    | settings_registry::SettingKind::Binding
+                    | settings_registry::SettingKind::BindingList => {
+                        let hint = if matches!(
+                            setting.kind,
+                            settings_registry::SettingKind::BindingList
+                        ) {
+                            "empty = unbound"
+                        } else {
+                            "none"
+                        };
+                        let width = (controls * 2.0 / 3.0).max(110.0).min(controls);
+                        let response = ui.add_sized(
+                            [width, 24.0],
+                            egui::TextEdit::singleline(&mut self.settings.texts[id])
+                                .hint_text(hint)
+                                .font(egui::FontId::monospace(11.5))
+                                .horizontal_align(egui::Align::LEFT),
+                        );
+                        let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        // Commit only on Enter/focus loss: a half-typed binding must never be
+                        // written, so rejected text stays in the box for the user to fix.
+                        if response.lost_focus() || (response.has_focus() && enter) {
+                            let text = self.settings.texts[id].clone();
+                            match settings_registry::set(
+                                &mut self.config,
+                                id,
+                                &settings_registry::SettingValue::Text(text),
+                            ) {
+                                Ok(()) => {
+                                    self.settings.texts[id] =
+                                        Self::settings_text_value(&self.config, id);
+                                    changed = true;
+                                    write_now = true;
+                                }
+                                Err(err) => self.set_settings_status(err, true),
+                            }
+                        }
+                    }
+                }
+            });
+        });
+        row.response.on_hover_text(tooltip);
+        if changed {
+            Some(write_now)
+        } else {
+            None
+        }
+    }
+
+    fn draw_settings_group_header(ui: &mut egui::Ui, group: &str) {
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(group.to_uppercase())
+                .size(10.5)
+                .strong()
+                .color(ui_rgb(140, 190, 230)),
+        );
+        ui.add_space(3.0);
+    }
+
+    /// Draws `ids` (registry order) as uppercase group headers with one card per group.
+    fn draw_settings_groups(&mut self, ui: &mut egui::Ui, ids: &[usize]) {
+        let mut index = 0;
+        while index < ids.len() {
+            let group = settings_registry::SETTINGS[ids[index]].group;
+            let start = index;
+            while index < ids.len() && settings_registry::SETTINGS[ids[index]].group == group {
+                index += 1;
+            }
+            let card_ids = &ids[start..index];
+            Self::draw_settings_group_header(ui, group);
+            let mut changed = false;
+            let mut write_now = false;
+            egui::Frame::none()
+                .fill(ui_rgba(255, 255, 255, 8))
+                .stroke(egui::Stroke::new(1.0_f32, ui_rgba(255, 255, 255, 18)))
+                .rounding(12.0)
+                .inner_margin(egui::Margin::symmetric(12.0, 8.0))
+                .show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    for (offset, id) in card_ids.iter().enumerate() {
+                        if offset > 0 {
+                            ui.add_space(6.0);
+                        }
+                        if let Some(row_write_now) =
+                            self.draw_setting_row(ui, &settings_registry::SETTINGS[*id])
+                        {
+                            changed = true;
+                            write_now |= row_write_now;
+                        }
+                    }
+                });
+            if changed {
+                self.finish_settings_edit(write_now);
+            }
+            ui.add_space(6.0);
+        }
+    }
+
+    /// Search results: the same cards, grouped by tab then group.
+    fn draw_settings_search_results(&mut self, ui: &mut egui::Ui, ids: &[usize]) {
+        let mut index = 0;
+        while index < ids.len() {
+            let tab = settings_registry::SETTINGS[ids[index]].tab;
+            let start = index;
+            while index < ids.len() && settings_registry::SETTINGS[ids[index]].tab == tab {
+                index += 1;
+            }
+            if start > 0 {
+                ui.add_space(8.0);
+            }
+            ui.label(
+                egui::RichText::new(SettingsTabSlot::Tab(tab).label())
+                    .size(11.0)
+                    .strong()
+                    .color(ui_rgb(140, 190, 230)),
+            );
+            ui.add_space(4.0);
+            self.draw_settings_groups(ui, &ids[start..index]);
+        }
+    }
+
+    /// Right-aligned mini pill for preset rows; returns the width it used.
+    fn paint_settings_pill(
+        ui: &egui::Ui,
+        right_center: egui::Pos2,
+        text: &str,
+        fill: egui::Color32,
+        color: egui::Color32,
+        size: f32,
+    ) -> f32 {
+        let galley =
+            ui.painter()
+                .layout_no_wrap(text.to_string(), egui::FontId::proportional(size), color);
+        let width = galley.size().x + 12.0;
+        let rect = egui::Rect::from_min_max(
+            egui::pos2(right_center.x - width, right_center.y - 8.0),
+            egui::pos2(right_center.x, right_center.y + 8.0),
+        );
+        let painter = ui.painter();
+        painter.rect_filled(rect, 4.0, fill);
+        painter.galley(
+            egui::pos2(rect.left() + 6.0, rect.center().y - galley.size().y * 0.5),
+            galley,
+            color,
+        );
+        width
+    }
+
+    fn draw_settings_presets_panel(
+        &mut self,
+        ui: &mut egui::Ui,
+        body_height: f32,
+        modified: bool,
+        action: &mut Option<SettingsPresetAction>,
+    ) {
+        let mut delete_clicked = false;
+        egui::ScrollArea::vertical()
+            .id_salt("settings_presets_panel")
+            .max_height(body_height)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new("PRESETS")
+                        .size(10.5)
+                        .strong()
+                        .color(ui_rgb(140, 190, 230)),
+                );
+                ui.add_space(6.0);
+
+                let presets = self.settings.presets.clone();
+                let selected = self.settings.selected.clone();
+                egui::ScrollArea::vertical()
+                    .id_salt("settings_preset_list")
+                    .max_height(8.0 * 34.0)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        if presets.is_empty() {
+                            ui.label(
+                                egui::RichText::new("No presets found.")
+                                    .size(12.0)
+                                    .color(ui_rgb(170, 190, 212)),
+                            );
+                        }
+                        for entry in presets.iter() {
+                            let is_selected = selected.as_deref() == Some(entry.name.as_str());
+                            let armed = self.settings.pending_delete.as_deref()
+                                == Some(entry.name.as_str());
+                            let (rect, response) = ui.allocate_exact_size(
+                                egui::vec2(ui.available_width(), 30.0),
+                                egui::Sense::click(),
+                            );
+                            let painter = ui.painter();
+                            if is_selected {
+                                painter.rect_filled(rect, 8.0, ui_rgba(94, 214, 255, 22));
+                                painter.rect_filled(
+                                    egui::Rect::from_min_size(
+                                        rect.left_top() + egui::vec2(0.0, 5.0),
+                                        egui::vec2(2.0, rect.height() - 10.0),
+                                    ),
+                                    1.0,
+                                    ui_rgb(94, 214, 255),
+                                );
+                            } else if response.hovered() {
+                                painter.rect_filled(rect, 8.0, ui_rgba(255, 255, 255, 14));
+                            }
+                            if armed {
+                                painter.rect_stroke(
+                                    rect,
+                                    8.0,
+                                    egui::Stroke::new(1.0_f32, ui_rgba(255, 150, 150, 160)),
+                                );
+                            }
+                            let mut right = rect.right() - 10.0;
+                            if entry.builtin {
+                                right -= Self::paint_settings_pill(
+                                    ui,
+                                    egui::pos2(right, rect.center().y),
+                                    "BUILT-IN",
+                                    ui_rgba(255, 255, 255, 18),
+                                    ui_rgb(210, 224, 238),
+                                    8.5,
+                                ) + 4.0;
+                            }
+                            if modified && is_selected {
+                                right -= Self::paint_settings_pill(
+                                    ui,
+                                    egui::pos2(right, rect.center().y),
+                                    "modified",
+                                    ui_rgba(94, 214, 255, 26),
+                                    ui_rgb(150, 214, 255),
+                                    8.5,
+                                ) + 4.0;
+                            }
+                            ui.painter()
+                                .with_clip_rect(egui::Rect::from_min_max(
+                                    egui::pos2(rect.left() + 10.0, rect.top()),
+                                    egui::pos2(right - 2.0, rect.bottom()),
+                                ))
+                                .text(
+                                    egui::pos2(rect.left() + 12.0, rect.center().y),
+                                    egui::Align2::LEFT_CENTER,
+                                    &entry.name,
+                                    egui::FontId::proportional(12.5),
+                                    if is_selected {
+                                        egui::Color32::WHITE
+                                    } else {
+                                        ui_rgb(206, 220, 234)
+                                    },
+                                );
+                            if response.clicked() {
+                                self.settings.selected = Some(entry.name.clone());
+                                self.settings.pending_delete = None;
+                                self.settings.rename = None;
+                                self.load_selected_preset_values();
+                            }
+                            ui.add_space(4.0);
+                        }
+                    });
+
+                ui.add_space(8.0);
+                let full = ui.available_width();
+                let has_selection = selected.is_some();
+                let selected_is_builtin = selected
+                    .as_deref()
+                    .is_some_and(settings_registry::is_builtin);
+                let can_edit_preset = has_selection && !selected_is_builtin;
+                let secondary_button = |label: &str| {
+                    egui::Button::new(
+                        egui::RichText::new(label)
+                            .size(12.5)
+                            .color(ui_rgb(226, 236, 246)),
+                    )
+                    .fill(ui_rgba(255, 255, 255, 14))
+                    .stroke(egui::Stroke::new(1.0_f32, ui_rgba(255, 255, 255, 30)))
+                    .rounding(8.0)
+                    .min_size(egui::vec2(full, 28.0))
+                };
+
+                let load = egui::Button::new(
+                    egui::RichText::new("Load")
+                        .size(12.5)
+                        .color(egui::Color32::WHITE),
+                )
+                .fill(ui_rgba(94, 214, 255, 40))
+                .stroke(egui::Stroke::new(1.0_f32, ui_rgba(94, 214, 255, 120)))
+                .rounding(8.0)
+                .min_size(egui::vec2(full, 28.0));
+                if ui.add_enabled(has_selection, load).clicked() {
+                    if let Some(name) = selected.clone() {
+                        self.settings.pending_delete = None;
+                        self.settings.rename = None;
+                        *action = Some(SettingsPresetAction::Load(name));
+                    }
+                }
+                ui.add_space(4.0);
+                if ui
+                    .add_enabled(can_edit_preset, secondary_button("Overwrite"))
+                    .clicked()
+                {
+                    if let Some(name) = selected.clone() {
+                        self.settings.pending_delete = None;
+                        self.settings.rename = None;
+                        *action = Some(SettingsPresetAction::Overwrite(name));
+                    }
+                }
+                ui.add_space(4.0);
+                if ui
+                    .add_enabled(can_edit_preset, secondary_button("Rename"))
+                    .clicked()
+                {
+                    if let Some(name) = selected.clone() {
+                        self.settings.pending_delete = None;
+                        *action = Some(SettingsPresetAction::BeginRename(name));
+                    }
+                }
+                ui.add_space(4.0);
+                let delete_label = if self.settings.pending_delete.is_some() {
+                    "Confirm delete?"
+                } else {
+                    "Delete"
+                };
+                let delete = egui::Button::new(
+                    egui::RichText::new(delete_label)
+                        .size(12.5)
+                        .color(ui_rgb(255, 225, 225)),
+                )
+                .fill(ui_rgba(172, 44, 44, 120))
+                .stroke(egui::Stroke::new(1.0_f32, ui_rgba(255, 120, 120, 90)))
+                .rounding(8.0)
+                .min_size(egui::vec2(full, 28.0));
+                if ui.add_enabled(can_edit_preset, delete).clicked() {
+                    delete_clicked = true;
+                    self.settings.rename = None;
+                    match self.settings.pending_delete.take() {
+                        Some(name) => *action = Some(SettingsPresetAction::ConfirmDelete(name)),
+                        None => self.settings.pending_delete = selected.clone(),
+                    }
+                }
+
+                if let Some((old_name, mut draft)) = self.settings.rename.clone() {
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new(format!("Rename '{old_name}'"))
+                            .size(11.5)
+                            .color(ui_rgb(170, 190, 212)),
+                    );
+                    ui.add(
+                        egui::TextEdit::singleline(&mut draft)
+                            .desired_width(full)
+                            .hint_text("preset name"),
+                    );
+                    self.settings.rename = Some((old_name.clone(), draft.clone()));
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        let confirm = egui::Button::new(
+                            egui::RichText::new("Confirm")
+                                .size(12.0)
+                                .color(egui::Color32::WHITE),
+                        )
+                        .fill(ui_rgba(94, 214, 255, 40))
+                        .stroke(egui::Stroke::new(1.0_f32, ui_rgba(94, 214, 255, 120)))
+                        .rounding(8.0)
+                        .min_size(egui::vec2((full - 6.0) * 0.5, 26.0));
+                        if ui.add(confirm).clicked() {
+                            *action = Some(SettingsPresetAction::Rename(
+                                old_name.clone(),
+                                draft.clone(),
+                            ));
+                        }
+                        let cancel = egui::Button::new(
+                            egui::RichText::new("Cancel")
+                                .size(12.0)
+                                .color(ui_rgb(226, 236, 246)),
+                        )
+                        .fill(ui_rgba(255, 255, 255, 14))
+                        .stroke(egui::Stroke::new(1.0_f32, ui_rgba(255, 255, 255, 30)))
+                        .rounding(8.0)
+                        .min_size(egui::vec2((full - 6.0) * 0.5, 26.0));
+                        if ui.add(cancel).clicked() {
+                            *action = Some(SettingsPresetAction::CancelRename);
+                        }
+                    });
+                }
+
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new("Save current as")
+                        .size(11.5)
+                        .color(ui_rgb(170, 190, 212)),
+                );
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.settings.new_name)
+                        .hint_text("new preset name")
+                        .desired_width(full),
+                );
+                ui.add_space(4.0);
+                let create = egui::Button::new(
+                    egui::RichText::new("Create")
+                        .size(12.5)
+                        .color(egui::Color32::WHITE),
+                )
+                .fill(ui_rgba(94, 214, 255, 40))
+                .stroke(egui::Stroke::new(1.0_f32, ui_rgba(94, 214, 255, 120)))
+                .rounding(8.0)
+                .min_size(egui::vec2(full, 28.0));
+                if ui
+                    .add_enabled(!self.settings.new_name.trim().is_empty(), create)
+                    .clicked()
+                {
+                    self.settings.pending_delete = None;
+                    self.settings.rename = None;
+                    *action = Some(SettingsPresetAction::Create);
+                }
+            });
+        // Any other click in the modal disarms the delete confirmation.
+        if self.settings.pending_delete.is_some()
+            && ui.input(|i| i.pointer.any_click())
+            && !delete_clicked
+        {
+            self.settings.pending_delete = None;
+        }
+    }
+
+    /// Video-game style tab strip; the active pill slides instead of popping.
+    fn draw_settings_tab_strip(&mut self, ui: &mut egui::Ui) {
+        let font = egui::FontId::proportional(12.0);
+        let mut total_width = 0.0;
+        for slot in SettingsTabSlot::ALL {
+            total_width += ui.fonts(|fonts| {
+                fonts
+                    .layout_no_wrap(slot.label().to_string(), font.clone(), egui::Color32::WHITE)
+                    .size()
+                    .x
+            }) + 30.0;
+        }
+        if total_width > ui.available_width() {
+            egui::ScrollArea::horizontal()
+                .id_salt("settings_tabs")
+                .scroll_bar_visibility(
+                    egui::containers::scroll_area::ScrollBarVisibility::AlwaysHidden,
+                )
+                .show(ui, |ui| {
+                    ui.set_min_width(total_width);
+                    self.draw_settings_tab_pills(ui, total_width);
+                });
+        } else {
+            self.draw_settings_tab_pills(ui, total_width);
+        }
+    }
+
+    fn draw_settings_tab_pills(&mut self, ui: &mut egui::Ui, total_width: f32) {
+        // Reserved behind the pills so the animated highlight can be filled in after layout.
+        let highlight_idx = ui.painter().add(egui::Shape::Noop);
+        let mut active_rect = None;
+        ui.allocate_ui_with_layout(
+            egui::vec2(total_width, 28.0),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                for slot in SettingsTabSlot::ALL {
+                    let label = slot.label();
+                    let width = ui.fonts(|fonts| {
+                        fonts
+                            .layout_no_wrap(
+                                label.to_string(),
+                                egui::FontId::proportional(12.0),
+                                egui::Color32::WHITE,
+                            )
+                            .size()
+                            .x
+                    }) + 24.0;
+                    let (rect, response) =
+                        ui.allocate_exact_size(egui::vec2(width, 28.0), egui::Sense::click());
+                    let is_active = self.settings.tab == slot;
+                    if is_active {
+                        active_rect = Some(rect);
+                    }
+                    let painter = ui.painter();
+                    if is_active {
+                        painter.rect_stroke(
+                            rect,
+                            8.0,
+                            egui::Stroke::new(1.0_f32, ui_rgba(94, 214, 255, 120)),
+                        );
+                    } else if response.hovered() {
+                        painter.rect_filled(rect, 8.0, ui_rgba(255, 255, 255, 14));
+                    }
+                    painter.text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        label,
+                        egui::FontId::proportional(12.0),
+                        if is_active {
+                            egui::Color32::WHITE
+                        } else if response.hovered() {
+                            ui_rgb(226, 236, 246)
+                        } else {
+                            ui_rgb(158, 180, 202)
+                        },
+                    );
+                    if response.clicked() && !is_active {
+                        self.settings.tab = slot;
+                        self.settings.search.clear();
+                    }
+                    response.on_hover_cursor(egui::CursorIcon::PointingHand);
+                }
+            },
+        );
+        if let Some(rect) = active_rect {
+            let ctx = ui.ctx();
+            let left = ctx.animate_value_with_time(
+                egui::Id::new("settings_tab_highlight_left"),
+                rect.left(),
+                0.14,
+            );
+            let right = ctx.animate_value_with_time(
+                egui::Id::new("settings_tab_highlight_right"),
+                rect.right(),
+                0.14,
+            );
+            let animated = egui::Rect::from_min_max(
+                egui::pos2(left, rect.top()),
+                egui::pos2(right, rect.bottom()),
+            );
+            ui.painter().set(
+                highlight_idx,
+                egui::epaint::RectShape::filled(animated, 8.0, ui_rgba(94, 214, 255, 34)),
+            );
+        }
+    }
+
+    fn draw_settings_modal(&mut self, ctx: &egui::Context) {
+        if !self.settings.open {
+            return;
+        }
+
+        if let Some((_, created_at)) = self.settings.status.as_ref() {
+            if created_at.elapsed() > Duration::from_secs(4) {
+                self.settings.status = None;
+            }
+        }
+
+        let mut close_modal = false;
+        let mut action: Option<SettingsPresetAction> = None;
         let screen_rect = ctx.screen_rect();
 
-        egui::Area::new(egui::Id::new("motion_settings_backdrop"))
+        if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+            // Esc clears the search first, so a stale filter never survives a reopen.
+            if self.settings.search.is_empty() {
+                close_modal = true;
+            } else {
+                self.settings.search.clear();
+            }
+        }
+        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::F)) {
+            self.settings.focus_search = true;
+        }
+
+        egui::Area::new(egui::Id::new("settings_modal_backdrop"))
             .fixed_pos(screen_rect.min)
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
@@ -12693,17 +13604,15 @@ impl ImageViewer {
             });
 
         let modal_size = egui::vec2(
-            (screen_rect.width() - 60.0).clamp(680.0, 1080.0),
-            (screen_rect.height() - 44.0).clamp(480.0, 820.0),
+            (screen_rect.width() - 60.0).clamp(560.0, 960.0),
+            (screen_rect.height() - 44.0).clamp(440.0, 780.0),
         );
         let modal_pos = screen_rect.center() - modal_size * 0.5;
-        let presets_dir_label = settings_registry::presets_dir().display().to_string();
-        let body_height = (modal_size.y - 214.0).max(240.0);
-        // Explicit widths: the nested layouts' available_width is not the column width here.
-        let right_column_width = (modal_size.x - 250.0 - 64.0).max(360.0);
-        let slider_width = (right_column_width - 150.0 - 78.0 - 28.0).max(120.0);
+        let body_height = (modal_size.y - 152.0).max(220.0);
+        let config_path_label = Config::config_path().display().to_string();
+        let modified = self.selected_preset_modified();
 
-        let modal_response = egui::Area::new(egui::Id::new("motion_settings_modal"))
+        let modal_response = egui::Area::new(egui::Id::new("settings_modal"))
             .fixed_pos(modal_pos)
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
@@ -12719,54 +13628,130 @@ impl ImageViewer {
                     .show(ui, |ui| {
                         ui.vertical(|ui| {
                             ui.horizontal(|ui| {
-                                ui.vertical(|ui| {
-                                    ui.label(
-                                        egui::RichText::new("Motion & Input Settings")
-                                            .color(egui::Color32::WHITE)
-                                            .strong()
-                                            .size(22.0),
-                                    );
-                                    ui.add_space(2.0);
-                                    ui.label(
-                                        egui::RichText::new(
-                                            "Mouse, scroll, zoom, pan, inertia and autoscroll feel. Changes apply live and are written to config.ini.",
-                                        )
-                                        .color(egui::Color32::from_rgb(170, 190, 212))
-                                        .size(12.5),
-                                    );
-                                    ui.add_space(4.0);
-                                    ui.label(
-                                        egui::RichText::new(format!(
-                                            "Presets: {presets_dir_label}"
-                                        ))
-                                        .monospace()
-                                        .color(egui::Color32::from_rgb(128, 165, 198))
-                                        .size(11.0),
-                                    );
-                                });
+                                let header_width = (ui.available_width() - 300.0).max(150.0);
+                                ui.allocate_ui_with_layout(
+                                    // Fixed height: a 0-height max_rect makes wrapped labels behave oddly.
+                                    egui::vec2(header_width, 72.0),
+                                    egui::Layout::top_down(egui::Align::Min),
+                                    |ui| {
+                                        ui.label(
+                                            egui::RichText::new("Settings")
+                                                .color(egui::Color32::WHITE)
+                                                .strong()
+                                                .size(22.0),
+                                        );
+                                        ui.add_space(2.0);
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "Tune every config.ini setting. Edits apply live and are written to config.ini.",
+                                            )
+                                            .color(ui_rgb(170, 190, 212))
+                                            .size(12.5),
+                                        );
+                                        ui.add_space(4.0);
+                                        ui.label(
+                                            egui::RichText::new(config_path_label.clone())
+                                                .monospace()
+                                                .color(ui_rgb(128, 165, 198))
+                                                .size(11.0),
+                                        );
+                                    },
+                                );
 
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
-                                        let close_button = ui.add(
-                                            egui::Button::new(
-                                                egui::RichText::new("Close")
-                                                    .color(egui::Color32::WHITE),
-                                            )
-                                            .min_size(egui::vec2(88.0, 30.0))
-                                            .fill(egui::Color32::from_rgba_unmultiplied(
-                                                255, 255, 255, 24,
-                                            ))
-                                            .stroke(egui::Stroke::new(
+                                        let (close_rect, close_response) = ui
+                                            .allocate_exact_size(
+                                                egui::vec2(32.0, 32.0),
+                                                egui::Sense::click(),
+                                            );
+                                        let hovered = close_response.hovered();
+                                        let painter = ui.painter();
+                                        painter.rect(
+                                            close_rect,
+                                            9.0,
+                                            if hovered {
+                                                ui_rgba(255, 255, 255, 22)
+                                            } else {
+                                                egui::Color32::TRANSPARENT
+                                            },
+                                            egui::Stroke::new(
                                                 1.0_f32,
-                                                egui::Color32::from_rgba_unmultiplied(
-                                                    255, 255, 255, 56,
-                                                ),
-                                            ))
-                                            .rounding(7.0),
+                                                if hovered {
+                                                    ui_rgba(255, 255, 255, 90)
+                                                } else {
+                                                    ui_rgba(255, 255, 255, 40)
+                                                },
+                                            ),
                                         );
-                                        if close_button.clicked() {
+                                        let center = close_rect.center();
+                                        let arm = 3.0;
+                                        let stroke = egui::Stroke::new(1.6_f32, ui_rgb(226, 236, 246));
+                                        painter.line_segment(
+                                            [
+                                                center + egui::vec2(-arm, -arm),
+                                                center + egui::vec2(arm, arm),
+                                            ],
+                                            stroke,
+                                        );
+                                        painter.line_segment(
+                                            [
+                                                center + egui::vec2(arm, -arm),
+                                                center + egui::vec2(-arm, arm),
+                                            ],
+                                            stroke,
+                                        );
+                                        if close_response.clicked() {
                                             close_modal = true;
+                                        }
+                                        close_response.on_hover_text("Close (Esc)");
+
+                                        ui.add_space(8.0);
+                                        let (search_rect, _) = ui.allocate_exact_size(
+                                            egui::vec2(250.0, 28.0),
+                                            egui::Sense::hover(),
+                                        );
+                                        let painter = ui.painter();
+                                        painter.rect(
+                                            search_rect,
+                                            8.0,
+                                            ui_rgba(255, 255, 255, 10),
+                                            egui::Stroke::new(1.0_f32, ui_rgba(255, 255, 255, 30)),
+                                        );
+                                        let glass = egui::pos2(
+                                            search_rect.left() + 13.0,
+                                            search_rect.center().y - 1.0,
+                                        );
+                                        let glyph_stroke =
+                                            egui::Stroke::new(1.3_f32, ui_rgba(160, 190, 215, 220));
+                                        painter.circle_stroke(glass, 4.0, glyph_stroke);
+                                        painter.line_segment(
+                                            [
+                                                glass + egui::vec2(3.0, 3.0),
+                                                glass + egui::vec2(6.0, 6.0),
+                                            ],
+                                            glyph_stroke,
+                                        );
+                                        let text_rect = egui::Rect::from_min_max(
+                                            egui::pos2(
+                                                search_rect.left() + 26.0,
+                                                search_rect.top() + 4.0,
+                                            ),
+                                            egui::pos2(
+                                                search_rect.right() - 8.0,
+                                                search_rect.bottom() - 4.0,
+                                            ),
+                                        );
+                                        let response = ui.put(
+                                            text_rect,
+                                            egui::TextEdit::singleline(&mut self.settings.search)
+                                                .hint_text("Search settings…  (Ctrl+F)")
+                                                .frame(false)
+                                                .desired_width(text_rect.width()),
+                                        );
+                                        if std::mem::take(&mut self.settings.focus_search) {
+                                            response.request_focus();
                                         }
                                     },
                                 );
@@ -12774,397 +13759,139 @@ impl ImageViewer {
 
                             ui.add_space(10.0);
                             ui.separator();
+                            ui.add_space(6.0);
+                            self.draw_settings_tab_strip(ui);
                             ui.add_space(8.0);
 
-                            let presets = self.motion_settings.presets.clone();
-                            let selected = self.motion_settings.selected.clone();
-                            let selected_is_builtin =
-                                selected.as_deref().is_some_and(settings_registry::is_builtin);
-                            let has_selection = selected.is_some();
-
+                            let presets_width =
+                                236.0_f32.min((ui.available_width() - 300.0).max(180.0));
+                            let right_width =
+                                (ui.available_width() - presets_width - 25.0).max(200.0);
                             ui.horizontal_top(|ui| {
                                 ui.allocate_ui_with_layout(
-                                    egui::vec2(250.0, body_height),
+                                    egui::vec2(presets_width, body_height),
                                     egui::Layout::top_down(egui::Align::Min),
                                     |ui| {
-                                        ui.label(
-                                            egui::RichText::new("Presets")
-                                                .strong()
-                                                .size(14.0)
-                                                .color(egui::Color32::from_rgb(
-                                                    198, 222, 255,
-                                                )),
+                                        self.draw_settings_presets_panel(
+                                            ui,
+                                            body_height,
+                                            modified,
+                                            &mut action,
                                         );
-                                        egui::ScrollArea::vertical()
-                                            .id_salt("motion_settings_preset_list")
-                                            .max_height((body_height - 330.0).max(88.0))
-                                            .auto_shrink([false, false])
-                                            .show(ui, |ui| {
-                                                if presets.is_empty() {
-                                                    ui.label(
-                                                        egui::RichText::new("No presets found.")
-                                                            .size(12.0)
-                                                            .color(egui::Color32::from_rgb(
-                                                                170, 190, 212,
-                                                            )),
-                                                    );
-                                                }
-                                                for entry in presets.iter() {
-                                                    let is_selected = selected.as_deref()
-                                                        == Some(entry.name.as_str());
-                                                    // Badge inline: a second widget wraps badly in the narrow column.
-                                                    let label = if entry.builtin {
-                                                        format!("{}   BUILT-IN", entry.name)
-                                                    } else {
-                                                        entry.name.clone()
-                                                    };
-                                                    if ui
-                                                        .selectable_label(
-                                                            is_selected,
-                                                            egui::RichText::new(label).size(13.0),
-                                                        )
-                                                        .clicked()
-                                                    {
-                                                        self.motion_settings.selected =
-                                                            Some(entry.name.clone());
-                                                        self.motion_settings.pending_delete =
-                                                            None;
-                                                        self.motion_settings.rename = None;
-                                                    }
-                                                }
-                                            });
-
-                                        ui.add_space(6.0);
-                                        ui.horizontal(|ui| {
-                                            if ui
-                                                .add_enabled(
-                                                    has_selection,
-                                                    egui::Button::new("Load"),
-                                                )
-                                                .clicked()
-                                            {
-                                                if let Some(name) = selected.clone() {
-                                                    action = Some(MotionPresetAction::Load(name));
-                                                }
-                                            }
-                                            if ui
-                                                .add_enabled(
-                                                    has_selection && !selected_is_builtin,
-                                                    egui::Button::new("Overwrite"),
-                                                )
-                                                .clicked()
-                                            {
-                                                if let Some(name) = selected.clone() {
-                                                    action = Some(MotionPresetAction::Overwrite(
-                                                        name,
-                                                    ));
-                                                }
-                                            }
-                                        });
-                                        ui.horizontal(|ui| {
-                                            if ui
-                                                .add_enabled(
-                                                    has_selection && !selected_is_builtin,
-                                                    egui::Button::new("Rename"),
-                                                )
-                                                .clicked()
-                                            {
-                                                if let Some(name) = selected.clone() {
-                                                    action =
-                                                        Some(MotionPresetAction::BeginRename(name));
-                                                }
-                                            }
-                                            if ui
-                                                .add_enabled(
-                                                    has_selection && !selected_is_builtin,
-                                                    egui::Button::new("Delete"),
-                                                )
-                                                .clicked()
-                                            {
-                                                // First click only arms the confirmation below.
-                                                self.motion_settings.rename = None;
-                                                self.motion_settings.pending_delete =
-                                                    selected.clone();
-                                            }
-                                        });
-
-                                        if let Some((old_name, mut draft)) =
-                                            self.motion_settings.rename.clone()
-                                        {
-                                            ui.add_space(6.0);
-                                            ui.label(
-                                                egui::RichText::new(format!(
-                                                    "Rename '{old_name}'"
-                                                ))
-                                                .size(12.0)
-                                                .color(egui::Color32::from_rgb(170, 190, 212)),
-                                            );
-                                            ui.add(
-                                                egui::TextEdit::singleline(&mut draft)
-                                                    .desired_width(212.0),
-                                            );
-                                            self.motion_settings.rename =
-                                                Some((old_name.clone(), draft.clone()));
-                                            ui.horizontal(|ui| {
-                                                if ui.button("Confirm").clicked() {
-                                                    action = Some(MotionPresetAction::Rename(
-                                                        old_name.clone(),
-                                                        draft.clone(),
-                                                    ));
-                                                }
-                                                if ui.button("Cancel").clicked() {
-                                                    action =
-                                                        Some(MotionPresetAction::CancelRename);
-                                                }
-                                            });
-                                        }
-
-                                        if let Some(target) =
-                                            self.motion_settings.pending_delete.clone()
-                                        {
-                                            ui.add_space(6.0);
-                                            ui.label(
-                                                egui::RichText::new(format!(
-                                                    "Delete '{target}'?"
-                                                ))
-                                                .size(12.0)
-                                                .color(egui::Color32::from_rgb(
-                                                    255, 170, 170,
-                                                )),
-                                            );
-                                            ui.horizontal(|ui| {
-                                                if ui.button("Confirm delete").clicked() {
-                                                    action = Some(
-                                                        MotionPresetAction::ConfirmDelete(
-                                                            target.clone(),
-                                                        ),
-                                                    );
-                                                }
-                                                if ui.button("Cancel").clicked() {
-                                                    action =
-                                                        Some(MotionPresetAction::CancelDelete);
-                                                }
-                                            });
-                                        }
-
-                                        ui.add_space(8.0);
-                                        ui.separator();
-                                        ui.add_space(4.0);
-                                        ui.label(
-                                            egui::RichText::new("Save current as new preset")
-                                                .size(12.0)
-                                                .color(egui::Color32::from_rgb(170, 190, 212)),
-                                        );
-                                        ui.add(
-                                            egui::TextEdit::singleline(
-                                                &mut self.motion_settings.new_name,
-                                            )
-                                            .hint_text("preset name")
-                                            .desired_width(212.0),
-                                        );
-                                        let can_create = !self
-                                            .motion_settings
-                                            .new_name
-                                            .trim()
-                                            .is_empty();
-                                        if ui
-                                            .add_enabled(
-                                                can_create,
-                                                egui::Button::new("Create preset"),
-                                            )
-                                            .clicked()
-                                        {
-                                            action = Some(MotionPresetAction::Create);
-                                        }
                                     },
                                 );
-
-                                ui.separator();
-
+                                ui.add_space(12.0);
+                                let (separator_rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(1.0, body_height),
+                                    egui::Sense::hover(),
+                                );
+                                ui.painter().rect_filled(
+                                    separator_rect,
+                                    0.0,
+                                    ui_rgba(255, 255, 255, 20),
+                                );
+                                ui.add_space(12.0);
                                 ui.allocate_ui_with_layout(
-                                    egui::vec2(right_column_width, body_height),
+                                    egui::vec2(right_width, body_height),
                                     egui::Layout::top_down(egui::Align::Min),
                                     |ui| {
                                         egui::ScrollArea::vertical()
-                                            .id_salt("motion_settings_values")
+                                            .id_salt("settings_values")
                                             .max_height(body_height)
                                             .auto_shrink([false, false])
                                             .show(ui, |ui| {
                                                 ui.set_min_width(ui.available_width());
-                                                let mut current_group: Option<&str> = None;
-                                                // Interim content: the modal still shows only the
-                                                // zoom/motion/autoscroll tabs' numeric rows.
-                                                for setting in settings_registry::SETTINGS.iter().filter(
-                                                    |setting| {
-                                                        matches!(
-                                                            setting.tab,
-                                                            settings_registry::SettingsTab::ZoomScroll
-                                                                | settings_registry::SettingsTab::Motion
-                                                                | settings_registry::SettingsTab::Autoscroll
-                                                        )
-                                                    },
-                                                ) {
-                                                    let (min, max, decimals) = match setting.kind {
-                                                        settings_registry::SettingKind::Int {
-                                                            min,
-                                                            max,
-                                                        } => (min as f64, max as f64, 0),
-                                                        settings_registry::SettingKind::Float {
-                                                            min,
-                                                            max,
-                                                            decimals,
-                                                        } => (min, max, decimals),
-                                                        _ => continue,
-                                                    };
-                                                    if current_group != Some(setting.group) {
-                                                        if current_group.is_some() {
-                                                            ui.add_space(10.0);
+                                                let query =
+                                                    self.settings.search.trim().to_string();
+                                                if query.is_empty() {
+                                                    match self.settings.tab {
+                                                        SettingsTabSlot::Help => {
+                                                            self.draw_help_tab(ui)
                                                         }
-                                                        ui.label(
-                                                            egui::RichText::new(setting.group)
-                                                                .strong()
-                                                                .size(14.0)
-                                                                .color(
-                                                                    egui::Color32::from_rgb(
-                                                                        198, 222, 255,
-                                                                    ),
-                                                                ),
-                                                        );
-                                                        ui.add_space(2.0);
-                                                        current_group = Some(setting.group);
+                                                        SettingsTabSlot::Tab(tab) => {
+                                                            let ids: Vec<usize> =
+                                                                settings_registry::SETTINGS
+                                                                    .iter()
+                                                                    .filter(|setting| {
+                                                                        setting.tab == tab
+                                                                    })
+                                                                    .map(|setting| setting.id)
+                                                                    .collect();
+                                                            self.draw_settings_groups(ui, &ids);
+                                                        }
                                                     }
-
-                                                    ui.horizontal(|ui| {
-                                                        ui.spacing_mut().slider_width = slider_width;
-                                                        let index = setting.id;
-                                                        let label = ui.add_sized(
-                                                            egui::vec2(150.0, 20.0),
-                                                            egui::Label::new(
-                                                                egui::RichText::new(setting.label)
-                                                                    .size(12.5),
-                                                            )
-                                                            .truncate(),
+                                                } else {
+                                                    let ids = settings_search_results(&query);
+                                                    if ids.is_empty() {
+                                                        ui.add_space(6.0);
+                                                        ui.label(
+                                                            egui::RichText::new(format!(
+                                                                "no matches for \"{query}\""
+                                                            ))
+                                                            .size(12.5)
+                                                            .color(ui_rgb(170, 190, 212)),
                                                         );
-                                                        label.on_hover_text({
-                                                            let hint = setting.status_hint();
-                                                            if hint.is_empty() {
-                                                                format!(
-                                                                    "{}\nkey: {}",
-                                                                    setting.help, setting.key
-                                                                )
-                                                            } else {
-                                                                format!(
-                                                                    "{}\nkey: {}\n{}",
-                                                                    setting.help, setting.key, hint
-                                                                )
-                                                            }
-                                                        });
-                                                        let step = if decimals == 0 {
-                                                            1.0
-                                                        } else {
-                                                            10f64.powi(-(decimals as i32))
-                                                        };
-                                                        let before =
-                                                            self.motion_settings.values[index];
-                                                        let slider_response = ui.add(
-                                                            egui::Slider::new(
-                                                                &mut self.motion_settings.values
-                                                                    [index],
-                                                                min..=max,
-                                                            )
-                                                            .show_value(false)
-                                                            .fixed_decimals(decimals),
-                                                        );
-                                                        ui.add_space(4.0);
-                                                        let drag_response = ui.add_sized(
-                                                            [78.0, 20.0],
-                                                            egui::DragValue::new(
-                                                                &mut self.motion_settings.values
-                                                                    [index],
-                                                            )
-                                                            .range(min..=max)
-                                                            .speed(step)
-                                                            .fixed_decimals(decimals),
-                                                        );
-                                                        let changed = slider_response.changed()
-                                                            || drag_response.changed();
-                                                        // Release and keyboard edits write at once: the idle
-                                                        // viewer runs no frames, so a timer-only debounce
-                                                        // could leave the last drag unsaved.
-                                                        let write_now = slider_response.drag_stopped()
-                                                            || drag_response.drag_stopped()
-                                                            || (changed
-                                                                && !ui.input(|i| i.pointer.any_down()));
-                                                        if changed && !write_now {
-                                                            self.motion_settings.save_due_at =
-                                                                Some(
-                                                                    Instant::now()
-                                                                        + Duration::from_millis(300),
-                                                                );
-                                                        }
-                                                        if changed {
-                                                            let requested = self
-                                                                .motion_settings
-                                                                .values[index];
-                                                            if requested != before {
-                                                                let _ = settings_registry::set_num(
-                                                                    &mut self.config,
-                                                                    index,
-                                                                    requested,
-                                                                );
-                                                                for setting in settings_registry::SETTINGS {
-                                                                    self.motion_settings.values[setting.id] =
-                                                                        settings_registry::get_num(
-                                                                            &self.config,
-                                                                            setting.id,
-                                                                        );
-                                                                }
-                                                            }
-                                                        }
-                                                        if write_now {
-                                                            self.motion_settings.save_due_at = None;
-                                                            self.config.save();
-                                                        }
-                                                    });
+                                                    } else {
+                                                        self.draw_settings_search_results(ui, &ids);
+                                                    }
                                                 }
                                             });
                                     },
                                 );
                             });
 
-                            ui.add_space(8.0);
+                            ui.add_space(6.0);
                             ui.separator();
-                            ui.add_space(4.0);
-                            let status = self.motion_settings.status.clone();
-                            let status_is_error = self.motion_settings.status_is_error;
-                            match status {
-                                Some((message, _)) => {
-                                    let color = if status_is_error {
-                                        egui::Color32::from_rgb(255, 150, 150)
-                                    } else {
-                                        egui::Color32::from_rgb(150, 220, 180)
-                                    };
-                                    ui.label(
-                                        egui::RichText::new(message).color(color).size(12.0),
-                                    );
+                            ui.add_space(2.0);
+                            let status = self.settings.status.clone();
+                            let status_is_error = self.settings.status_is_error;
+                            let visible_count = if self.settings.search.trim().is_empty() {
+                                match self.settings.tab {
+                                    SettingsTabSlot::Help => settings_registry::SETTINGS.len(),
+                                    SettingsTabSlot::Tab(tab) => settings_registry::SETTINGS
+                                        .iter()
+                                        .filter(|setting| setting.tab == tab)
+                                        .count(),
                                 }
-                                None => {
-                                    ui.label(
-                                        egui::RichText::new(
-                                            "Sliders and number boxes apply live; config.ini is saved 300 ms after the last change.",
-                                        )
-                                        .color(egui::Color32::from_rgb(140, 160, 182))
-                                        .size(11.5),
+                            } else {
+                                settings_search_results(&self.settings.search).len()
+                            };
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(ui.available_width(), 24.0),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    if let Some((message, _)) = status {
+                                        ui.label(
+                                            egui::RichText::new(message).size(12.0).color(
+                                                if status_is_error {
+                                                    ui_rgb(255, 150, 150)
+                                                } else {
+                                                    ui_rgb(150, 214, 255)
+                                                },
+                                            ),
+                                        );
+                                    }
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "{visible_count} settings"
+                                                ))
+                                                .size(11.5)
+                                                .color(ui_rgba(140, 160, 182, 200)),
+                                            );
+                                        },
                                     );
-                                }
-                            }
+                                },
+                            );
                         });
                     });
             });
 
         let modal_rect = modal_response.response.rect;
-        if self.motion_settings.skip_outside_click_once {
-            self.motion_settings.skip_outside_click_once = false;
+        if self.settings.skip_outside_click_once {
+            self.settings.skip_outside_click_once = false;
         } else {
             let clicked_outside_modal = ctx.input(|input| {
                 let primary_clicked = input.pointer.button_clicked(egui::PointerButton::Primary);
@@ -13184,22 +13911,22 @@ impl ImageViewer {
         }
 
         if let Some(action) = action {
-            self.apply_motion_preset_action(action);
+            self.apply_settings_preset_action(action);
             ctx.request_repaint();
         }
 
         // The debounce deadline is set during drawing, after this frame's flush: without an
         // explicit wake-up the idle viewer never draws the frame that would save.
-        if let Some(due_at) = self.motion_settings.save_due_at {
+        if let Some(due_at) = self.settings.save_due_at {
             ctx.request_repaint_after(due_at.saturating_duration_since(Instant::now()));
         }
 
         if close_modal {
-            self.flush_pending_motion_settings_save(ctx);
-            self.motion_settings.open = false;
-            self.motion_settings.skip_outside_click_once = false;
-            self.motion_settings.rename = None;
-            self.motion_settings.pending_delete = None;
+            self.flush_pending_settings_save(ctx);
+            self.settings.open = false;
+            self.settings.skip_outside_click_once = false;
+            self.settings.rename = None;
+            self.settings.pending_delete = None;
         }
     }
 
@@ -26435,8 +27162,7 @@ impl ImageViewer {
                                         )
                                         .clicked()
                                     {
-                                        self.shortcuts_help_modal_open = true;
-                                        self.shortcuts_help_modal_skip_outside_click_once = true;
+                                        self.open_settings_modal(SettingsTabSlot::Help);
                                         self.file_action_menu = None;
                                         self.show_controls = true;
                                         self.controls_show_time = Instant::now();
@@ -26446,14 +27172,12 @@ impl ImageViewer {
                                     ui.separator();
 
                                     if self
-                                        .menu_action_row(
-                                            ui,
-                                            "Motion & input settings",
-                                            MenuActionIcon::Motion,
-                                        )
+                                        .menu_action_row(ui, "Settings", MenuActionIcon::Motion)
                                         .clicked()
                                     {
-                                        self.open_motion_settings_modal();
+                                        self.open_settings_modal(SettingsTabSlot::Tab(
+                                            settings_registry::SettingsTab::General,
+                                        ));
                                         self.file_action_menu = None;
                                         self.show_controls = true;
                                         self.controls_show_time = Instant::now();
@@ -29853,8 +30577,8 @@ impl eframe::App for ImageViewer {
             self.last_mouse_pos = None;
         }
 
-        // Debounced config.ini write for motion-setting slider drags.
-        self.flush_pending_motion_settings_save(ctx);
+        // Debounced config.ini write for settings slider drags.
+        self.flush_pending_settings_save(ctx);
 
         // Handle input (disabled while a settings/help modal is open).
         if !self.settings_modal_open() {
@@ -30233,8 +30957,7 @@ impl eframe::App for ImageViewer {
             self.draw_delete_confirmation_modal(ctx);
             self.draw_rename_modal(ctx);
             self.draw_exit_confirmation_modal(ctx);
-            self.draw_shortcuts_help_modal(ctx);
-            self.draw_motion_settings_modal(ctx);
+            self.draw_settings_modal(ctx);
         }
 
         let (hide_idle_cursor, cursor_idle_repaint_after) = if skip_drawing {
@@ -31495,5 +32218,129 @@ mod tests {
         let commands = ImageViewer::close_viewport_commands();
 
         assert_eq!(commands, [egui::ViewportCommand::Close]);
+    }
+
+    #[test]
+    fn settings_tab_strip_covers_every_registry_tab_once() {
+        use super::{settings_registry, SettingsTabSlot};
+        use settings_registry::SettingsTab;
+
+        let tabs = [
+            SettingsTab::General,
+            SettingsTab::Appearance,
+            SettingsTab::ZoomScroll,
+            SettingsTab::Motion,
+            SettingsTab::Autoscroll,
+            SettingsTab::Window,
+            SettingsTab::Files,
+            SettingsTab::Video,
+            SettingsTab::Performance,
+            SettingsTab::Shortcuts,
+        ];
+        assert_eq!(SettingsTabSlot::ALL.len(), tabs.len() + 1);
+        for tab in tabs {
+            let hits = SettingsTabSlot::ALL
+                .iter()
+                .filter(|slot| **slot == SettingsTabSlot::Tab(tab))
+                .count();
+            assert_eq!(hits, 1, "{tab:?} must appear exactly once in the tab strip");
+        }
+        for setting in settings_registry::SETTINGS {
+            assert!(
+                SettingsTabSlot::ALL.contains(&SettingsTabSlot::Tab(setting.tab)),
+                "{} has no tab in the strip",
+                setting.key
+            );
+        }
+        assert_eq!(
+            SettingsTabSlot::ALL
+                .iter()
+                .filter(|slot| **slot == SettingsTabSlot::Help)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn settings_search_matches_key_label_group_and_help() {
+        use super::settings_matches;
+
+        assert!(settings_matches(
+            "zoom_step",
+            "zoom_step",
+            "Zoom step",
+            "Zoom",
+            ""
+        ));
+        assert!(settings_matches(
+            "zoom step",
+            "zoom_step",
+            "Zoom step",
+            "Zoom",
+            ""
+        ));
+        assert!(settings_matches("manga wheel", "x", "x", "Manga wheel", ""));
+        assert!(settings_matches(
+            "glide",
+            "x",
+            "x",
+            "g",
+            "Lower = longer glide"
+        ));
+        assert!(!settings_matches("glide", "x", "x", "g", "unrelated"));
+    }
+
+    #[test]
+    fn settings_search_is_case_insensitive_and_ignores_blank_queries() {
+        use super::{settings_matches, settings_search_results};
+
+        assert!(settings_matches(
+            "ZOOM",
+            "zoom_step",
+            "Zoom step",
+            "Zoom",
+            ""
+        ));
+        assert!(settings_matches(
+            "ZoOm",
+            "zoom_step",
+            "Zoom step",
+            "Zoom",
+            ""
+        ));
+        assert!(!settings_matches(
+            "",
+            "zoom_step",
+            "Zoom step",
+            "Zoom",
+            "help"
+        ));
+        assert!(!settings_matches(
+            "   ",
+            "zoom_step",
+            "Zoom step",
+            "Zoom",
+            "help"
+        ));
+        assert!(settings_search_results("").is_empty());
+        assert!(settings_search_results("   ").is_empty());
+    }
+
+    #[test]
+    fn settings_search_results_are_registry_ordered_and_real() {
+        use super::{settings_registry, settings_search_results};
+
+        let ids = settings_search_results("zoom_step");
+        assert_eq!(
+            ids,
+            vec![settings_registry::setting_index_for_key("zoom_step").unwrap()]
+        );
+        let ids = settings_search_results("WHEEL");
+        assert!(!ids.is_empty());
+        assert!(ids.windows(2).all(|pair| pair[0] < pair[1]), "{ids:?}");
+        for id in ids {
+            assert_eq!(settings_registry::SETTINGS[id].id, id);
+        }
+        assert!(settings_search_results("zzz-no-such-setting").is_empty());
     }
 }
