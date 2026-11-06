@@ -13773,7 +13773,7 @@ impl ImageViewer {
         // Get screen size from monitor info if available
         #[cfg(target_os = "windows")]
         {
-            let primary_monitor = get_primary_monitor_size();
+            let primary_monitor = get_primary_monitor_size_points();
             viewer.screen_size = primary_monitor;
             viewer.last_known_monitor_size = primary_monitor;
         }
@@ -15341,6 +15341,46 @@ impl ImageViewer {
             .and_then(Self::valid_layout_bounds)
         {
             self.last_known_monitor_size = monitor;
+        }
+    }
+
+    /// Keep the floating window's title-bar buttons (menu/minimize/maximize/close) reachable.
+    ///
+    /// On a scaled display (125%/150%/200%) or after a monitor change the floating window can end
+    /// up wider than its monitor or hanging past its right edge, which hides the button cluster
+    /// and makes Close unclickable. Only the position is corrected, never the size, and only the
+    /// two edges the buttons live on are pulled back (top and right).
+    fn enforce_floating_window_buttons_on_display(&mut self, ctx: &egui::Context) {
+        if self.is_fullscreen
+            || self.is_resizing
+            || self.is_panning
+            || self.pending_window_resize.is_some()
+            || self.pending_media_layout
+            || self.floating_drag_start_outer_pos.is_some()
+            || !self.startup_window_shown
+            || self.current_window_is_maximized(ctx)
+        {
+            return;
+        }
+
+        let Some(outer) = ctx.input(|i| i.raw.viewport().outer_rect) else {
+            return;
+        };
+        let Some(work) = monitor_work_area_points_at(outer.center(), ctx.pixels_per_point()) else {
+            return;
+        };
+
+        let mut corrected = outer.min;
+        if corrected.y < work.min.y {
+            corrected.y = work.min.y;
+        }
+        let right = corrected.x + outer.width();
+        if right > work.max.x {
+            corrected.x = work.max.x - outer.width();
+        }
+
+        if (corrected - outer.min).length() > 0.5 {
+            self.send_outer_position(ctx, corrected);
         }
     }
 
@@ -24006,7 +24046,7 @@ impl ImageViewer {
         {
             // `viewport.monitor_size` can be undersized on some setups; use the primary
             // monitor dimensions as a safety floor so we don't trigger in-window zoom too early.
-            let primary_bounds = get_primary_monitor_size();
+            let primary_bounds = get_primary_monitor_size_points();
             monitor_bounds = Some(match monitor_bounds {
                 Some(bounds) => egui::vec2(
                     bounds.x.max(primary_bounds.x),
@@ -25260,20 +25300,10 @@ impl ImageViewer {
                             if let Some(path) = details_path {
                                 ui.add_space(8.0);
 
-                                // If there isn't enough remaining room, collapse the detailed description.
+                                // If there isn't enough remaining room, drop the detailed
+                                // description entirely (no "..." placeholder).
                                 // (Keep the buttons intact by design, and avoid wrapping the title bar.)
-                                let show_details = ui.available_width() >= 220.0;
-                                if !show_details {
-                                    let resp = ui.add(
-                                        egui::Label::new(
-                                            egui::RichText::new("...").color(egui::Color32::GRAY),
-                                        )
-                                        .selectable(true),
-                                    );
-                                    over_title_text |= resp.contains_pointer();
-                                    started_title_text_drag |=
-                                        resp.drag_started() || resp.dragged();
-                                } else {
+                                if ui.available_width() >= 220.0 {
                                     if let Some((w, h)) = self.media_display_dimensions() {
                                         let resp = ui.add(
                                             egui::Label::new(
@@ -28376,9 +28406,12 @@ impl ImageViewer {
                 animation_active = true;
             }
 
-            // Handle resize start (but not if over video controls)
+            // Handle resize start (but not if over video controls, and never from the
+            // title-bar button cluster: a resize moves/resizes the window under the cursor and
+            // swallows the button click, which made Close unreachable in floating mode).
             if primary_pressed
                 && hover_resize_direction != ResizeDirection::None
+                && !self.mouse_over_window_buttons
                 && !self.is_resizing
                 && !self.is_panning
             {
@@ -28877,6 +28910,10 @@ impl eframe::App for ImageViewer {
         // Manga mode uses this for layout/scroll math; if it drifts from `ctx.screen_rect()`,
         // you can get clamping oscillations and visible jitter.
         self.screen_size = ctx.screen_rect().size();
+
+        // Safety net for scaled displays and monitor changes: keep the floating window where
+        // its title-bar buttons stay clickable.
+        self.enforce_floating_window_buttons_on_display(ctx);
 
         // PERFORMANCE: Check if window is minimized to reduce resource usage
         let is_minimized = ctx.input(|i| i.raw.viewport().minimized.unwrap_or(false));
@@ -29590,6 +29627,94 @@ fn get_primary_monitor_size() -> egui::Vec2 {
     egui::Vec2::new(1920.0, 1080.0)
 }
 
+/// Windows reports monitor metrics and cursor positions in physical pixels, while every egui
+/// window coordinate is a logical point. Divide physical metrics by this factor before using
+/// them as window geometry, or the floating window ends up oversized on a 125%/150%/200%
+/// display and its title-bar buttons (including Close) land off screen.
+#[cfg(target_os = "windows")]
+fn system_dpi_scale_factor() -> f32 {
+    use winapi::um::wingdi::{GetDeviceCaps, LOGPIXELSY};
+    use winapi::um::winuser::{GetDC, ReleaseDC};
+
+    unsafe {
+        let hdc = GetDC(std::ptr::null_mut());
+        if hdc.is_null() {
+            return 1.0;
+        }
+        let dpi = GetDeviceCaps(hdc, LOGPIXELSY);
+        ReleaseDC(std::ptr::null_mut(), hdc);
+        if dpi > 0 {
+            (dpi as f32 / 96.0).clamp(0.5, 4.0)
+        } else {
+            1.0
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+#[allow(dead_code)]
+fn system_dpi_scale_factor() -> f32 {
+    1.0
+}
+
+/// Primary monitor size in egui logical points (the space window geometry uses).
+#[cfg(target_os = "windows")]
+fn get_primary_monitor_size_points() -> egui::Vec2 {
+    let scale = system_dpi_scale_factor();
+    let physical = get_primary_monitor_size();
+    egui::Vec2::new(physical.x / scale, physical.y / scale)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn get_primary_monitor_size_points() -> egui::Vec2 {
+    get_primary_monitor_size()
+}
+
+/// Work area (desktop minus taskbar) of the monitor containing `anchor`, in logical points.
+/// `anchor` is in egui viewport points and `scale` is `Context::pixels_per_point`.
+#[cfg(target_os = "windows")]
+fn monitor_work_area_points_at(anchor: egui::Pos2, scale: f32) -> Option<egui::Rect> {
+    use winapi::shared::windef::POINT;
+    use winapi::um::winuser::{
+        GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    };
+
+    let scale = if scale.is_finite() && scale > 0.01 {
+        scale
+    } else {
+        1.0
+    };
+
+    unsafe {
+        let point = POINT {
+            x: (anchor.x * scale).round() as i32,
+            y: (anchor.y * scale).round() as i32,
+        };
+        let monitor = MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST);
+        if monitor.is_null() {
+            return None;
+        }
+
+        let mut info: MONITORINFO = std::mem::zeroed();
+        info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(monitor, &mut info) == 0 {
+            return None;
+        }
+
+        let work = info.rcWork;
+        Some(egui::Rect::from_min_max(
+            egui::pos2(work.left as f32 / scale, work.top as f32 / scale),
+            egui::pos2(work.right as f32 / scale, work.bottom as f32 / scale),
+        ))
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+#[allow(dead_code)]
+fn monitor_work_area_points_at(_anchor: egui::Pos2, _scale: f32) -> Option<egui::Rect> {
+    None
+}
+
 #[cfg(target_os = "windows")]
 fn get_primary_monitor_refresh_hz() -> Option<f32> {
     use std::mem::{size_of, zeroed};
@@ -29780,7 +29905,10 @@ fn main() -> eframe::Result<()> {
 
     // Determine media type and calculate initial window size BEFORE creating the window.
     // This prevents the flash of a default-sized window.
-    let screen_size = get_primary_monitor_size();
+    // Logical points, matching `ViewportBuilder::with_inner_size`/`with_position`. Feeding
+    // physical pixels here oversizes the floating window on scaled displays, which pushes the
+    // title-bar window buttons (including Close) off screen.
+    let screen_size = get_primary_monitor_size_points();
 
     // For images, we can get dimensions immediately from the file header.
     // For videos, we start hidden and show once GStreamer decodes the first frame.
