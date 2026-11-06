@@ -12415,7 +12415,7 @@ impl ImageViewer {
             return false;
         }
 
-        let Some(display_size) = self.image_display_size_at_zoom() else {
+        let Some(display_size) = self.image_display_size_at(self.zoom_target) else {
             return false;
         };
 
@@ -15407,8 +15407,14 @@ impl ImageViewer {
         };
 
         let corrected = clamp_floating_window_pos(display, outer.size(), outer.min);
-        // Tolerance covers physical-pixel rounding of the logical position: without it the guard
-        // could re-send the same command every frame on a fractional DPI scale.
+        // Compare in whole physical pixels: a fractional scale otherwise leaves an unrepresentable
+        // position, so the same correction is re-sent every frame and the window vibrates.
+        let points_per_px = ctx.pixels_per_point().max(0.01);
+        let corrected = egui::pos2(
+            (corrected.x * points_per_px).round() / points_per_px,
+            (corrected.y * points_per_px).round() / points_per_px,
+        );
+        // Tolerance covers physical-pixel rounding of the logical position.
         if (corrected - outer.min).length() > 2.0 {
             self.send_outer_position(ctx, corrected);
         }
@@ -15967,19 +15973,23 @@ impl ImageViewer {
             return;
         }
 
-        let old_zoom = self.zoom;
+        // Accumulate on the target only: `tick_floating_zoom_animation` springs `zoom` toward it,
+        // so a notch eases in instead of jumping instantly.
+        let old_zoom = self.zoom_target;
         self.zoom_target = self.clamp_zoom(self.zoom_target * factor);
-        self.zoom = self.clamp_zoom(self.zoom * factor);
+        if self.config.zoom_animation_speed <= 0.0 {
+            // No animator will apply the target, so stay instant.
+            self.zoom = self.zoom_target;
+        }
 
         let has_offset = self.offset.length() > 0.1;
-        if old_zoom > 1.0 || self.zoom > 1.0 || has_offset {
+        if old_zoom > 1.0 || self.zoom_target > 1.0 || has_offset {
             let rect_center = screen_rect.center();
             let cursor_offset = pointer_pos - rect_center;
-            let zoom_ratio = self.zoom / old_zoom;
+            let zoom_ratio = self.zoom_target / old_zoom;
             self.offset = self.offset * zoom_ratio - cursor_offset * (zoom_ratio - 1.0);
         }
         self.zoom_velocity = 0.0;
-        self.maybe_refresh_current_solo_image_lod();
     }
 
     fn layout_mode_is_grid(layout_mode: MangaLayoutMode) -> bool {
@@ -23729,8 +23739,14 @@ impl ImageViewer {
     }
 
     fn image_display_size_at_zoom(&self) -> Option<egui::Vec2> {
+        self.image_display_size_at(self.zoom)
+    }
+
+    /// Media size at an arbitrary zoom: autosize asks for `zoom` (several steps of the spring, so the
+    /// window follows it) and the "zoom inside the window" lock asks for `zoom_target`.
+    fn image_display_size_at(&self, zoom: f32) -> Option<egui::Vec2> {
         let (img_w, img_h) = self.media_display_dimensions()?;
-        let base_size = egui::Vec2::new(img_w as f32 * self.zoom, img_h as f32 * self.zoom);
+        let base_size = egui::Vec2::new(img_w as f32 * zoom, img_h as f32 * zoom);
         let rotation_degrees = self.current_precise_rotation_angle_degrees();
         if rotation_degrees.abs() < 0.01 {
             Some(base_size)
@@ -24039,7 +24055,7 @@ impl ImageViewer {
             return;
         }
 
-        let Some(mut desired) = self.image_display_size_at_zoom() else {
+        let Some(mut desired) = self.image_display_size_at(self.zoom) else {
             return;
         };
 
@@ -24049,10 +24065,16 @@ impl ImageViewer {
         let (current_inner_rect, current_outer_rect) =
             ctx.input(|i| (i.raw.viewport().inner_rect, i.raw.viewport().outer_rect));
 
+        // "Zoom inside the window" is a question about what the wheel asked for, not about the size the
+        // spring happens to be passing, so the lock does not flap mid-animation.
+        let wanted_size = self
+            .image_display_size_at(self.zoom_target)
+            .unwrap_or(desired);
+
         // While the zoomed media already exceeds the current floating viewport, keep this
         // "zoom inside window" mode stable and do not autosize the native window.
         let zoom_inside_current_viewport = current_inner_rect
-            .map(|rect| desired.x > rect.width() + 1.0 || desired.y > rect.height() + 1.0)
+            .map(|rect| wanted_size.x > rect.width() + 1.0 || wanted_size.y > rect.height() + 1.0)
             .unwrap_or(false);
         if zoom_inside_current_viewport && self.floating_zoom_inside_window_locked {
             return;
@@ -24098,20 +24120,49 @@ impl ImageViewer {
             .unwrap_or(true);
 
         if should_send {
+            let mut outer_rect_target: Option<(egui::Pos2, egui::Vec2)> = None;
             if let (Some(inner_rect), Some(outer_rect)) = (current_inner_rect, current_outer_rect) {
                 // Keep the window center stable while changing inner size so zoom-resize
                 // expands/contracts from center instead of top-left.
                 let inner_to_outer_offset = inner_rect.min - outer_rect.min;
                 let target_inner_min = inner_rect.center() - desired * 0.5;
                 let target_outer_min = target_inner_min - inner_to_outer_offset;
-                let target_outer_min = clamp_outer_pos_on_display(
-                    ctx,
-                    None,
-                    target_outer_min,
-                    outer_rect.size() + (desired - inner_rect.size()),
-                );
-                self.send_outer_position(ctx, target_outer_min);
+                let new_outer_size = outer_rect.size() + (desired - inner_rect.size());
+                let target_outer_min =
+                    clamp_outer_pos_on_display(ctx, None, target_outer_min, new_outer_size);
+                outer_rect_target = Some((target_outer_min, new_outer_size));
             }
+
+            #[cfg(target_os = "windows")]
+            if let Some((pos, size)) = outer_rect_target {
+                let points_per_px = ctx.pixels_per_point().max(0.01);
+                let wanted_rect = outer_rect_physical(pos, size, points_per_px);
+                let current_rect = current_outer_rect
+                    .map(|rect| outer_rect_physical(rect.min, rect.size(), points_per_px));
+
+                // Sub-pixel zoom must not move the window at all: nothing to send while the rounded
+                // box is the box the window already has.
+                if current_rect == Some(wanted_rect) {
+                    return;
+                }
+
+                // One move+resize call. Windows applies OuterPosition and InnerSize in separate
+                // frames, which paints one frame at the new position with the old size.
+                if crate::windows_env::set_active_window_outer_rect(
+                    wanted_rect[0],
+                    wanted_rect[1],
+                    wanted_rect[2] - wanted_rect[0],
+                    wanted_rect[3] - wanted_rect[1],
+                ) {
+                    return;
+                }
+            }
+
+            #[cfg(not(target_os = "windows"))]
+            if let Some((pos, _)) = outer_rect_target {
+                self.send_outer_position(ctx, pos);
+            }
+
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(desired));
         }
     }
@@ -29771,6 +29822,19 @@ fn clamp_outer_pos_on_display(
     }
 }
 
+/// An outer window rect as whole physical pixels: one rounding per edge, a tie taken *outward* (left
+/// and top down, right and bottom up) so a tie leaves the box a pixel wider instead of shifting it.
+/// Rounding position and size separately is two roundings of one rect, and shifts the box half a pixel
+/// on the frames whose ideal size is odd.
+fn outer_rect_physical(pos: egui::Pos2, size: egui::Vec2, pixels_per_point: f32) -> [i32; 4] {
+    let left = (pos.x * pixels_per_point - 0.5).ceil();
+    let top = (pos.y * pixels_per_point - 0.5).ceil();
+    let right = ((pos.x + size.x) * pixels_per_point + 0.5).floor();
+    let bottom = ((pos.y + size.y) * pixels_per_point + 0.5).floor();
+
+    [left as i32, top as i32, right as i32, bottom as i32]
+}
+
 /// Wheel input normalized into device-independent "steps", where `1.0` is one physical
 /// mouse-wheel notch.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -29850,8 +29914,8 @@ fn wheel_steps_from_events(
 /// Zoom factor for a wheel delta expressed in [`WheelSteps`].
 ///
 /// Applying `zoom_step^steps` (instead of adding one step per frame the smoothed scroll delta is
-/// non-zero) makes a notch a fixed `zoom_step` on every refresh rate and keeps trackpad flicks
-/// proportional to how far the user actually scrolled.
+/// non-zero) makes a notch a fixed `zoom_step` on every refresh rate and keeps fractional
+/// (high-resolution wheel/trackpad) steps proportional to how far the user actually scrolled.
 fn zoom_factor_for_steps(zoom_step: f32, steps: f32) -> f32 {
     let step = zoom_step.max(1.0);
     if !steps.is_finite() || steps == 0.0 {
@@ -30408,6 +30472,70 @@ mod tests {
         assert!((super::zoom_factor_for_steps(step, -1.0) - 1.0 / step).abs() < 1e-6);
         assert!((super::zoom_factor_for_steps(step, 0.5) - step.sqrt()).abs() < 1e-6);
         assert_eq!(super::zoom_factor_for_steps(step, 0.0), 1.0);
+    }
+
+    #[test]
+    fn one_notch_in_and_one_notch_out_leave_the_zoom_where_it_was() {
+        let step = 1.10;
+        let zoom =
+            super::zoom_factor_for_steps(step, 1.0) * super::zoom_factor_for_steps(step, -1.0);
+
+        assert!((zoom - 1.0).abs() < 1e-4, "zoom came back as {zoom}");
+    }
+
+    #[test]
+    fn wheel_accumulates_on_the_asked_for_zoom_not_the_drawn_one() {
+        let step = 1.10;
+
+        // Four notches from a fast wheel: nothing drawn between them.
+        let mut fast = 1.0_f32;
+        for _ in 0..4 {
+            fast *= super::zoom_factor_for_steps(step, 1.0);
+        }
+
+        // Four notches from a slow wheel, with a drawn value lagging behind the target each time.
+        let mut slow_target = 1.0_f32;
+        let mut drawn = 1.0_f32;
+        for _ in 0..4 {
+            slow_target *= super::zoom_factor_for_steps(step, 1.0);
+            drawn += (slow_target - drawn) * 0.3;
+        }
+
+        assert!((fast - slow_target).abs() < 1e-4, "{fast} vs {slow_target}");
+        assert!((fast - step.powf(4.0)).abs() < 1e-4);
+        // The lagging drawn value is behind the target mid-travel and catches it up afterwards.
+        assert!(drawn < slow_target);
+    }
+
+    #[test]
+    fn outer_rect_rounds_each_edge_once_and_takes_a_tie_outward() {
+        // 1.0 ppp: the whole rect is its own edges, ties (the .5) widen the box a pixel.
+        assert_eq!(
+            super::outer_rect_physical(egui::pos2(10.5, 20.5), egui::vec2(100.0, 50.0), 1.0),
+            [10, 20, 111, 71]
+        );
+
+        // 1.5 ppp: the box is 150x75 physical pixels, placed at the rounded edges.
+        assert_eq!(
+            super::outer_rect_physical(egui::pos2(10.0, 20.0), egui::vec2(100.0, 50.0), 1.5),
+            [15, 30, 165, 105]
+        );
+    }
+
+    #[test]
+    fn sub_pixel_zoom_does_not_move_the_window() {
+        // A quarter of a pixel of growth at 1.5 ppp rounds to the rect the window already has, which
+        // is what keeps a spring from issuing a SetWindowPos per frame on a sub-pixel travel.
+        let pos = egui::pos2(100.0, 100.0);
+        let before = super::outer_rect_physical(pos, egui::vec2(200.0, 100.0), 1.5);
+        let after = super::outer_rect_physical(pos, egui::vec2(200.15, 100.1), 1.5);
+
+        assert_eq!(before, after);
+        // ... and a whole pixel of growth does move it.
+        assert_ne!(
+            before,
+            super::outer_rect_physical(pos, egui::vec2(201.0, 101.0), 1.5)
+        );
     }
 
     #[test]

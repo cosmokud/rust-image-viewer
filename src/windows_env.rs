@@ -241,6 +241,50 @@ pub fn set_active_window_maximized(maximize: bool) -> bool {
     true
 }
 
+/// Move and resize the window in one call.
+///
+/// Separate `OuterPosition`/`InnerSize` viewport commands are applied in different frames, so one
+/// frame paints the new position with the old size - a jump of half the size delta, then a jump
+/// back. `SetWindowPos` moves and resizes atomically, so no intermediate rect is ever painted.
+///
+/// Returns false when the window handle cannot be resolved, so callers can fall back.
+pub fn set_active_window_outer_rect(x: i32, y: i32, width: i32, height: i32) -> bool {
+    use winapi::um::processthreadsapi::GetCurrentProcessId;
+    use winapi::um::winuser::{
+        GetWindowThreadProcessId, IsWindow, SetWindowPos, SWP_NOACTIVATE, SWP_NOOWNERZORDER,
+        SWP_NOZORDER,
+    };
+
+    let hwnd = active_or_foreground_window();
+    if hwnd.is_null() {
+        return false;
+    }
+
+    unsafe {
+        if IsWindow(hwnd) == 0 {
+            return false;
+        }
+
+        // The foreground fallback can resolve to another process's window when this app is not
+        // focused; moving that window would be a visible bug.
+        let mut owner_pid = 0u32;
+        GetWindowThreadProcessId(hwnd, &mut owner_pid);
+        if owner_pid != GetCurrentProcessId() {
+            return false;
+        }
+
+        SetWindowPos(
+            hwnd,
+            std::ptr::null_mut(),
+            x,
+            y,
+            width,
+            height,
+            SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+        ) != 0
+    }
+}
+
 /// Refreshes the process `PATH` from the registry (HKLM + HKCU), merging with the current
 /// process PATH. This makes DLL/plugin discovery resilient when the process is launched from
 /// a parent process with a stale/sanitized environment (e.g., some browsers).
