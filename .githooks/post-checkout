@@ -18,6 +18,25 @@
 
 set -eu
 
+root=$(git rev-parse --show-toplevel) || exit 0
+root=$(printf '%s' "$root" | tr '\\' '/')
+
+# The release profile is machine-local for the same reason the target dir is: what ships is
+# not built on a workstation, and a workstation should not pay for it on every edit. `thin`
+# is a rebuild in 35s instead of 2m06s, because fat LTO merges all 427 crates into one module
+# and optimizes it on one thread (117s of that build). The committed Cargo.toml keeps
+# `lto = true`, and a CI runner has no `riv.releaseLto` and so no such file, so the binary it
+# builds is unchanged. Unset, or `fat`, removes the file and restores the shipping profile.
+mkdir -p "$root/.cargo"
+case "$(git config --get riv.releaseLto || true)" in
+  thin)
+    printf '# Written by .githooks/post-checkout from `git config riv.releaseLto`. Machine-local, never committed.\n[profile.release]\nlto = "thin"\n' > "$root/.cargo/release-profile.local.toml"
+    ;;
+  *)
+    rm -f "$root/.cargo/release-profile.local.toml"
+    ;;
+esac
+
 target=$(git config --get riv.targetDir) || exit 0
 [ -n "$target" ] || exit 0
 

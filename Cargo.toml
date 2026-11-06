@@ -131,6 +131,10 @@ lto = true
 # codegen-units = 1 the pre-LTO LLVM pass is 90s of a 162s rustc; at 16 it is 8s of 130s,
 # and the rest is LLVM_fatlto (117s, one thread) plus 0.3s of linking. It also applies to
 # every dependency, where 1 turned 427 parallel compilations into 427 serial ones.
+#
+# This is the profile CI ships. A workstation gets a 35s rebuild instead of 2m06s from
+# `git config riv.releaseLto thin`, which writes the machine-local lto = "thin" that
+# .cargo/config.toml includes; nothing about that file reaches a clone or a runner.
 codegen-units = 16
 panic = "abort"
 strip = true

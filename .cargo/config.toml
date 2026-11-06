@@ -1,4 +1,7 @@
-include = [{ path = "target-dir.local.toml", optional = true }]
+include = [
+    { path = "target-dir.local.toml", optional = true },
+    { path = "release-profile.local.toml", optional = true },
+]
 
 [target.x86_64-pc-windows-msvc]
 linker = "rust-lld.exe"
