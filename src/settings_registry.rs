@@ -2334,6 +2334,21 @@ pub fn set(config: &mut Config, id: usize, value: &SettingValue) -> Result<(), S
     let Some(setting) = SETTINGS.get(id) else {
         return Err(format!("unknown setting id {id}"));
     };
+    // Slider drags produce full f64 precision (`29.915012`); snap to the precision the UI
+    // displays so `config.ini` and the numeric box never show noise digits.
+    let quantized;
+    let value = match (&setting.kind, value) {
+        (SettingKind::Int { .. }, SettingValue::Num(raw)) => {
+            quantized = SettingValue::Num(raw.round());
+            &quantized
+        }
+        (SettingKind::Float { decimals, .. }, SettingValue::Num(raw)) => {
+            let factor = 10f64.powi(*decimals as i32);
+            quantized = SettingValue::Num((raw * factor).round() / factor);
+            &quantized
+        }
+        _ => value,
+    };
     set_value(config, setting, value).map_err(|err| format!("{}: {err}", setting.key))?;
     enforce_cross_guards(config, setting.key);
     Ok(())

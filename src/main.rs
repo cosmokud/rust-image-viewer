@@ -12004,7 +12004,13 @@ impl ImageViewer {
     }
 
     fn draw_shortcuts_help_row(ui: &mut egui::Ui, trigger: &str, title: &str, detail: &str) {
-        ui.horizontal(|ui| {
+        // Inside `ui.horizontal` labels never wrap on their own, and a long binding CSV used to
+        // stretch the whole dialog (thousands of pixels wide once the preset column took its
+        // share). Bound both columns explicitly and wrap the text.
+        let total_width = ui.available_width();
+        let trigger_width = 248.0_f32.min((total_width * 0.42).max(120.0));
+        let text_width = (total_width - trigger_width - 10.0).max(160.0);
+        ui.horizontal_top(|ui| {
             egui::Frame::none()
                 .fill(egui::Color32::from_rgba_unmultiplied(62, 138, 222, 28))
                 .stroke(egui::Stroke::new(
@@ -12014,30 +12020,45 @@ impl ImageViewer {
                 .rounding(8.0)
                 .inner_margin(egui::Margin::symmetric(10.0, 7.0))
                 .show(ui, |ui| {
-                    ui.set_min_width(248.0);
-                    ui.label(
-                        egui::RichText::new(trigger)
-                            .monospace()
-                            .color(egui::Color32::from_rgb(208, 228, 252))
-                            .size(12.5),
+                    ui.set_min_width(trigger_width - 20.0);
+                    ui.set_max_width(trigger_width - 20.0);
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(trigger)
+                                .monospace()
+                                .color(egui::Color32::from_rgb(208, 228, 252))
+                                .size(12.5),
+                        )
+                        .wrap(),
                     );
                 });
 
             ui.add_space(10.0);
 
-            ui.vertical(|ui| {
-                ui.label(
-                    egui::RichText::new(title)
-                        .color(egui::Color32::WHITE)
-                        .strong()
-                        .size(13.5),
-                );
-                ui.label(
-                    egui::RichText::new(detail)
-                        .color(egui::Color32::from_rgb(178, 191, 205))
-                        .size(12.0),
-                );
-            });
+            ui.allocate_ui_with_layout(
+                egui::vec2(text_width, 0.0),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    ui.set_max_width(text_width);
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(title)
+                                .color(egui::Color32::WHITE)
+                                .strong()
+                                .size(13.5),
+                        )
+                        .wrap(),
+                    );
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(detail)
+                                .color(egui::Color32::from_rgb(178, 191, 205))
+                                .size(12.0),
+                        )
+                        .wrap(),
+                    );
+                },
+            );
         });
         ui.add_space(7.0);
     }
@@ -13608,7 +13629,9 @@ impl ImageViewer {
             (screen_rect.height() - 44.0).clamp(440.0, 780.0),
         );
         let modal_pos = screen_rect.center() - modal_size * 0.5;
-        let body_height = (modal_size.y - 152.0).max(220.0);
+        // 212 = measured chrome (18 margin * 2 + 72 header + tab strip + separators + 24 status).
+        // The old 152 let the frame grow ~59 px past `modal_size.y` on short windows.
+        let body_height = (modal_size.y - 212.0).max(200.0);
         let config_path_label = Config::config_path().display().to_string();
         let modified = self.selected_preset_modified();
 
@@ -13617,6 +13640,10 @@ impl ImageViewer {
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
                 ui.set_min_size(modal_size);
+                // An `Area` is unbounded: without a max width every `available_width()` inside
+                // it (header split, body columns) collapses to the whole desktop and the modal
+                // draws thousands of pixels wide.
+                ui.set_max_width(modal_size.x);
                 egui::Frame::none()
                     .fill(egui::Color32::from_rgba_unmultiplied(16, 23, 31, 252))
                     .stroke(egui::Stroke::new(
