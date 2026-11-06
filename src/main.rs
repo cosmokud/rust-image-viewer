@@ -13,8 +13,8 @@ mod manga_loader;
 mod manga_spatial;
 mod media_index;
 mod metadata_cache;
-mod motion_presets;
 mod perf_metrics;
+mod settings_registry;
 #[cfg(target_os = "windows")]
 mod single_instance;
 mod video_player;
@@ -585,9 +585,9 @@ struct MotionSettingsModal {
     skip_outside_click_once: bool,
     /// Preset marked in the list; Load/Overwrite/Rename/Delete act on it.
     selected: Option<String>,
-    presets: Vec<motion_presets::PresetEntry>,
+    presets: Vec<settings_registry::PresetEntry>,
     /// Mirror of the live config values owned by the slider/drag-value widgets.
-    values: [f64; motion_presets::SETTINGS.len()],
+    values: [f64; settings_registry::SETTINGS.len()],
     new_name: String,
     /// `(old_name, draft_name)` while an inline rename is pending.
     rename: Option<(String, String)>,
@@ -606,7 +606,7 @@ impl Default for MotionSettingsModal {
             skip_outside_click_once: false,
             selected: None,
             presets: Vec::new(),
-            values: [0.0; motion_presets::SETTINGS.len()],
+            values: [0.0; settings_registry::SETTINGS.len()],
             new_name: String::new(),
             rename: None,
             pending_delete: None,
@@ -2902,7 +2902,7 @@ impl Default for ImageViewer {
     fn default() -> Self {
         let config = Config::load();
         // Built-ins are regenerated whenever their bytes drift from the embedded template.
-        let _ = motion_presets::ensure_builtin_presets();
+        let _ = settings_registry::ensure_builtin_presets();
 
         // Apply the decoder-rank preferences BEFORE anything can call gst::init().
         // GST_PLUGIN_FEATURE_RANK is only read while GStreamer initializes, so applying
@@ -12464,10 +12464,11 @@ impl ImageViewer {
         }
     }
 
-    fn motion_values_from_config(config: &Config) -> [f64; motion_presets::SETTINGS.len()] {
-        let mut values = [0.0; motion_presets::SETTINGS.len()];
-        for (id, value) in motion_presets::capture(config) {
-            values[id] = value;
+    /// Numeric mirror of every registry entry for the modal's sliders.
+    fn motion_values_from_config(config: &Config) -> [f64; settings_registry::SETTINGS.len()] {
+        let mut values = [0.0; settings_registry::SETTINGS.len()];
+        for setting in settings_registry::SETTINGS {
+            values[setting.id] = settings_registry::get_num(config, setting.id);
         }
         values
     }
@@ -12493,8 +12494,8 @@ impl ImageViewer {
     }
 
     fn refresh_motion_presets(&mut self) {
-        let _ = motion_presets::ensure_builtin_presets();
-        self.motion_settings.presets = motion_presets::list_presets();
+        let _ = settings_registry::ensure_builtin_presets();
+        self.motion_settings.presets = settings_registry::list_presets();
     }
 
     fn set_motion_status(&mut self, message: String, is_error: bool) {
@@ -12529,34 +12530,47 @@ impl ImageViewer {
                 else {
                     return;
                 };
-                match motion_presets::load_preset_values(&path) {
-                    Ok(values) => {
-                        let missing = motion_presets::SETTINGS.len().saturating_sub(values.len());
-                        motion_presets::apply_values(&mut self.config, &values);
-                        self.motion_settings.values = Self::motion_values_from_config(&self.config);
-                        self.motion_settings.selected = Some(name.clone());
-                        self.config.save();
-                        self.motion_settings.save_due_at = None;
-                        if missing > 0 {
-                            self.set_motion_status(
-                                format!(
-                                    "Loaded '{name}' ({missing} key(s) missing, those left unchanged)."
-                                ),
-                                true,
-                            );
-                        } else {
-                            self.set_motion_status(format!("Loaded preset '{name}'."), false);
-                        }
+                let content = match std::fs::read_to_string(&path) {
+                    Ok(content) => content,
+                    Err(err) => {
+                        self.set_motion_status(
+                            format!("Could not load '{}': {err}", path.display()),
+                            true,
+                        );
+                        return;
                     }
-                    Err(err) => self.set_motion_status(
-                        format!("Could not load '{}': {err}", path.display()),
+                };
+                let (values, mut warnings) = settings_registry::parse_preset(&content);
+                warnings.extend(settings_registry::apply_values(&mut self.config, &values));
+                // `masonry_items_per_row` also owns an app-side setter (layout cache invalidation).
+                let needs_setter = values.iter().any(|(id, _)| {
+                    settings_registry::SETTINGS
+                        .get(*id)
+                        .is_some_and(|setting| settings_registry::needs_app_setter(setting.key))
+                });
+                if needs_setter {
+                    self.set_masonry_items_per_row(self.config.masonry_items_per_row);
+                }
+                self.motion_settings.values = Self::motion_values_from_config(&self.config);
+                self.motion_settings.selected = Some(name.clone());
+                self.config.save();
+                self.motion_settings.save_due_at = None;
+                if warnings.is_empty() {
+                    self.set_motion_status(format!("Loaded preset '{name}'."), false);
+                } else {
+                    self.set_motion_status(
+                        format!(
+                            "Loaded '{name}' with {} warning(s): {}",
+                            warnings.len(),
+                            warnings.join("; ")
+                        ),
                         true,
-                    ),
+                    );
                 }
             }
             MotionPresetAction::Overwrite(name) => {
-                let values = motion_presets::capture(&self.config);
-                match motion_presets::save_preset(&name, &values) {
+                let values = settings_registry::capture(&self.config);
+                match settings_registry::save_preset(&name, &values) {
                     Ok(path) => {
                         self.refresh_motion_presets();
                         self.set_motion_status(format!("Saved '{}'.", path.display()), false);
@@ -12571,13 +12585,13 @@ impl ImageViewer {
                 self.motion_settings.rename = Some((name.clone(), name));
             }
             MotionPresetAction::Rename(old, new) => {
-                match motion_presets::sanitize_preset_name(&new) {
+                match settings_registry::sanitize_preset_name(&new) {
                     Ok(clean) => {
                         self.motion_settings.rename = None;
                         if clean == old {
                             return;
                         }
-                        match motion_presets::rename_preset(&old, &clean) {
+                        match settings_registry::rename_preset(&old, &clean) {
                             Ok(()) => {
                                 self.motion_settings.selected = Some(clean.clone());
                                 self.refresh_motion_presets();
@@ -12597,7 +12611,7 @@ impl ImageViewer {
             MotionPresetAction::CancelRename => self.motion_settings.rename = None,
             MotionPresetAction::ConfirmDelete(name) => {
                 self.motion_settings.pending_delete = None;
-                match motion_presets::delete_preset(&name) {
+                match settings_registry::delete_preset(&name) {
                     Ok(()) => {
                         if self.motion_settings.selected.as_deref() == Some(name.as_str()) {
                             self.motion_settings.selected = self
@@ -12616,9 +12630,9 @@ impl ImageViewer {
             MotionPresetAction::CancelDelete => self.motion_settings.pending_delete = None,
             MotionPresetAction::Create => {
                 let raw = self.motion_settings.new_name.clone();
-                match motion_presets::sanitize_preset_name(&raw) {
+                match settings_registry::sanitize_preset_name(&raw) {
                     Ok(name) => {
-                        if motion_presets::presets_dir()
+                        if settings_registry::presets_dir()
                             .join(format!("{name}.ini"))
                             .exists()
                         {
@@ -12630,8 +12644,8 @@ impl ImageViewer {
                             );
                             return;
                         }
-                        let values = motion_presets::capture(&self.config);
-                        match motion_presets::save_preset(&name, &values) {
+                        let values = settings_registry::capture(&self.config);
+                        match settings_registry::save_preset(&name, &values) {
                             Ok(path) => {
                                 self.motion_settings.new_name.clear();
                                 self.motion_settings.selected = Some(name);
@@ -12683,7 +12697,7 @@ impl ImageViewer {
             (screen_rect.height() - 44.0).clamp(480.0, 820.0),
         );
         let modal_pos = screen_rect.center() - modal_size * 0.5;
-        let presets_dir_label = motion_presets::presets_dir().display().to_string();
+        let presets_dir_label = settings_registry::presets_dir().display().to_string();
         let body_height = (modal_size.y - 214.0).max(240.0);
         // Explicit widths: the nested layouts' available_width is not the column width here.
         let right_column_width = (modal_size.x - 250.0 - 64.0).max(360.0);
@@ -12765,7 +12779,7 @@ impl ImageViewer {
                             let presets = self.motion_settings.presets.clone();
                             let selected = self.motion_settings.selected.clone();
                             let selected_is_builtin =
-                                selected.as_deref().is_some_and(motion_presets::is_builtin);
+                                selected.as_deref().is_some_and(settings_registry::is_builtin);
                             let has_selection = selected.is_some();
 
                             ui.horizontal_top(|ui| {
@@ -12978,7 +12992,30 @@ impl ImageViewer {
                                             .show(ui, |ui| {
                                                 ui.set_min_width(ui.available_width());
                                                 let mut current_group: Option<&str> = None;
-                                                for setting in motion_presets::SETTINGS.iter() {
+                                                // Interim content: the modal still shows only the
+                                                // zoom/motion/autoscroll tabs' numeric rows.
+                                                for setting in settings_registry::SETTINGS.iter().filter(
+                                                    |setting| {
+                                                        matches!(
+                                                            setting.tab,
+                                                            settings_registry::SettingsTab::ZoomScroll
+                                                                | settings_registry::SettingsTab::Motion
+                                                                | settings_registry::SettingsTab::Autoscroll
+                                                        )
+                                                    },
+                                                ) {
+                                                    let (min, max, decimals) = match setting.kind {
+                                                        settings_registry::SettingKind::Int {
+                                                            min,
+                                                            max,
+                                                        } => (min as f64, max as f64, 0),
+                                                        settings_registry::SettingKind::Float {
+                                                            min,
+                                                            max,
+                                                            decimals,
+                                                        } => (min, max, decimals),
+                                                        _ => continue,
+                                                    };
                                                     if current_group != Some(setting.group) {
                                                         if current_group.is_some() {
                                                             ui.add_space(10.0);
@@ -13008,14 +13045,24 @@ impl ImageViewer {
                                                             )
                                                             .truncate(),
                                                         );
-                                                        label.on_hover_text(format!(
-                                                            "{}\nkey: {}",
-                                                            setting.help, setting.key
-                                                        ));
-                                                        let step = if setting.decimals == 0 {
+                                                        label.on_hover_text({
+                                                            let hint = setting.status_hint();
+                                                            if hint.is_empty() {
+                                                                format!(
+                                                                    "{}\nkey: {}",
+                                                                    setting.help, setting.key
+                                                                )
+                                                            } else {
+                                                                format!(
+                                                                    "{}\nkey: {}\n{}",
+                                                                    setting.help, setting.key, hint
+                                                                )
+                                                            }
+                                                        });
+                                                        let step = if decimals == 0 {
                                                             1.0
                                                         } else {
-                                                            10f64.powi(-(setting.decimals as i32))
+                                                            10f64.powi(-(decimals as i32))
                                                         };
                                                         let before =
                                                             self.motion_settings.values[index];
@@ -13023,10 +13070,10 @@ impl ImageViewer {
                                                             egui::Slider::new(
                                                                 &mut self.motion_settings.values
                                                                     [index],
-                                                                setting.min..=setting.max,
+                                                                min..=max,
                                                             )
                                                             .show_value(false)
-                                                            .fixed_decimals(setting.decimals),
+                                                            .fixed_decimals(decimals),
                                                         );
                                                         ui.add_space(4.0);
                                                         let drag_response = ui.add_sized(
@@ -13035,9 +13082,9 @@ impl ImageViewer {
                                                                 &mut self.motion_settings.values
                                                                     [index],
                                                             )
-                                                            .range(setting.min..=setting.max)
+                                                            .range(min..=max)
                                                             .speed(step)
-                                                            .fixed_decimals(setting.decimals),
+                                                            .fixed_decimals(decimals),
                                                         );
                                                         let changed = slider_response.changed()
                                                             || drag_response.changed();
@@ -13060,18 +13107,17 @@ impl ImageViewer {
                                                                 .motion_settings
                                                                 .values[index];
                                                             if requested != before {
-                                                                motion_presets::set(
+                                                                let _ = settings_registry::set_num(
                                                                     &mut self.config,
                                                                     index,
                                                                     requested,
                                                                 );
-                                                                for (id, value) in
-                                                                    motion_presets::capture(
-                                                                        &self.config,
-                                                                    )
-                                                                {
-                                                                    self.motion_settings
-                                                                        .values[id] = value;
+                                                                for setting in settings_registry::SETTINGS {
+                                                                    self.motion_settings.values[setting.id] =
+                                                                        settings_registry::get_num(
+                                                                            &self.config,
+                                                                            setting.id,
+                                                                        );
                                                                 }
                                                             }
                                                         }

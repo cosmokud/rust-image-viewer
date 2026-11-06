@@ -965,7 +965,7 @@ impl Config {
         }
     }
 
-    fn replace_action_bindings(&mut self, action: Action, bindings: &[InputBinding]) {
+    pub(crate) fn replace_action_bindings(&mut self, action: Action, bindings: &[InputBinding]) {
         let mut unique_bindings = Vec::with_capacity(bindings.len());
         for binding in bindings {
             if !unique_bindings.contains(binding) {
@@ -2550,7 +2550,7 @@ impl Config {
         values
     }
 
-    fn action_bindings_csv(&self, action: Action) -> String {
+    pub(crate) fn action_bindings_csv(&self, action: Action) -> String {
         self.action_bindings
             .get(&action)
             .map(|bindings| {
@@ -2594,7 +2594,7 @@ impl Config {
     }
 }
 
-fn parse_binding_list(value: &str) -> Vec<InputBinding> {
+pub(crate) fn parse_binding_list(value: &str) -> Vec<InputBinding> {
     let mut bindings = Vec::new();
 
     for binding_str in value.split(',') {
@@ -2610,7 +2610,7 @@ fn parse_binding_list(value: &str) -> Vec<InputBinding> {
 }
 
 /// Convert InputBinding back to string representation
-fn binding_to_string(binding: &InputBinding) -> String {
+pub(crate) fn binding_to_string(binding: &InputBinding) -> String {
     match binding {
         InputBinding::Key(key) => key_to_string(key),
         InputBinding::MouseLeft => "mouse_left".to_string(),
@@ -2630,24 +2630,24 @@ fn binding_to_string(binding: &InputBinding) -> String {
     }
 }
 
-fn optional_binding_to_string(binding: Option<&InputBinding>) -> String {
+pub(crate) fn optional_binding_to_string(binding: Option<&InputBinding>) -> String {
     binding
         .map(binding_to_string)
         .unwrap_or_else(|| "none".to_string())
 }
 
-fn optional_mark_key_to_string(key: Option<&egui::Key>) -> String {
+pub(crate) fn optional_mark_key_to_string(key: Option<&egui::Key>) -> String {
     key.map(key_to_string).unwrap_or_else(|| "none".to_string())
 }
 
-fn optional_shortcut_modifier_to_string(modifier: Option<&ShortcutModifier>) -> String {
+pub(crate) fn optional_shortcut_modifier_to_string(modifier: Option<&ShortcutModifier>) -> String {
     modifier
         .map(ShortcutModifier::as_str)
         .unwrap_or("none")
         .to_string()
 }
 
-fn key_to_string(key: &egui::Key) -> String {
+pub(crate) fn key_to_string(key: &egui::Key) -> String {
     format!("{:?}", key).to_lowercase()
 }
 
@@ -2721,7 +2721,7 @@ fn format_with_optional_trailing_zero_f64(value: f64) -> String {
     value_str
 }
 
-fn parse_bool(value: &str) -> Option<bool> {
+pub(crate) fn parse_bool(value: &str) -> Option<bool> {
     match value.trim().to_lowercase().as_str() {
         "1" | "true" | "yes" | "y" | "on" => Some(true),
         "0" | "false" | "no" | "n" | "off" => Some(false),
@@ -2729,7 +2729,7 @@ fn parse_bool(value: &str) -> Option<bool> {
     }
 }
 
-fn parse_optional_binding(value: &str) -> Option<Option<InputBinding>> {
+pub(crate) fn parse_optional_binding(value: &str) -> Option<Option<InputBinding>> {
     let value = value.trim();
     if value.eq_ignore_ascii_case("none")
         || value.eq_ignore_ascii_case("off")
@@ -2741,7 +2741,7 @@ fn parse_optional_binding(value: &str) -> Option<Option<InputBinding>> {
     parse_input_binding(value).map(Some)
 }
 
-fn parse_optional_mark_key(value: &str) -> Option<Option<egui::Key>> {
+pub(crate) fn parse_optional_mark_key(value: &str) -> Option<Option<egui::Key>> {
     let value = value.trim();
     if value.eq_ignore_ascii_case("none")
         || value.eq_ignore_ascii_case("off")
@@ -2753,7 +2753,7 @@ fn parse_optional_mark_key(value: &str) -> Option<Option<egui::Key>> {
     parse_key(value).map(Some)
 }
 
-fn parse_optional_shortcut_modifier(value: &str) -> Option<Option<ShortcutModifier>> {
+pub(crate) fn parse_optional_shortcut_modifier(value: &str) -> Option<Option<ShortcutModifier>> {
     let value = value.trim();
     if value.eq_ignore_ascii_case("none")
         || value.eq_ignore_ascii_case("off")
@@ -2765,7 +2765,7 @@ fn parse_optional_shortcut_modifier(value: &str) -> Option<Option<ShortcutModifi
     ShortcutModifier::from_str(value).map(Some)
 }
 
-fn parse_rgb_triplet(value: &str) -> Option<[u8; 3]> {
+pub(crate) fn parse_rgb_triplet(value: &str) -> Option<[u8; 3]> {
     let parts: Vec<&str> = value
         .split(',')
         .map(|p| p.trim())
