@@ -657,17 +657,52 @@ fn settings_search_results(query: &str) -> Vec<usize> {
         .collect()
 }
 
-/// Inner size used the first time the settings window opens.
-const SETTINGS_WINDOW_DEFAULT_SIZE: egui::Vec2 = egui::vec2(980.0, 800.0);
+/// Smallest inner size the settings window takes on a small screen.
+const SETTINGS_WINDOW_MIN_SIZE: egui::Vec2 = egui::vec2(560.0, 400.0);
+/// Fraction of the monitor work area the settings window occupies when it opens.
+const SETTINGS_WINDOW_SCREEN_FRACTION: f32 = 0.5;
+/// Frames the dialog re-asserts its centered geometry while the native window settles.
+const SETTINGS_WINDOW_PLACE_FRAMES: u8 = 3;
 
+/// Monitor work area (egui points) hosting the viewer. The dialog centers on it and takes
+/// half of it, so the geometry follows the actual screen instead of a hard-coded size.
+fn settings_screen_rect(ctx: &egui::Context) -> egui::Rect {
+    let scale = ctx.pixels_per_point();
+    let anchor = ctx
+        .input(|input| input.viewport().outer_rect.map(|rect| rect.center()))
+        .unwrap_or_else(|| egui::pos2(0.0, 0.0));
+    if let Some(work_area) = monitor_work_area_points_at(anchor, scale) {
+        return work_area;
+    }
+    let size = ctx
+        .input(|input| input.viewport().monitor_size)
+        .unwrap_or(egui::vec2(1920.0, 1080.0));
+    egui::Rect::from_min_size(egui::Pos2::ZERO, size)
+}
+
+/// Half the screen, clamped so the dialog never shrinks below its layout minimum or grows
+/// past the monitor.
+fn settings_window_size(screen: egui::Rect) -> egui::Vec2 {
+    let half = screen.size() * SETTINGS_WINDOW_SCREEN_FRACTION;
+    egui::vec2(
+        half.x.clamp(
+            SETTINGS_WINDOW_MIN_SIZE.x.min(screen.width()),
+            screen.width(),
+        ),
+        half.y.clamp(
+            SETTINGS_WINDOW_MIN_SIZE.y.min(screen.height()),
+            screen.height(),
+        ),
+    )
+}
 /// State for the tabbed Settings modal: every registry setting, presets and the help page.
 struct SettingsModal {
     open: bool,
-    /// Inner size remembered between opens, so a resized dialog reopens at the same size.
-    window_size: Option<egui::Vec2>,
-    /// Size the live dialog window was created with. Frozen while it is open: feeding the live
-    /// size back into the viewport builder would fight the user resizing the window.
-    open_size: egui::Vec2,
+    /// Monitor work area (egui points) captured when the dialog opened. The 50%-of-screen
+    /// size and the centering both derive from it, so the live window cannot jump.
+    screen: Option<egui::Rect>,
+    /// Frames left to re-assert size and position right after the native window appears.
+    place_frames: u8,
     tab: SettingsTabSlot,
     search: String,
     /// Set by Ctrl+F; consumed by the search field when it is drawn.
@@ -696,8 +731,8 @@ impl Default for SettingsModal {
     fn default() -> Self {
         Self {
             open: false,
-            window_size: None,
-            open_size: SETTINGS_WINDOW_DEFAULT_SIZE,
+            screen: None,
+            place_frames: 0,
             tab: SettingsTabSlot::Tab(settings_registry::SettingsTab::General),
             search: String::new(),
             focus_search: false,
@@ -5227,7 +5262,8 @@ impl ImageViewer {
         !self.marked_files.is_empty()
     }
 
-    /// True while the settings dialog that swallows viewer input is open.
+    /// True while the settings window is open. The window is detached from the viewer, so this
+    /// only reports its lifetime: it never gates viewer input.
     fn settings_modal_open(&self) -> bool {
         self.settings.open
     }
@@ -5237,7 +5273,6 @@ impl ImageViewer {
             || self.pending_single_delete_target.is_some()
             || !self.pending_marked_delete_targets.is_empty()
             || self.pending_exit_confirmation
-            || self.settings_modal_open()
     }
 
     fn request_app_exit(&mut self) {
@@ -12445,10 +12480,10 @@ impl ImageViewer {
 
     fn open_settings_modal(&mut self, tab: SettingsTabSlot) {
         self.settings.open = true;
-        self.settings.open_size = self
-            .settings
-            .window_size
-            .unwrap_or(SETTINGS_WINDOW_DEFAULT_SIZE);
+        // Geometry is recomputed from the screen on every open: the dialog always comes back
+        // centered at 50% of the screen, never at the size of the last manual resize.
+        self.settings.screen = None;
+        self.settings.place_frames = SETTINGS_WINDOW_PLACE_FRAMES;
         self.settings.tab = tab;
         self.settings.search.clear();
         self.settings.focus_search = false;
@@ -13558,7 +13593,7 @@ impl ImageViewer {
     }
 
     fn draw_settings_modal(&mut self, ctx: &egui::Context) {
-        if !self.settings.open {
+        if !self.settings_modal_open() {
             return;
         }
 
@@ -13573,25 +13608,43 @@ impl ImageViewer {
         let config_path_label = Config::config_path().display().to_string();
         let modified = self.selected_preset_modified();
 
-        // The dialog lives in its own native window (an immediate child viewport). A separate
-        // window cannot be clipped by a tiny viewer window the way the old same-window `Area`
-        // could, which is the whole point of the split.
+        // The dialog lives in its own top-level native window: it is not clipped by a tiny
+        // viewer window, owns its own taskbar entry, and never takes input away from the viewer.
+        let screen = match self.settings.screen {
+            Some(screen) => screen,
+            None => {
+                let screen = settings_screen_rect(ctx);
+                self.settings.screen = Some(screen);
+                screen
+            }
+        };
+        let window_size = settings_window_size(screen);
+        // Only an approximation: the outer size also carries the native title bar, so the exact
+        // centering is re-sent once the window reports its real outer rectangle.
+        let initial_position = screen.center() - (window_size + egui::vec2(0.0, 34.0)) * 0.5;
         let viewport_id = egui::ViewportId::from_hash_of("settings_window");
         let viewport_builder = egui::ViewportBuilder::default()
             .with_title("Settings")
-            .with_inner_size(self.settings.open_size)
-            .with_min_inner_size(egui::vec2(720.0, 480.0))
-            .with_resizable(true)
-            // The dialog belongs to the viewer: keep a single taskbar entry.
-            .with_taskbar(false);
+            .with_inner_size(window_size)
+            .with_min_inner_size(SETTINGS_WINDOW_MIN_SIZE)
+            .with_position(initial_position)
+            .with_resizable(true);
 
         ctx.show_viewport_immediate(viewport_id, viewport_builder, |ctx, _class| {
             // A decorated window brings its own close button; both paths share `close_modal`.
             if ctx.input(|input| input.viewport().close_requested()) {
                 close_modal = true;
             }
-            if let Some(inner_rect) = ctx.input(|input| input.viewport().inner_rect) {
-                self.settings.window_size = Some(inner_rect.size());
+            // A reused viewport id ignores the builder size and position, so both are re-sent
+            // for a few frames until the native window settles on them.
+            if 0 < self.settings.place_frames {
+                self.settings.place_frames -= 1;
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(window_size));
+                if let Some(outer_rect) = ctx.input(|input| input.viewport().outer_rect) {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(
+                        screen.center() - outer_rect.size() * 0.5,
+                    ));
+                }
             }
 
             if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
@@ -23877,8 +23930,6 @@ impl ImageViewer {
             return false;
         }
 
-        let freeze_for_help = self.settings_modal_open();
-
         self.manga_prune_ttv_pending();
 
         if self.masonry_layout_invalidation_deferred
@@ -23899,8 +23950,8 @@ impl ImageViewer {
         let mut masonry_scrollbar_moved_this_frame = false;
         let mut masonry_autoscroll_moved_this_frame = false;
         let mut masonry_scroll_animation_moved_this_frame = false;
-        let masonry_preload_input_blocked = self.settings_modal_open()
-            || (self.is_masonry_mode() && self.masonry_metadata_preload_active);
+        let masonry_preload_input_blocked =
+            self.is_masonry_mode() && self.masonry_metadata_preload_active;
         let mode_scroll_up_action = if self.is_masonry_mode() {
             Action::MasonryScrollUp
         } else {
@@ -24757,7 +24808,7 @@ impl ImageViewer {
             None
         };
 
-        if !freeze_for_help && self.manga_tick_scroll_animation(dt) {
+        if self.manga_tick_scroll_animation(dt) {
             if self.is_masonry_mode() && self.manga_autoscroll_active {
                 if let Some(previous_visible_index) = masonry_previous_visible_index {
                     self.masonry_sync_loader_visible_index(previous_visible_index);
@@ -24816,21 +24867,19 @@ impl ImageViewer {
             false
         };
         if dims_updated {
-            if !freeze_for_help {
-                if self.is_masonry_mode() {
-                    // Masonry has non-linear row ordering; index/fraction anchors can oscillate when
-                    // late dimension updates reshuffle column heights. Preserve absolute scroll instead.
-                    let max_scroll = (self.manga_total_height() - self.screen_size.y).max(0.0);
-                    let new_offset = masonry_prev_scroll.clamp(0.0, max_scroll);
-                    self.manga_scroll_offset = new_offset;
-                    self.manga_scroll_target =
-                        (new_offset + masonry_prev_target_delta).clamp(0.0, max_scroll);
-                    self.manga_scroll_velocity = masonry_prev_velocity;
-                    self.manga_update_current_index();
-                } else if let Some(anchor) = load_anchor {
-                    self.manga_apply_scroll_anchor(anchor);
-                    self.manga_update_current_index();
-                }
+            if self.is_masonry_mode() {
+                // Masonry has non-linear row ordering; index/fraction anchors can oscillate when
+                // late dimension updates reshuffle column heights. Preserve absolute scroll instead.
+                let max_scroll = (self.manga_total_height() - self.screen_size.y).max(0.0);
+                let new_offset = masonry_prev_scroll.clamp(0.0, max_scroll);
+                self.manga_scroll_offset = new_offset;
+                self.manga_scroll_target =
+                    (new_offset + masonry_prev_target_delta).clamp(0.0, max_scroll);
+                self.manga_scroll_velocity = masonry_prev_velocity;
+                self.manga_update_current_index();
+            } else if let Some(anchor) = load_anchor {
+                self.manga_apply_scroll_anchor(anchor);
+                self.manga_update_current_index();
             }
         }
 
@@ -29646,16 +29695,11 @@ impl ImageViewer {
             }
         }
 
-        let mut pointer_pos = ctx.input(|i| i.pointer.hover_pos());
-
-        if self.settings_modal_open() {
-            self.is_panning = false;
-            self.is_resizing = false;
-            self.resize_direction = ResizeDirection::None;
-            self.last_mouse_pos = None;
-            self.reset_floating_window_drag_anchor();
-            self.stop_manga_autoscroll();
-        } else {
+        // Filled from the pointer state inside the input block below.
+        let pointer_pos;
+        // The settings window is detached, so viewer input is never frozen. The block keeps the
+        // pointer-input scope of the old modal branch without its reset arm.
+        {
             // Handle modifier-wheel pan/zoom input (not in manga mode - that's handled in draw_manga_mode).
             // Ctrl+wheel may be routed to `zoom_delta` on some platforms, so we support both raw wheel and
             // zoom-delta fallback for direction when Ctrl is held.
@@ -30511,17 +30555,15 @@ impl eframe::App for ImageViewer {
             }
         }
 
-        // Handle file drops (disabled while a settings/help modal is open).
-        if !self.settings_modal_open() {
-            ctx.input(|i| {
-                if !i.raw.dropped_files.is_empty() {
-                    if let Some(path) = i.raw.dropped_files[0].path.clone() {
-                        // Layout will be applied via `image_changed`.
-                        self.load_image(&path);
-                    }
+        // Handle file drops.
+        ctx.input(|i| {
+            if !i.raw.dropped_files.is_empty() {
+                if let Some(path) = i.raw.dropped_files[0].path.clone() {
+                    // Layout will be applied via `image_changed`.
+                    self.load_image(&path);
                 }
-            });
-        }
+            }
+        });
 
         // Window title might have changed due to file drops.
         self.apply_pending_window_title(ctx);
@@ -30534,26 +30576,11 @@ impl eframe::App for ImageViewer {
         // Run this before input so the input handler can properly suppress actions over the video bar.
         let _ = self.update_bottom_overlays_visibility(ctx);
 
-        if self.settings_modal_open() {
-            self.stop_manga_wheel_scroll();
-            self.stop_manga_autoscroll();
-            self.manga_scroll_target = self.manga_scroll_offset;
-            self.manga_scroll_velocity = 0.0;
-            self.manga_scrollbar_dragging = false;
-            self.masonry_scrollbar_last_motion_at = None;
-            self.masonry_autoscroll_last_motion_at = None;
-            self.mark_selection_box = None;
-            self.is_panning = false;
-            self.last_mouse_pos = None;
-        }
-
         // Debounced config.ini write for settings slider drags.
         self.flush_pending_settings_save(ctx);
 
-        // Handle input (disabled while a settings/help modal is open).
-        if !self.settings_modal_open() {
-            self.handle_input(ctx);
-        }
+        // The settings window is its own window: the viewer keeps handling its own input.
+        self.handle_input(ctx);
 
         if self.should_short_circuit_frame_for_exit(false) {
             Self::send_fast_close_viewport_commands(ctx);
@@ -30891,7 +30918,7 @@ impl eframe::App for ImageViewer {
         // Draw controls overlay (top bar for title/buttons) BEFORE the main view.
         // This ensures title-bar hover/selection state is available to suppress gestures
         // (drag/pan/double-click) in the same frame.
-        if !skip_drawing && !self.settings_modal_open() {
+        if !skip_drawing {
             self.draw_controls(ctx);
         } else {
             self.mouse_over_window_buttons = false;
@@ -30908,14 +30935,14 @@ impl eframe::App for ImageViewer {
         };
 
         // Draw video controls overlay (bottom bar for video playback controls)
-        if !skip_drawing && !self.settings_modal_open() {
+        if !skip_drawing {
             self.draw_video_controls(ctx);
             // Also draw manga mode video controls if in manga mode
             self.draw_manga_video_controls(ctx);
         }
 
         // Draw manga mode toggle button and zoom HUD (bottom-right in fullscreen)
-        if !skip_drawing && !self.settings_modal_open() {
+        if !skip_drawing {
             self.draw_manga_zoom_bar(ctx);
             self.draw_manga_toggle_button(ctx);
         }
