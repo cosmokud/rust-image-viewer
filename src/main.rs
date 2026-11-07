@@ -657,11 +657,17 @@ fn settings_search_results(query: &str) -> Vec<usize> {
         .collect()
 }
 
+/// Inner size used the first time the settings window opens.
+const SETTINGS_WINDOW_DEFAULT_SIZE: egui::Vec2 = egui::vec2(980.0, 800.0);
+
 /// State for the tabbed Settings modal: every registry setting, presets and the help page.
 struct SettingsModal {
     open: bool,
-    /// Skips one outside-click close check right after opening.
-    skip_outside_click_once: bool,
+    /// Inner size remembered between opens, so a resized dialog reopens at the same size.
+    window_size: Option<egui::Vec2>,
+    /// Size the live dialog window was created with. Frozen while it is open: feeding the live
+    /// size back into the viewport builder would fight the user resizing the window.
+    open_size: egui::Vec2,
     tab: SettingsTabSlot,
     search: String,
     /// Set by Ctrl+F; consumed by the search field when it is drawn.
@@ -690,7 +696,8 @@ impl Default for SettingsModal {
     fn default() -> Self {
         Self {
             open: false,
-            skip_outside_click_once: false,
+            window_size: None,
+            open_size: SETTINGS_WINDOW_DEFAULT_SIZE,
             tab: SettingsTabSlot::Tab(settings_registry::SettingsTab::General),
             search: String::new(),
             focus_search: false,
@@ -755,9 +762,7 @@ enum MenuActionIcon {
     Delete,
     Rename,
     OpenLocation,
-    Config,
     Motion,
-    Help,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -10403,17 +10408,6 @@ impl ImageViewer {
                     stroke,
                 );
             }
-            MenuActionIcon::Config => {
-                painter.circle_stroke(rect.center(), 4.0, stroke);
-                for angle in [0.0_f32, 45.0, 90.0, 135.0] {
-                    let radians = angle.to_radians();
-                    let dir = egui::vec2(radians.cos(), radians.sin());
-                    painter.line_segment(
-                        [rect.center() + dir * 5.5, rect.center() + dir * 8.0],
-                        stroke,
-                    );
-                }
-            }
             MenuActionIcon::Motion => {
                 // 3 rails with a knob dot on each.
                 let knob_x = [0.32_f32, 0.68, 0.45];
@@ -10432,31 +10426,6 @@ impl ImageViewer {
                         color,
                     );
                 }
-            }
-            MenuActionIcon::Help => {
-                painter.circle_stroke(rect.center(), 6.0, stroke);
-                painter.line_segment(
-                    [
-                        egui::pos2(rect.center().x - 2.5, rect.top() + 7.0),
-                        egui::pos2(rect.center().x + 0.5, rect.top() + 4.0),
-                    ],
-                    stroke,
-                );
-                painter.line_segment(
-                    [
-                        egui::pos2(rect.center().x + 0.5, rect.top() + 4.0),
-                        egui::pos2(rect.center().x + 2.5, rect.top() + 6.0),
-                    ],
-                    stroke,
-                );
-                painter.line_segment(
-                    [
-                        egui::pos2(rect.center().x, rect.top() + 6.0),
-                        egui::pos2(rect.center().x, rect.center().y + 1.0),
-                    ],
-                    stroke,
-                );
-                painter.circle_filled(egui::pos2(rect.center().x, rect.bottom() - 3.5), 1.3, color);
             }
         }
     }
@@ -12476,7 +12445,10 @@ impl ImageViewer {
 
     fn open_settings_modal(&mut self, tab: SettingsTabSlot) {
         self.settings.open = true;
-        self.settings.skip_outside_click_once = true;
+        self.settings.open_size = self
+            .settings
+            .window_size
+            .unwrap_or(SETTINGS_WINDOW_DEFAULT_SIZE);
         self.settings.tab = tab;
         self.settings.search.clear();
         self.settings.focus_search = false;
@@ -13598,61 +13570,49 @@ impl ImageViewer {
 
         let mut close_modal = false;
         let mut action: Option<SettingsPresetAction> = None;
-        let screen_rect = ctx.screen_rect();
-
-        if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
-            // Esc clears the search first, so a stale filter never survives a reopen.
-            if self.settings.search.is_empty() {
-                close_modal = true;
-            } else {
-                self.settings.search.clear();
-            }
-        }
-        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::F)) {
-            self.settings.focus_search = true;
-        }
-
-        egui::Area::new(egui::Id::new("settings_modal_backdrop"))
-            .fixed_pos(screen_rect.min)
-            .order(egui::Order::Foreground)
-            .show(ctx, |ui| {
-                let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, screen_rect.size());
-                ui.painter().rect_filled(
-                    rect,
-                    0.0,
-                    egui::Color32::from_rgba_unmultiplied(4, 8, 13, 214),
-                );
-            });
-
-        let modal_size = egui::vec2(
-            (screen_rect.width() - 60.0).clamp(560.0, 960.0),
-            (screen_rect.height() - 44.0).clamp(440.0, 780.0),
-        );
-        let modal_pos = screen_rect.center() - modal_size * 0.5;
-        // 212 = measured chrome (18 margin * 2 + 72 header + tab strip + separators + 24 status).
-        // The old 152 let the frame grow ~59 px past `modal_size.y` on short windows.
-        let body_height = (modal_size.y - 212.0).max(200.0);
         let config_path_label = Config::config_path().display().to_string();
         let modified = self.selected_preset_modified();
 
-        let modal_response = egui::Area::new(egui::Id::new("settings_modal"))
-            .fixed_pos(modal_pos)
-            .order(egui::Order::Foreground)
-            .show(ctx, |ui| {
-                ui.set_min_size(modal_size);
-                // An `Area` is unbounded: without a max width every `available_width()` inside
-                // it (header split, body columns) collapses to the whole desktop and the modal
-                // draws thousands of pixels wide.
-                ui.set_max_width(modal_size.x);
-                egui::Frame::none()
-                    .fill(egui::Color32::from_rgba_unmultiplied(16, 23, 31, 252))
-                    .stroke(egui::Stroke::new(
-                        1.0_f32,
-                        egui::Color32::from_rgba_unmultiplied(166, 207, 255, 62),
-                    ))
-                    .rounding(18.0)
-                    .inner_margin(egui::Margin::same(18.0))
-                    .show(ui, |ui| {
+        // The dialog lives in its own native window (an immediate child viewport). A separate
+        // window cannot be clipped by a tiny viewer window the way the old same-window `Area`
+        // could, which is the whole point of the split.
+        let viewport_id = egui::ViewportId::from_hash_of("settings_window");
+        let viewport_builder = egui::ViewportBuilder::default()
+            .with_title("Settings")
+            .with_inner_size(self.settings.open_size)
+            .with_min_inner_size(egui::vec2(720.0, 480.0))
+            .with_resizable(true)
+            // The dialog belongs to the viewer: keep a single taskbar entry.
+            .with_taskbar(false);
+
+        ctx.show_viewport_immediate(viewport_id, viewport_builder, |ctx, _class| {
+            // A decorated window brings its own close button; both paths share `close_modal`.
+            if ctx.input(|input| input.viewport().close_requested()) {
+                close_modal = true;
+            }
+            if let Some(inner_rect) = ctx.input(|input| input.viewport().inner_rect) {
+                self.settings.window_size = Some(inner_rect.size());
+            }
+
+            if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+                // Esc clears the search first, so a stale filter never survives a reopen.
+                if self.settings.search.is_empty() {
+                    close_modal = true;
+                } else {
+                    self.settings.search.clear();
+                }
+            }
+            if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::F)) {
+                self.settings.focus_search = true;
+            }
+
+            egui::CentralPanel::default()
+                .frame(
+                    egui::Frame::none()
+                        .fill(egui::Color32::from_rgb(16, 23, 31))
+                        .inner_margin(egui::Margin::same(18.0)),
+                )
+                .show(ctx, |ui| {
                         ui.vertical(|ui| {
                             ui.horizontal(|ui| {
                                 let header_width = (ui.available_width() - 300.0).max(150.0);
@@ -13790,6 +13750,10 @@ impl ImageViewer {
                             self.draw_settings_tab_strip(ui);
                             ui.add_space(8.0);
 
+                            // ~44 = the status row closing the dialog (space + separator +
+                            // row height). Deriving the body height from the live window keeps
+                            // the layout correct while the user resizes the dialog.
+                            let body_height = (ui.available_height() - 44.0).max(160.0);
                             let presets_width =
                                 236.0_f32.min((ui.available_width() - 300.0).max(180.0));
                             let right_width =
@@ -13884,7 +13848,7 @@ impl ImageViewer {
                                 settings_search_results(&self.settings.search).len()
                             };
                             ui.allocate_ui_with_layout(
-                                egui::vec2(ui.available_width(), 24.0),
+                                egui::vec2(ui.available_width(), 26.0),
                                 egui::Layout::left_to_right(egui::Align::Center),
                                 |ui| {
                                     if let Some((message, _)) = status {
@@ -13901,6 +13865,46 @@ impl ImageViewer {
                                     ui.with_layout(
                                         egui::Layout::right_to_left(egui::Align::Center),
                                         |ui| {
+                                            let edit_config = ui
+                                                .add(
+                                                    egui::Button::new(
+                                                        egui::RichText::new("Edit config.ini")
+                                                            .size(11.5)
+                                                            .color(ui_rgb(214, 232, 248)),
+                                                    )
+                                                    .fill(ui_rgba(255, 255, 255, 12))
+                                                    .stroke(egui::Stroke::new(
+                                                        1.0_f32,
+                                                        ui_rgba(255, 255, 255, 36),
+                                                    ))
+                                                    .rounding(7.0)
+                                                    .min_size(egui::vec2(0.0, 22.0)),
+                                                )
+                                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                                .on_hover_text(
+                                                    "Open config.ini in the default editor",
+                                                );
+                                            if edit_config.clicked() {
+                                                let config_path = Config::config_path();
+                                                match open_path_in_default_app(
+                                                    config_path.as_path(),
+                                                ) {
+                                                    Ok(()) => self.set_settings_status(
+                                                        format!(
+                                                            "Opened {}",
+                                                            config_path.display()
+                                                        ),
+                                                        false,
+                                                    ),
+                                                    Err(err) => self.set_settings_status(
+                                                        format!(
+                                                            "Failed to open config.ini: {err}"
+                                                        ),
+                                                        true,
+                                                    ),
+                                                }
+                                            }
+                                            ui.add_space(10.0);
                                             ui.label(
                                                 egui::RichText::new(format!(
                                                     "{visible_count} settings"
@@ -13916,27 +13920,6 @@ impl ImageViewer {
                     });
             });
 
-        let modal_rect = modal_response.response.rect;
-        if self.settings.skip_outside_click_once {
-            self.settings.skip_outside_click_once = false;
-        } else {
-            let clicked_outside_modal = ctx.input(|input| {
-                let primary_clicked = input.pointer.button_clicked(egui::PointerButton::Primary);
-                let secondary_clicked =
-                    input.pointer.button_clicked(egui::PointerButton::Secondary);
-                let pointer_pos = input
-                    .pointer
-                    .interact_pos()
-                    .or_else(|| input.pointer.hover_pos());
-
-                (primary_clicked || secondary_clicked)
-                    && pointer_pos.is_some_and(|pos| !modal_rect.contains(pos))
-            });
-            if clicked_outside_modal {
-                close_modal = true;
-            }
-        }
-
         if let Some(action) = action {
             self.apply_settings_preset_action(action);
             ctx.request_repaint();
@@ -13950,8 +13933,10 @@ impl ImageViewer {
 
         if close_modal {
             self.flush_pending_settings_save(ctx);
+            // Dropping the viewport closes the window in this frame instead of leaving an empty
+            // dialog on screen until the next pass.
+            ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Close);
             self.settings.open = false;
-            self.settings.skip_outside_click_once = false;
             self.settings.rename = None;
             self.settings.pending_delete = None;
         }
@@ -13961,17 +13946,6 @@ impl ImageViewer {
         if let Some(title) = self.pending_window_title.take() {
             let title = self.truncate_window_title_for_viewport(ctx, title);
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
-        }
-    }
-
-    fn open_config_file_in_editor(&mut self) {
-        let config_path = Config::config_path();
-        if let Err(e) = open_path_in_default_app(config_path.as_path()) {
-            self.error_message = Some(format!(
-                "Failed to open config file ({}): {}",
-                config_path.display(),
-                e
-            ));
         }
     }
 
@@ -27182,23 +27156,6 @@ impl ImageViewer {
                                     }
 
                                     if self
-                                        .menu_action_row(
-                                            ui,
-                                            "Shortcuts and Help",
-                                            MenuActionIcon::Help,
-                                        )
-                                        .clicked()
-                                    {
-                                        self.open_settings_modal(SettingsTabSlot::Help);
-                                        self.file_action_menu = None;
-                                        self.show_controls = true;
-                                        self.controls_show_time = Instant::now();
-                                        close_popup = true;
-                                    }
-
-                                    ui.separator();
-
-                                    if self
                                         .menu_action_row(ui, "Settings", MenuActionIcon::Motion)
                                         .clicked()
                                     {
@@ -27208,20 +27165,6 @@ impl ImageViewer {
                                         self.file_action_menu = None;
                                         self.show_controls = true;
                                         self.controls_show_time = Instant::now();
-                                        close_popup = true;
-                                    }
-
-                                    ui.separator();
-
-                                    if self
-                                        .menu_action_row(
-                                            ui,
-                                            "Edit config.ini",
-                                            MenuActionIcon::Config,
-                                        )
-                                        .clicked()
-                                    {
-                                        self.open_config_file_in_editor();
                                         close_popup = true;
                                     }
 
