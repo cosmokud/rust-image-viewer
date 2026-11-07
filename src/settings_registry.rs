@@ -2841,13 +2841,18 @@ pub fn reset_preset(name: &str) -> io::Result<PathBuf> {
 /// Returns the name of the preset that should become active.
 pub fn ensure_user_preset() -> io::Result<String> {
     ensure_builtin_presets()?;
+    // Earlier builds capitalized this preset; keep one `user.ini` instead of two.
+    let legacy = preset_path("User");
+    if legacy.exists() && !preset_path("user").exists() {
+        let _ = fs::rename(&legacy, preset_path("user"));
+    }
     if let Some(entry) = list_presets().into_iter().find(|entry| !entry.builtin) {
         return Ok(entry.name);
     }
     let default_bytes = fs::read(default_preset_path())
         .unwrap_or_else(|_| BUILTIN_PRESETS[0].1.as_bytes().to_vec());
-    fs::write(preset_path("User"), default_bytes)?;
-    Ok("User".to_string())
+    fs::write(preset_path("user"), default_bytes)?;
+    Ok("user".to_string())
 }
 
 pub fn delete_preset(name: &str) -> io::Result<()> {

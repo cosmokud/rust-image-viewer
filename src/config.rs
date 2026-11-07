@@ -13,7 +13,7 @@ const DEFAULT_CONFIG_TEMPLATE: &str = include_str!("../assets/presets/default.in
 const CONFIG_FILE_NAME: &str = "config.ini";
 const STATE_FILE_NAME: &str = "state.ini";
 /// Name of the auto-created working preset (a byte copy of `default.ini`).
-const USER_PRESET_NAME: &str = "User";
+const USER_PRESET_NAME: &str = "user";
 const LEGACY_CONFIG_FILE_NAME: &str = "rust-image-viewer-config.ini";
 const LEGACY_SETTINGS_FILE_NAME: &str = "setting.ini";
 

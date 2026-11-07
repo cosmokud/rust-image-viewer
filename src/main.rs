@@ -931,7 +931,7 @@ struct SettingsModal {
     search: String,
     /// Set by Ctrl+F; consumed by the search field when it is drawn.
     focus_search: bool,
-    /// Preset marked in the list; Load/Overwrite/Rename/Delete act on it.
+    /// Preset marked in the list; Load/Rename/Delete act on it.
     selected: Option<String>,
     presets: Vec<settings_registry::PresetEntry>,
     /// Values parsed from the selected preset file; the `modified` badge diffs the live config.
@@ -982,7 +982,6 @@ impl Default for SettingsModal {
 /// egui closure is alive).
 enum SettingsPresetAction {
     Load(String),
-    Overwrite(String),
     BeginRename(String),
     Rename(String, String),
     CancelRename,
@@ -12845,18 +12844,6 @@ impl ImageViewer {
                     );
                 }
             }
-            SettingsPresetAction::Overwrite(name) => {
-                let values = settings_registry::capture(&self.config);
-                match settings_registry::save_preset(&name, &values) {
-                    Ok(_) => {
-                        self.refresh_settings_presets();
-                        self.set_settings_status(format!("Overwrote preset '{name}'"), false);
-                    }
-                    Err(err) => {
-                        self.set_settings_status(format!("Could not save '{name}': {err}"), true)
-                    }
-                }
-            }
             SettingsPresetAction::BeginRename(name) => {
                 self.settings.pending_delete = None;
                 self.settings.rename = Some((name.clone(), name));
@@ -12946,9 +12933,7 @@ impl ImageViewer {
                             .exists()
                         {
                             self.set_settings_status(
-                                format!(
-                                    "Preset '{name}' already exists; select it and use Overwrite."
-                                ),
+                                format!("Preset '{name}' already exists; pick another name."),
                                 true,
                             );
                             return;
@@ -13639,22 +13624,6 @@ impl ImageViewer {
                         self.settings.pending_delete = None;
                         self.settings.rename = None;
                         *action = Some(SettingsPresetAction::Load(name));
-                    }
-                }
-                ui.add_space(4.0);
-                if settings_button(
-                    ui,
-                    "Overwrite",
-                    button_size,
-                    can_edit_preset,
-                    SettingsButtonKind::Secondary,
-                )
-                .clicked()
-                {
-                    if let Some(name) = selected.clone() {
-                        self.settings.pending_delete = None;
-                        self.settings.rename = None;
-                        *action = Some(SettingsPresetAction::Overwrite(name));
                     }
                 }
                 ui.add_space(4.0);
