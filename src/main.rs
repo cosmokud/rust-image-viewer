@@ -9406,43 +9406,23 @@ impl ImageViewer {
     }
 
     fn draw_video_control_vector_icon(
-        painter: &egui::Painter,
+        ui: &egui::Ui,
         icon: VideoControlIcon,
         rect: egui::Rect,
         color: egui::Color32,
     ) {
+        let painter = ui.painter();
         match icon {
             VideoControlIcon::Previous | VideoControlIcon::Next => {
-                let forward = matches!(icon, VideoControlIcon::Next);
-                let width = rect.width();
-                let bar_width = width * 0.13;
-                let side_inset = width * 0.17;
-                let vertical_inset = rect.height() * 0.18;
-                let (bar_left, base_x, apex_x) = if forward {
-                    (
-                        rect.right() - side_inset - bar_width,
-                        rect.left() + side_inset,
-                        rect.right() - side_inset - bar_width - width * 0.1,
-                    )
+                let source = if matches!(icon, VideoControlIcon::Next) {
+                    egui::include_image!("../assets/lucide/skip-forward.svg")
                 } else {
-                    (
-                        rect.left() + side_inset,
-                        rect.right() - side_inset,
-                        rect.left() + side_inset + bar_width + width * 0.1,
-                    )
+                    egui::include_image!("../assets/lucide/skip-back.svg")
                 };
-                let bar_rect = egui::Rect::from_min_max(
-                    egui::pos2(bar_left, rect.top() + vertical_inset),
-                    egui::pos2(bar_left + bar_width, rect.bottom() - vertical_inset),
-                );
-                painter.rect_filled(bar_rect, bar_width * 0.5, color);
-
-                let triangle = [
-                    egui::pos2(base_x, rect.top() + vertical_inset),
-                    egui::pos2(base_x, rect.bottom() - vertical_inset),
-                    egui::pos2(apex_x, rect.center().y),
-                ];
-                Self::fill_round_polygon(painter, &triangle, width * 0.08, color);
+                egui::Image::new(source)
+                    .fit_to_exact_size(rect.size())
+                    .tint(color)
+                    .paint_at(ui, rect);
             }
             VideoControlIcon::AudioTracks => {
                 let speaker_points = vec![
@@ -9568,7 +9548,7 @@ impl ImageViewer {
             icon_size,
         );
         let text_color = visuals.fg_stroke.color;
-        Self::draw_video_control_vector_icon(painter, icon, icon_rect, text_color);
+        Self::draw_video_control_vector_icon(ui, icon, icon_rect, text_color);
 
         if let Some(label_galley) = label_galley {
             let text_pos = egui::pos2(
@@ -10555,335 +10535,34 @@ impl ImageViewer {
         }
     }
 
-    /// Stroke a polyline with round caps and joins (egui strokes end in flat miters).
-    fn stroke_round_path(
-        painter: &egui::Painter,
-        points: &[egui::Pos2],
-        stroke: egui::Stroke,
-        closed: bool,
-    ) {
-        if points.len() < 2 {
-            return;
-        }
-        if closed {
-            painter.add(egui::Shape::closed_line(points.to_vec(), stroke));
-        } else {
-            painter.add(egui::Shape::line(points.to_vec(), stroke));
-        }
-        let dot_radius = stroke.width * 0.5;
-        for point in points {
-            painter.circle_filled(*point, dot_radius, stroke.color);
-        }
-    }
-
-    /// Filled polygon with softened (circular) corners.
-    fn fill_round_polygon(
-        painter: &egui::Painter,
-        points: &[egui::Pos2],
-        radius: f32,
-        color: egui::Color32,
-    ) {
-        if points.len() < 3 {
-            return;
-        }
-        let mut inner = Vec::with_capacity(points.len() * 2);
-        for (index, point) in points.iter().enumerate() {
-            let previous = points[(index + points.len() - 1) % points.len()];
-            let next = points[(index + 1) % points.len()];
-            for neighbour in [previous, next] {
-                let offset = neighbour - *point;
-                let distance = offset.length();
-                if distance > f32::EPSILON {
-                    inner.push(*point + offset / distance * radius.min(distance * 0.5));
-                }
-            }
-        }
-        painter.add(egui::Shape::convex_polygon(
-            inner,
-            color,
-            egui::Stroke::NONE,
-        ));
-        for point in points {
-            painter.circle_filled(*point, radius, color);
-        }
-    }
-
-    /// Rounded-rectangle outline as a polyline. `top_edge` is the drawn span of
-    /// the top edge, so icons can leave a gap for a tab (clipboard style).
-    fn rounded_rect_outline(
-        rect: egui::Rect,
-        radius: f32,
-        top_edge: (f32, f32),
-    ) -> Vec<egui::Pos2> {
-        use std::f32::consts::{FRAC_PI_2, PI};
-
-        let radius = radius
-            .min(rect.width() * 0.5)
-            .min(rect.height() * 0.5)
-            .max(0.0);
-        let (left, top, right, bottom) = (rect.left(), rect.top(), rect.right(), rect.bottom());
-        let mut points = Vec::with_capacity(32);
-        points.push(egui::pos2(top_edge.1, top));
-        points.extend(Self::video_control_icon_arc_points(
-            egui::pos2(right - radius, top + radius),
-            radius,
-            -FRAC_PI_2,
-            0.0,
-            5,
-        ));
-        points.push(egui::pos2(right, bottom - radius));
-        points.extend(Self::video_control_icon_arc_points(
-            egui::pos2(right - radius, bottom - radius),
-            radius,
-            0.0,
-            FRAC_PI_2,
-            5,
-        ));
-        points.push(egui::pos2(left + radius, bottom));
-        points.extend(Self::video_control_icon_arc_points(
-            egui::pos2(left + radius, bottom - radius),
-            radius,
-            FRAC_PI_2,
-            PI,
-            5,
-        ));
-        points.push(egui::pos2(left, top + radius));
-        points.extend(Self::video_control_icon_arc_points(
-            egui::pos2(left + radius, top + radius),
-            radius,
-            PI,
-            1.5 * PI,
-            5,
-        ));
-        points.push(egui::pos2(top_edge.0, top));
-        points
-    }
-
     fn paint_menu_action_icon(
-        painter: &egui::Painter,
+        ui: &egui::Ui,
         rect: egui::Rect,
         icon: MenuActionIcon,
         color: egui::Color32,
     ) {
-        use std::f32::consts::{FRAC_PI_2, PI};
-
-        // Icons are authored on a 15x15 grid and scaled to the paint rect.
-        let unit = (rect.width() / 15.0).max(0.1);
-        let point = |x: f32, y: f32| egui::pos2(rect.left() + x * unit, rect.top() + y * unit);
-        let stroke = egui::Stroke::new(1.75 * unit, color);
-        let arc = |center: egui::Pos2, radius: f32, start: f32, end: f32| {
-            Self::video_control_icon_arc_points(center, radius, start, end, 6)
-        };
-
-        match icon {
-            MenuActionIcon::Mark => {
-                let frame = egui::Rect::from_min_max(point(2.2, 2.2), point(12.8, 12.8));
-                painter.rect_stroke(frame, 3.4 * unit, stroke);
-                Self::stroke_round_path(
-                    painter,
-                    &[point(4.9, 7.7), point(6.9, 9.6), point(10.3, 5.5)],
-                    stroke,
-                    false,
-                );
-            }
-            MenuActionIcon::MarkAll => {
-                // List rows, each carrying a check.
-                for offset_y in [0.0_f32, 5.5] {
-                    Self::stroke_round_path(
-                        painter,
-                        &[
-                            point(2.0, 4.4 + offset_y),
-                            point(3.2, 5.6 + offset_y),
-                            point(5.7, 3.1 + offset_y),
-                        ],
-                        stroke,
-                        false,
-                    );
-                }
-                for y in [4.2_f32, 9.7] {
-                    Self::stroke_round_path(
-                        painter,
-                        &[point(8.2, y), point(13.1, y)],
-                        stroke,
-                        false,
-                    );
-                }
-            }
-            MenuActionIcon::Unmark => {
-                let frame = egui::Rect::from_min_max(point(2.2, 2.2), point(12.8, 12.8));
-                painter.rect_stroke(frame, 3.4 * unit, stroke);
-                Self::stroke_round_path(
-                    painter,
-                    &[point(5.2, 7.5), point(9.8, 7.5)],
-                    stroke,
-                    false,
-                );
-            }
-            MenuActionIcon::Cut => {
-                painter.circle_stroke(point(4.2, 3.9), 2.1 * unit, stroke);
-                painter.circle_stroke(point(4.2, 11.1), 2.1 * unit, stroke);
-                Self::stroke_round_path(
-                    painter,
-                    &[point(5.9, 5.1), point(12.4, 11.6)],
-                    stroke,
-                    false,
-                );
-                Self::stroke_round_path(
-                    painter,
-                    &[point(5.9, 9.9), point(12.4, 3.4)],
-                    stroke,
-                    false,
-                );
-            }
-            MenuActionIcon::Copy => {
-                let radius = 2.6 * unit;
-                let mut back = vec![point(9.7, 2.3), point(4.7, 2.3)];
-                back.extend(arc(point(4.7, 4.9), radius, -FRAC_PI_2, -PI));
-                back.push(point(2.1, 7.5));
-                back.extend(arc(point(4.7, 7.5), radius, PI, FRAC_PI_2));
-                back.push(point(5.0, 10.1));
-                Self::stroke_round_path(painter, &back, stroke, false);
-
-                let front = egui::Rect::from_min_max(point(5.4, 5.2), point(12.9, 12.7));
-                painter.rect_stroke(front, radius, stroke);
-            }
-            MenuActionIcon::Paste => {
-                let body = egui::Rect::from_min_max(point(2.8, 3.8), point(12.2, 13.2));
-                let body_path = Self::rounded_rect_outline(
-                    body,
-                    2.6 * unit,
-                    (point(5.3, 0.0).x, point(9.7, 0.0).x),
-                );
-                Self::stroke_round_path(painter, &body_path, stroke, false);
-
-                let tab = egui::Rect::from_min_max(point(5.6, 2.1), point(9.4, 4.8));
-                painter.rect_stroke(tab, 1.4 * unit, stroke);
-
-                Self::stroke_round_path(
-                    painter,
-                    &[point(7.5, 7.0), point(7.5, 10.7)],
-                    stroke,
-                    false,
-                );
-                Self::stroke_round_path(
-                    painter,
-                    &[point(5.9, 9.1), point(7.5, 10.8), point(9.1, 9.1)],
-                    stroke,
-                    false,
-                );
-            }
-            MenuActionIcon::Delete => {
-                Self::stroke_round_path(
-                    painter,
-                    &[point(2.6, 4.7), point(12.4, 4.7)],
-                    stroke,
-                    false,
-                );
-                Self::stroke_round_path(
-                    painter,
-                    &[
-                        point(5.7, 4.7),
-                        point(5.7, 3.5),
-                        point(6.6, 2.7),
-                        point(8.4, 2.7),
-                        point(9.3, 3.5),
-                        point(9.3, 4.7),
-                    ],
-                    stroke,
-                    false,
-                );
-                Self::stroke_round_path(
-                    painter,
-                    &[
-                        point(4.3, 4.7),
-                        point(4.8, 11.3),
-                        point(5.7, 13.0),
-                        point(9.3, 13.0),
-                        point(10.2, 11.3),
-                        point(10.7, 4.7),
-                    ],
-                    stroke,
-                    false,
-                );
-                for x in [6.5_f32, 8.5] {
-                    Self::stroke_round_path(
-                        painter,
-                        &[point(x, 7.0), point(x, 11.0)],
-                        stroke,
-                        false,
-                    );
-                }
-            }
-            MenuActionIcon::Rename => {
-                let nib = [
-                    point(9.3, 3.5),
-                    point(11.5, 5.7),
-                    point(5.6, 11.6),
-                    point(2.4, 12.7),
-                    point(3.5, 9.5),
-                ];
-                Self::stroke_round_path(painter, &nib, stroke, true);
-            }
+        // Lucide artwork, tinted to the row colour.
+        let source = match icon {
+            MenuActionIcon::Mark => egui::include_image!("../assets/lucide/square-check.svg"),
+            MenuActionIcon::MarkAll => egui::include_image!("../assets/lucide/list-checks.svg"),
+            MenuActionIcon::Unmark => egui::include_image!("../assets/lucide/square-minus.svg"),
+            MenuActionIcon::Cut => egui::include_image!("../assets/lucide/scissors.svg"),
+            MenuActionIcon::Copy => egui::include_image!("../assets/lucide/copy.svg"),
+            MenuActionIcon::Paste => egui::include_image!("../assets/lucide/clipboard-paste.svg"),
+            MenuActionIcon::Delete => egui::include_image!("../assets/lucide/trash-2.svg"),
+            MenuActionIcon::Rename => egui::include_image!("../assets/lucide/pencil-line.svg"),
             MenuActionIcon::OpenLocation => {
-                Self::stroke_round_path(
-                    painter,
-                    &[
-                        point(2.4, 12.9),
-                        point(2.4, 3.7),
-                        point(5.9, 3.7),
-                        point(7.1, 5.3),
-                        point(12.6, 5.3),
-                        point(12.6, 12.9),
-                    ],
-                    stroke,
-                    true,
-                );
-                Self::stroke_round_path(
-                    painter,
-                    &[point(5.4, 9.0), point(9.4, 9.0)],
-                    stroke,
-                    false,
-                );
-                Self::stroke_round_path(
-                    painter,
-                    &[point(7.7, 7.3), point(9.5, 9.0), point(7.7, 10.7)],
-                    stroke,
-                    false,
-                );
+                egui::include_image!("../assets/lucide/folder-open.svg")
             }
             MenuActionIcon::Settings => {
-                // Two sliders with round knobs.
-                let rail_start = point(2.6, 0.0).x;
-                let rail_end = point(12.4, 0.0).x;
-                let knob_radius = 2.2 * unit;
-                let upper_knob_x = point(9.9, 0.0).x;
-                let lower_knob_x = point(5.1, 0.0).x;
-                let upper_y = point(0.0, 4.9).y;
-                let lower_y = point(0.0, 10.1).y;
-
-                Self::stroke_round_path(
-                    painter,
-                    &[
-                        egui::pos2(rail_start, upper_y),
-                        egui::pos2(upper_knob_x - knob_radius, upper_y),
-                    ],
-                    stroke,
-                    false,
-                );
-                painter.circle_stroke(egui::pos2(upper_knob_x, upper_y), knob_radius, stroke);
-
-                painter.circle_stroke(egui::pos2(lower_knob_x, lower_y), knob_radius, stroke);
-                Self::stroke_round_path(
-                    painter,
-                    &[
-                        egui::pos2(lower_knob_x + knob_radius, lower_y),
-                        egui::pos2(rail_end, lower_y),
-                    ],
-                    stroke,
-                    false,
-                );
+                egui::include_image!("../assets/lucide/sliders-horizontal.svg")
             }
-        }
+        };
+
+        egui::Image::new(source)
+            .fit_to_exact_size(rect.size())
+            .tint(color)
+            .paint_at(ui, rect);
     }
 
     fn paint_breadcrumb_toggle_folder_icon(ui: &egui::Ui, rect: egui::Rect, tint: egui::Color32) {
@@ -10940,7 +10619,7 @@ impl ImageViewer {
                 egui::pos2(rect.left() + 17.0, rect.center().y),
                 egui::vec2(15.0, 15.0),
             );
-            Self::paint_menu_action_icon(ui.painter(), icon_rect, icon, text_color);
+            Self::paint_menu_action_icon(ui, icon_rect, icon, text_color);
 
             ui.painter().text(
                 egui::pos2(rect.left() + 34.0, rect.center().y),
