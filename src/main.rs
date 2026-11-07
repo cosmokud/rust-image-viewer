@@ -13894,7 +13894,7 @@ impl ImageViewer {
                                 // ~58 = the footer closing the dialog (spacing + divider +
                                 // status row). Deriving the body height from the live window
                                 // keeps the layout correct while the user resizes the dialog.
-                                let body_height = (ui.available_height() - 58.0).max(160.0);
+                                let body_height = (ui.available_height() - 58.0).max(120.0);
                                 let presets_width =
                                     214.0_f32.min((ui.available_width() - 320.0).max(170.0));
                                 ui.horizontal_top(|ui| {
