@@ -931,7 +931,7 @@ struct SettingsModal {
     search: String,
     /// Set by Ctrl+F; consumed by the search field when it is drawn.
     focus_search: bool,
-    /// Preset marked in the list; Load/Rename/Delete act on it.
+    /// Preset loaded in the list (clicking a row loads it); Rename/Delete act on it.
     selected: Option<String>,
     presets: Vec<settings_registry::PresetEntry>,
     /// Values parsed from the selected preset file; the `modified` badge diffs the live config.
@@ -943,12 +943,10 @@ struct SettingsModal {
     new_name: String,
     /// `(old_name, draft_name)` while an inline rename is pending.
     rename: Option<(String, String)>,
-    /// Name awaiting a second click on delete.
-    pending_delete: Option<String>,
     status: Option<(String, Instant)>,
     status_is_error: bool,
-    /// Preset name awaiting confirmation in the reset dialog.
-    pending_reset: Option<String>,
+    /// Preset operation awaiting confirmation in the centered dialog.
+    pending_confirm: Option<SettingsConfirm>,
     /// Debounces slider drags into one preset file write.
     save_due_at: Option<Instant>,
 }
@@ -969,10 +967,9 @@ impl Default for SettingsModal {
             texts: Vec::new(),
             new_name: String::new(),
             rename: None,
-            pending_delete: None,
             status: None,
             status_is_error: false,
-            pending_reset: None,
+            pending_confirm: None,
             save_due_at: None,
         }
     }
@@ -980,6 +977,43 @@ impl Default for SettingsModal {
 
 /// Preset actions resolved after the modal is drawn (avoids re-borrowing `self` while the
 /// egui closure is alive).
+/// Destructive preset operation awaiting confirmation. Both variants render in the same
+/// centered monochrome dialog as the settings window.
+#[derive(Clone, Debug)]
+enum SettingsConfirm {
+    Reset(String),
+    Delete(String),
+}
+
+impl SettingsConfirm {
+    fn title(&self) -> String {
+        match self {
+            Self::Reset(name) => format!("Reset '{name}'?"),
+            Self::Delete(name) => format!("Delete '{name}'?"),
+        }
+    }
+
+    fn body(&self) -> &'static str {
+        match self {
+            Self::Reset(_) => {
+                "Every setting in this preset goes back to the values in default.ini. The preset \
+                 file is overwritten and this cannot be undone."
+            }
+            Self::Delete(_) => {
+                "The preset file is deleted permanently. Other presets are not affected. This \
+                 cannot be undone."
+            }
+        }
+    }
+
+    fn confirm_label(&self) -> &'static str {
+        match self {
+            Self::Reset(_) => "Reset preset",
+            Self::Delete(_) => "Delete preset",
+        }
+    }
+}
+
 enum SettingsPresetAction {
     Load(String),
     BeginRename(String),
@@ -12697,12 +12731,12 @@ impl ImageViewer {
         self.settings.search.clear();
         self.settings.focus_search = false;
         self.settings.rename = None;
-        self.settings.pending_delete = None;
+        self.settings.pending_confirm = None;
         self.settings.status = None;
         self.settings.status_is_error = false;
         self.settings.save_due_at = None;
         self.refresh_settings_mirrors();
-        self.settings.pending_reset = None;
+        self.settings.pending_confirm = None;
         // Opening Settings is the first-run entry point: with only `Default` in the folder, seed
         // an editable `User` preset as an exact copy of `default.ini`.
         let _ = settings_registry::ensure_user_preset();
@@ -12845,7 +12879,7 @@ impl ImageViewer {
                 }
             }
             SettingsPresetAction::BeginRename(name) => {
-                self.settings.pending_delete = None;
+                self.settings.pending_confirm = None;
                 self.settings.rename = Some((name.clone(), name));
             }
             SettingsPresetAction::Rename(old, new) => {
@@ -12880,7 +12914,7 @@ impl ImageViewer {
             }
             SettingsPresetAction::CancelRename => self.settings.rename = None,
             SettingsPresetAction::ConfirmDelete(name) => {
-                self.settings.pending_delete = None;
+                self.settings.pending_confirm = None;
                 match settings_registry::delete_preset(&name) {
                     Ok(()) => {
                         let selected_was_deleted =
@@ -13171,9 +13205,7 @@ impl ImageViewer {
             tooltip.push_str(hint);
         }
         if read_only {
-            tooltip.push_str(
-                "\n\nThe Default preset is read-only: Load it or pick another preset to edit.",
-            );
+            tooltip.push_str("\n\nThe Default preset is read-only: pick another preset to edit.");
         }
         let row_width = ui.available_width();
         // Fits the widest label of this tab, so labels are not cut while there is room. On a
@@ -13510,7 +13542,6 @@ impl ImageViewer {
         modified: bool,
         action: &mut Option<SettingsPresetAction>,
     ) {
-        let mut delete_clicked = false;
         egui::ScrollArea::vertical()
             .id_salt("settings_presets_panel")
             .max_height(body_height)
@@ -13540,16 +13571,12 @@ impl ImageViewer {
                         }
                         for entry in presets.iter() {
                             let is_selected = selected.as_deref() == Some(entry.name.as_str());
-                            let armed = self.settings.pending_delete.as_deref()
-                                == Some(entry.name.as_str());
                             let (rect, response) = ui.allocate_exact_size(
                                 egui::vec2(ui.available_width(), 32.0),
                                 egui::Sense::click(),
                             );
                             let painter = ui.painter();
-                            if armed {
-                                painter.rect_filled(rect, 8.0, UI_SURFACE_HOVER);
-                            } else if is_selected {
+                            if is_selected {
                                 painter.rect_filled(rect, 8.0, UI_SURFACE);
                             } else if response.hovered() {
                                 painter.rect_filled(rect, 8.0, ui_alpha(UI_TEXT_STRONG, 10));
@@ -13592,10 +13619,10 @@ impl ImageViewer {
                                     },
                                 );
                             if response.clicked() {
-                                self.settings.selected = Some(entry.name.clone());
-                                self.settings.pending_delete = None;
+                                // Clicking a preset loads it: the selected file is the live
+                                // config, so there is no separate Load step.
                                 self.settings.rename = None;
-                                self.load_selected_preset_values();
+                                *action = Some(SettingsPresetAction::Load(entry.name.clone()));
                             }
                             response.on_hover_cursor(egui::CursorIcon::PointingHand);
                             ui.add_space(4.0);
@@ -13604,29 +13631,12 @@ impl ImageViewer {
 
                 ui.add_space(10.0);
                 let full = ui.available_width();
-                let has_selection = selected.is_some();
                 let selected_is_builtin = selected
                     .as_deref()
                     .is_some_and(settings_registry::is_builtin);
-                let can_edit_preset = has_selection && !selected_is_builtin;
+                let can_edit_preset = selected.is_some() && !selected_is_builtin;
                 let button_size = egui::vec2(full, 30.0);
 
-                if settings_button(
-                    ui,
-                    "Load",
-                    button_size,
-                    has_selection,
-                    SettingsButtonKind::Primary,
-                )
-                .clicked()
-                {
-                    if let Some(name) = selected.clone() {
-                        self.settings.pending_delete = None;
-                        self.settings.rename = None;
-                        *action = Some(SettingsPresetAction::Load(name));
-                    }
-                }
-                ui.add_space(4.0);
                 if settings_button(
                     ui,
                     "Rename",
@@ -13637,36 +13647,21 @@ impl ImageViewer {
                 .clicked()
                 {
                     if let Some(name) = selected.clone() {
-                        self.settings.pending_delete = None;
                         *action = Some(SettingsPresetAction::BeginRename(name));
                     }
                 }
                 ui.add_space(4.0);
-                let delete_armed = self.settings.pending_delete.is_some();
-                let delete_kind = if delete_armed {
-                    SettingsButtonKind::Primary
-                } else {
-                    SettingsButtonKind::Secondary
-                };
                 if settings_button(
                     ui,
-                    if delete_armed {
-                        "Confirm delete?"
-                    } else {
-                        "Delete"
-                    },
+                    "Delete",
                     button_size,
                     can_edit_preset,
-                    delete_kind,
+                    SettingsButtonKind::Secondary,
                 )
                 .clicked()
                 {
-                    delete_clicked = true;
                     self.settings.rename = None;
-                    match self.settings.pending_delete.take() {
-                        Some(name) => *action = Some(SettingsPresetAction::ConfirmDelete(name)),
-                        None => self.settings.pending_delete = selected.clone(),
-                    }
+                    self.settings.pending_confirm = selected.clone().map(SettingsConfirm::Delete);
                 }
 
                 if let Some((old_name, mut draft)) = self.settings.rename.clone() {
@@ -13731,18 +13726,10 @@ impl ImageViewer {
                 )
                 .clicked()
                 {
-                    self.settings.pending_delete = None;
                     self.settings.rename = None;
                     *action = Some(SettingsPresetAction::Create);
                 }
             });
-        // Any other click in the modal disarms the delete confirmation.
-        if self.settings.pending_delete.is_some()
-            && ui.input(|i| i.pointer.any_click())
-            && !delete_clicked
-        {
-            self.settings.pending_delete = None;
-        }
     }
 
     /// Browser-style tab bar: monochrome pills. The window is sized to fit them on one row, the
@@ -13836,15 +13823,15 @@ impl ImageViewer {
         }
     }
 
-    /// Centered confirmation overlay for the footer's Reset button, drawn in the dialog's own
-    /// monochrome theme on top of the settings body. Returns the user's choice for this frame.
-    fn draw_settings_reset_confirm(&mut self, ctx: &egui::Context) -> Option<bool> {
-        let name = self.settings.pending_reset.clone()?;
+    /// Centered confirmation overlay for resetting or deleting a preset, drawn in the dialog's
+    /// own monochrome theme on top of the settings body. Returns the user's choice this frame.
+    fn draw_settings_confirm(&self, ctx: &egui::Context) -> Option<bool> {
+        let pending = self.settings.pending_confirm.as_ref()?;
         let screen = ctx.screen_rect();
 
         // Backdrop: opaque enough to read as a modal, and clickable so the settings underneath
         // cannot be edited while the confirmation is open.
-        egui::Area::new(egui::Id::new("settings_reset_backdrop"))
+        egui::Area::new(egui::Id::new("settings_confirm_backdrop"))
             .order(egui::Order::Foreground)
             .fixed_pos(screen.min)
             .show(ctx, |ui| {
@@ -13855,7 +13842,7 @@ impl ImageViewer {
 
         let mut choice = None;
         let panel_width = 400.0_f32.min((screen.width() - 40.0).max(240.0));
-        egui::Area::new(egui::Id::new("settings_reset_confirm"))
+        egui::Area::new(egui::Id::new("settings_confirm_dialog"))
             .order(egui::Order::Tooltip)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .show(ctx, |ui| {
@@ -13873,19 +13860,15 @@ impl ImageViewer {
                                 .show(ui, |ui| {
                                     ui.set_min_width(panel_width - 42.0);
                                     ui.label(
-                                        egui::RichText::new(format!("Reset '{name}'?"))
+                                        egui::RichText::new(pending.title())
                                             .size(15.0)
                                             .color(UI_TEXT_STRONG),
                                     );
                                     ui.add_space(8.0);
                                     ui.label(
-                                        egui::RichText::new(
-                                            "Every setting in this preset goes back to the values \
-                                             in default.ini. The preset file is overwritten and \
-                                             this cannot be undone.",
-                                        )
-                                        .size(12.0)
-                                        .color(UI_TEXT_DIM),
+                                        egui::RichText::new(pending.body())
+                                            .size(12.0)
+                                            .color(UI_TEXT_DIM),
                                     );
                                     ui.add_space(18.0);
                                     ui.horizontal(|ui| {
@@ -13894,7 +13877,7 @@ impl ImageViewer {
                                             egui::vec2((ui.available_width() - gap) * 0.5, 30.0);
                                         if settings_button(
                                             ui,
-                                            "Reset preset",
+                                            pending.confirm_label(),
                                             half,
                                             true,
                                             SettingsButtonKind::Primary,
@@ -13945,7 +13928,7 @@ impl ImageViewer {
                     .to_string()
             });
         // The built-in Default preset is a read-only reference: every control is disabled.
-        let read_only = self.settings.pending_reset.is_some()
+        let read_only = self.settings.pending_confirm.is_some()
             || !self
                 .settings
                 .selected
@@ -14000,8 +13983,8 @@ impl ImageViewer {
 
             if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
                 // Esc closes the reset confirmation first, then clears search, then the dialog.
-                if self.settings.pending_reset.is_some() {
-                    self.settings.pending_reset = None;
+                if self.settings.pending_confirm.is_some() {
+                    self.settings.pending_confirm = None;
                 } else if self.settings.search.is_empty() {
                     close_modal = true;
                 } else {
@@ -14276,8 +14259,11 @@ impl ImageViewer {
                                                 )
                                                 .clicked()
                                                 {
-                                                    self.settings.pending_reset =
-                                                        self.settings.selected.clone();
+                                                    self.settings.pending_confirm = self
+                                                        .settings
+                                                        .selected
+                                                        .clone()
+                                                        .map(SettingsConfirm::Reset);
                                                 }
                                                 ui.add_space(14.0);
                                                 ui.label(
@@ -14293,11 +14279,17 @@ impl ImageViewer {
                                 );
                             });
                         });
-                    if let Some(confirm) = self.draw_settings_reset_confirm(ctx) {
-                        let name = self.settings.pending_reset.take();
+                    if let Some(confirm) = self.draw_settings_confirm(ctx) {
+                        let pending = self.settings.pending_confirm.take();
                         if confirm {
-                            if let Some(name) = name {
-                                action = Some(SettingsPresetAction::Reset(name));
+                            match pending {
+                                Some(SettingsConfirm::Reset(name)) => {
+                                    action = Some(SettingsPresetAction::Reset(name));
+                                }
+                                Some(SettingsConfirm::Delete(name)) => {
+                                    action = Some(SettingsPresetAction::ConfirmDelete(name));
+                                }
+                                None => {}
                             }
                         }
                     }
@@ -14324,8 +14316,8 @@ impl ImageViewer {
             ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Close);
             self.settings.open = false;
             self.settings.rename = None;
-            self.settings.pending_delete = None;
-            self.settings.pending_reset = None;
+            self.settings.pending_confirm = None;
+            self.settings.pending_confirm = None;
         }
     }
 
