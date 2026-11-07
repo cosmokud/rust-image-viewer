@@ -93,13 +93,193 @@ const GSTREAMER_MISSING_VIDEO_ERROR_TEXT: &str =
     "Cannot open video files because the GStreamer library is not installed. Please install GStreamer to enable video playback.";
 const TITLEBAR_CONTROL_ICON_COLOR: egui::Color32 = egui::Color32::WHITE;
 
-/// Settings/help modal palette: opaque and alpha variants of the same chrome tones.
-fn ui_rgb(r: u8, g: u8, b: u8) -> egui::Color32 {
-    egui::Color32::from_rgb(r, g, b)
+/// Settings window palette. Deliberately monochrome gray: the viewer chrome is a gray tool
+/// window, so the dialog follows it instead of introducing a second accent hue.
+const UI_WINDOW: egui::Color32 = egui::Color32::from_rgb(24, 25, 28);
+const UI_CHROME: egui::Color32 = egui::Color32::from_rgb(29, 30, 34);
+const UI_CONTENT: egui::Color32 = egui::Color32::from_rgb(33, 34, 38);
+const UI_SURFACE: egui::Color32 = egui::Color32::from_rgb(41, 42, 47);
+const UI_SURFACE_HOVER: egui::Color32 = egui::Color32::from_rgb(51, 52, 58);
+const UI_SURFACE_ACTIVE: egui::Color32 = egui::Color32::from_rgb(63, 64, 71);
+const UI_BORDER: egui::Color32 = egui::Color32::from_rgb(54, 55, 61);
+const UI_TEXT_STRONG: egui::Color32 = egui::Color32::from_rgb(233, 234, 237);
+const UI_TEXT: egui::Color32 = egui::Color32::from_rgb(197, 199, 204);
+const UI_TEXT_DIM: egui::Color32 = egui::Color32::from_rgb(147, 150, 156);
+const UI_TEXT_FAINT: egui::Color32 = egui::Color32::from_rgb(112, 115, 121);
+/// Monochrome accent: on-state toggles, slider fill and primary buttons.
+const UI_ACCENT: egui::Color32 = egui::Color32::from_rgb(214, 216, 220);
+/// Text and knobs drawn on top of [`UI_ACCENT`].
+const UI_ACCENT_TEXT: egui::Color32 = egui::Color32::from_rgb(22, 23, 26);
+
+/// [`UI_TEXT_STRONG`] at a lower alpha, for hover and separator tints.
+fn ui_alpha(color: egui::Color32, alpha: u8) -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha)
 }
 
-fn ui_rgba(r: u8, g: u8, b: u8, a: u8) -> egui::Color32 {
-    egui::Color32::from_rgba_unmultiplied(r, g, b, a)
+/// Rounded surface with an optional hairline border.
+///
+/// The border is a second fill, not a `Stroke`: the tessellator draws a 1px stroke around the
+/// path, so it lands between pixel centres and reads as a jagged, aliased hairline on rounded
+/// corners. Fills are feathered, so two stacked fills stay smooth at any scale.
+fn ui_paint_surface(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    rounding: f32,
+    fill: egui::Color32,
+    border: Option<egui::Color32>,
+) {
+    match border {
+        Some(border) => {
+            painter.rect_filled(rect, rounding, border);
+            let inner = rect.shrink(1.0);
+            if 1.0 < inner.width() && 1.0 < inner.height() {
+                painter.rect_filled(inner, (rounding - 1.0).max(0.0), fill);
+            }
+        }
+        None => {
+            painter.rect_filled(rect, rounding, fill);
+        }
+    }
+}
+
+/// One device-pixel hairline that fills the available width, used as a section divider.
+fn ui_divider(ui: &mut egui::Ui) {
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
+    ui.painter().rect_filled(rect, 0.0, UI_BORDER);
+}
+
+/// Every default widget in the dialog (search field, drag values, combo boxes, scroll bars,
+/// tooltips) is themed once here instead of per call site.
+fn settings_visuals() -> egui::Visuals {
+    let mut visuals = egui::Visuals::dark();
+    visuals.panel_fill = UI_CONTENT;
+    visuals.window_fill = UI_CHROME;
+    visuals.window_stroke = egui::Stroke::NONE;
+    visuals.window_rounding = egui::Rounding::same(10.0);
+    visuals.menu_rounding = egui::Rounding::same(8.0);
+    visuals.extreme_bg_color = UI_WINDOW;
+    visuals.faint_bg_color = UI_SURFACE;
+    visuals.code_bg_color = UI_SURFACE;
+    visuals.warn_fg_color = UI_TEXT;
+    visuals.error_fg_color = UI_TEXT;
+    visuals.hyperlink_color = UI_TEXT;
+    visuals.slider_trailing_fill = true;
+    visuals.striped = false;
+    visuals.text_cursor.stroke = egui::Stroke::new(1.4_f32, UI_TEXT_STRONG);
+    visuals.selection.bg_fill = UI_SURFACE_ACTIVE;
+    visuals.selection.stroke = egui::Stroke::new(1.0_f32, UI_TEXT_STRONG);
+
+    let rounding = egui::Rounding::same(8.0);
+    let widgets = &mut visuals.widgets;
+    widgets.noninteractive.bg_fill = UI_SURFACE;
+    widgets.noninteractive.weak_bg_fill = UI_SURFACE;
+    widgets.noninteractive.bg_stroke = egui::Stroke::NONE;
+    widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0_f32, UI_TEXT);
+    widgets.noninteractive.rounding = rounding;
+
+    // Inputs use `bg_fill`, buttons use `weak_bg_fill`: inputs sink into the card, buttons rise.
+    widgets.inactive.bg_fill = UI_WINDOW;
+    widgets.inactive.weak_bg_fill = UI_SURFACE;
+    widgets.inactive.bg_stroke = egui::Stroke::NONE;
+    widgets.inactive.fg_stroke = egui::Stroke::new(1.0_f32, UI_TEXT);
+    widgets.inactive.rounding = rounding;
+
+    widgets.hovered.bg_fill = UI_WINDOW;
+    widgets.hovered.weak_bg_fill = UI_SURFACE_HOVER;
+    widgets.hovered.bg_stroke = egui::Stroke::NONE;
+    widgets.hovered.fg_stroke = egui::Stroke::new(1.0_f32, UI_TEXT_STRONG);
+    widgets.hovered.rounding = rounding;
+
+    widgets.active.bg_fill = UI_WINDOW;
+    widgets.active.weak_bg_fill = UI_SURFACE_ACTIVE;
+    widgets.active.bg_stroke = egui::Stroke::NONE;
+    widgets.active.fg_stroke = egui::Stroke::new(1.0_f32, UI_TEXT_STRONG);
+    widgets.active.rounding = rounding;
+
+    widgets.open.bg_fill = UI_WINDOW;
+    widgets.open.weak_bg_fill = UI_SURFACE_HOVER;
+    widgets.open.bg_stroke = egui::Stroke::NONE;
+    widgets.open.fg_stroke = egui::Stroke::new(1.0_f32, UI_TEXT_STRONG);
+    widgets.open.rounding = rounding;
+
+    visuals
+}
+
+/// Which palette tone a dialog button uses.
+#[derive(Clone, Copy)]
+enum SettingsButtonKind {
+    /// Inverted fill: confirmations and other primary actions.
+    Primary,
+    /// Surface fill: everything else.
+    Secondary,
+}
+
+/// Monochrome button drawn from fills only, with explicit hover and pressed steps.
+///
+/// `egui::Button` cannot express that here: setting its `fill` also disables its hover
+/// feedback, and its outline stroke is the aliasing source this dialog avoids everywhere.
+fn settings_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    size: egui::Vec2,
+    enabled: bool,
+    kind: SettingsButtonKind,
+) -> egui::Response {
+    let sense = if enabled {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
+    };
+    let (rect, response) = ui.allocate_exact_size(size, sense);
+    let (base, hover, pressed) = match kind {
+        SettingsButtonKind::Primary => (UI_ACCENT, UI_TEXT_STRONG, UI_TEXT),
+        SettingsButtonKind::Secondary => (UI_SURFACE, UI_SURFACE_HOVER, UI_SURFACE_ACTIVE),
+    };
+    let fill = if !enabled {
+        ui_alpha(UI_SURFACE, 140)
+    } else if response.is_pointer_button_down_on() {
+        pressed
+    } else if response.hovered() {
+        hover
+    } else {
+        base
+    };
+    let text_color = match (enabled, kind) {
+        (false, _) => UI_TEXT_FAINT,
+        (true, SettingsButtonKind::Primary) => UI_ACCENT_TEXT,
+        (true, SettingsButtonKind::Secondary) => UI_TEXT_STRONG,
+    };
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        painter.rect_filled(rect, 8.0, fill);
+        let galley = painter.layout_no_wrap(
+            label.to_owned(),
+            egui::FontId::proportional(12.5),
+            text_color,
+        );
+        let text_pos = rect.center() - galley.size() * 0.5;
+        painter.galley(text_pos, galley, text_color);
+    }
+    if enabled {
+        response.on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        response
+    }
+}
+
+/// Width a [`settings_button`] needs to hold `label` with breathing room on both sides.
+fn settings_button_width(ui: &egui::Ui, label: &str) -> f32 {
+    ui.fonts(|fonts| {
+        fonts
+            .layout_no_wrap(
+                label.to_owned(),
+                egui::FontId::proportional(12.5),
+                UI_TEXT_STRONG,
+            )
+            .size()
+            .x
+    }) + 30.0
 }
 
 /// Paint a smooth, semi-transparent loading spinner in the bottom-right corner
@@ -11991,53 +12171,41 @@ impl ImageViewer {
     }
 
     fn draw_shortcuts_help_section_header(ui: &mut egui::Ui, title: &str, subtitle: &str) {
-        ui.add_space(4.0);
-        ui.label(
-            egui::RichText::new(title)
-                .color(egui::Color32::from_rgb(234, 241, 255))
-                .strong()
-                .size(16.0),
-        );
+        ui.add_space(12.0);
+        ui.label(egui::RichText::new(title).color(UI_TEXT_STRONG).size(15.0));
         ui.add_space(2.0);
-        ui.label(
-            egui::RichText::new(subtitle)
-                .color(egui::Color32::from_rgb(146, 162, 178))
-                .size(12.0),
-        );
-        ui.add_space(8.0);
+        ui.label(egui::RichText::new(subtitle).color(UI_TEXT_DIM).size(12.0));
+        ui.add_space(10.0);
     }
 
     fn draw_shortcuts_help_row(ui: &mut egui::Ui, trigger: &str, title: &str, detail: &str) {
         // Inside `ui.horizontal` labels never wrap on their own, and a long binding CSV used to
-        // stretch the whole dialog (thousands of pixels wide once the preset column took its
-        // share). Bound both columns explicitly and wrap the text.
+        // stretch the whole dialog. Bound both columns explicitly and wrap the text.
         let total_width = ui.available_width();
         let trigger_width = 248.0_f32.min((total_width * 0.42).max(120.0));
-        let text_width = (total_width - trigger_width - 10.0).max(160.0);
+        let text_width = (total_width - trigger_width - 16.0).max(160.0);
         ui.horizontal_top(|ui| {
+            // Filled chip, no stroke, and real padding: the old 1px stroke frame both aliased and
+            // left the binding text almost touching its border.
             egui::Frame::none()
-                .fill(egui::Color32::from_rgba_unmultiplied(62, 138, 222, 28))
-                .stroke(egui::Stroke::new(
-                    1.0_f32,
-                    egui::Color32::from_rgba_unmultiplied(127, 188, 255, 94),
-                ))
+                .fill(UI_SURFACE)
                 .rounding(8.0)
-                .inner_margin(egui::Margin::symmetric(10.0, 7.0))
+                .inner_margin(egui::Margin::symmetric(11.0, 7.0))
                 .show(ui, |ui| {
-                    ui.set_min_width(trigger_width - 20.0);
-                    ui.set_max_width(trigger_width - 20.0);
+                    ui.set_min_width(trigger_width - 22.0);
+                    ui.set_max_width(trigger_width - 22.0);
                     ui.add(
                         egui::Label::new(
                             egui::RichText::new(trigger)
                                 .monospace()
-                                .color(egui::Color32::from_rgb(208, 228, 252))
-                                .size(12.5),
+                                .color(UI_TEXT)
+                                .size(12.0),
                         )
                         .wrap(),
                     );
                 });
 
-            ui.add_space(10.0);
+            ui.add_space(16.0);
 
             ui.allocate_ui_with_layout(
                 egui::vec2(text_width, 0.0),
@@ -12046,25 +12214,19 @@ impl ImageViewer {
                     ui.set_max_width(text_width);
                     ui.add(
                         egui::Label::new(
-                            egui::RichText::new(title)
-                                .color(egui::Color32::WHITE)
-                                .strong()
-                                .size(13.5),
+                            egui::RichText::new(title).color(UI_TEXT_STRONG).size(13.0),
                         )
                         .wrap(),
                     );
+                    ui.add_space(2.0);
                     ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(detail)
-                                .color(egui::Color32::from_rgb(178, 191, 205))
-                                .size(12.0),
-                        )
-                        .wrap(),
+                        egui::Label::new(egui::RichText::new(detail).color(UI_TEXT_DIM).size(12.0))
+                            .wrap(),
                     );
                 },
             );
         });
-        ui.add_space(7.0);
+        ui.add_space(9.0);
     }
 
     fn draw_shortcuts_help_action_rows(
@@ -12368,7 +12530,7 @@ impl ImageViewer {
         );
 
         ui.add_space(8.0);
-        ui.separator();
+        ui_divider(ui);
 
         Self::draw_shortcuts_help_section_header(
             ui,
@@ -12378,7 +12540,7 @@ impl ImageViewer {
         self.draw_shortcuts_help_action_rows(ui, general_rows);
 
         ui.add_space(8.0);
-        ui.separator();
+        ui_divider(ui);
 
         Self::draw_shortcuts_help_section_header(
             ui,
@@ -12388,7 +12550,7 @@ impl ImageViewer {
         self.draw_shortcuts_help_action_rows(ui, manga_rows);
 
         ui.add_space(8.0);
-        ui.separator();
+        ui_divider(ui);
 
         Self::draw_shortcuts_help_section_header(
             ui,
@@ -12398,7 +12560,7 @@ impl ImageViewer {
         self.draw_shortcuts_help_action_rows(ui, masonry_rows);
 
         ui.add_space(8.0);
-        ui.separator();
+        ui_divider(ui);
 
         Self::draw_shortcuts_help_section_header(
             ui,
@@ -12431,7 +12593,7 @@ impl ImageViewer {
         );
 
         ui.add_space(8.0);
-        ui.separator();
+        ui_divider(ui);
 
         Self::draw_shortcuts_help_section_header(
             ui,
@@ -12713,10 +12875,10 @@ impl ImageViewer {
     ) {
         egui::Frame::none()
             .fill(fill)
-            .rounding(4.0)
-            .inner_margin(egui::Margin::symmetric(5.0, 1.0))
+            .rounding(6.0)
+            .inner_margin(egui::Margin::symmetric(7.0, 2.5))
             .show(ui, |ui| {
-                ui.label(egui::RichText::new(text).size(9.0).color(color));
+                ui.label(egui::RichText::new(text).size(9.5).color(color));
             });
     }
 
@@ -12729,9 +12891,9 @@ impl ImageViewer {
         width: f32,
     ) -> (egui::Response, bool) {
         let (rect, response) =
-            ui.allocate_exact_size(egui::vec2(width, 22.0), egui::Sense::click_and_drag());
-        let track_left = rect.left() + 10.0;
-        let track_right = (rect.right() - 10.0).max(track_left + 1.0);
+            ui.allocate_exact_size(egui::vec2(width, 26.0), egui::Sense::click_and_drag());
+        let track_left = rect.left() + 9.0;
+        let track_right = (rect.right() - 9.0).max(track_left + 1.0);
         let span = max - min;
         let normalized = |value: f64| {
             if span > 0.0 {
@@ -12764,14 +12926,11 @@ impl ImageViewer {
         let y = rect.center().y;
         let knob = egui::pos2(track_left + (track_right - track_left) * t, y);
         let painter = ui.painter();
-        painter.rect_filled(
-            egui::Rect::from_min_max(
-                egui::pos2(track_left, y - 2.0),
-                egui::pos2(track_right, y + 2.0),
-            ),
-            2.0,
-            ui_rgba(255, 255, 255, 32),
+        let track = egui::Rect::from_min_max(
+            egui::pos2(track_left, y - 2.0),
+            egui::pos2(track_right, y + 2.0),
         );
+        painter.rect_filled(track, 2.0, UI_SURFACE_ACTIVE);
         if knob.x > track_left {
             painter.rect_filled(
                 egui::Rect::from_min_max(
@@ -12779,48 +12938,48 @@ impl ImageViewer {
                     egui::pos2(knob.x, y + 2.0),
                 ),
                 2.0,
-                ui_rgb(94, 214, 255),
+                UI_ACCENT,
             );
         }
-        let radius = if response.hovered() || response.dragged() {
-            9.5
-        } else {
-            8.0
-        };
-        painter.circle_stroke(
+        let hovered = response.hovered() || response.dragged();
+        painter.circle_filled(
             knob,
-            radius + 1.5,
-            egui::Stroke::new(3.0_f32, ui_rgba(94, 214, 255, 140)),
+            if hovered { 8.0 } else { 7.0 },
+            if hovered { UI_TEXT_STRONG } else { UI_ACCENT },
         );
-        painter.circle_filled(knob, radius, egui::Color32::WHITE);
+        painter.circle_filled(knob, 2.5, if hovered { UI_ACCENT } else { UI_WINDOW });
         (response, changed)
     }
 
     fn draw_settings_toggle(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
-        let (rect, response) = ui.allocate_exact_size(egui::vec2(40.0, 20.0), egui::Sense::click());
+        let (rect, response) = ui.allocate_exact_size(egui::vec2(40.0, 22.0), egui::Sense::click());
         if response.clicked() {
             *on = !*on;
         }
         let t = ui
             .ctx()
             .animate_value_with_time(response.id, if *on { 1.0 } else { 0.0 }, 0.12);
-        let painter = ui.painter();
-        painter.rect_filled(
-            rect,
-            10.0,
-            if *on {
-                ui_rgb(94, 214, 255)
+        let hovered = response.hovered();
+        let track = if *on {
+            if hovered {
+                UI_TEXT_STRONG
             } else {
-                ui_rgba(255, 255, 255, 24)
-            },
-        );
+                UI_ACCENT
+            }
+        } else if hovered {
+            UI_SURFACE_ACTIVE
+        } else {
+            UI_SURFACE
+        };
+        let painter = ui.painter();
+        painter.rect_filled(rect, rect.height() * 0.5, track);
         painter.circle_filled(
             egui::pos2(
-                egui::lerp((rect.left() + 10.0)..=(rect.right() - 10.0), t),
+                egui::lerp((rect.left() + 11.0)..=(rect.right() - 11.0), t),
                 rect.center().y,
             ),
             8.0,
-            egui::Color32::WHITE,
+            if *on { UI_ACCENT_TEXT } else { UI_TEXT_DIM },
         );
         response.on_hover_cursor(egui::CursorIcon::PointingHand)
     }
@@ -12841,20 +13000,11 @@ impl ImageViewer {
         let number_box_width = 84.0_f32.min((controls_width * 0.45).max(56.0));
         let drag_response = ui
             .scope(|ui| {
-                let widgets = &mut ui.style_mut().visuals.widgets;
-                widgets.inactive.weak_bg_fill = ui_rgba(255, 255, 255, 10);
-                widgets.inactive.bg_fill = ui_rgba(255, 255, 255, 10);
-                widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, ui_rgba(255, 255, 255, 30));
-                widgets.inactive.rounding = egui::Rounding::same(8.0);
-                widgets.hovered.weak_bg_fill = ui_rgba(255, 255, 255, 22);
-                widgets.hovered.bg_fill = ui_rgba(255, 255, 255, 22);
-                widgets.hovered.rounding = egui::Rounding::same(8.0);
-                widgets.active.rounding = egui::Rounding::same(8.0);
                 ui.style_mut()
                     .text_styles
                     .insert(egui::TextStyle::Button, egui::FontId::monospace(12.0));
                 ui.add_sized(
-                    [number_box_width, 22.0],
+                    [number_box_width, 24.0],
                     egui::DragValue::new(&mut value)
                         .fixed_decimals(decimals)
                         .range(min..=max)
@@ -12862,8 +13012,8 @@ impl ImageViewer {
                 )
             })
             .inner;
-        ui.add_space(8.0);
-        let slider_width = (controls_width - number_box_width - 8.0).max(56.0);
+        ui.add_space(10.0);
+        let slider_width = (controls_width - number_box_width - 10.0).max(56.0);
         let (slider_response, slider_changed) =
             Self::draw_settings_slider(ui, &mut value, min, max, slider_width);
         if !slider_changed && !drag_response.changed() {
@@ -12904,45 +13054,31 @@ impl ImageViewer {
             tooltip.push_str(hint);
         }
         let row_width = ui.available_width();
-        // 172-wide label slot, narrowed only when the modal is too narrow to hold both halves.
-        let label_slot = 172.0_f32.min((row_width - 180.0).max(96.0));
+        // Label slot wide enough for the longest label; narrowed only in a very narrow dialog.
+        let label_slot = 210.0_f32.min((row_width - 200.0).max(120.0));
         let mut badge_width = 0.0_f32;
         if setting.applies == settings_registry::Applies::Restart {
-            badge_width += 50.0;
+            badge_width += 64.0;
         }
         if setting.unused {
-            badge_width += 46.0;
+            badge_width += 56.0;
         }
         let mut changed = false;
         let mut write_now = false;
 
         let row = ui.horizontal(|ui| {
-            ui.set_min_height(30.0);
-            ui.spacing_mut().item_spacing.x = 6.0;
+            ui.set_min_height(38.0);
+            ui.spacing_mut().item_spacing.x = 10.0;
             ui.add_sized(
-                [(label_slot - badge_width - 4.0).max(40.0), 20.0],
-                egui::Label::new(
-                    egui::RichText::new(setting.label)
-                        .size(13.0)
-                        .color(ui_rgb(226, 236, 246)),
-                )
-                .truncate(),
+                [(label_slot - badge_width - 6.0).max(40.0), 20.0],
+                egui::Label::new(egui::RichText::new(setting.label).size(13.0).color(UI_TEXT))
+                    .truncate(),
             );
             if setting.applies == settings_registry::Applies::Restart {
-                Self::draw_settings_badge(
-                    ui,
-                    "restart",
-                    ui_rgba(255, 196, 120, 30),
-                    ui_rgb(255, 206, 150),
-                );
+                Self::draw_settings_badge(ui, "restart", UI_SURFACE_HOVER, UI_TEXT_DIM);
             }
             if setting.unused {
-                Self::draw_settings_badge(
-                    ui,
-                    "unused",
-                    ui_rgba(255, 255, 255, 18),
-                    ui_rgb(150, 166, 182),
-                );
+                Self::draw_settings_badge(ui, "unused", UI_SURFACE, UI_TEXT_FAINT);
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -12984,30 +13120,14 @@ impl ImageViewer {
                     settings_registry::SettingKind::Enum { values } => {
                         let current = Self::settings_text_value(&self.config, id);
                         let mut draft = current.clone();
-                        ui.scope(|ui| {
-                            let widgets = &mut ui.style_mut().visuals.widgets;
-                            widgets.inactive.weak_bg_fill = ui_rgba(255, 255, 255, 10);
-                            widgets.inactive.bg_fill = ui_rgba(255, 255, 255, 10);
-                            widgets.inactive.bg_stroke =
-                                egui::Stroke::new(1.0_f32, ui_rgba(255, 255, 255, 30));
-                            widgets.inactive.rounding = egui::Rounding::same(8.0);
-                            widgets.hovered.weak_bg_fill = ui_rgba(255, 255, 255, 22);
-                            widgets.hovered.bg_fill = ui_rgba(255, 255, 255, 22);
-                            widgets.hovered.rounding = egui::Rounding::same(8.0);
-                            widgets.active.rounding = egui::Rounding::same(8.0);
-                            egui::ComboBox::from_id_salt(("settings_enum", id))
-                                .width(170.0_f32.min(controls.max(90.0)))
-                                .selected_text(egui::RichText::new(&current).size(12.0))
-                                .show_ui(ui, |ui| {
-                                    for entry in values {
-                                        ui.selectable_value(
-                                            &mut draft,
-                                            (*entry).to_string(),
-                                            *entry,
-                                        );
-                                    }
-                                });
-                        });
+                        egui::ComboBox::from_id_salt(("settings_enum", id))
+                            .width(180.0_f32.min(controls.max(90.0)))
+                            .selected_text(egui::RichText::new(&current).size(12.0).color(UI_TEXT))
+                            .show_ui(ui, |ui| {
+                                for entry in values {
+                                    ui.selectable_value(&mut draft, (*entry).to_string(), *entry);
+                                }
+                            });
                         if draft != current {
                             match settings_registry::set(
                                 &mut self.config,
@@ -13052,7 +13172,7 @@ impl ImageViewer {
                             ))
                             .monospace()
                             .size(11.5)
-                            .color(ui_rgba(200, 220, 240, 200)),
+                            .color(UI_TEXT_DIM),
                         );
                     }
                     settings_registry::SettingKind::Key
@@ -13069,7 +13189,7 @@ impl ImageViewer {
                         };
                         let width = (controls * 2.0 / 3.0).max(110.0).min(controls);
                         let response = ui.add_sized(
-                            [width, 24.0],
+                            [width, 26.0],
                             egui::TextEdit::singleline(&mut self.settings.texts[id])
                                 .hint_text(hint)
                                 .font(egui::FontId::monospace(11.5))
@@ -13107,14 +13227,13 @@ impl ImageViewer {
     }
 
     fn draw_settings_group_header(ui: &mut egui::Ui, group: &str) {
-        ui.add_space(4.0);
+        ui.add_space(12.0);
         ui.label(
             egui::RichText::new(group.to_uppercase())
-                .size(10.5)
-                .strong()
-                .color(ui_rgb(140, 190, 230)),
+                .size(10.0)
+                .color(UI_TEXT_FAINT),
         );
-        ui.add_space(3.0);
+        ui.add_space(6.0);
     }
 
     /// Draws `ids` (registry order) as uppercase group headers with one card per group.
@@ -13130,24 +13249,32 @@ impl ImageViewer {
             Self::draw_settings_group_header(ui, group);
             let mut changed = false;
             let mut write_now = false;
+            // Two stacked fills give the card a 1px border without a stroke (see
+            // `ui_paint_surface`): strokes are what made the old card edges look aliased.
             egui::Frame::none()
-                .fill(ui_rgba(255, 255, 255, 8))
-                .stroke(egui::Stroke::new(1.0_f32, ui_rgba(255, 255, 255, 18)))
+                .fill(UI_BORDER)
                 .rounding(12.0)
-                .inner_margin(egui::Margin::symmetric(12.0, 8.0))
+                .inner_margin(egui::Margin::same(1.0))
                 .show(ui, |ui| {
-                    ui.set_min_width(ui.available_width());
-                    for (offset, id) in card_ids.iter().enumerate() {
-                        if offset > 0 {
-                            ui.add_space(6.0);
-                        }
-                        if let Some(row_write_now) =
-                            self.draw_setting_row(ui, &settings_registry::SETTINGS[*id])
-                        {
-                            changed = true;
-                            write_now |= row_write_now;
-                        }
-                    }
+                    egui::Frame::none()
+                        .fill(UI_SURFACE)
+                        .rounding(11.0)
+                        .inner_margin(egui::Margin::symmetric(16.0, 6.0))
+                        .show(ui, |ui| {
+                            ui.set_min_width(ui.available_width());
+                            ui.spacing_mut().item_spacing.y = 2.0;
+                            for (offset, id) in card_ids.iter().enumerate() {
+                                if offset > 0 {
+                                    ui.add_space(2.0);
+                                }
+                                if let Some(row_write_now) =
+                                    self.draw_setting_row(ui, &settings_registry::SETTINGS[*id])
+                                {
+                                    changed = true;
+                                    write_now |= row_write_now;
+                                }
+                            }
+                        });
                 });
             if changed {
                 self.finish_settings_edit(write_now);
@@ -13166,13 +13293,12 @@ impl ImageViewer {
                 index += 1;
             }
             if start > 0 {
-                ui.add_space(8.0);
+                ui.add_space(10.0);
             }
             ui.label(
                 egui::RichText::new(SettingsTabSlot::Tab(tab).label())
-                    .size(11.0)
-                    .strong()
-                    .color(ui_rgb(140, 190, 230)),
+                    .size(10.5)
+                    .color(UI_TEXT_DIM),
             );
             ui.add_space(4.0);
             self.draw_settings_groups(ui, &ids[start..index]);
@@ -13191,15 +13317,18 @@ impl ImageViewer {
         let galley =
             ui.painter()
                 .layout_no_wrap(text.to_string(), egui::FontId::proportional(size), color);
-        let width = galley.size().x + 12.0;
+        // 8x4 of padding: the pill text used to sit right against the rounded edge.
+        let pad = egui::vec2(8.0, 4.0);
+        let width = galley.size().x + pad.x * 2.0;
+        let height = galley.size().y + pad.y * 2.0;
         let rect = egui::Rect::from_min_max(
-            egui::pos2(right_center.x - width, right_center.y - 8.0),
-            egui::pos2(right_center.x, right_center.y + 8.0),
+            egui::pos2(right_center.x - width, right_center.y - height * 0.5),
+            egui::pos2(right_center.x, right_center.y + height * 0.5),
         );
         let painter = ui.painter();
-        painter.rect_filled(rect, 4.0, fill);
+        painter.rect_filled(rect, height * 0.5, fill);
         painter.galley(
-            egui::pos2(rect.left() + 6.0, rect.center().y - galley.size().y * 0.5),
+            egui::pos2(rect.left() + pad.x, rect.center().y - galley.size().y * 0.5),
             galley,
             color,
         );
@@ -13221,17 +13350,16 @@ impl ImageViewer {
             .show(ui, |ui| {
                 ui.label(
                     egui::RichText::new("PRESETS")
-                        .size(10.5)
-                        .strong()
-                        .color(ui_rgb(140, 190, 230)),
+                        .size(10.0)
+                        .color(UI_TEXT_FAINT),
                 );
-                ui.add_space(6.0);
+                ui.add_space(8.0);
 
                 let presets = self.settings.presets.clone();
                 let selected = self.settings.selected.clone();
                 egui::ScrollArea::vertical()
                     .id_salt("settings_preset_list")
-                    .max_height(8.0 * 34.0)
+                    .max_height(8.0 * 36.0)
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
                         ui.set_min_width(ui.available_width());
@@ -13239,7 +13367,7 @@ impl ImageViewer {
                             ui.label(
                                 egui::RichText::new("No presets found.")
                                     .size(12.0)
-                                    .color(ui_rgb(170, 190, 212)),
+                                    .color(UI_TEXT_DIM),
                             );
                         }
                         for entry in presets.iter() {
@@ -13247,54 +13375,41 @@ impl ImageViewer {
                             let armed = self.settings.pending_delete.as_deref()
                                 == Some(entry.name.as_str());
                             let (rect, response) = ui.allocate_exact_size(
-                                egui::vec2(ui.available_width(), 30.0),
+                                egui::vec2(ui.available_width(), 32.0),
                                 egui::Sense::click(),
                             );
                             let painter = ui.painter();
-                            if is_selected {
-                                painter.rect_filled(rect, 8.0, ui_rgba(94, 214, 255, 22));
-                                painter.rect_filled(
-                                    egui::Rect::from_min_size(
-                                        rect.left_top() + egui::vec2(0.0, 5.0),
-                                        egui::vec2(2.0, rect.height() - 10.0),
-                                    ),
-                                    1.0,
-                                    ui_rgb(94, 214, 255),
-                                );
-                            } else if response.hovered() {
-                                painter.rect_filled(rect, 8.0, ui_rgba(255, 255, 255, 14));
-                            }
                             if armed {
-                                painter.rect_stroke(
-                                    rect,
-                                    8.0,
-                                    egui::Stroke::new(1.0_f32, ui_rgba(255, 150, 150, 160)),
-                                );
+                                painter.rect_filled(rect, 8.0, UI_SURFACE_HOVER);
+                            } else if is_selected {
+                                painter.rect_filled(rect, 8.0, UI_SURFACE);
+                            } else if response.hovered() {
+                                painter.rect_filled(rect, 8.0, ui_alpha(UI_TEXT_STRONG, 10));
                             }
-                            let mut right = rect.right() - 10.0;
+                            let mut right = rect.right() - 12.0;
                             if entry.builtin {
                                 right -= Self::paint_settings_pill(
                                     ui,
                                     egui::pos2(right, rect.center().y),
                                     "BUILT-IN",
-                                    ui_rgba(255, 255, 255, 18),
-                                    ui_rgb(210, 224, 238),
-                                    8.5,
-                                ) + 4.0;
+                                    ui_alpha(UI_TEXT_STRONG, 16),
+                                    UI_TEXT_DIM,
+                                    9.0,
+                                ) + 6.0;
                             }
                             if modified && is_selected {
                                 right -= Self::paint_settings_pill(
                                     ui,
                                     egui::pos2(right, rect.center().y),
                                     "modified",
-                                    ui_rgba(94, 214, 255, 26),
-                                    ui_rgb(150, 214, 255),
-                                    8.5,
-                                ) + 4.0;
+                                    UI_ACCENT,
+                                    UI_ACCENT_TEXT,
+                                    9.0,
+                                ) + 6.0;
                             }
                             ui.painter()
                                 .with_clip_rect(egui::Rect::from_min_max(
-                                    egui::pos2(rect.left() + 10.0, rect.top()),
+                                    egui::pos2(rect.left() + 12.0, rect.top()),
                                     egui::pos2(right - 2.0, rect.bottom()),
                                 ))
                                 .text(
@@ -13303,9 +13418,9 @@ impl ImageViewer {
                                     &entry.name,
                                     egui::FontId::proportional(12.5),
                                     if is_selected {
-                                        egui::Color32::WHITE
+                                        UI_TEXT_STRONG
                                     } else {
-                                        ui_rgb(206, 220, 234)
+                                        UI_TEXT_DIM
                                     },
                                 );
                             if response.clicked() {
@@ -13314,39 +13429,29 @@ impl ImageViewer {
                                 self.settings.rename = None;
                                 self.load_selected_preset_values();
                             }
+                            response.on_hover_cursor(egui::CursorIcon::PointingHand);
                             ui.add_space(4.0);
                         }
                     });
 
-                ui.add_space(8.0);
+                ui.add_space(10.0);
                 let full = ui.available_width();
                 let has_selection = selected.is_some();
                 let selected_is_builtin = selected
                     .as_deref()
                     .is_some_and(settings_registry::is_builtin);
                 let can_edit_preset = has_selection && !selected_is_builtin;
-                let secondary_button = |label: &str| {
-                    egui::Button::new(
-                        egui::RichText::new(label)
-                            .size(12.5)
-                            .color(ui_rgb(226, 236, 246)),
-                    )
-                    .fill(ui_rgba(255, 255, 255, 14))
-                    .stroke(egui::Stroke::new(1.0_f32, ui_rgba(255, 255, 255, 30)))
-                    .rounding(8.0)
-                    .min_size(egui::vec2(full, 28.0))
-                };
+                let button_size = egui::vec2(full, 30.0);
 
-                let load = egui::Button::new(
-                    egui::RichText::new("Load")
-                        .size(12.5)
-                        .color(egui::Color32::WHITE),
+                if settings_button(
+                    ui,
+                    "Load",
+                    button_size,
+                    has_selection,
+                    SettingsButtonKind::Primary,
                 )
-                .fill(ui_rgba(94, 214, 255, 40))
-                .stroke(egui::Stroke::new(1.0_f32, ui_rgba(94, 214, 255, 120)))
-                .rounding(8.0)
-                .min_size(egui::vec2(full, 28.0));
-                if ui.add_enabled(has_selection, load).clicked() {
+                .clicked()
+                {
                     if let Some(name) = selected.clone() {
                         self.settings.pending_delete = None;
                         self.settings.rename = None;
@@ -13354,9 +13459,14 @@ impl ImageViewer {
                     }
                 }
                 ui.add_space(4.0);
-                if ui
-                    .add_enabled(can_edit_preset, secondary_button("Overwrite"))
-                    .clicked()
+                if settings_button(
+                    ui,
+                    "Overwrite",
+                    button_size,
+                    can_edit_preset,
+                    SettingsButtonKind::Secondary,
+                )
+                .clicked()
                 {
                     if let Some(name) = selected.clone() {
                         self.settings.pending_delete = None;
@@ -13365,9 +13475,14 @@ impl ImageViewer {
                     }
                 }
                 ui.add_space(4.0);
-                if ui
-                    .add_enabled(can_edit_preset, secondary_button("Rename"))
-                    .clicked()
+                if settings_button(
+                    ui,
+                    "Rename",
+                    button_size,
+                    can_edit_preset,
+                    SettingsButtonKind::Secondary,
+                )
+                .clicked()
                 {
                     if let Some(name) = selected.clone() {
                         self.settings.pending_delete = None;
@@ -13375,21 +13490,25 @@ impl ImageViewer {
                     }
                 }
                 ui.add_space(4.0);
-                let delete_label = if self.settings.pending_delete.is_some() {
-                    "Confirm delete?"
+                let delete_armed = self.settings.pending_delete.is_some();
+                let delete_kind = if delete_armed {
+                    SettingsButtonKind::Primary
                 } else {
-                    "Delete"
+                    SettingsButtonKind::Secondary
                 };
-                let delete = egui::Button::new(
-                    egui::RichText::new(delete_label)
-                        .size(12.5)
-                        .color(ui_rgb(255, 225, 225)),
+                if settings_button(
+                    ui,
+                    if delete_armed {
+                        "Confirm delete?"
+                    } else {
+                        "Delete"
+                    },
+                    button_size,
+                    can_edit_preset,
+                    delete_kind,
                 )
-                .fill(ui_rgba(172, 44, 44, 120))
-                .stroke(egui::Stroke::new(1.0_f32, ui_rgba(255, 120, 120, 90)))
-                .rounding(8.0)
-                .min_size(egui::vec2(full, 28.0));
-                if ui.add_enabled(can_edit_preset, delete).clicked() {
+                .clicked()
+                {
                     delete_clicked = true;
                     self.settings.rename = None;
                     match self.settings.pending_delete.take() {
@@ -13399,76 +13518,62 @@ impl ImageViewer {
                 }
 
                 if let Some((old_name, mut draft)) = self.settings.rename.clone() {
-                    ui.add_space(8.0);
+                    ui.add_space(12.0);
                     ui.label(
                         egui::RichText::new(format!("Rename '{old_name}'"))
                             .size(11.5)
-                            .color(ui_rgb(170, 190, 212)),
+                            .color(UI_TEXT_DIM),
                     );
+                    ui.add_space(4.0);
                     ui.add(
                         egui::TextEdit::singleline(&mut draft)
                             .desired_width(full)
                             .hint_text("preset name"),
                     );
                     self.settings.rename = Some((old_name.clone(), draft.clone()));
-                    ui.add_space(4.0);
+                    ui.add_space(6.0);
+                    let gap = ui.spacing().item_spacing.x;
+                    let half = egui::vec2((full - gap) * 0.5, 28.0);
                     ui.horizontal(|ui| {
-                        let confirm = egui::Button::new(
-                            egui::RichText::new("Confirm")
-                                .size(12.0)
-                                .color(egui::Color32::WHITE),
-                        )
-                        .fill(ui_rgba(94, 214, 255, 40))
-                        .stroke(egui::Stroke::new(1.0_f32, ui_rgba(94, 214, 255, 120)))
-                        .rounding(8.0)
-                        .min_size(egui::vec2((full - 6.0) * 0.5, 26.0));
-                        if ui.add(confirm).clicked() {
+                        if settings_button(ui, "Confirm", half, true, SettingsButtonKind::Primary)
+                            .clicked()
+                        {
                             *action = Some(SettingsPresetAction::Rename(
                                 old_name.clone(),
                                 draft.clone(),
                             ));
                         }
-                        let cancel = egui::Button::new(
-                            egui::RichText::new("Cancel")
-                                .size(12.0)
-                                .color(ui_rgb(226, 236, 246)),
-                        )
-                        .fill(ui_rgba(255, 255, 255, 14))
-                        .stroke(egui::Stroke::new(1.0_f32, ui_rgba(255, 255, 255, 30)))
-                        .rounding(8.0)
-                        .min_size(egui::vec2((full - 6.0) * 0.5, 26.0));
-                        if ui.add(cancel).clicked() {
+                        if settings_button(ui, "Cancel", half, true, SettingsButtonKind::Secondary)
+                            .clicked()
+                        {
                             *action = Some(SettingsPresetAction::CancelRename);
                         }
                     });
                 }
 
-                ui.add_space(8.0);
-                ui.separator();
-                ui.add_space(4.0);
+                ui.add_space(12.0);
+                ui_divider(ui);
+                ui.add_space(10.0);
                 ui.label(
                     egui::RichText::new("Save current as")
                         .size(11.5)
-                        .color(ui_rgb(170, 190, 212)),
+                        .color(UI_TEXT_DIM),
                 );
+                ui.add_space(4.0);
                 ui.add(
                     egui::TextEdit::singleline(&mut self.settings.new_name)
                         .hint_text("new preset name")
                         .desired_width(full),
                 );
-                ui.add_space(4.0);
-                let create = egui::Button::new(
-                    egui::RichText::new("Create")
-                        .size(12.5)
-                        .color(egui::Color32::WHITE),
+                ui.add_space(6.0);
+                if settings_button(
+                    ui,
+                    "Create",
+                    egui::vec2(full, 30.0),
+                    !self.settings.new_name.trim().is_empty(),
+                    SettingsButtonKind::Primary,
                 )
-                .fill(ui_rgba(94, 214, 255, 40))
-                .stroke(egui::Stroke::new(1.0_f32, ui_rgba(94, 214, 255, 120)))
-                .rounding(8.0)
-                .min_size(egui::vec2(full, 28.0));
-                if ui
-                    .add_enabled(!self.settings.new_name.trim().is_empty(), create)
-                    .clicked()
+                .clicked()
                 {
                     self.settings.pending_delete = None;
                     self.settings.rename = None;
@@ -13484,111 +13589,91 @@ impl ImageViewer {
         }
     }
 
-    /// Video-game style tab strip; the active pill slides instead of popping.
+    /// Browser-style tab bar: monochrome pills that wrap onto a second row instead of scrolling
+    /// sideways out of reach.
     fn draw_settings_tab_strip(&mut self, ui: &mut egui::Ui) {
-        let font = egui::FontId::proportional(12.0);
-        let mut total_width = 0.0;
-        for slot in SettingsTabSlot::ALL {
-            total_width += ui.fonts(|fonts| {
-                fonts
-                    .layout_no_wrap(slot.label().to_string(), font.clone(), egui::Color32::WHITE)
-                    .size()
-                    .x
-            }) + 30.0;
-        }
-        if total_width > ui.available_width() {
-            egui::ScrollArea::horizontal()
-                .id_salt("settings_tabs")
-                .scroll_bar_visibility(
-                    egui::containers::scroll_area::ScrollBarVisibility::AlwaysHidden,
-                )
-                .show(ui, |ui| {
-                    ui.set_min_width(total_width);
-                    self.draw_settings_tab_pills(ui, total_width);
-                });
-        } else {
-            self.draw_settings_tab_pills(ui, total_width);
-        }
-    }
+        const HEIGHT: f32 = 30.0;
+        const GAP: f32 = 6.0;
+        const PADDING: f32 = 15.0;
 
-    fn draw_settings_tab_pills(&mut self, ui: &mut egui::Ui, total_width: f32) {
-        // Reserved behind the pills so the animated highlight can be filled in after layout.
-        let highlight_idx = ui.painter().add(egui::Shape::Noop);
-        let mut active_rect = None;
-        ui.allocate_ui_with_layout(
-            egui::vec2(total_width, 28.0),
-            egui::Layout::left_to_right(egui::Align::Center),
-            |ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
-                for slot in SettingsTabSlot::ALL {
-                    let label = slot.label();
-                    let width = ui.fonts(|fonts| {
-                        fonts
-                            .layout_no_wrap(
-                                label.to_string(),
-                                egui::FontId::proportional(12.0),
-                                egui::Color32::WHITE,
-                            )
-                            .size()
-                            .x
-                    }) + 24.0;
-                    let (rect, response) =
-                        ui.allocate_exact_size(egui::vec2(width, 28.0), egui::Sense::click());
-                    let is_active = self.settings.tab == slot;
-                    if is_active {
-                        active_rect = Some(rect);
-                    }
-                    let painter = ui.painter();
-                    if is_active {
-                        painter.rect_stroke(
-                            rect,
-                            8.0,
-                            egui::Stroke::new(1.0_f32, ui_rgba(94, 214, 255, 120)),
-                        );
-                    } else if response.hovered() {
-                        painter.rect_filled(rect, 8.0, ui_rgba(255, 255, 255, 14));
-                    }
-                    painter.text(
-                        rect.center(),
-                        egui::Align2::CENTER_CENTER,
-                        label,
-                        egui::FontId::proportional(12.0),
-                        if is_active {
-                            egui::Color32::WHITE
-                        } else if response.hovered() {
-                            ui_rgb(226, 236, 246)
-                        } else {
-                            ui_rgb(158, 180, 202)
-                        },
-                    );
-                    if response.clicked() && !is_active {
-                        self.settings.tab = slot;
-                        self.settings.search.clear();
-                    }
-                    response.on_hover_cursor(egui::CursorIcon::PointingHand);
-                }
-            },
+        let font = egui::FontId::proportional(12.5);
+        let widths: Vec<f32> = SettingsTabSlot::ALL
+            .iter()
+            .map(|slot| {
+                ui.fonts(|fonts| {
+                    fonts
+                        .layout_no_wrap(slot.label().to_owned(), font.clone(), UI_TEXT)
+                        .size()
+                        .x
+                }) + PADDING * 2.0
+            })
+            .collect();
+
+        // Row breaks first, so the strip height is known before anything is allocated.
+        let available = ui.available_width();
+        let mut row_of: Vec<usize> = Vec::with_capacity(widths.len());
+        let mut row = 0usize;
+        let mut cursor = 0.0_f32;
+        for width in widths.iter() {
+            let advance = if cursor == 0.0 { *width } else { GAP + *width };
+            if 0.0 < cursor && available < cursor + advance {
+                row += 1;
+                cursor = *width;
+            } else {
+                cursor += advance;
+            }
+            row_of.push(row);
+        }
+        let row_count = row_of.last().map_or(1, |row| row + 1);
+        let strip_height = HEIGHT * row_count as f32 + GAP * (row_count.saturating_sub(1)) as f32;
+        let (strip_rect, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), strip_height),
+            egui::Sense::hover(),
         );
-        if let Some(rect) = active_rect {
-            let ctx = ui.ctx();
-            let left = ctx.animate_value_with_time(
-                egui::Id::new("settings_tab_highlight_left"),
-                rect.left(),
-                0.14,
+
+        let mut x = strip_rect.left();
+        let mut y = strip_rect.top();
+        let mut current_row = 0usize;
+        for (index, slot) in SettingsTabSlot::ALL.iter().enumerate() {
+            if row_of[index] != current_row {
+                current_row = row_of[index];
+                x = strip_rect.left();
+                y += HEIGHT + GAP;
+            }
+            let rect =
+                egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(widths[index], HEIGHT));
+            x += widths[index] + GAP;
+
+            let response = ui.interact(
+                rect,
+                egui::Id::new(("settings_tab", index)),
+                egui::Sense::click(),
             );
-            let right = ctx.animate_value_with_time(
-                egui::Id::new("settings_tab_highlight_right"),
-                rect.right(),
-                0.14,
+            let is_active = self.settings.tab == *slot;
+            let painter = ui.painter();
+            if is_active {
+                ui_paint_surface(painter, rect, 8.0, UI_SURFACE, Some(UI_BORDER));
+            } else if response.hovered() {
+                painter.rect_filled(rect, 8.0, ui_alpha(UI_TEXT_STRONG, 10));
+            }
+            painter.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                slot.label(),
+                font.clone(),
+                if is_active {
+                    UI_TEXT_STRONG
+                } else if response.hovered() {
+                    UI_TEXT
+                } else {
+                    UI_TEXT_DIM
+                },
             );
-            let animated = egui::Rect::from_min_max(
-                egui::pos2(left, rect.top()),
-                egui::pos2(right, rect.bottom()),
-            );
-            ui.painter().set(
-                highlight_idx,
-                egui::epaint::RectShape::filled(animated, 8.0, ui_rgba(94, 214, 255, 34)),
-            );
+            if response.clicked() && !is_active {
+                self.settings.tab = *slot;
+                self.settings.search.clear();
+            }
+            response.on_hover_cursor(egui::CursorIcon::PointingHand);
         }
     }
 
@@ -13660,318 +13745,315 @@ impl ImageViewer {
             }
 
             egui::CentralPanel::default()
-                .frame(
-                    egui::Frame::none()
-                        .fill(egui::Color32::from_rgb(16, 23, 31))
-                        .inner_margin(egui::Margin::same(18.0)),
-                )
+                .frame(egui::Frame::none().fill(UI_CONTENT))
                 .show(ctx, |ui| {
-                        ui.vertical(|ui| {
-                            ui.horizontal(|ui| {
-                                let header_width = (ui.available_width() - 300.0).max(150.0);
-                                ui.allocate_ui_with_layout(
-                                    // Fixed height: a 0-height max_rect makes wrapped labels behave oddly.
-                                    egui::vec2(header_width, 72.0),
-                                    egui::Layout::top_down(egui::Align::Min),
-                                    |ui| {
-                                        ui.label(
-                                            egui::RichText::new("Settings")
-                                                .color(egui::Color32::WHITE)
-                                                .strong()
-                                                .size(22.0),
-                                        );
-                                        ui.add_space(2.0);
-                                        ui.label(
-                                            egui::RichText::new(
-                                                "Tune every config.ini setting. Edits apply live and are written to config.ini.",
-                                            )
-                                            .color(ui_rgb(170, 190, 212))
-                                            .size(12.5),
-                                        );
-                                        ui.add_space(4.0);
-                                        ui.label(
-                                            egui::RichText::new(config_path_label.clone())
-                                                .monospace()
-                                                .color(ui_rgb(128, 165, 198))
-                                                .size(11.0),
-                                        );
-                                    },
-                                );
+                    // One monochrome style for every default widget (search field, drag values,
+                    // combo boxes, scroll bars) instead of per-control colour overrides at the
+                    // call sites. It is applied to this `Ui` rather than the context: egui keeps
+                    // one style per context, and the child viewport shares the viewer's context,
+                    // so `ctx.style_mut` would restyle the viewer window too.
+                    let style = ui.style_mut();
+                    style.visuals = settings_visuals();
+                    style.spacing.item_spacing = egui::vec2(10.0, 8.0);
+                    style.spacing.button_padding = egui::vec2(12.0, 5.0);
+                    style.spacing.interact_size.y = 26.0;
+                    style.spacing.combo_width = 160.0;
+                    style.spacing.scroll = egui::style::ScrollStyle::floating();
+                    style.spacing.scroll.floating_allocated_width = 6.0;
 
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        let (close_rect, close_response) = ui
-                                            .allocate_exact_size(
-                                                egui::vec2(32.0, 32.0),
-                                                egui::Sense::click(),
-                                            );
-                                        let hovered = close_response.hovered();
-                                        let painter = ui.painter();
-                                        painter.rect(
-                                            close_rect,
-                                            9.0,
-                                            if hovered {
-                                                ui_rgba(255, 255, 255, 22)
-                                            } else {
-                                                egui::Color32::TRANSPARENT
-                                            },
-                                            egui::Stroke::new(
-                                                1.0_f32,
-                                                if hovered {
-                                                    ui_rgba(255, 255, 255, 90)
-                                                } else {
-                                                    ui_rgba(255, 255, 255, 40)
-                                                },
-                                            ),
-                                        );
-                                        let center = close_rect.center();
-                                        let arm = 3.0;
-                                        let stroke = egui::Stroke::new(1.6_f32, ui_rgb(226, 236, 246));
-                                        painter.line_segment(
-                                            [
-                                                center + egui::vec2(-arm, -arm),
-                                                center + egui::vec2(arm, arm),
-                                            ],
-                                            stroke,
-                                        );
-                                        painter.line_segment(
-                                            [
-                                                center + egui::vec2(arm, -arm),
-                                                center + egui::vec2(-arm, arm),
-                                            ],
-                                            stroke,
-                                        );
-                                        if close_response.clicked() {
-                                            close_modal = true;
-                                        }
-                                        close_response.on_hover_text("Close (Esc)");
-
-                                        ui.add_space(8.0);
-                                        let (search_rect, _) = ui.allocate_exact_size(
-                                            egui::vec2(250.0, 28.0),
-                                            egui::Sense::hover(),
-                                        );
-                                        let painter = ui.painter();
-                                        painter.rect(
-                                            search_rect,
-                                            8.0,
-                                            ui_rgba(255, 255, 255, 10),
-                                            egui::Stroke::new(1.0_f32, ui_rgba(255, 255, 255, 30)),
-                                        );
-                                        let glass = egui::pos2(
-                                            search_rect.left() + 13.0,
-                                            search_rect.center().y - 1.0,
-                                        );
-                                        let glyph_stroke =
-                                            egui::Stroke::new(1.3_f32, ui_rgba(160, 190, 215, 220));
-                                        painter.circle_stroke(glass, 4.0, glyph_stroke);
-                                        painter.line_segment(
-                                            [
-                                                glass + egui::vec2(3.0, 3.0),
-                                                glass + egui::vec2(6.0, 6.0),
-                                            ],
-                                            glyph_stroke,
-                                        );
-                                        let text_rect = egui::Rect::from_min_max(
-                                            egui::pos2(
-                                                search_rect.left() + 26.0,
-                                                search_rect.top() + 4.0,
-                                            ),
-                                            egui::pos2(
-                                                search_rect.right() - 8.0,
-                                                search_rect.bottom() - 4.0,
-                                            ),
-                                        );
-                                        let response = ui.put(
-                                            text_rect,
-                                            egui::TextEdit::singleline(&mut self.settings.search)
-                                                .hint_text("Search settings…  (Ctrl+F)")
-                                                .frame(false)
-                                                .desired_width(text_rect.width()),
-                                        );
-                                        if std::mem::take(&mut self.settings.focus_search) {
-                                            response.request_focus();
-                                        }
-                                    },
-                                );
-                            });
-
-                            ui.add_space(10.0);
-                            ui.separator();
-                            ui.add_space(6.0);
-                            self.draw_settings_tab_strip(ui);
-                            ui.add_space(8.0);
-
-                            // ~44 = the status row closing the dialog (space + separator +
-                            // row height). Deriving the body height from the live window keeps
-                            // the layout correct while the user resizes the dialog.
-                            let body_height = (ui.available_height() - 44.0).max(160.0);
-                            let presets_width =
-                                236.0_f32.min((ui.available_width() - 300.0).max(180.0));
-                            let right_width =
-                                (ui.available_width() - presets_width - 25.0).max(200.0);
-                            ui.horizontal_top(|ui| {
-                                ui.allocate_ui_with_layout(
-                                    egui::vec2(presets_width, body_height),
-                                    egui::Layout::top_down(egui::Align::Min),
-                                    |ui| {
-                                        self.draw_settings_presets_panel(
-                                            ui,
-                                            body_height,
-                                            modified,
-                                            &mut action,
-                                        );
-                                    },
-                                );
-                                ui.add_space(12.0);
-                                let (separator_rect, _) = ui.allocate_exact_size(
-                                    egui::vec2(1.0, body_height),
-                                    egui::Sense::hover(),
-                                );
-                                ui.painter().rect_filled(
-                                    separator_rect,
-                                    0.0,
-                                    ui_rgba(255, 255, 255, 20),
-                                );
-                                ui.add_space(12.0);
-                                ui.allocate_ui_with_layout(
-                                    egui::vec2(right_width, body_height),
-                                    egui::Layout::top_down(egui::Align::Min),
-                                    |ui| {
-                                        egui::ScrollArea::vertical()
-                                            .id_salt("settings_values")
-                                            .max_height(body_height)
-                                            .auto_shrink([false, false])
-                                            .show(ui, |ui| {
-                                                ui.set_min_width(ui.available_width());
-                                                let query =
-                                                    self.settings.search.trim().to_string();
-                                                if query.is_empty() {
-                                                    match self.settings.tab {
-                                                        SettingsTabSlot::Help => {
-                                                            self.draw_help_tab(ui)
-                                                        }
-                                                        SettingsTabSlot::Tab(tab) => {
-                                                            let ids: Vec<usize> =
-                                                                settings_registry::SETTINGS
-                                                                    .iter()
-                                                                    .filter(|setting| {
-                                                                        setting.tab == tab
-                                                                    })
-                                                                    .map(|setting| setting.id)
-                                                                    .collect();
-                                                            self.draw_settings_groups(ui, &ids);
-                                                        }
-                                                    }
-                                                } else {
-                                                    let ids = settings_search_results(&query);
-                                                    if ids.is_empty() {
-                                                        ui.add_space(6.0);
-                                                        ui.label(
-                                                            egui::RichText::new(format!(
-                                                                "no matches for \"{query}\""
-                                                            ))
-                                                            .size(12.5)
-                                                            .color(ui_rgb(170, 190, 212)),
-                                                        );
-                                                    } else {
-                                                        self.draw_settings_search_results(ui, &ids);
-                                                    }
-                                                }
-                                            });
-                                    },
-                                );
-                            });
-
-                            ui.add_space(6.0);
-                            ui.separator();
-                            ui.add_space(2.0);
-                            let status = self.settings.status.clone();
-                            let status_is_error = self.settings.status_is_error;
-                            let visible_count = if self.settings.search.trim().is_empty() {
-                                match self.settings.tab {
-                                    SettingsTabSlot::Help => settings_registry::SETTINGS.len(),
-                                    SettingsTabSlot::Tab(tab) => settings_registry::SETTINGS
-                                        .iter()
-                                        .filter(|setting| setting.tab == tab)
-                                        .count(),
-                                }
-                            } else {
-                                settings_search_results(&self.settings.search).len()
-                            };
-                            ui.allocate_ui_with_layout(
-                                egui::vec2(ui.available_width(), 26.0),
-                                egui::Layout::left_to_right(egui::Align::Center),
-                                |ui| {
-                                    if let Some((message, _)) = status {
-                                        ui.label(
-                                            egui::RichText::new(message).size(12.0).color(
-                                                if status_is_error {
-                                                    ui_rgb(255, 150, 150)
-                                                } else {
-                                                    ui_rgb(150, 214, 255)
-                                                },
-                                            ),
-                                        );
-                                    }
-                                    ui.with_layout(
-                                        egui::Layout::right_to_left(egui::Align::Center),
+                    egui::Frame::none()
+                        .inner_margin(egui::Margin::symmetric(22.0, 16.0))
+                        .show(ui, |ui| {
+                            ui.vertical(|ui| {
+                                // ---------------------------------------------------- header
+                                ui.horizontal(|ui| {
+                                    let header_width = (ui.available_width() - 360.0).max(150.0);
+                                    ui.allocate_ui_with_layout(
+                                        // Fixed height: a 0-height max_rect makes wrapped
+                                        // labels behave oddly.
+                                        egui::vec2(header_width, 44.0),
+                                        egui::Layout::top_down(egui::Align::Min),
                                         |ui| {
-                                            let edit_config = ui
-                                                .add(
-                                                    egui::Button::new(
-                                                        egui::RichText::new("Edit config.ini")
-                                                            .size(11.5)
-                                                            .color(ui_rgb(214, 232, 248)),
-                                                    )
-                                                    .fill(ui_rgba(255, 255, 255, 12))
-                                                    .stroke(egui::Stroke::new(
-                                                        1.0_f32,
-                                                        ui_rgba(255, 255, 255, 36),
-                                                    ))
-                                                    .rounding(7.0)
-                                                    .min_size(egui::vec2(0.0, 22.0)),
+                                            ui.add(
+                                                egui::Label::new(
+                                                    egui::RichText::new("Settings")
+                                                        .color(UI_TEXT_STRONG)
+                                                        .size(19.0),
                                                 )
-                                                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                                                .on_hover_text(
-                                                    "Open config.ini in the default editor",
-                                                );
-                                            if edit_config.clicked() {
-                                                let config_path = Config::config_path();
-                                                match open_path_in_default_app(
-                                                    config_path.as_path(),
-                                                ) {
-                                                    Ok(()) => self.set_settings_status(
-                                                        format!(
-                                                            "Opened {}",
-                                                            config_path.display()
-                                                        ),
-                                                        false,
-                                                    ),
-                                                    Err(err) => self.set_settings_status(
-                                                        format!(
-                                                            "Failed to open config.ini: {err}"
-                                                        ),
-                                                        true,
-                                                    ),
-                                                }
-                                            }
-                                            ui.add_space(10.0);
-                                            ui.label(
-                                                egui::RichText::new(format!(
-                                                    "{visible_count} settings"
-                                                ))
-                                                .size(11.5)
-                                                .color(ui_rgba(140, 160, 182, 200)),
+                                                .truncate(),
+                                            );
+                                            ui.add_space(3.0);
+                                            ui.add(
+                                                egui::Label::new(
+                                                    egui::RichText::new(config_path_label.clone())
+                                                        .monospace()
+                                                        .color(UI_TEXT_FAINT)
+                                                        .size(10.5),
+                                                )
+                                                .truncate(),
                                             );
                                         },
                                     );
-                                },
-                            );
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            let (close_rect, close_response) = ui
+                                                .allocate_exact_size(
+                                                    egui::vec2(28.0, 28.0),
+                                                    egui::Sense::click(),
+                                                );
+                                            let hovered = close_response.hovered();
+                                            let painter = ui.painter();
+                                            if hovered {
+                                                painter.rect_filled(
+                                                    close_rect,
+                                                    8.0,
+                                                    ui_alpha(UI_TEXT_STRONG, 14),
+                                                );
+                                            }
+                                            let center = close_rect.center();
+                                            let arm = 4.5;
+                                            let stroke = egui::Stroke::new(
+                                                1.6_f32,
+                                                if hovered { UI_TEXT_STRONG } else { UI_TEXT_DIM },
+                                            );
+                                            painter.line_segment(
+                                                [
+                                                    center + egui::vec2(-arm, -arm),
+                                                    center + egui::vec2(arm, arm),
+                                                ],
+                                                stroke,
+                                            );
+                                            painter.line_segment(
+                                                [
+                                                    center + egui::vec2(arm, -arm),
+                                                    center + egui::vec2(-arm, arm),
+                                                ],
+                                                stroke,
+                                            );
+                                            if close_response.clicked() {
+                                                close_modal = true;
+                                            }
+                                            close_response
+                                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                                .on_hover_text("Close (Esc)");
+
+                                            ui.add_space(12.0);
+                                            egui::Frame::none()
+                                                .fill(UI_WINDOW)
+                                                .rounding(9.0)
+                                                .inner_margin(egui::Margin::symmetric(11.0, 6.0))
+                                                .show(ui, |ui| {
+                                                    ui.horizontal(|ui| {
+                                                        let (glyph_rect, _) = ui
+                                                            .allocate_exact_size(
+                                                                egui::vec2(13.0, 13.0),
+                                                                egui::Sense::hover(),
+                                                            );
+                                                        let glass = glyph_rect.center()
+                                                            + egui::vec2(-0.5, -0.5);
+                                                        let glyph = egui::Stroke::new(
+                                                            1.4_f32,
+                                                            UI_TEXT_FAINT,
+                                                        );
+                                                        ui.painter()
+                                                            .circle_stroke(glass, 4.0, glyph);
+                                                        ui.painter().line_segment(
+                                                            [
+                                                                glass + egui::vec2(3.0, 3.0),
+                                                                glass + egui::vec2(5.5, 5.5),
+                                                            ],
+                                                            glyph,
+                                                        );
+                                                        let response = ui.add(
+                                                            egui::TextEdit::singleline(
+                                                                &mut self.settings.search,
+                                                            )
+                                                            .hint_text("Search settings")
+                                                            .frame(false)
+                                                            .desired_width(180.0),
+                                                        );
+                                                        if std::mem::take(
+                                                            &mut self.settings.focus_search,
+                                                        ) {
+                                                            response.request_focus();
+                                                        }
+                                                    });
+                                                });
+                                        },
+                                    );
+                                });
+
+                                ui.add_space(14.0);
+                                ui_divider(ui);
+                                ui.add_space(10.0);
+                                self.draw_settings_tab_strip(ui);
+                                ui.add_space(12.0);
+
+                                // ------------------------------------------------------ body
+                                // ~58 = the footer closing the dialog (spacing + divider +
+                                // status row). Deriving the body height from the live window
+                                // keeps the layout correct while the user resizes the dialog.
+                                let body_height = (ui.available_height() - 58.0).max(160.0);
+                                let presets_width =
+                                    214.0_f32.min((ui.available_width() - 320.0).max(170.0));
+                                ui.horizontal_top(|ui| {
+                                    ui.allocate_ui_with_layout(
+                                        egui::vec2(presets_width, body_height),
+                                        egui::Layout::top_down(egui::Align::Min),
+                                        |ui| {
+                                            self.draw_settings_presets_panel(
+                                                ui,
+                                                body_height,
+                                                modified,
+                                                &mut action,
+                                            );
+                                        },
+                                    );
+                                    ui.add_space(18.0);
+                                    let (divider_rect, _) = ui.allocate_exact_size(
+                                        egui::vec2(1.0, body_height),
+                                        egui::Sense::hover(),
+                                    );
+                                    ui.painter().rect_filled(divider_rect, 0.0, UI_BORDER);
+                                    ui.add_space(18.0);
+                                    let right_width = (ui.available_width() - 1.0).max(200.0);
+                                    ui.allocate_ui_with_layout(
+                                        egui::vec2(right_width, body_height),
+                                        egui::Layout::top_down(egui::Align::Min),
+                                        |ui| {
+                                            egui::ScrollArea::vertical()
+                                                .id_salt("settings_values")
+                                                .max_height(body_height)
+                                                .auto_shrink([false, false])
+                                                .show(ui, |ui| {
+                                                    ui.set_min_width(ui.available_width());
+                                                    ui.add_space(4.0);
+                                                    let query =
+                                                        self.settings.search.trim().to_string();
+                                                    if query.is_empty() {
+                                                        match self.settings.tab {
+                                                            SettingsTabSlot::Help => {
+                                                                self.draw_help_tab(ui)
+                                                            }
+                                                            SettingsTabSlot::Tab(tab) => {
+                                                                let ids: Vec<usize> =
+                                                                    settings_registry::SETTINGS
+                                                                        .iter()
+                                                                        .filter(|setting| {
+                                                                            setting.tab == tab
+                                                                        })
+                                                                        .map(|setting| setting.id)
+                                                                        .collect();
+                                                                self.draw_settings_groups(ui, &ids);
+                                                            }
+                                                        }
+                                                    } else {
+                                                        let ids = settings_search_results(&query);
+                                                        if ids.is_empty() {
+                                                            ui.add_space(8.0);
+                                                            ui.label(
+                                                                egui::RichText::new(format!(
+                                                                    "No settings match \"{query}\"."
+                                                                ))
+                                                                .size(12.5)
+                                                                .color(UI_TEXT_DIM),
+                                                            );
+                                                        } else {
+                                                            self.draw_settings_search_results(
+                                                                ui, &ids,
+                                                            );
+                                                        }
+                                                    }
+                                                });
+                                        },
+                                    );
+                                });
+
+                                // ---------------------------------------------------- footer
+                                ui.add_space(14.0);
+                                ui_divider(ui);
+                                ui.add_space(6.0);
+                                let status = self.settings.status.clone();
+                                let status_is_error = self.settings.status_is_error;
+                                let visible_count = if self.settings.search.trim().is_empty() {
+                                    match self.settings.tab {
+                                        SettingsTabSlot::Help => settings_registry::SETTINGS.len(),
+                                        SettingsTabSlot::Tab(tab) => settings_registry::SETTINGS
+                                            .iter()
+                                            .filter(|setting| setting.tab == tab)
+                                            .count(),
+                                    }
+                                } else {
+                                    settings_search_results(&self.settings.search).len()
+                                };
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(ui.available_width(), 30.0),
+                                    egui::Layout::left_to_right(egui::Align::Center),
+                                    |ui| {
+                                        if let Some((message, _)) = status {
+                                            ui.label(
+                                                egui::RichText::new(message).size(11.5).color(
+                                                    if status_is_error {
+                                                        UI_TEXT_STRONG
+                                                    } else {
+                                                        UI_TEXT_DIM
+                                                    },
+                                                ),
+                                            );
+                                        }
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                let width =
+                                                    settings_button_width(ui, "Edit config.ini");
+                                                if settings_button(
+                                                    ui,
+                                                    "Edit config.ini",
+                                                    egui::vec2(width, 28.0),
+                                                    true,
+                                                    SettingsButtonKind::Secondary,
+                                                )
+                                                .on_hover_text(
+                                                    "Open config.ini in the default editor",
+                                                )
+                                                .clicked()
+                                                {
+                                                    let config_path = Config::config_path();
+                                                    match open_path_in_default_app(
+                                                        config_path.as_path(),
+                                                    ) {
+                                                        Ok(()) => self.set_settings_status(
+                                                            format!(
+                                                                "Opened {}",
+                                                                config_path.display()
+                                                            ),
+                                                            false,
+                                                        ),
+                                                        Err(err) => self.set_settings_status(
+                                                            format!(
+                                                                "Failed to open config.ini: {err}"
+                                                            ),
+                                                            true,
+                                                        ),
+                                                    }
+                                                }
+                                                ui.add_space(14.0);
+                                                ui.label(
+                                                    egui::RichText::new(format!(
+                                                        "{visible_count} settings"
+                                                    ))
+                                                    .size(11.5)
+                                                    .color(UI_TEXT_FAINT),
+                                                );
+                                            },
+                                        );
+                                    },
+                                );
+                            });
                         });
-                    });
-            });
+                });
+        });
 
         if let Some(action) = action {
             self.apply_settings_preset_action(action);
