@@ -12910,19 +12910,22 @@ impl ImageViewer {
         }
     }
 
-    fn draw_settings_badge(
-        ui: &mut egui::Ui,
-        text: &str,
-        fill: egui::Color32,
-        color: egui::Color32,
-    ) {
-        egui::Frame::none()
-            .fill(fill)
-            .rounding(6.0)
-            .inner_margin(egui::Margin::symmetric(7.0, 2.5))
-            .show(ui, |ui| {
-                ui.label(egui::RichText::new(text).size(9.5).color(color));
-            });
+    /// Tooltip body for one settings row: the help text, the ini key, and why a change may not
+    /// show up (restart pending, or no reader at all).
+    fn settings_row_tooltip(
+        setting: &'static settings_registry::Setting,
+        read_only: bool,
+    ) -> String {
+        let mut tooltip = format!("{}\n\nkey: {}", setting.help, setting.key);
+        let hint = setting.status_hint();
+        if !hint.is_empty() {
+            tooltip.push('\n');
+            tooltip.push_str(hint);
+        }
+        if read_only {
+            tooltip.push_str("\n\nThe Default preset is read-only: pick another preset to edit.");
+        }
+        tooltip
     }
 
     /// Custom track + knob slider; drag maps pointer x to the value, Shift makes it 4x finer.
@@ -13116,26 +13119,12 @@ impl ImageViewer {
         read_only: bool,
     ) -> Option<bool> {
         let id = setting.id;
-        let mut tooltip = format!("{}\n\nkey: {}", setting.help, setting.key);
-        let hint = setting.status_hint();
-        if !hint.is_empty() {
-            tooltip.push('\n');
-            tooltip.push_str(hint);
-        }
-        if read_only {
-            tooltip.push_str("\n\nThe Default preset is read-only: pick another preset to edit.");
-        }
+        let tooltip = Self::settings_row_tooltip(setting, read_only);
+        let tooltip_width = ui.spacing().tooltip_width.min(420.0);
         let row_width = ui.available_width();
         // Fits the widest label of this tab, so labels are not cut while there is room. On a
         // narrow dialog the label elides first: the control keeps `SETTINGS_CONTROLS_MIN_WIDTH`.
         let label_slot = label_column.min((row_width - SETTINGS_CONTROLS_MIN_WIDTH).max(90.0));
-        let mut badge_width = 0.0_f32;
-        if setting.applies == settings_registry::Applies::Restart {
-            badge_width += 64.0;
-        }
-        if setting.unused {
-            badge_width += 56.0;
-        }
         let mut changed = false;
         let mut write_now = false;
 
@@ -13143,7 +13132,7 @@ impl ImageViewer {
             ui.set_min_height(38.0);
             ui.spacing_mut().item_spacing.x = 10.0;
             ui.add_sized(
-                [(label_slot - badge_width - 6.0).max(40.0), 20.0],
+                [(label_slot - 6.0).max(40.0), 20.0],
                 egui::Label::new(
                     egui::RichText::new(setting.label)
                         .size(13.0)
@@ -13151,12 +13140,6 @@ impl ImageViewer {
                 )
                 .truncate(),
             );
-            if setting.applies == settings_registry::Applies::Restart {
-                Self::draw_settings_badge(ui, "restart", UI_SURFACE_HOVER, UI_TEXT_DIM);
-            }
-            if setting.unused {
-                Self::draw_settings_badge(ui, "unused", UI_SURFACE, UI_TEXT_FAINT);
-            }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add_enabled_ui(!read_only, |ui| {
@@ -13308,7 +13291,16 @@ impl ImageViewer {
                 });
             });
         });
-        row.response.on_hover_text(tooltip);
+        let row_response = row.response;
+        // Paint the tooltip on the hover frame instead of `on_hover_text`: that delayed path needs a
+        // frame after `interaction.tooltip_delay`, and an idle viewer only wakes the dialog's own
+        // viewport on input, so the deadline frame usually never arrives and nothing is shown.
+        if row_response.hovered() && !ui.ctx().input(|i| i.pointer.any_down()) {
+            row_response.show_tooltip_ui(|ui| {
+                ui.set_max_width(tooltip_width);
+                ui.label(tooltip.as_str());
+            });
+        }
         if changed {
             Some(write_now)
         } else {
@@ -13377,25 +13369,19 @@ impl ImageViewer {
         }
     }
 
-    /// Width of the label column that fits the longest label in `ids`, badges included, so no
-    /// row in the tab truncates its label while the dialog is wide enough to hold it.
+    /// Width of the label column that fits the longest label in `ids`, so no row in the tab
+    /// truncates its label while the dialog is wide enough to hold it.
     fn settings_label_column(ui: &egui::Ui, ids: &[usize]) -> f32 {
         let font = egui::FontId::proportional(13.0);
         let mut widest = 0.0_f32;
         for id in ids {
             let setting = &settings_registry::SETTINGS[*id];
-            let mut needed = ui.fonts(|fonts| {
+            let needed = ui.fonts(|fonts| {
                 fonts
                     .layout_no_wrap(setting.label.to_owned(), font.clone(), UI_TEXT)
                     .size()
                     .x
             });
-            if setting.applies == settings_registry::Applies::Restart {
-                needed += 64.0;
-            }
-            if setting.unused {
-                needed += 56.0;
-            }
             widest = widest.max(needed);
         }
         widest + 16.0

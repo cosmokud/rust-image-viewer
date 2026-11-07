@@ -39,7 +39,6 @@ pub enum SettingsTab {
 pub enum Applies {
     Live,
     Restart,
-    None,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -85,8 +84,8 @@ impl Setting {
             return "no reader: changing this has no effect";
         }
         match self.applies {
-            Applies::Restart => "restart required",
-            Applies::Live | Applies::None => "",
+            Applies::Restart => "restart required: takes effect on the next launch",
+            Applies::Live => "",
         }
     }
 }
@@ -359,18 +358,6 @@ pub const SETTINGS: &[Setting] = &[
     },
     Setting {
         id: 22,
-        key: "manga_hover_autoplay_resume_delay_ms",
-        tab: SettingsTab::Motion,
-        label: "Hover autoplay resume delay ms",
-        group: "Masonry hover",
-        help: "Masonry mode: delay before hover-based autoplay resumes after scroll/pan/zoom stops (milliseconds) 0 = immediate autoplay on hover, 220 = recommended smooth behavior",
-        kind: SettingKind::Int { min: 0, max: 5000 },
-        applies: Applies::None,
-        unused: true,
-        action: None,
-    },
-    Setting {
-        id: 23,
         key: "manga_autoscroll_dead_zone_px",
         tab: SettingsTab::Autoscroll,
         label: "Dead zone px",
@@ -382,7 +369,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 24,
+        id: 23,
         key: "manga_autoscroll_base_speed_multiplier",
         tab: SettingsTab::Autoscroll,
         label: "Base speed multiplier",
@@ -394,7 +381,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 25,
+        id: 24,
         key: "manga_autoscroll_min_speed_multiplier",
         tab: SettingsTab::Autoscroll,
         label: "Min speed multiplier",
@@ -406,7 +393,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 26,
+        id: 25,
         key: "manga_autoscroll_max_speed_multiplier",
         tab: SettingsTab::Autoscroll,
         label: "Max speed multiplier",
@@ -418,7 +405,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 27,
+        id: 26,
         key: "manga_autoscroll_curve_power",
         tab: SettingsTab::Autoscroll,
         label: "Curve power",
@@ -430,7 +417,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 28,
+        id: 27,
         key: "manga_autoscroll_min_speed_px_per_sec",
         tab: SettingsTab::Autoscroll,
         label: "Min speed px per sec",
@@ -442,7 +429,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 29,
+        id: 28,
         key: "manga_autoscroll_max_speed_px_per_sec",
         tab: SettingsTab::Autoscroll,
         label: "Max speed px per sec",
@@ -454,7 +441,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 30,
+        id: 29,
         key: "manga_autoscroll_horizontal_speed_multiplier",
         tab: SettingsTab::Autoscroll,
         label: "Horizontal speed multiplier",
@@ -466,7 +453,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 31,
+        id: 30,
         key: "manga_autoscroll_vertical_speed_multiplier",
         tab: SettingsTab::Autoscroll,
         label: "Vertical speed multiplier",
@@ -478,7 +465,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 32,
+        id: 31,
         key: "manga_autoscroll_circle_fill_alpha",
         tab: SettingsTab::Autoscroll,
         label: "Circle fill alpha",
@@ -490,7 +477,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 33,
+        id: 32,
         key: "manga_autoscroll_arrow_rgb",
         tab: SettingsTab::Autoscroll,
         label: "Arrow RGB",
@@ -502,7 +489,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 34,
+        id: 33,
         key: "manga_autoscroll_arrow_alpha",
         tab: SettingsTab::Autoscroll,
         label: "Arrow alpha",
@@ -514,7 +501,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 35,
+        id: 34,
         key: "startup_window_mode",
         tab: SettingsTab::Window,
         label: "Startup window mode",
@@ -526,7 +513,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 36,
+        id: 35,
         key: "single_instance",
         tab: SettingsTab::Window,
         label: "Single instance",
@@ -538,7 +525,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 37,
+        id: 36,
         key: "window_title_show_full_path",
         tab: SettingsTab::Window,
         label: "Window title show full path",
@@ -550,7 +537,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 38,
+        id: 37,
         key: "vsync",
         tab: SettingsTab::Window,
         label: "VSync",
@@ -562,7 +549,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 39,
+        id: 38,
         key: "fullscreen_reset_fit_on_mode_switch",
         tab: SettingsTab::Window,
         label: "Fullscreen reset fit on mode switch",
@@ -574,7 +561,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 40,
+        id: 39,
         key: "manga_long_strip_reset_fit_on_fullscreen_exit",
         tab: SettingsTab::Window,
         label: "Manga long strip reset fit on fullscreen exit",
@@ -586,7 +573,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 41,
+        id: 40,
         key: "fullscreen_remember_view_state_in_ram",
         tab: SettingsTab::Window,
         label: "Fullscreen remember view state in RAM",
@@ -598,7 +585,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 42,
+        id: 41,
         key: "fullscreen_native_window_transition",
         tab: SettingsTab::Window,
         label: "Fullscreen native window transition",
@@ -610,7 +597,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 43,
+        id: 42,
         key: "maximize_to_borderless_fullscreen",
         tab: SettingsTab::Window,
         label: "Maximize to borderless fullscreen",
@@ -622,7 +609,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 44,
+        id: 43,
         key: "metadata_cache_max_size_mb",
         tab: SettingsTab::Files,
         label: "Metadata cache max size MB",
@@ -634,7 +621,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 45,
+        id: 44,
         key: "masonry_metadata_ram_cache_limit_mb",
         tab: SettingsTab::Files,
         label: "Metadata RAM cache limit MB",
@@ -646,7 +633,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 46,
+        id: 45,
         key: "confirm_delete_to_recycle_bin",
         tab: SettingsTab::Files,
         label: "Confirm delete to recycle bin",
@@ -658,7 +645,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 47,
+        id: 46,
         key: "auto_unmark_after_paste",
         tab: SettingsTab::Files,
         label: "Auto unmark after paste",
@@ -670,7 +657,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 48,
+        id: 47,
         key: "masonry_items_per_row",
         tab: SettingsTab::Files,
         label: "Items per row",
@@ -682,7 +669,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 49,
+        id: 48,
         key: "manga_virtualization_backend",
         tab: SettingsTab::Files,
         label: "Virtualization backend",
@@ -694,7 +681,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 50,
+        id: 49,
         key: "muted_by_default",
         tab: SettingsTab::Video,
         label: "Muted by default",
@@ -706,7 +693,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 51,
+        id: 50,
         key: "default_volume",
         tab: SettingsTab::Video,
         label: "Default volume",
@@ -718,7 +705,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 52,
+        id: 51,
         key: "loop",
         tab: SettingsTab::Video,
         label: "Loop",
@@ -730,7 +717,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 53,
+        id: 52,
         key: "seek_policy",
         tab: SettingsTab::Video,
         label: "Seek policy",
@@ -742,7 +729,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 54,
+        id: 53,
         key: "prefer_hardware_decode",
         tab: SettingsTab::Video,
         label: "Prefer hardware decode",
@@ -754,7 +741,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 55,
+        id: 54,
         key: "disable_hardware_decode",
         tab: SettingsTab::Video,
         label: "Disable hardware decode",
@@ -766,7 +753,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 56,
+        id: 55,
         key: "videos_only_navigation",
         tab: SettingsTab::Video,
         label: "Videos only navigation",
@@ -778,7 +765,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 57,
+        id: 56,
         key: "priority_previous_file_binding",
         tab: SettingsTab::Video,
         label: "Priority previous file binding",
@@ -790,7 +777,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 58,
+        id: 57,
         key: "priority_next_file_binding",
         tab: SettingsTab::Video,
         label: "Priority next file binding",
@@ -802,7 +789,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 59,
+        id: 58,
         key: "priority_play_pause_binding",
         tab: SettingsTab::Video,
         label: "Priority play pause binding",
@@ -814,7 +801,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 60,
+        id: 59,
         key: "show_fps",
         tab: SettingsTab::Performance,
         label: "Show FPS",
@@ -826,7 +813,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 61,
+        id: 60,
         key: "show_fps_update_interval_ms",
         tab: SettingsTab::Performance,
         label: "Show FPS update interval ms",
@@ -838,7 +825,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 62,
+        id: 61,
         key: "use_hardware_acceleration",
         tab: SettingsTab::Performance,
         label: "Use hardware acceleration",
@@ -850,7 +837,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 63,
+        id: 62,
         key: "enable_d3d12",
         tab: SettingsTab::Performance,
         label: "Enable D3D12",
@@ -862,7 +849,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 64,
+        id: 63,
         key: "enable_cuda",
         tab: SettingsTab::Performance,
         label: "Enable CUDA",
@@ -874,19 +861,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 65,
-        key: "upscale_filter",
-        tab: SettingsTab::Performance,
-        label: "Upscale filter",
-        group: "Image scaling",
-        help: "Filter used when enlarging images (small images displayed larger) Recommended: catmullrom (good upscaling without excessive blur)",
-        kind: SettingKind::Enum { values: &["nearest", "triangle", "catmullrom", "gaussian", "lanczos3"] },
-        applies: Applies::None,
-        unused: true,
-        action: None,
-    },
-    Setting {
-        id: 66,
+        id: 64,
         key: "downscale_filter",
         tab: SettingsTab::Performance,
         label: "Downscale filter",
@@ -898,7 +873,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 67,
+        id: 65,
         key: "gif_resize_filter",
         tab: SettingsTab::Performance,
         label: "Gif resize filter",
@@ -910,7 +885,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 68,
+        id: 66,
         key: "texture_filter_static",
         tab: SettingsTab::Performance,
         label: "Texture filter static",
@@ -922,7 +897,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 69,
+        id: 67,
         key: "texture_filter_animated",
         tab: SettingsTab::Performance,
         label: "Texture filter animated",
@@ -934,7 +909,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 70,
+        id: 68,
         key: "texture_filter_video",
         tab: SettingsTab::Performance,
         label: "Texture filter video",
@@ -946,7 +921,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 71,
+        id: 69,
         key: "manga_mipmap_static",
         tab: SettingsTab::Performance,
         label: "Mipmap static",
@@ -958,7 +933,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 72,
+        id: 70,
         key: "manga_mipmap_video_thumbnails",
         tab: SettingsTab::Performance,
         label: "Mipmap video thumbnails",
@@ -970,7 +945,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 73,
+        id: 71,
         key: "manga_mipmap_min_side",
         tab: SettingsTab::Performance,
         label: "Mipmap min side",
@@ -982,7 +957,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 74,
+        id: 72,
         key: "toggle_fullscreen",
         tab: SettingsTab::Shortcuts,
         label: "Toggle fullscreen",
@@ -994,7 +969,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::ToggleFullscreen),
     },
     Setting {
-        id: 75,
+        id: 73,
         key: "exit",
         tab: SettingsTab::Shortcuts,
         label: "Exit",
@@ -1006,7 +981,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::Exit),
     },
     Setting {
-        id: 76,
+        id: 74,
         key: "pan",
         tab: SettingsTab::Shortcuts,
         label: "Pan",
@@ -1018,7 +993,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::Pan),
     },
     Setting {
-        id: 77,
+        id: 75,
         key: "select_area",
         tab: SettingsTab::Shortcuts,
         label: "Select area",
@@ -1030,7 +1005,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::SelectArea),
     },
     Setting {
-        id: 78,
+        id: 76,
         key: "goto_file",
         tab: SettingsTab::Shortcuts,
         label: "Goto file",
@@ -1042,7 +1017,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::GotoFile),
     },
     Setting {
-        id: 79,
+        id: 77,
         key: "freehand_autoscroll",
         tab: SettingsTab::Shortcuts,
         label: "Freehand autoscroll",
@@ -1054,7 +1029,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::FreehandAutoscroll),
     },
     Setting {
-        id: 80,
+        id: 78,
         key: "mark_file",
         tab: SettingsTab::Shortcuts,
         label: "Mark file",
@@ -1066,7 +1041,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 81,
+        id: 79,
         key: "toggle_mark_file",
         tab: SettingsTab::Shortcuts,
         label: "Toggle mark file",
@@ -1078,7 +1053,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 82,
+        id: 80,
         key: "next_image",
         tab: SettingsTab::Shortcuts,
         label: "Next image",
@@ -1090,7 +1065,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::NextImage),
     },
     Setting {
-        id: 83,
+        id: 81,
         key: "previous_image",
         tab: SettingsTab::Shortcuts,
         label: "Previous image",
@@ -1102,7 +1077,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::PreviousImage),
     },
     Setting {
-        id: 84,
+        id: 82,
         key: "rotate_clockwise",
         tab: SettingsTab::Shortcuts,
         label: "Rotate clockwise",
@@ -1114,7 +1089,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::RotateClockwise),
     },
     Setting {
-        id: 85,
+        id: 83,
         key: "rotate_counterclockwise",
         tab: SettingsTab::Shortcuts,
         label: "Rotate counterclockwise",
@@ -1126,7 +1101,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::RotateCounterClockwise),
     },
     Setting {
-        id: 86,
+        id: 84,
         key: "precise_rotation_clockwise",
         tab: SettingsTab::Shortcuts,
         label: "Precise rotation clockwise",
@@ -1138,7 +1113,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::PreciseRotationClockwise),
     },
     Setting {
-        id: 87,
+        id: 85,
         key: "precise_rotation_counterclockwise",
         tab: SettingsTab::Shortcuts,
         label: "Precise rotation counterclockwise",
@@ -1150,7 +1125,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::PreciseRotationCounterClockwise),
     },
     Setting {
-        id: 88,
+        id: 86,
         key: "flip_vertically",
         tab: SettingsTab::Shortcuts,
         label: "Flip vertically",
@@ -1162,7 +1137,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::FlipVertically),
     },
     Setting {
-        id: 89,
+        id: 87,
         key: "flip_horizontally",
         tab: SettingsTab::Shortcuts,
         label: "Flip horizontally",
@@ -1174,7 +1149,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::FlipHorizontally),
     },
     Setting {
-        id: 90,
+        id: 88,
         key: "zoom_in",
         tab: SettingsTab::Shortcuts,
         label: "Zoom in",
@@ -1186,7 +1161,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::ZoomIn),
     },
     Setting {
-        id: 91,
+        id: 89,
         key: "zoom_out",
         tab: SettingsTab::Shortcuts,
         label: "Zoom out",
@@ -1198,7 +1173,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::ZoomOut),
     },
     Setting {
-        id: 92,
+        id: 90,
         key: "manga_pan",
         tab: SettingsTab::Shortcuts,
         label: "Pan",
@@ -1210,7 +1185,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MangaPan),
     },
     Setting {
-        id: 93,
+        id: 91,
         key: "manga_goto_file",
         tab: SettingsTab::Shortcuts,
         label: "Goto file",
@@ -1222,7 +1197,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MangaGotoFile),
     },
     Setting {
-        id: 94,
+        id: 92,
         key: "manga_freehand_autoscroll",
         tab: SettingsTab::Shortcuts,
         label: "Freehand autoscroll",
@@ -1234,7 +1209,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MangaFreehandAutoscroll),
     },
     Setting {
-        id: 95,
+        id: 93,
         key: "manga_mark_file",
         tab: SettingsTab::Shortcuts,
         label: "Mark file",
@@ -1246,7 +1221,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 96,
+        id: 94,
         key: "manga_toggle_mark_file",
         tab: SettingsTab::Shortcuts,
         label: "Toggle mark file",
@@ -1258,7 +1233,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 97,
+        id: 95,
         key: "manga_pan_up",
         tab: SettingsTab::Shortcuts,
         label: "Pan up",
@@ -1270,7 +1245,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MangaPanUp),
     },
     Setting {
-        id: 98,
+        id: 96,
         key: "manga_pan_down",
         tab: SettingsTab::Shortcuts,
         label: "Pan down",
@@ -1282,7 +1257,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MangaPanDown),
     },
     Setting {
-        id: 99,
+        id: 97,
         key: "manga_next_image_fit",
         tab: SettingsTab::Shortcuts,
         label: "Next image fit",
@@ -1294,7 +1269,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MangaNextImageFit),
     },
     Setting {
-        id: 100,
+        id: 98,
         key: "manga_previous_image_fit",
         tab: SettingsTab::Shortcuts,
         label: "Previous image fit",
@@ -1306,7 +1281,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MangaPreviousImageFit),
     },
     Setting {
-        id: 101,
+        id: 99,
         key: "manga_next_image",
         tab: SettingsTab::Shortcuts,
         label: "Next image",
@@ -1318,7 +1293,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MangaNextImage),
     },
     Setting {
-        id: 102,
+        id: 100,
         key: "manga_previous_image",
         tab: SettingsTab::Shortcuts,
         label: "Previous image",
@@ -1330,7 +1305,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MangaPreviousImage),
     },
     Setting {
-        id: 103,
+        id: 101,
         key: "manga_scroll_up",
         tab: SettingsTab::Shortcuts,
         label: "Scroll up",
@@ -1342,7 +1317,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MangaScrollUp),
     },
     Setting {
-        id: 104,
+        id: 102,
         key: "manga_scroll_down",
         tab: SettingsTab::Shortcuts,
         label: "Scroll down",
@@ -1354,7 +1329,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MangaScrollDown),
     },
     Setting {
-        id: 105,
+        id: 103,
         key: "manga_zoom_in",
         tab: SettingsTab::Shortcuts,
         label: "Zoom in",
@@ -1366,7 +1341,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MangaZoomIn),
     },
     Setting {
-        id: 106,
+        id: 104,
         key: "manga_zoom_out",
         tab: SettingsTab::Shortcuts,
         label: "Zoom out",
@@ -1378,7 +1353,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MangaZoomOut),
     },
     Setting {
-        id: 107,
+        id: 105,
         key: "masonry_pan",
         tab: SettingsTab::Shortcuts,
         label: "Pan",
@@ -1390,7 +1365,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MasonryPan),
     },
     Setting {
-        id: 108,
+        id: 106,
         key: "masonry_goto_file",
         tab: SettingsTab::Shortcuts,
         label: "Goto file",
@@ -1402,7 +1377,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MasonryGotoFile),
     },
     Setting {
-        id: 109,
+        id: 107,
         key: "masonry_freehand_autoscroll",
         tab: SettingsTab::Shortcuts,
         label: "Freehand autoscroll",
@@ -1414,7 +1389,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MasonryFreehandAutoscroll),
     },
     Setting {
-        id: 110,
+        id: 108,
         key: "masonry_mark_file",
         tab: SettingsTab::Shortcuts,
         label: "Mark file",
@@ -1426,7 +1401,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 111,
+        id: 109,
         key: "masonry_toggle_mark_file",
         tab: SettingsTab::Shortcuts,
         label: "Toggle mark file",
@@ -1438,7 +1413,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 112,
+        id: 110,
         key: "masonry_pan_up",
         tab: SettingsTab::Shortcuts,
         label: "Pan up",
@@ -1450,7 +1425,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MasonryPanUp),
     },
     Setting {
-        id: 113,
+        id: 111,
         key: "masonry_pan_down",
         tab: SettingsTab::Shortcuts,
         label: "Pan down",
@@ -1462,7 +1437,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MasonryPanDown),
     },
     Setting {
-        id: 114,
+        id: 112,
         key: "masonry_pan_up_2",
         tab: SettingsTab::Shortcuts,
         label: "Pan up 2",
@@ -1474,7 +1449,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MasonryPanUp2),
     },
     Setting {
-        id: 115,
+        id: 113,
         key: "masonry_pan_down_2",
         tab: SettingsTab::Shortcuts,
         label: "Pan down 2",
@@ -1486,7 +1461,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MasonryPanDown2),
     },
     Setting {
-        id: 116,
+        id: 114,
         key: "masonry_pan_up_3",
         tab: SettingsTab::Shortcuts,
         label: "Pan up 3",
@@ -1498,7 +1473,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MasonryPanUp3),
     },
     Setting {
-        id: 117,
+        id: 115,
         key: "masonry_pan_down_3",
         tab: SettingsTab::Shortcuts,
         label: "Pan down 3",
@@ -1510,7 +1485,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MasonryPanDown3),
     },
     Setting {
-        id: 118,
+        id: 116,
         key: "masonry_scroll_up",
         tab: SettingsTab::Shortcuts,
         label: "Scroll up",
@@ -1522,7 +1497,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MasonryScrollUp),
     },
     Setting {
-        id: 119,
+        id: 117,
         key: "masonry_scroll_down",
         tab: SettingsTab::Shortcuts,
         label: "Scroll down",
@@ -1534,7 +1509,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MasonryScrollDown),
     },
     Setting {
-        id: 120,
+        id: 118,
         key: "masonry_zoom_in",
         tab: SettingsTab::Shortcuts,
         label: "Zoom in",
@@ -1546,7 +1521,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MasonryZoomIn),
     },
     Setting {
-        id: 121,
+        id: 119,
         key: "masonry_zoom_out",
         tab: SettingsTab::Shortcuts,
         label: "Zoom out",
@@ -1558,7 +1533,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MasonryZoomOut),
     },
     Setting {
-        id: 122,
+        id: 120,
         key: "gallery_pan",
         tab: SettingsTab::Shortcuts,
         label: "Pan",
@@ -1570,7 +1545,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MasonryPan),
     },
     Setting {
-        id: 123,
+        id: 121,
         key: "gallery_goto_file",
         tab: SettingsTab::Shortcuts,
         label: "Goto file",
@@ -1582,7 +1557,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MasonryGotoFile),
     },
     Setting {
-        id: 124,
+        id: 122,
         key: "gallery_freehand_autoscroll",
         tab: SettingsTab::Shortcuts,
         label: "Freehand autoscroll",
@@ -1594,7 +1569,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MasonryFreehandAutoscroll),
     },
     Setting {
-        id: 125,
+        id: 123,
         key: "gallery_mark_file",
         tab: SettingsTab::Shortcuts,
         label: "Mark file",
@@ -1606,7 +1581,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 126,
+        id: 124,
         key: "gallery_toggle_mark_file",
         tab: SettingsTab::Shortcuts,
         label: "Toggle mark file",
@@ -1618,7 +1593,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 127,
+        id: 125,
         key: "gallery_pan_up",
         tab: SettingsTab::Shortcuts,
         label: "Pan up",
@@ -1630,7 +1605,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MasonryPanUp),
     },
     Setting {
-        id: 128,
+        id: 126,
         key: "gallery_pan_down",
         tab: SettingsTab::Shortcuts,
         label: "Pan down",
@@ -1642,7 +1617,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MasonryPanDown),
     },
     Setting {
-        id: 129,
+        id: 127,
         key: "gallery_pan_up_2",
         tab: SettingsTab::Shortcuts,
         label: "Pan up 2",
@@ -1654,7 +1629,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MasonryPanUp2),
     },
     Setting {
-        id: 130,
+        id: 128,
         key: "gallery_pan_down_2",
         tab: SettingsTab::Shortcuts,
         label: "Pan down 2",
@@ -1666,7 +1641,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MasonryPanDown2),
     },
     Setting {
-        id: 131,
+        id: 129,
         key: "gallery_pan_up_3",
         tab: SettingsTab::Shortcuts,
         label: "Pan up 3",
@@ -1678,7 +1653,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MasonryPanUp3),
     },
     Setting {
-        id: 132,
+        id: 130,
         key: "gallery_pan_down_3",
         tab: SettingsTab::Shortcuts,
         label: "Pan down 3",
@@ -1690,7 +1665,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MasonryPanDown3),
     },
     Setting {
-        id: 133,
+        id: 131,
         key: "gallery_scroll_up",
         tab: SettingsTab::Shortcuts,
         label: "Scroll up",
@@ -1702,7 +1677,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MasonryScrollUp),
     },
     Setting {
-        id: 134,
+        id: 132,
         key: "gallery_scroll_down",
         tab: SettingsTab::Shortcuts,
         label: "Scroll down",
@@ -1714,7 +1689,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MasonryScrollDown),
     },
     Setting {
-        id: 135,
+        id: 133,
         key: "gallery_zoom_in",
         tab: SettingsTab::Shortcuts,
         label: "Zoom in",
@@ -1726,7 +1701,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MasonryZoomIn),
     },
     Setting {
-        id: 136,
+        id: 134,
         key: "gallery_zoom_out",
         tab: SettingsTab::Shortcuts,
         label: "Zoom out",
@@ -1738,7 +1713,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MasonryZoomOut),
     },
     Setting {
-        id: 137,
+        id: 135,
         key: "video_play_pause",
         tab: SettingsTab::Shortcuts,
         label: "Video play pause",
@@ -1750,7 +1725,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::VideoPlayPause),
     },
     Setting {
-        id: 138,
+        id: 136,
         key: "video_mute",
         tab: SettingsTab::Shortcuts,
         label: "Video mute",
@@ -1799,9 +1774,6 @@ fn value_of(config: &Config, key: &str) -> SettingValue {
         "manga_wheel_edge_spring_hz" => SettingValue::Num(config.manga_wheel_edge_spring_hz as f64),
         "manga_inertial_friction" => SettingValue::Num(config.manga_inertial_friction as f64),
         "manga_arrow_scroll_speed" => SettingValue::Num(config.manga_arrow_scroll_speed as f64),
-        "manga_hover_autoplay_resume_delay_ms" => {
-            SettingValue::Num(config.manga_hover_autoplay_resume_delay_ms as f64)
-        }
         "manga_autoscroll_dead_zone_px" => {
             SettingValue::Num(config.manga_autoscroll_dead_zone_px as f64)
         }
@@ -1906,7 +1878,6 @@ fn value_of(config: &Config, key: &str) -> SettingValue {
         "use_hardware_acceleration" => SettingValue::Bool(config.use_hardware_acceleration),
         "enable_d3d12" => SettingValue::Bool(config.enable_d3d12),
         "enable_cuda" => SettingValue::Bool(config.enable_cuda),
-        "upscale_filter" => SettingValue::Text(config.upscale_filter.as_str().to_string()),
         "downscale_filter" => SettingValue::Text(config.downscale_filter.as_str().to_string()),
         "gif_resize_filter" => SettingValue::Text(config.gif_resize_filter.as_str().to_string()),
         "texture_filter_static" => {
@@ -2123,9 +2094,6 @@ fn set_num_field(config: &mut Config, key: &str, value: f64) {
         "manga_wheel_edge_spring_hz" => config.manga_wheel_edge_spring_hz = value as f32,
         "manga_inertial_friction" => config.manga_inertial_friction = value as f32,
         "manga_arrow_scroll_speed" => config.manga_arrow_scroll_speed = value as f32,
-        "manga_hover_autoplay_resume_delay_ms" => {
-            config.manga_hover_autoplay_resume_delay_ms = value as u64
-        }
         "manga_autoscroll_dead_zone_px" => config.manga_autoscroll_dead_zone_px = value as f32,
         "manga_autoscroll_base_speed_multiplier" => {
             config.manga_autoscroll_base_speed_multiplier = value as f32
@@ -2209,9 +2177,6 @@ fn set_text(config: &mut Config, setting: &Setting, text: &str) -> Result<(), St
         "priority_play_pause_binding" => {
             config.video_priority_play_pause_binding =
                 parse_or_err(text, parse_optional_binding(text))?
-        }
-        "upscale_filter" => {
-            config.upscale_filter = parse_or_err(text, ImageFilter::from_str(text))?
         }
         "downscale_filter" => {
             config.downscale_filter = parse_or_err(text, ImageFilter::from_str(text))?
@@ -2979,17 +2944,17 @@ mod tests {
 
     #[test]
     fn registry_covers_every_tab() {
-        assert_eq!(SETTINGS.len(), 139);
+        assert_eq!(SETTINGS.len(), 137);
         for (tab, expected) in [
             (SettingsTab::General, 5),
             (SettingsTab::Appearance, 2),
             (SettingsTab::ZoomScroll, 8),
-            (SettingsTab::Motion, 8),
+            (SettingsTab::Motion, 7),
             (SettingsTab::Autoscroll, 12),
             (SettingsTab::Window, 9),
             (SettingsTab::Files, 6),
             (SettingsTab::Video, 10),
-            (SettingsTab::Performance, 14),
+            (SettingsTab::Performance, 13),
             (SettingsTab::Shortcuts, 65),
         ] {
             assert_eq!(tab_count(tab), expected, "{tab:?}");

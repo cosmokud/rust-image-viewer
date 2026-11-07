@@ -385,7 +385,6 @@ Delete `config.ini` if you want to regenerate it from the current defaults.
 | `manga_inertial_friction`                      | `0.33`          | Inertial target friction for keyboard / page / autoscroll movement. |
 | `manga_arrow_scroll_speed`                     | `140`           | Base arrow-key pan distance.                                        |
 | `masonry_items_per_row`                        | `5`             | Number of columns in Masonry mode.                                  |
-| `manga_hover_autoplay_resume_delay_ms`         | `220`           | Delay before Masonry hover autoplay resumes after movement settles. |
 | `manga_virtualization_backend`                 | `rtree`         | `auto`, `linear`, or `rtree`. Default is the R-tree path.           |
 | `manga_autoscroll_dead_zone_px`                | `14.0`          | Freehand autoscroll dead zone around the anchor.                    |
 | `manga_autoscroll_base_speed_multiplier`       | `5.0`           | Base autoscroll multiplier relative to arrow-scroll speed.          |
@@ -436,7 +435,6 @@ These values are updated automatically and used when `muted_by_default` or `defa
 
 | Key                             | Default      | Meaning                                                                           |
 | ------------------------------- | ------------ | --------------------------------------------------------------------------------- |
-| `upscale_filter`                | `catmullrom` | CPU resize filter for enlarging images.                                           |
 | `downscale_filter`              | `lanczos3`   | CPU resize filter for shrinking images.                                           |
 | `gif_resize_filter`             | `triangle`   | CPU resize filter for GIF frames. Uses a faster default for animation throughput. |
 | `texture_filter_static`         | `linear`     | GPU texture filtering for static images.                                          |

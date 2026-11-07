@@ -569,8 +569,6 @@ pub struct Config {
     pub manga_arrow_scroll_speed: f32,
     /// Masonry mode: number of items per row
     pub masonry_items_per_row: usize,
-    /// Masonry mode: delay before hover autoplay resumes after interaction stops (milliseconds)
-    pub manga_hover_autoplay_resume_delay_ms: u64,
     /// Manga mode viewport virtualization backend.
     /// Default is `rtree`; users can switch to `linear` or `auto` in config.ini.
     pub manga_virtualization_backend: MangaVirtualizationBackend,
@@ -659,8 +657,6 @@ pub struct Config {
     pub masonry_metadata_ram_cache_limit_mb: u64,
 
     // ============ PERFORMANCE SETTINGS ============
-    /// Filter for upscaling images (making them larger)
-    pub upscale_filter: ImageFilter,
     /// Filter for downscaling images (making them smaller)
     pub downscale_filter: ImageFilter,
     /// Filter for GIF animation frame resizing (affects performance)
@@ -780,7 +776,6 @@ impl Config {
             manga_inertial_friction: 0.33,
             manga_arrow_scroll_speed: 140.0,
             masonry_items_per_row: 5,
-            manga_hover_autoplay_resume_delay_ms: 220,
             manga_virtualization_backend: MangaVirtualizationBackend::RTree,
             manga_autoscroll_dead_zone_px: 14.0,
             manga_autoscroll_base_speed_multiplier: 5.0,
@@ -819,7 +814,6 @@ impl Config {
             metadata_cache_max_size_mb: 1024,
             masonry_metadata_ram_cache_limit_mb: 2048,
             // Image quality defaults
-            upscale_filter: ImageFilter::CatmullRom,
             downscale_filter: ImageFilter::Lanczos3,
             gif_resize_filter: ImageFilter::Triangle,
             texture_filter_static: TextureFilter::Linear,
@@ -1715,12 +1709,7 @@ impl Config {
                         "manga_hover_autoplay_resume_delay_ms"
                         | "masonry_hover_autoplay_resume_delay_ms"
                         | "hover_autoplay_resume_delay_ms" => {
-                            if let Ok(v) = value.parse::<f32>() {
-                                if v.is_finite() {
-                                    config.manga_hover_autoplay_resume_delay_ms =
-                                        v.round().clamp(0.0, 5000.0) as u64;
-                                }
-                            }
+                            // Retired key: the masonry hover resume is always immediate.
                         }
                         "manga_virtualization_backend"
                         | "manga_viewport_backend"
@@ -1967,9 +1956,7 @@ impl Config {
 
                     match key.as_str() {
                         "upscale_filter" => {
-                            if let Some(f) = ImageFilter::from_str(value) {
-                                config.upscale_filter = f;
-                            }
+                            // Retired key: no loader path enlarges pixels (see downscale_filter).
                         }
                         "downscale_filter" => {
                             if let Some(f) = ImageFilter::from_str(value) {
