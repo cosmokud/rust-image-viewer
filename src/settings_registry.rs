@@ -2841,11 +2841,6 @@ pub fn reset_preset(name: &str) -> io::Result<PathBuf> {
 /// Returns the name of the preset that should become active.
 pub fn ensure_user_preset() -> io::Result<String> {
     ensure_builtin_presets()?;
-    // Earlier builds capitalized this preset; keep one `user.ini` instead of two.
-    let legacy = preset_path("User");
-    if legacy.exists() && !preset_path("user").exists() {
-        let _ = fs::rename(&legacy, preset_path("user"));
-    }
     if let Some(entry) = list_presets().into_iter().find(|entry| !entry.builtin) {
         return Ok(entry.name);
     }
