@@ -5,3 +5,16 @@ include = [
 
 [target.x86_64-pc-windows-msvc]
 linker = "rust-lld.exe"
+
+# What everything compiled from source in this tree is built for: AVX2, FMA, BMI2, LZCNT and
+# MOVBE, rather than the 2003 baseline an executable of this target otherwise carries. The
+# precompiled `std` is not rebuilt, so nothing inside the standard library gains them; what
+# does is this crate, every dependency compiled here and their build scripts — the decoders,
+# the resize paths and the scaling this app does itself. The C engines built beside them are
+# compiled by `cc` and never see a Rust flag.
+#
+# A machine below this level does not run the binary slowly, it faults, which is why the
+# release also carries a second set built for it: `build-installers.ps1` asks for these same
+# artifacts at `-C target-cpu=x86-64-v2` through `RUSTFLAGS`, which replaces this list rather
+# than adding to it, and every portable and installer a release publishes has a legacy twin.
+rustflags = ["-C", "target-cpu=x86-64-v3"]

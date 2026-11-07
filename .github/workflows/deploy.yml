@@ -80,7 +80,10 @@ jobs:
           path: |
             target/packager/*-setup.exe
             target/packager/*-setup-no-gstreamer.exe
-            target/release/rust-image-viewer.exe
+            target/packager/*-setup-legacy.exe
+            target/packager/*-setup-no-gstreamer-legacy.exe
+            target/packager/rust-image-viewer.exe
+            target/packager/rust-image-viewer-legacy.exe
           if-no-files-found: error
 
       - name: Extract Changelog
@@ -108,4 +111,7 @@ jobs:
           files: |
             target/packager/*-setup.exe
             target/packager/*-setup-no-gstreamer.exe
-            target/release/rust-image-viewer.exe
+            target/packager/*-setup-legacy.exe
+            target/packager/*-setup-no-gstreamer-legacy.exe
+            target/packager/rust-image-viewer.exe
+            target/packager/rust-image-viewer-legacy.exe

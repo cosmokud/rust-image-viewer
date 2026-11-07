@@ -92,6 +92,49 @@ cargo build --release
     Write-Host (" - " + $binaryPath)
 }
 
+function Build-LegacyBinary {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RepoRoot,
+
+        [Parameter(Mandatory = $true)]
+        [string]$BinaryName
+    )
+
+    # The same profile, asked for the instruction set a machine below AVX2 has. `.cargo/config.toml`
+    # carries `-C target-cpu=x86-64-v3` for every build in this tree, and `RUSTFLAGS` replaces that
+    # list rather than adding to it, so this one variable is the whole of the difference — and a
+    # target directory of its own is what keeps the two binaries from overwriting each other, since
+    # cargo names the artifact after the profile and not after the flags.
+    $binaryPath = Join-Path $RepoRoot ("target\legacy\release\{0}.exe" -f $BinaryName)
+    Write-Host "Building the x86-64-v2 binary the legacy artifacts carry..."
+
+    $previousRustFlags = $env:RUSTFLAGS
+    $previousTargetDir = $env:CARGO_TARGET_DIR
+    try {
+        $env:RUSTFLAGS = "-C target-cpu=x86-64-v2"
+        $env:CARGO_TARGET_DIR = Join-Path $RepoRoot "target\legacy"
+        cargo build --release
+        if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+        }
+    }
+    finally {
+        $env:RUSTFLAGS = $previousRustFlags
+        $env:CARGO_TARGET_DIR = $previousTargetDir
+    }
+
+    if (-not (Test-Path -LiteralPath $binaryPath)) {
+        throw @"
+Legacy build completed, but expected binary is missing:
+$binaryPath
+"@
+    }
+
+    Write-Host "Using legacy (x86-64-v2) binary for the legacy installers and portable:"
+    Write-Host (" - " + $binaryPath)
+}
+
 function Copy-MatchingFiles {
     param(
         [Parameter(Mandatory = $true)]
@@ -290,18 +333,24 @@ function Write-PackagerConfig {
         [string]$PackageVersion,
 
         [Parameter(Mandatory = $true)]
-        [bool]$IncludeGStreamer
+        [bool]$IncludeGStreamer,
+
+        # Where the exe this variant installs is, which is the whole of what tells the AVX2
+        # artifacts from the legacy ones: both are `rust-image-viewer.exe`, and only the
+        # directory differs.
+        [Parameter(Mandatory = $true)]
+        [string]$BinariesDir
     )
 
     $repoRootAbs = [System.IO.Path]::GetFullPath($RepoRoot)
     $outputDirAbs = [System.IO.Path]::GetFullPath($OutputDir)
-    $releaseDirAbs = [System.IO.Path]::GetFullPath((Join-Path $repoRootAbs "target\release"))
+    $binariesDirAbs = [System.IO.Path]::GetFullPath($BinariesDir)
     $licensePathAbs = [System.IO.Path]::GetFullPath((Join-Path $repoRootAbs "LICENSE"))
     $iconPathAbs = [System.IO.Path]::GetFullPath((Join-Path $repoRootAbs "assets\icon.ico"))
     $nsisTemplatePathAbs = [System.IO.Path]::GetFullPath((Join-Path $repoRootAbs "packaging\nsis\installer.nsi"))
 
     $tomlOutputDir = $outputDirAbs.Replace("\", "/")
-    $tomlReleaseDir = $releaseDirAbs.Replace("\", "/")
+    $tomlBinariesDir = $binariesDirAbs.Replace("\", "/")
     $tomlLicensePath = $licensePathAbs.Replace("\", "/")
     $tomlIconPath = $iconPathAbs.Replace("\", "/")
     $tomlNsisTemplatePath = $nsisTemplatePathAbs.Replace("\", "/")
@@ -319,8 +368,8 @@ function Write-PackagerConfig {
         "icons = [""$tomlIconPath""]",
         "formats = [""nsis""]",
         "out-dir = ""$tomlOutputDir""",
-        "binaries-dir = ""$tomlReleaseDir""",
-        "before-packaging-command = ""echo using prebuilt target/release binary""",
+        "binaries-dir = ""$tomlBinariesDir""",
+        "before-packaging-command = ""echo using the binary already in binaries-dir""",
         ""
     )
 
@@ -413,7 +462,7 @@ function Invoke-Packager {
     }
 }
 
-function Rename-NoGstreamerArtifacts {
+function Rename-PackagedInstaller {
     param(
         [Parameter(Mandatory = $true)]
         [string]$OutputDir,
@@ -422,7 +471,12 @@ function Rename-NoGstreamerArtifacts {
         [string]$PackageName,
 
         [Parameter(Mandatory = $true)]
-        [string]$PackageVersion
+        [string]$PackageVersion,
+
+        # What this one carries, appended to the name the packager gives every variant. The
+        # packager names all four the same, so each run has to be renamed before the next writes
+        # over it — and the run that keeps the bare `-setup.exe` name is the one made last.
+        [string]$Suffix = ""
     )
 
     $escapedPackageName = [regex]::Escape($PackageName)
@@ -432,11 +486,13 @@ function Rename-NoGstreamerArtifacts {
         Where-Object { $_.Name -match "^$escapedPackageName`_$escapedVersion`_.*-setup\.exe$" } |
         Sort-Object LastWriteTime -Descending |
         Select-Object -First 1
-    if ($nsisFile) {
-        $renamedNsis = $nsisFile.Name -replace "-setup\.exe$", "-setup-no-gstreamer.exe"
-        if ($renamedNsis -ne $nsisFile.Name) {
-            Move-Item -LiteralPath $nsisFile.FullName -Destination (Join-Path $OutputDir $renamedNsis) -Force
-        }
+    if (-not $nsisFile -or -not $Suffix) {
+        return
+    }
+
+    $renamedNsis = $nsisFile.Name -replace "-setup\.exe$", ("-setup{0}.exe" -f $Suffix)
+    if ($renamedNsis -ne $nsisFile.Name) {
+        Move-Item -LiteralPath $nsisFile.FullName -Destination (Join-Path $OutputDir $renamedNsis) -Force
     }
 
 }
@@ -446,12 +502,18 @@ Ensure-CargoPackager
 $package = Resolve-PackageInfo
 $packageName = $package.name
 $packageVersion = $package.version
+
+# Two binaries, one program: the AVX2 build every artifact carries by default, and the
+# x86-64-v2 build beside it for hardware below that. Both are built before anything is
+# packaged, so the four installers below only compress what is already on disk.
 Build-ReleaseBinary -RepoRoot $repoRoot -BinaryName "rust-image-viewer"
+Build-LegacyBinary -RepoRoot $repoRoot -BinaryName "rust-image-viewer"
 
 $outputDir = Join-Path $repoRoot "target\packager"
 New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
 
-# Clean old artifacts for this version so each run outputs exactly two installers.
+# Clean old artifacts for this version so each run outputs exactly four installers and the
+# two portables.
 $artifactPrefix = "{0}_{1}_" -f $packageName, $packageVersion
 Get-ChildItem -LiteralPath $outputDir -File -ErrorAction SilentlyContinue |
     Where-Object { $_.Name.StartsWith($artifactPrefix) -and $_.Extension -eq ".exe" } |
@@ -460,17 +522,49 @@ Get-ChildItem -LiteralPath $outputDir -File -ErrorAction SilentlyContinue |
 $configDir = Join-Path $outputDir ".packager-configs"
 $noGstreamerConfig = Join-Path $configDir "packager-no-gstreamer.toml"
 $withGstreamerConfig = Join-Path $configDir "packager-with-gstreamer.toml"
+$legacyNoGstreamerConfig = Join-Path $configDir "packager-no-gstreamer-legacy.toml"
+$legacyWithGstreamerConfig = Join-Path $configDir "packager-with-gstreamer-legacy.toml"
 $bundleRoot = Join-Path $outputDir ".with-gstreamer"
+$releaseBinariesDir = Join-Path $repoRoot "target\release"
+$legacyBinariesDir = Join-Path $repoRoot "target\legacy\release"
 
-Write-PackagerConfig -ConfigPath $noGstreamerConfig -RepoRoot $repoRoot -OutputDir $outputDir -PackageName $packageName -PackageVersion $packageVersion -IncludeGStreamer $false
+# Staged once: both bundled installers carry the same runtime, and only their own copy of the
+# executable differs.
+Stage-GStreamerBundle -BundleRoot $bundleRoot
+
+Write-PackagerConfig -ConfigPath $noGstreamerConfig -RepoRoot $repoRoot -OutputDir $outputDir -PackageName $packageName -PackageVersion $packageVersion -BinariesDir $releaseBinariesDir -IncludeGStreamer $false
 Write-Host "Building no-GStreamer installer (NSIS)..."
 Invoke-Packager -ConfigPath $noGstreamerConfig -OutputDir $outputDir
-Rename-NoGstreamerArtifacts -OutputDir $outputDir -PackageName $packageName -PackageVersion $packageVersion
+Rename-PackagedInstaller -OutputDir $outputDir -PackageName $packageName -PackageVersion $packageVersion -Suffix "-no-gstreamer"
 
-Stage-GStreamerBundle -BundleRoot $bundleRoot
-Write-PackagerConfig -ConfigPath $withGstreamerConfig -RepoRoot $repoRoot -OutputDir $outputDir -PackageName $packageName -PackageVersion $packageVersion -IncludeGStreamer $true
+Write-PackagerConfig -ConfigPath $legacyNoGstreamerConfig -RepoRoot $repoRoot -OutputDir $outputDir -PackageName $packageName -PackageVersion $packageVersion -BinariesDir $legacyBinariesDir -IncludeGStreamer $false
+Write-Host "Building no-GStreamer legacy installer (NSIS)..."
+Invoke-Packager -ConfigPath $legacyNoGstreamerConfig -OutputDir $outputDir
+Rename-PackagedInstaller -OutputDir $outputDir -PackageName $packageName -PackageVersion $packageVersion -Suffix "-no-gstreamer-legacy"
+
+Write-PackagerConfig -ConfigPath $legacyWithGstreamerConfig -RepoRoot $repoRoot -OutputDir $outputDir -PackageName $packageName -PackageVersion $packageVersion -BinariesDir $legacyBinariesDir -IncludeGStreamer $true
+Write-Host "Building bundled-GStreamer legacy installer (NSIS)..."
+Invoke-Packager -ConfigPath $legacyWithGstreamerConfig -OutputDir $outputDir
+Rename-PackagedInstaller -OutputDir $outputDir -PackageName $packageName -PackageVersion $packageVersion -Suffix "-legacy"
+
+# Last, because this is the one that keeps the name the packager gives it: every earlier run
+# wrote `-setup.exe` and was moved off it before this one starts.
+Write-PackagerConfig -ConfigPath $withGstreamerConfig -RepoRoot $repoRoot -OutputDir $outputDir -PackageName $packageName -PackageVersion $packageVersion -BinariesDir $releaseBinariesDir -IncludeGStreamer $true
 Write-Host "Building bundled-GStreamer installer (NSIS)..."
 Invoke-Packager -ConfigPath $withGstreamerConfig -OutputDir $outputDir
+
+# The standalone binaries a release publishes beside the installers. The packager's own names
+# say nothing about an instruction set, so both are copied out under the names a release uses.
+$portables = @(
+    @{ Source = (Join-Path $releaseBinariesDir "rust-image-viewer.exe"); Name = "rust-image-viewer.exe" },
+    @{ Source = (Join-Path $legacyBinariesDir "rust-image-viewer.exe"); Name = "rust-image-viewer-legacy.exe" }
+)
+foreach ($portable in $portables) {
+    if (-not (Test-Path -LiteralPath $portable.Source)) {
+        throw "Expected binary is missing: $($portable.Source)"
+    }
+    Copy-Item -LiteralPath $portable.Source -Destination (Join-Path $outputDir $portable.Name) -Force
+}
 
 $resolvedOutputDir = [System.IO.Path]::GetFullPath($outputDir)
 Write-Host ""
@@ -490,3 +584,9 @@ if (-not $installers) {
 }
 
 $installers | ForEach-Object { Write-Host (" - " + $_.FullName) }
+foreach ($portable in $portables) {
+    $portablePath = Join-Path $resolvedOutputDir $portable.Name
+    if (Test-Path -LiteralPath $portablePath) {
+        Write-Host (" - " + $portablePath)
+    }
+}

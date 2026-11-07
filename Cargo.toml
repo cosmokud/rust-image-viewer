@@ -132,9 +132,12 @@ lto = true
 # and the rest is LLVM_fatlto (117s, one thread) plus 0.3s of linking. It also applies to
 # every dependency, where 1 turned 427 parallel compilations into 427 serial ones.
 #
-# This is the profile CI ships. A workstation gets a 35s rebuild instead of 2m06s from
-# `git config riv.releaseLto thin`, which writes the machine-local lto = "thin" that
-# .cargo/config.toml includes; nothing about that file reaches a clone or a runner.
+# This is the profile CI ships, and the only one it ships: the instruction set an artifact is
+# built for is not part of a profile, so it comes from `-C target-cpu` in `.cargo/config.toml`
+# (AVX2) and from `RUSTFLAGS` in `build-installers.ps1` for the legacy set built beside it. A
+# workstation gets a 35s rebuild instead of 2m06s from `git config riv.releaseLto thin`, which
+# writes the machine-local lto = "thin" that .cargo/config.toml includes; nothing about that
+# file reaches a clone or a runner.
 codegen-units = 16
 panic = "abort"
 strip = true

@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Highlights
+
+- The release now carries two builds of the same version. Every default artifact is compiled for AVX2 (`-C target-cpu=x86-64-v3` in `.cargo/config.toml`), and a second set suffixed `-legacy` is the same version compiled for SSE4.2 (`-C target-cpu=x86-64-v2`) for a machine below that. Both installers exist in both levels — with and without the bundled GStreamer runtime — and the two portable executables are the same pair.
+
 ## [v0.4.1-rc.5] - 2026-08-12
 
 ### Highlights

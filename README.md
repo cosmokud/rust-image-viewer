@@ -145,7 +145,7 @@ Download the latest release from the [Releases](https://github.com/cosmokud/rust
 The app is portable in the sense that you can place the executable folder anywhere. Use Windows `Open with` or file associations to launch media directly into it.
 
 Release automation now targets NSIS-style installer artifacts and a guarded manual tagged deploy path; legacy nightly/WiX workflow paths were removed.
-Current tagged release workflows also publish the portable `target/release/rust-image-viewer.exe` artifact alongside installer executables.
+Current tagged release workflows publish six files: the installer with the bundled GStreamer runtime and the one without it, the same two for the legacy build, and the two portable executables. The default build asks the CPU for AVX2, which every processor Windows 11 supports has; the `-legacy` files are the same version built for SSE4.2, for a machine below that — everything else about a legacy file is identical, including what it can read and what it bundles.
 The NSIS installer includes a migration path for legacy WiX/MSI installs: it detects older entries and can force uninstall before continuing to prevent conflicting side-by-side installs.
 
 ### Windows SmartScreen / Smart App Control
