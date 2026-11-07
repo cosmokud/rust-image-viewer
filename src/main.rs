@@ -149,6 +149,19 @@ fn ui_divider(ui: &mut egui::Ui) {
     ui.painter().rect_filled(rect, 0.0, UI_BORDER);
 }
 
+/// Dialog style: the viewer style with the monochrome palette and roomier spacing.
+fn settings_style(base: &egui::Style) -> egui::Style {
+    let mut style = base.clone();
+    style.visuals = settings_visuals();
+    style.spacing.item_spacing = egui::vec2(10.0, 8.0);
+    style.spacing.button_padding = egui::vec2(12.0, 5.0);
+    style.spacing.interact_size.y = 26.0;
+    style.spacing.combo_width = 160.0;
+    style.spacing.scroll = egui::style::ScrollStyle::floating();
+    style.spacing.scroll.floating_allocated_width = 6.0;
+    style
+}
+
 /// Every default widget in the dialog (search field, drag values, combo boxes, scroll bars,
 /// tooltips) is themed once here instead of per call site.
 fn settings_visuals() -> egui::Visuals {
@@ -13715,6 +13728,12 @@ impl ImageViewer {
             .with_position(initial_position)
             .with_resizable(true);
 
+        // egui keeps one style per context and the child viewport shares the viewer's context,
+        // so the monochrome dialog style is installed for the duration of the dialog's frame:
+        // combo popups and tooltips read the context style when they are created. It is handed
+        // back before the viewer draws again.
+        let viewer_style = ctx.style();
+        ctx.set_style(settings_style(viewer_style.as_ref()));
         ctx.show_viewport_immediate(viewport_id, viewport_builder, |ctx, _class| {
             // A decorated window brings its own close button; both paths share `close_modal`.
             if ctx.input(|input| input.viewport().close_requested()) {
@@ -13747,20 +13766,6 @@ impl ImageViewer {
             egui::CentralPanel::default()
                 .frame(egui::Frame::none().fill(UI_CONTENT))
                 .show(ctx, |ui| {
-                    // One monochrome style for every default widget (search field, drag values,
-                    // combo boxes, scroll bars) instead of per-control colour overrides at the
-                    // call sites. It is applied to this `Ui` rather than the context: egui keeps
-                    // one style per context, and the child viewport shares the viewer's context,
-                    // so `ctx.style_mut` would restyle the viewer window too.
-                    let style = ui.style_mut();
-                    style.visuals = settings_visuals();
-                    style.spacing.item_spacing = egui::vec2(10.0, 8.0);
-                    style.spacing.button_padding = egui::vec2(12.0, 5.0);
-                    style.spacing.interact_size.y = 26.0;
-                    style.spacing.combo_width = 160.0;
-                    style.spacing.scroll = egui::style::ScrollStyle::floating();
-                    style.spacing.scroll.floating_allocated_width = 6.0;
-
                     egui::Frame::none()
                         .inner_margin(egui::Margin::symmetric(22.0, 16.0))
                         .show(ui, |ui| {
@@ -14054,6 +14059,8 @@ impl ImageViewer {
                         });
                 });
         });
+
+        ctx.set_style(viewer_style);
 
         if let Some(action) = action {
             self.apply_settings_preset_action(action);
