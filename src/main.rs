@@ -919,6 +919,12 @@ fn settings_tab_strip_width(ctx: &egui::Context) -> f32 {
         .sum()
 }
 
+/// Native viewport that hosts the detached Settings dialog. A stable id lets a second click on
+/// the Settings entry raise the existing window instead of opening a duplicate.
+fn settings_viewport_id() -> egui::ViewportId {
+    egui::ViewportId::from_hash_of("settings_window")
+}
+
 /// State for the tabbed Settings modal: every registry setting, presets and the help page.
 struct SettingsModal {
     open: bool,
@@ -12721,7 +12727,13 @@ impl ImageViewer {
         self.settings.status_is_error = is_error;
     }
 
-    fn open_settings_modal(&mut self, tab: SettingsTabSlot) {
+    fn open_settings_modal(&mut self, ctx: &egui::Context, tab: SettingsTabSlot) {
+        // Already open: bring the existing dialog to the front instead of resetting its state.
+        if self.settings.open {
+            ctx.send_viewport_cmd_to(settings_viewport_id(), egui::ViewportCommand::Focus);
+            ctx.request_repaint();
+            return;
+        }
         self.settings.open = true;
         // Geometry is recomputed from the screen on every open: the dialog always comes back
         // centered at 50% of the screen, never at the size of the last manual resize.
@@ -13950,7 +13962,7 @@ impl ImageViewer {
         // Only an approximation: the outer size also carries the native title bar, so the exact
         // centering is re-sent once the window reports its real outer rectangle.
         let initial_position = screen.center() - (window_size + egui::vec2(0.0, 34.0)) * 0.5;
-        let viewport_id = egui::ViewportId::from_hash_of("settings_window");
+        let viewport_id = settings_viewport_id();
         let viewport_builder = egui::ViewportBuilder::default()
             .with_title("Settings")
             .with_inner_size(window_size)
@@ -27534,9 +27546,12 @@ impl ImageViewer {
                                         .menu_action_row(ui, "Settings", MenuActionIcon::Motion)
                                         .clicked()
                                     {
-                                        self.open_settings_modal(SettingsTabSlot::Tab(
-                                            settings_registry::SettingsTab::General,
-                                        ));
+                                        self.open_settings_modal(
+                                            ui.ctx(),
+                                            SettingsTabSlot::Tab(
+                                                settings_registry::SettingsTab::General,
+                                            ),
+                                        );
                                         self.file_action_menu = None;
                                         self.show_controls = true;
                                         self.controls_show_time = Instant::now();
