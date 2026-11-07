@@ -155,7 +155,7 @@ fn settings_style(base: &egui::Style) -> egui::Style {
     style.visuals = settings_visuals();
     style.spacing.item_spacing = egui::vec2(10.0, 8.0);
     style.spacing.button_padding = egui::vec2(12.0, 5.0);
-    style.spacing.interact_size.y = 26.0;
+    style.spacing.interact_size.y = 28.0;
     style.spacing.combo_width = 160.0;
     style.spacing.scroll = egui::style::ScrollStyle::floating();
     style.spacing.scroll.floating_allocated_width = 6.0;
@@ -852,8 +852,20 @@ fn settings_search_results(query: &str) -> Vec<usize> {
 
 /// Smallest inner size the settings window takes on a small screen.
 const SETTINGS_WINDOW_MIN_SIZE: egui::Vec2 = egui::vec2(560.0, 400.0);
-/// Fraction of the monitor work area the settings window occupies when it opens.
-const SETTINGS_WINDOW_SCREEN_FRACTION: f32 = 0.5;
+/// Fraction of the monitor work area *height* the settings window occupies. The width
+/// follows the tab bar instead: half of a 3440px monitor was mostly empty space.
+const SETTINGS_WINDOW_HEIGHT_FRACTION: f32 = 0.5;
+/// Tab bar metrics, shared by the bar itself and by the window width that has to fit it.
+const SETTINGS_TAB_HEIGHT: f32 = 30.0;
+const SETTINGS_TAB_GAP: f32 = 6.0;
+const SETTINGS_TAB_PADDING: f32 = 15.0;
+const SETTINGS_TAB_FONT_SIZE: f32 = 12.5;
+/// Dialog content margin on the left and on the right.
+const SETTINGS_CONTENT_MARGIN_X: f32 = 22.0;
+/// One height for every text field, so fields and chips line up.
+const SETTINGS_INPUT_HEIGHT: f32 = 30.0;
+/// Every settings row keeps at least this much width for its control.
+const SETTINGS_CONTROLS_MIN_WIDTH: f32 = 220.0;
 /// Frames the dialog re-asserts its centered geometry while the native window settles.
 const SETTINGS_WINDOW_PLACE_FRAMES: u8 = 3;
 
@@ -873,21 +885,40 @@ fn settings_screen_rect(ctx: &egui::Context) -> egui::Rect {
     egui::Rect::from_min_size(egui::Pos2::ZERO, size)
 }
 
-/// Half the screen, clamped so the dialog never shrinks below its layout minimum or grows
-/// past the monitor.
-fn settings_window_size(screen: egui::Rect) -> egui::Vec2 {
-    let half = screen.size() * SETTINGS_WINDOW_SCREEN_FRACTION;
-    egui::vec2(
-        half.x.clamp(
-            SETTINGS_WINDOW_MIN_SIZE.x.min(screen.width()),
-            screen.width(),
-        ),
-        half.y.clamp(
-            SETTINGS_WINDOW_MIN_SIZE.y.min(screen.height()),
-            screen.height(),
-        ),
-    )
+/// Dialog size: as wide as the tab bar needs (so the tabs never wrap) and half the screen tall,
+/// instead of half of everything.
+fn settings_window_size(ctx: &egui::Context, screen: egui::Rect) -> egui::Vec2 {
+    let tab_width = settings_tab_strip_width(ctx);
+    // 16px of slack so a rounding difference cannot push the last tab onto a second row.
+    let width = (tab_width + SETTINGS_CONTENT_MARGIN_X * 2.0 + 16.0)
+        .max(SETTINGS_WINDOW_MIN_SIZE.x)
+        .min(screen.width() * 0.9);
+    let height = (screen.height() * SETTINGS_WINDOW_HEIGHT_FRACTION).clamp(
+        SETTINGS_WINDOW_MIN_SIZE.y.min(screen.height()),
+        screen.height() * 0.9,
+    );
+    egui::vec2(width, height)
 }
+
+/// Width of the whole tab bar on one row, measured with the same font and padding the bar uses.
+fn settings_tab_strip_width(ctx: &egui::Context) -> f32 {
+    let font = egui::FontId::proportional(SETTINGS_TAB_FONT_SIZE);
+    SettingsTabSlot::ALL
+        .iter()
+        .enumerate()
+        .map(|(index, slot)| {
+            let label = ctx.fonts(|fonts| {
+                fonts
+                    .layout_no_wrap(slot.label().to_owned(), font.clone(), UI_TEXT)
+                    .size()
+                    .x
+            });
+            let gap = if index == 0 { 0.0 } else { SETTINGS_TAB_GAP };
+            label + SETTINGS_TAB_PADDING * 2.0 + gap
+        })
+        .sum()
+}
+
 /// State for the tabbed Settings modal: every registry setting, presets and the help page.
 struct SettingsModal {
     open: bool,
@@ -13017,7 +13048,7 @@ impl ImageViewer {
                     .text_styles
                     .insert(egui::TextStyle::Button, egui::FontId::monospace(12.0));
                 ui.add_sized(
-                    [number_box_width, 24.0],
+                    [number_box_width, SETTINGS_INPUT_HEIGHT],
                     egui::DragValue::new(&mut value)
                         .fixed_decimals(decimals)
                         .range(min..=max)
@@ -13058,6 +13089,7 @@ impl ImageViewer {
         &mut self,
         ui: &mut egui::Ui,
         setting: &'static settings_registry::Setting,
+        label_column: f32,
     ) -> Option<bool> {
         let id = setting.id;
         let mut tooltip = format!("{}\n\nkey: {}", setting.help, setting.key);
@@ -13067,8 +13099,9 @@ impl ImageViewer {
             tooltip.push_str(hint);
         }
         let row_width = ui.available_width();
-        // Label slot wide enough for the longest label; narrowed only in a very narrow dialog.
-        let label_slot = 210.0_f32.min((row_width - 200.0).max(120.0));
+        // Fits the widest label of this tab, so labels are not cut while there is room. On a
+        // narrow dialog the label elides first: the control keeps `SETTINGS_CONTROLS_MIN_WIDTH`.
+        let label_slot = label_column.min((row_width - SETTINGS_CONTROLS_MIN_WIDTH).max(90.0));
         let mut badge_width = 0.0_f32;
         if setting.applies == settings_registry::Applies::Restart {
             badge_width += 64.0;
@@ -13200,12 +13233,15 @@ impl ImageViewer {
                         } else {
                             "none"
                         };
-                        let width = (controls * 2.0 / 3.0).max(110.0).min(controls);
-                        let response = ui.add_sized(
-                            [width, 26.0],
+                        // Full control width: in the shortcuts tab the binding is the payload,
+                        // so the field reaches the card edge instead of leaving a gap.
+                        let response = ui.add(
                             egui::TextEdit::singleline(&mut self.settings.texts[id])
                                 .hint_text(hint)
                                 .font(egui::FontId::monospace(11.5))
+                                .margin(egui::Margin::symmetric(8.0, 6.0))
+                                .min_size(egui::vec2(0.0, SETTINGS_INPUT_HEIGHT))
+                                .desired_width(controls)
                                 .horizontal_align(egui::Align::LEFT),
                         );
                         let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -13251,6 +13287,7 @@ impl ImageViewer {
 
     /// Draws `ids` (registry order) as uppercase group headers with one card per group.
     fn draw_settings_groups(&mut self, ui: &mut egui::Ui, ids: &[usize]) {
+        let label_column = Self::settings_label_column(ui, ids);
         let mut index = 0;
         while index < ids.len() {
             let group = settings_registry::SETTINGS[ids[index]].group;
@@ -13280,9 +13317,11 @@ impl ImageViewer {
                                 if offset > 0 {
                                     ui.add_space(2.0);
                                 }
-                                if let Some(row_write_now) =
-                                    self.draw_setting_row(ui, &settings_registry::SETTINGS[*id])
-                                {
+                                if let Some(row_write_now) = self.draw_setting_row(
+                                    ui,
+                                    &settings_registry::SETTINGS[*id],
+                                    label_column,
+                                ) {
                                     changed = true;
                                     write_now |= row_write_now;
                                 }
@@ -13294,6 +13333,30 @@ impl ImageViewer {
             }
             ui.add_space(6.0);
         }
+    }
+
+    /// Width of the label column that fits the longest label in `ids`, badges included, so no
+    /// row in the tab truncates its label while the dialog is wide enough to hold it.
+    fn settings_label_column(ui: &egui::Ui, ids: &[usize]) -> f32 {
+        let font = egui::FontId::proportional(13.0);
+        let mut widest = 0.0_f32;
+        for id in ids {
+            let setting = &settings_registry::SETTINGS[*id];
+            let mut needed = ui.fonts(|fonts| {
+                fonts
+                    .layout_no_wrap(setting.label.to_owned(), font.clone(), UI_TEXT)
+                    .size()
+                    .x
+            });
+            if setting.applies == settings_registry::Applies::Restart {
+                needed += 64.0;
+            }
+            if setting.unused {
+                needed += 56.0;
+            }
+            widest = widest.max(needed);
+        }
+        widest + 16.0
     }
 
     /// Search results: the same cards, grouped by tab then group.
@@ -13540,6 +13603,8 @@ impl ImageViewer {
                     ui.add_space(4.0);
                     ui.add(
                         egui::TextEdit::singleline(&mut draft)
+                            .margin(egui::Margin::symmetric(8.0, 6.0))
+                            .min_size(egui::vec2(0.0, SETTINGS_INPUT_HEIGHT))
                             .desired_width(full)
                             .hint_text("preset name"),
                     );
@@ -13575,6 +13640,8 @@ impl ImageViewer {
                 ui.add_space(4.0);
                 ui.add(
                     egui::TextEdit::singleline(&mut self.settings.new_name)
+                        .margin(egui::Margin::symmetric(8.0, 6.0))
+                        .min_size(egui::vec2(0.0, SETTINGS_INPUT_HEIGHT))
                         .hint_text("new preset name")
                         .desired_width(full),
                 );
@@ -13602,14 +13669,10 @@ impl ImageViewer {
         }
     }
 
-    /// Browser-style tab bar: monochrome pills that wrap onto a second row instead of scrolling
-    /// sideways out of reach.
+    /// Browser-style tab bar: monochrome pills. The window is sized to fit them on one row, the
+    /// wrapping stays as a fallback for a dialog narrowed by the user.
     fn draw_settings_tab_strip(&mut self, ui: &mut egui::Ui) {
-        const HEIGHT: f32 = 30.0;
-        const GAP: f32 = 6.0;
-        const PADDING: f32 = 15.0;
-
-        let font = egui::FontId::proportional(12.5);
+        let font = egui::FontId::proportional(SETTINGS_TAB_FONT_SIZE);
         let widths: Vec<f32> = SettingsTabSlot::ALL
             .iter()
             .map(|slot| {
@@ -13618,7 +13681,7 @@ impl ImageViewer {
                         .layout_no_wrap(slot.label().to_owned(), font.clone(), UI_TEXT)
                         .size()
                         .x
-                }) + PADDING * 2.0
+                }) + SETTINGS_TAB_PADDING * 2.0
             })
             .collect();
 
@@ -13628,7 +13691,11 @@ impl ImageViewer {
         let mut row = 0usize;
         let mut cursor = 0.0_f32;
         for width in widths.iter() {
-            let advance = if cursor == 0.0 { *width } else { GAP + *width };
+            let advance = if cursor == 0.0 {
+                *width
+            } else {
+                SETTINGS_TAB_GAP + *width
+            };
             if 0.0 < cursor && available < cursor + advance {
                 row += 1;
                 cursor = *width;
@@ -13638,7 +13705,8 @@ impl ImageViewer {
             row_of.push(row);
         }
         let row_count = row_of.last().map_or(1, |row| row + 1);
-        let strip_height = HEIGHT * row_count as f32 + GAP * (row_count.saturating_sub(1)) as f32;
+        let strip_height = SETTINGS_TAB_HEIGHT * row_count as f32
+            + SETTINGS_TAB_GAP * (row_count.saturating_sub(1)) as f32;
         let (strip_rect, _) = ui.allocate_exact_size(
             egui::vec2(ui.available_width(), strip_height),
             egui::Sense::hover(),
@@ -13651,11 +13719,13 @@ impl ImageViewer {
             if row_of[index] != current_row {
                 current_row = row_of[index];
                 x = strip_rect.left();
-                y += HEIGHT + GAP;
+                y += SETTINGS_TAB_HEIGHT + SETTINGS_TAB_GAP;
             }
-            let rect =
-                egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(widths[index], HEIGHT));
-            x += widths[index] + GAP;
+            let rect = egui::Rect::from_min_size(
+                egui::pos2(x, y),
+                egui::vec2(widths[index], SETTINGS_TAB_HEIGHT),
+            );
+            x += widths[index] + SETTINGS_TAB_GAP;
 
             let response = ui.interact(
                 rect,
@@ -13716,7 +13786,7 @@ impl ImageViewer {
                 screen
             }
         };
-        let window_size = settings_window_size(screen);
+        let window_size = settings_window_size(ctx, screen);
         // Only an approximation: the outer size also carries the native title bar, so the exact
         // centering is re-sent once the window reports its real outer rectangle.
         let initial_position = screen.center() - (window_size + egui::vec2(0.0, 34.0)) * 0.5;
@@ -13767,12 +13837,12 @@ impl ImageViewer {
                 .frame(egui::Frame::none().fill(UI_CONTENT))
                 .show(ctx, |ui| {
                     egui::Frame::none()
-                        .inner_margin(egui::Margin::symmetric(22.0, 16.0))
+                        .inner_margin(egui::Margin::symmetric(SETTINGS_CONTENT_MARGIN_X, 16.0))
                         .show(ui, |ui| {
                             ui.vertical(|ui| {
                                 // ---------------------------------------------------- header
                                 ui.horizontal(|ui| {
-                                    let header_width = (ui.available_width() - 360.0).max(150.0);
+                                    let header_width = (ui.available_width() - 280.0).max(150.0);
                                     ui.allocate_ui_with_layout(
                                         // Fixed height: a 0-height max_rect makes wrapped
                                         // labels behave oddly.
@@ -13802,48 +13872,6 @@ impl ImageViewer {
                                     ui.with_layout(
                                         egui::Layout::right_to_left(egui::Align::Center),
                                         |ui| {
-                                            let (close_rect, close_response) = ui
-                                                .allocate_exact_size(
-                                                    egui::vec2(28.0, 28.0),
-                                                    egui::Sense::click(),
-                                                );
-                                            let hovered = close_response.hovered();
-                                            let painter = ui.painter();
-                                            if hovered {
-                                                painter.rect_filled(
-                                                    close_rect,
-                                                    8.0,
-                                                    ui_alpha(UI_TEXT_STRONG, 14),
-                                                );
-                                            }
-                                            let center = close_rect.center();
-                                            let arm = 4.5;
-                                            let stroke = egui::Stroke::new(
-                                                1.6_f32,
-                                                if hovered { UI_TEXT_STRONG } else { UI_TEXT_DIM },
-                                            );
-                                            painter.line_segment(
-                                                [
-                                                    center + egui::vec2(-arm, -arm),
-                                                    center + egui::vec2(arm, arm),
-                                                ],
-                                                stroke,
-                                            );
-                                            painter.line_segment(
-                                                [
-                                                    center + egui::vec2(arm, -arm),
-                                                    center + egui::vec2(-arm, arm),
-                                                ],
-                                                stroke,
-                                            );
-                                            if close_response.clicked() {
-                                                close_modal = true;
-                                            }
-                                            close_response
-                                                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                                                .on_hover_text("Close (Esc)");
-
-                                            ui.add_space(12.0);
                                             egui::Frame::none()
                                                 .fill(UI_WINDOW)
                                                 .rounding(9.0)
