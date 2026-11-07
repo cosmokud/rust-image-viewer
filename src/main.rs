@@ -9406,23 +9406,43 @@ impl ImageViewer {
     }
 
     fn draw_video_control_vector_icon(
-        ui: &egui::Ui,
+        painter: &egui::Painter,
         icon: VideoControlIcon,
         rect: egui::Rect,
         color: egui::Color32,
     ) {
-        let painter = ui.painter();
         match icon {
             VideoControlIcon::Previous | VideoControlIcon::Next => {
-                let source = if matches!(icon, VideoControlIcon::Next) {
-                    egui::include_image!("../assets/lucide/skip-forward.svg")
+                let forward = matches!(icon, VideoControlIcon::Next);
+                let width = rect.width();
+                let bar_width = width * 0.13;
+                let side_inset = width * 0.17;
+                let vertical_inset = rect.height() * 0.18;
+                let (bar_left, base_x, apex_x) = if forward {
+                    (
+                        rect.right() - side_inset - bar_width,
+                        rect.left() + side_inset,
+                        rect.right() - side_inset - bar_width - width * 0.1,
+                    )
                 } else {
-                    egui::include_image!("../assets/lucide/skip-back.svg")
+                    (
+                        rect.left() + side_inset,
+                        rect.right() - side_inset,
+                        rect.left() + side_inset + bar_width + width * 0.1,
+                    )
                 };
-                egui::Image::new(source)
-                    .fit_to_exact_size(rect.size())
-                    .tint(color)
-                    .paint_at(ui, rect);
+                let bar_rect = egui::Rect::from_min_max(
+                    egui::pos2(bar_left, rect.top() + vertical_inset),
+                    egui::pos2(bar_left + bar_width, rect.bottom() - vertical_inset),
+                );
+                painter.rect_filled(bar_rect, bar_width * 0.5, color);
+
+                let triangle = [
+                    egui::pos2(base_x, rect.top() + vertical_inset),
+                    egui::pos2(base_x, rect.bottom() - vertical_inset),
+                    egui::pos2(apex_x, rect.center().y),
+                ];
+                Self::fill_round_polygon(painter, &triangle, width * 0.08, color);
             }
             VideoControlIcon::AudioTracks => {
                 let speaker_points = vec![
@@ -9548,7 +9568,7 @@ impl ImageViewer {
             icon_size,
         );
         let text_color = visuals.fg_stroke.color;
-        Self::draw_video_control_vector_icon(ui, icon, icon_rect, text_color);
+        Self::draw_video_control_vector_icon(painter, icon, icon_rect, text_color);
 
         if let Some(label_galley) = label_galley {
             let text_pos = egui::pos2(
@@ -10535,6 +10555,62 @@ impl ImageViewer {
         }
     }
 
+    /// Filled polygon with softened (circular) corners.
+    fn fill_round_polygon(
+        painter: &egui::Painter,
+        points: &[egui::Pos2],
+        radius: f32,
+        color: egui::Color32,
+    ) {
+        if points.len() < 3 {
+            return;
+        }
+        let mut inner = Vec::with_capacity(points.len() * 2);
+        for (index, point) in points.iter().enumerate() {
+            let previous = points[(index + points.len() - 1) % points.len()];
+            let next = points[(index + 1) % points.len()];
+            for neighbour in [previous, next] {
+                let offset = neighbour - *point;
+                let distance = offset.length();
+                if distance > f32::EPSILON {
+                    inner.push(*point + offset / distance * radius.min(distance * 0.5));
+                }
+            }
+        }
+        painter.add(egui::Shape::convex_polygon(
+            inner,
+            color,
+            egui::Stroke::NONE,
+        ));
+        for point in points {
+            painter.circle_filled(*point, radius, color);
+        }
+    }
+
+    /// Paint a Lucide SVG at `rect`, snapped to whole device pixels, so the
+    /// rasterised texture is sampled 1:1 instead of being resampled (which blurs).
+    fn paint_lucide_icon(
+        ui: &egui::Ui,
+        rect: egui::Rect,
+        source: egui::ImageSource<'static>,
+        color: egui::Color32,
+    ) {
+        let pixels_per_point = ui.ctx().pixels_per_point().max(0.5);
+        let snap = |value: f32| (value * pixels_per_point).round();
+        let snapped = egui::Rect::from_min_size(
+            egui::pos2(snap(rect.left()), snap(rect.top())) / pixels_per_point,
+            egui::vec2(
+                snap(rect.width()).max(1.0) / pixels_per_point,
+                snap(rect.height()).max(1.0) / pixels_per_point,
+            ),
+        );
+
+        egui::Image::new(source)
+            .texture_options(egui::TextureOptions::NEAREST)
+            .tint(color)
+            .paint_at(ui, snapped);
+    }
+
     fn paint_menu_action_icon(
         ui: &egui::Ui,
         rect: egui::Rect,
@@ -10559,10 +10635,7 @@ impl ImageViewer {
             }
         };
 
-        egui::Image::new(source)
-            .fit_to_exact_size(rect.size())
-            .tint(color)
-            .paint_at(ui, rect);
+        Self::paint_lucide_icon(ui, rect, source, color);
     }
 
     fn paint_breadcrumb_toggle_folder_icon(ui: &egui::Ui, rect: egui::Rect, tint: egui::Color32) {
