@@ -13320,7 +13320,7 @@ impl ImageViewer {
         ui.add_space(12.0);
         ui.label(
             egui::RichText::new(group.to_uppercase())
-                .size(10.0)
+                .size(11.0)
                 .color(UI_TEXT_FAINT),
         );
         ui.add_space(6.0);
