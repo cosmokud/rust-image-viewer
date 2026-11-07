@@ -496,6 +496,8 @@ pub fn detect_video_acceleration_capabilities() -> VideoAccelerationCapabilities
     })
 }
 
+// Kept as a capability probe for diagnostics: nothing in the app reads it any more.
+#[allow(dead_code)]
 pub fn cuda_acceleration_available() -> bool {
     detect_video_acceleration_capabilities().cuda_available
 }

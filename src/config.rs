@@ -7,15 +7,28 @@ use std::fs;
 use std::path::PathBuf;
 
 use crate::app_dirs;
-use crate::video_player::cuda_acceleration_available;
 
-const DEFAULT_CONFIG_TEMPLATE: &str = include_str!("../assets/config.ini");
+#[cfg(test)]
+const DEFAULT_CONFIG_TEMPLATE: &str = include_str!("../assets/presets/default.ini");
 const CONFIG_FILE_NAME: &str = "config.ini";
+const STATE_FILE_NAME: &str = "state.ini";
+/// Name of the auto-created working preset (a byte copy of `default.ini`).
+const USER_PRESET_NAME: &str = "User";
 const LEGACY_CONFIG_FILE_NAME: &str = "rust-image-viewer-config.ini";
 const LEGACY_SETTINGS_FILE_NAME: &str = "setting.ini";
 
+#[cfg(test)]
 fn default_config_ini() -> &'static str {
     DEFAULT_CONFIG_TEMPLATE
+}
+
+/// Parsed `state.ini`: runtime state plus the remembered active preset name.
+#[derive(Default)]
+struct StateFile {
+    active_preset: Option<String>,
+    muted: Option<bool>,
+    volume: Option<f64>,
+    show_breadcrumb_bar: Option<bool>,
 }
 
 /// Image resampling filter types for scaling operations.
@@ -664,6 +677,9 @@ pub struct Config {
     pub manga_mipmap_video_thumbnails: bool,
     /// Minimum texture side length required before mipmaps are enabled.
     pub manga_mipmap_min_side: u32,
+    /// Preset file currently backing this config (`presets/<name>.ini`). Runtime only: it is
+    /// remembered in `state.ini`, never written into a preset.
+    pub active_preset: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -775,13 +791,13 @@ impl Config {
             manga_autoscroll_max_speed_px_per_sec: 14000.0,
             manga_autoscroll_horizontal_speed_multiplier: 1.0,
             manga_autoscroll_vertical_speed_multiplier: 1.0,
-            manga_autoscroll_circle_fill_alpha: 110,
+            manga_autoscroll_circle_fill_alpha: 50,
             manga_autoscroll_arrow_rgb: [140, 190, 255],
-            manga_autoscroll_arrow_alpha: 150,
+            manga_autoscroll_arrow_alpha: 50,
             video_muted_by_default: true,
-            video_muted_remember: false,
+            video_muted_remember: true,
             video_default_volume: 0.0,
-            video_volume_remember: false,
+            video_volume_remember: true,
             state_muted: true,
             state_volume: 0.0,
             state_show_breadcrumb_bar: true,
@@ -812,6 +828,7 @@ impl Config {
             manga_mipmap_static: true,
             manga_mipmap_video_thumbnails: true,
             manga_mipmap_min_side: 128,
+            active_preset: None,
         }
     }
 }
@@ -1170,31 +1187,180 @@ impl Config {
         config
     }
 
-    /// Load configuration from INI file
+    /// Path of `state.ini`: the only file that keeps runtime state (`[State]` plus the active
+    /// preset name) outside of a preset.
+    pub fn state_path() -> PathBuf {
+        Self::config_dir().join(STATE_FILE_NAME)
+    }
+
+    /// Path of the active preset file, when one is loaded.
+    pub fn active_preset_path(&self) -> Option<PathBuf> {
+        self.active_preset
+            .as_deref()
+            .map(crate::settings_registry::preset_path)
+    }
+
+    /// Loads the active preset (`presets/<name>.ini`); the app no longer has a `config.ini`.
+    ///
+    /// Startup order: migrate a leftover legacy `config.ini` into `presets/User.ini`, then use the
+    /// preset remembered in `state.ini`, else the first user preset, else create `User.ini` as an
+    /// exact copy of `default.ini`.
     pub fn load() -> Self {
-        let config_path = Self::config_path();
-        let default_config = default_config_ini();
+        let _ = crate::settings_registry::ensure_builtin_presets();
+        Self::migrate_legacy_config_file();
 
-        if !config_path.exists() {
-            if fs::write(&config_path, default_config).is_ok() {
-            } else {
-                let config = Self::parse_ini(default_config);
-                config.save();
-                return config;
+        let state = Self::read_state_file();
+        let mut config = Self::default();
+        let active = Self::resolve_active_preset(state.active_preset.as_deref());
+        if let Some(content) =
+            fs::read_to_string(crate::settings_registry::preset_path(&active)).ok()
+        {
+            let (values, _warnings) = crate::settings_registry::parse_preset(&content);
+            let _ = crate::settings_registry::apply_values(&mut config, &values);
+            // Hand-edited files are repaired in place: only offending lines change.
+            if !crate::settings_registry::is_builtin(&active) {
+                let (repaired, _) = crate::settings_registry::rewrite_preset(
+                    &content,
+                    &crate::settings_registry::capture(&config),
+                );
+                if repaired != content {
+                    let _ = fs::write(crate::settings_registry::preset_path(&active), repaired);
+                }
+            }
+        }
+        config.active_preset = Some(active);
+        if let Some(muted) = state.muted {
+            config.state_muted = muted;
+        }
+        if let Some(volume) = state.volume {
+            config.state_volume = volume.clamp(0.0, 1.0);
+        }
+        if let Some(show_breadcrumb_bar) = state.show_breadcrumb_bar {
+            config.state_show_breadcrumb_bar = show_breadcrumb_bar;
+        }
+        config.save_state();
+        config
+    }
+
+    /// Chooses the preset that backs the live config, creating `User.ini` when none exists.
+    fn resolve_active_preset(remembered: Option<&str>) -> String {
+        if let Some(name) = remembered {
+            let valid = crate::settings_registry::is_builtin(name)
+                || crate::settings_registry::sanitize_preset_name(name).is_ok();
+            if valid && crate::settings_registry::preset_path(name).exists() {
+                return name.to_string();
+            }
+        }
+        crate::settings_registry::ensure_user_preset()
+            .unwrap_or_else(|_| USER_PRESET_NAME.to_string())
+    }
+
+    /// One-shot migration from the deprecated `config.ini` in the roaming root.
+    ///
+    /// A value that differs from the hardcoded defaults is carried over into `presets/User.ini`;
+    /// the remembered `[State]` is carried into `state.ini`. The old file is then deleted so the
+    /// check never runs again.
+    fn migrate_legacy_config_file() {
+        let legacy_path = Self::config_path();
+        if !legacy_path.exists() {
+            return;
+        }
+        let content = fs::read_to_string(&legacy_path).unwrap_or_default();
+        let (content, _) = strip_legacy_config_version_tag(&content);
+        let legacy = Self::parse_ini(content.as_ref());
+        let differs = crate::settings_registry::capture(&legacy)
+            != crate::settings_registry::capture(&Self::default());
+
+        if differs {
+            let user_path = crate::settings_registry::preset_path(USER_PRESET_NAME);
+            if !user_path.exists() {
+                let values = crate::settings_registry::capture(&legacy);
+                let rendered =
+                    crate::settings_registry::render_preset(USER_PRESET_NAME, false, &values);
+                let _ = crate::settings_registry::presets_dir();
+                let _ = fs::write(&user_path, rendered);
             }
         }
 
-        match fs::read_to_string(&config_path) {
-            Ok(content) => {
-                let (content_without_legacy_header, _) = strip_legacy_config_version_tag(&content);
-                Self::parse_ini(content_without_legacy_header.as_ref())
+        let active = if differs {
+            Some(USER_PRESET_NAME.to_string())
+        } else {
+            Self::read_state_file().active_preset
+        };
+        let _ = Self::write_state_file(
+            active.as_deref(),
+            legacy.state_muted,
+            legacy.state_volume,
+            legacy.state_show_breadcrumb_bar,
+        );
+        let _ = fs::remove_file(&legacy_path);
+    }
+
+    fn read_state_file() -> StateFile {
+        let mut state = StateFile::default();
+        let Ok(content) = fs::read_to_string(Self::state_path()) else {
+            return state;
+        };
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty()
+                || line.starts_with(';')
+                || line.starts_with('#')
+                || line.starts_with('[')
+            {
+                continue;
             }
-            Err(_) => {
-                let config = Self::parse_ini(default_config);
-                let _ = fs::write(&config_path, default_config);
-                config
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            let value = value.trim();
+            match key.trim().to_ascii_lowercase().as_str() {
+                "active_preset" => {
+                    if !value.is_empty() {
+                        state.active_preset = Some(value.to_string());
+                    }
+                }
+                "muted_state" => state.muted = parse_bool(value),
+                "volume_state" => state.volume = value.parse::<f64>().ok(),
+                "show_breadcrumb_bar" => state.show_breadcrumb_bar = parse_bool(value),
+                _ => {}
             }
         }
+        state
+    }
+
+    fn write_state_file(
+        active_preset: Option<&str>,
+        muted: bool,
+        volume: f64,
+        show_breadcrumb_bar: bool,
+    ) -> std::io::Result<()> {
+        let mut content = String::with_capacity(256);
+        content.push_str("; rust-image-viewer runtime state (not a preset)\n");
+        content.push_str("[State]\n");
+        if let Some(name) = active_preset {
+            content.push_str(&format!("active_preset = {name}\n"));
+        }
+        content.push_str(&format!("muted_state = {}\n", bool_to_ini(muted)));
+        content.push_str(&format!(
+            "volume_state = {}\n",
+            format_with_optional_trailing_zero_f64(volume)
+        ));
+        content.push_str(&format!(
+            "show_breadcrumb_bar = {}\n",
+            bool_to_ini(show_breadcrumb_bar)
+        ));
+        fs::write(Self::state_path(), content)
+    }
+
+    /// Persists `[State]` and the active preset name into `state.ini`.
+    pub fn save_state(&self) {
+        let _ = Self::write_state_file(
+            self.active_preset.as_deref(),
+            self.state_muted,
+            self.state_volume,
+            self.state_show_breadcrumb_bar,
+        );
     }
 
     /// Parse INI content into Config
@@ -1925,629 +2091,24 @@ impl Config {
         config
     }
 
-    /// Save configuration to INI file
-    pub fn save(&self) {
-        let content = self.render_ini_from_template();
-        let _ = fs::write(Self::config_path(), content);
-    }
-
-    /// Rewrites AppData `config.ini` into template order with comments and missing keys.
+    /// Saves the live settings into the active preset file and refreshes `state.ini`.
     ///
+    /// The write is surgical: existing lines keep their comments and ordering, only value text
+    /// changes, unknown keys are commented out with a reason and missing keys are appended.
+    /// A built-in preset (read-only `Default`) is never written.
+    pub fn save(&self) {
+        if let Some(name) = self.active_preset.as_deref() {
+            if !crate::settings_registry::is_builtin(name) {
+                let values = crate::settings_registry::capture(self);
+                let _ = crate::settings_registry::save_preset(name, &values);
+            }
+        }
+        self.save_state();
+    }
+
+    /// Repairs the active preset on disk and refreshes `state.ini` (idle-time maintenance).
     pub fn sync_disk_file_with_template(&self) {
-        let config_path = Self::config_path();
-        let expected_content = self.render_ini_from_template();
-
-        match fs::read_to_string(&config_path) {
-            Ok(existing_content) => {
-                let (existing_without_legacy_header, had_legacy_header) =
-                    strip_legacy_config_version_tag(&existing_content);
-
-                if had_legacy_header || existing_without_legacy_header.as_ref() != expected_content
-                {
-                    let _ = fs::write(config_path, expected_content);
-                }
-            }
-            Err(_) => {
-                let _ = fs::write(config_path, expected_content);
-            }
-        }
-    }
-
-    fn render_ini_from_template(&self) -> String {
-        let values = self.ini_value_replacements();
-        let default_config = default_config_ini();
-        let mut rendered = String::with_capacity(default_config.len() + 256);
-
-        for line in default_config.split_inclusive('\n') {
-            let (line_body, line_ending) = split_line_ending(line);
-            let trimmed = line_body.trim_start();
-
-            if trimmed.starts_with(';') || trimmed.starts_with('#') || trimmed.starts_with('[') {
-                rendered.push_str(line_body);
-                rendered.push_str(line_ending);
-                continue;
-            }
-
-            if let Some((lhs, rhs)) = line_body.split_once('=') {
-                let key = lhs.trim();
-                if key.eq_ignore_ascii_case("enable_cuda") {
-                    if let Some(comment) = self.cuda_enable_runtime_comment() {
-                        rendered.push_str(comment);
-                        rendered.push_str(line_ending);
-                    }
-                }
-                if let Some(value) = values.get(key) {
-                    let spacing_end = rhs
-                        .char_indices()
-                        .find(|(_, ch)| !ch.is_whitespace())
-                        .map(|(idx, _)| idx)
-                        .unwrap_or(rhs.len());
-
-                    rendered.push_str(lhs);
-                    rendered.push('=');
-                    if spacing_end == 0 && !value.is_empty() {
-                        rendered.push(' ');
-                    } else {
-                        rendered.push_str(&rhs[..spacing_end]);
-                    }
-                    rendered.push_str(value);
-                    rendered.push_str(line_ending);
-                    continue;
-                }
-            }
-
-            rendered.push_str(line_body);
-            rendered.push_str(line_ending);
-        }
-
-        rendered
-    }
-
-    fn cuda_enable_runtime_comment(&self) -> Option<&'static str> {
-        if self.use_hardware_acceleration && self.enable_cuda && cuda_acceleration_available() {
-            Some("; CUDA runtime detected on this machine. `enable_cuda` lets the app prefer CUDA-capable decode paths.")
-        } else {
-            None
-        }
-    }
-
-    fn ini_value_replacements(&self) -> HashMap<&'static str, String> {
-        let mut values = HashMap::new();
-
-        values.insert(
-            "controls_hide_delay",
-            format!("{}", self.controls_hide_delay),
-        );
-        values.insert(
-            "bottom_overlay_hide_delay",
-            format!("{}", self.bottom_overlay_hide_delay),
-        );
-        values.insert(
-            "cursor_idle_hide_delay",
-            format_with_optional_trailing_zero_f32(self.cursor_idle_hide_delay),
-        );
-        values.insert(
-            "double_click_grace_period",
-            format_with_optional_trailing_zero_f64(self.double_click_grace_period),
-        );
-        values.insert("show_fps", bool_to_ini(self.show_fps).to_string());
-        values.insert(
-            "show_fps_update_interval_ms",
-            format!("{}", self.show_fps_update_interval_ms),
-        );
-        values.insert("resize_border_size", format!("{}", self.resize_border_size));
-        values.insert(
-            "startup_window_mode",
-            self.startup_window_mode.as_str().to_string(),
-        );
-        values.insert(
-            "single_instance",
-            bool_to_ini(self.single_instance).to_string(),
-        );
-        values.insert(
-            "window_title_show_full_path",
-            self.window_title_show_full_path.as_str().to_string(),
-        );
-        values.insert("vsync", bool_to_ini(self.vsync).to_string());
-        values.insert(
-            "use_hardware_acceleration",
-            bool_to_ini(self.use_hardware_acceleration).to_string(),
-        );
-        values.insert("enable_d3d12", bool_to_ini(self.enable_d3d12).to_string());
-        values.insert("enable_cuda", bool_to_ini(self.enable_cuda).to_string());
-        values.insert(
-            "metadata_cache_max_size_mb",
-            format!("{}", self.metadata_cache_max_size_mb),
-        );
-        values.insert(
-            "masonry_metadata_ram_cache_limit_mb",
-            format!("{}", self.masonry_metadata_ram_cache_limit_mb),
-        );
-        values.insert(
-            "background_rgb",
-            format!(
-                "{}, {}, {}",
-                self.background_rgb[0], self.background_rgb[1], self.background_rgb[2]
-            ),
-        );
-        values.insert("background_r", format!("{}", self.background_rgb[0]));
-        values.insert("background_g", format!("{}", self.background_rgb[1]));
-        values.insert("background_b", format!("{}", self.background_rgb[2]));
-        values.insert(
-            "marked_file_border_rgb",
-            format!(
-                "{}, {}, {}",
-                self.marked_file_border_rgb[0],
-                self.marked_file_border_rgb[1],
-                self.marked_file_border_rgb[2]
-            ),
-        );
-        values.insert(
-            "marked_file_border_r",
-            format!("{}", self.marked_file_border_rgb[0]),
-        );
-        values.insert(
-            "marked_file_border_g",
-            format!("{}", self.marked_file_border_rgb[1]),
-        );
-        values.insert(
-            "marked_file_border_b",
-            format!("{}", self.marked_file_border_rgb[2]),
-        );
-        values.insert(
-            "fullscreen_reset_fit_on_mode_switch",
-            bool_to_ini(self.fullscreen_reset_fit_on_mode_switch).to_string(),
-        );
-        values.insert(
-            "manga_long_strip_reset_fit_on_fullscreen_exit",
-            bool_to_ini(self.manga_long_strip_reset_fit_on_fullscreen_exit).to_string(),
-        );
-        values.insert(
-            "fullscreen_remember_view_state_in_ram",
-            bool_to_ini(self.fullscreen_remember_view_state_in_ram).to_string(),
-        );
-        values.insert(
-            "fullscreen_native_window_transition",
-            bool_to_ini(self.fullscreen_native_window_transition).to_string(),
-        );
-        values.insert(
-            "maximize_to_borderless_fullscreen",
-            bool_to_ini(self.maximize_to_borderless_fullscreen).to_string(),
-        );
-        values.insert(
-            "confirm_delete_to_recycle_bin",
-            bool_to_ini(self.confirm_delete_to_recycle_bin).to_string(),
-        );
-        values.insert(
-            "auto_unmark_after_paste",
-            bool_to_ini(self.auto_unmark_after_paste).to_string(),
-        );
-        values.insert(
-            "mark_file",
-            optional_mark_key_to_string(self.mark_file.as_ref()),
-        );
-        values.insert(
-            "toggle_mark_file",
-            optional_shortcut_modifier_to_string(self.toggle_mark_file.as_ref()),
-        );
-        values.insert(
-            "manga_mark_file",
-            optional_mark_key_to_string(self.manga_mark_file.as_ref()),
-        );
-        values.insert(
-            "manga_toggle_mark_file",
-            optional_shortcut_modifier_to_string(self.manga_toggle_mark_file.as_ref()),
-        );
-        values.insert(
-            "masonry_mark_file",
-            optional_mark_key_to_string(self.masonry_mark_file.as_ref()),
-        );
-        values.insert(
-            "gallery_mark_file",
-            optional_mark_key_to_string(self.masonry_mark_file.as_ref()),
-        );
-        values.insert(
-            "masonry_toggle_mark_file",
-            optional_shortcut_modifier_to_string(self.masonry_toggle_mark_file.as_ref()),
-        );
-        values.insert(
-            "gallery_toggle_mark_file",
-            optional_shortcut_modifier_to_string(self.masonry_toggle_mark_file.as_ref()),
-        );
-        values.insert(
-            "zoom_animation_speed",
-            format!("{}", self.zoom_animation_speed),
-        );
-        values.insert(
-            "precise_rotation_step_degrees",
-            format_with_optional_trailing_zero_f32(self.precise_rotation_step_degrees),
-        );
-        values.insert("zoom_step", format!("{}", self.zoom_step));
-        values.insert(
-            "ctrl_scroll_up_pan_speed_px_per_step",
-            format_with_optional_trailing_zero_f32(self.ctrl_scroll_up_pan_speed_px_per_step),
-        );
-        values.insert(
-            "ctrl_scroll_down_pan_speed_px_per_step",
-            format_with_optional_trailing_zero_f32(self.ctrl_scroll_down_pan_speed_px_per_step),
-        );
-        values.insert(
-            "shift_scroll_up_pan_speed_px_per_step",
-            format_with_optional_trailing_zero_f32(self.shift_scroll_up_pan_speed_px_per_step),
-        );
-        values.insert(
-            "shift_scroll_down_pan_speed_px_per_step",
-            format_with_optional_trailing_zero_f32(self.shift_scroll_down_pan_speed_px_per_step),
-        );
-        values.insert("max_zoom_percent", format!("{}", self.max_zoom_percent));
-        values.insert(
-            "manga_drag_pan_speed",
-            format_with_optional_trailing_zero_f32(self.manga_drag_pan_speed),
-        );
-        values.insert(
-            "manga_wheel_impulse_per_step",
-            format_with_optional_trailing_zero_f32(self.manga_wheel_impulse_per_step),
-        );
-        values.insert(
-            "manga_wheel_decay_rate",
-            format_with_optional_trailing_zero_f32(self.manga_wheel_decay_rate),
-        );
-        values.insert(
-            "manga_wheel_max_velocity",
-            format_with_optional_trailing_zero_f32(self.manga_wheel_max_velocity),
-        );
-        values.insert(
-            "manga_wheel_edge_spring_hz",
-            format_with_optional_trailing_zero_f32(self.manga_wheel_edge_spring_hz),
-        );
-        values.insert(
-            "manga_inertial_friction",
-            format!("{}", self.manga_inertial_friction),
-        );
-        values.insert(
-            "manga_arrow_scroll_speed",
-            format!("{}", self.manga_arrow_scroll_speed),
-        );
-        values.insert(
-            "masonry_items_per_row",
-            format!("{}", self.masonry_items_per_row),
-        );
-        values.insert(
-            "manga_hover_autoplay_resume_delay_ms",
-            format!("{}", self.manga_hover_autoplay_resume_delay_ms),
-        );
-        values.insert(
-            "manga_virtualization_backend",
-            self.manga_virtualization_backend.as_str().to_string(),
-        );
-        values.insert(
-            "manga_autoscroll_dead_zone_px",
-            format_with_optional_trailing_zero_f32(self.manga_autoscroll_dead_zone_px),
-        );
-        values.insert(
-            "manga_autoscroll_base_speed_multiplier",
-            format_with_optional_trailing_zero_f32(self.manga_autoscroll_base_speed_multiplier),
-        );
-        values.insert(
-            "manga_autoscroll_min_speed_multiplier",
-            format_with_optional_trailing_zero_f32(self.manga_autoscroll_min_speed_multiplier),
-        );
-        values.insert(
-            "manga_autoscroll_max_speed_multiplier",
-            format_with_optional_trailing_zero_f32(self.manga_autoscroll_max_speed_multiplier),
-        );
-        values.insert(
-            "manga_autoscroll_curve_power",
-            format_with_optional_trailing_zero_f32(self.manga_autoscroll_curve_power),
-        );
-        values.insert(
-            "manga_autoscroll_min_speed_px_per_sec",
-            format_with_optional_trailing_zero_f32(self.manga_autoscroll_min_speed_px_per_sec),
-        );
-        values.insert(
-            "manga_autoscroll_max_speed_px_per_sec",
-            format_with_optional_trailing_zero_f32(self.manga_autoscroll_max_speed_px_per_sec),
-        );
-        values.insert(
-            "manga_autoscroll_horizontal_speed_multiplier",
-            format_with_optional_trailing_zero_f32(
-                self.manga_autoscroll_horizontal_speed_multiplier,
-            ),
-        );
-        values.insert(
-            "manga_autoscroll_vertical_speed_multiplier",
-            format_with_optional_trailing_zero_f32(self.manga_autoscroll_vertical_speed_multiplier),
-        );
-        values.insert(
-            "manga_autoscroll_circle_fill_alpha",
-            format!("{}", self.manga_autoscroll_circle_fill_alpha),
-        );
-        values.insert(
-            "manga_autoscroll_arrow_rgb",
-            format!(
-                "{}, {}, {}",
-                self.manga_autoscroll_arrow_rgb[0],
-                self.manga_autoscroll_arrow_rgb[1],
-                self.manga_autoscroll_arrow_rgb[2]
-            ),
-        );
-        values.insert(
-            "manga_autoscroll_arrow_alpha",
-            format!("{}", self.manga_autoscroll_arrow_alpha),
-        );
-
-        values.insert(
-            "muted_by_default",
-            if self.video_muted_remember {
-                "remember".to_string()
-            } else {
-                bool_to_ini(self.video_muted_by_default).to_string()
-            },
-        );
-        values.insert(
-            "default_volume",
-            if self.video_volume_remember {
-                "remember".to_string()
-            } else {
-                format_with_optional_trailing_zero_f64(self.video_default_volume)
-            },
-        );
-        values.insert("loop", bool_to_ini(self.video_loop).to_string());
-        values.insert("seek_policy", self.video_seek_policy.as_str().to_string());
-        values.insert(
-            "prefer_hardware_decode",
-            bool_to_ini(self.video_prefer_hardware_decode).to_string(),
-        );
-        values.insert(
-            "disable_hardware_decode",
-            bool_to_ini(self.video_disable_hardware_decode).to_string(),
-        );
-        values.insert(
-            "videos_only_navigation",
-            bool_to_ini(self.videos_only_navigation).to_string(),
-        );
-        values.insert(
-            "priority_previous_file_binding",
-            optional_binding_to_string(self.video_priority_previous_file_binding.as_ref()),
-        );
-        values.insert(
-            "priority_next_file_binding",
-            optional_binding_to_string(self.video_priority_next_file_binding.as_ref()),
-        );
-        values.insert(
-            "priority_play_pause_binding",
-            optional_binding_to_string(self.video_priority_play_pause_binding.as_ref()),
-        );
-        values.insert("muted_state", bool_to_ini(self.state_muted).to_string());
-        values.insert(
-            "volume_state",
-            format_with_optional_trailing_zero_f64(self.state_volume),
-        );
-        values.insert(
-            "show_breadcrumb_bar",
-            bool_to_ini(self.state_show_breadcrumb_bar).to_string(),
-        );
-
-        values.insert("upscale_filter", self.upscale_filter.as_str().to_string());
-        values.insert(
-            "downscale_filter",
-            self.downscale_filter.as_str().to_string(),
-        );
-        values.insert(
-            "gif_resize_filter",
-            self.gif_resize_filter.as_str().to_string(),
-        );
-        values.insert(
-            "texture_filter_static",
-            self.texture_filter_static.as_str().to_string(),
-        );
-        values.insert(
-            "texture_filter_animated",
-            self.texture_filter_animated.as_str().to_string(),
-        );
-        values.insert(
-            "texture_filter_video",
-            self.texture_filter_video.as_str().to_string(),
-        );
-        values.insert(
-            "manga_mipmap_static",
-            bool_to_ini(self.manga_mipmap_static).to_string(),
-        );
-        values.insert(
-            "manga_mipmap_video_thumbnails",
-            bool_to_ini(self.manga_mipmap_video_thumbnails).to_string(),
-        );
-        values.insert(
-            "manga_mipmap_min_side",
-            format!("{}", self.manga_mipmap_min_side),
-        );
-
-        values.insert(
-            "toggle_fullscreen",
-            self.action_bindings_csv(Action::ToggleFullscreen),
-        );
-        values.insert("goto_file", self.action_bindings_csv(Action::GotoFile));
-        values.insert("select_area", self.action_bindings_csv(Action::SelectArea));
-        values.insert(
-            "freehand_autoscroll",
-            self.action_bindings_csv(Action::FreehandAutoscroll),
-        );
-        values.insert("next_image", self.action_bindings_csv(Action::NextImage));
-        values.insert(
-            "previous_image",
-            self.action_bindings_csv(Action::PreviousImage),
-        );
-        values.insert(
-            "rotate_clockwise",
-            self.action_bindings_csv(Action::RotateClockwise),
-        );
-        values.insert(
-            "rotate_counterclockwise",
-            self.action_bindings_csv(Action::RotateCounterClockwise),
-        );
-        values.insert(
-            "precise_rotation_clockwise",
-            self.action_bindings_csv(Action::PreciseRotationClockwise),
-        );
-        values.insert(
-            "precise_rotation_counterclockwise",
-            self.action_bindings_csv(Action::PreciseRotationCounterClockwise),
-        );
-        values.insert("zoom_in", self.action_bindings_csv(Action::ZoomIn));
-        values.insert("zoom_out", self.action_bindings_csv(Action::ZoomOut));
-        values.insert("exit", self.action_bindings_csv(Action::Exit));
-        values.insert("pan", self.action_bindings_csv(Action::Pan));
-        values.insert(
-            "video_play_pause",
-            self.action_bindings_csv(Action::VideoPlayPause),
-        );
-        values.insert("video_mute", self.action_bindings_csv(Action::VideoMute));
-        values.insert(
-            "manga_zoom_in",
-            self.action_bindings_csv(Action::MangaZoomIn),
-        );
-        values.insert(
-            "manga_zoom_out",
-            self.action_bindings_csv(Action::MangaZoomOut),
-        );
-        values.insert("manga_pan", self.action_bindings_csv(Action::MangaPan));
-        values.insert(
-            "manga_goto_file",
-            self.action_bindings_csv(Action::MangaGotoFile),
-        );
-        values.insert(
-            "manga_freehand_autoscroll",
-            self.action_bindings_csv(Action::MangaFreehandAutoscroll),
-        );
-        values.insert("manga_pan_up", self.action_bindings_csv(Action::MangaPanUp));
-        values.insert(
-            "manga_pan_down",
-            self.action_bindings_csv(Action::MangaPanDown),
-        );
-        values.insert(
-            "manga_next_image_fit",
-            self.action_bindings_csv(Action::MangaNextImageFit),
-        );
-        values.insert(
-            "manga_previous_image_fit",
-            self.action_bindings_csv(Action::MangaPreviousImageFit),
-        );
-        values.insert(
-            "manga_next_image",
-            self.action_bindings_csv(Action::MangaNextImage),
-        );
-        values.insert(
-            "manga_previous_image",
-            self.action_bindings_csv(Action::MangaPreviousImage),
-        );
-        values.insert(
-            "manga_scroll_up",
-            self.action_bindings_csv(Action::MangaScrollUp),
-        );
-        values.insert(
-            "manga_scroll_down",
-            self.action_bindings_csv(Action::MangaScrollDown),
-        );
-        values.insert(
-            "masonry_pan_up",
-            self.action_bindings_csv(Action::MasonryPanUp),
-        );
-        values.insert("masonry_pan", self.action_bindings_csv(Action::MasonryPan));
-        values.insert(
-            "masonry_goto_file",
-            self.action_bindings_csv(Action::MasonryGotoFile),
-        );
-        values.insert(
-            "masonry_freehand_autoscroll",
-            self.action_bindings_csv(Action::MasonryFreehandAutoscroll),
-        );
-        values.insert(
-            "masonry_pan_down",
-            self.action_bindings_csv(Action::MasonryPanDown),
-        );
-        values.insert(
-            "masonry_pan_up_2",
-            self.action_bindings_csv(Action::MasonryPanUp2),
-        );
-        values.insert(
-            "masonry_pan_down_2",
-            self.action_bindings_csv(Action::MasonryPanDown2),
-        );
-        values.insert(
-            "masonry_pan_up_3",
-            self.action_bindings_csv(Action::MasonryPanUp3),
-        );
-        values.insert(
-            "masonry_pan_down_3",
-            self.action_bindings_csv(Action::MasonryPanDown3),
-        );
-        values.insert(
-            "masonry_scroll_up",
-            self.action_bindings_csv(Action::MasonryScrollUp),
-        );
-        values.insert(
-            "masonry_scroll_down",
-            self.action_bindings_csv(Action::MasonryScrollDown),
-        );
-        values.insert(
-            "masonry_zoom_in",
-            self.action_bindings_csv(Action::MasonryZoomIn),
-        );
-        values.insert(
-            "masonry_zoom_out",
-            self.action_bindings_csv(Action::MasonryZoomOut),
-        );
-        values.insert("gallery_pan", self.action_bindings_csv(Action::MasonryPan));
-        values.insert(
-            "gallery_goto_file",
-            self.action_bindings_csv(Action::MasonryGotoFile),
-        );
-        values.insert(
-            "gallery_freehand_autoscroll",
-            self.action_bindings_csv(Action::MasonryFreehandAutoscroll),
-        );
-        values.insert(
-            "gallery_pan_up",
-            self.action_bindings_csv(Action::MasonryPanUp),
-        );
-        values.insert(
-            "gallery_pan_down",
-            self.action_bindings_csv(Action::MasonryPanDown),
-        );
-        values.insert(
-            "gallery_pan_up_2",
-            self.action_bindings_csv(Action::MasonryPanUp2),
-        );
-        values.insert(
-            "gallery_pan_down_2",
-            self.action_bindings_csv(Action::MasonryPanDown2),
-        );
-        values.insert(
-            "gallery_pan_up_3",
-            self.action_bindings_csv(Action::MasonryPanUp3),
-        );
-        values.insert(
-            "gallery_pan_down_3",
-            self.action_bindings_csv(Action::MasonryPanDown3),
-        );
-        values.insert(
-            "gallery_scroll_up",
-            self.action_bindings_csv(Action::MasonryScrollUp),
-        );
-        values.insert(
-            "gallery_scroll_down",
-            self.action_bindings_csv(Action::MasonryScrollDown),
-        );
-        values.insert(
-            "gallery_zoom_in",
-            self.action_bindings_csv(Action::MasonryZoomIn),
-        );
-        values.insert(
-            "gallery_zoom_out",
-            self.action_bindings_csv(Action::MasonryZoomOut),
-        );
-
-        values
+        self.save();
     }
 
     pub(crate) fn action_bindings_csv(&self, action: Action) -> String {
@@ -2659,16 +2220,6 @@ fn bool_to_ini(value: bool) -> &'static str {
     }
 }
 
-fn split_line_ending(line: &str) -> (&str, &str) {
-    if let Some(without_newline) = line.strip_suffix("\r\n") {
-        (without_newline, "\r\n")
-    } else if let Some(without_newline) = line.strip_suffix('\n') {
-        (without_newline, "\n")
-    } else {
-        (line, "")
-    }
-}
-
 fn strip_legacy_config_version_tag(content: &str) -> (Cow<'_, str>, bool) {
     let content = content.trim_start_matches('\u{feff}');
     let Some(first_line) = content.lines().next() else {
@@ -2703,14 +2254,6 @@ fn is_semver_triplet(version: &str) -> bool {
             .all(|part| !part.is_empty() && part.chars().all(|ch| ch.is_ascii_digit())),
         _ => false,
     }
-}
-
-fn format_with_optional_trailing_zero_f32(value: f32) -> String {
-    let mut value_str = format!("{}", value);
-    if !value_str.contains('.') && !value_str.contains('e') && !value_str.contains('E') {
-        value_str.push_str(".0");
-    }
-    value_str
 }
 
 fn format_with_optional_trailing_zero_f64(value: f64) -> String {
@@ -2797,6 +2340,26 @@ fn parse_u8_clamped(value: &str) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::{default_config_ini, Config};
+
+    /// The shipped legacy template and the hardcoded defaults must agree, so switching the app
+    /// from `config.ini` to preset files cannot change behaviour for anyone.
+    #[test]
+    fn shipped_legacy_config_matches_code_defaults() {
+        let shipped = Config::parse_ini(include_str!("../assets/config.ini"));
+        let defaults = Config::default();
+        let shipped = crate::settings_registry::capture(&shipped);
+        let defaults = crate::settings_registry::capture(&defaults);
+        let mut diffs = Vec::new();
+        for ((id, shipped_value), (_, default_value)) in shipped.iter().zip(defaults.iter()) {
+            if shipped_value != default_value {
+                diffs.push(format!(
+                    "{}: shipped={shipped_value:?} default={default_value:?}",
+                    crate::settings_registry::SETTINGS[*id].key
+                ));
+            }
+        }
+        assert!(diffs.is_empty(), "{diffs:#?}");
+    }
 
     #[test]
     fn fullscreen_reset_fit_on_mode_switch_defaults_true() {

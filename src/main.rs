@@ -947,7 +947,9 @@ struct SettingsModal {
     pending_delete: Option<String>,
     status: Option<(String, Instant)>,
     status_is_error: bool,
-    /// Debounces slider drags into one config.ini write.
+    /// Preset name awaiting confirmation in the reset dialog.
+    pending_reset: Option<String>,
+    /// Debounces slider drags into one preset file write.
     save_due_at: Option<Instant>,
 }
 
@@ -970,6 +972,7 @@ impl Default for SettingsModal {
             pending_delete: None,
             status: None,
             status_is_error: false,
+            pending_reset: None,
             save_due_at: None,
         }
     }
@@ -984,6 +987,7 @@ enum SettingsPresetAction {
     Rename(String, String),
     CancelRename,
     ConfirmDelete(String),
+    Reset(String),
     Create,
 }
 
@@ -2618,7 +2622,7 @@ struct ImageViewer {
     pending_marked_delete_targets: Vec<PathBuf>,
     /// Whether an exit confirmation modal is waiting on user input because marks remain.
     pending_exit_confirmation: bool,
-    /// Settings dialog state: every config.ini setting, presets and the help page.
+    /// Settings dialog state: every preset setting, the preset list and the help page.
     settings: SettingsModal,
     /// Tracks Ctrl+V hold state so paste triggers once per key press even if key_pressed is swallowed.
     paste_shortcut_ctrl_v_was_down: bool,
@@ -2682,7 +2686,7 @@ struct ImageViewer {
     last_pointer_activity_at: Instant,
     /// Configuration
     config: Config,
-    /// One-shot deferred AppData config.ini normalization for fast startup.
+    /// One-shot deferred preset-file repair for fast startup.
     pending_idle_config_sync: bool,
     /// Whether we're in fullscreen mode
     is_fullscreen: bool,
@@ -11820,7 +11824,7 @@ impl ImageViewer {
                             ui.add_space(12.0);
                             ui.label(
                                 egui::RichText::new(
-                                    "Set confirm_delete_to_recycle_bin = false in config.ini to skip this confirmation.",
+                                    "Set confirm_delete_to_recycle_bin = false in your preset .ini to skip this confirmation.",
                                 )
                                 .color(egui::Color32::from_rgb(130, 168, 196))
                                 .size(12.0),
@@ -12309,7 +12313,7 @@ impl ImageViewer {
                 ui,
                 trigger.as_str(),
                 title.as_str(),
-                "Loaded from your user config.ini action bindings.",
+                "Loaded from the action bindings in your active preset .ini.",
             );
         }
     }
@@ -12633,7 +12637,7 @@ impl ImageViewer {
             ui,
             "Three-stripes title-bar menu",
             "Quick command center",
-            "Contains current-file actions, marked-file actions, this Help page, the Settings dialog (every config.ini setting plus presets), and Edit config.ini.",
+            "Contains current-file actions, marked-file actions, this Help page, and the Settings dialog (every preset setting plus preset management).",
         );
 
         ui.add_space(8.0);
@@ -12641,8 +12645,8 @@ impl ImageViewer {
 
         Self::draw_shortcuts_help_section_header(
             ui,
-            "AppData config.ini Bindings",
-            "Complete action list loaded from your user config file.",
+            "Preset .ini Bindings",
+            "Complete action list loaded from the active preset file.",
         );
         self.draw_shortcuts_help_config_rows(ui);
     }
@@ -12699,16 +12703,30 @@ impl ImageViewer {
         self.settings.status_is_error = false;
         self.settings.save_due_at = None;
         self.refresh_settings_mirrors();
+        self.settings.pending_reset = None;
+        // Opening Settings is the first-run entry point: with only `Default` in the folder, seed
+        // an editable `User` preset as an exact copy of `default.ini`.
+        let _ = settings_registry::ensure_user_preset();
         self.refresh_settings_presets();
-        if self.settings.selected.is_none() {
-            self.settings.selected = self
-                .settings
-                .presets
-                .iter()
-                .find(|entry| entry.builtin)
-                .map(|entry| entry.name.clone());
-            self.load_selected_preset_values();
-        }
+        // Always reflect the preset that actually backs the live config.
+        self.settings.selected = self
+            .config
+            .active_preset
+            .clone()
+            .filter(|name| {
+                self.settings
+                    .presets
+                    .iter()
+                    .any(|entry| &entry.name == name)
+            })
+            .or_else(|| {
+                self.settings
+                    .presets
+                    .iter()
+                    .find(|entry| !entry.builtin)
+                    .map(|entry| entry.name.clone())
+            });
+        self.load_selected_preset_values();
     }
 
     fn refresh_settings_presets(&mut self) {
@@ -12732,6 +12750,14 @@ impl ImageViewer {
 
     /// True when the live config differs from the selected preset file.
     fn selected_preset_modified(&self) -> bool {
+        if self
+            .settings
+            .selected
+            .as_deref()
+            .is_some_and(settings_registry::is_builtin)
+        {
+            return false;
+        }
         let Some(values) = self.settings.selected_preset_values.as_ref() else {
             return false;
         };
@@ -12740,7 +12766,7 @@ impl ImageViewer {
             .any(|(id, value)| settings_registry::get(&self.config, *id) != *value)
     }
 
-    /// Runs after the debounce window so slider drags produce one `config.ini` write.
+    /// Runs after the debounce window so slider drags produce one preset-file write.
     fn flush_pending_settings_save(&mut self, ctx: &egui::Context) {
         let Some(due_at) = self.settings.save_due_at else {
             return;
@@ -12755,7 +12781,7 @@ impl ImageViewer {
         }
     }
 
-    /// Writes `config.ini` now (pointer released / keyboard edit) or debounces a drag.
+    /// Writes the active preset now (pointer released / keyboard edit) or debounces a drag.
     fn finish_settings_edit(&mut self, write_now: bool) {
         if write_now {
             self.settings.save_due_at = None;
@@ -12801,6 +12827,9 @@ impl ImageViewer {
                 self.refresh_settings_mirrors();
                 self.settings.selected = Some(name.clone());
                 self.load_selected_preset_values();
+                // The last loaded preset *is* the live config: point it at this file and let
+                // `save` persist values plus the remembered active name.
+                self.config.active_preset = Some(name.clone());
                 self.config.save();
                 self.settings.save_due_at = None;
                 if warnings.is_empty() {
@@ -12842,6 +12871,12 @@ impl ImageViewer {
                         match settings_registry::rename_preset(&old, &clean) {
                             Ok(()) => {
                                 self.settings.selected = Some(clean.clone());
+                                // An active preset whose file is renamed must follow the new name,
+                                // or the next save would recreate the old file.
+                                if self.config.active_preset.as_deref() == Some(old.as_str()) {
+                                    self.config.active_preset = Some(clean.clone());
+                                    self.config.save_state();
+                                }
                                 self.refresh_settings_presets();
                                 self.set_settings_status(
                                     format!("Renamed '{old}' to '{clean}'"),
@@ -12861,20 +12896,47 @@ impl ImageViewer {
                 self.settings.pending_delete = None;
                 match settings_registry::delete_preset(&name) {
                     Ok(()) => {
-                        if self.settings.selected.as_deref() == Some(name.as_str()) {
-                            self.settings.selected = self
+                        let selected_was_deleted =
+                            self.settings.selected.as_deref() == Some(name.as_str());
+                        self.refresh_settings_presets();
+                        // Deleting the preset that backs the live config must not resurrect it on
+                        // the next save: fall back to any remaining user preset, else Default.
+                        if self.config.active_preset.as_deref() == Some(name.as_str()) {
+                            let fallback = self
                                 .settings
                                 .presets
                                 .iter()
-                                .find(|entry| entry.builtin)
-                                .map(|entry| entry.name.clone());
+                                .find(|entry| !entry.builtin)
+                                .map(|entry| entry.name.clone())
+                                .unwrap_or_else(|| "default".to_string());
+                            self.config.active_preset = Some(fallback);
+                            self.config.save_state();
                         }
-                        self.refresh_settings_presets();
+                        if selected_was_deleted {
+                            self.settings.selected = self.config.active_preset.clone();
+                            self.load_selected_preset_values();
+                        }
                         self.set_settings_status(format!("Deleted preset '{name}'"), false);
                     }
                     Err(err) => self.set_settings_status(format!("Could not delete: {err}"), true),
                 }
             }
+            SettingsPresetAction::Reset(name) => match settings_registry::reset_preset(&name) {
+                Ok(_) => {
+                    if self.config.active_preset.as_deref() == Some(name.as_str()) {
+                        let defaults = settings_registry::capture(&Config::default());
+                        let _ = settings_registry::apply_values(&mut self.config, &defaults);
+                        self.set_masonry_items_per_row(self.config.masonry_items_per_row);
+                        self.refresh_settings_mirrors();
+                    }
+                    self.refresh_settings_presets();
+                    self.set_settings_status(
+                        format!("Reset preset '{name}' to default settings"),
+                        false,
+                    );
+                }
+                Err(err) => self.set_settings_status(format!("Could not reset: {err}"), true),
+            },
             SettingsPresetAction::Create => {
                 let raw = self.settings.new_name.clone();
                 match settings_registry::sanitize_preset_name(&raw) {
@@ -12934,8 +12996,15 @@ impl ImageViewer {
         max: f64,
         width: f32,
     ) -> (egui::Response, bool) {
-        let (rect, response) =
-            ui.allocate_exact_size(egui::vec2(width, 26.0), egui::Sense::click_and_drag());
+        let enabled = ui.is_enabled();
+        let (rect, response) = ui.allocate_exact_size(
+            egui::vec2(width, 26.0),
+            if enabled {
+                egui::Sense::click_and_drag()
+            } else {
+                egui::Sense::hover()
+            },
+        );
         let track_left = rect.left() + 9.0;
         let track_right = (rect.right() - 9.0).max(track_left + 1.0);
         let span = max - min;
@@ -12948,7 +13017,7 @@ impl ImageViewer {
         };
         let mut changed = false;
         if let Some(pointer) = response.interact_pointer_pos() {
-            if response.dragged() || response.clicked() {
+            if enabled && (response.dragged() || response.clicked()) {
                 let target = (((pointer.x - track_left) / (track_right - track_left)) as f64)
                     .clamp(0.0, 1.0);
                 let current = normalized(*value);
@@ -12982,29 +13051,46 @@ impl ImageViewer {
                     egui::pos2(knob.x, y + 2.0),
                 ),
                 2.0,
-                UI_ACCENT,
+                if enabled {
+                    UI_ACCENT
+                } else {
+                    ui_alpha(UI_ACCENT, 70)
+                },
             );
         }
-        let hovered = response.hovered() || response.dragged();
-        painter.circle_filled(
-            knob,
-            if hovered { 8.0 } else { 7.0 },
-            if hovered { UI_TEXT_STRONG } else { UI_ACCENT },
-        );
+        let hovered = enabled && (response.hovered() || response.dragged());
+        let knob_fill = if !enabled {
+            ui_alpha(UI_TEXT_FAINT, 110)
+        } else if hovered {
+            UI_TEXT_STRONG
+        } else {
+            UI_ACCENT
+        };
+        painter.circle_filled(knob, if hovered { 8.0 } else { 7.0 }, knob_fill);
         painter.circle_filled(knob, 2.5, if hovered { UI_ACCENT } else { UI_WINDOW });
         (response, changed)
     }
 
     fn draw_settings_toggle(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
-        let (rect, response) = ui.allocate_exact_size(egui::vec2(40.0, 22.0), egui::Sense::click());
-        if response.clicked() {
+        let enabled = ui.is_enabled();
+        let (rect, response) = ui.allocate_exact_size(
+            egui::vec2(40.0, 22.0),
+            if enabled {
+                egui::Sense::click()
+            } else {
+                egui::Sense::hover()
+            },
+        );
+        if enabled && response.clicked() {
             *on = !*on;
         }
         let t = ui
             .ctx()
             .animate_value_with_time(response.id, if *on { 1.0 } else { 0.0 }, 0.12);
-        let hovered = response.hovered();
-        let track = if *on {
+        let hovered = enabled && response.hovered();
+        let track = if !enabled {
+            UI_SURFACE_ACTIVE
+        } else if *on {
             if hovered {
                 UI_TEXT_STRONG
             } else {
@@ -13090,6 +13176,7 @@ impl ImageViewer {
         ui: &mut egui::Ui,
         setting: &'static settings_registry::Setting,
         label_column: f32,
+        read_only: bool,
     ) -> Option<bool> {
         let id = setting.id;
         let mut tooltip = format!("{}\n\nkey: {}", setting.help, setting.key);
@@ -13097,6 +13184,11 @@ impl ImageViewer {
         if !hint.is_empty() {
             tooltip.push('\n');
             tooltip.push_str(hint);
+        }
+        if read_only {
+            tooltip.push_str(
+                "\n\nThe Default preset is read-only: Load it or pick another preset to edit.",
+            );
         }
         let row_width = ui.available_width();
         // Fits the widest label of this tab, so labels are not cut while there is room. On a
@@ -13117,8 +13209,12 @@ impl ImageViewer {
             ui.spacing_mut().item_spacing.x = 10.0;
             ui.add_sized(
                 [(label_slot - badge_width - 6.0).max(40.0), 20.0],
-                egui::Label::new(egui::RichText::new(setting.label).size(13.0).color(UI_TEXT))
-                    .truncate(),
+                egui::Label::new(
+                    egui::RichText::new(setting.label)
+                        .size(13.0)
+                        .color(if read_only { UI_TEXT_FAINT } else { UI_TEXT }),
+                )
+                .truncate(),
             );
             if setting.applies == settings_registry::Applies::Restart {
                 Self::draw_settings_badge(ui, "restart", UI_SURFACE_HOVER, UI_TEXT_DIM);
@@ -13128,143 +13224,153 @@ impl ImageViewer {
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let controls = ui.available_width().max(80.0);
-                match setting.kind {
-                    settings_registry::SettingKind::Int { min, max } => {
-                        let (row_changed, row_write_now) = self.draw_settings_number_control(
-                            ui, setting, min as f64, max as f64, 0, controls,
-                        );
-                        changed |= row_changed;
-                        write_now |= row_write_now;
-                    }
-                    settings_registry::SettingKind::Float { min, max, decimals } => {
-                        let (row_changed, row_write_now) = self.draw_settings_number_control(
-                            ui, setting, min, max, decimals, controls,
-                        );
-                        changed |= row_changed;
-                        write_now |= row_write_now;
-                    }
-                    settings_registry::SettingKind::Bool => {
-                        let before = self.settings.values[id] != 0.0;
-                        let mut on = before;
-                        if Self::draw_settings_toggle(ui, &mut on).clicked() && on != before {
-                            match settings_registry::set(
-                                &mut self.config,
-                                id,
-                                &settings_registry::SettingValue::Bool(on),
-                            ) {
-                                Ok(()) => {
-                                    self.settings.values =
-                                        Self::settings_values_from_config(&self.config);
-                                    changed = true;
-                                    write_now = true;
+                ui.add_enabled_ui(!read_only, |ui| {
+                    let controls = ui.available_width().max(80.0);
+                    match setting.kind {
+                        settings_registry::SettingKind::Int { min, max } => {
+                            let (row_changed, row_write_now) = self.draw_settings_number_control(
+                                ui, setting, min as f64, max as f64, 0, controls,
+                            );
+                            changed |= row_changed;
+                            write_now |= row_write_now;
+                        }
+                        settings_registry::SettingKind::Float { min, max, decimals } => {
+                            let (row_changed, row_write_now) = self.draw_settings_number_control(
+                                ui, setting, min, max, decimals, controls,
+                            );
+                            changed |= row_changed;
+                            write_now |= row_write_now;
+                        }
+                        settings_registry::SettingKind::Bool => {
+                            let before = self.settings.values[id] != 0.0;
+                            let mut on = before;
+                            if Self::draw_settings_toggle(ui, &mut on).clicked() && on != before {
+                                match settings_registry::set(
+                                    &mut self.config,
+                                    id,
+                                    &settings_registry::SettingValue::Bool(on),
+                                ) {
+                                    Ok(()) => {
+                                        self.settings.values =
+                                            Self::settings_values_from_config(&self.config);
+                                        changed = true;
+                                        write_now = true;
+                                    }
+                                    Err(err) => self.set_settings_status(err, true),
                                 }
-                                Err(err) => self.set_settings_status(err, true),
+                            }
+                        }
+                        settings_registry::SettingKind::Enum { values } => {
+                            let current = Self::settings_text_value(&self.config, id);
+                            let mut draft = current.clone();
+                            egui::ComboBox::from_id_salt(("settings_enum", id))
+                                .width(180.0_f32.min(controls.max(90.0)))
+                                .selected_text(
+                                    egui::RichText::new(&current).size(12.0).color(UI_TEXT),
+                                )
+                                .show_ui(ui, |ui| {
+                                    for entry in values {
+                                        ui.selectable_value(
+                                            &mut draft,
+                                            (*entry).to_string(),
+                                            *entry,
+                                        );
+                                    }
+                                });
+                            if draft != current {
+                                match settings_registry::set(
+                                    &mut self.config,
+                                    id,
+                                    &settings_registry::SettingValue::Text(draft),
+                                ) {
+                                    Ok(()) => {
+                                        self.settings.texts[id] =
+                                            Self::settings_text_value(&self.config, id);
+                                        changed = true;
+                                        write_now = true;
+                                    }
+                                    Err(err) => self.set_settings_status(err, true),
+                                }
+                            }
+                        }
+                        settings_registry::SettingKind::Rgb => {
+                            let mut rgb = [0u8; 3];
+                            for (slot, part) in
+                                rgb.iter_mut().zip(self.settings.texts[id].split(','))
+                            {
+                                *slot = part.trim().parse::<u8>().unwrap_or(0);
+                            }
+                            if ui.color_edit_button_srgb(&mut rgb).changed() {
+                                let text = format!("{}, {}, {}", rgb[0], rgb[1], rgb[2]);
+                                match settings_registry::set(
+                                    &mut self.config,
+                                    id,
+                                    &settings_registry::SettingValue::Text(text),
+                                ) {
+                                    Ok(()) => {
+                                        self.settings.texts[id] =
+                                            Self::settings_text_value(&self.config, id);
+                                        changed = true;
+                                        write_now = true;
+                                    }
+                                    Err(err) => self.set_settings_status(err, true),
+                                }
+                            }
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "#{:02X}{:02X}{:02X}",
+                                    rgb[0], rgb[1], rgb[2]
+                                ))
+                                .monospace()
+                                .size(11.5)
+                                .color(UI_TEXT_DIM),
+                            );
+                        }
+                        settings_registry::SettingKind::Key
+                        | settings_registry::SettingKind::Modifier
+                        | settings_registry::SettingKind::Binding
+                        | settings_registry::SettingKind::BindingList => {
+                            let hint = if matches!(
+                                setting.kind,
+                                settings_registry::SettingKind::BindingList
+                            ) {
+                                "empty = unbound"
+                            } else {
+                                "none"
+                            };
+                            // Full control width: in the shortcuts tab the binding is the payload,
+                            // so the field reaches the card edge instead of leaving a gap.
+                            let response = ui.add(
+                                egui::TextEdit::singleline(&mut self.settings.texts[id])
+                                    .hint_text(hint)
+                                    .font(egui::FontId::monospace(11.5))
+                                    .margin(egui::Margin::symmetric(8.0, 6.0))
+                                    .min_size(egui::vec2(0.0, SETTINGS_INPUT_HEIGHT))
+                                    .desired_width(controls)
+                                    .horizontal_align(egui::Align::LEFT),
+                            );
+                            let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                            // Commit only on Enter/focus loss: a half-typed binding must never be
+                            // written, so rejected text stays in the box for the user to fix.
+                            if response.lost_focus() || (response.has_focus() && enter) {
+                                let text = self.settings.texts[id].clone();
+                                match settings_registry::set(
+                                    &mut self.config,
+                                    id,
+                                    &settings_registry::SettingValue::Text(text),
+                                ) {
+                                    Ok(()) => {
+                                        self.settings.texts[id] =
+                                            Self::settings_text_value(&self.config, id);
+                                        changed = true;
+                                        write_now = true;
+                                    }
+                                    Err(err) => self.set_settings_status(err, true),
+                                }
                             }
                         }
                     }
-                    settings_registry::SettingKind::Enum { values } => {
-                        let current = Self::settings_text_value(&self.config, id);
-                        let mut draft = current.clone();
-                        egui::ComboBox::from_id_salt(("settings_enum", id))
-                            .width(180.0_f32.min(controls.max(90.0)))
-                            .selected_text(egui::RichText::new(&current).size(12.0).color(UI_TEXT))
-                            .show_ui(ui, |ui| {
-                                for entry in values {
-                                    ui.selectable_value(&mut draft, (*entry).to_string(), *entry);
-                                }
-                            });
-                        if draft != current {
-                            match settings_registry::set(
-                                &mut self.config,
-                                id,
-                                &settings_registry::SettingValue::Text(draft),
-                            ) {
-                                Ok(()) => {
-                                    self.settings.texts[id] =
-                                        Self::settings_text_value(&self.config, id);
-                                    changed = true;
-                                    write_now = true;
-                                }
-                                Err(err) => self.set_settings_status(err, true),
-                            }
-                        }
-                    }
-                    settings_registry::SettingKind::Rgb => {
-                        let mut rgb = [0u8; 3];
-                        for (slot, part) in rgb.iter_mut().zip(self.settings.texts[id].split(',')) {
-                            *slot = part.trim().parse::<u8>().unwrap_or(0);
-                        }
-                        if ui.color_edit_button_srgb(&mut rgb).changed() {
-                            let text = format!("{}, {}, {}", rgb[0], rgb[1], rgb[2]);
-                            match settings_registry::set(
-                                &mut self.config,
-                                id,
-                                &settings_registry::SettingValue::Text(text),
-                            ) {
-                                Ok(()) => {
-                                    self.settings.texts[id] =
-                                        Self::settings_text_value(&self.config, id);
-                                    changed = true;
-                                    write_now = true;
-                                }
-                                Err(err) => self.set_settings_status(err, true),
-                            }
-                        }
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "#{:02X}{:02X}{:02X}",
-                                rgb[0], rgb[1], rgb[2]
-                            ))
-                            .monospace()
-                            .size(11.5)
-                            .color(UI_TEXT_DIM),
-                        );
-                    }
-                    settings_registry::SettingKind::Key
-                    | settings_registry::SettingKind::Modifier
-                    | settings_registry::SettingKind::Binding
-                    | settings_registry::SettingKind::BindingList => {
-                        let hint = if matches!(
-                            setting.kind,
-                            settings_registry::SettingKind::BindingList
-                        ) {
-                            "empty = unbound"
-                        } else {
-                            "none"
-                        };
-                        // Full control width: in the shortcuts tab the binding is the payload,
-                        // so the field reaches the card edge instead of leaving a gap.
-                        let response = ui.add(
-                            egui::TextEdit::singleline(&mut self.settings.texts[id])
-                                .hint_text(hint)
-                                .font(egui::FontId::monospace(11.5))
-                                .margin(egui::Margin::symmetric(8.0, 6.0))
-                                .min_size(egui::vec2(0.0, SETTINGS_INPUT_HEIGHT))
-                                .desired_width(controls)
-                                .horizontal_align(egui::Align::LEFT),
-                        );
-                        let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
-                        // Commit only on Enter/focus loss: a half-typed binding must never be
-                        // written, so rejected text stays in the box for the user to fix.
-                        if response.lost_focus() || (response.has_focus() && enter) {
-                            let text = self.settings.texts[id].clone();
-                            match settings_registry::set(
-                                &mut self.config,
-                                id,
-                                &settings_registry::SettingValue::Text(text),
-                            ) {
-                                Ok(()) => {
-                                    self.settings.texts[id] =
-                                        Self::settings_text_value(&self.config, id);
-                                    changed = true;
-                                    write_now = true;
-                                }
-                                Err(err) => self.set_settings_status(err, true),
-                            }
-                        }
-                    }
-                }
+                });
             });
         });
         row.response.on_hover_text(tooltip);
@@ -13286,7 +13392,7 @@ impl ImageViewer {
     }
 
     /// Draws `ids` (registry order) as uppercase group headers with one card per group.
-    fn draw_settings_groups(&mut self, ui: &mut egui::Ui, ids: &[usize]) {
+    fn draw_settings_groups(&mut self, ui: &mut egui::Ui, ids: &[usize], read_only: bool) {
         let label_column = Self::settings_label_column(ui, ids);
         let mut index = 0;
         while index < ids.len() {
@@ -13321,6 +13427,7 @@ impl ImageViewer {
                                     ui,
                                     &settings_registry::SETTINGS[*id],
                                     label_column,
+                                    read_only,
                                 ) {
                                     changed = true;
                                     write_now |= row_write_now;
@@ -13360,7 +13467,7 @@ impl ImageViewer {
     }
 
     /// Search results: the same cards, grouped by tab then group.
-    fn draw_settings_search_results(&mut self, ui: &mut egui::Ui, ids: &[usize]) {
+    fn draw_settings_search_results(&mut self, ui: &mut egui::Ui, ids: &[usize], read_only: bool) {
         let mut index = 0;
         while index < ids.len() {
             let tab = settings_registry::SETTINGS[ids[index]].tab;
@@ -13377,7 +13484,7 @@ impl ImageViewer {
                     .color(UI_TEXT_DIM),
             );
             ui.add_space(4.0);
-            self.draw_settings_groups(ui, &ids[start..index]);
+            self.draw_settings_groups(ui, &ids[start..index], read_only);
         }
     }
 
@@ -13760,6 +13867,92 @@ impl ImageViewer {
         }
     }
 
+    /// Centered confirmation overlay for the footer's Reset button, drawn in the dialog's own
+    /// monochrome theme on top of the settings body. Returns the user's choice for this frame.
+    fn draw_settings_reset_confirm(&mut self, ctx: &egui::Context) -> Option<bool> {
+        let name = self.settings.pending_reset.clone()?;
+        let screen = ctx.screen_rect();
+
+        // Backdrop: opaque enough to read as a modal, and clickable so the settings underneath
+        // cannot be edited while the confirmation is open.
+        egui::Area::new(egui::Id::new("settings_reset_backdrop"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(screen.min)
+            .show(ctx, |ui| {
+                let (rect, _) = ui.allocate_exact_size(screen.size(), egui::Sense::click());
+                ui.painter()
+                    .rect_filled(rect, 0.0, egui::Color32::from_black_alpha(140));
+            });
+
+        let mut choice = None;
+        let panel_width = 400.0_f32.min((screen.width() - 40.0).max(240.0));
+        egui::Area::new(egui::Id::new("settings_reset_confirm"))
+            .order(egui::Order::Tooltip)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.allocate_ui(egui::vec2(panel_width, 0.0), |ui| {
+                    // Two fills instead of a stroke: the same border trick the settings cards use.
+                    egui::Frame::none()
+                        .fill(UI_BORDER)
+                        .rounding(14.0)
+                        .inner_margin(egui::Margin::same(1.0))
+                        .show(ui, |ui| {
+                            egui::Frame::none()
+                                .fill(UI_WINDOW)
+                                .rounding(13.0)
+                                .inner_margin(egui::Margin::symmetric(20.0, 18.0))
+                                .show(ui, |ui| {
+                                    ui.set_min_width(panel_width - 42.0);
+                                    ui.label(
+                                        egui::RichText::new(format!("Reset '{name}'?"))
+                                            .size(15.0)
+                                            .color(UI_TEXT_STRONG),
+                                    );
+                                    ui.add_space(8.0);
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "Every setting in this preset goes back to the values \
+                                             in default.ini. The preset file is overwritten and \
+                                             this cannot be undone.",
+                                        )
+                                        .size(12.0)
+                                        .color(UI_TEXT_DIM),
+                                    );
+                                    ui.add_space(18.0);
+                                    ui.horizontal(|ui| {
+                                        let gap = ui.spacing().item_spacing.x;
+                                        let half =
+                                            egui::vec2((ui.available_width() - gap) * 0.5, 30.0);
+                                        if settings_button(
+                                            ui,
+                                            "Reset preset",
+                                            half,
+                                            true,
+                                            SettingsButtonKind::Primary,
+                                        )
+                                        .clicked()
+                                        {
+                                            choice = Some(true);
+                                        }
+                                        if settings_button(
+                                            ui,
+                                            "Cancel",
+                                            half,
+                                            true,
+                                            SettingsButtonKind::Secondary,
+                                        )
+                                        .clicked()
+                                        {
+                                            choice = Some(false);
+                                        }
+                                    });
+                                });
+                        });
+                });
+            });
+        choice
+    }
+
     fn draw_settings_modal(&mut self, ctx: &egui::Context) {
         if !self.settings_modal_open() {
             return;
@@ -13773,7 +13966,22 @@ impl ImageViewer {
 
         let mut close_modal = false;
         let mut action: Option<SettingsPresetAction> = None;
-        let config_path_label = Config::config_path().display().to_string();
+        let preset_path_label = self
+            .config
+            .active_preset_path()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| {
+                settings_registry::default_preset_path()
+                    .display()
+                    .to_string()
+            });
+        // The built-in Default preset is a read-only reference: every control is disabled.
+        let read_only = self.settings.pending_reset.is_some()
+            || !self
+                .settings
+                .selected
+                .as_deref()
+                .is_some_and(|name| !settings_registry::is_builtin(name));
         let modified = self.selected_preset_modified();
 
         // The dialog lives in its own top-level native window: it is not clipped by a tiny
@@ -13822,8 +14030,10 @@ impl ImageViewer {
             }
 
             if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
-                // Esc clears the search first, so a stale filter never survives a reopen.
-                if self.settings.search.is_empty() {
+                // Esc closes the reset confirmation first, then clears search, then the dialog.
+                if self.settings.pending_reset.is_some() {
+                    self.settings.pending_reset = None;
+                } else if self.settings.search.is_empty() {
                     close_modal = true;
                 } else {
                     self.settings.search.clear();
@@ -13860,7 +14070,7 @@ impl ImageViewer {
                                             ui.add_space(3.0);
                                             ui.add(
                                                 egui::Label::new(
-                                                    egui::RichText::new(config_path_label.clone())
+                                                    egui::RichText::new(preset_path_label.clone())
                                                         .monospace()
                                                         .color(UI_TEXT_FAINT)
                                                         .size(10.5),
@@ -13978,7 +14188,9 @@ impl ImageViewer {
                                                                         })
                                                                         .map(|setting| setting.id)
                                                                         .collect();
-                                                                self.draw_settings_groups(ui, &ids);
+                                                                self.draw_settings_groups(
+                                                                    ui, &ids, read_only,
+                                                                );
                                                             }
                                                         }
                                                     } else {
@@ -13994,7 +14206,7 @@ impl ImageViewer {
                                                             );
                                                         } else {
                                                             self.draw_settings_search_results(
-                                                                ui, &ids,
+                                                                ui, &ids, read_only,
                                                             );
                                                         }
                                                     }
@@ -14038,38 +14250,65 @@ impl ImageViewer {
                                         ui.with_layout(
                                             egui::Layout::right_to_left(egui::Align::Center),
                                             |ui| {
+                                                let edit_label = "Edit .ini";
                                                 let width =
-                                                    settings_button_width(ui, "Edit config.ini");
+                                                    settings_button_width(ui, edit_label);
                                                 if settings_button(
                                                     ui,
-                                                    "Edit config.ini",
+                                                    edit_label,
                                                     egui::vec2(width, 28.0),
                                                     true,
                                                     SettingsButtonKind::Secondary,
                                                 )
                                                 .on_hover_text(
-                                                    "Open config.ini in the default editor",
+                                                    "Open the active preset .ini in the default editor",
                                                 )
                                                 .clicked()
                                                 {
-                                                    let config_path = Config::config_path();
-                                                    match open_path_in_default_app(
-                                                        config_path.as_path(),
-                                                    ) {
-                                                        Ok(()) => self.set_settings_status(
-                                                            format!(
-                                                                "Opened {}",
-                                                                config_path.display()
+                                                    match self.config.active_preset_path() {
+                                                        Some(preset_path) => match
+                                                            open_path_in_default_app(
+                                                                preset_path.as_path(),
+                                                            )
+                                                        {
+                                                            Ok(()) => self.set_settings_status(
+                                                                format!(
+                                                                    "Opened {}",
+                                                                    preset_path.display()
+                                                                ),
+                                                                false,
                                                             ),
-                                                            false,
-                                                        ),
-                                                        Err(err) => self.set_settings_status(
-                                                            format!(
-                                                                "Failed to open config.ini: {err}"
+                                                            Err(err) => self.set_settings_status(
+                                                                format!(
+                                                                    "Failed to open .ini: {err}"
+                                                                ),
+                                                                true,
                                                             ),
+                                                        },
+                                                        None => self.set_settings_status(
+                                                            "No active preset file to open"
+                                                                .to_string(),
                                                             true,
                                                         ),
                                                     }
+                                                }
+                                                ui.add_space(10.0);
+                                                let reset_width =
+                                                    settings_button_width(ui, "Reset");
+                                                if settings_button(
+                                                    ui,
+                                                    "Reset",
+                                                    egui::vec2(reset_width, 28.0),
+                                                    !read_only,
+                                                    SettingsButtonKind::Secondary,
+                                                )
+                                                .on_hover_text(
+                                                    "Restore this preset to the default settings (default.ini)",
+                                                )
+                                                .clicked()
+                                                {
+                                                    self.settings.pending_reset =
+                                                        self.settings.selected.clone();
                                                 }
                                                 ui.add_space(14.0);
                                                 ui.label(
@@ -14085,6 +14324,14 @@ impl ImageViewer {
                                 );
                             });
                         });
+                    if let Some(confirm) = self.draw_settings_reset_confirm(ctx) {
+                        let name = self.settings.pending_reset.take();
+                        if confirm {
+                            if let Some(name) = name {
+                                action = Some(SettingsPresetAction::Reset(name));
+                            }
+                        }
+                    }
                 });
         });
 
@@ -14109,6 +14356,7 @@ impl ImageViewer {
             self.settings.open = false;
             self.settings.rename = None;
             self.settings.pending_delete = None;
+            self.settings.pending_reset = None;
         }
     }
 
@@ -30693,7 +30941,7 @@ impl eframe::App for ImageViewer {
         // Run this before input so the input handler can properly suppress actions over the video bar.
         let _ = self.update_bottom_overlays_visibility(ctx);
 
-        // Debounced config.ini write for settings slider drags.
+        // Debounced preset-file write for settings slider drags.
         self.flush_pending_settings_save(ctx);
 
         // The settings window is its own window: the viewer keeps handling its own input.
@@ -31709,7 +31957,7 @@ fn main() -> eframe::Result<()> {
         // Keep the renderer lightweight at idle. This viewer renders 2D UI + a single image/video
         // texture; MSAA and a depth buffer are not required for perceptible quality.
         renderer: eframe::Renderer::Glow,
-        // Configurable via [Settings].vsync in config.ini (default: true).
+        // Configurable via [Settings].vsync in the preset .ini (default: true).
         // Keep enabled by default for smoother presentation and no tearing.
         vsync: config.vsync,
         // VRAM/GPU optimization: Disable MSAA and depth buffer (not needed for 2D image viewer)

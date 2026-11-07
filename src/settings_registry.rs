@@ -1,8 +1,9 @@
-//! Registry for every editable `config.ini` setting (all sections except `[State]`) plus the
-//! INI preset store (`presets/` next to `config.ini`).
+//! Registry for every editable setting (all sections except `[State]`) plus the INI preset store
+//! (`presets/`). The active preset file *is* the app config: `default.ini` holds the built-in
+//! defaults and every other `<name>.ini` is a readable, hand-editable settings file.
 //!
 //! `SETTINGS` order is the UI order and the preset file order. Every read/write goes through
-//! `get`/`set`, so widgets, presets and `config.ini` share one path: `set` clamps to the
+//! `get`/`set`, so widgets and presets share one path: `set` clamps to the
 //! `SettingKind` bounds, keeps the autoscroll min/max pairs ordered, and writes alias rows
 //! (`gallery_*`/`masonry_*` share one `Action`; `background_rgb` is the single source for
 //! `background_r/g/b`).
@@ -2335,7 +2336,7 @@ pub fn set(config: &mut Config, id: usize, value: &SettingValue) -> Result<(), S
         return Err(format!("unknown setting id {id}"));
     };
     // Slider drags produce full f64 precision (`29.915012`); snap to the precision the UI
-    // displays so `config.ini` and the numeric box never show noise digits.
+    // displays so the preset file and the numeric box never show noise digits.
     let quantized;
     let value = match (&setting.kind, value) {
         (SettingKind::Int { .. }, SettingValue::Num(raw)) => {
@@ -2523,8 +2524,9 @@ pub fn render_preset(name: &str, builtin: bool, values: &[(usize, SettingValue)]
     out.push_str("; rust-image-viewer settings preset\n");
     out.push_str(&format!("; preset: {name}\n"));
     out.push_str(&format!("; kind: {kind}\n"));
-    out.push_str("; Keys mirror config.ini. [State] is never stored here.\n");
-    out.push_str("; Apply from the app: title-bar menu > Settings > pick a preset > Load.\n");
+    out.push_str("; This file is the live app config while the preset is loaded.\n");
+    out.push_str("; [State] is never stored here; it lives in state.ini.\n");
+    out.push_str("; Hand-editing is safe: bad values are clamped and unknown keys disabled.\n");
 
     let mut section = "";
     let mut group = "";
@@ -2607,6 +2609,115 @@ pub fn parse_preset(content: &str) -> (Vec<(usize, SettingValue)>, Vec<String>) 
     (values, warnings)
 }
 
+fn split_line_ending(line: &str) -> (&str, &str) {
+    if let Some(body) = line.strip_suffix("\r\n") {
+        (body, "\r\n")
+    } else if let Some(body) = line.strip_suffix('\n') {
+        (body, "\n")
+    } else {
+        (line, "")
+    }
+}
+
+/// Rewrites only what is wrong: a known key whose text differs from the canonical value gets that
+/// value back (this is what clamps `zoom_step = 999`), unknown or duplicate keys are commented out
+/// with the reason instead of deleted, and keys missing from the file are appended under their
+/// section. Comments, blank lines and ordering are kept byte-for-byte.
+pub fn rewrite_preset(content: &str, values: &[(usize, SettingValue)]) -> (String, Vec<String>) {
+    let mut wanted: Vec<Option<String>> = SETTINGS.iter().map(|_| None).collect();
+    for (id, value) in values {
+        if let Some(slot) = wanted.get_mut(*id) {
+            *slot = Some(value_text(&SETTINGS[*id], value));
+        }
+    }
+    let mut seen = vec![false; SETTINGS.len()];
+    let mut warnings = Vec::new();
+    let mut out = String::with_capacity(content.len() + 256);
+
+    for line in content.split_inclusive('\n') {
+        let (body, ending) = split_line_ending(line);
+        let trimmed = body.trim();
+        if trimmed.is_empty()
+            || trimmed.starts_with(';')
+            || trimmed.starts_with('#')
+            || (trimmed.starts_with('[') && trimmed.ends_with(']'))
+        {
+            out.push_str(body);
+            out.push_str(ending);
+            continue;
+        }
+        let Some((lhs, rhs)) = body.split_once('=') else {
+            warnings.push(format!(
+                "disabled a line that is not `key = value`: {trimmed}"
+            ));
+            out.push_str(&format!("; {body}   ; disabled: not a key = value line"));
+            out.push_str(ending);
+            continue;
+        };
+        let key = lhs.trim();
+        let Some(id) = setting_index_for_key(key) else {
+            warnings.push(format!("disabled unknown setting key `{key}`"));
+            out.push_str(&format!(
+                "; {body}   ; disabled: unknown setting key `{key}`"
+            ));
+            out.push_str(ending);
+            continue;
+        };
+        if seen[id] {
+            warnings.push(format!("disabled duplicate setting key `{key}`"));
+            out.push_str(&format!(
+                "; {body}   ; disabled: duplicate setting key `{key}`"
+            ));
+            out.push_str(ending);
+            continue;
+        }
+        seen[id] = true;
+        let Some(want) = wanted[id].as_deref() else {
+            out.push_str(body);
+            out.push_str(ending);
+            continue;
+        };
+        if rhs.trim() == want {
+            out.push_str(body);
+            out.push_str(ending);
+            continue;
+        }
+        warnings.push(format!("`{key}` set to `{want}`"));
+        out.push_str(lhs);
+        out.push('=');
+        let spacing = &rhs[..rhs.len() - rhs.trim_start().len()];
+        if spacing.is_empty() && !want.is_empty() {
+            out.push(' ');
+        } else {
+            out.push_str(spacing);
+        }
+        out.push_str(want);
+        out.push_str(ending);
+    }
+
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    let mut section = "";
+    for setting in SETTINGS {
+        if seen[setting.id] || wanted[setting.id].is_none() {
+            continue;
+        }
+        let target = section_of(setting.tab);
+        if section != target {
+            out.push_str(&format!("\n[{target}]\n"));
+            section = target;
+        }
+        let text = wanted[setting.id].as_deref().unwrap_or_default();
+        if text.is_empty() {
+            out.push_str(&format!("{} =\n", setting.key));
+        } else {
+            out.push_str(&format!("{} = {text}\n", setting.key));
+        }
+    }
+    (out, warnings)
+}
+
 /// Resolved once per process: callers hit this every frame from the modal header, so the
 /// `create_dir_all` must not run per call.
 pub fn presets_dir() -> PathBuf {
@@ -2617,6 +2728,14 @@ pub fn presets_dir() -> PathBuf {
         dir
     })
     .clone()
+}
+
+pub fn preset_path(name: &str) -> PathBuf {
+    presets_dir().join(format!("{name}.ini"))
+}
+
+pub fn default_preset_path() -> PathBuf {
+    preset_path("default")
 }
 
 /// Built-ins are immutable by regeneration: any edit or deletion on disk is overwritten
@@ -2681,6 +2800,9 @@ pub fn list_presets() -> Vec<PresetEntry> {
     entries
 }
 
+/// Writes a preset through the surgical rewriter: a preset that already exists on disk keeps its
+/// comments and ordering, only the value text of known keys is normalized. Missing files get the
+/// full template render.
 pub fn save_preset(name: &str, values: &[(usize, SettingValue)]) -> io::Result<PathBuf> {
     let name = sanitize_preset_name(name)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
@@ -2690,9 +2812,42 @@ pub fn save_preset(name: &str, values: &[(usize, SettingValue)]) -> io::Result<P
             "built-in presets are read-only",
         ));
     }
-    let path = presets_dir().join(format!("{name}.ini"));
-    fs::write(&path, render_preset(&name, false, values))?;
+    let path = preset_path(&name);
+    let content = match fs::read_to_string(&path) {
+        Ok(existing) => rewrite_preset(&existing, values).0,
+        Err(_) => render_preset(&name, false, values),
+    };
+    fs::write(&path, content)?;
     Ok(path)
+}
+
+/// Resets an existing user preset to the hardcoded defaults (`default.ini` values).
+pub fn reset_preset(name: &str) -> io::Result<PathBuf> {
+    let name = sanitize_preset_name(name)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+    if is_builtin(&name) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "built-in presets are read-only",
+        ));
+    }
+    let path = preset_path(&name);
+    let values = capture(&Config::default());
+    fs::write(&path, render_preset(&name, false, &values))?;
+    Ok(path)
+}
+
+/// Creates `User.ini` with the exact bytes of `default.ini` when no user preset exists yet.
+/// Returns the name of the preset that should become active.
+pub fn ensure_user_preset() -> io::Result<String> {
+    ensure_builtin_presets()?;
+    if let Some(entry) = list_presets().into_iter().find(|entry| !entry.builtin) {
+        return Ok(entry.name);
+    }
+    let default_bytes = fs::read(default_preset_path())
+        .unwrap_or_else(|_| BUILTIN_PRESETS[0].1.as_bytes().to_vec());
+    fs::write(preset_path("User"), default_bytes)?;
+    Ok("User".to_string())
 }
 
 pub fn delete_preset(name: &str) -> io::Result<()> {
@@ -2784,8 +2939,8 @@ const BUILTIN_PRESETS: [(&str, &str); 1] =
 mod tests {
     use super::{
         apply_values, capture, format_value, get, is_builtin, needs_app_setter, parse_preset,
-        render_preset, sanitize_preset_name, set, setting_index_for_key, SettingValue, SettingsTab,
-        SETTINGS,
+        render_preset, rewrite_preset, sanitize_preset_name, set, setting_index_for_key,
+        SettingValue, SettingsTab, SETTINGS,
     };
     use crate::config::Config;
 
@@ -3057,5 +3212,62 @@ mod tests {
         assert!(is_builtin("Default"));
         assert!(!is_builtin("dev"));
         assert!(!is_builtin("dev2"));
+    }
+
+    #[test]
+    fn rewrite_preset_repairs_only_broken_lines() {
+        let content = "; my preset\n[Settings]\n; keep me\nzoom_step = 999\nunknown_thing = 4\nzoom_step = 1.5\ncursor_idle_hide_delay = 3.0\n";
+        let (parsed, _) = parse_preset(content);
+        let mut config = Config::default();
+        assert!(apply_values(&mut config, &parsed).is_empty());
+        let (rewritten, warnings) = rewrite_preset(content, &capture(&config));
+        assert!(
+            rewritten.starts_with("; my preset\n[Settings]\n; keep me\n"),
+            "{rewritten}"
+        );
+        assert!(rewritten.contains("\nzoom_step = 2\n"), "{rewritten}");
+        assert!(
+            rewritten
+                .contains("; unknown_thing = 4   ; disabled: unknown setting key `unknown_thing`"),
+            "{rewritten}"
+        );
+        assert!(
+            rewritten.contains("; zoom_step = 1.5   ; disabled: duplicate setting key `zoom_step`"),
+            "{rewritten}"
+        );
+        assert!(
+            rewritten.contains("\ncursor_idle_hide_delay = 3\n"),
+            "{rewritten}"
+        );
+        assert_eq!(
+            warnings.len(),
+            4,
+            "clamped, normalized, unknown and duplicate each warn once: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn rewrite_preset_appends_missing_keys_under_their_section() {
+        let content = "[Settings]\nzoom_step = 1.5\n";
+        let mut config = Config::default();
+        set(
+            &mut config,
+            setting_index_for_key("zoom_step").unwrap(),
+            &SettingValue::Num(1.5),
+        )
+        .unwrap();
+        let (rewritten, warnings) = rewrite_preset(content, &capture(&config));
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(rewritten.contains("\nzoom_step = 1.5\n"), "{rewritten}");
+        assert!(
+            rewritten.contains("\ncontrols_hide_delay = 0.5\n"),
+            "{rewritten}"
+        );
+        assert!(rewritten.contains("\n[Shortcuts]\n"), "{rewritten}");
+        assert!(rewritten.contains("\nvideo_play_pause =\n"), "{rewritten}");
+        // Re-running the rewriter on its own output is a no-op.
+        let (again, warnings) = rewrite_preset(&rewritten, &capture(&config));
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(again, rewritten);
     }
 }
