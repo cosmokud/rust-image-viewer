@@ -13131,14 +13131,17 @@ impl ImageViewer {
         let row = ui.horizontal(|ui| {
             ui.set_min_height(38.0);
             ui.spacing_mut().item_spacing.x = 10.0;
-            ui.add_sized(
+            let label_response = ui.add_sized(
                 [(label_slot - 6.0).max(40.0), 20.0],
                 egui::Label::new(
                     egui::RichText::new(setting.label)
                         .size(13.0)
                         .color(if read_only { UI_TEXT_FAINT } else { UI_TEXT }),
                 )
-                .truncate(),
+                .truncate()
+                // Selectable so the label can be highlighted and copied; the response rect is the
+                // galley, so it doubles as the tooltip hit region (text only, not the row).
+                .selectable(true),
             );
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -13290,13 +13293,14 @@ impl ImageViewer {
                     }
                 });
             });
+            label_response
         });
-        let row_response = row.response;
         // Paint the tooltip on the hover frame instead of `on_hover_text`: that delayed path needs a
         // frame after `interaction.tooltip_delay`, and an idle viewer only wakes the dialog's own
         // viewport on input, so the deadline frame usually never arrives and nothing is shown.
-        if row_response.hovered() && !ui.ctx().input(|i| i.pointer.any_down()) {
-            row_response.show_tooltip_ui(|ui| {
+        // Only the label galley hovers: an empty part of the row must not spawn a tooltip.
+        if row.inner.hovered() && !ui.ctx().input(|i| i.pointer.any_down()) {
+            row.inner.show_tooltip_ui(|ui| {
                 ui.set_max_width(tooltip_width);
                 ui.label(tooltip.as_str());
             });
