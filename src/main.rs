@@ -2767,7 +2767,9 @@ struct ImageViewer {
     resize_start_cursor_screen: Option<egui::Pos2>,
     /// Last commanded window size during resize (for stable content rendering)
     resize_last_size: Option<egui::Vec2>,
-    /// Initial window outer position when a manual floating-window drag starts.
+    /// Initial window outer position when a manual floating-window drag starts, in physical
+    /// screen pixels (`GetCursorPos` units), so a mid-drag `pixels_per_point` change cannot
+    /// leak into the drag delta.
     floating_drag_start_outer_pos: Option<egui::Pos2>,
     /// Global screen cursor position when a manual floating-window drag starts, in physical
     /// screen pixels (`GetCursorPos` units), to match `OuterPosition` after the conversion
@@ -13952,39 +13954,48 @@ impl ImageViewer {
             .unwrap_or(false)
     }
 
+    /// Window outer position (egui points, as `ViewportCommand::OuterPosition` wants it) for a
+    /// floating-window drag, computed entirely in physical screen pixels so a mid-drag
+    /// `pixels_per_point` change (monitor with a different DPI scale) cannot leak into the delta.
+    fn floating_drag_target_outer_pos(
+        start_outer_physical: egui::Pos2,
+        start_cursor_physical: egui::Pos2,
+        current_cursor_physical: egui::Pos2,
+        pixels_per_point: f32,
+    ) -> egui::Pos2 {
+        let ppp = pixels_per_point.max(0.01);
+        (start_outer_physical + (current_cursor_physical - start_cursor_physical)) / ppp
+    }
+
     fn drag_floating_window_without_native_snap(&mut self, ctx: &egui::Context) {
         if self.floating_zoom_inside_window_active(ctx) {
             self.floating_zoom_inside_window_locked = true;
         }
 
-        let Some(current_cursor_screen) = get_global_cursor_pos() else {
+        let Some(current_cursor_physical) = get_global_cursor_pos() else {
             // Platforms without a global cursor query: hand the drag to the windowing system
             // once (it owns the move from there), instead of re-issuing StartDrag every frame.
             if self.floating_drag_start_outer_pos.is_none() {
-                self.floating_drag_start_outer_pos =
-                    ctx.input(|i| i.raw.viewport().outer_rect).map(|r| r.min);
+                let ppp = ctx.pixels_per_point().max(0.01);
+                self.floating_drag_start_outer_pos = ctx
+                    .input(|i| i.raw.viewport().outer_rect)
+                    .map(|r| r.min * ppp);
                 ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
                 ctx.request_repaint();
             }
             return;
         };
 
-        let pixels_per_point = ctx.pixels_per_point().max(0.01);
-        // The window position and the cursor are both in physical screen pixels here.
-        let current_cursor_physical = egui::pos2(
-            current_cursor_screen.x * pixels_per_point,
-            current_cursor_screen.y * pixels_per_point,
-        );
-
-        let (start_outer_pos, start_cursor_physical) = match (
+        let (start_outer_physical, start_cursor_physical) = match (
             self.floating_drag_start_outer_pos,
             self.floating_drag_start_cursor_screen,
         ) {
             (Some(outer), Some(cursor)) => (outer, cursor),
             _ => {
+                let ppp = ctx.pixels_per_point().max(0.01);
                 let outer_pos = ctx
                     .input(|i| i.raw.viewport().outer_rect)
-                    .map(|r| r.min)
+                    .map(|r| r.min * ppp)
                     .unwrap_or(egui::Pos2::ZERO);
                 self.floating_drag_start_outer_pos = Some(outer_pos);
                 self.floating_drag_start_cursor_screen = Some(current_cursor_physical);
@@ -13996,8 +14007,12 @@ impl ImageViewer {
             }
         };
 
-        let delta_physical = current_cursor_physical - start_cursor_physical;
-        let new_pos = start_outer_pos + delta_physical / pixels_per_point;
+        let new_pos = Self::floating_drag_target_outer_pos(
+            start_outer_physical,
+            start_cursor_physical,
+            current_cursor_physical,
+            ctx.pixels_per_point(),
+        );
         self.send_outer_position(ctx, new_pos);
         // A drag that outruns the window can lose pointer events (capture changes, and
         // cursor moves that no longer arrive once the cursor sits outside the window),
@@ -25243,6 +25258,7 @@ impl ImageViewer {
             || self.current_window_is_maximized(ctx)
             || self.is_resizing
             || self.pending_window_resize.is_some()
+            || self.floating_drag_start_outer_pos.is_some()
             || self.defer_media_view_reset
         {
             return;
@@ -32051,5 +32067,71 @@ mod tests {
         ));
         // Fullscreen never moves the window, however the bar is treated.
         assert!(!ImageViewer::drag_moves_window(true, true, false));
+    }
+
+    #[test]
+    fn floating_drag_tracks_the_cursor_one_to_one_at_ppp_1() {
+        let start_outer_physical = egui::pos2(100.0, 200.0);
+        let start_cursor_physical = egui::pos2(400.0, 300.0);
+
+        let target = ImageViewer::floating_drag_target_outer_pos(
+            start_outer_physical,
+            start_cursor_physical,
+            egui::pos2(520.0, 360.0),
+            1.0,
+        );
+
+        // 120 physical px of cursor travel is 120 points at ppp 1.0.
+        assert_eq!(target, egui::pos2(220.0, 260.0));
+    }
+
+    #[test]
+    fn floating_drag_does_not_rescale_the_cursor_sample_at_ppp_1_5() {
+        let start_outer_physical = egui::pos2(150.0, 300.0);
+        let start_cursor_physical = egui::pos2(600.0, 450.0);
+
+        let target = ImageViewer::floating_drag_target_outer_pos(
+            start_outer_physical,
+            start_cursor_physical,
+            egui::pos2(750.0, 450.0),
+            1.5,
+        );
+
+        // 150 physical px of cursor travel is 100 points at ppp 1.5: pre-scaling the sample
+        // would move the window 1.5x faster than the cursor.
+        assert_eq!(target, egui::pos2(200.0, 200.0));
+    }
+
+    #[test]
+    fn floating_drag_holds_its_physical_place_across_a_monitor_dpi_change() {
+        let start_outer_physical = egui::pos2(200.0, 400.0);
+        let start_cursor_physical = egui::pos2(500.0, 600.0);
+
+        let at_ppp_1 = ImageViewer::floating_drag_target_outer_pos(
+            start_outer_physical,
+            start_cursor_physical,
+            start_cursor_physical,
+            1.0,
+        );
+        let at_ppp_1_5 = ImageViewer::floating_drag_target_outer_pos(
+            start_outer_physical,
+            start_cursor_physical,
+            start_cursor_physical,
+            1.5,
+        );
+
+        // The scale changed under a still cursor: the emitted points move, the physical place not.
+        assert_ne!(at_ppp_1, at_ppp_1_5);
+        assert!((at_ppp_1 * 1.0 - at_ppp_1_5 * 1.5).length() < 0.01);
+
+        let moved = ImageViewer::floating_drag_target_outer_pos(
+            start_outer_physical,
+            start_cursor_physical,
+            start_cursor_physical + egui::vec2(100.0, 0.0),
+            1.5,
+        );
+
+        // A further 100 physical px of cursor travel is 100 physical px of window travel.
+        assert!((moved * 1.5 - at_ppp_1_5 * 1.5 - egui::vec2(100.0, 0.0)).length() < 0.01);
     }
 }
