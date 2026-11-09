@@ -23,6 +23,7 @@ mod texture_upload;
 mod video_player;
 mod video_thumbnail;
 mod viewer_mode;
+mod window_geometry;
 #[cfg(target_os = "windows")]
 mod windows_env;
 
@@ -2621,6 +2622,10 @@ struct ImageViewer {
     pending_media_layout: bool,
     /// Screen size
     screen_size: egui::Vec2,
+    /// Last `pixels_per_point` a frame ran at; a change means a display scale change.
+    last_ppp: f32,
+    /// Native window handle of the main window (0 until the window exists).
+    main_hwnd: isize,
     /// Last valid monitor size reported by the viewport.
     last_known_monitor_size: egui::Vec2,
     /// Request to exit
@@ -2636,6 +2641,12 @@ struct ImageViewer {
     request_minimize: bool,
     /// Request native maximize (`Some(true)`) or restore (`Some(false)`) for the root window.
     request_native_maximize: Option<bool>,
+    /// Window's physical outer rect before a native maximize: restore lands the window back on
+    /// the display it came from, not on the one the OS thinks is current.
+    maximize_restore_anchor: Option<crate::window_geometry::Rect>,
+    /// The scale guard restored the window's physical size in this frame: the position rules
+    /// stand aside until the restored rect has reached the viewport.
+    scale_restore_in_flight: bool,
 
     /// Maximum supported texture side for the active GPU backend.
     /// Used to prevent crashes when attempting to upload oversized images.
@@ -3286,6 +3297,8 @@ impl Default for ImageViewer {
             image_changed: false,
             pending_media_layout: false,
             screen_size: egui::Vec2::new(1920.0, 1080.0),
+            last_ppp: 0.0,
+            main_hwnd: 0,
             last_known_monitor_size: egui::Vec2::new(1920.0, 1080.0),
             should_exit: false,
             toggle_fullscreen: false,
@@ -3293,6 +3306,8 @@ impl Default for ImageViewer {
             toggle_fullscreen_from_titlebar: false,
             request_minimize: false,
             request_native_maximize: None,
+            maximize_restore_anchor: None,
+            scale_restore_in_flight: false,
             max_texture_side: 8192,
             startup_window_mode_applied: false,
             pending_window_title: None,
@@ -15372,12 +15387,41 @@ impl ImageViewer {
             opt.input_options.max_double_click_delay = viewer.config.double_click_grace_period;
         });
 
-        // Get screen size from monitor info if available
+        // The native handle is what lets geometry ask the *display under the window* instead of
+        // a cached primary size; the wndproc guard keeps the window's physical size across a
+        // display scale change.
         #[cfg(target_os = "windows")]
         {
-            let primary_monitor = get_primary_monitor_size_points();
-            viewer.screen_size = primary_monitor;
-            viewer.last_known_monitor_size = primary_monitor;
+            use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+            if let Ok(handle) = cc.window_handle() {
+                if let RawWindowHandle::Win32(win32) = handle.as_raw() {
+                    let hwnd = win32.hwnd.get() as isize;
+                    viewer.main_hwnd = hwnd;
+                    crate::windows_env::install_scale_change_guard(
+                        hwnd as winapi::shared::windef::HWND,
+                    );
+                }
+            }
+        }
+
+        // Get screen size from monitor info if available: the display under the window, in
+        // points. The primary size is only the last fallback, when the OS cannot name the display.
+        #[cfg(target_os = "windows")]
+        {
+            let display = viewer.current_display(&cc.egui_ctx);
+            let ppp = cc.egui_ctx.pixels_per_point();
+            let monitor = display
+                .filter(|_| ppp.is_finite() && ppp > 0.01)
+                .map(|display| {
+                    egui::vec2(
+                        display.monitor.width() as f32 / ppp,
+                        display.monitor.height() as f32 / ppp,
+                    )
+                })
+                .unwrap_or_else(get_primary_monitor_size_points);
+            viewer.screen_size = monitor;
+            viewer.last_known_monitor_size = monitor;
         }
 
         if let Some(path) = path {
@@ -15918,14 +15962,17 @@ impl ImageViewer {
 
     fn async_video_output_bounds_for_solo(&self) -> Option<(u32, u32)> {
         let max_side = self.max_texture_side.max(1);
-        let monitor = get_primary_monitor_size();
-        if monitor.x > 0.0 && monitor.y > 0.0 {
-            let width = (monitor.x.ceil() as u32).clamp(1, max_side);
-            let height = (monitor.y.ceil() as u32).clamp(1, max_side);
-            Some((width, height))
-        } else {
-            self.live_video_output_bounds_for_solo()
+
+        // The display the window is on, never the primary: decode output larger than the screen
+        // it is shown on is wasted texture memory, smaller is a blurry first frame.
+        #[cfg(target_os = "windows")]
+        if let Some(display) = self.current_display_from_window_rect() {
+            let width = (display.monitor.width() as u32).clamp(1, max_side);
+            let height = (display.monitor.height() as u32).clamp(1, max_side);
+            return Some((width, height));
         }
+
+        self.live_video_output_bounds_for_solo()
     }
 
     fn start_async_video_load(&mut self, path: PathBuf) {
@@ -16940,28 +16987,129 @@ impl ImageViewer {
             return;
         }
 
-        let Some(outer) = ctx.input(|i| i.raw.viewport().outer_rect) else {
-            return;
-        };
-        let Some(work) = monitor_work_area_points_at(outer.center(), ctx.pixels_per_point()) else {
-            return;
-        };
+        #[cfg(target_os = "windows")]
+        {
+            // The work area and the window rect are both physical, so a stale or mid-change
+            // `pixels_per_point` cannot put the correction in the wrong place. The guard's own
+            // restore is the authority while it is writing the window's size.
+            if self.scale_restore_in_flight || crate::windows_env::is_scale_restore_in_flight() {
+                return;
+            }
 
-        let mut corrected = outer.min;
-        if corrected.y < work.min.y {
-            corrected.y = work.min.y;
-        }
-        let right = corrected.x + outer.width();
-        if right > work.max.x {
-            corrected.x = work.max.x - outer.width();
+            let Some(display) = self.current_display(ctx) else {
+                return;
+            };
+            let Some(outer) = self.main_window_rect_physical(ctx) else {
+                return;
+            };
+            let (left, top) = crate::window_geometry::clamp_into(display.work, outer);
+            if left == outer.left && top == outer.top {
+                return;
+            }
+
+            let ppp = ctx.pixels_per_point();
+            if !ppp.is_finite() || ppp <= 0.01 {
+                return;
+            }
+            self.send_outer_position(ctx, egui::pos2(left as f32 / ppp, top as f32 / ppp));
+            return;
         }
 
-        if (corrected - outer.min).length() > 0.5 {
-            self.send_outer_position(ctx, corrected);
+        #[cfg(not(target_os = "windows"))]
+        {
+            let Some(outer) = ctx.input(|i| i.raw.viewport().outer_rect) else {
+                return;
+            };
+            let Some(work) = monitor_work_area_points_at(outer.center(), ctx.pixels_per_point())
+            else {
+                return;
+            };
+
+            let mut corrected = outer.min;
+            if corrected.y < work.min.y {
+                corrected.y = work.min.y;
+            }
+            let right = corrected.x + outer.width();
+            if right > work.max.x {
+                corrected.x = work.max.x - outer.width();
+            }
+
+            if (corrected - outer.min).length() > 0.5 {
+                self.send_outer_position(ctx, corrected);
+            }
+        }
+    }
+
+    fn track_display_scale_change(&mut self, ctx: &egui::Context) {
+        let ppp = ctx.pixels_per_point();
+        if !ppp.is_finite() || ppp <= 0.01 {
+            return;
+        }
+
+        let previous = self.last_ppp;
+        if previous <= 0.0 || (ppp - previous).abs() <= 0.0001 {
+            self.last_ppp = ppp;
+            self.scale_restore_in_flight = false;
+            return;
+        }
+
+        self.last_ppp = ppp;
+
+        // The flag is read only on a scale change: the guard may have fired a frame before the
+        // scale factor reached egui, and a pending flag must survive until the two meet.
+        let restored = {
+            #[cfg(target_os = "windows")]
+            {
+                crate::windows_env::take_scale_restore_event()
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                false
+            }
+        };
+        if !restored {
+            // Scale changed without the guard restoring the size (maximized, fullscreen, or a
+            // size the app asked for): nothing of the media geometry is re-based.
+            self.scale_restore_in_flight = false;
+            return;
+        }
+        self.scale_restore_in_flight = true;
+
+        // The window kept its physical size, so the rendered image must keep its physical size
+        // too: `zoom` is media px per egui point, and a point is now `ppp/previous` times larger,
+        // so `zoom` shrinks by the same ratio — the media's physical size is unchanged and the
+        // autosize below computes a no-op instead of a resize.
+        let inverse_scale = previous / ppp;
+        self.zoom *= inverse_scale;
+        self.zoom_target *= inverse_scale;
+        self.offset *= inverse_scale;
+        // The locked in-window zoom was measured against the old point size.
+        self.floating_zoom_inside_window_locked = false;
+        self.pending_media_layout = false;
+
+        // A scale change while borderless fullscreen re-targets the display that now holds the
+        // window centre: the old rect is in the old display's pixels and would leave a gap or
+        // overflow on the new one.
+        #[cfg(target_os = "windows")]
+        if self.mode().is_fullscreen() {
+            self.request_borderless_fullscreen_rect(ctx);
         }
     }
 
     fn monitor_size_points(&self, ctx: &egui::Context) -> egui::Vec2 {
+        // The display the window is on, never the primary: a window moved to monitor 2 that still
+        // sized itself against monitor 1 is what resized it on every layout pass.
+        #[cfg(target_os = "windows")]
+        if let Some(display) = self.current_display(ctx) {
+            let ppp = ctx.pixels_per_point();
+            if ppp.is_finite() && ppp > 0.01 {
+                return egui::vec2(
+                    display.monitor.width() as f32 / ppp,
+                    display.monitor.height() as f32 / ppp,
+                );
+            }
+        }
+
         Self::floating_monitor_bounds_for_layout(
             ctx.input(|i| i.raw.viewport().monitor_size),
             self.screen_size,
@@ -16969,11 +17117,198 @@ impl ImageViewer {
         )
     }
 
+    /// The display owning the window: the one nearest the window's centre.
+    #[cfg(target_os = "windows")]
+    fn current_display(&self, ctx: &egui::Context) -> Option<crate::window_geometry::Display> {
+        use crate::window_geometry::display_for_window_centre;
+
+        if let Some(rect) = self.main_window_rect_physical(ctx) {
+            return display_for_window_centre(rect);
+        }
+
+        // No usable window rect: fall back to the monitor size the viewport reports, which is
+        // physical pixels, and ask the display nearest its centre.
+        let monitor = Self::floating_monitor_bounds_for_layout(
+            ctx.input(|i| i.raw.viewport().monitor_size),
+            self.screen_size,
+            self.last_known_monitor_size,
+        );
+        let ppp = ctx.pixels_per_point();
+        if !ppp.is_finite() || ppp <= 0.01 {
+            return None;
+        }
+        crate::window_geometry::display_at(((monitor.x * ppp) as i32, (monitor.y * ppp) as i32))
+    }
+
+    /// The display owning the window, without an egui context: the window rect is the only
+    /// question, and the OS answers it synchronously.
+    #[cfg(target_os = "windows")]
+    fn current_display_from_window_rect(&self) -> Option<crate::window_geometry::Display> {
+        let rect = crate::windows_env::window_rect(self.resolved_main_hwnd())?;
+        crate::window_geometry::display_for_window_centre(crate::window_geometry::Rect::new(
+            rect.left,
+            rect.top,
+            rect.right,
+            rect.bottom,
+        ))
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn current_display(&self, _ctx: &egui::Context) -> Option<crate::window_geometry::Display> {
+        None
+    }
+
+    /// The main window's outer rectangle in physical pixels.
+    #[cfg(target_os = "windows")]
+    fn main_window_rect_physical(
+        &self,
+        ctx: &egui::Context,
+    ) -> Option<crate::window_geometry::Rect> {
+        use crate::window_geometry::Rect;
+
+        let hwnd = self.resolved_main_hwnd();
+        if let Some(rect) = crate::windows_env::window_rect(hwnd) {
+            return Some(Rect::new(rect.left, rect.top, rect.right, rect.bottom));
+        }
+
+        let outer = ctx.input(|i| i.raw.viewport().outer_rect)?;
+        let ppp = ctx.pixels_per_point();
+        if !ppp.is_finite() || ppp <= 0.01 {
+            return None;
+        }
+        let size = outer.size() * ppp;
+        Some(Rect::new(
+            (outer.min.x * ppp).round() as i32,
+            (outer.min.y * ppp).round() as i32,
+            (outer.min.x * ppp).round() as i32 + size.x.round() as i32,
+            (outer.min.y * ppp).round() as i32 + size.y.round() as i32,
+        ))
+    }
+
+    #[cfg(target_os = "windows")]
+    fn park_window_on_its_display(
+        &mut self,
+        hwnd: winapi::shared::windef::HWND,
+        ctx: &egui::Context,
+    ) {
+        let Some(display) = self.current_display(ctx) else {
+            return;
+        };
+        let Some(outer) = self.main_window_rect_physical(ctx) else {
+            return;
+        };
+        // No-op when already inside: only the two edges the buttons live on are corrected.
+        let (left, top) = crate::window_geometry::clamp_into(display.work, outer);
+        if left == outer.left && top == outer.top {
+            return;
+        }
+        crate::windows_env::set_window_rect(hwnd, left, top, outer.width(), outer.height());
+    }
+
+    #[cfg(target_os = "windows")]
+    fn reassert_position_after_restore(&mut self, ctx: &egui::Context) {
+        let Some(anchor) = self.maximize_restore_anchor.take() else {
+            return;
+        };
+        let ppp = ctx.pixels_per_point();
+        if !ppp.is_finite() || ppp <= 0.01 {
+            return;
+        }
+
+        // OS restore puts the window back where it thinks it belongs; keep it on the display
+        // the maximize started from, and inside that display's work area.
+        let display = crate::window_geometry::display_for_window_centre(anchor)
+            .or_else(|| self.current_display(ctx));
+        let Some(display) = display else {
+            return;
+        };
+        let size = self
+            .main_window_rect_physical(ctx)
+            .map(|rect| (rect.width(), rect.height()))
+            .unwrap_or((anchor.width(), anchor.height()));
+        let (left, top) = crate::window_geometry::clamp_into(
+            display.work,
+            crate::window_geometry::Rect::new(
+                anchor.left,
+                anchor.top,
+                anchor.left + size.0,
+                anchor.top + size.1,
+            ),
+        );
+        self.send_outer_position(ctx, egui::pos2(left as f32 / ppp, top as f32 / ppp));
+    }
+
+    #[cfg(target_os = "windows")]
+    fn resolved_main_hwnd(&self) -> winapi::shared::windef::HWND {
+        if self.main_hwnd != 0 {
+            return self.main_hwnd as winapi::shared::windef::HWND;
+        }
+        crate::windows_env::active_window_handle()
+    }
+
     fn center_window_on_monitor(&mut self, ctx: &egui::Context, inner_size: egui::Vec2) {
+        #[cfg(target_os = "windows")]
+        if let Some(display) = self.current_display(ctx) {
+            let ppp = ctx.pixels_per_point();
+            if ppp.is_finite() && ppp > 0.01 {
+                // Physical pixels throughout: the outer box (inner + chrome) is centred in the
+                // display's work area, and only the final position is handed back in points.
+                let outer = self.outer_size_for_inner(ctx, inner_size);
+                let outer_w = (outer.x * ppp).round() as i32;
+                let outer_h = (outer.y * ppp).round() as i32;
+                let (left, top) = crate::window_geometry::centre_in(display.work, outer_w, outer_h);
+                self.send_outer_position(ctx, egui::pos2(left as f32 / ppp, top as f32 / ppp));
+                return;
+            }
+        }
+
         let monitor = self.monitor_size_points(ctx);
         let x = (monitor.x - inner_size.x) * 0.5;
         let y = (monitor.y - inner_size.y) * 0.5;
         self.send_outer_position(ctx, egui::pos2(x.max(0.0), y));
+    }
+
+    /// Outer size (inner plus decorations) for a wanted inner size, in points.
+    fn outer_size_for_inner(&self, ctx: &egui::Context, inner_size: egui::Vec2) -> egui::Vec2 {
+        let (inner_rect, outer_rect) =
+            ctx.input(|i| (i.raw.viewport().inner_rect, i.raw.viewport().outer_rect));
+        match (inner_rect, outer_rect) {
+            (Some(inner), Some(outer)) => inner_size + (outer.size() - inner.size()),
+            _ => inner_size,
+        }
+    }
+
+    /// Borderless fullscreen: the whole display the window is on, written in physical pixels
+    /// and converted once to points.
+    #[cfg(target_os = "windows")]
+    fn request_borderless_fullscreen_rect(&mut self, ctx: &egui::Context) {
+        // Armed first: a scale change on the way must not fight the rect written below.
+        crate::windows_env::set_fullscreen_guard(true);
+
+        let ppp = ctx.pixels_per_point();
+        let Some(display) = self.current_display(ctx) else {
+            return;
+        };
+        if !ppp.is_finite() || ppp <= 0.01 {
+            return;
+        }
+
+        let rect = crate::window_geometry::fullscreen_rect(display);
+        self.send_outer_position(
+            ctx,
+            egui::pos2(rect.left as f32 / ppp, rect.top as f32 / ppp),
+        );
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+            rect.width() as f32 / ppp,
+            rect.height() as f32 / ppp,
+        )));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn request_borderless_fullscreen_rect(&mut self, ctx: &egui::Context) {
+        let monitor = self.monitor_size_points(ctx);
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::Pos2::ZERO));
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(monitor));
     }
 
     fn floating_layout_size_for_media_bounds(
@@ -17019,6 +17354,8 @@ impl ImageViewer {
         self.strip_return_masonry_list_snapshot = None;
         self.strip_return_preserve_masonry_cache = false;
         self.toggle_fullscreen = false;
+        #[cfg(target_os = "windows")]
+        crate::windows_env::set_fullscreen_guard(false);
         self.toggle_fullscreen_force_borderless = false;
         self.toggle_fullscreen_from_titlebar = false;
         self.pending_window_resize = None;
@@ -17067,9 +17404,24 @@ impl ImageViewer {
     }
 
     fn fullscreen_layout_ready(&self, ctx: &egui::Context) -> bool {
-        let monitor = self.monitor_size_points(ctx);
         let viewport = ctx.screen_rect().size();
 
+        // Both targets of the fullscreen window are the *current* display's:
+        // native maximize gives the work area, borderless fullscreen the whole display.
+        #[cfg(target_os = "windows")]
+        if let Some(display) = self.current_display(ctx) {
+            let ppp = ctx.pixels_per_point();
+            if ppp.is_finite() && ppp > 0.01 {
+                let matches = |rect: crate::window_geometry::Rect| {
+                    (viewport.x - rect.width() as f32 / ppp).abs() <= 2.0
+                        && (viewport.y - rect.height() as f32 / ppp).abs() <= 2.0
+                };
+                return matches(crate::window_geometry::maximized_rect(display))
+                    || matches(crate::window_geometry::fullscreen_rect(display));
+            }
+        }
+
+        let monitor = self.monitor_size_points(ctx);
         (viewport.x - monitor.x).abs() <= 2.0 && (viewport.y - monitor.y).abs() <= 2.0
     }
 
@@ -17255,6 +17607,22 @@ impl ImageViewer {
         self.center_window_on_monitor(ctx, size);
     }
 
+    /// Bounds a maximized window's media is fitted into: the work area of the display the window
+    /// is on, in points. The viewport rect is the same number once the OS applies the maximize
+    /// (both come from `rcWork`), but it lags the request by a frame.
+    fn maximized_layout_bounds(&self, ctx: &egui::Context) -> egui::Vec2 {
+        #[cfg(target_os = "windows")]
+        if let Some(display) = self.current_display(ctx) {
+            let ppp = ctx.pixels_per_point();
+            if ppp.is_finite() && ppp > 0.01 {
+                let work = crate::window_geometry::maximized_rect(display);
+                return egui::vec2(work.width() as f32 / ppp, work.height() as f32 / ppp);
+            }
+        }
+
+        ctx.screen_rect().size()
+    }
+
     fn apply_maximized_layout_for_current_image(&mut self, ctx: &egui::Context) {
         self.offset = egui::Vec2::ZERO;
         self.zoom_velocity = 0.0;
@@ -17268,7 +17636,7 @@ impl ImageViewer {
             return;
         }
 
-        let available = ctx.screen_rect().size();
+        let available = self.maximized_layout_bounds(ctx);
         let fit_zoom = self.fit_zoom_for_target_height(available.y.max(1.0), img_h);
 
         self.zoom = fit_zoom;
@@ -25274,16 +25642,18 @@ impl ImageViewer {
         let mut monitor_bounds = ctx.input(|i| i.raw.viewport().monitor_size);
         #[cfg(target_os = "windows")]
         {
-            // `viewport.monitor_size` can be undersized on some setups; use the primary
-            // monitor dimensions as a safety floor so we don't trigger in-window zoom too early.
-            let primary_bounds = get_primary_monitor_size_points();
-            monitor_bounds = Some(match monitor_bounds {
-                Some(bounds) => egui::vec2(
-                    bounds.x.max(primary_bounds.x),
-                    bounds.y.max(primary_bounds.y),
-                ),
-                None => primary_bounds,
-            });
+            // The display the window is actually on. The primary monitor's size used to be
+            // floored over this, which is what forced monitor 1's dimensions onto a window
+            // living on monitor 2.
+            if let Some(display) = self.current_display(ctx) {
+                let ppp = ctx.pixels_per_point();
+                if ppp.is_finite() && ppp > 0.01 {
+                    monitor_bounds = Some(egui::vec2(
+                        display.monitor.width() as f32 / ppp,
+                        display.monitor.height() as f32 / ppp,
+                    ));
+                }
+            }
         }
 
         if let Some(monitor_bounds) = monitor_bounds {
@@ -25304,7 +25674,25 @@ impl ImageViewer {
                     return;
                 }
 
-                desired = Self::fit_size_preserving_aspect(desired, monitor_bounds);
+                // Physical pixels on both sides: the wanted inner size is converted once and
+                // fitted against the display, so no scale can shrink it twice.
+                let ppp = ctx.pixels_per_point();
+                let fitted = if ppp.is_finite() && ppp > 0.01 {
+                    let (w, h) = crate::window_geometry::fit_within(
+                        (
+                            (desired.x * ppp).round() as i32,
+                            (desired.y * ppp).round() as i32,
+                        ),
+                        (
+                            (monitor_bounds.x * ppp).round() as i32,
+                            (monitor_bounds.y * ppp).round() as i32,
+                        ),
+                    );
+                    egui::vec2(w as f32 / ppp, h as f32 / ppp)
+                } else {
+                    Self::fit_size_preserving_aspect(desired, monitor_bounds)
+                };
+                desired = fitted;
                 desired.x = desired.x.max(1.0);
                 desired.y = desired.y.max(1.0);
             }
@@ -30122,6 +30510,14 @@ impl Drop for ImageViewer {
             self.pending_idle_config_sync = false;
             self.config.sync_disk_file_with_template();
         }
+
+        #[cfg(target_os = "windows")]
+        if self.main_hwnd != 0 {
+            crate::windows_env::remove_scale_change_guard(
+                self.main_hwnd as winapi::shared::windef::HWND,
+            );
+            self.main_hwnd = 0;
+        }
     }
 }
 
@@ -30182,6 +30578,8 @@ impl eframe::App for ImageViewer {
         // Manga mode uses this for layout/scroll math; if it drifts from `ctx.screen_rect()`,
         // you can get clamping oscillations and visible jitter.
         self.screen_size = ctx.screen_rect().size();
+
+        self.track_display_scale_change(ctx);
 
         // Safety net for scaled displays and monitor changes: keep the floating window where
         // its title-bar buttons stay clickable.
@@ -30438,16 +30836,17 @@ impl eframe::App for ImageViewer {
 
                         // Use borderless "pseudo-fullscreen" instead of OS fullscreen.
                         // This avoids a brief desktop flash on Windows caused by toggling window styles/swapchain.
-                        let monitor = self.monitor_size_points(ctx);
-                        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(
-                            egui::Pos2::ZERO,
-                        ));
-                        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(monitor));
+                        // The rect comes from the display the window is on, in physical pixels, so a
+                        // window moved to monitor 2 fills monitor 2 with no scale-derived gap.
+                        self.request_borderless_fullscreen_rect(ctx);
                     }
                 } else {
                     // Exiting fullscreen - use delayed resize to prevent flash
                     self.fullscreen_transition = 0.0;
                     self.fullscreen_transition_target = 0.0;
+                    // The guard may take sides again: the fullscreen rect is no longer wanted.
+                    #[cfg(target_os = "windows")]
+                    crate::windows_env::set_fullscreen_guard(false);
                     self.mode_state.set_pending_fullscreen_layout(false);
                     if !preserve_strip_return_context {
                         self.clear_strip_return_context();
@@ -30553,7 +30952,20 @@ impl eframe::App for ImageViewer {
         if let Some(maximize) = self.request_native_maximize.take() {
             #[cfg(target_os = "windows")]
             {
-                let _ = crate::windows_env::set_active_window_maximized(maximize);
+                let hwnd = self.resolved_main_hwnd();
+                if maximize {
+                    // Remember where the window stood, so a later restore can put it back on the
+                    // display it came from instead of wherever the OS thinks it belongs.
+                    self.maximize_restore_anchor = self.main_window_rect_physical(ctx);
+                    // `SW_MAXIMIZE` sizes off the display holding the window, but only after the
+                    // move: a window half off a seam would maximize onto the wrong one. Written
+                    // synchronously, so the proc's `WM_GETMINMAXINFO` answer sees the new centre.
+                    self.park_window_on_its_display(hwnd, ctx);
+                }
+                let _ = crate::windows_env::set_window_maximized(hwnd, maximize);
+                if !maximize {
+                    self.reassert_position_after_restore(ctx);
+                }
             }
 
             #[cfg(not(target_os = "windows"))]

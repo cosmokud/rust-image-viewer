@@ -3796,6 +3796,7 @@ dependencies = [
  "moka",
  "parking_lot",
  "puffin",
+ "raw-window-handle",
  "rayon",
  "redb",
  "rstar",
