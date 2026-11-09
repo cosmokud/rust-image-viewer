@@ -2580,6 +2580,14 @@ struct ImageViewer {
     is_panning: bool,
     /// Last mouse position for panning
     last_mouse_pos: Option<egui::Pos2>,
+    /// Which pointer button started the current pan/window drag (if any).
+    /// Once held, that button alone keeps the drag alive: egui drops the pointer
+    /// (`hover_pos()` becomes `None`) as soon as the cursor leaves the window, which
+    /// used to end a floating-window drag the moment the window lagged behind the cursor.
+    pan_drag_button: Option<egui::PointerButton>,
+    /// Drag detent latched on press (window move vs in-window image pan), so the
+    /// roll-over that makes the window lag can never flip the drag mode mid-drag.
+    pan_drag_moves_window: bool,
     /// Last observed pointer hover position, used for cursor-idle detection.
     last_pointer_hover_pos: Option<egui::Pos2>,
     /// Time of the most recent pointer move/click/wheel event.
@@ -2718,6 +2726,11 @@ struct ImageViewer {
     /// Whether the pointer is over selectable title-bar text (filename, resolution, zoom, etc.).
     /// Used to suppress drag/pan/double-click gestures while selecting/copying title text.
     mouse_over_title_text: bool,
+    /// Whether the pointer is over the chrome bar itself (not over title text or a window
+    /// button), in a mode where the bar drags the window. Filled by `draw_controls`, which runs
+    /// before the input pass, so a press on the empty bar starts a window drag like a native
+    /// title bar instead of doing nothing.
+    mouse_over_title_bar_drag_handle: bool,
     /// Whether the title-bar FAB menu button or popup is active.
     /// Used to keep the title bar visible and block click-through into the main view.
     title_bar_menu_active: bool,
@@ -2756,7 +2769,9 @@ struct ImageViewer {
     resize_last_size: Option<egui::Vec2>,
     /// Initial window outer position when a manual floating-window drag starts.
     floating_drag_start_outer_pos: Option<egui::Pos2>,
-    /// Global screen cursor position when a manual floating-window drag starts.
+    /// Global screen cursor position when a manual floating-window drag starts, in physical
+    /// screen pixels (`GetCursorPos` units), to match `OuterPosition` after the conversion
+    /// applied in `drag_floating_window_without_native_snap`.
     floating_drag_start_cursor_screen: Option<egui::Pos2>,
     /// When true, floating autosize is suppressed while zoomed media exceeds the viewport.
     /// Set by explicit user window drag/resize while in zoom-inside-window mode.
@@ -3253,6 +3268,8 @@ impl Default for ImageViewer {
             offset: egui::Vec2::ZERO,
             is_panning: false,
             last_mouse_pos: None,
+            pan_drag_button: None,
+            pan_drag_moves_window: false,
             last_pointer_hover_pos: None,
             last_pointer_activity_at: Instant::now(),
             config,
@@ -3310,6 +3327,7 @@ impl Default for ImageViewer {
             mouse_over_video_controls: false,
             mouse_over_window_buttons: false,
             mouse_over_title_text: false,
+            mouse_over_title_bar_drag_handle: false,
             title_bar_menu_active: false,
             title_text_dragging: false,
             is_seeking: false,
@@ -3510,6 +3528,12 @@ impl ImageViewer {
     const TITLE_BAR_HEIGHT: f32 = 32.0;
     const BREADCRUMB_BAR_HEIGHT: f32 = 30.0;
     const TOP_CONTROLS_HOTZONE_EXTRA: f32 = 18.0;
+    /// Drawn window-button size in the title bar, and the gap the cluster keeps at its right edge.
+    /// `title_bar_buttons_pointer_zone` derives the drag-handle boundary from these, so the strip
+    /// where a press cannot move the window is exactly as wide as the buttons it protects.
+    const TITLE_BAR_BUTTON_SIZE: egui::Vec2 = egui::vec2(32.0, 32.0);
+    const TITLE_BAR_BUTTON_TRAILING_GAP: f32 = 2.0;
+    const TITLE_BAR_BUTTON_LEAD_PADDING: f32 = 5.0;
     const BOTTOM_RIGHT_OVERLAY_MARGIN: f32 = 16.0;
     const BOTTOM_RIGHT_OVERLAY_SCROLLBAR_PADDING: f32 = 35.0;
     const MANGA_HUD_PANEL_WIDTH: f32 = 224.0;
@@ -9655,14 +9679,26 @@ impl ImageViewer {
 
     /// Right-hand strip of the title bar that holds the window buttons.
     ///
-    /// Deliberately generous: wider than the button cluster, full bar height and out to the very
-    /// right edge, so no pixel of a button is left outside it. A press in here must never start a
-    /// window drag or resize - both move the window under the cursor and the button click is
+    /// The drawn cluster is four 32pt buttons and three gaps; this zone is exactly that area (same
+    /// button size and spacing the bar lays the cluster out with), full bar height and out to the
+    /// very right edge, so every pixel of a button is inside it. A press in here must never start
+    /// a window drag or resize - both move the window under the cursor and the button click is
     /// lost (the window-drag branch is the one that shows the four-arrow move cursor).
-    fn title_bar_buttons_pointer_zone(&self, screen_rect: egui::Rect) -> egui::Rect {
-        const ZONE_WIDTH: f32 = 200.0;
+    ///
+    /// It must not be wider than the cluster: the title bar left of it is the drag handle, and
+    /// widening the zone turns that empty bar back into a stretch where the press moves nothing.
+    fn title_bar_buttons_pointer_zone(
+        &self,
+        ctx: &egui::Context,
+        screen_rect: egui::Rect,
+    ) -> egui::Rect {
+        const BUTTON_COUNT: f32 = 4.0;
 
-        let width = ZONE_WIDTH.min(screen_rect.width());
+        let button_size_x = Self::TITLE_BAR_BUTTON_SIZE.x;
+        let gap = ctx.style().spacing.item_spacing.x;
+        let cluster_w = (button_size_x * BUTTON_COUNT) + (gap * (BUTTON_COUNT - 1.0));
+        let width =
+            (cluster_w + Self::TITLE_BAR_BUTTON_TRAILING_GAP + 1.0).min(screen_rect.width());
         egui::Rect::from_min_max(
             egui::pos2(screen_rect.max.x - width, screen_rect.min.y),
             egui::pos2(
@@ -9670,6 +9706,34 @@ impl ImageViewer {
                 screen_rect.min.y + Self::TITLE_BAR_HEIGHT,
             ),
         )
+    }
+
+    /// The chrome bar as the window's drag handle: the full-width strip the bar occupies, in the
+    /// mode where dragging the bar moves the window.
+    ///
+    /// Measured on the bar itself, not on a drawn widget: title text and window buttons only
+    /// sense clicks and drags on their own glyph rects, so a press on the empty stretch between
+    /// the file details and the buttons lands on no widget at all. That stretch used to fall
+    /// through to the main view, which pans the image unless it is zoomed past the window, so a
+    /// drag there moved nothing.
+    fn title_bar_drag_handle_rect(&self, screen_rect: egui::Rect) -> egui::Rect {
+        egui::Rect::from_min_size(
+            screen_rect.min,
+            egui::Vec2::new(screen_rect.width(), Self::TITLE_BAR_HEIGHT),
+        )
+    }
+
+    /// Whether a drag latched at press time moves the window rather than panning the image.
+    ///
+    /// Floating mode: the chrome bar always moves the window, and so does a drag anywhere else
+    /// while the media still fits the window (there is nothing to pan). Fullscreen never moves
+    /// the window.
+    fn drag_moves_window(
+        is_fullscreen: bool,
+        over_title_bar_drag_handle: bool,
+        media_exceeds_window: bool,
+    ) -> bool {
+        !is_fullscreen && (over_title_bar_drag_handle || !media_exceeds_window)
     }
 
     fn title_bar_ui_blocking(&self) -> bool {
@@ -13894,12 +13958,25 @@ impl ImageViewer {
         }
 
         let Some(current_cursor_screen) = get_global_cursor_pos() else {
-            // Fallback for platforms where global cursor coordinates are unavailable.
-            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+            // Platforms without a global cursor query: hand the drag to the windowing system
+            // once (it owns the move from there), instead of re-issuing StartDrag every frame.
+            if self.floating_drag_start_outer_pos.is_none() {
+                self.floating_drag_start_outer_pos =
+                    ctx.input(|i| i.raw.viewport().outer_rect).map(|r| r.min);
+                ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                ctx.request_repaint();
+            }
             return;
         };
 
-        let (start_outer_pos, start_cursor_screen) = match (
+        let pixels_per_point = ctx.pixels_per_point().max(0.01);
+        // The window position and the cursor are both in physical screen pixels here.
+        let current_cursor_physical = egui::pos2(
+            current_cursor_screen.x * pixels_per_point,
+            current_cursor_screen.y * pixels_per_point,
+        );
+
+        let (start_outer_pos, start_cursor_physical) = match (
             self.floating_drag_start_outer_pos,
             self.floating_drag_start_cursor_screen,
         ) {
@@ -13910,14 +13987,22 @@ impl ImageViewer {
                     .map(|r| r.min)
                     .unwrap_or(egui::Pos2::ZERO);
                 self.floating_drag_start_outer_pos = Some(outer_pos);
-                self.floating_drag_start_cursor_screen = Some(current_cursor_screen);
+                self.floating_drag_start_cursor_screen = Some(current_cursor_physical);
+                // Keep repainting while the button is held so the loop keeps sampling the
+                // cursor at its own cadence instead of egui's event cadence: that is what
+                // keeps the window glued to the cursor when it overshoots the window.
+                ctx.request_repaint();
                 return;
             }
         };
 
-        let delta = current_cursor_screen - start_cursor_screen;
-        let new_pos = start_outer_pos + delta;
+        let delta_physical = current_cursor_physical - start_cursor_physical;
+        let new_pos = start_outer_pos + delta_physical / pixels_per_point;
         self.send_outer_position(ctx, new_pos);
+        // A drag that outruns the window can lose pointer events (capture changes, and
+        // cursor moves that no longer arrive once the cursor sits outside the window),
+        // so keep the loop hot while the drag is alive: each frame re-samples the cursor.
+        ctx.request_repaint();
     }
 
     fn apply_manga_pan_step(&mut self, direction: f32, multiplier: f32) {
@@ -14229,6 +14314,61 @@ impl ImageViewer {
             .get_bindings(action)
             .iter()
             .any(|binding| self.binding_down(binding, input, ctrl, shift, alt))
+    }
+
+    /// Egui only reports built-in pointer actions while egui holds the pointer: a
+    /// `PointerGone` (cursor left the window) clears `hover_pos()` for the rest of the
+    /// drag. These two helpers keep the physical button state authoritative instead.
+    fn binding_held(&self, binding: &InputBinding, input: &egui::InputState) -> bool {
+        match binding {
+            InputBinding::MouseLeft => global_mouse_button_down(GLOBAL_MOUSE_LEFT),
+            InputBinding::MouseMiddle => global_mouse_button_down(GLOBAL_MOUSE_MIDDLE),
+            InputBinding::Mouse4 => global_mouse_button_down(GLOBAL_MOUSE_EXTRA1),
+            InputBinding::Mouse5 => global_mouse_button_down(GLOBAL_MOUSE_EXTRA2),
+            _ => self.binding_down(
+                binding,
+                input,
+                input.raw.modifiers.ctrl,
+                input.raw.modifiers.shift,
+                input.raw.modifiers.alt,
+            ),
+        }
+    }
+
+    fn action_binding_held(&self, action: Action, input: &egui::InputState) -> bool {
+        self.config
+            .get_bindings(action)
+            .iter()
+            .any(|binding| self.binding_held(binding, input))
+    }
+
+    /// The mouse button a pan/drag action is bound to, if any.
+    fn pan_button_for_action(&self, action: Action) -> Option<egui::PointerButton> {
+        self.config
+            .get_bindings(action)
+            .iter()
+            .find_map(|binding| match binding {
+                InputBinding::MouseLeft => Some(egui::PointerButton::Primary),
+                InputBinding::MouseMiddle => Some(egui::PointerButton::Middle),
+                InputBinding::Mouse4 => Some(egui::PointerButton::Extra1),
+                InputBinding::Mouse5 => Some(egui::PointerButton::Extra2),
+                _ => None,
+            })
+    }
+
+    /// Is the button that owns the current drag still down? Falls back to egui's own
+    /// pointer state where no OS-level button query is available.
+    fn pan_drag_button_held(&self, ctx: &egui::Context) -> bool {
+        let (button, global) = match self.pan_drag_button {
+            Some(egui::PointerButton::Primary) => (egui::PointerButton::Primary, GLOBAL_MOUSE_LEFT),
+            Some(egui::PointerButton::Middle) => (egui::PointerButton::Middle, GLOBAL_MOUSE_MIDDLE),
+            Some(egui::PointerButton::Extra1) => (egui::PointerButton::Extra1, GLOBAL_MOUSE_EXTRA1),
+            Some(egui::PointerButton::Extra2) => (egui::PointerButton::Extra2, GLOBAL_MOUSE_EXTRA2),
+            // Keyboard-driven pan has no button of its own.
+            None => return true,
+            Some(_) => return false,
+        };
+        global_mouse_button_down(global) || ctx.input(|i| i.pointer.button_down(button))
     }
 
     fn action_mouse_binding_down(&self, action: Action, input: &egui::InputState) -> bool {
@@ -23495,7 +23635,16 @@ impl ImageViewer {
                 let ctrl = input.modifiers.ctrl;
                 let shift = input.modifiers.shift;
                 let alt = input.modifiers.alt;
-                self.action_binding_down(self.manga_layout_pan_action(), input, ctrl, shift, alt)
+                // Held, not event-driven, once the drag is running: egui drops the pointer when
+                // the cursor leaves the window, and a drag that outruns the cursor must keep going.
+                (self.is_panning && self.action_binding_held(self.manga_layout_pan_action(), input))
+                    || self.action_binding_down(
+                        self.manga_layout_pan_action(),
+                        input,
+                        ctrl,
+                        shift,
+                        alt,
+                    )
             });
 
         // Avoid triggering manga interactions while selecting/copying title-bar text.
@@ -24150,15 +24299,23 @@ impl ImageViewer {
                 ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
             }
 
-            if pan_down_action && self.is_panning {
+            if self.is_panning {
                 let drag_speed = self.config.manga_drag_pan_speed;
                 self.manga_shift_wheel_pan_velocity_x = 0.0;
 
                 // Stop any residual inertial scroll while the user is actively dragging.
                 self.stop_manga_wheel_scroll();
 
+                // Once the cursor leaves the window egui stops reporting it, so fall back to
+                // the last known in-window position: the drag keeps going, it just stops moving.
+                let current_pos = pointer_pos.or(self.last_mouse_pos);
+                let drag_delta = match (self.last_mouse_pos, current_pos) {
+                    (Some(previous), Some(current)) => current - previous,
+                    _ => pointer_delta,
+                };
+
                 // Vertical drag = scroll the manga strip (1:1 feel).
-                let delta_y = -pointer_delta.y * drag_speed;
+                let delta_y = -drag_delta.y * drag_speed;
                 let total_height = self.manga_total_height();
                 let visible_height = self.screen_size.y;
                 let max_scroll = (total_height - visible_height).max(0.0);
@@ -24167,8 +24324,9 @@ impl ImageViewer {
                 self.manga_scroll_target = self.manga_scroll_offset;
 
                 // Horizontal drag = pan X.
-                self.offset.x += pointer_delta.x * drag_speed;
+                self.offset.x += drag_delta.x * drag_speed;
 
+                self.last_mouse_pos = current_pos.or(self.last_mouse_pos);
                 self.manga_update_current_index();
                 self.manga_update_preload_queue();
                 ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
@@ -26156,6 +26314,7 @@ impl ImageViewer {
         // Default to false each frame; updated below when the bar is visible.
         self.mouse_over_window_buttons = false;
         self.mouse_over_title_text = false;
+        self.mouse_over_title_bar_drag_handle = false;
         self.title_bar_menu_active = false;
 
         // Keep title-text drag-selection state sticky until the primary button is released.
@@ -26232,13 +26391,15 @@ impl ImageViewer {
                     // In floating mode, keep a small invisible gap on the top/right edges of the
                     // button cluster so top-edge drag and top-right resize remain reachable.
                     // In fullscreen, disable the gap so top-edge clicks still hit window buttons.
-                    let button_size = egui::Vec2::new(32.0, bar_height);
-                    let buttons_area_w =
-                        5.0 + (button_size.x * 4.0) + (ui.spacing().item_spacing.x * 3.0) + 6.0;
+                    let button_size = Self::TITLE_BAR_BUTTON_SIZE;
+                    let buttons_area_w = Self::TITLE_BAR_BUTTON_LEAD_PADDING
+                        + (button_size.x * 4.0)
+                        + (ui.spacing().item_spacing.x * 3.0)
+                        + 6.0;
                     let button_edge_gap = if self.mode().is_fullscreen() {
                         0.0
                     } else {
-                        2.0
+                        Self::TITLE_BAR_BUTTON_TRAILING_GAP
                     };
                     let buttons_rect = egui::Rect::from_min_max(
                         egui::pos2(
@@ -26249,13 +26410,22 @@ impl ImageViewer {
                     );
 
                     // If the pointer is over the window buttons region, suppress window dragging
-                    // and resize. The zone is a superset of the drawn cluster: full bar height and
-                    // out to the right edge, so no pixel of a button can start a drag.
+                    // and resize. The zone covers the whole button cluster, no wider.
                     if let Some(pos) = mouse_pos {
                         self.mouse_over_window_buttons = self
-                            .title_bar_buttons_pointer_zone(screen_rect)
+                            .title_bar_buttons_pointer_zone(ctx, screen_rect)
                             .contains(pos);
                     }
+                    // Grabbing strip: the whole chrome bar, both sides of the cluster, as long
+                    // as no window button is under the pointer. The bar is a drag handle in
+                    // floating mode, including the empty stretch between the file details and
+                    // the buttons. Title text keeps its own pixels: a press on it sets
+                    // `mouse_over_title_text`, which the drag branch refuses.
+                    self.mouse_over_title_bar_drag_handle = !self.mode().is_fullscreen()
+                        && mouse_pos.is_some_and(|pos| {
+                            self.title_bar_drag_handle_rect(screen_rect).contains(pos)
+                                && !self.mouse_over_window_buttons
+                        });
                     let left_rect = egui::Rect::from_min_max(
                         bar_rect.min,
                         egui::pos2(buttons_rect.min.x, bar_rect.max.y),
@@ -26469,7 +26639,7 @@ impl ImageViewer {
                                 kind: WindowButton,
                             ) -> egui::Response {
                                 // Match the control bar height so the hit area reaches the very top (y=0).
-                                let size = egui::Vec2::new(32.0, 32.0);
+                                let size = ImageViewer::TITLE_BAR_BUTTON_SIZE;
                                 let (rect, response) =
                                     ui.allocate_exact_size(size, egui::Sense::click());
 
@@ -26685,7 +26855,7 @@ impl ImageViewer {
 
                             // Add padding on the LEFT of the button cluster (not on the right),
                             // so the close button remains clickable at the very top-right pixel.
-                            ui.add_space(5.0);
+                            ui.add_space(Self::TITLE_BAR_BUTTON_LEAD_PADDING);
                         });
                     });
                 });
@@ -29332,7 +29502,13 @@ impl ImageViewer {
             pointer_pos = ctx.input(|i| i.pointer.hover_pos());
             let primary_clicked =
                 ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Primary));
-            let primary_down = ctx.input(|i| i.pointer.button_down(egui::PointerButton::Primary));
+            // egui only knows the pointer while it holds it: a `PointerGone` (cursor left the
+            // window) clears `hover_pos()` and with it the button state, which made a lagging
+            // floating-window drag read as released. Ask the OS instead, but only while a
+            // drag/resize that began inside this window is running.
+            let primary_down = ctx.input(|i| i.pointer.button_down(egui::PointerButton::Primary))
+                || ((self.is_panning || self.is_resizing)
+                    && global_mouse_button_down(GLOBAL_MOUSE_LEFT));
             let primary_pressed =
                 ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary));
             let secondary_clicked =
@@ -29352,7 +29528,11 @@ impl ImageViewer {
                 let ctrl = input.modifiers.ctrl;
                 let shift = input.modifiers.shift;
                 let alt = input.modifiers.alt;
-                self.action_binding_down(Action::Pan, input, ctrl, shift, alt)
+                // Held, not event-driven, once the drag is running: egui drops the pointer when
+                // the cursor leaves the window, and a window drag that outruns the cursor must
+                // not read as a release.
+                (self.is_panning && self.action_binding_held(Action::Pan, input))
+                    || self.action_binding_down(Action::Pan, input, ctrl, shift, alt)
             });
 
             // Title bar gesture suppression:
@@ -29365,7 +29545,7 @@ impl ImageViewer {
             // hidden (auto-hide means `over_title_bar` is false then, which used to turn a press
             // on a button into a window drag: the four-arrow move cursor, and a lost click).
             let over_title_bar_buttons = pointer_pos.map_or(false, |pos| {
-                self.title_bar_buttons_pointer_zone(screen_rect)
+                self.title_bar_buttons_pointer_zone(ctx, screen_rect)
                     .contains(pos)
             });
 
@@ -29494,8 +29674,20 @@ impl ImageViewer {
                 self.resize_start_cursor_screen = None;
                 self.resize_last_size = None;
             } else if !self.is_resizing {
-                // Handle panning/window dragging (only if not resizing, not seeking, and not over video controls)
-                if pan_down_action
+                // Handle panning/window dragging (only if not resizing, not seeking, and not over video controls).
+                // A drag this code started stays alive while the button that started it is still
+                // held. Every hover-derived gate below (resize edge, title-bar button strip, overlays)
+                // is computed from the cursor position *inside* the window, which goes stale the moment
+                // the window lags behind the cursor and the cursor leaves it: re-evaluating those
+                // mid-drag is exactly what used to drop the drag.
+                let cursor_delta = ctx.input(|i| i.pointer.delta());
+                let drag_continues = self.is_panning
+                    && self.pan_drag_button.is_some()
+                    && self.pan_drag_button_held(ctx);
+                // A new drag still needs the cursor inside the window: pressing something and
+                // then yanking the cursor out of it must not start moving the window.
+                let drag_can_start = pan_down_action
+                    && pointer_pos.is_some()
                     && hover_resize_direction == ResizeDirection::None
                     && !over_video_controls
                     && !self.is_seeking
@@ -29509,51 +29701,77 @@ impl ImageViewer {
                     && !pointer_over_shortcut_ui
                     && !self.manga_autoscroll_active
                     && !primary_consumed_for_autoscroll
-                    && !(over_title_bar && self.mouse_over_title_text)
-                {
+                    && !(over_title_bar && self.mouse_over_title_text);
+                if drag_continues || drag_can_start {
                     self.manga_shift_wheel_pan_velocity_x = 0.0;
-                    if let Some(pos) = pointer_pos {
-                        // Check if drag started from the top controls region for window dragging.
-                        let in_title_bar = self
-                            .last_mouse_pos
-                            .map_or(pos.y < self.top_controls_hotzone_height(), |lp| {
-                                lp.y < self.top_controls_hotzone_height()
-                            });
 
-                        if let Some(_last_pos) = self.last_mouse_pos {
-                            if self.is_panning {
-                                if self.mode().is_fullscreen() {
-                                    self.reset_floating_window_drag_anchor();
-                                    // In fullscreen, pan the image
-                                    let delta = ctx.input(|i| i.pointer.delta());
-                                    self.offset += delta;
-                                    self.remember_current_fullscreen_view_state();
-                                } else if in_title_bar {
-                                    // In floating mode, bypass native StartDrag to avoid Win11 top-edge snap.
-                                    self.drag_floating_window_without_native_snap(ctx);
-                                } else if floating_image_exceeds_window {
-                                    self.reset_floating_window_drag_anchor();
-                                    // In floating mode when zoomed past 100%, pan image inside window
-                                    let delta = ctx.input(|i| i.pointer.delta());
-                                    self.offset += delta;
-                                } else {
-                                    // In floating mode at/below 100%, bypass native StartDrag snap behavior.
-                                    self.drag_floating_window_without_native_snap(ctx);
-                                }
-                            }
-                        }
-                        if !self.is_panning {
-                            self.is_panning = true;
-                            self.reset_floating_window_drag_anchor();
-                        }
-                        self.last_mouse_pos = Some(pos);
-                        ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+                    if !self.is_panning {
+                        // Latch the drag mode at press time, while the cursor is still over the
+                        // window and the title-bar test is trustworthy. The chrome bar is a drag
+                        // handle wherever it holds no title text and no window button, the way a
+                        // native title bar is; `mouse_over_title_bar_drag_handle` counts exactly
+                        // that and stays true even while auto-hide has hidden the bar.
+                        self.is_panning = true;
+                        self.pan_drag_button = self.pan_button_for_action(Action::Pan);
+                        self.pan_drag_moves_window = Self::drag_moves_window(
+                            self.mode().is_fullscreen(),
+                            self.mouse_over_title_bar_drag_handle,
+                            floating_image_exceeds_window,
+                        );
+                        self.last_mouse_pos = pointer_pos;
+                        self.reset_floating_window_drag_anchor();
                     }
+
+                    // Re-sample the cursor: once it has left the window egui has no position for
+                    // it, and window and cursor can diverge by a long way, so a pointer delta
+                    // there would be a stale, too-small step.
+                    let cursor_points = match (pointer_pos, get_global_cursor_pos()) {
+                        (Some(pos), _) => Some(pos),
+                        (None, Some(screen_pos)) => {
+                            let scale = ctx.pixels_per_point().max(0.01);
+                            let outer_min = ctx
+                                .input(|i| i.raw.viewport().outer_rect)
+                                .map(|r| r.min)
+                                .unwrap_or(egui::Pos2::ZERO);
+                            Some(screen_pos / scale - outer_min.to_vec2())
+                        }
+                        (None, None) => None,
+                    };
+                    let drag_delta = match (self.last_mouse_pos, cursor_points) {
+                        (Some(previous), Some(current)) => current - previous,
+                        _ => cursor_delta,
+                    };
+
+                    if let Some(cursor) = cursor_points {
+                        if self.mode().is_fullscreen() {
+                            self.reset_floating_window_drag_anchor();
+                            // In fullscreen, pan the image
+                            self.offset += drag_delta;
+                            self.remember_current_fullscreen_view_state();
+                        } else if self.pan_drag_moves_window {
+                            // In floating mode, bypass native StartDrag to avoid Win11 top-edge snap.
+                            self.drag_floating_window_without_native_snap(ctx);
+                        } else {
+                            self.reset_floating_window_drag_anchor();
+                            // In floating mode when zoomed past 100%, pan image inside window
+                            self.offset += drag_delta;
+                        }
+                        self.last_mouse_pos = Some(cursor);
+                    } else if self.pan_drag_moves_window && !self.mode().is_fullscreen() {
+                        self.drag_floating_window_without_native_snap(ctx);
+                    }
+
+                    ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+                    // Keep the loop hot for the lifetime of the drag: the window must follow
+                    // the cursor even when egui stops receiving move events (cursor outside).
+                    ctx.request_repaint();
                 } else {
                     if self.is_panning {
                         self.is_panning = false;
                     }
                     self.last_mouse_pos = None;
+                    self.pan_drag_button = None;
+                    self.pan_drag_moves_window = false;
                     self.reset_floating_window_drag_anchor();
 
                     // Set cursor based on hover state
@@ -30385,6 +30603,7 @@ impl eframe::App for ImageViewer {
         } else {
             self.mouse_over_window_buttons = false;
             self.mouse_over_title_text = false;
+            self.mouse_over_title_bar_drag_handle = false;
             self.title_bar_menu_active = false;
             self.title_text_dragging = false;
         }
@@ -30820,6 +31039,27 @@ fn get_global_cursor_pos() -> Option<egui::Pos2> {
 fn get_global_cursor_pos() -> Option<egui::Pos2> {
     // Fallback for non-Windows: return None and let the caller handle it
     None
+}
+
+pub(crate) const GLOBAL_MOUSE_LEFT: u32 = 0x01;
+pub(crate) const GLOBAL_MOUSE_MIDDLE: u32 = 0x04;
+pub(crate) const GLOBAL_MOUSE_EXTRA1: u32 = 0x05;
+pub(crate) const GLOBAL_MOUSE_EXTRA2: u32 = 0x06;
+
+/// Is `button` (a Windows mouse-button `VK_*` code, `GLOBAL_MOUSE_*` above) still
+/// physically held? Unlike egui's pointer state this survives the cursor leaving
+/// the window, which is what a window drag does when the window lags behind.
+#[cfg(target_os = "windows")]
+pub(crate) fn global_mouse_button_down(button: u32) -> bool {
+    use winapi::um::winuser::GetAsyncKeyState;
+
+    unsafe { (GetAsyncKeyState(button as i32) as u16 & 0x8000) != 0 }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn global_mouse_button_down(_button: u32) -> bool {
+    // Unknown: callers fall back to egui's own pointer state (see the `||` at the call sites).
+    false
 }
 
 fn init_runtime_diagnostics() {
@@ -31768,5 +32008,48 @@ mod tests {
             assert_eq!(settings_registry::SETTINGS[id].id, id);
         }
         assert!(settings_search_results("zzz-no-such-setting").is_empty());
+    }
+
+    #[test]
+    fn title_bar_button_zone_covers_the_cluster_and_stops_at_the_drag_handle() {
+        let mut viewer = ImageViewer::default();
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        set_test_mode(&mut viewer, Mode::FloatingSolo(MangaLayoutMode::LongStrip));
+
+        // The zone ends where the bar starts reserving the cluster, so the empty bar left of it
+        // is a drag handle instead of a strip where a press moves nothing.
+        let ctx = egui::Context::default();
+        let zone = viewer.title_bar_buttons_pointer_zone(&ctx, screen_rect);
+        assert!(zone.min.x > screen_rect.width() - 200.0, "{zone:?}");
+        assert_eq!(zone.max.x, screen_rect.max.x);
+        assert_eq!(
+            zone.max.y,
+            screen_rect.min.y + ImageViewer::TITLE_BAR_HEIGHT
+        );
+        assert!(
+            zone.contains(egui::pos2(screen_rect.max.x - 1.0, screen_rect.min.y + 1.0)),
+            "every button pixel, including the top-right one, is inside the zone"
+        );
+    }
+
+    #[test]
+    fn every_pixel_of_the_chrome_bar_moves_the_window_in_floating_mode() {
+        let mut viewer = ImageViewer::default();
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        set_test_mode(&mut viewer, Mode::FloatingSolo(MangaLayoutMode::LongStrip));
+        let handle = viewer.title_bar_drag_handle_rect(screen_rect);
+        assert_eq!(handle.min, screen_rect.min);
+        assert_eq!(handle.width(), screen_rect.width());
+        assert_eq!(handle.height(), ImageViewer::TITLE_BAR_HEIGHT);
+
+        // The stretch between the file details and the buttons, with the media zoomed past the
+        // window so nothing else could be claimed as a pan: still a window move.
+        assert!(ImageViewer::drag_moves_window(
+            false,
+            handle.contains(egui::pos2(500.0, 16.0)),
+            true
+        ));
+        // Fullscreen never moves the window, however the bar is treated.
+        assert!(!ImageViewer::drag_moves_window(true, true, false));
     }
 }
