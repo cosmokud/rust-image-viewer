@@ -7,6 +7,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use crate::app_dirs;
+use crate::settings_registry::{self, SETTINGS};
 
 #[cfg(test)]
 const DEFAULT_CONFIG_TEMPLATE: &str = include_str!("../assets/presets/default.ini");
@@ -20,6 +21,548 @@ const LEGACY_SETTINGS_FILE_NAME: &str = "setting.ini";
 #[cfg(test)]
 fn default_config_ini() -> &'static str {
     DEFAULT_CONFIG_TEMPLATE
+}
+
+/// Legacy `config.ini` section: gates which alias spellings are accepted.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IniSection {
+    Settings,
+    Video,
+    Performance,
+    Shortcuts,
+    State,
+    Other,
+}
+
+impl IniSection {
+    fn of(name: &str) -> Self {
+        let name = name.trim();
+        if name.eq_ignore_ascii_case("shortcuts") {
+            Self::Shortcuts
+        } else if name.eq_ignore_ascii_case("settings") {
+            Self::Settings
+        } else if name.eq_ignore_ascii_case("video") {
+            Self::Video
+        } else if name.eq_ignore_ascii_case("quality")
+            || name.eq_ignore_ascii_case("performance")
+            || name.eq_ignore_ascii_case("image_quality")
+            || name.eq_ignore_ascii_case("filters")
+        {
+            Self::Performance
+        } else if name.eq_ignore_ascii_case("state") || name.eq_ignore_ascii_case("video_state") {
+            Self::State
+        } else {
+            Self::Other
+        }
+    }
+}
+
+/// Legacy ini spelling -> registry key. The registry then does the parsing, clamping and
+/// cross-key guards, so a legacy file and a preset file cannot diverge.
+///
+/// The table is per section, and a spelling may appear in more than one section only when it
+/// must route to a different key there: `[Settings] controls_hide_delay` is the controls
+/// delay, `[Video] controls_hide_delay` is the legacy name for the bottom overlay delay.
+const INI_ALIASES: [(IniSection, &[&str], &str); 66] = [
+    (
+        IniSection::Settings,
+        &["controls_hide_delay"],
+        "controls_hide_delay",
+    ),
+    (
+        IniSection::Video,
+        &[
+            "controls_hide_delay",
+            "video_controls_hide_delay",
+            "bottom_overlay_hide_delay",
+            "bottom_controls_hide_delay",
+            "bottom_hud_hide_delay",
+        ],
+        "bottom_overlay_hide_delay",
+    ),
+    (
+        IniSection::Settings,
+        &[
+            "bottom_overlay_hide_delay",
+            "bottom_controls_hide_delay",
+            "bottom_hud_hide_delay",
+            "video_controls_hide_delay",
+        ],
+        "bottom_overlay_hide_delay",
+    ),
+    (
+        IniSection::Settings,
+        &[
+            "cursor_idle_hide_delay",
+            "idle_cursor_hide_delay",
+            "mouse_idle_hide_delay",
+        ],
+        "cursor_idle_hide_delay",
+    ),
+    (
+        IniSection::Settings,
+        &[
+            "auto_unmark_after_paste",
+            "unmark_after_paste",
+            "clear_marks_after_paste",
+            "clear_marked_files_after_paste",
+        ],
+        "auto_unmark_after_paste",
+    ),
+    (IniSection::Settings, &["background_rgb"], "background_rgb"),
+    (
+        IniSection::Settings,
+        &[
+            "confirm_delete_to_recycle_bin",
+            "confirm_recycle_bin_delete",
+            "show_delete_confirmation",
+            "confirm_delete",
+        ],
+        "confirm_delete_to_recycle_bin",
+    ),
+    (
+        IniSection::Settings,
+        &[
+            "ctrl_scroll_down_pan_speed_px_per_step",
+            "ctrl_scroll_down_pan_speed",
+            "ctrl_scroll_down_pan_px",
+            "ctrl_wheel_down_pan_speed",
+        ],
+        "ctrl_scroll_down_pan_speed_px_per_step",
+    ),
+    (
+        IniSection::Settings,
+        &[
+            "ctrl_scroll_up_pan_speed_px_per_step",
+            "ctrl_scroll_up_pan_speed",
+            "ctrl_scroll_up_pan_px",
+            "ctrl_wheel_up_pan_speed",
+        ],
+        "ctrl_scroll_up_pan_speed_px_per_step",
+    ),
+    (
+        IniSection::Settings,
+        &[
+            "double_click_grace_period",
+            "double_click_delay",
+            "double_click_grace_seconds",
+        ],
+        "double_click_grace_period",
+    ),
+    (
+        IniSection::Settings,
+        &[
+            "fullscreen_native_window_transition",
+            "fullscreen_native_transition",
+            "fullscreen_animated_window_transition",
+            "animate_fullscreen_with_maximize_restore",
+        ],
+        "fullscreen_native_window_transition",
+    ),
+    (
+        IniSection::Settings,
+        &["fullscreen_remember_view_state_in_ram"],
+        "fullscreen_remember_view_state_in_ram",
+    ),
+    (
+        IniSection::Settings,
+        &["fullscreen_reset_fit_on_mode_switch"],
+        "fullscreen_reset_fit_on_mode_switch",
+    ),
+    (
+        IniSection::Settings,
+        &["manga_arrow_scroll_speed", "manga_arrow_key_scroll_speed"],
+        "manga_arrow_scroll_speed",
+    ),
+    (
+        IniSection::Settings,
+        &[
+            "manga_autoscroll_arrow_alpha",
+            "manga_autoscroll_arrow_opacity",
+        ],
+        "manga_autoscroll_arrow_alpha",
+    ),
+    (
+        IniSection::Settings,
+        &[
+            "manga_autoscroll_arrow_rgb",
+            "manga_autoscroll_arrow_color",
+            "manga_autoscroll_arrow_color_rgb",
+        ],
+        "manga_autoscroll_arrow_rgb",
+    ),
+    (
+        IniSection::Settings,
+        &[
+            "manga_autoscroll_base_speed_multiplier",
+            "manga_autoscroll_base_multiplier",
+        ],
+        "manga_autoscroll_base_speed_multiplier",
+    ),
+    (
+        IniSection::Settings,
+        &[
+            "manga_autoscroll_circle_fill_alpha",
+            "manga_autoscroll_ball_fill_alpha",
+            "manga_autoscroll_fill_alpha",
+        ],
+        "manga_autoscroll_circle_fill_alpha",
+    ),
+    (
+        IniSection::Settings,
+        &[
+            "manga_autoscroll_curve_power",
+            "manga_autoscroll_speed_curve_power",
+        ],
+        "manga_autoscroll_curve_power",
+    ),
+    (
+        IniSection::Settings,
+        &[
+            "manga_autoscroll_dead_zone_px",
+            "manga_autoscroll_deadzone_px",
+            "manga_autoscroll_dead_zone",
+            "manga_autoscroll_deadzone",
+        ],
+        "manga_autoscroll_dead_zone_px",
+    ),
+    (
+        IniSection::Settings,
+        &[
+            "manga_autoscroll_horizontal_speed_multiplier",
+            "manga_autoscroll_horizontal_multiplier",
+            "manga_autoscroll_x_speed_multiplier",
+        ],
+        "manga_autoscroll_horizontal_speed_multiplier",
+    ),
+    (
+        IniSection::Settings,
+        &[
+            "manga_autoscroll_max_speed_multiplier",
+            "manga_autoscroll_max_multiplier",
+        ],
+        "manga_autoscroll_max_speed_multiplier",
+    ),
+    (
+        IniSection::Settings,
+        &[
+            "manga_autoscroll_max_speed_px_per_sec",
+            "manga_autoscroll_max_speed",
+            "manga_autoscroll_max_px_per_sec",
+        ],
+        "manga_autoscroll_max_speed_px_per_sec",
+    ),
+    (
+        IniSection::Settings,
+        &[
+            "manga_autoscroll_min_speed_multiplier",
+            "manga_autoscroll_min_multiplier",
+        ],
+        "manga_autoscroll_min_speed_multiplier",
+    ),
+    (
+        IniSection::Settings,
+        &[
+            "manga_autoscroll_min_speed_px_per_sec",
+            "manga_autoscroll_min_speed",
+            "manga_autoscroll_min_px_per_sec",
+        ],
+        "manga_autoscroll_min_speed_px_per_sec",
+    ),
+    (
+        IniSection::Settings,
+        &[
+            "manga_autoscroll_vertical_speed_multiplier",
+            "manga_autoscroll_vertical_multiplier",
+            "manga_autoscroll_y_speed_multiplier",
+        ],
+        "manga_autoscroll_vertical_speed_multiplier",
+    ),
+    (
+        IniSection::Settings,
+        &["manga_drag_pan_speed", "manga_drag_pan_multiplier"],
+        "manga_drag_pan_speed",
+    ),
+    (
+        IniSection::Settings,
+        &[
+            "manga_inertial_friction",
+            "manga_scroll_friction",
+            "manga_inertia_friction",
+        ],
+        "manga_inertial_friction",
+    ),
+    (
+        IniSection::Settings,
+        &["manga_long_strip_reset_fit_on_fullscreen_exit"],
+        "manga_long_strip_reset_fit_on_fullscreen_exit",
+    ),
+    (
+        IniSection::Settings,
+        &[
+            "manga_wheel_decay_rate",
+            "manga_wheel_decay",
+            "manga_wheel_momentum_decay",
+        ],
+        "manga_wheel_decay_rate",
+    ),
+    (
+        IniSection::Settings,
+        &[
+            "manga_wheel_edge_spring_hz",
+            "manga_wheel_edge_spring_frequency",
+        ],
+        "manga_wheel_edge_spring_hz",
+    ),
+    (
+        IniSection::Settings,
+        &[
+            "manga_wheel_impulse_per_step",
+            "manga_wheel_velocity_per_step",
+            "manga_wheel_momentum_per_step",
+        ],
+        "manga_wheel_impulse_per_step",
+    ),
+    (
+        IniSection::Settings,
+        &["manga_wheel_max_velocity", "manga_wheel_velocity_cap"],
+        "manga_wheel_max_velocity",
+    ),
+    (
+        IniSection::Settings,
+        &[
+            "marked_file_border_rgb",
+            "marked_item_border_rgb",
+            "mark_border_rgb",
+        ],
+        "marked_file_border_rgb",
+    ),
+    (
+        IniSection::Settings,
+        &["masonry_items_per_row", "manga_masonry_items_per_row"],
+        "masonry_items_per_row",
+    ),
+    (
+        IniSection::Settings,
+        &[
+            "masonry_metadata_ram_cache_limit_mb",
+            "masonry_metadata_ram_limit_mb",
+            "masonry_metadata_preload_ram_limit_mb",
+            "masonry_metadata_ram_mb",
+        ],
+        "masonry_metadata_ram_cache_limit_mb",
+    ),
+    (
+        IniSection::Settings,
+        &["max_zoom_percent", "max_zoom_percentage", "max_zoom"],
+        "max_zoom_percent",
+    ),
+    (
+        IniSection::Settings,
+        &[
+            "maximize_to_borderless_fullscreen",
+            "maximize_to_fullscreen",
+            "titlebar_maximize_to_fullscreen",
+        ],
+        "maximize_to_borderless_fullscreen",
+    ),
+    (
+        IniSection::Settings,
+        &[
+            "metadata_cache_max_size_mb",
+            "metadata_cache_limit_mb",
+            "metadata_cache_max_mb",
+            "thumbnail_cache_max_size_mb",
+            "thumbnail_cache_limit_mb",
+            "folder_placeholder_thumbnail_cache_max_size_mb",
+        ],
+        "metadata_cache_max_size_mb",
+    ),
+    (
+        IniSection::Settings,
+        &[
+            "precise_rotation_step_degrees",
+            "fullscreen_precise_rotation_step_degrees",
+            "precise_rotation_step",
+            "precise_rotation_speed",
+        ],
+        "precise_rotation_step_degrees",
+    ),
+    (
+        IniSection::Settings,
+        &["resize_border_size"],
+        "resize_border_size",
+    ),
+    (
+        IniSection::Settings,
+        &[
+            "shift_scroll_down_pan_speed_px_per_step",
+            "shift_scroll_down_pan_speed",
+            "shift_scroll_down_pan_px",
+            "shift_wheel_down_pan_speed",
+        ],
+        "shift_scroll_down_pan_speed_px_per_step",
+    ),
+    (
+        IniSection::Settings,
+        &[
+            "shift_scroll_up_pan_speed_px_per_step",
+            "shift_scroll_up_pan_speed",
+            "shift_scroll_up_pan_px",
+            "shift_wheel_up_pan_speed",
+        ],
+        "shift_scroll_up_pan_speed_px_per_step",
+    ),
+    (
+        IniSection::Settings,
+        &["show_fps", "show_fps_overlay", "fps_overlay"],
+        "show_fps",
+    ),
+    (
+        IniSection::Settings,
+        &[
+            "show_fps_update_interval_ms",
+            "fps_update_interval_ms",
+            "fps_overlay_update_interval_ms",
+        ],
+        "show_fps_update_interval_ms",
+    ),
+    (
+        IniSection::Settings,
+        &["single_instance", "single_window", "reuse_window"],
+        "single_instance",
+    ),
+    (
+        IniSection::Settings,
+        &["vsync", "v_sync", "enable_vsync"],
+        "vsync",
+    ),
+    (
+        IniSection::Settings,
+        &["zoom_animation_speed"],
+        "zoom_animation_speed",
+    ),
+    (IniSection::Settings, &["zoom_step"], "zoom_step"),
+    (
+        IniSection::Video,
+        &["default_volume", "volume"],
+        "default_volume",
+    ),
+    (
+        IniSection::Video,
+        &[
+            "disable_hardware_decode",
+            "force_software_decode",
+            "force_sw_decode",
+        ],
+        "disable_hardware_decode",
+    ),
+    (IniSection::Video, &["loop"], "loop"),
+    (
+        IniSection::Video,
+        &["muted_by_default", "muted"],
+        "muted_by_default",
+    ),
+    (
+        IniSection::Video,
+        &[
+            "prefer_hardware_decode",
+            "prefer_hw_decode",
+            "hardware_decode_preference",
+        ],
+        "prefer_hardware_decode",
+    ),
+    (
+        IniSection::Video,
+        &[
+            "priority_next_file_binding",
+            "priority_nxt_file_binding",
+            "priority_pagedown_binding",
+        ],
+        "priority_next_file_binding",
+    ),
+    (
+        IniSection::Video,
+        &[
+            "priority_play_pause_binding",
+            "priority_pause_binding",
+            "priority_video_pause_binding",
+        ],
+        "priority_play_pause_binding",
+    ),
+    (
+        IniSection::Video,
+        &[
+            "priority_previous_file_binding",
+            "priority_prev_file_binding",
+            "priority_pageup_binding",
+        ],
+        "priority_previous_file_binding",
+    ),
+    (
+        IniSection::Video,
+        &["videos_only_navigation"],
+        "videos_only_navigation",
+    ),
+    (
+        IniSection::Performance,
+        &["enable_cuda", "cuda", "cuda_acceleration"],
+        "enable_cuda",
+    ),
+    (
+        IniSection::Performance,
+        &["enable_d3d12", "d3d12", "d3d12_acceleration"],
+        "enable_d3d12",
+    ),
+    (
+        IniSection::Performance,
+        &["manga_mipmap_min_side", "manga_mipmap_min_size"],
+        "manga_mipmap_min_side",
+    ),
+    (
+        IniSection::Performance,
+        &["manga_mipmap_static", "mipmap_static"],
+        "manga_mipmap_static",
+    ),
+    (
+        IniSection::Performance,
+        &[
+            "manga_mipmap_video_thumbnails",
+            "manga_mipmap_video_thumbnail",
+            "mipmap_video_thumbnails",
+        ],
+        "manga_mipmap_video_thumbnails",
+    ),
+    (
+        IniSection::Performance,
+        &["show_fps", "show_fps_overlay", "fps_overlay"],
+        "show_fps",
+    ),
+    (
+        IniSection::Performance,
+        &[
+            "show_fps_update_interval_ms",
+            "fps_update_interval_ms",
+            "fps_overlay_update_interval_ms",
+        ],
+        "show_fps_update_interval_ms",
+    ),
+    (
+        IniSection::Performance,
+        &[
+            "use_hardware_acceleration",
+            "hardware_acceleration",
+            "gpu_acceleration",
+        ],
+        "use_hardware_acceleration",
+    ),
+];
+
+fn alias_target(section: IniSection, key: &str) -> Option<&'static str> {
+    INI_ALIASES
+        .iter()
+        .find(|(sec, keys, _)| *sec == section && keys.iter().any(|alias| *alias == key))
+        .map(|(_, _, target)| *target)
 }
 
 /// Parsed `state.ini`: runtime state plus the remembered active preset name.
@@ -1361,41 +1904,37 @@ impl Config {
     fn parse_ini(content: &str) -> Self {
         let mut config = Self::default_without_bindings();
 
-        let mut in_shortcuts_section = false;
-        let mut in_settings_section = false;
-        let mut in_video_section = false;
-        let mut in_quality_section = false;
-        let mut in_state_section = false;
-
+        let mut section = IniSection::Other;
         for line in content.lines() {
             let line = line.trim();
 
-            // Skip empty lines and comments
             if line.is_empty() || line.starts_with(';') || line.starts_with('#') {
                 continue;
             }
 
-            // Check for section headers
             if line.starts_with('[') && line.ends_with(']') {
-                let section = &line[1..line.len() - 1];
-                in_shortcuts_section = section.eq_ignore_ascii_case("shortcuts");
-                in_settings_section = section.eq_ignore_ascii_case("settings");
-                in_video_section = section.eq_ignore_ascii_case("video");
-                in_quality_section = section.eq_ignore_ascii_case("quality")
-                    || section.eq_ignore_ascii_case("performance")
-                    || section.eq_ignore_ascii_case("image_quality")
-                    || section.eq_ignore_ascii_case("filters");
-                in_state_section = section.eq_ignore_ascii_case("state")
-                    || section.eq_ignore_ascii_case("video_state");
+                section = IniSection::of(&line[1..line.len() - 1]);
                 continue;
             }
 
-            // Parse key=value pairs in shortcuts section
-            if in_shortcuts_section {
-                if let Some((key, value)) = line.split_once('=') {
-                    let key = key.trim();
-                    let value = value.trim();
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            let key = key.trim().to_lowercase();
+            let value = value.trim();
 
+            // Registry keys take the same parse/clamp/alias path as the preset files.
+            if let Some(target) = alias_target(section, &key) {
+                if let Some(id) = settings_registry::setting_index_for_key(target) {
+                    if let Ok(parsed) = settings_registry::parse_value(&SETTINGS[id], value) {
+                        let _ = settings_registry::set(&mut config, id, &parsed);
+                    }
+                }
+                continue;
+            }
+
+            match section {
+                IniSection::Shortcuts => {
                     if key.eq_ignore_ascii_case("select_file")
                         || key.eq_ignore_ascii_case("strip_item_open")
                         || key.eq_ignore_ascii_case("strip_item_open_binding")
@@ -1453,379 +1992,17 @@ impl Config {
                         continue;
                     }
 
-                    if let Some(action) = Action::from_str(key) {
+                    if let Some(action) = Action::from_str(&key) {
                         config.replace_action_bindings(action, &parse_binding_list(value));
                     }
                 }
-            }
-
-            // Parse key=value pairs in settings section
-            if in_settings_section {
-                if let Some((key, value)) = line.split_once('=') {
-                    let key = key.trim().to_lowercase();
-                    let value = value.trim();
-
+                IniSection::Settings | IniSection::Video | IniSection::Performance => {
                     match key.as_str() {
-                        "controls_hide_delay" => {
-                            if let Ok(v) = value.parse::<f32>() {
-                                config.controls_hide_delay = v.max(0.1);
-                            }
-                        }
-                        "bottom_overlay_hide_delay"
-                        | "bottom_controls_hide_delay"
-                        | "bottom_hud_hide_delay" => {
-                            if let Ok(v) = value.parse::<f32>() {
-                                config.bottom_overlay_hide_delay = v.max(0.1);
-                            }
-                        }
-                        "cursor_idle_hide_delay"
-                        | "idle_cursor_hide_delay"
-                        | "mouse_idle_hide_delay" => {
-                            if let Ok(v) = value.parse::<f32>() {
-                                if v.is_finite() {
-                                    config.cursor_idle_hide_delay = v.max(0.0);
-                                }
-                            }
-                        }
-                        "double_click_grace_period"
-                        | "double_click_delay"
-                        | "double_click_grace_seconds" => {
-                            if let Ok(v) = value.parse::<f64>() {
-                                config.double_click_grace_period = v.clamp(0.1, 1.2);
-                            }
-                        }
-                        "resize_border_size" => {
-                            if let Ok(v) = value.parse::<f32>() {
-                                config.resize_border_size = v.clamp(2.0, 20.0);
-                            }
-                        }
-                        "show_fps" | "show_fps_overlay" | "fps_overlay" => {
-                            if let Some(v) = parse_bool(value) {
-                                config.show_fps = v;
-                            }
-                        }
-                        "show_fps_update_interval_ms"
-                        | "fps_update_interval_ms"
-                        | "fps_overlay_update_interval_ms" => {
-                            if let Ok(v) = value.parse::<u64>() {
-                                config.show_fps_update_interval_ms = v.clamp(50, 10_000);
-                            }
-                        }
-                        "background_rgb" => {
-                            if let Some(rgb) = parse_rgb_triplet(value) {
-                                config.background_rgb = rgb;
-                            }
-                        }
-                        "background_r" => {
-                            if let Ok(v) = value.parse::<u8>() {
-                                config.background_rgb[0] = v;
-                            }
-                        }
-                        "background_g" => {
-                            if let Ok(v) = value.parse::<u8>() {
-                                config.background_rgb[1] = v;
-                            }
-                        }
-                        "background_b" => {
-                            if let Ok(v) = value.parse::<u8>() {
-                                config.background_rgb[2] = v;
-                            }
-                        }
-                        "marked_file_border_rgb" | "marked_item_border_rgb" | "mark_border_rgb" => {
-                            if let Some(rgb) = parse_rgb_triplet(value) {
-                                config.marked_file_border_rgb = rgb;
-                            }
-                        }
-                        "marked_file_border_r" => {
-                            if let Ok(v) = value.parse::<u8>() {
-                                config.marked_file_border_rgb[0] = v;
-                            }
-                        }
-                        "marked_file_border_g" => {
-                            if let Ok(v) = value.parse::<u8>() {
-                                config.marked_file_border_rgb[1] = v;
-                            }
-                        }
-                        "marked_file_border_b" => {
-                            if let Ok(v) = value.parse::<u8>() {
-                                config.marked_file_border_rgb[2] = v;
-                            }
-                        }
-                        "fullscreen_reset_fit_on_mode_switch" => {
-                            if let Some(v) = parse_bool(value) {
-                                config.fullscreen_reset_fit_on_mode_switch = v;
-                            }
-                        }
-                        "manga_long_strip_reset_fit_on_fullscreen_exit" => {
-                            if let Some(v) = parse_bool(value) {
-                                config.manga_long_strip_reset_fit_on_fullscreen_exit = v;
-                            }
-                        }
-                        "fullscreen_remember_view_state_in_ram" => {
-                            if let Some(v) = parse_bool(value) {
-                                config.fullscreen_remember_view_state_in_ram = v;
-                            }
-                        }
-                        "fullscreen_native_window_transition"
-                        | "fullscreen_native_transition"
-                        | "fullscreen_animated_window_transition"
-                        | "animate_fullscreen_with_maximize_restore" => {
-                            if let Some(v) = parse_bool(value) {
-                                config.fullscreen_native_window_transition = v;
-                            }
-                        }
-                        "maximize_to_borderless_fullscreen"
-                        | "maximize_to_fullscreen"
-                        | "titlebar_maximize_to_fullscreen" => {
-                            if let Some(v) = parse_bool(value) {
-                                config.maximize_to_borderless_fullscreen = v;
-                            }
-                        }
-                        "confirm_delete_to_recycle_bin"
-                        | "confirm_recycle_bin_delete"
-                        | "show_delete_confirmation"
-                        | "confirm_delete" => {
-                            if let Some(v) = parse_bool(value) {
-                                config.confirm_delete_to_recycle_bin = v;
-                            }
-                        }
-                        "auto_unmark_after_paste"
-                        | "unmark_after_paste"
-                        | "clear_marks_after_paste"
-                        | "clear_marked_files_after_paste" => {
-                            if let Some(v) = parse_bool(value) {
-                                config.auto_unmark_after_paste = v;
-                            }
-                        }
-                        "zoom_animation_speed" => {
-                            if let Ok(v) = value.parse::<f32>() {
-                                // 0 disables animation (snap), otherwise speed controls spring stiffness.
-                                config.zoom_animation_speed = v.clamp(0.0, 60.0);
-                            }
-                        }
-                        "precise_rotation_step_degrees"
-                        | "fullscreen_precise_rotation_step_degrees"
-                        | "precise_rotation_step"
-                        | "precise_rotation_speed" => {
-                            if let Ok(v) = value.parse::<f32>() {
-                                config.precise_rotation_step_degrees = v.clamp(0.1, 45.0);
-                            }
-                        }
-                        "zoom_step" => {
-                            if let Ok(v) = value.parse::<f32>() {
-                                // Zoom multiplier per scroll step (1.05 = 5%, 1.25 = 25%)
-                                config.zoom_step = v.clamp(1.01, 2.0);
-                            }
-                        }
-                        "ctrl_scroll_up_pan_speed_px_per_step"
-                        | "ctrl_scroll_up_pan_speed"
-                        | "ctrl_scroll_up_pan_px"
-                        | "ctrl_wheel_up_pan_speed" => {
-                            if let Ok(v) = value.parse::<f32>() {
-                                config.ctrl_scroll_up_pan_speed_px_per_step = v.clamp(0.1, 1000.0);
-                            }
-                        }
-                        "ctrl_scroll_down_pan_speed_px_per_step"
-                        | "ctrl_scroll_down_pan_speed"
-                        | "ctrl_scroll_down_pan_px"
-                        | "ctrl_wheel_down_pan_speed" => {
-                            if let Ok(v) = value.parse::<f32>() {
-                                config.ctrl_scroll_down_pan_speed_px_per_step =
-                                    v.clamp(0.1, 1000.0);
-                            }
-                        }
-                        "shift_scroll_up_pan_speed_px_per_step"
-                        | "shift_scroll_up_pan_speed"
-                        | "shift_scroll_up_pan_px"
-                        | "shift_wheel_up_pan_speed" => {
-                            if let Ok(v) = value.parse::<f32>() {
-                                config.shift_scroll_up_pan_speed_px_per_step = v.clamp(0.1, 1000.0);
-                            }
-                        }
-                        "shift_scroll_down_pan_speed_px_per_step"
-                        | "shift_scroll_down_pan_speed"
-                        | "shift_scroll_down_pan_px"
-                        | "shift_wheel_down_pan_speed" => {
-                            if let Ok(v) = value.parse::<f32>() {
-                                config.shift_scroll_down_pan_speed_px_per_step =
-                                    v.clamp(0.1, 1000.0);
-                            }
-                        }
-                        "max_zoom_percent" | "max_zoom_percentage" | "max_zoom" => {
-                            if let Ok(v) = value.parse::<f32>() {
-                                // Clamp defensively: allow very large values, but keep it finite.
-                                // 1000% = 10x is the default.
-                                config.max_zoom_percent = v.clamp(10.0, 100000.0);
-                            }
-                        }
-                        "manga_drag_pan_speed" | "manga_drag_pan_multiplier" => {
-                            if let Ok(v) = value.parse::<f32>() {
-                                config.manga_drag_pan_speed = v.clamp(0.1, 20.0);
-                            }
-                        }
-                        "manga_wheel_impulse_per_step"
-                        | "manga_wheel_velocity_per_step"
-                        | "manga_wheel_momentum_per_step" => {
-                            if let Ok(v) = value.parse::<f32>() {
-                                config.manga_wheel_impulse_per_step = v.clamp(50.0, 20000.0);
-                            }
-                        }
-                        "manga_wheel_decay_rate"
-                        | "manga_wheel_decay"
-                        | "manga_wheel_momentum_decay" => {
-                            if let Ok(v) = value.parse::<f32>() {
-                                config.manga_wheel_decay_rate = v.clamp(0.5, 40.0);
-                            }
-                        }
-                        "manga_wheel_max_velocity" | "manga_wheel_velocity_cap" => {
-                            if let Ok(v) = value.parse::<f32>() {
-                                config.manga_wheel_max_velocity = v.clamp(200.0, 30000.0);
-                            }
-                        }
-                        "manga_wheel_edge_spring_hz" | "manga_wheel_edge_spring_frequency" => {
-                            if let Ok(v) = value.parse::<f32>() {
-                                config.manga_wheel_edge_spring_hz = v.clamp(0.5, 20.0);
-                            }
-                        }
-                        "manga_inertial_friction"
-                        | "manga_scroll_friction"
-                        | "manga_inertia_friction" => {
-                            if let Ok(v) = value.parse::<f32>() {
-                                // Keep within a practical range to avoid "teleport" (too high)
-                                // or excessively sluggish motion (too low).
-                                config.manga_inertial_friction = v.clamp(0.01, 0.5);
-                            }
-                        }
-                        "manga_arrow_scroll_speed" | "manga_arrow_key_scroll_speed" => {
-                            if let Ok(v) = value.parse::<f32>() {
-                                config.manga_arrow_scroll_speed = v.clamp(1.0, 5000.0);
-                            }
-                        }
-                        "masonry_items_per_row" | "manga_masonry_items_per_row" => {
-                            if let Ok(v) = value.parse::<usize>() {
-                                config.masonry_items_per_row = v.clamp(2, 10);
-                            }
-                        }
-                        "manga_hover_autoplay_resume_delay_ms"
-                        | "masonry_hover_autoplay_resume_delay_ms"
-                        | "hover_autoplay_resume_delay_ms" => {
-                            // Retired key: the masonry hover resume is always immediate.
-                        }
-                        "manga_virtualization_backend"
-                        | "manga_viewport_backend"
-                        | "manga_spatial_backend"
-                        | "manga_virtualization_mode" => {
-                            if let Some(mode) = MangaVirtualizationBackend::from_str(value) {
-                                config.manga_virtualization_backend = mode;
-                            }
-                        }
-                        "manga_autoscroll_dead_zone_px"
-                        | "manga_autoscroll_deadzone_px"
-                        | "manga_autoscroll_dead_zone"
-                        | "manga_autoscroll_deadzone" => {
-                            if let Ok(v) = value.parse::<f32>() {
-                                config.manga_autoscroll_dead_zone_px = v.clamp(0.0, 400.0);
-                            }
-                        }
-                        "manga_autoscroll_base_speed_multiplier"
-                        | "manga_autoscroll_base_multiplier" => {
-                            if let Ok(v) = value.parse::<f32>() {
-                                config.manga_autoscroll_base_speed_multiplier = v.clamp(0.05, 20.0);
-                            }
-                        }
-                        "manga_autoscroll_min_speed_multiplier"
-                        | "manga_autoscroll_min_multiplier" => {
-                            if let Ok(v) = value.parse::<f32>() {
-                                config.manga_autoscroll_min_speed_multiplier = v.clamp(0.0, 20.0);
-                            }
-                        }
-                        "manga_autoscroll_max_speed_multiplier"
-                        | "manga_autoscroll_max_multiplier" => {
-                            if let Ok(v) = value.parse::<f32>() {
-                                config.manga_autoscroll_max_speed_multiplier = v.clamp(0.05, 100.0);
-                            }
-                        }
-                        "manga_autoscroll_curve_power" | "manga_autoscroll_speed_curve_power" => {
-                            if let Ok(v) = value.parse::<f32>() {
-                                config.manga_autoscroll_curve_power = v.clamp(0.5, 6.0);
-                            }
-                        }
-                        "manga_autoscroll_min_speed_px_per_sec"
-                        | "manga_autoscroll_min_speed"
-                        | "manga_autoscroll_min_px_per_sec" => {
-                            if let Ok(v) = value.parse::<f32>() {
-                                config.manga_autoscroll_min_speed_px_per_sec =
-                                    v.clamp(0.0, 20000.0);
-                            }
-                        }
-                        "manga_autoscroll_max_speed_px_per_sec"
-                        | "manga_autoscroll_max_speed"
-                        | "manga_autoscroll_max_px_per_sec" => {
-                            if let Ok(v) = value.parse::<f32>() {
-                                config.manga_autoscroll_max_speed_px_per_sec =
-                                    v.clamp(1.0, 50000.0);
-                            }
-                        }
-                        "manga_autoscroll_horizontal_speed_multiplier"
-                        | "manga_autoscroll_horizontal_multiplier"
-                        | "manga_autoscroll_x_speed_multiplier" => {
-                            if let Ok(v) = value.parse::<f32>() {
-                                config.manga_autoscroll_horizontal_speed_multiplier =
-                                    v.clamp(0.05, 10.0);
-                            }
-                        }
-                        "manga_autoscroll_vertical_speed_multiplier"
-                        | "manga_autoscroll_vertical_multiplier"
-                        | "manga_autoscroll_y_speed_multiplier" => {
-                            if let Ok(v) = value.parse::<f32>() {
-                                config.manga_autoscroll_vertical_speed_multiplier =
-                                    v.clamp(0.05, 10.0);
-                            }
-                        }
-                        "manga_autoscroll_circle_fill_alpha"
-                        | "manga_autoscroll_ball_fill_alpha"
-                        | "manga_autoscroll_fill_alpha" => {
-                            if let Some(v) = parse_u8_clamped(value) {
-                                config.manga_autoscroll_circle_fill_alpha = v;
-                            }
-                        }
-                        "manga_autoscroll_arrow_rgb"
-                        | "manga_autoscroll_arrow_color"
-                        | "manga_autoscroll_arrow_color_rgb" => {
-                            if let Some(rgb) = parse_rgb_triplet(value) {
-                                config.manga_autoscroll_arrow_rgb = rgb;
-                            }
-                        }
-                        "manga_autoscroll_arrow_alpha" | "manga_autoscroll_arrow_opacity" => {
-                            if let Some(v) = parse_u8_clamped(value) {
-                                config.manga_autoscroll_arrow_alpha = v;
-                            }
-                        }
-                        "strip_item_open_binding"
-                        | "strip_item_open_trigger"
-                        | "manga_item_open_binding"
-                        | "manga_item_open_trigger" => {
-                            if let Some(binding) = parse_input_binding(value) {
-                                if is_strip_item_open_binding(&binding) {
-                                    config.replace_action_bindings(
-                                        Action::MangaGotoFile,
-                                        &[binding.clone()],
-                                    );
-                                    config.replace_action_bindings(
-                                        Action::MasonryGotoFile,
-                                        &[binding],
-                                    );
-                                }
-                            }
-                        }
+                        // Enum keys keep their legacy `from_str` tolerance (`bilinear`, `auto`,
+                        // `default`, ...), which the registry's enum membership check rejects.
                         "startup_window_mode" | "startup_mode" | "window_mode" => {
                             if let Some(mode) = StartupWindowMode::from_str(value) {
                                 config.startup_window_mode = mode;
-                            }
-                        }
-                        "single_instance" | "single_window" | "reuse_window" => {
-                            if let Some(v) = parse_bool(value) {
-                                config.single_instance = v;
                             }
                         }
                         "window_title_show_full_path"
@@ -1836,127 +2013,18 @@ impl Config {
                                 config.window_title_show_full_path = mode;
                             }
                         }
-                        "vsync" | "v_sync" | "enable_vsync" => {
-                            if let Some(v) = parse_bool(value) {
-                                config.vsync = v;
-                            }
-                        }
-                        "metadata_cache_max_size_mb"
-                        | "metadata_cache_limit_mb"
-                        | "metadata_cache_max_mb"
-                        | "thumbnail_cache_max_size_mb"
-                        | "thumbnail_cache_limit_mb"
-                        | "folder_placeholder_thumbnail_cache_max_size_mb" => {
-                            if let Ok(v) = value.parse::<u64>() {
-                                config.metadata_cache_max_size_mb = v.min(1_048_576);
-                            }
-                        }
-                        "masonry_metadata_ram_cache_limit_mb"
-                        | "masonry_metadata_ram_limit_mb"
-                        | "masonry_metadata_preload_ram_limit_mb"
-                        | "masonry_metadata_ram_mb" => {
-                            if let Ok(v) = value.parse::<u64>() {
-                                config.masonry_metadata_ram_cache_limit_mb = v.clamp(1, 1_048_576);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-
-            // Parse key=value pairs in video section
-            if in_video_section {
-                if let Some((key, value)) = line.split_once('=') {
-                    let key = key.trim().to_lowercase();
-                    let value = value.trim();
-
-                    match key.as_str() {
-                        "muted_by_default" | "muted" => {
-                            if value.eq_ignore_ascii_case("remember") {
-                                config.video_muted_by_default = true;
-                                config.video_muted_remember = true;
-                            } else if let Some(v) = parse_bool(value) {
-                                config.video_muted_by_default = v;
-                                config.video_muted_remember = false;
-                            }
-                        }
-                        "default_volume" | "volume" => {
-                            if value.eq_ignore_ascii_case("remember") {
-                                config.video_default_volume = 0.0;
-                                config.video_volume_remember = true;
-                            } else if let Ok(v) = value.parse::<f64>() {
-                                config.video_default_volume = v.clamp(0.0, 1.0);
-                                config.video_volume_remember = false;
-                            }
-                        }
-                        "loop" => {
-                            if let Some(v) = parse_bool(value) {
-                                config.video_loop = v;
+                        "manga_virtualization_backend"
+                        | "manga_viewport_backend"
+                        | "manga_spatial_backend"
+                        | "manga_virtualization_mode" => {
+                            if let Some(mode) = MangaVirtualizationBackend::from_str(value) {
+                                config.manga_virtualization_backend = mode;
                             }
                         }
                         "seek_policy" | "seek_mode" | "seek_behavior" => {
                             if let Some(policy) = VideoSeekPolicy::from_str(value) {
                                 config.video_seek_policy = policy;
                             }
-                        }
-                        "prefer_hardware_decode"
-                        | "prefer_hw_decode"
-                        | "hardware_decode_preference" => {
-                            if let Some(v) = parse_bool(value) {
-                                config.video_prefer_hardware_decode = v;
-                            }
-                        }
-                        "disable_hardware_decode" | "force_software_decode" | "force_sw_decode" => {
-                            if let Some(v) = parse_bool(value) {
-                                config.video_disable_hardware_decode = v;
-                            }
-                        }
-                        "videos_only_navigation" => {
-                            if let Some(v) = parse_bool(value) {
-                                config.videos_only_navigation = v;
-                            }
-                        }
-                        "priority_previous_file_binding"
-                        | "priority_prev_file_binding"
-                        | "priority_pageup_binding" => {
-                            if let Some(binding) = parse_optional_binding(value) {
-                                config.video_priority_previous_file_binding = binding;
-                            }
-                        }
-                        "priority_next_file_binding"
-                        | "priority_nxt_file_binding"
-                        | "priority_pagedown_binding" => {
-                            if let Some(binding) = parse_optional_binding(value) {
-                                config.video_priority_next_file_binding = binding;
-                            }
-                        }
-                        "priority_play_pause_binding"
-                        | "priority_pause_binding"
-                        | "priority_video_pause_binding" => {
-                            if let Some(binding) = parse_optional_binding(value) {
-                                config.video_priority_play_pause_binding = binding;
-                            }
-                        }
-                        // Backwards-compat: legacy per-video hide delay now maps to the unified bottom overlay delay.
-                        "controls_hide_delay" | "video_controls_hide_delay" => {
-                            if let Ok(v) = value.parse::<f32>() {
-                                config.bottom_overlay_hide_delay = v.max(0.1);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-
-            // Parse key=value pairs in performance section
-            if in_quality_section {
-                if let Some((key, value)) = line.split_once('=') {
-                    let key = key.trim().to_lowercase();
-                    let value = value.trim();
-
-                    match key.as_str() {
-                        "upscale_filter" => {
-                            // Retired key: no loader path enlarges pixels (see downscale_filter).
                         }
                         "downscale_filter" => {
                             if let Some(f) = ImageFilter::from_str(value) {
@@ -1983,82 +2051,93 @@ impl Config {
                                 config.texture_filter_video = f;
                             }
                         }
-                        "manga_mipmap_static" | "mipmap_static" => {
-                            if let Some(v) = parse_bool(value) {
-                                config.manga_mipmap_static = v;
+                        // Retired keys, and the per-channel background/border colours that
+                        // `background_rgb`/`marked_file_border_rgb` own on the registry side.
+                        "upscale_filter"
+                        | "manga_hover_autoplay_resume_delay_ms"
+                        | "masonry_hover_autoplay_resume_delay_ms"
+                        | "hover_autoplay_resume_delay_ms" => {}
+                        "background_r" => {
+                            if let Ok(v) = value.parse::<u8>() {
+                                config.background_rgb[0] = v;
                             }
                         }
-                        "manga_mipmap_video_thumbnails"
-                        | "manga_mipmap_video_thumbnail"
-                        | "mipmap_video_thumbnails" => {
-                            if let Some(v) = parse_bool(value) {
-                                config.manga_mipmap_video_thumbnails = v;
+                        "background_g" => {
+                            if let Ok(v) = value.parse::<u8>() {
+                                config.background_rgb[1] = v;
                             }
                         }
-                        "manga_mipmap_min_side" | "manga_mipmap_min_size" => {
-                            if let Ok(v) = value.parse::<u32>() {
-                                config.manga_mipmap_min_side = v.clamp(1, 4096);
+                        "background_b" => {
+                            if let Ok(v) = value.parse::<u8>() {
+                                config.background_rgb[2] = v;
                             }
                         }
-                        "use_hardware_acceleration"
-                        | "hardware_acceleration"
-                        | "gpu_acceleration" => {
-                            if let Some(v) = parse_bool(value) {
-                                config.use_hardware_acceleration = v;
+                        "marked_file_border_r" => {
+                            if let Ok(v) = value.parse::<u8>() {
+                                config.marked_file_border_rgb[0] = v;
                             }
                         }
-                        "enable_cuda" | "cuda" | "cuda_acceleration" => {
-                            if let Some(v) = parse_bool(value) {
-                                config.enable_cuda = v;
+                        "marked_file_border_g" => {
+                            if let Ok(v) = value.parse::<u8>() {
+                                config.marked_file_border_rgb[1] = v;
                             }
                         }
-                        "enable_d3d12" | "d3d12" | "d3d12_acceleration" => {
-                            if let Some(v) = parse_bool(value) {
-                                config.enable_d3d12 = v;
+                        "marked_file_border_b" => {
+                            if let Ok(v) = value.parse::<u8>() {
+                                config.marked_file_border_rgb[2] = v;
                             }
                         }
-                        "show_fps" | "show_fps_overlay" | "fps_overlay" => {
-                            if let Some(v) = parse_bool(value) {
-                                config.show_fps = v;
+                        "strip_item_open_binding"
+                        | "strip_item_open_trigger"
+                        | "manga_item_open_binding"
+                        | "manga_item_open_trigger" => {
+                            if let Some(binding) = parse_input_binding(value) {
+                                if is_strip_item_open_binding(&binding) {
+                                    config.replace_action_bindings(
+                                        Action::MangaGotoFile,
+                                        &[binding.clone()],
+                                    );
+                                    config.replace_action_bindings(
+                                        Action::MasonryGotoFile,
+                                        &[binding],
+                                    );
+                                }
                             }
                         }
-                        "show_fps_update_interval_ms"
-                        | "fps_update_interval_ms"
-                        | "fps_overlay_update_interval_ms" => {
-                            if let Ok(v) = value.parse::<u64>() {
-                                config.show_fps_update_interval_ms = v.clamp(50, 10_000);
+                        "manga_autoscroll_circle_fill_alpha"
+                        | "manga_autoscroll_ball_fill_alpha"
+                        | "manga_autoscroll_fill_alpha" => {
+                            if let Some(v) = parse_u8_clamped(value) {
+                                config.manga_autoscroll_circle_fill_alpha = v;
                             }
                         }
-                        _ => {}
-                    }
-                }
-            }
-
-            // Parse key=value pairs in state section
-            if in_state_section {
-                if let Some((key, value)) = line.split_once('=') {
-                    let key = key.trim().to_lowercase();
-                    let value = value.trim();
-
-                    match key.as_str() {
-                        "muted_state" | "muted" => {
-                            if let Some(v) = parse_bool(value) {
-                                config.state_muted = v;
-                            }
-                        }
-                        "volume_state" | "volume" => {
-                            if let Ok(v) = value.parse::<f64>() {
-                                config.state_volume = v.clamp(0.0, 1.0);
-                            }
-                        }
-                        "show_breadcrumb_bar" | "breadcrumb_bar" | "breadcrumb" => {
-                            if let Some(v) = parse_bool(value) {
-                                config.state_show_breadcrumb_bar = v;
+                        "manga_autoscroll_arrow_alpha" | "manga_autoscroll_arrow_opacity" => {
+                            if let Some(v) = parse_u8_clamped(value) {
+                                config.manga_autoscroll_arrow_alpha = v;
                             }
                         }
                         _ => {}
                     }
                 }
+                IniSection::State => match key.as_str() {
+                    "muted_state" | "muted" => {
+                        if let Some(v) = parse_bool(value) {
+                            config.state_muted = v;
+                        }
+                    }
+                    "volume_state" | "volume" => {
+                        if let Ok(v) = value.parse::<f64>() {
+                            config.state_volume = v.clamp(0.0, 1.0);
+                        }
+                    }
+                    "show_breadcrumb_bar" | "breadcrumb_bar" | "breadcrumb" => {
+                        if let Some(v) = parse_bool(value) {
+                            config.state_show_breadcrumb_bar = v;
+                        }
+                    }
+                    _ => {}
+                },
+                IniSection::Other => {}
             }
         }
 
@@ -2330,6 +2409,157 @@ mod tests {
 
     /// The shipped legacy template and the hardcoded defaults must agree, so switching the app
     /// from `config.ini` to preset files cannot change behaviour for anyone.
+    /// Every legacy spelling in `INI_ALIASES` must parse to the same `Config` as its registry
+    /// key, so a hand-edited old file and a preset file can never disagree.
+    #[test]
+    fn legacy_alias_spellings_parse_like_their_registry_key() {
+        use super::{IniSection, INI_ALIASES};
+        use crate::settings_registry::{capture, get, set, SettingKind, SettingValue, SETTINGS};
+
+        fn section_name(section: IniSection) -> &'static str {
+            match section {
+                IniSection::Settings => "Settings",
+                IniSection::Video => "Video",
+                IniSection::Performance => "Performance",
+                IniSection::Shortcuts => "Shortcuts",
+                IniSection::State => "State",
+                IniSection::Other => "Other",
+            }
+        }
+
+        /// A value that is not the default, so an ignored alias cannot pass by luck.
+        fn probe_text(id: usize) -> String {
+            let setting = &SETTINGS[id];
+            let default = get(&Config::default(), id);
+            if let SettingKind::Bool = setting.kind {
+                return match default {
+                    SettingValue::Bool(true) => "false".to_string(),
+                    _ => "true".to_string(),
+                };
+            }
+            if let SettingKind::Enum { values } = setting.kind {
+                for value in values {
+                    let mut probe = Config::default();
+                    if set(&mut probe, id, &SettingValue::Text(value.to_string())).is_ok()
+                        && get(&probe, id) != default
+                    {
+                        return value.to_string();
+                    }
+                }
+            }
+            match setting.kind {
+                SettingKind::Int { .. } | SettingKind::Float { .. } => {
+                    let (min, max) = match setting.kind {
+                        SettingKind::Int { min, max } => (min as f64, max as f64),
+                        SettingKind::Float { min, max, .. } => (min, max),
+                        _ => unreachable!(),
+                    };
+                    let current = match default {
+                        SettingValue::Num(value) => value,
+                        _ => min,
+                    };
+                    if current == max {
+                        format!("{min}")
+                    } else {
+                        format!("{max}")
+                    }
+                }
+                _ => {
+                    for candidate in [
+                        "mouse_right",
+                        "ctrl+scroll_up",
+                        "12, 34, 56",
+                        "12",
+                        "ctrl",
+                        "none",
+                        "a",
+                    ] {
+                        let mut probe = Config::default();
+                        if set(&mut probe, id, &SettingValue::Text(candidate.to_string())).is_ok()
+                            && get(&probe, id) != default
+                        {
+                            return candidate.to_string();
+                        }
+                    }
+                    panic!("no probe value for {}", setting.key);
+                }
+            }
+        }
+
+        for (section, keys, target) in INI_ALIASES {
+            let id = crate::settings_registry::setting_index_for_key(target)
+                .unwrap_or_else(|| panic!("alias target `{target}` is not in SETTINGS"));
+            let probe = probe_text(id);
+            let section = section_name(section);
+            let canonical = Config::parse_ini(&format!("[{section}]\n{target} = {probe}\n"));
+            let reference = capture(&canonical);
+            assert_ne!(reference, capture(&Config::default()), "probe for {target}");
+            for spelling in keys {
+                let parsed = Config::parse_ini(&format!("[{section}]\n{spelling} = {probe}\n"));
+                assert_eq!(
+                    capture(&parsed),
+                    reference,
+                    "alias `{spelling}` -> `{target}`"
+                );
+            }
+        }
+    }
+
+    /// The alias table is an inverse map: every spelling resolves to one registry key, every
+    /// target exists, and no spelling is claimed twice inside a section.
+    #[test]
+    fn legacy_alias_table_is_a_total_inverse_map() {
+        use super::{IniSection, INI_ALIASES};
+        use crate::settings_registry::{setting_index_for_key, SETTINGS};
+
+        let mut seen: Vec<(IniSection, &str)> = Vec::new();
+        for (section, keys, target) in INI_ALIASES {
+            let id = setting_index_for_key(target)
+                .unwrap_or_else(|| panic!("`{target}` is not a registry key"));
+            assert!(
+                !SETTINGS[id].key.is_empty(),
+                "empty canonical key for `{target}`"
+            );
+            assert!(keys.contains(&target), "`{target}` must alias itself");
+            for spelling in keys {
+                assert!(!spelling.is_empty(), "empty alias for `{target}`");
+                assert_eq!(
+                    spelling,
+                    &spelling.to_lowercase(),
+                    "alias must be lowercase"
+                );
+                assert!(
+                    !seen.contains(&(section, *spelling)),
+                    "`{spelling}` is claimed twice in the same section"
+                );
+                seen.push((section, *spelling));
+            }
+        }
+        // Reverse direction: the canonical key of every routed entry wins over its aliases.
+        for (section, keys, target) in INI_ALIASES {
+            for spelling in keys {
+                assert!(
+                    SETTINGS.iter().any(|setting| *setting.key == *target),
+                    "`{spelling}` loses its target"
+                );
+            }
+            let _ = section;
+        }
+    }
+
+    /// `controls_hide_delay` means two different things by section: the controls delay under
+    /// `[Settings]`, the retired per-video name for the bottom overlay delay under `[Video]`.
+    /// Routing the alias table by spelling alone silently moved the Settings key.
+    #[test]
+    fn section_dependent_spellings_keep_their_own_field() {
+        let config = Config::parse_ini(
+            "[Settings]\ncontrols_hide_delay = 7.0\n\n[Video]\ncontrols_hide_delay = 2.0\n",
+        );
+
+        assert_eq!(config.controls_hide_delay, 7.0);
+        assert_eq!(config.bottom_overlay_hide_delay, 2.0);
+    }
+
     #[test]
     fn shipped_legacy_config_matches_code_defaults() {
         let shipped = Config::parse_ini(include_str!("../assets/config.ini"));

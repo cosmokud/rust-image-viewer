@@ -54,6 +54,26 @@ pub enum SettingKind {
     BindingList,
 }
 
+/// What the settings dialog draws for one row. The dialog matches this, never `SettingKind`,
+/// so a new kind is a registry change only.
+#[derive(Clone, Copy, Debug)]
+pub enum RowControl {
+    Slider { min: f64, max: f64, decimals: usize },
+    Toggle,
+    Choice(&'static [&'static str]),
+    RgbText,
+    KeyText,
+    ModifierText,
+    BindingText,
+    BindingListText,
+}
+
+/// App-side effects a registry write must trigger; the only place `main` inspects ids for them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AppConsequence {
+    MasonryItemsPerRow,
+}
+
 /// `Text` carries the raw INI string for `Rgb`/`Key`/`Modifier`/`Binding`/`BindingList`
 /// (and for the `remember` words of the tri-state video keys).
 #[derive(Clone, Debug, PartialEq)]
@@ -78,6 +98,32 @@ pub struct Setting {
 }
 
 impl Setting {
+    pub fn control(&self) -> RowControl {
+        match self.kind {
+            SettingKind::Bool => RowControl::Toggle,
+            SettingKind::Int { min, max } => RowControl::Slider {
+                min: min as f64,
+                max: max as f64,
+                decimals: 0,
+            },
+            SettingKind::Float { min, max, decimals } => RowControl::Slider { min, max, decimals },
+            SettingKind::Enum { values } => RowControl::Choice(values),
+            SettingKind::Rgb => RowControl::RgbText,
+            SettingKind::Key => RowControl::KeyText,
+            SettingKind::Modifier => RowControl::ModifierText,
+            SettingKind::Binding => RowControl::BindingText,
+            SettingKind::BindingList => RowControl::BindingListText,
+        }
+    }
+
+    /// Digits shown for numeric rows; `0` renders integer text.
+    pub fn decimals(&self) -> usize {
+        match self.kind {
+            SettingKind::Float { decimals, .. } => decimals,
+            _ => 0,
+        }
+    }
+
     /// Empty for live keys; the modal appends this to the row tooltip.
     pub fn status_hint(&self) -> &'static str {
         if self.unused {
@@ -1738,396 +1784,244 @@ pub const SETTINGS: &[Setting] = &[
     },
 ];
 
-fn value_of(config: &Config, key: &str) -> SettingValue {
-    match key {
-        "controls_hide_delay" => SettingValue::Num(config.controls_hide_delay as f64),
-        "bottom_overlay_hide_delay" => SettingValue::Num(config.bottom_overlay_hide_delay as f64),
-        "cursor_idle_hide_delay" => SettingValue::Num(config.cursor_idle_hide_delay as f64),
-        "double_click_grace_period" => SettingValue::Num(config.double_click_grace_period as f64),
-        "resize_border_size" => SettingValue::Num(config.resize_border_size as f64),
-        "background_rgb" => SettingValue::Text(rgb_text(config.background_rgb)),
-        "marked_file_border_rgb" => SettingValue::Text(rgb_text(config.marked_file_border_rgb)),
-        "zoom_animation_speed" => SettingValue::Num(config.zoom_animation_speed as f64),
-        "precise_rotation_step_degrees" => {
-            SettingValue::Num(config.precise_rotation_step_degrees as f64)
-        }
-        "zoom_step" => SettingValue::Num(config.zoom_step as f64),
-        "ctrl_scroll_up_pan_speed_px_per_step" => {
-            SettingValue::Num(config.ctrl_scroll_up_pan_speed_px_per_step as f64)
-        }
-        "ctrl_scroll_down_pan_speed_px_per_step" => {
-            SettingValue::Num(config.ctrl_scroll_down_pan_speed_px_per_step as f64)
-        }
-        "shift_scroll_up_pan_speed_px_per_step" => {
-            SettingValue::Num(config.shift_scroll_up_pan_speed_px_per_step as f64)
-        }
-        "shift_scroll_down_pan_speed_px_per_step" => {
-            SettingValue::Num(config.shift_scroll_down_pan_speed_px_per_step as f64)
-        }
-        "max_zoom_percent" => SettingValue::Num(config.max_zoom_percent as f64),
-        "manga_drag_pan_speed" => SettingValue::Num(config.manga_drag_pan_speed as f64),
-        "manga_wheel_impulse_per_step" => {
-            SettingValue::Num(config.manga_wheel_impulse_per_step as f64)
-        }
-        "manga_wheel_decay_rate" => SettingValue::Num(config.manga_wheel_decay_rate as f64),
-        "manga_wheel_max_velocity" => SettingValue::Num(config.manga_wheel_max_velocity as f64),
-        "manga_wheel_edge_spring_hz" => SettingValue::Num(config.manga_wheel_edge_spring_hz as f64),
-        "manga_inertial_friction" => SettingValue::Num(config.manga_inertial_friction as f64),
-        "manga_arrow_scroll_speed" => SettingValue::Num(config.manga_arrow_scroll_speed as f64),
-        "manga_autoscroll_dead_zone_px" => {
-            SettingValue::Num(config.manga_autoscroll_dead_zone_px as f64)
-        }
-        "manga_autoscroll_base_speed_multiplier" => {
-            SettingValue::Num(config.manga_autoscroll_base_speed_multiplier as f64)
-        }
-        "manga_autoscroll_min_speed_multiplier" => {
-            SettingValue::Num(config.manga_autoscroll_min_speed_multiplier as f64)
-        }
-        "manga_autoscroll_max_speed_multiplier" => {
-            SettingValue::Num(config.manga_autoscroll_max_speed_multiplier as f64)
-        }
-        "manga_autoscroll_curve_power" => {
-            SettingValue::Num(config.manga_autoscroll_curve_power as f64)
-        }
-        "manga_autoscroll_min_speed_px_per_sec" => {
-            SettingValue::Num(config.manga_autoscroll_min_speed_px_per_sec as f64)
-        }
-        "manga_autoscroll_max_speed_px_per_sec" => {
-            SettingValue::Num(config.manga_autoscroll_max_speed_px_per_sec as f64)
-        }
-        "manga_autoscroll_horizontal_speed_multiplier" => {
-            SettingValue::Num(config.manga_autoscroll_horizontal_speed_multiplier as f64)
-        }
-        "manga_autoscroll_vertical_speed_multiplier" => {
-            SettingValue::Num(config.manga_autoscroll_vertical_speed_multiplier as f64)
-        }
-        "manga_autoscroll_circle_fill_alpha" => {
-            SettingValue::Num(config.manga_autoscroll_circle_fill_alpha as f64)
-        }
-        "manga_autoscroll_arrow_rgb" => {
-            SettingValue::Text(rgb_text(config.manga_autoscroll_arrow_rgb))
-        }
-        "manga_autoscroll_arrow_alpha" => {
-            SettingValue::Num(config.manga_autoscroll_arrow_alpha as f64)
-        }
-        "startup_window_mode" => {
-            SettingValue::Text(config.startup_window_mode.as_str().to_string())
-        }
-        "single_instance" => SettingValue::Bool(config.single_instance),
-        "window_title_show_full_path" => {
-            SettingValue::Text(config.window_title_show_full_path.as_str().to_string())
-        }
-        "vsync" => SettingValue::Bool(config.vsync),
-        "fullscreen_reset_fit_on_mode_switch" => {
-            SettingValue::Bool(config.fullscreen_reset_fit_on_mode_switch)
-        }
-        "manga_long_strip_reset_fit_on_fullscreen_exit" => {
-            SettingValue::Bool(config.manga_long_strip_reset_fit_on_fullscreen_exit)
-        }
-        "fullscreen_remember_view_state_in_ram" => {
-            SettingValue::Bool(config.fullscreen_remember_view_state_in_ram)
-        }
-        "fullscreen_native_window_transition" => {
-            SettingValue::Bool(config.fullscreen_native_window_transition)
-        }
-        "maximize_to_borderless_fullscreen" => {
-            SettingValue::Bool(config.maximize_to_borderless_fullscreen)
-        }
-        "metadata_cache_max_size_mb" => SettingValue::Num(config.metadata_cache_max_size_mb as f64),
-        "masonry_metadata_ram_cache_limit_mb" => {
-            SettingValue::Num(config.masonry_metadata_ram_cache_limit_mb as f64)
-        }
-        "confirm_delete_to_recycle_bin" => SettingValue::Bool(config.confirm_delete_to_recycle_bin),
-        "auto_unmark_after_paste" => SettingValue::Bool(config.auto_unmark_after_paste),
-        "masonry_items_per_row" => SettingValue::Num(config.masonry_items_per_row as f64),
-        "manga_virtualization_backend" => {
-            SettingValue::Text(config.manga_virtualization_backend.as_str().to_string())
-        }
-        "muted_by_default" => SettingValue::Text(if config.video_muted_remember {
+fn value_of(config: &Config, id: usize) -> SettingValue {
+    match id {
+        0 => SettingValue::Num(config.controls_hide_delay as f64),
+        1 => SettingValue::Num(config.bottom_overlay_hide_delay as f64),
+        2 => SettingValue::Num(config.cursor_idle_hide_delay as f64),
+        3 => SettingValue::Num(config.double_click_grace_period as f64),
+        4 => SettingValue::Num(config.resize_border_size as f64),
+        5 => SettingValue::Text(rgb_text(config.background_rgb)),
+        6 => SettingValue::Text(rgb_text(config.marked_file_border_rgb)),
+        7 => SettingValue::Num(config.zoom_animation_speed as f64),
+        8 => SettingValue::Num(config.precise_rotation_step_degrees as f64),
+        9 => SettingValue::Num(config.zoom_step as f64),
+        10 => SettingValue::Num(config.ctrl_scroll_up_pan_speed_px_per_step as f64),
+        11 => SettingValue::Num(config.ctrl_scroll_down_pan_speed_px_per_step as f64),
+        12 => SettingValue::Num(config.shift_scroll_up_pan_speed_px_per_step as f64),
+        13 => SettingValue::Num(config.shift_scroll_down_pan_speed_px_per_step as f64),
+        14 => SettingValue::Num(config.max_zoom_percent as f64),
+        15 => SettingValue::Num(config.manga_drag_pan_speed as f64),
+        16 => SettingValue::Num(config.manga_wheel_impulse_per_step as f64),
+        17 => SettingValue::Num(config.manga_wheel_decay_rate as f64),
+        18 => SettingValue::Num(config.manga_wheel_max_velocity as f64),
+        19 => SettingValue::Num(config.manga_wheel_edge_spring_hz as f64),
+        20 => SettingValue::Num(config.manga_inertial_friction as f64),
+        21 => SettingValue::Num(config.manga_arrow_scroll_speed as f64),
+        22 => SettingValue::Num(config.manga_autoscroll_dead_zone_px as f64),
+        23 => SettingValue::Num(config.manga_autoscroll_base_speed_multiplier as f64),
+        24 => SettingValue::Num(config.manga_autoscroll_min_speed_multiplier as f64),
+        25 => SettingValue::Num(config.manga_autoscroll_max_speed_multiplier as f64),
+        26 => SettingValue::Num(config.manga_autoscroll_curve_power as f64),
+        27 => SettingValue::Num(config.manga_autoscroll_min_speed_px_per_sec as f64),
+        28 => SettingValue::Num(config.manga_autoscroll_max_speed_px_per_sec as f64),
+        29 => SettingValue::Num(config.manga_autoscroll_horizontal_speed_multiplier as f64),
+        30 => SettingValue::Num(config.manga_autoscroll_vertical_speed_multiplier as f64),
+        31 => SettingValue::Num(config.manga_autoscroll_circle_fill_alpha as f64),
+        32 => SettingValue::Text(rgb_text(config.manga_autoscroll_arrow_rgb)),
+        33 => SettingValue::Num(config.manga_autoscroll_arrow_alpha as f64),
+        34 => SettingValue::Text(config.startup_window_mode.as_str().to_string()),
+        35 => SettingValue::Bool(config.single_instance),
+        36 => SettingValue::Text(config.window_title_show_full_path.as_str().to_string()),
+        37 => SettingValue::Bool(config.vsync),
+        38 => SettingValue::Bool(config.fullscreen_reset_fit_on_mode_switch),
+        39 => SettingValue::Bool(config.manga_long_strip_reset_fit_on_fullscreen_exit),
+        40 => SettingValue::Bool(config.fullscreen_remember_view_state_in_ram),
+        41 => SettingValue::Bool(config.fullscreen_native_window_transition),
+        42 => SettingValue::Bool(config.maximize_to_borderless_fullscreen),
+        43 => SettingValue::Num(config.metadata_cache_max_size_mb as f64),
+        44 => SettingValue::Num(config.masonry_metadata_ram_cache_limit_mb as f64),
+        45 => SettingValue::Bool(config.confirm_delete_to_recycle_bin),
+        46 => SettingValue::Bool(config.auto_unmark_after_paste),
+        47 => SettingValue::Num(config.masonry_items_per_row as f64),
+        48 => SettingValue::Text(config.manga_virtualization_backend.as_str().to_string()),
+        49 => SettingValue::Text(if config.video_muted_remember {
             "remember".to_string()
         } else if config.video_muted_by_default {
             "true".to_string()
         } else {
             "false".to_string()
         }),
-        "default_volume" => {
+        50 => {
             if config.video_volume_remember {
                 SettingValue::Text("remember".to_string())
             } else {
                 SettingValue::Num(config.video_default_volume)
             }
         }
-        "loop" => SettingValue::Bool(config.video_loop),
-        "seek_policy" => SettingValue::Text(config.video_seek_policy.as_str().to_string()),
-        "prefer_hardware_decode" => SettingValue::Bool(config.video_prefer_hardware_decode),
-        "disable_hardware_decode" => SettingValue::Bool(config.video_disable_hardware_decode),
-        "videos_only_navigation" => SettingValue::Bool(config.videos_only_navigation),
-        "priority_previous_file_binding" => SettingValue::Text(optional_binding_to_string(
+        51 => SettingValue::Bool(config.video_loop),
+        52 => SettingValue::Text(config.video_seek_policy.as_str().to_string()),
+        53 => SettingValue::Bool(config.video_prefer_hardware_decode),
+        54 => SettingValue::Bool(config.video_disable_hardware_decode),
+        55 => SettingValue::Bool(config.videos_only_navigation),
+        56 => SettingValue::Text(optional_binding_to_string(
             config.video_priority_previous_file_binding.as_ref(),
         )),
-        "priority_next_file_binding" => SettingValue::Text(optional_binding_to_string(
+        57 => SettingValue::Text(optional_binding_to_string(
             config.video_priority_next_file_binding.as_ref(),
         )),
-        "priority_play_pause_binding" => SettingValue::Text(optional_binding_to_string(
+        58 => SettingValue::Text(optional_binding_to_string(
             config.video_priority_play_pause_binding.as_ref(),
         )),
-        "show_fps" => SettingValue::Bool(config.show_fps),
-        "show_fps_update_interval_ms" => {
-            SettingValue::Num(config.show_fps_update_interval_ms as f64)
-        }
-        "use_hardware_acceleration" => SettingValue::Bool(config.use_hardware_acceleration),
-        "enable_d3d12" => SettingValue::Bool(config.enable_d3d12),
-        "enable_cuda" => SettingValue::Bool(config.enable_cuda),
-        "downscale_filter" => SettingValue::Text(config.downscale_filter.as_str().to_string()),
-        "gif_resize_filter" => SettingValue::Text(config.gif_resize_filter.as_str().to_string()),
-        "texture_filter_static" => {
-            SettingValue::Text(config.texture_filter_static.as_str().to_string())
-        }
-        "texture_filter_animated" => {
-            SettingValue::Text(config.texture_filter_animated.as_str().to_string())
-        }
-        "texture_filter_video" => {
-            SettingValue::Text(config.texture_filter_video.as_str().to_string())
-        }
-        "manga_mipmap_static" => SettingValue::Bool(config.manga_mipmap_static),
-        "manga_mipmap_video_thumbnails" => SettingValue::Bool(config.manga_mipmap_video_thumbnails),
-        "manga_mipmap_min_side" => SettingValue::Num(config.manga_mipmap_min_side as f64),
-        "toggle_fullscreen" => {
-            SettingValue::Text(config.action_bindings_csv(Action::ToggleFullscreen))
-        }
-        "exit" => SettingValue::Text(config.action_bindings_csv(Action::Exit)),
-        "pan" => SettingValue::Text(config.action_bindings_csv(Action::Pan)),
-        "select_area" => SettingValue::Text(config.action_bindings_csv(Action::SelectArea)),
-        "goto_file" => SettingValue::Text(config.action_bindings_csv(Action::GotoFile)),
-        "freehand_autoscroll" => {
-            SettingValue::Text(config.action_bindings_csv(Action::FreehandAutoscroll))
-        }
-        "mark_file" => SettingValue::Text(optional_mark_key_to_string(config.mark_file.as_ref())),
-        "toggle_mark_file" => SettingValue::Text(optional_shortcut_modifier_to_string(
+        59 => SettingValue::Bool(config.show_fps),
+        60 => SettingValue::Num(config.show_fps_update_interval_ms as f64),
+        61 => SettingValue::Bool(config.use_hardware_acceleration),
+        62 => SettingValue::Bool(config.enable_d3d12),
+        63 => SettingValue::Bool(config.enable_cuda),
+        64 => SettingValue::Text(config.downscale_filter.as_str().to_string()),
+        65 => SettingValue::Text(config.gif_resize_filter.as_str().to_string()),
+        66 => SettingValue::Text(config.texture_filter_static.as_str().to_string()),
+        67 => SettingValue::Text(config.texture_filter_animated.as_str().to_string()),
+        68 => SettingValue::Text(config.texture_filter_video.as_str().to_string()),
+        69 => SettingValue::Bool(config.manga_mipmap_static),
+        70 => SettingValue::Bool(config.manga_mipmap_video_thumbnails),
+        71 => SettingValue::Num(config.manga_mipmap_min_side as f64),
+        72 => SettingValue::Text(config.action_bindings_csv(Action::ToggleFullscreen)),
+        73 => SettingValue::Text(config.action_bindings_csv(Action::Exit)),
+        74 => SettingValue::Text(config.action_bindings_csv(Action::Pan)),
+        75 => SettingValue::Text(config.action_bindings_csv(Action::SelectArea)),
+        76 => SettingValue::Text(config.action_bindings_csv(Action::GotoFile)),
+        77 => SettingValue::Text(config.action_bindings_csv(Action::FreehandAutoscroll)),
+        78 => SettingValue::Text(optional_mark_key_to_string(config.mark_file.as_ref())),
+        79 => SettingValue::Text(optional_shortcut_modifier_to_string(
             config.toggle_mark_file.as_ref(),
         )),
-        "next_image" => SettingValue::Text(config.action_bindings_csv(Action::NextImage)),
-        "previous_image" => SettingValue::Text(config.action_bindings_csv(Action::PreviousImage)),
-        "rotate_clockwise" => {
-            SettingValue::Text(config.action_bindings_csv(Action::RotateClockwise))
-        }
-        "rotate_counterclockwise" => {
-            SettingValue::Text(config.action_bindings_csv(Action::RotateCounterClockwise))
-        }
-        "precise_rotation_clockwise" => {
-            SettingValue::Text(config.action_bindings_csv(Action::PreciseRotationClockwise))
-        }
-        "precise_rotation_counterclockwise" => {
+        80 => SettingValue::Text(config.action_bindings_csv(Action::NextImage)),
+        81 => SettingValue::Text(config.action_bindings_csv(Action::PreviousImage)),
+        82 => SettingValue::Text(config.action_bindings_csv(Action::RotateClockwise)),
+        83 => SettingValue::Text(config.action_bindings_csv(Action::RotateCounterClockwise)),
+        84 => SettingValue::Text(config.action_bindings_csv(Action::PreciseRotationClockwise)),
+        85 => {
             SettingValue::Text(config.action_bindings_csv(Action::PreciseRotationCounterClockwise))
         }
-        "flip_vertically" => SettingValue::Text(config.action_bindings_csv(Action::FlipVertically)),
-        "flip_horizontally" => {
-            SettingValue::Text(config.action_bindings_csv(Action::FlipHorizontally))
-        }
-        "zoom_in" => SettingValue::Text(config.action_bindings_csv(Action::ZoomIn)),
-        "zoom_out" => SettingValue::Text(config.action_bindings_csv(Action::ZoomOut)),
-        "manga_pan" => SettingValue::Text(config.action_bindings_csv(Action::MangaPan)),
-        "manga_goto_file" => SettingValue::Text(config.action_bindings_csv(Action::MangaGotoFile)),
-        "manga_freehand_autoscroll" => {
-            SettingValue::Text(config.action_bindings_csv(Action::MangaFreehandAutoscroll))
-        }
-        "manga_mark_file" => {
-            SettingValue::Text(optional_mark_key_to_string(config.manga_mark_file.as_ref()))
-        }
-        "manga_toggle_mark_file" => SettingValue::Text(optional_shortcut_modifier_to_string(
+        86 => SettingValue::Text(config.action_bindings_csv(Action::FlipVertically)),
+        87 => SettingValue::Text(config.action_bindings_csv(Action::FlipHorizontally)),
+        88 => SettingValue::Text(config.action_bindings_csv(Action::ZoomIn)),
+        89 => SettingValue::Text(config.action_bindings_csv(Action::ZoomOut)),
+        90 => SettingValue::Text(config.action_bindings_csv(Action::MangaPan)),
+        91 => SettingValue::Text(config.action_bindings_csv(Action::MangaGotoFile)),
+        92 => SettingValue::Text(config.action_bindings_csv(Action::MangaFreehandAutoscroll)),
+        93 => SettingValue::Text(optional_mark_key_to_string(config.manga_mark_file.as_ref())),
+        94 => SettingValue::Text(optional_shortcut_modifier_to_string(
             config.manga_toggle_mark_file.as_ref(),
         )),
-        "manga_pan_up" => SettingValue::Text(config.action_bindings_csv(Action::MangaPanUp)),
-        "manga_pan_down" => SettingValue::Text(config.action_bindings_csv(Action::MangaPanDown)),
-        "manga_next_image_fit" => {
-            SettingValue::Text(config.action_bindings_csv(Action::MangaNextImageFit))
-        }
-        "manga_previous_image_fit" => {
-            SettingValue::Text(config.action_bindings_csv(Action::MangaPreviousImageFit))
-        }
-        "manga_next_image" => {
-            SettingValue::Text(config.action_bindings_csv(Action::MangaNextImage))
-        }
-        "manga_previous_image" => {
-            SettingValue::Text(config.action_bindings_csv(Action::MangaPreviousImage))
-        }
-        "manga_scroll_up" => SettingValue::Text(config.action_bindings_csv(Action::MangaScrollUp)),
-        "manga_scroll_down" => {
-            SettingValue::Text(config.action_bindings_csv(Action::MangaScrollDown))
-        }
-        "manga_zoom_in" => SettingValue::Text(config.action_bindings_csv(Action::MangaZoomIn)),
-        "manga_zoom_out" => SettingValue::Text(config.action_bindings_csv(Action::MangaZoomOut)),
-        "masonry_pan" => SettingValue::Text(config.action_bindings_csv(Action::MasonryPan)),
-        "masonry_goto_file" => {
-            SettingValue::Text(config.action_bindings_csv(Action::MasonryGotoFile))
-        }
-        "masonry_freehand_autoscroll" => {
-            SettingValue::Text(config.action_bindings_csv(Action::MasonryFreehandAutoscroll))
-        }
-        "masonry_mark_file" => SettingValue::Text(optional_mark_key_to_string(
+        95 => SettingValue::Text(config.action_bindings_csv(Action::MangaPanUp)),
+        96 => SettingValue::Text(config.action_bindings_csv(Action::MangaPanDown)),
+        97 => SettingValue::Text(config.action_bindings_csv(Action::MangaNextImageFit)),
+        98 => SettingValue::Text(config.action_bindings_csv(Action::MangaPreviousImageFit)),
+        99 => SettingValue::Text(config.action_bindings_csv(Action::MangaNextImage)),
+        100 => SettingValue::Text(config.action_bindings_csv(Action::MangaPreviousImage)),
+        101 => SettingValue::Text(config.action_bindings_csv(Action::MangaScrollUp)),
+        102 => SettingValue::Text(config.action_bindings_csv(Action::MangaScrollDown)),
+        103 => SettingValue::Text(config.action_bindings_csv(Action::MangaZoomIn)),
+        104 => SettingValue::Text(config.action_bindings_csv(Action::MangaZoomOut)),
+        105 => SettingValue::Text(config.action_bindings_csv(Action::MasonryPan)),
+        106 => SettingValue::Text(config.action_bindings_csv(Action::MasonryGotoFile)),
+        107 => SettingValue::Text(config.action_bindings_csv(Action::MasonryFreehandAutoscroll)),
+        108 => SettingValue::Text(optional_mark_key_to_string(
             config.masonry_mark_file.as_ref(),
         )),
-        "masonry_toggle_mark_file" => SettingValue::Text(optional_shortcut_modifier_to_string(
+        109 => SettingValue::Text(optional_shortcut_modifier_to_string(
             config.masonry_toggle_mark_file.as_ref(),
         )),
-        "masonry_pan_up" => SettingValue::Text(config.action_bindings_csv(Action::MasonryPanUp)),
-        "masonry_pan_down" => {
-            SettingValue::Text(config.action_bindings_csv(Action::MasonryPanDown))
-        }
-        "masonry_pan_up_2" => SettingValue::Text(config.action_bindings_csv(Action::MasonryPanUp2)),
-        "masonry_pan_down_2" => {
-            SettingValue::Text(config.action_bindings_csv(Action::MasonryPanDown2))
-        }
-        "masonry_pan_up_3" => SettingValue::Text(config.action_bindings_csv(Action::MasonryPanUp3)),
-        "masonry_pan_down_3" => {
-            SettingValue::Text(config.action_bindings_csv(Action::MasonryPanDown3))
-        }
-        "masonry_scroll_up" => {
-            SettingValue::Text(config.action_bindings_csv(Action::MasonryScrollUp))
-        }
-        "masonry_scroll_down" => {
-            SettingValue::Text(config.action_bindings_csv(Action::MasonryScrollDown))
-        }
-        "masonry_zoom_in" => SettingValue::Text(config.action_bindings_csv(Action::MasonryZoomIn)),
-        "masonry_zoom_out" => {
-            SettingValue::Text(config.action_bindings_csv(Action::MasonryZoomOut))
-        }
-        "gallery_pan" => SettingValue::Text(config.action_bindings_csv(Action::MasonryPan)),
-        "gallery_goto_file" => {
-            SettingValue::Text(config.action_bindings_csv(Action::MasonryGotoFile))
-        }
-        "gallery_freehand_autoscroll" => {
-            SettingValue::Text(config.action_bindings_csv(Action::MasonryFreehandAutoscroll))
-        }
-        "gallery_mark_file" => SettingValue::Text(optional_mark_key_to_string(
+        110 => SettingValue::Text(config.action_bindings_csv(Action::MasonryPanUp)),
+        111 => SettingValue::Text(config.action_bindings_csv(Action::MasonryPanDown)),
+        112 => SettingValue::Text(config.action_bindings_csv(Action::MasonryPanUp2)),
+        113 => SettingValue::Text(config.action_bindings_csv(Action::MasonryPanDown2)),
+        114 => SettingValue::Text(config.action_bindings_csv(Action::MasonryPanUp3)),
+        115 => SettingValue::Text(config.action_bindings_csv(Action::MasonryPanDown3)),
+        116 => SettingValue::Text(config.action_bindings_csv(Action::MasonryScrollUp)),
+        117 => SettingValue::Text(config.action_bindings_csv(Action::MasonryScrollDown)),
+        118 => SettingValue::Text(config.action_bindings_csv(Action::MasonryZoomIn)),
+        119 => SettingValue::Text(config.action_bindings_csv(Action::MasonryZoomOut)),
+        120 => SettingValue::Text(config.action_bindings_csv(Action::MasonryPan)),
+        121 => SettingValue::Text(config.action_bindings_csv(Action::MasonryGotoFile)),
+        122 => SettingValue::Text(config.action_bindings_csv(Action::MasonryFreehandAutoscroll)),
+        123 => SettingValue::Text(optional_mark_key_to_string(
             config.masonry_mark_file.as_ref(),
         )),
-        "gallery_toggle_mark_file" => SettingValue::Text(optional_shortcut_modifier_to_string(
+        124 => SettingValue::Text(optional_shortcut_modifier_to_string(
             config.masonry_toggle_mark_file.as_ref(),
         )),
-        "gallery_pan_up" => SettingValue::Text(config.action_bindings_csv(Action::MasonryPanUp)),
-        "gallery_pan_down" => {
-            SettingValue::Text(config.action_bindings_csv(Action::MasonryPanDown))
-        }
-        "gallery_pan_up_2" => SettingValue::Text(config.action_bindings_csv(Action::MasonryPanUp2)),
-        "gallery_pan_down_2" => {
-            SettingValue::Text(config.action_bindings_csv(Action::MasonryPanDown2))
-        }
-        "gallery_pan_up_3" => SettingValue::Text(config.action_bindings_csv(Action::MasonryPanUp3)),
-        "gallery_pan_down_3" => {
-            SettingValue::Text(config.action_bindings_csv(Action::MasonryPanDown3))
-        }
-        "gallery_scroll_up" => {
-            SettingValue::Text(config.action_bindings_csv(Action::MasonryScrollUp))
-        }
-        "gallery_scroll_down" => {
-            SettingValue::Text(config.action_bindings_csv(Action::MasonryScrollDown))
-        }
-        "gallery_zoom_in" => SettingValue::Text(config.action_bindings_csv(Action::MasonryZoomIn)),
-        "gallery_zoom_out" => {
-            SettingValue::Text(config.action_bindings_csv(Action::MasonryZoomOut))
-        }
-        "video_play_pause" => {
-            SettingValue::Text(config.action_bindings_csv(Action::VideoPlayPause))
-        }
-        "video_mute" => SettingValue::Text(config.action_bindings_csv(Action::VideoMute)),
+        125 => SettingValue::Text(config.action_bindings_csv(Action::MasonryPanUp)),
+        126 => SettingValue::Text(config.action_bindings_csv(Action::MasonryPanDown)),
+        127 => SettingValue::Text(config.action_bindings_csv(Action::MasonryPanUp2)),
+        128 => SettingValue::Text(config.action_bindings_csv(Action::MasonryPanDown2)),
+        129 => SettingValue::Text(config.action_bindings_csv(Action::MasonryPanUp3)),
+        130 => SettingValue::Text(config.action_bindings_csv(Action::MasonryPanDown3)),
+        131 => SettingValue::Text(config.action_bindings_csv(Action::MasonryScrollUp)),
+        132 => SettingValue::Text(config.action_bindings_csv(Action::MasonryScrollDown)),
+        133 => SettingValue::Text(config.action_bindings_csv(Action::MasonryZoomIn)),
+        134 => SettingValue::Text(config.action_bindings_csv(Action::MasonryZoomOut)),
+        135 => SettingValue::Text(config.action_bindings_csv(Action::VideoPlayPause)),
+        136 => SettingValue::Text(config.action_bindings_csv(Action::VideoMute)),
         _ => SettingValue::Num(0.0),
     }
 }
 
-fn set_bool(config: &mut Config, key: &str, value: bool) {
-    match key {
-        "single_instance" => config.single_instance = value,
-        "vsync" => config.vsync = value,
-        "fullscreen_reset_fit_on_mode_switch" => config.fullscreen_reset_fit_on_mode_switch = value,
-        "manga_long_strip_reset_fit_on_fullscreen_exit" => {
-            config.manga_long_strip_reset_fit_on_fullscreen_exit = value
-        }
-        "fullscreen_remember_view_state_in_ram" => {
-            config.fullscreen_remember_view_state_in_ram = value
-        }
-        "fullscreen_native_window_transition" => config.fullscreen_native_window_transition = value,
-        "maximize_to_borderless_fullscreen" => config.maximize_to_borderless_fullscreen = value,
-        "confirm_delete_to_recycle_bin" => config.confirm_delete_to_recycle_bin = value,
-        "auto_unmark_after_paste" => config.auto_unmark_after_paste = value,
-        "loop" => config.video_loop = value,
-        "prefer_hardware_decode" => config.video_prefer_hardware_decode = value,
-        "disable_hardware_decode" => config.video_disable_hardware_decode = value,
-        "videos_only_navigation" => config.videos_only_navigation = value,
-        "show_fps" => config.show_fps = value,
-        "use_hardware_acceleration" => config.use_hardware_acceleration = value,
-        "enable_d3d12" => config.enable_d3d12 = value,
-        "enable_cuda" => config.enable_cuda = value,
-        "manga_mipmap_static" => config.manga_mipmap_static = value,
-        "manga_mipmap_video_thumbnails" => config.manga_mipmap_video_thumbnails = value,
+fn set_bool(config: &mut Config, id: usize, value: bool) {
+    match id {
+        35 => config.single_instance = value,
+        37 => config.vsync = value,
+        38 => config.fullscreen_reset_fit_on_mode_switch = value,
+        39 => config.manga_long_strip_reset_fit_on_fullscreen_exit = value,
+        40 => config.fullscreen_remember_view_state_in_ram = value,
+        41 => config.fullscreen_native_window_transition = value,
+        42 => config.maximize_to_borderless_fullscreen = value,
+        45 => config.confirm_delete_to_recycle_bin = value,
+        46 => config.auto_unmark_after_paste = value,
+        51 => config.video_loop = value,
+        53 => config.video_prefer_hardware_decode = value,
+        54 => config.video_disable_hardware_decode = value,
+        55 => config.videos_only_navigation = value,
+        59 => config.show_fps = value,
+        61 => config.use_hardware_acceleration = value,
+        62 => config.enable_d3d12 = value,
+        63 => config.enable_cuda = value,
+        69 => config.manga_mipmap_static = value,
+        70 => config.manga_mipmap_video_thumbnails = value,
         _ => {}
     }
 }
 
-fn set_num_field(config: &mut Config, key: &str, value: f64) {
-    match key {
-        "controls_hide_delay" => config.controls_hide_delay = value as f32,
-        "bottom_overlay_hide_delay" => config.bottom_overlay_hide_delay = value as f32,
-        "cursor_idle_hide_delay" => config.cursor_idle_hide_delay = value as f32,
-        "double_click_grace_period" => config.double_click_grace_period = value as f64,
-        "resize_border_size" => config.resize_border_size = value as f32,
-        "zoom_animation_speed" => config.zoom_animation_speed = value as f32,
-        "precise_rotation_step_degrees" => config.precise_rotation_step_degrees = value as f32,
-        "zoom_step" => config.zoom_step = value as f32,
-        "ctrl_scroll_up_pan_speed_px_per_step" => {
-            config.ctrl_scroll_up_pan_speed_px_per_step = value as f32
-        }
-        "ctrl_scroll_down_pan_speed_px_per_step" => {
-            config.ctrl_scroll_down_pan_speed_px_per_step = value as f32
-        }
-        "shift_scroll_up_pan_speed_px_per_step" => {
-            config.shift_scroll_up_pan_speed_px_per_step = value as f32
-        }
-        "shift_scroll_down_pan_speed_px_per_step" => {
-            config.shift_scroll_down_pan_speed_px_per_step = value as f32
-        }
-        "max_zoom_percent" => config.max_zoom_percent = value as f32,
-        "manga_drag_pan_speed" => config.manga_drag_pan_speed = value as f32,
-        "manga_wheel_impulse_per_step" => config.manga_wheel_impulse_per_step = value as f32,
-        "manga_wheel_decay_rate" => config.manga_wheel_decay_rate = value as f32,
-        "manga_wheel_max_velocity" => config.manga_wheel_max_velocity = value as f32,
-        "manga_wheel_edge_spring_hz" => config.manga_wheel_edge_spring_hz = value as f32,
-        "manga_inertial_friction" => config.manga_inertial_friction = value as f32,
-        "manga_arrow_scroll_speed" => config.manga_arrow_scroll_speed = value as f32,
-        "manga_autoscroll_dead_zone_px" => config.manga_autoscroll_dead_zone_px = value as f32,
-        "manga_autoscroll_base_speed_multiplier" => {
-            config.manga_autoscroll_base_speed_multiplier = value as f32
-        }
-        "manga_autoscroll_min_speed_multiplier" => {
-            config.manga_autoscroll_min_speed_multiplier = value as f32
-        }
-        "manga_autoscroll_max_speed_multiplier" => {
-            config.manga_autoscroll_max_speed_multiplier = value as f32
-        }
-        "manga_autoscroll_curve_power" => config.manga_autoscroll_curve_power = value as f32,
-        "manga_autoscroll_min_speed_px_per_sec" => {
-            config.manga_autoscroll_min_speed_px_per_sec = value as f32
-        }
-        "manga_autoscroll_max_speed_px_per_sec" => {
-            config.manga_autoscroll_max_speed_px_per_sec = value as f32
-        }
-        "manga_autoscroll_horizontal_speed_multiplier" => {
-            config.manga_autoscroll_horizontal_speed_multiplier = value as f32
-        }
-        "manga_autoscroll_vertical_speed_multiplier" => {
-            config.manga_autoscroll_vertical_speed_multiplier = value as f32
-        }
-        "manga_autoscroll_circle_fill_alpha" => {
-            config.manga_autoscroll_circle_fill_alpha = value as u8
-        }
-        "manga_autoscroll_arrow_alpha" => config.manga_autoscroll_arrow_alpha = value as u8,
-        "metadata_cache_max_size_mb" => config.metadata_cache_max_size_mb = value as u64,
-        "masonry_metadata_ram_cache_limit_mb" => {
-            config.masonry_metadata_ram_cache_limit_mb = value as u64
-        }
-        "masonry_items_per_row" => config.masonry_items_per_row = value as usize,
-        "show_fps_update_interval_ms" => config.show_fps_update_interval_ms = value as u64,
-        "manga_mipmap_min_side" => config.manga_mipmap_min_side = value as u32,
+fn set_num_field(config: &mut Config, id: usize, value: f64) {
+    match id {
+        0 => config.controls_hide_delay = value as f32,
+        1 => config.bottom_overlay_hide_delay = value as f32,
+        2 => config.cursor_idle_hide_delay = value as f32,
+        3 => config.double_click_grace_period = value as f64,
+        4 => config.resize_border_size = value as f32,
+        7 => config.zoom_animation_speed = value as f32,
+        8 => config.precise_rotation_step_degrees = value as f32,
+        9 => config.zoom_step = value as f32,
+        10 => config.ctrl_scroll_up_pan_speed_px_per_step = value as f32,
+        11 => config.ctrl_scroll_down_pan_speed_px_per_step = value as f32,
+        12 => config.shift_scroll_up_pan_speed_px_per_step = value as f32,
+        13 => config.shift_scroll_down_pan_speed_px_per_step = value as f32,
+        14 => config.max_zoom_percent = value as f32,
+        15 => config.manga_drag_pan_speed = value as f32,
+        16 => config.manga_wheel_impulse_per_step = value as f32,
+        17 => config.manga_wheel_decay_rate = value as f32,
+        18 => config.manga_wheel_max_velocity = value as f32,
+        19 => config.manga_wheel_edge_spring_hz = value as f32,
+        20 => config.manga_inertial_friction = value as f32,
+        21 => config.manga_arrow_scroll_speed = value as f32,
+        22 => config.manga_autoscroll_dead_zone_px = value as f32,
+        23 => config.manga_autoscroll_base_speed_multiplier = value as f32,
+        24 => config.manga_autoscroll_min_speed_multiplier = value as f32,
+        25 => config.manga_autoscroll_max_speed_multiplier = value as f32,
+        26 => config.manga_autoscroll_curve_power = value as f32,
+        27 => config.manga_autoscroll_min_speed_px_per_sec = value as f32,
+        28 => config.manga_autoscroll_max_speed_px_per_sec = value as f32,
+        29 => config.manga_autoscroll_horizontal_speed_multiplier = value as f32,
+        30 => config.manga_autoscroll_vertical_speed_multiplier = value as f32,
+        31 => config.manga_autoscroll_circle_fill_alpha = value as u8,
+        33 => config.manga_autoscroll_arrow_alpha = value as u8,
+        43 => config.metadata_cache_max_size_mb = value as u64,
+        44 => config.masonry_metadata_ram_cache_limit_mb = value as u64,
+        47 => config.masonry_items_per_row = value as usize,
+        60 => config.show_fps_update_interval_ms = value as u64,
+        71 => config.manga_mipmap_min_side = value as u32,
         _ => {}
     }
 }
@@ -2146,75 +2040,53 @@ fn set_text(config: &mut Config, setting: &Setting, text: &str) -> Result<(), St
         config.replace_action_bindings(action, &parse_binding_list(text));
         return Ok(());
     }
-    match setting.key {
-        "background_rgb" => config.background_rgb = parse_rgb(text)?,
-        "marked_file_border_rgb" => config.marked_file_border_rgb = parse_rgb(text)?,
-        "manga_autoscroll_arrow_rgb" => config.manga_autoscroll_arrow_rgb = parse_rgb(text)?,
-        "startup_window_mode" => {
-            config.startup_window_mode = parse_or_err(text, StartupWindowMode::from_str(text))?
-        }
-        "window_title_show_full_path" => {
+    match setting.id {
+        5 => config.background_rgb = parse_rgb(text)?,
+        6 => config.marked_file_border_rgb = parse_rgb(text)?,
+        32 => config.manga_autoscroll_arrow_rgb = parse_rgb(text)?,
+        34 => config.startup_window_mode = parse_or_err(text, StartupWindowMode::from_str(text))?,
+        36 => {
             config.window_title_show_full_path =
                 parse_or_err(text, WindowTitlePathMode::from_str(text))?
         }
-        "manga_virtualization_backend" => {
+        48 => {
             config.manga_virtualization_backend =
                 parse_or_err(text, MangaVirtualizationBackend::from_str(text))?
         }
-        "muted_by_default" => set_video_muted(config, text)?,
-        "default_volume" => set_video_volume(config, text)?,
-        "seek_policy" => {
-            config.video_seek_policy = parse_or_err(text, VideoSeekPolicy::from_str(text))?
-        }
-        "priority_previous_file_binding" => {
+        49 => set_video_muted(config, text)?,
+        50 => set_video_volume(config, text)?,
+        52 => config.video_seek_policy = parse_or_err(text, VideoSeekPolicy::from_str(text))?,
+        56 => {
             config.video_priority_previous_file_binding =
                 parse_or_err(text, parse_optional_binding(text))?
         }
-        "priority_next_file_binding" => {
+        57 => {
             config.video_priority_next_file_binding =
                 parse_or_err(text, parse_optional_binding(text))?
         }
-        "priority_play_pause_binding" => {
+        58 => {
             config.video_priority_play_pause_binding =
                 parse_or_err(text, parse_optional_binding(text))?
         }
-        "downscale_filter" => {
-            config.downscale_filter = parse_or_err(text, ImageFilter::from_str(text))?
-        }
-        "gif_resize_filter" => {
-            config.gif_resize_filter = parse_or_err(text, ImageFilter::from_str(text))?
-        }
-        "texture_filter_static" => {
-            config.texture_filter_static = parse_or_err(text, TextureFilter::from_str(text))?
-        }
-        "texture_filter_animated" => {
-            config.texture_filter_animated = parse_or_err(text, TextureFilter::from_str(text))?
-        }
-        "texture_filter_video" => {
-            config.texture_filter_video = parse_or_err(text, TextureFilter::from_str(text))?
-        }
-        "mark_file" => config.mark_file = parse_or_err(text, parse_optional_mark_key(text))?,
-        "toggle_mark_file" => {
-            config.toggle_mark_file = parse_or_err(text, parse_optional_shortcut_modifier(text))?
-        }
-        "manga_mark_file" => {
-            config.manga_mark_file = parse_or_err(text, parse_optional_mark_key(text))?
-        }
-        "manga_toggle_mark_file" => {
+        64 => config.downscale_filter = parse_or_err(text, ImageFilter::from_str(text))?,
+        65 => config.gif_resize_filter = parse_or_err(text, ImageFilter::from_str(text))?,
+        66 => config.texture_filter_static = parse_or_err(text, TextureFilter::from_str(text))?,
+        67 => config.texture_filter_animated = parse_or_err(text, TextureFilter::from_str(text))?,
+        68 => config.texture_filter_video = parse_or_err(text, TextureFilter::from_str(text))?,
+        78 => config.mark_file = parse_or_err(text, parse_optional_mark_key(text))?,
+        79 => config.toggle_mark_file = parse_or_err(text, parse_optional_shortcut_modifier(text))?,
+        93 => config.manga_mark_file = parse_or_err(text, parse_optional_mark_key(text))?,
+        94 => {
             config.manga_toggle_mark_file =
                 parse_or_err(text, parse_optional_shortcut_modifier(text))?
         }
-        "masonry_mark_file" => {
-            config.masonry_mark_file = parse_or_err(text, parse_optional_mark_key(text))?
-        }
-        "masonry_toggle_mark_file" => {
+        108 => config.masonry_mark_file = parse_or_err(text, parse_optional_mark_key(text))?,
+        109 => {
             config.masonry_toggle_mark_file =
                 parse_or_err(text, parse_optional_shortcut_modifier(text))?
         }
-        "gallery_mark_file" => {
-            config.masonry_mark_file = parse_or_err(text, parse_optional_mark_key(text))?
-        }
-        "gallery_toggle_mark_file" => {
+        123 => config.masonry_mark_file = parse_or_err(text, parse_optional_mark_key(text))?,
+        124 => {
             config.masonry_toggle_mark_file =
                 parse_or_err(text, parse_optional_shortcut_modifier(text))?
         }
@@ -2276,7 +2148,7 @@ pub fn setting_index_for_key(key: &str) -> Option<usize> {
 
 pub fn get(config: &Config, id: usize) -> SettingValue {
     match SETTINGS.get(id) {
-        Some(setting) => value_of(config, setting.key),
+        Some(_) => value_of(config, id),
         None => SettingValue::Num(0.0),
     }
 }
@@ -2342,9 +2214,34 @@ pub fn apply_values(config: &mut Config, values: &[(usize, SettingValue)]) -> Ve
     warnings
 }
 
-/// The one preset key with an app-side setter that also invalidates layout caches.
-pub fn needs_app_setter(key: &str) -> bool {
-    key.eq_ignore_ascii_case("masonry_items_per_row")
+/// Registry-declared side effect of writing `id`: `main` matches this once instead of
+/// knowing which keys have app-side setters.
+pub fn app_consequence(id: usize) -> Option<AppConsequence> {
+    match id {
+        47 => Some(AppConsequence::MasonryItemsPerRow),
+        _ => None,
+    }
+}
+
+/// Search over registry data: case-folded substring over key/label/group/help; an empty
+/// query matches nothing so the dialog keeps its normal tabs.
+pub fn settings_matches(query: &str, setting: &Setting) -> bool {
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() {
+        return false;
+    }
+    [setting.key, setting.label, setting.group, setting.help]
+        .iter()
+        .any(|haystack| haystack.to_lowercase().contains(&needle))
+}
+
+/// Matching ids in `SETTINGS` order.
+pub fn settings_search_results(query: &str) -> Vec<usize> {
+    SETTINGS
+        .iter()
+        .filter(|setting| settings_matches(query, setting))
+        .map(|setting| setting.id)
+        .collect()
 }
 
 /// `decimals == 0` renders integer text; otherwise trailing zeros/dot are trimmed so a
@@ -2365,13 +2262,6 @@ pub fn format_value(value: f64, decimals: usize) -> String {
     text
 }
 
-fn decimals_of(setting: &Setting) -> usize {
-    match setting.kind {
-        SettingKind::Float { decimals, .. } => decimals,
-        _ => 0,
-    }
-}
-
 fn value_text(setting: &Setting, value: &SettingValue) -> String {
     match value {
         SettingValue::Bool(value) => {
@@ -2381,7 +2271,7 @@ fn value_text(setting: &Setting, value: &SettingValue) -> String {
                 "false".to_string()
             }
         }
-        SettingValue::Num(value) => format_value(*value, decimals_of(setting)),
+        SettingValue::Num(value) => format_value(*value, setting.decimals()),
         SettingValue::Text(text) => text.clone(),
     }
 }
@@ -2416,17 +2306,17 @@ fn as_bool(value: &SettingValue) -> Result<bool, String> {
     }
 }
 
-fn as_text(value: &SettingValue) -> Result<String, String> {
+fn as_text(value: &SettingValue, decimals: usize) -> Result<String, String> {
     match value {
         SettingValue::Bool(value) => Ok(if *value { "true" } else { "false" }.to_string()),
-        SettingValue::Num(value) => Ok(format_value(*value, 2)),
+        SettingValue::Num(value) => Ok(format_value(*value, decimals)),
         SettingValue::Text(text) => Ok(text.clone()),
     }
 }
 
 fn set_value(config: &mut Config, setting: &Setting, value: &SettingValue) -> Result<(), String> {
     match setting.kind {
-        SettingKind::Bool => set_bool(config, setting.key, as_bool(value)?),
+        SettingKind::Bool => set_bool(config, setting.id, as_bool(value)?),
         SettingKind::Int { min, max } => {
             let value = as_num(value)?;
             if !value.is_finite() {
@@ -2434,7 +2324,7 @@ fn set_value(config: &mut Config, setting: &Setting, value: &SettingValue) -> Re
             }
             set_num_field(
                 config,
-                setting.key,
+                setting.id,
                 value.round().clamp(min as f64, max as f64),
             );
         }
@@ -2443,9 +2333,9 @@ fn set_value(config: &mut Config, setting: &Setting, value: &SettingValue) -> Re
             if !value.is_finite() {
                 return Err("value must be finite".to_string());
             }
-            set_num_field(config, setting.key, value.clamp(min, max));
+            set_num_field(config, setting.id, value.clamp(min, max));
         }
-        _ => set_text(config, setting, &as_text(value)?)?,
+        _ => set_text(config, setting, &as_text(value, setting.decimals())?)?,
     }
     Ok(())
 }
@@ -2525,6 +2415,20 @@ pub fn render_preset(name: &str, builtin: bool, values: &[(usize, SettingValue)]
     out
 }
 
+/// One raw INI token -> typed value. The error text is what `parse_preset` warns with.
+pub fn parse_value(setting: &Setting, raw: &str) -> Result<SettingValue, String> {
+    match setting.kind {
+        SettingKind::Bool => parse_bool(raw)
+            .map(SettingValue::Bool)
+            .ok_or_else(|| format!("`{}` needs true/false, got `{raw}`", setting.key)),
+        SettingKind::Int { .. } | SettingKind::Float { .. } => match raw.parse::<f64>() {
+            Ok(value) if value.is_finite() => Ok(SettingValue::Num(value)),
+            _ => Err(format!("`{}` needs a number, got `{raw}`", setting.key)),
+        },
+        _ => Ok(SettingValue::Text(raw.to_string())),
+    }
+}
+
 /// Accepts `key = value` lines anywhere, `;`/`#` comments and `[Section]` headers; unknown or
 /// unparsable keys come back as warnings so a partially broken preset still loads.
 pub fn parse_preset(content: &str) -> (Vec<(usize, SettingValue)>, Vec<String>) {
@@ -2551,22 +2455,12 @@ pub fn parse_preset(content: &str) -> (Vec<(usize, SettingValue)>, Vec<String>) 
             warnings.push(format!("duplicate key `{key}` ignored"));
             continue;
         }
-        let value = match SETTINGS[id].kind {
-            SettingKind::Bool => match parse_bool(raw) {
-                Some(value) => SettingValue::Bool(value),
-                None => {
-                    warnings.push(format!("`{key}` needs true/false, got `{raw}`"));
-                    continue;
-                }
-            },
-            SettingKind::Int { .. } | SettingKind::Float { .. } => match raw.parse::<f64>() {
-                Ok(value) if value.is_finite() => SettingValue::Num(value),
-                _ => {
-                    warnings.push(format!("`{key}` needs a number, got `{raw}`"));
-                    continue;
-                }
-            },
-            _ => SettingValue::Text(raw.to_string()),
+        let value = match parse_value(&SETTINGS[id], raw) {
+            Ok(value) => value,
+            Err(warning) => {
+                warnings.push(warning);
+                continue;
+            }
         };
         values.push((id, value));
     }
@@ -2903,8 +2797,8 @@ const BUILTIN_PRESETS: [(&str, &str); 1] =
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_values, capture, format_value, get, is_builtin, needs_app_setter, parse_preset,
-        render_preset, rewrite_preset, sanitize_preset_name, set, setting_index_for_key,
+        apply_values, capture, format_value, get, get_num, is_builtin, parse_preset, render_preset,
+        rewrite_preset, sanitize_preset_name, set, setting_index_for_key, RowControl, SettingKind,
         SettingValue, SettingsTab, SETTINGS,
     };
     use crate::config::Config;
@@ -3094,6 +2988,56 @@ mod tests {
 
         // Unknown ids are an error, not a panic.
         assert!(set(&mut config, 999, &SettingValue::Num(1.0)).is_err());
+
+        // Every bounded kind clamps both ends; the value read back is the clamped one.
+        for setting in SETTINGS {
+            let (min, max) = match setting.kind {
+                SettingKind::Int { min, max } => (min as f64, max as f64),
+                SettingKind::Float { min, max, .. } => (min, max),
+                _ => continue,
+            };
+            let mut config = Config::default();
+            set(&mut config, setting.id, &SettingValue::Num(min - 1.0)).unwrap();
+            let low = get_num(&config, setting.id);
+            assert!((low - min).abs() < 1e-6, "{} low clamp: {low}", setting.key);
+            set(&mut config, setting.id, &SettingValue::Num(max + 1.0)).unwrap();
+            let high = get_num(&config, setting.id);
+            assert!(
+                (high - max).abs() < 1e-6,
+                "{} high clamp: {high}",
+                setting.key
+            );
+            assert!(
+                set(&mut config, setting.id, &SettingValue::Num(f64::NAN)).is_err(),
+                "{} accepted NaN",
+                setting.key
+            );
+        }
+
+        // Enum membership, single-binding and rgb kinds reject garbage text. A binding *list*
+        // accepts anything: unparsable entries are dropped, so it ends at "unbound".
+        for setting in SETTINGS {
+            let garbage = match setting.kind {
+                SettingKind::Enum { .. }
+                | SettingKind::Key
+                | SettingKind::Modifier
+                | SettingKind::Binding
+                | SettingKind::Rgb => "not a value",
+                _ => continue,
+            };
+            let mut config = Config::default();
+            let before = get(&config, setting.id);
+            let err = match set(
+                &mut config,
+                setting.id,
+                &SettingValue::Text(garbage.to_string()),
+            ) {
+                Ok(()) => panic!("{} accepted `{garbage}`", setting.key),
+                Err(err) => err,
+            };
+            assert!(err.contains(setting.key), "{}: {err}", setting.key);
+            assert_eq!(get(&config, setting.id), before, "{} changed", setting.key);
+        }
     }
 
     #[test]
@@ -3128,10 +3072,131 @@ mod tests {
     }
 
     #[test]
-    fn only_masonry_items_per_row_needs_the_app_setter() {
-        assert!(needs_app_setter("masonry_items_per_row"));
-        assert!(!needs_app_setter("manga_items_per_row"));
-        assert!(!needs_app_setter("zoom_step"));
+    fn only_masonry_items_per_row_has_an_app_consequence() {
+        use super::{app_consequence, AppConsequence};
+
+        for setting in SETTINGS {
+            let expected = if setting.key == "masonry_items_per_row" {
+                Some(AppConsequence::MasonryItemsPerRow)
+            } else {
+                None
+            };
+            assert_eq!(app_consequence(setting.id), expected, "{}", setting.key);
+        }
+        assert_eq!(app_consequence(999), None);
+    }
+
+    #[test]
+    fn id_dispatch_is_total_and_roundtrips_every_setting() {
+        let defaults = Config::default();
+        let values = capture(&defaults);
+        assert_eq!(values.len(), SETTINGS.len());
+        for setting in SETTINGS {
+            let value = get(&defaults, setting.id);
+            let kind_matches = match (&setting.kind, &value) {
+                (SettingKind::Bool, SettingValue::Bool(_)) => true,
+                (SettingKind::Int { .. } | SettingKind::Float { .. }, SettingValue::Num(_)) => true,
+                (
+                    SettingKind::Enum { .. }
+                    | SettingKind::Rgb
+                    | SettingKind::Key
+                    | SettingKind::Modifier
+                    | SettingKind::Binding
+                    | SettingKind::BindingList,
+                    SettingValue::Text(_),
+                ) => true,
+                // default_volume reports its numeric side unless the remember flag is set.
+                (SettingKind::Enum { .. }, SettingValue::Num(_)) => setting.key == "default_volume",
+                _ => false,
+            };
+            assert!(kind_matches, "{} returned {value:?}", setting.key);
+
+            let mut config = Config::default();
+            set(&mut config, setting.id, &value).unwrap();
+            assert_eq!(get(&config, setting.id), value, "{}", setting.key);
+        }
+        assert_eq!(capture(&defaults), values);
+    }
+
+    #[test]
+    fn every_kind_has_exactly_one_control() {
+        // Kind -> control is a bijection: a kind maps to exactly one control and no arm is dead.
+        let mut kinds = Vec::new();
+        for setting in SETTINGS {
+            let control = setting.control();
+            match (&setting.kind, control) {
+                (SettingKind::Bool, RowControl::Toggle) => {}
+                (
+                    SettingKind::Int { .. } | SettingKind::Float { .. },
+                    RowControl::Slider { .. },
+                ) => {}
+                (SettingKind::Enum { values }, RowControl::Choice(shown)) => {
+                    assert_eq!(*shown, **values, "{}", setting.key)
+                }
+                (SettingKind::Rgb, RowControl::RgbText) => {}
+                (SettingKind::Key, RowControl::KeyText) => {}
+                (SettingKind::Modifier, RowControl::ModifierText) => {}
+                (SettingKind::Binding, RowControl::BindingText) => {}
+                (SettingKind::BindingList, RowControl::BindingListText) => {}
+                _ => panic!("{} maps to a mismatched control", setting.key),
+            }
+            let tag = std::mem::discriminant(&control);
+            if !kinds.contains(&tag) {
+                kinds.push(tag);
+            }
+        }
+        assert_eq!(
+            kinds.len(),
+            SETTINGS
+                .iter()
+                .map(|setting| std::mem::discriminant(&setting.control()))
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+        );
+
+        // Slider bounds come straight from `kind`, including integer kinds.
+        for setting in SETTINGS {
+            let (min, max, decimals) = match setting.kind {
+                SettingKind::Int { min, max } => (min as f64, max as f64, 0),
+                SettingKind::Float { min, max, decimals } => (min, max, decimals),
+                _ => continue,
+            };
+            match setting.control() {
+                RowControl::Slider {
+                    min: row_min,
+                    max: row_max,
+                    decimals: row_decimals,
+                } => {
+                    assert_eq!((row_min, row_max, row_decimals), (min, max, decimals))
+                }
+                _ => panic!("{} is not a slider", setting.key),
+            }
+            assert_eq!(setting.decimals(), decimals, "{}", setting.key);
+        }
+    }
+
+    #[test]
+    fn settings_search_covers_registry_data_only() {
+        use super::{settings_matches, settings_search_results};
+
+        for setting in SETTINGS {
+            assert!(settings_matches(setting.key, setting), "{}", setting.key);
+            assert!(settings_matches(&setting.label.to_uppercase(), setting));
+        }
+        assert!(!settings_matches("", &SETTINGS[0]));
+        assert!(!settings_matches("   ", &SETTINGS[0]));
+        assert!(!settings_matches("zzz-no-such-setting", &SETTINGS[0]));
+        let ids = settings_search_results("WHEEL");
+        assert!(ids.windows(2).all(|pair| pair[0] < pair[1]), "{ids:?}");
+        for id in &ids {
+            assert_eq!(SETTINGS[*id].id, *id);
+        }
+        assert!(settings_search_results("").is_empty());
+        assert!(settings_search_results("   ").is_empty());
+        assert_eq!(
+            settings_search_results("zoom_step"),
+            vec![setting_index_for_key("zoom_step").unwrap()]
+        );
     }
 
     #[test]

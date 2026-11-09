@@ -827,34 +827,8 @@ impl SettingsTabSlot {
     }
 }
 
-fn settings_matches(query: &str, key: &str, label: &str, group: &str, help: &str) -> bool {
-    let needle = query.trim().to_lowercase();
-    if needle.is_empty() {
-        return false;
-    }
-    [key, label, group, help]
-        .iter()
-        .any(|haystack| haystack.to_lowercase().contains(&needle))
-}
-
-/// Matching ids in `SETTINGS` order, which is also tab/group order.
 fn settings_search_results(query: &str) -> Vec<usize> {
-    if query.trim().is_empty() {
-        return Vec::new();
-    }
-    settings_registry::SETTINGS
-        .iter()
-        .filter(|setting| {
-            settings_matches(
-                query,
-                setting.key,
-                setting.label,
-                setting.group,
-                setting.help,
-            )
-        })
-        .map(|setting| setting.id)
-        .collect()
+    settings_registry::settings_search_results(query)
 }
 
 /// Smallest inner size the settings window takes on a small screen.
@@ -12299,11 +12273,12 @@ impl ImageViewer {
     }
 
     fn settings_text_value(config: &Config, id: usize) -> String {
+        let decimals = settings_registry::SETTINGS[id].decimals();
         match settings_registry::get(config, id) {
             settings_registry::SettingValue::Text(text) => text,
             settings_registry::SettingValue::Bool(value) => value.to_string(),
             settings_registry::SettingValue::Num(value) => {
-                settings_registry::format_value(value, 2)
+                settings_registry::format_value(value, decimals)
             }
         }
     }
@@ -12425,6 +12400,20 @@ impl ImageViewer {
         }
     }
 
+    /// The one place that turns a registry consequence into an app-side setter call.
+    fn apply_app_consequences(&mut self, ids: impl IntoIterator<Item = usize>) {
+        for consequence in ids
+            .into_iter()
+            .filter_map(settings_registry::app_consequence)
+        {
+            match consequence {
+                settings_registry::AppConsequence::MasonryItemsPerRow => {
+                    self.set_masonry_items_per_row(self.config.masonry_items_per_row)
+                }
+            }
+        }
+    }
+
     /// Writes the active preset now (pointer released / keyboard edit) or debounces a drag.
     fn finish_settings_edit(&mut self, write_now: bool) {
         if write_now {
@@ -12459,15 +12448,8 @@ impl ImageViewer {
                 };
                 let (values, mut warnings) = settings_registry::parse_preset(&content);
                 warnings.extend(settings_registry::apply_values(&mut self.config, &values));
-                // `masonry_items_per_row` also owns an app-side setter (layout cache invalidation).
-                let needs_setter = values.iter().any(|(id, _)| {
-                    settings_registry::SETTINGS
-                        .get(*id)
-                        .is_some_and(|setting| settings_registry::needs_app_setter(setting.key))
-                });
-                if needs_setter {
-                    self.set_masonry_items_per_row(self.config.masonry_items_per_row);
-                }
+                // A registry key may own an app-side setter (layout cache invalidation).
+                self.apply_app_consequences(values.iter().map(|(id, _)| *id));
                 self.refresh_settings_mirrors();
                 self.settings.selected = Some(name.clone());
                 self.load_selected_preset_values();
@@ -12558,7 +12540,7 @@ impl ImageViewer {
                     if self.config.active_preset.as_deref() == Some(name.as_str()) {
                         let defaults = settings_registry::capture(&Config::default());
                         let _ = settings_registry::apply_values(&mut self.config, &defaults);
-                        self.set_masonry_items_per_row(self.config.masonry_items_per_row);
+                        self.apply_app_consequences(defaults.iter().map(|(id, _)| *id));
                         self.refresh_settings_mirrors();
                     }
                     self.refresh_settings_presets();
@@ -12791,9 +12773,7 @@ impl ImageViewer {
             Ok(()) => {
                 // Registry clamps and keeps paired keys ordered, so remirror every number.
                 self.settings.values = Self::settings_values_from_config(&self.config);
-                if settings_registry::needs_app_setter(setting.key) {
-                    self.set_masonry_items_per_row(self.config.masonry_items_per_row);
-                }
+                self.apply_app_consequences(std::iter::once(id));
                 (true, write_now)
             }
             Err(err) => {
@@ -12840,22 +12820,15 @@ impl ImageViewer {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add_enabled_ui(!read_only, |ui| {
                     let controls = ui.available_width().max(80.0);
-                    match setting.kind {
-                        settings_registry::SettingKind::Int { min, max } => {
-                            let (row_changed, row_write_now) = self.draw_settings_number_control(
-                                ui, setting, min as f64, max as f64, 0, controls,
-                            );
-                            changed |= row_changed;
-                            write_now |= row_write_now;
-                        }
-                        settings_registry::SettingKind::Float { min, max, decimals } => {
+                    match setting.control() {
+                        settings_registry::RowControl::Slider { min, max, decimals } => {
                             let (row_changed, row_write_now) = self.draw_settings_number_control(
                                 ui, setting, min, max, decimals, controls,
                             );
                             changed |= row_changed;
                             write_now |= row_write_now;
                         }
-                        settings_registry::SettingKind::Bool => {
+                        settings_registry::RowControl::Toggle => {
                             let before = self.settings.values[id] != 0.0;
                             let mut on = before;
                             if Self::draw_settings_toggle(ui, &mut on).clicked() && on != before {
@@ -12874,7 +12847,7 @@ impl ImageViewer {
                                 }
                             }
                         }
-                        settings_registry::SettingKind::Enum { values } => {
+                        settings_registry::RowControl::Choice(values) => {
                             let current = Self::settings_text_value(&self.config, id);
                             let mut draft = current.clone();
                             egui::ComboBox::from_id_salt(("settings_enum", id))
@@ -12907,7 +12880,7 @@ impl ImageViewer {
                                 }
                             }
                         }
-                        settings_registry::SettingKind::Rgb => {
+                        settings_registry::RowControl::RgbText => {
                             let mut rgb = [0u8; 3];
                             for (slot, part) in
                                 rgb.iter_mut().zip(self.settings.texts[id].split(','))
@@ -12940,13 +12913,13 @@ impl ImageViewer {
                                 .color(UI_TEXT_DIM),
                             );
                         }
-                        settings_registry::SettingKind::Key
-                        | settings_registry::SettingKind::Modifier
-                        | settings_registry::SettingKind::Binding
-                        | settings_registry::SettingKind::BindingList => {
+                        settings_registry::RowControl::KeyText
+                        | settings_registry::RowControl::ModifierText
+                        | settings_registry::RowControl::BindingText
+                        | settings_registry::RowControl::BindingListText => {
                             let hint = if matches!(
-                                setting.kind,
-                                settings_registry::SettingKind::BindingList
+                                setting.control(),
+                                settings_registry::RowControl::BindingListText
                             ) {
                                 "empty = unbound"
                             } else {
@@ -32087,71 +32060,6 @@ mod tests {
                 .count(),
             1
         );
-    }
-
-    #[test]
-    fn settings_search_matches_key_label_group_and_help() {
-        use super::settings_matches;
-
-        assert!(settings_matches(
-            "zoom_step",
-            "zoom_step",
-            "Zoom step",
-            "Zoom",
-            ""
-        ));
-        assert!(settings_matches(
-            "zoom step",
-            "zoom_step",
-            "Zoom step",
-            "Zoom",
-            ""
-        ));
-        assert!(settings_matches("manga wheel", "x", "x", "Manga wheel", ""));
-        assert!(settings_matches(
-            "glide",
-            "x",
-            "x",
-            "g",
-            "Lower = longer glide"
-        ));
-        assert!(!settings_matches("glide", "x", "x", "g", "unrelated"));
-    }
-
-    #[test]
-    fn settings_search_is_case_insensitive_and_ignores_blank_queries() {
-        use super::{settings_matches, settings_search_results};
-
-        assert!(settings_matches(
-            "ZOOM",
-            "zoom_step",
-            "Zoom step",
-            "Zoom",
-            ""
-        ));
-        assert!(settings_matches(
-            "ZoOm",
-            "zoom_step",
-            "Zoom step",
-            "Zoom",
-            ""
-        ));
-        assert!(!settings_matches(
-            "",
-            "zoom_step",
-            "Zoom step",
-            "Zoom",
-            "help"
-        ));
-        assert!(!settings_matches(
-            "   ",
-            "zoom_step",
-            "Zoom step",
-            "Zoom",
-            "help"
-        ));
-        assert!(settings_search_results("").is_empty());
-        assert!(settings_search_results("   ").is_empty());
     }
 
     #[test]
