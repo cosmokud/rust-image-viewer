@@ -2,6 +2,11 @@
 
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+
+use winapi::shared::minwindef::{LPARAM, LRESULT, UINT, WPARAM};
+use winapi::shared::windef::{HWND, RECT};
+use winapi::um::winuser::WNDPROC;
 
 fn wide(s: &OsStr) -> Vec<u16> {
     s.encode_wide().chain(std::iter::once(0)).collect()
@@ -197,6 +202,212 @@ pub fn set_active_window_maximized(maximize: bool) -> bool {
         ShowWindow(hwnd, cmd);
     }
     true
+}
+
+/// A display's rectangles and effective scale, all in physical pixels.
+#[derive(Clone, Copy)]
+pub struct MonitorBox {
+    pub monitor: RECT,
+    pub work: RECT,
+    pub dpi_x: u32,
+}
+
+pub fn window_rect(hwnd: HWND) -> Option<RECT> {
+    use winapi::um::winuser::GetWindowRect;
+
+    if hwnd.is_null() {
+        return None;
+    }
+    unsafe {
+        let mut rect: RECT = std::mem::zeroed();
+        if GetWindowRect(hwnd, &mut rect) == 0 {
+            return None;
+        }
+        Some(rect)
+    }
+}
+
+pub fn set_window_rect(hwnd: HWND, x: i32, y: i32, w: i32, h: i32) -> bool {
+    use winapi::um::winuser::{SetWindowPos, SWP_NOACTIVATE, SWP_NOZORDER};
+
+    if hwnd.is_null() || w <= 0 || h <= 0 {
+        return false;
+    }
+    unsafe {
+        SetWindowPos(
+            hwnd,
+            std::ptr::null_mut(),
+            x,
+            y,
+            w,
+            h,
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        ) != 0
+    }
+}
+
+/// The display nearest the physical point `(x, y)`.
+///
+/// Asks the display, never the window: a window carries the scale its process was told about,
+/// and the display under the point is one question with one answer.
+pub fn monitor_info_at(x: i32, y: i32) -> Option<MonitorBox> {
+    use winapi::shared::windef::POINT;
+    use winapi::um::shellscalingapi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
+    use winapi::um::winuser::{
+        GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    };
+
+    unsafe {
+        let monitor = MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST);
+        if monitor.is_null() {
+            return None;
+        }
+
+        let mut info: MONITORINFO = std::mem::zeroed();
+        info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(monitor, &mut info) == 0 {
+            return None;
+        }
+
+        // A display that cannot report its dpi is a display drawn at the baseline.
+        let mut dpi_x: u32 = 0;
+        let mut dpi_y: u32 = 0;
+        let dpi_x = match GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) {
+            0 if dpi_x > 0 => dpi_x,
+            _ => 96,
+        };
+
+        Some(MonitorBox {
+            monitor: info.rcMonitor,
+            work: info.rcWork,
+            dpi_x,
+        })
+    }
+}
+
+pub fn is_window_maximized(hwnd: HWND) -> bool {
+    use winapi::um::winuser::IsZoomed;
+
+    if hwnd.is_null() {
+        return false;
+    }
+    unsafe { IsZoomed(hwnd) != 0 }
+}
+
+/// True while the app itself is putting the window into borderless fullscreen: the scale guard
+/// must then leave the OS's resize alone, because the app writes the full display rect itself.
+static FULLSCREEN_TARGET: AtomicBool = AtomicBool::new(false);
+
+pub fn set_fullscreen_guard(active: bool) {
+    FULLSCREEN_TARGET.store(active, Ordering::SeqCst);
+}
+
+static PREVIOUS_WNDPROC: AtomicIsize = AtomicIsize::new(0);
+
+/// Re-asserts the window's physical outer size across a display scale change.
+///
+/// Windows answers `WM_DPICHANGED` with a rectangle that keeps the window's *logical* size, so a
+/// window moved to a display of another scale comes out rescaled although nothing about its
+/// content changed. The pre-change outer size is snapshotted here, winit is still given the
+/// message (`CallWindowProcW`), and the physical size is written back over the OS's suggestion in
+/// the same message: winit's `ScaleFactorChanged` (which egui turns into `pixels_per_point`) and
+/// the window geometry then agree, and the image keeps its physical size instead of growing.
+///
+/// Only the size is restored; the position the OS chose is kept, then pulled inside the work area
+/// of the display that now holds the window centre, so a restore cannot leave it off screen.
+unsafe extern "system" fn scale_change_wndproc(
+    hwnd: HWND,
+    msg: UINT,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    use winapi::um::winuser::{CallWindowProcW, WM_DPICHANGED};
+
+    let previous = PREVIOUS_WNDPROC.load(Ordering::SeqCst);
+    if previous == 0 {
+        return def_proc(hwnd, msg, wparam, lparam);
+    }
+    let previous: WNDPROC = std::mem::transmute(previous);
+
+    if msg != WM_DPICHANGED {
+        return CallWindowProcW(previous, hwnd, msg, wparam, lparam);
+    }
+
+    // Snapshot before the OS resize: after `CallWindowProcW` the rect is the rescaled one.
+    let before = window_rect(hwnd);
+    let result = CallWindowProcW(previous, hwnd, msg, wparam, lparam);
+
+    if FULLSCREEN_TARGET.load(Ordering::SeqCst) || is_window_maximized(hwnd) {
+        return result;
+    }
+
+    let (Some(before), Some(after)) = (before, window_rect(hwnd)) else {
+        return result;
+    };
+
+    let (width, height) = (before.right - before.left, before.bottom - before.top);
+    if width <= 0 || height <= 0 {
+        return result;
+    }
+
+    let mut left = after.left;
+    let mut top = after.top;
+    if let Some(display) = monitor_info_at(
+        after.left + (after.right - after.left) / 2,
+        after.top + (after.bottom - after.top) / 2,
+    ) {
+        let work = display.work;
+        if top < work.top {
+            top = work.top;
+        }
+        if left + width > work.right {
+            left = work.right - width;
+        }
+    }
+
+    if after.right - after.left != width || after.bottom - after.top != height {
+        set_window_rect(hwnd, left, top, width, height);
+    } else if left != after.left || top != after.top {
+        set_window_rect(hwnd, left, top, width, height);
+    }
+
+    result
+}
+
+unsafe fn def_proc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    use winapi::um::winuser::DefWindowProcW;
+
+    DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
+/// Hooks the window procedure once, so a display scale change cannot resize the window.
+pub fn install_scale_change_guard(hwnd: HWND) {
+    use winapi::um::winuser::{GetWindowLongPtrW, SetWindowLongPtrW, GWLP_WNDPROC};
+
+    if hwnd.is_null() {
+        return;
+    }
+    unsafe {
+        let previous = GetWindowLongPtrW(hwnd, GWLP_WNDPROC);
+        if previous == 0 || previous == scale_change_wndproc as usize as isize {
+            return;
+        }
+        PREVIOUS_WNDPROC.store(previous, Ordering::SeqCst);
+        SetWindowLongPtrW(hwnd, GWLP_WNDPROC, scale_change_wndproc as usize as isize);
+    }
+}
+
+/// Unhooks the window procedure; a no-op when no guard was installed.
+pub fn remove_scale_change_guard(hwnd: HWND) {
+    use winapi::um::winuser::{SetWindowLongPtrW, GWLP_WNDPROC};
+
+    let previous = PREVIOUS_WNDPROC.swap(0, Ordering::SeqCst);
+    if hwnd.is_null() || previous == 0 {
+        return;
+    }
+    unsafe {
+        SetWindowLongPtrW(hwnd, GWLP_WNDPROC, previous);
+    }
 }
 
 /// Refreshes the process `PATH` from the registry (HKLM + HKCU), merging with the current

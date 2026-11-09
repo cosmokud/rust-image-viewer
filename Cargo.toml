@@ -74,7 +74,7 @@ directories = "6.0"
 
 # Windows-specific
 [target.'cfg(windows)'.dependencies]
-winapi = { version = "0.3", features = ["winuser", "wingdi", "dwmapi", "libloaderapi", "winreg", "processenv", "synchapi", "handleapi", "namedpipeapi", "fileapi", "winbase", "errhandlingapi", "winerror", "minwinbase"] }
+winapi = { version = "0.3", features = ["winuser", "wingdi", "dwmapi", "libloaderapi", "winreg", "processenv", "synchapi", "handleapi", "namedpipeapi", "fileapi", "winbase", "errhandlingapi", "winerror", "minwinbase", "shellscalingapi"] }
 clipboard-win = "5.4"
 windows = { version = "0.58", features = ["Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_Shell_PropertiesSystem", "Win32_System_Com", "Win32_Foundation", "Win32_Graphics_Gdi"] }
 

@@ -23,6 +23,7 @@ mod texture_upload;
 mod video_player;
 mod video_thumbnail;
 mod viewer_mode;
+mod window_geometry;
 #[cfg(target_os = "windows")]
 mod windows_env;
 
