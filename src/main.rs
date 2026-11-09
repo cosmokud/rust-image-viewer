@@ -2726,6 +2726,11 @@ struct ImageViewer {
     /// Whether the pointer is over selectable title-bar text (filename, resolution, zoom, etc.).
     /// Used to suppress drag/pan/double-click gestures while selecting/copying title text.
     mouse_over_title_text: bool,
+    /// Whether the pointer is over the chrome bar itself (not over title text or a window
+    /// button), in a mode where the bar drags the window. Filled by `draw_controls`, which runs
+    /// before the input pass, so a press on the empty bar starts a window drag like a native
+    /// title bar instead of doing nothing.
+    mouse_over_title_bar_drag_handle: bool,
     /// Whether the title-bar FAB menu button or popup is active.
     /// Used to keep the title bar visible and block click-through into the main view.
     title_bar_menu_active: bool,
@@ -3322,6 +3327,7 @@ impl Default for ImageViewer {
             mouse_over_video_controls: false,
             mouse_over_window_buttons: false,
             mouse_over_title_text: false,
+            mouse_over_title_bar_drag_handle: false,
             title_bar_menu_active: false,
             title_text_dragging: false,
             is_seeking: false,
@@ -3522,6 +3528,12 @@ impl ImageViewer {
     const TITLE_BAR_HEIGHT: f32 = 32.0;
     const BREADCRUMB_BAR_HEIGHT: f32 = 30.0;
     const TOP_CONTROLS_HOTZONE_EXTRA: f32 = 18.0;
+    /// Drawn window-button size in the title bar, and the gap the cluster keeps at its right edge.
+    /// `title_bar_buttons_pointer_zone` derives the drag-handle boundary from these, so the strip
+    /// where a press cannot move the window is exactly as wide as the buttons it protects.
+    const TITLE_BAR_BUTTON_SIZE: egui::Vec2 = egui::vec2(32.0, 32.0);
+    const TITLE_BAR_BUTTON_TRAILING_GAP: f32 = 2.0;
+    const TITLE_BAR_BUTTON_LEAD_PADDING: f32 = 5.0;
     const BOTTOM_RIGHT_OVERLAY_MARGIN: f32 = 16.0;
     const BOTTOM_RIGHT_OVERLAY_SCROLLBAR_PADDING: f32 = 35.0;
     const MANGA_HUD_PANEL_WIDTH: f32 = 224.0;
@@ -9667,14 +9679,26 @@ impl ImageViewer {
 
     /// Right-hand strip of the title bar that holds the window buttons.
     ///
-    /// Deliberately generous: wider than the button cluster, full bar height and out to the very
-    /// right edge, so no pixel of a button is left outside it. A press in here must never start a
-    /// window drag or resize - both move the window under the cursor and the button click is
+    /// The drawn cluster is four 32pt buttons and three gaps; this zone is exactly that area (same
+    /// button size and spacing the bar lays the cluster out with), full bar height and out to the
+    /// very right edge, so every pixel of a button is inside it. A press in here must never start
+    /// a window drag or resize - both move the window under the cursor and the button click is
     /// lost (the window-drag branch is the one that shows the four-arrow move cursor).
-    fn title_bar_buttons_pointer_zone(&self, screen_rect: egui::Rect) -> egui::Rect {
-        const ZONE_WIDTH: f32 = 200.0;
+    ///
+    /// It must not be wider than the cluster: the title bar left of it is the drag handle, and
+    /// widening the zone turns that empty bar back into a stretch where the press moves nothing.
+    fn title_bar_buttons_pointer_zone(
+        &self,
+        ctx: &egui::Context,
+        screen_rect: egui::Rect,
+    ) -> egui::Rect {
+        const BUTTON_COUNT: f32 = 4.0;
 
-        let width = ZONE_WIDTH.min(screen_rect.width());
+        let button_size_x = Self::TITLE_BAR_BUTTON_SIZE.x;
+        let gap = ctx.style().spacing.item_spacing.x;
+        let cluster_w = (button_size_x * BUTTON_COUNT) + (gap * (BUTTON_COUNT - 1.0));
+        let width =
+            (cluster_w + Self::TITLE_BAR_BUTTON_TRAILING_GAP + 1.0).min(screen_rect.width());
         egui::Rect::from_min_max(
             egui::pos2(screen_rect.max.x - width, screen_rect.min.y),
             egui::pos2(
@@ -9682,6 +9706,34 @@ impl ImageViewer {
                 screen_rect.min.y + Self::TITLE_BAR_HEIGHT,
             ),
         )
+    }
+
+    /// The chrome bar as the window's drag handle: the full-width strip the bar occupies, in the
+    /// mode where dragging the bar moves the window.
+    ///
+    /// Measured on the bar itself, not on a drawn widget: title text and window buttons only
+    /// sense clicks and drags on their own glyph rects, so a press on the empty stretch between
+    /// the file details and the buttons lands on no widget at all. That stretch used to fall
+    /// through to the main view, which pans the image unless it is zoomed past the window, so a
+    /// drag there moved nothing.
+    fn title_bar_drag_handle_rect(&self, screen_rect: egui::Rect) -> egui::Rect {
+        egui::Rect::from_min_size(
+            screen_rect.min,
+            egui::Vec2::new(screen_rect.width(), Self::TITLE_BAR_HEIGHT),
+        )
+    }
+
+    /// Whether a drag latched at press time moves the window rather than panning the image.
+    ///
+    /// Floating mode: the chrome bar always moves the window, and so does a drag anywhere else
+    /// while the media still fits the window (there is nothing to pan). Fullscreen never moves
+    /// the window.
+    fn drag_moves_window(
+        is_fullscreen: bool,
+        over_title_bar_drag_handle: bool,
+        media_exceeds_window: bool,
+    ) -> bool {
+        !is_fullscreen && (over_title_bar_drag_handle || !media_exceeds_window)
     }
 
     fn title_bar_ui_blocking(&self) -> bool {
@@ -26262,6 +26314,7 @@ impl ImageViewer {
         // Default to false each frame; updated below when the bar is visible.
         self.mouse_over_window_buttons = false;
         self.mouse_over_title_text = false;
+        self.mouse_over_title_bar_drag_handle = false;
         self.title_bar_menu_active = false;
 
         // Keep title-text drag-selection state sticky until the primary button is released.
@@ -26338,13 +26391,15 @@ impl ImageViewer {
                     // In floating mode, keep a small invisible gap on the top/right edges of the
                     // button cluster so top-edge drag and top-right resize remain reachable.
                     // In fullscreen, disable the gap so top-edge clicks still hit window buttons.
-                    let button_size = egui::Vec2::new(32.0, bar_height);
-                    let buttons_area_w =
-                        5.0 + (button_size.x * 4.0) + (ui.spacing().item_spacing.x * 3.0) + 6.0;
+                    let button_size = Self::TITLE_BAR_BUTTON_SIZE;
+                    let buttons_area_w = Self::TITLE_BAR_BUTTON_LEAD_PADDING
+                        + (button_size.x * 4.0)
+                        + (ui.spacing().item_spacing.x * 3.0)
+                        + 6.0;
                     let button_edge_gap = if self.mode().is_fullscreen() {
                         0.0
                     } else {
-                        2.0
+                        Self::TITLE_BAR_BUTTON_TRAILING_GAP
                     };
                     let buttons_rect = egui::Rect::from_min_max(
                         egui::pos2(
@@ -26355,13 +26410,22 @@ impl ImageViewer {
                     );
 
                     // If the pointer is over the window buttons region, suppress window dragging
-                    // and resize. The zone is a superset of the drawn cluster: full bar height and
-                    // out to the right edge, so no pixel of a button can start a drag.
+                    // and resize. The zone covers the whole button cluster, no wider.
                     if let Some(pos) = mouse_pos {
                         self.mouse_over_window_buttons = self
-                            .title_bar_buttons_pointer_zone(screen_rect)
+                            .title_bar_buttons_pointer_zone(ctx, screen_rect)
                             .contains(pos);
                     }
+                    // Grabbing strip: the whole chrome bar, both sides of the cluster, as long
+                    // as no window button is under the pointer. The bar is a drag handle in
+                    // floating mode, including the empty stretch between the file details and
+                    // the buttons. Title text keeps its own pixels: a press on it sets
+                    // `mouse_over_title_text`, which the drag branch refuses.
+                    self.mouse_over_title_bar_drag_handle = !self.mode().is_fullscreen()
+                        && mouse_pos.is_some_and(|pos| {
+                            self.title_bar_drag_handle_rect(screen_rect).contains(pos)
+                                && !self.mouse_over_window_buttons
+                        });
                     let left_rect = egui::Rect::from_min_max(
                         bar_rect.min,
                         egui::pos2(buttons_rect.min.x, bar_rect.max.y),
@@ -26575,7 +26639,7 @@ impl ImageViewer {
                                 kind: WindowButton,
                             ) -> egui::Response {
                                 // Match the control bar height so the hit area reaches the very top (y=0).
-                                let size = egui::Vec2::new(32.0, 32.0);
+                                let size = ImageViewer::TITLE_BAR_BUTTON_SIZE;
                                 let (rect, response) =
                                     ui.allocate_exact_size(size, egui::Sense::click());
 
@@ -26791,7 +26855,7 @@ impl ImageViewer {
 
                             // Add padding on the LEFT of the button cluster (not on the right),
                             // so the close button remains clickable at the very top-right pixel.
-                            ui.add_space(5.0);
+                            ui.add_space(Self::TITLE_BAR_BUTTON_LEAD_PADDING);
                         });
                     });
                 });
@@ -29481,7 +29545,7 @@ impl ImageViewer {
             // hidden (auto-hide means `over_title_bar` is false then, which used to turn a press
             // on a button into a window drag: the four-arrow move cursor, and a lost click).
             let over_title_bar_buttons = pointer_pos.map_or(false, |pos| {
-                self.title_bar_buttons_pointer_zone(screen_rect)
+                self.title_bar_buttons_pointer_zone(ctx, screen_rect)
                     .contains(pos)
             });
 
@@ -29643,13 +29707,17 @@ impl ImageViewer {
 
                     if !self.is_panning {
                         // Latch the drag mode at press time, while the cursor is still over the
-                        // window and the title-bar test is trustworthy.
-                        let in_title_bar = pointer_pos
-                            .is_some_and(|pos| pos.y < self.top_controls_hotzone_height());
+                        // window and the title-bar test is trustworthy. The chrome bar is a drag
+                        // handle wherever it holds no title text and no window button, the way a
+                        // native title bar is; `mouse_over_title_bar_drag_handle` counts exactly
+                        // that and stays true even while auto-hide has hidden the bar.
                         self.is_panning = true;
                         self.pan_drag_button = self.pan_button_for_action(Action::Pan);
-                        self.pan_drag_moves_window = !self.mode().is_fullscreen()
-                            && (in_title_bar || !floating_image_exceeds_window);
+                        self.pan_drag_moves_window = Self::drag_moves_window(
+                            self.mode().is_fullscreen(),
+                            self.mouse_over_title_bar_drag_handle,
+                            floating_image_exceeds_window,
+                        );
                         self.last_mouse_pos = pointer_pos;
                         self.reset_floating_window_drag_anchor();
                     }
@@ -30535,6 +30603,7 @@ impl eframe::App for ImageViewer {
         } else {
             self.mouse_over_window_buttons = false;
             self.mouse_over_title_text = false;
+            self.mouse_over_title_bar_drag_handle = false;
             self.title_bar_menu_active = false;
             self.title_text_dragging = false;
         }
@@ -31939,5 +32008,48 @@ mod tests {
             assert_eq!(settings_registry::SETTINGS[id].id, id);
         }
         assert!(settings_search_results("zzz-no-such-setting").is_empty());
+    }
+
+    #[test]
+    fn title_bar_button_zone_covers_the_cluster_and_stops_at_the_drag_handle() {
+        let mut viewer = ImageViewer::default();
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        set_test_mode(&mut viewer, Mode::FloatingSolo(MangaLayoutMode::LongStrip));
+
+        // The zone ends where the bar starts reserving the cluster, so the empty bar left of it
+        // is a drag handle instead of a strip where a press moves nothing.
+        let ctx = egui::Context::default();
+        let zone = viewer.title_bar_buttons_pointer_zone(&ctx, screen_rect);
+        assert!(zone.min.x > screen_rect.width() - 200.0, "{zone:?}");
+        assert_eq!(zone.max.x, screen_rect.max.x);
+        assert_eq!(
+            zone.max.y,
+            screen_rect.min.y + ImageViewer::TITLE_BAR_HEIGHT
+        );
+        assert!(
+            zone.contains(egui::pos2(screen_rect.max.x - 1.0, screen_rect.min.y + 1.0)),
+            "every button pixel, including the top-right one, is inside the zone"
+        );
+    }
+
+    #[test]
+    fn every_pixel_of_the_chrome_bar_moves_the_window_in_floating_mode() {
+        let mut viewer = ImageViewer::default();
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        set_test_mode(&mut viewer, Mode::FloatingSolo(MangaLayoutMode::LongStrip));
+        let handle = viewer.title_bar_drag_handle_rect(screen_rect);
+        assert_eq!(handle.min, screen_rect.min);
+        assert_eq!(handle.width(), screen_rect.width());
+        assert_eq!(handle.height(), ImageViewer::TITLE_BAR_HEIGHT);
+
+        // The stretch between the file details and the buttons, with the media zoomed past the
+        // window so nothing else could be claimed as a pan: still a window move.
+        assert!(ImageViewer::drag_moves_window(
+            false,
+            handle.contains(egui::pos2(500.0, 16.0)),
+            true
+        ));
+        // Fullscreen never moves the window, however the bar is treated.
+        assert!(!ImageViewer::drag_moves_window(true, true, false));
     }
 }
