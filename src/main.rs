@@ -16923,11 +16923,12 @@ impl ImageViewer {
 
         // The window kept its physical size, so the rendered image must keep its physical size
         // too: `zoom` is media px per egui point, and a point is now `ppp/previous` times larger,
-        // so the ratio is undone once here instead of by a later autosize.
-        let ratio = ppp / previous;
-        self.zoom *= ratio;
-        self.zoom_target *= ratio;
-        self.offset *= ratio;
+        // so `zoom` shrinks by the same ratio — the media's physical size is unchanged and the
+        // autosize below computes a no-op instead of a resize.
+        let inverse_scale = previous / ppp;
+        self.zoom *= inverse_scale;
+        self.zoom_target *= inverse_scale;
+        self.offset *= inverse_scale;
         // The locked in-window zoom was measured against the old point size.
         self.floating_zoom_inside_window_locked = false;
         self.pending_media_layout = false;
