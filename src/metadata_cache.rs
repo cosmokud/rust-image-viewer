@@ -218,7 +218,7 @@ impl MetadataCache {
         path: &Path,
         expected_kind: CachedMediaKind,
     ) -> Option<(u32, u32)> {
-        let key = cache_key(path);
+        let key = crate::cache_key::key(path, crate::cache_key::KeyScope::Bare).unwrap_or_default();
 
         let read_txn = self.db.begin_read().ok()?;
         let table = read_txn.open_table(METADATA_TABLE).ok()?;
@@ -250,7 +250,8 @@ impl MetadataCache {
         let mut results = Vec::with_capacity(items.len());
 
         for (path, expected_kind) in items {
-            let key = cache_key(path.as_path());
+            let key = crate::cache_key::key(path.as_path(), crate::cache_key::KeyScope::Bare)
+                .unwrap_or_default();
             let raw = match table.get(key.as_str()) {
                 Ok(Some(raw)) => raw,
                 _ => {
@@ -288,7 +289,7 @@ impl MetadataCache {
             return;
         }
 
-        let key = cache_key(path);
+        let key = crate::cache_key::key(path, crate::cache_key::KeyScope::Bare).unwrap_or_default();
         let Some(file_type) = detect_file_type(path) else {
             return;
         };
@@ -831,28 +832,6 @@ pub fn configure_metadata_cache_size_limit(max_size_mb: u64) {
     METADATA_CACHE_MAX_SIZE_BYTES.store(max_size_bytes, Ordering::Relaxed);
 }
 
-fn cache_key(path: &Path) -> String {
-    let normalized_path = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        path.canonicalize()
-            .ok()
-            .unwrap_or_else(|| path.to_path_buf())
-    };
-
-    let key = normalized_path.to_string_lossy().to_string();
-
-    #[cfg(target_os = "windows")]
-    {
-        return key.to_lowercase();
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        key
-    }
-}
-
 fn unix_now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1180,6 +1159,22 @@ mod tests {
         assert!(!tables.iter().any(|name| name == "video_first_frame_rgba"));
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn bare_key_spelling_is_stable_on_disk() {
+        // Absolute on purpose: canonicalize would prepend `\\?\` and change the persisted bytes.
+        let key = crate::cache_key::key(
+            Path::new("D:/Images/Cats/Angora/2121.jpg"),
+            crate::cache_key::KeyScope::Bare,
+        )
+        .unwrap();
+
+        #[cfg(target_os = "windows")]
+        assert_eq!(key, "d:/images/cats/angora/2121.jpg");
+
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(key, "D:/Images/Cats/Angora/2121.jpg");
     }
 
     fn temp_cache_path(test_name: &str) -> PathBuf {

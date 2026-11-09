@@ -132,12 +132,17 @@ pub fn store_folder_travel_position(
 }
 
 fn folder_travel_key(directory: &Path, layout_mode: FolderTravelLayoutMode) -> Option<String> {
-    let normalized = normalize_path_key(directory)?;
-    Some(format!("{}#{}", normalized, layout_mode.key_suffix()))
+    crate::cache_key::key(
+        directory,
+        crate::cache_key::KeyScope::TravelLayout(layout_mode.key_suffix()),
+    )
 }
 
 fn encode_position_record(position: &FolderTravelPosition) -> Option<Vec<u8>> {
-    let normalized_path = normalize_path_key(position.current_path.as_path())?;
+    let normalized_path = crate::cache_key::key(
+        position.current_path.as_path(),
+        crate::cache_key::KeyScope::Bare,
+    )?;
     let path_bytes = normalized_path.as_bytes();
     let path_len = u32::try_from(path_bytes.len()).ok()?;
     let index = u64::try_from(position.current_index).ok()?;
@@ -198,34 +203,6 @@ fn default_cache_path() -> Option<PathBuf> {
     }
 
     None
-}
-
-fn normalize_path_key(path: &Path) -> Option<String> {
-    let normalized_path = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        path.canonicalize()
-            .ok()
-            .unwrap_or_else(|| path.to_path_buf())
-    };
-
-    let key = normalized_path.to_string_lossy().to_string();
-
-    #[cfg(target_os = "windows")]
-    {
-        if key.is_empty() {
-            return None;
-        }
-        Some(key.to_lowercase())
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        if key.is_empty() {
-            return None;
-        }
-        Some(key)
-    }
 }
 
 fn io_other_error(message: &'static str) -> io::Error {
@@ -338,5 +315,38 @@ fn open_database_with_size_limit(path: &Path, max_size_bytes: u64) -> Option<Dat
                 .ok()
         }
         Err(_) => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn travel_key_and_record_path_spelling_are_stable_on_disk() {
+        // Absolute on purpose: canonicalize would prepend `\\?\` and change the persisted bytes.
+        let directory = Path::new("D:/Images/Cats/Angora");
+
+        let key = folder_travel_key(directory, FolderTravelLayoutMode::LongStrip).unwrap();
+        #[cfg(target_os = "windows")]
+        assert_eq!(key, "d:/images/cats/angora#long_strip");
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(key, "D:/Images/Cats/Angora#long_strip");
+
+        let position = FolderTravelPosition {
+            current_path: directory.join("2121.jpg"),
+            current_index: 3,
+            scroll_offset: 120.0,
+        };
+        let encoded = encode_position_record(&position).unwrap();
+        let path_start = key.trim_end_matches("#long_strip");
+        assert!(std::str::from_utf8(&encoded[17..])
+            .unwrap()
+            .starts_with(path_start));
+    }
+
+    #[test]
+    fn empty_path_has_no_travel_key() {
+        assert!(folder_travel_key(Path::new(""), FolderTravelLayoutMode::Masonry).is_none());
     }
 }

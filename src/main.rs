@@ -5,6 +5,7 @@
 
 mod app_dirs;
 mod async_runtime;
+mod cache_key;
 mod config;
 mod first_frame;
 mod folder_travel_cache;
@@ -2453,28 +2454,6 @@ fn file_stamp_for_path(path: &Path) -> Option<FileStamp> {
         modified_secs: duration.as_secs(),
         modified_nanos: duration.subsec_nanos(),
     })
-}
-
-fn decoded_image_cache_key(path: &Path, max_texture_side: u32) -> String {
-    let normalized_path = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        path.canonicalize()
-            .ok()
-            .unwrap_or_else(|| path.to_path_buf())
-    };
-
-    let key = normalized_path.to_string_lossy().to_string();
-
-    #[cfg(target_os = "windows")]
-    {
-        return format!("{}#ts{}", key.to_lowercase(), max_texture_side.max(1));
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        format!("{}#ts{}", key, max_texture_side.max(1))
-    }
 }
 
 #[cfg(target_os = "windows")]
@@ -6879,7 +6858,8 @@ impl ImageViewer {
             return;
         }
 
-        let key = decoded_image_cache_key(path, max_texture_side);
+        let key = cache_key::key(path, cache_key::KeyScope::TextureSide(max_texture_side))
+            .unwrap_or_default();
         let frame = &cached.first_frame;
         if frame.width == 0 || frame.height == 0 || frame.pixels.is_empty() {
             return;
@@ -6942,7 +6922,8 @@ impl ImageViewer {
         gif_filter: FilterType,
         preserve_view_on_complete: bool,
     ) -> bool {
-        let key = decoded_image_cache_key(path, max_texture_side);
+        let key = cache_key::key(path, cache_key::KeyScope::TextureSide(max_texture_side))
+            .unwrap_or_default();
 
         // Animated GIFs cannot be reconstructed from a single cached frame.
         // If we restore them from this cache they appear as static images.
@@ -7034,7 +7015,8 @@ impl ImageViewer {
         path: &PathBuf,
         max_texture_side: u32,
     ) -> bool {
-        let key = decoded_image_cache_key(path, max_texture_side);
+        let key = cache_key::key(path, cache_key::KeyScope::TextureSide(max_texture_side))
+            .unwrap_or_default();
         let path_is_gif = path
             .extension()
             .and_then(|ext| ext.to_str())
@@ -7089,7 +7071,8 @@ impl ImageViewer {
         }
 
         self.decoded_image_cache.insert(
-            decoded_image_cache_key(path, max_texture_side),
+            cache_key::key(path, cache_key::KeyScope::TextureSide(max_texture_side))
+                .unwrap_or_default(),
             Arc::new(CachedDecodedImage {
                 stamp,
                 first_frame: frame.clone(),
@@ -7696,7 +7679,9 @@ impl ImageViewer {
                         continue;
                     };
 
-                    let cache_key = decoded_image_cache_key(&path, max_texture_side);
+                    let cache_key =
+                        cache_key::key(&path, cache_key::KeyScope::TextureSide(max_texture_side))
+                            .unwrap_or_default();
                     let cached = Arc::new(cached);
                     self.decoded_image_cache
                         .insert(cache_key, Arc::clone(&cached));
@@ -7816,7 +7801,8 @@ impl ImageViewer {
                 continue;
             }
 
-            let key = decoded_image_cache_key(&path, target_side);
+            let key = cache_key::key(&path, cache_key::KeyScope::TextureSide(target_side))
+                .unwrap_or_default();
             let Some(cached) = self.decoded_image_cache.get(&key) else {
                 continue;
             };
@@ -11113,10 +11099,13 @@ impl ImageViewer {
                     let texture = ctx.load_texture(
                         format!(
                             "folder-placeholder-thumbnail:{}",
-                            decoded_image_cache_key(
+                            cache_key::key(
                                 decoded.path.as_path(),
-                                self.modal_thumbnail_target_side(),
+                                cache_key::KeyScope::TextureSide(
+                                    self.modal_thumbnail_target_side()
+                                )
                             )
+                            .unwrap_or_default()
                         ),
                         egui::ColorImage::from_rgba_unmultiplied(
                             [decoded.width as usize, decoded.height as usize],
@@ -11219,7 +11208,8 @@ impl ImageViewer {
         let texture = ctx.load_texture(
             format!(
                 "modal-thumbnail:{}",
-                decoded_image_cache_key(path, target_side)
+                cache_key::key(path, cache_key::KeyScope::TextureSide(target_side))
+                    .unwrap_or_default()
             ),
             color_image,
             texture_options,
