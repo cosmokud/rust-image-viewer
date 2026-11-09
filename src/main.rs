@@ -19,6 +19,7 @@ mod perf_metrics;
 mod settings_registry;
 #[cfg(target_os = "windows")]
 mod single_instance;
+mod texture_upload;
 mod video_player;
 mod video_thumbnail;
 #[cfg(target_os = "windows")]
@@ -65,7 +66,6 @@ use video_thumbnail::{
     probe_video_dimensions_without_gstreamer,
 };
 
-use bytes::Bytes;
 use eframe::egui;
 use image::imageops::FilterType;
 use parking_lot::Mutex;
@@ -417,35 +417,41 @@ fn paint_rotated_texture(
     painter.add(egui::Shape::mesh(mesh));
 }
 
-fn try_color_image_from_opaque_rgba_bytes(
-    size: [usize; 2],
-    pixels: Bytes,
-) -> Result<egui::ColorImage, Bytes> {
-    let expected_len = size[0].saturating_mul(size[1]).saturating_mul(4);
-    if expected_len != pixels.len() {
-        return Err(pixels);
+/// First policy inputs: config filters + mipmap masters, no display-size or nav hints.
+fn base_upload_policy_inputs(viewer: &ImageViewer) -> texture_upload::PolicyInputs {
+    texture_upload::PolicyInputs {
+        static_filter: viewer.config.texture_filter_static,
+        animated_filter: viewer.config.texture_filter_animated,
+        video_filter: viewer.config.texture_filter_video,
+        mipmap_static: viewer.mipmap_static_enabled(),
+        mipmap_video_thumbnails: viewer.mipmap_video_thumbnail_enabled(),
+        mipmap_min_side: viewer.config.manga_mipmap_min_side,
+        display_min_side: 0.0,
+        navigation_active: false,
+        frame_budget_tight: false,
     }
+}
 
-    let pixels_mut = match pixels.try_into_mut() {
-        Ok(pixels_mut) => pixels_mut,
-        Err(pixels) => return Err(pixels),
-    };
-    let pixels_vec: Vec<u8> = pixels_mut.into();
-    if pixels_vec.capacity() % std::mem::size_of::<egui::Color32>() != 0 {
-        return Err(Bytes::from(pixels_vec));
+fn manga_placeholder_kind(
+    media_kind: FolderPlaceholderThumbnailMediaKind,
+) -> texture_upload::UploadKind {
+    texture_upload::UploadKind::Placeholder(match media_kind {
+        FolderPlaceholderThumbnailMediaKind::StaticImage => {
+            texture_upload::PlaceholderKind::StaticImage
+        }
+        FolderPlaceholderThumbnailMediaKind::Video => texture_upload::PlaceholderKind::Video,
+        FolderPlaceholderThumbnailMediaKind::AnimatedImage => {
+            texture_upload::PlaceholderKind::AnimatedImage
+        }
+    })
+}
+
+fn upload_media_kind(media_type: MangaMediaType) -> texture_upload::UploadKind {
+    match media_type {
+        MangaMediaType::StaticImage => texture_upload::UploadKind::MangaPage,
+        MangaMediaType::Video => texture_upload::UploadKind::MangaVideoThumbnail,
+        MangaMediaType::AnimatedImage => texture_upload::UploadKind::MangaAnimatedFrame,
     }
-
-    // Video frames negotiated as RGBA are opaque. Color32 has the same byte layout
-    // for opaque sRGBA, so this avoids egui's per-pixel conversion loop.
-    debug_assert_eq!(std::mem::size_of::<egui::Color32>(), 4);
-    debug_assert_eq!(std::mem::align_of::<egui::Color32>(), 1);
-    let mut pixels_vec = std::mem::ManuallyDrop::new(pixels_vec);
-    let color_len = pixels_vec.len() / 4;
-    let color_cap = pixels_vec.capacity() / 4;
-    let color_ptr = pixels_vec.as_mut_ptr() as *mut egui::Color32;
-    let pixels = unsafe { Vec::from_raw_parts(color_ptr, color_len, color_cap) };
-
-    Ok(egui::ColorImage { size, pixels })
 }
 
 fn cached_or_probe_video_dimensions(path: &Path) -> Option<(u32, u32)> {
@@ -6885,32 +6891,28 @@ impl ImageViewer {
             max_texture_side,
             self.config.downscale_filter.to_image_filter(),
         );
-        let color_image =
-            egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], pixels.as_ref());
         let display_size = self.solo_expected_display_size_for_path(path, MediaType::Image, false);
         let display_min_side = display_size.x.min(display_size.y).max(1.0);
-        let min_side = w.min(h);
-        let mipmap_enabled = self.mipmap_static_enabled()
-            && min_side >= self.config.manga_mipmap_min_side.max(1)
-            && (min_side as f32) >= display_min_side * 1.15;
-        let texture_options = self
-            .config
-            .texture_filter_static
-            .to_egui_options_with_mipmap(mipmap_enabled);
-        let texture = ctx.load_texture(
-            format!("solo-image-preload:{key}"),
-            color_image,
-            texture_options,
+        let mut inputs = base_upload_policy_inputs(self);
+        inputs.display_min_side = display_min_side;
+        let policy = inputs.policy(texture_upload::UploadKind::StaticImage);
+        let texture = texture_upload::upload(
+            ctx,
+            &format!("solo-image-preload:{key}"),
+            None,
+            texture_upload::PixelSource::Rgba(pixels.as_ref()),
+            (w, h),
+            &policy,
         );
 
         self.insert_solo_image_texture_cache_entry(
             key,
             CachedSoloImageTexture {
                 stamp,
-                texture,
+                texture: texture.handle,
                 width: w,
                 height: h,
-                mipmap_enabled,
+                mipmap_enabled: texture.mipmap_enabled,
             },
         );
     }
@@ -7388,18 +7390,10 @@ impl ImageViewer {
             })
     }
 
-    fn solo_video_thumbnail_texture_options(&self, frame: &FirstFrame) -> egui::TextureOptions {
-        let min_side = frame.width.min(frame.height);
-        let mipmap_allowed_by_size = min_side >= self.config.manga_mipmap_min_side.max(1);
-        let meaningfully_minified =
-            (min_side as f32) >= self.solo_current_display_min_side() * 1.15;
-        let enable_mipmap = self.mipmap_video_thumbnail_enabled()
-            && mipmap_allowed_by_size
-            && meaningfully_minified;
-
-        self.config
-            .texture_filter_video
-            .to_egui_options_with_mipmap(enable_mipmap)
+    fn solo_video_thumbnail_policy(&self) -> texture_upload::UploadPolicy {
+        let mut inputs = base_upload_policy_inputs(self);
+        inputs.display_min_side = self.solo_current_display_min_side();
+        inputs.policy(texture_upload::UploadKind::VideoThumbnail)
     }
 
     fn solo_wrapped_index_with_offset(&self, offset: isize) -> Option<usize> {
@@ -11032,33 +11026,16 @@ impl ImageViewer {
         }
     }
 
-    fn folder_placeholder_texture_options(
+    fn folder_placeholder_upload_policy(
         &self,
         media_kind: FolderPlaceholderThumbnailMediaKind,
-        width: u32,
-        height: u32,
-    ) -> egui::TextureOptions {
-        let min_side = width.min(height);
-        let mipmap_allowed_by_size = min_side >= self.config.manga_mipmap_min_side.max(1);
-        let allow_mipmaps = mipmap_allowed_by_size
-            && !self.folder_placeholder_upload_frame_budget_tight()
-            && !self.folder_placeholder_heavy_work_deferred();
-
-        match media_kind {
-            FolderPlaceholderThumbnailMediaKind::Video => self
-                .config
-                .texture_filter_video
-                .to_egui_options_with_mipmap(
-                    self.mipmap_video_thumbnail_enabled() && allow_mipmaps,
-                ),
-            FolderPlaceholderThumbnailMediaKind::AnimatedImage => {
-                self.config.texture_filter_animated.to_egui_options()
-            }
-            FolderPlaceholderThumbnailMediaKind::StaticImage => self
-                .config
-                .texture_filter_static
-                .to_egui_options_with_mipmap(self.mipmap_static_enabled() && allow_mipmaps),
-        }
+    ) -> texture_upload::UploadPolicy {
+        let mut inputs = base_upload_policy_inputs(self);
+        // Both placeholder vetoes collapse into one flag: assembly is deferred while the
+        // preview scan or the frame budget is busy.
+        inputs.frame_budget_tight = self.folder_placeholder_upload_frame_budget_tight()
+            || self.folder_placeholder_heavy_work_deferred();
+        inputs.policy(manga_placeholder_kind(media_kind))
     }
 
     fn poll_pending_folder_placeholder_thumbnail_loads(&mut self, ctx: &egui::Context) {
@@ -11090,14 +11067,9 @@ impl ImageViewer {
                         continue;
                     }
 
-                    let texture_options = self.folder_placeholder_texture_options(
-                        decoded.media_kind,
-                        decoded.width,
-                        decoded.height,
-                    );
-
-                    let texture = ctx.load_texture(
-                        format!(
+                    let texture = texture_upload::upload(
+                        ctx,
+                        &format!(
                             "folder-placeholder-thumbnail:{}",
                             cache_key::key(
                                 decoded.path.as_path(),
@@ -11107,12 +11079,12 @@ impl ImageViewer {
                             )
                             .unwrap_or_default()
                         ),
-                        egui::ColorImage::from_rgba_unmultiplied(
-                            [decoded.width as usize, decoded.height as usize],
-                            &decoded.pixels,
-                        ),
-                        texture_options,
-                    );
+                        None,
+                        texture_upload::PixelSource::Rgba(&decoded.pixels),
+                        (decoded.width, decoded.height),
+                        &self.folder_placeholder_upload_policy(decoded.media_kind),
+                    )
+                    .handle;
 
                     self.folder_placeholder_thumbnail_failures
                         .remove(&decoded.path);
@@ -11168,7 +11140,7 @@ impl ImageViewer {
             .map(|ext| matches!(ext.to_ascii_lowercase().as_str(), "gif" | "webp"))
             .unwrap_or(false);
 
-        let (pixels, width, height, texture_options) = match media_type {
+        let (pixels, width, height, policy) = match media_type {
             MediaType::Image => {
                 let cached = load_solo_probe_image(
                     path,
@@ -11178,42 +11150,41 @@ impl ImageViewer {
                 )?;
                 let animated =
                     cached.first_frame.delay_ms > 0 || cached.is_animated_webp || animated_by_ext;
-                let min_side = cached.first_frame.width.min(cached.first_frame.height);
-                let texture_options = if animated {
-                    self.config.texture_filter_animated.to_egui_options()
+                let kind = if animated {
+                    texture_upload::UploadKind::AnimatedFrame
                 } else {
-                    self.config
-                        .texture_filter_static
-                        .to_egui_options_with_mipmap(
-                            self.mipmap_static_enabled()
-                                && min_side >= self.config.manga_mipmap_min_side.max(1),
-                        )
+                    texture_upload::UploadKind::StaticThumbnail
                 };
+                let policy = base_upload_policy_inputs(self).policy(kind);
                 (
                     cached.first_frame.pixels,
                     cached.first_frame.width,
                     cached.first_frame.height,
-                    texture_options,
+                    policy,
                 )
             }
             MediaType::Video => {
                 let cached = extract_video_first_frame_thumbnail(path, target_side)?;
-                let texture_options = self.solo_video_thumbnail_texture_options(&cached);
-                (cached.pixels, cached.width, cached.height, texture_options)
+                let mut inputs = base_upload_policy_inputs(self);
+                inputs.display_min_side = self.solo_current_display_min_side();
+                let policy = inputs.policy(texture_upload::UploadKind::VideoThumbnail);
+                (cached.pixels, cached.width, cached.height, policy)
             }
         };
 
-        let color_image =
-            egui::ColorImage::from_rgba_unmultiplied([width as usize, height as usize], &pixels);
-        let texture = ctx.load_texture(
-            format!(
+        let texture = texture_upload::upload(
+            ctx,
+            &format!(
                 "modal-thumbnail:{}",
                 cache_key::key(path, cache_key::KeyScope::TextureSide(target_side))
                     .unwrap_or_default()
             ),
-            color_image,
-            texture_options,
-        );
+            None,
+            texture_upload::PixelSource::Rgba(&pixels),
+            (width, height),
+            &policy,
+        )
+        .handle;
 
         self.modal_thumbnail_cache.insert(
             path.clone(),
@@ -15741,49 +15712,47 @@ impl ImageViewer {
                             );
                             let no_downscale =
                                 frame.width <= target_side && frame.height <= target_side;
-                            let (w, h, color_image) = if no_downscale {
-                                let size = [frame.width as usize, frame.height as usize];
-                                match try_color_image_from_opaque_rgba_bytes(size, frame.pixels) {
-                                    Ok(color_image) => (frame.width, frame.height, color_image),
-                                    Err(pixels) => (
-                                        frame.width,
-                                        frame.height,
-                                        egui::ColorImage::from_rgba_unmultiplied(size, &pixels),
-                                    ),
-                                }
-                            } else {
-                                let (w, h, pixels) = downscale_rgba_if_needed(
+                            let policy = base_upload_policy_inputs(self)
+                                .policy(texture_upload::UploadKind::VideoFrame);
+                            let frame = frame;
+                            let downscaled = (!no_downscale).then(|| {
+                                downscale_rgba_if_needed(
                                     frame.width,
                                     frame.height,
                                     &frame.pixels,
                                     target_side,
                                     self.config.downscale_filter.to_image_filter(),
-                                );
-                                (
-                                    w,
-                                    h,
-                                    egui::ColorImage::from_rgba_unmultiplied(
-                                        [w as usize, h as usize],
-                                        pixels.as_ref(),
-                                    ),
                                 )
+                            });
+                            let (w, h) = downscaled
+                                .as_ref()
+                                .map(|(w, h, _)| (*w, *h))
+                                .unwrap_or((frame.width, frame.height));
+                            let pixels = match downscaled.as_ref() {
+                                Some((_, _, pixels)) => {
+                                    texture_upload::PixelSource::Rgba(pixels.as_ref())
+                                }
+                                None => texture_upload::PixelSource::OpaqueBytes(&frame.pixels),
                             };
-                            let texture_options =
-                                self.config.texture_filter_video.to_egui_options();
 
-                            if let Some((texture, stored_w, stored_h)) =
+                            let uploaded = texture_upload::upload(
+                                ctx,
+                                &format!("manga_video_{}", index),
+                                self.manga_video_textures
+                                    .get_mut(&index)
+                                    .map(|(texture, _, _)| texture),
+                                pixels,
+                                (w, h),
+                                &policy,
+                            );
+                            if let Some((_, stored_w, stored_h)) =
                                 self.manga_video_textures.get_mut(&index)
                             {
-                                texture.set(color_image, texture_options);
                                 *stored_w = w;
                                 *stored_h = h;
                             } else {
-                                let texture = ctx.load_texture(
-                                    format!("manga_video_{}", index),
-                                    color_image,
-                                    texture_options,
-                                );
-                                self.manga_video_textures.insert(index, (texture, w, h));
+                                self.manga_video_textures
+                                    .insert(index, (uploaded.handle, w, h));
                             }
                             if let Some(path) = self.image_list.get(index).cloned() {
                                 self.manga_video_texture_paths.insert(index, path);
@@ -20642,18 +20611,13 @@ impl ImageViewer {
                     }
 
                     let no_downscale = frame.width <= upload_side && frame.height <= upload_side;
-                    let (w, h, color_image) = if no_downscale {
-                        let size = [frame.width as usize, frame.height as usize];
-                        match try_color_image_from_opaque_rgba_bytes(size, frame.pixels) {
-                            Ok(color_image) => (frame.width, frame.height, color_image),
-                            Err(pixels) => (
-                                frame.width,
-                                frame.height,
-                                egui::ColorImage::from_rgba_unmultiplied(size, &pixels),
-                            ),
-                        }
-                    } else {
-                        let (w, h, pixels) = downscale_rgba_if_needed(
+                    // Live video textures are updated every frame; the module's VideoFrame
+                    // policy keeps mipmaps off because the sink already outputs
+                    // near-display resolution.
+                    let policy = base_upload_policy_inputs(self)
+                        .policy(texture_upload::UploadKind::VideoFrame);
+                    let downscaled = (!no_downscale).then(|| {
+                        downscale_rgba_if_needed(
                             frame.width,
                             frame.height,
                             &frame.pixels,
@@ -20663,36 +20627,35 @@ impl ImageViewer {
                             } else {
                                 self.config.downscale_filter.to_image_filter()
                             },
-                        );
-                        (
-                            w,
-                            h,
-                            egui::ColorImage::from_rgba_unmultiplied(
-                                [w as usize, h as usize],
-                                pixels.as_ref(),
-                            ),
                         )
+                    });
+                    let (w, h) = downscaled
+                        .as_ref()
+                        .map(|(w, h, _)| (*w, *h))
+                        .unwrap_or((frame.width, frame.height));
+                    let pixels = match downscaled.as_ref() {
+                        Some((_, _, pixels)) => texture_upload::PixelSource::Rgba(pixels.as_ref()),
+                        None => texture_upload::PixelSource::OpaqueBytes(&frame.pixels),
                     };
 
-                    // Live video textures are updated every frame; generating mipmaps here is
-                    // expensive and the video sink already outputs near-display resolution.
-                    let texture_options = self.config.texture_filter_video.to_egui_options();
-
-                    if let Some((texture, stored_w, stored_h)) =
+                    let uploaded = texture_upload::upload(
+                        ctx,
+                        &format!("manga_video_{}", focused_idx),
+                        self.manga_video_textures
+                            .get_mut(&focused_idx)
+                            .map(|(texture, _, _)| texture),
+                        pixels,
+                        (w, h),
+                        &policy,
+                    );
+                    if let Some((_, stored_w, stored_h)) =
                         self.manga_video_textures.get_mut(&focused_idx)
                     {
-                        texture.set(color_image, texture_options);
                         *stored_w = w;
                         *stored_h = h;
                     } else {
-                        let texture = ctx.load_texture(
-                            format!("manga_video_{}", focused_idx),
-                            color_image,
-                            texture_options,
-                        );
-
                         self.manga_video_textures
-                            .insert(focused_idx, (texture, w, h));
+                            .insert(focused_idx, (uploaded.handle, w, h));
                     }
                     if let Some(path) = self.image_list.get(focused_idx).cloned() {
                         self.manga_video_texture_paths.insert(focused_idx, path);
@@ -20931,6 +20894,8 @@ impl ImageViewer {
         }
 
         // ── Update animation frames for the focused animated image only ──
+        let anim_upload_policy =
+            base_upload_policy_inputs(self).policy(texture_upload::UploadKind::MangaAnimatedFrame);
         for &idx in focused_anim_idx.iter() {
             let cached_side_floor = self
                 .image_list
@@ -20999,34 +20964,32 @@ impl ImageViewer {
                         active_gif_filter,
                     );
 
-                    let color_image = egui::ColorImage::from_rgba_unmultiplied(
-                        [w as usize, h as usize],
-                        pixels.as_ref(),
-                    );
-
-                    let texture_options = self.config.texture_filter_animated.to_egui_options();
                     let entry_path = self.image_list.get(idx).cloned();
-                    if let Some((mut texture, _, _, _)) = entry_path.as_ref().and_then(|path| {
+                    let mut slot = entry_path.as_ref().and_then(|path| {
                         self.manga_texture_cache
                             .get_texture_handle_info_for_path(idx, path)
-                    }) {
-                        texture.set(color_image, texture_options);
-                        if let Some(path) = entry_path.as_deref() {
-                            let _ = self
-                                .manga_texture_cache
-                                .update_texture(idx, path, texture, w, h);
-                        }
-                    } else if let Some(path) = entry_path {
-                        let texture = ctx.load_texture(
-                            format!("manga_anim_{}", idx),
-                            color_image,
-                            texture_options,
+                    });
+                    let uploaded = texture_upload::upload(
+                        ctx,
+                        &format!("manga_anim_{}", idx),
+                        slot.as_mut().map(|(texture, _, _, _)| texture),
+                        texture_upload::PixelSource::Rgba(pixels.as_ref()),
+                        (w, h),
+                        &anim_upload_policy,
+                    );
+                    if let Some(path) = entry_path.as_deref().filter(|_| slot.is_some()) {
+                        let _ = self.manga_texture_cache.update_texture(
+                            idx,
+                            path,
+                            uploaded.handle,
+                            w,
+                            h,
                         );
-
+                    } else if let Some(path) = entry_path {
                         let evicted = self.manga_texture_cache.insert_with_type(
                             idx,
                             path,
-                            texture,
+                            uploaded.handle,
                             w,
                             h,
                             MangaMediaType::AnimatedImage,
@@ -21105,6 +21068,8 @@ impl ImageViewer {
         } else {
             self.config.gif_resize_filter.to_image_filter()
         };
+        let policy =
+            base_upload_policy_inputs(self).policy(texture_upload::UploadKind::MangaAnimatedFrame);
 
         if let Some(img) = self.manga_animated_images.get_mut(&idx) {
             if !stream_done && img.frame_count() > 1 {
@@ -21122,27 +21087,28 @@ impl ImageViewer {
                 target_side,
                 reset_filter,
             );
-            let color_image =
-                egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], pixels.as_ref());
-            let texture_options = self.config.texture_filter_animated.to_egui_options();
             let entry_path = self.image_list.get(idx).cloned();
-            if let Some((mut texture, _, _, _)) = entry_path.as_ref().and_then(|path| {
+            let mut slot = entry_path.as_ref().and_then(|path| {
                 self.manga_texture_cache
                     .get_texture_handle_info_for_path(idx, path)
-            }) {
-                texture.set(color_image, texture_options);
-                if let Some(path) = entry_path.as_deref() {
-                    let _ = self
-                        .manga_texture_cache
-                        .update_texture(idx, path, texture, w, h);
-                }
+            });
+            let uploaded = texture_upload::upload(
+                ctx,
+                &format!("manga_anim_{}", idx),
+                slot.as_mut().map(|(texture, _, _, _)| texture),
+                texture_upload::PixelSource::Rgba(pixels.as_ref()),
+                (w, h),
+                &policy,
+            );
+            if let Some(path) = entry_path.as_deref().filter(|_| slot.is_some()) {
+                let _ = self
+                    .manga_texture_cache
+                    .update_texture(idx, path, uploaded.handle, w, h);
             } else if let Some(path) = entry_path {
-                let texture =
-                    ctx.load_texture(format!("manga_anim_{}", idx), color_image, texture_options);
                 let evicted = self.manga_texture_cache.insert_with_type(
                     idx,
                     path,
-                    texture,
+                    uploaded.handle,
                     w,
                     h,
                     MangaMediaType::AnimatedImage,
@@ -21578,89 +21544,32 @@ impl ImageViewer {
         )
     }
 
-    /// Select texture options for manga/masonry preload uploads.
-    ///
-    /// Mipmaps are only enabled for static pages and video thumbnails.
-    /// Animated textures are frequently updated and stay non-mipmapped to avoid
-    /// repeated mipmap generation costs.
-    fn manga_texture_options_for_upload(
-        &self,
-        media_type: MangaMediaType,
-        width: u32,
-        height: u32,
-    ) -> egui::TextureOptions {
-        let min_side = width.min(height);
-        let mipmap_allowed_by_size = min_side >= self.config.manga_mipmap_min_side.max(1);
-        let navigation_blocks_mipmaps =
-            self.is_masonry_mode() && self.masonry_navigation_active_for_heavy_work();
-
-        match media_type {
-            MangaMediaType::StaticImage => {
-                let enable_mipmap = self.mipmap_static_enabled()
-                    && mipmap_allowed_by_size
-                    && !navigation_blocks_mipmaps;
-                self.config
-                    .texture_filter_static
-                    .to_egui_options_with_mipmap(enable_mipmap)
-            }
-            MangaMediaType::Video => {
-                let enable_mipmap = self.mipmap_video_thumbnail_enabled()
-                    && mipmap_allowed_by_size
-                    && !navigation_blocks_mipmaps;
-                self.config
-                    .texture_filter_video
-                    .to_egui_options_with_mipmap(enable_mipmap)
-            }
-            MangaMediaType::AnimatedImage => self.config.texture_filter_animated.to_egui_options(),
-        }
-    }
-
-    fn manga_texture_options_for_cached_upload(
+    /// Manga/masonry upload policy: static pages and video thumbnails may use mipmaps,
+    /// animated frames never do, and masonry navigation vetoes the rest.
+    fn manga_upload_policy(
         &mut self,
         index: usize,
         media_type: MangaMediaType,
-        width: u32,
-        height: u32,
-    ) -> egui::TextureOptions {
-        if media_type == MangaMediaType::AnimatedImage {
-            return self.manga_texture_options_for_upload(media_type, width, height);
-        }
-
-        let min_side = width.min(height);
-        let mipmap_allowed_by_size = min_side >= self.config.manga_mipmap_min_side.max(1);
-        let navigation_blocks_mipmaps =
+        size: (u32, u32),
+    ) -> texture_upload::UploadPolicy {
+        let kind = upload_media_kind(media_type);
+        let mut inputs = base_upload_policy_inputs(self);
+        inputs.navigation_active =
             self.is_masonry_mode() && self.masonry_navigation_active_for_heavy_work();
-        let display_min_side = if self.is_masonry_mode() {
-            self.masonry_item_current_display_size(index)
-                .map(|size| size.x.min(size.y).max(1.0))
-                .unwrap_or(min_side.max(1) as f32)
-        } else {
-            let size = self.manga_strip_item_current_display_size(index);
-            size.x.min(size.y)
-        };
-        let meaningfully_minified = (min_side as f32) >= display_min_side * 1.15;
-
-        match media_type {
-            MangaMediaType::StaticImage => {
-                let enable_mipmap = self.mipmap_static_enabled()
-                    && mipmap_allowed_by_size
-                    && meaningfully_minified
-                    && !navigation_blocks_mipmaps;
-                self.config
-                    .texture_filter_static
-                    .to_egui_options_with_mipmap(enable_mipmap)
-            }
-            MangaMediaType::Video => {
-                let enable_mipmap = self.mipmap_video_thumbnail_enabled()
-                    && mipmap_allowed_by_size
-                    && meaningfully_minified
-                    && !navigation_blocks_mipmaps;
-                self.config
-                    .texture_filter_video
-                    .to_egui_options_with_mipmap(enable_mipmap)
-            }
-            MangaMediaType::AnimatedImage => self.config.texture_filter_animated.to_egui_options(),
+        if kind.uses_display_min_side() {
+            // Gather the display size only for kinds whose mipmap decision reads it;
+            // touching the masonry layout cache for animated frames is wasted work.
+            let min_side = size.0.min(size.1) as f32;
+            inputs.display_min_side = if self.is_masonry_mode() {
+                self.masonry_item_current_display_size(index)
+                    .map(|size| size.x.min(size.y).max(1.0))
+                    .unwrap_or(min_side.max(1.0))
+            } else {
+                let size = self.manga_strip_item_current_display_size(index);
+                size.x.min(size.y)
+            };
         }
+        inputs.policy(kind)
     }
 
     /// Process decoded images from the parallel loader and upload them as GPU textures.
@@ -21840,27 +21749,24 @@ impl ImageViewer {
                 continue;
             }
 
-            // Create the texture
-            let color_image = egui::ColorImage::from_rgba_unmultiplied(
-                [decoded.width as usize, decoded.height as usize],
-                &decoded.pixels,
-            );
-
             // Static images + video thumbnails can use mipmaps for faster minification
             // in manga strip and masonry layouts.
-            let texture_options = self.manga_texture_options_for_cached_upload(
+            let policy = self.manga_upload_policy(
                 decoded.index,
                 decoded.media_type,
-                decoded.width,
-                decoded.height,
+                (decoded.width, decoded.height),
             );
 
             let upload_texture_started = Instant::now();
-            let texture = ctx.load_texture(
-                format!("manga_{}", decoded.index),
-                color_image,
-                texture_options,
-            );
+            let texture = texture_upload::upload(
+                ctx,
+                &format!("manga_{}", decoded.index),
+                None,
+                texture_upload::PixelSource::Rgba(&decoded.pixels),
+                (decoded.width, decoded.height),
+                &policy,
+            )
+            .handle;
             self.perf_metrics.record(
                 Metric::MangaUploadTextureMs,
                 upload_texture_started.elapsed(),
@@ -25724,18 +25630,18 @@ impl ImageViewer {
             if should_upload_placeholder {
                 if let Some(placeholder) = self.pending_video_thumbnail_placeholder.take() {
                     let placeholder_path = placeholder.path.clone();
-                    let color_image = egui::ColorImage::from_rgba_unmultiplied(
-                        [
-                            placeholder.thumbnail.width as usize,
-                            placeholder.thumbnail.height as usize,
-                        ],
-                        &placeholder.thumbnail.pixels,
+                    let policy = self.solo_video_thumbnail_policy();
+                    self.video_texture = Some(
+                        texture_upload::upload(
+                            ctx,
+                            "video-thumbnail-placeholder",
+                            None,
+                            texture_upload::PixelSource::Rgba(&placeholder.thumbnail.pixels),
+                            (placeholder.thumbnail.width, placeholder.thumbnail.height),
+                            &policy,
+                        )
+                        .handle,
                     );
-                    self.video_texture = Some(ctx.load_texture(
-                        "video-thumbnail-placeholder",
-                        color_image,
-                        self.solo_video_thumbnail_texture_options(&placeholder.thumbnail),
-                    ));
                     self.video_texture_source_path = Some(placeholder_path);
                     self.video_texture_dims =
                         Some((placeholder.thumbnail.width, placeholder.thumbnail.height));
@@ -25752,8 +25658,10 @@ impl ImageViewer {
             .map(|path| self.solo_target_texture_side_for_path(path, MediaType::Video, false))
             .unwrap_or(self.max_texture_side.max(1));
         let solo_video_upload_filter = self.config.downscale_filter.to_image_filter();
-        let solo_video_texture_filter = self.config.texture_filter_video;
-        let solo_static_mipmaps_enabled = self.mipmap_static_enabled();
+        let mut solo_static_inputs = base_upload_policy_inputs(self);
+        solo_static_inputs.display_min_side = solo_current_display_min_side;
+        let solo_video_policy =
+            base_upload_policy_inputs(self).policy(texture_upload::UploadKind::VideoFrame);
 
         if let Some((path, frame_count, total_duration_ms)) = self.image.as_ref().and_then(|img| {
             if Self::path_uses_animated_fps_override(img.path.as_path()) {
@@ -25805,11 +25713,10 @@ impl ImageViewer {
                 && !self.image_texture_mipmap_enabled
             {
                 self.image_texture_dims
-                    .map(|(texture_w, texture_h)| {
-                        let min_side = texture_w.min(texture_h);
-                        solo_static_mipmaps_enabled
-                            && min_side >= self.config.manga_mipmap_min_side.max(1)
-                            && (min_side as f32) >= solo_current_display_min_side * 1.15
+                    .map(|dims| {
+                        solo_static_inputs
+                            .policy(texture_upload::UploadKind::StaticImage)
+                            .mipmap_enabled(dims)
                     })
                     .unwrap_or(false)
             } else {
@@ -25837,31 +25744,24 @@ impl ImageViewer {
                     self.max_texture_side,
                     downscale_filter,
                 );
-                let color_image = egui::ColorImage::from_rgba_unmultiplied(
-                    [w as usize, h as usize],
-                    pixels.as_ref(),
-                );
-
-                // Use configured texture filter based on content type
-                let texture_options = if img.is_animated() {
-                    self.image_texture_mipmap_enabled = false;
-                    self.config.texture_filter_animated.to_egui_options()
+                // Animated frames resolve to the animated filter without mipmaps; static
+                // images follow the display-size mipmap policy.
+                let kind = if img.is_animated() {
+                    texture_upload::UploadKind::AnimatedFrame
                 } else {
-                    let min_side = w.min(h);
-                    let enable_mipmap = solo_static_mipmaps_enabled
-                        && min_side >= self.config.manga_mipmap_min_side.max(1)
-                        && (min_side as f32) >= solo_current_display_min_side * 1.15;
-                    self.image_texture_mipmap_enabled = enable_mipmap;
-                    self.config
-                        .texture_filter_static
-                        .to_egui_options_with_mipmap(enable_mipmap)
+                    texture_upload::UploadKind::StaticImage
                 };
-
-                if let Some(texture) = self.texture.as_mut() {
-                    texture.set(color_image, texture_options);
-                } else {
-                    self.texture = Some(ctx.load_texture("image", color_image, texture_options));
-                }
+                let policy = solo_static_inputs.policy(kind);
+                let uploaded = texture_upload::upload(
+                    ctx,
+                    "image",
+                    self.texture.as_mut(),
+                    texture_upload::PixelSource::Rgba(pixels.as_ref()),
+                    (w, h),
+                    &policy,
+                );
+                self.image_texture_mipmap_enabled = uploaded.mipmap_enabled;
+                self.texture = Some(uploaded.handle);
                 self.image_texture_dims = Some((w, h));
                 self.texture_frame = img.current_frame_index();
             }
@@ -25904,47 +25804,40 @@ impl ImageViewer {
                 activate_deferred_video_swap = self.defer_media_view_reset;
                 solo_displayed_video_position = frame.pts;
 
+                // Live video frames change continuously, so per-frame mipmap generation is wasted
+                // work. Thumbnails still use the manga_mipmap_video_thumbnails setting elsewhere.
+                let policy = solo_video_policy;
+
                 let no_downscale = frame.width <= current_video_target_side
                     && frame.height <= current_video_target_side;
-                let (w, h, color_image) = if no_downscale {
-                    let size = [frame.width as usize, frame.height as usize];
-                    match try_color_image_from_opaque_rgba_bytes(size, frame.pixels) {
-                        Ok(color_image) => (frame.width, frame.height, color_image),
-                        Err(pixels) => (
-                            frame.width,
-                            frame.height,
-                            egui::ColorImage::from_rgba_unmultiplied(size, &pixels),
-                        ),
-                    }
-                } else {
-                    let (w, h, pixels) = downscale_rgba_if_needed(
+                let downscaled = (!no_downscale).then(|| {
+                    downscale_rgba_if_needed(
                         frame.width,
                         frame.height,
                         &frame.pixels,
                         current_video_target_side,
                         solo_video_upload_filter,
-                    );
-                    (
-                        w,
-                        h,
-                        egui::ColorImage::from_rgba_unmultiplied(
-                            [w as usize, h as usize],
-                            pixels.as_ref(),
-                        ),
                     )
+                });
+                let (w, h) = downscaled
+                    .as_ref()
+                    .map(|(w, h, _)| (*w, *h))
+                    .unwrap_or((frame.width, frame.height));
+                let pixels = match downscaled.as_ref() {
+                    Some((_, _, pixels)) => texture_upload::PixelSource::Rgba(pixels.as_ref()),
+                    None => texture_upload::PixelSource::OpaqueBytes(&frame.pixels),
                 };
 
-                // Live video frames change continuously, so per-frame mipmap generation is wasted
-                // work. Thumbnails still use the manga_mipmap_video_thumbnails setting elsewhere.
-                let texture_options = solo_video_texture_filter.to_egui_options();
-
                 // Reuse the same GPU texture across frames to avoid per-frame allocations.
-                if let Some(texture) = self.video_texture.as_mut() {
-                    texture.set(color_image, texture_options);
-                } else {
-                    self.video_texture =
-                        Some(ctx.load_texture("video", color_image, texture_options));
-                }
+                let uploaded = texture_upload::upload(
+                    ctx,
+                    "video",
+                    self.video_texture.as_mut(),
+                    pixels,
+                    (w, h),
+                    &policy,
+                );
+                self.video_texture = Some(uploaded.handle);
                 if self.video_texture_source_path.as_ref() != current_video_path.as_ref() {
                     self.video_texture_source_path = current_video_path.clone();
                 }
