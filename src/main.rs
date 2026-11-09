@@ -13904,8 +13904,14 @@ impl ImageViewer {
         }
 
         let Some(current_cursor_screen) = get_global_cursor_pos() else {
-            // Fallback for platforms where global cursor coordinates are unavailable.
-            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+            // Platforms without a global cursor query: hand the drag to the windowing system
+            // once (it owns the move from there), instead of re-issuing StartDrag every frame.
+            if self.floating_drag_start_outer_pos.is_none() {
+                self.floating_drag_start_outer_pos =
+                    ctx.input(|i| i.raw.viewport().outer_rect).map(|r| r.min);
+                ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                ctx.request_repaint();
+            }
             return;
         };
 
