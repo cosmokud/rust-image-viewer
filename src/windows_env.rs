@@ -196,8 +196,8 @@ pub fn set_window_maximized(hwnd: HWND, maximize: bool) -> bool {
         }
     }
 
-    // Native maximize already targets the display the window is on, so the position fix
-    // `enforce_floating_window_buttons_on_display` does beforehand is all it needs.
+    // The display the window is on decides the maximize rectangle: the `WM_GETMINMAXINFO` guard
+    // rewrites it to that display's `rcWork`, so a move staged beforehand is all this needs.
     let cmd = if maximize { SW_MAXIMIZE } else { SW_RESTORE };
     unsafe {
         ShowWindow(hwnd, cmd);
@@ -344,13 +344,19 @@ unsafe extern "system" fn scale_change_wndproc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    use winapi::um::winuser::{CallWindowProcW, WM_DPICHANGED};
+    use winapi::um::winuser::{CallWindowProcW, WM_DPICHANGED, WM_GETMINMAXINFO};
 
     let previous = PREVIOUS_WNDPROC.load(Ordering::SeqCst);
     if previous == 0 {
         return def_proc(hwnd, msg, wparam, lparam);
     }
     let previous: WNDPROC = std::mem::transmute(previous);
+
+    if msg == WM_GETMINMAXINFO {
+        let result = CallWindowProcW(previous, hwnd, msg, wparam, lparam);
+        override_maximize_target(hwnd, lparam);
+        return result;
+    }
 
     if msg != WM_DPICHANGED {
         return CallWindowProcW(previous, hwnd, msg, wparam, lparam);
@@ -406,6 +412,49 @@ unsafe fn def_proc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) -> LRE
     use winapi::um::winuser::DefWindowProcW;
 
     DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
+/// Rewrites only the maximize fields of a `WM_GETMINMAXINFO` answer.
+///
+/// The default answer for an undecorated window inflates `rcWork` by `SM_CXSIZEFRAME +
+/// SM_CXPADDEDBORDER` and reuses geometry computed for a previous display, so the maximized
+/// window overshoots the work area edges. Writing the display's own rectangles over it makes
+/// maximize cover `rcWork` exactly. The track sizes stay as the previous proc computed them.
+unsafe fn override_maximize_target(hwnd: HWND, lparam: LPARAM) {
+    use winapi::um::winuser::MINMAXINFO;
+
+    if FULLSCREEN_TARGET.load(Ordering::SeqCst) || lparam == 0 {
+        return;
+    }
+    let Some(rect) = window_rect(hwnd) else {
+        return;
+    };
+    let centre = (
+        rect.left + (rect.right - rect.left) / 2,
+        rect.top + (rect.bottom - rect.top) / 2,
+    );
+    let Some(display) = monitor_info_at(centre.0, centre.1) else {
+        return;
+    };
+    let monitor = crate::window_geometry::Rect::new(
+        display.monitor.left,
+        display.monitor.top,
+        display.monitor.right,
+        display.monitor.bottom,
+    );
+    let work = crate::window_geometry::Rect::new(
+        display.work.left,
+        display.work.top,
+        display.work.right,
+        display.work.bottom,
+    );
+    let (x, y, width, height) = crate::window_geometry::maximize_target(monitor, work);
+
+    let info = lparam as *mut MINMAXINFO;
+    (*info).ptMaxPosition.x = x;
+    (*info).ptMaxPosition.y = y;
+    (*info).ptMaxSize.x = width;
+    (*info).ptMaxSize.y = height;
 }
 
 /// Hooks the window procedure once, so a display scale change cannot resize the window.

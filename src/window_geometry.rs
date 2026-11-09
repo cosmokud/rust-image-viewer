@@ -93,6 +93,18 @@ pub fn maximized_rect(display: Display) -> Rect {
     display.work
 }
 
+/// A maximized window's `ptMaxPosition`/`ptMaxSize`, as `(x, y, width, height)`: the work area
+/// expressed against the display's `rcMonitor` origin, which is what `WM_GETMINMAXINFO` wants.
+/// All physical pixels; a PMv2 process needs no scale conversion here.
+pub fn maximize_target(monitor: Rect, work: Rect) -> (i32, i32, i32, i32) {
+    (
+        work.left - monitor.left,
+        work.top - monitor.top,
+        work.width(),
+        work.height(),
+    )
+}
+
 /// Position-only correction: the top and right edges are pulled back into `work`, size never
 /// changes (the title-bar buttons live on those two edges).
 pub fn clamp_into(work: Rect, rect: Rect) -> (i32, i32) {
@@ -192,6 +204,28 @@ mod tests {
         // Neither is the primary's rectangle, which starts at the origin.
         assert_ne!(fullscreen_rect(display).left, 0);
         assert_ne!(maximized_rect(display).left, 0);
+    }
+
+    #[test]
+    fn maximize_target_covers_the_work_area_of_a_display_at_a_non_zero_origin() {
+        let display = mon2();
+        let (x, y, w, h) = maximize_target(display.monitor, display.work);
+
+        // Offset from the display's own origin, so the OS lands the rect on this display only.
+        assert_eq!((x, y), (0, 0));
+        assert_eq!((w, h), (display.work.width(), display.work.height()));
+        // 150% display: the physical size is the work area itself, never a dpi multiple of it.
+        assert_eq!(display.dpi, 144);
+        assert_eq!(h, display.monitor.height() - 80);
+    }
+
+    #[test]
+    fn maximize_target_keeps_a_taskbar_on_the_opposite_edge() {
+        // Taskbar on the left of a display that starts at a negative y.
+        let monitor = Rect::new(-1920, 0, 0, 1080);
+        let work = Rect::new(-1920 + 120, 0, 0, 1080);
+
+        assert_eq!(maximize_target(monitor, work), (120, 0, 1800, 1080));
     }
 
     #[test]
