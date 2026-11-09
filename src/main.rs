@@ -2580,6 +2580,14 @@ struct ImageViewer {
     is_panning: bool,
     /// Last mouse position for panning
     last_mouse_pos: Option<egui::Pos2>,
+    /// Which pointer button started the current pan/window drag (if any).
+    /// Once held, that button alone keeps the drag alive: egui drops the pointer
+    /// (`hover_pos()` becomes `None`) as soon as the cursor leaves the window, which
+    /// used to end a floating-window drag the moment the window lagged behind the cursor.
+    pan_drag_button: Option<egui::PointerButton>,
+    /// Drag detent latched on press (window move vs in-window image pan), so the
+    /// roll-over that makes the window lag can never flip the drag mode mid-drag.
+    pan_drag_moves_window: bool,
     /// Last observed pointer hover position, used for cursor-idle detection.
     last_pointer_hover_pos: Option<egui::Pos2>,
     /// Time of the most recent pointer move/click/wheel event.
@@ -3253,6 +3261,8 @@ impl Default for ImageViewer {
             offset: egui::Vec2::ZERO,
             is_panning: false,
             last_mouse_pos: None,
+            pan_drag_button: None,
+            pan_drag_moves_window: false,
             last_pointer_hover_pos: None,
             last_pointer_activity_at: Instant::now(),
             config,
@@ -13899,7 +13909,14 @@ impl ImageViewer {
             return;
         };
 
-        let (start_outer_pos, start_cursor_screen) = match (
+        let pixels_per_point = ctx.pixels_per_point().max(0.01);
+        // The window position and the cursor are both in physical screen pixels here.
+        let current_cursor_physical = egui::pos2(
+            current_cursor_screen.x * pixels_per_point,
+            current_cursor_screen.y * pixels_per_point,
+        );
+
+        let (start_outer_pos, start_cursor_physical) = match (
             self.floating_drag_start_outer_pos,
             self.floating_drag_start_cursor_screen,
         ) {
@@ -13910,14 +13927,22 @@ impl ImageViewer {
                     .map(|r| r.min)
                     .unwrap_or(egui::Pos2::ZERO);
                 self.floating_drag_start_outer_pos = Some(outer_pos);
-                self.floating_drag_start_cursor_screen = Some(current_cursor_screen);
+                self.floating_drag_start_cursor_screen = Some(current_cursor_physical);
+                // Keep repainting while the button is held so the loop keeps sampling the
+                // cursor at its own cadence instead of egui's event cadence: that is what
+                // keeps the window glued to the cursor when it overshoots the window.
+                ctx.request_repaint();
                 return;
             }
         };
 
-        let delta = current_cursor_screen - start_cursor_screen;
-        let new_pos = start_outer_pos + delta;
+        let delta_physical = current_cursor_physical - start_cursor_physical;
+        let new_pos = start_outer_pos + delta_physical / pixels_per_point;
         self.send_outer_position(ctx, new_pos);
+        // A drag that outruns the window can lose pointer events (capture changes, and
+        // cursor moves that no longer arrive once the cursor sits outside the window),
+        // so keep the loop hot while the drag is alive: each frame re-samples the cursor.
+        ctx.request_repaint();
     }
 
     fn apply_manga_pan_step(&mut self, direction: f32, multiplier: f32) {
@@ -14229,6 +14254,61 @@ impl ImageViewer {
             .get_bindings(action)
             .iter()
             .any(|binding| self.binding_down(binding, input, ctrl, shift, alt))
+    }
+
+    /// Egui only reports built-in pointer actions while egui holds the pointer: a
+    /// `PointerGone` (cursor left the window) clears `hover_pos()` for the rest of the
+    /// drag. These two helpers keep the physical button state authoritative instead.
+    fn binding_held(&self, binding: &InputBinding, input: &egui::InputState) -> bool {
+        match binding {
+            InputBinding::MouseLeft => global_mouse_button_down(GLOBAL_MOUSE_LEFT),
+            InputBinding::MouseMiddle => global_mouse_button_down(GLOBAL_MOUSE_MIDDLE),
+            InputBinding::Mouse4 => global_mouse_button_down(GLOBAL_MOUSE_EXTRA1),
+            InputBinding::Mouse5 => global_mouse_button_down(GLOBAL_MOUSE_EXTRA2),
+            _ => self.binding_down(
+                binding,
+                input,
+                input.raw.modifiers.ctrl,
+                input.raw.modifiers.shift,
+                input.raw.modifiers.alt,
+            ),
+        }
+    }
+
+    fn action_binding_held(&self, action: Action, input: &egui::InputState) -> bool {
+        self.config
+            .get_bindings(action)
+            .iter()
+            .any(|binding| self.binding_held(binding, input))
+    }
+
+    /// The mouse button a pan/drag action is bound to, if any.
+    fn pan_button_for_action(&self, action: Action) -> Option<egui::PointerButton> {
+        self.config
+            .get_bindings(action)
+            .iter()
+            .find_map(|binding| match binding {
+                InputBinding::MouseLeft => Some(egui::PointerButton::Primary),
+                InputBinding::MouseMiddle => Some(egui::PointerButton::Middle),
+                InputBinding::Mouse4 => Some(egui::PointerButton::Extra1),
+                InputBinding::Mouse5 => Some(egui::PointerButton::Extra2),
+                _ => None,
+            })
+    }
+
+    /// Is the button that owns the current drag still down? Falls back to egui's own
+    /// pointer state where no OS-level button query is available.
+    fn pan_drag_button_held(&self, ctx: &egui::Context) -> bool {
+        let (button, global) = match self.pan_drag_button {
+            Some(egui::PointerButton::Primary) => (egui::PointerButton::Primary, GLOBAL_MOUSE_LEFT),
+            Some(egui::PointerButton::Middle) => (egui::PointerButton::Middle, GLOBAL_MOUSE_MIDDLE),
+            Some(egui::PointerButton::Extra1) => (egui::PointerButton::Extra1, GLOBAL_MOUSE_EXTRA1),
+            Some(egui::PointerButton::Extra2) => (egui::PointerButton::Extra2, GLOBAL_MOUSE_EXTRA2),
+            // Keyboard-driven pan has no button of its own.
+            None => return true,
+            Some(_) => return false,
+        };
+        global_mouse_button_down(global) || ctx.input(|i| i.pointer.button_down(button))
     }
 
     fn action_mouse_binding_down(&self, action: Action, input: &egui::InputState) -> bool {
@@ -23495,7 +23575,16 @@ impl ImageViewer {
                 let ctrl = input.modifiers.ctrl;
                 let shift = input.modifiers.shift;
                 let alt = input.modifiers.alt;
-                self.action_binding_down(self.manga_layout_pan_action(), input, ctrl, shift, alt)
+                // Held, not event-driven, once the drag is running: egui drops the pointer when
+                // the cursor leaves the window, and a drag that outruns the cursor must keep going.
+                (self.is_panning && self.action_binding_held(self.manga_layout_pan_action(), input))
+                    || self.action_binding_down(
+                        self.manga_layout_pan_action(),
+                        input,
+                        ctrl,
+                        shift,
+                        alt,
+                    )
             });
 
         // Avoid triggering manga interactions while selecting/copying title-bar text.
@@ -24150,15 +24239,23 @@ impl ImageViewer {
                 ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
             }
 
-            if pan_down_action && self.is_panning {
+            if self.is_panning {
                 let drag_speed = self.config.manga_drag_pan_speed;
                 self.manga_shift_wheel_pan_velocity_x = 0.0;
 
                 // Stop any residual inertial scroll while the user is actively dragging.
                 self.stop_manga_wheel_scroll();
 
+                // Once the cursor leaves the window egui stops reporting it, so fall back to
+                // the last known in-window position: the drag keeps going, it just stops moving.
+                let current_pos = pointer_pos.or(self.last_mouse_pos);
+                let drag_delta = match (self.last_mouse_pos, current_pos) {
+                    (Some(previous), Some(current)) => current - previous,
+                    _ => pointer_delta,
+                };
+
                 // Vertical drag = scroll the manga strip (1:1 feel).
-                let delta_y = -pointer_delta.y * drag_speed;
+                let delta_y = -drag_delta.y * drag_speed;
                 let total_height = self.manga_total_height();
                 let visible_height = self.screen_size.y;
                 let max_scroll = (total_height - visible_height).max(0.0);
@@ -24167,8 +24264,9 @@ impl ImageViewer {
                 self.manga_scroll_target = self.manga_scroll_offset;
 
                 // Horizontal drag = pan X.
-                self.offset.x += pointer_delta.x * drag_speed;
+                self.offset.x += drag_delta.x * drag_speed;
 
+                self.last_mouse_pos = current_pos.or(self.last_mouse_pos);
                 self.manga_update_current_index();
                 self.manga_update_preload_queue();
                 ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
@@ -29332,7 +29430,13 @@ impl ImageViewer {
             pointer_pos = ctx.input(|i| i.pointer.hover_pos());
             let primary_clicked =
                 ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Primary));
-            let primary_down = ctx.input(|i| i.pointer.button_down(egui::PointerButton::Primary));
+            // egui only knows the pointer while it holds it: a `PointerGone` (cursor left the
+            // window) clears `hover_pos()` and with it the button state, which made a lagging
+            // floating-window drag read as released. Ask the OS instead, but only while a
+            // drag/resize that began inside this window is running.
+            let primary_down = ctx.input(|i| i.pointer.button_down(egui::PointerButton::Primary))
+                || ((self.is_panning || self.is_resizing)
+                    && global_mouse_button_down(GLOBAL_MOUSE_LEFT));
             let primary_pressed =
                 ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary));
             let secondary_clicked =
@@ -29352,7 +29456,11 @@ impl ImageViewer {
                 let ctrl = input.modifiers.ctrl;
                 let shift = input.modifiers.shift;
                 let alt = input.modifiers.alt;
-                self.action_binding_down(Action::Pan, input, ctrl, shift, alt)
+                // Held, not event-driven, once the drag is running: egui drops the pointer when
+                // the cursor leaves the window, and a window drag that outruns the cursor must
+                // not read as a release.
+                (self.is_panning && self.action_binding_held(Action::Pan, input))
+                    || self.action_binding_down(Action::Pan, input, ctrl, shift, alt)
             });
 
             // Title bar gesture suppression:
@@ -29494,8 +29602,20 @@ impl ImageViewer {
                 self.resize_start_cursor_screen = None;
                 self.resize_last_size = None;
             } else if !self.is_resizing {
-                // Handle panning/window dragging (only if not resizing, not seeking, and not over video controls)
-                if pan_down_action
+                // Handle panning/window dragging (only if not resizing, not seeking, and not over video controls).
+                // A drag this code started stays alive while the button that started it is still
+                // held. Every hover-derived gate below (resize edge, title-bar button strip, overlays)
+                // is computed from the cursor position *inside* the window, which goes stale the moment
+                // the window lags behind the cursor and the cursor leaves it: re-evaluating those
+                // mid-drag is exactly what used to drop the drag.
+                let cursor_delta = ctx.input(|i| i.pointer.delta());
+                let drag_continues = self.is_panning
+                    && self.pan_drag_button.is_some()
+                    && self.pan_drag_button_held(ctx);
+                // A new drag still needs the cursor inside the window: pressing something and
+                // then yanking the cursor out of it must not start moving the window.
+                let drag_can_start = pan_down_action
+                    && pointer_pos.is_some()
                     && hover_resize_direction == ResizeDirection::None
                     && !over_video_controls
                     && !self.is_seeking
@@ -29509,51 +29629,73 @@ impl ImageViewer {
                     && !pointer_over_shortcut_ui
                     && !self.manga_autoscroll_active
                     && !primary_consumed_for_autoscroll
-                    && !(over_title_bar && self.mouse_over_title_text)
-                {
+                    && !(over_title_bar && self.mouse_over_title_text);
+                if drag_continues || drag_can_start {
                     self.manga_shift_wheel_pan_velocity_x = 0.0;
-                    if let Some(pos) = pointer_pos {
-                        // Check if drag started from the top controls region for window dragging.
-                        let in_title_bar = self
-                            .last_mouse_pos
-                            .map_or(pos.y < self.top_controls_hotzone_height(), |lp| {
-                                lp.y < self.top_controls_hotzone_height()
-                            });
 
-                        if let Some(_last_pos) = self.last_mouse_pos {
-                            if self.is_panning {
-                                if self.mode().is_fullscreen() {
-                                    self.reset_floating_window_drag_anchor();
-                                    // In fullscreen, pan the image
-                                    let delta = ctx.input(|i| i.pointer.delta());
-                                    self.offset += delta;
-                                    self.remember_current_fullscreen_view_state();
-                                } else if in_title_bar {
-                                    // In floating mode, bypass native StartDrag to avoid Win11 top-edge snap.
-                                    self.drag_floating_window_without_native_snap(ctx);
-                                } else if floating_image_exceeds_window {
-                                    self.reset_floating_window_drag_anchor();
-                                    // In floating mode when zoomed past 100%, pan image inside window
-                                    let delta = ctx.input(|i| i.pointer.delta());
-                                    self.offset += delta;
-                                } else {
-                                    // In floating mode at/below 100%, bypass native StartDrag snap behavior.
-                                    self.drag_floating_window_without_native_snap(ctx);
-                                }
-                            }
-                        }
-                        if !self.is_panning {
-                            self.is_panning = true;
-                            self.reset_floating_window_drag_anchor();
-                        }
-                        self.last_mouse_pos = Some(pos);
-                        ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+                    if !self.is_panning {
+                        // Latch the drag mode at press time, while the cursor is still over the
+                        // window and the title-bar test is trustworthy.
+                        let in_title_bar = pointer_pos
+                            .is_some_and(|pos| pos.y < self.top_controls_hotzone_height());
+                        self.is_panning = true;
+                        self.pan_drag_button = self.pan_button_for_action(Action::Pan);
+                        self.pan_drag_moves_window = !self.mode().is_fullscreen()
+                            && (in_title_bar || !floating_image_exceeds_window);
+                        self.last_mouse_pos = pointer_pos;
+                        self.reset_floating_window_drag_anchor();
                     }
+
+                    // Re-sample the cursor: once it has left the window egui has no position for
+                    // it, and window and cursor can diverge by a long way, so a pointer delta
+                    // there would be a stale, too-small step.
+                    let cursor_points = match (pointer_pos, get_global_cursor_pos()) {
+                        (Some(pos), _) => Some(pos),
+                        (None, Some(screen_pos)) => {
+                            let scale = ctx.pixels_per_point().max(0.01);
+                            let outer_min = ctx
+                                .input(|i| i.raw.viewport().outer_rect)
+                                .map(|r| r.min)
+                                .unwrap_or(egui::Pos2::ZERO);
+                            Some(screen_pos / scale - outer_min.to_vec2())
+                        }
+                        (None, None) => None,
+                    };
+                    let drag_delta = match (self.last_mouse_pos, cursor_points) {
+                        (Some(previous), Some(current)) => current - previous,
+                        _ => cursor_delta,
+                    };
+
+                    if let Some(cursor) = cursor_points {
+                        if self.mode().is_fullscreen() {
+                            self.reset_floating_window_drag_anchor();
+                            // In fullscreen, pan the image
+                            self.offset += drag_delta;
+                            self.remember_current_fullscreen_view_state();
+                        } else if self.pan_drag_moves_window {
+                            // In floating mode, bypass native StartDrag to avoid Win11 top-edge snap.
+                            self.drag_floating_window_without_native_snap(ctx);
+                        } else {
+                            self.reset_floating_window_drag_anchor();
+                            // In floating mode when zoomed past 100%, pan image inside window
+                            self.offset += drag_delta;
+                        }
+                        self.last_mouse_pos = Some(cursor);
+                    } else if self.pan_drag_moves_window && !self.mode().is_fullscreen() {
+                        self.drag_floating_window_without_native_snap(ctx);
+                    }
+
+                    ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+                    // Keep the loop hot for the lifetime of the drag: the window must follow
+                    // the cursor even when egui stops receiving move events (cursor outside).
+                    ctx.request_repaint();
                 } else {
                     if self.is_panning {
                         self.is_panning = false;
                     }
                     self.last_mouse_pos = None;
+                    self.pan_drag_button = None;
+                    self.pan_drag_moves_window = false;
                     self.reset_floating_window_drag_anchor();
 
                     // Set cursor based on hover state
@@ -30820,6 +30962,27 @@ fn get_global_cursor_pos() -> Option<egui::Pos2> {
 fn get_global_cursor_pos() -> Option<egui::Pos2> {
     // Fallback for non-Windows: return None and let the caller handle it
     None
+}
+
+pub(crate) const GLOBAL_MOUSE_LEFT: u32 = 0x01;
+pub(crate) const GLOBAL_MOUSE_MIDDLE: u32 = 0x04;
+pub(crate) const GLOBAL_MOUSE_EXTRA1: u32 = 0x05;
+pub(crate) const GLOBAL_MOUSE_EXTRA2: u32 = 0x06;
+
+/// Is `button` (a Windows mouse-button `VK_*` code, `GLOBAL_MOUSE_*` above) still
+/// physically held? Unlike egui's pointer state this survives the cursor leaving
+/// the window, which is what a window drag does when the window lags behind.
+#[cfg(target_os = "windows")]
+pub(crate) fn global_mouse_button_down(button: u32) -> bool {
+    use winapi::um::winuser::GetAsyncKeyState;
+
+    unsafe { (GetAsyncKeyState(button as i32) as u16 & 0x8000) != 0 }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn global_mouse_button_down(_button: u32) -> bool {
+    // Unknown: callers fall back to egui's own pointer state (see the `||` at the call sites).
+    false
 }
 
 fn init_runtime_diagnostics() {
