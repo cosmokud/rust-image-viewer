@@ -2764,7 +2764,9 @@ struct ImageViewer {
     resize_last_size: Option<egui::Vec2>,
     /// Initial window outer position when a manual floating-window drag starts.
     floating_drag_start_outer_pos: Option<egui::Pos2>,
-    /// Global screen cursor position when a manual floating-window drag starts.
+    /// Global screen cursor position when a manual floating-window drag starts, in physical
+    /// screen pixels (`GetCursorPos` units), to match `OuterPosition` after the conversion
+    /// applied in `drag_floating_window_without_native_snap`.
     floating_drag_start_cursor_screen: Option<egui::Pos2>,
     /// When true, floating autosize is suppressed while zoomed media exceeds the viewport.
     /// Set by explicit user window drag/resize while in zoom-inside-window mode.
