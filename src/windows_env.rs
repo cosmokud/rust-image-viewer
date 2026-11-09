@@ -183,10 +183,9 @@ pub fn active_window_is_maximized() -> Option<bool> {
     unsafe { Some(IsZoomed(hwnd) != 0) }
 }
 
-pub fn set_active_window_maximized(maximize: bool) -> bool {
+pub fn set_window_maximized(hwnd: HWND, maximize: bool) -> bool {
     use winapi::um::winuser::{IsWindow, ShowWindow, SW_MAXIMIZE, SW_RESTORE};
 
-    let hwnd = active_or_foreground_window();
     if hwnd.is_null() {
         return false;
     }
@@ -197,6 +196,8 @@ pub fn set_active_window_maximized(maximize: bool) -> bool {
         }
     }
 
+    // Native maximize already targets the display the window is on, so the position fix
+    // `enforce_floating_window_buttons_on_display` does beforehand is all it needs.
     let cmd = if maximize { SW_MAXIMIZE } else { SW_RESTORE };
     unsafe {
         ShowWindow(hwnd, cmd);
@@ -294,6 +295,28 @@ pub fn is_window_maximized(hwnd: HWND) -> bool {
     unsafe { IsZoomed(hwnd) != 0 }
 }
 
+/// The active window, or the foreground one when nothing is active.
+pub fn active_window_handle() -> HWND {
+    active_or_foreground_window()
+}
+
+/// True while `scale_change_wndproc` is writing the restored size back: callers that would
+/// position the window themselves must wait for it to finish.
+pub fn is_scale_restore_in_flight() -> bool {
+    RESTORE_IN_FLIGHT.load(Ordering::SeqCst)
+}
+
+static RESTORE_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+/// True once after the guard restored a size across a scale change; cleared on read.
+/// The app scales its own zoom/offset by the same ratio, which keeps the rendered image
+/// the same physical size as the window it is in.
+pub fn take_scale_restore_event() -> bool {
+    SCALE_RESTORED.swap(false, Ordering::SeqCst)
+}
+
+static SCALE_RESTORED: AtomicBool = AtomicBool::new(false);
+
 /// True while the app itself is putting the window into borderless fullscreen: the scale guard
 /// must then leave the OS's resize alone, because the app writes the full display rect itself.
 static FULLSCREEN_TARGET: AtomicBool = AtomicBool::new(false);
@@ -366,7 +389,12 @@ unsafe extern "system" fn scale_change_wndproc(
     }
 
     if after.right - after.left != width || after.bottom - after.top != height {
-        set_window_rect(hwnd, left, top, width, height);
+        RESTORE_IN_FLIGHT.store(true, Ordering::SeqCst);
+        let restored = set_window_rect(hwnd, left, top, width, height);
+        RESTORE_IN_FLIGHT.store(false, Ordering::SeqCst);
+        if restored {
+            SCALE_RESTORED.store(true, Ordering::SeqCst);
+        }
     } else if left != after.left || top != after.top {
         set_window_rect(hwnd, left, top, width, height);
     }
@@ -388,12 +416,13 @@ pub fn install_scale_change_guard(hwnd: HWND) {
         return;
     }
     unsafe {
+        let hook = scale_change_wndproc as *const () as usize as isize;
         let previous = GetWindowLongPtrW(hwnd, GWLP_WNDPROC);
-        if previous == 0 || previous == scale_change_wndproc as usize as isize {
+        if previous == 0 || previous == hook {
             return;
         }
         PREVIOUS_WNDPROC.store(previous, Ordering::SeqCst);
-        SetWindowLongPtrW(hwnd, GWLP_WNDPROC, scale_change_wndproc as usize as isize);
+        SetWindowLongPtrW(hwnd, GWLP_WNDPROC, hook);
     }
 }
 

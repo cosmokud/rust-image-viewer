@@ -42,10 +42,6 @@ impl Rect {
         self.bottom - self.top
     }
 
-    pub fn size(self) -> (i32, i32) {
-        (self.width(), self.height())
-    }
-
     pub fn centre(self) -> (i32, i32) {
         (self.left + self.width() / 2, self.top + self.height() / 2)
     }
