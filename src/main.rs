@@ -14659,6 +14659,8 @@ impl ImageViewer {
     }
 
     fn prepare_enter_manga_mode_state(&mut self, current_media_type: Option<MediaType>) {
+        // Strip is fullscreen-only: `Mode::Strip` reports `is_fullscreen()`, so the window must
+        // already be fullscreen here. All three callers are gated on it; `ModeState` asserts it.
         self.set_strip_entry_placeholder_from_current_media(current_media_type);
         self.stop_manga_wheel_scroll();
         self.stop_manga_autoscroll();

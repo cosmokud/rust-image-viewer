@@ -179,6 +179,10 @@ impl Default for ModeState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ModeEvent {
     /// Enter strip with the already selected layout.
+    ///
+    /// Strip is fullscreen-only (`Mode::Strip` reports `is_fullscreen()`), so the caller must
+    /// already be fullscreen: the window commands that make it true are theirs to have issued.
+    /// No production path calls this from a floating mode, and the state machine asserts that.
     EnterStrip,
     /// Leave strip, keeping the current windowed/fullscreen placement.
     LeaveStrip,
@@ -201,6 +205,11 @@ impl ModeState {
     pub fn transition(&mut self, event: ModeEvent) -> Mode {
         match event {
             ModeEvent::EnterStrip => {
+                debug_assert!(
+                    self.mode.is_fullscreen(),
+                    "EnterStrip requires a fullscreen mode: a strip that reports fullscreen while the \
+                     window is still floating is the combination Mode exists to forbid"
+                );
                 self.mode = Mode::Strip(self.mode.layout());
             }
             ModeEvent::LeaveStrip => {
@@ -429,7 +438,7 @@ mod tests {
 
     #[test]
     fn enter_strip_uses_selected_layout() {
-        let mut state = ModeState::default();
+        let mut state = state(fullscreen(MangaLayoutMode::LongStrip));
         state.set_layout(MangaLayoutMode::Masonry);
 
         assert_eq!(
@@ -440,14 +449,14 @@ mod tests {
         assert!(state.mode().is_fullscreen());
     }
 
+    /// Every caller enters fullscreen first, so a floating source is a caller bug rather than a
+    /// supported shorthand -- it would produce a strip that claims a placement it never got.
     #[test]
-    fn enter_strip_from_floating_defaults_to_long_strip() {
+    #[should_panic(expected = "EnterStrip requires a fullscreen mode")]
+    fn enter_strip_from_floating_is_a_contract_violation() {
         let mut state = ModeState::default();
 
-        assert_eq!(
-            state.transition(ModeEvent::EnterStrip),
-            strip(MangaLayoutMode::LongStrip)
-        );
+        state.transition(ModeEvent::EnterStrip);
     }
 
     #[test]
@@ -760,6 +769,7 @@ mod tests {
         state.transition(ModeEvent::Handoff);
 
         assert!(!state.mode().is_fullscreen());
+        state.transition(ModeEvent::EnterFullscreen);
         state.transition(ModeEvent::EnterStrip);
         assert_eq!(state.mode(), strip(MangaLayoutMode::Gallery));
     }
@@ -987,6 +997,7 @@ mod tests {
         // Once the native maximize lands, the restore re-enters the strip.
         let restore = state.titlebar_pending_restore_layout().unwrap();
         state.set_titlebar_pending_restore_layout(None);
+        state.transition(ModeEvent::EnterFullscreen);
         state.set_layout(restore);
         state.transition(ModeEvent::EnterStrip);
         assert_eq!(state.mode(), strip(MangaLayoutMode::Masonry));
