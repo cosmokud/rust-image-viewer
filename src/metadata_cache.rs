@@ -22,16 +22,8 @@ const METADATA_CACHE_DEFAULT_MAX_SIZE_BYTES: u64 = 1024 * 1024 * 1024;
 const BYTES_PER_MIB: u64 = 1024 * 1024;
 static DIMENSION_HITS: AtomicU64 = AtomicU64::new(0);
 static DIMENSION_MISSES: AtomicU64 = AtomicU64::new(0);
-static THUMBNAIL_HITS: AtomicU64 = AtomicU64::new(0);
-static THUMBNAIL_MISSES: AtomicU64 = AtomicU64::new(0);
 static DIMENSION_EXPIRED: AtomicU64 = AtomicU64::new(0);
-static THUMBNAIL_EXPIRED: AtomicU64 = AtomicU64::new(0);
 static DIMENSION_EVICTED: AtomicU64 = AtomicU64::new(0);
-static THUMBNAIL_EVICTED: AtomicU64 = AtomicU64::new(0);
-static STATIC_THUMBNAIL_HITS: AtomicU64 = AtomicU64::new(0);
-static STATIC_THUMBNAIL_MISSES: AtomicU64 = AtomicU64::new(0);
-static STATIC_THUMBNAIL_EXPIRED: AtomicU64 = AtomicU64::new(0);
-static STATIC_THUMBNAIL_EVICTED: AtomicU64 = AtomicU64::new(0);
 static LAST_PRUNE_SECS: AtomicU64 = AtomicU64::new(0);
 static METADATA_CACHE_MAX_SIZE_BYTES: AtomicU64 =
     AtomicU64::new(METADATA_CACHE_DEFAULT_MAX_SIZE_BYTES);
@@ -51,16 +43,8 @@ pub fn set_metadata_cache_enabled(enabled: bool) {
 pub struct MetadataCacheStats {
     pub dimension_hits: u64,
     pub dimension_misses: u64,
-    pub thumbnail_hits: u64,
-    pub thumbnail_misses: u64,
     pub dimension_expired: u64,
-    pub thumbnail_expired: u64,
     pub dimension_evicted: u64,
-    pub thumbnail_evicted: u64,
-    pub static_thumbnail_hits: u64,
-    pub static_thumbnail_misses: u64,
-    pub static_thumbnail_expired: u64,
-    pub static_thumbnail_evicted: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -199,24 +183,6 @@ struct CachedRecord {
     height: u32,
     file_type: CachedFileType,
     animated: bool,
-}
-
-#[derive(Clone)]
-pub struct CachedVideoThumbnail {
-    pub pixels: Vec<u8>,
-    pub width: u32,
-    pub height: u32,
-    pub original_width: u32,
-    pub original_height: u32,
-}
-
-#[derive(Clone)]
-pub struct CachedImageThumbnail {
-    pub pixels: Vec<u8>,
-    pub width: u32,
-    pub height: u32,
-    pub original_width: u32,
-    pub original_height: u32,
 }
 
 enum CacheWriteOp {
@@ -649,22 +615,6 @@ pub fn store_cached_dimensions(path: &Path, media_kind: CachedMediaKind, width: 
     }
 }
 
-pub fn lookup_cached_video_thumbnail(
-    path: &Path,
-    max_texture_side: u32,
-) -> Option<CachedVideoThumbnail> {
-    let _ = (path, max_texture_side);
-    None
-}
-
-pub fn store_cached_video_thumbnail(
-    path: &Path,
-    max_texture_side: u32,
-    thumbnail: &CachedVideoThumbnail,
-) {
-    let _ = (path, max_texture_side, thumbnail);
-}
-
 #[cfg(test)]
 pub(crate) fn reset_cache_write_shutdown_for_test() {
     CACHE_WRITE_SHUTDOWN.store(false, Ordering::Release);
@@ -696,22 +646,6 @@ fn metadata_cache_accepts_dimension_writes_for_test() -> bool {
     !CACHE_WRITE_SHUTDOWN.load(Ordering::Acquire)
 }
 
-pub fn lookup_cached_static_thumbnail(
-    path: &Path,
-    max_texture_side: u32,
-) -> Option<CachedImageThumbnail> {
-    let _ = (path, max_texture_side);
-    None
-}
-
-pub fn store_cached_static_thumbnail(
-    path: &Path,
-    max_texture_side: u32,
-    thumbnail: &CachedImageThumbnail,
-) {
-    let _ = (path, max_texture_side, thumbnail);
-}
-
 pub fn metadata_cache_stats() -> MetadataCacheStats {
     if !metadata_cache_access_enabled() {
         return MetadataCacheStats::default();
@@ -720,16 +654,8 @@ pub fn metadata_cache_stats() -> MetadataCacheStats {
     MetadataCacheStats {
         dimension_hits: DIMENSION_HITS.load(Ordering::Relaxed),
         dimension_misses: DIMENSION_MISSES.load(Ordering::Relaxed),
-        thumbnail_hits: THUMBNAIL_HITS.load(Ordering::Relaxed),
-        thumbnail_misses: THUMBNAIL_MISSES.load(Ordering::Relaxed),
         dimension_expired: DIMENSION_EXPIRED.load(Ordering::Relaxed),
-        thumbnail_expired: THUMBNAIL_EXPIRED.load(Ordering::Relaxed),
         dimension_evicted: DIMENSION_EVICTED.load(Ordering::Relaxed),
-        thumbnail_evicted: THUMBNAIL_EVICTED.load(Ordering::Relaxed),
-        static_thumbnail_hits: STATIC_THUMBNAIL_HITS.load(Ordering::Relaxed),
-        static_thumbnail_misses: STATIC_THUMBNAIL_MISSES.load(Ordering::Relaxed),
-        static_thumbnail_expired: STATIC_THUMBNAIL_EXPIRED.load(Ordering::Relaxed),
-        static_thumbnail_evicted: STATIC_THUMBNAIL_EVICTED.load(Ordering::Relaxed),
     }
 }
 
@@ -1173,21 +1099,6 @@ mod tests {
         .concat();
 
         assert_eq!(webp_header_is_animated(&header), Some(false));
-    }
-
-    #[test]
-    fn thumbnail_cache_public_api_is_noop() {
-        let thumbnail = CachedVideoThumbnail {
-            pixels: vec![1, 2, 3, 4],
-            width: 1,
-            height: 1,
-            original_width: 1,
-            original_height: 1,
-        };
-        let path = Path::new("unused.jpg");
-
-        store_cached_video_thumbnail(path, 128, &thumbnail);
-        assert!(lookup_cached_video_thumbnail(path, 128).is_none());
     }
 
     #[test]

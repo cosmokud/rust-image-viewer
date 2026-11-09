@@ -6,6 +6,7 @@
 mod app_dirs;
 mod async_runtime;
 mod config;
+mod first_frame;
 mod folder_travel_cache;
 mod image_loader;
 mod image_resize;
@@ -30,6 +31,7 @@ use config::{
     Action, Config, InputBinding, MangaVirtualizationBackend, ShortcutModifier, StartupWindowMode,
     VideoSeekPolicy, WindowTitlePathMode,
 };
+use first_frame::FirstFrame;
 use folder_travel_cache::{
     lookup_folder_travel_position, store_folder_travel_position, FolderTravelLayoutMode,
     FolderTravelPosition,
@@ -46,12 +48,10 @@ use manga_loader::{
 use manga_spatial::{MangaSpatialIndex, SpatialRect, STRIP_QUERY_HALF_WIDTH};
 use media_index::{DirectoryScanResult, MediaDirectoryIndex};
 use metadata_cache::{
-    configure_metadata_cache_size_limit, lookup_cached_dimensions, lookup_cached_static_thumbnail,
-    lookup_cached_video_thumbnail, metadata_cache_stats, set_metadata_cache_enabled,
-    store_cached_dimensions, store_cached_static_thumbnail, store_cached_video_thumbnail,
-    CachedImageThumbnail, CachedMediaKind, CachedVideoThumbnail,
+    configure_metadata_cache_size_limit, lookup_cached_dimensions, metadata_cache_stats,
+    set_metadata_cache_enabled, store_cached_dimensions, CachedMediaKind,
 };
-use perf_metrics::PerfMetrics;
+use perf_metrics::{Metric, PerfMetrics};
 #[cfg(target_os = "windows")]
 use single_instance::{FileReceiver, SingleInstanceResult};
 use video_player::{
@@ -1572,7 +1572,7 @@ struct AsyncImageLoad {
 #[derive(Clone)]
 struct PendingVideoThumbnailPlaceholder {
     path: PathBuf,
-    thumbnail: CachedVideoThumbnail,
+    thumbnail: FirstFrame,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1655,8 +1655,7 @@ enum SoloProbeResult {
     },
     Video {
         path: PathBuf,
-        max_texture_side: u32,
-        thumbnail: Option<CachedVideoThumbnail>,
+        thumbnail: Option<FirstFrame>,
     },
 }
 
@@ -1930,7 +1929,6 @@ fn process_solo_probe_request(request: SoloProbeRequest) -> SoloProbeResult {
         } => SoloProbeResult::Video {
             thumbnail: extract_video_first_frame_thumbnail(path.as_path(), max_texture_side),
             path,
-            max_texture_side,
         },
     }
 }
@@ -2036,33 +2034,6 @@ fn load_solo_probe_image(
 ) -> Option<CachedDecodedImage> {
     let stamp = file_stamp_for_path(path)?;
 
-    let may_be_animated_by_ext = path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| matches!(ext.to_ascii_lowercase().as_str(), "gif" | "webp"))
-        .unwrap_or(false);
-
-    if !may_be_animated_by_ext {
-        if let Some(cached) = lookup_cached_static_thumbnail(path, max_texture_side) {
-            if cached.pixels.len() > DECODED_IMAGE_CACHE_SKIP_ENTRY_BYTES {
-                return None;
-            }
-
-            return Some(CachedDecodedImage {
-                stamp,
-                first_frame: ImageFrame {
-                    pixels: cached.pixels,
-                    width: cached.width,
-                    height: cached.height,
-                    delay_ms: 0,
-                },
-                original_width: cached.original_width,
-                original_height: cached.original_height,
-                is_animated_webp: false,
-            });
-        }
-    }
-
     let mut image = LoadedImage::load_first_frame_only(
         path,
         Some(max_texture_side),
@@ -2074,28 +2045,6 @@ fn load_solo_probe_image(
 
     let is_animated_webp = LoadedImage::is_animated_webp(path);
     let frame = image.current_frame_data().clone();
-
-    if !image.is_animated()
-        && !is_animated_webp
-        && should_store_static_thumbnail(
-            frame.width,
-            frame.height,
-            frame.pixels.len(),
-            max_texture_side,
-        )
-    {
-        store_cached_static_thumbnail(
-            path,
-            max_texture_side,
-            &CachedImageThumbnail {
-                pixels: frame.pixels.clone(),
-                width: frame.width,
-                height: frame.height,
-                original_width: image.original_width,
-                original_height: image.original_height,
-            },
-        );
-    }
 
     if frame.pixels.len() > DECODED_IMAGE_CACHE_SKIP_ENTRY_BYTES {
         return None;
@@ -2110,41 +2059,18 @@ fn load_solo_probe_image(
     })
 }
 
-fn extract_video_first_frame_thumbnail(
-    path: &Path,
-    max_texture_side: u32,
-) -> Option<CachedVideoThumbnail> {
-    if let Some(mut cached) = lookup_cached_video_thumbnail(path, max_texture_side) {
-        if !gstreamer_runtime_available() {
-            if let Some((original_width, original_height)) =
-                probe_video_dimensions_without_gstreamer(path)
-            {
-                if cached.original_width != original_width
-                    || cached.original_height != original_height
-                {
-                    cached.original_width = original_width;
-                    cached.original_height = original_height;
-                    store_cached_video_thumbnail(path, max_texture_side, &cached);
-                }
-            }
-        }
-
-        return Some(cached);
-    }
-
+fn extract_video_first_frame_thumbnail(path: &Path, max_texture_side: u32) -> Option<FirstFrame> {
     if !gstreamer_runtime_available() {
         let (pixels, width, height, original_width, original_height) =
             extract_video_first_frame_without_gstreamer(path, max_texture_side)?;
 
-        let thumbnail = CachedVideoThumbnail {
+        return Some(FirstFrame::new(
             pixels,
             width,
             height,
             original_width,
             original_height,
-        };
-        store_cached_video_thumbnail(path, max_texture_side, &thumbnail);
-        return Some(thumbnail);
+        ));
     }
 
     use gstreamer as gst;
@@ -2279,15 +2205,13 @@ fn extract_video_first_frame_thumbnail(
         FilterType::Triangle,
     );
 
-    let thumbnail = CachedVideoThumbnail {
-        pixels: final_pixels.into_owned(),
-        width: final_width,
-        height: final_height,
-        original_width: width,
-        original_height: height,
-    };
-    store_cached_video_thumbnail(path, max_texture_side, &thumbnail);
-    Some(thumbnail)
+    Some(FirstFrame::new(
+        final_pixels.into_owned(),
+        final_width,
+        final_height,
+        width,
+        height,
+    ))
 }
 
 fn load_folder_placeholder_thumbnail(
@@ -2475,7 +2399,6 @@ fn process_manga_focused_video_load_request(
 
 const DECODED_IMAGE_CACHE_MAX_BYTES: u64 = 384 * 1024 * 1024;
 const DECODED_IMAGE_CACHE_SKIP_ENTRY_BYTES: usize = 96 * 1024 * 1024;
-const STATIC_THUMBNAIL_CACHE_SKIP_ENTRY_BYTES: usize = 96 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct FileStamp {
@@ -2552,17 +2475,6 @@ fn decoded_image_cache_key(path: &Path, max_texture_side: u32) -> String {
     {
         format!("{}#ts{}", key, max_texture_side.max(1))
     }
-}
-
-fn should_store_static_thumbnail(
-    width: u32,
-    height: u32,
-    pixel_len: usize,
-    max_texture_side: u32,
-) -> bool {
-    width <= max_texture_side
-        && height <= max_texture_side
-        && pixel_len <= STATIC_THUMBNAIL_CACHE_SKIP_ENTRY_BYTES
 }
 
 #[cfg(target_os = "windows")]
@@ -7042,34 +6954,29 @@ impl ImageViewer {
         if path_is_gif {
             self.decoded_image_cache.invalidate(&key);
             self.remove_solo_image_texture_cache_entry(&key);
-            self.perf_metrics
-                .increment_counter("decoded_image_cache_miss", 1);
+            self.perf_metrics.count(Metric::DecodedImageCacheMiss, 1);
             return false;
         }
 
         let Some(cached) = self.decoded_image_cache.get(&key) else {
-            self.perf_metrics
-                .increment_counter("decoded_image_cache_miss", 1);
+            self.perf_metrics.count(Metric::DecodedImageCacheMiss, 1);
             return false;
         };
 
         let Some(current_stamp) = file_stamp_for_path(path) else {
             self.remove_solo_image_texture_cache_entry(&key);
-            self.perf_metrics
-                .increment_counter("decoded_image_cache_miss", 1);
+            self.perf_metrics.count(Metric::DecodedImageCacheMiss, 1);
             return false;
         };
 
         if cached.stamp != current_stamp {
             self.decoded_image_cache.invalidate(&key);
             self.remove_solo_image_texture_cache_entry(&key);
-            self.perf_metrics
-                .increment_counter("decoded_image_cache_miss", 1);
+            self.perf_metrics.count(Metric::DecodedImageCacheMiss, 1);
             return false;
         }
 
-        self.perf_metrics
-            .increment_counter("decoded_image_cache_hit", 1);
+        self.perf_metrics.count(Metric::DecodedImageCacheHit, 1);
 
         if !preserve_view_on_complete {
             self.consume_deferred_media_view_reset();
@@ -7092,13 +6999,12 @@ impl ImageViewer {
             self.image_texture_dims = Some(dims);
             self.image_texture_mipmap_enabled = mipmap_enabled;
             self.texture_frame = 0;
-            self.perf_metrics
-                .increment_counter("solo_image_texture_cache_hit", 1);
+            self.perf_metrics.count(Metric::SoloImageTextureCacheHit, 1);
         } else {
             self.clear_current_image_texture_upload();
             if !cached.is_animated_webp {
                 self.perf_metrics
-                    .increment_counter("solo_image_texture_cache_miss", 1);
+                    .count(Metric::SoloImageTextureCacheMiss, 1);
             }
         }
         self.image_changed =
@@ -7159,61 +7065,6 @@ impl ImageViewer {
         true
     }
 
-    fn try_load_image_from_thumbnail_cache(
-        &mut self,
-        path: &PathBuf,
-        max_texture_side: u32,
-    ) -> bool {
-        let may_be_animated_by_ext = path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .map(|ext| matches!(ext.to_ascii_lowercase().as_str(), "gif" | "webp"))
-            .unwrap_or(false);
-        if may_be_animated_by_ext {
-            return false;
-        }
-
-        let Some(cached) = lookup_cached_static_thumbnail(path, max_texture_side) else {
-            return false;
-        };
-
-        self.consume_deferred_media_view_reset();
-
-        let frame = ImageFrame {
-            pixels: cached.pixels,
-            width: cached.width,
-            height: cached.height,
-            delay_ms: 0,
-        };
-
-        if let Some(stamp) = file_stamp_for_path(path) {
-            self.decoded_image_cache.insert(
-                decoded_image_cache_key(path, max_texture_side),
-                Arc::new(CachedDecodedImage {
-                    stamp,
-                    first_frame: frame.clone(),
-                    original_width: cached.original_width,
-                    original_height: cached.original_height,
-                    is_animated_webp: false,
-                }),
-            );
-        }
-
-        self.image = Some(LoadedImage::from_single_frame(
-            path.clone(),
-            frame,
-            cached.original_width,
-            cached.original_height,
-        ));
-        self.retained_media_placeholder_visible = false;
-        self.clear_current_image_texture_upload();
-        self.image_changed = true;
-        self.pending_media_layout = false;
-        self.error_message = None;
-
-        true
-    }
-
     fn cache_loaded_image_first_frame(
         &mut self,
         path: &PathBuf,
@@ -7232,28 +7083,6 @@ impl ImageViewer {
         }
 
         let frame = image.current_frame_data();
-
-        if !image.is_animated()
-            && !is_animated_webp
-            && should_store_static_thumbnail(
-                frame.width,
-                frame.height,
-                frame.pixels.len(),
-                max_texture_side,
-            )
-        {
-            store_cached_static_thumbnail(
-                path,
-                max_texture_side,
-                &CachedImageThumbnail {
-                    pixels: frame.pixels.clone(),
-                    width: frame.width,
-                    height: frame.height,
-                    original_width: image.original_width,
-                    original_height: image.original_height,
-                },
-            );
-        }
 
         if frame.pixels.len() > DECODED_IMAGE_CACHE_SKIP_ENTRY_BYTES {
             return;
@@ -7576,12 +7405,8 @@ impl ImageViewer {
             })
     }
 
-    fn solo_video_thumbnail_texture_options(
-        &self,
-        width: u32,
-        height: u32,
-    ) -> egui::TextureOptions {
-        let min_side = width.min(height);
+    fn solo_video_thumbnail_texture_options(&self, frame: &FirstFrame) -> egui::TextureOptions {
+        let min_side = frame.width.min(frame.height);
         let mipmap_allowed_by_size = min_side >= self.config.manga_mipmap_min_side.max(1);
         let meaningfully_minified =
             (min_side as f32) >= self.solo_current_display_min_side() * 1.15;
@@ -7784,20 +7609,11 @@ impl ImageViewer {
         if current_media_type == Some(MediaType::Video) {
             let current_target_side =
                 self.solo_target_texture_side_for_path(current_path, MediaType::Video, false);
-            if let Some(thumbnail) =
-                lookup_cached_video_thumbnail(current_path, current_target_side)
-            {
-                self.pending_video_thumbnail_placeholder = Some(PendingVideoThumbnailPlaceholder {
-                    path: current_path.clone(),
-                    thumbnail,
-                });
-            } else {
-                requests.push(SoloProbeRequest::Video {
-                    path: current_path.clone(),
-                    max_texture_side: current_target_side,
-                });
-                queued_indices.insert(self.current_index);
-            }
+            requests.push(SoloProbeRequest::Video {
+                path: current_path.clone(),
+                max_texture_side: current_target_side,
+            });
+            queued_indices.insert(self.current_index);
         }
 
         for offset in offsets {
@@ -7831,13 +7647,6 @@ impl ImageViewer {
                         continue;
                     }
 
-                    let may_be_animated_by_ext = matches!(extension.as_deref(), Some("webp"));
-                    if !may_be_animated_by_ext
-                        && lookup_cached_static_thumbnail(&path, target_side).is_some()
-                    {
-                        continue;
-                    }
-
                     requests.push(SoloProbeRequest::Image {
                         path,
                         max_texture_side: target_side,
@@ -7853,10 +7662,6 @@ impl ImageViewer {
                 MediaType::Video => {
                     let target_side =
                         self.solo_target_texture_side_for_path(&path, media_type, false);
-                    if lookup_cached_video_thumbnail(&path, target_side).is_some() {
-                        continue;
-                    }
-
                     requests.push(SoloProbeRequest::Video {
                         path,
                         max_texture_side: target_side,
@@ -7930,11 +7735,7 @@ impl ImageViewer {
                         }
                     }
                 }
-                SoloProbeResult::Video {
-                    path,
-                    max_texture_side,
-                    thumbnail,
-                } => {
+                SoloProbeResult::Video { path, thumbnail } => {
                     let Some(thumbnail) = thumbnail else {
                         continue;
                     };
@@ -7959,8 +7760,6 @@ impl ImageViewer {
                                 thumbnail,
                             });
                         request_repaint = true;
-                    } else {
-                        store_cached_video_thumbnail(&path, max_texture_side, &thumbnail);
                     }
                 }
             }
@@ -8128,18 +7927,14 @@ impl ImageViewer {
     }
 
     fn manga_record_target_side_sample(&mut self, side: u32) {
-        self.perf_metrics
-            .increment_counter("manga_target_side_samples", 1);
+        self.perf_metrics.count(Metric::MangaTargetSideSamples, 1);
 
         if side <= 192 {
-            self.perf_metrics
-                .increment_counter("manga_target_side_low", 1);
+            self.perf_metrics.count(Metric::MangaTargetSideLow, 1);
         } else if side <= 512 {
-            self.perf_metrics
-                .increment_counter("manga_target_side_mid", 1);
+            self.perf_metrics.count(Metric::MangaTargetSideMid, 1);
         } else {
-            self.perf_metrics
-                .increment_counter("manga_target_side_high", 1);
+            self.perf_metrics.count(Metric::MangaTargetSideHigh, 1);
         }
     }
 
@@ -8205,10 +8000,7 @@ impl ImageViewer {
         }
 
         // Adapt upload budget to measured upload pass latency.
-        if let Some(upload_p95_ms) = self
-            .perf_metrics
-            .percentile_ms("manga_upload_pass_ms", 0.95)
-        {
+        if let Some(upload_p95_ms) = self.perf_metrics.p95(Metric::MangaUploadPassMs) {
             if upload_p95_ms >= Self::MANGA_UPLOAD_P95_HARD_BUDGET_MS {
                 limit = limit.saturating_sub(4);
             } else if upload_p95_ms >= Self::MANGA_UPLOAD_P95_SOFT_BUDGET_MS {
@@ -8323,7 +8115,7 @@ impl ImageViewer {
 
         if dropped_count > 0 {
             self.perf_metrics
-                .increment_counter("manga_decoded_mailbox_drop", dropped_count);
+                .count(Metric::MangaDecodedMailboxDrop, dropped_count);
         }
 
         near_radius
@@ -8453,8 +8245,8 @@ impl ImageViewer {
             index_stats.hits, index_stats.misses
         ));
 
-        let decoded_hits = self.perf_metrics.counter("decoded_image_cache_hit");
-        let decoded_misses = self.perf_metrics.counter("decoded_image_cache_miss");
+        let decoded_hits = self.perf_metrics.counter(Metric::DecodedImageCacheHit);
+        let decoded_misses = self.perf_metrics.counter(Metric::DecodedImageCacheMiss);
         if decoded_hits > 0 || decoded_misses > 0 {
             text.push_str(&format!(" | DC H{} M{}", decoded_hits, decoded_misses));
         }
@@ -8462,99 +8254,56 @@ impl ImageViewer {
         let metadata_stats = metadata_cache_stats();
         if metadata_stats.dimension_hits > 0
             || metadata_stats.dimension_misses > 0
-            || metadata_stats.thumbnail_hits > 0
-            || metadata_stats.thumbnail_misses > 0
-            || metadata_stats.static_thumbnail_hits > 0
-            || metadata_stats.static_thumbnail_misses > 0
             || metadata_stats.dimension_expired > 0
-            || metadata_stats.thumbnail_expired > 0
-            || metadata_stats.static_thumbnail_expired > 0
             || metadata_stats.dimension_evicted > 0
-            || metadata_stats.thumbnail_evicted > 0
-            || metadata_stats.static_thumbnail_evicted > 0
         {
             text.push_str(&format!(
-                " | MC D{}/{} TV{}/{} TS{}/{} E{}/{}/{} V{}/{}/{}",
+                " | MC D{}/{} E{} V{}",
                 metadata_stats.dimension_hits,
                 metadata_stats.dimension_misses,
-                metadata_stats.thumbnail_hits,
-                metadata_stats.thumbnail_misses,
-                metadata_stats.static_thumbnail_hits,
-                metadata_stats.static_thumbnail_misses,
                 metadata_stats.dimension_expired,
-                metadata_stats.thumbnail_expired,
-                metadata_stats.static_thumbnail_expired,
                 metadata_stats.dimension_evicted,
-                metadata_stats.thumbnail_evicted,
-                metadata_stats.static_thumbnail_evicted,
             ));
         }
 
-        if let Some(p95) = self
-            .perf_metrics
-            .percentile_ms("media_index_lookup_ms", 0.95)
-        {
+        if let Some(p95) = self.perf_metrics.p95(Metric::MediaIndexLookupMs) {
             text.push_str(&format!(" p95:{p95:.2}ms"));
         }
 
         if self.manga_mode {
-            if let Some(p95) = self
-                .perf_metrics
-                .percentile_ms("manga_upload_pass_ms", 0.95)
-            {
+            if let Some(p95) = self.perf_metrics.p95(Metric::MangaUploadPassMs) {
                 text.push_str(&format!(" | UP p95:{p95:.2}ms"));
             }
 
-            if let Some(p95) = self
-                .perf_metrics
-                .percentile_ms("manga_decode_queue_wait_ms", 0.95)
-            {
+            if let Some(p95) = self.perf_metrics.p95(Metric::MangaDecodeQueueWaitMs) {
                 text.push_str(&format!(" | QW p95:{p95:.2}ms"));
             }
-            if let Some(p95) = self
-                .perf_metrics
-                .percentile_ms("manga_decode_worker_ms", 0.95)
-            {
+            if let Some(p95) = self.perf_metrics.p95(Metric::MangaDecodeWorkerMs) {
                 text.push_str(&format!(" | DEC p95:{p95:.2}ms"));
             }
-            if let Some(p95) = self
-                .perf_metrics
-                .percentile_ms("manga_decode_resize_ms", 0.95)
-            {
+            if let Some(p95) = self.perf_metrics.p95(Metric::MangaDecodeResizeMs) {
                 text.push_str(&format!(" | RSZ p95:{p95:.2}ms"));
             }
-            if let Some(p95) = self
-                .perf_metrics
-                .percentile_ms("manga_upload_texture_ms", 0.95)
-            {
+            if let Some(p95) = self.perf_metrics.p95(Metric::MangaUploadTextureMs) {
                 text.push_str(&format!(" | UTX p95:{p95:.2}ms"));
             }
-            if let Some(p95) = self
-                .perf_metrics
-                .percentile_ms("masonry_layout_rebuild_ms", 0.95)
-            {
+            if let Some(p95) = self.perf_metrics.p95(Metric::MasonryLayoutRebuildMs) {
                 text.push_str(&format!(" | LY p95:{p95:.2}ms"));
             }
-            if let Some(p95) = self
-                .perf_metrics
-                .percentile_ms("masonry_spatial_rebuild_ms", 0.95)
-            {
+            if let Some(p95) = self.perf_metrics.p95(Metric::MasonrySpatialRebuildMs) {
                 text.push_str(&format!(" | SI p95:{p95:.2}ms"));
             }
-            if let Some(p95) = self
-                .perf_metrics
-                .percentile_ms("manga_visible_query_ms", 0.95)
-            {
+            if let Some(p95) = self.perf_metrics.p95(Metric::MangaVisibleQueryMs) {
                 text.push_str(&format!(" | VQ p95:{p95:.2}ms"));
             }
 
-            let uploaded_total = self.perf_metrics.counter("manga_uploaded_textures");
+            let uploaded_total = self.perf_metrics.counter(Metric::MangaUploadedTextures);
             if uploaded_total > 0 {
                 text.push_str(&format!(" | UTot {}", uploaded_total));
             }
 
-            let visible_query_rtree = self.perf_metrics.counter("manga_visible_query_rtree");
-            let visible_query_linear = self.perf_metrics.counter("manga_visible_query_linear");
+            let visible_query_rtree = self.perf_metrics.counter(Metric::MangaVisibleQueryRtree);
+            let visible_query_linear = self.perf_metrics.counter(Metric::MangaVisibleQueryLinear);
             if visible_query_rtree > 0 || visible_query_linear > 0 {
                 text.push_str(&format!(
                     " | VQ R/L {}/{}",
@@ -8570,9 +8319,10 @@ impl ImageViewer {
 
                 text.push_str(&format!(" | DM {}", self.manga_decoded_mailbox.len()));
 
-                let dim_commit_visible = self.perf_metrics.counter("masonry_dim_commit_visible");
-                let dim_commit_idle = self.perf_metrics.counter("masonry_dim_commit_idle");
-                let dim_commit_deferred = self.perf_metrics.counter("masonry_dim_commit_deferred");
+                let dim_commit_visible = self.perf_metrics.counter(Metric::MasonryDimCommitVisible);
+                let dim_commit_idle = self.perf_metrics.counter(Metric::MasonryDimCommitIdle);
+                let dim_commit_deferred =
+                    self.perf_metrics.counter(Metric::MasonryDimCommitDeferred);
                 if dim_commit_visible > 0 || dim_commit_idle > 0 || dim_commit_deferred > 0 {
                     text.push_str(&format!(
                         " | DQ V/I/D {}/{}/{}",
@@ -8580,21 +8330,22 @@ impl ImageViewer {
                     ));
                 }
 
-                let decoded_mailbox_drop = self.perf_metrics.counter("manga_decoded_mailbox_drop");
+                let decoded_mailbox_drop =
+                    self.perf_metrics.counter(Metric::MangaDecodedMailboxDrop);
                 if decoded_mailbox_drop > 0 {
                     text.push_str(&format!(" | DMdrop {}", decoded_mailbox_drop));
                 }
             }
 
-            let retry_enqueued = self.perf_metrics.counter("manga_retry_enqueued");
-            let retry_rejected = self.perf_metrics.counter("manga_retry_rejected");
+            let retry_enqueued = self.perf_metrics.counter(Metric::MangaRetryEnqueued);
+            let retry_rejected = self.perf_metrics.counter(Metric::MangaRetryRejected);
             if retry_enqueued > 0 || retry_rejected > 0 {
                 text.push_str(&format!(" | RR {}/{}", retry_enqueued, retry_rejected));
             }
 
-            let side_low = self.perf_metrics.counter("manga_target_side_low");
-            let side_mid = self.perf_metrics.counter("manga_target_side_mid");
-            let side_high = self.perf_metrics.counter("manga_target_side_high");
+            let side_low = self.perf_metrics.counter(Metric::MangaTargetSideLow);
+            let side_mid = self.perf_metrics.counter(Metric::MangaTargetSideMid);
+            let side_high = self.perf_metrics.counter(Metric::MangaTargetSideHigh);
             if side_low > 0 || side_mid > 0 || side_high > 0 {
                 text.push_str(&format!(
                     " | TS L/M/H {}/{}/{}",
@@ -8602,8 +8353,8 @@ impl ImageViewer {
                 ));
             }
 
-            let deferred_nav = self.perf_metrics.counter("manga_upgrade_deferred_nav");
-            let low_lod_nav = self.perf_metrics.counter("manga_retry_low_lod_nav");
+            let deferred_nav = self.perf_metrics.counter(Metric::MangaUpgradeDeferredNav);
+            let low_lod_nav = self.perf_metrics.counter(Metric::MangaRetryLowLodNav);
             if deferred_nav > 0 || low_lod_nav > 0 {
                 text.push_str(&format!(" | NavDQ {} NavLL {}", deferred_nav, low_lod_nav));
             }
@@ -8723,9 +8474,7 @@ impl ImageViewer {
             .map_or(false, |pending| pending.path == *path);
 
         if !has_pending_for_path && self.video_texture.is_none() {
-            if let Some(thumbnail) = lookup_cached_video_thumbnail(path, target_side)
-                .or_else(|| extract_video_first_frame_thumbnail(path, target_side))
-            {
+            if let Some(thumbnail) = extract_video_first_frame_thumbnail(path, target_side) {
                 self.pending_video_thumbnail_placeholder = Some(PendingVideoThumbnailPlaceholder {
                     path: path.clone(),
                     thumbnail,
@@ -11432,52 +11181,35 @@ impl ImageViewer {
 
         let (pixels, width, height, texture_options) = match media_type {
             MediaType::Image => {
-                if let Some(cached) = lookup_cached_static_thumbnail(path, target_side) {
-                    let min_side = cached.width.min(cached.height);
-                    let texture_options = if animated_by_ext {
-                        self.config.texture_filter_animated.to_egui_options()
-                    } else {
-                        self.config
-                            .texture_filter_static
-                            .to_egui_options_with_mipmap(
-                                self.mipmap_static_enabled()
-                                    && min_side >= self.config.manga_mipmap_min_side.max(1),
-                            )
-                    };
-                    (cached.pixels, cached.width, cached.height, texture_options)
+                let cached = load_solo_probe_image(
+                    path,
+                    target_side,
+                    self.config.downscale_filter.to_image_filter(),
+                    self.config.gif_resize_filter.to_image_filter(),
+                )?;
+                let animated =
+                    cached.first_frame.delay_ms > 0 || cached.is_animated_webp || animated_by_ext;
+                let min_side = cached.first_frame.width.min(cached.first_frame.height);
+                let texture_options = if animated {
+                    self.config.texture_filter_animated.to_egui_options()
                 } else {
-                    let cached = load_solo_probe_image(
-                        path,
-                        target_side,
-                        self.config.downscale_filter.to_image_filter(),
-                        self.config.gif_resize_filter.to_image_filter(),
-                    )?;
-                    let animated = cached.first_frame.delay_ms > 0
-                        || cached.is_animated_webp
-                        || animated_by_ext;
-                    let min_side = cached.first_frame.width.min(cached.first_frame.height);
-                    let texture_options = if animated {
-                        self.config.texture_filter_animated.to_egui_options()
-                    } else {
-                        self.config
-                            .texture_filter_static
-                            .to_egui_options_with_mipmap(
-                                self.mipmap_static_enabled()
-                                    && min_side >= self.config.manga_mipmap_min_side.max(1),
-                            )
-                    };
-                    (
-                        cached.first_frame.pixels,
-                        cached.first_frame.width,
-                        cached.first_frame.height,
-                        texture_options,
-                    )
-                }
+                    self.config
+                        .texture_filter_static
+                        .to_egui_options_with_mipmap(
+                            self.mipmap_static_enabled()
+                                && min_side >= self.config.manga_mipmap_min_side.max(1),
+                        )
+                };
+                (
+                    cached.first_frame.pixels,
+                    cached.first_frame.width,
+                    cached.first_frame.height,
+                    texture_options,
+                )
             }
             MediaType::Video => {
                 let cached = extract_video_first_frame_thumbnail(path, target_side)?;
-                let texture_options =
-                    self.solo_video_thumbnail_texture_options(cached.width, cached.height);
+                let texture_options = self.solo_video_thumbnail_texture_options(&cached);
                 (cached.pixels, cached.width, cached.height, texture_options)
             }
         };
@@ -15668,7 +15400,7 @@ impl ImageViewer {
 
         if let Some(started_at) = self.pending_media_directory_started_at.take() {
             self.perf_metrics
-                .record_duration("media_index_async_scan_ms", started_at.elapsed());
+                .record(Metric::MediaIndexAsyncScanMs, started_at.elapsed());
         }
 
         let scanned_directory = result.directory.clone();
@@ -15899,8 +15631,7 @@ impl ImageViewer {
                 || result_index != pending.index
                 || result_path != &pending.path
             {
-                self.perf_metrics
-                    .increment_counter("manga_video_async_stale", 1);
+                self.perf_metrics.count(Metric::MangaVideoAsyncStale, 1);
                 continue;
             }
 
@@ -15910,11 +15641,11 @@ impl ImageViewer {
 
             let total_elapsed = pending.started_at.elapsed();
             self.perf_metrics
-                .record_duration("manga_video_async_ms", total_elapsed);
+                .record(Metric::MangaVideoAsyncMs, total_elapsed);
             self.perf_metrics
-                .record_duration("manga_video_async_worker_ms", worker_elapsed);
-            self.perf_metrics.record_duration(
-                "manga_video_async_queue_ms",
+                .record(Metric::MangaVideoAsyncWorkerMs, worker_elapsed);
+            self.perf_metrics.record(
+                Metric::MangaVideoAsyncQueueMs,
                 total_elapsed.saturating_sub(worker_elapsed),
             );
 
@@ -15926,8 +15657,7 @@ impl ImageViewer {
                     .is_some_and(|current_path| current_path == result_path);
 
             if !still_targeted {
-                self.perf_metrics
-                    .increment_counter("manga_video_async_stale", 1);
+                self.perf_metrics.count(Metric::MangaVideoAsyncStale, 1);
                 continue;
             }
 
@@ -16291,8 +16021,7 @@ impl ImageViewer {
             };
 
             if result_request_id != pending.request_id || result_path != &pending.path {
-                self.perf_metrics
-                    .increment_counter("load_media_async_stale", 1);
+                self.perf_metrics.count(Metric::LoadMediaAsyncStale, 1);
                 continue;
             }
 
@@ -16302,11 +16031,11 @@ impl ImageViewer {
 
             let total_elapsed = pending.started_at.elapsed();
             self.perf_metrics
-                .record_duration("load_media_async_ms", total_elapsed);
+                .record(Metric::LoadMediaAsyncMs, total_elapsed);
             self.perf_metrics
-                .record_duration("load_media_async_worker_ms", worker_elapsed);
-            self.perf_metrics.record_duration(
-                "load_media_async_queue_ms",
+                .record(Metric::LoadMediaAsyncWorkerMs, worker_elapsed);
+            self.perf_metrics.record(
+                Metric::LoadMediaAsyncQueueMs,
                 total_elapsed.saturating_sub(worker_elapsed),
             );
 
@@ -16621,17 +16350,17 @@ impl ImageViewer {
         }
 
         self.perf_metrics
-            .record_duration("media_index_lookup_ms", index_lookup_start.elapsed());
+            .record(Metric::MediaIndexLookupMs, index_lookup_start.elapsed());
         let index_stats_after = self.media_directory_index.stats();
         if index_stats_after.hits > index_stats_before.hits {
-            self.perf_metrics.increment_counter(
-                "media_index_hits",
+            self.perf_metrics.count(
+                Metric::MediaIndexHits,
                 index_stats_after.hits - index_stats_before.hits,
             );
         }
         if index_stats_after.misses > index_stats_before.misses {
-            self.perf_metrics.increment_counter(
-                "media_index_misses",
+            self.perf_metrics.count(
+                Metric::MediaIndexMisses,
                 index_stats_after.misses - index_stats_before.misses,
             );
         }
@@ -16655,7 +16384,7 @@ impl ImageViewer {
                     self.image_changed = true;
                     self.pending_media_layout = false;
                     self.perf_metrics
-                        .record_duration("load_media_prepare_ms", load_media_start.elapsed());
+                        .record(Metric::LoadMediaPrepareMs, load_media_start.elapsed());
                     return;
                 }
 
@@ -16679,7 +16408,7 @@ impl ImageViewer {
                     self.image_changed = true;
                     self.pending_media_layout = false;
                     self.perf_metrics
-                        .record_duration("load_media_prepare_ms", load_media_start.elapsed());
+                        .record(Metric::LoadMediaPrepareMs, load_media_start.elapsed());
                     return;
                 }
 
@@ -16699,16 +16428,7 @@ impl ImageViewer {
                         self.schedule_solo_probe_window(path, media_type);
                     }
                     self.perf_metrics
-                        .record_duration("load_media_prepare_ms", load_media_start.elapsed());
-                    return;
-                }
-
-                if self.try_load_image_from_thumbnail_cache(path, max_tex) {
-                    if !defer_directory_work_for_fast_startup {
-                        self.schedule_solo_probe_window(path, media_type);
-                    }
-                    self.perf_metrics
-                        .record_duration("load_media_prepare_ms", load_media_start.elapsed());
+                        .record(Metric::LoadMediaPrepareMs, load_media_start.elapsed());
                     return;
                 }
 
@@ -16732,7 +16452,7 @@ impl ImageViewer {
         }
 
         self.perf_metrics
-            .record_duration("load_media_prepare_ms", load_media_start.elapsed());
+            .record(Metric::LoadMediaPrepareMs, load_media_start.elapsed());
     }
 
     /// Save the current view state for the current image (fullscreen only).
@@ -18850,7 +18570,7 @@ impl ImageViewer {
             }
             self.masonry_spatial_index = Some(MangaSpatialIndex::from_rects(rects));
             self.perf_metrics
-                .record_duration("masonry_spatial_rebuild_ms", rebuild_started.elapsed());
+                .record(Metric::MasonrySpatialRebuildMs, rebuild_started.elapsed());
         }
 
         self.masonry_spatial_index.as_ref()
@@ -18978,18 +18698,16 @@ impl ImageViewer {
                 self.manga_query_visible_indices_rtree(viewport_top, viewport_bottom)
             {
                 self.perf_metrics
-                    .record_duration("manga_visible_query_ms", query_started.elapsed());
-                self.perf_metrics
-                    .increment_counter("manga_visible_query_rtree", 1);
+                    .record(Metric::MangaVisibleQueryMs, query_started.elapsed());
+                self.perf_metrics.count(Metric::MangaVisibleQueryRtree, 1);
                 return indices;
             }
         }
 
         let indices = self.manga_collect_visible_indices_linear();
         self.perf_metrics
-            .record_duration("manga_visible_query_ms", query_started.elapsed());
-        self.perf_metrics
-            .increment_counter("manga_visible_query_linear", 1);
+            .record(Metric::MangaVisibleQueryMs, query_started.elapsed());
+        self.perf_metrics.count(Metric::MangaVisibleQueryLinear, 1);
         indices
     }
 
@@ -19519,7 +19237,7 @@ impl ImageViewer {
         self.masonry_layout_valid = true;
         self.masonry_spatial_index = None;
         self.perf_metrics
-            .record_duration("masonry_layout_rebuild_ms", rebuild_started.elapsed());
+            .record(Metric::MasonryLayoutRebuildMs, rebuild_started.elapsed());
     }
 
     fn masonry_item_screen_rect(&self, index: usize) -> Option<egui::Rect> {
@@ -19590,8 +19308,7 @@ impl ImageViewer {
         let should_apply =
             force || self.masonry_should_apply_dimension_updates_now(&pending_indices);
         if !should_apply {
-            self.perf_metrics
-                .increment_counter("masonry_dim_commit_deferred", 1);
+            self.perf_metrics.count(Metric::MasonryDimCommitDeferred, 1);
             self.masonry_layout_invalidation_deferred = true;
             return false;
         }
@@ -19600,16 +19317,16 @@ impl ImageViewer {
         self.masonry_pending_dimension_updates.clear();
         self.masonry_layout_invalidation_deferred = false;
         self.invalidate_manga_layout_cache();
-        self.perf_metrics.increment_counter(
+        self.perf_metrics.count(
             if force {
-                "masonry_dim_commit_idle"
+                Metric::MasonryDimCommitIdle
             } else {
-                "masonry_dim_commit_visible"
+                Metric::MasonryDimCommitVisible
             },
             1,
         );
         self.perf_metrics
-            .increment_counter("masonry_dim_commit_items", pending_count);
+            .count(Metric::MasonryDimCommitItems, pending_count);
 
         if force && !self.masonry_metadata_preload_active {
             self.restore_masonry_scroll_after_metadata_preload();
@@ -22104,11 +21821,11 @@ impl ImageViewer {
             }
 
             self.perf_metrics
-                .record_duration("manga_decode_queue_wait_ms", decoded.queue_wait);
+                .record(Metric::MangaDecodeQueueWaitMs, decoded.queue_wait);
             self.perf_metrics
-                .record_duration("manga_decode_worker_ms", decoded.decode_time);
+                .record(Metric::MangaDecodeWorkerMs, decoded.decode_time);
             self.perf_metrics
-                .record_duration("manga_decode_resize_ms", decoded.resize_time);
+                .record(Metric::MangaDecodeResizeMs, decoded.resize_time);
             self.manga_record_target_side_sample(decoded.requested_side);
 
             // Keep current texture unless the decoded payload is a meaningful quality upgrade.
@@ -22154,8 +21871,10 @@ impl ImageViewer {
                 color_image,
                 texture_options,
             );
-            self.perf_metrics
-                .record_duration("manga_upload_texture_ms", upload_texture_started.elapsed());
+            self.perf_metrics.record(
+                Metric::MangaUploadTextureMs,
+                upload_texture_started.elapsed(),
+            );
 
             // Insert into cache with media type (this may evict old entries)
             let evicted = self.manga_texture_cache.insert_with_type(
@@ -22187,10 +21906,10 @@ impl ImageViewer {
         self.manga_texture_cache.tick();
 
         self.perf_metrics
-            .record_duration("manga_upload_pass_ms", upload_pass_started.elapsed());
+            .record(Metric::MangaUploadPassMs, upload_pass_started.elapsed());
         if uploaded_textures > 0 {
             self.perf_metrics
-                .increment_counter("manga_uploaded_textures", uploaded_textures);
+                .count(Metric::MangaUploadedTextures, uploaded_textures);
         }
 
         dims_updated
@@ -23564,14 +23283,13 @@ impl ImageViewer {
             && Some(index) != self.manga_focused_video_index;
 
         if quality_upgrade && defer_visible_quality {
-            self.perf_metrics
-                .increment_counter("manga_upgrade_deferred_nav", 1);
+            self.perf_metrics.count(Metric::MangaUpgradeDeferredNav, 1);
             return false;
         }
 
         if strip_placeholder_during_playback && quality_upgrade {
             self.perf_metrics
-                .increment_counter("manga_upgrade_deferred_strip_playback", 1);
+                .count(Metric::MangaUpgradeDeferredStripPlayback, 1);
             return false;
         }
 
@@ -23603,11 +23321,11 @@ impl ImageViewer {
                 .max(min_target_side);
             let side = desired_target_side.min(fill_cap).max(min_target_side);
             if side < desired_target_side {
-                self.perf_metrics.increment_counter(
+                self.perf_metrics.count(
                     if defer_visible_quality {
-                        "manga_retry_low_lod_nav"
+                        Metric::MangaRetryLowLodNav
                     } else {
-                        "manga_retry_low_lod_fill"
+                        Metric::MangaRetryLowLodFill
                     },
                     1,
                 );
@@ -23680,8 +23398,7 @@ impl ImageViewer {
             }
 
             if requested {
-                self.perf_metrics
-                    .increment_counter("manga_retry_forced_requeue", 1);
+                self.perf_metrics.count(Metric::MangaRetryForcedRequeue, 1);
             }
         }
 
@@ -23704,18 +23421,15 @@ impl ImageViewer {
             }
 
             if requested {
-                self.perf_metrics
-                    .increment_counter("manga_retry_stall_heal", 1);
+                self.perf_metrics.count(Metric::MangaRetryStallHeal, 1);
             }
         }
 
         if requested {
-            self.perf_metrics
-                .increment_counter("manga_retry_enqueued", 1);
+            self.perf_metrics.count(Metric::MangaRetryEnqueued, 1);
             self.manga_record_target_side_sample(target_texture_side);
         } else {
-            self.perf_metrics
-                .increment_counter("manga_retry_rejected", 1);
+            self.perf_metrics.count(Metric::MangaRetryRejected, 1);
         }
 
         requested
@@ -26030,10 +25744,7 @@ impl ImageViewer {
                     self.video_texture = Some(ctx.load_texture(
                         "video-thumbnail-placeholder",
                         color_image,
-                        self.solo_video_thumbnail_texture_options(
-                            placeholder.thumbnail.width,
-                            placeholder.thumbnail.height,
-                        ),
+                        self.solo_video_thumbnail_texture_options(&placeholder.thumbnail),
                     ));
                     self.video_texture_source_path = Some(placeholder_path);
                     self.video_texture_dims =

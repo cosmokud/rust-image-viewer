@@ -31,15 +31,15 @@ use lru::LruCache;
 use parking_lot::RwLock;
 use rayon::prelude::*;
 
+use crate::first_frame::FirstFrame;
 use crate::image_loader::{
     get_media_type, is_supported_image, is_supported_video, probe_image_dimensions, LoadedImage,
     MediaType,
 };
 use crate::image_resize::downscale_rgba_if_needed;
 use crate::metadata_cache::{
-    lookup_cached_dimensions, lookup_cached_dimensions_batch, lookup_cached_static_thumbnail,
-    lookup_cached_video_thumbnail, store_cached_dimensions, store_cached_static_thumbnail,
-    store_cached_video_thumbnail, CachedImageThumbnail, CachedMediaKind, CachedVideoThumbnail,
+    lookup_cached_dimensions, lookup_cached_dimensions_batch, store_cached_dimensions,
+    CachedMediaKind,
 };
 use crate::video_player::gstreamer_runtime_available;
 use crate::video_thumbnail::{
@@ -995,17 +995,6 @@ impl MangaLoader {
         Self::fallback_video_dimensions(path).unwrap_or((1920, 1080))
     }
 
-    fn is_webm_video_path(path: &std::path::Path) -> bool {
-        path.extension()
-            .and_then(|ext| ext.to_str())
-            .map(|ext| ext.eq_ignore_ascii_case("webm"))
-            .unwrap_or(false)
-    }
-
-    fn webm_gstreamer_thumbnail_cache_side(max_texture_side: u32) -> u32 {
-        1_000_000_000u32.saturating_add(max_texture_side.max(1))
-    }
-
     /// Load a single image on a worker thread.
     /// For video files, this extracts the first frame as a thumbnail placeholder.
     fn load_single_image(req: &LoadRequest) -> Option<DecodedImage> {
@@ -1022,12 +1011,12 @@ impl MangaLoader {
                 // For videos, try to extract the first frame as a thumbnail
                 // This provides a visual preview instead of a gray placeholder
                 match Self::extract_video_first_frame(&req.path, effective_texture_side) {
-                    Some((pixels, width, height, original_width, original_height)) => {
+                    Some(frame) => {
                         let resize_started = Instant::now();
                         let (width, height, pixels) = downscale_rgba_if_needed(
-                            width,
-                            height,
-                            &pixels,
+                            frame.width,
+                            frame.height,
+                            &frame.pixels,
                             effective_texture_side,
                             req.downscale_filter,
                         );
@@ -1039,8 +1028,8 @@ impl MangaLoader {
                             pixels: pixels.into_owned(),
                             width,
                             height,
-                            original_width,
-                            original_height,
+                            original_width: frame.original_width,
+                            original_height: frame.original_height,
                             media_type: MangaMediaType::Video,
                             requested_side: effective_texture_side,
                             queue_wait: Duration::ZERO,
@@ -1075,35 +1064,6 @@ impl MangaLoader {
                 // Get original dimensions from file header first (fast, no decode)
                 let (original_width, original_height) =
                     Self::probe_image_dimensions_cached(&req.path)?;
-
-                // For definitely-static formats, prefer persistent thumbnail pyramid cache.
-                // This avoids repeat decode+resize work across sessions and dense masonry runs.
-                let may_be_animated_by_ext = req
-                    .path
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    .map(|ext| matches!(ext.to_ascii_lowercase().as_str(), "gif" | "webp"))
-                    .unwrap_or(false);
-                if !may_be_animated_by_ext {
-                    if let Some(cached) =
-                        lookup_cached_static_thumbnail(&req.path, effective_texture_side)
-                    {
-                        return Some(DecodedImage {
-                            index: req.index,
-                            path: req.path.clone(),
-                            pixels: cached.pixels,
-                            width: cached.width,
-                            height: cached.height,
-                            original_width: cached.original_width,
-                            original_height: cached.original_height,
-                            media_type: MangaMediaType::StaticImage,
-                            requested_side: effective_texture_side,
-                            queue_wait: Duration::ZERO,
-                            decode_time: Duration::ZERO,
-                            resize_time: Duration::ZERO,
-                        });
-                    }
-                }
 
                 // For animated WebP files we only decode the first frame here so that
                 // the manga scroll view isn't blocked by a potentially very expensive
@@ -1155,20 +1115,6 @@ impl MangaLoader {
                 );
                 let resize_time = resize_started.elapsed();
                 let pixels = pixels.into_owned();
-
-                if manga_media_type == MangaMediaType::StaticImage {
-                    store_cached_static_thumbnail(
-                        &req.path,
-                        effective_texture_side,
-                        &CachedImageThumbnail {
-                            pixels: pixels.clone(),
-                            width,
-                            height,
-                            original_width,
-                            original_height,
-                        },
-                    );
-                }
 
                 Some(DecodedImage {
                     index: req.index,
@@ -1240,7 +1186,7 @@ impl MangaLoader {
         }
 
         let probed = Self::extract_video_first_frame(path, 256)
-            .map(|(_, _, _, original_w, original_h)| (original_w, original_h));
+            .map(|frame| (frame.original_width, frame.original_height));
 
         if let Some((w, h)) = probed {
             if w > 0 && h > 0 {
@@ -1312,59 +1258,23 @@ impl MangaLoader {
     /// This is much faster than full video playback initialization and provides
     /// a visual preview for videos in manga mode.
     ///
-    /// Returns: Some((pixels, width, height, original_width, original_height)) or None on failure
     fn extract_video_first_frame(
         path: &std::path::Path,
         max_texture_side: u32,
-    ) -> Option<(Vec<u8>, u32, u32, u32, u32)> {
+    ) -> Option<FirstFrame> {
         let gstreamer_available = gstreamer_runtime_available();
-        let cache_texture_side = if gstreamer_available && Self::is_webm_video_path(path) {
-            Self::webm_gstreamer_thumbnail_cache_side(max_texture_side)
-        } else {
-            max_texture_side
-        };
-
-        if let Some(mut cached) = lookup_cached_video_thumbnail(path, cache_texture_side) {
-            if !gstreamer_runtime_available() {
-                if let Some((original_width, original_height)) =
-                    probe_video_dimensions_without_gstreamer(path)
-                {
-                    if cached.original_width != original_width
-                        || cached.original_height != original_height
-                    {
-                        cached.original_width = original_width;
-                        cached.original_height = original_height;
-                        store_cached_video_thumbnail(path, cache_texture_side, &cached);
-                    }
-                }
-            }
-
-            return Some((
-                cached.pixels,
-                cached.width,
-                cached.height,
-                cached.original_width,
-                cached.original_height,
-            ));
-        }
 
         if !gstreamer_available {
             if let Some((pixels, width, height, original_width, original_height)) =
                 extract_video_first_frame_without_gstreamer(path, max_texture_side)
             {
-                store_cached_video_thumbnail(
-                    path,
-                    cache_texture_side,
-                    &CachedVideoThumbnail {
-                        pixels: pixels.clone(),
-                        width,
-                        height,
-                        original_width,
-                        original_height,
-                    },
-                );
-
-                return Some((pixels, width, height, original_width, original_height));
+                return Some(FirstFrame::new(
+                    pixels,
+                    width,
+                    height,
+                    original_width,
+                    original_height,
+                ));
             }
             return None;
         }
@@ -1535,21 +1445,8 @@ impl MangaLoader {
             FilterType::Triangle,
         );
 
-        let final_pixels = final_pixels.into_owned();
-        store_cached_video_thumbnail(
-            path,
-            cache_texture_side,
-            &CachedVideoThumbnail {
-                pixels: final_pixels.clone(),
-                width: final_width,
-                height: final_height,
-                original_width,
-                original_height,
-            },
-        );
-
-        Some((
-            final_pixels,
+        Some(FirstFrame::new(
+            final_pixels.into_owned(),
             final_width,
             final_height,
             original_width,
