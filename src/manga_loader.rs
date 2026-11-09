@@ -46,6 +46,7 @@ use crate::video_thumbnail::{
     extract_video_first_frame_without_gstreamer, probe_video_dimensions_with_gstreamer,
     probe_video_dimensions_without_gstreamer,
 };
+use crate::viewer_mode::MangaLayoutMode;
 
 /// Maximum number of decoded images to hold in memory awaiting GPU upload.
 /// This bounds memory usage even if the main thread is slow to consume results.
@@ -165,6 +166,90 @@ struct RetryState {
     next_retry_at: Instant,
 }
 
+/// Cache entry limits shared with the byte-aware budget clamps.
+const MANGA_CACHE_MIN_ENTRIES: usize = 64;
+const MANGA_CACHE_MAX_ENTRIES: usize = 1024;
+/// Byte-aware cache budgets: oversized textures must not inflate entry-count targets.
+const MASONRY_CACHE_BUDGET_BYTES_IDLE: usize = 768 * 1024 * 1024;
+const MASONRY_CACHE_BUDGET_BYTES_NAV: usize = 512 * 1024 * 1024;
+
+/// What the viewer currently shows. One `demand` call replaces the hand-sequenced
+/// visible-count + dimension-probe + preload + cache-budget sequence that used to live in main.rs.
+pub struct Demand<'a> {
+    pub image_list: &'a [PathBuf],
+    pub layout: MangaLayoutMode,
+    /// Index at the viewport top; anchors probe, preload and keep windows.
+    pub anchor_index: usize,
+    pub visible_indices: &'a [usize],
+    /// Whole-page count for the viewport when it differs from `visible_indices` (strip fallback).
+    pub visible_page_count: usize,
+    /// Long-strip fractional viewport coverage; None for grid layouts.
+    pub strip_visible_item_equivalent: Option<f32>,
+    pub max_texture_side: u32,
+    /// Display-derived side before LOD quantization; quantized inside the loader.
+    pub target_texture_side: u32,
+    pub downscale_filter: FilterType,
+    pub gif_filter: FilterType,
+    pub force_triangle_filters: bool,
+    pub masonry_rows: usize,
+    pub zoom: f32,
+    /// Scroll offset moved up this frame (keep window bias).
+    pub scrolling_up: bool,
+    /// Scrolling up or backward velocity (probe window bias).
+    pub moving_up: bool,
+    pub navigation_active: bool,
+    pub preserve_recent_cache: bool,
+    /// Capacity from the previous demand; used by the retain floor.
+    pub previous_cache_capacity: usize,
+    /// Indices the texture cache currently holds; the keep window evicts from this set.
+    pub cached_indices: &'a [usize],
+}
+
+/// Loader-side answers for `Demand`. main.rs applies them to its texture cache.
+pub struct DemandPlan {
+    pub cache_capacity: usize,
+    pub pinned_indices: Vec<usize>,
+    /// Cache entries outside the keep window; already forgotten by the loader.
+    pub evicted_indices: Vec<usize>,
+}
+
+/// Work products waiting to be consumed by the UI thread.
+pub struct Taken {
+    pub decoded: Vec<DecodedImage>,
+    pub dimension_updates: Vec<usize>,
+}
+
+/// Pending counts main.rs polls for repaint scheduling.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Backlog {
+    pub loads: usize,
+    pub decoded: usize,
+    pub dimension_results: usize,
+    pub dimension_probes: usize,
+}
+
+/// Repairs a visible-retry may carry besides a plain re-request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetryRepair {
+    None,
+    /// Quality upgrade: drop loaded bookkeeping but keep in-flight requests.
+    ForceReload,
+    /// Stall heal: drop in-flight bookkeeping too so the placeholder can re-request.
+    ResetState,
+}
+
+/// A visible-item repair request; the retry params every caller used to pass by hand.
+pub struct VisibleRetry<'a> {
+    pub image_list: &'a [PathBuf],
+    pub index: usize,
+    pub max_texture_side: u32,
+    pub target_texture_side: u32,
+    pub downscale_filter: FilterType,
+    pub gif_filter: FilterType,
+    pub force_triangle_filters: bool,
+    pub repair: RetryRepair,
+}
+
 /// High-performance manga image loader with parallel decoding.
 pub struct MangaLoader {
     /// Channel to send load requests to worker threads
@@ -210,6 +295,24 @@ pub struct MangaLoader {
     visible_page_count: usize,
     /// Long-strip-only viewport coverage equivalent (e.g. 1.5 visible pages).
     strip_visible_item_equivalent: Option<f32>,
+    /// Last demand's cache capacity, kept for the retain floor.
+    cache_capacity_last: usize,
+    /// Layout and raw on-screen count from the last demand; prime windows are derived from them.
+    last_layout: MangaLayoutMode,
+    last_visible_indices_count: usize,
+    last_masonry_rows: usize,
+    /// Test seam: the worker-facing halves of the channels, so tests can observe/inject.
+    #[cfg(test)]
+    probe: Option<LoaderProbe>,
+}
+
+#[cfg(test)]
+struct LoaderProbe {
+    requests: Receiver<LoadRequest>,
+    urgent: Receiver<LoadRequest>,
+    dim_requests: Receiver<DimRequest>,
+    dim_background_requests: Receiver<DimRequest>,
+    dim_results: Sender<DimResult>,
 }
 
 /// Statistics for monitoring loader performance.
@@ -219,20 +322,69 @@ pub struct LoaderStats {
     pub images_pending: usize,
 }
 
-impl MangaLoader {
-    /// Create a new manga loader with background thread pool.
-    pub fn new() -> Self {
-        // Create bounded channels to prevent unbounded memory growth
+/// Channels a loader owns or keeps private to its workers.
+struct LoaderChannels {
+    request_tx: Sender<LoadRequest>,
+    request_rx: Receiver<LoadRequest>,
+    urgent_request_tx: Sender<LoadRequest>,
+    urgent_request_rx: Receiver<LoadRequest>,
+    result_tx: Sender<DecodedImage>,
+    result_rx: Receiver<DecodedImage>,
+    dim_request_tx: Sender<DimRequest>,
+    dim_request_rx: Receiver<DimRequest>,
+    dim_background_request_tx: Sender<DimRequest>,
+    dim_background_request_rx: Receiver<DimRequest>,
+    dim_result_tx: Sender<DimResult>,
+    dim_result_rx: Receiver<DimResult>,
+}
+
+impl LoaderChannels {
+    fn bounded() -> Self {
+        // Bounded channels prevent unbounded memory growth under scroll bursts.
         let (request_tx, request_rx) = crossbeam_channel::bounded::<LoadRequest>(256);
         let (urgent_request_tx, urgent_request_rx) =
             crossbeam_channel::bounded::<LoadRequest>(URGENT_REQUEST_QUEUE_CAPACITY);
         let (result_tx, result_rx) =
             crossbeam_channel::bounded::<DecodedImage>(MAX_PENDING_UPLOADS);
-
         let (dim_request_tx, dim_request_rx) = crossbeam_channel::bounded::<DimRequest>(64);
         let (dim_background_request_tx, dim_background_request_rx) =
             crossbeam_channel::bounded::<DimRequest>(64);
         let (dim_result_tx, dim_result_rx) = crossbeam_channel::bounded::<DimResult>(64);
+
+        Self {
+            request_tx,
+            request_rx,
+            urgent_request_tx,
+            urgent_request_rx,
+            result_tx,
+            result_rx,
+            dim_request_tx,
+            dim_request_rx,
+            dim_background_request_tx,
+            dim_background_request_rx,
+            dim_result_tx,
+            dim_result_rx,
+        }
+    }
+}
+
+impl MangaLoader {
+    /// Create a new manga loader with background thread pool.
+    pub fn new() -> Self {
+        let LoaderChannels {
+            request_tx,
+            request_rx,
+            urgent_request_tx,
+            urgent_request_rx,
+            result_tx,
+            result_rx,
+            dim_request_tx,
+            dim_request_rx,
+            dim_background_request_tx,
+            dim_background_request_rx,
+            dim_result_tx,
+            dim_result_rx,
+        } = LoaderChannels::bounded();
 
         let loading_indices = Arc::new(RwLock::new(HashMap::new()));
         let loaded_levels = Arc::new(RwLock::new(HashMap::new()));
@@ -261,7 +413,7 @@ impl MangaLoader {
         });
 
         // Spawn a lightweight dimension probe worker.
-        // This keeps header-based size probes off the UI thread.
+        // Header-based size probes stay off the UI thread.
         let shutdown_clone = Arc::clone(&shutdown);
         let generation_clone = Arc::clone(&generation);
         crate::async_runtime::spawn_blocking_or_thread("manga-dimension-worker", move || {
@@ -380,30 +532,63 @@ impl MangaLoader {
             stats: LoaderStats::default(),
             visible_page_count: 1,
             strip_visible_item_equivalent: None,
+            cache_capacity_last: MANGA_CACHE_MIN_ENTRIES,
+            last_layout: MangaLayoutMode::LongStrip,
+            last_visible_indices_count: 1,
+            last_masonry_rows: 2,
+            #[cfg(test)]
+            probe: None,
         }
     }
 
-    /// Number of indices currently being decoded on background workers.
-    ///
-    /// This is the authoritative source for "are we still loading?".
-    /// `stats.images_pending` is updated opportunistically and may lag.
-    pub fn pending_load_count(&self) -> usize {
-        self.loading_indices.read().len()
+    /// Handle-only loader: no worker threads. Paired channels let tests inject dimension
+    /// results and read what `demand`/`prime`/`retry_visible` enqueued.
+    #[cfg(test)]
+    fn without_workers() -> Self {
+        let channels = LoaderChannels::bounded();
+
+        Self {
+            request_tx: channels.request_tx,
+            urgent_request_tx: channels.urgent_request_tx,
+            result_rx: channels.result_rx,
+            loading_indices: Arc::new(RwLock::new(HashMap::new())),
+            loaded_levels: Arc::new(RwLock::new(HashMap::new())),
+            retry_state: Arc::new(RwLock::new(HashMap::new())),
+            dimension_cache: HashMap::new(),
+            dim_request_tx: channels.dim_request_tx,
+            dim_background_request_tx: channels.dim_background_request_tx,
+            dim_result_rx: channels.dim_result_rx,
+            dim_pending: HashSet::new(),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            scroll_direction: 1,
+            last_visible_index: 0,
+            generation: Arc::new(AtomicUsize::new(0)),
+            current_generation: 0,
+            stats: LoaderStats::default(),
+            visible_page_count: 1,
+            strip_visible_item_equivalent: None,
+            cache_capacity_last: MANGA_CACHE_MIN_ENTRIES,
+            last_layout: MangaLayoutMode::LongStrip,
+            last_visible_indices_count: 1,
+            last_masonry_rows: 2,
+            probe: Some(LoaderProbe {
+                requests: channels.request_rx,
+                urgent: channels.urgent_request_rx,
+                dim_requests: channels.dim_request_rx,
+                dim_background_requests: channels.dim_background_request_rx,
+                dim_results: channels.dim_result_tx,
+            }),
+        }
     }
 
-    /// Number of decoded-image messages waiting to be consumed by the UI thread.
-    pub fn pending_decoded_count(&self) -> usize {
-        self.result_rx.len()
-    }
-
-    /// Number of async dimension-probe results waiting to be consumed by the UI thread.
-    pub fn pending_dimension_results_count(&self) -> usize {
-        self.dim_result_rx.len()
-    }
-
-    /// Number of indices currently waiting for dimension probe completion.
-    pub fn pending_dimension_probe_count(&self) -> usize {
-        self.dim_pending.len()
+    /// Pending counts for repaint scheduling. Authoritative source for "are we still loading?".
+    pub fn backlog(&self) -> Backlog {
+        Backlog {
+            loads: self.loading_indices.read().len(),
+            decoded: self.result_rx.len(),
+            dimension_results: self.dim_result_rx.len(),
+            dimension_probes: self.dim_pending.len(),
+        }
     }
 
     /// Number of cached dimensions for indices in `[0, total_len)`.
@@ -420,16 +605,15 @@ impl MangaLoader {
 
     /// Queue async dimension probes for a range of indices.
     ///
-    /// This does not block the UI thread. Results are applied when `poll_dimension_results` is called.
-    pub fn request_dimensions_range(&mut self, image_list: &[PathBuf], start: usize, end: usize) {
+    /// This does not block the UI thread. Results are applied when `take` runs.
+    fn queue_dimension_range(&mut self, image_list: &[PathBuf], start: usize, end: usize) {
         self.enqueue_dimension_range(image_list, start, end, self.dim_request_tx.clone());
     }
 
     /// Queue async background dimension probes for a range of indices.
     ///
-    /// This is intended for non-interactive masonry warm-up and should not compete with
-    /// immediately visible media.
-    pub fn request_dimensions_range_background(
+    /// For non-interactive masonry warm-up: must not compete with visible media.
+    fn queue_background_dimension_range(
         &mut self,
         image_list: &[PathBuf],
         start: usize,
@@ -502,75 +686,27 @@ impl MangaLoader {
         }
     }
 
-    /// Queue async dimension probes for all uncached indices.
-    ///
-    /// This is non-blocking and respects channel backpressure.
-    /// Returns the number of indices successfully enqueued in this call.
-    #[allow(dead_code)]
-    pub fn request_all_missing_dimensions(&mut self, image_list: &[PathBuf]) -> usize {
-        if image_list.is_empty() {
-            return 0;
+    /// Background metadata warm-up for `[start, end)`: queues probes and, when
+    /// `fallback_seed_max > 0`, seeds the stall-recovery fallback dimensions.
+    /// Returns how many fallback entries were seeded.
+    pub fn warm_dimensions_background(
+        &mut self,
+        image_list: &[PathBuf],
+        start: usize,
+        end: usize,
+        fallback_seed_max: usize,
+    ) -> usize {
+        self.queue_background_dimension_range(image_list, start, end);
+        if fallback_seed_max == 0 {
+            0
+        } else {
+            self.seed_fallback_dimensions_for_range(image_list, start, end, fallback_seed_max)
         }
-
-        let mut enqueued = 0usize;
-        let mut batch: Vec<(usize, PathBuf)> = Vec::with_capacity(DIM_REQUEST_BATCH_SIZE);
-
-        for (idx, path) in image_list.iter().enumerate() {
-            if self.dimension_cache.contains_key(&idx) || self.dim_pending.contains(&idx) {
-                continue;
-            }
-
-            if !is_supported_image(path) && !is_supported_video(path) {
-                continue;
-            }
-
-            batch.push((idx, path.clone()));
-
-            if batch.len() >= DIM_REQUEST_BATCH_SIZE {
-                let indices: Vec<usize> = batch.iter().map(|(i, _)| *i).collect();
-                let items = std::mem::take(&mut batch);
-                match self.dim_background_request_tx.try_send(DimRequest {
-                    generation: self.current_generation,
-                    items,
-                }) {
-                    Ok(()) => {
-                        for idx in indices {
-                            self.dim_pending.insert(idx);
-                        }
-                        enqueued += DIM_REQUEST_BATCH_SIZE;
-                    }
-                    Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
-                        return enqueued;
-                    }
-                }
-            }
-        }
-
-        if !batch.is_empty() {
-            let indices: Vec<usize> = batch.iter().map(|(i, _)| *i).collect();
-            let items = std::mem::take(&mut batch);
-            match self.dim_background_request_tx.try_send(DimRequest {
-                generation: self.current_generation,
-                items,
-            }) {
-                Ok(()) => {
-                    for idx in &indices {
-                        self.dim_pending.insert(*idx);
-                    }
-                    enqueued += indices.len();
-                }
-                Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
-                    return enqueued;
-                }
-            }
-        }
-
-        enqueued
     }
 
     /// Drain async dimension results and apply them to `dimension_cache`.
     /// Returns indices whose dimensions were updated.
-    pub fn poll_dimension_results(&mut self, max_messages: usize) -> Vec<usize> {
+    fn apply_dimension_results(&mut self, max_messages: usize) -> Vec<usize> {
         let mut updated: Vec<usize> = Vec::new();
 
         for _ in 0..max_messages {
@@ -626,7 +762,7 @@ impl MangaLoader {
     ///
     /// This is a recovery path for rare probe stalls: it keeps masonry warm-up moving
     /// while higher-fidelity dimensions can still arrive later from decode/probe results.
-    pub fn seed_fallback_dimensions_for_range(
+    fn seed_fallback_dimensions_for_range(
         &mut self,
         image_list: &[PathBuf],
         start: usize,
@@ -1454,27 +1590,8 @@ impl MangaLoader {
         ))
     }
 
-    fn calculate_strip_preload_counts(&self, visible_item_equivalent: f32) -> (usize, usize) {
-        let visible_items = visible_item_equivalent.max(1.0);
-        let ahead = (visible_items * STRIP_PRELOAD_LOOK_AHEAD_MULTIPLIER)
-            .ceil()
-            .max(1.0) as usize;
-        let behind = (visible_items * STRIP_PRELOAD_LOOK_BEHIND_MULTIPLIER)
-            .ceil()
-            .max(1.0) as usize;
-
-        (ahead.min(MAX_PRELOAD_AHEAD), behind.min(MAX_PRELOAD_BEHIND))
-    }
-
-    /// Calculate preload counts based on the current layout's visible item signal.
-    /// Long strip uses fractional viewport coverage; masonry keeps the existing whole-item floor.
-    ///
-    /// Returns (preload_ahead, preload_behind)
+    /// Preload counts (ahead, behind) from the applied visible-item signal.
     fn calculate_preload_counts(&self) -> (usize, usize) {
-        if let Some(visible_item_equivalent) = self.strip_visible_item_equivalent {
-            return self.calculate_strip_preload_counts(visible_item_equivalent);
-        }
-
         let visible_items = self.visible_page_count.max(1);
         let ahead = visible_items
             .saturating_mul(PRELOAD_LOOK_AHEAD_MULTIPLIER)
@@ -1486,39 +1603,302 @@ impl MangaLoader {
         (ahead, behind)
     }
 
-    /// Update the visible item count for adaptive preloading.
-    /// Call this after calculating how many items are visible on screen.
-    /// Long strip can optionally pass fractional viewport coverage to avoid oversized windows.
-    pub fn update_visible_page_count(
-        &mut self,
-        visible_page_count: usize,
-        strip_visible_item_equivalent: Option<f32>,
-    ) {
-        self.visible_page_count = visible_page_count.max(1);
-        self.strip_visible_item_equivalent = strip_visible_item_equivalent
+    fn strip_window_counts(visible_item_equivalent: f32) -> (usize, usize) {
+        let visible = visible_item_equivalent.max(1.0);
+        let behind = (visible * STRIP_PRELOAD_LOOK_BEHIND_MULTIPLIER)
+            .ceil()
+            .max(1.0) as usize;
+        let ahead = (visible * STRIP_PRELOAD_LOOK_AHEAD_MULTIPLIER)
+            .ceil()
+            .max(1.0) as usize;
+
+        (behind, ahead)
+    }
+
+    /// (ahead, behind) preload counts for the current layout signal, direction-agnostic.
+    fn effective_preload_counts(&self) -> (usize, usize) {
+        match self.strip_visible_item_equivalent {
+            Some(visible_item_equivalent) => {
+                let (behind, ahead) = Self::strip_window_counts(visible_item_equivalent);
+                (ahead, behind)
+            }
+            None => self.calculate_preload_counts(),
+        }
+    }
+
+    /// Dimension-probe window around the anchor, biased by scroll direction.
+    /// Grid layouts get row-scaled 384/768 caps; strip gets its fractional look window.
+    fn probe_window(demand: &Demand<'_>) -> (usize, usize) {
+        if demand.layout.is_grid() {
+            let rows = demand.masonry_rows.clamp(2, 10);
+            let directional_visible = demand.visible_indices.len().max(1);
+            let forward = directional_visible
+                .saturating_mul(2)
+                .max(rows.saturating_mul(8));
+            let backward = directional_visible.max(rows.saturating_mul(4));
+            let max_behind = 384usize.saturating_mul(rows);
+            let max_ahead = 768usize.saturating_mul(rows);
+
+            if demand.moving_up {
+                (forward.min(max_behind), backward.min(max_ahead))
+            } else {
+                (backward.min(max_behind), forward.min(max_ahead))
+            }
+        } else {
+            let visible_item_equivalent = demand
+                .strip_visible_item_equivalent
+                .unwrap_or(demand.visible_indices.len() as f32);
+            let (look_backward, look_forward) = Self::strip_window_counts(visible_item_equivalent);
+
+            if demand.moving_up {
+                (look_forward, look_backward)
+            } else {
+                (look_backward, look_forward)
+            }
+        }
+    }
+
+    /// Entry-count capacity target: visible density × zoom tier, byte-clamped for grid layouts.
+    fn cache_capacity_target(visible_indices_count: usize, demand: &Demand<'_>) -> usize {
+        let visible = demand.visible_page_count.max(visible_indices_count).max(1);
+        let mut target = if demand.layout.is_grid() {
+            let rows = demand.masonry_rows.clamp(2, 10);
+            let zoom_factor = if demand.zoom <= 0.35 {
+                4
+            } else if demand.zoom <= 0.55 {
+                3
+            } else if demand.zoom <= 0.80 {
+                2
+            } else {
+                1
+            };
+            let density_factor = 3 + rows;
+
+            visible
+                .saturating_mul(density_factor)
+                .saturating_mul(zoom_factor)
+                .clamp(MANGA_CACHE_MIN_ENTRIES, MANGA_CACHE_MAX_ENTRIES)
+        } else {
+            let zoom_factor = if demand.zoom <= 0.45 {
+                3
+            } else if demand.zoom <= 0.75 {
+                2
+            } else {
+                1
+            };
+
+            visible
+                .saturating_mul(5)
+                .saturating_mul(zoom_factor)
+                .clamp(MANGA_CACHE_MIN_ENTRIES, 512)
+        };
+
+        if demand.layout.is_grid() {
+            // Byte-aware clamp: oversized textures must not inflate the entry-count target.
+            // 1.5 x RGBA is the decode+texture peak per entry.
+            let est_side = demand.target_texture_side.max(1) as usize;
+            let est_bytes_per_texture = est_side
+                .saturating_mul(est_side)
+                .saturating_mul(4)
+                .saturating_mul(3)
+                / 2;
+            let budget_bytes = if demand.navigation_active {
+                MASONRY_CACHE_BUDGET_BYTES_NAV
+            } else {
+                MASONRY_CACHE_BUDGET_BYTES_IDLE
+            };
+            let byte_limited_capacity = (budget_bytes / est_bytes_per_texture.max(1))
+                .clamp(MANGA_CACHE_MIN_ENTRIES, MANGA_CACHE_MAX_ENTRIES);
+            let keep_floor = demand
+                .visible_indices
+                .len()
+                .max(1)
+                .max(demand.masonry_rows.clamp(2, 10).saturating_mul(4));
+            target = target.min(byte_limited_capacity.max(keep_floor));
+        }
+
+        if demand.preserve_recent_cache {
+            let retain_floor = demand
+                .previous_cache_capacity
+                .saturating_mul(7)
+                .saturating_div(8)
+                .max(demand.visible_indices.len().max(1));
+            target = target.max(retain_floor);
+        }
+
+        target
+    }
+
+    /// Symmetric keep window around the anchor, scaled by the preload bias and the cache budget.
+    fn keep_window(
+        target_cache_capacity: usize,
+        demand: &Demand<'_>,
+        counts: (usize, usize),
+    ) -> (usize, usize) {
+        let (keep_ahead, keep_behind) = counts;
+
+        let (mut final_keep_behind, mut final_keep_ahead) = if demand.layout.is_grid() {
+            let rows = demand.masonry_rows.clamp(2, 10);
+            let symmetric = keep_ahead
+                .max(keep_behind)
+                .saturating_mul((rows + 1) / 2)
+                .max(12usize.saturating_mul(rows));
+            (symmetric, symmetric)
+        } else if demand.scrolling_up {
+            (keep_ahead, keep_behind)
+        } else {
+            (keep_behind, keep_ahead)
+        };
+
+        let visible_budget = demand
+            .visible_indices
+            .len()
+            .max(1)
+            .min(target_cache_capacity.max(1));
+        let keep_budget_total = target_cache_capacity.saturating_sub(visible_budget);
+        if keep_budget_total == 0 {
+            final_keep_behind = 0;
+            final_keep_ahead = 0;
+        } else {
+            let requested_total = final_keep_behind.saturating_add(final_keep_ahead);
+            if requested_total > keep_budget_total {
+                let mut scaled_behind =
+                    final_keep_behind.saturating_mul(keep_budget_total) / requested_total.max(1);
+                let mut scaled_ahead = keep_budget_total.saturating_sub(scaled_behind);
+
+                if final_keep_behind > 0 && scaled_behind == 0 {
+                    scaled_behind = 1.min(keep_budget_total);
+                    scaled_ahead = keep_budget_total.saturating_sub(scaled_behind);
+                }
+                if final_keep_ahead > 0 && scaled_ahead == 0 && keep_budget_total > 1 {
+                    scaled_ahead = 1;
+                    scaled_behind = keep_budget_total.saturating_sub(scaled_ahead);
+                }
+
+                final_keep_behind = scaled_behind;
+                final_keep_ahead = scaled_ahead;
+            }
+        }
+
+        (final_keep_behind, final_keep_ahead)
+    }
+
+    /// The only way the viewer says "this is what is on screen".
+    ///
+    /// Owns the whole derived sequence: LOD side, dimension-probe window, preload queue,
+    /// cache capacity target, pinned set and keep-window eviction. The texture cache stays
+    /// with the caller (it holds egui handles), so the plan comes back rather than gets applied.
+    pub fn demand(&mut self, demand: &Demand<'_>) -> DemandPlan {
+        let image_list = demand.image_list;
+        let visible_indices_count = demand.visible_indices.len().max(1);
+        self.last_layout = demand.layout;
+        self.last_visible_indices_count = visible_indices_count;
+        self.last_masonry_rows = demand.masonry_rows.clamp(2, 10);
+        self.strip_visible_item_equivalent = demand
+            .strip_visible_item_equivalent
             .filter(|value| value.is_finite())
             .map(|value| value.max(1.0));
+
+        let target_texture_side =
+            Self::quantize_target_texture_side(demand.target_texture_side, demand.max_texture_side);
+        let cache_capacity = Self::cache_capacity_target(visible_indices_count, demand);
+        self.cache_capacity_last = cache_capacity;
+        // Cache-bounded visible count: capacity is derived from the raw count, then feeds back.
+        self.visible_page_count = visible_indices_count.min(cache_capacity.max(1)).max(1);
+
+        let (behind, ahead) = Self::probe_window(demand);
+        let cache_start = demand.anchor_index.saturating_sub(behind);
+        let cache_end = (demand.anchor_index + ahead).min(image_list.len());
+        self.queue_dimension_range(image_list, cache_start, cache_end);
+
+        self.prefetch(
+            image_list,
+            demand.anchor_index,
+            demand.max_texture_side,
+            target_texture_side,
+            demand.downscale_filter,
+            demand.gif_filter,
+            demand.force_triangle_filters,
+        );
+
+        let (keep_behind, keep_ahead) =
+            Self::keep_window(cache_capacity, demand, self.effective_preload_counts());
+        let keep_start = demand.anchor_index.saturating_sub(keep_behind);
+        let keep_end = (demand
+            .anchor_index
+            .saturating_add(keep_ahead)
+            .saturating_add(1))
+        .min(image_list.len());
+        let visible: HashSet<usize> = demand.visible_indices.iter().copied().collect();
+        let mut evicted_indices = Vec::new();
+        for &idx in demand.cached_indices {
+            if !(keep_start..keep_end).contains(&idx) && !visible.contains(&idx) {
+                self.forget_indices(std::iter::once(idx));
+                evicted_indices.push(idx);
+            }
+        }
+
+        // Wanted texture-cache state; main.rs owns the cache (egui handles) and applies it.
+        DemandPlan {
+            cache_capacity,
+            pinned_indices: demand.visible_indices.to_vec(),
+            evicted_indices,
+        }
     }
 
-    /// Get current preload ahead count (useful for cache eviction in main.rs)
-    pub fn get_preload_ahead(&self) -> usize {
-        self.calculate_preload_counts().0
+    /// Strip-window (behind, ahead) for a fractional viewport coverage signal.
+    pub fn strip_window_for_visible_equivalent(visible_item_equivalent: f32) -> (usize, usize) {
+        Self::strip_window_counts(visible_item_equivalent)
     }
 
-    /// Get current preload behind count (useful for cache eviction in main.rs)
-    pub fn get_preload_behind(&self) -> usize {
-        self.calculate_preload_counts().1
+    /// Jump-prime window (behind, ahead) for a destination far from the current demand.
+    fn prime_window(&self) -> (usize, usize) {
+        if self.last_layout.is_grid() {
+            let rows = self.last_masonry_rows.clamp(2, 10);
+            let visible = self.last_visible_indices_count.max(1);
+            (
+                visible.max(rows.saturating_mul(4)),
+                visible.saturating_mul(2).max(rows.saturating_mul(8)),
+            )
+        } else {
+            Self::strip_window_counts(self.strip_visible_item_equivalent.unwrap_or(1.0))
+        }
     }
 
-    /// Request loading of images around the visible range.
-    /// Uses priority-based loading with scroll direction and visibility awareness.
-    ///
-    /// The algorithm adapts to the number of currently visible items.
-    pub fn update_preload_queue(
+    /// Load a navigation destination before the viewport actually arrives there.
+    /// Same windows and priority path as a `demand` at that index, minus the cache plan.
+    pub fn prime(
+        &mut self,
+        image_list: &[PathBuf],
+        index: usize,
+        max_texture_side: u32,
+        target_texture_side: u32,
+        downscale_filter: FilterType,
+        gif_filter: FilterType,
+        force_triangle_filters: bool,
+    ) {
+        let index = index.min(image_list.len().saturating_sub(1));
+        let (behind, ahead) = self.prime_window();
+        let start = index.saturating_sub(behind);
+        let end = index.saturating_add(ahead).min(image_list.len());
+        self.queue_dimension_range(image_list, start, end);
+        let target_texture_side =
+            Self::quantize_target_texture_side(target_texture_side, max_texture_side);
+        self.prefetch(
+            image_list,
+            index,
+            max_texture_side,
+            target_texture_side,
+            downscale_filter,
+            gif_filter,
+            force_triangle_filters,
+        );
+    }
+
+    fn prefetch(
         &mut self,
         image_list: &[PathBuf],
         visible_index: usize,
-        _screen_height: f32,
         max_texture_side: u32,
         target_texture_side: u32,
         downscale_filter: FilterType,
@@ -1543,7 +1923,7 @@ impl MangaLoader {
         let index_delta = visible_index.abs_diff(prev_visible_index);
         let is_large_jump = index_delta > LARGE_JUMP_INDEX_THRESHOLD;
         if is_large_jump {
-            self.cancel_pending_loads();
+            self.cancel_all();
         }
 
         // Update scroll direction based on visible index change
@@ -1554,8 +1934,8 @@ impl MangaLoader {
         }
         self.last_visible_index = visible_index;
 
-        // Calculate preload counts based on visible pages
-        let (base_ahead, base_behind) = self.calculate_preload_counts();
+        // Apply scroll direction bias to the counts set by `demand`
+        let (base_ahead, base_behind) = self.effective_preload_counts();
 
         // Apply scroll direction bias
         let ahead = if self.scroll_direction > 0 {
@@ -1676,16 +2056,25 @@ impl MangaLoader {
         self.stats.images_pending = self.loading_indices.read().len();
     }
 
-    /// Poll for decoded images ready for GPU upload with a caller-provided limit.
-    ///
-    /// `max_items` is clamped to `1..=MAX_PENDING_UPLOADS`.
-    /// Returns `(decoded_images, dimension_updates)` where `dimension_updates`
-    /// includes indices whose cached source dimensions changed.
-    pub fn poll_decoded_images_with_limit(
-        &mut self,
-        max_items: usize,
-    ) -> (Vec<DecodedImage>, Vec<usize>) {
-        let max_items = max_items.clamp(1, MAX_PENDING_UPLOADS);
+    /// Drain queued work products: decoded images and dimension results, both bounded.
+    /// The only way the caller asks for work products; counts come from `backlog`.
+    pub fn take(&mut self, max_decoded: usize, max_dimension_results: usize) -> Taken {
+        let (decoded, decoded_dimension_updates) = self.take_decoded(max_decoded);
+        let mut dimension_updates = self.apply_dimension_results(max_dimension_results);
+        dimension_updates.extend(decoded_dimension_updates);
+        dimension_updates.sort_unstable();
+        dimension_updates.dedup();
+
+        Taken {
+            decoded,
+            dimension_updates,
+        }
+    }
+
+    /// Decoded images ready for GPU upload, bounded by `max_items` (0 takes none).
+    /// Also returns indices whose cached source dimensions changed.
+    fn take_decoded(&mut self, max_items: usize) -> (Vec<DecodedImage>, Vec<usize>) {
+        let max_items = max_items.min(MAX_PENDING_UPLOADS);
         let mut results = Vec::with_capacity(max_items);
         let mut dimension_updates = Vec::with_capacity(max_items);
 
@@ -1745,7 +2134,7 @@ impl MangaLoader {
     /// Start async dimension caching for all images in the list.
     /// This returns immediately and caches dimensions in the background.
     /// The first few visible images are prioritized.
-    pub fn cache_all_dimensions(&mut self, image_list: &[PathBuf]) -> usize {
+    pub fn prime_dimension_cache(&mut self, image_list: &[PathBuf]) -> usize {
         // For fast startup, only cache the first batch of visible media synchronously.
         // The rest will be cached on-demand or when media is loaded.
         const INITIAL_CACHE_COUNT: usize = 30;
@@ -1873,30 +2262,40 @@ impl MangaLoader {
     }
 
     /// Clear runtime state but keep the current list's cached dimensions warm.
+    /// Drop runtime state; keep the cached dimensions warm. Distinct from `cancel_all`:
+    /// this drops dimensions, `cancel_all` keeps them and only cancels pending work.
     pub fn clear_preserving_dimensions(&mut self) {
         self.clear_with_dimension_policy(true);
     }
 
-    /// Mark an index as needing reload (called when cache is evicted).
-    pub fn mark_unloaded(&mut self, index: usize) {
-        self.loaded_levels.write().remove(&index);
-        self.retry_state.write().remove(&index);
+    /// Forget loaded/retry bookkeeping for evicted indices so they can be re-requested.
+    /// In-flight requests are untouched; only `reset_index_state` clears those.
+    pub fn forget_indices<I>(&mut self, indices: I)
+    where
+        I: IntoIterator<Item = usize>,
+    {
+        let mut loaded = self.loaded_levels.write();
+        let mut retry = self.retry_state.write();
+        for index in indices {
+            loaded.remove(&index);
+            retry.remove(&index);
+        }
     }
 
-    /// Clear all pending/loaded bookkeeping for an index so a visible placeholder can self-heal.
-    pub fn reset_index_state(&mut self, index: usize) {
+    /// Drop all bookkeeping for one index so a stale/placeholder tile can re-request.
+    pub fn reset_index_state_for(&mut self, index: usize) {
         self.loading_indices.write().remove(&index);
         self.loaded_levels.write().remove(&index);
         self.retry_state.write().remove(&index);
         self.stats.images_pending = self.loading_indices.read().len();
     }
 
-    /// Sync loader jump-tracking to an externally handled visible-index change.
+    /// Sync jump-tracking to an externally handled visible-index change.
     ///
     /// Masonry scrollbar dragging can jump far enough that the UI already knows it has
-    /// repositioned to a new destination. In that case we may want to cancel stale work once,
-    /// then prevent `update_preload_queue` from treating the same jump as a second fresh jump.
-    pub fn sync_external_visible_index(&mut self, visible_index: usize, cancel_pending: bool) {
+    /// repositioned. Cancel stale work once, then stop `prefetch` from treating the same
+    /// jump as a fresh one.
+    pub fn sync_visible_index(&mut self, visible_index: usize, cancel_pending: bool) {
         let previous_index = self.last_visible_index;
 
         if visible_index > previous_index {
@@ -1906,17 +2305,36 @@ impl MangaLoader {
         }
 
         if cancel_pending {
-            self.cancel_pending_loads();
+            self.cancel_all();
         }
 
         self.last_visible_index = visible_index;
+    }
+
+    /// Visible-index repair path: a high-priority retry for an in-view placeholder.
+    pub fn retry_visible(&mut self, request: &VisibleRetry<'_>) -> bool {
+        match request.repair {
+            RetryRepair::None => {}
+            RetryRepair::ForceReload => self.forget_indices(std::iter::once(request.index)),
+            RetryRepair::ResetState => self.reset_index_state_for(request.index),
+        }
+
+        self.request_visible_retry(
+            request.image_list,
+            request.index,
+            request.max_texture_side,
+            request.target_texture_side,
+            request.downscale_filter,
+            request.gif_filter,
+            request.force_triangle_filters,
+        )
     }
 
     /// Force a high-priority retry for a visible item that is missing a texture.
     ///
     /// This is used as a self-healing path when UI detects an in-view placeholder
     /// but loader bookkeeping says the item was already loaded.
-    pub fn request_visible_retry(
+    fn request_visible_retry(
         &mut self,
         image_list: &[PathBuf],
         index: usize,
@@ -1992,9 +2410,9 @@ impl MangaLoader {
         }
     }
 
-    /// Cancel all pending load requests (called on large jumps like Home/End or fast scrollbar drag).
-    /// This prevents loading intermediate images when jumping to a distant position.
-    pub fn cancel_pending_loads(&mut self) {
+    /// Cancel all pending work (large jumps like Home/End, fast scrollbar drags, exit).
+    /// Stale in-flight results are dropped by generation checks in the coordinator.
+    pub fn cancel_all(&mut self) {
         // Increment generation to invalidate in-flight requests
         // The coordinator thread will check this and skip stale requests
         self.current_generation += 1;
@@ -2347,5 +2765,665 @@ impl MangaTextureCache {
 impl Default for MangaTextureCache {
     fn default() -> Self {
         Self::new(DEFAULT_CACHED_TEXTURES)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TARGET_SIDE: u32 = 512;
+    const MAX_SIDE: u32 = 4096;
+
+    fn paths(n: usize) -> Vec<PathBuf> {
+        (0..n)
+            .map(|i| PathBuf::from(format!("img{i:04}.png")))
+            .collect()
+    }
+
+    fn demand<'a>(
+        list: &'a [PathBuf],
+        visible: &'a [usize],
+        cached: &'a [usize],
+        anchor: usize,
+        layout: MangaLayoutMode,
+    ) -> Demand<'a> {
+        Demand {
+            image_list: list,
+            layout,
+            anchor_index: anchor,
+            visible_indices: visible,
+            visible_page_count: visible.len().max(1),
+            strip_visible_item_equivalent: (!layout.is_grid()).then_some(1.5),
+            max_texture_side: MAX_SIDE,
+            target_texture_side: TARGET_SIDE,
+            downscale_filter: FilterType::Triangle,
+            gif_filter: FilterType::Triangle,
+            force_triangle_filters: false,
+            masonry_rows: 3,
+            zoom: 1.0,
+            scrolling_up: false,
+            moving_up: false,
+            navigation_active: false,
+            preserve_recent_cache: false,
+            previous_cache_capacity: MANGA_CACHE_MIN_ENTRIES,
+            cached_indices: cached,
+        }
+    }
+
+    /// Dimension window `(start, end)` of the last queued probe batch.
+    fn dim_window(loader: &MangaLoader) -> (usize, usize) {
+        let probe = loader.probe.as_ref().expect("probe channels");
+        let mut last: Option<DimRequest> = None;
+        while let Ok(req) = probe.dim_requests.try_recv() {
+            last = Some(req);
+        }
+        let req = last.expect("demand must enqueue a dimension probe window");
+        let start = req.items.first().map(|(idx, _)| *idx).unwrap();
+        let end = req.items.last().map(|(idx, _)| *idx + 1).unwrap();
+        (start, end)
+    }
+
+    fn preload_requests(loader: &MangaLoader) -> Vec<LoadRequest> {
+        loader
+            .probe
+            .as_ref()
+            .expect("probe channels")
+            .requests
+            .try_iter()
+            .collect()
+    }
+
+    fn urgent_requests(loader: &MangaLoader) -> Vec<LoadRequest> {
+        loader
+            .probe
+            .as_ref()
+            .expect("probe channels")
+            .urgent
+            .try_iter()
+            .collect()
+    }
+
+    fn inject_dimensions(loader: &MangaLoader, items: Vec<(usize, u32, u32, MangaMediaType)>) {
+        let results = loader
+            .probe
+            .as_ref()
+            .expect("probe channels")
+            .dim_results
+            .clone();
+        results
+            .try_send(DimResult {
+                generation: loader.current_generation,
+                items,
+            })
+            .expect("dimension result channel has room");
+    }
+
+    #[test]
+    fn demand_probe_window_matches_grid_rows_arithmetic() {
+        let list = paths(400);
+        let visible = [40usize];
+
+        // rows 3, 1 visible: forward max(2, 24) = 24, backward max(1, 12) = 12.
+        let mut loader = MangaLoader::without_workers();
+        loader.demand(&demand(&list, &visible, &[], 40, MangaLayoutMode::Masonry));
+        assert_eq!(dim_window(&loader), (28, 64));
+
+        let mut up = demand(&list, &visible, &[], 40, MangaLayoutMode::Masonry);
+        up.moving_up = true;
+        let mut loader = MangaLoader::without_workers();
+        loader.demand(&up);
+        assert_eq!(dim_window(&loader), (16, 52));
+    }
+
+    #[test]
+    fn demand_probe_window_scales_with_visible_count() {
+        let list = paths(400);
+        let visible = [19usize, 20, 21, 22, 23, 24];
+
+        let mut loader = MangaLoader::without_workers();
+        loader.demand(&demand(&list, &visible, &[], 21, MangaLayoutMode::Masonry));
+        assert_eq!(dim_window(&loader), (9, 45));
+
+        let mut up = demand(&list, &visible, &[], 21, MangaLayoutMode::Masonry);
+        up.moving_up = true;
+        let mut loader = MangaLoader::without_workers();
+        loader.demand(&up);
+        assert_eq!(dim_window(&loader), (0, 33));
+    }
+
+    #[test]
+    fn demand_probe_window_clamps_to_list_edges() {
+        let list = paths(50);
+
+        let mut loader = MangaLoader::without_workers();
+        loader.demand(&demand(&list, &[0], &[], 0, MangaLayoutMode::Gallery));
+        assert_eq!(dim_window(&loader), (0, 24));
+
+        let mut up = demand(&list, &[49], &[], 49, MangaLayoutMode::Gallery);
+        up.moving_up = true;
+        let mut loader = MangaLoader::without_workers();
+        loader.demand(&up);
+        assert_eq!(dim_window(&loader), (25, 50));
+    }
+
+    #[test]
+    fn demand_out_of_range_anchor_queues_nothing() {
+        let list = paths(50);
+        let mut loader = MangaLoader::without_workers();
+        loader.demand(&demand(&list, &[999], &[], 999, MangaLayoutMode::Masonry));
+
+        assert_eq!(loader.backlog().dimension_probes, 0);
+        assert!(preload_requests(&loader).is_empty());
+    }
+
+    #[test]
+    fn demand_probe_window_uses_strip_fractional_coverage() {
+        let list = paths(200);
+        let visible = [30usize, 31];
+
+        // 1.5 visible pages -> behind ceil(1.5) = 2, ahead ceil(3.0) = 3.
+        let mut loader = MangaLoader::without_workers();
+        loader.demand(&demand(
+            &list,
+            &visible,
+            &[],
+            30,
+            MangaLayoutMode::LongStrip,
+        ));
+        assert_eq!(dim_window(&loader), (28, 33));
+
+        let mut up = demand(&list, &visible, &[], 30, MangaLayoutMode::LongStrip);
+        up.moving_up = true;
+        let mut loader = MangaLoader::without_workers();
+        loader.demand(&up);
+        assert_eq!(dim_window(&loader), (27, 32));
+    }
+
+    #[test]
+    fn demand_preload_window_biases_towards_scroll_direction() {
+        let list = paths(200);
+        let mut loader = MangaLoader::without_workers();
+
+        // Anchor moves forward: 3 ahead, 2 behind around 60 -> 58..=63.
+        loader.demand(&demand(
+            &list,
+            &[60usize],
+            &[],
+            60,
+            MangaLayoutMode::LongStrip,
+        ));
+        let indices = preload_requests(&loader)
+            .iter()
+            .map(|req| req.index)
+            .collect::<Vec<_>>();
+        assert_eq!(indices.len(), 6);
+        assert!(indices.iter().all(|idx| (58..=63).contains(idx)));
+
+        // Anchor moves back: the bias flips -> 3 behind, 2 ahead around 50 = 47..=52.
+        loader.demand(&demand(
+            &list,
+            &[50usize],
+            &[],
+            50,
+            MangaLayoutMode::LongStrip,
+        ));
+        let indices = preload_requests(&loader)
+            .iter()
+            .map(|req| req.index)
+            .collect::<Vec<_>>();
+        assert!(indices.iter().all(|idx| (47..=52).contains(idx)));
+        assert!(indices.contains(&47));
+        assert!(indices.contains(&52));
+    }
+
+    #[test]
+    fn demand_lod_side_quantizes_up_and_caps_by_source_box() {
+        let list = paths(10);
+        let visible = [0usize];
+
+        let mut loader = MangaLoader::without_workers();
+        loader.demand(&demand(&list, &visible, &[], 0, MangaLayoutMode::LongStrip));
+        // 300 (512 draws off, use 300) -> next bucket; 512 is already a bucket.
+        assert_eq!(
+            preload_requests(&loader)
+                .iter()
+                .find(|req| req.index == 0)
+                .map(|req| req.target_texture_side),
+            Some(512)
+        );
+
+        let mut unquantized = demand(&list, &visible, &[], 0, MangaLayoutMode::LongStrip);
+        unquantized.target_texture_side = 300;
+        let mut loader = MangaLoader::without_workers();
+        loader.demand(&unquantized);
+        assert_eq!(
+            preload_requests(&loader)
+                .iter()
+                .find(|req| req.index == 0)
+                .map(|req| req.target_texture_side),
+            Some(384)
+        );
+
+        let mut loader = MangaLoader::without_workers();
+        loader
+            .dimension_cache
+            .insert(0, (120, 180, MangaMediaType::StaticImage));
+        loader.demand(&demand(&list, &visible, &[], 0, MangaLayoutMode::LongStrip));
+        // Quantized 512 capped by the 180px source long side.
+        assert_eq!(
+            preload_requests(&loader)
+                .iter()
+                .find(|req| req.index == 0)
+                .map(|req| req.target_texture_side),
+            Some(180)
+        );
+    }
+
+    #[test]
+    fn demand_lod_side_clamps_zero_and_one() {
+        let list = paths(4);
+        let visible = [0usize];
+
+        let mut zero_target = demand(&list, &visible, &[], 0, MangaLayoutMode::LongStrip);
+        zero_target.target_texture_side = 0;
+        let mut loader = MangaLoader::without_workers();
+        loader.demand(&zero_target);
+        assert_eq!(
+            preload_requests(&loader)
+                .first()
+                .map(|req| req.target_texture_side),
+            Some(96)
+        );
+
+        let mut tiny_max = demand(&list, &visible, &[], 0, MangaLayoutMode::LongStrip);
+        tiny_max.target_texture_side = 0;
+        tiny_max.max_texture_side = 1;
+        let mut loader = MangaLoader::without_workers();
+        loader.demand(&tiny_max);
+        let requests = preload_requests(&loader);
+        assert_eq!(requests.first().map(|req| req.target_texture_side), Some(1));
+        assert!(requests.iter().all(|req| req.max_texture_side == 1));
+    }
+
+    #[test]
+    fn demand_capacity_grid_and_strip_zoom_tiers() {
+        let list = paths(10);
+        let visible = [0usize, 1, 2];
+
+        // Grid rows 3, zoom 0.8 -> visible 3 * 6 * 2 = 36 -> clamped up to 64.
+        let mut loader = MangaLoader::without_workers();
+        let mut grid = demand(&list, &visible, &[], 1, MangaLayoutMode::Masonry);
+        grid.zoom = 0.8;
+        let plan = loader.demand(&grid);
+        assert_eq!(plan.cache_capacity, 64);
+
+        // Strip zoom 0.8 -> visible 3 * 5 * 1 = 15 -> clamped up to 64.
+        let mut loader = MangaLoader::without_workers();
+        let mut strip = demand(&list, &visible, &[], 1, MangaLayoutMode::LongStrip);
+        strip.zoom = 0.8;
+        let plan = loader.demand(&strip);
+        assert_eq!(plan.cache_capacity, 64);
+
+        // Strip zoom 0.4 -> factor 3: 6 visible * 5 * 3 = 90.
+        let mut loader = MangaLoader::without_workers();
+        let six: Vec<usize> = (0..6).collect();
+        let mut strip = demand(&list, &six, &[], 1, MangaLayoutMode::LongStrip);
+        strip.zoom = 0.4;
+        let plan = loader.demand(&strip);
+        assert_eq!(plan.cache_capacity, 90);
+    }
+
+    #[test]
+    fn demand_capacity_clamps_to_byte_budget_for_huge_folders() {
+        let list = paths(400);
+        let visible: Vec<usize> = (0..40).collect();
+        let mut dense = demand(&list, &visible, &[], 10, MangaLayoutMode::Masonry);
+        dense.masonry_rows = 10;
+        dense.zoom = 0.3;
+
+        // Side 512: density target clamps to 1024, byte budget allows 512.
+        let mut loader = MangaLoader::without_workers();
+        let plan = loader.demand(&dense);
+        assert_eq!(plan.cache_capacity, 512);
+
+        // Side 4096: byte budget collapses to the 64-entry floor.
+        dense.target_texture_side = 4096;
+        let mut loader = MangaLoader::without_workers();
+        let plan = loader.demand(&dense);
+        assert_eq!(plan.cache_capacity, 64);
+    }
+
+    #[test]
+    fn demand_keeps_preserved_capacity_floor_while_navigating() {
+        let list = paths(10);
+        let visible = [0usize, 1];
+        let mut preserve = demand(&list, &visible, &[], 1, MangaLayoutMode::LongStrip);
+        preserve.preserve_recent_cache = true;
+        preserve.previous_cache_capacity = 200;
+
+        let mut loader = MangaLoader::without_workers();
+        let plan = loader.demand(&preserve);
+        // Retain floor = 200 * 7/8 = 175, above the 64-entry computed target.
+        assert_eq!(plan.cache_capacity, 175);
+        assert_eq!(plan.pinned_indices, visible.to_vec());
+    }
+
+    #[test]
+    fn demand_evicts_outside_keep_window_but_never_visible_items() {
+        let list = paths(300);
+        let visible = [40usize, 41];
+        let cached = [0usize, 41, 90, 200];
+        let mut loader = MangaLoader::without_workers();
+        let plan = loader.demand(&demand(
+            &list,
+            &visible,
+            &cached,
+            40,
+            MangaLayoutMode::Masonry,
+        ));
+
+        assert_eq!(plan.evicted_indices.len(), 3);
+        assert!(plan.evicted_indices.contains(&0));
+        assert!(plan.evicted_indices.contains(&90));
+        assert!(plan.evicted_indices.contains(&200));
+        assert!(!plan.evicted_indices.contains(&41));
+        // Evicted indices lose their loaded bookkeeping so they can be re-requested.
+        assert!(loader.loaded_levels.read().is_empty());
+    }
+
+    #[test]
+    fn demand_eviction_keeps_pinned_visible_set_intact() {
+        let list = paths(400);
+        let visible: Vec<usize> = (100..170).collect();
+        let cached = [0usize, 299, 300];
+        let mut loader = MangaLoader::without_workers();
+        let plan = loader.demand(&demand(
+            &list,
+            &visible,
+            &cached,
+            100,
+            MangaLayoutMode::Masonry,
+        ));
+
+        assert!(visible
+            .iter()
+            .all(|idx| !plan.evicted_indices.contains(idx)));
+        assert!(plan.evicted_indices.contains(&299));
+        assert!(plan.evicted_indices.contains(&300));
+        assert!(!plan.evicted_indices.contains(&0));
+    }
+
+    #[test]
+    fn cancel_all_drops_pending_work_but_keeps_dimensions() {
+        let list = paths(120);
+        let visible = [10usize];
+        let mut loader = MangaLoader::without_workers();
+        loader.demand(&demand(
+            &list,
+            &visible,
+            &[],
+            10,
+            MangaLayoutMode::LongStrip,
+        ));
+        inject_dimensions(
+            &mut loader,
+            vec![(12, 400, 600, MangaMediaType::StaticImage)],
+        );
+        loader.take(0, 4);
+        assert_eq!(loader.get_dimensions(12), Some((400, 600)));
+
+        let backlog = loader.backlog();
+        assert!(backlog.loads > 0);
+        assert!(backlog.dimension_probes > 0);
+
+        loader.cancel_all();
+        let backlog = loader.backlog();
+        assert_eq!(backlog.loads, 0);
+        assert_eq!(backlog.decoded, 0);
+        assert_eq!(backlog.dimension_results, 0);
+        assert_eq!(backlog.dimension_probes, 0);
+        assert_eq!(loader.get_dimensions(12), Some((400, 600)));
+    }
+
+    #[test]
+    fn clear_and_cancel_all_are_separate_behaviours() {
+        let mut loader = MangaLoader::without_workers();
+        loader
+            .dimension_cache
+            .insert(3, (500, 700, MangaMediaType::StaticImage));
+
+        loader.cancel_all();
+        assert_eq!(loader.get_dimensions(3), Some((500, 700)));
+
+        loader.clear_preserving_dimensions();
+        assert_eq!(loader.get_dimensions(3), Some((500, 700)));
+
+        loader.clear();
+        assert_eq!(loader.get_dimensions(3), None);
+    }
+
+    #[test]
+    fn retry_visible_requeues_urgently_after_forget() {
+        let list = paths(40);
+        let mut loader = MangaLoader::without_workers();
+        let retry = VisibleRetry {
+            image_list: &list,
+            index: 7,
+            max_texture_side: MAX_SIDE,
+            target_texture_side: TARGET_SIDE,
+            downscale_filter: FilterType::Triangle,
+            gif_filter: FilterType::Triangle,
+            force_triangle_filters: false,
+            repair: RetryRepair::ForceReload,
+        };
+        assert!(loader.retry_visible(&retry));
+
+        let urgent = urgent_requests(&loader);
+        assert_eq!(urgent.len(), 1);
+        assert_eq!(urgent[0].index, 7);
+        assert_eq!(urgent[0].priority, -200_000);
+
+        // Already in flight: a second retry must not stack another request.
+        assert!(!loader.retry_visible(&retry));
+        assert!(urgent_requests(&loader).is_empty());
+    }
+
+    #[test]
+    fn retry_visible_after_mark_unloaded_reloads_a_satisfied_index() {
+        let list = paths(40);
+        let mut loader = MangaLoader::without_workers();
+        // Pretend the index is loaded at full LOD and not in flight.
+        loader.loaded_levels.write().insert(7, MAX_SIDE);
+
+        let mut retry = VisibleRetry {
+            image_list: &list,
+            index: 7,
+            max_texture_side: MAX_SIDE,
+            target_texture_side: TARGET_SIDE,
+            downscale_filter: FilterType::Triangle,
+            gif_filter: FilterType::Triangle,
+            force_triangle_filters: false,
+            repair: RetryRepair::ForceReload,
+        };
+        assert!(loader.retry_visible(&retry));
+        assert_eq!(urgent_requests(&loader).len(), 1);
+
+        loader.forget_indices([7]);
+        (retry.repair, retry.index) = (RetryRepair::ResetState, 8);
+        loader
+            .loading_indices
+            .write()
+            .insert(8, loader.current_generation);
+        assert!(loader.retry_visible(&retry));
+        assert!(loader.loading_indices.read().get(&8) == Some(&loader.current_generation));
+    }
+
+    #[test]
+    fn reset_index_state_forgets_one_index_only() {
+        let list = paths(40);
+        let visible = [10usize];
+        let mut loader = MangaLoader::without_workers();
+        loader.demand(&demand(
+            &list,
+            &visible,
+            &[],
+            10,
+            MangaLayoutMode::LongStrip,
+        ));
+
+        let before = loader.backlog().loads;
+        assert!(before > 1);
+        loader.reset_index_state_for(10);
+
+        assert_eq!(loader.backlog().loads, before - 1);
+        assert!(!loader.loading_indices.read().contains_key(&10));
+        assert!(loader.loading_indices.read().contains_key(&11));
+    }
+
+    #[test]
+    fn sync_visible_index_cancels_on_far_jump_and_tracks_direction() {
+        let list = paths(300);
+        let visible = [10usize];
+        let mut loader = MangaLoader::without_workers();
+        loader.demand(&demand(&list, &visible, &[], 10, MangaLayoutMode::Masonry));
+        assert!(loader.backlog().loads > 0);
+
+        loader.sync_visible_index(280, true);
+        assert_eq!(loader.backlog().loads, 0);
+        assert_eq!(loader.scroll_direction, 1);
+        assert_eq!(loader.last_visible_index, 280);
+
+        loader.sync_visible_index(3, false);
+        assert_eq!(loader.scroll_direction, -1);
+        assert_eq!(loader.last_visible_index, 3);
+    }
+
+    #[test]
+    fn take_applies_dimension_results_once_per_change() {
+        let mut loader = MangaLoader::without_workers();
+        inject_dimensions(
+            &mut loader,
+            vec![(5, 800, 1200, MangaMediaType::StaticImage)],
+        );
+
+        let taken = loader.take(0, 4);
+        assert!(taken.decoded.is_empty());
+        assert_eq!(taken.dimension_updates, vec![5]);
+        assert_eq!(loader.get_dimensions(5), Some((800, 1200)));
+        assert_eq!(loader.get_media_type(5), Some(MangaMediaType::StaticImage));
+
+        // Same dimensions again: already satisfied, so no update and no new request.
+        inject_dimensions(
+            &mut loader,
+            vec![(5, 800, 1200, MangaMediaType::StaticImage)],
+        );
+        let taken = loader.take(0, 4);
+        assert!(taken.dimension_updates.is_empty());
+        assert!(preload_requests(&loader).is_empty());
+    }
+
+    #[test]
+    fn demand_skips_indices_already_loaded_at_sufficient_lod() {
+        let list = paths(30);
+        let visible = [10usize];
+        let mut loader = MangaLoader::without_workers();
+        loader.loaded_levels.write().insert(10, MAX_SIDE);
+
+        loader.demand(&demand(
+            &list,
+            &visible,
+            &[],
+            10,
+            MangaLayoutMode::LongStrip,
+        ));
+        let requests = preload_requests(&loader);
+        assert!(!requests.is_empty());
+        assert!(requests.iter().all(|req| req.index != 10));
+    }
+
+    #[test]
+    fn take_honours_the_dimension_result_limit() {
+        let items = (0..8)
+            .map(|idx| (idx, 100 + idx as u32, 200, MangaMediaType::StaticImage))
+            .collect();
+        let mut loader = MangaLoader::without_workers();
+        inject_dimensions(&mut loader, items);
+
+        let taken = loader.take(0, 1);
+        // One message may carry several indices; the limit bounds messages drained.
+        assert!(!taken.dimension_updates.is_empty());
+        assert!(taken.dimension_updates.len() <= 8);
+        assert_eq!(loader.backlog().dimension_results, 0);
+    }
+
+    #[test]
+    fn prime_clamps_window_to_list_and_destination() {
+        let list = paths(60);
+        let visible = [0usize, 1, 2, 3, 4, 5];
+        let mut loader = MangaLoader::without_workers();
+        loader.demand(&demand(&list, &visible, &[], 0, MangaLayoutMode::Masonry));
+
+        // rows 3: behind max(6, 12) = 12, ahead max(12, 24) = 24 around index 55.
+        loader.prime(
+            &list,
+            55,
+            MAX_SIDE,
+            TARGET_SIDE,
+            FilterType::Triangle,
+            FilterType::Triangle,
+            true,
+        );
+        assert_eq!(dim_window(&loader), (43, 60));
+        assert!(preload_requests(&loader)
+            .iter()
+            .all(|req| matches!(req.downscale_filter, FilterType::Triangle)));
+    }
+
+    #[test]
+    fn warm_dimensions_background_queues_only_the_missing_range() {
+        let list = paths(200);
+        let mut loader = MangaLoader::without_workers();
+        loader.warm_dimensions_background(&list, 90, 120, 0);
+
+        let probe = loader
+            .probe
+            .as_ref()
+            .expect("probe channels")
+            .dim_background_requests
+            .clone();
+        let req = probe.try_recv().expect("background probe batch");
+        assert_eq!(req.items.first().map(|(idx, _)| *idx), Some(90));
+        assert_eq!(req.items.last().map(|(idx, _)| *idx), Some(119));
+
+        // Everything in that window is now pending, so a second request adds nothing.
+        loader.warm_dimensions_background(&list, 90, 120, 0);
+        assert!(probe.try_recv().is_err());
+    }
+
+    #[test]
+    fn prime_forces_triangle_filters_for_neighbours() {
+        let list = paths(30);
+        let visible = [0usize];
+        let mut loader = MangaLoader::without_workers();
+        loader.demand(&demand(&list, &visible, &[], 0, MangaLayoutMode::LongStrip));
+
+        loader.prime(
+            &list,
+            20,
+            MAX_SIDE,
+            TARGET_SIDE,
+            FilterType::Nearest,
+            FilterType::CatmullRom,
+            true,
+        );
+        let requests = preload_requests(&loader);
+        assert!(!requests.is_empty());
+        assert!(requests
+            .iter()
+            .all(|req| matches!(req.downscale_filter, FilterType::Triangle)));
+        assert!(requests
+            .iter()
+            .all(|req| matches!(req.gif_filter, FilterType::Triangle)));
     }
 }

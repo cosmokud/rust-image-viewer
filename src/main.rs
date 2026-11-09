@@ -46,7 +46,8 @@ use image_loader::{
 };
 use image_resize::downscale_rgba_if_needed;
 use manga_loader::{
-    DecodedImage, MangaLoader, MangaMediaType, MangaTextureCache, LOD_SIDE_BUCKETS,
+    DecodedImage, MangaLoader, MangaMediaType, MangaTextureCache, RetryRepair, VisibleRetry,
+    LOD_SIDE_BUCKETS,
 };
 use manga_spatial::{MangaSpatialIndex, SpatialRect, STRIP_QUERY_HALF_WIDTH};
 use media_index::{DirectoryScanResult, MediaDirectoryIndex};
@@ -3524,9 +3525,6 @@ impl ImageViewer {
     const MANGA_UPLOAD_P95_HARD_BUDGET_MS: f32 = 7.5;
     const MANGA_VIRTUALIZATION_AUTO_RTREE_MIN_ITEMS: usize = 2048;
     const MANGA_CACHE_MIN_ENTRIES: usize = 64;
-    const MANGA_CACHE_MAX_ENTRIES: usize = 1024;
-    const MANGA_STRIP_LOOK_AHEAD_MULTIPLIER: f32 = 2.0;
-    const MANGA_STRIP_LOOK_BEHIND_MULTIPLIER: f32 = 1.0;
     const SOLO_FULLSCREEN_PRELOAD_NEUTRAL_DEPTH: usize = 6;
     const SOLO_FULLSCREEN_PRELOAD_MOMENTUM_DEPTH: usize = 12;
     const SOLO_FULLSCREEN_TEXTURE_READY_NEUTRAL_DEPTH: usize = 2;
@@ -3687,7 +3685,7 @@ impl ImageViewer {
         self.reset_masonry_metadata_preload();
 
         if let Some(loader) = self.manga_loader.as_mut() {
-            loader.cancel_pending_loads();
+            loader.cancel_all();
         }
         self.manga_loader = None;
         self.manga_texture_cache.clear();
@@ -5235,7 +5233,7 @@ impl ImageViewer {
 
             if self.mode().is_masonry() {
                 if let Some(ref mut loader) = self.manga_loader {
-                    loader.cache_all_dimensions(&self.image_list);
+                    loader.prime_dimension_cache(&self.image_list);
                 }
                 self.restore_masonry_folder_metadata_snapshot();
                 self.mark_manga_dimension_cache_current_if_complete();
@@ -8012,9 +8010,7 @@ impl ImageViewer {
         let dropped_count = dropped.len() as u64;
 
         if let Some(loader) = self.manga_loader.as_mut() {
-            for decoded in dropped {
-                loader.mark_unloaded(decoded.index);
-            }
+            loader.forget_indices(dropped.into_iter().map(|decoded| decoded.index));
         }
 
         if dropped_count > 0 {
@@ -8032,7 +8028,7 @@ impl ImageViewer {
 
         let jumped_far = self.current_index.abs_diff(previous_visible_index) > 32;
         if let Some(loader) = self.manga_loader.as_mut() {
-            loader.sync_external_visible_index(self.current_index, jumped_far);
+            loader.sync_visible_index(self.current_index, jumped_far);
         }
     }
 
@@ -8127,13 +8123,13 @@ impl ImageViewer {
                 ));
             }
 
-            if let Some(loader) = self.manga_loader.as_ref() {
+            if let Some(backlog) = self.manga_loader.as_ref().map(|loader| loader.backlog()) {
                 text.push_str(&format!(
                     " | U{} L{}/{} D{}/{} V{}/{}",
                     self.manga_upload_batch_limit,
-                    loader.pending_load_count(),
+                    backlog.loads,
                     self.manga_pending_loads_peak,
-                    loader.pending_decoded_count(),
+                    backlog.decoded,
                     self.manga_pending_decoded_peak,
                     self.manga_visible_indices_last,
                     self.manga_visible_indices_peak
@@ -14808,12 +14804,13 @@ impl ImageViewer {
             .filter(|path| self.is_folder_navigation_entry_path(path.as_path()))
             .count();
         let fully_warm = self.manga_loader.as_ref().is_some_and(|loader| {
+            let backlog = loader.backlog();
             loader
                 .cached_dimensions_count(total)
                 .saturating_add(folder_ready)
                 >= total
-                && loader.pending_dimension_probe_count() == 0
-                && loader.pending_dimension_results_count() == 0
+                && backlog.dimension_probes == 0
+                && backlog.dimension_results == 0
         });
 
         if fully_warm || !allow_startup_preload {
@@ -14920,20 +14917,17 @@ impl ImageViewer {
             };
 
             if allow_preload_step {
-                loader.request_dimensions_range_background(
-                    &self.image_list,
-                    preload_cursor,
-                    preload_end,
-                );
+                loader.warm_dimensions_background(&self.image_list, preload_cursor, preload_end, 0);
             }
 
+            let backlog = loader.backlog();
             (
                 loader
                     .cached_dimensions_count(total)
                     .saturating_add(folder_ready)
                     .min(total),
-                loader.pending_dimension_probe_count(),
-                loader.pending_dimension_results_count(),
+                backlog.dimension_probes,
+                backlog.dimension_results,
             )
         };
 
@@ -14954,25 +14948,21 @@ impl ImageViewer {
                         return;
                     };
 
-                    loader.request_dimensions_range_background(
-                        &self.image_list,
-                        preload_cursor,
-                        preload_end,
-                    );
-                    let fallback_seeded = loader.seed_fallback_dimensions_for_range(
+                    let fallback_seeded = loader.warm_dimensions_background(
                         &self.image_list,
                         preload_cursor,
                         preload_end,
                         24,
                     );
+                    let backlog = loader.backlog();
 
                     (
                         loader
                             .cached_dimensions_count(total)
                             .saturating_add(folder_ready)
                             .min(total),
-                        loader.pending_dimension_probe_count(),
-                        loader.pending_dimension_results_count(),
+                        backlog.dimension_probes,
+                        backlog.dimension_results,
                         fallback_seeded,
                     )
                 };
@@ -17428,7 +17418,7 @@ impl ImageViewer {
 
     fn manga_suspend_runtime_for_solo_fullscreen(&mut self) {
         if let Some(ref mut loader) = self.manga_loader {
-            loader.cancel_pending_loads();
+            loader.cancel_all();
         }
 
         // Keep texture/dimension caches alive for fast strip restore,
@@ -18533,46 +18523,6 @@ impl ImageViewer {
         indices
     }
 
-    fn manga_compute_cache_capacity_target(
-        &self,
-        visible_page_count: usize,
-        visible_indices_count: usize,
-    ) -> usize {
-        let visible = visible_page_count.max(1).max(visible_indices_count.max(1));
-
-        if self.mode().is_masonry() {
-            let rows = self.masonry_items_per_row.clamp(2, 10);
-            let zoom_factor = if self.zoom <= 0.35 {
-                4
-            } else if self.zoom <= 0.55 {
-                3
-            } else if self.zoom <= 0.80 {
-                2
-            } else {
-                1
-            };
-            let density_factor = 3 + rows;
-
-            visible
-                .saturating_mul(density_factor)
-                .saturating_mul(zoom_factor)
-                .clamp(Self::MANGA_CACHE_MIN_ENTRIES, Self::MANGA_CACHE_MAX_ENTRIES)
-        } else {
-            let zoom_factor = if self.zoom <= 0.45 {
-                3
-            } else if self.zoom <= 0.75 {
-                2
-            } else {
-                1
-            };
-
-            visible
-                .saturating_mul(5)
-                .saturating_mul(zoom_factor)
-                .clamp(Self::MANGA_CACHE_MIN_ENTRIES, 512)
-        }
-    }
-
     fn manga_target_texture_side_for_preload(
         &mut self,
         anchor_index: usize,
@@ -18621,41 +18571,20 @@ impl ImageViewer {
         self.manga_strip_target_texture_side_from_display_side(visible_max_side.max(1.0))
     }
 
-    fn navigation_preload_window(&self) -> (usize, usize) {
-        if self.mode().is_masonry() {
-            let visible = self.manga_visible_indices_last.max(1);
-            let min_behind = self.masonry_items_per_row.clamp(2, 10).saturating_mul(4);
-            let min_ahead = self.masonry_items_per_row.clamp(2, 10).saturating_mul(8);
-
-            return (
-                visible.max(min_behind),
-                visible.saturating_mul(2).max(min_ahead),
-            );
-        }
-
-        self.manga_strip_preload_window_counts(self.manga_visible_strip_equivalent_last)
-    }
-
     fn manga_prime_navigation_destination(&mut self, target: usize) {
         if self.mode().is_solo() || self.image_list.is_empty() {
             return;
         }
 
         let target = target.min(self.image_list.len().saturating_sub(1));
-        let (preload_behind, preload_ahead) = self.navigation_preload_window();
         let target_texture_side = self.manga_target_texture_side_for_preload(target, &[]);
         let (downscale_filter, gif_filter) = self.manga_decode_filters_for_strip_mode();
         let force_triangle_filters = self.manga_should_force_triangle_filters();
 
         if let Some(ref mut loader) = self.manga_loader {
-            let len = self.image_list.len();
-            let start = target.saturating_sub(preload_behind);
-            let end = target.saturating_add(preload_ahead).min(len);
-            loader.request_dimensions_range(&self.image_list, start, end);
-            loader.update_preload_queue(
+            loader.prime(
                 &self.image_list,
                 target,
-                self.screen_size.y,
                 self.max_texture_side,
                 target_texture_side,
                 downscale_filter,
@@ -18670,15 +18599,7 @@ impl ImageViewer {
     }
 
     fn manga_strip_preload_window_counts(&self, visible_item_equivalent: f32) -> (usize, usize) {
-        let visible = visible_item_equivalent.max(1.0);
-        let behind = (visible * Self::MANGA_STRIP_LOOK_BEHIND_MULTIPLIER)
-            .ceil()
-            .max(1.0) as usize;
-        let ahead = (visible * Self::MANGA_STRIP_LOOK_AHEAD_MULTIPLIER)
-            .ceil()
-            .max(1.0) as usize;
-
-        (behind, ahead)
+        MangaLoader::strip_window_for_visible_equivalent(visible_item_equivalent)
     }
 
     fn manga_strip_visible_item_equivalent(
@@ -19339,7 +19260,7 @@ impl ImageViewer {
             let uses_metadata_cache = self.mode().uses_metadata_cache();
             if let Some(ref mut loader) = self.manga_loader {
                 if !reuse_preserved_masonry_layout && uses_metadata_cache {
-                    loader.cache_all_dimensions(&self.image_list);
+                    loader.prime_dimension_cache(&self.image_list);
                 }
             }
             if entering_grid {
@@ -20862,9 +20783,7 @@ impl ImageViewer {
                         );
                         if !evicted.is_empty() {
                             if let Some(loader) = self.manga_loader.as_mut() {
-                                for evicted_idx in evicted {
-                                    loader.mark_unloaded(evicted_idx);
-                                }
+                                loader.forget_indices(evicted);
                             }
                         }
                     }
@@ -20981,9 +20900,7 @@ impl ImageViewer {
                 );
                 if !evicted.is_empty() {
                     if let Some(loader) = self.manga_loader.as_mut() {
-                        for evicted_idx in evicted {
-                            loader.mark_unloaded(evicted_idx);
-                        }
+                        loader.forget_indices(evicted);
                     }
                 }
             }
@@ -21038,14 +20955,7 @@ impl ImageViewer {
             self.manga_visible_strip_equivalent_last = visible_item_equivalent;
             Some(visible_item_equivalent)
         };
-        let visible_set: HashSet<usize> = visible_indices.iter().copied().collect();
-        let previous_cache_capacity = self
-            .manga_cache_target_capacity
-            .max(Self::MANGA_CACHE_MIN_ENTRIES);
-        let masonry_rows = self.masonry_items_per_row.clamp(2, 10);
-        let masonry_side_multiplier = (masonry_rows + 1) / 2;
-        let mut target_cache_capacity =
-            self.manga_compute_cache_capacity_target(visible_page_count, visible_indices_count);
+
         self.manga_target_texture_side =
             self.manga_target_texture_side_for_preload(current_visible_index, &visible_indices);
         self.manga_record_target_side_sample(self.manga_target_texture_side);
@@ -21053,29 +20963,8 @@ impl ImageViewer {
         self.manga_visible_indices_peak =
             self.manga_visible_indices_peak.max(visible_indices_count);
 
-        if is_masonry {
-            // Byte-aware clamp to avoid oversized entry-count targets when textures are large.
-            const MASONRY_CACHE_BUDGET_BYTES_IDLE: usize = 768 * 1024 * 1024;
-            const MASONRY_CACHE_BUDGET_BYTES_NAV: usize = 512 * 1024 * 1024;
-
-            let est_side = self.manga_target_texture_side.max(1) as usize;
-            let est_bytes_per_texture = est_side
-                .saturating_mul(est_side)
-                .saturating_mul(4)
-                .saturating_mul(3)
-                / 2;
-            let budget_bytes = if self.masonry_navigation_active_for_heavy_work() {
-                MASONRY_CACHE_BUDGET_BYTES_NAV
-            } else {
-                MASONRY_CACHE_BUDGET_BYTES_IDLE
-            };
-            let byte_limited_capacity = (budget_bytes / est_bytes_per_texture.max(1))
-                .clamp(Self::MANGA_CACHE_MIN_ENTRIES, Self::MANGA_CACHE_MAX_ENTRIES);
-            let keep_floor = visible_indices_count.max(masonry_rows.saturating_mul(4));
-            target_cache_capacity =
-                target_cache_capacity.min(byte_limited_capacity.max(keep_floor));
-        }
-
+        let scrolling_up = self.manga_scroll_offset < prev_scroll_pos - 0.5;
+        let moving_up = scrolling_up || self.manga_scroll_velocity < -0.5;
         let preserve_recent_cache = if is_masonry {
             self.masonry_navigation_active_for_heavy_work()
                 || self.masonry_navigation_was_active
@@ -21086,175 +20975,55 @@ impl ImageViewer {
                 || self.is_panning
                 || self.manga_scroll_velocity.abs() > 0.5
         };
+        let previous_cache_capacity = self
+            .manga_cache_target_capacity
+            .max(Self::MANGA_CACHE_MIN_ENTRIES);
+        let (downscale_filter, gif_filter) = self.manga_decode_filters_for_strip_mode();
+        let force_triangle_filters = self.manga_should_force_triangle_filters();
+        let cached_indices = self.manga_texture_cache.cached_indices();
+        let layout = self.mode().layout();
+        let navigation_active = self.masonry_navigation_active_for_heavy_work();
+        let masonry_rows = self.masonry_items_per_row.clamp(2, 10);
 
-        if preserve_recent_cache {
-            let retain_floor = previous_cache_capacity
-                .saturating_mul(7)
-                .saturating_div(8)
-                .max(visible_indices_count);
-            target_cache_capacity = target_cache_capacity.max(retain_floor);
-        }
+        let plan = {
+            let Some(loader) = self.manga_loader.as_mut() else {
+                return;
+            };
 
-        self.manga_cache_target_capacity = target_cache_capacity;
-
-        self.manga_texture_cache
-            .set_pinned_indices(visible_indices.iter().copied());
-
-        let mut evicted_for_capacity = self
-            .manga_texture_cache
-            .set_max_entries(self.manga_cache_target_capacity);
-        if !evicted_for_capacity.is_empty() {
-            if let Some(loader) = self.manga_loader.as_mut() {
-                for idx in evicted_for_capacity.drain(..) {
-                    loader.mark_unloaded(idx);
-                }
-            }
-        }
-
-        // Update the loader's visible item count using the actual visible set. When the R-tree
-        // backend is active, `visible_indices` already reflects the current on-screen tile count.
-        // Long strip also passes a fractional viewport-coverage hint so partial pages do not
-        // expand the preload window to whole-item minimums.
-        if let Some(ref mut loader) = self.manga_loader {
-            let visible_for_loader = visible_indices_count.max(1);
-            let cache_limited_visible =
-                visible_for_loader.min(self.manga_cache_target_capacity.max(1));
-            loader.update_visible_page_count(
-                cache_limited_visible.max(1),
+            loader.demand(&manga_loader::Demand {
+                image_list: &self.image_list,
+                layout,
+                anchor_index: current_visible_index,
+                visible_indices: &visible_indices,
+                visible_page_count,
                 strip_visible_item_equivalent,
-            );
-        }
-
-        // Cache dimensions for a directional window around the visible range.
-        // Use the actual visible item count so backend probe work scales with what is truly on screen.
-        let scrolling_up = self.manga_scroll_offset < prev_scroll_pos - 0.5;
-        let moving_up = scrolling_up || self.manga_scroll_velocity < -0.5;
-        let (behind, ahead) = if is_masonry {
-            let directional_visible = visible_indices_count.max(1);
-            let look_forward = directional_visible.saturating_mul(2);
-            let look_backward = directional_visible;
-            let min_forward = masonry_rows.saturating_mul(8);
-            let min_backward = masonry_rows.saturating_mul(4);
-            let max_behind = 384usize.saturating_mul(masonry_rows);
-            let max_ahead = 768usize.saturating_mul(masonry_rows);
-            let forward = look_forward.max(min_forward);
-            let backward = look_backward.max(min_backward);
-
-            if moving_up {
-                (forward.min(max_behind), backward.min(max_ahead))
-            } else {
-                (backward.min(max_behind), forward.min(max_ahead))
-            }
-        } else {
-            let visible_item_equivalent =
-                strip_visible_item_equivalent.unwrap_or(visible_indices_count as f32);
-            let (look_backward, look_forward) =
-                self.manga_strip_preload_window_counts(visible_item_equivalent);
-
-            if moving_up {
-                (look_forward, look_backward)
-            } else {
-                (look_backward, look_forward)
-            }
+                max_texture_side: self.max_texture_side,
+                target_texture_side: self.manga_target_texture_side,
+                downscale_filter,
+                gif_filter,
+                force_triangle_filters,
+                masonry_rows,
+                zoom: self.zoom,
+                scrolling_up,
+                moving_up,
+                navigation_active,
+                preserve_recent_cache,
+                previous_cache_capacity,
+                cached_indices: &cached_indices,
+            })
         };
 
-        let cache_start = current_visible_index.saturating_sub(behind);
-        let cache_end = (current_visible_index + ahead).min(self.image_list.len());
-        if let Some(ref mut loader) = self.manga_loader {
-            loader.request_dimensions_range(&self.image_list, cache_start, cache_end);
+        self.manga_cache_target_capacity = plan.cache_capacity;
+        self.manga_texture_cache
+            .set_pinned_indices(plan.pinned_indices);
+        self.manga_texture_cache
+            .set_max_entries(self.manga_cache_target_capacity);
+        for idx in plan.evicted_indices {
+            self.manga_texture_cache.remove(idx);
         }
 
         // Now that layout is stabilized, update the last scroll position.
         self.manga_last_scroll_position = self.manga_scroll_offset;
-
-        // Update the parallel loader's preload queue
-        let (downscale_filter, gif_filter) = self.manga_decode_filters_for_strip_mode();
-        let force_triangle_filters = self.manga_should_force_triangle_filters();
-        if let Some(ref mut loader) = self.manga_loader {
-            loader.update_preload_queue(
-                &self.image_list,
-                current_visible_index,
-                self.screen_size.y,
-                self.max_texture_side,
-                self.manga_target_texture_side,
-                downscale_filter,
-                gif_filter,
-                force_triangle_filters,
-            );
-        }
-
-        // Evict textures that are far from the visible range to control VRAM usage.
-        // Use adaptive eviction based on zoom level: at low zoom, we need more cached
-        // textures since more are visible simultaneously.
-        // Get preload counts from the loader (they're zoom-aware)
-        let (keep_ahead, keep_behind) = if let Some(ref loader) = self.manga_loader {
-            (loader.get_preload_ahead(), loader.get_preload_behind())
-        } else {
-            (32, 16)
-        };
-
-        // Apply eviction policy
-        let (mut final_keep_behind, mut final_keep_ahead) = if is_masonry {
-            // Masonry: symmetric keep window from the larger side, scaled by rows-per-row.
-            let symmetric = keep_ahead
-                .max(keep_behind)
-                .saturating_mul(masonry_side_multiplier)
-                .max(12usize.saturating_mul(masonry_rows));
-            (symmetric, symmetric)
-        } else if scrolling_up {
-            (keep_ahead, keep_behind) // Keep more behind when scrolling up
-        } else {
-            (keep_behind, keep_ahead) // Keep more ahead when scrolling down
-        };
-
-        let visible_budget = visible_indices_count.min(self.manga_cache_target_capacity.max(1));
-        let keep_budget_total = self
-            .manga_cache_target_capacity
-            .saturating_sub(visible_budget);
-        if keep_budget_total == 0 {
-            final_keep_behind = 0;
-            final_keep_ahead = 0;
-        } else {
-            let requested_total = final_keep_behind.saturating_add(final_keep_ahead);
-            if requested_total > keep_budget_total {
-                let mut scaled_behind =
-                    final_keep_behind.saturating_mul(keep_budget_total) / requested_total.max(1);
-                let mut scaled_ahead = keep_budget_total.saturating_sub(scaled_behind);
-
-                if final_keep_behind > 0 && scaled_behind == 0 {
-                    scaled_behind = 1.min(keep_budget_total);
-                    scaled_ahead = keep_budget_total.saturating_sub(scaled_behind);
-                }
-                if final_keep_ahead > 0 && scaled_ahead == 0 && keep_budget_total > 1 {
-                    scaled_ahead = 1;
-                    scaled_behind = keep_budget_total.saturating_sub(scaled_ahead);
-                }
-
-                final_keep_behind = scaled_behind;
-                final_keep_ahead = scaled_ahead;
-            }
-        }
-
-        let keep_start = current_visible_index.saturating_sub(final_keep_behind);
-        let keep_end = (current_visible_index + final_keep_ahead + 1).min(self.image_list.len());
-
-        let mut evicted_by_window = Vec::new();
-        let cached_indices = self.manga_texture_cache.cached_indices();
-        for idx in cached_indices {
-            let outside_keep_window = idx < keep_start || idx >= keep_end;
-            if outside_keep_window && !visible_set.contains(&idx) {
-                self.manga_texture_cache.remove(idx);
-                evicted_by_window.push(idx);
-            }
-        }
-
-        if !evicted_by_window.is_empty() {
-            if let Some(loader) = self.manga_loader.as_mut() {
-                for idx in evicted_by_window {
-                    loader.mark_unloaded(idx);
-                }
-            }
-        }
     }
 
     /// Calculate the number of pages currently visible on screen.
@@ -21452,7 +21221,10 @@ impl ImageViewer {
         let (pending_loads, pending_decoded) = self
             .manga_loader
             .as_ref()
-            .map(|loader| (loader.pending_load_count(), loader.pending_decoded_count()))
+            .map(|loader| {
+                let backlog = loader.backlog();
+                (backlog.loads, backlog.decoded)
+            })
             .unwrap_or((0, 0));
         let decoded_backlog_total =
             pending_decoded.saturating_add(self.manga_decoded_mailbox.len());
@@ -21468,18 +21240,9 @@ impl ImageViewer {
                 return false;
             };
 
-            // Poll for decoded images from the background threads
             let mailbox_headroom = Self::MANGA_DECODED_MAILBOX_MAX_ITEMS
                 .saturating_sub(self.manga_decoded_mailbox.len());
-            let (decoded_images, decoded_dim_updates) = if mailbox_headroom == 0 {
-                (Vec::new(), Vec::new())
-            } else {
-                loader.poll_decoded_images_with_limit(
-                    mailbox_headroom.min(upload_batch_limit.saturating_mul(4).max(1)),
-                )
-            };
-
-            // Also poll async dimension probe results (header reads), applied incrementally.
+            let max_decoded = mailbox_headroom.min(upload_batch_limit.saturating_mul(4).max(1));
             // Limiting messages per frame prevents layout updates from causing bursts of work.
             let dim_poll_limit =
                 if defer_masonry_layout_work || self.masonry_metadata_preload_active {
@@ -21487,13 +21250,10 @@ impl ImageViewer {
                 } else {
                     4
                 };
-            let mut layout_dim_updates = loader.poll_dimension_results(dim_poll_limit);
-            layout_dim_updates.extend(decoded_dim_updates);
+            let taken = loader.take(max_decoded, dim_poll_limit);
 
-            (decoded_images, layout_dim_updates)
+            (taken.decoded, taken.dimension_updates)
         };
-        layout_dim_updates.sort_unstable();
-        layout_dim_updates.dedup();
 
         if self.mode().is_masonry()
             && self.masonry_authoritative_dimension_lock_active()
@@ -21580,7 +21340,7 @@ impl ImageViewer {
                 .is_some_and(|path| path == &decoded.path)
             {
                 if let Some(loader) = self.manga_loader.as_mut() {
-                    loader.reset_index_state(decoded.index);
+                    loader.reset_index_state_for(decoded.index);
                 }
                 continue;
             }
@@ -21658,9 +21418,7 @@ impl ImageViewer {
 
         if !evicted_to_mark_unloaded.is_empty() {
             if let Some(loader) = self.manga_loader.as_mut() {
-                for evicted_idx in evicted_to_mark_unloaded {
-                    loader.mark_unloaded(evicted_idx);
-                }
+                loader.forget_indices(evicted_to_mark_unloaded);
             }
         }
 
@@ -21956,20 +21714,14 @@ impl ImageViewer {
         self.manga_scroll_velocity = 0.0;
 
         // Prime the loader around the destination so the transition stays smooth.
-        let (preload_behind, preload_ahead) = self.navigation_preload_window();
         let target_texture_side = self.manga_target_texture_side_for_preload(target, &[]);
         let (downscale_filter, gif_filter) = self.manga_decode_filters_for_strip_mode();
         let force_triangle_filters = self.manga_should_force_triangle_filters();
         if let Some(ref mut loader) = self.manga_loader {
-            let len = self.image_list.len();
-            if len > 0 {
-                let start = target.saturating_sub(preload_behind);
-                let end = target.saturating_add(preload_ahead).min(len);
-                loader.request_dimensions_range(&self.image_list, start, end);
-                loader.update_preload_queue(
+            if !self.image_list.is_empty() {
+                loader.prime(
                     &self.image_list,
                     target,
-                    self.screen_size.y,
                     self.max_texture_side,
                     target_texture_side,
                     downscale_filter,
@@ -22049,19 +21801,13 @@ impl ImageViewer {
         self.manga_scroll_velocity = 0.0;
 
         // Prime the loader around the destination so the transition stays smooth.
-        let (preload_behind, preload_ahead) = self.navigation_preload_window();
         let target_texture_side = self.manga_target_texture_side_for_preload(target, &[]);
         let (downscale_filter, gif_filter) = self.manga_decode_filters_for_strip_mode();
         let force_triangle_filters = self.manga_should_force_triangle_filters();
         if let Some(ref mut loader) = self.manga_loader {
-            let len = self.image_list.len();
-            let start = target.saturating_sub(preload_behind);
-            let end = target.saturating_add(preload_ahead).min(len);
-            loader.request_dimensions_range(&self.image_list, start, end);
-            loader.update_preload_queue(
+            loader.prime(
                 &self.image_list,
                 target,
-                self.screen_size.y,
                 self.max_texture_side,
                 target_texture_side,
                 downscale_filter,
@@ -22127,13 +21873,9 @@ impl ImageViewer {
             return;
         }
         self.stop_manga_wheel_scroll();
-        let (_, preload_ahead) = self.navigation_preload_window();
         // Cancel all pending loads - we're jumping to a new position
         if let Some(ref mut loader) = self.manga_loader {
-            loader.cancel_pending_loads();
-            // Pre-cache dimensions for the target area
-            let end = preload_ahead.min(self.image_list.len());
-            loader.request_dimensions_range(&self.image_list, 0, end);
+            loader.cancel_all();
         }
         // Use INSTANT scroll for large jumps to avoid cache churn
         self.manga_scroll_offset = 0.0;
@@ -22156,13 +21898,9 @@ impl ImageViewer {
         }
         self.stop_manga_wheel_scroll();
         let last_index = self.image_list.len() - 1;
-        let (preload_behind, _) = self.navigation_preload_window();
         // Cancel all pending loads - we're jumping to a new position
         if let Some(ref mut loader) = self.manga_loader {
-            loader.cancel_pending_loads();
-            // Pre-cache dimensions for the target area
-            let start = last_index.saturating_sub(preload_behind);
-            loader.request_dimensions_range(&self.image_list, start, self.image_list.len());
+            loader.cancel_all();
         }
         self.set_current_index_clamped(last_index);
         // Invalidate height cache since we're at a new position
@@ -23124,15 +22862,16 @@ impl ImageViewer {
             .manga_loader
             .as_mut()
             .map(|loader| {
-                loader.request_visible_retry(
-                    &self.image_list,
+                loader.retry_visible(&VisibleRetry {
+                    image_list: &self.image_list,
                     index,
-                    self.max_texture_side,
+                    max_texture_side: self.max_texture_side,
                     target_texture_side,
                     downscale_filter,
                     gif_filter,
                     force_triangle_filters,
-                )
+                    repair: RetryRepair::None,
+                })
             })
             .unwrap_or(false);
 
@@ -23148,16 +22887,16 @@ impl ImageViewer {
             )
         {
             if let Some(loader) = self.manga_loader.as_mut() {
-                loader.mark_unloaded(index);
-                requested = loader.request_visible_retry(
-                    &self.image_list,
+                requested = loader.retry_visible(&VisibleRetry {
+                    image_list: &self.image_list,
                     index,
-                    self.max_texture_side,
+                    max_texture_side: self.max_texture_side,
                     target_texture_side,
                     downscale_filter,
                     gif_filter,
                     force_triangle_filters,
-                );
+                    repair: RetryRepair::ForceReload,
+                });
             }
 
             if requested {
@@ -23171,16 +22910,16 @@ impl ImageViewer {
             && self.manga_should_heal_placeholder_retry(index)
         {
             if let Some(loader) = self.manga_loader.as_mut() {
-                loader.reset_index_state(index);
-                requested = loader.request_visible_retry(
-                    &self.image_list,
+                requested = loader.retry_visible(&VisibleRetry {
+                    image_list: &self.image_list,
                     index,
-                    self.max_texture_side,
+                    max_texture_side: self.max_texture_side,
                     target_texture_side,
                     downscale_filter,
                     gif_filter,
                     force_triangle_filters,
-                );
+                    repair: RetryRepair::ResetState,
+                });
             }
 
             if requested {
@@ -24141,7 +23880,7 @@ impl ImageViewer {
                     if self.mode().is_masonry() {
                         let jumped_far = self.current_index.abs_diff(previous_visible_index) > 32;
                         if let Some(loader) = self.manga_loader.as_mut() {
-                            loader.sync_external_visible_index(self.current_index, jumped_far);
+                            loader.sync_visible_index(self.current_index, jumped_far);
                         }
                     }
 
@@ -24686,10 +24425,11 @@ impl ImageViewer {
             .manga_loader
             .as_ref()
             .map(|loader| {
-                loader.pending_load_count() > 0
-                    || loader.pending_decoded_count() > 0
-                    || loader.pending_dimension_results_count() > 0
-                    || loader.pending_dimension_probe_count() > 0
+                let backlog = loader.backlog();
+                backlog.loads > 0
+                    || backlog.decoded > 0
+                    || backlog.dimension_results > 0
+                    || backlog.dimension_probes > 0
             })
             .unwrap_or(false);
 
@@ -30703,11 +30443,12 @@ impl eframe::App for ImageViewer {
             .manga_loader
             .as_ref()
             .map(|loader| {
+                let backlog = loader.backlog();
                 (
-                    loader.pending_load_count(),
-                    loader.pending_decoded_count(),
-                    loader.pending_dimension_results_count(),
-                    loader.pending_dimension_probe_count(),
+                    backlog.loads,
+                    backlog.decoded,
+                    backlog.dimension_results,
+                    backlog.dimension_probes,
                 )
             })
             .unwrap_or((0, 0, 0, 0));
