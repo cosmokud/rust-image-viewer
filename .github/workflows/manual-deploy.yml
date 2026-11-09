@@ -98,8 +98,9 @@ jobs:
 
       - name: Extract Changelog
         shell: bash
+        env:
+          TAG_NAME: ${{ inputs.tag_to_build }}
         run: |
-          TAG_NAME="${{ inputs.tag_to_build }}"
           VERSION="${TAG_NAME}"
 
           # Extract changelog section for the current version
