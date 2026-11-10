@@ -35,7 +35,9 @@ The architecture is intentionally biased toward "what helps the next visible fra
 | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
 | `build.rs`                     | Build-time config-template sync, optional AppData sync (`RIV_SYNC_APPDATA_CONFIG_AT_BUILD`), Windows icon embedding, delay-loaded GStreamer DLL linkage | Keeps runtime config in sync and reduces image-only startup baggage on Windows/MSVC |
 | `src/main.rs`                  | Main application state, UI loop, solo mode, Long Strip, Masonry, window transitions, async coordinator glue                                             | This is the orchestration center of the app                                         |
+| `src/cache_key.rs`             | Canonical cache key identity hashing (path, mtime, size) across loaders and cache layers                               | Eliminates ad-hoc key formatting and cache identity mismatches                     |
 | `src/config.rs`                | INI parsing, defaults, action-first shortcut model, save/load, quality and behavior settings                                                            | Configuration affects nearly every subsystem                                        |
+| `src/first_frame.rs`           | First-frame video thumbnail extraction and preview frame representation                                                 | Decouples preview thumbnail probing from the live playback lifecycle               |
 | `src/app_dirs.rs`              | OS-aware app config/local-data directory resolution via `directories::BaseDirs`                                                                         | Centralizes storage paths and fallback behavior across config and cache subsystems  |
 | `src/async_runtime.rs`         | Shared Tokio runtime with thread fallback                                                                                                               | Standardizes background execution without blocking the UI thread                    |
 | `src/image_loader.rs`          | Static image decode, GIF handling, animated WebP helpers, directory enumeration                                                                         | Owns the image hot path                                                             |
@@ -45,7 +47,11 @@ The architecture is intentionally biased toward "what helps the next visible fra
 | `src/manga_loader.rs`          | Background dimension probing, prioritized strip/masonry decode, LOD bookkeeping, retry logic, texture-cache type                                        | Owns multi-item throughput                                                          |
 | `src/manga_spatial.rs`         | `rstar` spatial index wrapper                                                                                                                           | Keeps visibility queries from scaling linearly in huge folders                      |
 | `src/perf_metrics.rs`          | Rolling p50/p95-style runtime metrics                                                                                                                   | Feeds the in-app diagnostics overlay                                                |
+| `src/settings_registry.rs`     | Declarative configuration registry, tabbed settings UI, search, validation, and preset handling                         | Isolates settings UI and preset management from core runtime loops                 |
 | `src/single_instance.rs`       | Windows single-instance mutex and IPC handoff                                                                                                           | Lets secondary launches reuse the primary window                                    |
+| `src/texture_upload.rs`        | Centralized egui texture upload helper, mipmapping, format conversions, and texture handle reuse                        | Guarantees uniform filtering policies and bounded GPU texture allocations          |
+| `src/viewer_mode.rs`           | Viewer state machine and mode transitions (`SoloFloating`, `SoloFullscreen`, `LongStrip`, `Masonry`)                   | Encapsulates layout mode state and enforces valid mode transition invariants        |
+| `src/window_geometry.rs`       | Physical display monitor enumeration, work-area tracking, multi-monitor coordinate clamping, and DPI transition math   | Prevents window loss, title bar clipping, and jumpy drags across varied displays   |
 | `src/windows_env.rs`           | Windows PATH refresh and maximize helpers                                                                                                               | Makes GStreamer discovery and native window transitions more reliable               |
 | `assets/config.ini`            | Canonical config template                                                                                                                               | Source of truth for user-facing configuration                                       |
 | `build-installers.ps1`         | Windows packaging orchestrator for two prebuilt binaries (AVX2 and the legacy x86-64-v2 set) and four NSIS output variants                                                   | Standardizes release packaging inputs/outputs across local and CI builds            |
@@ -123,6 +129,14 @@ When `eframe::run_native` constructs `ImageViewer`, initialization does several 
 - loads the initial file through `load_image()` / `load_media_internal()`
 
 At this point, the viewer has a window, app state, and an initial load request, but not necessarily a fully decoded image or video frame yet.
+
+### 3.6 Multi-monitor physical geometry and window clamping
+
+`src/window_geometry.rs` handles display topology and window bounds in physical pixels:
+
+- Display detection: Uses Win32 `MonitorFromPoint` on the window's physical center rather than its top-left corner, ensuring a window spanning multiple monitors is associated with the display holding the majority of its area.
+- Maximize vs Fullscreen: Borderless fullscreen targets `rcMonitor` (covering the full display), while maximize targets `rcWork` (preserving the taskbar). Neither defaults to the primary monitor; all operations anchor to the active monitor.
+- Clamping and DPI scaling: Window coordinates are clamped to stay reachable on displays with negative coordinate offsets (e.g. secondary monitors placed to the left or above the primary display). When dragging across monitors with different DPI scalings, the floating window latches to the cursor position and converts coordinates via inverse display scale ratios without cumulative drift.
 
 ## 4. Main event loop structure
 
@@ -298,6 +312,14 @@ Its jobs are:
 - LOD bookkeeping via highest-loaded side per index
 - returning decoded RGBA payloads ready for GPU upload
 
+### 6.2.1 Unified Demand and DemandPlan interface
+
+Rather than hand-sequencing preload ranges, dimension probes, and cache budget updates across `src/main.rs`, the loader exposes a unified interface:
+
+- `Demand`: Declares current UI state (visible indices, anchor index, layout mode, LOD target side, filters, scroll direction, and currently cached indices).
+- `DemandPlan`: Returned by `MangaLoader::demand()`, declaring the computed cache capacity, pinned indices, and indices to evict outside the keep window.
+- `Taken`: Consumed each frame on the UI thread via `take_work()`, returning newly decoded textures and async dimension updates.
+
 ### 6.3 Bounded worker topology
 
 The loader is intentionally bounded:
@@ -369,7 +391,8 @@ This exists because speculative preload bookkeeping can occasionally believe an 
 The recovery path:
 
 - visible item missing texture
-- reset state for that index if necessary
+- repair policy distinguishes simple retry (`None`), quality upgrade (`ForceReload`), and stall heal (`ResetState`)
+- `ResetState` clears in-flight tracking so a corrupted or hanging decode cannot permanently block the tile
 - enqueue a high-priority urgent retry
 - retry backoff starts at `250 ms` and caps at `4000 ms`
 - visibly stalled placeholders can self-heal after `900 ms`
@@ -464,6 +487,17 @@ Masonry layout rebuilds are measured separately from spatial-index rebuilds beca
 
 Video items use source-dimension probes (cached or playback-reported) for layout bounds. Downscaled output frames are ignored for layout sizing so low-zoom output bounds do not cascade reflow/squash. Masonry queues video dimension updates through the loader and flushes them once navigation settles.
 
+### 6.13 Video thumbnail probe concurrency gate (`VIDEO_PROBE_GATE`)
+
+Video first-frame extraction and folder placeholder probes require creating GStreamer pipelines that seek and preroll. Running multiple probes unconstrained saturates disk I/O and CPU worker pools, starving image decoding and freezing UI navigation.
+
+The concurrency gate in `src/manga_loader.rs` enforces:
+
+- Dynamic permit limit between `MIN_CONCURRENT_VIDEO_PROBES` (2) and `MAX_CONCURRENT_VIDEO_PROBES` (8), scaled from system CPU core count.
+- Condvar-backed permit acquisition with a bounded timeout (`VIDEO_PROBE_ACQUIRE_TIMEOUT = 400 ms`).
+- Graceful degradation: if a probe permit times out, the worker degrades to cheap fallback dimensions immediately rather than parking the worker thread indefinitely.
+- Lifetime-free `VideoProbePermit` RAII handles that pass down from first-frame extraction to dimension probing without double-queueing.
+
 ## 7. Visible-item query architecture
 
 ### 7.1 Linear scan fallback
@@ -521,6 +555,7 @@ Shutdown behavior:
 
 - the write loop honors a shutdown signal (`CACHE_WRITE_SHUTDOWN` flag, `CACHE_WRITE_ACTIVE` counter, and a `Shutdown` write-op)
 - `request_metadata_cache_shutdown()` sets the flag, pokes the writer with the shutdown op, and waits for in-flight writes to finish, so the fast app-exit path never leaves the cache file mid-write
+- dimension-record file reads are deferred to the background writer thread, keeping the metadata cache writer off the UI frame path
 
 ### 8.2 Solo decoded-image cache (`src/main.rs`)
 
@@ -576,6 +611,16 @@ Additional behavior:
 - mode switches can preserve zoom/pan when `fullscreen_reset_fit_on_mode_switch` is disabled
 
 That prevents stale auto-fit states from coming back as fake user intent.
+
+### 8.6 Cache-key identity abstraction (`src/cache_key.rs`)
+
+Cache identity across in-memory and on-disk tiers is centralized in `src/cache_key.rs`:
+
+- Canonicalization: Relative paths are canonicalized; Windows paths are lowercased for case-insensitive matching.
+- Scopes:
+  - `KeyScope::Bare`: Byte-identical to on-disk redb keys (metadata and folder travel tables) with no suffix.
+  - `KeyScope::TextureSide(side)`: Suffixes `#ts{side}` for in-memory texture caches and GPU handles.
+  - `KeyScope::TravelLayout(layout)`: Suffixes `#{layout}` for folder travel state persistence.
 
 ## 9. Image and animation architecture
 
@@ -705,7 +750,36 @@ Instead:
 
 That policy is essential for dense mixed-media folders.
 
-## 11. Windowing and mode transitions
+## 11. Windowing, mode transitions, and settings
+
+### 11.1 Viewer mode state machine (`src/viewer_mode.rs`)
+
+Viewer presentation state is formalized in `src/viewer_mode.rs`:
+
+- State enum: `Mode::FloatingSolo(layout)`, `Mode::FullscreenSolo(layout)`, and `Mode::Strip(layout)`.
+- Sticky layout mode: `MangaLayoutMode` (`LongStrip`, `Masonry`, `Gallery`) is preserved across solo excursions so returning to multi-item mode restores the active layout.
+- Invariant enforcement: Transitions strictly validate state changes (e.g. asserting strip mode is entered only from fullscreen).
+- Layout queries: Helper methods like `is_grid()` and `shows_preview_video_controls()` centralize layout-dependent UI decisions.
+
+### 11.2 Texture upload pipeline (`src/texture_upload.rs`)
+
+Texture creation and updates are centralized in `src/texture_upload.rs`:
+
+- Upload classification: `UploadKind` classifies targets (`StaticImage`, `AnimatedFrame`, `VideoFrame`, `VideoThumbnail`, `MangaVideoThumbnail`, `MangaPage`, `Placeholder`).
+- Filter source: Resolves texture filtering (Bilinear vs Nearest) based on media kind and configuration.
+- Mipmap gate: Enforces `MEANINGFUL_MINIFY_RATIO` (1.15) and minimum side thresholds before generating mipmaps, avoiding GPU memory overhead for minor scale changes.
+- Handle reuse: Manages texture allocation and updates cleanly without duplicating GL upload logic across loaders.
+
+### 11.3 Settings registry and preset management (`src/settings_registry.rs`)
+
+Configuration management and settings UI are decoupled from `src/config.rs`:
+
+- Declarative registry: All editable settings are defined in a structured registry mapping to `SettingKind` and `RowControl`.
+- Categorized tabs: Grouped into 10 tabs (`General`, `Appearance`, `ZoomScroll`, `Motion`, `Autoscroll`, `Window`, `Files`, `Video`, `Performance`, `Shortcuts`).
+- Standalone window: Settings opens in its own dedicated, searchable window with instant search filtering.
+- Preset architecture: The active preset file is the app configuration. Presets are stored under `presets/` with a read-only `default.ini` and editable user presets, featuring auto-load on selection, reset options, and deletion confirmation dialogs.
+
+### 11.4 Window transitions
 
 The app deliberately separates:
 
@@ -785,6 +859,10 @@ The viewer's speed comes from many cooperating techniques rather than one big tr
 | Hidden off-screen video startup       | `src/main.rs`                          | Starts video windows hidden until real dimensions/frame are ready             | Prevents ugly startup flashes                                    |
 | Lazy Windows font load                | `src/main.rs`                          | Loads large CJK fonts only when filenames need them                           | Reduces startup work                                             |
 | Reactive idle rendering               | `src/main.rs`                          | Avoids needless repaint when nothing is changing                              | Cuts idle CPU/GPU usage                                          |
+| Video probe concurrency gate         | `src/manga_loader.rs`                  | Caps concurrent GStreamer thumbnail and placeholder pipelines (2-8 dynamic)    | Prevents disk I/O and worker thread saturation                   |
+| Unified demand loader pipeline        | `src/manga_loader.rs`                  | Replaces 41 hand-sequenced calls with a declarative demand query               | Keeps cache budgeting, pinning, and eviction in one pass         |
+| Off-thread metadata cache writes      | `src/metadata_cache.rs`                | Defers dimension file I/O to the background writer thread                      | Keeps metadata lookups and writing off the UI frame path         |
+| Centralized texture upload reuse      | `src/texture_upload.rs`                | Consolidates filter policy, mipmap ratio gates, and texture handle allocation  | Guarantees uniform filtering and prevents texture handle churn   |
 
 ## 14. Third-party crate map
 

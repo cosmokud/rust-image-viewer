@@ -2,11 +2,38 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.4.2] - 2026-11-10
 
 ### Highlights
 
-- The release now carries two builds of the same version. Every default artifact is compiled for AVX2 (`-C target-cpu=x86-64-v3` in `.cargo/config.toml`), and a second set suffixed `-legacy` is the same version compiled for SSE4.2 (`-C target-cpu=x86-64-v2`) for a machine below that. Both installers exist in both levels — with and without the bundled GStreamer runtime — and the two portable executables are the same pair.
+- The release now carries two builds of the same version: default AVX2 (`-C target-cpu=x86-64-v3`) and a `-legacy` SSE4.2 build (`-C target-cpu=x86-64-v2`), with standalone and bundled-GStreamer installers plus bundled third-party notices.
+- A tabbed, searchable Settings dialog now runs in its own dedicated window with live preset management (`default.ini` and user presets), reset to defaults, and auto-loading on selection.
+- Multi-monitor geometry tracking ensures floating window drags hold the cursor across DPI changes, maximization respects the active display's work area, and windows stay reachable across displays left of primary.
+- A unified `Demand` loader interface replaces hand-sequenced loading calls, adds stuck-tile self-healing, and gates video thumbnail probing to prevent worker thread exhaustion.
+
+### Added
+
+- Dedicated Settings window with categorized tabs, preset loading/saving/deleting, inline search, and a centralized configuration registry (`src/settings_registry.rs`).
+- Crisp Lucide SVG icons across menus, video transport, and settings dialogs.
+- Physical display geometry module (`src/window_geometry.rs`), 10% default scroll-wheel zoom notch, and environment-gated crash/freeze diagnostics (`env.local`).
+
+### Changed
+
+- Replaced 41 hand-sequenced manga loading calls with a unified `Demand`/`DemandPlan` interface in `src/manga_loader.rs`.
+- Centralized viewer mode transitions in `src/viewer_mode.rs`, texture upload/mipmap pipeline in `src/texture_upload.rs`, and cache-key identity in `src/cache_key.rs`.
+- Window title bar now collapses the file name before file metadata on narrow windows, and opening Settings while active refocuses the existing window.
+
+### Fixed
+
+- Stuck or corrupted manga tiles self-heal to prevent preload pipeline stalls, and the preload queue pumps on outstanding demand rather than in-flight backlog.
+- Video thumbnail extraction and folder placeholders now run behind a concurrency gate (`VIDEO_PROBE_GATE`) to prevent UI and background worker starvation.
+- Video playback offloads blocking GStreamer control calls (e.g. EOS restart) to a dedicated thread, and oversized textures/allocations are rejected before decoding.
+- Full chrome bar moves floating windows during drag, cursor anchors latch reliably, and multi-monitor scale transitions preserve zoom scale and window bounds.
+
+### Maintenance
+
+- Shipped complete third-party attribution and LGPL notices for installers and GStreamer runtime bundles (`THIRD-PARTY.md`, `NOTICES/`).
+- Build pipeline improvements with thin LTO for fast dev rebuilds, fat LTO for release builds, and minimum supported Rust version set to 1.99.
 
 ## [v0.4.1-rc.5] - 2026-08-12
 

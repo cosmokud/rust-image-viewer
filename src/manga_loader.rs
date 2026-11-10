@@ -57,6 +57,58 @@ const MAX_CONCURRENT_VIDEO_PROBES: usize = 8;
 /// Bounded wait: a rayon worker must never park indefinitely behind the gate.
 const VIDEO_PROBE_ACQUIRE_TIMEOUT: Duration = Duration::from_millis(400);
 
+/// Cooldown after a gate timeout: the index keeps its cheap dimensions and no gated probe is
+/// retried until this elapses. Retrying on the next pass saturated the gate and re-ran a
+/// masonry/strip relayout every pass (20 timeouts in one session).
+const VIDEO_PROBE_COOLDOWN: Duration = Duration::from_secs(5);
+
+/// Index -> cooldown deadline. Global because the decode workers and the single dimension worker
+/// probe the same indices; cleared wholesale when the media list changes.
+static VIDEO_PROBE_COOLDOWN_UNTIL: std::sync::OnceLock<
+    parking_lot::Mutex<HashMap<usize, Instant>>,
+> = std::sync::OnceLock::new();
+
+fn probe_cooldown_map() -> &'static parking_lot::Mutex<HashMap<usize, Instant>> {
+    VIDEO_PROBE_COOLDOWN_UNTIL.get_or_init(|| parking_lot::Mutex::new(HashMap::new()))
+}
+
+/// `true` while this index must skip gated video probes and keep its cheap dimensions.
+fn probe_cooldown_active(index: usize) -> bool {
+    let mut map = probe_cooldown_map().lock();
+    match map.get(&index).copied() {
+        Some(deadline) if deadline > Instant::now() => true,
+        Some(_) => {
+            map.remove(&index);
+            false
+        }
+        None => false,
+    }
+}
+
+fn start_probe_cooldown(index: usize) {
+    probe_cooldown_map()
+        .lock()
+        .insert(index, Instant::now() + VIDEO_PROBE_COOLDOWN);
+}
+
+fn clear_probe_cooldown(index: usize) {
+    probe_cooldown_map().lock().remove(&index);
+}
+
+/// Drop cooldowns for indices outside the prefetch window: a video scrolled back into view gets a
+/// fresh chance at a real probe even though the cooldown has not expired yet.
+fn clear_probe_cooldowns_outside(start: usize, end: usize) {
+    let mut map = probe_cooldown_map().lock();
+    if map.is_empty() {
+        return;
+    }
+    map.retain(|index, _| *index >= start && *index < end);
+}
+
+fn clear_all_probe_cooldowns() {
+    probe_cooldown_map().lock().clear();
+}
+
 fn video_probe_permit_count() -> usize {
     std::thread::available_parallelism()
         .map_or(MIN_CONCURRENT_VIDEO_PROBES, |cores| cores.get() / 4)
@@ -166,6 +218,20 @@ fn probe_permit<'a>(
 
     *owned = acquire_probe_permit();
     owned.as_ref()
+}
+
+/// Gate permit for one tile. A timeout starts the index cooldown, so the next pass reuses the
+/// cheap dimensions instead of queueing behind the same saturated gate.
+fn probe_permit_for_index(index: usize) -> Option<VideoProbePermit> {
+    if probe_cooldown_active(index) {
+        return None;
+    }
+
+    let permit = acquire_probe_permit();
+    if permit.is_none() {
+        start_probe_cooldown(index);
+    }
+    permit
 }
 
 /// Runs `probe` under the shared video-probe gate. `None` when the gate stayed busy past the
@@ -792,7 +858,7 @@ impl MangaLoader {
                 };
 
                 let dims = if is_video {
-                    Self::probe_video_dimensions(&path)
+                    Self::probe_video_dimensions(idx, &path)
                 } else {
                     Self::probe_image_dimensions_cached(&path)
                 };
@@ -1626,11 +1692,13 @@ impl MangaLoader {
                 // For videos, try to extract the first frame as a thumbnail
                 // This provides a visual preview instead of a gray placeholder
                 // One permit for the whole tile: extraction and its inner dimension probe share it.
-                let tile_permit = acquire_probe_permit();
+                // A gate timeout starts this index's cooldown instead of retrying next pass.
+                let tile_permit = probe_permit_for_index(req.index);
                 match tile_permit.as_ref().and_then(|permit| {
                     Self::extract_video_first_frame(&req.path, effective_texture_side, Some(permit))
                 }) {
                     Some(frame) => {
+                        clear_probe_cooldown(req.index);
                         let resize_started = Instant::now();
                         let (width, height, pixels) = downscale_rgba_if_needed(
                             frame.width,
@@ -1785,18 +1853,29 @@ impl MangaLoader {
     ///
     /// Uses a lightweight first-frame probe, then falls back to filename heuristics. One permit
     /// covers the whole chain: the first-frame fallback inside must not wait on the gate again.
-    fn probe_video_dimensions(path: &std::path::Path) -> Option<(u32, u32)> {
+    fn probe_video_dimensions(index: usize, path: &std::path::Path) -> Option<(u32, u32)> {
         if let Some((w, h)) = lookup_cached_dimensions(path, CachedMediaKind::Video) {
             return Some((w, h));
         }
 
+        // Cooling down after a gate timeout: keep the cheap size layout already has instead of
+        // re-probing (and re-laying-out) on every pass.
+        if probe_cooldown_active(index) {
+            return Self::fallback_video_dimensions(path);
+        }
+
         let mut owned = None;
-        if let Some(permit) = probe_permit(None, &mut owned) {
+        let permit = probe_permit(None, &mut owned);
+        if permit.is_none() {
+            start_probe_cooldown(index);
+        }
+        if let Some(permit) = permit {
             if gstreamer_runtime_available() {
                 Self::note_gst_probe();
                 if let Some((w, h)) = probe_video_dimensions_with_gstreamer(path) {
                     if w > 0 && h > 0 {
                         store_cached_dimensions(path, CachedMediaKind::Video, w, h);
+                        clear_probe_cooldown(index);
                         return Some((w, h));
                     }
                 }
@@ -1805,6 +1884,7 @@ impl MangaLoader {
             if let Some((w, h)) = probe_video_dimensions_without_gstreamer(path) {
                 if w > 0 && h > 0 {
                     store_cached_dimensions(path, CachedMediaKind::Video, w, h);
+                    clear_probe_cooldown(index);
                     return Some((w, h));
                 }
             }
@@ -1815,17 +1895,15 @@ impl MangaLoader {
             if let Some((w, h)) = probed {
                 if w > 0 && h > 0 {
                     store_cached_dimensions(path, CachedMediaKind::Video, w, h);
+                    clear_probe_cooldown(index);
                     return Some((w, h));
                 }
             }
         }
 
-        let fallback = Self::fallback_video_dimensions(path);
-        if let Some((w, h)) = fallback {
-            store_cached_dimensions(path, CachedMediaKind::Video, w, h);
-        }
-
-        fallback
+        // The filename heuristic is a guess, not a probe: caching it pinned a loadable video at
+        // the wrong size for the whole session.
+        Self::fallback_video_dimensions(path)
     }
 
     fn fallback_video_dimensions(path: &std::path::Path) -> Option<(u32, u32)> {
@@ -2446,6 +2524,9 @@ impl MangaLoader {
         let start_idx = visible_index.saturating_sub(behind);
         let end_idx = (visible_index + ahead + 1).min(image_list.len());
 
+        // A video that scrolled out of the window gets a fresh probe chance on the way back.
+        clear_probe_cooldowns_outside(start_idx, end_idx);
+
         // Collect indices that need loading
         let mut requests: Vec<LoadRequest> = Vec::new();
         let generation = self.current_generation;
@@ -2716,7 +2797,7 @@ impl MangaLoader {
 
                 if is_video {
                     // For videos, probe dimensions
-                    let dims = Self::probe_video_dimensions(path);
+                    let dims = Self::probe_video_dimensions(*idx, path);
                     (*idx, dims.map(|(w, h)| (w, h, MangaMediaType::Video)))
                 } else if is_image {
                     // For images, get from file header
@@ -2762,6 +2843,7 @@ impl MangaLoader {
 
         // Clear any queued dimension probes
         self.dim_pending.clear();
+        clear_all_probe_cooldowns();
 
         // Drain dimension result channel
         while self.dim_result_rx.try_recv().is_ok() {}
@@ -3488,6 +3570,28 @@ mod tests {
     fn video_probe_permit_count_scales_with_cores_within_bounds() {
         let count = video_probe_permit_count();
         assert!((MIN_CONCURRENT_VIDEO_PROBES..=MAX_CONCURRENT_VIDEO_PROBES).contains(&count));
+    }
+
+    #[test]
+    fn probe_cooldown_blocks_until_cleared_or_window_moves() {
+        // Indices unique to this test: the map is shared with every real worker.
+        let cooled = 99_001;
+        start_probe_cooldown(cooled);
+        assert!(probe_cooldown_active(cooled));
+
+        clear_probe_cooldown(cooled);
+        assert!(!probe_cooldown_active(cooled));
+
+        for index in [99_002, 99_003, 99_004] {
+            start_probe_cooldown(index);
+        }
+        clear_probe_cooldowns_outside(99_003, 99_004);
+        assert!(!probe_cooldown_active(99_002), "left the window");
+        assert!(probe_cooldown_active(99_003), "still visible");
+        assert!(!probe_cooldown_active(99_004), "window is half-open");
+
+        clear_all_probe_cooldowns();
+        assert!(!probe_cooldown_active(99_003));
     }
 
     #[test]

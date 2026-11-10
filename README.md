@@ -21,6 +21,9 @@ The RGBA resize path is centralized in `src/image_resize.rs`: static images, ani
 ## Highlights
 
 - Borderless floating window with custom title bar, auto-hide controls, native-feeling fullscreen / maximize transitions, and steadier drag/zoom/resize behavior on Windows.
+- Multi-monitor geometry tracking with display-aware maximization, DPI scaling guards, and seamless drag clamping across monitors.
+- Tabbed, searchable Settings window in a dedicated window with live preset management, reset options, and searchable settings registry.
+- Dual release builds: default AVX2 (`-C target-cpu=x86-64-v3`) and legacy SSE4.2 (`-C target-cpu=x86-64-v2`) with bundled LGPL attribution notices.
 - Fullscreen view-state memory in RAM with configurable zoom/pan preservation between floating and fullscreen.
 - Configurable window title path mode (auto/full path/filename) with smart truncation for narrow title bars.
 - Fast single-file viewing plus fast folder navigation, including natural-sort media lists and optional single-instance reuse.
@@ -59,7 +62,7 @@ The RGBA resize path is centralized in `src/image_resize.rs`: static images, ani
 - Windows folder shortcuts (`.lnk`) are treated as navigable folders.
 - Breadcrumb address bar for fullscreen manga modes with back/forward/up navigation, history popup, visibility toggle, and Windows drive-root entries.
 - Windows cut/copy/paste for marked files; paste into the current folder via Ctrl+V or the menu.
-- Title bar menu entry for `Edit Settings`, which opens the active `config.ini` in the default editor.
+- Title bar menu entry for `Settings`, opening a tabbed, searchable settings window with live presets and reset options.
 - CJK filename support through lazy Windows font loading.
 
 ### Image and animation viewing
@@ -105,6 +108,7 @@ The RGBA resize path is centralized in `src/image_resize.rs`: static images, ani
 - Manga video control bar appears only in Long Strip; grid layouts keep previews without the controls.
 - Long Strip can reset to a fitted view when returning from solo fullscreen (configurable).
 - Solo fullscreen quick-open from Long Strip / Masonry with preserved return context and warm-cache reuse.
+- Unified demand-driven page loading with stuck-tile self-healing and video thumbnail probe concurrency gating.
 
 ## Supported Formats
 
