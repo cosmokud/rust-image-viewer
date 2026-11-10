@@ -74,6 +74,7 @@ use eframe::egui;
 use image::imageops::FilterType;
 use parking_lot::Mutex;
 use smallvec::SmallVec;
+use std::cell::Cell;
 use std::collections::{hash_map::DefaultHasher, VecDeque};
 use std::fs;
 use std::hash::{Hash, Hasher};
@@ -2452,6 +2453,15 @@ fn windows_ctrl_v_shortcut_down() -> bool {
     false
 }
 
+/// Memo key/value for [`ImageViewer::current_image_cached_dimensions`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ImageCachedDimsMemo {
+    list_signature: u64,
+    index: usize,
+    texture_dims: Option<(u32, u32)>,
+    value: Option<(u32, u32)>,
+}
+
 /// Application state
 struct ImageViewer {
     /// Current loaded image
@@ -2461,6 +2471,10 @@ struct ImageViewer {
     /// Dimensions corresponding to the current `texture`.
     /// Used to keep showing the last image frame while replacement media is loading.
     image_texture_dims: Option<(u32, u32)>,
+    /// Draw-path memo for `current_image_cached_dimensions`: that cache lookup can land behind
+    /// the metadata-cache writer (file opens, redb commit, fsync), which froze the frame loop
+    /// while the disk was saturated. Keyed on every input it depends on, so a change misses.
+    image_cached_dims_memo: Cell<Option<ImageCachedDimsMemo>>,
     /// Whether the current static image texture was uploaded with mipmaps enabled.
     /// Used to trigger a one-time quality upgrade when users zoom out after initial load.
     image_texture_mipmap_enabled: bool,
@@ -3218,6 +3232,7 @@ impl Default for ImageViewer {
             image: None,
             texture: None,
             image_texture_dims: None,
+            image_cached_dims_memo: Cell::new(None),
             image_texture_mipmap_enabled: false,
             texture_frame: 0,
             image_list: Vec::new(),
@@ -8197,13 +8212,15 @@ impl ImageViewer {
             || metadata_stats.dimension_misses > 0
             || metadata_stats.dimension_expired > 0
             || metadata_stats.dimension_evicted > 0
+            || metadata_stats.dimension_write_drops > 0
         {
             text.push_str(&format!(
-                " | MC D{}/{} E{} V{}",
+                " | MC D{}/{} E{} V{} X{}",
                 metadata_stats.dimension_hits,
                 metadata_stats.dimension_misses,
                 metadata_stats.dimension_expired,
                 metadata_stats.dimension_evicted,
+                metadata_stats.dimension_write_drops,
             ));
         }
 
@@ -25303,9 +25320,28 @@ impl ImageViewer {
             return None;
         }
 
-        self.image_list
+        let key = (
+            self.image_list_signature,
+            self.current_index,
+            self.image_texture_dims,
+        );
+        if let Some(memo) = self.image_cached_dims_memo.get() {
+            if (memo.list_signature, memo.index, memo.texture_dims) == key {
+                return memo.value;
+            }
+        }
+
+        let value = self
+            .image_list
             .get(self.current_index)
-            .and_then(|path| lookup_cached_dimensions(path, CachedMediaKind::Image))
+            .and_then(|path| lookup_cached_dimensions(path, CachedMediaKind::Image));
+        self.image_cached_dims_memo.set(Some(ImageCachedDimsMemo {
+            list_signature: key.0,
+            index: key.1,
+            texture_dims: key.2,
+            value,
+        }));
+        value
     }
 
     fn pending_image_display_dimensions(

@@ -1,5 +1,6 @@
 //! Persistent metadata cache for placeholder-critical media metadata.
 
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -7,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::UNIX_EPOCH;
 
-use parking_lot::Mutex;
+use parking_lot::RwLock;
 use redb::backends::FileBackend;
 use redb::{Database, DatabaseError, ReadableTable, StorageBackend, TableDefinition, TableHandle};
 
@@ -16,8 +17,16 @@ use crate::app_dirs;
 const METADATA_TABLE: TableDefinition<&str, &str> = TableDefinition::new("media_dimensions");
 
 const DIMENSION_CACHE_MAX_ENTRIES: usize = 80_000;
+/// RAM mirror cap, a subset of `DIMENSION_CACHE_MAX_ENTRIES`: eviction is free of correctness
+/// concerns because a miss falls back to redb.
+const DIMENSION_MIRROR_MAX_ENTRIES: usize = 16_384;
 const PRUNE_INTERVAL_SECS: u64 = 60;
 const CACHE_WRITE_QUEUE_CAPACITY: usize = 512;
+const CACHE_WRITE_BATCH_MAX: usize = 64;
+/// Encoded record is `w,h,type,animated` at ~20 bytes; the rest is redb btree overhead.
+const RECORD_DISK_BYTES_ESTIMATE: u64 = 512;
+/// Writer wakeup that doubles as the idle prune tick.
+const CACHE_WRITER_IDLE_TICK_SECS: u64 = 5;
 const METADATA_CACHE_DEFAULT_MAX_SIZE_BYTES: u64 = 1024 * 1024 * 1024;
 const BYTES_PER_MIB: u64 = 1024 * 1024;
 static DIMENSION_HITS: AtomicU64 = AtomicU64::new(0);
@@ -30,6 +39,9 @@ static METADATA_CACHE_MAX_SIZE_BYTES: AtomicU64 =
 static METADATA_CACHE_ENABLED: AtomicBool = AtomicBool::new(false);
 static CACHE_WRITE_SHUTDOWN: AtomicBool = AtomicBool::new(false);
 static CACHE_WRITE_ACTIVE: AtomicUsize = AtomicUsize::new(0);
+static DIMENSION_WRITE_DROPS: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+static CACHE_BATCH_COMMITS: AtomicU64 = AtomicU64::new(0);
 
 fn metadata_cache_access_enabled() -> bool {
     METADATA_CACHE_ENABLED.load(Ordering::Relaxed)
@@ -45,6 +57,8 @@ pub struct MetadataCacheStats {
     pub dimension_misses: u64,
     pub dimension_expired: u64,
     pub dimension_evicted: u64,
+    /// Writes dropped because the bounded write queue was full (recomputed on next miss).
+    pub dimension_write_drops: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -186,18 +200,20 @@ struct CachedRecord {
 }
 
 enum CacheWriteOp {
-    Dimensions {
-        path: PathBuf,
-        media_kind: CachedMediaKind,
-        width: u32,
-        height: u32,
-    },
+    // Disk facts (file type, animated) are resolved at enqueue: the writer must stay pure redb.
+    Dimensions { key: String, record: CachedRecord },
     Shutdown,
 }
 
 pub struct MetadataCache {
-    db: Database,
+    // Readers share this handle and never take the writer's path: redb read transactions run
+    // concurrently with writes, so reads used to block only on the lock the writer held. The
+    // inner `Arc` is cloned out under the lock and released first, so no I/O runs under it.
+    db: RwLock<Arc<Database>>,
     cache_path: PathBuf,
+    // Backend-tracked file length: the write-side size gate without a per-write stat.
+    file_len: Arc<AtomicU64>,
+    mirror: RwLock<HashMap<String, CachedRecord>>,
 }
 
 impl MetadataCache {
@@ -205,11 +221,13 @@ impl MetadataCache {
         let path = default_cache_path()?;
         let max_size_bytes = metadata_cache_max_size_bytes();
 
-        let db = open_database_with_size_limit(path.as_path(), max_size_bytes)?;
+        let (db, file_len) = open_database_with_size_limit(path.as_path(), max_size_bytes)?;
 
         Some(Self {
-            db,
+            db: RwLock::new(Arc::new(db)),
             cache_path: path,
+            file_len,
+            mirror: RwLock::new(HashMap::new()),
         })
     }
 
@@ -219,11 +237,7 @@ impl MetadataCache {
         expected_kind: CachedMediaKind,
     ) -> Option<(u32, u32)> {
         let key = crate::cache_key::key(path, crate::cache_key::KeyScope::Bare).unwrap_or_default();
-
-        let read_txn = self.db.begin_read().ok()?;
-        let table = read_txn.open_table(METADATA_TABLE).ok()?;
-        let raw = table.get(key.as_str()).ok()??;
-        let record = decode_record(raw.value())?;
+        let record = self.mirror_record(key.as_str())?;
 
         if !expected_kind.matches_file_type(record.file_type) {
             return None;
@@ -240,98 +254,152 @@ impl MetadataCache {
         &self,
         items: &[(PathBuf, CachedMediaKind)],
     ) -> Vec<Option<(u32, u32)>> {
-        let Ok(read_txn) = self.db.begin_read() else {
-            return vec![None; items.len()];
-        };
-        let Ok(table) = read_txn.open_table(METADATA_TABLE) else {
-            return vec![None; items.len()];
-        };
+        let mut records: Vec<Option<CachedRecord>> = Vec::with_capacity(items.len());
+        let mut misses: Vec<(usize, String)> = Vec::new();
 
-        let mut results = Vec::with_capacity(items.len());
-
-        for (path, expected_kind) in items {
+        for (index, (path, _)) in items.iter().enumerate() {
             let key = crate::cache_key::key(path.as_path(), crate::cache_key::KeyScope::Bare)
                 .unwrap_or_default();
-            let raw = match table.get(key.as_str()) {
-                Ok(Some(raw)) => raw,
-                _ => {
-                    results.push(None);
-                    continue;
+            match self.mirror_peek(key.as_str()) {
+                Some(record) => records.push(Some(record)),
+                None => {
+                    misses.push((index, key));
+                    records.push(None);
                 }
-            };
-            let Some(record) = decode_record(raw.value()) else {
-                results.push(None);
-                continue;
-            };
-
-            if !expected_kind.matches_file_type(record.file_type)
-                || record.width == 0
-                || record.height == 0
-            {
-                results.push(None);
-                continue;
             }
-
-            results.push(Some((record.width, record.height)));
         }
 
-        results
+        if !misses.is_empty() {
+            // One read transaction for the whole batch; mirror-only hits skip it entirely.
+            if let Ok(read_txn) = self.db_clone().begin_read() {
+                if let Ok(table) = read_txn.open_table(METADATA_TABLE) {
+                    for (index, key) in misses {
+                        let Some(record) = table
+                            .get(key.as_str())
+                            .ok()
+                            .flatten()
+                            .and_then(|raw| decode_record(raw.value()))
+                        else {
+                            continue;
+                        };
+                        self.insert_mirror(key, record);
+                        records[index] = Some(record);
+                    }
+                }
+            }
+        }
+
+        items
+            .iter()
+            .zip(records)
+            .map(|((_, expected_kind), record)| {
+                let record = record?;
+                if !expected_kind.matches_file_type(record.file_type)
+                    || record.width == 0
+                    || record.height == 0
+                {
+                    return None;
+                }
+                Some((record.width, record.height))
+            })
+            .collect()
     }
 
-    pub fn store_dimensions(
-        &mut self,
-        path: &Path,
-        media_kind: CachedMediaKind,
-        width: u32,
-        height: u32,
-    ) {
-        if width == 0 || height == 0 {
-            return;
+    fn mirror_peek(&self, key: &str) -> Option<CachedRecord> {
+        self.mirror.read().get(key).copied()
+    }
+
+    fn mirror_record(&self, key: &str) -> Option<CachedRecord> {
+        if let Some(record) = self.mirror_peek(key) {
+            return Some(record);
         }
 
-        let key = crate::cache_key::key(path, crate::cache_key::KeyScope::Bare).unwrap_or_default();
-        let Some(file_type) = detect_file_type(path) else {
-            return;
-        };
-        if !media_kind.matches_file_type(file_type) {
-            return;
-        };
-        let animated = detect_animated(path, file_type);
+        let record = self.read_record_from_db(key)?;
+        self.insert_mirror(key.to_string(), record);
+        Some(record)
+    }
 
-        let encoded = encode_record(CachedRecord {
-            width,
-            height,
-            file_type,
-            animated,
-        });
+    fn db_clone(&self) -> Arc<Database> {
+        self.db.read().clone()
+    }
 
-        let estimated_write_bytes = key.len().saturating_add(encoded.len()).saturating_add(512);
-        if self.should_skip_write_due_to_size_limit(estimated_write_bytes) {
-            self.maybe_prune_tables();
-            if self.should_skip_write_due_to_size_limit(estimated_write_bytes) {
-                return;
+    fn read_record_from_db(&self, key: &str) -> Option<CachedRecord> {
+        let read_txn = self.db_clone().begin_read().ok()?;
+        let table = read_txn.open_table(METADATA_TABLE).ok()?;
+        let raw = table.get(key).ok()??;
+        decode_record(raw.value())
+    }
+
+    fn insert_mirror(&self, key: String, record: CachedRecord) {
+        let mut mirror = self.mirror.write();
+        if mirror.len() >= DIMENSION_MIRROR_MAX_ENTRIES && !mirror.contains_key(&key) {
+            mirror.clear();
+        }
+        mirror.insert(key, record);
+    }
+
+    /// Writer thread only. One write transaction (and one fsync) per drained batch: the batch
+    /// runs behind a queue, so per-record transactions are pure latency for everyone.
+    /// Returns how many records were stored.
+    fn apply_batch(&self, batch: &[(String, CachedRecord)]) -> usize {
+        let max_size_bytes = metadata_cache_max_size_bytes();
+        let mut estimated_write_bytes = 0_u64;
+        let mut accepted: Vec<&(String, CachedRecord)> = Vec::with_capacity(batch.len());
+
+        for entry in batch {
+            if max_size_bytes > 0 {
+                // Slack for btree page churn; the store is a hint, so dropping beats blocking.
+                let bytes = (entry.0.len() as u64).saturating_add(RECORD_DISK_BYTES_ESTIMATE);
+                let projected = self
+                    .file_len
+                    .load(Ordering::Relaxed)
+                    .saturating_add(estimated_write_bytes)
+                    .saturating_add(bytes);
+                if projected > max_size_bytes {
+                    continue;
+                }
+                estimated_write_bytes = estimated_write_bytes.saturating_add(bytes);
             }
+            accepted.push(entry);
         }
 
-        let Ok(write_txn) = self.db.begin_write() else {
-            return;
+        if accepted.is_empty() {
+            return 0;
+        }
+
+        let Ok(write_txn) = self.db_clone().begin_write() else {
+            return 0;
         };
 
         {
             let Ok(mut table) = write_txn.open_table(METADATA_TABLE) else {
-                return;
+                return 0;
             };
 
-            if table.insert(key.as_str(), encoded.as_str()).is_err() {
-                return;
+            for (key, record) in &accepted {
+                let encoded = encode_record(*record);
+                // One bad record must not abort the rest of the batch.
+                let _ = table.insert(key.as_str(), encoded.as_str());
             }
         }
 
-        let _ = write_txn.commit();
-        self.maybe_prune_tables();
+        if write_txn.commit().is_err() {
+            return 0;
+        }
+
+        #[cfg(test)]
+        CACHE_BATCH_COMMITS.fetch_add(1, Ordering::Relaxed);
+
+        for (key, record) in &accepted {
+            self.insert_mirror(key.clone(), *record);
+        }
+
+        accepted.len()
     }
 
-    fn maybe_prune_tables(&mut self) {
+    /// Idle-only (writer loop). Never inside a batch: `prune_dimension_table` rewrites the whole
+    /// table and `compact` rewrites the file, which is what used to stall every reader.
+    fn prune_if_due(&self) {
         let last_prune_secs = LAST_PRUNE_SECS.load(Ordering::Relaxed);
         let now_secs = unix_now_secs();
         let prune_due_to_interval = now_secs.saturating_sub(last_prune_secs) >= PRUNE_INTERVAL_SECS;
@@ -348,10 +416,19 @@ impl MetadataCache {
         if prune_due_to_size {
             self.prune_to_size_limit();
         }
+
+        self.refresh_file_len();
+    }
+
+    /// Idle-only: re-sync the atomic size estimate with the real file length.
+    fn refresh_file_len(&self) {
+        if let Ok(metadata) = std::fs::metadata(&self.cache_path) {
+            self.file_len.store(metadata.len(), Ordering::Relaxed);
+        }
     }
 
     fn prune_dimension_table(&self) {
-        let Ok(write_txn) = self.db.begin_write() else {
+        let Ok(write_txn) = self.db_clone().begin_write() else {
             return;
         };
 
@@ -409,36 +486,16 @@ impl MetadataCache {
         let _ = write_txn.commit();
     }
 
-    fn cache_file_len(&self) -> Option<u64> {
-        std::fs::metadata(&self.cache_path)
-            .ok()
-            .map(|metadata| metadata.len())
-    }
-
-    fn should_skip_write_due_to_size_limit(&self, estimated_write_bytes: usize) -> bool {
-        let max_size_bytes = metadata_cache_max_size_bytes();
-        if max_size_bytes == 0 {
-            return false;
-        }
-
-        let Some(current_len) = self.cache_file_len() else {
-            return false;
-        };
-
-        current_len.saturating_add(estimated_write_bytes as u64) > max_size_bytes
-    }
-
     fn cache_needs_size_prune(&self) -> bool {
         let max_size_bytes = metadata_cache_max_size_bytes();
         if max_size_bytes == 0 {
             return false;
         }
 
-        self.cache_file_len()
-            .is_some_and(|len| len > max_size_bytes)
+        self.file_len.load(Ordering::Relaxed) > max_size_bytes
     }
 
-    fn prune_to_size_limit(&mut self) {
+    fn prune_to_size_limit(&self) {
         let max_size_bytes = metadata_cache_max_size_bytes();
         if max_size_bytes == 0 {
             return;
@@ -448,16 +505,22 @@ impl MetadataCache {
             return;
         }
 
-        let _ = self.db.compact();
+        // `compact` needs `&mut Database`; skip the tick while a reader still holds a clone
+        // (retried on the next idle tick) instead of making readers wait for the rewrite.
+        let mut db = self.db.write();
+        let Some(db) = Arc::get_mut(&mut db) else {
+            return;
+        };
+        let _ = db.compact();
     }
 }
 
-static GLOBAL_CACHE: OnceLock<Option<Arc<Mutex<MetadataCache>>>> = OnceLock::new();
+static GLOBAL_CACHE: OnceLock<Option<Arc<MetadataCache>>> = OnceLock::new();
 static CACHE_WRITE_TX: OnceLock<Option<crossbeam_channel::Sender<CacheWriteOp>>> = OnceLock::new();
 
-fn global_cache_handle() -> Option<&'static Arc<Mutex<MetadataCache>>> {
+fn global_cache_handle() -> Option<&'static Arc<MetadataCache>> {
     GLOBAL_CACHE
-        .get_or_init(|| MetadataCache::open_default().map(|cache| Arc::new(Mutex::new(cache))))
+        .get_or_init(|| MetadataCache::open_default().map(Arc::new))
         .as_ref()
 }
 
@@ -476,44 +539,53 @@ fn cache_write_tx() -> Option<&'static crossbeam_channel::Sender<CacheWriteOp>> 
         .as_ref()
 }
 
-fn cache_write_loop(
-    cache: Arc<Mutex<MetadataCache>>,
-    rx: crossbeam_channel::Receiver<CacheWriteOp>,
-) {
-    while let Ok(first_op) = rx.recv() {
+fn cache_write_loop(cache: Arc<MetadataCache>, rx: crossbeam_channel::Receiver<CacheWriteOp>) {
+    loop {
+        let first_op =
+            match rx.recv_timeout(std::time::Duration::from_secs(CACHE_WRITER_IDLE_TICK_SECS)) {
+                Ok(op) => op,
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    // Idle: the only place pruning may run, never behind a batch.
+                    run_cache_write_active(|| cache.prune_if_due());
+                    if CACHE_WRITE_SHUTDOWN.load(Ordering::Acquire) {
+                        break;
+                    }
+                    continue;
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+            };
+
         if CACHE_WRITE_SHUTDOWN.load(Ordering::Acquire) {
             break;
         }
 
-        let mut pending: Vec<CacheWriteOp> = Vec::with_capacity(32);
-        pending.push(first_op);
+        let mut stop = matches!(first_op, CacheWriteOp::Shutdown);
+        let mut batch: Vec<(String, CachedRecord)> = Vec::with_capacity(CACHE_WRITE_BATCH_MAX);
 
-        while pending.len() < 64 && !CACHE_WRITE_SHUTDOWN.load(Ordering::Acquire) {
+        if let CacheWriteOp::Dimensions { key, record } = first_op {
+            batch.push((key, record));
+        }
+
+        while !stop && batch.len() < CACHE_WRITE_BATCH_MAX {
             match rx.try_recv() {
-                Ok(op) => pending.push(op),
+                Ok(CacheWriteOp::Dimensions { key, record }) => batch.push((key, record)),
+                Ok(CacheWriteOp::Shutdown) => stop = true,
                 Err(_) => break,
             }
         }
 
-        let mut cache = cache.lock();
-        for op in pending {
-            if CACHE_WRITE_SHUTDOWN.load(Ordering::Acquire) {
-                break;
-            }
+        if CACHE_WRITE_SHUTDOWN.load(Ordering::Acquire) {
+            break;
+        }
 
-            match op {
-                CacheWriteOp::Dimensions {
-                    path,
-                    media_kind,
-                    width,
-                    height,
-                } => {
-                    run_cache_write_active(|| {
-                        cache.store_dimensions(path.as_path(), media_kind, width, height);
-                    });
-                }
-                CacheWriteOp::Shutdown => break,
-            }
+        if !batch.is_empty() {
+            run_cache_write_active(|| {
+                cache.apply_batch(&batch);
+            });
+        }
+
+        if stop {
+            break;
         }
     }
 }
@@ -548,7 +620,7 @@ pub fn lookup_cached_dimensions(path: &Path, expected_kind: CachedMediaKind) -> 
         return None;
     };
 
-    let result = cache.lock().lookup_dimensions(path, expected_kind);
+    let result = cache.lookup_dimensions(path, expected_kind);
     if result.is_some() {
         DIMENSION_HITS.fetch_add(1, Ordering::Relaxed);
     } else {
@@ -574,7 +646,7 @@ pub fn lookup_cached_dimensions_batch(
         return vec![None; items.len()];
     };
 
-    let results = cache.lock().lookup_dimensions_batch(items);
+    let results = cache.lookup_dimensions_batch(items);
     let hits = results.iter().filter(|result| result.is_some()).count() as u64;
     let misses = items.len() as u64 - hits;
     if hits > 0 {
@@ -596,24 +668,62 @@ pub fn store_cached_dimensions(path: &Path, media_kind: CachedMediaKind, width: 
         return;
     }
 
-    if let Some(tx) = cache_write_tx() {
-        let op = CacheWriteOp::Dimensions {
-            path: path.to_path_buf(),
-            media_kind,
-            width,
-            height,
-        };
-        if tx.try_send(op).is_ok() {
-            return;
-        }
+    let Some((key, record)) = resolve_dimension_record(path, media_kind, width, height) else {
+        return;
+    };
+
+    let Some(tx) = cache_write_tx() else {
+        return;
+    };
+
+    let _ = enqueue_dimension_write(tx, key, record);
+}
+
+/// Resolves the disk facts the record needs (file type, animated) on the caller's thread: it
+/// already touched that file, and the writer must not re-open media files under its lock.
+fn resolve_dimension_record(
+    path: &Path,
+    media_kind: CachedMediaKind,
+    width: u32,
+    height: u32,
+) -> Option<(String, CachedRecord)> {
+    if width == 0 || height == 0 {
+        return None;
     }
 
-    if let Some(cache) = global_cache_handle() {
-        let mut cache = cache.lock();
-        run_cache_write_active(|| {
-            cache.store_dimensions(path, media_kind, width, height);
-        });
+    let file_type = detect_file_type(path)?;
+    if !media_kind.matches_file_type(file_type) {
+        return None;
     }
+
+    let key = crate::cache_key::key(path, crate::cache_key::KeyScope::Bare)?;
+    let record = CachedRecord {
+        width,
+        height,
+        file_type,
+        animated: detect_animated(path, file_type),
+    };
+
+    Some((key, record))
+}
+
+fn enqueue_dimension_write(
+    tx: &crossbeam_channel::Sender<CacheWriteOp>,
+    key: String,
+    record: CachedRecord,
+) -> bool {
+    if tx
+        .try_send(CacheWriteOp::Dimensions { key, record })
+        .is_ok()
+    {
+        return true;
+    }
+
+    // Queue full: a cache entry is a derived value recomputed on the next miss. Storing it
+    // inline here ran a redb commit (plus file opens and an fsync) on the caller's thread,
+    // which on the UI thread froze the window while the disk was saturated.
+    DIMENSION_WRITE_DROPS.fetch_add(1, Ordering::Relaxed);
+    false
 }
 
 #[cfg(test)]
@@ -657,6 +767,7 @@ pub fn metadata_cache_stats() -> MetadataCacheStats {
         dimension_misses: DIMENSION_MISSES.load(Ordering::Relaxed),
         dimension_expired: DIMENSION_EXPIRED.load(Ordering::Relaxed),
         dimension_evicted: DIMENSION_EVICTED.load(Ordering::Relaxed),
+        dimension_write_drops: DIMENSION_WRITE_DROPS.load(Ordering::Relaxed),
     }
 }
 
@@ -690,16 +801,21 @@ fn io_other_error(message: &'static str) -> io::Error {
 struct SizeLimitedFileBackend {
     inner: FileBackend,
     max_size_bytes: u64,
-    current_len: AtomicU64,
+    // Shared with `MetadataCache`: the size gate reads it instead of stat'ing the file.
+    current_len: Arc<AtomicU64>,
 }
 
 impl SizeLimitedFileBackend {
-    fn new(inner: FileBackend, max_size_bytes: u64, current_len: u64) -> Self {
-        Self {
-            inner,
-            max_size_bytes,
-            current_len: AtomicU64::new(current_len),
-        }
+    fn new(inner: FileBackend, max_size_bytes: u64, current_len: u64) -> (Self, Arc<AtomicU64>) {
+        let current_len = Arc::new(AtomicU64::new(current_len));
+        (
+            Self {
+                inner,
+                max_size_bytes,
+                current_len: current_len.clone(),
+            },
+            current_len,
+        )
     }
 
     fn exceeds_limit(&self, required_len: u64) -> bool {
@@ -751,7 +867,10 @@ impl StorageBackend for SizeLimitedFileBackend {
     }
 }
 
-fn open_database_with_size_limit(path: &Path, max_size_bytes: u64) -> Option<Database> {
+fn open_database_with_size_limit(
+    path: &Path,
+    max_size_bytes: u64,
+) -> Option<(Database, Arc<AtomicU64>)> {
     if max_size_bytes > 0 {
         if let Ok(metadata) = std::fs::metadata(path) {
             if metadata.len() > max_size_bytes {
@@ -761,7 +880,7 @@ fn open_database_with_size_limit(path: &Path, max_size_bytes: u64) -> Option<Dat
     }
 
     match create_database_with_size_limit(path, max_size_bytes, false) {
-        Ok(db) if database_uses_old_schema(&db) => {
+        Ok(db) if database_uses_old_schema(&db.0) => {
             drop(db);
             let _ = std::fs::remove_file(path);
             create_database_with_size_limit(path, max_size_bytes, true).ok()
@@ -779,7 +898,7 @@ fn create_database_with_size_limit(
     path: &Path,
     max_size_bytes: u64,
     truncate: bool,
-) -> Result<Database, DatabaseError> {
+) -> Result<(Database, Arc<AtomicU64>), DatabaseError> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -790,8 +909,10 @@ fn create_database_with_size_limit(
     let current_len = file.metadata().ok().map(|m| m.len()).unwrap_or(0);
 
     let base_backend = FileBackend::new(file)?;
-    let limited_backend = SizeLimitedFileBackend::new(base_backend, max_size_bytes, current_len);
-    Database::builder().create_with_backend(limited_backend)
+    let (limited_backend, file_len) =
+        SizeLimitedFileBackend::new(base_backend, max_size_bytes, current_len);
+    let db = Database::builder().create_with_backend(limited_backend)?;
+    Ok((db, file_len))
 }
 
 fn database_uses_old_schema(db: &Database) -> bool {
@@ -1005,6 +1126,119 @@ mod tests {
     use std::sync::Mutex as StdMutex;
 
     static CACHE_SHUTDOWN_TEST_LOCK: StdMutex<()> = StdMutex::new(());
+    static BATCH_TEST_LOCK: StdMutex<()> = StdMutex::new(());
+
+    fn test_cache(test_name: &str) -> MetadataCache {
+        let path = temp_cache_path(test_name);
+        let (db, file_len) = open_database_with_size_limit(path.as_path(), 0).unwrap();
+        MetadataCache {
+            db: RwLock::new(Arc::new(db)),
+            cache_path: path,
+            file_len,
+            mirror: RwLock::new(HashMap::new()),
+        }
+    }
+
+    fn test_record(width: u32, height: u32) -> CachedRecord {
+        CachedRecord {
+            width,
+            height,
+            file_type: CachedFileType::Png,
+            animated: false,
+        }
+    }
+
+    #[test]
+    fn mirror_miss_falls_back_to_redb_and_repopulates() {
+        let _guard = BATCH_TEST_LOCK.lock().unwrap();
+        let cache = test_cache("mirror-fallback");
+        let media = std::env::temp_dir().join("riv-metadata-mirror-fallback.png");
+        let key = crate::cache_key::key(media.as_path(), crate::cache_key::KeyScope::Bare).unwrap();
+
+        assert_eq!(
+            cache.apply_batch(&[(key.clone(), test_record(640, 480))]),
+            1
+        );
+        assert!(cache.mirror_peek(&key).is_some());
+
+        // Evicted from RAM: the record must still come back from redb and refill the mirror.
+        cache.mirror.write().clear();
+        assert_eq!(
+            cache.lookup_dimensions(media.as_path(), CachedMediaKind::Image),
+            Some((640, 480))
+        );
+        assert!(cache.mirror_peek(&key).is_some());
+
+        // Kind mismatch and zero dimensions stay rejected from the mirror path too.
+        assert_eq!(
+            cache.lookup_dimensions(media.as_path(), CachedMediaKind::Video),
+            None
+        );
+        assert_eq!(
+            cache.lookup_dimensions_batch(&[(media.clone(), CachedMediaKind::Image)]),
+            vec![Some((640, 480))]
+        );
+
+        let path = cache.cache_path.clone();
+        drop(cache);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn dimension_batch_commits_once_for_all_records() {
+        let _guard = BATCH_TEST_LOCK.lock().unwrap();
+        let cache = test_cache("one-txn-per-batch");
+        let batch: Vec<(String, CachedRecord)> = (0..32)
+            .map(|index| (format!("batch-key-{index}"), test_record(100 + index, 200)))
+            .collect();
+
+        let commits_before = CACHE_BATCH_COMMITS.load(Ordering::Relaxed);
+        assert_eq!(cache.apply_batch(&batch), batch.len());
+        assert_eq!(
+            CACHE_BATCH_COMMITS.load(Ordering::Relaxed) - commits_before,
+            1
+        );
+
+        let read_txn = cache.db_clone().begin_read().unwrap();
+        let table = read_txn.open_table(METADATA_TABLE).unwrap();
+        for (key, _) in &batch {
+            assert!(table.get(key.as_str()).unwrap().is_some());
+        }
+        drop(table);
+        drop(read_txn);
+
+        let path = cache.cache_path.clone();
+        drop(cache);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn full_write_queue_drops_op_instead_of_writing_inline() {
+        let (tx, rx) = crossbeam_channel::bounded::<CacheWriteOp>(1);
+        let drops_before = DIMENSION_WRITE_DROPS.load(Ordering::Relaxed);
+
+        assert!(enqueue_dimension_write(
+            &tx,
+            "key-1".to_string(),
+            test_record(1, 1)
+        ));
+        assert!(!enqueue_dimension_write(
+            &tx,
+            "key-2".to_string(),
+            test_record(2, 2)
+        ));
+
+        // The rejected op was dropped, not written: the queue still holds exactly the first.
+        assert_eq!(rx.len(), 1);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(CacheWriteOp::Dimensions { key, .. }) if key == "key-1"
+        ));
+        assert_eq!(
+            DIMENSION_WRITE_DROPS.load(Ordering::Relaxed) - drops_before,
+            1
+        );
+    }
 
     #[test]
     fn metadata_record_encodes_only_placeholder_columns() {
@@ -1111,7 +1345,7 @@ mod tests {
     fn old_dimension_schema_deletes_database_on_open() {
         let path = temp_cache_path("old-dimension-schema");
         {
-            let db = open_database_with_size_limit(path.as_path(), 0).unwrap();
+            let (db, _) = open_database_with_size_limit(path.as_path(), 0).unwrap();
             let write_txn = db.begin_write().unwrap();
             {
                 let mut table = write_txn.open_table(METADATA_TABLE).unwrap();
@@ -1122,7 +1356,7 @@ mod tests {
             write_txn.commit().unwrap();
         }
 
-        let db = open_database_with_size_limit(path.as_path(), 0).unwrap();
+        let (db, _) = open_database_with_size_limit(path.as_path(), 0).unwrap();
         assert!(!database_uses_old_schema(&db));
         let read_txn = db.begin_read().unwrap();
         let table = read_txn.open_table(METADATA_TABLE);
@@ -1138,7 +1372,7 @@ mod tests {
 
         let path = temp_cache_path("old-thumbnail-table");
         {
-            let db = open_database_with_size_limit(path.as_path(), 0).unwrap();
+            let (db, _) = open_database_with_size_limit(path.as_path(), 0).unwrap();
             let write_txn = db.begin_write().unwrap();
             {
                 let mut table = write_txn.open_table(OLD_THUMBNAIL_TABLE).unwrap();
@@ -1149,7 +1383,7 @@ mod tests {
             write_txn.commit().unwrap();
         }
 
-        let db = open_database_with_size_limit(path.as_path(), 0).unwrap();
+        let (db, _) = open_database_with_size_limit(path.as_path(), 0).unwrap();
         let read_txn = db.begin_read().unwrap();
         let tables: Vec<String> = read_txn
             .list_tables()

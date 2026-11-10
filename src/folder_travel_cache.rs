@@ -1,12 +1,13 @@
 //! Persistent folder-travel position cache for manga long-strip and masonry modes.
 
+use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use parking_lot::Mutex;
+use parking_lot::RwLock;
 use redb::backends::FileBackend;
 use redb::{Database, DatabaseError, StorageBackend, TableDefinition};
 
@@ -17,6 +18,8 @@ const FOLDER_TRAVEL_TABLE: TableDefinition<&str, &[u8]> =
 const CACHE_FILE_NAME: &str = "folder_travel_cache.redb";
 const CACHE_SCHEMA_VERSION: u8 = 1;
 const FOLDER_TRAVEL_CACHE_DEFAULT_MAX_SIZE_BYTES: u64 = 64 * 1024 * 1024;
+const FOLDER_TRAVEL_WRITE_QUEUE_CAPACITY: usize = 256;
+const FOLDER_TRAVEL_MIRROR_MAX_ENTRIES: usize = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FolderTravelLayoutMode {
@@ -41,7 +44,9 @@ pub struct FolderTravelPosition {
 }
 
 struct FolderTravelCache {
-    db: Database,
+    // Readers share this handle: redb read transactions never wait for the writer.
+    db: Arc<Database>,
+    mirror: RwLock<HashMap<String, FolderTravelPosition>>,
 }
 
 impl FolderTravelCache {
@@ -52,7 +57,10 @@ impl FolderTravelCache {
             FOLDER_TRAVEL_CACHE_DEFAULT_MAX_SIZE_BYTES,
         )?;
 
-        Some(Self { db })
+        Some(Self {
+            db: Arc::new(db),
+            mirror: RwLock::new(HashMap::new()),
+        })
     }
 
     fn lookup(
@@ -62,25 +70,32 @@ impl FolderTravelCache {
     ) -> Option<FolderTravelPosition> {
         let key = folder_travel_key(directory, layout_mode)?;
 
+        if let Some(position) = self.mirror.read().get(&key).cloned() {
+            return Some(position);
+        }
+
+        let position = self.read_from_db(key.as_str())?;
+        self.insert_mirror(key, position.clone());
+        Some(position)
+    }
+
+    fn read_from_db(&self, key: &str) -> Option<FolderTravelPosition> {
         let read_txn = self.db.begin_read().ok()?;
         let table = read_txn.open_table(FOLDER_TRAVEL_TABLE).ok()?;
-        let raw = table.get(key.as_str()).ok()??;
+        let raw = table.get(key).ok()??;
         decode_position_record(raw.value())
     }
 
-    fn store(
-        &mut self,
-        directory: &Path,
-        layout_mode: FolderTravelLayoutMode,
-        position: &FolderTravelPosition,
-    ) {
-        let Some(key) = folder_travel_key(directory, layout_mode) else {
-            return;
-        };
-        let Some(encoded) = encode_position_record(position) else {
-            return;
-        };
+    fn insert_mirror(&self, key: String, position: FolderTravelPosition) {
+        let mut mirror = self.mirror.write();
+        if mirror.len() >= FOLDER_TRAVEL_MIRROR_MAX_ENTRIES && !mirror.contains_key(&key) {
+            mirror.clear();
+        }
+        mirror.insert(key, position);
+    }
 
+    /// Writer thread only.
+    fn store(&self, key: &str, encoded: &[u8]) {
         let Ok(write_txn) = self.db.begin_write() else {
             return;
         };
@@ -90,7 +105,7 @@ impl FolderTravelCache {
                 return;
             };
 
-            if table.insert(key.as_str(), encoded.as_slice()).is_err() {
+            if table.insert(key, encoded).is_err() {
                 return;
             }
         }
@@ -99,12 +114,36 @@ impl FolderTravelCache {
     }
 }
 
-static GLOBAL_FOLDER_TRAVEL_CACHE: OnceLock<Option<Arc<Mutex<FolderTravelCache>>>> =
+enum FolderTravelWriteOp {
+    Record { key: String, encoded: Vec<u8> },
+}
+
+static GLOBAL_FOLDER_TRAVEL_CACHE: OnceLock<Option<Arc<FolderTravelCache>>> = OnceLock::new();
+static FOLDER_TRAVEL_WRITE_TX: OnceLock<Option<crossbeam_channel::Sender<FolderTravelWriteOp>>> =
     OnceLock::new();
 
-fn global_folder_travel_cache_handle() -> Option<&'static Arc<Mutex<FolderTravelCache>>> {
+fn global_folder_travel_cache_handle() -> Option<&'static Arc<FolderTravelCache>> {
     GLOBAL_FOLDER_TRAVEL_CACHE
-        .get_or_init(|| FolderTravelCache::open_default().map(|cache| Arc::new(Mutex::new(cache))))
+        .get_or_init(|| FolderTravelCache::open_default().map(Arc::new))
+        .as_ref()
+}
+
+fn folder_travel_write_tx() -> Option<&'static crossbeam_channel::Sender<FolderTravelWriteOp>> {
+    FOLDER_TRAVEL_WRITE_TX
+        .get_or_init(|| {
+            let cache = global_folder_travel_cache_handle()?.clone();
+            let (tx, rx) = crossbeam_channel::bounded::<FolderTravelWriteOp>(
+                FOLDER_TRAVEL_WRITE_QUEUE_CAPACITY,
+            );
+
+            crate::async_runtime::spawn_blocking_or_thread("folder-travel-writer", move || {
+                while let Ok(FolderTravelWriteOp::Record { key, encoded }) = rx.recv() {
+                    cache.store(key.as_str(), encoded.as_slice());
+                }
+            });
+
+            Some(tx)
+        })
         .as_ref()
 }
 
@@ -112,11 +151,7 @@ pub fn lookup_folder_travel_position(
     directory: &Path,
     layout_mode: FolderTravelLayoutMode,
 ) -> Option<FolderTravelPosition> {
-    let Some(cache) = global_folder_travel_cache_handle() else {
-        return None;
-    };
-
-    cache.lock().lookup(directory, layout_mode)
+    global_folder_travel_cache_handle()?.lookup(directory, layout_mode)
 }
 
 pub fn store_folder_travel_position(
@@ -127,8 +162,24 @@ pub fn store_folder_travel_position(
     let Some(cache) = global_folder_travel_cache_handle() else {
         return;
     };
+    let Some(key) = folder_travel_key(directory, layout_mode) else {
+        return;
+    };
+    let Some(encoded) = encode_position_record(position) else {
+        return;
+    };
 
-    cache.lock().store(directory, layout_mode, position);
+    // Mirror before the queue: the next restore of this folder must see the newest position
+    // even if the durable write is still pending (or dropped).
+    cache.insert_mirror(key.clone(), position.clone());
+
+    let Some(tx) = folder_travel_write_tx() else {
+        return;
+    };
+
+    // Queue full -> drop: the position is re-recorded on the next navigation. Writing inline
+    // here ran a redb commit on the UI thread and stalled it while the disk was busy.
+    let _ = tx.try_send(FolderTravelWriteOp::Record { key, encoded });
 }
 
 fn folder_travel_key(directory: &Path, layout_mode: FolderTravelLayoutMode) -> Option<String> {
