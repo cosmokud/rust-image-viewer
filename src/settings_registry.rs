@@ -1782,6 +1782,18 @@ pub const SETTINGS: &[Setting] = &[
         unused: false,
         action: Some(Action::VideoMute),
     },
+    Setting {
+        id: 137,
+        key: "show_loading_spinners",
+        tab: SettingsTab::Performance,
+        label: "Show loading spinners",
+        group: "Overlay",
+        help: "Animate a spinner on manga/masonry/gallery tiles that have been waiting more than 300ms for their texture (true/false).",
+        kind: SettingKind::Bool,
+        applies: Applies::Live,
+        unused: false,
+        action: None,
+    },
 ];
 
 fn value_of(config: &Config, id: usize) -> SettingValue {
@@ -1955,6 +1967,7 @@ fn value_of(config: &Config, id: usize) -> SettingValue {
         134 => SettingValue::Text(config.action_bindings_csv(Action::MasonryZoomOut)),
         135 => SettingValue::Text(config.action_bindings_csv(Action::VideoPlayPause)),
         136 => SettingValue::Text(config.action_bindings_csv(Action::VideoMute)),
+        137 => SettingValue::Bool(config.show_loading_spinners),
         _ => SettingValue::Num(0.0),
     }
 }
@@ -1980,6 +1993,7 @@ fn set_bool(config: &mut Config, id: usize, value: bool) {
         63 => config.enable_cuda = value,
         69 => config.manga_mipmap_static = value,
         70 => config.manga_mipmap_video_thumbnails = value,
+        137 => config.show_loading_spinners = value,
         _ => {}
     }
 }
@@ -2838,7 +2852,7 @@ mod tests {
 
     #[test]
     fn registry_covers_every_tab() {
-        assert_eq!(SETTINGS.len(), 137);
+        assert_eq!(SETTINGS.len(), 138);
         for (tab, expected) in [
             (SettingsTab::General, 5),
             (SettingsTab::Appearance, 2),
@@ -2848,7 +2862,7 @@ mod tests {
             (SettingsTab::Window, 9),
             (SettingsTab::Files, 6),
             (SettingsTab::Video, 10),
-            (SettingsTab::Performance, 13),
+            (SettingsTab::Performance, 14),
             (SettingsTab::Shortcuts, 65),
         ] {
             assert_eq!(tab_count(tab), expected, "{tab:?}");

@@ -3021,6 +3021,8 @@ struct ImageViewer {
     manga_demand_pump_at: Instant,
     /// Visible index with no cached texture while the loader may still call it satisfied.
     manga_texture_missing_since: HashMap<usize, Instant>,
+    /// Placeholder-spinner budget left in the current frame.
+    manga_placeholder_spinners_left: usize,
     /// Repairs spent per index: `(heals, window_start)`; bounds work on a genuinely broken file.
     manga_texture_heal_budget: HashMap<usize, (u32, Instant)>,
     /// First-seen instant per in-flight decode index, for stale in-flight eviction.
@@ -3511,6 +3513,7 @@ impl Default for ImageViewer {
             manga_demand_outstanding: false,
             manga_demand_pump_at: Instant::now(),
             manga_texture_missing_since: HashMap::new(),
+            manga_placeholder_spinners_left: Self::MANGA_PLACEHOLDER_SPINNER_MAX_PER_FRAME,
             manga_texture_heal_budget: HashMap::new(),
             manga_inflight_since: HashMap::new(),
             manga_pending_probe_since: HashMap::new(),
@@ -3636,6 +3639,11 @@ impl ImageViewer {
     const MANGA_DEMAND_PUMP_INTERVAL: Duration = Duration::from_millis(100);
     /// A visible tile with no texture is only repaired after being missing this long.
     const MANGA_TEXTURE_MISS_HEAL_AFTER: Duration = Duration::from_millis(1500);
+    /// Placeholder spinners only start once a tile has been pending this long.
+    const MANGA_PLACEHOLDER_SPINNER_AFTER: Duration = Duration::from_millis(300);
+    /// Animated spinners allowed per frame: a screen of them must not cost the frame rate.
+    const MANGA_PLACEHOLDER_SPINNER_MAX_PER_FRAME: usize = 64;
+    const MANGA_PLACEHOLDER_SPINNER_REPAINT: Duration = Duration::from_millis(16);
     /// Repairs allowed per index per window; a broken file settles instead of spinning the pump.
     const MANGA_TEXTURE_HEAL_MAX: u32 = 3;
     const MANGA_TEXTURE_HEAL_WINDOW: Duration = Duration::from_secs(30);
@@ -21566,6 +21574,46 @@ impl ImageViewer {
         )
     }
 
+    /// True when a placeholder has been pending long enough to animate its spinner. Retry-ceiling
+    /// tiles stay static (nothing is loading) and the per-frame budget bounds the drawing cost.
+    fn manga_placeholder_spinner_due(
+        pending_for: Option<Duration>,
+        retry_blocked: bool,
+        budget_left: usize,
+    ) -> bool {
+        !retry_blocked
+            && budget_left > 0
+            && pending_for.is_some_and(|age| age >= Self::MANGA_PLACEHOLDER_SPINNER_AFTER)
+    }
+
+    /// Indeterminate spinner on a placeholder tile still waiting for its texture.
+    fn manga_paint_placeholder_spinner(&mut self, ui: &egui::Ui, index: usize, rect: egui::Rect) {
+        if !self.config.show_loading_spinners {
+            return;
+        }
+
+        let pending_for = self
+            .manga_texture_missing_since
+            .get(&index)
+            .map(|since| since.elapsed());
+        let retry_blocked = self
+            .manga_loader
+            .as_ref()
+            .is_some_and(|loader| loader.retry_blocked(index));
+
+        if !Self::manga_placeholder_spinner_due(
+            pending_for,
+            retry_blocked,
+            self.manga_placeholder_spinners_left,
+        ) {
+            return;
+        }
+
+        // Must be the egui clock, not `Instant`: the spinner only turns when we repaint.
+        paint_loading_spinner(ui.painter(), rect, ui.input(|input| input.time));
+        self.manga_placeholder_spinners_left -= 1;
+    }
+
     /// True when a visible tile has no texture for its current path although the loader may
     /// still report it loaded.
     fn manga_visible_texture_missed(&self, index: usize) -> bool {
@@ -24011,6 +24059,7 @@ impl ImageViewer {
                     egui::FontId::proportional(32.0),
                     egui::Color32::from_gray(100),
                 );
+                self.manga_paint_placeholder_spinner(ui, idx, image_rect);
 
                 if video_thumbnail_retry_allowed {
                     self.manga_mark_placeholder_visible(idx);
@@ -24159,6 +24208,7 @@ impl ImageViewer {
                     egui::FontId::proportional(24.0),
                     egui::Color32::from_gray(80),
                 );
+                self.manga_paint_placeholder_spinner(ui, idx, image_rect);
 
                 if is_animated_image {
                     let icon_bg_rect =
@@ -24208,6 +24258,8 @@ impl ImageViewer {
         if self.mode().is_solo() || !self.mode().is_fullscreen() {
             return false;
         }
+
+        self.manga_placeholder_spinners_left = Self::MANGA_PLACEHOLDER_SPINNER_MAX_PER_FRAME;
 
         self.manga_prune_ttv_pending();
 
@@ -25549,6 +25601,11 @@ impl ImageViewer {
 
         if requested_visible_retry {
             animation_active = true;
+        }
+
+        // Only a visible spinner needs this cadence: a placeholder screen otherwise repaints idle.
+        if self.manga_placeholder_spinners_left < Self::MANGA_PLACEHOLDER_SPINNER_MAX_PER_FRAME {
+            ctx.request_repaint_after(Self::MANGA_PLACEHOLDER_SPINNER_REPAINT);
         }
 
         // Pump while work is in flight OR demand is outstanding. In-flight-only pumping is
@@ -33126,6 +33183,27 @@ mod tests {
 
         // A further 100 physical px of cursor travel is 100 physical px of window travel.
         assert!((moved * 1.5 - at_ppp_1_5 * 1.5 - egui::vec2(100.0, 0.0)).length() < 0.01);
+    }
+
+    #[test]
+    fn placeholder_spinner_waits_for_age_and_skips_settled_tiles() {
+        let due = ImageViewer::manga_placeholder_spinner_due;
+        let budget = ImageViewer::MANGA_PLACEHOLDER_SPINNER_MAX_PER_FRAME;
+        let after = std::time::Duration::from_millis;
+
+        // No pending timestamp at all: nothing is loading for this tile.
+        assert!(!due(None, false, budget));
+        // Below the 300ms threshold the tile may still resolve without a spinner flash.
+        assert!(!due(Some(after(299)), false, budget));
+        assert!(due(
+            Some(ImageViewer::MANGA_PLACEHOLDER_SPINNER_AFTER),
+            false,
+            budget
+        ));
+        // Retry ceiling: the loader gave up, an animated spinner would lie.
+        assert!(!due(Some(after(5_000)), true, budget));
+        // Per-frame cap spent: no more animation this frame.
+        assert!(!due(Some(after(5_000)), false, 0));
     }
 
     #[test]

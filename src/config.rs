@@ -1216,6 +1216,8 @@ pub struct Config {
     pub manga_mipmap_video_thumbnails: bool,
     /// Minimum texture side length required before mipmaps are enabled.
     pub manga_mipmap_min_side: u32,
+    /// Animate a spinner on tiles that have been waiting for their texture.
+    pub show_loading_spinners: bool,
     /// Preset file currently backing this config (`presets/<name>.ini`). Runtime only: it is
     /// remembered in `state.ini`, never written into a preset.
     pub active_preset: Option<String>,
@@ -1365,6 +1367,7 @@ impl Config {
             manga_mipmap_static: true,
             manga_mipmap_video_thumbnails: true,
             manga_mipmap_min_side: 128,
+            show_loading_spinners: true,
             active_preset: None,
         }
     }
