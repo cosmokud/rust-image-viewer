@@ -72,6 +72,7 @@ pub enum RowControl {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AppConsequence {
     MasonryItemsPerRow,
+    AlphaOpaqueFallback,
 }
 
 /// `Text` carries the raw INI string for `Rgb`/`Key`/`Modifier`/`Binding`/`BindingList`
@@ -1794,6 +1795,18 @@ pub const SETTINGS: &[Setting] = &[
         unused: false,
         action: None,
     },
+    Setting {
+        id: 138,
+        key: "video_alpha_opaque_fallback",
+        tab: SettingsTab::Video,
+        label: "Opaque fallback for alpha video",
+        group: "Decoding",
+        help: "Play VP8/VP9 webm files whose alpha decoder fails (\"Cannot handle streams without an initial alpha buffer\") by decoding them opaque instead of failing the load (true/false).",
+        kind: SettingKind::Bool,
+        applies: Applies::Live,
+        unused: false,
+        action: None,
+    },
 ];
 
 fn value_of(config: &Config, id: usize) -> SettingValue {
@@ -1968,6 +1981,7 @@ fn value_of(config: &Config, id: usize) -> SettingValue {
         135 => SettingValue::Text(config.action_bindings_csv(Action::VideoPlayPause)),
         136 => SettingValue::Text(config.action_bindings_csv(Action::VideoMute)),
         137 => SettingValue::Bool(config.show_loading_spinners),
+        138 => SettingValue::Bool(config.video_alpha_opaque_fallback),
         _ => SettingValue::Num(0.0),
     }
 }
@@ -1994,6 +2008,7 @@ fn set_bool(config: &mut Config, id: usize, value: bool) {
         69 => config.manga_mipmap_static = value,
         70 => config.manga_mipmap_video_thumbnails = value,
         137 => config.show_loading_spinners = value,
+        138 => config.video_alpha_opaque_fallback = value,
         _ => {}
     }
 }
@@ -2233,6 +2248,7 @@ pub fn apply_values(config: &mut Config, values: &[(usize, SettingValue)]) -> Ve
 pub fn app_consequence(id: usize) -> Option<AppConsequence> {
     match id {
         47 => Some(AppConsequence::MasonryItemsPerRow),
+        138 => Some(AppConsequence::AlphaOpaqueFallback),
         _ => None,
     }
 }
@@ -2852,7 +2868,7 @@ mod tests {
 
     #[test]
     fn registry_covers_every_tab() {
-        assert_eq!(SETTINGS.len(), 138);
+        assert_eq!(SETTINGS.len(), 139);
         for (tab, expected) in [
             (SettingsTab::General, 5),
             (SettingsTab::Appearance, 2),
@@ -2861,7 +2877,7 @@ mod tests {
             (SettingsTab::Autoscroll, 12),
             (SettingsTab::Window, 9),
             (SettingsTab::Files, 6),
-            (SettingsTab::Video, 10),
+            (SettingsTab::Video, 11),
             (SettingsTab::Performance, 14),
             (SettingsTab::Shortcuts, 65),
         ] {
@@ -3086,14 +3102,14 @@ mod tests {
     }
 
     #[test]
-    fn only_masonry_items_per_row_has_an_app_consequence() {
+    fn only_declared_keys_have_an_app_consequence() {
         use super::{app_consequence, AppConsequence};
 
         for setting in SETTINGS {
-            let expected = if setting.key == "masonry_items_per_row" {
-                Some(AppConsequence::MasonryItemsPerRow)
-            } else {
-                None
+            let expected = match setting.key {
+                "masonry_items_per_row" => Some(AppConsequence::MasonryItemsPerRow),
+                "video_alpha_opaque_fallback" => Some(AppConsequence::AlphaOpaqueFallback),
+                _ => None,
             };
             assert_eq!(app_consequence(setting.id), expected, "{}", setting.key);
         }

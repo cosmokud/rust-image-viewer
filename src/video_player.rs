@@ -614,6 +614,251 @@ fn demote_av1_hardware_tiers() {
     }
 }
 
+/// Autoplugged when a VP8/VP9 stream carries an alpha plane. Their `alphacombine` bin errors on
+/// the first buffer ("Cannot handle streams without an initial alpha buffer") and never
+/// prerolls, so such a file decodes only with these ranked `NONE` for the attempt: opaque
+/// output, no transparency. Chrome decodes the same files itself.
+const ALPHA_DECODEBINS: &[&str] = &["vp8alphadecodebin", "vp9alphadecodebin"];
+
+/// Every element that exists only on the alpha decode path. The failing bus message's source
+/// factory is the signal that survives any plugin wording change.
+const ALPHA_PATH_ELEMENTS: &[&str] = &["alphacombine", "vp8alphadecodebin", "vp9alphadecodebin"];
+
+/// Pre-roll wait that lets the alpha failure surface; it arrives within tens of ms of the first
+/// buffer, and a healthy load is done prerolling well inside this.
+const ALPHA_PREROLL_WINDOW: Duration = Duration::from_millis(500);
+
+/// The failing element's factory name: `Message::src` is a bare `Object`, so it needs the
+/// downcast before `ElementExt::factory` applies.
+pub(crate) fn message_src_factory(message: &gst::Message) -> Option<String> {
+    message
+        .src()
+        .and_then(|src| src.downcast_ref::<gst::Element>())
+        .and_then(|element| element.factory())
+        .map(|factory| factory.name().to_string())
+}
+
+/// True for the alpha-path decode failure. `src_factory` is the failing element's factory name;
+/// the text match is the fallback for errors that only survive as message text.
+fn is_alpha_decode_error(src_factory: Option<&str>, error: &str, debug: Option<&str>) -> bool {
+    if src_factory.is_some_and(|name| ALPHA_PATH_ELEMENTS.contains(&name)) {
+        return true;
+    }
+    format!("{error} {}", debug.unwrap_or_default())
+        .to_ascii_lowercase()
+        .contains("alpha buffer")
+}
+
+/// The `video_alpha_opaque_fallback` setting. A process-wide flag because playback (media worker)
+/// and first-frame extraction (probe workers) both read it and neither sees the app config.
+static ALPHA_FALLBACK_ENABLED: AtomicBool = AtomicBool::new(true);
+
+pub fn set_alpha_opaque_fallback_enabled(enabled: bool) {
+    ALPHA_FALLBACK_ENABLED.store(enabled, Ordering::Release);
+}
+
+pub fn alpha_opaque_fallback_enabled() -> bool {
+    ALPHA_FALLBACK_ENABLED.load(Ordering::Acquire)
+}
+
+/// `Some(reason)` when `error`/`debug` (or the failing element's factory) is the alpha-path
+/// failure, so playback and thumbnail extraction share one detector.
+pub(crate) fn alpha_decode_error_reason(
+    src_factory: Option<&str>,
+    error: &str,
+    debug: Option<&str>,
+) -> Option<String> {
+    is_alpha_decode_error(src_factory, error, debug)
+        .then(|| format!("{error} src={}", src_factory.unwrap_or("?")))
+}
+
+/// Record `path` as needing opaque decoding after an alpha failure, counting it for the diag
+/// summary. `true` the first time only (one line per path).
+pub(crate) fn note_alpha_opaque_fallback(path: &Path, reason: &str) -> bool {
+    let fresh = remember_alpha_opaque(path, reason);
+    if fresh {
+        crate::diag::count(crate::diag::Counter::AlphaFallback, 1);
+    }
+    fresh
+}
+
+/// A file that needs opaque decoding, keyed by path + mtime so an edited file is retried with
+/// alpha instead of inheriting the old verdict.
+struct AlphaMemo {
+    path: PathBuf,
+    modified: Option<std::time::SystemTime>,
+    /// Why the alpha path failed, as `--probe-video` reports it.
+    reason: String,
+}
+
+/// Bounded: the oldest entry makes room once full.
+const ALPHA_MEMO_CAP: usize = 64;
+static ALPHA_MEMO: Mutex<Vec<AlphaMemo>> = Mutex::new(Vec::new());
+
+fn alpha_memo_key(path: &Path, reason: &str) -> AlphaMemo {
+    let modified = std::fs::metadata(path)
+        .ok()
+        .and_then(|meta| meta.modified().ok());
+    AlphaMemo {
+        path: path.to_path_buf(),
+        modified,
+        reason: reason.to_string(),
+    }
+}
+
+fn alpha_memo_matches(
+    entry: &AlphaMemo,
+    path: &Path,
+    modified: Option<std::time::SystemTime>,
+) -> bool {
+    entry.path == path && entry.modified == modified
+}
+
+/// True when `path` is already known to need opaque decoding, so a play can skip the attempt that
+/// is known to fail.
+pub fn alpha_opaque_memoized(path: &Path) -> bool {
+    alpha_opaque_reason(path).is_some()
+}
+
+/// The alpha failure recorded for `path` while it still has the same mtime.
+pub fn alpha_opaque_reason(path: &Path) -> Option<String> {
+    let key = alpha_memo_key(path, "");
+    ALPHA_MEMO
+        .lock()
+        .iter()
+        .find(|entry| alpha_memo_matches(entry, &key.path, key.modified))
+        .map(|entry| entry.reason.clone())
+}
+
+/// Record `path` as needing opaque decoding. `true` only the first time, so the diag line is
+/// written once per path instead of once per attempt.
+fn remember_alpha_opaque(path: &Path, reason: &str) -> bool {
+    let key = alpha_memo_key(path, reason);
+    let mut memo = ALPHA_MEMO.lock();
+    if memo
+        .iter()
+        .any(|entry| alpha_memo_matches(entry, &key.path, key.modified))
+    {
+        return false;
+    }
+    if memo.len() >= ALPHA_MEMO_CAP {
+        memo.remove(0);
+    }
+    memo.push(key);
+    drop(memo);
+    crate::diag::write_line(&format!(
+        "[video-alpha] path={} fallback=opaque reason={reason}",
+        path.display()
+    ));
+    true
+}
+
+/// Restores the alpha decodebins' previous ranks on drop. By then the attempt has already
+/// autoplugged, so the files that do decode keep their alpha support.
+pub(crate) struct AlphaRankGuard(Vec<(&'static str, gst::Rank)>);
+
+impl Drop for AlphaRankGuard {
+    fn drop(&mut self) {
+        for (name, rank) in self.0.drain(..) {
+            if let Some(factory) = gst::ElementFactory::find(name) {
+                factory.set_rank(rank);
+            }
+        }
+    }
+}
+
+/// Rank the alpha decodebins `NONE` for one attempt, so autoplug picks the plain VP8/VP9 decoder
+/// and the stream decodes opaque. The returned guard restores the ranks on drop.
+pub(crate) fn demote_alpha_decodebins() -> AlphaRankGuard {
+    let mut saved = Vec::new();
+    for &name in ALPHA_DECODEBINS {
+        let Some(factory) = gst::ElementFactory::find(name) else {
+            continue;
+        };
+        let previous = factory.rank();
+        if previous == gst::Rank::NONE {
+            continue;
+        }
+        factory.set_rank(gst::Rank::NONE);
+        saved.push((name, previous));
+    }
+    AlphaRankGuard(saved)
+}
+
+/// Build the player for one attempt, also surfacing the alpha-path error this attempt hit (the
+/// player is dropped on failure, so the reason has to come out with the error).
+fn alpha_attempt<F>(
+    path: &Path,
+    muted: bool,
+    initial_volume: f64,
+    prefer_hardware_decode: bool,
+    disable_hardware_decode: bool,
+    enable_cuda_decode: bool,
+    enable_d3d12_decode: bool,
+    source_dimensions: Option<(u32, u32)>,
+    output_dimensions: Option<(u32, u32)>,
+    start: F,
+    alpha_error: &mut Option<String>,
+) -> Result<VideoPlayer, String>
+where
+    F: Fn(&mut VideoPlayer) -> Result<(), String> + Copy,
+{
+    let mut player = VideoPlayer::new(
+        path,
+        muted,
+        initial_volume,
+        prefer_hardware_decode,
+        disable_hardware_decode,
+        enable_cuda_decode,
+        enable_d3d12_decode,
+        source_dimensions,
+        output_dimensions,
+    )?;
+    match start(&mut player) {
+        Ok(()) => {
+            if let Some(reason) = player.preroll_alpha_error(ALPHA_PREROLL_WINDOW) {
+                *alpha_error = Some(reason.clone());
+                return Err(reason);
+            }
+            Ok(player)
+        }
+        Err(err) => {
+            *alpha_error = player.take_alpha_decode_error();
+            Err(err)
+        }
+    }
+}
+
+/// `--probe-video` line: alpha decodebin ranks, whether the live pipeline took the alpha autoplug
+/// path, and whether (and why) the opaque fallback applies to `path`. One run diagnoses a file.
+pub fn alpha_state_line(path: &Path, pipeline: &gst::Pipeline) -> String {
+    let ranks: Vec<String> = ALPHA_PATH_ELEMENTS
+        .iter()
+        .map(|name| format!("{name}={:?}", live_decoder_rank(name)))
+        .collect();
+    let autoplugged: Vec<String> = pipeline
+        .iterate_recurse()
+        .into_iter()
+        .flatten()
+        .filter_map(|element| element.factory().map(|factory| factory.name().to_string()))
+        .filter(|name| ALPHA_PATH_ELEMENTS.contains(&name.as_str()))
+        .collect();
+    let fallback = match (alpha_opaque_fallback_enabled(), alpha_opaque_reason(path)) {
+        (false, _) => "disabled by config".to_string(),
+        (true, Some(reason)) => format!("applied (opaque) reason={reason}"),
+        (true, None) => "not needed".to_string(),
+    };
+    format!(
+        "alpha: ranks [{}] autoplug={} fallback={fallback}",
+        ranks.join(" "),
+        if autoplugged.is_empty() {
+            "none".to_string()
+        } else {
+            autoplugged.join(",")
+        },
+    )
+}
+
 /// True when the error indicates a GStreamer call that hit its timeout bound (a wedged
 /// pipeline), as opposed to an ordinary playback error (corrupt file, missing codec...).
 fn is_timeout_like_error(err: &str) -> bool {
@@ -647,27 +892,55 @@ where
 {
     // Every new player gets a fresh chance at hardware decoding once the cooldown elapsed.
     reinstate_stale_demotions();
+    // A file this process already failed on goes straight to the opaque path.
+    let mut alpha_memoized = alpha_opaque_fallback_enabled() && alpha_opaque_memoized(path);
+    let mut alpha_retried = false;
+    let mut alpha_freshly_memoized = false;
     loop {
-        let attempt = VideoPlayer::new(
-            path,
-            muted,
-            initial_volume,
-            prefer_hardware_decode,
-            disable_hardware_decode,
-            enable_cuda_decode,
-            enable_d3d12_decode,
-            source_dimensions,
-            output_dimensions,
-        )
-        .and_then(|mut player| {
-            start(&mut player)?;
-            Ok(player)
-        });
+        let mut alpha_error: Option<String> = None;
+        let attempt = {
+            // Ranks are restored once this attempt has autoplugged its decoder.
+            let _alpha_guard = alpha_memoized.then(demote_alpha_decodebins);
+            alpha_attempt(
+                path,
+                muted,
+                initial_volume,
+                prefer_hardware_decode,
+                disable_hardware_decode,
+                enable_cuda_decode,
+                enable_d3d12_decode,
+                source_dimensions,
+                output_dimensions,
+                start,
+                &mut alpha_error,
+            )
+        };
 
         match attempt {
-            Ok(player) => return Ok(player),
+            Ok(player) => {
+                if alpha_freshly_memoized {
+                    crate::diag::write_line(&format!(
+                        "[video-alpha] path={} fallback=opaque result=ok",
+                        path.display()
+                    ));
+                }
+                return Ok(player);
+            }
             Err(err) => {
                 let timeout_like = is_timeout_like_error(&err);
+                // Alpha-path failure: retried exactly once with the alpha decodebins disabled. A
+                // failure after that degrades through the ordinary demote path below, never a loop.
+                if alpha_opaque_fallback_enabled()
+                    && !alpha_retried
+                    && !alpha_memoized
+                    && (alpha_error.is_some() || is_alpha_decode_error(None, &err, None))
+                {
+                    alpha_retried = true;
+                    alpha_memoized = true;
+                    let reason = alpha_error.unwrap_or_else(|| err.clone());
+                    alpha_freshly_memoized = note_alpha_opaque_fallback(path, &reason);
+                    continue;
+                }
                 // Ordinary failures (corrupt file, missing codec, ...) will not be fixed
                 // by switching decoders; report them immediately.
                 if !timeout_like || disable_hardware_decode {
@@ -2058,6 +2331,8 @@ pub struct VideoPlayer {
     control_events: crossbeam_channel::Receiver<ControlEvent>,
     /// Last failure reported by the control thread; the UI polls it for the error popup.
     control_error: Option<String>,
+    /// Alpha-path decode failure seen on the bus; consumed by the opaque-fallback retry.
+    alpha_decode_error: Option<String>,
 }
 
 impl VideoPlayer {
@@ -2334,6 +2609,7 @@ Ensure your GStreamer installation includes the playback elements (usually from 
             control_queue: Some(control_queue),
             control_events,
             control_error: None,
+            alpha_decode_error: None,
         };
 
         let mut player = player;
@@ -2390,6 +2666,48 @@ Ensure your GStreamer installation includes the playback elements (usually from 
         Ok(())
     }
 
+    /// The alpha-path error this player hit, if any; `None` once taken.
+    pub fn take_alpha_decode_error(&mut self) -> Option<String> {
+        self.alpha_decode_error.take()
+    }
+
+    /// Report the alpha-path failure that playbin posts *after* a successful state change.
+    ///
+    /// The only signal is the bus, and it arrives while the load is still being accepted, so a
+    /// pass-through sync handler records it without consuming any message (the app's own pumping
+    /// still sees everything). Polling stops at the first delivered frame, so a healthy stream
+    /// only pays its own pre-roll time.
+    fn preroll_alpha_error(&mut self, window: Duration) -> Option<String> {
+        let seen: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let recorded = Arc::clone(&seen);
+        let bus = self.pipeline.bus()?;
+        bus.set_sync_handler(move |_bus, message| {
+            if let gst::MessageView::Error(err) = message.view() {
+                if let Some(reason) = alpha_decode_error_reason(
+                    message_src_factory(message).as_deref(),
+                    &format!("{}", err.error()),
+                    err.debug().as_deref(),
+                ) {
+                    *recorded.lock() = Some(reason);
+                }
+            }
+            gst::BusSyncReply::Pass
+        });
+
+        let deadline = Instant::now() + window;
+        while Instant::now() < deadline && self.samples_delivered() == 0 {
+            if seen.lock().is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Leave a no-op handler behind: the binding cannot unset one, and Pass keeps the app's
+        // message flow identical.
+        bus.set_sync_handler(|_bus, _message| gst::BusSyncReply::Pass);
+        let reason = seen.lock().take();
+        reason
+    }
+
     fn drain_bus_error_string(&mut self) -> Option<String> {
         let bus = self.pipeline.bus()?;
         let mut last_warning: Option<String> = None;
@@ -2414,10 +2732,19 @@ Ensure your GStreamer installation includes the playback elements (usually from 
                 }
                 gst::MessageView::Error(err) => {
                     let debug = err.debug().unwrap_or_else(|| gst::glib::GString::from(""));
-                    if debug.is_empty() {
-                        return Some(format!("{}", err.error()));
+                    let error = format!("{}", err.error());
+                    let src_factory = message_src_factory(&msg);
+                    if is_alpha_decode_error(src_factory.as_deref(), &error, Some(&debug)) {
+                        self.alpha_decode_error = Some(format!(
+                            "{} src={}",
+                            error,
+                            src_factory.unwrap_or_else(|| "?".to_string())
+                        ));
                     }
-                    return Some(format!("{}: {}", err.error(), debug));
+                    if debug.is_empty() {
+                        return Some(error);
+                    }
+                    return Some(format!("{}: {}", error, debug));
                 }
                 gst::MessageView::Warning(warn) => {
                     let debug = warn.debug().unwrap_or_else(|| gst::glib::GString::from(""));
@@ -3586,5 +3913,62 @@ mod tests {
             now
         ));
         assert!(demotion_expired(now - DEMOTION_COOLDOWN, now));
+    }
+
+    /// Alphabet, exact strings taken from the failing bundle: `alphacombine` errors before the
+    /// first alpha buffer, and nothing else may claim to be an alpha failure.
+    #[test]
+    fn alpha_failure_is_recognised_by_factory_or_message_text() {
+        assert!(is_alpha_decode_error(
+            Some("alphacombine"),
+            "Cannot handle streams without an initial alpha buffer",
+            None
+        ));
+        assert!(is_alpha_decode_error(
+            Some("vp8alphadecodebin"),
+            "internal error",
+            None
+        ));
+        assert!(is_alpha_decode_error(Some("vp9alphadecodebin"), "", None));
+        // Factory lost, wording kept: the message alone must still classify.
+        assert!(is_alpha_decode_error(
+            None,
+            "Cannot handle streams without an initial alpha buffer",
+            None
+        ));
+        assert!(is_alpha_decode_error(
+            None,
+            "stream error",
+            Some("gstalphacombine.c(219): no alpha buffer in buffer")
+        ));
+        assert!(!is_alpha_decode_error(
+            Some("vp8dec"),
+            "Internal data stream error",
+            Some("gstbasesrc.c(3072): error: stream stops")
+        ));
+        assert!(!is_alpha_decode_error(None, "Could not open file", None));
+    }
+
+    #[test]
+    fn alpha_memo_ignores_a_rewritten_file() {
+        let dir = std::env::temp_dir().join(format!("video-alpha-memo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("alpha.webm");
+        std::fs::write(&path, b"one").unwrap();
+        assert!(!alpha_opaque_memoized(&path));
+        assert!(note_alpha_opaque_fallback(&path, "test"));
+        assert!(alpha_opaque_memoized(&path));
+        // Same path, new mtime: the verdict must not survive the edit.
+        std::fs::write(&path, b"two-two").unwrap();
+        let changed = std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .and_then(|file| {
+                file.set_modified(std::time::SystemTime::now() + Duration::from_secs(5))
+            });
+        if changed.is_ok() {
+            assert!(!alpha_opaque_memoized(&path));
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -63,7 +63,7 @@ impl IniSection {
 /// The table is per section, and a spelling may appear in more than one section only when it
 /// must route to a different key there: `[Settings] controls_hide_delay` is the controls
 /// delay, `[Video] controls_hide_delay` is the legacy name for the bottom overlay delay.
-const INI_ALIASES: [(IniSection, &[&str], &str); 67] = [
+const INI_ALIASES: [(IniSection, &[&str], &str); 68] = [
     (
         IniSection::Settings,
         &["controls_hide_delay"],
@@ -551,6 +551,15 @@ const INI_ALIASES: [(IniSection, &[&str], &str); 67] = [
         IniSection::Performance,
         &["show_loading_spinners", "loading_spinners"],
         "show_loading_spinners",
+    ),
+    (
+        IniSection::Video,
+        &[
+            "video_alpha_opaque_fallback",
+            "alpha_opaque_fallback",
+            "opaque_alpha_fallback",
+        ],
+        "video_alpha_opaque_fallback",
     ),
     (
         IniSection::Performance,
@@ -1168,6 +1177,9 @@ pub struct Config {
     pub video_prefer_hardware_decode: bool,
     /// Disable hardware decoders and force software decode path.
     pub video_disable_hardware_decode: bool,
+    /// Decode VP8/VP9-alpha files opaque when the alpha decodebin path fails, instead of failing
+    /// the load.
+    pub video_alpha_opaque_fallback: bool,
     /// When true, next/previous in video-like playback mode skips to video/animated media only.
     /// When false, next/previous navigates all files in the list.
     pub videos_only_navigation: bool,
@@ -1373,6 +1385,7 @@ impl Config {
             manga_mipmap_video_thumbnails: true,
             manga_mipmap_min_side: 128,
             show_loading_spinners: true,
+            video_alpha_opaque_fallback: true,
             active_preset: None,
         }
     }

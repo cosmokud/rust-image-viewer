@@ -129,6 +129,7 @@ fn probe(path: &Path) -> bool {
 
     // Caps are read after preroll, when the demuxer+decoder elements are actually instantiated.
     report_pipeline(player.pipeline());
+    say(&video_player::alpha_state_line(path, player.pipeline()));
 
     let before = player.samples_delivered();
     let started = Instant::now();
@@ -308,7 +309,7 @@ fn report_pipeline(pipeline: &gst::Pipeline) {
             .and_then(|pad| pad.current_caps())
             .filter(|caps| !caps.is_empty() && !caps.is_any());
         decoders.push(match &codec {
-            Some(caps) => format!("{factory} [{}]", caps_line(caps)),
+            Some(caps) => format!("{factory} [{}]{}", caps_line(caps), alpha_mode_note(caps)),
             None => factory,
         });
         if let Some(caps) = codec {
@@ -352,6 +353,14 @@ fn caps_line(caps: &gst::Caps) -> String {
         || caps.to_string(),
         |structure| structure.name().to_string(),
     )
+}
+
+/// ` alpha-mode=<v>` when the decoder caps advertise a VP8/VP9 alpha plane, so a probe run shows
+/// whether the stream itself carries alpha (rather than only whether the decodebin was picked).
+fn alpha_mode_note(caps: &gst::Caps) -> String {
+    caps.structure(0)
+        .and_then(|structure| structure.get::<&str>("alpha-mode").ok())
+        .map_or_else(String::new, |mode| format!(" alpha-mode={mode}"))
 }
 
 fn say(line: &str) {

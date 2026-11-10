@@ -83,6 +83,7 @@ struct Counters {
     dim_parked: u64,
     dim_flushed: u64,
     dim_dropped: u64,
+    alpha_fallbacks: u64,
 }
 
 /// What the per-second summary and a hang snapshot aggregate.
@@ -98,6 +99,7 @@ pub enum Counter {
     DimParked,
     DimFlushed,
     DimDropped,
+    AlphaFallback,
 }
 
 static COUNTERS: Mutex<Counters> = Mutex::new(Counters {
@@ -111,6 +113,7 @@ static COUNTERS: Mutex<Counters> = Mutex::new(Counters {
     dim_parked: 0,
     dim_flushed: 0,
     dim_dropped: 0,
+    alpha_fallbacks: 0,
 });
 
 /// The most recent frame, for the watchdog: it runs while the UI thread is stuck.
@@ -527,6 +530,7 @@ pub fn count(counter: Counter, delta: u64) {
         Counter::DimParked => &mut counters.dim_parked,
         Counter::DimFlushed => &mut counters.dim_flushed,
         Counter::DimDropped => &mut counters.dim_dropped,
+        Counter::AlphaFallback => &mut counters.alpha_fallbacks,
     };
     *slot = slot.saturating_add(delta);
 }
@@ -620,7 +624,7 @@ pub fn frame(stats: &FrameStats) {
         let spent = *counters;
         *counters = Counters::default();
         write_line(&format!(
-            "summary 1s frames={} slow={} gst_probes={} probe_waits={} probe_timeouts={} dim_attempts={} dim_chunks={} dim_parked={} dim_flushed={} dim_dropped={}",
+            "summary 1s frames={} slow={} gst_probes={} probe_waits={} probe_timeouts={} dim_attempts={} dim_chunks={} dim_parked={} dim_flushed={} dim_dropped={} alpha_fallback={}",
             spent.frames,
             spent.slow_frames,
             spent.gst_probes,
@@ -631,6 +635,7 @@ pub fn frame(stats: &FrameStats) {
             spent.dim_parked,
             spent.dim_flushed,
             spent.dim_dropped,
+            spent.alpha_fallbacks,
         ));
     }
 }
@@ -642,7 +647,7 @@ fn stage_snapshot() -> String {
 fn counters_snapshot() -> String {
     let counters = *locked(&COUNTERS);
     format!(
-        "frames={} slow={} gst_probes={} probe_waits={} probe_timeouts={} dim_attempts={} dim_chunks={} dim_parked={} dim_flushed={} dim_dropped={}",
+        "frames={} slow={} gst_probes={} probe_waits={} probe_timeouts={} dim_attempts={} dim_chunks={} dim_parked={} dim_flushed={} dim_dropped={} alpha_fallback={}",
         counters.frames,
         counters.slow_frames,
         counters.gst_probes,
@@ -653,6 +658,7 @@ fn counters_snapshot() -> String {
         counters.dim_parked,
         counters.dim_flushed,
         counters.dim_dropped,
+        counters.alpha_fallbacks,
     )
 }
 
