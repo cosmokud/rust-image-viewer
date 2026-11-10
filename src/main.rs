@@ -3613,6 +3613,9 @@ impl ImageViewer {
     const MANGA_UPLOAD_BATCH_MIN: usize = 3;
     const MANGA_UPLOAD_BATCH_MAX: usize = 20;
     const MANGA_DECODED_MAILBOX_MAX_ITEMS: usize = 64;
+    /// Byte budget for queued-but-not-yet-uploaded pixels. The item cap alone let 64 full-size
+    /// payloads sit in RAM (~1.6 GiB at the decode ceiling); the visible band is never pruned.
+    const MANGA_DECODED_MAILBOX_MAX_BYTES: usize = 512 * 1024 * 1024;
     const MANGA_UPLOAD_P95_SOFT_BUDGET_MS: f32 = 4.5;
     const MANGA_UPLOAD_P95_HARD_BUDGET_MS: f32 = 7.5;
     const MANGA_VIRTUALIZATION_AUTO_RTREE_MIN_ITEMS: usize = 2048;
@@ -8095,6 +8098,28 @@ impl ImageViewer {
         near_radius
     }
 
+    /// Prefix length of the (band-sorted) mailbox that fits both the item cap and the byte cap.
+    /// `entries` must already be sorted by distance band, so the tail is the farthest speculative
+    /// entry. Visible entries are never dropped, even when they alone exceed the byte budget.
+    fn manga_decoded_mailbox_keep_count(
+        entries: &[(usize, usize)],
+        visible_set: &HashSet<usize>,
+    ) -> usize {
+        let mut keep = entries.len().min(Self::MANGA_DECODED_MAILBOX_MAX_ITEMS);
+        let mut total_bytes: usize = entries.iter().take(keep).map(|(_, bytes)| bytes).sum();
+
+        while keep > 0 && total_bytes > Self::MANGA_DECODED_MAILBOX_MAX_BYTES {
+            let (index, bytes) = entries[keep - 1];
+            if visible_set.contains(&index) {
+                break;
+            }
+            total_bytes -= bytes;
+            keep -= 1;
+        }
+
+        keep
+    }
+
     fn manga_prune_decoded_mailbox(
         &mut self,
         visible_set: &HashSet<usize>,
@@ -8107,14 +8132,18 @@ impl ImageViewer {
             navigation_active,
         );
 
-        if self.manga_decoded_mailbox.len() <= Self::MANGA_DECODED_MAILBOX_MAX_ITEMS {
+        let budget: Vec<(usize, usize)> = self
+            .manga_decoded_mailbox
+            .iter()
+            .map(|decoded| (decoded.index, decoded.pixels.len()))
+            .collect();
+        let keep = Self::manga_decoded_mailbox_keep_count(&budget, visible_set);
+
+        if keep >= self.manga_decoded_mailbox.len() {
             return near_radius;
         }
 
-        let dropped: Vec<DecodedImage> = self
-            .manga_decoded_mailbox
-            .drain(Self::MANGA_DECODED_MAILBOX_MAX_ITEMS..)
-            .collect();
+        let dropped: Vec<DecodedImage> = self.manga_decoded_mailbox.drain(keep..).collect();
         let dropped_count = dropped.len() as u64;
 
         if let Some(loader) = self.manga_loader.as_mut() {
@@ -32467,9 +32496,43 @@ fn title_bar_left_layout(
 #[cfg(test)]
 mod tests {
     use super::{
-        FullscreenViewState, ImageFrame, ImageViewer, MangaLayoutMode, MangaLoader, MediaType,
-        Mode, SoloPreloadMomentum,
+        FullscreenViewState, HashSet, ImageFrame, ImageViewer, MangaLayoutMode, MangaLoader,
+        MediaType, Mode, SoloPreloadMomentum,
     };
+
+    #[test]
+    fn mailbox_byte_budget_prunes_speculative_entries_only() {
+        let mib = 1024 * 1024;
+        // Band-sorted: visible first, then speculative, farthest last.
+        let entries: Vec<(usize, usize)> = (0..10).map(|i| (i, 100 * mib)).collect();
+        let visible: HashSet<usize> = [0usize].into_iter().collect();
+
+        // 10 x 100 MiB = 1000 MiB, so the 512 MiB budget keeps 5.
+        assert_eq!(
+            ImageViewer::manga_decoded_mailbox_keep_count(&entries, &visible),
+            5
+        );
+
+        // Item cap still binds when the payloads are small.
+        let small: Vec<(usize, usize)> = (0..100).map(|i| (i, 1024)).collect();
+        assert_eq!(
+            ImageViewer::manga_decoded_mailbox_keep_count(&small, &visible),
+            ImageViewer::MANGA_DECODED_MAILBOX_MAX_ITEMS
+        );
+    }
+
+    #[test]
+    fn mailbox_byte_budget_never_drops_visible_entries() {
+        let mib = 1024 * 1024;
+        // Every entry is visible and together they exceed the budget: nothing may be dropped.
+        let entries: Vec<(usize, usize)> = (0..6).map(|i| (i, 200 * mib)).collect();
+        let visible: HashSet<usize> = (0..6).collect();
+
+        assert_eq!(
+            ImageViewer::manga_decoded_mailbox_keep_count(&entries, &visible),
+            6
+        );
+    }
 
     #[test]
     fn startup_window_without_file_is_500x500_and_visible() {

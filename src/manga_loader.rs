@@ -2475,12 +2475,26 @@ impl MangaLoader {
         // Only mark an index as "loading" after the request is successfully enqueued.
         // If the channel is full during fast scrollbar drags, dropping a request while still
         // marking it as loading will permanently wedge that item in the UI.
+        //
+        // In-flight cap: a window that slides every frame used to accumulate one extra decode per
+        // step (`loads:57` in the crash log). Bound the in-flight set to the prefetch window or
+        // two decodes per worker, whichever is larger. Priorities sort the visible index (and any
+        // urgent demand) first, and those are exempt, so the cap can only cut speculative work.
+        let window = end_idx.saturating_sub(start_idx);
+        let max_inflight = window.max(rayon::current_num_threads().saturating_mul(2));
+        let mut inflight = self.loading_indices.read().len();
+
         requests.sort_by_key(|r| r.priority);
         for req in requests {
             let idx = req.index;
+            let exempt = idx == visible_index || req.priority < 0;
+            if inflight >= max_inflight && !exempt {
+                continue;
+            }
             match self.request_tx.try_send(req) {
                 Ok(()) => {
                     self.loading_indices.write().insert(idx, generation);
+                    inflight = inflight.saturating_add(1);
                 }
                 Err(TrySendError::Full(_req)) => {
                     // Backpressure: stop here so already-enqueued high priority work runs first.
@@ -3781,6 +3795,44 @@ mod tests {
 
         loader.clear();
         assert_eq!(loader.get_dimensions(3), None);
+    }
+
+    #[test]
+    fn inflight_cap_bounds_prefetch_but_never_starves_visible_index() {
+        let list = paths(400);
+        let mut loader = MangaLoader::without_workers();
+
+        // First demand absorbs the initial far-jump cancel; the second must not.
+        loader.last_visible_index = 200;
+        loader.demand(&demand(&list, &[200], &[], 200, MangaLayoutMode::Masonry));
+        let _ = preload_requests(&loader);
+
+        // Simulate a scroll storm: 500 decodes already in flight, all far from the next viewport.
+        {
+            let generation = loader.current_generation;
+            let mut loading = loader.loading_indices.write();
+            loading.clear();
+            for idx in 1000..1500 {
+                loading.insert(idx, generation);
+            }
+        }
+
+        loader.demand(&demand(&list, &[201], &[], 201, MangaLayoutMode::Masonry));
+
+        assert!(
+            loader.loading_indices.read().contains_key(&201),
+            "visible index must bypass the in-flight cap"
+        );
+        assert_eq!(
+            loader.loading_indices.read().len(),
+            501,
+            "cap spilled: only the visible index may be added while 500 are in flight"
+        );
+        let queued: Vec<usize> = preload_requests(&loader)
+            .iter()
+            .map(|req| req.index)
+            .collect();
+        assert_eq!(queued, vec![201]);
     }
 
     #[test]
