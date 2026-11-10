@@ -445,6 +445,36 @@ pub fn trace(tag: &str, message: &str) -> bool {
     true
 }
 
+/// Per-file decode/upload forensics: names the file (and its numbers) behind a slow or failed
+/// decode. Gated by `RIV_MANGA_TRACE`, rate-limited to two lines per second so a scroll storm
+/// cannot fill the log. Disabled sessions pay one cached bool load; `line` is a closure so the
+/// formatting work is skipped too.
+pub fn trace_file(tag: &str, line: impl FnOnce() -> String) -> bool {
+    const MIN_INTERVAL_MS: u64 = 500;
+    static ENABLED_FILE: OnceLock<bool> = OnceLock::new();
+    static LAST_MS: AtomicU64 = AtomicU64::new(u64::MAX);
+
+    if !*ENABLED_FILE.get_or_init(|| flag("RIV_MANGA_TRACE")) {
+        return false;
+    }
+
+    let now = ORIGIN.get_or_init(Instant::now).elapsed().as_millis() as u64;
+    let mut last = LAST_MS.load(Ordering::Relaxed);
+    loop {
+        // `u64::MAX` = never written, so the first line is not swallowed by the window.
+        if last != u64::MAX && now.saturating_sub(last) < MIN_INTERVAL_MS {
+            return false;
+        }
+        match LAST_MS.compare_exchange_weak(last, now, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(actual) => last = actual,
+        }
+    }
+
+    write_line(&format!("[{}] {}", tag, line()));
+    true
+}
+
 pub fn count(counter: Counter, delta: u64) {
     if !enabled() {
         return;

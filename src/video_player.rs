@@ -884,6 +884,9 @@ const STATE_CHANGE_TIMEOUT: Duration = Duration::from_secs(5);
 const UI_STATE_CHANGE_TIMEOUT: Duration = Duration::from_secs(1);
 const SEEK_TIMEOUT: Duration = Duration::from_secs(3);
 const QUERY_TIMEOUT: Duration = Duration::from_millis(250);
+/// Bounded command queue for blocking GStreamer calls issued from the UI thread. A wedged decoder
+/// used to hold the frame for the full 3-5 s timeout; now the UI thread only enqueues.
+const CONTROL_QUEUE_CAPACITY: usize = 8;
 // Stall detection: a playing pipeline that delivers no frame for this long is almost
 // certainly a wedged hardware decoder (a freeze, not a slow start). Detecting it early
 // lets us demote the broken AV1 decoder BEFORE the user navigates, so the next file
@@ -1046,6 +1049,75 @@ pub(crate) fn run_gst_with_timeout<T: Send + 'static>(
             None
         }
     }
+}
+
+/// Spawn the per-player control thread and return its command queue.
+///
+/// Every blocking call keeps its existing timeout and `wedged` outcome, but the wait happens here
+/// instead of on the UI thread. The thread exits when the command sender is dropped (player drop).
+fn spawn_control_thread(
+    pipeline: gst::Pipeline,
+    state: Arc<VideoState>,
+) -> (
+    crossbeam_channel::Sender<ControlCommand>,
+    crossbeam_channel::Receiver<ControlEvent>,
+) {
+    let (command_tx, command_rx) = crossbeam_channel::bounded(CONTROL_QUEUE_CAPACITY);
+    let (event_tx, event_rx) = crossbeam_channel::bounded(CONTROL_QUEUE_CAPACITY);
+
+    crate::async_runtime::spawn_blocking_or_thread("video-control", move || {
+        while let Ok(command) = command_rx.recv() {
+            match command {
+                ControlCommand::Restart => {
+                    // Nothing to do if the state transition is still pending (initial load).
+                    let _ = pipeline.state(gst::ClockTime::from_mseconds(500));
+
+                    let seek_pipeline = pipeline.clone();
+                    let seek = run_gst_with_timeout("control-seek", SEEK_TIMEOUT, move || {
+                        seek_pipeline.seek_simple(
+                            gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
+                            gst::ClockTime::ZERO,
+                        )
+                    });
+                    match seek {
+                        Some(Ok(())) => {}
+                        Some(Err(err)) => {
+                            let _ = event_tx.try_send(ControlEvent::Failed(format!(
+                                "Failed to restart playback: {}",
+                                err
+                            )));
+                        }
+                        None => {
+                            let _ = event_tx.try_send(ControlEvent::Wedged);
+                        }
+                    }
+                    // Ends the seek window the UI thread opened; stall detection reads it.
+                    state.end_seek();
+
+                    let play_pipeline = pipeline.clone();
+                    let playing = run_gst_with_timeout(
+                        "control-state-playing",
+                        STATE_CHANGE_TIMEOUT,
+                        move || play_pipeline.set_state(gst::State::Playing),
+                    );
+                    match playing {
+                        Some(Ok(_)) => {}
+                        Some(Err(err)) => {
+                            let _ = event_tx.try_send(ControlEvent::Failed(format!(
+                                "Failed to resume playback: {}",
+                                err
+                            )));
+                        }
+                        None => {
+                            let _ = event_tx.try_send(ControlEvent::Wedged);
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    (command_tx, event_rx)
 }
 
 fn set_optional_bool_property(element: &gst::Element, name: &str, value: bool) {
@@ -1575,6 +1647,28 @@ fn process_video_sample(sample: gst::Sample, state: &VideoState) {
 }
 
 /// Video player using GStreamer
+/// Blocking work handed to the video control thread. Only commands issued from the UI thread's
+/// per-frame loop live here; one per user input (`play`/`pause`/scrub) stays synchronous because
+/// its error must reach the caller immediately.
+#[derive(Clone, Copy, Debug)]
+enum ControlCommand {
+    /// Seek to the start and resume: the end-of-stream loop path.
+    Restart,
+}
+
+/// Outcome of a queued command, drained by the UI thread once per frame.
+enum ControlEvent {
+    /// The pipeline stopped answering; nothing can recover it.
+    Wedged,
+    Failed(String),
+}
+
+/// Non-blocking enqueue. `false` means full or disconnected: the caller retries next frame, and
+/// the UI thread never waits on the control thread.
+fn try_enqueue_control<T>(tx: &crossbeam_channel::Sender<T>, command: T) -> bool {
+    tx.try_send(command).is_ok()
+}
+
 pub struct VideoPlayer {
     pipeline: gst::Pipeline,
     video_sink: gst_app::AppSink,
@@ -1613,6 +1707,9 @@ pub struct VideoPlayer {
     subtitle_selection: VideoSubtitleSelection,
     stream_collection: Option<gst::StreamCollection>,
     selected_stream_ids: Vec<String>,
+    // `None` once dropped, which closes the queue so the control thread exits before teardown.
+    control_tx: Option<crossbeam_channel::Sender<ControlCommand>>,
+    control_events: crossbeam_channel::Receiver<ControlEvent>,
 }
 
 impl VideoPlayer {
@@ -1855,6 +1952,11 @@ Ensure your GStreamer installation includes the playback elements (usually from 
                 .build(),
         );
 
+        // One control thread per player: it owns the blocking state/seek calls the UI thread used
+        // to make inline (a wedged decoder froze the frame for the entire 5 s timeout).
+        let (control_tx, control_events) =
+            spawn_control_thread(pipeline.clone(), std::sync::Arc::clone(&state));
+
         let player = VideoPlayer {
             pipeline,
             video_sink: appsink,
@@ -1880,6 +1982,8 @@ Ensure your GStreamer installation includes the playback elements (usually from 
             subtitle_selection: VideoSubtitleSelection::Off,
             stream_collection: None,
             selected_stream_ids: Vec::new(),
+            control_tx: Some(control_tx),
+            control_events,
         };
 
         let mut player = player;
@@ -2142,11 +2246,6 @@ Ensure your GStreamer installation includes the playback elements (usually from 
         }
 
         Ok(())
-    }
-
-    /// Seek to a specific time in seconds using frame-accurate mode.
-    pub fn seek_to_time(&mut self, seconds: f64) -> Result<(), String> {
-        self.seek_to_time_with_mode(seconds, VideoSeekMode::Accurate)
     }
 
     /// Seek to a specific time in seconds using the provided mode.
@@ -2670,6 +2769,7 @@ Ensure your GStreamer installation includes the playback elements (usually from 
     /// Get the latest video frame if updated
     /// Takes ownership of the freshest frame and drops stale queued frames.
     pub fn get_frame(&mut self) -> Option<VideoFrame> {
+        self.drain_control_events();
         self.last_polled_at.set(Some(Instant::now()));
         let latest = self.state.pop_latest_frame();
 
@@ -2812,18 +2912,53 @@ Ensure your GStreamer installation includes the playback elements (usually from 
         false
     }
 
-    /// Restart playback from the beginning
-    pub fn restart(&mut self) -> Result<(), String> {
-        self.seek_to_time(0.0)?;
-        if !self.is_playing {
-            self.play()?;
+    /// Restart playback from the beginning without blocking the calling (UI) thread.
+    ///
+    /// The cheap local state reset happens here so the very next frame already reports "playing";
+    /// the seek and the state change run on the control thread. Returns `false` when the queue is
+    /// full, leaving end-of-stream set so the caller retries next frame.
+    pub fn restart_async(&mut self) -> bool {
+        let Some(tx) = self.control_tx.as_ref() else {
+            return false;
+        };
+        if !try_enqueue_control(tx, ControlCommand::Restart) {
+            return false;
         }
-        Ok(())
+
+        // Mirrors what `seek_to_time(0.0)` + `play()` did inline before the queue existed.
+        self.state.begin_seek();
+        self.state.clear_frames();
+        self.last_frame_pts = None;
+        self.eos_seen = false;
+        self.last_frame_at.set(None);
+        self.is_playing = true;
+        self.buffering_paused = false;
+        self.buffering_pause_suppressed_until = None;
+        self.play_started_at.set(Some(Instant::now()));
+        true
+    }
+
+    /// Apply outcomes reported by the control thread. Cheap: one `try_recv` per frame.
+    fn drain_control_events(&mut self) {
+        while let Ok(event) = self.control_events.try_recv() {
+            match event {
+                ControlEvent::Wedged => {
+                    self.wedged.store(true, Ordering::Release);
+                    demote_av1_hardware_tiers();
+                }
+                ControlEvent::Failed(message) => {
+                    crate::diag::trace("video-control", &message);
+                }
+            }
+        }
     }
 }
 
 impl Drop for VideoPlayer {
     fn drop(&mut self) {
+        // Close the control queue first: the worker holds pipeline/state clones and must not start
+        // a new state change while the teardown below moves the pipeline to NULL.
+        self.control_tx = None;
         // If this player froze while playing, demote the AV1 hardware decoders NOW so the
         // next navigation does not have to wait for a state-change timeout. Covers the
         // race where the user navigates before the per-frame stall detection fired.
@@ -2981,5 +3116,35 @@ mod tests {
             ranks.ends_with("d3d12av1dec:256"),
             "stability override must be last: {ranks}"
         );
+    }
+
+    #[test]
+    fn control_queue_enqueue_returns_immediately_when_full() {
+        let (tx, rx) = crossbeam_channel::bounded::<u8>(2);
+        assert!(try_enqueue_control(&tx, 1));
+        assert!(try_enqueue_control(&tx, 2));
+
+        // Full queue: enqueue must refuse instead of blocking the UI thread.
+        let started = Instant::now();
+        for _ in 0..1000 {
+            assert!(!try_enqueue_control(&tx, 3));
+        }
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "enqueue blocked for {:?}",
+            started.elapsed()
+        );
+        assert_eq!(rx.len(), 2, "a refused enqueue must not queue");
+    }
+
+    #[test]
+    fn control_queue_enqueue_succeeds_while_not_full() {
+        let (tx, rx) = crossbeam_channel::bounded::<u8>(4);
+        assert!(try_enqueue_control(&tx, 7));
+        assert_eq!(rx.recv().unwrap(), 7);
+
+        // Dropped receiver: enqueue reports failure instead of panicking or blocking.
+        drop(rx);
+        assert!(!try_enqueue_control(&tx, 8));
     }
 }

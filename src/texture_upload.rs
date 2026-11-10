@@ -11,6 +11,34 @@ const MEANINGFUL_MINIFY_RATIO: f32 = 1.15;
 /// Floor for `manga_mipmap_min_side` so configured 0 cannot disable the check.
 const MIN_MIPMAP_SIDE_FLOOR: u32 = 1;
 
+/// Ceiling for one decoded payload handed to the GPU. `color_image` copies everything again, so
+/// an oversized payload costs 2x its size before texture creation even fails.
+pub const MAX_UPLOAD_RGBA_BYTES: usize = 256 * 1024 * 1024;
+
+/// `Some(reason)` when a payload must not reach [`upload`]: over the byte ceiling, or a side
+/// larger than the GPU limit (already implies a decode budget escape).
+pub fn oversized_payload_reason(
+    size: (u32, u32),
+    rgba_bytes: usize,
+    max_texture_side: u32,
+) -> Option<String> {
+    if rgba_bytes > MAX_UPLOAD_RGBA_BYTES {
+        return Some(format!(
+            "rgba {} MiB exceeds the {} MiB upload ceiling",
+            rgba_bytes / (1024 * 1024),
+            MAX_UPLOAD_RGBA_BYTES / (1024 * 1024)
+        ));
+    }
+    let side = max_texture_side.max(1);
+    if size.0 > side || size.1 > side {
+        return Some(format!(
+            "{}x{} exceeds the {} px texture side",
+            size.0, size.1, side
+        ));
+    }
+    None
+}
+
 /// What the pixels are. Selects the filter source and the mipmap gate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UploadKind {
@@ -508,5 +536,30 @@ mod tests {
             assert_eq!(p.navigation_active, nav, "{kind:?} navigation veto");
             assert_eq!(p.frame_budget_tight, budget, "{kind:?} budget veto");
         }
+    }
+
+    #[test]
+    fn oversized_payload_is_skipped_before_color_image() {
+        // Byte ceiling: a 20000x20000 RGBA payload (1.6 GiB) must never reach `color_image`.
+        let reason = oversized_payload_reason((20_000, 20_000), 1_600_000_000, 16_384)
+            .expect("oversized payload must be refused");
+        assert!(
+            reason.contains("upload ceiling"),
+            "unexpected reason: {reason}"
+        );
+
+        // Side ceiling: also refuses a small payload whose dims exceed the GPU limit.
+        let reason = oversized_payload_reason((8192, 64), 64 * 8192, 4096)
+            .expect("over-side payload must be refused");
+        assert!(
+            reason.contains("texture side"),
+            "unexpected reason: {reason}"
+        );
+
+        // A legitimate full-size page still passes.
+        assert_eq!(
+            oversized_payload_reason((4096, 4096), 4096 * 4096 * 4, 8192),
+            None
+        );
     }
 }

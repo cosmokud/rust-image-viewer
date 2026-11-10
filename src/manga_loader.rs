@@ -235,6 +235,8 @@ enum DimSend {
 
 /// Decode-queue waits above this are worth a diag line: a fast probe should never queue long.
 const DECODE_QUEUE_WAIT_TRACE: Duration = Duration::from_millis(100);
+/// Decode wall time above which the diag forensics line names the file.
+const DECODE_FORENSICS_SLOW: Duration = Duration::from_millis(250);
 /// Base backoff for decode retries after a failed/empty preload.
 const PRELOAD_RETRY_BASE_DELAY_MS: u64 = 250;
 /// Cap retry backoff so visible items recover quickly once they come into view.
@@ -322,6 +324,18 @@ pub fn trace_rule(rule: &str, index: usize) {
     if !crate::diag::trace("manga-trace", &format!("{rule} idx={index}")) {
         eprintln!("[manga-trace] {rule} idx={index}");
     }
+}
+
+/// One-line file identity for diag forensics: name + on-disk size (one stat, diag paths only).
+fn diag_file_label(path: &std::path::Path) -> String {
+    let bytes = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+    format!(
+        "{} ({}B)",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("?"),
+        bytes
+    )
 }
 
 /// Media type for manga items (extended to include videos/animations)
@@ -1323,7 +1337,12 @@ impl MangaLoader {
                 if queue_wait >= DECODE_QUEUE_WAIT_TRACE {
                     crate::diag::trace(
                         "decode-queue",
-                        &format!("idx={} wait={}ms", req.index, queue_wait.as_millis()),
+                        &format!(
+                            "idx={} wait={}ms file={}",
+                            req.index,
+                            queue_wait.as_millis(),
+                            diag_file_label(&req.path)
+                        ),
                     );
                 }
                 let decode_started = Instant::now();
@@ -1559,6 +1578,41 @@ impl MangaLoader {
     /// Load a single image on a worker thread.
     /// For video files, this extracts the first frame as a thumbnail placeholder.
     fn load_single_image(req: &LoadRequest) -> Option<DecodedImage> {
+        // Diag forensics wrap: a failed decode returns `None` from several depths, and the log has
+        // to name the file, so wrap the whole thing instead of instrumenting each exit.
+        let started = Instant::now();
+        let declared = Self::probe_image_dimensions_cached(&req.path);
+        let decoded = Self::load_single_image_inner(req);
+        let elapsed = started.elapsed();
+
+        let slow = elapsed >= DECODE_FORENSICS_SLOW;
+        if slow || decoded.is_none() {
+            crate::diag::trace_file("decode-file", || {
+                let (width, height, rgba_bytes) = decoded
+                    .as_ref()
+                    .map(|image| (image.width, image.height, image.pixels.len()))
+                    .unwrap_or((0, 0, 0));
+                let declared = declared
+                    .map(|(w, h)| format!("{}x{}", w, h))
+                    .unwrap_or_else(|| "?".to_string());
+                format!(
+                    "idx={} file={} declared={} decoded={}x{} rgba={}B elapsed={}ms outcome={}",
+                    req.index,
+                    diag_file_label(&req.path),
+                    declared,
+                    width,
+                    height,
+                    rgba_bytes,
+                    elapsed.as_millis(),
+                    if decoded.is_some() { "ok" } else { "failed" }
+                )
+            });
+        }
+
+        decoded
+    }
+
+    fn load_single_image_inner(req: &LoadRequest) -> Option<DecodedImage> {
         let effective_texture_side = req
             .target_texture_side
             .max(1)

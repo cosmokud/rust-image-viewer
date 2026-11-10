@@ -3616,6 +3616,8 @@ impl ImageViewer {
     /// Byte budget for queued-but-not-yet-uploaded pixels. The item cap alone let 64 full-size
     /// payloads sit in RAM (~1.6 GiB at the decode ceiling); the visible band is never pruned.
     const MANGA_DECODED_MAILBOX_MAX_BYTES: usize = 512 * 1024 * 1024;
+    /// Upload wall time above which the diag forensics line names the file.
+    const MANGA_UPLOAD_FORENSICS_MS: u128 = 32;
     const MANGA_UPLOAD_P95_SOFT_BUDGET_MS: f32 = 4.5;
     const MANGA_UPLOAD_P95_HARD_BUDGET_MS: f32 = 7.5;
     const MANGA_VIRTUALIZATION_AUTO_RTREE_MIN_ITEMS: usize = 2048;
@@ -8096,6 +8098,18 @@ impl ImageViewer {
         });
 
         near_radius
+    }
+
+    /// One-line file identity for diag forensics: name + on-disk size (one stat, diag paths only).
+    fn diag_file_label(path: &std::path::Path) -> String {
+        let bytes = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+        format!(
+            "{} ({}B)",
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("?"),
+            bytes
+        )
     }
 
     /// Prefix length of the (band-sorted) mailbox that fits both the item cap and the byte cap.
@@ -21002,7 +21016,8 @@ impl ImageViewer {
                 // Check for video end and handle looping
                 if player.is_eos() {
                     if self.config.video_loop {
-                        let _ = player.restart();
+                        // Enqueues only: a wedged decoder used to block this frame for 5 s.
+                        player.restart_async();
                     }
                 }
 
@@ -22285,6 +22300,32 @@ impl ImageViewer {
                 continue;
             }
 
+            // Never hand an oversized payload to the GPU: `color_image` would copy it whole and
+            // texture creation would fail anyway. Treat it as an upload failure so the tile falls
+            // back to the placeholder instead of pinning another full-size RGBA copy.
+            if let Some(reason) = texture_upload::oversized_payload_reason(
+                (decoded.width, decoded.height),
+                decoded.pixels.len(),
+                self.max_texture_side,
+            ) {
+                crate::diag::trace_file("upload-skip", || {
+                    format!(
+                        "idx={} file={} {}x{} rgba={}B {}",
+                        decoded.index,
+                        Self::diag_file_label(&decoded.path),
+                        decoded.width,
+                        decoded.height,
+                        decoded.pixels.len(),
+                        reason
+                    )
+                });
+                if let Some(loader) = self.manga_loader.as_mut() {
+                    loader.register_upload_failure(decoded.index);
+                }
+                self.manga_ttv_pending.remove(&decoded.index);
+                continue;
+            }
+
             // Static images + video thumbnails can use mipmaps for faster minification
             // in manga strip and masonry layouts.
             let policy = self.manga_upload_policy(
@@ -22303,10 +22344,25 @@ impl ImageViewer {
                 &policy,
             )
             .handle;
-            self.perf_metrics.record(
-                Metric::MangaUploadTextureMs,
-                upload_texture_started.elapsed(),
-            );
+            let upload_ms = upload_texture_started.elapsed();
+            self.perf_metrics
+                .record(Metric::MangaUploadTextureMs, upload_ms);
+            // Forensics: a slow upload is where a decode that slipped the pixel budget shows up.
+            if upload_ms.as_millis() >= Self::MANGA_UPLOAD_FORENSICS_MS {
+                crate::diag::trace_file("upload", || {
+                    format!(
+                        "idx={} file={} declared={}x{} decoded={}x{} rgba={}B elapsed={}ms",
+                        decoded.index,
+                        Self::diag_file_label(&decoded.path),
+                        decoded.original_width,
+                        decoded.original_height,
+                        decoded.width,
+                        decoded.height,
+                        decoded.pixels.len(),
+                        upload_ms.as_millis()
+                    )
+                });
+            }
 
             // Insert into cache with media type (this may evict old entries)
             let evicted = self.manga_texture_cache.insert_with_type(
@@ -26402,8 +26458,10 @@ impl ImageViewer {
             // Check for video end and handle looping
             if player.is_eos() {
                 if self.config.video_loop {
-                    let _ = player.restart();
-                    needs_repaint = true;
+                    // Enqueues only: a wedged decoder used to block this frame for 5 s.
+                    if player.restart_async() {
+                        needs_repaint = true;
+                    }
                 }
             }
 
