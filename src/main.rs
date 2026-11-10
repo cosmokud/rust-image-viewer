@@ -3026,6 +3026,9 @@ struct ImageViewer {
     manga_placeholder_spinners_left: usize,
     /// Textures uploaded by the last `manga_process_pending_loads` pass (diag trace).
     manga_uploads_last_pass: usize,
+    /// Items drained by that pass and its wall time, always reported in the frame line.
+    manga_upload_items_last_pass: usize,
+    manga_upload_ms_last_pass: f64,
     /// Repairs spent per index: `(heals, window_start)`; bounds work on a genuinely broken file.
     manga_texture_heal_budget: HashMap<usize, (u32, Instant)>,
     /// First-seen instant per in-flight decode index, for stale in-flight eviction.
@@ -3518,6 +3521,8 @@ impl Default for ImageViewer {
             manga_texture_missing_since: HashMap::new(),
             manga_placeholder_spinners_left: Self::MANGA_PLACEHOLDER_SPINNER_MAX_PER_FRAME,
             manga_uploads_last_pass: 0,
+            manga_upload_items_last_pass: 0,
+            manga_upload_ms_last_pass: 0.0,
             manga_texture_heal_budget: HashMap::new(),
             manga_inflight_since: HashMap::new(),
             manga_pending_probe_since: HashMap::new(),
@@ -19687,6 +19692,7 @@ impl ImageViewer {
     }
 
     fn masonry_flush_pending_dimension_updates(&mut self, force: bool) -> bool {
+        diag::note_stage("dimension_flush");
         if self.masonry_pending_dimension_updates.is_empty() {
             self.masonry_layout_invalidation_deferred = false;
             return false;
@@ -21115,6 +21121,7 @@ impl ImageViewer {
     /// blocking the UI — the manga texture cache already has a first-frame
     /// thumbnail from the normal manga loader pipeline.
     fn manga_update_animated_textures(&mut self, ctx: &egui::Context) -> bool {
+        diag::note_stage("anim_stream");
         if self.mode().is_solo() {
             return false;
         }
@@ -21224,6 +21231,14 @@ impl ImageViewer {
                         .max(cached_side_floor);
 
                     if LoadedImage::is_animated_webp(&path) {
+                        // Breadcrumb before the animated decode, as for static/video decodes.
+                        diag::note_file(idx, "anim-start", || {
+                            format!(
+                                "idx={idx} file={} bytes={} side={target_side}",
+                                Self::diag_file_label(&path),
+                                std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0)
+                            )
+                        });
                         if let Some(rx) = LoadedImage::start_streaming_webp(
                             &path,
                             Some(target_side),
@@ -21560,6 +21575,7 @@ impl ImageViewer {
                     &collected
                 }
             };
+            diag::note_stage("preload_pump");
             let bookkeeping = self.manga_loader.as_ref().is_some_and(|loader| {
                 loader.demand_outstanding(
                     &self.image_list,
@@ -22164,6 +22180,7 @@ impl ImageViewer {
 
             (taken.decoded, taken.dimension_updates)
         };
+        diag::note_stage("drain");
 
         if self.mode().is_masonry()
             && self.masonry_authoritative_dimension_lock_active()
@@ -22177,6 +22194,7 @@ impl ImageViewer {
 
         // Dimension updates can change page heights; invalidate cached layout/prefix sums.
         if layout_dims_changed {
+            diag::note_stage("dim_flush");
             if self.mode().is_masonry() {
                 self.masonry_queue_dimension_updates(layout_dim_updates.iter().copied());
                 if !defer_masonry_layout_work {
@@ -22194,7 +22212,6 @@ impl ImageViewer {
         if mailbox_received {
             self.manga_decoded_mailbox.extend(new_decoded_images);
         }
-
         let dims_updated = layout_dims_changed;
 
         let visible_indices = self.manga_collect_visible_indices();
@@ -22210,6 +22227,7 @@ impl ImageViewer {
             self.current_index
                 .min(self.image_list.len().saturating_sub(1)),
         );
+        diag::note_stage("mailbox_prune");
         let near_radius = self.manga_prune_decoded_mailbox(
             &visible_set,
             upload_anchor_index,
@@ -22237,10 +22255,12 @@ impl ImageViewer {
             self.manga_decoded_mailbox.drain(0..upload_count).collect()
         };
 
+        diag::note_stage("cache_evict");
         let mut evicted_to_mark_unloaded = self
             .manga_texture_cache
             .set_max_entries(self.manga_cache_target_capacity);
         let mut uploaded_textures = 0u64;
+        self.manga_upload_items_last_pass = decoded_images.len();
 
         // Upload decoded images to GPU as textures
         for decoded in decoded_images {
@@ -22327,6 +22347,7 @@ impl ImageViewer {
             );
 
             let upload_texture_started = Instant::now();
+            diag::note_stage("upload");
             let texture = texture_upload::upload(
                 ctx,
                 &format!("manga_{}", decoded.index),
@@ -22357,6 +22378,7 @@ impl ImageViewer {
             }
 
             // Insert into cache with media type (this may evict old entries)
+            diag::note_stage("cache_insert");
             let evicted = self.manga_texture_cache.insert_with_type(
                 decoded.index,
                 decoded.path.clone(),
@@ -22383,6 +22405,8 @@ impl ImageViewer {
         // Tick the cache's frame counter for LRU tracking
         self.manga_texture_cache.tick();
         self.manga_uploads_last_pass = uploaded_textures as usize;
+        self.manga_upload_ms_last_pass = upload_pass_started.elapsed().as_secs_f64() * 1000.0;
+        diag::note_stage("upload_done");
 
         self.perf_metrics
             .record(Metric::MangaUploadPassMs, upload_pass_started.elapsed());
@@ -24337,6 +24361,7 @@ impl ImageViewer {
 
     /// Draw images in manga (vertical strip) mode
     fn draw_manga_mode(&mut self, ctx: &egui::Context) -> bool {
+        diag::note_stage("manga_layout");
         if self.mode().is_solo() || !self.mode().is_fullscreen() {
             return false;
         }
@@ -25289,6 +25314,7 @@ impl ImageViewer {
             || self.manga_last_strip_playback_background_tick.elapsed()
                 >= Duration::from_millis(Self::MANGA_STRIP_PLAYBACK_BACKGROUND_TICK_MS);
         let dims_updated = if should_tick_strip_background {
+            diag::note_stage("manga_upload_pass");
             let updated = self.manga_process_pending_loads(ctx);
             if strip_playback_priority_mode {
                 self.manga_last_strip_playback_background_tick = Instant::now();
@@ -26439,6 +26465,7 @@ impl ImageViewer {
         }
 
         // Handle video frame updates
+        diag::note_stage("video_poll");
         // Failed queued state changes surface here instead of on the click/call site.
         if let Some(err) = self
             .video_player
@@ -31089,6 +31116,8 @@ fn diag_frame_stats(
         repaint,
         visible: viewer.manga_visible_indices_last,
         uploads: viewer.manga_uploads_last_pass,
+        upload_ms: viewer.manga_upload_ms_last_pass,
+        upload_items: viewer.manga_upload_items_last_pass,
         backlog,
         inflight,
         retry,
@@ -31895,6 +31924,8 @@ impl eframe::App for ImageViewer {
 
         // Guarded: a disabled session pays one cached bool load, no locks and no clock reads.
         if let Some(frame_started) = frame_started {
+            // Present handoff: everything above had to finish before egui/wgpu could present.
+            diag::note_stage("present");
             let backlog = self
                 .manga_loader
                 .as_ref()

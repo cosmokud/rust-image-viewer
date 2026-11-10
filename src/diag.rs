@@ -58,6 +58,14 @@ static HEARTBEAT: AtomicU64 = AtomicU64::new(0);
 static FRAME_STARTED_MS: AtomicU64 = AtomicU64::new(0);
 static SUMMARY_MS: AtomicU64 = AtomicU64::new(u64::MAX);
 static STAGE: Mutex<&'static str> = Mutex::new("?");
+/// Last stages the frame entered, oldest first, with the instant each was entered. The watchdog
+/// prints their durations so the blocking segment is named, not just the enclosing stage.
+static STAGES: Mutex<Vec<(&'static str, Instant)>> = Mutex::new(Vec::new());
+/// Segments printed per HANG / SLOW line.
+const STAGE_SEGMENTS: usize = 8;
+/// Indices already breadcrumbed: the first decode/probe per index names the file, repeats do not.
+static BREADCRUMBS: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+const BREADCRUMB_CAP: usize = 8192;
 
 /// Aggregated load-path counters, printed once per second and in a hang snapshot.
 #[derive(Clone, Copy, Default, Debug)]
@@ -119,6 +127,9 @@ pub struct FrameStats {
     pub repaint: &'static str,
     pub visible: usize,
     pub uploads: usize,
+    /// Total time the upload pass spent this frame, and how many items it touched.
+    pub upload_ms: f64,
+    pub upload_items: usize,
     pub backlog: (usize, usize, usize, usize),
     pub inflight: usize,
     pub retry: usize,
@@ -475,6 +486,27 @@ pub fn trace_file(tag: &str, line: impl FnOnce() -> String) -> bool {
     true
 }
 
+/// Per-index breadcrumb before a decode or probe: a hard kill leaves the offending file as the
+/// last line in the log. First time per index only, and `line` is not even built on a repeat.
+pub fn note_file(index: usize, tag: &str, line: impl FnOnce() -> String) -> bool {
+    if !enabled() {
+        return false;
+    }
+
+    let mut seen = locked(&BREADCRUMBS);
+    let seen = seen.get_or_insert_with(std::collections::HashSet::new);
+    if seen.len() >= BREADCRUMB_CAP {
+        // Indices are reused per folder: an unbounded set would silence later folders.
+        seen.clear();
+    }
+    if !seen.insert(index) {
+        return false;
+    }
+
+    write_line(&format!("[{tag}] {}", line()));
+    true
+}
+
 pub fn count(counter: Counter, delta: u64) {
     if !enabled() {
         return;
@@ -496,12 +528,42 @@ pub fn count(counter: Counter, delta: u64) {
     *slot = slot.saturating_add(delta);
 }
 
-/// Name the stage the frame is in; the watchdog prints the last one it saw.
+/// Name the stage the frame is in; the watchdog prints the last one it saw and the durations of
+/// the last few.
 pub fn note_stage(name: &'static str) {
     if !enabled() {
         return;
     }
     *locked(&STAGE) = name;
+    let mut stages = locked(&STAGES);
+    stages.push((name, Instant::now()));
+    let excess = stages.len().saturating_sub(STAGE_SEGMENTS * 4);
+    if excess > 0 {
+        stages.drain(..excess);
+    }
+}
+
+/// ` segments=upload:12ms cache_insert:4801ms paint:3ms` for the last stages entered. Each
+/// duration runs until the next stage was entered (or now), so the slow one is named.
+fn stage_segments() -> String {
+    let stages = locked(&STAGES);
+    if stages.len() < 2 {
+        return String::new();
+    }
+
+    let now = Instant::now();
+    let tail = &stages[stages.len().saturating_sub(STAGE_SEGMENTS)..];
+    let mut out = String::from(" segments=");
+    for (position, (name, started)) in tail.iter().enumerate() {
+        let ended = tail.get(position + 1).map_or(now, |(_, next)| *next);
+        let millis = ended.saturating_duration_since(*started).as_secs_f64() * 1000.0;
+        if position > 0 {
+            out.push(' ');
+        }
+        out.push_str(name);
+        out.push_str(&format!(":{millis:.0}ms"));
+    }
+    out
 }
 
 /// Heartbeat for the watchdog: one bump per completed frame.
@@ -522,11 +584,13 @@ pub fn frame(stats: &FrameStats) {
     count(Counter::Frames, 1);
     let total_ms = stats.total.as_secs_f64() * 1000.0;
     let line = format!(
-        "frame {total_ms:.1}ms stage={} repaint={} visible={} uploads={} backlog=loads:{} dec:{} dim:{} probes:{} inflight={} retry={} ttv={}",
+        "frame {total_ms:.1}ms stage={} repaint={} visible={} uploads={} upload_ms={:.1} upload_items={} backlog=loads:{} dec:{} dim:{} probes:{} inflight={} retry={} ttv={}",
         locked(&STAGE).to_string(),
         stats.repaint,
         stats.visible,
         stats.uploads,
+        stats.upload_ms,
+        stats.upload_items,
         stats.backlog.0,
         stats.backlog.1,
         stats.backlog.2,
@@ -535,11 +599,12 @@ pub fn frame(stats: &FrameStats) {
         stats.retry,
         stats.ttv_pending,
     );
-    *locked(&LAST_FRAME) = Some(line.clone());
+    let segments = stage_segments();
+    *locked(&LAST_FRAME) = Some(format!("{line}{segments}"));
 
     if stats.total >= frame_threshold() {
         count(Counter::SlowFrames, 1);
-        write_line(&format!("SLOW {line}"));
+        write_line(&format!("SLOW {line}{segments}"));
     }
 
     let elapsed_ms = origin().elapsed().as_millis() as u64;
@@ -592,11 +657,12 @@ fn counters_snapshot() -> String {
 fn dump_hang(stalled_ms: u128) {
     let stage = stage_snapshot();
     write_line(&format!(
-        "HANG no frame completed for {stalled_ms}ms; last stage={stage} since_frame_start={}ms",
+        "HANG no frame completed for {stalled_ms}ms; last stage={stage} since_frame_start={}ms{}",
         origin()
             .elapsed()
             .as_millis()
-            .saturating_sub(FRAME_STARTED_MS.load(Ordering::Relaxed) as u128)
+            .saturating_sub(FRAME_STARTED_MS.load(Ordering::Relaxed) as u128),
+        stage_segments()
     ));
     write_line(&format!("HANG counters {}", counters_snapshot()));
     if let Some(frame) = locked(&LAST_FRAME).clone() {
@@ -825,11 +891,29 @@ mod tests {
             repaint: "none",
             visible: 0,
             uploads: 0,
+            upload_ms: 0.0,
+            upload_items: 0,
             backlog: (0, 0, 0, 0),
             inflight: 0,
             retry: 0,
             ttv_pending: 0,
         });
         assert!(stage_snapshot().is_empty() || stage_snapshot() == "?");
+    }
+
+    #[test]
+    fn stage_segments_name_the_slow_one() {
+        // A segment lasts until the next stage starts, so a fixed base keeps it deterministic.
+        let base = Instant::now();
+        *locked(&STAGES) = vec![
+            ("upload", base - Duration::from_millis(4801)),
+            ("cache_insert", base - Duration::from_millis(1)),
+            ("paint", base),
+        ];
+        let segments = stage_segments();
+        assert!(segments.contains("upload:4800ms"), "{segments}");
+        assert!(segments.contains("cache_insert:1ms"), "{segments}");
+        assert!(segments.ends_with("paint:0ms"), "{segments}");
+        assert!(segments.starts_with(" segments="), "{segments}");
     }
 }

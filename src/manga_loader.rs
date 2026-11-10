@@ -857,6 +857,17 @@ impl MangaLoader {
                     MangaMediaType::StaticImage
                 };
 
+                // Breadcrumb before a probe: same reason as the decode one.
+                crate::diag::note_file(idx, "dim-probe", || {
+                    format!(
+                        "idx={} file={} bytes={} kind={}",
+                        idx,
+                        diag_file_label(&path),
+                        std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0),
+                        if is_video { "video" } else { "image" }
+                    )
+                });
+
                 let dims = if is_video {
                     Self::probe_video_dimensions(idx, &path)
                 } else {
@@ -1648,6 +1659,18 @@ impl MangaLoader {
         // to name the file, so wrap the whole thing instead of instrumenting each exit.
         let started = Instant::now();
         let declared = Self::probe_image_dimensions_cached(&req.path);
+        // Breadcrumb: a hard kill leaves the offending file as the last line in the log.
+        crate::diag::note_file(req.index, "decode-start", || {
+            format!(
+                "idx={} file={} bytes={} declared={}",
+                req.index,
+                diag_file_label(&req.path),
+                std::fs::metadata(&req.path)
+                    .map(|meta| meta.len())
+                    .unwrap_or(0),
+                declared.map_or_else(|| "?".to_string(), |(w, h)| format!("{w}x{h}"))
+            )
+        });
         let decoded = Self::load_single_image_inner(req);
         let elapsed = started.elapsed();
 
