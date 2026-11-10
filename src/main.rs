@@ -9764,6 +9764,15 @@ impl ImageViewer {
         )
     }
 
+    /// Whether this frame's pointer state starts a drag-pan of the strip.
+    ///
+    /// `pan_down_action` is a held (level) test and stays true for the whole gesture, so only the
+    /// frame that starts the drag may latch the anchor: re-latching it every frame would measure
+    /// the frame delta from the current pointer, which cancels the drag and freezes the strip.
+    fn manga_pan_starts(is_panning: bool, pan_down_action: bool, double_clicked: bool) -> bool {
+        pan_down_action && !double_clicked && !is_panning
+    }
+
     /// Whether a drag latched at press time moves the window rather than panning the image.
     ///
     /// Floating mode: the chrome bar always moves the window, and so does a drag anywhere else
@@ -24699,7 +24708,7 @@ impl ImageViewer {
         // - Apply pointer delta 1:1 (optionally scaled via config)
         // Manga mode maps vertical drag to strip scrolling and horizontal drag to X offset.
         if panning_allowed {
-            if pan_down_action && !primary_double_clicked {
+            if Self::manga_pan_starts(self.is_panning, pan_down_action, primary_double_clicked) {
                 self.is_panning = true;
                 self.last_mouse_pos = pointer_pos;
                 self.stop_manga_wheel_scroll();
@@ -32742,6 +32751,21 @@ mod tests {
         ));
         // Fullscreen never moves the window, however the bar is treated.
         assert!(!ImageViewer::drag_moves_window(true, true, false));
+    }
+
+    #[test]
+    fn a_held_pan_button_keeps_the_anchor_it_latched_at_press() {
+        // Press: the drag starts and latches the pointer as its anchor.
+        assert!(ImageViewer::manga_pan_starts(false, true, false));
+        // Held, frame after frame: the drag must not restart and re-latch, otherwise the frame
+        // delta is measured from the current pointer and the strip stops following the cursor
+        // after the few pixels the first frame allowed.
+        assert!(!ImageViewer::manga_pan_starts(true, true, false));
+        // A double click on the strip navigates, it does not pan.
+        assert!(!ImageViewer::manga_pan_starts(false, true, true));
+        // No pan button down: nothing to start or continue.
+        assert!(!ImageViewer::manga_pan_starts(false, false, false));
+        assert!(!ImageViewer::manga_pan_starts(true, false, false));
     }
 
     #[test]
