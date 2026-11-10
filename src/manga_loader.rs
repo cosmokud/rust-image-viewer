@@ -1861,7 +1861,7 @@ impl MangaLoader {
         // Cooling down after a gate timeout: keep the cheap size layout already has instead of
         // re-probing (and re-laying-out) on every pass.
         if probe_cooldown_active(index) {
-            return Self::fallback_video_dimensions(path);
+            return Some(Self::cheap_video_dimensions(path));
         }
 
         let mut owned = None;
