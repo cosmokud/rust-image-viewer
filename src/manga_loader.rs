@@ -84,18 +84,37 @@ impl VideoProbeGate {
     /// Parks on a condvar instead of the old `try_acquire` + 4ms sleep loop. `None` (gate still
     /// busy after the bounded wait) makes the caller degrade to cheap dimensions, never block.
     fn acquire_timeout(self: &std::sync::Arc<Self>, timeout: Duration) -> Option<VideoProbePermit> {
-        let deadline = Instant::now() + timeout;
+        let started = Instant::now();
+        let deadline = started + timeout;
         let mut available = self.available.lock();
         loop {
             if *available > 0 {
                 *available -= 1;
-                PROBE_DEPTH.with(|depth| depth.set(depth.get() + 1));
+                let depth = PROBE_DEPTH.with(|depth| {
+                    depth.set(depth.get() + 1);
+                    depth.get()
+                });
+                let waited = started.elapsed();
+                crate::diag::count(crate::diag::Counter::ProbeWaits, 1);
+                if crate::diag::enabled() {
+                    crate::diag::write_line(&format!(
+                        "probe permit wait={}ms depth={depth}",
+                        waited.as_millis()
+                    ));
+                }
                 return Some(VideoProbePermit {
                     gate: std::sync::Arc::clone(self),
                 });
             }
             let now = Instant::now();
             if now >= deadline {
+                crate::diag::count(crate::diag::Counter::ProbeTimeouts, 1);
+                if crate::diag::enabled() {
+                    crate::diag::write_line(&format!(
+                        "probe permit timeout after {}ms: degrading to cheap dims",
+                        started.elapsed().as_millis()
+                    ));
+                }
                 return None;
             }
             self.released.wait_for(&mut available, deadline - now);
@@ -214,6 +233,8 @@ enum DimSend {
     Disconnected,
 }
 
+/// Decode-queue waits above this are worth a diag line: a fast probe should never queue long.
+const DECODE_QUEUE_WAIT_TRACE: Duration = Duration::from_millis(100);
 /// Base backoff for decode retries after a failed/empty preload.
 const PRELOAD_RETRY_BASE_DELAY_MS: u64 = 250;
 /// Cap retry backoff so visible items recover quickly once they come into view.
@@ -300,7 +321,9 @@ pub fn trace_rule(rule: &str, index: usize) {
         }
     }
 
-    eprintln!("[manga-trace] {rule} idx={index}");
+    if !crate::diag::trace("manga-trace", &format!("{rule} idx={index}")) {
+        eprintln!("[manga-trace] {rule} idx={index}");
+    }
 }
 
 /// Media type for manga items (extended to include videos/animations)
@@ -809,8 +832,12 @@ impl MangaLoader {
         }
 
         for _ in 0..DIM_RESULT_SEND_MAX_ATTEMPTS {
+            crate::diag::count(crate::diag::Counter::DimAttempts, 1);
             match dim_result_tx.try_send(chunk) {
-                Ok(()) => return DimSend::Flushed,
+                Ok(()) => {
+                    crate::diag::count(crate::diag::Counter::DimChunks, 1);
+                    return DimSend::Flushed;
+                }
                 Err(TrySendError::Full(returned)) => {
                     chunk = returned;
                     std::thread::sleep(Duration::from_millis(DIM_RESULT_SEND_RETRY_SLEEP_MS));
@@ -819,6 +846,7 @@ impl MangaLoader {
             }
         }
 
+        crate::diag::count(crate::diag::Counter::DimParked, 1);
         parked.push_back(chunk);
         DimSend::Parked
     }
@@ -830,12 +858,13 @@ impl MangaLoader {
     ) -> DimSend {
         while let Some(chunk) = parked.pop_front() {
             match dim_result_tx.try_send(chunk) {
-                Ok(()) => {}
+                Ok(()) => crate::diag::count(crate::diag::Counter::DimFlushed, 1),
                 Err(TrySendError::Full(returned)) => {
                     parked.push_front(returned);
                     return DimSend::Parked;
                 }
                 Err(TrySendError::Disconnected(_)) => {
+                    crate::diag::count(crate::diag::Counter::DimDropped, parked.len() as u64 + 1);
                     parked.clear();
                     return DimSend::Disconnected;
                 }
@@ -893,6 +922,14 @@ impl MangaLoader {
             dimension_results: self.dim_result_rx.len(),
             dimension_probes: self.dim_pending.len(),
         }
+    }
+
+    /// (in-flight decode loads, retry-state entries) for the diag frame line.
+    pub fn diag_counts(&self) -> (usize, usize) {
+        (
+            self.loading_indices.read().len(),
+            self.retry_state.read().len(),
+        )
     }
 
     /// True when a visible index still needs a request: not in flight and no loaded level
@@ -1285,6 +1322,12 @@ impl MangaLoader {
 
                 // Load the image
                 let queue_wait = req.queued_at.elapsed();
+                if queue_wait >= DECODE_QUEUE_WAIT_TRACE {
+                    crate::diag::trace(
+                        "decode-queue",
+                        &format!("idx={} wait={}ms", req.index, queue_wait.as_millis()),
+                    );
+                }
                 let decode_started = Instant::now();
                 let decoded = Self::load_single_image(req);
                 let decode_time = decode_started.elapsed();
@@ -1471,6 +1514,11 @@ impl MangaLoader {
     }
 
     /// Dimensions without touching the gstreamer gate: cache, shell metadata, filename hint.
+    /// Counted once per gstreamer pipeline start: the summary line reports probes/s.
+    fn note_gst_probe() {
+        crate::diag::count(crate::diag::Counter::GstProbes, 1);
+    }
+
     fn cheap_video_dimensions(path: &std::path::Path) -> (u32, u32) {
         if let Some((w, h)) = lookup_cached_dimensions(path, CachedMediaKind::Video) {
             return (w, h);
@@ -1497,6 +1545,7 @@ impl MangaLoader {
         if gstreamer_runtime_available() {
             let mut owned = None;
             if probe_permit(permit, &mut owned).is_some() {
+                Self::note_gst_probe();
                 if let Some((w, h)) = probe_video_dimensions_with_gstreamer(path) {
                     if w > 0 && h > 0 {
                         store_cached_dimensions(path, CachedMediaKind::Video, w, h);
@@ -1692,6 +1741,7 @@ impl MangaLoader {
         let mut owned = None;
         if let Some(permit) = probe_permit(None, &mut owned) {
             if gstreamer_runtime_available() {
+                Self::note_gst_probe();
                 if let Some((w, h)) = probe_video_dimensions_with_gstreamer(path) {
                     if w > 0 && h > 0 {
                         store_cached_dimensions(path, CachedMediaKind::Video, w, h);
@@ -1851,6 +1901,7 @@ impl MangaLoader {
             caps_filter
         );
 
+        Self::note_gst_probe();
         let pipeline = gst::parse::launch(&pipeline_str).ok()?;
         let pipeline = pipeline.downcast::<gst::Pipeline>().ok()?;
 

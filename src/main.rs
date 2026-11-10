@@ -7,6 +7,7 @@ mod app_dirs;
 mod async_runtime;
 mod cache_key;
 mod config;
+mod diag;
 mod first_frame;
 mod folder_travel_cache;
 mod image_loader;
@@ -3023,6 +3024,8 @@ struct ImageViewer {
     manga_texture_missing_since: HashMap<usize, Instant>,
     /// Placeholder-spinner budget left in the current frame.
     manga_placeholder_spinners_left: usize,
+    /// Textures uploaded by the last `manga_process_pending_loads` pass (diag trace).
+    manga_uploads_last_pass: usize,
     /// Repairs spent per index: `(heals, window_start)`; bounds work on a genuinely broken file.
     manga_texture_heal_budget: HashMap<usize, (u32, Instant)>,
     /// First-seen instant per in-flight decode index, for stale in-flight eviction.
@@ -3514,6 +3517,7 @@ impl Default for ImageViewer {
             manga_demand_pump_at: Instant::now(),
             manga_texture_missing_since: HashMap::new(),
             manga_placeholder_spinners_left: Self::MANGA_PLACEHOLDER_SPINNER_MAX_PER_FRAME,
+            manga_uploads_last_pass: 0,
             manga_texture_heal_budget: HashMap::new(),
             manga_inflight_since: HashMap::new(),
             manga_pending_probe_since: HashMap::new(),
@@ -22301,6 +22305,7 @@ impl ImageViewer {
 
         // Tick the cache's frame counter for LRU tracking
         self.manga_texture_cache.tick();
+        self.manga_uploads_last_pass = uploaded_textures as usize;
 
         self.perf_metrics
             .record(Metric::MangaUploadPassMs, upload_pass_started.elapsed());
@@ -30979,8 +30984,38 @@ impl Drop for ImageViewer {
     }
 }
 
+/// Frame line fields for the diag trace; only built when diag is enabled.
+fn diag_frame_stats(
+    viewer: &ImageViewer,
+    frame_started: Instant,
+    repaint: &'static str,
+    backlog: (usize, usize, usize, usize),
+) -> diag::FrameStats {
+    let (inflight, retry) = viewer
+        .manga_loader
+        .as_ref()
+        .map(manga_loader::MangaLoader::diag_counts)
+        .unwrap_or((0, 0));
+
+    diag::FrameStats {
+        total: frame_started.elapsed(),
+        repaint,
+        visible: viewer.manga_visible_indices_last,
+        uploads: viewer.manga_uploads_last_pass,
+        backlog,
+        inflight,
+        retry,
+        ttv_pending: viewer.manga_ttv_pending.len(),
+    }
+}
+
 impl eframe::App for ImageViewer {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Only read the clock for the trace: a disabled frame must not pay for it.
+        let frame_started = diag::enabled().then(Instant::now);
+        diag::note_frame_start();
+        diag::note_stage("update");
+
         // Reset per-frame repaint tracking
         self.needs_repaint = false;
 
@@ -31104,6 +31139,7 @@ impl eframe::App for ImageViewer {
 
         // The settings window is its own window: the viewer keeps handling its own input.
         self.handle_input(ctx);
+        diag::note_stage("input");
 
         if self.should_short_circuit_frame_for_exit(false) {
             Self::send_fast_close_viewport_commands(ctx);
@@ -31121,6 +31157,7 @@ impl eframe::App for ImageViewer {
         // We must decode frames first so that pending_media_layout and show_window_if_ready
         // can see the correct dimensions and apply layout before showing the window.
         let texture_animation_active = self.update_texture(ctx);
+        diag::note_stage("texture");
         let window_is_maximized = self.current_window_is_maximized(ctx);
 
         // Apply layout changes after image changes.
@@ -31484,6 +31521,7 @@ impl eframe::App for ImageViewer {
         } else {
             self.draw_image(ctx)
         };
+        diag::note_stage("draw");
 
         // Draw video controls overlay (bottom bar for video playback controls)
         if !skip_drawing {
@@ -31654,36 +31692,48 @@ impl eframe::App for ImageViewer {
         // - Idle with video playing: poll near high-refresh cadence
         // - Time-based auto-hide UI: repaint once at its deadline
         // - Fully idle: push repaint far into the future (event loop will still wake on input)
+        diag::note_stage("schedule");
+        let mut repaint_reason = "none";
         if any_animation_active {
             if self.masonry_navigation_active_for_heavy_work() {
                 // Pace active masonry redraws near high-refresh cadence instead of spinning
                 // the UI thread as fast as possible under load.
+                repaint_reason = "animation-masonry-7ms";
                 ctx.request_repaint_after(Duration::from_millis(7));
             } else {
+                repaint_reason = "animation-immediate";
                 ctx.request_repaint();
             }
         } else if media_load_pending || manga_video_load_pending {
+            repaint_reason = "media-load-pending";
             ctx.request_repaint_after(Duration::from_millis(16));
         } else if self.pending_media_layout {
+            repaint_reason = "pending-layout";
             ctx.request_repaint_after(Duration::from_millis(16));
         } else if manga_needs_fast_background_poll {
+            repaint_reason = "manga-background-16ms";
             ctx.request_repaint_after(Duration::from_millis(16));
         } else if manga_background_work_pending {
+            repaint_reason = "manga-background-66ms";
             ctx.request_repaint_after(Duration::from_millis(66));
         } else if manga_video_playing {
             if self.mode().is_manga() && !self.mode().is_masonry() {
                 // Long-strip focused video playback should run near high-refresh cadence.
                 // 16ms caps it around 60 FPS and makes 120/144 FPS sources feel stuttery.
+                repaint_reason = "manga-video-playing-7ms";
                 ctx.request_repaint_after(Duration::from_millis(7));
             } else {
+                repaint_reason = "manga-video-playing-16ms";
                 ctx.request_repaint_after(Duration::from_millis(16));
             }
         } else if video_playing {
             // Solo video playback should match the same high-refresh pacing used by
             // long-strip focused video mode when hardware permits.
+            repaint_reason = "video-playing";
             ctx.request_repaint_after(Duration::from_millis(7));
         } else if self.video_player.is_some() {
             if let Some(delay) = cursor_idle_repaint_after {
+                repaint_reason = "cursor-idle";
                 ctx.request_repaint_after(delay);
             }
         } else {
@@ -31746,12 +31796,33 @@ impl eframe::App for ImageViewer {
             }
 
             if let Some(d) = next_repaint {
+                repaint_reason = "idle-deadline";
                 ctx.request_repaint_after(d);
             } else {
                 // Force truly idle behavior even if the integration's default would otherwise
                 // keep repainting. Input events still wake the event loop immediately.
+                repaint_reason = "idle-parked";
                 ctx.request_repaint_after(Duration::from_secs(60 * 60 * 24));
             }
+        }
+
+        // Guarded: a disabled session pays one cached bool load, no locks and no clock reads.
+        if let Some(frame_started) = frame_started {
+            let backlog = self
+                .manga_loader
+                .as_ref()
+                .map(manga_loader::MangaLoader::backlog)
+                .map(|backlog| {
+                    (
+                        backlog.loads,
+                        backlog.decoded,
+                        backlog.dimension_results,
+                        backlog.dimension_probes,
+                    )
+                })
+                .unwrap_or((0, 0, 0, 0));
+            let stats = diag_frame_stats(self, frame_started, repaint_reason, backlog);
+            diag::frame(&stats);
         }
     }
 
@@ -32011,6 +32082,8 @@ fn startup_window_for_no_file(screen_size: egui::Vec2) -> (egui::Vec2, egui::Pos
 fn main() -> eframe::Result<()> {
     init_runtime_diagnostics();
     install_panic_report_hook();
+    // After the panic-report hook, so diag's hook chains into it instead of replacing it.
+    diag::init();
     let _ = async_runtime::init_runtime();
 
     #[cfg(target_os = "windows")]
