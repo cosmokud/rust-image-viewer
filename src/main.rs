@@ -8685,14 +8685,10 @@ impl ImageViewer {
     }
 
     fn try_toggle_solo_video_play_pause(&mut self) {
-        let toggle_error = self
-            .video_player
-            .as_mut()
-            .and_then(|player| player.toggle_play_pause().err());
-
-        if let Some(err) = toggle_error {
-            self.set_video_playback_unavailable_runtime(err);
-            return;
+        // Enqueues only: a wedged decoder used to freeze this click for the full 5 s timeout.
+        // A real failure arrives through `take_control_error` and still raises the popup.
+        if let Some(player) = self.video_player.as_mut() {
+            player.toggle_play_pause_async();
         }
 
         if self.video_player.is_none() && self.is_video_playback_unavailable_active() {
@@ -8701,15 +8697,26 @@ impl ImageViewer {
     }
 
     fn try_toggle_manga_video_play_pause(&mut self, index: usize) {
-        let toggle_error = self
-            .manga_video_players
-            .get_mut(&index)
-            .and_then(|player| player.toggle_play_pause().err());
+        // Enqueues only; failure recovery happens in `manga_poll_video_control_errors`.
+        if let Some(player) = self.manga_video_players.get_mut(&index) {
+            player.toggle_play_pause_async();
+        }
+    }
 
-        if let Some(err) = toggle_error {
+    /// Async state changes report failures on the control thread. Apply the recovery the
+    /// synchronous path used to (drop the player, name the reason) once per frame.
+    fn manga_poll_video_control_errors(&mut self) {
+        let failed: Vec<(usize, String)> = self
+            .manga_video_players
+            .iter_mut()
+            .filter_map(|(&index, player)| player.take_control_error().map(|err| (index, err)))
+            .collect();
+
+        for (index, err) in failed {
             self.remove_manga_video_player(index);
             self.remove_manga_video_texture(index);
             self.manga_video_preview_resume_secs.remove(&index);
+            self.manga_video_failed.insert(index);
             if self.manga_focused_video_index == Some(index) {
                 self.manga_focused_video_index = None;
             }
@@ -15888,10 +15895,10 @@ impl ImageViewer {
 
                             if current_was_playing {
                                 if !player.is_playing() {
-                                    let _ = player.play();
+                                    player.play_async();
                                 }
                             } else if player.is_playing() {
-                                let _ = player.pause();
+                                player.pause_async();
                             }
 
                             player.set_muted(current_muted);
@@ -15908,12 +15915,8 @@ impl ImageViewer {
                         );
 
                         if autoplay && !player.is_playing() {
-                            if let Err(err) = player.play() {
-                                self.manga_video_failed.insert(index);
-                                self.video_playback_unavailable_reason = Some(err);
-                                self.manga_focused_video_index = None;
-                                continue;
-                            }
+                            // Enqueues only; a failure surfaces via `take_control_error` later.
+                            player.play_async();
                         }
                     }
 
@@ -20672,7 +20675,7 @@ impl ImageViewer {
                     }
                 }
                 if player.is_playing() {
-                    let _ = player.pause();
+                    player.pause_async();
                 }
             }
             self.manga_video_preview_resume_secs.remove(&idx);
@@ -20717,7 +20720,7 @@ impl ImageViewer {
                     }
                 }
                 if player.is_playing() {
-                    let _ = player.pause();
+                    player.pause_async();
                 }
             }
             self.remove_manga_video_texture(idx);
@@ -20741,6 +20744,7 @@ impl ImageViewer {
     /// Update manga video playback based on current scroll position.
     /// Ensures only one video plays at a time (the focused one).
     fn manga_update_video_focus(&mut self) {
+        self.manga_poll_video_control_errors();
         if self.mode().is_solo() || self.image_list.is_empty() {
             self.clear_pending_manga_video_load();
             return;
@@ -20750,7 +20754,7 @@ impl ImageViewer {
             if self.manga_focused_video_index.is_some() {
                 for player in self.manga_video_players.values_mut() {
                     if player.is_playing() {
-                        let _ = player.pause();
+                        player.pause_async();
                     }
                 }
             }
@@ -20772,7 +20776,7 @@ impl ImageViewer {
                 if self.manga_focused_video_index.is_some() {
                     for player in self.manga_video_players.values_mut() {
                         if player.is_playing() {
-                            let _ = player.pause();
+                            player.pause_async();
                         }
                     }
                     self.manga_focused_video_index = None;
@@ -20831,33 +20835,21 @@ impl ImageViewer {
                 // Pause all other videos
                 for (&idx, player) in self.manga_video_players.iter_mut() {
                     if idx != focused_idx && player.is_playing() {
-                        let _ = player.pause();
+                        player.pause_async();
                     }
                 }
             }
             self.manga_strip_retain_only_focused_video(focused_idx);
 
-            let focus_play_error =
-                if let Some(player) = self.manga_video_players.get_mut(&focused_idx) {
-                    if focus_changed {
-                        Self::seek_video_player_to_resume_position(player, resume_position);
-                    }
+            if let Some(player) = self.manga_video_players.get_mut(&focused_idx) {
+                if focus_changed {
+                    Self::seek_video_player_to_resume_position(player, resume_position);
+                }
 
-                    if focus_changed && !player.is_playing() {
-                        player.play().err()
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-
-            if let Some(err) = focus_play_error {
-                self.manga_video_failed.insert(focused_idx);
-                self.video_playback_unavailable_reason = Some(err);
-                self.manga_focused_video_index = None;
-                self.clear_pending_manga_video_load();
-                return;
+                // Enqueues only; a failed state change surfaces via the control-error poll.
+                if focus_changed && !player.is_playing() {
+                    player.play_async();
+                }
             }
 
             if let Some(player) = self.manga_video_players.get_mut(&focused_idx) {
@@ -20906,7 +20898,7 @@ impl ImageViewer {
             if self.manga_focused_video_index.is_some() {
                 for player in self.manga_video_players.values_mut() {
                     if player.is_playing() {
-                        let _ = player.pause();
+                        player.pause_async();
                     }
                 }
                 self.manga_focused_video_index = None;
@@ -26447,6 +26439,14 @@ impl ImageViewer {
         }
 
         // Handle video frame updates
+        // Failed queued state changes surface here instead of on the click/call site.
+        if let Some(err) = self
+            .video_player
+            .as_mut()
+            .and_then(|player| player.take_control_error())
+        {
+            self.set_video_playback_unavailable_runtime(err);
+        }
         if let Some(ref mut player) = self.video_player {
             // Detect a frozen decoder early and demote the AV1 hardware decoders so the
             // next navigation loads without a state-change timeout delay.
@@ -28418,7 +28418,7 @@ impl ImageViewer {
         let mut file_navigation_requested: Option<VideoFileNavigation> = None;
         let mut audio_track_requested: Option<i32> = None;
         let mut subtitle_selection_requested: Option<VideoSubtitleSelection> = None;
-        let mut resume_error: Option<String> = None;
+        let resume_error: Option<String> = None;
 
         ui.vertical(|ui| {
             // === Seek bar (top row) ===
@@ -28499,7 +28499,7 @@ impl ImageViewer {
                 self.is_seeking = true;
                 self.seek_was_playing = player.is_playing();
                 if self.seek_was_playing {
-                    let _ = player.pause();
+                    player.pause_async();
                 }
                 self.seek_last_requested_fraction = None;
                 // Allow an immediate seek on the first frame of interaction.
@@ -28556,7 +28556,7 @@ impl ImageViewer {
                 self.last_seek_sent_at = Instant::now();
 
                 if self.seek_was_playing {
-                    resume_error = player.play().err();
+                    player.play_async();
                 }
                 self.seek_was_playing = false;
                 ctx.request_repaint();
@@ -29348,7 +29348,7 @@ impl ImageViewer {
         let mut file_navigation_requested: Option<VideoFileNavigation> = None;
         let mut audio_track_requested: Option<i32> = None;
         let mut subtitle_selection_requested: Option<VideoSubtitleSelection> = None;
-        let mut resume_error: Option<String> = None;
+        let resume_error: Option<String> = None;
 
         if !self.manga_video_player_matches(video_idx) {
             return;
@@ -29433,7 +29433,7 @@ impl ImageViewer {
                     self.manga_video_seek_was_playing = player.is_playing();
                     if self.manga_video_seek_was_playing {
                         if let Some(p) = self.manga_video_players.get_mut(&video_idx) {
-                            let _ = p.pause();
+                            p.pause_async();
                         }
                     }
                     self.manga_video_seek_last_requested_fraction = None;
@@ -29496,7 +29496,7 @@ impl ImageViewer {
 
                 if self.manga_video_seek_was_playing {
                     if let Some(player) = self.manga_video_players.get_mut(&video_idx) {
-                        resume_error = player.play().err();
+                        player.play_async();
                     }
                 }
                 self.manga_video_seek_was_playing = false;
@@ -31173,7 +31173,7 @@ impl eframe::App for ImageViewer {
             // Pause video playback when minimized to save CPU
             if let Some(ref mut player) = self.video_player {
                 if player.is_playing() {
-                    let _ = player.pause();
+                    player.pause_async();
                 }
             }
             // Don't request repaint when minimized - OS will handle restore
@@ -32171,6 +32171,7 @@ fn main() -> eframe::Result<()> {
     install_panic_report_hook();
     // After the panic-report hook, so diag's hook chains into it instead of replacing it.
     diag::init();
+    video_player::mark_ui_thread();
     let _ = async_runtime::init_runtime();
 
     #[cfg(target_os = "windows")]

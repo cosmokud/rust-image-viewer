@@ -882,6 +882,19 @@ const ACCURATE_SEEK_PREROLL_TIMEOUT_MS: u64 = 75;
 // call therefore runs on a helper thread with a hard timeout.
 const STATE_CHANGE_TIMEOUT: Duration = Duration::from_secs(5);
 const UI_STATE_CHANGE_TIMEOUT: Duration = Duration::from_secs(1);
+/// Any blocking GStreamer call this long on the UI thread is a freeze worth a diag line.
+const UI_BLOCKING_WARN_TIMEOUT: Duration = Duration::from_secs(1);
+
+static UI_THREAD: std::sync::OnceLock<std::thread::ThreadId> = std::sync::OnceLock::new();
+
+/// Called once from `main` so a synchronous state change on the frame path can be detected.
+pub fn mark_ui_thread() {
+    let _ = UI_THREAD.set(std::thread::current().id());
+}
+
+fn on_ui_thread() -> bool {
+    UI_THREAD.get() == Some(&std::thread::current().id())
+}
 const SEEK_TIMEOUT: Duration = Duration::from_secs(3);
 const QUERY_TIMEOUT: Duration = Duration::from_millis(250);
 /// Bounded command queue for blocking GStreamer calls issued from the UI thread. A wedged decoder
@@ -1011,6 +1024,18 @@ pub(crate) fn run_gst_with_timeout<T: Send + 'static>(
     timeout: Duration,
     f: impl FnOnce() -> T + Send + 'static,
 ) -> Option<T> {
+    // A multi-second call on the UI thread is a freeze: name it in the diag log so a caller that
+    // regressed back onto the frame path is visible instead of only feeling like a stall.
+    if timeout >= UI_BLOCKING_WARN_TIMEOUT && on_ui_thread() {
+        debug_assert!(
+            false,
+            "blocking gst call '{thread_name}' ({}ms) on the UI thread",
+            timeout.as_millis()
+        );
+        crate::diag::trace_file("ui-gst-block", || {
+            format!("{thread_name} timeout={}ms", timeout.as_millis())
+        });
+    }
     let (result_tx, result_rx) = std::sync::mpsc::channel();
     // Hold the closure in a shared cell so we can still run it inline if spawning
     // the helper thread fails (the 'static requirement prevents borrowing it).
@@ -1113,11 +1138,44 @@ fn spawn_control_thread(
                         }
                     }
                 }
+                ControlCommand::Play => {
+                    apply_queued_state_change(&pipeline, StateTarget::Playing, &event_tx);
+                }
+                ControlCommand::Pause => {
+                    apply_queued_state_change(&pipeline, StateTarget::Paused, &event_tx);
+                }
             }
         }
     });
 
     (command_tx, event_rx)
+}
+
+/// One queued `play`/`pause`: the wait lives here, the UI thread only enqueued it.
+fn apply_queued_state_change(
+    pipeline: &gst::Pipeline,
+    target: StateTarget,
+    event_tx: &crossbeam_channel::Sender<ControlEvent>,
+) {
+    let (name, state, verb) = match target {
+        StateTarget::Playing => ("control-state-playing", gst::State::Playing, "resume"),
+        StateTarget::Paused => ("control-state-paused", gst::State::Paused, "pause"),
+    };
+    let pipeline = pipeline.clone();
+    match run_gst_with_timeout(name, STATE_CHANGE_TIMEOUT, move || {
+        pipeline.set_state(state)
+    }) {
+        Some(Ok(_)) => {}
+        Some(Err(err)) => {
+            let _ = event_tx.try_send(ControlEvent::Failed(format!(
+                "Failed to {verb} playback: {}",
+                err
+            )));
+        }
+        None => {
+            let _ = event_tx.try_send(ControlEvent::Wedged);
+        }
+    }
 }
 
 fn set_optional_bool_property(element: &gst::Element, name: &str, value: bool) {
@@ -1647,13 +1705,23 @@ fn process_video_sample(sample: gst::Sample, state: &VideoState) {
 }
 
 /// Video player using GStreamer
-/// Blocking work handed to the video control thread. Only commands issued from the UI thread's
-/// per-frame loop live here; one per user input (`play`/`pause`/scrub) stays synchronous because
-/// its error must reach the caller immediately.
+/// Blocking work handed to the video control thread. Every `play`/`pause` a UI thread site
+/// issues lands here: a wedged decoder used to hold that thread for the full 5s timeout.
 #[derive(Clone, Copy, Debug)]
 enum ControlCommand {
     /// Seek to the start and resume: the end-of-stream loop path.
     Restart,
+    /// Resume, fire-and-forget.
+    Play,
+    /// Pause, fire-and-forget.
+    Pause,
+}
+
+/// What a queued state change is trying to reach, for the failure message.
+#[derive(Clone, Copy)]
+enum StateTarget {
+    Playing,
+    Paused,
 }
 
 /// Outcome of a queued command, drained by the UI thread once per frame.
@@ -1710,6 +1778,8 @@ pub struct VideoPlayer {
     // `None` once dropped, which closes the queue so the control thread exits before teardown.
     control_tx: Option<crossbeam_channel::Sender<ControlCommand>>,
     control_events: crossbeam_channel::Receiver<ControlEvent>,
+    /// Last failure reported by the control thread; the UI polls it for the error popup.
+    control_error: Option<String>,
 }
 
 impl VideoPlayer {
@@ -1984,6 +2054,7 @@ Ensure your GStreamer installation includes the playback elements (usually from 
             selected_stream_ids: Vec::new(),
             control_tx: Some(control_tx),
             control_events,
+            control_error: None,
         };
 
         let mut player = player;
@@ -2109,13 +2180,54 @@ Ensure your GStreamer installation includes the playback elements (usually from 
         Ok(())
     }
 
-    /// Toggle play/pause
-    pub fn toggle_play_pause(&mut self) -> Result<(), String> {
-        if self.is_playing {
-            self.pause()
-        } else {
-            self.play()
+    /// `play()` without the wait: the state change runs on the control thread and the local state
+    /// is applied now, so the next frame already reports "playing". `false` = queue full or gone
+    /// (caller retries next frame); a failed state change arrives as `ControlEvent::Failed`.
+    pub fn play_async(&mut self) -> bool {
+        let Some(tx) = self.control_tx.as_ref() else {
+            return false;
+        };
+        if !try_enqueue_control(tx, ControlCommand::Play) {
+            return false;
         }
+
+        // Duration comes from the per-frame poll: querying it here blocks for QUERY_TIMEOUT.
+        self.is_playing = true;
+        self.buffering_paused = false;
+        self.buffering_pause_suppressed_until = None;
+        self.eos_seen = false;
+        self.last_frame_at.set(None);
+        self.play_started_at.set(Some(Instant::now()));
+        true
+    }
+
+    /// `pause()` without the wait. Same queue contract as `play_async`.
+    pub fn pause_async(&mut self) -> bool {
+        let Some(tx) = self.control_tx.as_ref() else {
+            return false;
+        };
+        if !try_enqueue_control(tx, ControlCommand::Pause) {
+            return false;
+        }
+        self.is_playing = false;
+        self.buffering_paused = false;
+        self.buffering_pause_suppressed_until = None;
+        self.last_frame_at.set(None);
+        true
+    }
+
+    /// `toggle_play_pause` without the wait: a user click must not freeze the frame for 5s.
+    pub fn toggle_play_pause_async(&mut self) -> bool {
+        if self.is_playing {
+            self.pause_async()
+        } else {
+            self.play_async()
+        }
+    }
+
+    /// Take the last state-change failure reported by the control thread, if any.
+    pub fn take_control_error(&mut self) -> Option<String> {
+        self.control_error.take()
     }
 
     /// Check if currently playing
@@ -2948,6 +3060,7 @@ Ensure your GStreamer installation includes the playback elements (usually from 
                 }
                 ControlEvent::Failed(message) => {
                     crate::diag::trace("video-control", &message);
+                    self.control_error = Some(message);
                 }
             }
         }
