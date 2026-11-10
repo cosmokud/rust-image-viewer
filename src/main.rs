@@ -3088,8 +3088,10 @@ struct ImageViewer {
     /// Path paired with each live manga video texture. Index-only ownership is
     /// unsafe during strip/fullscreen/strip churn because list slots can be reused.
     manga_video_texture_paths: HashMap<usize, PathBuf>,
-    /// Videos that failed focused playback startup in this manga session.
-    manga_video_failed: HashSet<usize>,
+    /// Videos that failed focused playback startup, with the failure time so the memo expires.
+    manga_video_failed: HashMap<usize, Instant>,
+    /// Rate-limits the "control queue refused play" diag line.
+    last_video_play_refused_log: Option<Instant>,
     /// Index of the currently focused (playing) video in manga mode.
     /// Only one video plays at a time; all others are paused.
     manga_focused_video_index: Option<usize>,
@@ -3551,7 +3553,8 @@ impl Default for ImageViewer {
             manga_video_preview_resume_by_path: HashMap::new(),
             manga_video_textures: HashMap::new(),
             manga_video_texture_paths: HashMap::new(),
-            manga_video_failed: HashSet::new(),
+            manga_video_failed: HashMap::new(),
+            last_video_play_refused_log: None,
             manga_focused_video_index: None,
             manga_hovered_media_index: None,
             manga_hover_autoplay_resume_at: Instant::now(),
@@ -3665,6 +3668,13 @@ impl ImageViewer {
     const MANGA_STALE_INFLIGHT_LIMIT: Duration = Duration::from_secs(10);
     /// Stale scan pacing: participant maps are loader-backed, so never scan every frame.
     const MANGA_STALE_SCAN_INTERVAL: Duration = Duration::from_millis(500);
+    /// An in-flight focused-video load older than this is abandoned so a coordinator/gst wedge
+    /// cannot gate hover autoplay for that tile for the rest of the session.
+    const MANGA_VIDEO_LOAD_STALE_AFTER: Duration = Duration::from_secs(12);
+    /// Failed-video memo lifetime; the tile retries after this instead of failing for the session.
+    const MANGA_VIDEO_FAILED_COOLDOWN: Duration = Duration::from_secs(30);
+    /// One "control queue refused play" diag line per this interval.
+    const MANGA_VIDEO_PLAY_REFUSED_LOG_INTERVAL: Duration = Duration::from_secs(1);
     const MANGA_STRIP_PLAYBACK_BACKGROUND_TICK_MS: u64 = 80;
     const MANGA_PAGE_NAV_REPEAT_INITIAL_DELAY_MS: u64 = 260;
     const MANGA_PAGE_NAV_REPEAT_INTERVAL_MS: u64 = 45;
@@ -8721,7 +8731,7 @@ impl ImageViewer {
             self.remove_manga_video_player(index);
             self.remove_manga_video_texture(index);
             self.manga_video_preview_resume_secs.remove(&index);
-            self.manga_video_failed.insert(index);
+            self.manga_video_failed.insert(index, Instant::now());
             if self.manga_focused_video_index == Some(index) {
                 self.manga_focused_video_index = None;
             }
@@ -15729,6 +15739,32 @@ impl ImageViewer {
         self.pending_manga_video_load = None;
     }
 
+    /// Drops failed-video memos that aged out or left the window: a re-entered tile retries
+    /// instead of failing for the whole session.
+    fn prune_manga_video_failed(&mut self, visible: Option<&HashSet<usize>>) {
+        if self.manga_video_failed.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        self.manga_video_failed.retain(|&index, failed_at| {
+            !Self::manga_video_failure_expired(*failed_at, now)
+                && visible.map_or(true, |set| set.contains(&index))
+        });
+    }
+
+    fn manga_video_failure_expired(failed_at: Instant, now: Instant) -> bool {
+        now.saturating_duration_since(failed_at) >= Self::MANGA_VIDEO_FAILED_COOLDOWN
+    }
+
+    /// A refused play must not latch the focus index, or the tile never retries.
+    fn manga_video_focus_should_latch(play_refused: bool) -> bool {
+        !play_refused
+    }
+
+    fn manga_video_load_expired(started_at: Instant, now: Instant) -> bool {
+        now.saturating_duration_since(started_at) >= Self::MANGA_VIDEO_LOAD_STALE_AFTER
+    }
+
     fn manga_video_load_pending_for_index(&self, index: usize) -> bool {
         self.pending_manga_video_load
             .as_ref()
@@ -15830,6 +15866,8 @@ impl ImageViewer {
             );
 
             let Some(pending) = self.pending_manga_video_load.as_ref() else {
+                // Late result for an expired/cleared load: drop it, but never silently.
+                self.perf_metrics.count(Metric::MangaVideoAsyncStale, 1);
                 continue;
             };
 
@@ -16016,7 +16054,7 @@ impl ImageViewer {
                     result: Err(err),
                     ..
                 } => {
-                    self.manga_video_failed.insert(index);
+                    self.manga_video_failed.insert(index, Instant::now());
                     self.video_playback_unavailable_reason =
                         Some(format!("Failed to load video: {}", err));
                     eprintln!(
@@ -20772,6 +20810,7 @@ impl ImageViewer {
         }
 
         let visible_indices_for_preview = self.manga_prune_hidden_video_preview_state();
+        self.prune_manga_video_failed(visible_indices_for_preview.as_ref());
 
         let focused_idx = if self.mode().is_masonry() {
             if let Some(hovered_idx) = self.manga_hovered_media_index {
@@ -20822,7 +20861,7 @@ impl ImageViewer {
         });
 
         if focused_is_video {
-            if self.manga_video_failed.contains(&focused_idx) {
+            if self.manga_video_failed.contains_key(&focused_idx) {
                 self.manga_focused_video_index = None;
                 self.clear_pending_manga_video_load();
                 return;
@@ -20847,14 +20886,26 @@ impl ImageViewer {
             }
             self.manga_strip_retain_only_focused_video(focused_idx);
 
+            let mut play_refused = false;
             if let Some(player) = self.manga_video_players.get_mut(&focused_idx) {
                 if focus_changed {
                     Self::seek_video_player_to_resume_position(player, resume_position);
                 }
 
                 // Enqueues only; a failed state change surfaces via the control-error poll.
-                if focus_changed && !player.is_playing() {
-                    player.play_async();
+                if focus_changed && !player.is_playing() && !player.play_async() {
+                    // Refused: keep focus unlatched so the next frame retries instead of
+                    // leaving this tile unable to play.
+                    play_refused = true;
+                    if self.last_video_play_refused_log.map_or(true, |at| {
+                        at.elapsed() >= Self::MANGA_VIDEO_PLAY_REFUSED_LOG_INTERVAL
+                    }) {
+                        self.last_video_play_refused_log = Some(Instant::now());
+                        crate::diag::trace(
+                            "video-control",
+                            "manga video control queue refused play; retrying next frame",
+                        );
+                    }
                 }
             }
 
@@ -20864,7 +20915,9 @@ impl ImageViewer {
                     Self::apply_video_audio_overrides(player, muted_override, volume_override);
                 }
 
-                self.manga_focused_video_index = Some(focused_idx);
+                if Self::manga_video_focus_should_latch(play_refused) {
+                    self.manga_focused_video_index = Some(focused_idx);
+                }
                 if !self.manga_video_load_pending_for_index(focused_idx) {
                     self.clear_pending_manga_video_load();
                 }
@@ -20884,6 +20937,25 @@ impl ImageViewer {
                 self.clear_pending_manga_video_load();
                 return;
             };
+
+            // Stale gate: a coordinator/gst wedge can leave the request pending forever, so an
+            // expired one is abandoned here and resubmitted in the same frame. The late result is
+            // discarded by the request_id/index/path check in poll_pending_manga_video_load.
+            if self
+                .pending_manga_video_load
+                .as_ref()
+                .is_some_and(|pending| {
+                    pending.index == focused_idx
+                        && Self::manga_video_load_expired(pending.started_at, Instant::now())
+                })
+            {
+                self.clear_pending_manga_video_load();
+                self.perf_metrics.count(Metric::MangaVideoAsyncStale, 1);
+                crate::diag::trace(
+                    "video-control",
+                    "stale manga focused video load expired; resubmitting",
+                );
+            }
 
             if !self.manga_video_load_pending_for_index(focused_idx) {
                 // Ensure GStreamer is initialized before background startup work.
@@ -32587,8 +32659,82 @@ fn title_bar_left_layout(
 mod tests {
     use super::{
         FullscreenViewState, HashSet, ImageFrame, ImageViewer, MangaLayoutMode, MangaLoader,
-        MediaType, Mode, SoloPreloadMomentum,
+        MediaType, Mode, PendingMangaFocusedVideoLoad, SoloPreloadMomentum,
     };
+
+    #[test]
+    fn stale_pending_manga_video_load_expires_and_reopens_the_submit_gate() {
+        let mut viewer = ImageViewer::default();
+        let path = std::path::PathBuf::from("sample.webm");
+        viewer.image_list = vec![path.clone()];
+        let stale_at = std::time::Instant::now()
+            - ImageViewer::MANGA_VIDEO_LOAD_STALE_AFTER
+            - std::time::Duration::from_secs(1);
+        viewer.pending_manga_video_load = Some(PendingMangaFocusedVideoLoad {
+            request_id: 1,
+            index: 0,
+            path,
+            started_at: stale_at,
+        });
+        assert!(viewer.manga_video_load_pending_for_index(0));
+
+        // Same predicate the focus path uses at the submit gate.
+        let expired = viewer
+            .pending_manga_video_load
+            .as_ref()
+            .is_some_and(|pending| {
+                pending.index == 0
+                    && ImageViewer::manga_video_load_expired(
+                        pending.started_at,
+                        std::time::Instant::now(),
+                    )
+            });
+        assert!(expired, "a wedged load must expire");
+        viewer.clear_pending_manga_video_load();
+        assert!(
+            !viewer.manga_video_load_pending_for_index(0),
+            "an expired load must allow a fresh submit"
+        );
+
+        // A fresh request is not stale.
+        assert!(!ImageViewer::manga_video_load_expired(
+            std::time::Instant::now(),
+            std::time::Instant::now()
+        ));
+    }
+
+    #[test]
+    fn manga_video_failure_memo_expires_and_clears_when_out_of_window() {
+        let mut viewer = ImageViewer::default();
+        let now = std::time::Instant::now();
+        let expired_at =
+            now - ImageViewer::MANGA_VIDEO_FAILED_COOLDOWN - std::time::Duration::from_secs(1);
+        viewer.manga_video_failed.insert(1, now);
+        viewer.manga_video_failed.insert(2, expired_at);
+        viewer.manga_video_failed.insert(3, now);
+
+        let visible: HashSet<usize> = [1usize, 2].into_iter().collect();
+        viewer.prune_manga_video_failed(Some(&visible));
+
+        assert!(
+            viewer.manga_video_failed.contains_key(&1),
+            "fresh memo gates"
+        );
+        assert!(
+            !viewer.manga_video_failed.contains_key(&2),
+            "an expired memo must let the tile retry"
+        );
+        assert!(
+            !viewer.manga_video_failed.contains_key(&3),
+            "leaving the window must clear the memo"
+        );
+    }
+
+    #[test]
+    fn refused_video_play_does_not_latch_focus() {
+        assert!(ImageViewer::manga_video_focus_should_latch(false));
+        assert!(!ImageViewer::manga_video_focus_should_latch(true));
+    }
 
     #[test]
     fn mailbox_byte_budget_prunes_speculative_entries_only() {
