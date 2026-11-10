@@ -3681,6 +3681,9 @@ impl ImageViewer {
     const BOTTOM_RIGHT_OVERLAY_MARGIN: f32 = 16.0;
     const BOTTOM_RIGHT_OVERLAY_SCROLLBAR_PADDING: f32 = 35.0;
     const MANGA_HUD_PANEL_WIDTH: f32 = 224.0;
+    /// Lucide box for the transport volume glyph. The SVG grid is 24px, so a
+    /// 16px box keeps its stroke weight in line with the drawn transport glyphs.
+    const VIDEO_VOLUME_ICON_SIZE: f32 = 16.0;
     const MANGA_HUD_PANEL_HEIGHT: f32 = 32.0;
     const MANGA_HUD_PANEL_INNER_WIDTH: f32 = 208.0;
     const MANGA_HUD_PANEL_INNER_HEIGHT: f32 = 24.0;
@@ -9304,23 +9307,49 @@ impl ImageViewer {
         color: egui::Color32,
     ) {
         match icon {
+            VideoControlIcon::Play => {
+                let inset_x = rect.width() * 0.24;
+                let inset_y = rect.height() * 0.14;
+                let triangle = [
+                    egui::pos2(rect.left() + inset_x, rect.top() + inset_y),
+                    egui::pos2(rect.left() + inset_x, rect.bottom() - inset_y),
+                    egui::pos2(rect.right() - inset_x * 0.6, rect.center().y),
+                ];
+                Self::fill_round_polygon(painter, &triangle, rect.width() * 0.09, color);
+            }
+            VideoControlIcon::Pause => {
+                let bar_width = rect.width() * 0.17;
+                let bar_height = rect.height() * 0.74;
+                let gap = rect.width() * 0.18;
+                let top = rect.center().y - bar_height * 0.5;
+                for bar_left in [
+                    rect.center().x - gap * 0.5 - bar_width,
+                    rect.center().x + gap * 0.5,
+                ] {
+                    let bar_rect = egui::Rect::from_min_size(
+                        egui::pos2(bar_left, top),
+                        egui::vec2(bar_width, bar_height),
+                    );
+                    painter.rect_filled(bar_rect, bar_width * 0.35, color);
+                }
+            }
             VideoControlIcon::Previous | VideoControlIcon::Next => {
                 let forward = matches!(icon, VideoControlIcon::Next);
                 let width = rect.width();
-                let bar_width = width * 0.13;
-                let side_inset = width * 0.17;
-                let vertical_inset = rect.height() * 0.18;
+                let bar_width = width * 0.15;
+                let side_inset = width * 0.13;
+                let vertical_inset = rect.height() * 0.15;
                 let (bar_left, base_x, apex_x) = if forward {
                     (
                         rect.right() - side_inset - bar_width,
                         rect.left() + side_inset,
-                        rect.right() - side_inset - bar_width - width * 0.1,
+                        rect.right() - side_inset - bar_width - width * 0.07,
                     )
                 } else {
                     (
                         rect.left() + side_inset,
                         rect.right() - side_inset,
-                        rect.left() + side_inset + bar_width + width * 0.1,
+                        rect.left() + side_inset + bar_width + width * 0.07,
                     )
                 };
                 let bar_rect = egui::Rect::from_min_max(
@@ -9334,7 +9363,7 @@ impl ImageViewer {
                     egui::pos2(base_x, rect.bottom() - vertical_inset),
                     egui::pos2(apex_x, rect.center().y),
                 ];
-                Self::fill_round_polygon(painter, &triangle, width * 0.08, color);
+                Self::fill_round_polygon(painter, &triangle, width * 0.07, color);
             }
             VideoControlIcon::AudioTracks => {
                 let speaker_points = vec![
@@ -9459,8 +9488,23 @@ impl ImageViewer {
             egui::pos2(content_start_x, rect.center().y - icon_size.y * 0.5),
             icon_size,
         );
+
+        // Volume uses the Lucide speaker artwork (plain, or crossed out when
+        // muted); every other transport glyph is drawn from primitives below.
         let text_color = visuals.fg_stroke.color;
-        Self::draw_video_control_vector_icon(painter, icon, icon_rect, text_color);
+        if matches!(
+            icon,
+            VideoControlIcon::VolumeOn | VideoControlIcon::VolumeOff
+        ) {
+            let muted = matches!(icon, VideoControlIcon::VolumeOff);
+            let volume_rect = egui::Rect::from_center_size(
+                icon_rect.center(),
+                egui::Vec2::splat(Self::VIDEO_VOLUME_ICON_SIZE),
+            );
+            Self::paint_volume_lucide_icon(ui, volume_rect, muted, text_color);
+        } else {
+            Self::draw_video_control_vector_icon(painter, icon, icon_rect, text_color);
+        }
 
         if let Some(label_galley) = label_galley {
             let text_pos = egui::pos2(
@@ -9480,34 +9524,7 @@ impl ImageViewer {
         label: Option<&str>,
         active: bool,
     ) -> egui::Response {
-        if matches!(
-            icon,
-            VideoControlIcon::Previous
-                | VideoControlIcon::Next
-                | VideoControlIcon::AudioTracks
-                | VideoControlIcon::SubtitleTracks
-        ) {
-            return Self::video_control_vector_icon_button(ui, icon, tooltip, label, active);
-        }
-
-        let icon_text = match icon {
-            VideoControlIcon::Play => "\u{25B6}",
-            VideoControlIcon::Pause => "\u{23F8}",
-            VideoControlIcon::VolumeOn => "\u{1F50A}",
-            VideoControlIcon::VolumeOff => "\u{1F507}",
-            VideoControlIcon::Previous
-            | VideoControlIcon::Next
-            | VideoControlIcon::AudioTracks
-            | VideoControlIcon::SubtitleTracks => "",
-        };
-
-        let button_text = label.filter(|text| !text.is_empty()).map_or_else(
-            || icon_text.to_string(),
-            |text| format!("{} {}", icon_text, text),
-        );
-
-        ui.add(egui::Button::new(button_text).min_size(egui::vec2(32.0, 24.0)))
-            .on_hover_text(tooltip)
+        Self::video_control_vector_icon_button(ui, icon, tooltip, label, active)
     }
 
     fn draw_audio_track_popup(
@@ -10496,7 +10513,9 @@ impl ImageViewer {
         }
     }
 
-    /// Filled polygon with softened (circular) corners.
+    /// Filled convex polygon with softened corners. The interior is inset along
+    /// each edge and no corner discs are added, so a transport triangle keeps its
+    /// points instead of bulging into a rounded blob.
     fn fill_round_polygon(
         painter: &egui::Painter,
         points: &[egui::Pos2],
@@ -10523,9 +10542,6 @@ impl ImageViewer {
             color,
             egui::Stroke::NONE,
         ));
-        for point in points {
-            painter.circle_filled(*point, radius, color);
-        }
     }
 
     /// Paint a Lucide SVG at `rect`, snapped to whole device pixels, so the
@@ -10550,6 +10566,22 @@ impl ImageViewer {
             .texture_options(egui::TextureOptions::NEAREST)
             .tint(color)
             .paint_at(ui, snapped);
+    }
+
+    /// Lucide artwork for a transport-volume state, carrying the same tint and
+    /// stroked outline as the drawn transport glyphs next to it.
+    fn paint_volume_lucide_icon(
+        ui: &egui::Ui,
+        rect: egui::Rect,
+        muted: bool,
+        color: egui::Color32,
+    ) {
+        let source = if muted {
+            egui::include_image!("../assets/lucide/volume-x.svg")
+        } else {
+            egui::include_image!("../assets/lucide/volume-2.svg")
+        };
+        Self::paint_lucide_icon(ui, rect, source, color);
     }
 
     fn paint_menu_action_icon(
