@@ -1900,7 +1900,10 @@ fn process_solo_probe_request(request: SoloProbeRequest) -> SoloProbeResult {
             path,
             max_texture_side,
         } => SoloProbeResult::Video {
-            thumbnail: extract_video_first_frame_thumbnail(path.as_path(), max_texture_side),
+            thumbnail: manga_loader::with_video_probe_gate(|| {
+                extract_video_first_frame_thumbnail(path.as_path(), max_texture_side)
+            })
+            .flatten(),
             path,
         },
     }
@@ -2223,7 +2226,11 @@ fn load_folder_placeholder_thumbnail(
             })
         }
         MediaType::Video => {
-            let thumbnail = extract_video_first_frame_thumbnail(path, max_texture_side)?;
+            // Placeholder scans can run alongside strip/masonry previews: share their gate so
+            // the two do not multiply concurrent decodes on a saturated disk.
+            let thumbnail = manga_loader::with_video_probe_gate(|| {
+                extract_video_first_frame_thumbnail(path, max_texture_side)
+            })??;
             Some(FolderPlaceholderThumbnailDecoded {
                 path: path.to_path_buf(),
                 stamp,

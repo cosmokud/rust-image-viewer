@@ -82,6 +82,16 @@ impl VideoProbeGate {
 
 static VIDEO_PROBE_GATE: VideoProbeGate = VideoProbeGate::new(MAX_CONCURRENT_VIDEO_PROBES);
 
+/// Runs `probe` under the shared video-probe gate. `None` when the gate stayed busy past the
+/// bounded wait, so an off-frame caller degrades instead of adding more disk load.
+///
+/// Worker threads only: the wait is bounded but not short, so never call this from the frame
+/// loop — a UI-thread caller must schedule the probe instead.
+pub fn with_video_probe_gate<T>(probe: impl FnOnce() -> T) -> Option<T> {
+    let _permit = VIDEO_PROBE_GATE.acquire()?;
+    Some(probe())
+}
+
 /// Maximum number of decoded images to hold in memory awaiting GPU upload.
 /// This bounds memory usage even if the main thread is slow to consume results.
 const MAX_PENDING_UPLOADS: usize = 128;
