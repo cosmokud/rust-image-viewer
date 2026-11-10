@@ -3613,6 +3613,9 @@ impl ImageViewer {
     const BOTTOM_RIGHT_OVERLAY_MARGIN: f32 = 16.0;
     const BOTTOM_RIGHT_OVERLAY_SCROLLBAR_PADDING: f32 = 35.0;
     const MANGA_HUD_PANEL_WIDTH: f32 = 224.0;
+    /// Lucide box for the transport volume glyph. The SVG grid is 24px, so a
+    /// 16px box keeps its stroke weight in line with the drawn transport glyphs.
+    const VIDEO_VOLUME_ICON_SIZE: f32 = 16.0;
     const MANGA_HUD_PANEL_HEIGHT: f32 = 32.0;
     const MANGA_HUD_PANEL_INNER_WIDTH: f32 = 208.0;
     const MANGA_HUD_PANEL_INNER_HEIGHT: f32 = 24.0;
@@ -9417,8 +9420,23 @@ impl ImageViewer {
             egui::pos2(content_start_x, rect.center().y - icon_size.y * 0.5),
             icon_size,
         );
+
+        // Volume uses the Lucide speaker artwork (plain, or crossed out when
+        // muted); every other transport glyph is drawn from primitives below.
         let text_color = visuals.fg_stroke.color;
-        Self::draw_video_control_vector_icon(painter, icon, icon_rect, text_color);
+        if matches!(
+            icon,
+            VideoControlIcon::VolumeOn | VideoControlIcon::VolumeOff
+        ) {
+            let muted = matches!(icon, VideoControlIcon::VolumeOff);
+            let volume_rect = egui::Rect::from_center_size(
+                icon_rect.center(),
+                egui::Vec2::splat(Self::VIDEO_VOLUME_ICON_SIZE),
+            );
+            Self::paint_volume_lucide_icon(ui, volume_rect, muted, text_color);
+        } else {
+            Self::draw_video_control_vector_icon(painter, icon, icon_rect, text_color);
+        }
 
         if let Some(label_galley) = label_galley {
             let text_pos = egui::pos2(
@@ -9438,28 +9456,7 @@ impl ImageViewer {
         label: Option<&str>,
         active: bool,
     ) -> egui::Response {
-        // Transport glyphs are drawn, not typed, so no button depends on a font
-        // shipping ▶ / ⏸; the button frame itself stays the stock egui one.
-        if !matches!(
-            icon,
-            VideoControlIcon::VolumeOn | VideoControlIcon::VolumeOff
-        ) {
-            return Self::video_control_vector_icon_button(ui, icon, tooltip, label, active);
-        }
-
-        let button_text = match icon {
-            VideoControlIcon::VolumeOn => "\u{1F50A}".to_string(),
-            VideoControlIcon::VolumeOff => "\u{1F507}".to_string(),
-            VideoControlIcon::Play
-            | VideoControlIcon::Pause
-            | VideoControlIcon::Previous
-            | VideoControlIcon::Next
-            | VideoControlIcon::AudioTracks
-            | VideoControlIcon::SubtitleTracks => String::new(),
-        };
-
-        ui.add(egui::Button::new(button_text).min_size(egui::vec2(32.0, 24.0)))
-            .on_hover_text(tooltip)
+        Self::video_control_vector_icon_button(ui, icon, tooltip, label, active)
     }
 
     fn draw_audio_track_popup(
@@ -10501,6 +10498,22 @@ impl ImageViewer {
             .texture_options(egui::TextureOptions::NEAREST)
             .tint(color)
             .paint_at(ui, snapped);
+    }
+
+    /// Lucide artwork for a transport-volume state, carrying the same tint and
+    /// stroked outline as the drawn transport glyphs next to it.
+    fn paint_volume_lucide_icon(
+        ui: &egui::Ui,
+        rect: egui::Rect,
+        muted: bool,
+        color: egui::Color32,
+    ) {
+        let source = if muted {
+            egui::include_image!("../assets/lucide/volume-x.svg")
+        } else {
+            egui::include_image!("../assets/lucide/volume-2.svg")
+        };
+        Self::paint_lucide_icon(ui, rect, source, color);
     }
 
     fn paint_menu_action_icon(
