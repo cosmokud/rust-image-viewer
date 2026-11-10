@@ -26893,129 +26893,170 @@ impl ImageViewer {
                             }
 
                             let current_path = self.image_list.get(self.current_index).cloned();
-                            let details_path = current_path.clone();
+
+                            // Metadata drawn to the right of the file name, in drawing order.
+                            // `priority` is what survives when the bar is too narrow for all of
+                            // it: the facts (resolution, file size) outlive the file name, and
+                            // the file name outlives only the lowest-priority segments.
+                            const DETAIL_PRIORITY_FILE_SIZE: u8 = 5;
+                            const DETAIL_PRIORITY_RESOLUTION: u8 = 4;
+                            const DETAIL_PRIORITY_POSITION: u8 = 3;
+                            const DETAIL_PRIORITY_ZOOM: u8 = 2;
+                            const DETAIL_PRIORITY_VIDEO: u8 = 1;
+
+                            let mut detail_entries: Vec<TitleBarDetail> = Vec::new();
                             if let Some(path) = current_path.as_ref() {
+                                if let Some((width, height)) = self.media_display_dimensions() {
+                                    detail_entries.push(TitleBarDetail {
+                                        text: format!("{width}x{height}"),
+                                        color: egui::Color32::GRAY,
+                                        priority: DETAIL_PRIORITY_RESOLUTION,
+                                    });
+                                }
+
+                                if self
+                                    .current_file_size_label_path
+                                    .as_ref()
+                                    .is_some_and(|label_path| label_path == path)
+                                {
+                                    if let Some(file_size_label) =
+                                        self.current_file_size_label.as_ref()
+                                    {
+                                        detail_entries.push(TitleBarDetail {
+                                            text: file_size_label.clone(),
+                                            color: egui::Color32::GRAY,
+                                            priority: DETAIL_PRIORITY_FILE_SIZE,
+                                        });
+                                    }
+                                }
+
+                                detail_entries.push(TitleBarDetail {
+                                    text: format!("{:.0}%", self.zoom * 100.0),
+                                    color: egui::Color32::GRAY,
+                                    priority: DETAIL_PRIORITY_ZOOM,
+                                });
+
+                                if self.video_player.is_some() {
+                                    detail_entries.push(TitleBarDetail {
+                                        text: "VIDEO".to_string(),
+                                        color: egui::Color32::from_rgb(66, 133, 244),
+                                        priority: DETAIL_PRIORITY_VIDEO,
+                                    });
+                                }
+
+                                if !self.image_list.is_empty() {
+                                    detail_entries.push(TitleBarDetail {
+                                        text: format!(
+                                            "[{}/{}]",
+                                            self.current_index + 1,
+                                            self.image_list.len()
+                                        ),
+                                        color: egui::Color32::GRAY,
+                                        priority: DETAIL_PRIORITY_POSITION,
+                                    });
+                                }
+                            }
+
+                            let body_font = egui::TextStyle::Body.resolve(ui.style());
+                            let detail_widths: Vec<f32> = detail_entries
+                                .iter()
+                                .map(|entry| {
+                                    ui.painter()
+                                        .layout_no_wrap(
+                                            entry.text.clone(),
+                                            body_font.clone(),
+                                            entry.color,
+                                        )
+                                        .rect
+                                        .width()
+                                })
+                                .collect();
+                            let detail_priorities: Vec<u8> =
+                                detail_entries.iter().map(|entry| entry.priority).collect();
+                            let left_strip_layout = title_bar_left_layout(
+                                ui.available_width(),
+                                current_path.is_some(),
+                                &detail_widths,
+                                &detail_priorities,
+                                ui.spacing().item_spacing.x,
+                            );
+
+                            if let (Some(filename_budget), Some(path)) =
+                                (left_strip_layout.filename_width, current_path.as_ref())
+                            {
                                 let filename = path
                                     .file_name()
-                                    .map(|n| n.to_string_lossy().to_string())
+                                    .map(|name| name.to_string_lossy().to_string())
                                     .unwrap_or_else(|| "Unknown".to_string());
                                 let mut title_text = filename.clone();
                                 if self.should_show_full_path_in_window_title() {
                                     let full_path = path.to_string_lossy().to_string();
                                     if !full_path.is_empty() && full_path != filename {
-                                        // Keep room for the details segment first; truncate path context before details.
-                                        const DETAILS_PRIORITY_WIDTH_RESERVE: f32 = 240.0;
-                                        const MIN_PATH_WIDTH: f32 = 110.0;
-                                        let available_for_title = ui.available_width();
-                                        let path_width_budget = if available_for_title
-                                            > DETAILS_PRIORITY_WIDTH_RESERVE + MIN_PATH_WIDTH
-                                        {
-                                            available_for_title - DETAILS_PRIORITY_WIDTH_RESERVE
-                                        } else {
-                                            available_for_title
-                                        };
+                                        // The metadata's width is already reserved; the path
+                                        // keeps whatever the name's share leaves it.
                                         title_text = self.truncate_window_title_for_ui_width(
                                             full_path,
-                                            path_width_budget,
+                                            filename_budget,
                                         );
                                     }
                                 }
 
-                                let resp = ui.add(
-                                    egui::Label::new(
-                                        egui::RichText::new(title_text).color(egui::Color32::WHITE),
+                                // Never let the name claim more than its share, and never more
+                                // than it needs: the metadata follows right after it.
+                                let title_width = ui
+                                    .painter()
+                                    .layout_no_wrap(
+                                        title_text.clone(),
+                                        body_font.clone(),
+                                        egui::Color32::WHITE,
                                     )
-                                    .selectable(true)
-                                    .truncate(),
+                                    .rect
+                                    .width()
+                                    .min(filename_budget);
+                                let strip_rect = ui.available_rect_before_wrap();
+                                let title_rect = egui::Rect::from_min_max(
+                                    strip_rect.min,
+                                    egui::pos2(strip_rect.min.x + title_width, strip_rect.max.y),
                                 );
+                                let resp = ui
+                                    .allocate_new_ui(
+                                        egui::UiBuilder::new().max_rect(title_rect),
+                                        |ui| {
+                                            ui.add(
+                                                egui::Label::new(
+                                                    egui::RichText::new(title_text)
+                                                        .color(egui::Color32::WHITE),
+                                                )
+                                                .selectable(true)
+                                                .truncate(),
+                                            )
+                                        },
+                                    )
+                                    .inner;
                                 over_title_text |= resp.contains_pointer();
                                 started_title_text_drag |= resp.drag_started() || resp.dragged();
                             }
 
-                            if let Some(path) = details_path {
-                                ui.add_space(8.0);
+                            // The metadata that still fits, in drawing order. Truncated rather than
+                            // wrapped so a rounding miss never spills under the window buttons.
+                            if !left_strip_layout.details.is_empty() {
+                                if left_strip_layout.filename_width.is_some() {
+                                    ui.add_space(TITLE_BAR_FILENAME_DETAILS_GAP);
+                                }
 
-                                // If there isn't enough remaining room, drop the detailed
-                                // description entirely (no "..." placeholder).
-                                // (Keep the buttons intact by design, and avoid wrapping the title bar.)
-                                if ui.available_width() >= 220.0 {
-                                    if let Some((w, h)) = self.media_display_dimensions() {
-                                        let resp = ui.add(
-                                            egui::Label::new(
-                                                egui::RichText::new(format!("{}x{}", w, h))
-                                                    .color(egui::Color32::GRAY),
-                                            )
-                                            .selectable(true),
-                                        );
-                                        over_title_text |= resp.contains_pointer();
-                                        started_title_text_drag |=
-                                            resp.drag_started() || resp.dragged();
-                                    }
-
-                                    if self
-                                        .current_file_size_label_path
-                                        .as_ref()
-                                        .is_some_and(|label_path| label_path == &path)
-                                    {
-                                        if let Some(file_size_label) =
-                                            self.current_file_size_label.as_ref()
-                                        {
-                                            let resp = ui.add(
-                                                egui::Label::new(
-                                                    egui::RichText::new(file_size_label)
-                                                        .color(egui::Color32::GRAY),
-                                                )
-                                                .selectable(true),
-                                            );
-                                            over_title_text |= resp.contains_pointer();
-                                            started_title_text_drag |=
-                                                resp.drag_started() || resp.dragged();
-                                        }
-                                    }
-
+                                for detail_index in left_strip_layout.details.iter() {
+                                    let detail = &detail_entries[*detail_index];
                                     let resp = ui.add(
                                         egui::Label::new(
-                                            egui::RichText::new(format!(
-                                                "{:.0}%",
-                                                self.zoom * 100.0
-                                            ))
-                                            .color(egui::Color32::GRAY),
+                                            egui::RichText::new(detail.text.clone())
+                                                .color(detail.color),
                                         )
-                                        .selectable(true),
+                                        .selectable(true)
+                                        .truncate(),
                                     );
                                     over_title_text |= resp.contains_pointer();
                                     started_title_text_drag |=
                                         resp.drag_started() || resp.dragged();
-
-                                    if self.video_player.is_some() {
-                                        let resp = ui.add(
-                                            egui::Label::new(
-                                                egui::RichText::new("VIDEO")
-                                                    .color(egui::Color32::from_rgb(66, 133, 244)),
-                                            )
-                                            .selectable(true),
-                                        );
-                                        over_title_text |= resp.contains_pointer();
-                                        started_title_text_drag |=
-                                            resp.drag_started() || resp.dragged();
-                                    }
-
-                                    if !self.image_list.is_empty() {
-                                        let resp = ui.add(
-                                            egui::Label::new(
-                                                egui::RichText::new(format!(
-                                                    "[{}/{}]",
-                                                    self.current_index + 1,
-                                                    self.image_list.len()
-                                                ))
-                                                .color(egui::Color32::GRAY),
-                                            )
-                                            .selectable(true),
-                                        );
-                                        over_title_text |= resp.contains_pointer();
-                                        started_title_text_drag |=
-                                            resp.drag_started() || resp.dragged();
-                                    }
                                 }
                             }
 
@@ -31843,6 +31884,106 @@ fn build_fallback_icon() -> egui::IconData {
     }
 }
 
+/// One segment of the title bar's file metadata: resolution, file size, zoom, video badge,
+/// position in the list.
+struct TitleBarDetail {
+    text: String,
+    color: egui::Color32,
+    /// Higher survives longer when the bar is too narrow for all of them.
+    priority: u8,
+}
+
+/// Space the title bar wants to keep for the file name before dropping it for good.
+const TITLE_BAR_MIN_FILENAME_WIDTH: f32 = 60.0;
+
+/// Gap between the file name and the metadata that follows it.
+const TITLE_BAR_FILENAME_DETAILS_GAP: f32 = 8.0;
+
+/// Slack between the measured text widths and the width the laid-out labels really take.
+const TITLE_BAR_WIDTH_SLACK: f32 = 6.0;
+
+/// How the left stretch of the title bar splits between the file name and the metadata.
+#[derive(Clone, Debug, PartialEq)]
+struct TitleBarLeftLayout {
+    /// Width the file name may take; `None` when it does not fit at all.
+    filename_width: Option<f32>,
+    /// Metadata segments to draw, as ascending indices into the caller's list.
+    details: Vec<usize>,
+    /// Width the drawn metadata segments take, spacing between them included.
+    details_width: f32,
+}
+
+/// Splits the title bar's left stretch: metadata first, file name with whatever is left.
+///
+/// The window buttons own a separate strip outside this budget, so they never lose.
+/// Nothing drops while the bar can still hold all the metadata plus
+/// `TITLE_BAR_MIN_FILENAME_WIDTH`: the file name shrinks with an ellipsis instead. Only once it
+/// cannot keep that much does the name disappear and, if the metadata still does not fit, the
+/// lowest `priority` segments after it.
+fn title_bar_left_layout(
+    available_width: f32,
+    has_filename: bool,
+    detail_widths: &[f32],
+    detail_priorities: &[u8],
+    spacing: f32,
+) -> TitleBarLeftLayout {
+    let available = (available_width - TITLE_BAR_WIDTH_SLACK).max(0.0);
+
+    // Highest priority first, taking each segment only if it still fits: a wide low-priority
+    // segment must not push a narrow high-priority one out of the bar.
+    let select = |budget: f32| -> (Vec<usize>, f32) {
+        let mut order: Vec<usize> = (0..detail_widths.len()).collect();
+        order.sort_by(|left, right| {
+            detail_priorities[*right]
+                .cmp(&detail_priorities[*left])
+                .then(left.cmp(right))
+        });
+
+        let mut selected: Vec<usize> = Vec::new();
+        let mut used = 0.0;
+        for index in order {
+            let extra = detail_widths[index] + if selected.is_empty() { 0.0 } else { spacing };
+            if used + extra <= budget {
+                used += extra;
+                selected.push(index);
+            }
+        }
+
+        selected.sort_unstable();
+        (selected, used)
+    };
+
+    if detail_widths.is_empty() {
+        return TitleBarLeftLayout {
+            filename_width: has_filename.then_some(available),
+            details: Vec::new(),
+            details_width: 0.0,
+        };
+    }
+
+    let gap = TITLE_BAR_FILENAME_DETAILS_GAP + spacing;
+    let all_details_width =
+        detail_widths.iter().sum::<f32>() + (spacing * (detail_widths.len() - 1) as f32);
+
+    // The whole metadata strip still sits next to a readable name: nothing has to give.
+    if has_filename && all_details_width + gap + TITLE_BAR_MIN_FILENAME_WIDTH <= available {
+        return TitleBarLeftLayout {
+            filename_width: Some(available - all_details_width - gap),
+            details: (0..detail_widths.len()).collect(),
+            details_width: all_details_width,
+        };
+    }
+
+    // The name goes first and the metadata takes the whole stretch; only what still does not
+    // fit after that drops, lowest priority first.
+    let (details, details_width) = select(available);
+    TitleBarLeftLayout {
+        filename_width: None,
+        details,
+        details_width,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -32436,6 +32577,81 @@ mod tests {
             assert_eq!(settings_registry::SETTINGS[id].id, id);
         }
         assert!(settings_search_results("zzz-no-such-setting").is_empty());
+    }
+
+    #[test]
+    fn title_bar_gives_the_file_name_what_the_metadata_leaves_it() {
+        use super::{title_bar_left_layout, TITLE_BAR_FILENAME_DETAILS_GAP};
+
+        // resolution, file size, zoom, [i/n] -- file size has the highest priority.
+        let widths = [70.0, 60.0, 40.0, 45.0];
+        let priorities = [4, 5, 2, 3];
+        let spacing = 8.0;
+        let all_details = 70.0 + 60.0 + 40.0 + 45.0 + (spacing * 3.0);
+        let gap = TITLE_BAR_FILENAME_DETAILS_GAP + spacing;
+
+        // Wide bar: every segment shows and the name keeps the rest.
+        let layout = title_bar_left_layout(1000.0, true, &widths, &priorities, spacing);
+        assert_eq!(layout.details, vec![0, 1, 2, 3]);
+        assert_eq!(layout.details_width, all_details);
+        assert_eq!(
+            layout.filename_width,
+            Some(1000.0 - 6.0 - all_details - gap)
+        );
+
+        // Narrower bar: the name shrinks, the metadata keeps everything.
+        let layout = title_bar_left_layout(400.0, true, &widths, &priorities, spacing);
+        assert_eq!(layout.details, vec![0, 1, 2, 3]);
+        assert_eq!(layout.filename_width, Some(400.0 - 6.0 - all_details - gap));
+    }
+
+    #[test]
+    fn title_bar_drops_the_file_name_before_any_metadata() {
+        use super::title_bar_left_layout;
+
+        let widths = [70.0, 60.0, 40.0, 45.0];
+        let priorities = [4, 5, 2, 3];
+        let spacing = 8.0;
+
+        // Room for the metadata and only a sliver of name: the name goes, no segment does.
+        let layout = title_bar_left_layout(280.0, true, &widths, &priorities, spacing);
+        assert_eq!(layout.filename_width, None, "the name collapses first");
+        assert_eq!(layout.details, vec![0, 1, 2, 3], "no metadata drops for it");
+    }
+
+    #[test]
+    fn title_bar_metadata_drops_lowest_priority_first() {
+        use super::title_bar_left_layout;
+
+        let widths = [70.0, 60.0, 40.0, 45.0];
+        let priorities = [4, 5, 2, 3];
+        let spacing = 8.0;
+
+        // Too narrow even without the name: the zoom (priority 2) and the index (3) go before
+        // the resolution (4) and the file size (5).
+        let layout = title_bar_left_layout(180.0, true, &widths, &priorities, spacing);
+        assert_eq!(layout.filename_width, None);
+        assert_eq!(layout.details, vec![0, 1]);
+        assert_eq!(layout.details_width, 70.0 + 60.0 + spacing);
+
+        // Squeezed further still: only the file size survives.
+        let layout = title_bar_left_layout(100.0, true, &widths, &priorities, spacing);
+        assert_eq!(layout.details, vec![1]);
+    }
+
+    #[test]
+    fn title_bar_metadata_stays_in_drawing_order_whatever_the_priority() {
+        use super::title_bar_left_layout;
+
+        let widths = [70.0, 60.0, 40.0, 45.0];
+        let priorities = [4, 5, 2, 3];
+
+        // Picked by priority, drawn left to right: the kept indices come back sorted.
+        let layout = title_bar_left_layout(120.0, false, &widths, &priorities, 8.0);
+        let mut sorted = layout.details.clone();
+        sorted.sort_unstable();
+        assert_eq!(layout.details, sorted);
+        assert!(layout.filename_width.is_none());
     }
 
     #[test]
