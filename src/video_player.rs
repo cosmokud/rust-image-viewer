@@ -4,7 +4,7 @@
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicI8, AtomicU32, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI8, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -313,16 +313,115 @@ const CUDA_DECODER_FACTORIES: &[&str] = &[
     "cudah265dec",
 ];
 
+/// Codec families, used to keep a demotion from stripping a codec's last autopluggable decoder:
+/// the D3D11 profile ranks `avdec_vp8` at 0, so demoting both hardware VP8 factories would leave
+/// VP8 with nothing to autoplug for the rest of the session.
+const DECODER_FAMILIES: &[&[&str]] = &[
+    &[
+        "d3d12h264dec",
+        "d3d11h264dec",
+        "nvh264dec",
+        "cudah264dec",
+        "avdec_h264",
+    ],
+    &[
+        "d3d12h265dec",
+        "d3d11h265dec",
+        "nvh265dec",
+        "cudah265dec",
+        "avdec_h265",
+        "avdec_hevc",
+    ],
+    &["d3d12vp8dec", "d3d11vp8dec", "avdec_vp8"],
+    &["d3d12vp9dec", "d3d11vp9dec", "nvvp9dec", "avdec_vp9"],
+    &["d3d12av1dec", "d3d11av1dec", "nvav1dec", "avdec_av1"],
+    &["d3d12mpeg2dec", "d3d11mpeg2dec", "avdec_mpeg2video"],
+];
+
+/// True when demoting `factory_name` still leaves its codec at least one ranked decoder.
+fn demotion_keeps_codec_decodable<F>(factory_name: &str, rank_of: F) -> bool
+where
+    F: Fn(&str) -> gst::Rank,
+{
+    let Some(family) = DECODER_FAMILIES
+        .iter()
+        .find(|family| family.contains(&factory_name))
+    else {
+        // Unknown codec: not provably the last decoder, so allow the demotion.
+        return true;
+    };
+    family
+        .iter()
+        .any(|other| *other != factory_name && rank_of(other) > gst::Rank::NONE)
+}
+
+fn live_decoder_rank(factory_name: &str) -> gst::Rank {
+    gst::ElementFactory::find(factory_name).map_or(gst::Rank::NONE, |factory| factory.rank())
+}
+
+/// A live demotion: the rank to restore and when it becomes restorable.
+struct RankDemotion {
+    factory: &'static str,
+    previous_rank: gst::Rank,
+    demoted_at: Instant,
+}
+
+/// A demotion is undone after this, so one wedged file cannot pin software decoding for the whole
+/// session.
+const DEMOTION_COOLDOWN: Duration = Duration::from_secs(60);
+
+static DEMOTIONS: Mutex<Vec<RankDemotion>> = Mutex::new(Vec::new());
+
+fn demotion_expired(demoted_at: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(demoted_at) >= DEMOTION_COOLDOWN
+}
+
+/// Restore hardware ranks demoted longer than `DEMOTION_COOLDOWN` ago.
+fn reinstate_stale_demotions() {
+    let mut demotions = DEMOTIONS.lock();
+    let now = Instant::now();
+    demotions.retain(|demotion| {
+        if !demotion_expired(demotion.demoted_at, now) {
+            return true;
+        }
+        if let Some(factory) = gst::ElementFactory::find(demotion.factory) {
+            factory.set_rank(demotion.previous_rank);
+        }
+        false
+    });
+}
+
 /// Runtime-demote a decoder factory so `decodebin`/`playbin` stop autoplugging it.
 ///
 /// Unlike the `GST_PLUGIN_FEATURE_RANK` environment variable (which is only consulted
 /// while the registry is loaded, i.e. before `gst::init`), this mutates the live feature
 /// objects and therefore affects every pipeline created afterwards in this process.
-fn demote_decoder_factory(factory_name: &str) {
+///
+/// `false` = nothing was demoted (factory absent, already NONE, or it is its codec's last
+/// ranked decoder). The demotion is recorded so `reinstate_stale_demotions` can undo it.
+fn demote_decoder_factory(factory_name: &'static str) -> bool {
     let Some(factory) = gst::ElementFactory::find(factory_name) else {
-        return;
+        return false;
     };
+    let previous_rank = factory.rank();
+    if previous_rank == gst::Rank::NONE {
+        return false;
+    }
+    if !demotion_keeps_codec_decodable(factory_name, live_decoder_rank) {
+        // Invariant guard: never leave a codec without an autopluggable decoder.
+        crate::diag::trace(
+            "video-decode",
+            &format!("Skip demoting {factory_name}: last ranked decoder for its codec"),
+        );
+        return false;
+    }
     factory.set_rank(gst::Rank::NONE);
+    DEMOTIONS.lock().push(RankDemotion {
+        factory: factory_name,
+        previous_rank,
+        demoted_at: Instant::now(),
+    });
+    true
 }
 
 /// Runtime counterpart of the `AV1_D3D12_STABILITY_RANK` env entry: demotes
@@ -344,25 +443,31 @@ pub(crate) fn apply_av1_decoder_stability_ranks() {
     });
 }
 
-/// Tracks which hardware-decoder tiers have been demoted for the rest of the process
-/// (0 = D3D12, 1 = D3D11, 2 = CUDA). Shared by the load-time fallback and the
-/// stall-detection path so both make the same, session-persistent demotions.
-static DEMOTED_HARDWARE_TIERS: AtomicU8 = AtomicU8::new(0);
-
-/// Demote the next hardware-decoder tier (D3D12 → D3D11 → CUDA). Returns false when
-/// every tier is already demoted (i.e. only software decoders remain).
+/// Demote the next still-ranked hardware-decoder tier (D3D12 → D3D11 → CUDA). Returns false when
+/// no tier had a demotable factory left (only software decoders remain).
 fn demote_next_hardware_tier() -> bool {
-    let tier = DEMOTED_HARDWARE_TIERS.fetch_add(1, Ordering::SeqCst);
-    let factories = match tier {
-        0 => D3D12_DECODER_FACTORIES,
-        1 => D3D11_DECODER_FACTORIES,
-        2 => CUDA_DECODER_FACTORIES,
-        _ => return false,
-    };
-    for factory in factories {
-        demote_decoder_factory(factory);
+    // A cooldown may have reinstated an earlier tier: always reconsider from D3D12.
+    reinstate_stale_demotions();
+    for factories in [
+        D3D12_DECODER_FACTORIES,
+        D3D11_DECODER_FACTORIES,
+        CUDA_DECODER_FACTORIES,
+    ] {
+        if !factories
+            .iter()
+            .any(|factory| live_decoder_rank(factory) > gst::Rank::NONE)
+        {
+            continue;
+        }
+        let mut demoted_any = false;
+        for &factory in factories {
+            demoted_any |= demote_decoder_factory(factory);
+        }
+        if demoted_any {
+            return true;
+        }
     }
-    true
+    false
 }
 
 /// AV1-specific hardware decoders on Windows. A stall on an AV1 file is most likely one
@@ -372,7 +477,8 @@ fn demote_next_hardware_tier() -> bool {
 const AV1_HARDWARE_DECODER_FACTORIES: &[&str] = &["d3d12av1dec", "d3d11av1dec", "nvav1dec"];
 
 fn demote_av1_hardware_tiers() {
-    for factory in AV1_HARDWARE_DECODER_FACTORIES {
+    reinstate_stale_demotions();
+    for &factory in AV1_HARDWARE_DECODER_FACTORIES {
         demote_decoder_factory(factory);
     }
 }
@@ -390,8 +496,9 @@ fn is_timeout_like_error(err: &str) -> bool {
 /// combinations) can hang the GStreamer streaming thread. Without a fallback, one
 /// wedged decoder would block the media-load worker forever, making next/previous
 /// navigation appear dead. Each attempt is bounded by the player's internal timeouts;
-/// when an attempt fails with a timeout, the corresponding hardware tier is demoted
-/// for the rest of the session and playback is retried (d3d12 → d3d11 → CUDA → software).
+/// when an attempt fails with a timeout, the corresponding hardware tier is demoted and
+/// playback is retried (d3d12 → d3d11 → CUDA → software). Demotions are reinstated after
+/// `DEMOTION_COOLDOWN`, so a wedged file cannot pin software decoding for the session.
 pub fn create_video_player_with_fallback<F>(
     path: &Path,
     muted: bool,
@@ -407,6 +514,8 @@ pub fn create_video_player_with_fallback<F>(
 where
     F: Fn(&mut VideoPlayer) -> Result<(), String> + Copy,
 {
+    // Every new player gets a fresh chance at hardware decoding once the cooldown elapsed.
+    reinstate_stale_demotions();
     loop {
         let attempt = VideoPlayer::new(
             path,
@@ -897,8 +1006,8 @@ fn on_ui_thread() -> bool {
 }
 const SEEK_TIMEOUT: Duration = Duration::from_secs(3);
 const QUERY_TIMEOUT: Duration = Duration::from_millis(250);
-/// Bounded command queue for blocking GStreamer calls issued from the UI thread. A wedged decoder
-/// used to hold the frame for the full 3-5 s timeout; now the UI thread only enqueues.
+/// Bounded queue for control-thread results drained once per frame. A wedged decoder used to hold
+/// the frame for the full 3-5 s timeout; now the UI thread only enqueues and polls.
 const CONTROL_QUEUE_CAPACITY: usize = 8;
 // Stall detection: a playing pipeline that delivers no frame for this long is almost
 // certainly a wedged hardware decoder (a freeze, not a slow start). Detecting it early
@@ -1083,72 +1192,76 @@ pub(crate) fn run_gst_with_timeout<T: Send + 'static>(
 fn spawn_control_thread(
     pipeline: gst::Pipeline,
     state: Arc<VideoState>,
-) -> (
-    crossbeam_channel::Sender<ControlCommand>,
-    crossbeam_channel::Receiver<ControlEvent>,
-) {
-    let (command_tx, command_rx) = crossbeam_channel::bounded(CONTROL_QUEUE_CAPACITY);
+) -> (ControlQueue, crossbeam_channel::Receiver<ControlEvent>) {
+    let (wake_tx, wake_rx) = crossbeam_channel::bounded::<()>(1);
     let (event_tx, event_rx) = crossbeam_channel::bounded(CONTROL_QUEUE_CAPACITY);
+    let commands: Arc<Mutex<VecDeque<ControlCommand>>> = Arc::new(Mutex::new(VecDeque::new()));
+    let worker_commands = Arc::clone(&commands);
 
     crate::async_runtime::spawn_blocking_or_thread("video-control", move || {
-        while let Ok(command) = command_rx.recv() {
-            match command {
-                ControlCommand::Restart => {
-                    // Nothing to do if the state transition is still pending (initial load).
-                    let _ = pipeline.state(gst::ClockTime::from_mseconds(500));
+        while wake_rx.recv().is_ok() {
+            loop {
+                let Some(command) = worker_commands.lock().pop_front() else {
+                    break;
+                };
+                match command {
+                    ControlCommand::Restart => {
+                        // Nothing to do if the state transition is still pending (initial load).
+                        let _ = pipeline.state(gst::ClockTime::from_mseconds(500));
 
-                    let seek_pipeline = pipeline.clone();
-                    let seek = run_gst_with_timeout("control-seek", SEEK_TIMEOUT, move || {
-                        seek_pipeline.seek_simple(
-                            gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
-                            gst::ClockTime::ZERO,
-                        )
-                    });
-                    match seek {
-                        Some(Ok(())) => {}
-                        Some(Err(err)) => {
-                            let _ = event_tx.try_send(ControlEvent::Failed(format!(
-                                "Failed to restart playback: {}",
-                                err
-                            )));
+                        let seek_pipeline = pipeline.clone();
+                        let seek = run_gst_with_timeout("control-seek", SEEK_TIMEOUT, move || {
+                            seek_pipeline.seek_simple(
+                                gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
+                                gst::ClockTime::ZERO,
+                            )
+                        });
+                        match seek {
+                            Some(Ok(())) => {}
+                            Some(Err(err)) => {
+                                let _ = event_tx.try_send(ControlEvent::Failed(format!(
+                                    "Failed to restart playback: {}",
+                                    err
+                                )));
+                            }
+                            None => {
+                                let _ = event_tx.try_send(ControlEvent::Wedged);
+                            }
                         }
-                        None => {
-                            let _ = event_tx.try_send(ControlEvent::Wedged);
+                        // Ends the seek window the UI thread opened; stall detection reads it.
+                        state.end_seek();
+
+                        let play_pipeline = pipeline.clone();
+                        let playing = run_gst_with_timeout(
+                            "control-state-playing",
+                            STATE_CHANGE_TIMEOUT,
+                            move || play_pipeline.set_state(gst::State::Playing),
+                        );
+                        match playing {
+                            Some(Ok(_)) => {}
+                            Some(Err(err)) => {
+                                let _ = event_tx.try_send(ControlEvent::Failed(format!(
+                                    "Failed to resume playback: {}",
+                                    err
+                                )));
+                            }
+                            None => {
+                                let _ = event_tx.try_send(ControlEvent::Wedged);
+                            }
                         }
                     }
-                    // Ends the seek window the UI thread opened; stall detection reads it.
-                    state.end_seek();
-
-                    let play_pipeline = pipeline.clone();
-                    let playing = run_gst_with_timeout(
-                        "control-state-playing",
-                        STATE_CHANGE_TIMEOUT,
-                        move || play_pipeline.set_state(gst::State::Playing),
-                    );
-                    match playing {
-                        Some(Ok(_)) => {}
-                        Some(Err(err)) => {
-                            let _ = event_tx.try_send(ControlEvent::Failed(format!(
-                                "Failed to resume playback: {}",
-                                err
-                            )));
-                        }
-                        None => {
-                            let _ = event_tx.try_send(ControlEvent::Wedged);
-                        }
+                    ControlCommand::Play => {
+                        apply_queued_state_change(&pipeline, StateTarget::Playing, &event_tx);
                     }
-                }
-                ControlCommand::Play => {
-                    apply_queued_state_change(&pipeline, StateTarget::Playing, &event_tx);
-                }
-                ControlCommand::Pause => {
-                    apply_queued_state_change(&pipeline, StateTarget::Paused, &event_tx);
+                    ControlCommand::Pause => {
+                        apply_queued_state_change(&pipeline, StateTarget::Paused, &event_tx);
+                    }
                 }
             }
         }
     });
 
-    (command_tx, event_rx)
+    (ControlQueue { commands, wake_tx }, event_rx)
 }
 
 /// One queued `play`/`pause`: the wait lives here, the UI thread only enqueued it.
@@ -1731,10 +1844,42 @@ enum ControlEvent {
     Failed(String),
 }
 
-/// Non-blocking enqueue. `false` means full or disconnected: the caller retries next frame, and
-/// the UI thread never waits on the control thread.
-fn try_enqueue_control<T>(tx: &crossbeam_channel::Sender<T>, command: T) -> bool {
-    tx.try_send(command).is_ok()
+impl ControlCommand {
+    /// Queued state changes supersede each other (latest wins); nothing else is queued.
+    /// A `Seek` is a position request, not a state, and runs synchronously through
+    /// `seek_to_time` — it must never be coalesced with a different target.
+    fn is_state_change(self) -> bool {
+        matches!(
+            self,
+            ControlCommand::Restart | ControlCommand::Play | ControlCommand::Pause
+        )
+    }
+}
+
+/// Latest-wins command queue for the control thread.
+///
+/// Coalescing instead of a bounded channel: a burst of state changes replaces the still-queued
+/// one, so the queue can never fill up and refuse the command that actually starts playback.
+struct ControlQueue {
+    commands: Arc<Mutex<VecDeque<ControlCommand>>>,
+    // Dropping this ends the control thread; bounded(1) so a pending wake coalesces.
+    wake_tx: crossbeam_channel::Sender<()>,
+}
+
+impl ControlQueue {
+    /// Non-blocking. `false` only when the control thread is gone: the caller retries next frame.
+    fn send(&self, command: ControlCommand) -> bool {
+        {
+            let mut queued = self.commands.lock();
+            queued.retain(|pending| !pending.is_state_change());
+            queued.push_back(command);
+        }
+        // A full wake channel already has a wake pending, which drains this command too.
+        !matches!(
+            self.wake_tx.try_send(()),
+            Err(crossbeam_channel::TrySendError::Disconnected(()))
+        )
+    }
 }
 
 pub struct VideoPlayer {
@@ -1775,8 +1920,8 @@ pub struct VideoPlayer {
     subtitle_selection: VideoSubtitleSelection,
     stream_collection: Option<gst::StreamCollection>,
     selected_stream_ids: Vec<String>,
-    // `None` once dropped, which closes the queue so the control thread exits before teardown.
-    control_tx: Option<crossbeam_channel::Sender<ControlCommand>>,
+    // `None` once dropped, which ends the control thread so it exits before teardown.
+    control_queue: Option<ControlQueue>,
     control_events: crossbeam_channel::Receiver<ControlEvent>,
     /// Last failure reported by the control thread; the UI polls it for the error popup.
     control_error: Option<String>,
@@ -2024,7 +2169,7 @@ Ensure your GStreamer installation includes the playback elements (usually from 
 
         // One control thread per player: it owns the blocking state/seek calls the UI thread used
         // to make inline (a wedged decoder froze the frame for the entire 5 s timeout).
-        let (control_tx, control_events) =
+        let (control_queue, control_events) =
             spawn_control_thread(pipeline.clone(), std::sync::Arc::clone(&state));
 
         let player = VideoPlayer {
@@ -2052,7 +2197,7 @@ Ensure your GStreamer installation includes the playback elements (usually from 
             subtitle_selection: VideoSubtitleSelection::Off,
             stream_collection: None,
             selected_stream_ids: Vec::new(),
-            control_tx: Some(control_tx),
+            control_queue: Some(control_queue),
             control_events,
             control_error: None,
         };
@@ -2184,10 +2329,10 @@ Ensure your GStreamer installation includes the playback elements (usually from 
     /// is applied now, so the next frame already reports "playing". `false` = queue full or gone
     /// (caller retries next frame); a failed state change arrives as `ControlEvent::Failed`.
     pub fn play_async(&mut self) -> bool {
-        let Some(tx) = self.control_tx.as_ref() else {
+        let Some(queue) = self.control_queue.as_ref() else {
             return false;
         };
-        if !try_enqueue_control(tx, ControlCommand::Play) {
+        if !queue.send(ControlCommand::Play) {
             return false;
         }
 
@@ -2203,10 +2348,10 @@ Ensure your GStreamer installation includes the playback elements (usually from 
 
     /// `pause()` without the wait. Same queue contract as `play_async`.
     pub fn pause_async(&mut self) -> bool {
-        let Some(tx) = self.control_tx.as_ref() else {
+        let Some(queue) = self.control_queue.as_ref() else {
             return false;
         };
-        if !try_enqueue_control(tx, ControlCommand::Pause) {
+        if !queue.send(ControlCommand::Pause) {
             return false;
         }
         self.is_playing = false;
@@ -3030,10 +3175,10 @@ Ensure your GStreamer installation includes the playback elements (usually from 
     /// the seek and the state change run on the control thread. Returns `false` when the queue is
     /// full, leaving end-of-stream set so the caller retries next frame.
     pub fn restart_async(&mut self) -> bool {
-        let Some(tx) = self.control_tx.as_ref() else {
+        let Some(queue) = self.control_queue.as_ref() else {
             return false;
         };
-        if !try_enqueue_control(tx, ControlCommand::Restart) {
+        if !queue.send(ControlCommand::Restart) {
             return false;
         }
 
@@ -3071,7 +3216,7 @@ impl Drop for VideoPlayer {
     fn drop(&mut self) {
         // Close the control queue first: the worker holds pipeline/state clones and must not start
         // a new state change while the teardown below moves the pipeline to NULL.
-        self.control_tx = None;
+        self.control_queue = None;
         // If this player froze while playing, demote the AV1 hardware decoders NOW so the
         // next navigation does not have to wait for a state-change timeout. Covers the
         // race where the user navigates before the per-frame stall detection fired.
@@ -3231,33 +3376,77 @@ mod tests {
         );
     }
 
-    #[test]
-    fn control_queue_enqueue_returns_immediately_when_full() {
-        let (tx, rx) = crossbeam_channel::bounded::<u8>(2);
-        assert!(try_enqueue_control(&tx, 1));
-        assert!(try_enqueue_control(&tx, 2));
-
-        // Full queue: enqueue must refuse instead of blocking the UI thread.
-        let started = Instant::now();
-        for _ in 0..1000 {
-            assert!(!try_enqueue_control(&tx, 3));
+    fn test_control_queue(wake_tx: crossbeam_channel::Sender<()>) -> ControlQueue {
+        ControlQueue {
+            commands: Arc::new(Mutex::new(VecDeque::new())),
+            wake_tx,
         }
-        assert!(
-            started.elapsed() < Duration::from_millis(100),
-            "enqueue blocked for {:?}",
-            started.elapsed()
-        );
-        assert_eq!(rx.len(), 2, "a refused enqueue must not queue");
     }
 
     #[test]
-    fn control_queue_enqueue_succeeds_while_not_full() {
-        let (tx, rx) = crossbeam_channel::bounded::<u8>(4);
-        assert!(try_enqueue_control(&tx, 7));
-        assert_eq!(rx.recv().unwrap(), 7);
+    fn control_queue_coalesces_state_changes_latest_wins() {
+        let (wake_tx, _wake_rx) = crossbeam_channel::bounded::<()>(1);
+        let queue = test_control_queue(wake_tx);
 
-        // Dropped receiver: enqueue reports failure instead of panicking or blocking.
-        drop(rx);
-        assert!(!try_enqueue_control(&tx, 8));
+        // A burst must never be refused, even with a wake already pending.
+        assert!(queue.send(ControlCommand::Play));
+        assert!(queue.send(ControlCommand::Pause));
+        assert!(queue.send(ControlCommand::Restart));
+        assert!(queue.send(ControlCommand::Play));
+
+        let queued = queue.commands.lock();
+        assert_eq!(queued.len(), 1, "only the latest state change survives");
+        assert!(matches!(queued.front(), Some(ControlCommand::Play)));
+    }
+
+    #[test]
+    fn control_queue_reports_refusal_only_when_worker_is_gone() {
+        let (wake_tx, wake_rx) = crossbeam_channel::bounded::<()>(1);
+        let queue = test_control_queue(wake_tx);
+        assert!(queue.send(ControlCommand::Play));
+
+        // Dropped worker: the send reports failure instead of panicking or blocking.
+        drop(wake_rx);
+        let started = Instant::now();
+        assert!(!queue.send(ControlCommand::Play));
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "send blocked for {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn demotion_never_strips_a_codecs_last_decoder() {
+        // D3D11 profile ranks `avdec_vp8` at 0: demoting the last hardware VP8 factory would
+        // leave VP8 with nothing to autoplug.
+        // d3d12vp8dec already demoted and the D3D11 profile ranks avdec_vp8 at 0.
+        let no_ranked_vp8_left = |name: &str| match name {
+            "d3d12vp8dec" | "d3d11vp8dec" | "avdec_vp8" => gst::Rank::NONE,
+            _ => gst::Rank::MARGINAL,
+        };
+        assert!(!demotion_keeps_codec_decodable(
+            "d3d11vp8dec",
+            no_ranked_vp8_left
+        ));
+        // With a ranked software fallback the demotion is allowed.
+        assert!(demotion_keeps_codec_decodable("d3d11vp8dec", |_| {
+            gst::Rank::MARGINAL
+        }));
+        // AV1: other hardware AV1 decoders keep the codec decodable.
+        assert!(demotion_keeps_codec_decodable("d3d12av1dec", |_| {
+            gst::Rank::PRIMARY
+        }));
+    }
+
+    #[test]
+    fn demotion_expires_after_cooldown_only() {
+        let now = Instant::now();
+        assert!(!demotion_expired(now, now));
+        assert!(!demotion_expired(
+            now - DEMOTION_COOLDOWN + Duration::from_millis(1),
+            now
+        ));
+        assert!(demotion_expired(now - DEMOTION_COOLDOWN, now));
     }
 }
