@@ -302,9 +302,7 @@ pub fn trace_rule(rule: &str, index: usize) {
     /// Sentinel `u64::MAX` = never printed, so the first rule is not swallowed by the window.
     static LAST_MS: AtomicU64 = AtomicU64::new(u64::MAX);
 
-    if !*ENABLED
-        .get_or_init(|| std::env::var_os("RIV_MANGA_TRACE").is_some_and(|value| value == "1"))
-    {
+    if !*ENABLED.get_or_init(|| crate::diag::flag("RIV_MANGA_TRACE")) {
         return;
     }
 

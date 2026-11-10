@@ -1,9 +1,29 @@
 //! Opt-in freeze/crash forensics. Disabled sessions pay one cached bool load per call site.
 //!
-//! Env (PowerShell: `$env:RIV_DIAG=1`; cmd: `set RIV_DIAG=1`):
+//! Primary switch: an `env.local` file next to the executable, so the setting travels with the
+//! portable folder and survives a double-click launch (Explorer passes no process env). Copy this
+//! beside `rust-image-viewer.exe`:
+//!
+//! ```text
+//! # -- diagnostics on; logs land in <app dir>/logs instead of %TEMP%
+//! RIV_DIAG=1
+//! RIV_DIAG_DIR=logs
+//! RIV_DIAG_FRAME_MS=16
+//! RIV_DIAG_HANG_MS=2000
+//! # RIV_MANGA_TRACE=1
+//! ```
+//!
+//! Syntax: `KEY=VALUE` per line, `#`/`;` comment lines, blank lines skipped, CRLF tolerated,
+//! surrounding quotes and a leading `export ` optional, duplicates resolve to the last one.
+//! Only `RIV_*` keys are read. Search order: executable directory, then the working directory.
+//!
+//! Override for one session (process env beats `env.local`):
+//! PowerShell `$env:RIV_DIAG='1'`, run, then `Remove-Item Env:RIV_DIAG`; cmd: `set RIV_DIAG=1`.
+//!
 //!   `RIV_DIAG=1`       enable the sink below.
 //!   `RIV_MANGA_TRACE=1` alias with the same sink (its heal-rule lines land here too).
-//!   `RIV_DIAG_DIR`     log directory (default `<temp>/rust-image-viewer`).
+//!   `RIV_DIAG_DIR`     log directory, relative = resolved against the exe dir
+//!                      (default `<temp>/rust-image-viewer`).
 //!   `RIV_DIAG_FRAME_MS` slow-frame threshold in ms (default 16).
 //!   `RIV_DIAG_HANG_MS`  watchdog stall threshold in ms (default 2000).
 //!
@@ -14,6 +34,7 @@
 //! a diagnostic that pulls in winapi features is a diagnostic nobody enables by default.
 //! shortcut: no thread/RSS snapshot, add GetProcessMemoryInfo if hangs need process-level data.
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -31,6 +52,7 @@ const DEFAULT_HANG_MS: u64 = 2000;
 const SUMMARY_INTERVAL: Duration = Duration::from_secs(1);
 
 static ENABLED: OnceLock<bool> = OnceLock::new();
+static CONFIG: OnceLock<Config> = OnceLock::new();
 static ORIGIN: OnceLock<Instant> = OnceLock::new();
 static HEARTBEAT: AtomicU64 = AtomicU64::new(0);
 static FRAME_STARTED_MS: AtomicU64 = AtomicU64::new(0);
@@ -103,27 +125,171 @@ pub struct FrameStats {
     pub ttv_pending: usize,
 }
 
+/// `env.local` file name, in the exe directory (portable folder) or the working directory.
+const CONFIG_FILE: &str = "env.local";
+
+/// Where the settings came from; the startup line names it.
+enum ConfigSource {
+    /// Absolute path of the `env.local` that was read.
+    File(PathBuf),
+    ProcessEnv,
+    None,
+}
+
+/// Resolved once: `env.local` values with the real process env layered on top (env wins).
+struct Config {
+    values: HashMap<String, String>,
+    source: ConfigSource,
+    /// Process env had at least one `RIV_*` key, so some file value may be shadowed.
+    env_overrides: bool,
+    /// Directory of the running exe; relative `RIV_DIAG_DIR` resolves against it.
+    exe_dir: Option<PathBuf>,
+}
+
 /// Cached: `false` unless one of the enabling flags is set.
 pub fn enabled() -> bool {
-    *ENABLED.get_or_init(|| env_flag("RIV_DIAG") || env_flag("RIV_MANGA_TRACE"))
+    *ENABLED.get_or_init(|| flag("RIV_DIAG") || flag("RIV_MANGA_TRACE"))
 }
 
-fn env_flag(name: &str) -> bool {
-    std::env::var_os(name).is_some_and(|value| value == "1")
+/// `true` only for the literal value `1`.
+pub fn flag(key: &str) -> bool {
+    setting(key).as_deref() == Some("1")
 }
 
-fn env_u64(name: &str, default: u64) -> u64 {
-    std::env::var_os(name)
-        .and_then(|value| value.to_str().and_then(|text| text.trim().parse().ok()))
+/// Every `RIV_*` switch resolves here: process env first, then `env.local`, and an empty value
+/// counts as unset so `RIV_DIAG_DIR=` falls back to the default directory.
+pub fn setting(key: &str) -> Option<String> {
+    config()
+        .values
+        .get(&key.to_ascii_uppercase())
+        .filter(|value| !value.is_empty())
+        .cloned()
+}
+
+/// Line every diag session starts with: switch state, config source, effective values.
+/// Callers print it only when `enabled()`, because a disabled session writes nothing anywhere.
+pub fn status_line() -> String {
+    let config = config();
+    let source = match &config.source {
+        ConfigSource::File(path) => path.display().to_string(),
+        ConfigSource::ProcessEnv => "process env".to_string(),
+        ConfigSource::None => "none".to_string(),
+    };
+    format!(
+        "diag start pid={} enabled={} source={} env_overrides={} riv_diag={} riv_manga_trace={} riv_diag_dir={} frame_ms={} hang_ms={}",
+        std::process::id(),
+        if enabled() { "yes" } else { "no" },
+        source,
+        if config.env_overrides { "yes" } else { "no" },
+        setting("RIV_DIAG").unwrap_or_else(|| "0".to_string()),
+        setting("RIV_MANGA_TRACE").unwrap_or_else(|| "0".to_string()),
+        log_dir().display(),
+        setting_u64("RIV_DIAG_FRAME_MS", DEFAULT_FRAME_MS),
+        setting_u64("RIV_DIAG_HANG_MS", DEFAULT_HANG_MS),
+    )
+}
+
+fn config() -> &'static Config {
+    CONFIG.get_or_init(|| {
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(Path::to_path_buf));
+        let cwd = std::env::current_dir().ok();
+        let path = find_config(exe_dir.as_deref(), cwd.as_deref());
+        let file = path
+            .as_deref()
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .map(|text| parse_env_file(&text))
+            .unwrap_or_default();
+        let (values, env_overrides) = merge(file, std::env::vars());
+        let source = match (path, env_overrides) {
+            (Some(path), _) => ConfigSource::File(path),
+            (None, true) => ConfigSource::ProcessEnv,
+            (None, false) => ConfigSource::None,
+        };
+        Config {
+            values,
+            source,
+            env_overrides,
+            exe_dir,
+        }
+    })
+}
+
+/// Exe directory first, working directory second; first existing file wins. Both roots are
+/// absolute, so the returned path is too. Reads nothing.
+fn find_config(exe_dir: Option<&Path>, cwd: Option<&Path>) -> Option<PathBuf> {
+    [exe_dir, cwd]
+        .into_iter()
+        .flatten()
+        .map(|dir| dir.join(CONFIG_FILE))
+        .find(|path| path.is_file())
+}
+
+/// `KEY=VALUE` lines; `#`/`;` comment lines, blank lines skipped, CRLF tolerated, one pair of
+/// surrounding quotes and a leading `export ` stripped. Duplicates: last wins. Non-`RIV_` keys are
+/// dropped at the door, so a stray `PATH=` in the file cannot reach the app.
+fn parse_env_file(text: &str) -> HashMap<String, String> {
+    let mut values = HashMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line).trim_start();
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim().to_ascii_uppercase();
+        if !key.starts_with("RIV_") {
+            continue;
+        }
+        values.insert(key, unquote(value.trim()));
+    }
+    values
+}
+
+fn unquote(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let quoted = bytes.len() >= 2
+        && ((bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"')
+            || (bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\''));
+    if quoted {
+        value[1..value.len() - 1].to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+/// Process env wins over the file, so `$env:RIV_DIAG='0'` still switches one run off.
+fn merge(
+    file: HashMap<String, String>,
+    env: impl Iterator<Item = (String, String)>,
+) -> (HashMap<String, String>, bool) {
+    let mut values = file;
+    let mut overrides = false;
+    for (key, value) in env {
+        let key = key.to_ascii_uppercase();
+        if key.starts_with("RIV_") {
+            values.insert(key, value);
+            overrides = true;
+        }
+    }
+    (values, overrides)
+}
+
+fn setting_u64(key: &str, default: u64) -> u64 {
+    setting(key)
+        .and_then(|value| value.trim().parse().ok())
         .unwrap_or(default)
 }
 
 fn frame_threshold() -> Duration {
-    Duration::from_millis(env_u64("RIV_DIAG_FRAME_MS", DEFAULT_FRAME_MS))
+    Duration::from_millis(setting_u64("RIV_DIAG_FRAME_MS", DEFAULT_FRAME_MS))
 }
 
 fn hang_threshold() -> Duration {
-    Duration::from_millis(env_u64("RIV_DIAG_HANG_MS", DEFAULT_HANG_MS))
+    Duration::from_millis(setting_u64("RIV_DIAG_HANG_MS", DEFAULT_HANG_MS))
 }
 
 fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -148,11 +314,8 @@ pub fn init() {
             let _ = SINK.set(Some(Mutex::new(sink)));
             prune_old_logs(&dir, KEEP_FILES);
             *locked(&STAGE) = "start";
-            write_line(&format!(
-                "diag start pid={} log={}",
-                std::process::id(),
-                path.display()
-            ));
+            // First line: how diag was switched on and from where, then the effective config.
+            write_line(&format!("{} log={}", status_line(), path.display()));
         }
         Err(_) => {
             let _ = SINK.set(None);
@@ -164,9 +327,24 @@ pub fn init() {
 }
 
 fn log_dir() -> PathBuf {
-    match std::env::var_os("RIV_DIAG_DIR") {
-        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
-        _ => std::env::temp_dir().join("rust-image-viewer"),
+    resolve_log_dir(
+        setting("RIV_DIAG_DIR").as_deref(),
+        config().exe_dir.as_deref(),
+    )
+}
+
+/// Relative `RIV_DIAG_DIR` resolves against the exe directory so `RIV_DIAG_DIR=logs` keeps the
+/// logs inside the portable folder; absolute paths are used as given.
+fn resolve_log_dir(value: Option<&str>, exe_dir: Option<&Path>) -> PathBuf {
+    match value.filter(|value| !value.is_empty()) {
+        Some(value) => {
+            let path = PathBuf::from(value.trim());
+            match exe_dir {
+                Some(base) if path.is_relative() => base.join(path),
+                _ => path,
+            }
+        }
+        None => std::env::temp_dir().join("rust-image-viewer"),
     }
 }
 
@@ -505,6 +683,100 @@ mod tests {
         left.sort_unstable();
         assert_eq!(left, vec![20, 30, 40]);
         assert!(dir.join("unrelated.txt").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn env_file_parses_comments_quotes_and_duplicates() {
+        let text = "# comment\r\n; also a comment\r\n\r\nexport RIV_DIAG=\"1\"\r\n\
+                    riv_diag_hang_ms = '4000'\r\n\
+                    RIV_DIAG_DIR=logs\r\nRIV_DIAG_DIR=roomy logs\r\n\
+                    PATH=/nope\r\nno_equals_here\r\n";
+        let values = parse_env_file(text);
+        assert_eq!(values.get("RIV_DIAG").map(String::as_str), Some("1"));
+        assert_eq!(
+            values.get("RIV_DIAG_HANG_MS").map(String::as_str),
+            Some("4000")
+        );
+        // Duplicate: last wins, inner spaces of an unquoted value kept.
+        assert_eq!(
+            values.get("RIV_DIAG_DIR").map(String::as_str),
+            Some("roomy logs")
+        );
+        // Unknown key dropped, malformed line skipped.
+        assert!(!values.contains_key("PATH"));
+        assert_eq!(values.len(), 3);
+    }
+
+    #[test]
+    fn process_env_wins_over_the_file() {
+        let file = parse_env_file("RIV_DIAG=1\nRIV_DIAG_HANG_MS=2000\n");
+        let env = vec![
+            ("RIV_DIAG_HANG_MS".to_string(), "9000".to_string()),
+            ("RIV_MANGA_TRACE".to_string(), "1".to_string()),
+            ("PATH".to_string(), "ignored".to_string()),
+        ];
+
+        let (values, overrides) = merge(file, env.into_iter());
+
+        assert!(overrides);
+        assert_eq!(
+            values.get("RIV_DIAG_HANG_MS").map(String::as_str),
+            Some("9000")
+        );
+        assert_eq!(values.get("RIV_DIAG").map(String::as_str), Some("1"));
+        assert_eq!(values.get("RIV_MANGA_TRACE").map(String::as_str), Some("1"));
+        assert!(!values.contains_key("PATH"));
+    }
+
+    #[test]
+    fn relative_diag_dir_lands_beside_the_exe() {
+        let base = Path::new("appdir");
+        assert_eq!(resolve_log_dir(Some("logs"), Some(base)), base.join("logs"));
+
+        let absolute = std::env::temp_dir().join("riv-diag-absolute");
+        let as_text = absolute.display().to_string();
+        assert_eq!(resolve_log_dir(Some(&as_text), Some(base)), absolute);
+
+        let default = std::env::temp_dir().join("rust-image-viewer");
+        assert_eq!(resolve_log_dir(Some(""), Some(base)), default);
+        assert_eq!(resolve_log_dir(None, None), default);
+    }
+
+    #[test]
+    fn env_local_beside_the_exe_wins_over_the_working_directory() {
+        let root = std::env::temp_dir().join(format!("riv-diag-config-{}", std::process::id()));
+        let exe_dir = root.join("app");
+        let cwd = root.join("cwd");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        assert_eq!(find_config(Some(&exe_dir), Some(&cwd)), None);
+        std::fs::write(cwd.join(CONFIG_FILE), b"RIV_DIAG=1\n").unwrap();
+        assert_eq!(
+            find_config(Some(&exe_dir), Some(&cwd)),
+            Some(cwd.join(CONFIG_FILE))
+        );
+        std::fs::write(exe_dir.join(CONFIG_FILE), b"RIV_DIAG=1\n").unwrap();
+        assert_eq!(
+            find_config(Some(&exe_dir), Some(&cwd)),
+            Some(exe_dir.join(CONFIG_FILE))
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn missing_env_local_writes_nothing() {
+        let dir = std::env::temp_dir().join(format!("riv-diag-missing-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // No file anywhere: nothing to read, nothing created, diag stays off.
+        assert_eq!(find_config(None, Some(&dir)), None);
+        assert!(!enabled());
+        assert!(!dir.join(CONFIG_FILE).exists());
+        assert!(!dir.join("logs").exists());
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

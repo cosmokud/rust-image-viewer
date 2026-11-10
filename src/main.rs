@@ -32013,9 +32013,9 @@ fn init_runtime_diagnostics() {
     static INIT: OnceLock<()> = OnceLock::new();
 
     INIT.get_or_init(|| {
-        let filter = std::env::var("RIV_LOG")
-            .or_else(|_| std::env::var("RUST_LOG"))
-            .unwrap_or_else(|_| "warn".to_string());
+        let filter = diag::setting("RIV_LOG")
+            .or_else(|| std::env::var("RUST_LOG").ok())
+            .unwrap_or_else(|| "warn".to_string());
 
         let env_filter = tracing_subscriber::EnvFilter::try_new(filter)
             .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
@@ -32026,7 +32026,7 @@ fn init_runtime_diagnostics() {
             .compact()
             .try_init();
 
-        if std::env::var_os("RIV_PUFFIN").is_some() {
+        if diag::setting("RIV_PUFFIN").is_some() {
             puffin::set_scopes_on(true);
         }
     });

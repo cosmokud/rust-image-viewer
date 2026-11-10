@@ -35,3 +35,6 @@ pi-session*.html
 
 # Machine-local release profile (thin LTO on a workstation, never commit)
 /.cargo/release-profile.local.toml
+
+# Machine-local diagnostics switch written by the operator beside the exe / repo root
+env.local
