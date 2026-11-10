@@ -36,6 +36,62 @@ use windows::{
 // Keep a generous decode budget so very large static images can load at full quality.
 // Header-based probing and dimension checks still guard against invalid/corrupt inputs.
 const DEFAULT_MAX_DECODE_ALLOC_BYTES: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
+/// Header-independent decode ceiling. A file may *declare* any dimensions in its header, so the
+/// only reliable bomb guard is a fixed pixel budget checked before the decoder allocates. Sized
+/// for real photos/comics (64 MP RGBA = 256 MiB); anything larger falls back to the placeholder.
+const MAX_DECODED_PIXELS: u64 = 64 * 1024 * 1024;
+/// Ceiling for one decoded RGBA buffer plus decoder scratch (inflate window, filter rows).
+/// `max_alloc` never exceeds it and no payload above it leaves this module.
+pub(crate) const MAX_DECODED_RGBA_BYTES: u64 = 320 * 1024 * 1024;
+/// Lower bound of the header-derived `max_alloc` window; small files stay cheap to decode.
+const MIN_DECODE_ALLOC_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Error for a declared/decoded size outside the fixed budget. Checked *before* any allocation so
+/// a bomb costs one header parse instead of gigabytes.
+fn decode_budget_error(width: u32, height: u32) -> Option<String> {
+    let pixels = (width as u64).saturating_mul(height as u64);
+    if pixels > MAX_DECODED_PIXELS {
+        return Some(format!(
+            "Image is too large to decode: {}x{} = {} MP exceeds the {} MP limit",
+            width,
+            height,
+            pixels / (1024 * 1024),
+            MAX_DECODED_PIXELS / (1024 * 1024)
+        ));
+    }
+    if pixels.saturating_mul(4) > MAX_DECODED_RGBA_BYTES {
+        return Some(format!(
+            "Image is too large to decode: {}x{} needs more than {} MiB of RGBA",
+            width,
+            height,
+            MAX_DECODED_RGBA_BYTES / (1024 * 1024)
+        ));
+    }
+    None
+}
+
+/// Header-derived `max_alloc`, clamped into `[MIN, ceiling]` so neither a tiny nor a lying header
+/// can talk the decoder into an unbounded allocation.
+fn decode_alloc_budget(width: u32, height: u32) -> u64 {
+    let estimated = (width as u64)
+        .saturating_mul(height as u64)
+        .saturating_mul(4)
+        .saturating_add(16 * 1024 * 1024);
+    estimated
+        .clamp(MIN_DECODE_ALLOC_BYTES, DEFAULT_MAX_DECODE_ALLOC_BYTES)
+        .min(MAX_DECODED_RGBA_BYTES)
+}
+
+fn check_decoded_buffer_len(len: usize) -> Result<(), String> {
+    if len as u64 > MAX_DECODED_RGBA_BYTES {
+        return Err(format!(
+            "Decoded pixel buffer is too large: {} MiB exceeds the {} MiB limit",
+            len / (1024 * 1024),
+            MAX_DECODED_RGBA_BYTES / (1024 * 1024)
+        ));
+    }
+    Ok(())
+}
 const ZUNE_STATIC_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "bmp", "psd"];
 const ZUNE_JPEG_EXTENSIONS: &[&str] = &["jpg", "jpeg"];
 const WEBP_STREAM_CHANNEL_CAPACITY: usize = 96;
@@ -206,13 +262,12 @@ fn decode_static_with_zune_limits(path: &Path) -> Result<(u32, u32, Vec<u8>), St
     // throughput high while still bounding decode memory.
     let (w, h) = probe_image_dimensions(path).unwrap_or((0, 0));
 
-    // Conservative upper bound: assume 4 bytes/pixel worst case.
-    let estimated = (w as u64)
-        .saturating_mul(h as u64)
-        .saturating_mul(4)
-        .saturating_add(16 * 1024 * 1024);
+    // Reject a bomb from the header alone: the allocation happens inside zune.
+    if let Some(err) = decode_budget_error(w, h) {
+        return Err(err);
+    }
 
-    let max_alloc = estimated.clamp(256 * 1024 * 1024, DEFAULT_MAX_DECODE_ALLOC_BYTES);
+    let max_alloc = decode_alloc_budget(w, h);
     let max_alloc_usize = usize::try_from(max_alloc).unwrap_or(usize::MAX);
 
     let options = static_zune_decoder_options(path, max_alloc_usize, w, h);
@@ -231,6 +286,10 @@ fn decode_static_with_zune_limits(path: &Path) -> Result<(u32, u32, Vec<u8>), St
 
     let width = u32::try_from(w).map_err(|_| "Decoded image width too large".to_string())?;
     let height = u32::try_from(h).map_err(|_| "Decoded image height too large".to_string())?;
+    // A decoder may ignore the header it was validated against; bound the real output too.
+    if let Some(err) = decode_budget_error(width, height) {
+        return Err(err);
+    }
 
     let pixels = img
         .flatten_to_u8()
@@ -250,6 +309,7 @@ fn decode_static_with_zune_limits(path: &Path) -> Result<(u32, u32, Vec<u8>), St
             pixels.len()
         ));
     }
+    check_decoded_buffer_len(pixels.len())?;
 
     Ok((width, height, pixels))
 }
@@ -259,12 +319,12 @@ fn decode_static_with_image_reader_limits(path: &Path) -> Result<(u32, u32, Vec<
     // We keep this for formats like ICO/TIFF while fast-pathing common formats via zune.
     let (w, h) = probe_image_dimensions(path).unwrap_or((0, 0));
 
-    let estimated = (w as u64)
-        .saturating_mul(h as u64)
-        .saturating_mul(4)
-        .saturating_add(16 * 1024 * 1024);
+    // Same fixed budget as the zune path; header dims are attacker-controlled.
+    if let Some(err) = decode_budget_error(w, h) {
+        return Err(err);
+    }
 
-    let max_alloc = estimated.clamp(256 * 1024 * 1024, DEFAULT_MAX_DECODE_ALLOC_BYTES);
+    let max_alloc = decode_alloc_budget(w, h);
 
     let mut reader = image::ImageReader::new(open_media_reader(path)?);
 
@@ -291,7 +351,12 @@ fn decode_static_with_image_reader_limits(path: &Path) -> Result<(u32, u32, Vec<
 
     let rgba = decoded.to_rgba8();
     let (width, height) = rgba.dimensions();
-    Ok((width, height, rgba.into_raw()))
+    if let Some(err) = decode_budget_error(width, height) {
+        return Err(err);
+    }
+    let raw = rgba.into_raw();
+    check_decoded_buffer_len(raw.len())?;
+    Ok((width, height, raw))
 }
 
 fn open_image_with_reasonable_limits(path: &Path) -> Result<(u32, u32, Vec<u8>), String> {
@@ -625,6 +690,10 @@ impl LoadedImage {
 
             let (width, height) = frame.dimensions();
             let data = frame.data();
+            if let Some(err) = decode_budget_error(width, height) {
+                crate::diag::trace("stream-decode-skip", &format!("huge frame: {}", err));
+                return;
+            }
 
             if target_width.is_none() {
                 if let Some(max_side) = max_texture_side {
@@ -725,6 +794,11 @@ impl LoadedImage {
 
         let (width, height) = frame.dimensions();
         let data = frame.data();
+        // WEBP carries real dims in the bitstream, so this is the first point a bomb is visible.
+        if let Some(err) = decode_budget_error(width, height) {
+            return Err(err);
+        }
+        check_decoded_buffer_len(data.len())?;
 
         // Downscale if necessary
         let (tw, th) = if let Some(max_side) = max_texture_side {
@@ -907,6 +981,10 @@ impl LoadedImage {
 
         let width = decoder.width() as u32;
         let height = decoder.height() as u32;
+        // GIF logical screen size is header data: bound it before any frame is composited.
+        if let Some(err) = decode_budget_error(width, height) {
+            return Err(err);
+        }
 
         let (target_width, target_height) = if let Some(max_side) = max_texture_side {
             if max_side > 0 && (width > max_side || height > max_side) {
@@ -1077,6 +1155,9 @@ impl LoadedImage {
 
             let (width, height) = frame.dimensions();
             let data = frame.data();
+            if let Some(err) = decode_budget_error(width, height) {
+                return Err(err);
+            }
 
             // Compute downscale targets on the first frame.
             if target_width.is_none() {
@@ -1435,7 +1516,10 @@ pub mod natord {
 
 #[cfg(test)]
 mod tests {
-    use super::{get_media_in_directory, static_zune_decoder_options, LoadedImage};
+    use super::{
+        decode_alloc_budget, decode_budget_error, get_media_in_directory,
+        static_zune_decoder_options, LoadedImage, MAX_DECODED_PIXELS, MAX_DECODED_RGBA_BYTES,
+    };
     use image::imageops::FilterType;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -1460,6 +1544,95 @@ mod tests {
             .as_nanos();
         path.push(format!("{}_{}_{}", prefix, std::process::id(), stamp));
         path
+    }
+
+    #[test]
+    fn decode_budget_rejects_bomb_dimensions_before_allocating() {
+        // 20000x20000 = 400 MP = 1.6 GiB RGBA: the exact shape the diag log crashed on.
+        let err = decode_budget_error(20_000, 20_000).expect("bomb dims must be rejected");
+        assert!(err.contains("too large"), "unexpected error: {err}");
+        assert_eq!(
+            decode_budget_error(8_192, 8_192),
+            None,
+            "64 MP is still allowed"
+        );
+        assert!(
+            decode_budget_error(8_193, 8_192).is_some(),
+            "above 64 MP is not"
+        );
+        // Header-derived alloc budget can never exceed the fixed ceiling.
+        assert!(decode_alloc_budget(20_000, 20_000) <= MAX_DECODED_RGBA_BYTES);
+        assert!(decode_alloc_budget(1, 1) >= 256 * 1024 * 1024);
+    }
+
+    /// Rewrites a real PNG's IHDR dimensions: keeps the file readable by header probes while
+    /// declaring a size no decoder could allocate. CRC is left stale on purpose — the guard has
+    /// to fire before any decoder runs.
+    fn png_claiming_dimensions(width: u32, height: u32) -> (PathBuf, PathBuf) {
+        let root = unique_temp_dir("image_loader_bomb");
+        fs::create_dir_all(&root).unwrap();
+
+        let seed = root.join("seed.png");
+        image::RgbImage::from_pixel(4, 4, image::Rgb([10, 20, 30]))
+            .save(&seed)
+            .unwrap();
+        let mut bytes = fs::read(&seed).unwrap();
+        bytes[16..20].copy_from_slice(&width.to_be_bytes());
+        bytes[20..24].copy_from_slice(&height.to_be_bytes());
+
+        let bomb = root.join("bomb.png");
+        fs::write(&bomb, &bytes).unwrap();
+        let _ = fs::remove_file(&seed);
+        (root, bomb)
+    }
+
+    #[test]
+    fn bomb_declared_png_is_rejected_without_decoding() {
+        let (root, bomb) = png_claiming_dimensions(20_000, 20_000);
+
+        let result = LoadedImage::load_with_max_texture_side(
+            &bomb,
+            Some(4096),
+            FilterType::Triangle,
+            FilterType::Nearest,
+        );
+        let err = result.err().expect("bomb must not decode");
+        assert!(err.contains("too large"), "unexpected error: {err}");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn large_but_allowed_image_still_decodes_and_resizes() {
+        let root = unique_temp_dir("image_loader_allowed_large");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("big.png");
+        image::RgbImage::from_pixel(3000, 2000, image::Rgb([7, 9, 11]))
+            .save(&path)
+            .unwrap();
+
+        let loaded = LoadedImage::load_with_max_texture_side(
+            &path,
+            Some(512),
+            FilterType::Triangle,
+            FilterType::Nearest,
+        )
+        .unwrap();
+        let frame = loaded.current_frame_data();
+        assert!(frame.width <= 512 && frame.height <= 512);
+        assert_eq!(
+            frame.pixels.len(),
+            (frame.width * frame.height * 4) as usize
+        );
+        assert_eq!(loaded.display_dimensions(), (3000, 2000));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn constants_stay_consistent() {
+        assert_eq!(MAX_DECODED_PIXELS * 4, 256 * 1024 * 1024);
+        assert!(MAX_DECODED_RGBA_BYTES > MAX_DECODED_PIXELS * 4);
     }
 
     #[test]
