@@ -63,7 +63,7 @@ impl IniSection {
 /// The table is per section, and a spelling may appear in more than one section only when it
 /// must route to a different key there: `[Settings] controls_hide_delay` is the controls
 /// delay, `[Video] controls_hide_delay` is the legacy name for the bottom overlay delay.
-const INI_ALIASES: [(IniSection, &[&str], &str); 66] = [
+const INI_ALIASES: [(IniSection, &[&str], &str); 67] = [
     (
         IniSection::Settings,
         &["controls_hide_delay"],
@@ -546,6 +546,11 @@ const INI_ALIASES: [(IniSection, &[&str], &str); 66] = [
             "fps_overlay_update_interval_ms",
         ],
         "show_fps_update_interval_ms",
+    ),
+    (
+        IniSection::Performance,
+        &["show_loading_spinners", "loading_spinners"],
+        "show_loading_spinners",
     ),
     (
         IniSection::Performance,
