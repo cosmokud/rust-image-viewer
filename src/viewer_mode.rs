@@ -16,11 +16,6 @@ impl MangaLayoutMode {
         matches!(self, Self::Masonry | Self::Gallery)
     }
 
-    // Gallery draws fixed slots straight from file dimensions, so it skips the shared cache.
-    pub fn uses_metadata_cache(self) -> bool {
-        self != Self::Gallery
-    }
-
     pub fn shows_preview_video_controls(self) -> bool {
         !self.is_grid()
     }
@@ -114,10 +109,6 @@ impl Mode {
 
     pub fn is_gallery(self) -> bool {
         self.is_manga() && self.layout() == MangaLayoutMode::Gallery
-    }
-
-    pub fn uses_metadata_cache(self) -> bool {
-        self.layout().uses_metadata_cache()
     }
 
     pub fn shows_preview_video_controls(self) -> bool {
@@ -871,17 +862,12 @@ mod tests {
             MangaLayoutMode::Gallery,
         ] {
             assert_eq!(layout.is_grid(), !layout.shows_preview_video_controls());
-            assert_eq!(
-                layout.uses_metadata_cache(),
-                !matches!(layout, MangaLayoutMode::Gallery)
-            );
             for mode in Mode::ALL
                 .iter()
                 .copied()
                 .filter(|mode| mode.layout() == layout)
             {
                 assert_eq!(mode.is_grid(), layout.is_grid());
-                assert_eq!(mode.uses_metadata_cache(), layout.uses_metadata_cache());
                 assert_eq!(
                     mode.shows_preview_video_controls(),
                     layout.shows_preview_video_controls()

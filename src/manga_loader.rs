@@ -50,37 +50,104 @@ use crate::viewer_mode::MangaLayoutMode;
 
 /// Caps concurrent gstreamer first-frame probes. Each probe opens the video, drives a pipeline
 /// to `Paused` and waits up to 1.5s on the bus; several at once saturate the disk and starve
-/// every other read, which is what froze the gallery/masonry/long-strip modes.
-const MAX_CONCURRENT_VIDEO_PROBES: usize = 2;
+/// every other read, which is what froze the gallery/masonry/long-strip modes. Scaled off the
+/// core count because the old fixed 2 serialized a whole gallery behind two pipelines.
+const MIN_CONCURRENT_VIDEO_PROBES: usize = 2;
+const MAX_CONCURRENT_VIDEO_PROBES: usize = 8;
 /// Bounded wait: a rayon worker must never park indefinitely behind the gate.
-const VIDEO_PROBE_ACQUIRE_SLEEP_MS: u64 = 4;
-const VIDEO_PROBE_ACQUIRE_ATTEMPTS: u32 = 500;
+const VIDEO_PROBE_ACQUIRE_TIMEOUT: Duration = Duration::from_millis(400);
+
+fn video_probe_permit_count() -> usize {
+    std::thread::available_parallelism()
+        .map_or(MIN_CONCURRENT_VIDEO_PROBES, |cores| cores.get() / 4)
+        .clamp(MIN_CONCURRENT_VIDEO_PROBES, MAX_CONCURRENT_VIDEO_PROBES)
+}
+
+// Probe permits held by the calling thread; the single-permit-per-tile rule means 1.
+thread_local! {
+    static PROBE_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 struct VideoProbeGate {
-    semaphore: tokio::sync::Semaphore,
+    available: parking_lot::Mutex<usize>,
+    released: parking_lot::Condvar,
 }
 
 impl VideoProbeGate {
-    const fn new(permits: usize) -> Self {
+    fn new(permits: usize) -> Self {
         Self {
-            semaphore: tokio::sync::Semaphore::const_new(permits),
+            available: parking_lot::Mutex::new(permits),
+            released: parking_lot::Condvar::new(),
         }
     }
 
-    /// `try_acquire` + short sleeps instead of one long blocking wait. `None` (gate still busy
-    /// after the bounded wait) makes the caller degrade to cheap dimensions, never block.
-    fn acquire(&self) -> Option<tokio::sync::SemaphorePermit<'_>> {
-        for _ in 0..VIDEO_PROBE_ACQUIRE_ATTEMPTS {
-            if let Ok(permit) = self.semaphore.try_acquire() {
-                return Some(permit);
+    /// Parks on a condvar instead of the old `try_acquire` + 4ms sleep loop. `None` (gate still
+    /// busy after the bounded wait) makes the caller degrade to cheap dimensions, never block.
+    fn acquire_timeout(self: &std::sync::Arc<Self>, timeout: Duration) -> Option<VideoProbePermit> {
+        let deadline = Instant::now() + timeout;
+        let mut available = self.available.lock();
+        loop {
+            if *available > 0 {
+                *available -= 1;
+                PROBE_DEPTH.with(|depth| depth.set(depth.get() + 1));
+                return Some(VideoProbePermit {
+                    gate: std::sync::Arc::clone(self),
+                });
             }
-            std::thread::sleep(Duration::from_millis(VIDEO_PROBE_ACQUIRE_SLEEP_MS));
+            let now = Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            self.released.wait_for(&mut available, deadline - now);
         }
-        None
+    }
+
+    #[cfg(test)]
+    fn available(&self) -> usize {
+        *self.available.lock()
     }
 }
 
-static VIDEO_PROBE_GATE: VideoProbeGate = VideoProbeGate::new(MAX_CONCURRENT_VIDEO_PROBES);
+/// A held video-probe permit. Deliberately lifetime-free: one tile hands the same permit down
+/// `extract_video_first_frame` -> `probe_video_dimensions_fast` instead of queueing twice.
+/// Holds its own gate handle so a test gate gets its permits back, not the global one.
+struct VideoProbePermit {
+    gate: std::sync::Arc<VideoProbeGate>,
+}
+
+impl Drop for VideoProbePermit {
+    fn drop(&mut self) {
+        PROBE_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+        *self.gate.available.lock() += 1;
+        self.gate.released.notify_one();
+    }
+}
+
+type VideoProbeGateCell = std::sync::OnceLock<std::sync::Arc<VideoProbeGate>>;
+static VIDEO_PROBE_GATE: VideoProbeGateCell = std::sync::OnceLock::new();
+
+fn video_probe_gate() -> &'static std::sync::Arc<VideoProbeGate> {
+    VIDEO_PROBE_GATE
+        .get_or_init(|| std::sync::Arc::new(VideoProbeGate::new(video_probe_permit_count())))
+}
+
+/// Permit for one probe chain, bounded by `VIDEO_PROBE_ACQUIRE_TIMEOUT`.
+fn acquire_probe_permit() -> Option<VideoProbePermit> {
+    video_probe_gate().acquire_timeout(VIDEO_PROBE_ACQUIRE_TIMEOUT)
+}
+
+/// Reuse the caller's permit, else take one. `None` = gate busy past the bounded wait.
+fn probe_permit<'a>(
+    ticket: Option<&'a VideoProbePermit>,
+    owned: &'a mut Option<VideoProbePermit>,
+) -> Option<&'a VideoProbePermit> {
+    if ticket.is_some() {
+        return ticket;
+    }
+
+    *owned = acquire_probe_permit();
+    owned.as_ref()
+}
 
 /// Runs `probe` under the shared video-probe gate. `None` when the gate stayed busy past the
 /// bounded wait, so an off-frame caller degrades instead of adding more disk load.
@@ -88,7 +155,7 @@ static VIDEO_PROBE_GATE: VideoProbeGate = VideoProbeGate::new(MAX_CONCURRENT_VID
 /// Worker threads only: the wait is bounded but not short, so never call this from the frame
 /// loop — a UI-thread caller must schedule the probe instead.
 pub fn with_video_probe_gate<T>(probe: impl FnOnce() -> T) -> Option<T> {
-    let _permit = VIDEO_PROBE_GATE.acquire()?;
+    let _permit = acquire_probe_permit()?;
     Some(probe())
 }
 
@@ -132,10 +199,20 @@ const DIM_REQUEST_BATCH_SIZE: usize = 64;
 const DIM_RESULT_CHUNK_SIZE: usize = 64;
 
 /// Bounded tries for handing a dimension chunk to the (64-slot) result channel before the
-/// chunk is abandoned: a blocking `send` here parks the only dim worker and stalls every
-/// later probe behind it until the main thread happens to drain.
+/// chunk is parked for the next pass: a blocking `send` here parks the only dim worker and
+/// stalls every later probe behind it until the main thread happens to drain.
 const DIM_RESULT_SEND_MAX_ATTEMPTS: u32 = 100;
 const DIM_RESULT_SEND_RETRY_SLEEP_MS: u64 = 2;
+
+/// What happened to a dimension chunk hand-off.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DimSend {
+    /// Accepted by the channel.
+    Flushed,
+    /// Channel still full: the chunk is queued for the next pass, never dropped.
+    Parked,
+    Disconnected,
+}
 
 /// Base backoff for decode retries after a failed/empty preload.
 const PRELOAD_RETRY_BASE_DELAY_MS: u64 = 250;
@@ -544,7 +621,44 @@ impl MangaLoader {
         let shutdown_clone = Arc::clone(&shutdown);
         let generation_clone = Arc::clone(&generation);
         crate::async_runtime::spawn_blocking_or_thread("manga-dimension-worker", move || {
+            // Chunks the result channel refused. Re-emitted on the next pass: dropping them made
+            // the tile fall back to 16:9 and re-probe, which is what stalled the gallery.
+            let mut parked: std::collections::VecDeque<DimResult> =
+                std::collections::VecDeque::new();
+
             while !shutdown_clone.load(Ordering::Acquire) {
+                // Parked results go out before new work, with a short poll instead of a 500ms
+                // block so a drained channel is refilled on the next tick.
+                if !parked.is_empty() {
+                    match Self::flush_parked_dim_chunks(&dim_result_tx, &mut parked) {
+                        DimSend::Disconnected => return,
+                        DimSend::Flushed => {}
+                        DimSend::Parked => {
+                            if let Ok(request) = dim_request_rx
+                                .try_recv()
+                                .or_else(|_| dim_background_request_rx.try_recv())
+                            {
+                                if let Some(req) =
+                                    Self::dim_request_ready(request, &generation_clone)
+                                {
+                                    Self::run_dim_request(
+                                        req,
+                                        &dim_result_tx,
+                                        &generation_clone,
+                                        &mut parked,
+                                    );
+                                }
+                                continue;
+                            }
+
+                            std::thread::sleep(Duration::from_millis(
+                                DIM_RESULT_SEND_RETRY_SLEEP_MS,
+                            ));
+                            continue;
+                        }
+                    }
+                }
+
                 let req = loop {
                     if let Ok(request) = dim_request_rx.try_recv() {
                         break Some(request);
@@ -577,92 +691,8 @@ impl MangaLoader {
                     break;
                 };
 
-                // Drop stale generation requests immediately so folder switches do not keep
-                // the dimension worker busy with obsolete probes.
-                if req.generation != generation_clone.load(Ordering::Acquire) {
-                    continue;
-                }
-
-                let mut out: Vec<(usize, u32, u32, MangaMediaType)> = req
-                    .items
-                    .into_par_iter()
-                    .filter_map(|(idx, path)| {
-                        let is_video = is_supported_video(&path);
-                        let is_image = is_supported_image(&path);
-
-                        if !is_video && !is_image {
-                            return None;
-                        }
-
-                        let media_type = if is_video {
-                            MangaMediaType::Video
-                        } else {
-                            MangaMediaType::StaticImage
-                        };
-
-                        let dims = if is_video {
-                            Self::probe_video_dimensions(&path)
-                        } else {
-                            Self::probe_image_dimensions_cached(&path)
-                        };
-
-                        let (w, h) = if let Some((w, h)) = dims {
-                            (w, h)
-                        } else if is_video {
-                            FALLBACK_VIDEO_DIMENSIONS
-                        } else {
-                            FALLBACK_IMAGE_DIMENSIONS
-                        };
-
-                        Some((idx, w, h, media_type))
-                    })
-                    .collect();
-
-                out.par_sort_unstable_by_key(|(idx, _, _, _)| *idx);
-
-                for chunk in out.chunks(DIM_RESULT_CHUNK_SIZE) {
-                    // Generation may advance while probing; avoid pushing obsolete results. The
-                    // dropped indices stay in `dim_pending`; the caller's stale-probe reaper
-                    // releases them so they can be probed again.
-                    if req.generation != generation_clone.load(Ordering::Acquire) {
-                        break;
-                    }
-
-                    // Bounded hand-off: a blocking send parks this sole worker whenever the
-                    // main thread drains slowly, stalling every later probe behind it.
-                    let mut attempts = 0u32;
-                    let mut sent = false;
-                    let mut disconnected = false;
-                    while attempts < DIM_RESULT_SEND_MAX_ATTEMPTS {
-                        match dim_result_tx.try_send(DimResult {
-                            generation: req.generation,
-                            items: chunk.to_vec(),
-                        }) {
-                            Ok(()) => {
-                                sent = true;
-                                break;
-                            }
-                            Err(TrySendError::Full(_)) => {
-                                attempts += 1;
-                                std::thread::sleep(Duration::from_millis(
-                                    DIM_RESULT_SEND_RETRY_SLEEP_MS,
-                                ));
-                            }
-                            Err(TrySendError::Disconnected(_)) => {
-                                disconnected = true;
-                                break;
-                            }
-                        }
-                    }
-
-                    if disconnected {
-                        return;
-                    }
-
-                    if !sent {
-                        // Channel stayed full: drop the chunk instead of wedging the worker.
-                        break;
-                    }
+                if let Some(req) = Self::dim_request_ready(req, &generation_clone) {
+                    Self::run_dim_request(req, &dim_result_tx, &generation_clone, &mut parked);
                 }
             }
         });
@@ -694,6 +724,125 @@ impl MangaLoader {
             #[cfg(test)]
             probe: None,
         }
+    }
+
+    /// `None` for a request whose generation has passed: folder switches must not keep the
+    /// dimension worker busy with obsolete probes.
+    fn dim_request_ready(req: DimRequest, generation: &AtomicUsize) -> Option<DimRequest> {
+        (req.generation == generation.load(Ordering::Acquire)).then_some(req)
+    }
+
+    /// Probe one batch and hand every chunk to the result channel, parking what it refuses.
+    fn run_dim_request(
+        req: DimRequest,
+        dim_result_tx: &Sender<DimResult>,
+        generation: &AtomicUsize,
+        parked: &mut std::collections::VecDeque<DimResult>,
+    ) {
+        let mut out: Vec<(usize, u32, u32, MangaMediaType)> = req
+            .items
+            .into_par_iter()
+            .filter_map(|(idx, path)| {
+                let is_video = is_supported_video(&path);
+                let is_image = is_supported_image(&path);
+
+                if !is_video && !is_image {
+                    return None;
+                }
+
+                let media_type = if is_video {
+                    MangaMediaType::Video
+                } else {
+                    MangaMediaType::StaticImage
+                };
+
+                let dims = if is_video {
+                    Self::probe_video_dimensions(&path)
+                } else {
+                    Self::probe_image_dimensions_cached(&path)
+                };
+
+                let (w, h) = if let Some((w, h)) = dims {
+                    (w, h)
+                } else if is_video {
+                    FALLBACK_VIDEO_DIMENSIONS
+                } else {
+                    FALLBACK_IMAGE_DIMENSIONS
+                };
+
+                Some((idx, w, h, media_type))
+            })
+            .collect();
+
+        out.par_sort_unstable_by_key(|(idx, _, _, _)| *idx);
+
+        for chunk in out.chunks(DIM_RESULT_CHUNK_SIZE) {
+            // Generation may advance while probing; avoid pushing obsolete results. The
+            // dropped indices stay in `dim_pending`; the caller's stale-probe reaper
+            // releases them so they can be probed again.
+            if req.generation != generation.load(Ordering::Acquire) {
+                break;
+            }
+
+            let chunk = DimResult {
+                generation: req.generation,
+                items: chunk.to_vec(),
+            };
+            if Self::queue_dim_chunk(dim_result_tx, chunk, parked) == DimSend::Disconnected {
+                return;
+            }
+        }
+    }
+
+    /// Hand one chunk over, or park it in `parked` for the next pass. Never discards: the
+    /// dropped indices would leave `dim_pending` set until the stale-probe reaper fires, and
+    /// the tile would re-probe the file through gstreamer.
+    fn queue_dim_chunk(
+        dim_result_tx: &Sender<DimResult>,
+        mut chunk: DimResult,
+        parked: &mut std::collections::VecDeque<DimResult>,
+    ) -> DimSend {
+        // Keep order: a later chunk must not overtake one still parked.
+        if !parked.is_empty() {
+            parked.push_back(chunk);
+            return DimSend::Parked;
+        }
+
+        for _ in 0..DIM_RESULT_SEND_MAX_ATTEMPTS {
+            match dim_result_tx.try_send(chunk) {
+                Ok(()) => return DimSend::Flushed,
+                Err(TrySendError::Full(returned)) => {
+                    chunk = returned;
+                    std::thread::sleep(Duration::from_millis(DIM_RESULT_SEND_RETRY_SLEEP_MS));
+                }
+                Err(TrySendError::Disconnected(_)) => return DimSend::Disconnected,
+            }
+        }
+
+        parked.push_back(chunk);
+        DimSend::Parked
+    }
+
+    /// Re-emit parked chunks until the channel is full again.
+    fn flush_parked_dim_chunks(
+        dim_result_tx: &Sender<DimResult>,
+        parked: &mut std::collections::VecDeque<DimResult>,
+    ) -> DimSend {
+        while let Some(chunk) = parked.pop_front() {
+            match dim_result_tx.try_send(chunk) {
+                Ok(()) => {}
+                Err(TrySendError::Full(returned)) => {
+                    parked.push_front(returned);
+                    return DimSend::Parked;
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    parked.clear();
+                    return DimSend::Disconnected;
+                }
+            }
+        }
+
+        DimSend::Flushed
     }
 
     /// Handle-only loader: no worker threads. Paired channels let tests inject dimension
@@ -1321,21 +1470,10 @@ impl MangaLoader {
             .is_some_and(|ext| ext.eq_ignore_ascii_case("webp"))
     }
 
-    fn probe_video_dimensions_fast(path: &std::path::Path) -> (u32, u32) {
+    /// Dimensions without touching the gstreamer gate: cache, shell metadata, filename hint.
+    fn cheap_video_dimensions(path: &std::path::Path) -> (u32, u32) {
         if let Some((w, h)) = lookup_cached_dimensions(path, CachedMediaKind::Video) {
             return (w, h);
-        }
-
-        if gstreamer_runtime_available() {
-            let probed = VIDEO_PROBE_GATE
-                .acquire()
-                .and_then(|_permit| probe_video_dimensions_with_gstreamer(path));
-            if let Some((w, h)) = probed {
-                if w > 0 && h > 0 {
-                    store_cached_dimensions(path, CachedMediaKind::Video, w, h);
-                    return (w, h);
-                }
-            }
         }
 
         if let Some((w, h)) = probe_video_dimensions_without_gstreamer(path) {
@@ -1345,7 +1483,30 @@ impl MangaLoader {
             }
         }
 
-        Self::fallback_video_dimensions(path).unwrap_or((1920, 1080))
+        Self::fallback_video_dimensions(path).unwrap_or(FALLBACK_VIDEO_DIMENSIONS)
+    }
+
+    fn probe_video_dimensions_fast(
+        path: &std::path::Path,
+        permit: Option<&VideoProbePermit>,
+    ) -> (u32, u32) {
+        if let Some((w, h)) = lookup_cached_dimensions(path, CachedMediaKind::Video) {
+            return (w, h);
+        }
+
+        if gstreamer_runtime_available() {
+            let mut owned = None;
+            if probe_permit(permit, &mut owned).is_some() {
+                if let Some((w, h)) = probe_video_dimensions_with_gstreamer(path) {
+                    if w > 0 && h > 0 {
+                        store_cached_dimensions(path, CachedMediaKind::Video, w, h);
+                        return (w, h);
+                    }
+                }
+            }
+        }
+
+        Self::cheap_video_dimensions(path)
     }
 
     /// Load a single image on a worker thread.
@@ -1363,7 +1524,11 @@ impl MangaLoader {
             MediaType::Video => {
                 // For videos, try to extract the first frame as a thumbnail
                 // This provides a visual preview instead of a gray placeholder
-                match Self::extract_video_first_frame(&req.path, effective_texture_side) {
+                // One permit for the whole tile: extraction and its inner dimension probe share it.
+                let tile_permit = acquire_probe_permit();
+                match tile_permit.as_ref().and_then(|permit| {
+                    Self::extract_video_first_frame(&req.path, effective_texture_side, Some(permit))
+                }) {
                     Some(frame) => {
                         let resize_started = Instant::now();
                         let (width, height, pixels) = downscale_rgba_if_needed(
@@ -1393,8 +1558,9 @@ impl MangaLoader {
                     None => {
                         // Fallback: use cheap dimensions only. Do not call the full probe here,
                         // because that can re-run first-frame extraction for already-failed videos.
+                        // A gate timeout also lands here: no decode worker may wait twice.
                         let (original_width, original_height) =
-                            Self::probe_video_dimensions_fast(&req.path);
+                            Self::cheap_video_dimensions(&req.path);
 
                         Some(DecodedImage {
                             index: req.index,
@@ -1516,39 +1682,39 @@ impl MangaLoader {
 
     /// Probe video dimensions for stable layout sizing.
     ///
-    /// Uses a lightweight first-frame probe, then falls back to filename heuristics.
+    /// Uses a lightweight first-frame probe, then falls back to filename heuristics. One permit
+    /// covers the whole chain: the first-frame fallback inside must not wait on the gate again.
     fn probe_video_dimensions(path: &std::path::Path) -> Option<(u32, u32)> {
         if let Some((w, h)) = lookup_cached_dimensions(path, CachedMediaKind::Video) {
             return Some((w, h));
         }
 
-        if gstreamer_runtime_available() {
-            // Permit scoped to the probe: the first-frame fallback below takes its own.
-            let probed = VIDEO_PROBE_GATE
-                .acquire()
-                .and_then(|_permit| probe_video_dimensions_with_gstreamer(path));
-            if let Some((w, h)) = probed {
+        let mut owned = None;
+        if let Some(permit) = probe_permit(None, &mut owned) {
+            if gstreamer_runtime_available() {
+                if let Some((w, h)) = probe_video_dimensions_with_gstreamer(path) {
+                    if w > 0 && h > 0 {
+                        store_cached_dimensions(path, CachedMediaKind::Video, w, h);
+                        return Some((w, h));
+                    }
+                }
+            }
+
+            if let Some((w, h)) = probe_video_dimensions_without_gstreamer(path) {
                 if w > 0 && h > 0 {
                     store_cached_dimensions(path, CachedMediaKind::Video, w, h);
                     return Some((w, h));
                 }
             }
-        }
 
-        if let Some((w, h)) = probe_video_dimensions_without_gstreamer(path) {
-            if w > 0 && h > 0 {
-                store_cached_dimensions(path, CachedMediaKind::Video, w, h);
-                return Some((w, h));
-            }
-        }
+            let probed = Self::extract_video_first_frame(path, 256, Some(permit))
+                .map(|frame| (frame.original_width, frame.original_height));
 
-        let probed = Self::extract_video_first_frame(path, 256)
-            .map(|frame| (frame.original_width, frame.original_height));
-
-        if let Some((w, h)) = probed {
-            if w > 0 && h > 0 {
-                store_cached_dimensions(path, CachedMediaKind::Video, w, h);
-                return Some((w, h));
+            if let Some((w, h)) = probed {
+                if w > 0 && h > 0 {
+                    store_cached_dimensions(path, CachedMediaKind::Video, w, h);
+                    return Some((w, h));
+                }
             }
         }
 
@@ -1618,9 +1784,11 @@ impl MangaLoader {
     fn extract_video_first_frame(
         path: &std::path::Path,
         max_texture_side: u32,
+        permit: Option<&VideoProbePermit>,
     ) -> Option<FirstFrame> {
         // Released by the guard on every path below, including the early returns.
-        let _probe_permit = VIDEO_PROBE_GATE.acquire()?;
+        let mut owned = None;
+        let _probe_permit = probe_permit(permit, &mut owned)?;
         let gstreamer_available = gstreamer_runtime_available();
 
         if !gstreamer_available {
@@ -1664,7 +1832,7 @@ impl MangaLoader {
         // Build URI from path
         let uri = gst::glib::filename_to_uri(path, None).ok()?.to_string();
 
-        let source_dimensions = Some(Self::probe_video_dimensions_fast(path));
+        let source_dimensions = Some(Self::probe_video_dimensions_fast(path, Some(_probe_permit)));
         let output_dimensions =
             Self::video_thumbnail_output_dimensions(source_dimensions, max_texture_side);
         let caps_filter = match output_dimensions {
@@ -3133,23 +3301,93 @@ mod tests {
 
     #[test]
     fn video_probe_gate_releases_permit_on_early_return() {
-        fn probe_that_bails(gate: &VideoProbeGate) -> Option<u32> {
-            let _permit = gate.acquire()?;
+        fn probe_that_bails(gate: &std::sync::Arc<VideoProbeGate>) -> Option<u32> {
+            let _permit = gate.acquire_timeout(Duration::from_millis(1))?;
             None
         }
 
-        let gate = VideoProbeGate::new(2);
+        let gate = std::sync::Arc::new(VideoProbeGate::new(2));
         assert_eq!(probe_that_bails(&gate), None);
-        assert_eq!(gate.semaphore.available_permits(), 2);
+        assert_eq!(gate.available(), 2);
 
-        let first = gate.acquire().unwrap();
-        let second = gate.acquire().unwrap();
-        assert!(gate.semaphore.try_acquire().is_err());
+        let first = gate.acquire_timeout(Duration::from_millis(1)).unwrap();
+        let second = gate.acquire_timeout(Duration::from_millis(1)).unwrap();
+        assert!(gate.acquire_timeout(Duration::from_millis(1)).is_none());
 
         drop(first);
-        assert!(gate.semaphore.try_acquire().is_ok());
+        let third = gate.acquire_timeout(Duration::from_millis(1));
+        assert!(third.is_some());
+        drop(third);
         drop(second);
-        assert_eq!(gate.semaphore.available_permits(), 2);
+        assert_eq!(gate.available(), 2);
+    }
+
+    #[test]
+    fn parked_dim_chunks_are_never_dropped() {
+        let (tx, rx) = crossbeam_channel::bounded::<DimResult>(1);
+        let mut parked = std::collections::VecDeque::new();
+        let chunk = |index: usize| DimResult {
+            generation: 0,
+            items: vec![(index, 640, 480, MangaMediaType::StaticImage)],
+        };
+
+        // First chunk fills the only slot, the second cannot follow it.
+        assert_eq!(
+            MangaLoader::queue_dim_chunk(&tx, chunk(0), &mut parked),
+            DimSend::Flushed
+        );
+        assert_eq!(
+            MangaLoader::queue_dim_chunk(&tx, chunk(1), &mut parked),
+            DimSend::Parked
+        );
+        assert_eq!(
+            MangaLoader::queue_dim_chunk(&tx, chunk(2), &mut parked),
+            DimSend::Parked
+        );
+        assert_eq!(parked.len(), 2);
+
+        // Draining the channel releases the parked chunks in order, one slot at a time.
+        assert!(rx.try_recv().is_ok());
+        assert_eq!(
+            MangaLoader::flush_parked_dim_chunks(&tx, &mut parked),
+            DimSend::Parked
+        );
+        assert_eq!(parked.len(), 1);
+        assert!(rx.try_recv().is_ok());
+        assert_eq!(
+            MangaLoader::flush_parked_dim_chunks(&tx, &mut parked),
+            DimSend::Flushed
+        );
+        assert!(parked.is_empty());
+        let got: Vec<usize> = [rx.try_recv(), rx.try_recv()]
+            .into_iter()
+            .flatten()
+            .map(|res| res.items[0].0)
+            .collect();
+        assert_eq!(got, vec![2]);
+    }
+
+    #[test]
+    fn video_probe_permit_count_scales_with_cores_within_bounds() {
+        let count = video_probe_permit_count();
+        assert!((MIN_CONCURRENT_VIDEO_PROBES..=MAX_CONCURRENT_VIDEO_PROBES).contains(&count));
+    }
+
+    #[test]
+    fn tile_probe_chain_takes_one_permit() {
+        // A tile hands its permit down the probe chain: no second acquisition while holding one.
+        let gate = std::sync::Arc::new(VideoProbeGate::new(1));
+        let held = gate.acquire_timeout(Duration::from_millis(1)).unwrap();
+        let mut owned = None;
+        assert!(probe_permit(Some(&held), &mut owned).is_some());
+        assert!(owned.is_none(), "nested acquire would deadlock the gate");
+        assert_eq!(gate.available(), 0);
+
+        // Without a ticket the chain takes its own permit from the shared gate.
+        let mut owned = None;
+        drop(held);
+        assert!(probe_permit(None, &mut owned).is_some());
+        assert!(owned.is_some());
     }
 
     #[test]

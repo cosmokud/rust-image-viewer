@@ -14907,7 +14907,7 @@ impl ImageViewer {
             self.reset_masonry_metadata_preload();
         }
         self.mode_transition(ModeEvent::EnterStrip);
-        set_metadata_cache_enabled(self.mode().uses_metadata_cache());
+        set_metadata_cache_enabled(true);
         self.stop_fullscreen_video_playback();
         self.reset_fullscreen_anim_stream_state();
         self.reset_manga_video_user_preferences();
@@ -19350,7 +19350,7 @@ impl ImageViewer {
         };
 
         self.mode_state.set_layout(layout_mode);
-        set_metadata_cache_enabled((layout_mode).uses_metadata_cache());
+        set_metadata_cache_enabled(true);
         let restored_masonry_session = if (layout_mode).is_grid() {
             self.mark_masonry_runtime_cache_resident();
             self.restore_masonry_folder_metadata_snapshot();
@@ -19848,9 +19848,8 @@ impl ImageViewer {
 
             // Warm the active list from in-memory state or persistent metadata cache before
             // falling back to background probes for the remaining misses.
-            let uses_metadata_cache = self.mode().uses_metadata_cache();
             if let Some(ref mut loader) = self.manga_loader {
-                if !reuse_preserved_masonry_layout && uses_metadata_cache {
+                if !reuse_preserved_masonry_layout {
                     loader.prime_dimension_cache(&self.image_list);
                 }
             }
@@ -22035,14 +22034,14 @@ impl ImageViewer {
 
         let defer_masonry_layout_work = self.masonry_navigation_active_for_heavy_work();
 
-        let (pending_loads, pending_decoded) = self
+        let (pending_loads, pending_decoded, pending_dims) = self
             .manga_loader
             .as_ref()
             .map(|loader| {
                 let backlog = loader.backlog();
-                (backlog.loads, backlog.decoded)
+                (backlog.loads, backlog.decoded, backlog.dimension_results)
             })
-            .unwrap_or((0, 0));
+            .unwrap_or((0, 0, 0));
         let decoded_backlog_total =
             pending_decoded.saturating_add(self.manga_decoded_mailbox.len());
         self.manga_pending_loads_peak = self.manga_pending_loads_peak.max(pending_loads);
@@ -22061,9 +22060,15 @@ impl ImageViewer {
                 .saturating_sub(self.manga_decoded_mailbox.len());
             let max_decoded = mailbox_headroom.min(upload_batch_limit.saturating_mul(4).max(1));
             // Limiting messages per frame prevents layout updates from causing bursts of work.
+            // A backed-up dimension channel drains wider even while navigating: the dim worker
+            // parks refused chunks, and dims that never arrive leave tiles on 16:9 and re-probing.
             let dim_poll_limit =
                 if defer_masonry_layout_work || self.masonry_metadata_preload_active {
-                    1
+                    if pending_dims >= 2 {
+                        4
+                    } else {
+                        1
+                    }
                 } else {
                     4
                 };
