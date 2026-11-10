@@ -3602,6 +3602,13 @@ impl Default for ImageViewer {
 
 impl ImageViewer {
     const TITLE_BAR_HEIGHT: f32 = 32.0;
+    /// Height of the bottom transport bar drawn over video and animated media while
+    /// the overlays are visible: one seekbar row plus one row of transport discs.
+    const VIDEO_CONTROL_BAR_HEIGHT: f32 = 78.0;
+    /// Diameter of the round play/pause and previous/next buttons in that bar.
+    const VIDEO_CONTROL_BUTTON_DIAMETER: f32 = 36.0;
+    /// Glyph box drawn inside a transport disc.
+    const VIDEO_CONTROL_GLYPH_SIZE: f32 = 16.0;
     const BREADCRUMB_BAR_HEIGHT: f32 = 30.0;
     const TOP_CONTROLS_HOTZONE_EXTRA: f32 = 18.0;
     /// Drawn window-button size in the title bar, and the gap the cluster keeps at its right edge.
@@ -9236,6 +9243,32 @@ impl ImageViewer {
         color: egui::Color32,
     ) {
         match icon {
+            VideoControlIcon::Play => {
+                let inset_x = rect.width() * 0.24;
+                let inset_y = rect.height() * 0.14;
+                let triangle = [
+                    egui::pos2(rect.left() + inset_x, rect.top() + inset_y),
+                    egui::pos2(rect.left() + inset_x, rect.bottom() - inset_y),
+                    egui::pos2(rect.right() - inset_x * 0.6, rect.center().y),
+                ];
+                Self::fill_round_polygon(painter, &triangle, rect.width() * 0.09, color);
+            }
+            VideoControlIcon::Pause => {
+                let bar_width = rect.width() * 0.17;
+                let bar_height = rect.height() * 0.74;
+                let gap = rect.width() * 0.18;
+                let top = rect.center().y - bar_height * 0.5;
+                for bar_left in [
+                    rect.center().x - gap * 0.5 - bar_width,
+                    rect.center().x + gap * 0.5,
+                ] {
+                    let bar_rect = egui::Rect::from_min_size(
+                        egui::pos2(bar_left, top),
+                        egui::vec2(bar_width, bar_height),
+                    );
+                    painter.rect_filled(bar_rect, bar_width * 0.35, color);
+                }
+            }
             VideoControlIcon::Previous | VideoControlIcon::Next => {
                 let forward = matches!(icon, VideoControlIcon::Next);
                 let width = rect.width();
@@ -9405,6 +9438,53 @@ impl ImageViewer {
         response.on_hover_text(tooltip)
     }
 
+    /// Round transport disc shared by play/pause and previous/next, so the whole
+    /// transport row reads as one control family: the same dark disc, hairline
+    /// ring and white vector glyph at the same size.
+    fn video_control_disc_button(
+        ui: &mut egui::Ui,
+        icon: VideoControlIcon,
+        tooltip: &str,
+        active: bool,
+    ) -> egui::Response {
+        let diameter = Self::VIDEO_CONTROL_BUTTON_DIAMETER;
+        let glyph_size = Self::VIDEO_CONTROL_GLYPH_SIZE;
+        let (rect, response) =
+            ui.allocate_exact_size(egui::vec2(diameter, diameter), egui::Sense::click());
+
+        // Keep the disc lighter than the near-black bar it sits on, otherwise the
+        // round shape disappears into the strip.
+        let (fill, ring_alpha) = if !ui.is_enabled() {
+            (egui::Color32::from_rgba_unmultiplied(58, 58, 64, 110), 14u8)
+        } else if response.is_pointer_button_down_on() {
+            (
+                egui::Color32::from_rgba_unmultiplied(104, 104, 112, 245),
+                62u8,
+            )
+        } else if response.hovered() || active {
+            (egui::Color32::from_rgba_unmultiplied(84, 84, 92, 240), 42u8)
+        } else {
+            (egui::Color32::from_rgba_unmultiplied(60, 60, 66, 220), 18u8)
+        };
+
+        let painter = ui.painter();
+        painter.circle_filled(rect.center(), diameter * 0.5, fill);
+        painter.circle_stroke(
+            rect.center(),
+            diameter * 0.5 - 0.5,
+            egui::Stroke::new(
+                1.0_f32,
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, ring_alpha),
+            ),
+        );
+
+        let glyph_rect =
+            egui::Rect::from_center_size(rect.center(), egui::vec2(glyph_size, glyph_size));
+        Self::draw_video_control_vector_icon(painter, icon, glyph_rect, egui::Color32::WHITE);
+
+        response.on_hover_text(tooltip)
+    }
+
     fn video_control_icon_button(
         ui: &mut egui::Ui,
         icon: VideoControlIcon,
@@ -9412,6 +9492,17 @@ impl ImageViewer {
         label: Option<&str>,
         active: bool,
     ) -> egui::Response {
+        if matches!(
+            icon,
+            VideoControlIcon::Play
+                | VideoControlIcon::Pause
+                | VideoControlIcon::Previous
+                | VideoControlIcon::Next
+        ) && label.filter(|text| !text.is_empty()).is_none()
+        {
+            return Self::video_control_disc_button(ui, icon, tooltip, active);
+        }
+
         if matches!(
             icon,
             VideoControlIcon::Previous
@@ -9675,7 +9766,7 @@ impl ImageViewer {
 
         // Track whether the pointer is currently over the bottom video controls region.
         // (Used for input suppression and for keeping overlays alive while hovering.)
-        let bar_height = 56.0;
+        let bar_height = Self::VIDEO_CONTROL_BAR_HEIGHT;
         let over_controls_bar = mouse_pos
             .map(|p| p.y > screen_rect.height() - bar_height)
             .unwrap_or(false);
@@ -9742,7 +9833,7 @@ impl ImageViewer {
         };
 
         if self.show_video_controls {
-            let bar_height = 56.0;
+            let bar_height = Self::VIDEO_CONTROL_BAR_HEIGHT;
             if pos.y > screen_rect.height() - bar_height {
                 return true;
             }
@@ -9755,7 +9846,7 @@ impl ImageViewer {
         let scrollbar_padding = Self::BOTTOM_RIGHT_OVERLAY_SCROLLBAR_PADDING;
         let margin = Self::BOTTOM_RIGHT_OVERLAY_MARGIN;
         let video_controls_offset = if self.show_video_controls {
-            56.0 + 8.0
+            Self::VIDEO_CONTROL_BAR_HEIGHT + 8.0
         } else {
             0.0
         };
@@ -23194,7 +23285,7 @@ impl ImageViewer {
 
         // If video controls are visible, lift the manga button above them.
         let video_controls_offset = if self.show_video_controls {
-            56.0 + 8.0
+            Self::VIDEO_CONTROL_BAR_HEIGHT + 8.0
         } else {
             0.0
         };
@@ -23336,7 +23427,7 @@ impl ImageViewer {
 
         // If video controls are visible, lift the zoom HUD above them.
         let video_controls_offset = if self.show_video_controls {
-            56.0 + 8.0
+            Self::VIDEO_CONTROL_BAR_HEIGHT + 8.0
         } else {
             0.0
         };
@@ -24639,7 +24730,7 @@ impl ImageViewer {
             });
         }
 
-        let controls_bar_height = 56.0;
+        let controls_bar_height = Self::VIDEO_CONTROL_BAR_HEIGHT;
         let over_controls =
             pointer_pos.map_or(false, |p| p.y > screen_height - controls_bar_height);
 
@@ -28372,8 +28463,8 @@ impl ImageViewer {
         }
 
         let screen_rect = ctx.screen_rect();
-        let bar_height = 56.0; // Increased height for bottom padding
-        let bottom_padding = 8.0; // Gap at the bottom so buttons don't look cramped
+        let bar_height = Self::VIDEO_CONTROL_BAR_HEIGHT;
+        let bottom_padding = 8.0; // Gap at the bottom so the discs don't look cramped
 
         // Draw control bar
         let bar_rect = egui::Rect::from_min_size(
@@ -28420,7 +28511,14 @@ impl ImageViewer {
 
     fn draw_video_playback_unavailable_controls_inner(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            let play_btn = ui.add(egui::Button::new("▶").min_size(egui::vec2(32.0, 24.0)));
+            // Same transport disc as the real bar so the fallback row still reads native.
+            let play_btn = Self::video_control_icon_button(
+                ui,
+                VideoControlIcon::Play,
+                "Video playback",
+                None,
+                false,
+            );
             if play_btn.clicked() {
                 self.queue_video_playback_unavailable_popup();
             }
@@ -29269,10 +29367,17 @@ impl ImageViewer {
 
             // === Bottom row: controls ===
             ui.horizontal(|ui| {
-                // Play/Pause button
-                let play_btn = ui.add(
-                    egui::Button::new(if self.gif_paused { "▶" } else { "⏸" })
-                        .min_size(egui::vec2(32.0, 24.0)),
+                // Play/Pause button: same round disc as the video transport.
+                let play_btn = Self::video_control_icon_button(
+                    ui,
+                    if self.gif_paused {
+                        VideoControlIcon::Play
+                    } else {
+                        VideoControlIcon::Pause
+                    },
+                    if self.gif_paused { "Play" } else { "Pause" },
+                    None,
+                    false,
                 );
 
                 if play_btn.clicked() {
@@ -29392,7 +29497,7 @@ impl ImageViewer {
         }
 
         let screen_rect = ctx.screen_rect();
-        let bar_height = 56.0;
+        let bar_height = Self::VIDEO_CONTROL_BAR_HEIGHT;
         let bottom_padding = 8.0;
 
         let bar_rect = egui::Rect::from_min_size(
@@ -29996,10 +30101,17 @@ impl ImageViewer {
 
             // === Bottom row: controls ===
             ui.horizontal(|ui| {
-                // Play/Pause button
-                let play_btn = ui.add(
-                    egui::Button::new(if self.gif_paused { "▶" } else { "⏸" })
-                        .min_size(egui::vec2(32.0, 24.0)),
+                // Play/Pause button: same round disc as the video transport.
+                let play_btn = Self::video_control_icon_button(
+                    ui,
+                    if self.gif_paused {
+                        VideoControlIcon::Play
+                    } else {
+                        VideoControlIcon::Pause
+                    },
+                    if self.gif_paused { "Play" } else { "Pause" },
+                    None,
+                    false,
                 );
 
                 if play_btn.clicked() {
@@ -30601,7 +30713,7 @@ impl ImageViewer {
             // Important: give resize edges priority over the overlay so bottom/bottom-corner resizing works.
             let over_video_controls =
                 self.show_video_controls && hover_resize_direction == ResizeDirection::None && {
-                    let bar_height = 56.0;
+                    let bar_height = Self::VIDEO_CONTROL_BAR_HEIGHT;
                     pointer_pos.map_or(false, |pos| pos.y > screen_rect.height() - bar_height)
                 };
             let pointer_over_shortcut_ui =
