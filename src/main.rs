@@ -25335,12 +25335,16 @@ impl ImageViewer {
             .image_list
             .get(self.current_index)
             .and_then(|path| lookup_cached_dimensions(path, CachedMediaKind::Image));
-        self.image_cached_dims_memo.set(Some(ImageCachedDimsMemo {
-            list_signature: key.0,
-            index: key.1,
-            texture_dims: key.2,
-            value,
-        }));
+        // Only a hit is memoized: a miss must stay refreshable, because the writer can
+        // land the record after this frame and the placeholder then sizes from it.
+        if value.is_some() {
+            self.image_cached_dims_memo.set(Some(ImageCachedDimsMemo {
+                list_signature: key.0,
+                index: key.1,
+                texture_dims: key.2,
+                value,
+            }));
+        }
         value
     }
 

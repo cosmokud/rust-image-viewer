@@ -200,9 +200,20 @@ struct CachedRecord {
 }
 
 enum CacheWriteOp {
-    // Disk facts (file type, animated) are resolved at enqueue: the writer must stay pure redb.
-    Dimensions { key: String, record: CachedRecord },
+    // Resolution to a durable record (file type, animated) is deferred to the writer: those
+    // reads open the media file, and a store can be called from the frame loop.
+    Dimensions(PendingDimension),
     Shutdown,
+}
+
+/// A dimension store awaiting resolution. Carries no disk-derived facts so that
+/// [`store_cached_dimensions`] never opens a file on the caller's thread.
+struct PendingDimension {
+    key: String,
+    path: PathBuf,
+    media_kind: CachedMediaKind,
+    width: u32,
+    height: u32,
 }
 
 pub struct MetadataCache {
@@ -560,15 +571,15 @@ fn cache_write_loop(cache: Arc<MetadataCache>, rx: crossbeam_channel::Receiver<C
         }
 
         let mut stop = matches!(first_op, CacheWriteOp::Shutdown);
-        let mut batch: Vec<(String, CachedRecord)> = Vec::with_capacity(CACHE_WRITE_BATCH_MAX);
+        let mut pending: Vec<PendingDimension> = Vec::with_capacity(CACHE_WRITE_BATCH_MAX);
 
-        if let CacheWriteOp::Dimensions { key, record } = first_op {
-            batch.push((key, record));
+        if let CacheWriteOp::Dimensions(op) = first_op {
+            pending.push(op);
         }
 
-        while !stop && batch.len() < CACHE_WRITE_BATCH_MAX {
+        while !stop && pending.len() < CACHE_WRITE_BATCH_MAX {
             match rx.try_recv() {
-                Ok(CacheWriteOp::Dimensions { key, record }) => batch.push((key, record)),
+                Ok(CacheWriteOp::Dimensions(op)) => pending.push(op),
                 Ok(CacheWriteOp::Shutdown) => stop = true,
                 Err(_) => break,
             }
@@ -577,6 +588,16 @@ fn cache_write_loop(cache: Arc<MetadataCache>, rx: crossbeam_channel::Receiver<C
         if CACHE_WRITE_SHUTDOWN.load(Ordering::Acquire) {
             break;
         }
+
+        // Resolve outside any transaction: this opens the media files, and readers must never
+        // be queued behind it (they no longer share a lock with the writer at all).
+        let batch: Vec<(String, CachedRecord)> = pending
+            .into_iter()
+            .filter_map(|op| {
+                let record = resolve_record(&op.path, op.media_kind, op.width, op.height)?;
+                Some((op.key, record))
+            })
+            .collect();
 
         if !batch.is_empty() {
             run_cache_write_active(|| {
@@ -668,7 +689,7 @@ pub fn store_cached_dimensions(path: &Path, media_kind: CachedMediaKind, width: 
         return;
     }
 
-    let Some((key, record)) = resolve_dimension_record(path, media_kind, width, height) else {
+    let Some(key) = crate::cache_key::key(path, crate::cache_key::KeyScope::Bare) else {
         return;
     };
 
@@ -676,17 +697,26 @@ pub fn store_cached_dimensions(path: &Path, media_kind: CachedMediaKind, width: 
         return;
     };
 
-    let _ = enqueue_dimension_write(tx, key, record);
+    let _ = enqueue_dimension_write(
+        tx,
+        PendingDimension {
+            key,
+            path: path.to_path_buf(),
+            media_kind,
+            width,
+            height,
+        },
+    );
 }
 
-/// Resolves the disk facts the record needs (file type, animated) on the caller's thread: it
-/// already touched that file, and the writer must not re-open media files under its lock.
-fn resolve_dimension_record(
+/// Writer thread only. Resolves the disk facts the record needs (file type, animated):
+/// [`store_cached_dimensions`] can run on the frame loop, so it must not open media files.
+fn resolve_record(
     path: &Path,
     media_kind: CachedMediaKind,
     width: u32,
     height: u32,
-) -> Option<(String, CachedRecord)> {
+) -> Option<CachedRecord> {
     if width == 0 || height == 0 {
         return None;
     }
@@ -696,26 +726,19 @@ fn resolve_dimension_record(
         return None;
     }
 
-    let key = crate::cache_key::key(path, crate::cache_key::KeyScope::Bare)?;
-    let record = CachedRecord {
+    Some(CachedRecord {
         width,
         height,
         file_type,
         animated: detect_animated(path, file_type),
-    };
-
-    Some((key, record))
+    })
 }
 
 fn enqueue_dimension_write(
     tx: &crossbeam_channel::Sender<CacheWriteOp>,
-    key: String,
-    record: CachedRecord,
+    op: PendingDimension,
 ) -> bool {
-    if tx
-        .try_send(CacheWriteOp::Dimensions { key, record })
-        .is_ok()
-    {
+    if tx.try_send(CacheWriteOp::Dimensions(op)).is_ok() {
         return true;
     }
 
@@ -1219,25 +1242,60 @@ mod tests {
 
         assert!(enqueue_dimension_write(
             &tx,
-            "key-1".to_string(),
-            test_record(1, 1)
+            PendingDimension {
+                key: "key-1".to_string(),
+                path: std::path::PathBuf::from("key-1"),
+                media_kind: CachedMediaKind::Image,
+                width: 1,
+                height: 1,
+            }
         ));
         assert!(!enqueue_dimension_write(
             &tx,
-            "key-2".to_string(),
-            test_record(2, 2)
+            PendingDimension {
+                key: "key-2".to_string(),
+                path: std::path::PathBuf::from("key-2"),
+                media_kind: CachedMediaKind::Image,
+                width: 2,
+                height: 2,
+            }
         ));
 
         // The rejected op was dropped, not written: the queue still holds exactly the first.
         assert_eq!(rx.len(), 1);
         assert!(matches!(
             rx.try_recv(),
-            Ok(CacheWriteOp::Dimensions { key, .. }) if key == "key-1"
+            Ok(CacheWriteOp::Dimensions(op)) if op.key == "key-1"
         ));
         assert_eq!(
             DIMENSION_WRITE_DROPS.load(Ordering::Relaxed) - drops_before,
             1
         );
+    }
+
+    #[test]
+    fn dimension_store_defers_file_reads_to_the_writer() {
+        let (tx, rx) = crossbeam_channel::bounded::<CacheWriteOp>(4);
+        let absent = std::env::temp_dir()
+            .join("riv-metadata-absent")
+            .join("missing.png");
+
+        // Caller side never opens the media file: an absent path still enqueues.
+        assert!(enqueue_dimension_write(
+            &tx,
+            PendingDimension {
+                key: "absent".to_string(),
+                path: absent.clone(),
+                media_kind: CachedMediaKind::Image,
+                width: 10,
+                height: 20,
+            }
+        ));
+        assert_eq!(rx.len(), 1);
+
+        // Writer side is where the file is read, and an absent file resolves to nothing.
+        assert!(resolve_record(&absent, CachedMediaKind::Image, 10, 20).is_none());
+        assert!(resolve_record(&absent, CachedMediaKind::Image, 0, 20).is_none());
     }
 
     #[test]
