@@ -3014,6 +3014,11 @@ struct ImageViewer {
     manga_cache_target_capacity: usize,
     /// Dynamic target texture side used for preload/retry requests.
     manga_target_texture_side: u32,
+    /// Visible item still needs a request while nothing is in flight; keeps the pump alive
+    /// without pointer input (backlog counters only report in-flight work).
+    manga_demand_outstanding: bool,
+    /// Earliest time the stalled (zero in-flight) preload pump may run again.
+    manga_demand_pump_at: Instant,
     /// Adaptive decoded-upload batch size used by manga texture uploads.
     manga_upload_batch_limit: usize,
     /// Last sampled number of visible media tiles in manga mode.
@@ -3493,6 +3498,8 @@ impl Default for ImageViewer {
             manga_last_scroll_position: 0.0,
             manga_cache_target_capacity: 64,
             manga_target_texture_side: 4096,
+            manga_demand_outstanding: false,
+            manga_demand_pump_at: Instant::now(),
             manga_upload_batch_limit: 4,
             manga_visible_indices_last: 0,
             manga_visible_strip_equivalent_last: 0.0,
@@ -3610,6 +3617,8 @@ impl ImageViewer {
     const MANGA_TTV_PENDING_MAX_AGE: Duration = Duration::from_secs(30);
     const MANGA_PLACEHOLDER_STALL_RETRY_MS: u64 = 900;
     const MANGA_STRIP_PLAYBACK_PRELOAD_INTERVAL_MS: u64 = 120;
+    /// Pump pacing when nothing is in flight but visible items are still unsatisfied.
+    const MANGA_DEMAND_PUMP_INTERVAL: Duration = Duration::from_millis(100);
     const MANGA_STRIP_PLAYBACK_BACKGROUND_TICK_MS: u64 = 80;
     const MANGA_PAGE_NAV_REPEAT_INITIAL_DELAY_MS: u64 = 260;
     const MANGA_PAGE_NAV_REPEAT_INTERVAL_MS: u64 = 45;
@@ -21465,6 +21474,34 @@ impl ImageViewer {
         }
     }
 
+    /// Outstanding-demand signal for the preload pump: a visible item is neither in flight nor
+    /// loaded at the target LOD. Level-triggered, unlike the in-flight backlog counters.
+    /// `visible` is the active mode's visible set (masonry, strip or collected fallback).
+    fn manga_refresh_demand_outstanding(&mut self, visible: Option<&[usize]>) -> bool {
+        let outstanding = if self.mode().is_solo() || self.image_list.is_empty() {
+            false
+        } else {
+            let collected;
+            let indices: &[usize] = match visible {
+                Some(indices) => indices,
+                None => {
+                    collected = self.manga_collect_visible_indices();
+                    &collected
+                }
+            };
+            self.manga_loader.as_ref().is_some_and(|loader| {
+                loader.demand_outstanding(
+                    &self.image_list,
+                    indices,
+                    self.max_texture_side,
+                    self.manga_target_texture_side,
+                )
+            })
+        };
+        self.manga_demand_outstanding = outstanding;
+        outstanding
+    }
+
     /// Update the preload queue based on current scroll position
     fn manga_update_preload_queue(&mut self) {
         if self.mode().is_solo() || self.image_list.is_empty() {
@@ -25280,11 +25317,28 @@ impl ImageViewer {
             animation_active = true;
         }
 
-        // Retry preload updates only while there is still background work in flight.
-        // When fully idle, avoid periodic O(n) scans that keep CPU usage elevated.
-        if has_pending_loads {
+        // Pump while work is in flight OR demand is outstanding. In-flight-only pumping is
+        // edge-triggered: when dropped batches drain the counters to zero nothing repaints, so
+        // tiles could only recover from pointer input (the hover force-retry path).
+        let demand_outstanding = self.manga_refresh_demand_outstanding(
+            masonry_visible_indices
+                .as_deref()
+                .or(strip_visible_indices.as_deref()),
+        );
+        let now = Instant::now();
+        let demand_pump_due = demand_outstanding && now >= self.manga_demand_pump_at;
+        if has_pending_loads || demand_pump_due {
             self.manga_update_preload_queue();
         }
+        // Stall pacing: in-flight work already drives frames; with none, pump at 100ms so a
+        // stuck item cannot scan the visible set at frame rate.
+        self.manga_demand_pump_at = if has_pending_loads || !demand_outstanding {
+            now
+        } else if demand_pump_due {
+            now + Self::MANGA_DEMAND_PUMP_INTERVAL
+        } else {
+            self.manga_demand_pump_at
+        };
 
         if self.mode().is_masonry() && !masonry_navigation_active_for_visible_retry {
             if let Some(due_at) = self.masonry_quality_refine_due_at {
@@ -31206,6 +31260,7 @@ impl eframe::App for ImageViewer {
                 || manga_pending_decoded > 0
                 || manga_pending_dimensions > 0
                 || manga_pending_dimension_probes > 0
+                || self.manga_demand_outstanding
                 || masonry_metadata_preload_running);
         let manga_needs_fast_background_poll = self.mode().is_manga()
             && (masonry_metadata_preload_running
@@ -31392,6 +31447,11 @@ impl eframe::App for ImageViewer {
 
             if let Some(delay) = cursor_idle_repaint_after {
                 schedule_min(delay);
+            }
+
+            // Watchdog: outstanding demand with zero in-flight work must keep waking the pump.
+            if self.mode().is_manga() && self.manga_demand_outstanding {
+                schedule_min(Duration::from_millis(250));
             }
 
             if let Some(d) = next_repaint {

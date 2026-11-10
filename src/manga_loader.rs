@@ -635,6 +635,51 @@ impl MangaLoader {
         }
     }
 
+    /// True when a visible index still needs a request: not in flight and no loaded level
+    /// reaching the target side. `backlog` only counts in-flight work, so a caller that pumps
+    /// the preload queue off `backlog` alone stalls once batches are dropped (generation
+    /// change, full result channel) and needs pointer input to recover. Level-triggered signal.
+    pub fn demand_outstanding(
+        &self,
+        image_list: &[PathBuf],
+        visible_indices: &[usize],
+        max_texture_side: u32,
+        target_texture_side: u32,
+    ) -> bool {
+        let loading = self.loading_indices.read();
+        let loaded = self.loaded_levels.read();
+        let retry = self.retry_state.read();
+
+        visible_indices.iter().any(|&idx| {
+            let Some(path) = image_list.get(idx) else {
+                return false;
+            };
+            if !is_supported_image(path) && !is_supported_video(path) {
+                return false;
+            }
+
+            // Same skip gates as `prefetch`, so this is true only while a request is issuable.
+            if loading.get(&idx).copied() == Some(self.current_generation) {
+                return false;
+            }
+            let request_target = self.limit_target_texture_side_for_index(
+                idx,
+                target_texture_side,
+                max_texture_side,
+            );
+            if let Some(side) = loaded.get(&idx) {
+                // Unknown source dims can put `request_target` above what the file can reach;
+                // any stored level then counts, else the pump would never go idle.
+                if *side >= request_target || !self.dimension_cache.contains_key(&idx) {
+                    return false;
+                }
+            }
+            !retry
+                .get(&idx)
+                .is_some_and(|state| state.attempts >= PRELOAD_RETRY_MAX_ATTEMPTS)
+        })
+    }
+
     /// Number of cached dimensions for indices in `[0, total_len)`.
     pub fn cached_dimensions_count(&self, total_len: usize) -> usize {
         if total_len == 0 {
@@ -3414,6 +3459,47 @@ mod tests {
         let requests = preload_requests(&loader);
         assert!(!requests.is_empty());
         assert!(requests.iter().all(|req| req.index != 10));
+    }
+
+    #[test]
+    fn demand_outstanding_tracks_pump_need_not_in_flight_work() {
+        let list = paths(3);
+        let mut loader = MangaLoader::without_workers();
+        // Source box known, so the LOD target is reachable by the file.
+        loader
+            .dimension_cache
+            .insert(0, (4000, 4000, MangaMediaType::StaticImage));
+        loader
+            .dimension_cache
+            .insert(1, (4000, 4000, MangaMediaType::StaticImage));
+
+        // Nothing in flight, nothing loaded.
+        assert!(loader.demand_outstanding(&list, &[0], MAX_SIDE, TARGET_SIDE));
+
+        // In flight for the active generation.
+        loader
+            .loading_indices
+            .write()
+            .insert(0, loader.current_generation);
+        assert!(!loader.demand_outstanding(&list, &[0], MAX_SIDE, TARGET_SIDE));
+
+        // Loaded below target -> still outstanding; at target -> satisfied.
+        loader.loading_indices.write().clear();
+        loader.loaded_levels.write().insert(0, TARGET_SIDE / 2);
+        assert!(loader.demand_outstanding(&list, &[0], MAX_SIDE, TARGET_SIDE));
+        loader.loaded_levels.write().insert(0, TARGET_SIDE);
+        assert!(!loader.demand_outstanding(&list, &[0], MAX_SIDE, TARGET_SIDE));
+
+        // Retry ceiling reached -> satisfied, so a failed item lets the app go idle.
+        loader.loaded_levels.write().clear();
+        loader.retry_state.write().insert(
+            1,
+            RetryState {
+                attempts: PRELOAD_RETRY_MAX_ATTEMPTS,
+                next_retry_at: Instant::now(),
+            },
+        );
+        assert!(!loader.demand_outstanding(&list, &[1], MAX_SIDE, TARGET_SIDE));
     }
 
     #[test]
