@@ -48,6 +48,50 @@ use crate::video_thumbnail::{
 };
 use crate::viewer_mode::MangaLayoutMode;
 
+/// Caps concurrent gstreamer first-frame probes. Each probe opens the video, drives a pipeline
+/// to `Paused` and waits up to 1.5s on the bus; several at once saturate the disk and starve
+/// every other read, which is what froze the gallery/masonry/long-strip modes.
+const MAX_CONCURRENT_VIDEO_PROBES: usize = 2;
+/// Bounded wait: a rayon worker must never park indefinitely behind the gate.
+const VIDEO_PROBE_ACQUIRE_SLEEP_MS: u64 = 4;
+const VIDEO_PROBE_ACQUIRE_ATTEMPTS: u32 = 500;
+
+struct VideoProbeGate {
+    semaphore: tokio::sync::Semaphore,
+}
+
+impl VideoProbeGate {
+    const fn new(permits: usize) -> Self {
+        Self {
+            semaphore: tokio::sync::Semaphore::const_new(permits),
+        }
+    }
+
+    /// `try_acquire` + short sleeps instead of one long blocking wait. `None` (gate still busy
+    /// after the bounded wait) makes the caller degrade to cheap dimensions, never block.
+    fn acquire(&self) -> Option<tokio::sync::SemaphorePermit<'_>> {
+        for _ in 0..VIDEO_PROBE_ACQUIRE_ATTEMPTS {
+            if let Ok(permit) = self.semaphore.try_acquire() {
+                return Some(permit);
+            }
+            std::thread::sleep(Duration::from_millis(VIDEO_PROBE_ACQUIRE_SLEEP_MS));
+        }
+        None
+    }
+}
+
+static VIDEO_PROBE_GATE: VideoProbeGate = VideoProbeGate::new(MAX_CONCURRENT_VIDEO_PROBES);
+
+/// Runs `probe` under the shared video-probe gate. `None` when the gate stayed busy past the
+/// bounded wait, so an off-frame caller degrades instead of adding more disk load.
+///
+/// Worker threads only: the wait is bounded but not short, so never call this from the frame
+/// loop — a UI-thread caller must schedule the probe instead.
+pub fn with_video_probe_gate<T>(probe: impl FnOnce() -> T) -> Option<T> {
+    let _permit = VIDEO_PROBE_GATE.acquire()?;
+    Some(probe())
+}
+
 /// Maximum number of decoded images to hold in memory awaiting GPU upload.
 /// This bounds memory usage even if the main thread is slow to consume results.
 const MAX_PENDING_UPLOADS: usize = 128;
@@ -1113,7 +1157,10 @@ impl MangaLoader {
         }
 
         if gstreamer_runtime_available() {
-            if let Some((w, h)) = probe_video_dimensions_with_gstreamer(path) {
+            let probed = VIDEO_PROBE_GATE
+                .acquire()
+                .and_then(|_permit| probe_video_dimensions_with_gstreamer(path));
+            if let Some((w, h)) = probed {
                 if w > 0 && h > 0 {
                     store_cached_dimensions(path, CachedMediaKind::Video, w, h);
                     return (w, h);
@@ -1306,7 +1353,11 @@ impl MangaLoader {
         }
 
         if gstreamer_runtime_available() {
-            if let Some((w, h)) = probe_video_dimensions_with_gstreamer(path) {
+            // Permit scoped to the probe: the first-frame fallback below takes its own.
+            let probed = VIDEO_PROBE_GATE
+                .acquire()
+                .and_then(|_permit| probe_video_dimensions_with_gstreamer(path));
+            if let Some((w, h)) = probed {
                 if w > 0 && h > 0 {
                     store_cached_dimensions(path, CachedMediaKind::Video, w, h);
                     return Some((w, h));
@@ -1398,6 +1449,8 @@ impl MangaLoader {
         path: &std::path::Path,
         max_texture_side: u32,
     ) -> Option<FirstFrame> {
+        // Released by the guard on every path below, including the early returns.
+        let _probe_permit = VIDEO_PROBE_GATE.acquire()?;
         let gstreamer_available = gstreamer_runtime_available();
 
         if !gstreamer_available {
@@ -2857,6 +2910,27 @@ mod tests {
                 items,
             })
             .expect("dimension result channel has room");
+    }
+
+    #[test]
+    fn video_probe_gate_releases_permit_on_early_return() {
+        fn probe_that_bails(gate: &VideoProbeGate) -> Option<u32> {
+            let _permit = gate.acquire()?;
+            None
+        }
+
+        let gate = VideoProbeGate::new(2);
+        assert_eq!(probe_that_bails(&gate), None);
+        assert_eq!(gate.semaphore.available_permits(), 2);
+
+        let first = gate.acquire().unwrap();
+        let second = gate.acquire().unwrap();
+        assert!(gate.semaphore.try_acquire().is_err());
+
+        drop(first);
+        assert!(gate.semaphore.try_acquire().is_ok());
+        drop(second);
+        assert_eq!(gate.semaphore.available_permits(), 2);
     }
 
     #[test]
