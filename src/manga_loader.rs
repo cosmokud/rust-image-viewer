@@ -131,6 +131,12 @@ const DIM_REQUEST_BATCH_SIZE: usize = 64;
 /// Maximum number of dimension results bundled into a single result message.
 const DIM_RESULT_CHUNK_SIZE: usize = 64;
 
+/// Bounded tries for handing a dimension chunk to the (64-slot) result channel before the
+/// chunk is abandoned: a blocking `send` here parks the only dim worker and stalls every
+/// later probe behind it until the main thread happens to drain.
+const DIM_RESULT_SEND_MAX_ATTEMPTS: u32 = 100;
+const DIM_RESULT_SEND_RETRY_SLEEP_MS: u64 = 2;
+
 /// Base backoff for decode retries after a failed/empty preload.
 const PRELOAD_RETRY_BASE_DELAY_MS: u64 = 250;
 /// Cap retry backoff so visible items recover quickly once they come into view.
@@ -142,6 +148,83 @@ const PRELOAD_RETRY_MAX_ATTEMPTS: u8 = 3;
 pub const LOD_SIDE_BUCKETS: &[u32] = &[
     96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096,
 ];
+
+/// Layout fallbacks used when a header probe yields nothing usable.
+const FALLBACK_IMAGE_DIMENSIONS: (u32, u32) = (1200, 1600);
+const FALLBACK_VIDEO_DIMENSIONS: (u32, u32) = (1920, 1080);
+/// Sanity ceiling for a probed pixel count and side length; real pages stay far below.
+const MAX_PROBED_PIXELS: u64 = 400_000_000;
+const MAX_PROBED_SIDE: u32 = 65535;
+/// Aspect ceiling (long:short); a corrupt header outside it poisons masonry layout.
+const MAX_PROBED_ASPECT: u32 = 100;
+
+/// Reject probed dimensions a corrupt/garbage header can produce.
+///
+/// A 0 or absurd side clamps the texture request target to ~1, which the loader then treats as
+/// "satisfied" and never re-requests; the tile stays a placeholder for good.
+fn sanitize_probed_dimensions(width: u32, height: u32) -> Option<(u32, u32)> {
+    if width < 1 || height < 1 || width > MAX_PROBED_SIDE || height > MAX_PROBED_SIDE {
+        return None;
+    }
+    if u64::from(width) * u64::from(height) > MAX_PROBED_PIXELS {
+        return None;
+    }
+    let (long, short) = if width >= height {
+        (width, height)
+    } else {
+        (height, width)
+    };
+    if long > short.saturating_mul(MAX_PROBED_ASPECT) {
+        return None;
+    }
+    Some((width, height))
+}
+
+/// Probed dimensions, or the media-type placeholder when the probe was unusable.
+fn probed_or_fallback_dimensions(
+    dims: Option<(u32, u32)>,
+    media_type: MangaMediaType,
+) -> (u32, u32) {
+    dims.and_then(|(width, height)| sanitize_probed_dimensions(width, height))
+        .unwrap_or(if media_type == MangaMediaType::Video {
+            FALLBACK_VIDEO_DIMENSIONS
+        } else {
+            FALLBACK_IMAGE_DIMENSIONS
+        })
+}
+
+/// `RIV_MANGA_TRACE=1` diagnostics: name the repair rule that fired, at most once per second.
+/// Off by default; the call sites are already slow paths, never per-frame loops.
+pub fn trace_rule(rule: &str, index: usize) {
+    use std::sync::atomic::AtomicU64;
+    use std::sync::OnceLock;
+
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    static ORIGIN: OnceLock<Instant> = OnceLock::new();
+    /// Sentinel `u64::MAX` = never printed, so the first rule is not swallowed by the window.
+    static LAST_MS: AtomicU64 = AtomicU64::new(u64::MAX);
+
+    if !*ENABLED
+        .get_or_init(|| std::env::var_os("RIV_MANGA_TRACE").is_some_and(|value| value == "1"))
+    {
+        return;
+    }
+
+    let elapsed_ms = ORIGIN.get_or_init(Instant::now).elapsed().as_millis() as u64;
+    let mut last = LAST_MS.load(Ordering::Relaxed);
+    loop {
+        if last != u64::MAX && elapsed_ms.saturating_sub(last) < 1000 {
+            return;
+        }
+        match LAST_MS.compare_exchange_weak(last, elapsed_ms, Ordering::Relaxed, Ordering::Relaxed)
+        {
+            Ok(_) => break,
+            Err(actual) => last = actual,
+        }
+    }
+
+    eprintln!("[manga-trace] {rule} idx={index}");
+}
 
 /// Media type for manga items (extended to include videos/animations)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -526,9 +609,9 @@ impl MangaLoader {
                         let (w, h) = if let Some((w, h)) = dims {
                             (w, h)
                         } else if is_video {
-                            (1920, 1080)
+                            FALLBACK_VIDEO_DIMENSIONS
                         } else {
-                            (1200, 1600)
+                            FALLBACK_IMAGE_DIMENSIONS
                         };
 
                         Some((idx, w, h, media_type))
@@ -538,19 +621,47 @@ impl MangaLoader {
                 out.par_sort_unstable_by_key(|(idx, _, _, _)| *idx);
 
                 for chunk in out.chunks(DIM_RESULT_CHUNK_SIZE) {
-                    // Generation may advance while probing; avoid pushing obsolete results.
+                    // Generation may advance while probing; avoid pushing obsolete results. The
+                    // dropped indices stay in `dim_pending`; the caller's stale-probe reaper
+                    // releases them so they can be probed again.
                     if req.generation != generation_clone.load(Ordering::Acquire) {
                         break;
                     }
 
-                    if dim_result_tx
-                        .send(DimResult {
+                    // Bounded hand-off: a blocking send parks this sole worker whenever the
+                    // main thread drains slowly, stalling every later probe behind it.
+                    let mut attempts = 0u32;
+                    let mut sent = false;
+                    let mut disconnected = false;
+                    while attempts < DIM_RESULT_SEND_MAX_ATTEMPTS {
+                        match dim_result_tx.try_send(DimResult {
                             generation: req.generation,
                             items: chunk.to_vec(),
-                        })
-                        .is_err()
-                    {
+                        }) {
+                            Ok(()) => {
+                                sent = true;
+                                break;
+                            }
+                            Err(TrySendError::Full(_)) => {
+                                attempts += 1;
+                                std::thread::sleep(Duration::from_millis(
+                                    DIM_RESULT_SEND_RETRY_SLEEP_MS,
+                                ));
+                            }
+                            Err(TrySendError::Disconnected(_)) => {
+                                disconnected = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    if disconnected {
                         return;
+                    }
+
+                    if !sent {
+                        // Channel stayed full: drop the chunk instead of wedging the worker.
+                        break;
                     }
                 }
             }
@@ -804,12 +915,18 @@ impl MangaLoader {
                 Err(_) => break,
             };
 
-            // Drop stale results (e.g., after cancel/clear).
+            // Drop stale results (e.g., after cancel/clear) but release the probe bookkeeping so
+            // those indices are not stranded in `dim_pending` for the whole next generation.
             if res.generation != self.current_generation {
+                for (idx, _, _, _) in res.items {
+                    self.dim_pending.remove(&idx);
+                }
                 continue;
             }
 
-            for (idx, w, h, mt) in res.items {
+            for (idx, raw_w, raw_h, mt) in res.items {
+                // Unsanitized header dims poison layout and can clamp the request target to 1.
+                let (w, h) = probed_or_fallback_dimensions(Some((raw_w, raw_h)), mt);
                 let changed =
                     self.dimension_cache
                         .get(&idx)
@@ -893,9 +1010,17 @@ impl MangaLoader {
             }
 
             let fallback = if is_video {
-                (1920, 1080, MangaMediaType::Video)
+                (
+                    FALLBACK_VIDEO_DIMENSIONS.0,
+                    FALLBACK_VIDEO_DIMENSIONS.1,
+                    MangaMediaType::Video,
+                )
             } else {
-                (1200, 1600, MangaMediaType::StaticImage)
+                (
+                    FALLBACK_IMAGE_DIMENSIONS.0,
+                    FALLBACK_IMAGE_DIMENSIONS.1,
+                    MangaMediaType::StaticImage,
+                )
             };
 
             self.dimension_cache.insert(idx, fallback);
@@ -2179,40 +2304,46 @@ impl MangaLoader {
         for _ in 0..max_items {
             match self.result_rx.try_recv() {
                 Ok(decoded) => {
-                    // Cache dimensions and media type for stable layout
-                    let new_dims = (
-                        decoded.original_width,
-                        decoded.original_height,
-                        decoded.media_type,
-                    );
-                    let changed = self.dimension_cache.get(&decoded.index).map_or(
-                        true,
-                        |(old_w, old_h, old_mt)| {
-                            if *old_w == new_dims.0 && *old_h == new_dims.1 && *old_mt == new_dims.2
-                            {
-                                return false;
-                            }
+                    // Cache dimensions and media type for stable layout. A corrupt header must not
+                    // land in `dimension_cache`; prefer the decoded texture size, else keep the
+                    // dimensions the layout already has.
+                    let new_dims =
+                        sanitize_probed_dimensions(decoded.original_width, decoded.original_height)
+                            .or_else(|| sanitize_probed_dimensions(decoded.width, decoded.height))
+                            .map(|(w, h)| (w, h, decoded.media_type));
+                    let changed = new_dims.is_some_and(|new_dims| {
+                        self.dimension_cache.get(&decoded.index).map_or(
+                            true,
+                            |(old_w, old_h, old_mt)| {
+                                if *old_w == new_dims.0
+                                    && *old_h == new_dims.1
+                                    && *old_mt == new_dims.2
+                                {
+                                    return false;
+                                }
 
-                            // Ignore tiny video size jitter to avoid perpetual masonry relayouts.
-                            if *old_mt == MangaMediaType::Video
-                                && new_dims.2 == MangaMediaType::Video
-                            {
-                                let width_delta = old_w.abs_diff(new_dims.0);
-                                let height_delta = old_h.abs_diff(new_dims.1);
-                                if width_delta <= 2 && height_delta <= 2 {
-                                    let old_aspect = *old_w as f32 / (*old_h).max(1) as f32;
-                                    let new_aspect = new_dims.0 as f32 / new_dims.1.max(1) as f32;
-                                    if (old_aspect - new_aspect).abs() <= 0.003 {
-                                        return false;
+                                // Ignore tiny video size jitter to avoid perpetual masonry relayouts.
+                                if *old_mt == MangaMediaType::Video
+                                    && new_dims.2 == MangaMediaType::Video
+                                {
+                                    let width_delta = old_w.abs_diff(new_dims.0);
+                                    let height_delta = old_h.abs_diff(new_dims.1);
+                                    if width_delta <= 2 && height_delta <= 2 {
+                                        let old_aspect = *old_w as f32 / (*old_h).max(1) as f32;
+                                        let new_aspect =
+                                            new_dims.0 as f32 / new_dims.1.max(1) as f32;
+                                        if (old_aspect - new_aspect).abs() <= 0.003 {
+                                            return false;
+                                        }
                                     }
                                 }
-                            }
 
-                            true
-                        },
-                    );
+                                true
+                            },
+                        )
+                    });
 
-                    if changed {
+                    if let (true, Some(new_dims)) = (changed, new_dims) {
                         self.dimension_cache.insert(decoded.index, new_dims);
                         if !dimension_updates.contains(&decoded.index) {
                             dimension_updates.push(decoded.index);
@@ -2268,7 +2399,7 @@ impl MangaLoader {
             for ((idx, kind, _), cached) in
                 cached_lookup_items.iter().zip(cached_results.into_iter())
             {
-                if let Some((w, h)) = cached {
+                if let Some((w, h)) = cached.and_then(|(w, h)| sanitize_probed_dimensions(w, h)) {
                     let media_type = match kind {
                         CachedMediaKind::Image => MangaMediaType::StaticImage,
                         CachedMediaKind::Video => MangaMediaType::Video,
@@ -2314,7 +2445,11 @@ impl MangaLoader {
             })
             .collect();
         for (idx, opt_dims) in initial_batch {
-            if let Some((w, h, media_type)) = opt_dims {
+            // Skip unusable headers: a later probe/decode fills the entry instead of poisoning it.
+            let Some((w, h, media_type)) = opt_dims else {
+                continue;
+            };
+            if let Some((w, h)) = sanitize_probed_dimensions(w, h) {
                 self.dimension_cache.insert(idx, (w, h, media_type));
             }
         }
@@ -2386,6 +2521,45 @@ impl MangaLoader {
         self.loaded_levels.write().remove(&index);
         self.retry_state.write().remove(&index);
         self.stats.images_pending = self.loading_indices.read().len();
+    }
+
+    /// Record that `index` produced no usable texture, keeping the bounded retry backoff intact
+    /// so a corrupt file cannot spin the pump.
+    pub fn register_upload_failure(&mut self, index: usize) {
+        Self::register_decode_failure(&self.loaded_levels, &self.retry_state, index);
+    }
+
+    /// Release a stranded dimension probe so the index can be probed again.
+    pub fn drop_dim_pending(&mut self, index: usize) {
+        self.dim_pending.remove(&index);
+    }
+
+    /// True once `index` exhausted its retry budget; nothing else will re-request it, so the
+    /// caller must stop treating it as outstanding work.
+    pub fn retry_blocked(&self, index: usize) -> bool {
+        self.retry_state
+            .read()
+            .get(&index)
+            .is_some_and(|state| state.attempts >= PRELOAD_RETRY_MAX_ATTEMPTS)
+    }
+
+    /// Highest level the loader believes is loaded for `index` (may be set with no texture).
+    pub fn loaded_level_for(&self, index: usize) -> Option<u32> {
+        self.loaded_levels.read().get(&index).copied()
+    }
+
+    /// True while a request for `index` is in flight for the active generation.
+    pub fn is_index_in_flight(&self, index: usize) -> bool {
+        self.loading_indices.read().get(&index).copied() == Some(self.current_generation)
+    }
+
+    /// Snapshot of in-flight work for the caller's stall tracking:
+    /// `(indices decoding, indices awaiting a dimension probe)`.
+    pub fn inflight_index_snapshot(&self) -> (Vec<usize>, Vec<usize>) {
+        (
+            self.loading_indices.read().keys().copied().collect(),
+            self.dim_pending.iter().copied().collect(),
+        )
     }
 
     /// Sync jump-tracking to an externally handled visible-index change.
@@ -3585,5 +3759,94 @@ mod tests {
         assert!(requests
             .iter()
             .all(|req| matches!(req.gif_filter, FilterType::Triangle)));
+    }
+
+    #[test]
+    fn probed_dimensions_reject_unusable_headers() {
+        // Zero/absurd sides clamp the texture target to 1 and wedge the tile as "satisfied".
+        assert_eq!(sanitize_probed_dimensions(0, 1600), None);
+        assert_eq!(sanitize_probed_dimensions(1200, 0), None);
+        assert_eq!(sanitize_probed_dimensions(70_000, 10), None);
+        assert_eq!(sanitize_probed_dimensions(40_000, 40_000), None);
+        assert_eq!(sanitize_probed_dimensions(10_000, 10), None);
+
+        assert_eq!(sanitize_probed_dimensions(1, 100), Some((1, 100)));
+        assert_eq!(sanitize_probed_dimensions(1200, 1600), Some((1200, 1600)));
+        assert_eq!(sanitize_probed_dimensions(4000, 6000), Some((4000, 6000)));
+
+        assert_eq!(
+            probed_or_fallback_dimensions(Some((0, 0)), MangaMediaType::StaticImage),
+            FALLBACK_IMAGE_DIMENSIONS
+        );
+        assert_eq!(
+            probed_or_fallback_dimensions(Some((0, 0)), MangaMediaType::Video),
+            FALLBACK_VIDEO_DIMENSIONS
+        );
+        assert_eq!(
+            probed_or_fallback_dimensions(None, MangaMediaType::StaticImage),
+            FALLBACK_IMAGE_DIMENSIONS
+        );
+        assert_eq!(
+            probed_or_fallback_dimensions(Some((800, 1200)), MangaMediaType::StaticImage),
+            (800, 1200)
+        );
+    }
+
+    #[test]
+    fn stale_dimension_results_release_their_pending_probes() {
+        let mut loader = MangaLoader::without_workers();
+        loader.dim_pending.insert(4);
+        loader.current_generation = 1;
+
+        let results = loader
+            .probe
+            .as_ref()
+            .expect("probe channels")
+            .dim_results
+            .clone();
+        results
+            .try_send(DimResult {
+                generation: 0,
+                items: vec![(4, 100, 200, MangaMediaType::StaticImage)],
+            })
+            .expect("dimension result channel has room");
+
+        assert!(loader.take(0, 4).dimension_updates.is_empty());
+        assert_eq!(loader.backlog().dimension_probes, 0, "stranded probe");
+        assert_eq!(loader.get_dimensions(4), None);
+    }
+
+    #[test]
+    fn inflight_snapshot_covers_loads_and_pending_probes() {
+        let list = paths(20);
+        let visible = [3usize];
+        let mut loader = MangaLoader::without_workers();
+        loader.demand(&demand(&list, &visible, &[], 3, MangaLayoutMode::Masonry));
+
+        let (loading, probing) = loader.inflight_index_snapshot();
+        assert!(loading.contains(&3));
+        assert!(!probing.is_empty());
+
+        loader.reset_index_state_for(3);
+        loader.drop_dim_pending(3);
+        let (loading, probing) = loader.inflight_index_snapshot();
+        assert!(!loading.contains(&3));
+        assert!(!probing.contains(&3));
+    }
+
+    #[test]
+    fn upload_failure_clears_the_level_and_settles_after_the_retry_ceiling() {
+        let list = paths(4);
+        let mut loader = MangaLoader::without_workers();
+        loader.loaded_levels.write().insert(1, TARGET_SIDE);
+
+        for _ in 0..PRELOAD_RETRY_MAX_ATTEMPTS {
+            loader.register_upload_failure(1);
+        }
+
+        // A level set without a texture must never keep the tile "satisfied" for good.
+        assert_eq!(loader.loaded_level_for(1), None);
+        assert!(loader.retry_blocked(1));
+        assert!(!loader.demand_outstanding(&list, &[1], MAX_SIDE, TARGET_SIDE));
     }
 }

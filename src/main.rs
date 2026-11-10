@@ -3019,6 +3019,16 @@ struct ImageViewer {
     manga_demand_outstanding: bool,
     /// Earliest time the stalled (zero in-flight) preload pump may run again.
     manga_demand_pump_at: Instant,
+    /// Visible index with no cached texture while the loader may still call it satisfied.
+    manga_texture_missing_since: HashMap<usize, Instant>,
+    /// Repairs spent per index: `(heals, window_start)`; bounds work on a genuinely broken file.
+    manga_texture_heal_budget: HashMap<usize, (u32, Instant)>,
+    /// First-seen instant per in-flight decode index, for stale in-flight eviction.
+    manga_inflight_since: HashMap<usize, Instant>,
+    /// First-seen instant per pending dimension probe, for stale probe eviction.
+    manga_pending_probe_since: HashMap<usize, Instant>,
+    /// Earliest time the next stale in-flight/dimension-probe scan may run.
+    manga_stale_scan_at: Instant,
     /// Adaptive decoded-upload batch size used by manga texture uploads.
     manga_upload_batch_limit: usize,
     /// Last sampled number of visible media tiles in manga mode.
@@ -3500,6 +3510,11 @@ impl Default for ImageViewer {
             manga_target_texture_side: 4096,
             manga_demand_outstanding: false,
             manga_demand_pump_at: Instant::now(),
+            manga_texture_missing_since: HashMap::new(),
+            manga_texture_heal_budget: HashMap::new(),
+            manga_inflight_since: HashMap::new(),
+            manga_pending_probe_since: HashMap::new(),
+            manga_stale_scan_at: Instant::now(),
             manga_upload_batch_limit: 4,
             manga_visible_indices_last: 0,
             manga_visible_strip_equivalent_last: 0.0,
@@ -3619,6 +3634,15 @@ impl ImageViewer {
     const MANGA_STRIP_PLAYBACK_PRELOAD_INTERVAL_MS: u64 = 120;
     /// Pump pacing when nothing is in flight but visible items are still unsatisfied.
     const MANGA_DEMAND_PUMP_INTERVAL: Duration = Duration::from_millis(100);
+    /// A visible tile with no texture is only repaired after being missing this long.
+    const MANGA_TEXTURE_MISS_HEAL_AFTER: Duration = Duration::from_millis(1500);
+    /// Repairs allowed per index per window; a broken file settles instead of spinning the pump.
+    const MANGA_TEXTURE_HEAL_MAX: u32 = 3;
+    const MANGA_TEXTURE_HEAL_WINDOW: Duration = Duration::from_secs(30);
+    /// In-flight loader work older than this is force-cleared so it cannot block the visible set.
+    const MANGA_STALE_INFLIGHT_LIMIT: Duration = Duration::from_secs(10);
+    /// Stale scan pacing: participant maps are loader-backed, so never scan every frame.
+    const MANGA_STALE_SCAN_INTERVAL: Duration = Duration::from_millis(500);
     const MANGA_STRIP_PLAYBACK_BACKGROUND_TICK_MS: u64 = 80;
     const MANGA_PAGE_NAV_REPEAT_INITIAL_DELAY_MS: u64 = 260;
     const MANGA_PAGE_NAV_REPEAT_INTERVAL_MS: u64 = 45;
@@ -21489,17 +21513,215 @@ impl ImageViewer {
                     &collected
                 }
             };
-            self.manga_loader.as_ref().is_some_and(|loader| {
+            let bookkeeping = self.manga_loader.as_ref().is_some_and(|loader| {
                 loader.demand_outstanding(
                     &self.image_list,
                     indices,
                     self.max_texture_side,
                     self.manga_target_texture_side,
                 )
-            })
+            });
+            // Loader bookkeeping alone can read "satisfied" forever while the tile renders a
+            // placeholder (level set by a decode that never reached the GPU). The texture cache
+            // is the only truth for what is actually drawn.
+            let missing = self.manga_repair_visible_textures(indices);
+            bookkeeping || missing
         };
         self.manga_demand_outstanding = outstanding;
         outstanding
+    }
+
+    /// A visible tile needs repair when it renders from no cached texture and the loader has not
+    /// exhausted its retry budget. Videos and folder entries own separate textures.
+    fn manga_tile_needs_texture(supported: bool, has_texture: bool, retry_blocked: bool) -> bool {
+        supported && !has_texture && !retry_blocked
+    }
+
+    /// One bounded repair step for a tile that has been missing a texture for `missing_for`.
+    /// Returns `(keep_pumping, repair_now, budget)`; once `MANGA_TEXTURE_HEAL_MAX` repairs are
+    /// spent in the window the tile stops pumping so a broken file cannot spin.
+    fn manga_miss_heal_step(
+        missing_for: Duration,
+        budget: Option<(u32, Instant)>,
+        now: Instant,
+    ) -> (bool, bool, (u32, Instant)) {
+        let (spent, window_start) = match budget {
+            Some((spent, window_start))
+                if now.saturating_duration_since(window_start)
+                    < Self::MANGA_TEXTURE_HEAL_WINDOW =>
+            {
+                (spent, window_start)
+            }
+            _ => (0, now),
+        };
+
+        if spent >= Self::MANGA_TEXTURE_HEAL_MAX {
+            return (false, false, (spent, window_start));
+        }
+
+        let repair_now = missing_for >= Self::MANGA_TEXTURE_MISS_HEAL_AFTER;
+        (
+            true,
+            repair_now,
+            (spent + u32::from(repair_now), window_start),
+        )
+    }
+
+    /// True when a visible tile has no texture for its current path although the loader may
+    /// still report it loaded.
+    fn manga_visible_texture_missed(&self, index: usize) -> bool {
+        let Some(path) = self.image_list.get(index) else {
+            return false;
+        };
+
+        Self::manga_tile_needs_texture(
+            crate::image_loader::is_supported_image(path),
+            self.manga_texture_cache
+                .contains_for_path(index, path.as_path()),
+            self.manga_loader
+                .as_ref()
+                .is_some_and(|loader| loader.retry_blocked(index)),
+        )
+    }
+
+    /// Self-healing containment for visible tiles the loader believes are done: repair them,
+    /// reclaim hung loader work, and report whether anything repairable is still missing.
+    /// Called once per frame from `manga_refresh_demand_outstanding`; every action inside is
+    /// throttled by its own timer, so a healthy view costs one cache lookup per visible tile.
+    fn manga_repair_visible_textures(&mut self, visible: &[usize]) -> bool {
+        let now = Instant::now();
+
+        if now >= self.manga_stale_scan_at {
+            self.manga_stale_scan_at = now + Self::MANGA_STALE_SCAN_INTERVAL;
+            self.manga_evict_stale_work(now);
+        }
+
+        let missing: Vec<usize> = visible
+            .iter()
+            .copied()
+            .filter(|&index| self.manga_visible_texture_missed(index))
+            .collect();
+
+        // Prune timers for tiles that have a texture again or scrolled out of view.
+        self.manga_texture_missing_since
+            .retain(|index, _| missing.contains(index));
+        self.manga_texture_heal_budget
+            .retain(|index, (_, window_start)| {
+                missing.contains(index)
+                    && now.saturating_duration_since(*window_start)
+                        < Self::MANGA_TEXTURE_HEAL_WINDOW
+            });
+
+        let mut still_missing = false;
+        let mut repairs: Vec<usize> = Vec::new();
+
+        for &index in &missing {
+            // Genuinely decoding work is not stuck: the stale in-flight scan bounds it. Resetting
+            // here would only queue a duplicate decode behind the live one.
+            if self
+                .manga_loader
+                .as_ref()
+                .is_some_and(|loader| loader.is_index_in_flight(index))
+            {
+                self.manga_texture_missing_since.entry(index).or_insert(now);
+                still_missing = true;
+                continue;
+            }
+
+            let since = *self.manga_texture_missing_since.entry(index).or_insert(now);
+            let (keep_pumping, repair_now, budget) = Self::manga_miss_heal_step(
+                now.saturating_duration_since(since),
+                self.manga_texture_heal_budget.get(&index).copied(),
+                now,
+            );
+            self.manga_texture_heal_budget.insert(index, budget);
+            still_missing |= keep_pumping;
+            if repair_now {
+                repairs.push(index);
+            }
+        }
+
+        for index in repairs {
+            let claimed = self
+                .manga_loader
+                .as_ref()
+                .is_some_and(|loader| loader.loaded_level_for(index).is_some());
+            if let Some(loader) = self.manga_loader.as_mut() {
+                // Clears level/loading/retry so the next prefetch re-requests the tile.
+                loader.reset_index_state_for(index);
+            }
+            self.manga_texture_missing_since.insert(index, now);
+            manga_loader::trace_rule(if claimed { "stuck-level" } else { "no-texture" }, index);
+        }
+
+        still_missing
+    }
+
+    /// Force-clear loader work that has been in flight far too long: a hung decode or a
+    /// generation-dropped dimension probe otherwise blocks its index for the session.
+    fn manga_evict_stale_work(&mut self, now: Instant) {
+        let Some((inflight, pending_probes)) = self
+            .manga_loader
+            .as_ref()
+            .map(|loader| loader.inflight_index_snapshot())
+        else {
+            return;
+        };
+
+        let limit = Self::MANGA_STALE_INFLIGHT_LIMIT;
+        let stale_loads =
+            Self::stale_first_seen(&mut self.manga_inflight_since, &inflight, now, limit);
+        let stale_probes = Self::stale_first_seen(
+            &mut self.manga_pending_probe_since,
+            &pending_probes,
+            now,
+            limit,
+        );
+
+        if stale_loads.is_empty() && stale_probes.is_empty() {
+            return;
+        }
+
+        if let Some(loader) = self.manga_loader.as_mut() {
+            for &index in &stale_loads {
+                loader.reset_index_state_for(index);
+            }
+            for &index in &stale_probes {
+                loader.drop_dim_pending(index);
+            }
+        }
+
+        for &index in &stale_loads {
+            manga_loader::trace_rule("stale-in-flight", index);
+        }
+        for &index in &stale_probes {
+            manga_loader::trace_rule("stale-dim", index);
+        }
+    }
+
+    /// Track when each in-flight index was first seen; return the ones past `limit` and forget
+    /// them so the eviction fires once. Entries leave as soon as the loader reports them done.
+    fn stale_first_seen(
+        first_seen: &mut HashMap<usize, Instant>,
+        in_flight: &[usize],
+        now: Instant,
+        limit: Duration,
+    ) -> Vec<usize> {
+        first_seen.retain(|index, _| in_flight.contains(index));
+
+        let mut stale = Vec::new();
+        for &index in in_flight {
+            let since = *first_seen.entry(index).or_insert(now);
+            if now.saturating_duration_since(since) >= limit {
+                stale.push(index);
+            }
+        }
+
+        for index in &stale {
+            first_seen.remove(index);
+        }
+
+        stale
     }
 
     /// Update the preload queue based on current scroll position
@@ -21965,8 +22187,15 @@ impl ImageViewer {
                 }
             }
 
-            // Skip if no pixel data (failed to extract frame or empty placeholder)
+            // Skip if no pixel data (failed to extract frame or empty placeholder).
+            // Bookkeeping first: the loader already set `loaded_levels` for this decode, and a
+            // level left set without a texture makes every re-request path treat the tile as
+            // satisfied forever. `register_upload_failure` also keeps the retry backoff bounded.
             if decoded.pixels.is_empty() {
+                if let Some(loader) = self.manga_loader.as_mut() {
+                    loader.register_upload_failure(decoded.index);
+                }
+                self.manga_ttv_pending.remove(&decoded.index);
                 continue;
             }
 
@@ -32892,5 +33121,85 @@ mod tests {
 
         // A further 100 physical px of cursor travel is 100 physical px of window travel.
         assert!((moved * 1.5 - at_ppp_1_5 * 1.5 - egui::vec2(100.0, 0.0)).length() < 0.01);
+    }
+
+    #[test]
+    fn manga_missing_texture_repair_is_bounded_per_window() {
+        let step = ImageViewer::manga_miss_heal_step;
+        let now = std::time::Instant::now();
+        let after = |ms: u64| std::time::Duration::from_millis(ms);
+
+        // Below the miss threshold: keep pumping, do not reset loader state yet.
+        let (pumping, repair_now, budget) = step(after(200), None, now);
+        assert!(pumping);
+        assert!(!repair_now);
+        assert_eq!(budget.0, 0);
+
+        // Missing past the threshold: repair once.
+        let mut budget = budget;
+        let mut repairs = 0u32;
+        for _ in 0..ImageViewer::MANGA_TEXTURE_HEAL_MAX {
+            let (pumping, repair_now, next) = step(after(2000), Some(budget), now);
+            assert!(pumping, "pump while the budget lasts");
+            assert!(repair_now);
+            budget = next;
+            repairs += 1;
+        }
+        assert_eq!(repairs, ImageViewer::MANGA_TEXTURE_HEAL_MAX);
+
+        // Budget spent: a broken file must stop pumping so the app can go idle.
+        let (pumping, repair_now, _) = step(after(60_000), Some(budget), now);
+        assert!(!pumping);
+        assert!(!repair_now);
+
+        // The window rolls over and the tile may be repaired again.
+        let later = now + ImageViewer::MANGA_TEXTURE_HEAL_WINDOW + after(1);
+        let (pumping, repair_now, _) = step(after(2000), Some(budget), later);
+        assert!(pumping);
+        assert!(repair_now);
+    }
+
+    #[test]
+    fn manga_stale_inflight_is_evicted_once_and_forgotten() {
+        let now = std::time::Instant::now();
+        let limit = std::time::Duration::from_secs(10);
+        let mut first_seen: super::HashMap<usize, std::time::Instant> = super::HashMap::new();
+
+        // First sighting starts the clock, nothing is stale yet.
+        assert!(ImageViewer::stale_first_seen(&mut first_seen, &[5, 6], now, limit).is_empty());
+        assert_eq!(first_seen.len(), 2);
+
+        // Index 6 finished: its entry is pruned, 5 is still in flight but not overdue.
+        let soon = now + std::time::Duration::from_secs(3);
+        assert!(ImageViewer::stale_first_seen(&mut first_seen, &[5], soon, limit).is_empty());
+        assert_eq!(first_seen.len(), 1);
+
+        // Overdue: evicted and forgotten, so a second pass cannot evict it twice.
+        let late = now + std::time::Duration::from_secs(11);
+        assert_eq!(
+            ImageViewer::stale_first_seen(&mut first_seen, &[5, 7], late, limit),
+            vec![5]
+        );
+        assert!(!first_seen.contains_key(&5));
+        assert!(first_seen.contains_key(&7), "new work restarts the clock");
+    }
+
+    #[test]
+    fn manga_fully_loaded_visible_set_keeps_the_pump_idle() {
+        // Every visible tile has a texture and no retry is blocked: no miss, no pump, no watchdog.
+        let tiles = [
+            (true, true, false),
+            (true, true, false),
+            (true, true, false),
+        ];
+        let any_missing = tiles.iter().any(|&(supported, has_texture, blocked)| {
+            ImageViewer::manga_tile_needs_texture(supported, has_texture, blocked)
+        });
+        assert!(!any_missing);
+
+        // Controls for the same predicate.
+        assert!(ImageViewer::manga_tile_needs_texture(true, false, false));
+        assert!(!ImageViewer::manga_tile_needs_texture(true, false, true));
+        assert!(!ImageViewer::manga_tile_needs_texture(false, false, false));
     }
 }
