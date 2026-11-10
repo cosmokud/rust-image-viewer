@@ -1,6 +1,6 @@
 # Changelog
 
-## [v0.4.2] - 2026-11-10
+## [0.4.2] - 2026-11-10
 
 ### Highlights
 
@@ -14,12 +14,15 @@
 - Dedicated Settings window with categorized tabs, preset loading/saving/deleting, inline search, and a centralized configuration registry (`src/settings_registry.rs`).
 - Crisp Lucide SVG icons across menus, video transport, and settings dialogs.
 - Physical display geometry module (`src/window_geometry.rs`), 10% default scroll-wheel zoom notch, and environment-gated crash/freeze diagnostics (`env.local`).
+- Opaque fallback for VP8/VP9 alpha WebM files whose alpha decodebin fails (`video_alpha_opaque_fallback`, default on, live-apply), and `--probe-video` printing the alpha decodebin ranks, the autoplugged alpha path and the recorded fallback reason (`src/probe_video.rs`).
 
 ### Changed
 
 - Replaced 41 hand-sequenced manga loading calls with a unified `Demand`/`DemandPlan` interface in `src/manga_loader.rs`.
 - Centralized viewer mode transitions in `src/viewer_mode.rs`, texture upload/mipmap pipeline in `src/texture_upload.rs`, and cache-key identity in `src/cache_key.rs`.
 - Window title bar now collapses the file name before file metadata on narrow windows, and opening Settings while active refocuses the existing window.
+- Video transport arrows, play/pause and the mute speaker are drawn as vector glyphs from one round control family, the mute state taking the Lucide `volume-2`/`volume-x` artwork, instead of font glyphs and an emoji.
+- Video control commands are coalesced, decoder demotion is recoverable, and diagnostics name the blocking segment rather than only the stage.
 
 ### Fixed
 
@@ -27,13 +30,17 @@
 - Video thumbnail extraction and folder placeholders now run behind a concurrency gate (`VIDEO_PROBE_GATE`) to prevent UI and background worker starvation.
 - Video playback offloads blocking GStreamer control calls (e.g. EOS restart) to a dedicated thread, and oversized textures/allocations are rejected before decoding.
 - Full chrome bar moves floating windows during drag, cursor anchors latch reliably, and multi-monitor scale transitions preserve zoom scale and window bounds.
+- A wedged video decoder is demoted to the codec's installed software fallback instead of gating tile playback for the rest of the session, and video probes cool down per index after a gate timeout.
+- VP8/VP9 alpha WebM files that made `alphacombine` error before prerolling played no sample and showed an empty first-frame thumbnail or a dead play button; they are retried with the alpha decodebin ranked NONE.
+- The previous/next arrows no longer render as blobs, and the mute toggle no longer renders at the font's size and weight.
+- Changelog release headings carry the bare version (`## [0.4.2]`) while tags keep the `v`, and every workflow extracts and guards a section by version, so a `v0.4.2` tag matches `## [0.4.2]`.
 
 ### Maintenance
 
 - Shipped complete third-party attribution and LGPL notices for installers and GStreamer runtime bundles (`THIRD-PARTY.md`, `NOTICES/`).
 - Build pipeline improvements with thin LTO for fast dev rebuilds, fat LTO for release builds, and minimum supported Rust version set to 1.99.
 
-## [v0.4.1-rc.5] - 2026-08-12
+## [0.4.1-rc.5] - 2026-08-12
 
 ### Highlights
 
@@ -60,7 +67,7 @@
 - Added unit coverage for the fast-exit preparation, metadata-cache shutdown waiting/flagging, GStreamer timeout behavior, timeout-error classification, and decoder tier/AV1 demotion list ordering.
 - Reverted an experimental in-place masonry reflow for dimension-only updates; masonry layout rebuilding behavior is unchanged.
 
-## [v0.4.1-rc.4] - 2026-06-03
+## [0.4.1-rc.4] - 2026-06-03
 
 ### Highlights
 
@@ -85,7 +92,7 @@
 - Added unit coverage for fullscreen view-state memory, floating fullscreen view transfers, startup window sizing, and live zoom LOD sizing.
 - Removed outdated package-version notes from the changelog.
 
-## [v0.4.1-rc.3] - 2026-05-21
+## [0.4.1-rc.3] - 2026-05-21
 
 ### Highlights
 
@@ -98,7 +105,7 @@
 - Added a short-circuit exit path so close requests skip additional per-frame work.
 - Masonry metadata warmup clears transient interaction latches on focus loss to keep background preloading moving.
 
-## [v0.4.1-rc.2] - 2026-05-15
+## [0.4.1-rc.2] - 2026-05-15
 
 ### Rendering And Resize Pipeline
 
@@ -119,7 +126,7 @@
 - The refactor keeps worker-side downscale behavior unchanged while making the CPU resize stage easier to profile, replace, or bypass when a GPU-backed scaling path is introduced.
 - No public configuration, shortcut, cache schema, or media-format behavior changed in this release candidate.
 
-## [v0.4.1-rc.1] - 2026-05-14
+## [0.4.1-rc.1] - 2026-05-14
 
 ### Highlights
 
@@ -142,7 +149,7 @@
 - Folder-navigation media lists now pass through one normalization path before being stored, reducing duplicated filtering around synthetic folder entries.
 - Folder metadata snapshot persistence and restoration now apply to the Gallery layout where the same cached folder-dimension data is valid.
 
-## [v0.3.9] - 2026-05-14
+## [0.3.9] - 2026-05-14
 
 ### Highlights
 
@@ -193,7 +200,7 @@
 - Layout reflow/squash when video output bounds downscale frames at low zoom.
 - Corrupted or legacy metadata cache files are deleted and recreated on open.
 
-## [v0.3.9-rc.7] - 2026-05-10
+## [0.3.9-rc.7] - 2026-05-10
 
 ### Highlights
 
@@ -218,7 +225,7 @@
 - Corrupted or legacy metadata cache files are deleted and recreated on open.
 - WebP animation detection avoids full decode by inspecting header chunks.
 
-## [v0.3.9-rc.6] - 2026-05-09
+## [0.3.9-rc.6] - 2026-05-09
 
 ### Highlights
 
@@ -239,7 +246,7 @@
 
 - Seek and volume drags now finalize if the primary pointer is released outside the control.
 
-## [v0.3.9-rc.5] - 2026-05-05
+## [0.3.9-rc.5] - 2026-05-05
 
 ### Highlights
 
@@ -258,7 +265,7 @@
 
 - Improved video seek stability by waiting for pending pipeline state transitions before issuing seeks.
 
-## [v0.3.9-rc.4] - 2026-05-05
+## [0.3.9-rc.4] - 2026-05-05
 
 ### Highlights
 
@@ -288,7 +295,7 @@
 
 - GIFs with very high custom FPS can render too quickly in dense strip/masonry layouts.
 
-## [v0.3.9-rc.3] - 2026-05-04
+## [0.3.9-rc.3] - 2026-05-04
 
 ### Highlights
 
@@ -315,7 +322,7 @@
 - Cascading layout reflow/squash when video output bounds downscale frames at low zoom.
 - Stale hover preview resume state during dense masonry navigation by basing pruning on spatial-index visibility.
 
-## [v0.3.9-rc.2] - 2026-05-03
+## [0.3.9-rc.2] - 2026-05-03
 
 ### Highlights
 
@@ -326,7 +333,7 @@
 - Bumped crate/package version to `0.3.9-rc.2` for the next release-candidate cycle.
 - Added this `v0.3.9-rc.2` changelog entry based on the current commit state after `v0.3.9-rc.1`.
 
-## [v0.3.9-rc.1] - 2026-05-03
+## [0.3.9-rc.1] - 2026-05-03
 
 ### Highlights
 
@@ -343,7 +350,7 @@
 - Renamed the workflow display name from `Deploy Test` to `Test` for clearer action history.
 - Updated deploy workflow tag filtering behavior by removing an exclusion pattern that blocked version-tag releases.
 
-## [v0.3.8] - 2026-05-02
+## [0.3.8] - 2026-05-02
 
 ### Highlights
 
@@ -380,7 +387,7 @@
 - Several track-selection and subtitle-state edge cases during video playback transitions.
 - Installer upgrade path now better handles legacy WiX-based installs by forcing uninstall earlier and reducing side-by-side install conflicts.
 
-## [v0.3.7] - 2026-04-28
+## [0.3.7] - 2026-04-28
 
 ### Highlights
 
@@ -396,7 +403,7 @@
 
 - Directory resolution and refresh after paste/delete operations.
 
-## [v0.3.6] - 2026-04-23
+## [0.3.6] - 2026-04-23
 
 ### Highlights
 
@@ -429,7 +436,7 @@
 - Dropped stale dimension probing requests and results to prevent outdated behavior.
 - Enhanced folder placeholder thumbnail request handling and preview scan state management.
 
-## [v0.3.5] - 2026-04-19
+## [0.3.5] - 2026-04-19
 
 ### Highlights
 
@@ -449,7 +456,7 @@
 - Upgraded Windows packaging to WiX Toolset v7 and improved workflow integration.
 - Refined modifier-wheel panning logic with viewport normalization and explanatory comments.
 
-## [v0.3.4] - 2026-04-02
+## [0.3.4] - 2026-04-02
 
 ### Highlights
 
@@ -478,7 +485,7 @@
 - Improved Explorer path-reveal robustness for quoted and edge-case paths.
 - Improved video window positioning and error messaging when playback cannot start.
 
-## [v0.3.3] - 2026-03-10
+## [0.3.3] - 2026-03-10
 
 ### Highlights
 
@@ -492,7 +499,7 @@
 
 - Idle cursor hiding now applies across the viewer background and media area, but remains disabled while the pointer is over visible UI surfaces.
 
-## [v0.3.2] - 2026-03-10
+## [0.3.2] - 2026-03-10
 
 ### Highlights
 
@@ -509,7 +516,7 @@
 - Copy and cut shortcuts no longer fall back to stale current-item selection while navigating dense multi-item layouts.
 - Masonry autoscroll no longer leaves loader-visible index tracking lagging behind large viewport jumps.
 
-## [v0.3.1] - 2026-03-10
+## [0.3.1] - 2026-03-10
 
 ### Highlights
 
@@ -528,7 +535,7 @@
 - Masonry cache and scroll restoration logic enhanced for better reuse and continuity.
 - MangaLoader now tracks its scrollbar and exposes an external visible index sync mechanism.
 
-## [v0.3.0] - 2026-03-09
+## [0.3.0] - 2026-03-09
 
 ### Highlights
 
@@ -562,7 +569,7 @@
 - README formatting corrections.
 - Updated architecture and security documentation for clarity and consistency.
 
-## [v0.2.4] - 2026-03-08
+## [0.2.4] - 2026-03-08
 
 ### Highlights
 
@@ -588,7 +595,7 @@
 
 - README formatting issues.
 
-## [v0.2.3] - 2026-03-08
+## [0.2.3] - 2026-03-08
 
 ### Highlights
 
@@ -618,7 +625,7 @@
 
 - Various under‑the‑hood fixes and stability improvements related to the above features.
 
-## [v0.2.2] - 2026-03-08
+## [0.2.2] - 2026-03-08
 
 ### Highlights
 
@@ -636,7 +643,7 @@
 
 - New `fullscreen_native_window_transition` INI option for choosing between native animations and instant snaps.
 
-## [v0.2.1] - 2026-03-06
+## [0.2.1] - 2026-03-06
 
 ### Highlights
 
@@ -655,7 +662,7 @@
 - Masonry texture retry and preload quality now track the actual fitted on-screen draw size instead of the slot width alone, which reduces blur on very tall and very wide thumbnails.
 - Corrected mouse-scroll handling so wheel movements are now consistent across views and respect user-configured acceleration settings.
 
-## [v0.2.0] - 2026-03-06
+## [0.2.0] - 2026-03-06
 
 ### Highlights
 
@@ -684,7 +691,7 @@
 - Fullscreen/navigation edge cases, including title-bar integration behavior and keybinding consistency updates.
 - Documentation/workflow polish for performance comparison and release automation.
 
-## [v0.1.0] - 2026-02-02
+## [0.1.0] - 2026-02-02
 
 ### Added
 

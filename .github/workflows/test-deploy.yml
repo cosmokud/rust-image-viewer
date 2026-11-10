@@ -18,8 +18,9 @@ name: Test Deploy
 # instead: the step that reads both workflows refuses the shape a tag must not be written into
 # a shell in.
 #
-# Our tags carry the `v` into the changelog too (`## [v0.4.1-rc.5]`), so the section a release
-# extracts is the one named by the tag, not by the bare version.
+# Our changelog headings carry the bare version (`## [0.4.2]`) while tags keep the `v`
+# (`v0.4.2`), so the section a release extracts is named by the tag's version, with or without
+# the `v` written into its heading.
 
 on:
   workflow_dispatch:
@@ -107,6 +108,40 @@ jobs:
             echo "version=${VERSION}"
             echo "tag=${TAG}"
           } >> "$GITHUB_OUTPUT"
+
+      - name: The tag names its changelog section, with or without the `v`
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # The two deploy workflows extract on the tag itself, so both shapes have to be
+          # matched there; this refuses the shape that reads only the tag.
+          if ! grep -qF '## [v" version "]' .github/workflows/deploy.yml; then
+            echo "::error::deploy.yml matches the changelog heading by the tag alone: a `v0.4.2` tag would find no `## [0.4.2]` section"
+            exit 1
+          fi
+          if ! grep -qF '## [v" version "]' .github/workflows/manual-deploy.yml; then
+            echo "::error::manual-deploy.yml matches the changelog heading by the tag alone: a `v0.4.2` tag would find no `## [0.4.2]` section"
+            exit 1
+          fi
+
+          # And the section really is found for a tag that carries the `v` and for one that does
+          # not, against this branch's changelog, so the case the release runs into is asserted.
+          fixture=$(printf '%s\n' '# Changelog' '' '## [0.4.2] - 2026-11-10' '' '- a change' '' '## [0.4.1] - 2026-08-12' '' '- an older change')
+          for tag in v0.4.2 0.4.2; do
+            version="${tag#v}"
+            printf '%s\n' "$fixture" | awk -v version="$version" '
+              index($0, "## [" version "]") == 1 || index($0, "## [v" version "]") == 1 { flag=1; next }
+              /^## \[/ { if (flag) exit; }
+              flag { print }
+            ' > release_notes.md
+            if ! grep -qx -- '- a change' release_notes.md || grep -qx -- '- an older change' release_notes.md; then
+              echo "::error::the extraction for ${tag} did not find the '## [0.4.2]' section and stop at the next heading"
+              cat release_notes.md || true
+              exit 1
+            fi
+            echo "${tag} extracts '## [${version}]'"
+          done
 
       # SECURITY: the shape the injection took — an expression assigned inside a script, where
       # the shell runs what it holds. `env:` is where a tag belongs.
@@ -202,8 +237,11 @@ jobs:
             exit 1
           fi
 
-          if ! grep -q "^## \[${TAG}\]" changelog-at-ref.md; then
-            echo "::error::CHANGELOG.md at ${REF} has no '## [${TAG}]' section: deploy.yml would publish empty release notes, or the generated ones"
+          # The tag carries the `v` and the heading may or may not, so both shapes name the
+          # same section: the tag is reduced to its version before it is matched.
+          version="${TAG#v}"
+          if ! grep -qE -e "^## \\[${version}\\]" -e "^## \\[v${version}\\]" changelog-at-ref.md; then
+            echo "::error::CHANGELOG.md at ${REF} has no '## [${version}]' or '## [v${version}]' section: deploy.yml would publish empty release notes, or the generated ones"
             exit 1
           fi
 
@@ -249,8 +287,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          awk -v version="$TAG" '
-            index($0, "## [" version "]") == 1 { flag=1; next }
+          awk -v version="${TAG#v}" '
+            index($0, "## [" version "]") == 1 || index($0, "## [v" version "]") == 1 { flag=1; next }
             /^## \[/ { if (flag) exit; }
             flag { print }
           ' changelog-at-ref.md > release_notes.md
@@ -275,8 +313,8 @@ jobs:
           canary=/tmp/rust-image-viewer-injection
           rm -f "$canary"
           TAG='v1.0.0$(touch /tmp/rust-image-viewer-injection)'
-          awk -v version="$TAG" '
-            index($0, "## [" version "]") == 1 { flag=1; next }
+          awk -v version="${TAG#v}" '
+            index($0, "## [" version "]") == 1 || index($0, "## [v" version "]") == 1 { flag=1; next }
             /^## \[/ { if (flag) exit; }
             flag { print }
           ' CHANGELOG.md > release_notes.md

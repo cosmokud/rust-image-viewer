@@ -101,14 +101,20 @@ jobs:
         env:
           TAG_NAME: ${{ inputs.tag_to_build }}
         run: |
-          VERSION="${TAG_NAME}"
+          VERSION="${TAG_NAME#v}"
 
-          # Extract changelog section for the current version
+          # Extract changelog section for the current version. The tag carries the `v` and the
+          # heading may or may not, so both shapes name the same section.
           awk -v version="$VERSION" '
-            index($0, "## [" version "]") == 1 { flag=1; next }
+            index($0, "## [" version "]") == 1 || index($0, "## [v" version "]") == 1 { flag=1; next }
             /^## \[/ { if (flag) exit; }
             flag { print }
           ' CHANGELOG.md > release_notes.md
+
+          if [[ ! -s release_notes.md ]]; then
+            echo "::error::CHANGELOG.md has no '## [${VERSION}]' section: the release would publish empty notes"
+            exit 1
+          fi
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
