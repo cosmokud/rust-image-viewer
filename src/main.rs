@@ -17,6 +17,7 @@ mod manga_spatial;
 mod media_index;
 mod metadata_cache;
 mod perf_metrics;
+mod probe_video;
 mod settings_registry;
 #[cfg(target_os = "windows")]
 mod single_instance;
@@ -2036,7 +2037,10 @@ fn load_solo_probe_image(
     })
 }
 
-fn extract_video_first_frame_thumbnail(path: &Path, max_texture_side: u32) -> Option<FirstFrame> {
+pub(crate) fn extract_video_first_frame_thumbnail(
+    path: &Path,
+    max_texture_side: u32,
+) -> Option<FirstFrame> {
     if !gstreamer_runtime_available() {
         let (pixels, width, height, original_width, original_height) =
             extract_video_first_frame_without_gstreamer(path, max_texture_side)?;
@@ -32270,18 +32274,32 @@ fn startup_window_for_no_file(screen_size: egui::Vec2) -> (egui::Vec2, egui::Pos
 }
 
 fn main() -> eframe::Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+
+    // Probe mode: a headless decode diagnostic, so it takes over before any GUI/tracing work.
+    // It needs the diag sink (a `windows_subsystem = "windows"` binary has no console when
+    // launched from Explorer), and process env beats `env.local`, so the switch is set here.
+    if let Some(paths) = probe_video::requested_paths(&args) {
+        std::env::set_var("RIV_DIAG", "1");
+        install_panic_report_hook();
+        diag::init();
+        // Deliberately not `mark_ui_thread()`: the probe blocks on purpose and must not trip the
+        // "blocking gst call on the UI thread" assert.
+        std::process::exit(probe_video::run(&paths));
+    }
+
     init_runtime_diagnostics();
     install_panic_report_hook();
+
+    #[cfg(target_os = "windows")]
+    windows_env::refresh_process_path_from_registry();
+
     // After the panic-report hook, so diag's hook chains into it instead of replacing it.
     diag::init();
     video_player::mark_ui_thread();
     let _ = async_runtime::init_runtime();
 
-    #[cfg(target_os = "windows")]
-    windows_env::refresh_process_path_from_registry();
-
     // Parse command line arguments
-    let args: Vec<String> = std::env::args().collect();
     let image_path = if args.len() > 1 {
         Some(PathBuf::from(&args[1]))
     } else {

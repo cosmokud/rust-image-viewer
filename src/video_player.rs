@@ -4,7 +4,7 @@
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicI8, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -313,57 +313,93 @@ const CUDA_DECODER_FACTORIES: &[&str] = &[
     "cudah265dec",
 ];
 
-/// Codec families, used to keep a demotion from stripping a codec's last autopluggable decoder:
-/// the D3D11 profile ranks `avdec_vp8` at 0, so demoting both hardware VP8 factories would leave
-/// VP8 with nothing to autoplug for the rest of the session.
-const DECODER_FAMILIES: &[&[&str]] = &[
-    &[
-        "d3d12h264dec",
-        "d3d11h264dec",
-        "nvh264dec",
-        "cudah264dec",
-        "avdec_h264",
-    ],
-    &[
-        "d3d12h265dec",
-        "d3d11h265dec",
-        "nvh265dec",
-        "cudah265dec",
-        "avdec_h265",
-        "avdec_hevc",
-    ],
-    &["d3d12vp8dec", "d3d11vp8dec", "avdec_vp8"],
-    &["d3d12vp9dec", "d3d11vp9dec", "nvvp9dec", "avdec_vp9"],
-    &["d3d12av1dec", "d3d11av1dec", "nvav1dec", "avdec_av1"],
-    &["d3d12mpeg2dec", "d3d11mpeg2dec", "avdec_mpeg2video"],
+/// One codec's decoders, split so a demotion can be backed by an *installed* software decoder
+/// instead of by whatever the current rank table happens to keep autopluggable.
+struct DecoderFamily {
+    hardware: &'static [&'static str],
+    /// Fallbacks in preference order. Only an entry that is actually installed can back a
+    /// demotion: a bundle without `gstlibav` has no `avdec_*` at all.
+    software: &'static [&'static str],
+}
+
+const DECODER_FAMILIES: &[DecoderFamily] = &[
+    DecoderFamily {
+        hardware: &["d3d12h264dec", "d3d11h264dec", "nvh264dec", "cudah264dec"],
+        software: &["openh264dec", "avdec_h264"],
+    },
+    DecoderFamily {
+        hardware: &["d3d12h265dec", "d3d11h265dec", "nvh265dec", "cudah265dec"],
+        software: &["avdec_h265", "avdec_hevc"],
+    },
+    DecoderFamily {
+        hardware: &["d3d12vp8dec", "d3d11vp8dec"],
+        software: &["vp8dec", "avdec_vp8"],
+    },
+    DecoderFamily {
+        hardware: &["d3d12vp9dec", "d3d11vp9dec", "nvvp9dec"],
+        software: &["vp9dec", "avdec_vp9"],
+    },
+    DecoderFamily {
+        hardware: &["d3d12av1dec", "d3d11av1dec", "nvav1dec"],
+        software: &["dav1ddec", "av1dec", "avdec_av1"],
+    },
+    DecoderFamily {
+        hardware: &["d3d12mpeg2dec", "d3d11mpeg2dec"],
+        software: &["mpeg2dec", "avdec_mpeg2video"],
+    },
 ];
 
-/// True when demoting `factory_name` still leaves its codec at least one ranked decoder.
-fn demotion_keeps_codec_decodable<F>(factory_name: &str, rank_of: F) -> bool
+fn family_of(factory_name: &str) -> Option<&'static DecoderFamily> {
+    DECODER_FAMILIES.iter().find(|family| {
+        family.hardware.contains(&factory_name) || family.software.contains(&factory_name)
+    })
+}
+
+/// A codec's software decoder: the only kind a demotion may never touch.
+fn is_software_decoder(factory_name: &str) -> bool {
+    DECODER_FAMILIES
+        .iter()
+        .any(|family| family.software.contains(&factory_name))
+}
+
+/// Installed software fallback for `factory_name`'s codec.
+///
+/// Probed on the live registry (`ElementFactory::find`), never on the rank table: the whole point
+/// is to keep decoding when the rank table no longer offers a workable decoder. `None` means this
+/// bundle ships no software decoder for that codec, so the demotion must be refused.
+fn software_fallback_for<F>(factory_name: &str, installed: F) -> Option<&'static str>
 where
-    F: Fn(&str) -> gst::Rank,
+    F: Fn(&str) -> bool,
 {
-    let Some(family) = DECODER_FAMILIES
+    family_of(factory_name)?
+        .software
         .iter()
-        .find(|family| family.contains(&factory_name))
-    else {
-        // Unknown codec: not provably the last decoder, so allow the demotion.
-        return true;
-    };
-    family
-        .iter()
-        .any(|other| *other != factory_name && rank_of(other) > gst::Rank::NONE)
+        .copied()
+        .find(|name| installed(name))
 }
 
 fn live_decoder_rank(factory_name: &str) -> gst::Rank {
     gst::ElementFactory::find(factory_name).map_or(gst::Rank::NONE, |factory| factory.rank())
 }
 
-/// A live demotion: the rank to restore and when it becomes restorable.
+fn decoder_installed(factory_name: &str) -> bool {
+    gst::ElementFactory::find(factory_name).is_some()
+}
+
+/// Rank a forced software fallback gets. Above every hardware rank this app assigns
+/// (`d3d12*:1024`), so autoplug cannot still pick a remaining hardware factory of the same codec.
+fn forced_software_rank() -> gst::Rank {
+    gst::Rank::from(2048)
+}
+
+/// A live demotion: the ranks to restore and when they become restorable.
 struct RankDemotion {
     factory: &'static str,
     previous_rank: gst::Rank,
     demoted_at: Instant,
+    /// Software decoder forced ahead of the remaining hardware tier for the same window.
+    fallback: &'static str,
+    fallback_previous_rank: gst::Rank,
 }
 
 /// A demotion is undone after this, so one wedged file cannot pin software decoding for the whole
@@ -387,6 +423,19 @@ fn reinstate_stale_demotions() {
         if let Some(factory) = gst::ElementFactory::find(demotion.factory) {
             factory.set_rank(demotion.previous_rank);
         }
+        if let Some(factory) = gst::ElementFactory::find(demotion.fallback) {
+            factory.set_rank(demotion.fallback_previous_rank);
+        }
+        crate::diag::trace(
+            "video-decode",
+            &format!(
+                "Reinstate {} rank={:?} fallback {} rank={:?}",
+                demotion.factory,
+                demotion.previous_rank,
+                demotion.fallback,
+                demotion.fallback_previous_rank
+            ),
+        );
         false
     });
 }
@@ -397,8 +446,9 @@ fn reinstate_stale_demotions() {
 /// while the registry is loaded, i.e. before `gst::init`), this mutates the live feature
 /// objects and therefore affects every pipeline created afterwards in this process.
 ///
-/// `false` = nothing was demoted (factory absent, already NONE, or it is its codec's last
-/// ranked decoder). The demotion is recorded so `reinstate_stale_demotions` can undo it.
+/// `false` = nothing was demoted (factory absent, already NONE, it is a software decoder, or this
+/// bundle ships no installed software decoder for its codec). The demotion is recorded so
+/// `reinstate_stale_demotions` can undo it.
 fn demote_decoder_factory(factory_name: &'static str) -> bool {
     let Some(factory) = gst::ElementFactory::find(factory_name) else {
         return false;
@@ -407,19 +457,48 @@ fn demote_decoder_factory(factory_name: &'static str) -> bool {
     if previous_rank == gst::Rank::NONE {
         return false;
     }
-    if !demotion_keeps_codec_decodable(factory_name, live_decoder_rank) {
-        // Invariant guard: never leave a codec without an autopluggable decoder.
+    if is_software_decoder(factory_name) {
+        // Software is what every demotion falls back to; demoting it would strip the codec.
+        debug_assert!(false, "refusing to demote software decoder {factory_name}");
         crate::diag::trace(
             "video-decode",
-            &format!("Skip demoting {factory_name}: last ranked decoder for its codec"),
+            &format!("Refuse demoting software decoder {factory_name}"),
         );
         return false;
     }
+    // Rank table is deliberately not consulted: a demoted-last hardware decoder still needs to go
+    // when a software one is installed, otherwise a wedged decoder survives for the session.
+    let Some(fallback) = software_fallback_for(factory_name, decoder_installed) else {
+        crate::diag::trace(
+            "video-decode",
+            &format!("Skip demoting {factory_name}: no software decoder installed for its codec"),
+        );
+        return false;
+    };
     factory.set_rank(gst::Rank::NONE);
+    // Force the fallback ahead of the hardware factories still ranked in this tier, which would
+    // otherwise keep winning the autoplug race for the rest of the cooldown.
+    let fallback_previous_rank = gst::ElementFactory::find(fallback).map_or(gst::Rank::NONE, |f| {
+        let previous = f.rank();
+        f.set_rank(forced_software_rank());
+        previous
+    });
+    crate::diag::trace(
+        "video-decode",
+        &format!(
+            "Demote {factory_name} rank={:?} -> NONE, prefer {fallback} rank={:?} -> {:?} for {}s",
+            previous_rank,
+            fallback_previous_rank,
+            forced_software_rank(),
+            DEMOTION_COOLDOWN.as_secs()
+        ),
+    );
     DEMOTIONS.lock().push(RankDemotion {
         factory: factory_name,
         previous_rank,
         demoted_at: Instant::now(),
+        fallback,
+        fallback_previous_rank,
     });
     true
 }
@@ -441,6 +520,58 @@ pub(crate) fn apply_av1_decoder_stability_ranks() {
             factory.set_rank(gst::Rank::PRIMARY);
         }
     });
+}
+
+/// One installed decoder factory that can handle a codec caps, as `--probe-video` reports it.
+pub struct DecoderCandidate {
+    pub name: String,
+    pub rank: gst::Rank,
+    pub software: bool,
+    /// `Some(reason)` when a live demotion/fallback override currently applies.
+    pub override_reason: Option<&'static str>,
+}
+
+/// Every installed video/audio decoder factory whose sink templates accept `codec_caps`, highest
+/// rank first. Enumerated from the registry, not from the rank table, so a demoted factory still
+/// shows up (rank NONE + reason) instead of disappearing.
+pub fn decoder_candidates_for(codec_caps: &gst::Caps) -> Vec<DecoderCandidate> {
+    let types = gst::ElementFactoryType::DECODER
+        | gst::ElementFactoryType::MEDIA_VIDEO
+        | gst::ElementFactoryType::MEDIA_AUDIO;
+    let mut candidates: Vec<DecoderCandidate> =
+        gst::ElementFactory::factories_with_type(types, gst::Rank::NONE)
+            .into_iter()
+            .filter(|factory| {
+                factory.static_pad_templates().iter().any(|template| {
+                    template.direction() == gst::PadDirection::Sink
+                        && template.caps().can_intersect(codec_caps)
+                })
+            })
+            .map(|factory| {
+                let name = factory.name().to_string();
+                let software = is_software_decoder(&name);
+                DecoderCandidate {
+                    override_reason: override_reason(&name),
+                    rank: factory.rank(),
+                    software,
+                    name,
+                }
+            })
+            .collect();
+    candidates.sort_by_key(|candidate| std::cmp::Reverse(i32::from(candidate.rank)));
+    candidates
+}
+
+/// Why a factory does not have its bundle-default rank right now, if it does not.
+fn override_reason(factory_name: &str) -> Option<&'static str> {
+    let demotions = DEMOTIONS.lock();
+    if demotions.iter().any(|d| d.factory == factory_name) {
+        return Some("demoted (wedged decoder), reinstated after cooldown");
+    }
+    if demotions.iter().any(|d| d.fallback == factory_name) {
+        return Some("forced software fallback for its codec, reinstated after cooldown");
+    }
+    None
 }
 
 /// Demote the next still-ranked hardware-decoder tier (D3D12 → D3D11 → CUDA). Returns false when
@@ -965,6 +1096,8 @@ struct VideoState {
     seek_in_progress: AtomicBool,
     // -1 unknown, 0 full-range (no expand), 1 limited-range (expand)
     needs_range_expand: AtomicI8,
+    /// Samples the appsink callbacks accepted; `--probe-video` reads it over a fixed window.
+    samples: AtomicU64,
 }
 
 const RANGE_EXPAND_UNKNOWN: i8 = -1;
@@ -990,7 +1123,6 @@ const ACCURATE_SEEK_PREROLL_TIMEOUT_MS: u64 = 75;
 // make file navigation appear dead while the UI stays responsive. Every blocking
 // call therefore runs on a helper thread with a hard timeout.
 const STATE_CHANGE_TIMEOUT: Duration = Duration::from_secs(5);
-const UI_STATE_CHANGE_TIMEOUT: Duration = Duration::from_secs(1);
 /// Any blocking GStreamer call this long on the UI thread is a freeze worth a diag line.
 const UI_BLOCKING_WARN_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -1763,6 +1895,7 @@ fn process_video_sample(sample: gst::Sample, state: &VideoState) {
     let Ok(video_info) = gst_video::VideoInfo::from_caps(caps) else {
         return;
     };
+    state.samples.fetch_add(1, Ordering::Relaxed);
 
     let width = video_info.width();
     let height = video_info.height();
@@ -1928,7 +2061,7 @@ pub struct VideoPlayer {
 }
 
 impl VideoPlayer {
-    fn ensure_init() -> Result<(), String> {
+    pub(crate) fn ensure_init() -> Result<(), String> {
         if !gstreamer_runtime_available() {
             return Err(
                 "GStreamer runtime was not found. Video playback is unavailable on this system."
@@ -2141,6 +2274,7 @@ Ensure your GStreamer installation includes the playback elements (usually from 
             video_height: AtomicU32::new(0),
             seek_in_progress: AtomicBool::new(false),
             needs_range_expand: AtomicI8::new(RANGE_EXPAND_UNKNOWN),
+            samples: AtomicU64::new(0),
         });
 
         // Set up appsink callbacks.
@@ -2326,13 +2460,10 @@ Ensure your GStreamer installation includes the playback elements (usually from 
     }
 
     /// `play()` without the wait: the state change runs on the control thread and the local state
-    /// is applied now, so the next frame already reports "playing". `false` = queue full or gone
+    /// is applied now, so the next frame already reports "playing". `false` = queue gone
     /// (caller retries next frame); a failed state change arrives as `ControlEvent::Failed`.
     pub fn play_async(&mut self) -> bool {
-        let Some(queue) = self.control_queue.as_ref() else {
-            return false;
-        };
-        if !queue.send(ControlCommand::Play) {
+        if !self.queue_state_change(ControlCommand::Play) {
             return false;
         }
 
@@ -2348,10 +2479,7 @@ Ensure your GStreamer installation includes the playback elements (usually from 
 
     /// `pause()` without the wait. Same queue contract as `play_async`.
     pub fn pause_async(&mut self) -> bool {
-        let Some(queue) = self.control_queue.as_ref() else {
-            return false;
-        };
-        if !queue.send(ControlCommand::Pause) {
+        if !self.queue_state_change(ControlCommand::Pause) {
             return false;
         }
         self.is_playing = false;
@@ -2359,6 +2487,15 @@ Ensure your GStreamer installation includes the playback elements (usually from 
         self.buffering_pause_suppressed_until = None;
         self.last_frame_at.set(None);
         true
+    }
+
+    /// Enqueue a state change without touching `is_playing`: a buffering pause is not a user pause.
+    /// `false` = control thread gone or queue rejected it; the caller leaves its own flag alone and
+    /// retries on the next poll.
+    fn queue_state_change(&self, command: ControlCommand) -> bool {
+        self.control_queue
+            .as_ref()
+            .is_some_and(|queue| queue.send(command))
     }
 
     /// `toggle_play_pause` without the wait: a user click must not freeze the frame for 5s.
@@ -2380,17 +2517,24 @@ Ensure your GStreamer installation includes the playback elements (usually from 
         self.is_playing
     }
 
+    /// Frames the appsink delivered since the player was created (`--probe-video` counter).
+    pub fn samples_delivered(&self) -> u64 {
+        self.state.samples.load(Ordering::Relaxed)
+    }
+
+    /// The live pipeline, for the `--probe-video` diagnostic only.
+    pub fn pipeline(&self) -> &gst::Pipeline {
+        &self.pipeline
+    }
+
     fn suppress_buffering_pause_for_track_switch(&mut self) {
         if !self.is_playing {
             return;
         }
 
         self.buffering_pause_suppressed_until = Some(Instant::now() + Duration::from_secs(1));
-        if self.buffering_paused {
-            let pipeline = self.pipeline.clone();
-            let _ = run_gst_with_timeout("state-unpause", UI_STATE_CHANGE_TIMEOUT, move || {
-                pipeline.set_state(gst::State::Playing)
-            });
+        // Queued: the unpause used to block the UI thread for its full 1 s timeout.
+        if self.buffering_paused && self.queue_state_change(ControlCommand::Play) {
             self.buffering_paused = false;
         }
     }
@@ -3131,34 +3275,26 @@ Ensure your GStreamer installation includes the playback elements (usually from 
                     }
                     gst::MessageView::Buffering(buffering) => {
                         let percent = buffering.percent();
+                        // Queued, not inline: this runs from the per-frame poll, and a 1 s blocking
+                        // state change here is a visible frame stall.
                         if percent >= 100 {
                             self.buffering_pause_suppressed_until = None;
-                            if self.is_playing && self.buffering_paused {
-                                let pipeline = self.pipeline.clone();
-                                let _ = run_gst_with_timeout(
-                                    "state-unpause",
-                                    UI_STATE_CHANGE_TIMEOUT,
-                                    move || pipeline.set_state(gst::State::Playing),
-                                );
+                            if self.is_playing
+                                && self.buffering_paused
+                                && self.queue_state_change(ControlCommand::Play)
+                            {
                                 self.buffering_paused = false;
                             }
                         } else if self.buffering_pause_suppressed() {
-                            if self.buffering_paused {
-                                let pipeline = self.pipeline.clone();
-                                let _ = run_gst_with_timeout(
-                                    "state-unpause",
-                                    UI_STATE_CHANGE_TIMEOUT,
-                                    move || pipeline.set_state(gst::State::Playing),
-                                );
+                            if self.buffering_paused
+                                && self.queue_state_change(ControlCommand::Play)
+                            {
                                 self.buffering_paused = false;
                             }
-                        } else if self.is_playing && !self.buffering_paused {
-                            let pipeline = self.pipeline.clone();
-                            let _ = run_gst_with_timeout(
-                                "state-pause",
-                                UI_STATE_CHANGE_TIMEOUT,
-                                move || pipeline.set_state(gst::State::Paused),
-                            );
+                        } else if self.is_playing
+                            && !self.buffering_paused
+                            && self.queue_state_change(ControlCommand::Pause)
+                        {
                             self.buffering_paused = true;
                         }
                     }
@@ -3284,6 +3420,31 @@ pub fn format_duration(duration: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn software_fallback_comes_from_installed_decoders_only() {
+        let nothing = |_: &str| false;
+        // Hardware-only bundle: the demotion has no fallback and must be refused.
+        assert_eq!(software_fallback_for("d3d12vp8dec", nothing), None);
+        // No gstlibav in the bundle: `vp8dec` alone has to back the demotion.
+        assert_eq!(
+            software_fallback_for("d3d12vp8dec", |name| name == "vp8dec"),
+            Some("vp8dec")
+        );
+        assert_eq!(
+            software_fallback_for("nvav1dec", |name| name == "dav1ddec"),
+            Some("dav1ddec")
+        );
+        assert_eq!(
+            software_fallback_for("nvav1dec", |name| name == "avdec_av1"),
+            Some("avdec_av1")
+        );
+        // Unknown factory: no family, no fallback claim.
+        assert_eq!(software_fallback_for("totallyfakedec", |_| true), None);
+        assert!(is_software_decoder("vp8dec"));
+        assert!(is_software_decoder("dav1ddec"));
+        assert!(!is_software_decoder("d3d11vp8dec"));
+    }
 
     #[test]
     fn gst_timeout_returns_result_when_call_finishes() {
@@ -3414,29 +3575,6 @@ mod tests {
             "send blocked for {:?}",
             started.elapsed()
         );
-    }
-
-    #[test]
-    fn demotion_never_strips_a_codecs_last_decoder() {
-        // D3D11 profile ranks `avdec_vp8` at 0: demoting the last hardware VP8 factory would
-        // leave VP8 with nothing to autoplug.
-        // d3d12vp8dec already demoted and the D3D11 profile ranks avdec_vp8 at 0.
-        let no_ranked_vp8_left = |name: &str| match name {
-            "d3d12vp8dec" | "d3d11vp8dec" | "avdec_vp8" => gst::Rank::NONE,
-            _ => gst::Rank::MARGINAL,
-        };
-        assert!(!demotion_keeps_codec_decodable(
-            "d3d11vp8dec",
-            no_ranked_vp8_left
-        ));
-        // With a ranked software fallback the demotion is allowed.
-        assert!(demotion_keeps_codec_decodable("d3d11vp8dec", |_| {
-            gst::Rank::MARGINAL
-        }));
-        // AV1: other hardware AV1 decoders keep the codec decodable.
-        assert!(demotion_keeps_codec_decodable("d3d12av1dec", |_| {
-            gst::Rank::PRIMARY
-        }));
     }
 
     #[test]

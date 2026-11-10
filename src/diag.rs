@@ -30,6 +30,9 @@
 //! Files: `diag-<pid>-<unix_ts>.log`, one flush per line so the tail survives an abort
 //! (`panic = "abort"` in Cargo.toml), 32 MB cap per file, 3 newest files kept.
 //!
+//! `--probe-video <path>...` (see `probe_video.rs`) writes its decode report here too, and turns
+//! this sink on by itself so a headless probe leaves a log even without `RIV_DIAG`.
+//!
 //! Not captured: process thread count and peak RSS. Both need platform calls outside std, and
 //! a diagnostic that pulls in winapi features is a diagnostic nobody enables by default.
 //! shortcut: no thread/RSS snapshot, add GetProcessMemoryInfo if hangs need process-level data.
