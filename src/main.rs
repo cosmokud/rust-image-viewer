@@ -22064,6 +22064,20 @@ impl ImageViewer {
         self.manga_unloadable_media.contains_key(&index)
     }
 
+    /// `manga_mark_media_unloadable` for images only: a video whose thumbnail failed keeps its
+    /// placeholder and its scheduled revive, because the file itself is still playable.
+    fn manga_mark_unloadable_if_image(&mut self, index: usize, media_type: MangaMediaType) {
+        if media_type == MangaMediaType::Video
+            || self
+                .image_list
+                .get(index)
+                .is_some_and(|path| is_supported_video(path.as_path()))
+        {
+            return;
+        }
+        self.manga_mark_media_unloadable(index);
+    }
+
     /// Record that `index` cannot be decoded. The tile paints an X from now on and no loader
     /// request is issued for it, so a corrupt file cannot keep a decode chain alive.
     fn manga_mark_media_unloadable(&mut self, index: usize) {
@@ -22868,10 +22882,12 @@ impl ImageViewer {
                         loader.retry_blocked(decoded.index)
                     })
                     .unwrap_or(false);
+                // Retries spent on an image: the file will not resolve by itself, so paint the X
+                // and drop every request path for it. A video is excluded: its first frame being
+                // undecodable does not make the file undrawable (it still plays), and its spent
+                // budget re-opens on a schedule instead of ending the tile's chances.
                 if exhausted {
-                    // Retries are spent: the file will not resolve by itself. Paint the X and
-                    // drop every request path for it instead of re-queuing a doomed decode.
-                    self.manga_mark_media_unloadable(decoded.index);
+                    self.manga_mark_unloadable_if_image(decoded.index, decoded.media_type);
                 }
                 self.manga_ttv_pending.remove(&decoded.index);
                 continue;
@@ -22905,7 +22921,8 @@ impl ImageViewer {
                     })
                     .unwrap_or(false);
                 if exhausted {
-                    self.manga_mark_media_unloadable(decoded.index);
+                    // Same rule as the empty-payload path: only an image settles into the X card.
+                    self.manga_mark_unloadable_if_image(decoded.index, decoded.media_type);
                 }
                 self.manga_ttv_pending.remove(&decoded.index);
                 continue;
