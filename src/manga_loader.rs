@@ -43,8 +43,7 @@ use crate::metadata_cache::{
 };
 use crate::video_player::gstreamer_runtime_available;
 use crate::video_thumbnail::{
-    extract_video_first_frame_without_gstreamer, probe_video_dimensions_with_gstreamer,
-    probe_video_dimensions_without_gstreamer,
+    probe_video_dimensions_with_gstreamer, probe_video_dimensions_without_gstreamer,
 };
 use crate::viewer_mode::MangaLayoutMode;
 use crate::FileStamp;
@@ -181,7 +180,7 @@ impl VideoProbeGate {
 }
 
 /// A held video-probe permit. Deliberately lifetime-free: one tile hands the same permit down
-/// `extract_video_first_frame` -> `probe_video_dimensions_fast` instead of queueing twice.
+/// `probe_video_dimensions` -> `extract_video_first_frame` instead of queueing twice.
 /// Holds its own gate handle so a test gate gets its permits back, not the global one.
 struct VideoProbePermit {
     gate: std::sync::Arc<VideoProbeGate>,
@@ -1875,30 +1874,6 @@ impl MangaLoader {
         Self::fallback_video_dimensions(path).unwrap_or(FALLBACK_VIDEO_DIMENSIONS)
     }
 
-    fn probe_video_dimensions_fast(
-        path: &std::path::Path,
-        permit: Option<&VideoProbePermit>,
-    ) -> (u32, u32) {
-        if let Some((w, h)) = lookup_cached_dimensions(path, CachedMediaKind::Video) {
-            return (w, h);
-        }
-
-        if gstreamer_runtime_available() {
-            let mut owned = None;
-            if probe_permit(permit, &mut owned).is_some() {
-                Self::note_gst_probe();
-                if let Some((w, h)) = probe_video_dimensions_with_gstreamer(path) {
-                    if w > 0 && h > 0 {
-                        store_cached_dimensions(path, CachedMediaKind::Video, w, h);
-                        return (w, h);
-                    }
-                }
-            }
-        }
-
-        Self::cheap_video_dimensions(path)
-    }
-
     /// Load a single image on a worker thread.
     /// For video files, this extracts the first frame as a thumbnail placeholder.
     fn load_single_image(req: &LoadRequest) -> Option<DecodedImage> {
@@ -2214,34 +2189,15 @@ impl MangaLoader {
         }
     }
 
-    fn video_thumbnail_output_dimensions(
-        source_dimensions: Option<(u32, u32)>,
-        max_texture_side: u32,
-    ) -> Option<(u32, u32)> {
-        let (source_w, source_h) = source_dimensions?;
-        if source_w == 0 || source_h == 0 || max_texture_side == 0 {
-            return None;
-        }
-
-        let scale = (max_texture_side as f64 / source_w as f64)
-            .min(max_texture_side as f64 / source_h as f64)
-            .min(1.0);
-        if scale >= 0.999 {
-            return None;
-        }
-
-        Some((
-            (source_w as f64 * scale).round().max(1.0) as u32,
-            (source_h as f64 * scale).round().max(1.0) as u32,
-        ))
-    }
-
-    /// Extract the first frame from a video file as a thumbnail.
+    /// First frame of a video tile, entirely delegated to the app's one alpha-aware extractor.
     ///
-    /// Uses GStreamer to decode just the first frame without loading the entire video.
-    /// This is much faster than full video playback initialization and provides
-    /// a visual preview for videos in manga mode.
-    ///
+    /// The permit is only claimed here so a tile's whole probe chain (dimensions, then the frame)
+    /// shares one gate slot; the decode runs inside `extract_video_first_frame_thumbnail`, which
+    /// demotes the alpha decodebin and retries opaque when the stream carries a VP8/VP9 alpha
+    /// plane. Keeping a second, alpha-unaware copy of that pipeline here is what left every such
+    /// webm on a permanent placeholder: this copy aborted on the alphacombine bus error ("Cannot
+    /// handle streams without an initial alpha buffer") instead of falling back, while playback
+    /// of the very same file worked.
     fn extract_video_first_frame(
         path: &std::path::Path,
         max_texture_side: u32,
@@ -2250,197 +2206,7 @@ impl MangaLoader {
         // Released by the guard on every path below, including the early returns.
         let mut owned = None;
         let _probe_permit = probe_permit(permit, &mut owned)?;
-        let gstreamer_available = gstreamer_runtime_available();
-
-        if !gstreamer_available {
-            if let Some((pixels, width, height, original_width, original_height)) =
-                extract_video_first_frame_without_gstreamer(path, max_texture_side)
-            {
-                return Some(FirstFrame::new(
-                    pixels,
-                    width,
-                    height,
-                    original_width,
-                    original_height,
-                ));
-            }
-            return None;
-        }
-
-        use gstreamer as gst;
-        use gstreamer::prelude::*;
-        use gstreamer_app as gst_app;
-        use gstreamer_video as gst_video;
-        use parking_lot::Mutex;
-        use std::sync::Arc;
-        use std::time::Duration;
-
-        use crate::video_player::run_gst_with_timeout;
-
-        // Initialize GStreamer if needed (static check to avoid repeated init)
-        static GST_INIT: std::sync::OnceLock<Result<(), ()>> = std::sync::OnceLock::new();
-        let init_result = GST_INIT.get_or_init(|| {
-            let result = gst::init().map_err(|_| ());
-            if result.is_ok() {
-                crate::video_player::apply_av1_decoder_stability_ranks();
-            }
-            result
-        });
-        if init_result.is_err() {
-            return None;
-        }
-
-        // Build URI from path
-        let uri = gst::glib::filename_to_uri(path, None).ok()?.to_string();
-
-        let source_dimensions = Some(Self::probe_video_dimensions_fast(path, Some(_probe_permit)));
-        let output_dimensions =
-            Self::video_thumbnail_output_dimensions(source_dimensions, max_texture_side);
-        let caps_filter = match output_dimensions {
-            Some((width, height)) if width > 0 && height > 0 => {
-                format!("video/x-raw,format=RGBA,width={},height={}", width, height)
-            }
-            _ => "video/x-raw,format=RGBA".to_string(),
-        };
-
-        // Create a minimal pipeline for frame extraction
-        // Use decodebin for auto-detection and videoscale/videoconvert for format conversion
-        let pipeline_str = format!(
-            "uridecodebin uri=\"{}\" name=dec ! videoconvert ! videoscale ! \
-             {} ! appsink name=sink max-buffers=1 drop=true",
-            uri.replace("\"", "\\\""),
-            caps_filter
-        );
-
-        Self::note_gst_probe();
-        let pipeline = gst::parse::launch(&pipeline_str).ok()?;
-        let pipeline = pipeline.downcast::<gst::Pipeline>().ok()?;
-
-        // Get the appsink element
-        let appsink = pipeline
-            .by_name("sink")?
-            .dynamic_cast::<gst_app::AppSink>()
-            .ok()?;
-
-        // Storage for extracted frame
-        let frame_data: Arc<Mutex<Option<(Vec<u8>, u32, u32)>>> = Arc::new(Mutex::new(None));
-        let frame_data_clone = Arc::clone(&frame_data);
-
-        // Set up preroll callback to capture the first frame
-        appsink.set_callbacks(
-            gst_app::AppSinkCallbacks::builder()
-                .new_preroll(move |sink| {
-                    if let Ok(sample) = sink.pull_preroll() {
-                        if let (Some(buffer), Some(caps)) = (sample.buffer(), sample.caps()) {
-                            if let Ok(video_info) = gst_video::VideoInfo::from_caps(caps) {
-                                let width = video_info.width();
-                                let height = video_info.height();
-                                if let Ok(map) = buffer.map_readable() {
-                                    let pixels = map.as_slice().to_vec();
-                                    let mut data = frame_data_clone.lock();
-                                    *data = Some((pixels, width, height));
-                                }
-                            }
-                        }
-                    }
-                    Ok(gst::FlowSuccess::Ok)
-                })
-                .build(),
-        );
-
-        // Set to PAUSED to get the first frame (preroll)
-        let pipeline_paused = pipeline.clone();
-        if run_gst_with_timeout("manga-thumb-paused", Duration::from_secs(8), move || {
-            pipeline_paused.set_state(gst::State::Paused)
-        })
-        .map_or(true, |result| result.is_err())
-        {
-            let pipeline_null = pipeline.clone();
-            let _ = run_gst_with_timeout("manga-thumb-null", Duration::from_secs(1), move || {
-                pipeline_null.set_state(gst::State::Null)
-            });
-            return None;
-        }
-
-        let bus = pipeline.bus()?;
-        let wait_for_frame = |timeout_ms: u64| -> bool {
-            let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
-            while std::time::Instant::now() < deadline {
-                if frame_data.lock().is_some() {
-                    return true;
-                }
-
-                if let Some(msg) = bus.timed_pop(gst::ClockTime::from_mseconds(50)) {
-                    match msg.view() {
-                        gst::MessageView::Error(_) => return false,
-                        gst::MessageView::AsyncDone(_) | gst::MessageView::Eos(_) => {
-                            if frame_data.lock().is_some() {
-                                return true;
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-
-            frame_data.lock().is_some()
-        };
-
-        let _ = wait_for_frame(300);
-        let pre_seek_frame = frame_data.lock().clone();
-        *frame_data.lock() = None;
-        let pipeline_seek = pipeline.clone();
-        let seeked_to_zero =
-            run_gst_with_timeout("manga-thumb-seek", Duration::from_secs(2), move || {
-                pipeline_seek
-                    .seek_simple(
-                        gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
-                        gst::ClockTime::ZERO,
-                    )
-                    .is_ok()
-            })
-            .unwrap_or(false);
-        let extracted_frame = if seeked_to_zero {
-            if wait_for_frame(3000) {
-                frame_data.lock().clone()
-            } else {
-                None
-            }
-        } else {
-            pre_seek_frame
-        };
-
-        // Cleanup pipeline
-        let pipeline_null = pipeline.clone();
-        let _ = run_gst_with_timeout("manga-thumb-null", Duration::from_secs(1), move || {
-            pipeline_null.set_state(gst::State::Null)
-        });
-
-        // Extract the frame data
-        let (pixels, width, height) = extracted_frame?;
-
-        if pixels.is_empty() || width == 0 || height == 0 {
-            return None;
-        }
-
-        let (original_width, original_height) = source_dimensions.unwrap_or((width, height));
-
-        // Downscale if needed for GPU texture limits
-        let (final_width, final_height, final_pixels) = downscale_rgba_if_needed(
-            width,
-            height,
-            &pixels,
-            max_texture_side,
-            FilterType::Triangle,
-        );
-
-        Some(FirstFrame::new(
-            final_pixels.into_owned(),
-            final_width,
-            final_height,
-            original_width,
-            original_height,
-        ))
+        crate::extract_video_first_frame_thumbnail(path, max_texture_side)
     }
 
     /// Preload counts (ahead, behind) from the applied visible-item signal.
