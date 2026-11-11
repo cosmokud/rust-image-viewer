@@ -3246,7 +3246,7 @@ impl MangaLoader {
             && self
                 .video_revive
                 .get(&index)
-                .map_or(true, |state| state.revives < VIDEO_THUMBNAIL_REVIVE_MAX)
+                .is_none_or(|state| state.revives < VIDEO_THUMBNAIL_REVIVE_MAX)
     }
 
     /// Hover/visible demand on a video tile: drop the pacing so the next pump re-opens the budget
