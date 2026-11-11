@@ -116,7 +116,6 @@ src/app/
   mod.rs                  ImageViewer struct + consts + Default + Drop + child wiring
   bootstrap.rs            main(): diagnostics, single instance, pre-window sizing, run_native
   app_loop.rs             impl eframe::App: update() and clear_color()
-  constructors.rs         ImageViewer::new + the directory-scan poll
   state.rs                owned state types (menus, modals, layouts, snapshots)
   cache_state.rs          decoded-image / texture cache entries and byte limits
   core_state.rs           small cross-cutting queries (list signature, exit locks)
@@ -136,17 +135,17 @@ src/app/
 | `ui/` | 18 | palette-driven widgets, overlays, icons, title bar, pointer/autohide, the solo draw, zoom math, floating resize |
 | `input/` | 5 | `draw_controls` (the whole top/bottom chrome), `handle_input`, action dispatch, binding evaluation, priority shortcuts |
 | `folder/` | 6 | media list mutation, folder placeholder cards, breadcrumbs, back/forward history, scan polling |
-| `files/` | 11 | mark selection, file action menu, rename, clipboard/cut/copy/paste/delete, context menu, file-size probes, global file shortcuts |
+| `files/` | 9 | mark selection, file action menu, rename, clipboard/cut/copy/paste/delete, context menu, file-size probes, global file shortcuts |
 | `media/` | 8 | `load_media_internal`, async solo image/video loads, media swap placeholders, displayed-size maths, animated (GIF/WebP) controls |
-| `solo/` | 5 | solo texture cache, LOD target sides, neighbour probing, neighbour preloading |
+| `solo/` | 4 | solo texture cache, LOD target sides, neighbour probing, neighbour preloading |
 | `video/` | 10 | playback availability state, track popups, video navigation, vector icons, resume positions, seek gesture, seekbar, first-frame extraction |
-| `manga/` | 40 | everything Long Strip and Masonry: layouts, uploads, demand accounting, preload, drawing, video tiles |
+| `manga/` | 39 | everything Long Strip and Masonry: layouts, uploads, demand accounting, preload, drawing, video tiles |
 | `masonry/` | 2 | authoritative dimension bookkeeping + folder metadata snapshots |
 | `window/` | 11 | layout application, display lookup, window rects, fullscreen transitions, dragging, autosize, title text, startup visibility, monitor queries |
 | `settings/` | 8 | settings window values/actions/widgets/rows/presets/tabs/modal |
 | `dialogs/` | 5 | delete/rename/exit modals, modal thumbnails and preview |
 | `help/` | 3 | shortcut help labels and the Help tab |
-| `diagnostics/` | 4 | FPS sampling, metrics overlay, per-frame diag stats |
+| `diagnostics/` | 3 | FPS sampling, per-frame diag stats (the overlay itself is in `ui/`) |
 | `fullscreen/` | 4 | per-image view memory, rotation/flip state, Long Strip reset |
 
 **Where do I look for X?** Query the `//!` header of the file: each one is a one-line ownership
@@ -231,7 +230,7 @@ window on a scaled display and push the title-bar buttons off screen.
 The app draws its own title bar, so there are no native decorations. MSAA/depth/stencil are
 dropped because the frame is 2D UI plus one media texture.
 
-### 3.4 `ImageViewer::new` / `init_viewer` (`src/app/constructors.rs`, `src/app/decode.rs`)
+### 3.4 `ImageViewer::new` / `init_viewer` (`src/app/mod.rs`, `src/app/decode.rs`)
 
 `init_viewer` stores the single-instance receiver and installs the wake callback, captures the
 runtime `MAX_TEXTURE_SIZE` from the GL backend, applies background visuals from config, adjusts
