@@ -353,6 +353,29 @@ fn paint_loading_spinner(painter: &egui::Painter, rect: egui::Rect, time: f64) {
     painter.add(egui::Shape::line(points.to_vec(), stroke));
 }
 
+/// The X drawn over a tile whose file cannot be decoded. One shape for every surface (strip
+/// tiles, folder previews, dialog thumbnails) so "unloadable" reads the same everywhere.
+fn paint_unloadable_cross(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let size = (rect.width().min(rect.height()) * 0.26).clamp(8.0, 40.0);
+    let glyph = egui::Rect::from_center_size(rect.center(), egui::Vec2::splat(size));
+    let stroke = egui::Stroke::new((size * 0.11).clamp(1.5, 4.0), color);
+    let inset = size * 0.18;
+    painter.line_segment(
+        [
+            glyph.left_top() + egui::vec2(inset, inset),
+            glyph.right_bottom() - egui::vec2(inset, inset),
+        ],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            glyph.left_bottom() + egui::vec2(inset, -inset),
+            glyph.right_top() + egui::vec2(-inset, inset),
+        ],
+        stroke,
+    );
+}
+
 fn paint_static_hourglass_placeholder(
     painter: &egui::Painter,
     rect: egui::Rect,
@@ -2012,7 +2035,9 @@ fn load_solo_probe_image(
 ) -> Option<CachedDecodedImage> {
     let stamp = file_stamp_for_path(path)?;
 
-    let mut image = LoadedImage::load_first_frame_only(
+    // Thumbnail-grade load: one frame for every animated format. The full animation is loaded
+    // separately when the media is actually shown.
+    let mut image = LoadedImage::load_first_frame_thumbnail(
         path,
         Some(max_texture_side),
         downscale_filter,
@@ -2448,10 +2473,16 @@ const DECODED_IMAGE_CACHE_MAX_BYTES: u64 = 384 * 1024 * 1024;
 const DECODED_IMAGE_CACHE_SKIP_ENTRY_BYTES: usize = 96 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct FileStamp {
+pub(crate) struct FileStamp {
     size_bytes: u64,
     modified_secs: u64,
     modified_nanos: u32,
+}
+
+impl FileStamp {
+    pub(crate) fn of_path(path: &Path) -> Option<FileStamp> {
+        file_stamp_for_path(path)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2629,6 +2660,10 @@ struct ImageViewer {
     folder_placeholder_thumbnail_pending: HashSet<PathBuf>,
     /// Recently failed folder-placeholder thumbnail loads (for retry backoff).
     folder_placeholder_thumbnail_failures: HashMap<PathBuf, Instant>,
+    /// Files known to be undrawable (folder-card and dialog thumbnails, solo neighbours),
+    /// pinned to the file shape that failed. Kept apart from any retry backoff: an entry here
+    /// means "do not decode this again until the file changes".
+    unloadable_files: HashMap<PathBuf, Option<FileStamp>>,
     /// Request channel for queued folder-placeholder thumbnail decode work.
     folder_placeholder_thumbnail_request_tx:
         crossbeam_channel::Sender<FolderPlaceholderThumbnailLoadRequest>,
@@ -3176,6 +3211,12 @@ struct ImageViewer {
     /// Index of the currently focused animated image in manga mode.
     /// Only this item is allowed to animate/stream at a time.
     manga_focused_anim_index: Option<usize>,
+    /// Media indices whose file could not produce a drawable texture, with the file they failed
+    /// at. The tile paints an X and issues no further decode requests; a different path at the
+    /// same index, or a rewrite of the file (stamp change), clears the mark.
+    manga_unloadable_media: HashMap<usize, (PathBuf, Option<FileStamp>)>,
+    /// When the unloadable marks above were last re-stamped (`stat` each, throttled).
+    manga_unloadable_recheck_at: Instant,
 
     // ============ GIF PLAYBACK CONTROL FIELDS ============
     /// Whether the current GIF animation is paused (for non-manga mode)
@@ -3377,6 +3418,7 @@ impl Default for ImageViewer {
             folder_placeholder_preview_scan_result_rx,
             folder_placeholder_thumbnail_pending: HashSet::new(),
             folder_placeholder_thumbnail_failures: HashMap::new(),
+            unloadable_files: HashMap::new(),
             folder_placeholder_thumbnail_request_tx,
             folder_placeholder_thumbnail_result_rx,
             folder_placeholder_thumbnail_cache: HashMap::new(),
@@ -3629,6 +3671,8 @@ impl Default for ImageViewer {
             manga_max_video_players: 3, // Keep at most 3 video players alive
             manga_animated_images: HashMap::new(),
             manga_focused_anim_index: None,
+            manga_unloadable_media: HashMap::new(),
+            manga_unloadable_recheck_at: Instant::now(),
 
             // GIF playback control fields
             gif_paused: false,
@@ -3744,6 +3788,9 @@ impl ImageViewer {
     const MANGA_VIDEO_LOAD_STALE_AFTER: Duration = Duration::from_secs(12);
     /// Failed-video memo lifetime; the tile retries after this instead of failing for the session.
     const MANGA_VIDEO_FAILED_COOLDOWN: Duration = Duration::from_secs(30);
+    /// How often the unloadable-media marks are re-stamped. The X card must go away when the
+    /// user fixes the file, but a broken file must not cost a `stat` every frame.
+    const UNLOADABLE_STAMP_RECHECK: Duration = Duration::from_secs(5);
     /// One "control queue refused play" diag line per this interval.
     const MANGA_VIDEO_PLAY_REFUSED_LOG_INTERVAL: Duration = Duration::from_secs(1);
     const MANGA_STRIP_PLAYBACK_BACKGROUND_TICK_MS: u64 = 80;
@@ -3887,6 +3934,8 @@ impl ImageViewer {
             loader.cancel_all();
         }
         self.manga_loader = None;
+        // The loader that held the failure history is gone; nothing is pinned any more.
+        self.manga_unloadable_media.clear();
         self.manga_texture_cache.clear();
         self.manga_decoded_mailbox.clear();
 
@@ -4387,6 +4436,8 @@ impl ImageViewer {
             self.clear_masonry_authoritative_dimension_lock();
             self.solo_image_texture_cache.clear();
             self.solo_image_texture_cache_order.clear();
+            // Index-keyed X marks describe a different list now.
+            self.manga_unloadable_media.clear();
         }
 
         self.image_list = files;
@@ -4415,6 +4466,7 @@ impl ImageViewer {
             .retain(|path| path.exists());
         self.folder_placeholder_thumbnail_failures
             .retain(|path, _| path.exists());
+        self.unloadable_files.retain(|path, _| path.exists());
         self.folder_placeholder_stamp_cache.clear();
 
         self.set_image_list_raw(files);
@@ -4948,6 +5000,13 @@ impl ImageViewer {
                     painter.image(texture_id, fitted_rect, uv, egui::Color32::WHITE);
                 } else if self.request_folder_placeholder_thumbnail_load(media_path) {
                     paint_static_hourglass_placeholder(painter, tile_rect, 3.0);
+                } else if self.unloadable_files.contains_key(media_path) {
+                    // Undrawable thumbnail: the X replaces the hourglass and no decode is queued.
+                    paint_unloadable_cross(
+                        painter,
+                        tile_rect,
+                        egui::Color32::from_rgb(214, 90, 82),
+                    );
                 } else {
                     paint_static_hourglass_placeholder(painter, tile_rect, 3.0);
                 }
@@ -7025,6 +7084,10 @@ impl ImageViewer {
             (w, h),
             &policy,
         );
+        if texture.used_placeholder {
+            // The GPU refused the payload: do not cache a texture that cannot be shown.
+            return;
+        }
 
         self.insert_solo_image_texture_cache_entry(
             key,
@@ -7729,6 +7792,17 @@ impl ImageViewer {
                 continue;
             };
 
+            // A neighbour already diagnosed as undrawable must not be re-probed: that decode
+            // ran off the UI thread but the request still poured a full decode of the same
+            // corrupt file into the queue on every window pass.
+            if let Some(stamp) = self.unloadable_files.get(&path).copied() {
+                let current = FileStamp::of_path(path.as_path());
+                if current.is_none() || current == stamp {
+                    continue;
+                }
+                self.unloadable_files.remove(&path);
+            }
+
             match media_type {
                 MediaType::Image => {
                     let extension = path
@@ -7791,6 +7865,13 @@ impl ImageViewer {
                     cached,
                 } => {
                     let Some(cached) = cached else {
+                        // Media file that cannot be decoded: remember it so the window probe
+                        // stops queueing the same corrupt bytes. Files that are simply gone
+                        // (thumbnails of deleted neighbours) are not pinned this way.
+                        if get_media_type(&path).is_some() {
+                            let stamp = FileStamp::of_path(path.as_path());
+                            self.unloadable_files.insert(path, stamp);
+                        }
                         continue;
                     };
 
@@ -8003,6 +8084,17 @@ impl ImageViewer {
 
     fn manga_mark_placeholder_visible(&mut self, index: usize) {
         if self.mode().is_solo() {
+            return;
+        }
+        // A tile nothing will ever load is not "pending work". Keeping it here drove the 16ms
+        // background poll (and thus a full-frame repaint) for as long as the corrupt file was
+        // on screen, which is where the sustained 100% CPU came from.
+        if self.manga_media_is_unloadable(index)
+            || self
+                .manga_loader
+                .as_ref()
+                .is_some_and(|loader| loader.retry_blocked(index))
+        {
             return;
         }
         self.manga_ttv_pending
@@ -11159,6 +11251,18 @@ impl ImageViewer {
             return true;
         }
 
+        // A file that already failed is only re-read once its stamp changes: a corrupt image
+        // must not be decoded again every three seconds while its card stays on screen.
+        if self.unloadable_files.contains_key(path) {
+            let stamp = self.unloadable_files.get(path).copied().flatten();
+            let current = FileStamp::of_path(path.as_path());
+            if current.is_none() || current == stamp {
+                return false;
+            }
+            self.unloadable_files.remove(path);
+            self.folder_placeholder_thumbnail_failures.remove(path);
+        }
+
         if self
             .folder_placeholder_thumbnail_failures
             .get(path)
@@ -11352,6 +11456,11 @@ impl ImageViewer {
                 }
                 FolderPlaceholderThumbnailLoadResult::Failed { path } => {
                     self.folder_placeholder_thumbnail_pending.remove(&path);
+                    // The worker reports failure only when the decode produced no thumbnail,
+                    // so this file is undrawable: paint the X and stop queueing decodes for
+                    // it until its stamp changes.
+                    let stamp = FileStamp::of_path(path.as_path());
+                    self.unloadable_files.insert(path.clone(), stamp);
                     self.folder_placeholder_thumbnail_failures
                         .insert(path, Instant::now());
                 }
@@ -11373,6 +11482,11 @@ impl ImageViewer {
         if let Some(texture) = self.try_get_cached_modal_thumbnail_texture(path) {
             return Some(texture);
         }
+        // A failed decode is remembered, so a dialog reopened on a corrupt file paints the X
+        // instead of decoding the same bytes again on every frame.
+        if self.modal_thumbnail_is_unloadable(path.as_path()) {
+            return None;
+        }
 
         let stamp = file_stamp_for_path(path.as_path())?;
 
@@ -11386,12 +11500,18 @@ impl ImageViewer {
 
         let (pixels, width, height, policy) = match media_type {
             MediaType::Image => {
-                let cached = load_solo_probe_image(
+                let cached = match load_solo_probe_image(
                     path,
                     target_side,
                     self.config.downscale_filter.to_image_filter(),
                     self.config.gif_resize_filter.to_image_filter(),
-                )?;
+                ) {
+                    Some(cached) => cached,
+                    None => {
+                        self.unloadable_files.insert(path.clone(), Some(stamp));
+                        return None;
+                    }
+                };
                 let animated =
                     cached.first_frame.delay_ms > 0 || cached.is_animated_webp || animated_by_ext;
                 let kind = if animated {
@@ -11408,7 +11528,13 @@ impl ImageViewer {
                 )
             }
             MediaType::Video => {
-                let cached = extract_video_first_frame_thumbnail(path, target_side)?;
+                let cached = match extract_video_first_frame_thumbnail(path, target_side) {
+                    Some(cached) => cached,
+                    None => {
+                        self.unloadable_files.insert(path.clone(), Some(stamp));
+                        return None;
+                    }
+                };
                 let mut inputs = base_upload_policy_inputs(self);
                 inputs.display_min_side = self.solo_current_display_min_side();
                 let policy = inputs.policy(texture_upload::UploadKind::VideoThumbnail);
@@ -11448,6 +11574,23 @@ impl ImageViewer {
         })
     }
 
+    /// True when the dialog thumbnail for `path` is known to be undrawable: the preview paints
+    /// the X and never runs another decode for it until the file changes.
+    fn modal_thumbnail_is_unloadable(&mut self, path: &Path) -> bool {
+        let Some(stamp) = self.unloadable_files.get(path) else {
+            return false;
+        };
+        let stamp = *stamp;
+        let current = FileStamp::of_path(path);
+        if current.is_some() && current != stamp {
+            self.unloadable_files.remove(path);
+            self.folder_placeholder_thumbnail_failures.remove(path);
+            self.modal_thumbnail_cache.remove(&path.to_path_buf());
+            return false;
+        }
+        true
+    }
+
     fn draw_modal_thumbnail_preview(
         &mut self,
         ui: &mut egui::Ui,
@@ -11470,7 +11613,12 @@ impl ImageViewer {
             ),
         );
 
-        if let Some((texture_id, image_size)) = self.ensure_modal_thumbnail_texture(ctx, path) {
+        let unloadable = self.modal_thumbnail_is_unloadable(path.as_path());
+        if unloadable {
+            paint_unloadable_cross(ui.painter(), rect, egui::Color32::from_rgb(214, 90, 82));
+        } else if let Some((texture_id, image_size)) =
+            self.ensure_modal_thumbnail_texture(ctx, path)
+        {
             let available = rect.shrink2(egui::vec2(6.0, 6.0));
             let scale = if image_size.x <= 0.0 || image_size.y <= 0.0 {
                 1.0
@@ -11487,7 +11635,7 @@ impl ImageViewer {
                 egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
                 egui::Color32::WHITE,
             );
-        } else {
+        } else if !unloadable {
             let placeholder = path
                 .extension()
                 .and_then(|ext| ext.to_str())
@@ -20657,7 +20805,7 @@ impl ImageViewer {
             && !self.manga_anim_failed.contains(&focused_idx);
         let focused_is_animated = focused_is_animated || focused_by_path;
 
-        if focused_is_animated {
+        if focused_is_animated && !self.manga_media_is_unloadable(focused_idx) {
             Some(focused_idx)
         } else {
             None
@@ -21310,6 +21458,7 @@ impl ImageViewer {
         }
 
         let mut needs_repaint = false;
+        let mut anim_render_failed: Vec<usize> = Vec::new();
         let active_gif_filter = if self.manga_should_force_triangle_filters() {
             FilterType::Triangle
         } else {
@@ -21380,7 +21529,7 @@ impl ImageViewer {
         let vis_start = self.manga_index_at_y(viewport_top);
         let vis_end = self.manga_index_at_y(viewport_bottom);
         // ── Start/prepare animation source for the focused animated item only ──
-        if let Some(idx) = focused_anim_idx {
+        if let Some(idx) = focused_anim_idx.filter(|&idx| !self.manga_media_is_unloadable(idx)) {
             // Already have the full animation?
             if !(self.manga_animated_images.contains_key(&idx)
                 && self
@@ -21426,13 +21575,18 @@ impl ImageViewer {
 
                             // Ensure there's a LoadedImage entry with at least the first frame.
                             if !self.manga_animated_images.contains_key(&idx) {
-                                if let Ok(img) = LoadedImage::load_first_frame_only(
+                                match LoadedImage::load_first_frame_only(
                                     &path,
                                     Some(target_side),
                                     active_downscale_filter,
                                     active_gif_filter,
                                 ) {
-                                    self.manga_animated_images.insert(idx, img);
+                                    Ok(img) => {
+                                        self.manga_animated_images.insert(idx, img);
+                                    }
+                                    Err(_) => {
+                                        anim_render_failed.push(idx);
+                                    }
                                 }
                             }
                             let base_frames = self
@@ -21461,8 +21615,26 @@ impl ImageViewer {
                                 self.manga_anim_seekbar_total_frames
                                     .insert(idx, total_frames.max(1));
                             }
-                            _ => {
+                            Ok(img) => {
+                                // Decoded, but not as animation: a single usable frame is all
+                                // this file has. Show it as a still instead of retrying.
+                                self.manga_animated_images.insert(idx, img);
+                                self.manga_anim_stream_done.insert(idx, true);
+                                self.manga_anim_seekbar_total_frames.remove(&idx);
                                 self.manga_anim_failed.insert(idx);
+                            }
+                            Err(_) => {
+                                let has_thumbnail = self.image_list.get(idx).is_some_and(|path| {
+                                    self.manga_texture_cache.contains_for_path(idx, path)
+                                });
+                                if has_thumbnail {
+                                    // The tile already shows a frame; only the animation is
+                                    // unavailable, so it stays a still image.
+                                    self.manga_anim_failed.insert(idx);
+                                } else {
+                                    // Nothing drawable at all: X card, and no further decodes.
+                                    self.manga_mark_media_unloadable(idx);
+                                }
                             }
                         }
                     }
@@ -21594,6 +21766,10 @@ impl ImageViewer {
                         (w, h),
                         &anim_upload_policy,
                     );
+                    if uploaded.used_placeholder {
+                        // The GPU refused the frame; every later frame will be refused too.
+                        anim_render_failed.push(idx);
+                    }
                     if let Some(path) = entry_path.as_deref().filter(|_| slot.is_some()) {
                         let _ = self.manga_texture_cache.update_texture(
                             idx,
@@ -21633,6 +21809,12 @@ impl ImageViewer {
                     }
                 }
             }
+        }
+
+        // A focused animation that decoded but will not go to the GPU is a file that cannot be
+        // shown at all: mark it so its tile becomes the X card instead of a spinner loop.
+        for idx in anim_render_failed {
+            self.manga_mark_media_unloadable(idx);
         }
 
         // ── Evict animated images that are far from the viewport ──
@@ -21753,6 +21935,7 @@ impl ImageViewer {
                 }
             };
             diag::note_stage("preload_pump");
+            self.manga_refresh_unloadable_media();
             let bookkeeping = self.manga_loader.as_ref().is_some_and(|loader| {
                 loader.demand_outstanding(
                     &self.image_list,
@@ -21819,6 +22002,99 @@ impl ImageViewer {
             && pending_for.is_some_and(|age| age >= Self::MANGA_PLACEHOLDER_SPINNER_AFTER)
     }
 
+    /// Index of a media tile whose file could not be decoded into a texture.
+    fn manga_media_is_unloadable(&self, index: usize) -> bool {
+        self.manga_unloadable_media.contains_key(&index)
+    }
+
+    /// Record that `index` cannot be decoded. The tile paints an X from now on and no loader
+    /// request is issued for it, so a corrupt file cannot keep a decode chain alive.
+    fn manga_mark_media_unloadable(&mut self, index: usize) {
+        if self.manga_unloadable_media.contains_key(&index) {
+            return;
+        }
+        let Some(path) = self.image_list.get(index).cloned() else {
+            return;
+        };
+        let stamp = FileStamp::of_path(path.as_path());
+        if let Some(loader) = self.manga_loader.as_mut() {
+            // Pin the index at the retry ceiling: prefetch and every visible-retry path then
+            // skip it until the file changes.
+            loader.mark_unloadable(index, path.as_path());
+        }
+        self.manga_unloadable_media.insert(index, (path, stamp));
+        self.manga_ttv_pending.remove(&index);
+        self.manga_texture_missing_since.remove(&index);
+        self.manga_texture_heal_budget.remove(&index);
+        crate::diag::trace("manga-unloadable", &format!("idx={}", index));
+    }
+
+    /// Drop the X marks whose file changed (or disappeared) since the failure, and the ones
+    /// whose index no longer exists. Runs at `UNLOADABLE_STAMP_RECHECK` pace: one `stat` per
+    /// marked file per interval, never per frame.
+    fn manga_refresh_unloadable_media(&mut self) {
+        let now = Instant::now();
+        if now < self.manga_unloadable_recheck_at + Self::UNLOADABLE_STAMP_RECHECK {
+            return;
+        }
+        self.manga_unloadable_recheck_at = now;
+
+        let image_list = std::mem::take(&mut self.image_list);
+        let mut revived = Vec::new();
+        self.manga_unloadable_media
+            .retain(|&index, (failed_path, stamp)| {
+                let Some(path) = image_list.get(index) else {
+                    return false;
+                };
+                // A different file at the same index (folder switch) is not the one that failed.
+                if path != failed_path {
+                    revived.push(index);
+                    return false;
+                }
+                let current = FileStamp::of_path(path.as_path());
+                if current.is_some() && current == *stamp {
+                    return true;
+                }
+                revived.push(index);
+                false
+            });
+        self.image_list = image_list;
+
+        for index in revived {
+            self.manga_anim_failed.remove(&index);
+            self.manga_ttv_pending.remove(&index);
+            if let Some(loader) = self.manga_loader.as_mut() {
+                loader.reset_index_state_for(index);
+            }
+            manga_loader::trace_rule("unloadable-revived", index);
+        }
+    }
+
+    /// Placeholder for a tile whose file cannot be drawn: the X replaces the hourglass, and
+    /// nothing above this point may request a decode or a spinner for it again.
+    fn paint_unloadable_media_placeholder(&self, ui: &egui::Ui, rect: egui::Rect, label: &str) {
+        let painter = ui.painter();
+        painter.rect_filled(rect, 0.0, egui::Color32::from_gray(24));
+        let size = (rect.width().min(rect.height()) * 0.22).clamp(12.0, 40.0);
+        paint_unloadable_cross(
+            painter,
+            egui::Rect::from_center_size(
+                rect.center() - egui::vec2(0.0, size * 0.4),
+                egui::Vec2::splat(size * 1.6),
+            ),
+            egui::Color32::from_rgb(214, 90, 82),
+        );
+        if rect.height() >= 64.0 {
+            painter.text(
+                rect.center() + egui::vec2(0.0, size * 0.75),
+                egui::Align2::CENTER_CENTER,
+                label,
+                egui::FontId::proportional((size * 0.4).clamp(9.0, 14.0)),
+                egui::Color32::from_gray(120),
+            );
+        }
+    }
+
     /// Indeterminate spinner on a placeholder tile still waiting for its texture.
     fn manga_paint_placeholder_spinner(&mut self, ui: &egui::Ui, index: usize, rect: egui::Rect) {
         if !self.config.show_loading_spinners {
@@ -21829,10 +22105,11 @@ impl ImageViewer {
             .manga_texture_missing_since
             .get(&index)
             .map(|since| since.elapsed());
-        let retry_blocked = self
-            .manga_loader
-            .as_ref()
-            .is_some_and(|loader| loader.retry_blocked(index));
+        let retry_blocked = self.manga_media_is_unloadable(index)
+            || self
+                .manga_loader
+                .as_ref()
+                .is_some_and(|loader| loader.retry_blocked(index));
 
         if !Self::manga_placeholder_spinner_due(
             pending_for,
@@ -21876,10 +22153,35 @@ impl ImageViewer {
             self.manga_evict_stale_work(now);
         }
 
+        // Out of retries on an image that still renders nothing: the file is broken, so give it
+        // the X card. Videos are excluded: a video with no thumbnail is still playable.
+        let exhausted: Vec<usize> = visible
+            .iter()
+            .copied()
+            .filter(|&index| {
+                !self.manga_media_is_unloadable(index)
+                    && self
+                        .manga_loader
+                        .as_ref()
+                        .is_some_and(|loader| loader.retry_blocked(index))
+                    && self.image_list.get(index).is_some_and(|path| {
+                        crate::image_loader::is_supported_image(path)
+                            && !self
+                                .manga_texture_cache
+                                .contains_for_path(index, path.as_path())
+                    })
+            })
+            .collect();
+        for index in exhausted {
+            self.manga_mark_media_unloadable(index);
+        }
+
         let missing: Vec<usize> = visible
             .iter()
             .copied()
-            .filter(|&index| self.manga_visible_texture_missed(index))
+            .filter(|&index| {
+                !self.manga_media_is_unloadable(index) && self.manga_visible_texture_missed(index)
+            })
             .collect();
 
         // Prune timers for tiles that have a texture again or scrolled out of view.
@@ -21964,7 +22266,9 @@ impl ImageViewer {
 
         if let Some(loader) = self.manga_loader.as_mut() {
             for &index in &stale_loads {
-                loader.reset_index_state_for(index);
+                // Keep the failure history: a corrupt file that hung a decode worker must not
+                // get a fresh retry budget on every stale sweep.
+                loader.release_inflight(index);
             }
             for &index in &stale_probes {
                 loader.drop_dim_pending(index);
@@ -22452,6 +22756,13 @@ impl ImageViewer {
                 continue;
             }
 
+            // An index already diagnosed as undrawable: drop the late payload of a request
+            // that was queued before the diagnosis instead of uploading it to a tile showing
+            // the X card.
+            if self.manga_media_is_unloadable(decoded.index) {
+                continue;
+            }
+
             self.perf_metrics
                 .record(Metric::MangaDecodeQueueWaitMs, decoded.queue_wait);
             self.perf_metrics
@@ -22482,8 +22793,18 @@ impl ImageViewer {
             // level left set without a texture makes every re-request path treat the tile as
             // satisfied forever. `register_upload_failure` also keeps the retry backoff bounded.
             if decoded.pixels.is_empty() {
-                if let Some(loader) = self.manga_loader.as_mut() {
-                    loader.register_upload_failure(decoded.index);
+                let exhausted = self
+                    .manga_loader
+                    .as_mut()
+                    .map(|loader| {
+                        loader.register_upload_failure(decoded.index, decoded.path.as_path());
+                        loader.retry_blocked(decoded.index)
+                    })
+                    .unwrap_or(false);
+                if exhausted {
+                    // Retries are spent: the file will not resolve by itself. Paint the X and
+                    // drop every request path for it instead of re-queuing a doomed decode.
+                    self.manga_mark_media_unloadable(decoded.index);
                 }
                 self.manga_ttv_pending.remove(&decoded.index);
                 continue;
@@ -22508,8 +22829,16 @@ impl ImageViewer {
                         reason
                     )
                 });
-                if let Some(loader) = self.manga_loader.as_mut() {
-                    loader.register_upload_failure(decoded.index);
+                let exhausted = self
+                    .manga_loader
+                    .as_mut()
+                    .map(|loader| {
+                        loader.register_upload_failure(decoded.index, decoded.path.as_path());
+                        loader.retry_blocked(decoded.index)
+                    })
+                    .unwrap_or(false);
+                if exhausted {
+                    self.manga_mark_media_unloadable(decoded.index);
                 }
                 self.manga_ttv_pending.remove(&decoded.index);
                 continue;
@@ -23924,6 +24253,12 @@ impl ImageViewer {
             return false;
         }
 
+        // A file already known to be undrawable never gets another decode request. The mark is
+        // cleared only when the file itself changes (see `manga_refresh_unloadable_media`).
+        if self.manga_media_is_unloadable(index) {
+            return false;
+        }
+
         if self.image_list.is_empty() {
             return false;
         }
@@ -24364,6 +24699,10 @@ impl ImageViewer {
                 let time = ui.input(|i| i.time);
                 paint_loading_spinner(ui.painter(), image_rect, time);
             }
+        } else if self.manga_media_is_unloadable(idx) {
+            // The file already failed to produce a drawable texture: X card, no request, no
+            // spinner. Nothing here may touch the loader, or every frame would re-decode it.
+            self.paint_unloadable_media_placeholder(ui, image_rect, "Can't load");
         } else {
             // Image item: use regular texture cache
             if let Some((texture_id, tex_w, tex_h)) = self.image_list.get(idx).and_then(|path| {

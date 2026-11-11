@@ -246,6 +246,10 @@ pub enum PixelSource<'a> {
 pub struct UploadResult {
     pub handle: egui::TextureHandle,
     pub mipmap_enabled: bool,
+    /// Egui fell back to its built-in placeholder texture: the upload itself failed (the
+    /// texture is still being created, or the payload was refused). Callers use this to tell
+    /// "the frame is on screen" from "the frame can never be shown".
+    pub used_placeholder: bool,
 }
 
 /// Uploads into `slot` when it holds a handle, else creates one.
@@ -267,12 +271,19 @@ pub fn upload(
             UploadResult {
                 handle: egui::TextureHandle::clone(&*texture),
                 mipmap_enabled,
+                used_placeholder: false,
             }
         }
-        None => UploadResult {
-            handle: ctx.load_texture(name, image, options),
-            mipmap_enabled,
-        },
+        None => {
+            let handle = ctx.load_texture(name, image, options);
+            // `0` is egui's "upload failed, here is the placeholder" id.
+            let used_placeholder = handle.id() == egui::TextureId::default();
+            UploadResult {
+                handle,
+                mipmap_enabled,
+                used_placeholder,
+            }
+        }
     }
 }
 

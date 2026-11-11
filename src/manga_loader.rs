@@ -47,6 +47,7 @@ use crate::video_thumbnail::{
     probe_video_dimensions_without_gstreamer,
 };
 use crate::viewer_mode::MangaLayoutMode;
+use crate::FileStamp;
 
 /// Caps concurrent gstreamer first-frame probes. Each probe opens the video, drives a pipeline
 /// to `Paused` and waits up to 1.5s on the bus; several at once saturate the disk and starve
@@ -309,6 +310,11 @@ const PRELOAD_RETRY_BASE_DELAY_MS: u64 = 250;
 const PRELOAD_RETRY_MAX_DELAY_MS: u64 = 4000;
 /// Stop retrying media that repeatedly fails to decode; broken videos/GIFs should not spin forever.
 const PRELOAD_RETRY_MAX_ATTEMPTS: u8 = 3;
+/// Verification re-reads allowed for a file that keeps failing at the *same* stamp.
+/// A GIF that decodes but cannot be rendered keeps failing until it is rewritten, and the
+/// file stamp is the only re-arm signal there is: one re-read per this interval, only for
+/// failed indices, keeps the tile dead on every frame in between.
+const FAILED_STAMP_RECHECK: Duration = Duration::from_secs(5);
 /// Texture-side buckets used for masonry/strip LOD requests.
 /// Requests are rounded up to the next bucket to avoid churn from tiny deltas.
 pub const LOD_SIDE_BUCKETS: &[u32] = &[
@@ -469,6 +475,11 @@ struct DimResult {
 struct RetryState {
     attempts: u8,
     next_retry_at: Instant,
+    /// Shape of the file when it failed. A rewritten file re-arms the index immediately;
+    /// while the stamp is unchanged the tile stays dead (no frame-by-frame re-decode).
+    stamp: Option<FileStamp>,
+    /// Last time the stamp of a stamp-blocked index was re-read.
+    stamp_checked_at: Instant,
 }
 
 /// Cache entry limits shared with the byte-aware budget clamps.
@@ -1381,7 +1392,8 @@ impl MangaLoader {
 
             enum DecodeOutcome {
                 Skipped,
-                Failed,
+                /// Decode returned nothing; carries the file shape it failed at.
+                Failed(Option<FileStamp>),
                 Decoded(DecodedImage),
             }
 
@@ -1432,7 +1444,7 @@ impl MangaLoader {
                         decoded.decode_time = decode_time;
                         DecodeOutcome::Decoded(decoded)
                     }
-                    None => DecodeOutcome::Failed,
+                    None => DecodeOutcome::Failed(FileStamp::of_path(&req.path)),
                 };
 
                 (req.index, req_generation, outcome)
@@ -1448,10 +1460,11 @@ impl MangaLoader {
 
                 match outcome {
                     DecodeOutcome::Skipped => {}
-                    DecodeOutcome::Failed => {
-                        Self::register_decode_failure(&loaded_levels, &retry_state, idx);
+                    DecodeOutcome::Failed(stamp) => {
+                        Self::register_decode_failure(&loaded_levels, &retry_state, idx, stamp);
                     }
                     DecodeOutcome::Decoded(decoded) => {
+                        let stamp = FileStamp::of_path(decoded.path.as_path());
                         // A decoded payload with empty pixels/dimensions is still useful for metadata
                         // (e.g., video dimension fallback), but does not satisfy texture preloading.
                         let has_usable_pixels =
@@ -1473,6 +1486,7 @@ impl MangaLoader {
                                         &loaded_levels,
                                         &retry_state,
                                         idx,
+                                        stamp,
                                     );
                                 }
                             }
@@ -1568,11 +1582,15 @@ impl MangaLoader {
         loaded_levels: &Arc<RwLock<HashMap<usize, u32>>>,
         retry_state: &Arc<RwLock<HashMap<usize, RetryState>>>,
         index: usize,
+        stamp: Option<FileStamp>,
     ) {
         loaded_levels.write().remove(&index);
 
         let now = Instant::now();
         let mut retry = retry_state.write();
+        // The stamp this failure happened at outlives the attempt count: once the budget is
+        // spent, an unchanged file must stay dead, and any change to the file must revive it.
+        let stamp = stamp.or_else(|| retry.get(&index).and_then(|state| state.stamp));
         let attempts = retry
             .get(&index)
             .map(|state| state.attempts)
@@ -1584,8 +1602,95 @@ impl MangaLoader {
             RetryState {
                 attempts,
                 next_retry_at,
+                stamp,
+                stamp_checked_at: now,
             },
         );
+    }
+
+    /// `rearm_failed_indices` over whatever is still blocked in this window, rate-limited per
+    /// index. Every prefetch pass goes through here, so a rewritten file comes back to life on
+    /// the next pass instead of waiting for the tile to be drawn.
+    fn rearm_failed_in_window(
+        &mut self,
+        image_list: &[PathBuf],
+        start: usize,
+        end: usize,
+    ) -> usize {
+        let blocked: Vec<usize> = {
+            let retry = self.retry_state.read();
+            (start..end.min(image_list.len()))
+                .filter(|idx| {
+                    retry
+                        .get(idx)
+                        .is_some_and(|state| state.attempts >= PRELOAD_RETRY_MAX_ATTEMPTS)
+                })
+                .collect()
+        };
+
+        self.rearm_failed_indices(image_list, blocked).len()
+    }
+
+    /// A file rewritten since it failed is a different file: drop everything that memoizes the
+    /// failure so the next prefetch/draw request can decode it again.
+    ///
+    /// The stamp is re-read only for indices at the retry ceiling and at most once per
+    /// `FAILED_STAMP_RECHECK`; a broken but unchanged file therefore costs one `stat` per
+    /// interval and is never re-decoded, which is what kept corrupt GIFs pegging the CPU.
+    pub fn rearm_failed_indices<I>(&mut self, image_list: &[PathBuf], indices: I) -> Vec<usize>
+    where
+        I: IntoIterator<Item = usize>,
+    {
+        let now = Instant::now();
+        let mut rearmed = Vec::new();
+
+        {
+            let mut retry = self.retry_state.write();
+            for index in indices {
+                let Some(state) = retry.get_mut(&index) else {
+                    continue;
+                };
+                if state.attempts < PRELOAD_RETRY_MAX_ATTEMPTS {
+                    // Backoff retries already cover this index; nothing is blocked yet.
+                    continue;
+                }
+                if now < state.stamp_checked_at + FAILED_STAMP_RECHECK {
+                    continue;
+                }
+                state.stamp_checked_at = now;
+
+                let Some(path) = image_list.get(index) else {
+                    continue;
+                };
+                let current = FileStamp::of_path(path);
+                // Same shape (or a file that vanished): still the broken file, stay blocked.
+                if current.is_none() || current == state.stamp {
+                    continue;
+                }
+
+                rearmed.push(index);
+            }
+
+            for index in &rearmed {
+                retry.remove(index);
+            }
+        }
+
+        if rearmed.is_empty() {
+            return Vec::new();
+        }
+
+        let mut loaded = self.loaded_levels.write();
+        let mut loading = self.loading_indices.write();
+        for &index in &rearmed {
+            loaded.remove(&index);
+            loading.remove(&index);
+        }
+        self.stats.images_pending = loading.len();
+        drop(loading);
+        drop(loaded);
+
+        rearmed
     }
 
     fn probe_image_dimensions_cached(path: &std::path::Path) -> Option<(u32, u32)> {
@@ -1776,17 +1881,23 @@ impl MangaLoader {
                 let (original_width, original_height) =
                     Self::probe_image_dimensions_cached(&req.path)?;
 
-                // For animated WebP files we only decode the first frame here so that
-                // the manga scroll view isn't blocked by a potentially very expensive
-                // full-animation decode.  The full animation will be loaded lazily by
+                // Animated media (GIF and animated WebP) only decode their first frame here:
+                // a tile needs one frame, and the full animation is loaded lazily by
                 // `manga_update_animated_textures` when the user actually focuses on it.
+                // Loading the full animation in a scroll pass made one long GIF pay a whole
+                // stream count plus window composite for a thumbnail nobody sees animate.
                 let is_animated_webp = LoadedImage::is_animated_webp(&req.path);
+                let is_gif = req
+                    .path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("gif"));
 
                 let downscale_filter = req.downscale_filter;
                 let gif_filter = req.gif_filter;
 
-                let mut img = if is_animated_webp {
-                    LoadedImage::load_first_frame_only(
+                let mut img = if is_animated_webp || is_gif {
+                    LoadedImage::load_first_frame_thumbnail(
                         &req.path,
                         Some(effective_texture_side),
                         downscale_filter,
@@ -1804,10 +1915,9 @@ impl MangaLoader {
                 };
                 img.reset_animation_to_first_frame();
 
-                // Determine if this is an animated image.
-                // For animated WebP, we loaded only the first frame, but we still
-                // know it's animated from the header check above.
-                let manga_media_type = if is_animated_webp || img.is_animated() {
+                // Determine if this is an animated image. For the first-frame-only loads the
+                // frame count is 1 by construction, so the header check above decides.
+                let manga_media_type = if is_animated_webp || is_gif || img.is_animated() {
                     MangaMediaType::AnimatedImage
                 } else {
                     MangaMediaType::StaticImage
@@ -2405,6 +2515,7 @@ impl MangaLoader {
         let cache_start = demand.anchor_index.saturating_sub(behind);
         let cache_end = (demand.anchor_index + ahead).min(image_list.len());
         self.queue_dimension_range(image_list, cache_start, cache_end);
+        self.rearm_failed_in_window(image_list, cache_start, cache_end);
 
         self.prefetch(
             image_list,
@@ -2479,6 +2590,7 @@ impl MangaLoader {
         self.queue_dimension_range(image_list, start, end);
         let target_texture_side =
             Self::quantize_target_texture_side(target_texture_side, max_texture_side);
+        self.rearm_failed_in_window(image_list, start, end);
         self.prefetch(
             image_list,
             index,
@@ -2905,6 +3017,17 @@ impl MangaLoader {
         }
     }
 
+    /// Release one index's in-flight and loaded bookkeeping but keep its failure history.
+    ///
+    /// Used for work that has been in flight far too long: the tile must be able to re-request,
+    /// but a file that already exhausted its retry budget must stay at the ceiling. Clearing the
+    /// retry state here instead would give a corrupt file a fresh budget every stale sweep.
+    pub fn release_inflight(&mut self, index: usize) {
+        self.loading_indices.write().remove(&index);
+        self.loaded_levels.write().remove(&index);
+        self.stats.images_pending = self.loading_indices.read().len();
+    }
+
     /// Drop all bookkeeping for one index so a stale/placeholder tile can re-request.
     pub fn reset_index_state_for(&mut self, index: usize) {
         self.loading_indices.write().remove(&index);
@@ -2913,10 +3036,36 @@ impl MangaLoader {
         self.stats.images_pending = self.loading_indices.read().len();
     }
 
+    /// Record that `index` cannot be drawn at all: pin it at the retry ceiling (so prefetch
+    /// and every visible-retry path skip it) and drop its in-flight/loaded bookkeeping.
+    ///
+    /// This is the "X card" state. It is cleared only by [`Self::rearm_failed_indices`], i.e.
+    /// when the file itself changed, which is what keeps a corrupt GIF off the CPU entirely.
+    pub fn mark_unloadable(&mut self, index: usize, path: &Path) {
+        let stamp = FileStamp::of_path(path);
+        self.loading_indices.write().remove(&index);
+        self.loaded_levels.write().remove(&index);
+        self.retry_state.write().insert(
+            index,
+            RetryState {
+                attempts: PRELOAD_RETRY_MAX_ATTEMPTS,
+                next_retry_at: Instant::now(),
+                stamp,
+                stamp_checked_at: Instant::now(),
+            },
+        );
+        self.stats.images_pending = self.loading_indices.read().len();
+    }
+
     /// Record that `index` produced no usable texture, keeping the bounded retry backoff intact
     /// so a corrupt file cannot spin the pump.
-    pub fn register_upload_failure(&mut self, index: usize) {
-        Self::register_decode_failure(&self.loaded_levels, &self.retry_state, index);
+    pub fn register_upload_failure(&mut self, index: usize, path: &Path) {
+        Self::register_decode_failure(
+            &self.loaded_levels,
+            &self.retry_state,
+            index,
+            FileStamp::of_path(path),
+        );
     }
 
     /// Release a stranded dimension probe so the index can be probed again.
@@ -2974,7 +3123,16 @@ impl MangaLoader {
     }
 
     /// Visible-index repair path: a high-priority retry for an in-view placeholder.
+    ///
+    /// Refused once the retry ceiling is reached: every repair variant re-arms the index (the
+    /// `ForceReload`/`ResetState` repairs even drop its retry state), so without this guard the
+    /// UI's heal and quality-upgrade paths would re-queue a corrupt file on every pass. A
+    /// rewritten file is re-armed earlier, by `rearm_failed_indices`.
     pub fn retry_visible(&mut self, request: &VisibleRetry<'_>) -> bool {
+        if self.retry_blocked(request.index) {
+            return false;
+        }
+
         match request.repair {
             RetryRepair::None => {}
             RetryRepair::ForceReload => self.forget_indices(std::iter::once(request.index)),
@@ -4137,6 +4295,92 @@ mod tests {
     }
 
     #[test]
+    fn unloadable_index_is_skipped_by_every_request_path() {
+        let dir = std::env::temp_dir().join(format!(
+            "riv_unloadable_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("corrupt.gif");
+        std::fs::write(&path, b"GIF89a truncated").unwrap();
+        let list = vec![path.clone()];
+
+        let mut loader = MangaLoader::without_workers();
+        loader.mark_unloadable(0, path.as_path());
+
+        // Prefetch window, visible retry and the pump's idle check must all leave it alone.
+        loader.demand(&demand(&list, &[0], &[], 0, MangaLayoutMode::Masonry));
+        assert!(
+            preload_requests(&loader).is_empty(),
+            "an unloadable index must not be queued by prefetch"
+        );
+        assert!(urgent_requests(&loader).is_empty());
+
+        let retry = VisibleRetry {
+            image_list: &list,
+            index: 0,
+            max_texture_side: MAX_SIDE,
+            target_texture_side: TARGET_SIDE,
+            downscale_filter: FilterType::Triangle,
+            gif_filter: FilterType::Triangle,
+            force_triangle_filters: false,
+            repair: RetryRepair::ForceReload,
+        };
+        assert!(!loader.retry_visible(&retry));
+        assert!(!loader.demand_outstanding(&list, &[0], MAX_SIDE, TARGET_SIDE));
+        assert!(loader.retry_blocked(0));
+
+        // A rewritten file revives it.
+        std::fs::write(&path, b"still corrupt, but a different file").unwrap();
+        loader
+            .retry_state
+            .write()
+            .get_mut(&0)
+            .unwrap()
+            .stamp_checked_at = Instant::now() - FAILED_STAMP_RECHECK;
+        let rearmed = loader.rearm_failed_in_window(&list, 0, 1);
+        assert_eq!(rearmed, 1);
+        assert!(!loader.retry_blocked(0));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn visible_retry_refuses_an_index_past_the_retry_ceiling() {
+        let list = paths(40);
+        let mut loader = MangaLoader::without_workers();
+        loader.retry_state.write().insert(
+            7,
+            RetryState {
+                attempts: PRELOAD_RETRY_MAX_ATTEMPTS,
+                next_retry_at: Instant::now(),
+                stamp: None,
+                stamp_checked_at: Instant::now(),
+            },
+        );
+
+        let retry = VisibleRetry {
+            image_list: &list,
+            index: 7,
+            max_texture_side: MAX_SIDE,
+            target_texture_side: TARGET_SIDE,
+            downscale_filter: FilterType::Triangle,
+            gif_filter: FilterType::Triangle,
+            force_triangle_filters: false,
+            repair: RetryRepair::ForceReload,
+        };
+
+        // Without this the tile heal/upgrade paths keep clearing the level of a corrupt file
+        // and re-queue it, which is the churn that pegged the CPU.
+        assert!(!loader.retry_visible(&retry));
+        assert!(urgent_requests(&loader).is_empty());
+    }
+
+    #[test]
     fn demand_skips_indices_already_loaded_at_sufficient_lod() {
         let list = paths(30);
         let visible = [10usize];
@@ -4191,6 +4435,8 @@ mod tests {
             RetryState {
                 attempts: PRELOAD_RETRY_MAX_ATTEMPTS,
                 next_retry_at: Instant::now(),
+                stamp: None,
+                stamp_checked_at: Instant::now(),
             },
         );
         assert!(!loader.demand_outstanding(&list, &[1], MAX_SIDE, TARGET_SIDE));
@@ -4355,13 +4601,129 @@ mod tests {
     }
 
     #[test]
+    fn rewritten_file_is_rearmed_outside_the_prefetch_window_block() {
+        let dir = std::env::temp_dir().join(format!(
+            "riv_rearm_window_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("corrupt.png");
+        std::fs::write(&path, b"broken").unwrap();
+        let stamp = FileStamp::of_path(&path).unwrap();
+        let list = vec![path.clone()];
+
+        let mut loader = MangaLoader::without_workers();
+        loader.retry_state.write().insert(
+            0,
+            RetryState {
+                attempts: PRELOAD_RETRY_MAX_ATTEMPTS,
+                next_retry_at: Instant::now(),
+                stamp: Some(stamp),
+                stamp_checked_at: Instant::now() - FAILED_STAMP_RECHECK,
+            },
+        );
+        loader.loaded_levels.write().insert(0, TARGET_SIDE);
+
+        // Rewritten: the window pass clears the failure and its loaded level together, so the
+        // decode can be queued again.
+        std::fs::write(&path, b"a different file").unwrap();
+        let rearmed = loader.rearm_failed_in_window(&list, 0, 1);
+        assert_eq!(rearmed, 1, "the rewritten file must be re-armed");
+        assert!(!loader.retry_blocked(0));
+        assert_eq!(loader.loaded_level_for(0), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn blocked_index_stays_dead_while_the_file_is_unchanged() {
+        let dir = std::env::temp_dir().join(format!(
+            "riv_rearm_unchanged_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("corrupt.gif");
+        std::fs::write(&path, b"not a gif").unwrap();
+        let stamp = FileStamp::of_path(&path).unwrap();
+
+        let list = vec![path.clone()];
+        let mut loader = MangaLoader::without_workers();
+        loader.retry_state.write().insert(
+            0,
+            RetryState {
+                attempts: PRELOAD_RETRY_MAX_ATTEMPTS,
+                next_retry_at: Instant::now(),
+                stamp: Some(stamp),
+                // Long enough ago that the recheck interval does not gate this call.
+                stamp_checked_at: Instant::now() - FAILED_STAMP_RECHECK,
+            },
+        );
+
+        loader.rearm_failed_indices(&list, [0]);
+        assert!(
+            loader.retry_blocked(0),
+            "an unchanged corrupt file must stay blocked"
+        );
+
+        // Rewriting the file changes the stamp: the index is re-armed on the next recheck.
+        std::fs::write(&path, b"not a gif either, but a new file").unwrap();
+        // Filesystem mtime granularity can land in the same second; the size is what differs
+        // here, and a real rewrite changes shape either way.
+        loader
+            .retry_state
+            .write()
+            .get_mut(&0)
+            .unwrap()
+            .stamp_checked_at = Instant::now() - FAILED_STAMP_RECHECK;
+        loader.rearm_failed_indices(&list, [0]);
+        assert!(
+            !loader.retry_blocked(0),
+            "a rewritten file must be re-armed"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rearm_recheck_is_rate_limited_per_index() {
+        let list = paths(4);
+        let mut loader = MangaLoader::without_workers();
+        loader.retry_state.write().insert(
+            1,
+            RetryState {
+                attempts: PRELOAD_RETRY_MAX_ATTEMPTS,
+                next_retry_at: Instant::now(),
+                // No stamp recorded: the first recheck of a missing path clears nothing, and
+                // the interval then keeps every following frame off that file.
+                stamp: None,
+                stamp_checked_at: Instant::now(),
+            },
+        );
+
+        loader.rearm_failed_indices(&list, [1]);
+        assert!(
+            loader.retry_blocked(1),
+            "a recheck inside the interval must not re-stat the file"
+        );
+    }
+
+    #[test]
     fn upload_failure_clears_the_level_and_settles_after_the_retry_ceiling() {
         let list = paths(4);
         let mut loader = MangaLoader::without_workers();
         loader.loaded_levels.write().insert(1, TARGET_SIDE);
 
         for _ in 0..PRELOAD_RETRY_MAX_ATTEMPTS {
-            loader.register_upload_failure(1);
+            // Bogus path: the stamp is `None`, which still records the failure shape.
+            loader.register_upload_failure(1, Path::new("img0001.png"));
         }
 
         // A level set without a texture must never keep the tile "satisfied" for good.

@@ -533,6 +533,9 @@ struct GifWindowState {
     window_start: usize,
     window_size: usize,
     global_frame: usize,
+    /// The stream ran out while frames were still coming (a truncated GIF). Window re-seeks
+    /// must not turn that into a hard error after the first window already rendered.
+    truncated: bool,
 }
 
 struct GifScanInfo {
@@ -540,6 +543,9 @@ struct GifScanInfo {
     target_height: u32,
     total_frames: usize,
     frame_delays_ms: Vec<u32>,
+    /// The stream ended in a decode error after frames were already counted. Corrupt GIFs are
+    /// common, and the frames before the corruption are what the tile renders anyway.
+    truncated: bool,
 }
 
 /// Loaded image data
@@ -596,6 +602,140 @@ impl LoadedImage {
         } else {
             Self::load_static(path, max_texture_side, downscale_filter)
         }
+    }
+
+    /// First frame only for every animated format: what a thumbnail needs.
+    ///
+    /// A GIF thumbnail through the full loader counts every frame and composites a whole window
+    /// first (a 35 MB / 144-frame GIF costs ~0.6 s of CPU per tile). Thumbnails only ever draw
+    /// frame one, and the full animation is loaded separately by the focused-item path, so this
+    /// reads the header and decodes exactly one frame.
+    pub fn load_first_frame_thumbnail(
+        path: &Path,
+        max_texture_side: Option<u32>,
+        downscale_filter: FilterType,
+        gif_filter: FilterType,
+    ) -> Result<Self, String> {
+        if extension_is(path, "gif") {
+            Self::load_gif_first_frame(path, max_texture_side, gif_filter)
+        } else {
+            Self::load_first_frame_only(path, max_texture_side, downscale_filter, gif_filter)
+        }
+    }
+
+    /// Read the GIF header and composite its first frame. `total_frames` stays unknown (1):
+    /// the caller detects animation from the extension, and the seekbar comes from the
+    /// full-animation load.
+    fn load_gif_first_frame(
+        path: &Path,
+        max_texture_side: Option<u32>,
+        gif_filter: FilterType,
+    ) -> Result<Self, String> {
+        use gif::DecodeOptions;
+        use gif_dispose::Screen;
+
+        let reader = open_media_reader(path)?;
+        let mut decoder = DecodeOptions::new();
+        decoder.set_color_output(gif::ColorOutput::Indexed);
+        let mut decoder = decoder
+            .read_info(reader)
+            .map_err(|e| format!("Failed to read GIF: {}", e))?;
+
+        let width = decoder.width() as u32;
+        let height = decoder.height() as u32;
+        if let Some(err) = decode_budget_error(width, height) {
+            return Err(err);
+        }
+
+        let (target_width, target_height) =
+            Self::target_dimensions(width, height, max_texture_side);
+        let mut screen = Screen::new_decoder(&decoder);
+        let frame = decoder
+            .read_next_frame()
+            .map_err(|e| format!("GIF frame error: {}", e))?
+            .ok_or_else(|| "No frames in GIF".to_string())?;
+        let delay_ms = Self::gif_delay_ms(frame.delay);
+        screen
+            .blit_frame(frame)
+            .map_err(|e| format!("Failed to composite GIF frame: {}", e))?;
+
+        let frame = Self::screen_frame(
+            &mut screen,
+            target_width,
+            target_height,
+            gif_filter,
+            delay_ms,
+        )?;
+
+        Ok(LoadedImage {
+            path: path.to_path_buf(),
+            frames: vec![frame],
+            current_frame: 0,
+            last_frame_time: Instant::now(),
+            original_width: target_width,
+            original_height: target_height,
+            animation_storage: AnimationStorage::FullyDecoded,
+        })
+    }
+
+    /// Scale a logical screen size down to the texture budget: `(width, height)` as-is when it
+    /// already fits, otherwise the congruent size inside `max_texture_side`.
+    fn target_dimensions(width: u32, height: u32, max_texture_side: Option<u32>) -> (u32, u32) {
+        if let Some(max_side) = max_texture_side {
+            if max_side > 0 && (width > max_side || height > max_side) {
+                let scale = (max_side as f64 / width as f64).min(max_side as f64 / height as f64);
+                return (
+                    ((width as f64) * scale).round().max(1.0) as u32,
+                    ((height as f64) * scale).round().max(1.0) as u32,
+                );
+            }
+        }
+        (width, height)
+    }
+
+    /// RGBA of one composited screen, resized to the target dimensions.
+    fn screen_frame(
+        screen: &mut gif_dispose::Screen,
+        target_width: u32,
+        target_height: u32,
+        gif_filter: FilterType,
+        delay_ms: u32,
+    ) -> Result<ImageFrame, String> {
+        let rgba = screen.pixels_rgba();
+        let (contiguous, src_w, src_h) = rgba.to_contiguous_buf();
+
+        let mut pixels = Vec::with_capacity(src_w.saturating_mul(src_h).saturating_mul(4));
+        for px in contiguous.iter() {
+            pixels.push(px.r);
+            pixels.push(px.g);
+            pixels.push(px.b);
+            pixels.push(px.a);
+        }
+
+        let src_w_u32 = src_w as u32;
+        let src_h_u32 = src_h as u32;
+        let (final_w, final_h, final_pixels) =
+            if src_w_u32 != target_width || src_h_u32 != target_height {
+                let resized = resize_rgba(
+                    src_w_u32,
+                    src_h_u32,
+                    &pixels,
+                    target_width,
+                    target_height,
+                    gif_filter,
+                )
+                .map_err(|e| format!("Failed to resize GIF frame: {}", e))?;
+                (target_width, target_height, resized)
+            } else {
+                (src_w_u32, src_h_u32, pixels)
+            };
+
+        Ok(ImageFrame {
+            pixels: final_pixels,
+            width: final_w,
+            height: final_h,
+            delay_ms,
+        })
     }
 
     /// Fast load for animated WebP: decode only the first frame so the UI can
@@ -919,6 +1059,7 @@ impl LoadedImage {
                 gif_filter,
                 0,
                 scan.total_frames,
+                scan.truncated,
             )?;
             frames.shrink_to_fit();
 
@@ -941,11 +1082,21 @@ impl LoadedImage {
             gif_filter,
             0,
             window_size,
+            scan.truncated,
         )?;
         if frames.is_empty() {
             return Err("Failed to decode GIF frame window".to_string());
         }
         frames.shrink_to_fit();
+
+        // The file ends before the requested window did: only the frames already decoded exist,
+        // so the frame count must not promise more of them.
+        let mut total_frames = scan.total_frames;
+        let mut frame_delays_ms = scan.frame_delays_ms;
+        if scan.truncated && frames.len() < window_size {
+            total_frames = frames.len();
+            frame_delays_ms.truncate(total_frames);
+        }
 
         Ok(LoadedImage {
             path: path.to_path_buf(),
@@ -959,11 +1110,12 @@ impl LoadedImage {
                 gif_filter,
                 target_width: scan.target_width,
                 target_height: scan.target_height,
-                total_frames: scan.total_frames,
-                frame_delays_ms: scan.frame_delays_ms,
+                total_frames,
+                frame_delays_ms,
                 window_start: 0,
                 window_size,
                 global_frame: 0,
+                truncated: scan.truncated,
             }),
         })
     }
@@ -1002,14 +1154,23 @@ impl LoadedImage {
 
         const MAX_FRAMES_SAFETY: usize = 4000;
         let mut frame_delays_ms = Vec::new();
-        while let Some(frame) = decoder
-            .read_next_frame()
-            .map_err(|e| format!("GIF frame error: {}", e))?
-        {
-            if frame_delays_ms.len() >= MAX_FRAMES_SAFETY {
-                break;
+        let mut truncated = false;
+        while frame_delays_ms.len() < MAX_FRAMES_SAFETY {
+            match decoder.read_next_frame() {
+                Ok(Some(frame)) => frame_delays_ms.push(Self::gif_delay_ms(frame.delay)),
+                // Clean end of stream: the GIF trailer was reached.
+                Ok(None) => break,
+                Err(err) => {
+                    // A corrupt or truncated stream is not a failed scan as long as frames were
+                    // already counted: this scan runs again on every retry of the tile, and the
+                    // frames before the corruption are what the tile renders.
+                    if frame_delays_ms.is_empty() {
+                        return Err(format!("GIF frame error: {}", err));
+                    }
+                    truncated = true;
+                    break;
+                }
             }
-            frame_delays_ms.push(Self::gif_delay_ms(frame.delay));
         }
 
         Ok(GifScanInfo {
@@ -1017,6 +1178,7 @@ impl LoadedImage {
             target_height,
             total_frames: frame_delays_ms.len(),
             frame_delays_ms,
+            truncated,
         })
     }
 
@@ -1027,6 +1189,7 @@ impl LoadedImage {
         gif_filter: FilterType,
         start_frame: usize,
         frame_count: usize,
+        tolerate_truncated_tail: bool,
     ) -> Result<Vec<ImageFrame>, String> {
         use gif::DecodeOptions;
         use gif_dispose::Screen;
@@ -1048,56 +1211,46 @@ impl LoadedImage {
 
         let mut frame_index = 0usize;
         let mut out = Vec::with_capacity(frame_count.min(96));
+        // Frames of the requested range already composited; only these make a truncated
+        // stream acceptable, so a broken seek window still reports the real error.
+        let mut composited = 0usize;
 
-        while let Some(frame) = decoder
-            .read_next_frame()
-            .map_err(|e| format!("GIF frame error: {}", e))?
-        {
+        loop {
             if frame_index >= end_frame {
                 break;
             }
 
-            let delay_ms = Self::gif_delay_ms(frame.delay);
-            screen
-                .blit_frame(frame)
-                .map_err(|e| format!("Failed to composite GIF frame: {}", e))?;
+            let raw_frame = match decoder.read_next_frame() {
+                Ok(Some(frame)) => frame,
+                Ok(None) => break,
+                Err(err) => {
+                    if tolerate_truncated_tail && composited > 0 {
+                        break;
+                    }
+                    return Err(format!("GIF frame error: {}", err));
+                }
+            };
+
+            let delay_ms = Self::gif_delay_ms(raw_frame.delay);
+            if let Err(err) = screen.blit_frame(raw_frame) {
+                // A frame that does not fit its own logical screen is a broken file. The
+                // frames composited so far are still real, and `gif-dispose` can panic here:
+                // never take the app down over one corrupt GIF.
+                if composited > 0 {
+                    break;
+                }
+                return Err(format!("Failed to composite GIF frame: {}", err));
+            }
 
             if frame_index >= start_frame {
-                let rgba = screen.pixels_rgba();
-                let (contiguous, src_w, src_h) = rgba.to_contiguous_buf();
-
-                let mut pixels = Vec::with_capacity(src_w.saturating_mul(src_h).saturating_mul(4));
-                for px in contiguous.iter() {
-                    pixels.push(px.r);
-                    pixels.push(px.g);
-                    pixels.push(px.b);
-                    pixels.push(px.a);
-                }
-
-                let src_w_u32 = src_w as u32;
-                let src_h_u32 = src_h as u32;
-                let (final_w, final_h, final_pixels) =
-                    if src_w_u32 != target_width || src_h_u32 != target_height {
-                        let resized = resize_rgba(
-                            src_w_u32,
-                            src_h_u32,
-                            &pixels,
-                            target_width,
-                            target_height,
-                            gif_filter,
-                        )
-                        .map_err(|e| format!("Failed to resize GIF frame: {}", e))?;
-                        (target_width, target_height, resized)
-                    } else {
-                        (src_w_u32, src_h_u32, pixels)
-                    };
-
-                out.push(ImageFrame {
-                    pixels: final_pixels,
-                    width: final_w,
-                    height: final_h,
+                out.push(Self::screen_frame(
+                    &mut screen,
+                    target_width,
+                    target_height,
+                    gif_filter,
                     delay_ms,
-                });
+                )?);
+                composited = composited.saturating_add(1);
             }
 
             frame_index = frame_index.saturating_add(1);
@@ -1272,6 +1425,7 @@ impl LoadedImage {
                     let desired_start = target_global.saturating_sub(state.window_size / 2);
                     let max_start = state.total_frames.saturating_sub(state.window_size);
                     let new_window_start = desired_start.min(max_start);
+                    let truncated = state.truncated;
 
                     if let Ok(mut decoded) = Self::decode_gif_disposal_range(
                         &state.path,
@@ -1280,8 +1434,20 @@ impl LoadedImage {
                         state.gif_filter,
                         new_window_start,
                         state.window_size,
+                        truncated,
                     ) {
                         decoded.shrink_to_fit();
+                        // A truncated file ends at the cut: the frames decoded here are all
+                        // that is left. Without clamping, every following animation step would
+                        // see a window shorter than requested and re-decode the tail again,
+                        // which is a full stream decode per animation tick.
+                        if truncated && decoded.len() < state.window_size {
+                            let last_global = new_window_start.saturating_add(decoded.len());
+                            if last_global < state.total_frames {
+                                state.total_frames = last_global;
+                                state.frame_delays_ms.truncate(last_global);
+                            }
+                        }
                         self.frames = decoded;
                         state.window_start = new_window_start;
                     }
@@ -1625,6 +1791,151 @@ mod tests {
             (frame.width * frame.height * 4) as usize
         );
         assert_eq!(loaded.display_dimensions(), (3000, 2000));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A real GIF stream, encoded frame by frame, with a controllable tail cut.
+    fn write_gif(path: &Path, frames: u16) {
+        let mut file = fs::File::create(path).unwrap();
+        let mut encoder = gif::Encoder::new(&mut file, 32, 32, &[]).unwrap();
+        encoder.set_repeat(gif::Repeat::Infinite).unwrap();
+        for delay in 0..frames {
+            let mut frame = gif::Frame::from_rgba_speed(32, 32, &mut vec![0u8; 32 * 32 * 4], 10);
+            frame.delay = delay.max(1) * 4;
+            encoder.write_frame(&frame).unwrap();
+        }
+        drop(encoder);
+    }
+
+    /// Truncates `bytes` off the end of the stream, i.e. what an interrupted download leaves.
+    fn truncate_tail(path: &Path, bytes: u64) {
+        let len = fs::metadata(path).unwrap().len();
+        let file = fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_len(len.saturating_sub(bytes)).unwrap();
+    }
+
+    #[test]
+    fn thumbnail_load_of_a_long_gif_decodes_one_frame() {
+        let root = unique_temp_dir("image_loader_gif_thumbnail");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("long.gif");
+        write_gif(&path, 200);
+
+        let thumb = LoadedImage::load_first_frame_thumbnail(
+            &path,
+            Some(32),
+            FilterType::Triangle,
+            FilterType::Nearest,
+        )
+        .expect("a GIF thumbnail must decode");
+        assert_eq!(thumb.frame_count(), 1, "a thumbnail decodes frame one only");
+        assert!(!thumb.is_animated(), "one frame is not an animation");
+        assert_eq!(thumb.frames[0].pixels.len(), 32 * 32 * 4);
+
+        // The full loader still sees the whole animation, which is what the focused item uses.
+        let full = LoadedImage::load_with_max_texture_side(
+            &path,
+            Some(32),
+            FilterType::Triangle,
+            FilterType::Nearest,
+        )
+        .unwrap();
+        assert_eq!(full.frame_count(), 200);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn truncated_gif_thumbnail_still_returns_its_first_frame() {
+        let root = unique_temp_dir("image_loader_truncated_gif_thumb");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("cut.gif");
+        write_gif(&path, 8);
+        truncate_tail(&path, 40);
+
+        // The header and frame one survive the cut even where the tail does not.
+        let thumb = LoadedImage::load_first_frame_thumbnail(
+            &path,
+            Some(32),
+            FilterType::Triangle,
+            FilterType::Nearest,
+        )
+        .expect("frame one is intact");
+        assert_eq!(thumb.frames[0].pixels.len(), 32 * 32 * 4);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn truncated_gif_loads_the_frames_before_the_cut() {
+        let root = unique_temp_dir("image_loader_truncated_gif");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("cut.gif");
+        write_gif(&path, 6);
+        // Cut deep enough that a frame header/block after the first few is incomplete.
+        truncate_tail(&path, 60);
+
+        let loaded = LoadedImage::load_with_max_texture_side(
+            &path,
+            Some(32),
+            FilterType::Triangle,
+            FilterType::Nearest,
+        )
+        .expect("a truncated GIF must still yield its readable frames");
+        assert!(
+            !loaded.frames.is_empty(),
+            "the frames before the cut must be decoded"
+        );
+        assert_eq!(loaded.frames[0].pixels.len(), 32 * 32 * 4);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn truncated_gif_window_reseek_does_not_turn_into_an_error() {
+        let root = unique_temp_dir("image_loader_truncated_gif_window");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("long_cut.gif");
+        // More frames than the window keeps, so `load_gif` picks windowed storage.
+        write_gif(&path, 200);
+        truncate_tail(&path, 40);
+
+        let mut loaded = LoadedImage::load_with_max_texture_side(
+            &path,
+            Some(32),
+            FilterType::Triangle,
+            FilterType::Nearest,
+        )
+        .expect("a truncated long GIF must still load");
+        let total = loaded.frame_count();
+        assert!(total > 0);
+
+        // Seeking past the loaded window re-decodes through the truncated tail; the frames
+        // before the cut must survive instead of the seek failing outright.
+        loaded.set_frame(total.saturating_sub(1));
+        assert!(!loaded.frames.is_empty());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn gif_with_no_readable_frame_is_an_error() {
+        let root = unique_temp_dir("image_loader_unreadable_gif");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("empty.gif");
+        fs::write(&path, b"GIF89a not actually a gif").unwrap();
+
+        let result = LoadedImage::load_with_max_texture_side(
+            &path,
+            Some(32),
+            FilterType::Triangle,
+            FilterType::Nearest,
+        );
+        assert!(
+            result.is_err(),
+            "a file with no decodable frame must report an error"
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
