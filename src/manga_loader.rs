@@ -3261,21 +3261,13 @@ impl MangaLoader {
     }
 
     /// Cheap "is anything waiting on the revive schedule at all" probe for the idle frame path.
-    /// A spent video with no state yet also counts: its first revive is due immediately.
+    ///
+    /// Only an open window counts: a spent video with no state yet has its first revive due
+    /// immediately, which `demand_outstanding` already reports, so nothing needs scheduling.
     pub fn video_revive_waiting(&self, now: Instant) -> bool {
-        if self
-            .video_revive
+        self.video_revive
             .values()
             .any(|state| state.revives < VIDEO_THUMBNAIL_REVIVE_MAX && now < state.next_revive_at)
-        {
-            return true;
-        }
-        let spent_anywhere = self
-            .retry_state
-            .read()
-            .values()
-            .any(|state| state.attempts >= PRELOAD_RETRY_MAX_ATTEMPTS);
-        spent_anywhere
     }
 
     /// Remaining wait of the soonest-usable visible video whose spent thumbnail budget the revive
