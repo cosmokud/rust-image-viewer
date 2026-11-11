@@ -16033,7 +16033,7 @@ impl ImageViewer {
     /// "Stuck" = no cached texture while the loader either refuses every request
     /// (`retry_blocked`) or has waited out `MANGA_PLACEHOLDER_STALL_RETRY_MS` on this tile
     /// without a texture.
-    fn manga_stuck_placeholder_needs_hover_probe(&self, index: usize) -> bool {
+    fn manga_placeholder_is_stuck(&self, index: usize) -> bool {
         let Some(loader) = self.manga_loader.as_ref() else {
             return false;
         };
@@ -16065,7 +16065,7 @@ impl ImageViewer {
         {
             return false;
         }
-        if !self.manga_stuck_placeholder_needs_hover_probe(index) {
+        if !self.manga_placeholder_is_stuck(index) {
             return false;
         }
 
