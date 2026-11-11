@@ -84,7 +84,7 @@ than one file.
 | `src/image_resize.rs` | `resize_rgba` / `downscale_rgba_if_needed` over `fast_image_resize`, `image` fallback | The one CPU resampling boundary before texture upload |
 | `src/manga_spatial.rs` | `rstar::RTree` wrapper (`SpatialRect`, `query_indices`, `query_vertical_band`) | Keeps visibility queries from going linear in huge folders |
 | `src/media_index.rs` | `MediaDirectoryIndex`: LRU of scanned directories (64 by default) | Removes a directory rescan per next/previous step |
-| `src/metadata_cache.rs` | Persistent dimensions/type/animation cache (now `src/metadata_cache/`) | Warm opens without touching the file |
+| `src/metadata_cache/` | Persistent dimensions/type/animation cache (redb + writer thread) | Warm opens without touching the file |
 | `src/perf_metrics.rs` | `Metric`, `PerfMetrics`: `hdrhistogram` windows, p95 and counters | Feeds the FPS/metrics overlay |
 | `src/probe_video.rs` | `--probe-video` headless decode probe | Diagnoses a decoder stack without a GUI |
 | `src/single_instance.rs` | Named mutex + namespaced socket handoff (Windows) | A second launch reuses the open window |
@@ -116,13 +116,13 @@ src/app/
   mod.rs                  ImageViewer struct + consts + Default + Drop + child wiring
   bootstrap.rs            main(): diagnostics, single instance, pre-window sizing, run_native
   app_loop.rs             impl eframe::App: update() and clear_color()
-  constructors.rs         ImageViewer::new
+  constructors.rs         ImageViewer::new + the directory-scan poll
   state.rs                owned state types (menus, modals, layouts, snapshots)
   cache_state.rs          decoded-image / texture cache entries and byte limits
   core_state.rs           small cross-cutting queries (list signature, exit locks)
   exit.rs                 fast-exit path
   decode.rs               decoder preferences, upload policy inputs, init_viewer
-  paths.rs                file stamps and platform shortcut helpers
+  paths.rs                file stamps and the Windows Ctrl+V probe
   platform.rs             Windows-only: CJK fonts, reveal-in-explorer, shell clipboard
   workers.rs              background coordinators (media load, solo probe, thumbnails)
   navigation.rs           solo next/prev/first/last
