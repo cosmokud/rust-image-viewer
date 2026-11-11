@@ -4,8 +4,6 @@
 
 pub(crate) mod fps;
 pub(crate) mod frame_stats;
-pub(crate) mod overlay;
 
 pub(crate) use fps::*;
 pub(crate) use frame_stats::*;
-pub(crate) use overlay::*;

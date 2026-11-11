@@ -1,14 +1,12 @@
 //! Application state and the pieces that must stay private to it.
 
 #![allow(unused_imports)]
-#![allow(unused_imports)]
 
 use crate::prelude::*;
 
 pub(crate) mod app_loop;
 pub(crate) mod bootstrap;
 pub(crate) mod cache_state;
-pub(crate) mod constructors;
 pub(crate) mod core_state;
 pub(crate) mod decode;
 pub(crate) mod diagnostics;
@@ -38,7 +36,6 @@ pub(crate) mod window;
 pub(crate) mod workers;
 
 pub(crate) use cache_state::*;
-pub(crate) use constructors::*;
 pub(crate) use core_state::*;
 pub(crate) use decode::*;
 pub(crate) use diagnostics::*;
