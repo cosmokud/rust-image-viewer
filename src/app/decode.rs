@@ -1,7 +1,8 @@
 //! Decoder preferences, filter choice and texture upload policy inputs.
 
+#![allow(unused_imports)]
+
 use crate::app::*;
-#[allow(unused_imports)]
 use crate::prelude::*;
 
 /// First policy inputs: config filters + mipmap masters, no display-size or nav hints.

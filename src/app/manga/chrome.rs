@@ -1,7 +1,8 @@
 //! Manga HUD chrome: toggle button and zoom bar.
 
+#![allow(unused_imports)]
+
 use crate::app::*;
-#[allow(unused_imports)]
 use crate::prelude::*;
 
 impl ImageViewer {

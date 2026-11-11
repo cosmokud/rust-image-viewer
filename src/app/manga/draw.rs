@@ -1,7 +1,8 @@
 //! The whole manga/strip/masonry viewport draw.
 
+#![allow(unused_imports)]
+
 use crate::app::*;
-#[allow(unused_imports)]
 use crate::prelude::*;
 
 impl ImageViewer {

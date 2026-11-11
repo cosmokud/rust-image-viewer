@@ -1,9 +1,9 @@
 //! The setting vocabulary: tabs, kinds, controls, values, and one setting's metadata.
 
-#[allow(unused_imports)]
+#![allow(unused_imports)]
+
 use super::*;
 
-#[allow(unused_imports)]
 use crate::config::{
     optional_binding_to_string, optional_mark_key_to_string, optional_shortcut_modifier_to_string,
     parse_binding_list, parse_bool, parse_optional_binding, parse_optional_mark_key,
@@ -11,13 +11,9 @@ use crate::config::{
     MangaVirtualizationBackend, StartupWindowMode, TextureFilter, VideoSeekPolicy,
     WindowTitlePathMode,
 };
-#[allow(unused_imports)]
 use std::fs;
-#[allow(unused_imports)]
 use std::io;
-#[allow(unused_imports)]
 use std::path::PathBuf;
-#[allow(unused_imports)]
 use std::sync::OnceLock;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

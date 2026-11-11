@@ -17,6 +17,8 @@
 //! | Load/save and the state round-trip | [`io`], [`parse_ini`] |
 //! | Binding text round-trip, value parsers | [`binding_text`], [`ini_text`] |
 
+#![allow(unused_imports)]
+
 pub(crate) mod actions;
 pub(crate) mod binding_text;
 pub(crate) mod bindings;
@@ -34,31 +36,17 @@ pub(crate) mod state_file;
 pub(crate) mod tests;
 pub(crate) mod types;
 
-#[allow(unused_imports)]
 pub(crate) use actions::*;
-#[allow(unused_imports)]
 pub(crate) use binding_text::*;
-#[allow(unused_imports)]
 pub(crate) use bindings::*;
-#[allow(unused_imports)]
 pub(crate) use config_struct::*;
-#[allow(unused_imports)]
 pub(crate) use defaults::*;
-#[allow(unused_imports)]
 pub(crate) use ini_aliases::*;
-#[allow(unused_imports)]
 pub(crate) use ini_sections::*;
-#[allow(unused_imports)]
 pub(crate) use ini_text::*;
-#[allow(unused_imports)]
 pub(crate) use io::*;
-#[allow(unused_imports)]
 pub(crate) use keys::*;
-#[allow(unused_imports)]
 pub(crate) use parse_ini::*;
-#[allow(unused_imports)]
 pub(crate) use paths::*;
-#[allow(unused_imports)]
 pub(crate) use state_file::*;
-#[allow(unused_imports)]
 pub(crate) use types::*;

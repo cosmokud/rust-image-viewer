@@ -1,19 +1,14 @@
 //! `parse_ini`: the INI reader that maps keys through the alias table.
 
-#[allow(unused_imports)]
+#![allow(unused_imports)]
+
 use super::*;
 
-#[allow(unused_imports)]
 use crate::app_dirs;
-#[allow(unused_imports)]
 use crate::settings_registry::{self, SETTINGS};
-#[allow(unused_imports)]
 use std::borrow::Cow;
-#[allow(unused_imports)]
 use std::collections::HashMap;
-#[allow(unused_imports)]
 use std::fs;
-#[allow(unused_imports)]
 use std::path::PathBuf;
 
 impl Config {

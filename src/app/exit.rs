@@ -1,7 +1,8 @@
 //! Fast-exit path: discard runtime work, close viewports, tear down.
 
+#![allow(unused_imports)]
+
 use crate::app::*;
-#[allow(unused_imports)]
 use crate::prelude::*;
 
 impl ImageViewer {

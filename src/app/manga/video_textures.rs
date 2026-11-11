@@ -1,7 +1,8 @@
 //! Uploading video frames into tile textures.
 
+#![allow(unused_imports)]
+
 use crate::app::*;
-#[allow(unused_imports)]
 use crate::prelude::*;
 
 impl ImageViewer {

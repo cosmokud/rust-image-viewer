@@ -1,7 +1,8 @@
 //! Applying floating/maximized/fullscreen layout to the current image.
 
+#![allow(unused_imports)]
+
 use crate::app::*;
-#[allow(unused_imports)]
 use crate::prelude::*;
 
 impl ImageViewer {

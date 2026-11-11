@@ -1,7 +1,8 @@
 //! Unit tests for the state machines above.
 
+#![allow(unused_imports)]
+
 use crate::app::*;
-#[allow(unused_imports)]
 use crate::prelude::*;
 
 use super::{

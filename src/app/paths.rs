@@ -1,7 +1,8 @@
 //! Path stamps and small path/shortcut helpers.
 
+#![allow(unused_imports)]
+
 use crate::app::*;
-#[allow(unused_imports)]
 use crate::prelude::*;
 
 pub(crate) fn file_stamp_for_path(path: &Path) -> Option<FileStamp> {

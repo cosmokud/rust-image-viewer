@@ -1,7 +1,8 @@
 //! Title-bar text/button layout maths.
 
+#![allow(unused_imports)]
+
 use crate::app::*;
-#[allow(unused_imports)]
 use crate::prelude::*;
 
 /// One segment of the title bar's file metadata: resolution, file size, zoom, video badge,

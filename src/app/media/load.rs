@@ -1,7 +1,8 @@
 //! The media open path (`load_media` and its internals).
 
+#![allow(unused_imports)]
+
 use crate::app::*;
-#[allow(unused_imports)]
 use crate::prelude::*;
 
 impl ImageViewer {

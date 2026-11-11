@@ -1,7 +1,8 @@
 //! Global file-action keyboard shortcuts.
 
+#![allow(unused_imports)]
+
 use crate::app::*;
-#[allow(unused_imports)]
 use crate::prelude::*;
 
 impl ImageViewer {

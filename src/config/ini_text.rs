@@ -1,19 +1,14 @@
 //! Value parsers and formatters used when reading/writing INI text.
 
-#[allow(unused_imports)]
+#![allow(unused_imports)]
+
 use super::*;
 
-#[allow(unused_imports)]
 use crate::app_dirs;
-#[allow(unused_imports)]
 use crate::settings_registry::{self, SETTINGS};
-#[allow(unused_imports)]
 use std::borrow::Cow;
-#[allow(unused_imports)]
 use std::collections::HashMap;
-#[allow(unused_imports)]
 use std::fs;
-#[allow(unused_imports)]
 use std::path::PathBuf;
 
 pub(crate) fn strip_legacy_config_version_tag(content: &str) -> (Cow<'_, str>, bool) {

@@ -1,7 +1,8 @@
 //! Upload policy, page/source dimension lookups.
 
+#![allow(unused_imports)]
+
 use crate::app::*;
-#[allow(unused_imports)]
 use crate::prelude::*;
 
 impl ImageViewer {

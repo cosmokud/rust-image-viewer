@@ -1,7 +1,8 @@
 //! Animated (GIF/WebP) playback timing helpers.
 
+#![allow(unused_imports)]
+
 use crate::app::*;
-#[allow(unused_imports)]
 use crate::prelude::*;
 
 impl ImageViewer {

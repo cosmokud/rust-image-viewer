@@ -1,7 +1,8 @@
 //! GStreamer first-frame extraction for video thumbnails.
 
+#![allow(unused_imports)]
+
 use crate::app::*;
-#[allow(unused_imports)]
 use crate::prelude::*;
 
 pub(crate) fn extract_video_first_frame_thumbnail(

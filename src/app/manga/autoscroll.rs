@@ -1,7 +1,8 @@
 //! Manga freehand autoscroll motion and indicator.
 
+#![allow(unused_imports)]
+
 use crate::app::*;
-#[allow(unused_imports)]
 use crate::prelude::*;
 
 impl ImageViewer {

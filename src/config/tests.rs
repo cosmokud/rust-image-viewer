@@ -1,6 +1,7 @@
 //! Config parser and migration tests.
 
-#[allow(unused_imports)]
+#![allow(unused_imports)]
+
 use super::*;
 
 use super::{default_config_ini, Config};

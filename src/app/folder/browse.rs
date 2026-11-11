@@ -1,7 +1,8 @@
 //! Folder placeholder cards, entry traversal and drive roots.
 
+#![allow(unused_imports)]
+
 use crate::app::*;
-#[allow(unused_imports)]
 use crate::prelude::*;
 
 impl ImageViewer {

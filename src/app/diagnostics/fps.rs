@@ -1,7 +1,8 @@
 //! FPS sampling and the metrics series.
 
+#![allow(unused_imports)]
+
 use crate::app::*;
-#[allow(unused_imports)]
 use crate::prelude::*;
 
 impl ImageViewer {

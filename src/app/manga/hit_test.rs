@@ -1,7 +1,8 @@
 //! Hit testing inside strip and masonry layouts.
 
+#![allow(unused_imports)]
+
 use crate::app::*;
-#[allow(unused_imports)]
 use crate::prelude::*;
 
 impl ImageViewer {

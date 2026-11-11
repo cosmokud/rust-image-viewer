@@ -1,7 +1,8 @@
 //! Decoded-image / texture cache entry types and limits.
 
+#![allow(unused_imports)]
+
 use crate::app::*;
-#[allow(unused_imports)]
 use crate::prelude::*;
 
 pub(crate) const DECODED_IMAGE_CACHE_MAX_BYTES: u64 = 384 * 1024 * 1024;

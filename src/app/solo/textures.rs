@@ -1,7 +1,8 @@
 //! Solo-mode texture cache and upload bookkeeping.
 
+#![allow(unused_imports)]
+
 use crate::app::*;
-#[allow(unused_imports)]
 use crate::prelude::*;
 
 impl ImageViewer {

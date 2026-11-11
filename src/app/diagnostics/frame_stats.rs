@@ -1,7 +1,8 @@
 //! Per-frame diag trace fields.
 
+#![allow(unused_imports)]
+
 use crate::app::*;
-#[allow(unused_imports)]
 use crate::prelude::*;
 
 /// Frame line fields for the diag trace; only built when diag is enabled.

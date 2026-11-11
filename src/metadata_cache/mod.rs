@@ -20,6 +20,8 @@
 //! | Header-based type/animation detection | [`detect`] |
 //! | Record encoding | [`encode`] |
 
+#![allow(unused_imports)]
+
 pub(crate) mod api;
 pub(crate) mod backend;
 pub(crate) mod cache;
@@ -40,37 +42,20 @@ pub(crate) mod time;
 pub(crate) mod types;
 pub(crate) mod writer;
 
-#[allow(unused_imports)]
 pub(crate) use api::*;
-#[allow(unused_imports)]
 pub(crate) use backend::*;
-#[allow(unused_imports)]
 pub(crate) use cache::*;
-#[allow(unused_imports)]
 pub(crate) use constants::*;
-#[allow(unused_imports)]
 pub(crate) use detect::*;
-#[allow(unused_imports)]
 pub(crate) use encode::*;
-#[allow(unused_imports)]
 pub(crate) use file_type::*;
-#[allow(unused_imports)]
 pub(crate) use flags::*;
-#[allow(unused_imports)]
 pub(crate) use global::*;
-#[allow(unused_imports)]
 pub(crate) use open::*;
-#[allow(unused_imports)]
 pub(crate) use records::*;
-#[allow(unused_imports)]
 pub(crate) use shutdown::*;
-#[allow(unused_imports)]
 pub(crate) use stats::*;
-#[allow(unused_imports)]
 pub(crate) use test_hooks::*;
-#[allow(unused_imports)]
 pub(crate) use time::*;
-#[allow(unused_imports)]
 pub(crate) use types::*;
-#[allow(unused_imports)]
 pub(crate) use writer::*;

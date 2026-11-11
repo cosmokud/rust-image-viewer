@@ -1,7 +1,8 @@
 //! Folder navigation history (back/forward stacks).
 
+#![allow(unused_imports)]
+
 use crate::app::*;
-#[allow(unused_imports)]
 use crate::prelude::*;
 
 impl ImageViewer {

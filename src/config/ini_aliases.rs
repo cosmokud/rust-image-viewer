@@ -1,19 +1,14 @@
 //! The alias table: every accepted INI key and the field it maps to.
 
-#[allow(unused_imports)]
+#![allow(unused_imports)]
+
 use super::*;
 
-#[allow(unused_imports)]
 use crate::app_dirs;
-#[allow(unused_imports)]
 use crate::settings_registry::{self, SETTINGS};
-#[allow(unused_imports)]
 use std::borrow::Cow;
-#[allow(unused_imports)]
 use std::collections::HashMap;
-#[allow(unused_imports)]
 use std::fs;
-#[allow(unused_imports)]
 use std::path::PathBuf;
 
 /// Legacy ini spelling -> registry key. The registry then does the parsing, clamping and

@@ -1,7 +1,8 @@
 //! Strip LOD target-side computation.
 
+#![allow(unused_imports)]
+
 use crate::app::*;
-#[allow(unused_imports)]
 use crate::prelude::*;
 
 impl ImageViewer {

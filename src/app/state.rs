@@ -1,7 +1,8 @@
 //! State types that the `ImageViewer` struct owns but never drives itself.
 
+#![allow(unused_imports)]
+
 use crate::app::*;
-#[allow(unused_imports)]
 use crate::prelude::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

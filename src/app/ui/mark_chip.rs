@@ -1,7 +1,8 @@
 //! The mark-count chip painted over marked tiles.
 
+#![allow(unused_imports)]
+
 use crate::app::*;
-#[allow(unused_imports)]
 use crate::prelude::*;
 
 pub(crate) fn paint_mark_chip(

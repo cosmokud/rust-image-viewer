@@ -1,7 +1,8 @@
 //! Focused manga video-tile load start/gate/poll.
 
+#![allow(unused_imports)]
+
 use crate::app::*;
-#[allow(unused_imports)]
 use crate::prelude::*;
 
 impl ImageViewer {

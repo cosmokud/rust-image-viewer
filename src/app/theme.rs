@@ -1,7 +1,8 @@
 //! Shared colour palette and the widget painters built on it.
 
+#![allow(unused_imports)]
+
 use crate::app::*;
-#[allow(unused_imports)]
 use crate::prelude::*;
 
 pub(crate) const GSTREAMER_MISSING_VIDEO_ERROR_TEXT: &str =

@@ -1,7 +1,8 @@
 //! The main control overlays (bottom bar, sliders).
 
+#![allow(unused_imports)]
+
 use crate::app::*;
-#[allow(unused_imports)]
 use crate::prelude::*;
 
 impl ImageViewer {

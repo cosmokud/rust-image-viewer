@@ -1,7 +1,8 @@
 //! Async image/video loads that feed the solo view.
 
+#![allow(unused_imports)]
+
 use crate::app::*;
-#[allow(unused_imports)]
 use crate::prelude::*;
 
 impl ImageViewer {

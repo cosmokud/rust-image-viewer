@@ -1,7 +1,8 @@
 //! Small state queries and setters used across the viewer.
 
+#![allow(unused_imports)]
+
 use crate::app::*;
-#[allow(unused_imports)]
 use crate::prelude::*;
 
 impl ImageViewer {

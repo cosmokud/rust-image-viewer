@@ -1,7 +1,8 @@
 //! First-frame readiness, window showing, no-file startup window.
 
+#![allow(unused_imports)]
+
 use crate::app::*;
-#[allow(unused_imports)]
 use crate::prelude::*;
 
 impl ImageViewer {

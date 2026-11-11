@@ -1,7 +1,8 @@
 //! Cursor autohide tracking and pointer/UI hit tests.
 
+#![allow(unused_imports)]
+
 use crate::app::*;
-#[allow(unused_imports)]
 use crate::prelude::*;
 
 impl ImageViewer {

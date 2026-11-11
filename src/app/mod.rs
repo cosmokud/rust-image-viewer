@@ -1,5 +1,7 @@
 //! Application state and the pieces that must stay private to it.
 
+#![allow(unused_imports)]
+
 use crate::prelude::*;
 
 pub(crate) mod cache_state;
@@ -32,59 +34,32 @@ pub(crate) mod video;
 pub(crate) mod window;
 pub(crate) mod workers;
 
-#[allow(unused_imports)]
 pub(crate) use cache_state::*;
-#[allow(unused_imports)]
 pub(crate) use constructors::*;
-#[allow(unused_imports)]
 pub(crate) use core_state::*;
-#[allow(unused_imports)]
 pub(crate) use decode::*;
-#[allow(unused_imports)]
 pub(crate) use diagnostics::*;
-#[allow(unused_imports)]
 pub(crate) use dialogs::*;
-#[allow(unused_imports)]
 pub(crate) use exit::*;
-#[allow(unused_imports)]
 pub(crate) use files::*;
-#[allow(unused_imports)]
 pub(crate) use folder::*;
-#[allow(unused_imports)]
 pub(crate) use fullscreen::*;
-#[allow(unused_imports)]
 pub(crate) use help::*;
-#[allow(unused_imports)]
 pub(crate) use input::*;
-#[allow(unused_imports)]
 pub(crate) use manga::*;
-#[allow(unused_imports)]
 pub(crate) use masonry::*;
-#[allow(unused_imports)]
 pub(crate) use media::*;
-#[allow(unused_imports)]
 pub(crate) use navigation::*;
-#[allow(unused_imports)]
 pub(crate) use paths::*;
-#[allow(unused_imports)]
 pub(crate) use platform::*;
-#[allow(unused_imports)]
 pub(crate) use runtime_diag::*;
-#[allow(unused_imports)]
 pub(crate) use settings::*;
-#[allow(unused_imports)]
 pub(crate) use solo::*;
-#[allow(unused_imports)]
 pub(crate) use state::*;
-#[allow(unused_imports)]
 pub(crate) use theme::*;
-#[allow(unused_imports)]
 pub(crate) use ui::*;
-#[allow(unused_imports)]
 pub(crate) use video::*;
-#[allow(unused_imports)]
 pub(crate) use window::*;
-#[allow(unused_imports)]
 pub(crate) use workers::*;
 
 impl Default for SettingsModal {

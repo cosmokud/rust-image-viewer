@@ -19,6 +19,8 @@
 //! | Animated WebP (streamed) | [`webp_stream`], [`webp_frames`] |
 //! | The animation interface both share | [`animation`] |
 
+#![allow(unused_imports)]
+
 pub(crate) mod animation;
 pub(crate) mod budget;
 pub(crate) mod constants;
@@ -44,51 +46,27 @@ pub(crate) mod webp_frames;
 pub(crate) mod webp_stream;
 pub(crate) mod zune;
 
-#[allow(unused_imports)]
 pub(crate) use animation::*;
-#[allow(unused_imports)]
 pub(crate) use budget::*;
-#[allow(unused_imports)]
 pub(crate) use constants::*;
-#[allow(unused_imports)]
 pub(crate) use constructors::*;
-#[allow(unused_imports)]
 pub(crate) use decode_static::*;
-#[allow(unused_imports)]
 pub(crate) use directory::*;
-#[allow(unused_imports)]
 pub(crate) use display::*;
-#[allow(unused_imports)]
 pub(crate) use extensions::*;
-#[allow(unused_imports)]
 pub(crate) use gif_decode::*;
-#[allow(unused_imports)]
 pub(crate) use image_decode::*;
-#[allow(unused_imports)]
 pub(crate) use load::*;
-#[allow(unused_imports)]
 pub(crate) use loaded::*;
-#[allow(unused_imports)]
 pub(crate) use probe::*;
-#[allow(unused_imports)]
 pub(crate) use reader::*;
-#[allow(unused_imports)]
 pub(crate) use rotate::*;
-#[allow(unused_imports)]
 pub(crate) use rotation::*;
-#[allow(unused_imports)]
 pub(crate) use screen_frame::*;
-#[allow(unused_imports)]
 pub(crate) use shortcuts::*;
-#[allow(unused_imports)]
 pub(crate) use sorting::*;
-#[allow(unused_imports)]
 pub(crate) use tests::*;
-#[allow(unused_imports)]
 pub(crate) use types::*;
-#[allow(unused_imports)]
 pub(crate) use webp_frames::*;
-#[allow(unused_imports)]
 pub(crate) use webp_stream::*;
-#[allow(unused_imports)]
 pub(crate) use zune::*;

@@ -1,7 +1,8 @@
 //! Cut/copy/paste plumbing over the media list.
 
+#![allow(unused_imports)]
+
 use crate::app::*;
-#[allow(unused_imports)]
 use crate::prelude::*;
 
 impl ImageViewer {

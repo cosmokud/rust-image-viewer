@@ -1,7 +1,8 @@
 //! Preview-tracked visibility and hidden video pruning.
 
+#![allow(unused_imports)]
+
 use crate::app::*;
-#[allow(unused_imports)]
 use crate::prelude::*;
 
 impl ImageViewer {

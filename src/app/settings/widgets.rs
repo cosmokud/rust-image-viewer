@@ -1,7 +1,8 @@
 //! Slider/toggle/number widgets for settings rows.
 
+#![allow(unused_imports)]
+
 use crate::app::*;
-#[allow(unused_imports)]
 use crate::prelude::*;
 
 impl ImageViewer {

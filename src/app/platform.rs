@@ -1,7 +1,8 @@
 //! Windows-specific OS glue: CJK fonts, file reveal, shell clipboard.
 
+#![allow(unused_imports)]
+
 use crate::app::*;
-#[allow(unused_imports)]
 use crate::prelude::*;
 
 #[cfg(target_os = "windows")]

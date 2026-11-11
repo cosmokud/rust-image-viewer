@@ -1,7 +1,8 @@
 //! Runtime diagnostics init and the panic report hook.
 
+#![allow(unused_imports)]
+
 use crate::app::*;
-#[allow(unused_imports)]
 use crate::prelude::*;
 
 pub(crate) fn init_runtime_diagnostics() {

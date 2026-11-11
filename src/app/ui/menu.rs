@@ -1,7 +1,8 @@
 //! Menu rows and the in-view file action buttons.
 
+#![allow(unused_imports)]
+
 use crate::app::*;
-#[allow(unused_imports)]
 use crate::prelude::*;
 
 impl ImageViewer {
