@@ -22008,6 +22008,26 @@ impl ImageViewer {
         outstanding
     }
 
+    /// Soonest wake-up a spent video thumbnail needs before its budget re-opens; `None` when no
+    /// visible video is waiting on the revive schedule.
+    fn manga_video_revive_wake(&mut self) -> Option<Duration> {
+        if self.mode().is_solo() || self.image_list.is_empty() {
+            return None;
+        }
+        let now = Instant::now();
+        let waiting = self
+            .manga_loader
+            .as_ref()
+            .is_some_and(|loader| loader.video_revive_waiting(now));
+        if !waiting {
+            return None;
+        }
+        let visible = self.manga_collect_visible_indices();
+        self.manga_loader
+            .as_ref()
+            .and_then(|loader| loader.video_revive_visible_wake(&self.image_list, &visible, now))
+    }
+
     /// Soonest wake-up a gate-blocked visible tile needs; `None` when nothing is pacing one.
     fn manga_probe_blocked_wake(&mut self) -> Option<Duration> {
         if self.mode().is_solo() || self.image_list.is_empty() {
@@ -32546,6 +32566,10 @@ impl eframe::App for ImageViewer {
             // pump across the whole backoff window was pure repaint cost.
             if self.mode().is_manga() {
                 if let Some(wake) = self.manga_probe_blocked_wake() {
+                    schedule_min(wake);
+                }
+                // Same for a spent video thumbnail: wake at its revive window, not every pump.
+                if let Some(wake) = self.manga_video_revive_wake() {
                     schedule_min(wake);
                 }
             }

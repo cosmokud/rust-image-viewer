@@ -1124,6 +1124,7 @@ impl MangaLoader {
         let loading = self.loading_indices.read();
         let loaded = self.loaded_levels.read();
         let retry = self.retry_state.read();
+        let now = Instant::now();
 
         visible_indices.iter().any(|&idx| {
             let Some(path) = image_list.get(idx) else {
@@ -1155,10 +1156,10 @@ impl MangaLoader {
             if !spent {
                 return true;
             }
-            // A video thumbnail budget re-opens on a schedule, so its visible tile is still
-            // outstanding work; an image at the ceiling lets the app go idle. `spent` is passed
-            // in: re-reading the retry lock under the one held above can self-deadlock.
-            self.video_thumbnail_revive_pending_state(idx, path, spent)
+            // A video thumbnail budget re-opens on a schedule, so its visible tile is outstanding
+            // work once that window has elapsed; until then it is parked (its wake-up is
+            // scheduled). An image at the ceiling lets the app go idle for good.
+            is_supported_video(path) && self.video_revive_due(idx, now)
         })
     }
 
@@ -3259,24 +3260,62 @@ impl MangaLoader {
         }
     }
 
-    /// True while a visible video tile still has thumbnail work scheduled: a spent budget a
-    /// revive will re-open, or a gate backoff that paces the probe. Its placeholder is honest
-    /// waiting work, so the pump may keep running; an image at the ceiling has none.
-    ///
-    /// `spent` is passed in because the only live caller already holds the retry state: re-reading
-    /// that lock from here would self-deadlock.
-    fn video_thumbnail_revive_pending_state(&self, index: usize, path: &Path, spent: bool) -> bool {
-        if !is_supported_video(path) {
-            return false;
-        }
-        if self.probe_blocked.contains_key(&index) {
+    /// Cheap "is anything waiting on the revive schedule at all" probe for the idle frame path.
+    /// A spent video with no state yet also counts: its first revive is due immediately.
+    pub fn video_revive_waiting(&self, now: Instant) -> bool {
+        if self
+            .video_revive
+            .values()
+            .any(|state| state.revives < VIDEO_THUMBNAIL_REVIVE_MAX && now < state.next_revive_at)
+        {
             return true;
         }
-        spent
-            && self
-                .video_revive
-                .get(&index)
-                .is_none_or(|state| state.revives < VIDEO_THUMBNAIL_REVIVE_MAX)
+        let spent_anywhere = self
+            .retry_state
+            .read()
+            .values()
+            .any(|state| state.attempts >= PRELOAD_RETRY_MAX_ATTEMPTS);
+        spent_anywhere
+    }
+
+    /// Remaining wait of the soonest-usable visible video whose spent thumbnail budget the revive
+    /// schedule has not re-opened yet, `ZERO` when one is due right now. `None` when every visible
+    /// video is satisfied, out of revives, or not waiting at all.
+    ///
+    /// Paired with `demand_outstanding`: the parked frame loop schedules this wait instead of
+    /// pumping a preload pass every interval that the schedule would refuse anyway.
+    pub fn video_revive_visible_wake(
+        &self,
+        image_list: &[PathBuf],
+        visible_indices: &[usize],
+        now: Instant,
+    ) -> Option<Duration> {
+        if self.video_revive.is_empty() && self.retry_state.read().is_empty() {
+            return None;
+        }
+        let retry = self.retry_state.read();
+        visible_indices
+            .iter()
+            .filter(|&&idx| {
+                image_list
+                    .get(idx)
+                    .is_some_and(|path| is_supported_video(path))
+            })
+            .filter_map(|&idx| {
+                let spent = retry
+                    .get(&idx)
+                    .is_some_and(|state| state.attempts >= PRELOAD_RETRY_MAX_ATTEMPTS);
+                if !spent {
+                    return None;
+                }
+                // No state yet means the first revive is due immediately, so it is issuable now.
+                let Some(state) = self.video_revive.get(&idx) else {
+                    return Some(Duration::ZERO);
+                };
+                (state.revives < VIDEO_THUMBNAIL_REVIVE_MAX)
+                    .then(|| state.next_revive_at.saturating_duration_since(now))
+            })
+            .min()
     }
 
     /// Hover/visible demand on a video tile: drop the pacing so the next pump re-opens the budget
@@ -5173,16 +5212,27 @@ mod tests {
             loader.register_upload_failure(0, Path::new("clip0001.mp4"));
         }
         assert!(loader.retry_blocked(0));
+        // A spent video budget is waiting work, not a settled failure: the visible tile reports a
+        // wake-up instead of letting the loop park for the session.
         assert!(
-            loader.video_thumbnail_revive_pending_state(
-                0,
-                Path::new("clip0001.mp4"),
-                loader.retry_blocked(0)
-            ),
-            "a spent video budget is waiting work, not a settled failure"
+            loader
+                .video_revive_visible_wake(&list, &[0], Instant::now())
+                .is_some(),
+            "a spent video budget must schedule its own revive"
         );
-        // The visible tile keeps the pump running while it waits.
-        assert!(loader.demand_outstanding(&list, &[0], MAX_SIDE, TARGET_SIDE));
+        // With a revive window still open the pump parks instead of retrying a refused pass, and
+        // the wake-up is what brings it back.
+        loader.video_revive.insert(
+            0,
+            VideoReviveState {
+                revives: 0,
+                next_revive_at: Instant::now() + Duration::from_secs(1),
+            },
+        );
+        assert!(!loader.demand_outstanding(&list, &[0], MAX_SIDE, TARGET_SIDE));
+        assert!(loader
+            .video_revive_visible_wake(&list, &[0], Instant::now())
+            .is_some_and(|wait| wait <= Duration::from_secs(1)));
 
         // The next window pass re-opens it once the revive window has elapsed, with no hover and
         // no retry_visible: the frame loop alone heals the tile.
@@ -5211,11 +5261,12 @@ mod tests {
         for _ in 0..PRELOAD_RETRY_MAX_ATTEMPTS {
             loader.register_upload_failure(0, Path::new("clip0001.mp4"));
         }
-        assert!(!loader.video_thumbnail_revive_pending_state(
-            0,
-            Path::new("clip0001.mp4"),
-            loader.retry_blocked(0)
-        ));
+        assert!(
+            loader
+                .video_revive_visible_wake(&list, &[0], Instant::now())
+                .is_none(),
+            "exhausted revives must stop scheduling wake-ups"
+        );
         loader.demand(&demand(&list, &[0], &[], 0, MangaLayoutMode::Masonry));
         assert!(loader.retry_blocked(0), "exhausted revives settle the tile");
     }
