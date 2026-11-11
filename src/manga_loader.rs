@@ -308,8 +308,15 @@ const DECODE_FORENSICS_SLOW: Duration = Duration::from_millis(250);
 const PRELOAD_RETRY_BASE_DELAY_MS: u64 = 250;
 /// Cap retry backoff so visible items recover quickly once they come into view.
 const PRELOAD_RETRY_MAX_DELAY_MS: u64 = 4000;
-/// Stop retrying media that repeatedly fails to decode; broken videos/GIFs should not spin forever.
+/// Stop retrying media that repeatedly fails to decode; broken GIFs should not spin forever.
 const PRELOAD_RETRY_MAX_ATTEMPTS: u8 = 3;
+/// Video thumbnails are a preview, not a requirement: a video whose first frame cannot be decoded
+/// still plays, so the ceiling above only *paces* re-attempts for it instead of ending them. The
+/// delay doubles per revive and the count is bounded, so a genuinely broken video settles while a
+/// one-off decoder hiccup no longer pins the tile as a placeholder for the session.
+const VIDEO_THUMBNAIL_REVIVE_BASE_DELAY: Duration = Duration::from_secs(1);
+const VIDEO_THUMBNAIL_REVIVE_MAX_DELAY: Duration = Duration::from_secs(10);
+const VIDEO_THUMBNAIL_REVIVE_MAX: u32 = 4;
 /// Verification re-reads allowed for a file that keeps failing at the *same* stamp.
 /// A GIF that decodes but cannot be rendered keeps failing until it is rewritten, and the
 /// file stamp is the only re-arm signal there is: one re-read per this interval, only for
@@ -515,6 +522,34 @@ impl ProbeBlockedState {
     }
 }
 
+/// Per-index pacing for a video whose spent thumbnail budget is re-opened. [`RetryState`] keeps the
+/// ceiling semantics (an image stays dead); a video widens the interval per revive instead, so the
+/// tile cannot sit on a static placeholder until the cursor happens to touch it.
+#[derive(Clone, Copy, Debug)]
+struct VideoReviveState {
+    /// Re-opens already granted; [`VIDEO_THUMBNAIL_REVIVE_MAX`] ends them.
+    revives: u32,
+    /// No re-open before this instant.
+    next_revive_at: Instant,
+}
+
+impl VideoReviveState {
+    fn note_revive(&mut self, now: Instant) {
+        self.revives = self
+            .revives
+            .saturating_add(1)
+            .min(VIDEO_THUMBNAIL_REVIVE_MAX);
+        self.next_revive_at = now + Self::delay_for_revives(self.revives.saturating_sub(1));
+    }
+
+    fn delay_for_revives(revives: u32) -> Duration {
+        let factor = 1u64 << revives.min(3);
+        VIDEO_THUMBNAIL_REVIVE_BASE_DELAY
+            .saturating_mul(factor as u32)
+            .min(VIDEO_THUMBNAIL_REVIVE_MAX_DELAY)
+    }
+}
+
 /// Cache entry limits shared with the byte-aware budget clamps.
 const MANGA_CACHE_MIN_ENTRIES: usize = 64;
 const MANGA_CACHE_MAX_ENTRIES: usize = 1024;
@@ -619,6 +654,9 @@ pub struct MangaLoader {
     /// Indices whose last video probe could not run because the gate was busy. Separate from
     /// `retry_state`: a probe miss paces the next attempt and never exhausts the decode budget.
     probe_blocked: HashMap<usize, ProbeBlockedState>,
+    /// Videos whose spent thumbnail budget re-opens on a widening schedule. Images never appear
+    /// here: their ceiling is final until the file itself changes.
+    video_revive: HashMap<usize, VideoReviveState>,
     /// Cached original dimensions and media type (from file headers) for stable layout
     /// Maps index -> (width, height, media_type)
     pub dimension_cache: HashMap<usize, (u32, u32, MangaMediaType)>,
@@ -853,6 +891,7 @@ impl MangaLoader {
             loaded_levels,
             retry_state,
             probe_blocked: HashMap::new(),
+            video_revive: HashMap::new(),
             dimension_cache: HashMap::new(),
             dim_request_tx,
             dim_background_request_tx,
@@ -1025,6 +1064,7 @@ impl MangaLoader {
             loaded_levels: Arc::new(RwLock::new(HashMap::new())),
             retry_state: Arc::new(RwLock::new(HashMap::new())),
             probe_blocked: HashMap::new(),
+            video_revive: HashMap::new(),
             dimension_cache: HashMap::new(),
             dim_request_tx: channels.dim_request_tx,
             dim_background_request_tx: channels.dim_background_request_tx,
@@ -1109,9 +1149,15 @@ impl MangaLoader {
                     return false;
                 }
             }
-            !retry
+            let spent = retry
                 .get(&idx)
-                .is_some_and(|state| state.attempts >= PRELOAD_RETRY_MAX_ATTEMPTS)
+                .is_some_and(|state| state.attempts >= PRELOAD_RETRY_MAX_ATTEMPTS);
+            if !spent {
+                return true;
+            }
+            // A video thumbnail budget re-opens on a schedule, so its visible tile is still
+            // outstanding work; an image at the ceiling lets the app go idle.
+            self.video_thumbnail_revive_pending(idx, path)
         })
     }
 
@@ -2746,6 +2792,9 @@ impl MangaLoader {
                 .is_some_and(|path| is_supported_video(path))
         });
         self.rearm_indices(reentered);
+        // A video tile inside the window whose budget is spent waits for its revive window; the
+        // ceiling has to pace re-attempts here or nothing would ever re-request it again.
+        self.revive_spent_video_thumbnails(image_list, start_idx, end_idx);
 
         // Collect indices that need loading
         let mut requests: Vec<LoadRequest> = Vec::new();
@@ -3065,6 +3114,7 @@ impl MangaLoader {
         self.loaded_levels.write().clear();
         self.retry_state.write().clear();
         self.probe_blocked.clear();
+        self.video_revive.clear();
 
         // Clear dimension cache
         if !preserve_dimensions {
@@ -3148,6 +3198,15 @@ impl MangaLoader {
             .is_some_and(|state| now < state.next_probe_at)
     }
 
+    /// Clear the gate-failure history for `index`: a payload actually reached the texture cache.
+    ///
+    /// Leaving the entry in place kept `demand_outstanding` true for a tile that had already
+    /// resolved, so the parked frame loop kept waking every pump interval for the session.
+    pub fn note_probe_succeeded(&mut self, index: usize) {
+        self.probe_blocked.remove(&index);
+        self.video_revive.remove(&index);
+    }
+
     /// Record that the last attempt for `index` could not run its gated probe.
     pub fn note_probe_blocked(&mut self, index: usize) {
         let now = Instant::now();
@@ -3160,9 +3219,90 @@ impl MangaLoader {
             .note_miss(now);
     }
 
-    /// Clear the gate-failure history for `index`: a probe actually ran and produced a frame.
-    pub fn note_probe_succeeded(&mut self, index: usize) {
+    /// A video thumbnail's spent budget re-opens on a widening schedule; images stay dead.
+    fn video_revive_due(&self, index: usize, now: Instant) -> bool {
+        match self.video_revive.get(&index) {
+            None => true,
+            Some(state) => now >= state.next_revive_at,
+        }
+    }
+
+    /// True while a visible video tile still has thumbnail work scheduled: a spent budget a
+    /// revive will re-open, or a gate backoff that paces the probe. Its placeholder is honest
+    /// waiting work, so the pump may keep running; an image at the ceiling has none.
+    fn video_thumbnail_revive_pending(&self, index: usize, path: &Path) -> bool {
+        if !is_supported_video(path) {
+            return false;
+        }
+        if self.probe_blocked.contains_key(&index) {
+            return true;
+        }
+        let spent = self
+            .retry_state
+            .read()
+            .get(&index)
+            .is_some_and(|state| state.attempts >= PRELOAD_RETRY_MAX_ATTEMPTS);
+        spent
+            && self
+                .video_revive
+                .get(&index)
+                .map_or(true, |state| state.revives < VIDEO_THUMBNAIL_REVIVE_MAX)
+    }
+
+    /// Hover/visible demand on a video tile: drop the pacing so the next pump re-opens the budget
+    /// now, and clear the gate backoff so the probe is not refused. Never runs a probe itself — a
+    /// first-frame decode on the frame path freezes the window for its whole timeout.
+    ///
+    /// Callers run this every frame on the hovered tile, so it is a no-op unless the tile is
+    /// actually pacing: clearing a fresh backoff each frame would re-queue a probe every pump.
+    pub fn accelerate_video_thumbnail_revive(&mut self, index: usize) {
+        let now = Instant::now();
+        let pacing = self.probe_blocked.contains_key(&index)
+            || self
+                .video_revive
+                .get(&index)
+                .is_some_and(|state| now < state.next_revive_at);
+        if !pacing {
+            return;
+        }
+        clear_probe_cooldown(index);
         self.probe_blocked.remove(&index);
+        if let Some(state) = self.video_revive.get_mut(&index) {
+            state.next_revive_at = now;
+        }
+    }
+
+    /// Re-open the spent thumbnail budget of every video in the window whose revive window has
+    /// elapsed. Images are untouched: their ceiling means the file is broken.
+    fn revive_spent_video_thumbnails(&mut self, image_list: &[PathBuf], start: usize, end: usize) {
+        let now = Instant::now();
+        let due: Vec<usize> = {
+            let retry = self.retry_state.read();
+            (start..end.min(image_list.len()))
+                .filter(|&idx| {
+                    image_list
+                        .get(idx)
+                        .is_some_and(|path| is_supported_video(path))
+                })
+                .filter(|&idx| {
+                    retry
+                        .get(&idx)
+                        .is_some_and(|state| state.attempts >= PRELOAD_RETRY_MAX_ATTEMPTS)
+                })
+                .filter(|&idx| self.video_revive_due(idx, now))
+                .collect()
+        };
+
+        for index in due {
+            self.video_revive
+                .entry(index)
+                .or_insert_with(|| VideoReviveState {
+                    revives: 0,
+                    next_revive_at: now,
+                })
+                .note_revive(now);
+            self.rearm_index(index);
+        }
     }
 
     /// Drop every memo that makes `index` look settled: retry ceiling, in-flight/loaded levels,
@@ -3277,7 +3417,17 @@ impl MangaLoader {
     /// rewritten file is re-armed earlier, by `rearm_failed_indices`.
     pub fn retry_visible(&mut self, request: &VisibleRetry<'_>) -> bool {
         if self.retry_blocked(request.index) {
-            return false;
+            // A video's spent thumbnail budget paces re-attempts instead of ending them: a visible
+            // tile re-opens it as soon as its revive window elapses, without a hover or a file
+            // change. Images stay refused — a corrupt image will not decode on the next pass.
+            let is_video = request
+                .image_list
+                .get(request.index)
+                .is_some_and(|path| is_supported_video(path));
+            if !is_video || !self.video_revive_due(request.index, Instant::now()) {
+                return false;
+            }
+            self.rearm_index(request.index);
         }
 
         match request.repair {
@@ -4933,6 +5083,8 @@ mod tests {
             "a video that left the window must get a fresh chance"
         );
         assert!(!loader.probe_blocked.contains_key(&0));
+        // Leaving the window is not a revive grant, so no revive history is burnt on the way out.
+        assert!(!loader.video_revive.contains_key(&0));
 
         // An image at the ceiling is still a broken file, not a gate victim.
         let images = vec![PathBuf::from("img0001.png")];
@@ -4945,5 +5097,79 @@ mod tests {
             loader.retry_blocked(0),
             "images stay dead without a file change"
         );
+        assert!(!loader.video_revive.contains_key(&0));
+    }
+
+    #[test]
+    fn spent_video_thumbnail_budget_reopens_without_a_hover() {
+        let list = vec![PathBuf::from("clip0001.mp4")];
+        let mut loader = MangaLoader::without_workers();
+
+        // The decoder hiccup spent the whole budget: exactly the state that used to leave the
+        // tile on a static placeholder until the cursor happened to touch it.
+        for _ in 0..PRELOAD_RETRY_MAX_ATTEMPTS {
+            loader.register_upload_failure(0, Path::new("clip0001.mp4"));
+        }
+        assert!(loader.retry_blocked(0));
+        assert!(
+            loader.video_thumbnail_revive_pending(0, Path::new("clip0001.mp4")),
+            "a spent video budget is waiting work, not a settled failure"
+        );
+        // The visible tile keeps the pump running while it waits.
+        assert!(loader.demand_outstanding(&list, &[0], MAX_SIDE, TARGET_SIDE));
+
+        // The next window pass re-opens it once the revive window has elapsed, with no hover and
+        // no retry_visible: the frame loop alone heals the tile.
+        loader.video_revive.insert(
+            0,
+            VideoReviveState {
+                revives: 0,
+                next_revive_at: Instant::now(),
+            },
+        );
+        loader.demand(&demand(&list, &[0], &[], 0, MangaLayoutMode::Masonry));
+        assert!(!loader.retry_blocked(0), "the budget must re-open");
+        assert!(
+            preload_requests(&loader).iter().any(|req| req.index == 0),
+            "the revived video must be queued by the same pass"
+        );
+
+        // Revives are bounded and widen: a genuinely broken video settles instead of spinning.
+        loader.video_revive.insert(
+            0,
+            VideoReviveState {
+                revives: VIDEO_THUMBNAIL_REVIVE_MAX,
+                next_revive_at: Instant::now() + Duration::from_secs(3600),
+            },
+        );
+        for _ in 0..PRELOAD_RETRY_MAX_ATTEMPTS {
+            loader.register_upload_failure(0, Path::new("clip0001.mp4"));
+        }
+        assert!(!loader.video_thumbnail_revive_pending(0, Path::new("clip0001.mp4")));
+        loader.demand(&demand(&list, &[0], &[], 0, MangaLayoutMode::Masonry));
+        assert!(loader.retry_blocked(0), "exhausted revives settle the tile");
+    }
+
+    #[test]
+    fn hover_demand_accelerates_a_pacing_video() {
+        let list = vec![PathBuf::from("clip0001.mp4")];
+        let mut loader = MangaLoader::without_workers();
+        for _ in 0..PRELOAD_RETRY_MAX_ATTEMPTS {
+            loader.register_upload_failure(0, Path::new("clip0001.mp4"));
+        }
+        loader.video_revive.insert(
+            0,
+            VideoReviveState {
+                revives: 0,
+                next_revive_at: Instant::now() + Duration::from_secs(60),
+            },
+        );
+
+        // Hover only drops the pacing: the frame loop still owns the decode, so a first-frame
+        // pipeline can never run on the UI thread.
+        loader.accelerate_video_thumbnail_revive(0);
+        loader.demand(&demand(&list, &[0], &[], 0, MangaLayoutMode::Masonry));
+        assert!(!loader.retry_blocked(0));
+        assert!(loader.probe_blocked.is_empty());
     }
 }
