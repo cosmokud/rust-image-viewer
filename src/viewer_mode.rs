@@ -1,6 +1,6 @@
 //! Viewer presentation mode: what the viewer currently is, plus the latches that
 //! mode transitions set. Decisions only; effects (loaders, texture caches, scroll
-//! restore, window commands) stay in `main.rs` and read from the returned mode.
+//! restore, window commands) live in `src/app/` and read from the returned mode.
 
 use crate::folder_travel_cache::FolderTravelLayoutMode;
 
