@@ -3769,10 +3769,6 @@ impl ImageViewer {
     const MANGA_STRIP_PLAYBACK_PRELOAD_INTERVAL_MS: u64 = 120;
     /// Pump pacing when nothing is in flight but visible items are still unsatisfied.
     const MANGA_DEMAND_PUMP_INTERVAL: Duration = Duration::from_millis(100);
-    /// Wake-up a parked frame loop schedules while demand is outstanding with no in-flight work.
-    /// It must be short enough to cover the shortest revive window a spent video thumbnail default
-    /// (1s) with one extra pump, otherwise the tile waits on a wake-up that is later than its work.
-    const MANGA_DEMAND_WAKE_INTERVAL: Duration = Duration::from_millis(100);
     /// A visible tile with no texture is only repaired after being missing this long.
     const MANGA_TEXTURE_MISS_HEAL_AFTER: Duration = Duration::from_millis(1500);
     /// Placeholder spinners only start once a tile has been pending this long.
@@ -32526,7 +32522,9 @@ impl eframe::App for ImageViewer {
 
             // Watchdog: outstanding demand with zero in-flight work must keep waking the pump.
             if self.mode().is_manga() && self.manga_demand_outstanding {
-                schedule_min(Self::MANGA_DEMAND_WAKE_INTERVAL);
+                // Short enough that a spent video thumbnail's revive window (1s) is noticed
+                // within one pump, long enough that a waiting screen is not a 10fps repaint.
+                schedule_min(Self::MANGA_DEMAND_PUMP_INTERVAL);
             }
 
             if let Some(d) = next_repaint {

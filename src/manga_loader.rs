@@ -3321,6 +3321,11 @@ impl MangaLoader {
         if !self.video_revive_due(index, now) {
             return false;
         }
+        // A live decode owns the index: re-opening here would queue a second one behind it, so
+        // the revive waits for the in-flight result (or the stale-in-flight sweep) to land.
+        if self.is_index_in_flight(index) {
+            return false;
+        }
         self.video_revive
             .entry(index)
             .or_insert_with(|| VideoReviveState {
