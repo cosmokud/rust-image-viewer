@@ -1174,17 +1174,13 @@ impl MangaLoader {
                 .any(|idx| self.probe_blocked.contains_key(idx))
     }
 
-    /// True while any index paces a video thumbnail attempt (gate backoff or a scheduled revive).
-    /// The hover acceleration is a no-op in that state alone, so the frame loop skips the pointer
-    /// hit test entirely when nothing is pacing.
+    /// True while the probe gate paces a video attempt. Hover is only worth a pointer hit test
+    /// then: a spent budget is already re-opened by the preload window on its own schedule, so a
+    /// per-frame spatial query would buy nothing for it.
     pub fn video_thumbnail_pacing(&self, now: Instant) -> bool {
         self.probe_blocked
             .values()
             .any(|state| now < state.next_probe_at)
-            || self
-                .video_revive
-                .values()
-                .any(|state| now < state.next_revive_at)
     }
 
     /// Number of cached dimensions for indices in `[0, total_len)`.
