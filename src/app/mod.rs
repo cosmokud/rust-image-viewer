@@ -4,6 +4,8 @@
 
 use crate::prelude::*;
 
+pub(crate) mod app_loop;
+pub(crate) mod bootstrap;
 pub(crate) mod cache_state;
 pub(crate) mod constructors;
 pub(crate) mod core_state;
@@ -1504,3 +1506,7 @@ impl Drop for ImageViewer {
         }
     }
 }
+#[allow(unused_imports)]
+pub(crate) use app_loop::*;
+#[allow(unused_imports)]
+pub(crate) use bootstrap::*;
