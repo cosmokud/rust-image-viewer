@@ -21993,16 +21993,10 @@ impl ImageViewer {
             // placeholder (level set by a decode that never reached the GPU). The texture cache
             // is the only truth for what is actually drawn.
             let missing = self.manga_repair_visible_textures(indices);
-            // A video tile the gate already blocked counts as outstanding only once its backoff
-            // has elapsed: it is issuable then, so the pump must run. During the window its wake-up
-            // is scheduled instead (see `manga_probe_blocked_wake`), which is what keeps a blocked
-            // screen parked instead of repainting a full frame for the whole backoff.
-            let probe_due = self
-                .manga_loader
-                .as_ref()
-                .and_then(|loader| loader.probe_blocked_visible_wake(indices, Instant::now()))
-                .is_some_and(|remaining| remaining.is_zero());
-            bookkeeping || missing || probe_due
+            // A tile waiting out a gate backoff (or a video revive window) is not issuable
+            // demand: `demand_outstanding` reports it as settled and the parked loop is woken by
+            // `manga_probe_blocked_wake` / `manga_video_revive_wake` at the exact deadline.
+            bookkeeping || missing
         };
         self.manga_demand_outstanding = outstanding;
         outstanding

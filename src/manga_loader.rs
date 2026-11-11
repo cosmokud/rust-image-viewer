@@ -1150,6 +1150,16 @@ impl MangaLoader {
                     return false;
                 }
             }
+            // Gate backoff still open: a request would be refused, so this is not issuable
+            // demand. The parked loop is woken by `probe_blocked_visible_wake` instead of
+            // repainting a full frame every pump for the whole window.
+            if self
+                .probe_blocked
+                .get(&idx)
+                .is_some_and(|state| now < state.next_probe_at)
+            {
+                return false;
+            }
             let spent = retry
                 .get(&idx)
                 .is_some_and(|state| state.attempts >= PRELOAD_RETRY_MAX_ATTEMPTS);
@@ -5154,12 +5164,14 @@ mod tests {
         assert!(settled
             .probe_blocked_visible_wake(&[0, 1, 2], Instant::now())
             .is_none());
+        // Inside the window a request would be refused, so the tile is not issuable demand: the
+        // wake-up asserted above brings the pump back instead of repainting every interval.
         assert!(
-            loader.demand_outstanding(&list, &[0], MAX_SIDE, TARGET_SIDE),
-            "a gate-blocked tile must keep the pump pumping"
+            !loader.demand_outstanding(&list, &[0], MAX_SIDE, TARGET_SIDE),
+            "a tile inside its backoff window is not issuable demand"
         );
 
-        // The backoff paces attempts without closing them: the window pass queues it again.
+        // The backoff paces attempts without closing them: once it elapses the window queues it.
         loader.probe_blocked.clear();
         loader.demand(&demand(&list, &[0], &[], 0, MangaLayoutMode::Masonry));
         assert!(
