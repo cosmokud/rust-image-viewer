@@ -1,3 +1,30 @@
+//! Module map for the split of `video_player.rs`.
+//!
+//! `VideoPlayer` ([`player`]) is one GStreamer pipeline driven from the UI
+//! thread through a small control queue ([`control`]); everything that decides
+//! *which* elements go into it lives on its own.
+//!
+//! | Concern | Where |
+//! | --- | --- |
+//! | Windows GStreamer environment discovery | [`env`] |
+//! | Decoder preference/rank policy, demotions, candidates | [`decoders`], [`demotions`], [`candidates`] |
+//! | VP8/VP9 alpha handling and the opaque fallback memo | [`alpha`] |
+//! | Building the pipeline with fallback | [`create`] |
+//! | Hardware-acceleration probes | [`caps`] |
+//! | Public types (seek mode, tracks, subtitle selection, frames) | [`types`] |
+//! | Zero-copy D3D11/D3D12 frame extraction | [`d3d11`], [`d3d12`] |
+//! | The shared stream state written from bus/appsink callbacks | [`state`] |
+//! | Bounded GStreamer calls and the control thread | [`gst_threads`] |
+//! | playbin property helpers, limited-range expansion | [`properties`], [`limited_range`] |
+//! | Track labels and subtitle font fallbacks | [`labels`] |
+//! | Player construction | [`player_init`] |
+//! | Transport (play/pause, position, duration) | [`player_transport`] |
+//! | Seeking | [`player_seek`] |
+//! | Volume/mute | [`player_volume`] |
+//! | Track selection | [`player_tracks`] |
+//! | Frames, EOS, stall detection, shutdown | [`player_frames`] |
+//! | Bus error draining | [`bus_errors`] |
+
 pub(crate) mod alpha;
 pub(crate) mod bus_errors;
 pub(crate) mod candidates;

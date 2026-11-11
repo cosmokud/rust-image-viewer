@@ -1,3 +1,34 @@
+//! Module map for the split of `manga_loader.rs`.
+//!
+//! `MangaLoader` owns the background pipeline for Long Strip and Masonry:
+//! dimension probing, prioritized decode scheduling, LOD bookkeeping, retry and
+//! revive policy, and the uploaded-texture cache. The pipeline is split by
+//! concern; `MangaLoader` itself is declared in [`loader`] and its inherent
+//! methods live in the child modules named below.
+//!
+//! | Concern | Where |
+//! | --- | --- |
+//! | Video-probe permits and per-index cooldown | [`probe_gate`] |
+//! | Capacity/limits constants | [`limits`], [`budget`], [`constants`] |
+//! | Retry, probe-blocked and revive state | [`states`] |
+//! | Dimension probing helpers | [`probe_dims`] |
+//! | Diag tracing | [`trace`] |
+//! | Data types handed to/from the UI | [`types`], [`demand_types`] |
+//! | The loader struct and its channels | [`loader`] |
+//! | Construction / teardown | [`ctor`] |
+//! | Dimension queueing and warm-up | [`dim_base`] |
+//! | Read-only queries and demand accounting | [`queries`] |
+//! | The coordinator thread | [`coordinator`] |
+//! | Decode-failure retry bookkeeping | [`retry`] |
+//! | Image/video decode of one tile | [`decode`] |
+//! | Prefetch and demand window maths | [`prefetch`], [`demand`] |
+//! | Draining results back to the UI | [`take`] |
+//! | Clear/forget/cancel family | [`cache_control`] |
+//! | Per-index backoff and bookkeeping | [`backoff`] |
+//! | Video-thumbnail revive scheduler | [`revive`] |
+//! | Visible-tile retries | [`retry_visible`] |
+//! | Uploaded texture LRU | [`texture_cache`] |
+
 pub(crate) mod backoff;
 pub(crate) mod budget;
 pub(crate) mod cache_control;
