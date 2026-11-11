@@ -442,6 +442,9 @@ pub struct DecodedImage {
     pub decode_time: Duration,
     /// Time spent in the final resize/downscale step after decode.
     pub resize_time: Duration,
+    /// Payload carries no texture because a gated probe could not run (permit timeout or cooldown),
+    /// not because the file failed: it must not spend the index's retry budget.
+    pub deferred: bool,
 }
 
 /// Request sent to the loader thread pool.
@@ -480,6 +483,36 @@ struct RetryState {
     stamp: Option<FileStamp>,
     /// Last time the stamp of a stamp-blocked index was re-read.
     stamp_checked_at: Instant,
+}
+
+/// Per-index state for "a gated video probe could not run". Kept apart from [`RetryState`] so a
+/// degenerate media set (every visible video blocked by the gate) can never drain the decode budget
+/// and settle every tile on a placeholder for the session.
+#[derive(Clone, Copy, Debug)]
+struct ProbeBlockedState {
+    /// Passes that could not run the probe; paces `next_probe_at`.
+    misses: u32,
+    /// No gated probe is attempted for this index before this instant.
+    next_probe_at: Instant,
+}
+
+impl ProbeBlockedState {
+    /// Consecutive misses that only slow the probe down; there is deliberately no ceiling.
+    const MISS_LIMIT: u32 = 16;
+    const BASE_DELAY: Duration = Duration::from_millis(250);
+    const MAX_DELAY: Duration = Duration::from_millis(2500);
+
+    fn note_miss(&mut self, now: Instant) {
+        self.next_probe_at = now + Self::backoff_for_misses(self.misses);
+        self.misses = self.misses.saturating_add(1).min(Self::MISS_LIMIT);
+    }
+
+    fn backoff_for_misses(misses: u32) -> Duration {
+        let factor = 1u64 << misses.min(4);
+        Self::BASE_DELAY
+            .saturating_mul(factor as u32)
+            .min(Self::MAX_DELAY)
+    }
 }
 
 /// Cache entry limits shared with the byte-aware budget clamps.
@@ -583,6 +616,9 @@ pub struct MangaLoader {
     /// Retry state for indices whose decode failed or produced no usable pixels.
     /// Failed items are retried with backoff, and only aggressively retried when visible.
     retry_state: Arc<RwLock<HashMap<usize, RetryState>>>,
+    /// Indices whose last video probe could not run because the gate was busy. Separate from
+    /// `retry_state`: a probe miss paces the next attempt and never exhausts the decode budget.
+    probe_blocked: HashMap<usize, ProbeBlockedState>,
     /// Cached original dimensions and media type (from file headers) for stable layout
     /// Maps index -> (width, height, media_type)
     pub dimension_cache: HashMap<usize, (u32, u32, MangaMediaType)>,
@@ -816,6 +852,7 @@ impl MangaLoader {
             loading_indices,
             loaded_levels,
             retry_state,
+            probe_blocked: HashMap::new(),
             dimension_cache: HashMap::new(),
             dim_request_tx,
             dim_background_request_tx,
@@ -987,6 +1024,7 @@ impl MangaLoader {
             loading_indices: Arc::new(RwLock::new(HashMap::new())),
             loaded_levels: Arc::new(RwLock::new(HashMap::new())),
             retry_state: Arc::new(RwLock::new(HashMap::new())),
+            probe_blocked: HashMap::new(),
             dimension_cache: HashMap::new(),
             dim_request_tx: channels.dim_request_tx,
             dim_background_request_tx: channels.dim_background_request_tx,
@@ -1075,6 +1113,18 @@ impl MangaLoader {
                 .get(&idx)
                 .is_some_and(|state| state.attempts >= PRELOAD_RETRY_MAX_ATTEMPTS)
         })
+    }
+
+    /// Indices in `visible_indices` still waiting on a gated video probe that the gate has already
+    /// blocked at least once. They are outstanding work (the tile shows a placeholder) but must
+    /// keep repainting until the backoff window opens, so the UI cannot settle on a static
+    /// placeholder with no wake-up scheduled.
+    pub fn probe_blocked_visible_indices(&self, visible_indices: &[usize]) -> Vec<usize> {
+        visible_indices
+            .iter()
+            .copied()
+            .filter(|idx| self.probe_blocked.contains_key(idx))
+            .collect()
     }
 
     /// Number of cached dimensions for indices in `[0, total_len)`.
@@ -1469,6 +1519,10 @@ impl MangaLoader {
                         // (e.g., video dimension fallback), but does not satisfy texture preloading.
                         let has_usable_pixels =
                             !decoded.pixels.is_empty() && decoded.width > 0 && decoded.height > 0;
+                        // A gated-probe miss is not a file failure: counting it spent the whole
+                        // video retry budget in one or two frame passes and the tile then never
+                        // re-requested itself for the session.
+                        let deferred = decoded.deferred;
 
                         let loaded_side = decoded.width.max(decoded.height);
 
@@ -1481,6 +1535,9 @@ impl MangaLoader {
                                         .and_modify(|side| *side = (*side).max(loaded_side))
                                         .or_insert(loaded_side);
                                     retry_state.write().remove(&idx);
+                                } else if deferred {
+                                    // The probe cooldown already paces the next attempt.
+                                    loaded_levels.write().remove(&idx);
                                 } else {
                                     Self::register_decode_failure(
                                         &loaded_levels,
@@ -1822,6 +1879,9 @@ impl MangaLoader {
                 // One permit for the whole tile: extraction and its inner dimension probe share it.
                 // A gate timeout starts this index's cooldown instead of retrying next pass.
                 let tile_permit = probe_permit_for_index(req.index);
+                // No permit (gate timeout or cooldown) is a transient miss, not a bad file: the
+                // payload still carries cheap dimensions, but the tile must stay re-requestable.
+                let deferred = tile_permit.is_none();
                 match tile_permit.as_ref().and_then(|permit| {
                     Self::extract_video_first_frame(&req.path, effective_texture_side, Some(permit))
                 }) {
@@ -1850,6 +1910,7 @@ impl MangaLoader {
                             queue_wait: Duration::ZERO,
                             decode_time: Duration::ZERO,
                             resize_time,
+                            deferred: false,
                         })
                     }
                     None => {
@@ -1872,6 +1933,7 @@ impl MangaLoader {
                             queue_wait: Duration::ZERO,
                             decode_time: Duration::ZERO,
                             resize_time: Duration::ZERO,
+                            deferred,
                         })
                     }
                 }
@@ -1950,6 +2012,7 @@ impl MangaLoader {
                     queue_wait: Duration::ZERO,
                     decode_time: Duration::ZERO,
                     resize_time,
+                    deferred: false,
                 })
             }
         }
@@ -2659,8 +2722,30 @@ impl MangaLoader {
         let start_idx = visible_index.saturating_sub(behind);
         let end_idx = (visible_index + ahead + 1).min(image_list.len());
 
-        // A video that scrolled out of the window gets a fresh probe chance on the way back.
+        // A video that scrolled out of the window gets a fresh probe chance on the way back:
+        // both its gate cooldown and (for videos only) the download budget spent on blocked
+        // probes are dropped once the index leaves the window.
         clear_probe_cooldowns_outside(start_idx, end_idx);
+        let mut reentered: Vec<usize> = Vec::new();
+        if !self.probe_blocked.is_empty() {
+            let (start, end) = (start_idx, end_idx);
+            reentered = self
+                .probe_blocked
+                .keys()
+                .copied()
+                .filter(|index| *index < start || *index >= end)
+                .collect();
+            self.probe_blocked
+                .retain(|index, _| *index >= start && *index < end);
+        }
+        // An image with a spent budget is genuinely broken (corrupt header), so only videos are
+        // revived here: their budget was burnt by gate timeouts rather than by the file.
+        reentered.retain(|index| {
+            image_list
+                .get(*index)
+                .is_some_and(|path| is_supported_video(path))
+        });
+        self.rearm_indices(reentered);
 
         // Collect indices that need loading
         let mut requests: Vec<LoadRequest> = Vec::new();
@@ -2700,6 +2785,15 @@ impl MangaLoader {
                     if retry_state.attempts >= PRELOAD_RETRY_MAX_ATTEMPTS || !retry_due {
                         continue;
                     }
+                }
+
+                // Gate-blocked video: wait out the probe backoff instead of burning attempts.
+                if self
+                    .probe_blocked
+                    .get(&idx)
+                    .is_some_and(|state| now < state.next_probe_at)
+                {
+                    continue;
                 }
 
                 // Calculate priority based on distance from visible index
@@ -2970,6 +3064,7 @@ impl MangaLoader {
         self.loading_indices.write().clear();
         self.loaded_levels.write().clear();
         self.retry_state.write().clear();
+        self.probe_blocked.clear();
 
         // Clear dimension cache
         if !preserve_dimensions {
@@ -3033,7 +3128,59 @@ impl MangaLoader {
         self.loading_indices.write().remove(&index);
         self.loaded_levels.write().remove(&index);
         self.retry_state.write().remove(&index);
+        self.probe_blocked.remove(&index);
+        self.clear_probe_cooldown_for(index);
         self.stats.images_pending = self.loading_indices.read().len();
+    }
+
+    /// Drop this index's gate cooldown and probe backoff. Used when the tile comes back into view
+    /// or is hovered: a video that scrolled away and returned gets a fresh probed attempt.
+    pub fn clear_probe_cooldown_for(&mut self, index: usize) {
+        clear_probe_cooldown(index);
+        self.probe_blocked.remove(&index);
+    }
+
+    /// True while a video index waits out its `ProbeBlockedState` backoff after gate misses.
+    /// Paces probe attempts only; the caller still treats the tile as outstanding work.
+    fn probe_backoff_active(&self, index: usize, now: Instant) -> bool {
+        self.probe_blocked
+            .get(&index)
+            .is_some_and(|state| now < state.next_probe_at)
+    }
+
+    /// Record that the last attempt for `index` could not run its gated probe.
+    pub fn note_probe_blocked(&mut self, index: usize) {
+        let now = Instant::now();
+        self.probe_blocked
+            .entry(index)
+            .or_insert_with(|| ProbeBlockedState {
+                misses: 0,
+                next_probe_at: now,
+            })
+            .note_miss(now);
+    }
+
+    /// Clear the gate-failure history for `index`: a probe actually ran and produced a frame.
+    pub fn note_probe_succeeded(&mut self, index: usize) {
+        self.probe_blocked.remove(&index);
+    }
+
+    /// Drop every memo that makes `index` look settled: retry ceiling, in-flight/loaded levels,
+    /// gate cooldown and probe backoff. Used when a dropped payload or a re-entered window means
+    /// the tile never actually got a chance to resolve.
+    pub fn rearm_index(&mut self, index: usize) {
+        self.reset_index_state_for(index);
+        self.release_inflight(index);
+    }
+
+    /// `rearm_index` for a batch, skipping indices that already have a texture.
+    pub fn rearm_indices<I>(&mut self, indices: I)
+    where
+        I: IntoIterator<Item = usize>,
+    {
+        for index in indices {
+            self.rearm_index(index);
+        }
     }
 
     /// Record that `index` cannot be drawn at all: pin it at the retry ceiling (so prefetch
@@ -3179,6 +3326,11 @@ impl MangaLoader {
         if self.retry_state.read().get(&index).is_some_and(|state| {
             state.attempts >= PRELOAD_RETRY_MAX_ATTEMPTS || Instant::now() < state.next_retry_at
         }) {
+            return false;
+        }
+
+        // A gate-blocked video is outstanding work, just not yet: one attempt per backoff window.
+        if self.probe_backoff_active(index, Instant::now()) {
             return false;
         }
 
@@ -4730,5 +4882,68 @@ mod tests {
         assert_eq!(loader.loaded_level_for(1), None);
         assert!(loader.retry_blocked(1));
         assert!(!loader.demand_outstanding(&list, &[1], MAX_SIDE, TARGET_SIDE));
+    }
+
+    #[test]
+    fn gate_blocked_probe_never_spends_the_retry_budget() {
+        let list = vec![PathBuf::from("clip0001.mp4")];
+        let mut loader = MangaLoader::without_workers();
+
+        // Many passes blocked by the gate: no attempt may be recorded, so the tile stays
+        // requestable forever instead of settling on a placeholder for the session.
+        for _ in 0..PRELOAD_RETRY_MAX_ATTEMPTS * 4 {
+            loader.note_probe_blocked(0);
+        }
+
+        assert!(
+            !loader.retry_blocked(0),
+            "gate misses are not the file's fault"
+        );
+        assert_eq!(loader.probe_blocked_visible_indices(&[0]), vec![0]);
+        assert!(
+            loader.demand_outstanding(&list, &[0], MAX_SIDE, TARGET_SIDE),
+            "a gate-blocked tile must keep the pump pumping"
+        );
+
+        // The backoff paces attempts without closing them: the window pass queues it again.
+        loader.probe_blocked.clear();
+        loader.demand(&demand(&list, &[0], &[], 0, MangaLayoutMode::Masonry));
+        assert!(
+            preload_requests(&loader).iter().any(|req| req.index == 0),
+            "an unblocked video must be queued by prefetch"
+        );
+    }
+
+    #[test]
+    fn leaving_the_window_rearms_a_gate_blocked_video() {
+        let list = vec![PathBuf::from("clip0001.mp4")];
+        let mut loader = MangaLoader::without_workers();
+
+        // A video that burnt its budget on blocked probes: still blocked, as before the fix.
+        for _ in 0..PRELOAD_RETRY_MAX_ATTEMPTS {
+            loader.register_upload_failure(0, Path::new("clip0001.mp4"));
+        }
+        loader.note_probe_blocked(0);
+        assert!(loader.retry_blocked(0));
+
+        // Scroll away: the window no longer contains the index, so it is re-armed.
+        loader.demand(&demand(&list, &[], &[], 9, MangaLayoutMode::Masonry));
+        assert!(
+            !loader.retry_blocked(0),
+            "a video that left the window must get a fresh chance"
+        );
+        assert!(!loader.probe_blocked.contains_key(&0));
+
+        // An image at the ceiling is still a broken file, not a gate victim.
+        let images = vec![PathBuf::from("img0001.png")];
+        for _ in 0..PRELOAD_RETRY_MAX_ATTEMPTS {
+            loader.register_upload_failure(0, Path::new("img0001.png"));
+        }
+        loader.note_probe_blocked(0);
+        loader.demand(&demand(&images, &[], &[], 9, MangaLayoutMode::Masonry));
+        assert!(
+            loader.retry_blocked(0),
+            "images stay dead without a file change"
+        );
     }
 }

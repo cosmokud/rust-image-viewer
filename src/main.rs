@@ -3215,6 +3215,9 @@ struct ImageViewer {
     /// at. The tile paints an X and issues no further decode requests; a different path at the
     /// same index, or a rewrite of the file (stamp change), clears the mark.
     manga_unloadable_media: HashMap<usize, (PathBuf, Option<FileStamp>)>,
+    /// Hover-resolved video thumbnail per index: the path whose thumbnail was already probed and
+    /// uploaded on hover, so the frame pass does not redo it.
+    manga_hover_probe_paths: HashMap<usize, PathBuf>,
     /// When the unloadable marks above were last re-stamped (`stat` each, throttled).
     manga_unloadable_recheck_at: Instant,
 
@@ -3672,6 +3675,7 @@ impl Default for ImageViewer {
             manga_animated_images: HashMap::new(),
             manga_focused_anim_index: None,
             manga_unloadable_media: HashMap::new(),
+            manga_hover_probe_paths: HashMap::new(),
             manga_unloadable_recheck_at: Instant::now(),
 
             // GIF playback control fields
@@ -3936,6 +3940,7 @@ impl ImageViewer {
         self.manga_loader = None;
         // The loader that held the failure history is gone; nothing is pinned any more.
         self.manga_unloadable_media.clear();
+        self.manga_hover_probe_paths.clear();
         self.manga_texture_cache.clear();
         self.manga_decoded_mailbox.clear();
 
@@ -4438,6 +4443,7 @@ impl ImageViewer {
             self.solo_image_texture_cache_order.clear();
             // Index-keyed X marks describe a different list now.
             self.manga_unloadable_media.clear();
+            self.manga_hover_probe_paths.clear();
         }
 
         self.image_list = files;
@@ -16030,6 +16036,104 @@ impl ImageViewer {
             })
     }
 
+    /// "Stuck" = no cached texture while the loader either refuses every request
+    /// (`retry_blocked`) or has waited out `MANGA_PLACEHOLDER_STALL_RETRY_MS` on this tile
+    /// without a texture.
+    fn manga_stuck_placeholder_needs_hover_probe(&self, index: usize) -> bool {
+        let Some(loader) = self.manga_loader.as_ref() else {
+            return false;
+        };
+        loader.retry_blocked(index) || self.manga_should_heal_placeholder_retry(index)
+    }
+
+    /// A hovered video tile whose loader retry budget is spent because the probe gate blocked it
+    /// (rather than because the file is bad). Downloads the first-frame thumbnail texturally so
+    /// the tile resolves the moment the cursor touches it, instead of only when playback starts.
+    ///
+    /// Uses `with_video_probe_gate` so the frame loop never waits: the gate answers in a few
+    /// milliseconds once nothing is blocked, and the tile keeps its placeholder otherwise.
+    fn manga_hover_probe_blocked_video(&mut self, ctx: &egui::Context, index: usize) -> bool {
+        if self.mode().is_solo() {
+            return false;
+        }
+        if self.manga_media_is_unloadable(index) {
+            return false;
+        }
+        let Some(path) = self.image_list.get(index).cloned() else {
+            return false;
+        };
+        // Cheap gates first: the frame loop calls this for every hovered tile.
+        if !is_supported_video(path.as_path()) {
+            return false;
+        }
+        if self
+            .manga_texture_cache
+            .contains_for_path(index, path.as_path())
+        {
+            return false;
+        }
+        if self.manga_hover_probe_paths.get(&index) == Some(&path) {
+            return false;
+        }
+        if !self.manga_stuck_placeholder_needs_hover_probe(index) {
+            return false;
+        }
+
+        let target_side = self
+            .manga_retry_target_sides_for_rect(
+                index,
+                egui::Rect::from_min_size(egui::Pos2::ZERO, self.screen_size),
+                MangaMediaType::Video,
+            )
+            .0;
+        let max_side = self.max_texture_side.max(1).min(target_side.max(1));
+        let Some(Some(thumbnail)) = manga_loader::with_video_probe_gate(|| {
+            extract_video_first_frame_thumbnail(path.as_path(), max_side)
+        }) else {
+            self.manga_hover_probe_paths.insert(index, path);
+            return false;
+        };
+        if thumbnail.pixels.is_empty() || thumbnail.width == 0 || thumbnail.height == 0 {
+            self.manga_hover_probe_paths.insert(index, path);
+            return false;
+        }
+
+        let policy = self.manga_upload_policy(
+            index,
+            MangaMediaType::Video,
+            (thumbnail.width, thumbnail.height),
+        );
+        let uploaded = texture_upload::upload(
+            ctx,
+            &format!("manga-hover-thumb:{}", index),
+            None,
+            texture_upload::PixelSource::Rgba(&thumbnail.pixels),
+            (thumbnail.width, thumbnail.height),
+            &policy,
+        )
+        .handle;
+        let evicted = self.manga_texture_cache.insert_with_type(
+            index,
+            path.clone(),
+            uploaded,
+            thumbnail.width,
+            thumbnail.height,
+            MangaMediaType::Video,
+        );
+        self.manga_hover_probe_paths.insert(index, path);
+        if let Some(loader) = self.manga_loader.as_mut() {
+            loader.note_probe_succeeded(index);
+            loader.reset_index_state_for(index);
+            loader.clear_probe_cooldown_for(index);
+            if !evicted.is_empty() {
+                loader.forget_indices(evicted);
+            }
+        }
+        self.manga_texture_missing_since.remove(&index);
+        self.manga_ttv_pending.remove(&index);
+        true
+    }
+
     fn start_async_manga_focused_video_load(
         &mut self,
         index: usize,
@@ -21948,7 +22052,15 @@ impl ImageViewer {
             // placeholder (level set by a decode that never reached the GPU). The texture cache
             // is the only truth for what is actually drawn.
             let missing = self.manga_repair_visible_textures(indices);
-            bookkeeping || missing
+            // A video waiting out its gate-miss backoff is outstanding work even though every
+            // retry gate refuses it: without this the frame loop stops pumping and the tile
+            // settles on a static placeholder, which is what made it look permanently stuck.
+            let probe_blocked = self
+                .manga_loader
+                .as_ref()
+                .map(|loader| !loader.probe_blocked_visible_indices(indices).is_empty())
+                .unwrap_or(false);
+            bookkeeping || missing || probe_blocked
         };
         self.manga_demand_outstanding = outstanding;
         outstanding
@@ -22793,11 +22905,21 @@ impl ImageViewer {
             // level left set without a texture makes every re-request path treat the tile as
             // satisfied forever. `register_upload_failure` also keeps the retry backoff bounded.
             if decoded.pixels.is_empty() {
+                // The loader already accounted for this empty payload in `publish_one`: a
+                // genuine decode failure spent one attempt there, and a gated-probe miss spent
+                // none. Counting it again here halved the budget towards a permanent
+                // placeholder, so the upload-side count is only kept for payloads the loader
+                // handled as failures itself.
+                let deferred_by_gate = decoded.deferred;
                 let exhausted = self
                     .manga_loader
                     .as_mut()
                     .map(|loader| {
-                        loader.register_upload_failure(decoded.index, decoded.path.as_path());
+                        if deferred_by_gate {
+                            loader.note_probe_blocked(decoded.index);
+                        } else {
+                            loader.register_upload_failure(decoded.index, decoded.path.as_path());
+                        }
                         loader.retry_blocked(decoded.index)
                     })
                     .unwrap_or(false);
@@ -24880,6 +25002,24 @@ impl ImageViewer {
         diag::note_stage("manga_layout");
         if self.mode().is_solo() || !self.mode().is_fullscreen() {
             return false;
+        }
+
+        // Hover is the demand signal for a video tile the loader gave up on: re-arm its retry
+        // path and probe the thumbnail texturally, so the tile resolves on hover instead of
+        // waiting for playback to start. Both are gated once per index+path, and only a tile
+        // whose downloaded retry budget is actually spent takes this path.
+        if let Some(hovered_idx) = self.hovered_manga_index_from_pointer(ctx) {
+            // Probe first: a successful thumbnail repairs the tile without spending any decode
+            // attempts. Only when that cannot run (gate busy, no frame) does the hover fall back
+            // to re-arming the loader so its normal retry path gets a fresh chance.
+            if !self.manga_hover_probe_blocked_video(ctx, hovered_idx) {
+                if let Some(loader) = self.manga_loader.as_mut() {
+                    if loader.retry_blocked(hovered_idx) {
+                        loader.reset_index_state_for(hovered_idx);
+                        loader.clear_probe_cooldown_for(hovered_idx);
+                    }
+                }
+            }
         }
 
         self.manga_placeholder_spinners_left = Self::MANGA_PLACEHOLDER_SPINNER_MAX_PER_FRAME;
