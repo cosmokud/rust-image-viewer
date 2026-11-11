@@ -32522,9 +32522,9 @@ impl eframe::App for ImageViewer {
 
             // Watchdog: outstanding demand with zero in-flight work must keep waking the pump.
             if self.mode().is_manga() && self.manga_demand_outstanding {
-                // Short enough that a spent video thumbnail's revive window (1s) is noticed
-                // within one pump, long enough that a waiting screen is not a 10fps repaint.
-                schedule_min(Self::MANGA_DEMAND_PUMP_INTERVAL);
+                // Cheap wake-up for a parked loop: nothing is decoding, so this only has to
+                // notice a spent video thumbnail's revive window (>= 1s) — not run a frame rate.
+                schedule_min(Duration::from_millis(250));
             }
 
             if let Some(d) = next_repaint {
