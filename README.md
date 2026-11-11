@@ -43,6 +43,7 @@ The RGBA resize path is centralized in `src/image_resize.rs`: static images, ani
 - Persistent metadata caching (dimensions, file type, animation), plus in-memory decode and texture caches.
 - R-tree viewport virtualization, LOD bucketing, mipmapping, batch uploads, and bounded worker queues for dense layouts.
 - Built-in FPS / diagnostics overlay for runtime diagnostics.
+- Video thumbnail revive-window scheduler parks the retry pump on failure and reopens on a timer, preventing retry-budget exhaustion on gated probes; corrupt GIFs are marked unloadable on first decode failure.
 
 ## Features
 

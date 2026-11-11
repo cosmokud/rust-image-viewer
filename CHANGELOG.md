@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.4.3] - 2026-11-11
+
+### Highlights
+
+- Video thumbnail retry scheduler now uses a revive-window model: thumbnails that fail or time out park the pump and schedule a timed re-open instead of burning retry budget on gated probes.
+- Corrupt GIFs no longer pin the CPU in strip/masonry; they are marked unloadable immediately.
+
+### Fixed
+
+- Revive window open/closed state guards scheduling, wake-up registration, and hit-test entry.
+- Pump interval is shared and parked wake-up is capped at 250 ms (shortest revive window is 1 s).
+- A refused retry window no longer counts as issuable demand; decode failures are not double-charged.
+- Dead thumbnails are bounded in decode cost; a video stays off the X card when only its thumbnail fails.
+- First frame of video tiles is decoded through the alpha-aware extractor.
+
+### Maintenance
+
+- Internal rename: hover guard named for what it reports; `is_none_or` used for ceiling check.
+
 ## [0.4.2] - 2026-11-10
 
 ### Highlights
