@@ -1,14 +1,10 @@
 # rust-image-viewer
 
-![License](https://img.shields.io/badge/license-MIT-blue.svg)
-![Rust](https://img.shields.io/badge/rust-1.99%2B-orange.svg)
-![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-lightgrey.svg)
+![Rust](https://img.shields.io/badge/Rust-1.99%2B-orange?logo=rust)
+![Windows](https://img.shields.io/badge/Platform-Windows%2010%2F11-blue?logo=windows)
+![License](https://img.shields.io/badge/License-MIT-green)
 
-A high-performance, borderless image and video viewer for Windows, built with Rust, egui, and GStreamer.
-
-This project is intentionally optimized for one job: opening media fast, navigating large folders fast, and keeping dense Long Strip / Masonry layouts responsive. It is not trying to be a DAM, editor, cataloger, or full video player. Think of it as a QuickLook-style viewer with unusually aggressive performance work under the hood.
-
-The RGBA resize path is centralized in `src/image_resize.rs`: static images, animated frames, manga pages, and video thumbnails share the same FIR-first resize helper and bounded texture-limit downscale helper before egui texture upload. No-op downscale stays allocation-free by borrowing the decoded pixel slice, malformed RGBA buffers fail without panicking, and the single boundary keeps future GPU-backed scaling work isolated from decode and upload ownership.
+A fast, borderless image and video viewer for Windows. Open media instantly, navigate large folders without waiting, and read long image sequences in a continuous strip or a dense multi-column grid. It is not a photo manager, editor, or cataloger — it does one thing and tries to do it well.
 
 [floating.webm](https://github.com/user-attachments/assets/09a10ba9-53e3-4eea-a79a-323ec6b11ffb)
 
@@ -20,96 +16,15 @@ The RGBA resize path is centralized in `src/image_resize.rs`: static images, ani
 
 ## Highlights
 
-- Borderless floating window with custom title bar, auto-hide controls, native-feeling fullscreen / maximize transitions, and steadier drag/zoom/resize behavior on Windows.
-- Multi-monitor geometry tracking with display-aware maximization, DPI scaling guards, and seamless drag clamping across monitors.
-- Tabbed, searchable Settings window in a dedicated window with live preset management, reset options, and searchable settings registry.
-- Dual release builds: default AVX2 (`-C target-cpu=x86-64-v3`) and legacy SSE4.2 (`-C target-cpu=x86-64-v2`) with bundled LGPL attribution notices.
-- Fullscreen view-state memory in RAM with configurable zoom/pan preservation between floating and fullscreen.
-- Configurable window title path mode (auto/full path/filename) with smart truncation for narrow title bars.
-- Fast single-file viewing plus fast folder navigation, including natural-sort media lists and optional single-instance reuse.
-- Launching without a file opens a ready-to-drop window for drag-and-drop starts.
-- Breadcrumb address bar with back/forward/up navigation, a folder-history popup, a hide/show toggle, and Windows drive-root entries in fullscreen manga modes.
-- Windows cut/copy/paste for marked files with optional auto-unmark after paste.
-- Marking shortcuts for hovered files in floating, Long Strip, and Masonry modes.
-- Static images, animated GIF, animated WebP, and video playback in one app.
-- Shared RGBA resize and texture-limit downscale pipeline with FIR-first filtering, `image::imageops::resize` fallback, allocation-free no-op paths, and one choke point for future GPU scaling.
-- Optional hardware-accelerated video decode on Windows with D3D12/D3D11/CUDA preference and capability status readouts.
-- Hardened video playback: every blocking GStreamer call runs under a hard timeout with automatic decoder-tier fallback (D3D12 → D3D11 → CUDA → software) and proactive AV1 stability demotion, so a wedged hardware decoder can never freeze the UI.
-- Fast app exit that cancels pending loads/probes and shuts down the metadata cache cleanly when closing.
-- Two fullscreen multi-item layouts: Long Strip and Masonry.
-- Manga-mode video previews now autoplay on focus/hover and resume from the last preview position, with steadier layout sizing during zoom.
-- Seamless video handoffs reuse the active frame to avoid first-frame flashes when switching modes.
-- Context-aware shortcut system where the same input can map to different actions in different modes.
-- Persistent metadata caching (dimensions, file type, animation), plus in-memory decode and texture caches.
-- R-tree viewport virtualization, LOD bucketing, mipmapping, batch uploads, and bounded worker queues for dense layouts.
-- Built-in FPS / diagnostics overlay for runtime diagnostics.
-- Video thumbnail revive-window scheduler parks the retry pump on failure and reopens on a timer, preventing retry-budget exhaustion on gated probes; corrupt GIFs are marked unloadable on first decode failure.
-
-## Features
-
-### Windowing and navigation
-
-- Borderless floating mode for quick previewing.
-- Fullscreen mode with configurable Windows-native maximize / restore transitions.
-- Optional borderless fullscreen behavior for the custom maximize button and fullscreen shortcuts.
-- Floating drag/resize behavior tuned to reduce accidental snap-style jumps and keep zoomed centering more predictable.
-- Smart initial sizing: open at 100% when possible, otherwise fit to the screen.
-- Launching without a file opens a 500x500 window ready for drag-and-drop.
-- Drag and drop support.
-- Single-instance mode that forwards file-open requests from secondary launches to the primary window.
-- Fast exit on close: pending loads/probes are cancelled, runtime caches are discarded, and the metadata-cache writer shuts down cleanly before the window closes.
-- Configurable window title path mode: auto (filename in floating, full path in fullscreen), always-full-path, or filename-only, with smart truncation to fit the title bar width.
-- Folder scans include symlinked files and directories for navigation.
-- Windows folder shortcuts (`.lnk`) are treated as navigable folders.
-- Breadcrumb address bar for fullscreen manga modes with back/forward/up navigation, history popup, visibility toggle, and Windows drive-root entries.
-- Windows cut/copy/paste for marked files; paste into the current folder via Ctrl+V or the menu.
-- Title bar menu entry for `Settings`, opening a tabbed, searchable settings window with live presets and reset options.
-- CJK filename support through lazy Windows font loading.
-
-### Image and animation viewing
-
-- Smooth cursor-follow zoom in floating and fullscreen modes.
-- 90 degree rotation with `Up` / `Down`.
-- Fine rotation in fullscreen with `Ctrl+Up` / `Ctrl+Down` using a configurable step size.
-- Double-click reset / fit behavior.
-- Per-image fullscreen view memory (RAM, configurable) for zoom, pan, and rotation, captured only after explicit user interaction so automatic fit transitions do not create stale remembered states.
-- Animated GIF playback with play / pause and scrubbing.
-- Animated WebP support, including progressive frame streaming in the solo-view path.
-
-### Video playback
-
-- GStreamer-backed video playback with `playbin3` fallback to `playbin`.
-- Play / pause, seek, mute, volume, looping, and hover-driven controls.
-- Deferred audio-track switching to reduce playback stutter during active transitions.
-- `videos_only_navigation` mode for next/previous in video-like playback (videos, GIF, animated WebP).
-- GIF/animated-WebP FPS override controls with presets, slider, and manual input for playback-rate tuning.
-- Volume and FPS sliders support scroll-wheel adjustments with a guard against accidental changes.
-- Adaptive seek policy support:
-  - `adaptive` = keyframe while dragging, accurate on release
-  - `accurate` = always frame-accurate seeks
-  - `keyframe` = fastest seeks, less precise
-- Optional hardware-decoder preference on Windows (D3D12/D3D11 with optional CUDA), with a config switch to force software decode.
-- All blocking GStreamer calls (state changes, seeks, element queries) run under hard timeouts, so a wedged hardware decoder can never freeze the UI or the media-load worker; a timed-out load reports a clear error and retries with the next decoder tier demoted for the rest of the session.
-- Unstable AV1 hardware decoders are demoted proactively — decoder-rank prefs apply before any GStreamer init, the AV1 stability demotion is re-applied after every `gst::init`, and stall detection demotes the AV1 hardware decoders shortly after a playing pipeline stops delivering frames.
-- Decode capability status is surfaced in the video playback UI.
-- Seamless mode switches keep the currently visible video frame instead of falling back to a first-frame thumbnail.
-- Improved multilingual subtitle/audio track labeling and selection behavior.
-- Manga-mode video previews can autoplay on focus/hover and resume from the last preview position while items remain visible.
-- In Long Strip / Masonry, videos use first-frame thumbnails until a focused live player is needed.
-
-### Long Strip and Masonry
-
-- Long Strip: continuous vertical reading layout for the current folder.
-- Masonry: dense multi-column layout with configurable `masonry_items_per_row`.
-- Bottom-right mode buttons for toggling `Masonry` and `Long Strip` while fullscreen.
-- Inertial scrolling, drag panning, pointer-anchored Ctrl+wheel zoom, and a configurable middle-click freehand autoscroll ball.
-- Masonry freehand autoscroll keeps visible-item prioritization and visible-quality recovery aligned with the moving viewport.
-- Video first-frame thumbnails and animated media support inside multi-item layouts.
-- Hover-based autoplay in Masonry after a configurable settle delay, with resume-aware previews that stay warm while visible.
-- Manga video control bar appears only in Long Strip; grid layouts keep previews without the controls.
-- Long Strip can reset to a fitted view when returning from solo fullscreen (configurable).
-- Solo fullscreen quick-open from Long Strip / Masonry with preserved return context and warm-cache reuse.
-- Unified demand-driven page loading with stuck-tile self-healing and video thumbnail probe concurrency gating.
+- Borderless floating window with a custom title bar, auto-hiding controls, and smooth fullscreen transitions.
+- Multi-monitor aware: maximization, DPI scaling, and window dragging all do the right thing across displays.
+- Two fullscreen multi-item layouts: **Long Strip** (continuous vertical scroll) and **Masonry** (dense grid).
+- Fast folder navigation with natural sort, single-instance reuse, and drag-and-drop support.
+- Animated GIF, animated WebP, and video playback in the same window — no switching apps.
+- Hardware-accelerated video decoding on Windows (D3D12 / D3D11 / CUDA) with automatic fallback to software if a hardware decoder wedges.
+- Tabbed, searchable Settings window with live preset management and reset-to-defaults.
+- Dual release builds: AVX2 (default, every Windows 11 machine) and SSE4.2 (`-legacy`, for older CPUs).
+- Persistent metadata cache so the second time you open a folder is noticeably faster than the first.
 
 ## Supported Formats
 
@@ -143,101 +58,84 @@ The RGBA resize path is centralized in `src/image_resize.rs`: static images, ani
 
 ## Installation
 
-### Download release
+### Download a release
 
-Download the latest release from the [Releases](https://github.com/cosmokud/rust-image-viewer/releases) page.
+Grab the latest installer from the [Releases](https://github.com/cosmokud/rust-image-viewer/releases) page.
 
-The app is portable in the sense that you can place the executable folder anywhere. Use Windows `Open with` or file associations to launch media directly into it.
+Each release ships six files: installer with bundled GStreamer and without it, the same two for the `-legacy` (SSE4.2) build, and two portable executables. Use the bundled installer if you just want things to work; use the unbundled one if you already have GStreamer installed.
 
-Release automation now targets NSIS-style installer artifacts and a guarded manual tagged deploy path; legacy nightly/WiX workflow paths were removed.
-Current tagged release workflows publish six files: the installer with the bundled GStreamer runtime and the one without it, the same two for the legacy build, and the two portable executables. The default build asks the CPU for AVX2, which every processor Windows 11 supports has; the `-legacy` files are the same version built for SSE4.2, for a machine below that — everything else about a legacy file is identical, including what it can read and what it bundles.
-The NSIS installer includes a migration path for legacy WiX/MSI installs: it detects older entries and can force uninstall before continuing to prevent conflicting side-by-side installs.
+The app is portable — place the executable folder anywhere and use Windows **Open with** or file associations to launch media directly into it.
 
-### Windows SmartScreen / Smart App Control
+### Windows SmartScreen warning
 
-Because this project is built and distributed by a solo developer, the installer is not signed with an expensive enterprise code-signing certificate. As a result, Windows may treat the downloaded file as unfamiliar and flag it with a Mark of the Web (MotW), showing a "Windows protected your PC" or Smart App Control warning.
+This project is built by a solo developer without an expensive code-signing certificate, so Windows may show a "Windows protected your PC" warning on first run. That is a standard Mark-of-the-Web notice for unsigned downloads, not an indication of malware.
 
-This is a safety mechanism in Windows for unsigned downloads, not proof that the app is malware. If you trust the source, you can unblock the installer manually:
+To unblock:
 
-1. Download the installer.
-2. Right-click the downloaded file and select **Properties**.
-3. Go to the **General** tab.
-4. Look at the bottom for a Security warning and check the box that says **Unblock**.
-5. Click **Apply** and **OK**.
-6. Run the installer normally.
-
-If you still see warnings after unblocking, Windows is simply being cautious about unsigned software. The unblock step tells Windows that you trust this file from this source.
+1. Right-click the downloaded file → **Properties**.
+2. On the **General** tab, find the Security section at the bottom.
+3. Check **Unblock**, then click **Apply** and **OK**.
+4. Run the installer normally.
 
 ### Video prerequisites
 
-Image viewing works without GStreamer, but video playback requires a GStreamer runtime install.
+Image viewing works out of the box. Video playback requires GStreamer:
 
-1. Download GStreamer from https://gstreamer.freedesktop.org/download/
-2. Install the 64-bit MSVC runtime package.
-3. If you build from source, install the development package too.
-4. Make sure the GStreamer binaries and plugins are discoverable.
+1. Download GStreamer from <https://gstreamer.freedesktop.org/download/>.
+2. Install the **64-bit MSVC runtime** package.
+3. The bundled installer handles this for you automatically.
 
-The app also tries to improve Windows-side discovery by refreshing `PATH` from the registry, probing common GStreamer install locations, and configuring plugin-scanner / registry paths automatically.
-
-D3D12/CUDA decode paths are opportunistic: if the runtime plugins or GPU drivers are unavailable, the app falls back to D3D11 or software decode automatically.
+D3D12 and CUDA decode paths are opportunistic — if the runtime or GPU drivers are unavailable the app falls back to D3D11 or software decode without any configuration.
 
 ### Build from source
+
+Requirements: Windows 10/11, Rust 1.99+, Visual Studio Build Tools (MSVC / C++), and GStreamer MSVC runtime + development packages.
 
 ```bash
 git clone https://github.com/cosmokud/rust-image-viewer.git
 cd rust-image-viewer
-
-# Fully optimized release build
 cargo build --release
-
-# Optional: release build with mimalloc as the global allocator
-cargo build --release --features mimalloc-allocator
-
-# Optional: faster-to-build release-like profile
-cargo build --profile release-fast
 ```
 
-Build requirements:
-
-- Rust 1.99+
-- Windows 10/11
-- GStreamer MSVC runtime + development packages for video support
-- `PKG_CONFIG_PATH` pointing at GStreamer's `pkgconfig` directory if it is not auto-detected
+Set `PKG_CONFIG_PATH` if GStreamer is not auto-detected:
 
 ```powershell
 $env:PKG_CONFIG_PATH = "C:\gstreamer\1.0\msvc_x86_64\lib\pkgconfig"
 ```
 
-The executable will be written to `target/release/rust-image-viewer.exe` for the standard release profile.
+The binary lands at `target/release/rust-image-viewer.exe`.
 
 ## Usage
 
-### Opening media
+### Opening files
 
 ```bash
 rust-image-viewer.exe path\to\file.jpg
 rust-image-viewer.exe path\to\video.mp4
 ```
 
-When you open one file, the viewer builds the media list for its directory and enables previous / next navigation across the supported files in that folder.
-Launching without a path opens a 500x500 window ready for drag-and-drop.
+Opening one file builds the media list for its entire folder and enables previous/next navigation across all supported files in that folder. Launching without a path opens a window ready for drag-and-drop.
 
-### Interaction model
+### View modes
 
-- Floating / solo fullscreen mode is optimized for one current item at a time.
-- Long Strip and Masonry are fullscreen-only multi-item layouts.
-- Keyboard copy / cut actions prefer marked files first; without marks, Long Strip and Masonry target the hovered item.
-- Space marks the hovered item; Ctrl+left-click toggles marks in the active mode.
-- Right-click is contextual by design:
-  - floating / solo fullscreen side zones and black bars navigate previous / next
-  - right-click on the current media toggles fullscreen when bound to `goto_file`
-  - right-click on a strip or masonry item opens that item into solo fullscreen by default
-- Middle-click is the freehand autoscroll trigger by default, not fullscreen.
-- Center right-click can still act as play / pause for video or animated GIF when it is not consumed by navigation or fullscreen routing.
+- **Floating** — single-item preview, resizable and borderless.
+- **Solo fullscreen** — one item, full screen.
+- **Long Strip** — continuous vertical scroll through the whole folder, great for reading manga or image sequences.
+- **Masonry** — multi-column grid for browsing dense folders.
+
+Switch between Long Strip and Masonry with the mode buttons in the bottom-right corner while fullscreen.
+
+### Interaction
+
+- Left-click drag pans the current view.
+- Right-click on a side zone or black bar navigates previous/next.
+- Middle-click starts freehand autoscroll.
+- Space marks the hovered item; Ctrl+Left-click toggles the mark.
+- In Long Strip or Masonry, right-click on an item opens it in solo fullscreen.
 
 ## Default Shortcuts
 
-Bindings are action-first and context-aware. The same input can legally belong to multiple actions as long as those actions live in different modes.
+Bindings are context-aware — the same key can do different things in different modes.
 
 ### Global
 
@@ -248,59 +146,52 @@ Bindings are action-first and context-aware. The same input can legally belong t
 
 ### Floating and solo fullscreen
 
-| Action                                         | Default                           |
-| ---------------------------------------------- | --------------------------------- |
-| Pan current view                               | `mouse_left`                      |
-| Side-zone / black-bar previous-next navigation | `mouse_right`                     |
-| Toggle fullscreen on current media             | `mouse_right`                     |
-| Freehand autoscroll                            | `mouse_middle`                    |
-| Mark hovered file                              | `space`                           |
-| Toggle mark on hovered file                    | `ctrl+mouse_left`                 |
-| Next item                                      | `right`, `pagedown`, `mouse5`     |
-| Previous item                                  | `left`, `pageup`, `mouse4`        |
-| Rotate clockwise                               | `up`                              |
-| Rotate counterclockwise                        | `down`                            |
-| Precise rotation clockwise                     | `ctrl+up`                         |
-| Precise rotation counterclockwise              | `ctrl+down`                       |
-| Zoom in                                        | `scroll_up`, `ctrl+scroll_up`     |
-| Zoom out                                       | `scroll_down`, `ctrl+scroll_down` |
-| Jump to first item                             | built-in fallback `home`          |
-| Jump to last item                              | built-in fallback `end`           |
+| Action                             | Default                           |
+| ---------------------------------- | --------------------------------- |
+| Pan                                | `mouse_left`                      |
+| Previous / next (side zones)       | `mouse_right`                     |
+| Freehand autoscroll                | `mouse_middle`                    |
+| Mark hovered file                  | `space`                           |
+| Toggle mark                        | `ctrl+mouse_left`                 |
+| Next item                          | `right`, `pagedown`, `mouse5`     |
+| Previous item                      | `left`, `pageup`, `mouse4`        |
+| Rotate clockwise                   | `up`                              |
+| Rotate counterclockwise            | `down`                            |
+| Precise rotation clockwise         | `ctrl+up`                         |
+| Precise rotation counterclockwise  | `ctrl+down`                       |
+| Zoom in                            | `scroll_up`, `ctrl+scroll_up`     |
+| Zoom out                           | `scroll_down`, `ctrl+scroll_down` |
+| Jump to first / last               | `home` / `end`                    |
 
 ### Long Strip
 
 | Action                               | Default                |
 | ------------------------------------ | ---------------------- |
-| Drag-pan strip                       | `mouse_left`           |
-| Open clicked item in solo fullscreen | `mouse_right`          |
+| Drag-pan                             | `mouse_left`           |
+| Open item in solo fullscreen         | `mouse_right`          |
 | Freehand autoscroll                  | `mouse_middle`         |
 | Mark hovered item                    | `space`                |
-| Toggle mark on hovered item          | `ctrl+mouse_left`      |
-| Continuous pan up                    | `up`                   |
-| Continuous pan down                  | `down`                 |
-| Fit-aware next page                  | `right`                |
-| Fit-aware previous page              | `left`                 |
-| Jump to next item                    | `pagedown`, `mouse5`   |
-| Jump to previous item                | `pageup`, `mouse4`     |
-| Inertial wheel scroll up             | `scroll_up`            |
-| Inertial wheel scroll down           | `scroll_down`          |
-| Zoom in                              | `ctrl+scroll_up`       |
-| Zoom out                             | `ctrl+scroll_down`     |
-| Jump to start / end                  | built-in `home`, `end` |
+| Toggle mark                          | `ctrl+mouse_left`      |
+| Pan up / down                        | `up`, `down`           |
+| Fit-aware next / previous page       | `right`, `left`        |
+| Jump to next / previous item         | `pagedown` / `pageup`  |
+| Scroll up / down                     | `scroll_up/down`       |
+| Zoom in / out                        | `ctrl+scroll_up/down`  |
+| Jump to start / end                  | `home`, `end`          |
 
 ### Masonry
 
 | Action                               | Default                                  |
 | ------------------------------------ | ---------------------------------------- |
-| Drag-pan masonry                     | `mouse_left`                             |
-| Open clicked item in solo fullscreen | `mouse_right`                            |
+| Drag-pan                             | `mouse_left`                             |
+| Open item in solo fullscreen         | `mouse_right`                            |
 | Freehand autoscroll                  | `mouse_middle`                           |
 | Mark hovered item                    | `space`                                  |
-| Toggle mark on hovered item          | `ctrl+mouse_left`                        |
+| Toggle mark                          | `ctrl+mouse_left`                        |
 | Pan up / down                        | `up`, `down`                             |
-| Faster pan up / down                 | `left`, `right`                          |
-| Fastest pan up / down                | `pageup`, `pagedown`, `mouse4`, `mouse5` |
-| Inertial wheel scroll up / down      | `scroll_up`, `scroll_down`               |
+| Faster pan                           | `left`, `right`                          |
+| Jump pan                             | `pageup`, `pagedown`, `mouse4`, `mouse5` |
+| Scroll                               | `scroll_up`, `scroll_down`               |
 | Zoom in / out                        | `ctrl+scroll_up`, `ctrl+scroll_down`     |
 
 ### Video
@@ -310,17 +201,9 @@ Bindings are action-first and context-aware. The same input can legally belong t
 | Play / pause | `space` |
 | Mute         | `m`     |
 
-### Custom shortcut model
+### Custom shortcuts
 
-- The canonical template is `assets/config.ini`.
-- Your runtime config is normally created under the OS config directory via `directories::BaseDirs` (`%APPDATA%\rust-image-viewer\config.ini` on Windows).
-- If the OS config directory cannot be resolved, the app falls back to an app-local folder next to the executable, then `./rust-image-viewer`.
-- Legacy `rust-image-viewer-config.ini` and `setting.ini` files are migrated automatically.
-- Leaving a shortcut value empty disables the default binding for that action.
-- Older fullscreen defaults that used middle-click are migrated to the newer `f`, `f11`, `f12`, `enter` set.
-- Context priority is deliberate. For example, in strip mode the item-open binding outranks generic right-click logic, and in floating / solo fullscreen the side-zone navigation binding outranks center fullscreen toggling.
-
-Example custom bindings:
+Shortcuts live in `config.ini` under `[Shortcuts]`. Leave a value empty to disable the default binding.
 
 ```ini
 [Shortcuts]
@@ -330,216 +213,172 @@ manga_goto_file = mouse_middle
 masonry_goto_file = enter
 ```
 
-Available binding syntax:
-
 | Type          | Values                                                                                                  |
 | ------------- | ------------------------------------------------------------------------------------------------------- |
 | Mouse buttons | `mouse_left`, `mouse_right`, `mouse_middle`, `mouse4`, `mouse5`                                         |
 | Scroll wheel  | `scroll_up`, `scroll_down`                                                                              |
 | Modifiers     | `ctrl+<key>`, `shift+<key>`, `alt+<key>`                                                                |
-| Letters       | `a` - `z`                                                                                               |
-| Numbers       | `0` - `9`                                                                                               |
-| Function keys | `f1` - `f12`                                                                                            |
+| Letters       | `a` – `z`                                                                                               |
+| Numbers       | `0` – `9`                                                                                               |
+| Function keys | `f1` – `f12`                                                                                            |
 | Arrow keys    | `left`, `right`, `up`, `down`                                                                           |
 | Special keys  | `escape`, `enter`, `space`, `tab`, `backspace`, `delete`, `insert`, `home`, `end`, `pageup`, `pagedown` |
 
-## Settings and Config File
+## Configuration
 
-The config file is versioned. If the file is missing, stale, or missing its version header, the app regenerates the default template. The shipped template is also synchronized during the build so new keys stay discoverable.
+The config file is at `%APPDATA%\rust-image-viewer\config.ini` on Windows. Delete it to regenerate the defaults.
 
-Delete `config.ini` if you want to regenerate it from the current defaults.
+### General
 
-### General settings
+| Key                                             | Default    | Meaning                                                                                            |
+| ----------------------------------------------- | ---------- | -------------------------------------------------------------------------------------------------- |
+| `controls_hide_delay`                           | `0.5`      | Seconds before the title bar / controls hide.                                                      |
+| `bottom_overlay_hide_delay`                     | `0.5`      | Seconds before bottom overlays (video controls, mode buttons, zoom HUD) hide.                     |
+| `double_click_grace_period`                     | `0.35`     | Double-click timing window in seconds.                                                             |
+| `show_fps`                                      | `false`    | Show the diagnostics overlay in the top-right corner.                                              |
+| `resize_border_size`                            | `6`        | Floating-window resize hit area in pixels.                                                         |
+| `startup_window_mode`                           | `floating` | `floating` or `fullscreen`.                                                                        |
+| `single_instance`                               | `true`     | Reuse the existing window for new file-open requests.                                              |
+| `window_title_show_full_path`                   | `auto`     | `auto` = filename in floating, full path in fullscreen. `true` = always full path. `false` = filename only. |
+| `vsync`                                         | `true`     | Enable vsync to reduce tearing.                                                                    |
+| `metadata_cache_max_size_mb`                    | `1024`     | Max on-disk size of the metadata cache in MiB. `0` disables the cap.                              |
+| `background_rgb`                                | `0, 0, 0`  | Background color as an RGB triplet.                                                                |
+| `fullscreen_reset_fit_on_mode_switch`           | `true`     | Fit media when switching between floating and fullscreen.                                          |
+| `manga_long_strip_reset_fit_on_fullscreen_exit` | `true`     | Fit long-strip view when returning from solo fullscreen.                                           |
+| `fullscreen_remember_view_state_in_ram`         | `true`     | Remember zoom/pan/rotation per image for the current fullscreen session.                           |
+| `fullscreen_native_window_transition`           | `true`     | Use Windows maximize/restore animations during fullscreen transitions.                             |
+| `maximize_to_borderless_fullscreen`             | `true`     | Make the maximize button enter borderless fullscreen instead of a maximized floating window.       |
+| `auto_unmark_after_paste`                       | `true`     | Clear the marked selection after a successful paste.                                               |
+| `zoom_animation_speed`                          | `20`       | Floating zoom animation speed. `0` disables animation.                                            |
+| `precise_rotation_step_degrees`                 | `2.0`      | Degrees per `Ctrl+Up` / `Ctrl+Down`.                                                               |
+| `zoom_step`                                     | `1.02`     | Scroll-wheel zoom multiplier.                                                                      |
+| `max_zoom_percent`                              | `1000`     | Maximum zoom level as a percentage.                                                                |
 
-| Key                                             | Default    | Meaning                                                                                                                        |
-| ----------------------------------------------- | ---------- | ------------------------------------------------------------------------------------------------------------------------------ |
-| `controls_hide_delay`                           | `0.5`      | Delay before the top controls / title bar hide.                                                                                |
-| `bottom_overlay_hide_delay`                     | `0.5`      | Delay before bottom overlays hide. Affects video controls, mode buttons, and zoom HUD.                                         |
-| `double_click_grace_period`                     | `0.35`     | Double-click timing window in seconds.                                                                                         |
-| `show_fps`                                      | `false`    | Enables the top-right diagnostics overlay.                                                                                     |
-| `resize_border_size`                            | `6`        | Hit area for floating-window resize borders.                                                                                   |
-| `startup_window_mode`                           | `floating` | `floating` or `fullscreen`.                                                                                                    |
-| `single_instance`                               | `true`     | Reuse one window and forward file-open requests into it.                                                                       |
-| `window_title_show_full_path`                   | `auto`     | `auto` = filename in floating, full path in fullscreen/masonry/long strip. `true` = always full path. `false` = filename only. |
-| `vsync`                                         | `true`     | Enable swapchain vsync to reduce tearing.                                                                                      |
-| `metadata_cache_max_size_mb`                    | `1024`     | Max on-disk size of `metadata_cache.redb` in MiB. `0` disables the size cap. Stores dimensions, type, animation.               |
-| `background_rgb`                                | `0, 0, 0`  | Background color as one RGB triplet.                                                                                           |
-| `background_r`                                  | `0`        | Alternative per-channel background override.                                                                                   |
-| `background_g`                                  | `0`        | Alternative per-channel background override.                                                                                   |
-| `background_b`                                  | `0`        | Alternative per-channel background override.                                                                                   |
-| `fullscreen_reset_fit_on_mode_switch`           | `true`     | Reset and fit media when switching between floating and fullscreen. `false` preserves zoom/pan.                                |
-| `manga_long_strip_reset_fit_on_fullscreen_exit` | `true`     | Reset and fit long-strip view when returning from solo fullscreen. `false` keeps fullscreen zoom/pan.                          |
-| `fullscreen_remember_view_state_in_ram`         | `true`     | In fullscreen, remember opened image/video zoom and pan in RAM for the current fullscreen session; disable to clear on exit.   |
-| `fullscreen_native_window_transition`           | `true`     | Use Windows maximize / restore animations during fullscreen transitions.                                                       |
-| `maximize_to_borderless_fullscreen`             | `true`     | Make the title-bar maximize action enter borderless fullscreen instead of a separate maximized floating state.                 |
-| `auto_unmark_after_paste`                       | `true`     | Clear current marked-file selection after a successful paste operation.                                                        |
-| `zoom_animation_speed`                          | `20`       | Speed of floating zoom animation. `0` disables the animation.                                                                  |
-| `precise_rotation_step_degrees`                 | `2.0`      | Degrees added per `Ctrl+Up` / `Ctrl+Down`.                                                                                     |
-| `zoom_step`                                     | `1.02`     | Scroll-wheel zoom multiplier.                                                                                                  |
-| `max_zoom_percent`                              | `1000`     | Maximum zoom level, stored as percent.                                                                                         |
+### Long Strip and Masonry
 
-### Long Strip and Masonry settings
+| Key                                            | Default         | Meaning                                            |
+| ---------------------------------------------- | --------------- | -------------------------------------------------- |
+| `manga_drag_pan_speed`                         | `1.0`           | Drag-pan multiplier.                               |
+| `manga_wheel_impulse_per_step`                 | `2400.0`        | Velocity per wheel step.                           |
+| `manga_wheel_decay_rate`                       | `11.0`          | Wheel momentum decay.                              |
+| `manga_wheel_max_velocity`                     | `9000.0`        | Wheel velocity cap.                                |
+| `manga_wheel_edge_spring_hz`                   | `4.5`           | Edge overscroll return stiffness.                  |
+| `manga_inertial_friction`                      | `0.33`          | Keyboard / page / autoscroll friction.             |
+| `manga_arrow_scroll_speed`                     | `140`           | Base arrow-key pan distance.                       |
+| `masonry_items_per_row`                        | `5`             | Number of columns in Masonry.                      |
+| `manga_autoscroll_dead_zone_px`                | `14.0`          | Freehand autoscroll dead zone around the anchor.   |
+| `manga_autoscroll_base_speed_multiplier`       | `5.0`           | Base autoscroll speed multiplier.                  |
+| `manga_autoscroll_min_speed_multiplier`        | `0.6`           | Lower autoscroll speed bound.                      |
+| `manga_autoscroll_max_speed_multiplier`        | `14.0`          | Upper autoscroll speed bound.                      |
+| `manga_autoscroll_curve_power`                 | `2.0`           | Speed curve power from center to edge.             |
+| `manga_autoscroll_min_speed_px_per_sec`        | `80.0`          | Absolute minimum autoscroll speed.                 |
+| `manga_autoscroll_max_speed_px_per_sec`        | `14000.0`       | Absolute maximum autoscroll speed.                 |
 
-| Key                                            | Default         | Meaning                                                             |
-| ---------------------------------------------- | --------------- | ------------------------------------------------------------------- |
-| `manga_drag_pan_speed`                         | `1.0`           | Drag-pan multiplier for multi-item layouts.                         |
-| `manga_wheel_impulse_per_step`                 | `2400.0`        | Velocity injected per wheel step.                                   |
-| `manga_wheel_decay_rate`                       | `11.0`          | Exponential decay for free wheel momentum.                          |
-| `manga_wheel_max_velocity`                     | `9000.0`        | Cap on accumulated wheel velocity.                                  |
-| `manga_wheel_edge_spring_hz`                   | `4.5`           | Edge return stiffness for overscroll.                               |
-| `manga_inertial_friction`                      | `0.33`          | Inertial target friction for keyboard / page / autoscroll movement. |
-| `manga_arrow_scroll_speed`                     | `140`           | Base arrow-key pan distance.                                        |
-| `masonry_items_per_row`                        | `5`             | Number of columns in Masonry mode.                                  |
-| `manga_virtualization_backend`                 | `rtree`         | `auto`, `linear`, or `rtree`. Default is the R-tree path.           |
-| `manga_autoscroll_dead_zone_px`                | `14.0`          | Freehand autoscroll dead zone around the anchor.                    |
-| `manga_autoscroll_base_speed_multiplier`       | `5.0`           | Base autoscroll multiplier relative to arrow-scroll speed.          |
-| `manga_autoscroll_min_speed_multiplier`        | `0.6`           | Lower speed multiplier bound.                                       |
-| `manga_autoscroll_max_speed_multiplier`        | `14.0`          | Upper speed multiplier bound.                                       |
-| `manga_autoscroll_curve_power`                 | `2.0`           | Speed curve power from center to edge.                              |
-| `manga_autoscroll_min_speed_px_per_sec`        | `80.0`          | Absolute minimum autoscroll speed.                                  |
-| `manga_autoscroll_max_speed_px_per_sec`        | `14000.0`       | Absolute maximum autoscroll speed.                                  |
-| `manga_autoscroll_horizontal_speed_multiplier` | `1.0`           | Horizontal autoscroll multiplier.                                   |
-| `manga_autoscroll_vertical_speed_multiplier`   | `1.0`           | Vertical autoscroll multiplier.                                     |
-| `manga_autoscroll_circle_fill_alpha`           | `50`            | Fill alpha of the autoscroll anchor ring.                           |
-| `manga_autoscroll_arrow_rgb`                   | `140, 190, 255` | Arrow color for the autoscroll indicator.                           |
-| `manga_autoscroll_arrow_alpha`                 | `50`            | Arrow alpha for the autoscroll indicator.                           |
-
-### Video settings
+### Video
 
 | Key                       | Default    | Meaning                                                                                 |
 | ------------------------- | ---------- | --------------------------------------------------------------------------------------- |
-| `muted_by_default`        | `remember` | `true`, `false`, or `remember` (remember uses the persisted state from the last video). |
-| `default_volume`          | `remember` | Initial video volume (0.0 to 1.0) or `remember` to reuse the last stored volume.        |
-| `loop`                    | `true`     | Restart videos automatically at end-of-stream.                                          |
-| `seek_policy`             | `adaptive` | `adaptive`, `accurate`, or `keyframe`.                                                  |
-| `prefer_hardware_decode`  | `true`     | Prefer hardware decoders on Windows (D3D12/D3D11 when available).                       |
-| `disable_hardware_decode` | `false`    | Disable hardware decoders completely. Overrides `prefer_hardware_decode`.               |
-| `videos_only_navigation`  | `true`     | In video-like playback mode, next/previous skip non-video-like files when enabled.      |
+| `muted_by_default`        | `remember` | `true`, `false`, or `remember` (uses the last muted state).                             |
+| `default_volume`          | `remember` | Initial volume (0.0–1.0) or `remember`.                                                 |
+| `loop`                    | `true`     | Loop videos at end-of-stream.                                                           |
+| `seek_policy`             | `adaptive` | `adaptive` (keyframe while dragging, accurate on release), `accurate`, or `keyframe`.   |
+| `prefer_hardware_decode`  | `true`     | Prefer hardware decoders (D3D12 / D3D11).                                               |
+| `disable_hardware_decode` | `false`    | Force software decode. Overrides `prefer_hardware_decode`.                              |
+| `videos_only_navigation`  | `true`     | Skip non-video files when navigating in video-like playback mode.                       |
 
-### Persisted state
+### Performance
 
-These values are updated automatically and used when `muted_by_default` or `default_volume` are set to `remember`.
+| Key                           | Default | Meaning                                                   |
+| ----------------------------- | ------- | --------------------------------------------------------- |
+| `show_fps_update_interval_ms` | `500`   | Diagnostics overlay refresh cadence in milliseconds.      |
+| `use_hardware_acceleration`   | `true`  | Master switch for hardware-accelerated paths.             |
+| `enable_d3d12`                | `true`  | Prefer D3D12 decoders (falls back to D3D11).              |
+| `enable_cuda`                 | `true`  | Enable CUDA decoder preference where supported.           |
 
-| Key                   | Default | Meaning                             |
-| --------------------- | ------- | ----------------------------------- |
-| `muted_state`         | `true`  | Last muted state for video audio    |
-| `volume_state`        | `0.0`   | Last volume level for video audio   |
-| `show_breadcrumb_bar` | `true`  | Persisted breadcrumb bar visibility |
+### Quality
 
-### Performance settings
+| Key                             | Default    | Meaning                                                                           |
+| ------------------------------- | ---------- | --------------------------------------------------------------------------------- |
+| `downscale_filter`              | `lanczos3` | CPU resize filter for shrinking images.                                           |
+| `gif_resize_filter`             | `triangle` | CPU resize filter for GIF frames.                                                 |
+| `texture_filter_static`         | `linear`   | GPU texture filtering for static images.                                          |
+| `texture_filter_animated`       | `linear`   | GPU texture filtering for GIF / animated WebP.                                    |
+| `texture_filter_video`          | `linear`   | GPU texture filtering for video.                                                  |
+| `manga_mipmap_static`           | `true`     | Enable mipmaps for static textures in Long Strip / Masonry.                       |
+| `manga_mipmap_video_thumbnails` | `true`     | Enable mipmaps for video thumbnails in Long Strip / Masonry.                      |
+| `manga_mipmap_min_side`         | `128`      | Minimum texture side before mipmaps are generated.                                |
 
-| Key                           | Default | Meaning                                                             |
-| ----------------------------- | ------- | ------------------------------------------------------------------- |
-| `show_fps`                    | `false` | Enable the top-right FPS/diagnostics overlay.                       |
-| `show_fps_update_interval_ms` | `500`   | Refresh cadence for overlay FPS values in milliseconds.             |
-| `use_hardware_acceleration`   | `true`  | Master switch for hardware-accelerated paths where available.       |
-| `enable_d3d12`                | `true`  | Prefer GStreamer D3D12 decoders when available (fallback to D3D11). |
-| `enable_cuda`                 | `true`  | Enable CUDA decoder preference when runtime support is available.   |
-
-### Quality settings
-
-| Key                             | Default      | Meaning                                                                           |
-| ------------------------------- | ------------ | --------------------------------------------------------------------------------- |
-| `downscale_filter`              | `lanczos3`   | CPU resize filter for shrinking images.                                           |
-| `gif_resize_filter`             | `triangle`   | CPU resize filter for GIF frames. Uses a faster default for animation throughput. |
-| `texture_filter_static`         | `linear`     | GPU texture filtering for static images.                                          |
-| `texture_filter_animated`       | `linear`     | GPU texture filtering for GIF / animated WebP textures.                           |
-| `texture_filter_video`          | `linear`     | GPU texture filtering for video textures and video thumbnails.                    |
-| `manga_mipmap_static`           | `true`       | Enable mipmaps for static textures in Long Strip / Masonry.                       |
-| `manga_mipmap_video_thumbnails` | `true`       | Enable mipmaps for video first-frame thumbnails in Long Strip / Masonry.          |
-| `manga_mipmap_min_side`         | `128`        | Minimum texture side before mipmaps are generated.                                |
-
-Supported filter values:
+Supported values:
 
 - Scaling filters: `nearest`, `triangle`, `catmullrom`, `gaussian`, `lanczos3`
 - Texture filters: `nearest`, `linear`
-- Virtualization backends: `auto`, `linear`, `rtree`
 - Startup window modes: `floating`, `fullscreen`
 - Video seek policies: `adaptive`, `accurate`, `keyframe`
 
-## Performance Architecture
+## Diagnostics Overlay
 
-Performance here comes from layering several smaller systems: metadata-first opening, persistent metadata cache plus in-memory caches, latest-only async coordinators, bounded worker queues, R-tree viewport queries, LOD-bucketed texture requests, selective mipmaps, and adaptive upload/caching policy for Long Strip and Masonry.
+Enable with `show_fps = true`. The overlay appears in the top-right corner.
 
-For the full startup flow, module-by-module design, cache hierarchy, optimization catalogue, and third-party crate map, see [ARCHITECTURE.md](ARCHITECTURE.md).
+| Label         | Meaning                                               |
+| ------------- | ----------------------------------------------------- |
+| `FPS`         | Smoothed render FPS and last active-frame time.       |
+| `TTV p50/p95` | Time-to-visible for multi-item media.                 |
+| `U`           | Current upload batch limit.                           |
+| `L`           | Pending load requests (plus peak).                    |
+| `D`           | Pending decoded images (plus peak).                   |
+| `V`           | Visible item count (plus peak).                       |
+| `IDX H/M`     | Directory-index cache hits / misses.                  |
+| `DC H/M`      | Decoded-image cache hits / misses.                    |
+| `MC ...`      | Metadata-cache hits, misses, expirations, evictions.  |
+| `UP p95`      | Upload pass p95 latency.                              |
+| `QW p95`      | Decode queue-wait p95.                                |
+| `DEC p95`     | Decode worker p95.                                    |
+| `RSZ p95`     | Resize p95.                                           |
+| `UTX p95`     | Texture-upload p95.                                   |
+| `LY p95`      | Masonry layout rebuild p95.                           |
+| `SI p95`      | Spatial-index rebuild p95.                            |
+| `VQ p95`      | Visible-query p95.                                    |
+| `VQ R/L`      | R-tree vs linear visible-query counts.                |
+| `RR`          | Retry requests enqueued / rejected.                   |
+| `TS L/M/H`    | Low / mid / high target-side distribution.            |
 
-## Diagnostics and Benchmarks
+## Architecture
 
-### FPS / diagnostics overlay
-
-Set `show_fps = true` to enable the top-right overlay. Use `show_fps_update_interval_ms` to control refresh cadence; the overlay uses the primary monitor refresh rate when available.
-
-Useful labels:
-
-| Label         | Meaning                                                  |
-| ------------- | -------------------------------------------------------- |
-| `FPS`         | Smoothed render FPS and last active-frame time.          |
-| `TTV p50/p95` | Time to visible for multi-item media.                    |
-| `U`           | Current upload batch limit.                              |
-| `L`           | Pending load requests, plus peak.                        |
-| `D`           | Pending decoded images, plus peak.                       |
-| `V`           | Visible item count, plus peak.                           |
-| `IDX H/M`     | Directory-index cache hits / misses.                     |
-| `DC H/M`      | Decoded-image cache hits / misses.                       |
-| `MC ...`      | Metadata-cache hits, misses, expirations, and evictions. |
-| `UP p95`      | Upload pass p95.                                         |
-| `QW p95`      | Decode queue-wait p95.                                   |
-| `DEC p95`     | Decode worker p95.                                       |
-| `RSZ p95`     | Resize p95.                                              |
-| `UTX p95`     | Texture-upload p95.                                      |
-| `LY p95`      | Masonry layout rebuild p95.                              |
-| `SI p95`      | Spatial-index rebuild p95.                               |
-| `VQ p95`      | Visible-query p95.                                       |
-| `VQ R/L`      | R-tree vs linear visible-query counts.                   |
-| `DQ`          | Pending Masonry dimension updates.                       |
-| `DM`          | Decoded mailbox size.                                    |
-| `RR`          | Retry requests enqueued / rejected.                      |
-| `TS L/M/H`    | Low / mid / high target-side distribution.               |
-
-### Reproducible Masonry profiling checklist
-
-When comparing performance changes, keep the scenario fixed:
-
-1. Build a release binary.
-2. Enable `show_fps = true`.
-3. Open the same dense mixed-media folder for every run.
-4. Test the same `masonry_items_per_row` values, such as `3`, `5`, and `10`.
-5. Repeat the same gestures: slow wheel scroll, fast wheel scroll, scrollbar drag, and zoom changes.
-6. Record `FPS`, `TTV`, `UP p95`, `QW p95`, `DEC p95`, `RSZ p95`, `UTX p95`, `VQ p95`, `RR`, and `TS L/M/H`.
-
-That keeps branch-to-branch comparisons honest.
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the full design overview.
 
 ## Troubleshooting
 
 ### Video playback
 
-1. `Failed to create video pipeline` usually means the GStreamer playback elements were not found. Install the runtime and verify plugin discovery.
-2. If decode is unstable on your system, set `disable_hardware_decode = true`.
-3. If you want hardware decode but it is not being selected, keep `prefer_hardware_decode = true`, enable `enable_d3d12`/`enable_cuda` as needed, and verify a compatible Windows decoder is available.
-4. If the decode capability status shows unavailable, check the GStreamer runtime and GPU drivers, then restart the app to refresh plugin discovery.
-5. If the app was launched from an environment with a stale `PATH`, restart it after installing GStreamer so the refreshed environment and plugin registry can be rebuilt.
-6. If a hardware decoder hangs (playback stops delivering frames or loads time out with a "Timed out" error), the app demotes the offending decoder tier for the rest of the session and retries down to software decoding; restart the app to reset the demotion.
+1. `Failed to create video pipeline` — GStreamer playback plugins were not found. Install the runtime and restart the app.
+2. Unstable decode — try `disable_hardware_decode = true`.
+3. Hardware decode not being selected — keep `prefer_hardware_decode = true`, enable `enable_d3d12` / `enable_cuda`, and verify GPU drivers.
+4. Decode shows unavailable — check GStreamer runtime and GPU drivers, then restart.
+5. Stale `PATH` — restart the app after installing GStreamer so the refreshed environment and plugin registry are picked up.
+6. Hardware decoder hangs — the app demotes the offending tier automatically and retries with the next one down to software. Restart to reset demotion.
 
-### Config file issues
+### Config file
 
-1. Delete `config.ini` to regenerate the latest default template.
-2. If you are migrating from very old versions, legacy config file names are imported automatically.
-3. If a shortcut is interfering, set that action's value to an empty string to disable its default binding.
+1. Delete `config.ini` to regenerate the latest defaults.
+2. Legacy config file names (`rust-image-viewer-config.ini`, `setting.ini`) are migrated automatically.
+3. Set a shortcut value to empty to disable its default binding.
 
-### Cache issues
+### Cache
 
-1. If metadata seems stale, delete the metadata cache file in the app local-data directory (`%LOCALAPPDATA%\rust-image-viewer\metadata_cache.redb` on Windows). The app also resets the cache automatically when it detects an old schema or corruption.
-2. If you want to cap disk usage more aggressively, lower `metadata_cache_max_size_mb`.
+1. If metadata seems stale, delete `%LOCALAPPDATA%\rust-image-viewer\metadata_cache.redb`. The app also resets the cache automatically on schema changes or corruption.
+2. To cap disk usage, lower `metadata_cache_max_size_mb`.
 
 ### Crash logs
 
-If the app panics, a crash report is written to `%TEMP%\rust-image-viewer\panic.log` on Windows.
+Panic reports are written to `%TEMP%\rust-image-viewer\panic.log`.
 
 ### Build issues
 
-1. `pkg-config` errors usually mean `PKG_CONFIG_PATH` is not pointing at GStreamer's `pkgconfig` directory.
-2. Linker errors usually mean the GStreamer development package is missing.
+1. `pkg-config` errors — `PKG_CONFIG_PATH` is not pointing at GStreamer's `pkgconfig` directory.
+2. Linker errors — the GStreamer development package is missing.
 
 ## License
 
-MIT License. See [LICENSE](LICENSE) for details.
+MIT. See [LICENSE](LICENSE).
+
+Dependencies carry their own licences. [THIRD-PARTY.md](THIRD-PARTY.md) lists every dependency grouped by licence with copyright holders; full licence texts are in [`LICENSES/`](LICENSES/).
