@@ -161,7 +161,7 @@ Quick index of the hot entry points:
 | Where is next/prev decided? | `src/app/navigation.rs` |
 | Where is the solo texture uploaded? | `src/app/ui/texture.rs` (`update_texture`) |
 | Where is the solo image painted? | `src/app/ui/draw_image.rs` |
-| Where is the whole strip/masonry frame painted? | `src/app/manga/draw_item.rs` (`draw_manga_mode`), `src/app/manga/draw.rs` |
+| Where is the whole strip/masonry frame painted? | `src/app/manga/draw_item.rs` — `draw_manga_mode` and the per-tile `draw_manga_item` |
 | Where does a manga tile get decoded? | `src/manga_loader/decode.rs` + `.../coordinator.rs` |
 | Where is what-to-load-next decided? | `src/manga_loader/demand.rs` + `src/app/manga/demand.rs` |
 | Where are keyboard shortcuts mapped? | `src/app/input/bindings.rs`, `src/app/input/actions.rs`, `src/app/input/shortcuts.rs` |
