@@ -1161,16 +1161,27 @@ impl MangaLoader {
         })
     }
 
-    /// Indices in `visible_indices` still waiting on a gated video probe that the gate has already
-    /// blocked at least once. They are outstanding work (the tile shows a placeholder) but must
-    /// keep repainting until the backoff window opens, so the UI cannot settle on a static
-    /// placeholder with no wake-up scheduled.
-    pub fn probe_blocked_visible_indices(&self, visible_indices: &[usize]) -> Vec<usize> {
-        visible_indices
-            .iter()
-            .copied()
-            .filter(|idx| self.probe_blocked.contains_key(idx))
-            .collect()
+    /// True when any index in `visible_indices` is still waiting on a gated video probe the gate
+    /// already blocked at least once: outstanding work whose backoff window keeps the pump going.
+    /// A predicate, not a list: the frame loop asks this every frame.
+    pub fn any_probe_blocked_visible(&self, visible_indices: &[usize]) -> bool {
+        self.probe_blocked.is_empty()
+            || visible_indices
+                .iter()
+                .any(|idx| self.probe_blocked.contains_key(idx))
+    }
+
+    /// True while any index paces a video thumbnail attempt (gate backoff or a scheduled revive).
+    /// The hover acceleration is a no-op in that state alone, so the frame loop skips the pointer
+    /// hit test entirely when nothing is pacing.
+    pub fn video_thumbnail_pacing(&self, now: Instant) -> bool {
+        self.probe_blocked
+            .values()
+            .any(|state| now < state.next_probe_at)
+            || self
+                .video_revive
+                .values()
+                .any(|state| now < state.next_revive_at)
     }
 
     /// Number of cached dimensions for indices in `[0, total_len)`.
@@ -5049,7 +5060,8 @@ mod tests {
             !loader.retry_blocked(0),
             "gate misses are not the file's fault"
         );
-        assert_eq!(loader.probe_blocked_visible_indices(&[0]), vec![0]);
+        assert!(loader.any_probe_blocked_visible(&[0]));
+        assert!(!loader.any_probe_blocked_visible(&[1]));
         assert!(
             loader.demand_outstanding(&list, &[0], MAX_SIDE, TARGET_SIDE),
             "a gate-blocked tile must keep the pump pumping"

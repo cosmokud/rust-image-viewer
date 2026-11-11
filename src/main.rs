@@ -22003,8 +22003,7 @@ impl ImageViewer {
             let probe_blocked = self
                 .manga_loader
                 .as_ref()
-                .map(|loader| !loader.probe_blocked_visible_indices(indices).is_empty())
-                .unwrap_or(false);
+                .is_some_and(|loader| loader.any_probe_blocked_visible(indices));
             bookkeeping || missing || probe_blocked
         };
         self.manga_demand_outstanding = outstanding;
@@ -24973,9 +24972,16 @@ impl ImageViewer {
 
         // Hover is the demand signal for a video tile the loader gave up on: drop its revive
         // pacing and probe backoff so the very next preload pass re-opens the thumbnail budget.
-        // Scheduling only — see `manga_hover_accelerate_video_thumbnail`.
-        if let Some(hovered_idx) = self.hovered_manga_index_from_pointer(ctx) {
-            self.manga_hover_accelerate_video_thumbnail(hovered_idx);
+        // Scheduling only — see `manga_hover_accelerate_video_thumbnail`. Guarded by the pacing
+        // state: the pointer hit test is a spatial query the idle path must not pay for.
+        let pacing = self
+            .manga_loader
+            .as_ref()
+            .is_some_and(|loader| loader.video_thumbnail_pacing(Instant::now()));
+        if pacing {
+            if let Some(hovered_idx) = self.hovered_manga_index_from_pointer(ctx) {
+                self.manga_hover_accelerate_video_thumbnail(hovered_idx);
+            }
         }
 
         self.manga_placeholder_spinners_left = Self::MANGA_PLACEHOLDER_SPINNER_MAX_PER_FRAME;
