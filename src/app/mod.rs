@@ -1,6 +1,7 @@
 //! Application state and the pieces that must stay private to it.
 
 #![allow(unused_imports)]
+#![allow(unused_imports)]
 
 use crate::prelude::*;
 
@@ -1506,7 +1507,5 @@ impl Drop for ImageViewer {
         }
     }
 }
-#[allow(unused_imports)]
 pub(crate) use app_loop::*;
-#[allow(unused_imports)]
 pub(crate) use bootstrap::*;

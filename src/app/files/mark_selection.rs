@@ -100,4 +100,10 @@ impl ImageViewer {
             self.masonry_runtime_cache_signature = self.image_list_signature;
         }
     }
+
+    pub(crate) fn mark_selection_preview_contains(&self, index: usize) -> bool {
+        self.mark_selection_box
+            .as_ref()
+            .is_some_and(|selection| selection.preview_indices.contains(&index))
+    }
 }
