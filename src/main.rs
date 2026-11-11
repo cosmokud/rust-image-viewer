@@ -2,7 +2,8 @@
 //! Built with Rust + egui (eframe) + GStreamer
 //!
 //! This file only wires the crate together: module declarations, the global
-//! allocator and `main()`. Everything else lives in [`app`].
+//! allocator, and the re-exports the crate root provides (`main()` is
+//! [`app::bootstrap::main`]). Everything else lives in [`app`].
 
 #![windows_subsystem = "windows"]
 
@@ -10,8 +11,6 @@ mod app;
 mod prelude;
 
 pub(crate) use app::*;
-
-use prelude::*;
 
 mod app_dirs;
 
