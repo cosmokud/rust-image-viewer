@@ -3235,7 +3235,11 @@ impl MangaLoader {
     fn video_revive_due(&self, index: usize, now: Instant) -> bool {
         match self.video_revive.get(&index) {
             None => true,
-            Some(state) => now >= state.next_revive_at,
+            // Bounded: once every revive is granted the tile settles, so a video that genuinely
+            // has no decodable first frame stops costing a decode every interval.
+            Some(state) => {
+                state.revives < VIDEO_THUMBNAIL_REVIVE_MAX && now >= state.next_revive_at
+            }
         }
     }
 
@@ -3284,6 +3288,9 @@ impl MangaLoader {
 
     /// Re-open the spent thumbnail budget of every video in the window whose revive window has
     /// elapsed. Images are untouched: their ceiling means the file is broken.
+    ///
+    /// This is the only path that needs a schedule at all — a visible video tile is therefore
+    /// re-opened by the frame loop alone, with no hover, no click and no file change.
     fn revive_spent_video_thumbnails(&mut self, image_list: &[PathBuf], start: usize, end: usize) {
         let now = Instant::now();
         let due: Vec<usize> = {
@@ -3304,15 +3311,25 @@ impl MangaLoader {
         };
 
         for index in due {
-            self.video_revive
-                .entry(index)
-                .or_insert_with(|| VideoReviveState {
-                    revives: 0,
-                    next_revive_at: now,
-                })
-                .note_revive(now);
-            self.rearm_index(index);
+            self.grant_video_revive(index, now);
         }
+    }
+
+    /// Grant one revive: count it (widening the next window) and re-open the budget. Returns
+    /// `false` when the tile has already spent every revive, so callers cannot re-open it again.
+    fn grant_video_revive(&mut self, index: usize, now: Instant) -> bool {
+        if !self.video_revive_due(index, now) {
+            return false;
+        }
+        self.video_revive
+            .entry(index)
+            .or_insert_with(|| VideoReviveState {
+                revives: 0,
+                next_revive_at: now,
+            })
+            .note_revive(now);
+        self.rearm_index(index);
+        true
     }
 
     /// Drop every memo that makes `index` look settled: retry ceiling, in-flight/loaded levels,
@@ -3434,10 +3451,9 @@ impl MangaLoader {
                 .image_list
                 .get(request.index)
                 .is_some_and(|path| is_supported_video(path));
-            if !is_video || !self.video_revive_due(request.index, Instant::now()) {
+            if !is_video || !self.grant_video_revive(request.index, Instant::now()) {
                 return false;
             }
-            self.rearm_index(request.index);
         }
 
         match request.repair {
