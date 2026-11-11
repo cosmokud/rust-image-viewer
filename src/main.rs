@@ -21993,17 +21993,39 @@ impl ImageViewer {
             // placeholder (level set by a decode that never reached the GPU). The texture cache
             // is the only truth for what is actually drawn.
             let missing = self.manga_repair_visible_textures(indices);
-            // A video waiting out its gate-miss backoff is outstanding work even though every
-            // retry gate refuses it: without this the frame loop stops pumping and the tile
-            // settles on a static placeholder, which is what made it look permanently stuck.
-            let probe_blocked = self
+            // A video tile the gate already blocked counts as outstanding only once its backoff
+            // has elapsed: it is issuable then, so the pump must run. During the window its wake-up
+            // is scheduled instead (see `manga_probe_blocked_wake`), which is what keeps a blocked
+            // screen parked instead of repainting a full frame for the whole backoff.
+            let probe_due = self
                 .manga_loader
                 .as_ref()
-                .is_some_and(|loader| loader.any_probe_blocked_visible(indices));
-            bookkeeping || missing || probe_blocked
+                .and_then(|loader| loader.probe_blocked_visible_wake(indices, Instant::now()))
+                .is_some_and(|remaining| remaining.is_zero());
+            bookkeeping || missing || probe_due
         };
         self.manga_demand_outstanding = outstanding;
         outstanding
+    }
+
+    /// Soonest wake-up a gate-blocked visible tile needs; `None` when nothing is pacing one.
+    fn manga_probe_blocked_wake(&mut self) -> Option<Duration> {
+        if self.mode().is_solo() || self.image_list.is_empty() {
+            return None;
+        }
+        // Nothing pacing (the common case) must cost no spatial query at all.
+        let now = Instant::now();
+        let pacing = self
+            .manga_loader
+            .as_ref()
+            .is_some_and(|loader| loader.probe_gate_pacing(now));
+        if !pacing {
+            return None;
+        }
+        let visible = self.manga_collect_visible_indices();
+        self.manga_loader
+            .as_ref()
+            .and_then(|loader| loader.probe_blocked_visible_wake(&visible, now))
     }
 
     /// A visible tile needs repair when it renders from no cached texture and the loader has not
@@ -32518,6 +32540,14 @@ impl eframe::App for ImageViewer {
 
             if let Some(delay) = cursor_idle_repaint_after {
                 schedule_min(delay);
+            }
+
+            // A gate-blocked tile wakes exactly when its probe becomes issuable; a full-frame
+            // pump across the whole backoff window was pure repaint cost.
+            if self.mode().is_manga() {
+                if let Some(wake) = self.manga_probe_blocked_wake() {
+                    schedule_min(wake);
+                }
             }
 
             // Watchdog: outstanding demand with zero in-flight work must keep waking the pump.

@@ -1162,16 +1162,34 @@ impl MangaLoader {
         })
     }
 
-    /// True when any index in `visible_indices` is still waiting on a gated video probe the gate
-    /// already blocked at least once: outstanding work whose backoff window keeps the pump going.
-    /// A predicate, not a list: the frame loop asks this every frame.
-    pub fn any_probe_blocked_visible(&self, visible_indices: &[usize]) -> bool {
-        // Empty map means nothing is pacing: the answer is `false`, or the frame loop would keep
-        // pumping 250ms wake-ups on a fully settled screen for the whole session.
-        !self.probe_blocked.is_empty()
-            && visible_indices
-                .iter()
-                .any(|idx| self.probe_blocked.contains_key(idx))
+    /// Cheap "is any tile pacing the gate at all" probe: one map scan, no visible-set work, so the
+    /// idle frame path can skip the spatial query entirely.
+    pub fn probe_gate_pacing(&self, now: Instant) -> bool {
+        self.probe_blocked
+            .values()
+            .any(|state| now < state.next_probe_at)
+    }
+
+    /// Remaining backoff of the soonest-usable visible tile the gate already blocked, `ZERO` when
+    /// one is usable right now. `None` when no visible tile is gate-blocked.
+    ///
+    /// The remaining time is the whole reason this returns a duration: the frame loop parks
+    /// between attempts and wakes exactly when the next one becomes issuable, instead of pumping
+    /// a full-frame repaint for the whole backoff window.
+    pub fn probe_blocked_visible_wake(
+        &self,
+        visible_indices: &[usize],
+        now: Instant,
+    ) -> Option<Duration> {
+        // Empty map (the common case) costs one load and no scan.
+        if self.probe_blocked.is_empty() {
+            return None;
+        }
+        visible_indices
+            .iter()
+            .filter_map(|idx| self.probe_blocked.get(idx))
+            .map(|state| state.next_probe_at.saturating_duration_since(now))
+            .min()
     }
 
     /// True while the probe gate paces a video attempt. Hover is only worth a pointer hit test
@@ -5078,13 +5096,22 @@ mod tests {
             !loader.retry_blocked(0),
             "gate misses are not the file's fault"
         );
-        assert!(loader.any_probe_blocked_visible(&[0]));
-        assert!(!loader.any_probe_blocked_visible(&[1]));
+        assert!(loader
+            .probe_blocked_visible_wake(&[0], Instant::now())
+            .is_some());
+        assert!(
+            loader
+                .probe_blocked_visible_wake(&[1], Instant::now())
+                .is_none(),
+            "an index that is not gate-blocked is not waiting on the gate"
+        );
 
         // Nothing pacing at all: the frame loop must be able to park, or every settled screen
         // keeps its 250ms wake-up for the session.
         let settled = MangaLoader::without_workers();
-        assert!(!settled.any_probe_blocked_visible(&[0, 1, 2]));
+        assert!(settled
+            .probe_blocked_visible_wake(&[0, 1, 2], Instant::now())
+            .is_none());
         assert!(
             loader.demand_outstanding(&list, &[0], MAX_SIDE, TARGET_SIDE),
             "a gate-blocked tile must keep the pump pumping"
