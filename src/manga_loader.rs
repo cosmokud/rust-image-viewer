@@ -1156,8 +1156,9 @@ impl MangaLoader {
                 return true;
             }
             // A video thumbnail budget re-opens on a schedule, so its visible tile is still
-            // outstanding work; an image at the ceiling lets the app go idle.
-            self.video_thumbnail_revive_pending(idx, path)
+            // outstanding work; an image at the ceiling lets the app go idle. `spent` is passed
+            // in: re-reading the retry lock under the one held above can self-deadlock.
+            self.video_thumbnail_revive_pending_state(idx, path, spent)
         })
     }
 
@@ -3241,18 +3242,16 @@ impl MangaLoader {
     /// True while a visible video tile still has thumbnail work scheduled: a spent budget a
     /// revive will re-open, or a gate backoff that paces the probe. Its placeholder is honest
     /// waiting work, so the pump may keep running; an image at the ceiling has none.
-    fn video_thumbnail_revive_pending(&self, index: usize, path: &Path) -> bool {
+    ///
+    /// `spent` is passed in because the only live caller already holds the retry state: re-reading
+    /// that lock from here would self-deadlock.
+    fn video_thumbnail_revive_pending_state(&self, index: usize, path: &Path, spent: bool) -> bool {
         if !is_supported_video(path) {
             return false;
         }
         if self.probe_blocked.contains_key(&index) {
             return true;
         }
-        let spent = self
-            .retry_state
-            .read()
-            .get(&index)
-            .is_some_and(|state| state.attempts >= PRELOAD_RETRY_MAX_ATTEMPTS);
         spent
             && self
                 .video_revive
@@ -5124,7 +5123,11 @@ mod tests {
         }
         assert!(loader.retry_blocked(0));
         assert!(
-            loader.video_thumbnail_revive_pending(0, Path::new("clip0001.mp4")),
+            loader.video_thumbnail_revive_pending_state(
+                0,
+                Path::new("clip0001.mp4"),
+                loader.retry_blocked(0)
+            ),
             "a spent video budget is waiting work, not a settled failure"
         );
         // The visible tile keeps the pump running while it waits.
@@ -5157,7 +5160,11 @@ mod tests {
         for _ in 0..PRELOAD_RETRY_MAX_ATTEMPTS {
             loader.register_upload_failure(0, Path::new("clip0001.mp4"));
         }
-        assert!(!loader.video_thumbnail_revive_pending(0, Path::new("clip0001.mp4")));
+        assert!(!loader.video_thumbnail_revive_pending_state(
+            0,
+            Path::new("clip0001.mp4"),
+            loader.retry_blocked(0)
+        ));
         loader.demand(&demand(&list, &[0], &[], 0, MangaLayoutMode::Masonry));
         assert!(loader.retry_blocked(0), "exhausted revives settle the tile");
     }
