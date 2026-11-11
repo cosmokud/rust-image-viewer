@@ -22868,15 +22868,15 @@ impl ImageViewer {
                 // none. Counting it again here halved the budget towards a permanent
                 // placeholder, so the upload-side count is only kept for payloads the loader
                 // handled as failures itself.
-                let deferred_by_gate = decoded.deferred;
                 let exhausted = self
                     .manga_loader
                     .as_mut()
                     .map(|loader| {
-                        if deferred_by_gate {
+                        // Only the gate miss is counted here: `publish_one` already spent the
+                        // attempt of a payload the decode genuinely failed to produce, so
+                        // counting again cut the budget to under two real failures.
+                        if decoded.deferred {
                             loader.note_probe_blocked(decoded.index);
-                        } else {
-                            loader.register_upload_failure(decoded.index, decoded.path.as_path());
                         }
                         loader.retry_blocked(decoded.index)
                     })
