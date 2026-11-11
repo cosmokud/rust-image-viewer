@@ -3339,6 +3339,17 @@ impl MangaLoader {
     /// This is the only path that needs a schedule at all — a visible video tile is therefore
     /// re-opened by the frame loop alone, with no hover, no click and no file change.
     fn revive_spent_video_thumbnails(&mut self, image_list: &[PathBuf], start: usize, end: usize) {
+        // One lock over the retry map, which only holds failed indices: the common healthy pass
+        // must not walk a window of a few hundred entries for a state that cannot exist.
+        if !self
+            .retry_state
+            .read()
+            .values()
+            .any(|state| state.attempts >= PRELOAD_RETRY_MAX_ATTEMPTS)
+        {
+            return;
+        }
+
         let now = Instant::now();
         let due: Vec<usize> = {
             let retry = self.retry_state.read();
