@@ -1166,8 +1166,10 @@ impl MangaLoader {
     /// already blocked at least once: outstanding work whose backoff window keeps the pump going.
     /// A predicate, not a list: the frame loop asks this every frame.
     pub fn any_probe_blocked_visible(&self, visible_indices: &[usize]) -> bool {
-        self.probe_blocked.is_empty()
-            || visible_indices
+        // Empty map means nothing is pacing: the answer is `false`, or the frame loop would keep
+        // pumping 250ms wake-ups on a fully settled screen for the whole session.
+        !self.probe_blocked.is_empty()
+            && visible_indices
                 .iter()
                 .any(|idx| self.probe_blocked.contains_key(idx))
     }
@@ -5082,6 +5084,11 @@ mod tests {
         );
         assert!(loader.any_probe_blocked_visible(&[0]));
         assert!(!loader.any_probe_blocked_visible(&[1]));
+
+        // Nothing pacing at all: the frame loop must be able to park, or every settled screen
+        // keeps its 250ms wake-up for the session.
+        let settled = MangaLoader::without_workers();
+        assert!(!settled.any_probe_blocked_visible(&[0, 1, 2]));
         assert!(
             loader.demand_outstanding(&list, &[0], MAX_SIDE, TARGET_SIDE),
             "a gate-blocked tile must keep the pump pumping"
