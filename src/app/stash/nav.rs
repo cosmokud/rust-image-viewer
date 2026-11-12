@@ -1,7 +1,8 @@
 //! Keyboard navigation across the stash grid.
 //!
 //! Left/Right walk the flat order, Up/Down jump one row at a time, Page Up/Page Down jump one
-//! visible screen, Home/End go to the first and last file.
+//! visible screen, Home/End go to the first and last file, Enter opens the selection in the
+//! viewer and Delete drops it from the stash.
 
 #![allow(unused_imports)]
 
@@ -33,6 +34,8 @@ impl ImageViewer {
 
         let mut target = current;
         let mut moved = false;
+        let mut open_selected = false;
+        let mut remove_selected = false;
         ctx.input(|input| {
             if input.key_pressed(egui::Key::ArrowRight) {
                 target += 1;
@@ -66,7 +69,29 @@ impl ImageViewer {
                 target = last;
                 moved = true;
             }
+            if input.key_pressed(egui::Key::Enter) {
+                open_selected = true;
+            }
+            if input.key_pressed(egui::Key::Delete) {
+                remove_selected = true;
+            }
         });
+
+        if open_selected {
+            if let Some(path) = self.stash.selected.clone() {
+                self.prepare_single_instance_media_handoff(ctx);
+                self.load_media(&path);
+                ctx.request_repaint();
+            }
+            return;
+        }
+
+        if remove_selected {
+            if let Some(path) = self.stash.selected.clone() {
+                self.remove_path_from_stash(&path);
+            }
+            return;
+        }
 
         if !moved {
             return;

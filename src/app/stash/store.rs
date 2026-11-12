@@ -187,6 +187,41 @@ impl ImageViewer {
         }
     }
 
+    /// Drops one entry, keeps the grid selection on the tile that took its place, and rewrites
+    /// the file. Unmarking is deliberately not involved: the mark is the session selection.
+    pub(crate) fn remove_path_from_stash(&mut self, path: &Path) {
+        if self.stash.entries.remove(path).is_none() {
+            return;
+        }
+        self.modal_thumbnail_cache.remove(&path.to_path_buf());
+        if self.stash.preview.requested_path.as_deref() == Some(path) {
+            self.stash.preview.clear();
+        }
+
+        let removed_index = self
+            .stash
+            .layout
+            .paths
+            .iter()
+            .position(|candidate| candidate == path);
+        let remaining: Vec<PathBuf> = self
+            .stash
+            .layout
+            .paths
+            .iter()
+            .filter(|candidate| candidate.as_path() != path)
+            .cloned()
+            .collect();
+        self.stash.selected = removed_index.and_then(|index| {
+            remaining
+                .get(index.min(remaining.len().saturating_sub(1)))
+                .cloned()
+        });
+        self.stash.scroll_to_selection = self.stash.selected.is_some();
+
+        self.save_stash();
+    }
+
     /// Keeps the stash entry across a rename, preserving dimensions already captured.
     pub(crate) fn stash_rename_path(&mut self, original: &Path, new: &Path) -> bool {
         let Some(previous) = self.stash.entries.remove(original) else {
