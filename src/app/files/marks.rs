@@ -75,10 +75,6 @@ impl ImageViewer {
         }
     }
 
-    pub(crate) fn has_marked_files(&self) -> bool {
-        !self.marked_files.is_empty()
-    }
-
     /// True while the settings window is open. The window is detached from the viewer, so this
     /// only reports its lifetime: it never gates viewer input.
     pub(crate) fn settings_modal_open(&self) -> bool {
@@ -89,18 +85,12 @@ impl ImageViewer {
         self.rename_overlay.is_some()
             || self.pending_single_delete_target.is_some()
             || !self.pending_marked_delete_targets.is_empty()
-            || self.pending_exit_confirmation
     }
 
+    /// Marks and the stash survive an exit, so nothing here asks the user to confirm.
     pub(crate) fn request_app_exit(&mut self) {
-        if self.has_marked_files() {
-            self.pending_exit_confirmation = true;
-            self.file_action_menu = None;
-            self.show_controls = true;
-            self.controls_show_time = Instant::now();
-        } else {
-            self.begin_fast_app_exit();
-        }
+        self.file_action_menu = None;
+        self.begin_fast_app_exit();
     }
 
     pub(crate) fn prepared_clipboard_operation_for_path(
@@ -400,7 +390,6 @@ impl ImageViewer {
         self.rename_overlay = None;
         self.pending_single_delete_target = None;
         self.pending_marked_delete_targets.clear();
-        self.pending_exit_confirmation = false;
         self.modal_thumbnail_cache.clear();
 
         if self.mode().is_manga() {

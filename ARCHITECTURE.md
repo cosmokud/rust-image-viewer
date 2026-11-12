@@ -143,8 +143,8 @@ src/app/
 | `masonry/` | 2 | authoritative dimension bookkeeping + folder metadata snapshots |
 | `window/` | 11 | layout application, display lookup, window rects, fullscreen transitions, dragging, autosize, title text, startup visibility, monitor queries |
 | `settings/` | 8 | settings window values/actions/widgets/rows/presets/tabs/modal |
-| `stash/` | 4 | the Stash window: gallery, hover video preview, details column, on-disk stash (`stash.tsv`) |
-| `dialogs/` | 5 | delete/rename/exit modals, modal thumbnails and preview |
+| `stash/` | 5 | the Stash window: gallery, keyboard navigation, hover video preview, details column, on-disk stash (`stash.tsv`) |
+| `dialogs/` | 5 | delete/rename modals, modal thumbnails and preview |
 | `help/` | 3 | shortcut help labels and the Help tab |
 | `diagnostics/` | 3 | FPS sampling, per-frame diag stats (the overlay itself is in `ui/`) |
 | `fullscreen/` | 4 | per-image view memory, rotation/flip state, Long Strip reset |
@@ -277,7 +277,7 @@ double-click timing, and issues the first `load_image` / `load_media_internal`.
     fullscreen entry is already pending.
 11. **Draw** (`note_stage("draw")`): `draw_image`, then overlays in fixed order — video controls,
     manga video controls, manga zoom bar and toggle, FPS overlay, file action context menu,
-    delete/rename/exit modals, settings window, help.
+    delete/rename modals, settings window, help.
 12. **Repaint schedule** (`note_stage("schedule")`): 0 ms while animating, 7 ms under masonry
     navigation, 16 ms while placeholders/queues are live, slower for background decode, a
     deadline for a timed UI auto-hide, and a long idle wait otherwise. The event loop still wakes

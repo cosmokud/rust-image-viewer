@@ -286,6 +286,14 @@ pub(crate) fn stash_window_size(screen: egui::Rect) -> egui::Vec2 {
     egui::vec2(width, height)
 }
 
+/// Grid metrics recorded while the stash gallery draws, so the keyboard can move around it.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct StashGalleryLayout {
+    pub(crate) paths: Vec<PathBuf>,
+    pub(crate) columns: usize,
+    pub(crate) rows_visible: usize,
+}
+
 /// The Stash dialog: a gallery over the marked files, plus one optional details column.
 pub(crate) struct StashState {
     pub(crate) open: bool,
@@ -296,6 +304,10 @@ pub(crate) struct StashState {
     /// Everything in the stash, persisted in `<config dir>/stash.tsv`.
     pub(crate) entries: HashMap<PathBuf, StashEntry>,
     pub(crate) selected: Option<PathBuf>,
+    /// Last drawn grid, read by the keyboard handler on the next frame.
+    pub(crate) layout: StashGalleryLayout,
+    /// Set by the keyboard handler: the next draw scrolls the selected tile into view.
+    pub(crate) scroll_to_selection: bool,
     pub(crate) details_open: bool,
     /// Tile currently under the pointer. Drives the hover video preview.
     pub(crate) hovered: Option<PathBuf>,
@@ -311,6 +323,8 @@ impl Default for StashState {
             search: String::new(),
             entries: HashMap::new(),
             selected: None,
+            layout: StashGalleryLayout::default(),
+            scroll_to_selection: false,
             details_open: false,
             hovered: None,
             preview: StashVideoPreview::default(),

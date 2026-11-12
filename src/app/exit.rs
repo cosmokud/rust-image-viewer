@@ -10,10 +10,7 @@ impl ImageViewer {
         &self,
         viewport_close_requested: bool,
     ) -> bool {
-        self.should_exit
-            || (viewport_close_requested
-                && !self.pending_exit_confirmation
-                && !self.has_marked_files())
+        self.should_exit || viewport_close_requested
     }
 
     pub(crate) fn begin_fast_app_exit(&mut self) {

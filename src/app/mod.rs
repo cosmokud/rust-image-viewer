@@ -190,8 +190,6 @@ pub(crate) struct ImageViewer {
     pub(crate) pending_single_delete_target: Option<PathBuf>,
     /// Delete-confirmation target for marked-file actions.
     pub(crate) pending_marked_delete_targets: Vec<PathBuf>,
-    /// Whether an exit confirmation modal is waiting on user input because marks remain.
-    pub(crate) pending_exit_confirmation: bool,
     /// Settings dialog state: every preset setting, the preset list and the help page.
     pub(crate) settings: SettingsModal,
     /// Stash dialog state: the gallery over marked files.
@@ -964,7 +962,6 @@ impl Default for ImageViewer {
             mark_selection_box: None,
             pending_single_delete_target: None,
             pending_marked_delete_targets: Vec::new(),
-            pending_exit_confirmation: false,
             settings: SettingsModal::default(),
             stash: StashState::default(),
             paste_shortcut_ctrl_v_was_down: false,

@@ -21,14 +21,7 @@ impl eframe::App for ImageViewer {
 
         let viewport_close_requested = ctx.input(|input| input.viewport().close_requested());
         if viewport_close_requested {
-            if self.pending_exit_confirmation || self.has_marked_files() {
-                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                if !self.pending_exit_confirmation {
-                    self.request_app_exit();
-                }
-            } else {
-                self.begin_fast_app_exit();
-            }
+            self.request_app_exit();
         }
         if self.should_short_circuit_frame_for_exit(viewport_close_requested) {
             Self::send_fast_close_viewport_commands(ctx);
@@ -542,7 +535,6 @@ impl eframe::App for ImageViewer {
             self.draw_file_action_context_menu(ctx);
             self.draw_delete_confirmation_modal(ctx);
             self.draw_rename_modal(ctx);
-            self.draw_exit_confirmation_modal(ctx);
             self.draw_settings_modal(ctx);
             self.draw_stash_modal(ctx);
         }

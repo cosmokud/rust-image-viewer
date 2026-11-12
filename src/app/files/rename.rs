@@ -37,7 +37,6 @@ impl ImageViewer {
             just_opened: true,
         });
         self.file_action_menu = None;
-        self.pending_exit_confirmation = false;
         self.show_controls = true;
         self.controls_show_time = Instant::now();
     }

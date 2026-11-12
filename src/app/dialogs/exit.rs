@@ -1,4 +1,4 @@
-//! Exit confirmation modal.
+//! Human-readable names for the keys shown in the shortcut help.
 
 #![allow(unused_imports)]
 

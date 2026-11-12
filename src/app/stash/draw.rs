@@ -11,6 +11,11 @@ pub(crate) const STASH_GALLERY_COLUMN_MIN: f32 = 168.0;
 /// Width of the details column spawned by the command bar button.
 pub(crate) const STASH_DETAILS_WIDTH: f32 = 300.0;
 
+/// Space kept for the gallery scrollbar. It is subtracted whether or not the bar is visible:
+/// letting the bar's presence change the column count made the grid flip back and forth while
+/// the window was being resized from the left/right edges.
+pub(crate) const STASH_SCROLLBAR_ALLOWANCE: f32 = 10.0;
+
 impl ImageViewer {
     pub(crate) fn draw_stash_modal(&mut self, ctx: &egui::Context) {
         if !self.stash.open {
@@ -65,6 +70,7 @@ impl ImageViewer {
             // The preview player belongs to this window: its frames are uploaded for this
             // viewport's frame, so it is polled and drawn from inside the callback.
             self.stash.hovered = None;
+            self.handle_stash_keyboard(ctx);
             self.update_stash_video_preview(ctx);
 
             egui::CentralPanel::default()
@@ -183,25 +189,53 @@ impl ImageViewer {
         }
 
         let gap = 12.0_f32;
+        // The grid is computed from the allocated width before the scroll area runs, so the
+        // column count only follows the window, never the scrollbar or a mid-resize repaint.
+        let width = (ui.available_width() - STASH_SCROLLBAR_ALLOWANCE)
+            .max(64.0)
+            .floor();
+        let columns = (((width + gap) / (STASH_GALLERY_COLUMN_MIN + gap)).floor() as usize).max(1);
+        let tile = ((width - gap * columns.saturating_sub(1) as f32) / columns as f32).max(48.0);
+        let viewport_height = ui.available_height().max(64.0);
+        let rows_visible = ((viewport_height + gap) / (tile + gap)).floor().max(1.0) as usize;
+        self.stash.layout = StashGalleryLayout {
+            paths: paths.to_vec(),
+            columns,
+            rows_visible,
+        };
+
         // Fresh decodes are capped per frame so a folder of large stills cannot stall the window.
         let mut thumbnail_budget = 3usize;
+        let mut selected_rect = None;
         egui::ScrollArea::vertical()
             .id_salt("stash_gallery")
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                let width = ui.available_width();
-                let columns =
-                    (((width + gap) / (STASH_GALLERY_COLUMN_MIN + gap)).floor() as usize).max(1);
-                let tile =
-                    ((width - gap * columns.saturating_sub(1) as f32) / columns as f32).max(48.0);
                 for row in paths.chunks(columns) {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = gap;
                         for path in row {
-                            self.draw_stash_tile(ui, ctx, path, tile, &mut thumbnail_budget);
+                            let tile_rect =
+                                self.draw_stash_tile(ui, ctx, path, tile, &mut thumbnail_budget);
+                            if self
+                                .stash
+                                .selected
+                                .as_ref()
+                                .is_some_and(|selected| selected == path)
+                            {
+                                selected_rect = Some(tile_rect);
+                            }
                         }
                     });
                     ui.add_space(gap);
+                }
+
+                if self.stash.scroll_to_selection {
+                    if let Some(rect) = selected_rect {
+                        ui.scroll_to_rect(rect, Some(egui::Align::Center));
+                    }
+                    self.stash.scroll_to_selection = false;
                 }
             });
     }
@@ -214,7 +248,7 @@ impl ImageViewer {
         path: &PathBuf,
         side: f32,
         thumbnail_budget: &mut usize,
-    ) {
+    ) -> egui::Rect {
         let (rect, response) = ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::click());
         if response.hovered() {
             self.stash.hovered = Some(path.clone());
@@ -223,7 +257,7 @@ impl ImageViewer {
             self.stash.selected = Some(path.clone());
         }
         if !ui.is_rect_visible(rect) {
-            return;
+            return rect;
         }
 
         let selected = self
@@ -315,6 +349,8 @@ impl ImageViewer {
         if !self.stash.details_open && response.hovered() {
             self.draw_stash_tile_tooltip(response, path);
         }
+
+        rect
     }
 
     /// Hover card: name, size/dimension chips, then the whole path and the extension.
