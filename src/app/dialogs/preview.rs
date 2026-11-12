@@ -107,16 +107,20 @@ impl ImageViewer {
             .rounding(12.0)
             .inner_margin(egui::Margin::same(1.0))
             .show(ui, |ui| {
+                // The card is a row, not a chip: it spans the dialog's full width.
+                ui.set_min_width(ui.available_width());
                 egui::Frame::none()
                     .fill(UI_WINDOW)
                     .rounding(11.0)
                     .inner_margin(egui::Margin::same(11.0))
                     .show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
                         ui.horizontal(|ui| {
                             self.draw_modal_thumbnail_preview(ui, ctx, &item.path);
                             ui.add_space(12.0);
                             ui.vertical(|ui| {
                                 ui.set_min_height(84.0);
+                                ui.set_min_width(ui.available_width());
                                 match draft_name {
                                     Some(draft_name) => {
                                         let response = ui.add(

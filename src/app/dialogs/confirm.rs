@@ -98,6 +98,11 @@ impl ImageViewer {
         );
         self.rename_dialog_place_frames = place_frames;
 
+        // Typed edits live in the local clone while the window draws, so they are stored back
+        // every frame: a text field must keep what the user types, and `just_opened` has to
+        // clear or the first field would steal focus back on every pass.
+        self.rename_overlay = Some(edited_state);
+
         let Some(choice) = choice else {
             return;
         };
@@ -109,7 +114,6 @@ impl ImageViewer {
             }
             DialogChoice::Confirm => {
                 // A rejected rename keeps the window open with its error message on screen.
-                self.rename_overlay = Some(edited_state);
                 self.commit_inline_rename();
                 if self.rename_overlay.is_none() {
                     ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Close);
