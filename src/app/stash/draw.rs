@@ -1,17 +1,14 @@
-//! Stash window: caption, command bar, square gallery and the details column.
+//! Stash window: its own native viewport, with a command bar, square gallery and details column.
 
 #![allow(unused_imports)]
 
 use crate::app::*;
 use crate::prelude::*;
 
-/// Height of the caption strip, the command bar and the divider together.
-pub(crate) const STASH_CHROME_HEIGHT: f32 = 108.0;
-
 /// Narrowest gallery column, so the tile count follows the window width.
 pub(crate) const STASH_GALLERY_COLUMN_MIN: f32 = 168.0;
 
-/// Width of the details column spawned by the caption button.
+/// Width of the details column spawned by the command bar button.
 pub(crate) const STASH_DETAILS_WIDTH: f32 = 300.0;
 
 impl ImageViewer {
@@ -19,200 +16,158 @@ impl ImageViewer {
         if !self.stash.open {
             return;
         }
-        // Repopulated by the tiles that are actually drawn this frame.
-        self.stash.hovered = None;
 
-        let screen = ctx.screen_rect();
-        let window_size = egui::vec2(
-            (screen.width() - 120.0).clamp(520.0, 1180.0),
-            (screen.height() - 120.0).clamp(320.0, 820.0),
-        );
-        let window_pos = screen.center() - window_size * 0.5;
-        let mut close = ctx.input(|input| input.key_pressed(egui::Key::Escape));
+        let screen = match self.stash.screen {
+            Some(screen) => screen,
+            None => {
+                let screen = settings_screen_rect(ctx);
+                self.stash.screen = Some(screen);
+                screen
+            }
+        };
+        let window_size = stash_window_size(screen);
+        // Only an approximation: the outer size also carries the native title bar, so the exact
+        // centering is re-sent once the window reports its real outer rectangle.
+        let initial_position = screen.center() - (window_size + egui::vec2(0.0, 34.0)) * 0.5;
+        let viewport_id = stash_viewport_id();
+        let viewport_builder = egui::ViewportBuilder::default()
+            .with_title("Stash")
+            .with_inner_size(window_size)
+            .with_min_inner_size(STASH_WINDOW_MIN_SIZE)
+            .with_position(initial_position)
+            .with_resizable(true);
 
-        let backdrop_clicked = egui::Area::new(egui::Id::new("stash_backdrop"))
-            .order(egui::Order::Foreground)
-            .fixed_pos(screen.min)
-            .show(ctx, |ui| {
-                let (rect, response) = ui.allocate_exact_size(screen.size(), egui::Sense::click());
-                ui.painter()
-                    .rect_filled(rect, 0.0, egui::Color32::from_black_alpha(160));
-                response.clicked()
-            })
-            .inner;
-        if backdrop_clicked {
-            close = true;
-        }
+        let mut close_window = false;
+        // The dialog is drawn in its own monochrome theme; egui keeps one style per context, so
+        // it is installed for the duration of this window's frame and handed back afterwards.
+        let viewer_style = ctx.style();
+        ctx.set_style(settings_style(viewer_style.as_ref()));
+        ctx.show_viewport_immediate(viewport_id, viewport_builder, |ctx, _class| {
+            // A decorated window brings its own close button, minimize and taskbar entry.
+            if ctx.input(|input| input.viewport().close_requested()) {
+                close_window = true;
+            }
+            // A reused viewport id ignores the builder size and position, so both are re-sent
+            // for a few frames until the native window settles on them.
+            if 0 < self.stash.place_frames {
+                self.stash.place_frames -= 1;
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(window_size));
+                if let Some(outer_rect) = ctx.input(|input| input.viewport().outer_rect) {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(
+                        screen.center() - outer_rect.size() * 0.5,
+                    ));
+                }
+            }
+            if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+                close_window = true;
+            }
 
-        let paths = self.filtered_stash_paths();
-        let marked_count = self.marked_files.len();
+            // The preview player belongs to this window: its frames are uploaded for this
+            // viewport's frame, so it is polled and drawn from inside the callback.
+            self.stash.hovered = None;
+            self.update_stash_video_preview(ctx);
 
-        egui::Area::new(egui::Id::new("stash_window"))
-            .order(egui::Order::Foreground)
-            .fixed_pos(window_pos)
-            .show(ctx, |ui| {
-                ui.set_width(window_size.x);
-                egui::Frame::none()
-                    .fill(UI_WINDOW)
-                    .stroke(egui::Stroke::new(1.0_f32, UI_BORDER))
-                    .rounding(14.0)
-                    .inner_margin(egui::Margin::ZERO)
-                    .show(ui, |ui| {
-                        ui.set_width(window_size.x - 2.0);
-                        if self.draw_stash_caption(ui, marked_count) {
-                            close = true;
-                        }
-                        self.draw_stash_command_bar(ui);
-                        ui_divider(ui);
-                        self.draw_stash_body(ui, ctx, &paths, window_size.y);
-                    });
-            });
+            egui::CentralPanel::default()
+                .frame(egui::Frame::none().fill(UI_CONTENT))
+                .show(ctx, |ui| {
+                    egui::Frame::none()
+                        .inner_margin(egui::Margin::symmetric(16.0, 12.0))
+                        .show(ui, |ui| {
+                            self.draw_stash_command_bar(ui);
+                        });
+                    ui_divider(ui);
+                    egui::Frame::none()
+                        .inner_margin(egui::Margin::same(16.0))
+                        .show(ui, |ui| {
+                            self.draw_stash_body(ui, ctx);
+                        });
+                });
+        });
+        ctx.set_style(viewer_style);
 
-        if close {
+        if close_window {
+            // Dropping the viewport closes the window in this frame instead of leaving an empty
+            // dialog on screen until the next pass.
+            ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Close);
             self.close_stash();
-            return;
         }
-        self.update_stash_video_preview(ctx);
     }
 
-    /// Window caption: title, file count, and the top-right details toggle next to Close.
-    fn draw_stash_caption(&mut self, ui: &mut egui::Ui, marked_count: usize) -> bool {
-        let mut close = false;
-        egui::Frame::none()
-            .fill(UI_CHROME)
-            .rounding(egui::Rounding {
-                nw: 13.0,
-                ne: 13.0,
-                sw: 0.0,
-                se: 0.0,
-            })
-            .inner_margin(egui::Margin::symmetric(16.0, 7.0))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("Stash")
-                            .size(14.0)
-                            .color(UI_TEXT_STRONG),
-                    );
-                    ui.add_space(2.0);
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "{} {}",
-                            marked_count,
-                            if marked_count == 1 { "file" } else { "files" }
-                        ))
-                        .size(11.5)
-                        .color(UI_TEXT_DIM),
-                    );
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if settings_button(
-                            ui,
-                            "Close",
-                            egui::vec2(62.0, 24.0),
-                            true,
-                            SettingsButtonKind::Secondary,
-                        )
-                        .clicked()
-                        {
-                            close = true;
-                        }
-
-                        let (details_label, details_kind) = if self.stash.details_open {
-                            ("Hide details", SettingsButtonKind::Primary)
-                        } else {
-                            ("Details", SettingsButtonKind::Secondary)
-                        };
-                        let details_width = settings_button_width(ui, details_label);
-                        if settings_button(
-                            ui,
-                            details_label,
-                            egui::vec2(details_width, 24.0),
-                            true,
-                            details_kind,
-                        )
-                        .clicked()
-                        {
-                            self.stash.details_open = !self.stash.details_open;
-                        }
-                    });
-                });
-            });
-        close
-    }
-
+    /// Filter box on the left, file count and the details toggle on the right.
     fn draw_stash_command_bar(&mut self, ui: &mut egui::Ui) {
-        egui::Frame::none()
-            .fill(UI_WINDOW)
-            .inner_margin(egui::Margin::symmetric(16.0, 9.0))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    let search_width = (ui.available_width() - 220.0).clamp(140.0, 420.0);
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.stash.search)
-                            .hint_text("Filter stash")
-                            .desired_width(search_width)
-                            .margin(egui::vec2(8.0, 4.0)),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(
-                            egui::RichText::new("Esc closes")
-                                .size(11.0)
-                                .color(UI_TEXT_FAINT),
-                        );
-                    });
-                });
+        ui.horizontal(|ui| {
+            let search_width = (ui.available_width() - 260.0).clamp(140.0, 400.0);
+            ui.add(
+                egui::TextEdit::singleline(&mut self.stash.search)
+                    .hint_text("Filter stash")
+                    .desired_width(search_width)
+                    .margin(egui::vec2(8.0, 4.0)),
+            );
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let (details_label, details_kind) = if self.stash.details_open {
+                    ("Hide details", SettingsButtonKind::Primary)
+                } else {
+                    ("Details", SettingsButtonKind::Secondary)
+                };
+                let details_width = settings_button_width(ui, details_label);
+                if settings_button(
+                    ui,
+                    details_label,
+                    egui::vec2(details_width, 26.0),
+                    true,
+                    details_kind,
+                )
+                .clicked()
+                {
+                    self.stash.details_open = !self.stash.details_open;
+                }
+
+                ui.add_space(10.0);
+                let marked_count = self.marked_files.len();
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} {}",
+                        marked_count,
+                        if marked_count == 1 { "file" } else { "files" }
+                    ))
+                    .size(11.5)
+                    .color(UI_TEXT_DIM),
+                );
             });
+        });
     }
 
-    fn draw_stash_body(
-        &mut self,
-        ui: &mut egui::Ui,
-        ctx: &egui::Context,
-        paths: &[PathBuf],
-        window_height: f32,
-    ) {
-        let body_height = (window_height - STASH_CHROME_HEIGHT).max(160.0);
-        egui::Frame::none()
-            .fill(UI_CONTENT)
-            .rounding(egui::Rounding {
-                nw: 0.0,
-                ne: 0.0,
-                sw: 13.0,
-                se: 13.0,
-            })
-            .inner_margin(egui::Margin::same(16.0))
-            .show(ui, |ui| {
-                ui.set_min_height(body_height);
-                ui.set_max_height(body_height);
-                ui.horizontal_top(|ui| {
-                    let row_height = (body_height - 32.0).max(80.0);
-                    let details_open = self.stash.details_open;
-                    let gallery_width = if details_open {
-                        (ui.available_width() - STASH_DETAILS_WIDTH - 14.0).max(180.0)
-                    } else {
-                        ui.available_width()
-                    };
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(gallery_width, row_height),
-                        egui::Layout::top_down(egui::Align::Min),
-                        |ui| {
-                            self.draw_stash_gallery(ui, ctx, paths);
-                        },
-                    );
+    fn draw_stash_body(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let paths = self.filtered_stash_paths();
+        let row_height = ui.available_height().max(120.0);
 
-                    if details_open {
-                        ui.add_space(14.0);
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(STASH_DETAILS_WIDTH, row_height),
-                            egui::Layout::top_down(egui::Align::Min),
-                            |ui| {
-                                self.draw_stash_details(ui, ctx);
-                            },
-                        );
-                    }
-                });
-            });
+        ui.horizontal_top(|ui| {
+            let details_open = self.stash.details_open;
+            let gallery_width = if details_open {
+                (ui.available_width() - STASH_DETAILS_WIDTH - 14.0).max(180.0)
+            } else {
+                ui.available_width()
+            };
+            ui.allocate_ui_with_layout(
+                egui::vec2(gallery_width, row_height),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    self.draw_stash_gallery(ui, ctx, &paths);
+                },
+            );
+
+            if details_open {
+                ui.add_space(14.0);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(STASH_DETAILS_WIDTH, row_height),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        self.draw_stash_details(ui, ctx);
+                    },
+                );
+            }
+        });
     }
 
     fn draw_stash_gallery(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, paths: &[PathBuf]) {

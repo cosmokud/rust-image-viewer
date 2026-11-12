@@ -263,9 +263,35 @@ pub(crate) struct DeleteModalItemInfo {
     pub(crate) dimensions_label: String,
 }
 
+/// Smallest inner size the stash window takes on a small screen.
+pub(crate) const STASH_WINDOW_MIN_SIZE: egui::Vec2 = egui::vec2(560.0, 400.0);
+
+/// Frames the stash window re-asserts its centered geometry while the native window settles.
+pub(crate) const STASH_WINDOW_PLACE_FRAMES: u8 = 3;
+
+/// Native viewport that hosts the detached Stash dialog. A stable id lets a second click on the
+/// menu entry raise the existing window instead of opening a duplicate.
+pub(crate) fn stash_viewport_id() -> egui::ViewportId {
+    egui::ViewportId::from_hash_of("stash_window")
+}
+
+/// Dialog size: most of the work area, so the gallery gets several columns.
+pub(crate) fn stash_window_size(screen: egui::Rect) -> egui::Vec2 {
+    let width = (screen.width() * 0.7)
+        .max(STASH_WINDOW_MIN_SIZE.x.min(screen.width()))
+        .min(screen.width() * 0.9);
+    let height = (screen.height() * 0.7)
+        .max(STASH_WINDOW_MIN_SIZE.y.min(screen.height()))
+        .min(screen.height() * 0.9);
+    egui::vec2(width, height)
+}
+
 /// The Stash dialog: a gallery over the marked files, plus one optional details column.
 pub(crate) struct StashState {
     pub(crate) open: bool,
+    /// Monitor work area the window centers on, resolved on open.
+    pub(crate) screen: Option<egui::Rect>,
+    pub(crate) place_frames: u8,
     pub(crate) search: String,
     pub(crate) selected: Option<PathBuf>,
     pub(crate) details_open: bool,
@@ -278,6 +304,8 @@ impl Default for StashState {
     fn default() -> Self {
         Self {
             open: false,
+            screen: None,
+            place_frames: 0,
             search: String::new(),
             selected: None,
             details_open: false,

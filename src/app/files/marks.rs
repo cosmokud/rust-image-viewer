@@ -90,7 +90,6 @@ impl ImageViewer {
             || self.pending_single_delete_target.is_some()
             || !self.pending_marked_delete_targets.is_empty()
             || self.pending_exit_confirmation
-            || self.stash.open
     }
 
     pub(crate) fn request_app_exit(&mut self) {
