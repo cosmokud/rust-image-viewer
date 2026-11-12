@@ -371,8 +371,6 @@ pub(crate) enum StashAction {
 }
 
 impl StashAction {
-    pub(crate) const ALWAYS_AVAILABLE: [Self; 2] = [Self::SelectAll, Self::DeselectAll];
-
     pub(crate) const SELECTION_ACTIONS: [Self; 5] = [
         Self::DeleteFromStash,
         Self::Copy,
@@ -516,6 +514,8 @@ pub(crate) enum MenuActionIcon {
     Rename,
     OpenLocation,
     Stash,
+    StashRemove,
+    Deselect,
     Settings,
 }
 

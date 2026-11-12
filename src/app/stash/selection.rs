@@ -110,11 +110,21 @@ impl ImageViewer {
         self.stash.selection_anchor = self.stash.selected.clone();
     }
 
-    /// The actions both surfaces offer: Select All and Deselect All always, the rest only with
-    /// something selected.
-    pub(crate) fn stash_visible_actions(&self) -> Vec<StashAction> {
-        let mut actions: Vec<StashAction> = StashAction::ALWAYS_AVAILABLE.to_vec();
+    /// Chips: nothing at all until a file is selected, then the whole set.
+    pub(crate) fn stash_chip_actions(&self) -> Vec<StashAction> {
+        if !self.stash_selection_active() {
+            return Vec::new();
+        }
+        let mut actions = vec![StashAction::SelectAll, StashAction::DeselectAll];
+        actions.extend(StashAction::SELECTION_ACTIONS);
+        actions
+    }
+
+    /// Menu: Select All stays reachable with an empty selection; the rest needs one.
+    pub(crate) fn stash_menu_actions(&self) -> Vec<StashAction> {
+        let mut actions = vec![StashAction::SelectAll];
         if self.stash_selection_active() {
+            actions.push(StashAction::DeselectAll);
             actions.extend(StashAction::SELECTION_ACTIONS);
         }
         actions
@@ -167,11 +177,23 @@ impl ImageViewer {
     }
 }
 
+pub(crate) fn stash_action_tooltip(action: StashAction) -> &'static str {
+    match action {
+        StashAction::SelectAll => "Select every file in the stash",
+        StashAction::DeselectAll => "Clear the selection",
+        StashAction::DeleteFromStash => "Remove from the stash (the file itself is kept)",
+        StashAction::Copy => "Copy the selected files to the clipboard",
+        StashAction::Cut => "Cut the selected files to the clipboard",
+        StashAction::Delete => "Delete the selected files to the Recycle Bin",
+        StashAction::Rename => "Rename the selected files",
+    }
+}
+
 pub(crate) fn stash_action_icon(action: StashAction) -> MenuActionIcon {
     match action {
         StashAction::SelectAll => MenuActionIcon::MarkAll,
-        StashAction::DeselectAll => MenuActionIcon::Unmark,
-        StashAction::DeleteFromStash => MenuActionIcon::Stash,
+        StashAction::DeselectAll => MenuActionIcon::Deselect,
+        StashAction::DeleteFromStash => MenuActionIcon::StashRemove,
         StashAction::Copy => MenuActionIcon::Copy,
         StashAction::Cut => MenuActionIcon::Cut,
         StashAction::Delete => MenuActionIcon::Delete,

@@ -76,6 +76,12 @@ impl ImageViewer {
             MenuActionIcon::Stash => {
                 egui::include_image!("../../../assets/lucide/briefcase-plus.svg")
             }
+            MenuActionIcon::StashRemove => {
+                egui::include_image!("../../../assets/lucide/archive-x.svg")
+            }
+            MenuActionIcon::Deselect => {
+                egui::include_image!("../../../assets/lucide/square-x.svg")
+            }
             MenuActionIcon::Settings => {
                 egui::include_image!("../../../assets/lucide/sliders-horizontal.svg")
             }

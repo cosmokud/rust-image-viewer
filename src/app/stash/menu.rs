@@ -13,7 +13,7 @@ impl ImageViewer {
             return;
         };
 
-        let actions = self.stash_visible_actions();
+        let actions = self.stash_menu_actions();
         let mut chosen: Option<StashAction> = None;
         let close = ctx.input(|input| input.key_pressed(egui::Key::Escape));
 

@@ -128,7 +128,7 @@ impl ImageViewer {
         ui.horizontal(|ui| {
             // The chips take the room they need; the filter box gives it up first.
             let reserved = if self.stash_selection_active() {
-                520.0
+                300.0
             } else {
                 260.0
             };
@@ -172,21 +172,10 @@ impl ImageViewer {
                 );
 
                 // Chips read left to right in action order; added right to left because of the
-                // layout. Select All and Deselect All are always there, the rest appear with a
-                // selection.
+                // layout. Nothing shows until a file is selected.
                 ui.add_space(10.0);
-                for action in self.stash_visible_actions().into_iter().rev() {
-                    let label = action.label();
-                    let chip_width = settings_button_width(ui, label);
-                    if settings_button(
-                        ui,
-                        label,
-                        egui::vec2(chip_width, 24.0),
-                        true,
-                        SettingsButtonKind::Secondary,
-                    )
-                    .clicked()
-                    {
+                for action in self.stash_chip_actions().into_iter().rev() {
+                    if stash_chip_button(ui, action).clicked() {
                         self.stash_run_action(ui.ctx(), action);
                     }
                     ui.add_space(6.0);
@@ -571,47 +560,107 @@ impl ImageViewer {
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
 
-                let Some(path) = self.stash.selected.clone() else {
-                    ui.label(
-                        egui::RichText::new("Select a file to see its details.")
-                            .size(12.0)
-                            .color(UI_TEXT_DIM),
-                    );
-                    return;
-                };
-                let info = self.stash_item_info(&path);
+                // The preview grows to the column width, so a tall image makes the column
+                // scroll instead of being squeezed into a fixed box.
+                egui::ScrollArea::vertical()
+                    .id_salt("stash_details")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        let Some(path) = self.stash.selected.clone() else {
+                            ui.label(
+                                egui::RichText::new("Select a file to see its details.")
+                                    .size(12.0)
+                                    .color(UI_TEXT_DIM),
+                            );
+                            return;
+                        };
+                        let info = self.stash_item_info(&path);
+                        let preview = self.ensure_modal_thumbnail_texture(ctx, &path);
 
-                let (preview_rect, _) = ui.allocate_exact_size(
-                    egui::vec2(ui.available_width(), 160.0),
-                    egui::Sense::hover(),
-                );
-                ui_paint_surface(ui.painter(), preview_rect, 8.0, UI_CONTENT, Some(UI_BORDER));
-                if let Some((texture_id, size)) = self.ensure_modal_thumbnail_texture(ctx, &path) {
-                    Self::paint_stash_preview(ui, preview_rect.shrink(8.0), texture_id, size);
-                }
+                        let preview_width = ui.available_width();
+                        let preview_height = preview
+                            .map(|(_, size)| {
+                                if 0.0 < size.x {
+                                    preview_width * size.y / size.x
+                                } else {
+                                    preview_width
+                                }
+                            })
+                            .unwrap_or(160.0)
+                            .max(80.0);
+                        let (preview_rect, _) = ui.allocate_exact_size(
+                            egui::vec2(preview_width, preview_height),
+                            egui::Sense::hover(),
+                        );
+                        ui_paint_surface(
+                            ui.painter(),
+                            preview_rect,
+                            8.0,
+                            UI_CONTENT,
+                            Some(UI_BORDER),
+                        );
+                        if let Some((texture_id, size)) = preview {
+                            Self::paint_stash_preview(
+                                ui,
+                                preview_rect.shrink(8.0),
+                                texture_id,
+                                size,
+                            );
+                        }
 
-                ui.add_space(10.0);
-                ui.label(
-                    egui::RichText::new(&info.display_name)
-                        .size(13.5)
-                        .color(UI_TEXT_STRONG),
-                );
-                ui.add_space(7.0);
-                Self::draw_modal_metadata_chips(ui, &info.file_size_label, &info.dimensions_label);
-                ui.add_space(9.0);
-                ui.label(
-                    egui::RichText::new(format!("Type  {}", stash_media_type_label(&path)))
-                        .size(11.5)
-                        .color(UI_TEXT),
-                );
-                ui.add_space(4.0);
-                ui.label(
-                    egui::RichText::new(path.to_string_lossy().to_string())
-                        .size(11.0)
-                        .color(UI_TEXT_DIM),
-                );
+                        ui.add_space(10.0);
+                        ui.label(
+                            egui::RichText::new(&info.display_name)
+                                .size(13.5)
+                                .color(UI_TEXT_STRONG),
+                        );
+                        ui.add_space(7.0);
+                        Self::draw_modal_metadata_chips(
+                            ui,
+                            &info.file_size_label,
+                            &info.dimensions_label,
+                        );
+                        ui.add_space(9.0);
+                        ui.label(
+                            egui::RichText::new(format!("Type  {}", stash_media_type_label(&path)))
+                                .size(11.5)
+                                .color(UI_TEXT),
+                        );
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new(path.to_string_lossy().to_string())
+                                .size(11.0)
+                                .color(UI_TEXT_DIM),
+                        );
+                    });
             });
     }
+}
+
+/// Square icon chip for the command bar: the icon carries the action, the hover text explains
+/// it.
+fn stash_chip_button(ui: &mut egui::Ui, action: StashAction) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(28.0, 24.0), egui::Sense::click());
+    let fill = if response.is_pointer_button_down_on() {
+        UI_SURFACE_ACTIVE
+    } else if response.hovered() {
+        UI_SURFACE_HOVER
+    } else {
+        UI_SURFACE
+    };
+    if ui.is_rect_visible(rect) {
+        ui_paint_surface(ui.painter(), rect, 7.0, fill, Some(UI_BORDER));
+        ImageViewer::paint_menu_action_icon(
+            ui,
+            egui::Rect::from_center_size(rect.center(), egui::vec2(14.0, 14.0)),
+            stash_action_icon(action),
+            UI_TEXT_STRONG,
+        );
+    }
+
+    response
+        .on_hover_text(stash_action_tooltip(action))
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 fn stash_media_type_label(path: &Path) -> &'static str {
