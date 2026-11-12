@@ -5,8 +5,14 @@
 use crate::app::*;
 use crate::prelude::*;
 
-/// Narrowest gallery column, so the tile count follows the window width.
-pub(crate) const STASH_GALLERY_COLUMN_MIN: f32 = 168.0;
+/// Fixed tile side. A tile never resizes with the window: a width-derived side made every
+/// tile squirm while dragging and then collapse the instant an extra column fitted.
+pub(crate) const STASH_TILE_SIDE: f32 = 176.0;
+
+/// Gap bounds between tiles. The width left over after the tiles is spread across the gaps,
+/// so a resize only moves tiles when the column count itself changes.
+pub(crate) const STASH_TILE_GAP_MIN: f32 = 8.0;
+pub(crate) const STASH_TILE_GAP_MAX: f32 = 28.0;
 
 /// Width of the details column spawned by the command bar button.
 pub(crate) const STASH_DETAILS_WIDTH: f32 = 300.0;
@@ -188,14 +194,20 @@ impl ImageViewer {
             return;
         }
 
-        let gap = 12.0_f32;
         // The grid is computed from the allocated width before the scroll area runs, so the
         // column count only follows the window, never the scrollbar or a mid-resize repaint.
         let width = (ui.available_width() - STASH_SCROLLBAR_ALLOWANCE)
             .max(64.0)
             .floor();
-        let columns = (((width + gap) / (STASH_GALLERY_COLUMN_MIN + gap)).floor() as usize).max(1);
-        let tile = ((width - gap * columns.saturating_sub(1) as f32) / columns as f32).max(48.0);
+        let tile = STASH_TILE_SIDE.min(width);
+        let columns =
+            (((width + STASH_TILE_GAP_MIN) / (tile + STASH_TILE_GAP_MIN)).floor() as usize).max(1);
+        let gap = if 1 < columns {
+            ((width - columns as f32 * tile) / (columns - 1) as f32)
+                .clamp(STASH_TILE_GAP_MIN, STASH_TILE_GAP_MAX)
+        } else {
+            STASH_TILE_GAP_MIN
+        };
         let viewport_height = ui.available_height().max(64.0);
         let rows_visible = ((viewport_height + gap) / (tile + gap)).floor().max(1.0) as usize;
         self.stash.layout = StashGalleryLayout {
