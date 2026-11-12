@@ -208,10 +208,10 @@ pub(crate) struct SettingsModal {
     pub(crate) pending_confirm: Option<SettingsConfirm>,
     /// Debounces slider drags into one preset file write.
     pub(crate) save_due_at: Option<Instant>,
-    /// Setting whose row is under the pointer this frame, with that row's rect. The right-click
-    /// hit-test runs on the next frame, when the whole row is known: the custom controls in a row
-    /// sink the pointer, so the row frame itself only hovers over the label and the empty body.
-    pub(crate) row_hover: Option<(usize, egui::Rect)>,
+    /// Every row drawn this frame, with its rect. The right-click hit-test runs on this instead of
+    /// widget hover: a row's custom controls sink the pointer, and a right-click anywhere on the
+    /// row has to open the same menu, so the rows are hit-tested by rect.
+    pub(crate) row_rects: Vec<(usize, egui::Rect)>,
     /// Open row context menu: the setting it acts on and where it was opened.
     pub(crate) row_menu: Option<SettingsRowMenu>,
     /// Painted rect of the open row menu, so a right-click inside it never re-anchors it.

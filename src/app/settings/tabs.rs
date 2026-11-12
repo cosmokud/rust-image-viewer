@@ -178,6 +178,7 @@ impl ImageViewer {
                 self.settings.focus_search = true;
             }
 
+            self.begin_settings_row_rects();
             egui::CentralPanel::default()
                 .frame(egui::Frame::none().fill(UI_CONTENT))
                 .show(ctx, |ui| {
@@ -478,8 +479,8 @@ impl ImageViewer {
                     }
                 });
 
-            // Body first, then the row menu: opening needs this frame's `row_hover`, so a row
-            // right-clicked elsewhere on the page still resolves to the row under the pointer.
+            // Body first, then the row menu: opening needs this frame's row rects, so a row
+            // right-clicked anywhere on the page resolves to the row under the pointer.
             self.open_settings_row_menu(ctx);
             self.draw_settings_row_menu(ctx);
         });
