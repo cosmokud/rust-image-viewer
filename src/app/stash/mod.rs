@@ -8,7 +8,9 @@ use crate::prelude::*;
 pub(crate) mod draw;
 pub(crate) mod open;
 pub(crate) mod preview;
+pub(crate) mod store;
 
 pub(crate) use draw::*;
 pub(crate) use open::*;
 pub(crate) use preview::*;
+pub(crate) use store::*;

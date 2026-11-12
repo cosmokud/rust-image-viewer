@@ -924,7 +924,7 @@ impl Default for ImageViewer {
             .masonry_metadata_ram_cache_limit_mb
             .saturating_mul(1024 * 1024);
 
-        Self {
+        let mut viewer = Self {
             image: None,
             texture: None,
             image_texture_dims: None,
@@ -1264,7 +1264,10 @@ impl Default for ImageViewer {
             // Single instance fields
             #[cfg(target_os = "windows")]
             file_receiver: None,
-        }
+        };
+        // The stash outlives the process: paths only, no pixels.
+        viewer.load_stash_from_disk();
+        viewer
     }
 }
 

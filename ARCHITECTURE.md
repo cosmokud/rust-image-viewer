@@ -143,7 +143,7 @@ src/app/
 | `masonry/` | 2 | authoritative dimension bookkeeping + folder metadata snapshots |
 | `window/` | 11 | layout application, display lookup, window rects, fullscreen transitions, dragging, autosize, title text, startup visibility, monitor queries |
 | `settings/` | 8 | settings window values/actions/widgets/rows/presets/tabs/modal |
-| `stash/` | 3 | the Stash dialog: marked-file gallery, hover video preview, details column |
+| `stash/` | 4 | the Stash window: gallery, hover video preview, details column, on-disk stash (`stash.tsv`) |
 | `dialogs/` | 5 | delete/rename/exit modals, modal thumbnails and preview |
 | `help/` | 3 | shortcut help labels and the Help tab |
 | `diagnostics/` | 3 | FPS sampling, per-frame diag stats (the overlay itself is in `ui/`) |

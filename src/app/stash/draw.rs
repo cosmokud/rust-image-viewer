@@ -124,7 +124,7 @@ impl ImageViewer {
                 }
 
                 ui.add_space(10.0);
-                let marked_count = self.marked_files.len();
+                let marked_count = self.stash.entries.len();
                 ui.label(
                     egui::RichText::new(format!(
                         "{} {}",
@@ -319,7 +319,7 @@ impl ImageViewer {
 
     /// Hover card: name, size/dimension chips, then the whole path and the extension.
     fn draw_stash_tile_tooltip(&self, response: egui::Response, path: &PathBuf) {
-        let info = self.delete_modal_item_info(path);
+        let info = self.stash_item_info(path);
         let extension = path
             .extension()
             .and_then(|ext| ext.to_str())
@@ -392,7 +392,7 @@ impl ImageViewer {
                     );
                     return;
                 };
-                let info = self.delete_modal_item_info(&path);
+                let info = self.stash_item_info(&path);
 
                 let (preview_rect, _) = ui.allocate_exact_size(
                     egui::vec2(ui.available_width(), 160.0),

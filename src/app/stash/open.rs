@@ -26,10 +26,27 @@ impl ImageViewer {
         self.stash.preview.clear();
     }
 
-    /// Marked files in viewer order, narrowed by the stash filter box.
+    /// Stashed files in viewer order, narrowed by the stash filter box. Files stashed from
+    /// another folder follow, sorted, so the order is stable across sessions.
     pub(crate) fn filtered_stash_paths(&self) -> Vec<PathBuf> {
         let query = self.stash.search.trim().to_lowercase();
-        self.collect_marked_paths_in_current_order()
+        let mut ordered: Vec<PathBuf> = self
+            .image_list
+            .iter()
+            .filter(|path| self.stash.entries.contains_key(*path) && path.exists())
+            .cloned()
+            .collect();
+        let mut extras: Vec<PathBuf> = self
+            .stash
+            .entries
+            .keys()
+            .filter(|path| !self.image_list.contains(*path) && path.exists())
+            .cloned()
+            .collect();
+        extras.sort();
+        ordered.extend(extras);
+
+        ordered
             .into_iter()
             .filter(|path| {
                 query.is_empty()

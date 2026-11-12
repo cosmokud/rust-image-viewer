@@ -132,6 +132,8 @@ impl ImageViewer {
             return false;
         }
 
+        // Marking is what feeds the stash; unmarking only clears the bulk-action selection.
+        self.stash_remember_paths(std::slice::from_ref(&path));
         true
     }
 
@@ -139,6 +141,7 @@ impl ImageViewer {
         let mut changed = 0usize;
         let mut prepared_clipboard_changed = false;
         let mut seen_paths = HashSet::new();
+        let mut stashed_paths: Vec<PathBuf> = Vec::new();
 
         for index in indices {
             if let Some(path) = self.image_list.get(*index).cloned() {
@@ -154,6 +157,8 @@ impl ImageViewer {
                     if self.clear_prepared_clipboard_for_path(&path) {
                         prepared_clipboard_changed = true;
                     }
+                } else {
+                    stashed_paths.push(path.clone());
                 }
                 changed = changed.saturating_add(1);
             }
@@ -162,20 +167,24 @@ impl ImageViewer {
         if prepared_clipboard_changed {
             self.sync_prepared_clipboard_with_system();
         }
+        self.stash_remember_paths(&stashed_paths);
 
         changed
     }
 
     pub(crate) fn mark_all_files(&mut self) -> usize {
         let mut added = 0usize;
+        let mut stashed_paths: Vec<PathBuf> = Vec::new();
         for path in &self.image_list {
             if Self::is_up_navigation_entry_path(path.as_path()) {
                 continue;
             }
             if self.marked_files.insert(path.clone()) {
+                stashed_paths.push(path.clone());
                 added = added.saturating_add(1);
             }
         }
+        self.stash_remember_paths(&stashed_paths);
 
         added
     }
@@ -446,6 +455,7 @@ impl ImageViewer {
         self.set_image_list(files);
         self.clear_stale_marked_files();
         self.clear_stale_prepared_clipboard_paths();
+        self.stash_prune_missing();
         self.modal_thumbnail_cache.retain(|path, _| path.exists());
 
         if self.image_list.is_empty() {

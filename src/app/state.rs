@@ -293,6 +293,8 @@ pub(crate) struct StashState {
     pub(crate) screen: Option<egui::Rect>,
     pub(crate) place_frames: u8,
     pub(crate) search: String,
+    /// Everything in the stash, persisted in `<config dir>/stash.tsv`.
+    pub(crate) entries: HashMap<PathBuf, StashEntry>,
     pub(crate) selected: Option<PathBuf>,
     pub(crate) details_open: bool,
     /// Tile currently under the pointer. Drives the hover video preview.
@@ -307,6 +309,7 @@ impl Default for StashState {
             screen: None,
             place_frames: 0,
             search: String::new(),
+            entries: HashMap::new(),
             selected: None,
             details_open: false,
             hovered: None,

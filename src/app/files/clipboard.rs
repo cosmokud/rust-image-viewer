@@ -51,6 +51,7 @@ impl ImageViewer {
                     self.marked_files.insert(path.clone());
                 }
             }
+            self.stash_remember_paths(&paths);
             self.set_prepared_clipboard_targets(&paths, operation);
         }
     }

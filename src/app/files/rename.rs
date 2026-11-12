@@ -210,9 +210,13 @@ impl ImageViewer {
         }
 
         let mut prepared_clipboard_changed = false;
+        let mut stash_changed = false;
         for (original_path, new_path) in &changed_paths {
             if self.marked_files.remove(original_path) {
                 self.marked_files.insert(new_path.clone());
+            }
+            if self.stash_rename_path(original_path, new_path) {
+                stash_changed = true;
             }
             if let Some(operation) = self.prepared_clipboard_paths.remove(original_path) {
                 self.prepared_clipboard_paths
@@ -224,6 +228,9 @@ impl ImageViewer {
 
         if prepared_clipboard_changed {
             self.sync_prepared_clipboard_with_system();
+        }
+        if stash_changed {
+            self.save_stash();
         }
 
         self.rename_overlay = None;
