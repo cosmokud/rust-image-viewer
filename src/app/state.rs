@@ -112,6 +112,10 @@ pub(crate) const SETTINGS_CONTENT_MARGIN_X: f32 = 22.0;
 /// One height for every text field, so fields and chips line up.
 pub(crate) const SETTINGS_INPUT_HEIGHT: f32 = 30.0;
 
+/// Height of one settings row. The row itself is the right-click target, so it has to be a full
+/// row tall; the label is sized to it and the controls centre in it.
+pub(crate) const SETTINGS_ROW_HEIGHT: f32 = 38.0;
+
 /// Every settings row keeps at least this much width for its control.
 pub(crate) const SETTINGS_CONTROLS_MIN_WIDTH: f32 = 220.0;
 
@@ -204,6 +208,21 @@ pub(crate) struct SettingsModal {
     pub(crate) pending_confirm: Option<SettingsConfirm>,
     /// Debounces slider drags into one preset file write.
     pub(crate) save_due_at: Option<Instant>,
+    /// Setting whose row is under the pointer this frame, with that row's rect. The right-click
+    /// hit-test runs on the next frame, when the whole row is known: the custom controls in a row
+    /// sink the pointer, so the row frame itself only hovers over the label and the empty body.
+    pub(crate) row_hover: Option<(usize, egui::Rect)>,
+    /// Open row context menu: the setting it acts on and where it was opened.
+    pub(crate) row_menu: Option<SettingsRowMenu>,
+    /// Painted rect of the open row menu, so a right-click inside it never re-anchors it.
+    pub(crate) row_menu_rect: Option<egui::Rect>,
+}
+
+/// One right-clicked settings row: its id and the position the menu anchors at.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SettingsRowMenu {
+    pub(crate) id: usize,
+    pub(crate) pos: egui::Pos2,
 }
 
 /// Preset actions resolved after the modal is drawn (avoids re-borrowing `self` while the

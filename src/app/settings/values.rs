@@ -55,6 +55,7 @@ impl ImageViewer {
         self.settings.status = None;
         self.settings.status_is_error = false;
         self.settings.save_due_at = None;
+        self.close_settings_row_menu();
         self.refresh_settings_mirrors();
         self.settings.pending_confirm = None;
         // Opening Settings is the first-run entry point: with only `Default` in the folder, seed

@@ -73,6 +73,20 @@ pub fn set_num(config: &mut Config, id: usize, value: f64) -> Result<(), String>
     set(config, id, &SettingValue::Num(value))
 }
 
+/// The value `default.ini` ships for one key: the file is rendered from `Config::default()`,
+/// so a per-key reset lands on exactly the text the built-in preset carries.
+pub fn default_value(id: usize) -> Option<&'static SettingValue> {
+    static DEFAULTS: OnceLock<Vec<SettingValue>> = OnceLock::new();
+    DEFAULTS
+        .get_or_init(|| {
+            capture(&Config::default())
+                .into_iter()
+                .map(|(_, value)| value)
+                .collect()
+        })
+        .get(id)
+}
+
 pub fn capture(config: &Config) -> Vec<(usize, SettingValue)> {
     SETTINGS
         .iter()

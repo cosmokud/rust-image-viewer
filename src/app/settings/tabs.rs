@@ -477,6 +477,11 @@ impl ImageViewer {
                         }
                     }
                 });
+
+            // Body first, then the row menu: opening needs this frame's `row_hover`, so a row
+            // right-clicked elsewhere on the page still resolves to the row under the pointer.
+            self.open_settings_row_menu(ctx);
+            self.draw_settings_row_menu(ctx);
         });
 
         ctx.set_style(viewer_style);
@@ -493,6 +498,7 @@ impl ImageViewer {
         }
 
         if close_modal {
+            self.close_settings_row_menu();
             self.flush_pending_settings_save(ctx);
             // Dropping the viewport closes the window in this frame instead of leaving an empty
             // dialog on screen until the next pass.
