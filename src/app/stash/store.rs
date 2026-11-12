@@ -190,33 +190,58 @@ impl ImageViewer {
     /// Drops one entry, keeps the grid selection on the tile that took its place, and rewrites
     /// the file. Unmarking is deliberately not involved: the mark is the session selection.
     pub(crate) fn remove_path_from_stash(&mut self, path: &Path) {
-        if self.stash.entries.remove(path).is_none() {
+        self.remove_paths_from_stash(std::slice::from_ref(&path.to_path_buf()));
+    }
+
+    /// Drops several entries in one write. The primary selection lands on the tile that took the
+    /// place of the first removed one, so a bulk delete does not leave the details panel empty.
+    pub(crate) fn remove_paths_from_stash(&mut self, paths: &[PathBuf]) {
+        let removed_index = paths.first().and_then(|first| {
+            self.stash
+                .layout
+                .paths
+                .iter()
+                .position(|candidate| candidate == first)
+        });
+
+        let mut removed_any = false;
+        for path in paths {
+            if self.stash.entries.remove(path).is_some() {
+                removed_any = true;
+                self.modal_thumbnail_cache.remove(path);
+                self.stash.selection.remove(path);
+                if self.stash.preview.requested_path.as_deref() == Some(path.as_path()) {
+                    self.stash.preview.clear();
+                }
+            }
+        }
+        if !removed_any {
             return;
         }
-        self.modal_thumbnail_cache.remove(&path.to_path_buf());
-        if self.stash.preview.requested_path.as_deref() == Some(path) {
-            self.stash.preview.clear();
-        }
 
-        let removed_index = self
-            .stash
-            .layout
-            .paths
-            .iter()
-            .position(|candidate| candidate == path);
         let remaining: Vec<PathBuf> = self
             .stash
             .layout
             .paths
             .iter()
-            .filter(|candidate| candidate.as_path() != path)
+            .filter(|candidate| self.stash.entries.contains_key(*candidate))
             .cloned()
             .collect();
-        self.stash.selected = removed_index.and_then(|index| {
-            remaining
-                .get(index.min(remaining.len().saturating_sub(1)))
-                .cloned()
-        });
+        let primary_gone = self
+            .stash
+            .selected
+            .as_ref()
+            .is_some_and(|selected| !self.stash.entries.contains_key(selected));
+        if primary_gone {
+            self.stash.selected = removed_index.and_then(|index| {
+                remaining
+                    .get(index.min(remaining.len().saturating_sub(1)))
+                    .cloned()
+            });
+            if self.stash.selected.is_none() {
+                self.stash.selected = remaining.first().cloned();
+            }
+        }
         self.stash.scroll_to_selection = self.stash.selected.is_some();
 
         self.save_stash();

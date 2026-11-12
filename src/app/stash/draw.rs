@@ -78,7 +78,12 @@ impl ImageViewer {
                 }
             }
             if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
-                close_window = true;
+                // Esc backs out of the right-click menu before it closes the window.
+                if self.stash.menu_pos.is_some() {
+                    self.stash.menu_pos = None;
+                } else {
+                    close_window = true;
+                }
             }
 
             // The preview player belongs to this window: its frames are uploaded for this
@@ -105,6 +110,8 @@ impl ImageViewer {
                             self.draw_stash_body(ui, ctx);
                         });
                 });
+
+            self.draw_stash_context_menu(ctx);
         });
         ctx.set_style(viewer_style);
 
@@ -119,7 +126,13 @@ impl ImageViewer {
     /// Filter box on the left, file count and the details toggle on the right.
     fn draw_stash_command_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            let search_width = (ui.available_width() - 260.0).clamp(140.0, 400.0);
+            // The chips take the room they need; the filter box gives it up first.
+            let reserved = if self.stash_selection_active() {
+                520.0
+            } else {
+                260.0
+            };
+            let search_width = (ui.available_width() - reserved).clamp(120.0, 400.0);
             ui.add(
                 egui::TextEdit::singleline(&mut self.stash.search)
                     .hint_text("Filter stash")
@@ -157,6 +170,27 @@ impl ImageViewer {
                     .size(11.5)
                     .color(UI_TEXT_DIM),
                 );
+
+                // Chips read left to right in action order; added right to left because of the
+                // layout. Select All and Deselect All are always there, the rest appear with a
+                // selection.
+                ui.add_space(10.0);
+                for action in self.stash_visible_actions().into_iter().rev() {
+                    let label = action.label();
+                    let chip_width = settings_button_width(ui, label);
+                    if settings_button(
+                        ui,
+                        label,
+                        egui::vec2(chip_width, 24.0),
+                        true,
+                        SettingsButtonKind::Secondary,
+                    )
+                    .clicked()
+                    {
+                        self.stash_run_action(ui.ctx(), action);
+                    }
+                    ui.add_space(6.0);
+                }
             });
         });
     }
@@ -222,10 +256,74 @@ impl ImageViewer {
         let gap = STASH_TILE_GAP;
         let viewport_height = ui.available_height().max(64.0);
         let rows_visible = ((viewport_height + gap) / (tile + gap)).floor().max(1.0) as usize;
+
+        // Rubber band: press anywhere in the gallery, follow the pointer even outside it, and
+        // resolve against the tiles recorded by the previous frame.
+        let marquee_rect = ui.available_rect_before_wrap();
+        self.stash.box_swallowed_click = false;
+        let modifiers = ctx.input(|input| input.modifiers);
+        let mut band_released = None;
+        ctx.input(|input| {
+            let pointer = input
+                .pointer
+                .interact_pos()
+                .or_else(|| input.pointer.hover_pos());
+            if input.pointer.primary_pressed() {
+                if let Some(pos) = pointer {
+                    if marquee_rect.contains(pos) {
+                        self.stash.selection_box = Some(StashSelectionBox {
+                            start: pos,
+                            current: pos,
+                        });
+                    }
+                }
+            } else if input.pointer.primary_down() {
+                if let (Some(pos), Some(band)) = (pointer, self.stash.selection_box.as_mut()) {
+                    band.current = pos;
+                }
+            }
+            if input.pointer.primary_released() {
+                band_released = self.stash.selection_box;
+            }
+        });
+        if let Some(band) = band_released {
+            self.stash.box_swallowed_click = band.is_drag();
+            self.stash.selection_box = Some(band);
+            self.stash_apply_selection_box(modifiers.command || modifiers.ctrl);
+        }
+
+        // Clicks on the empty space of the gallery clear the selection or open the menu, using
+        // the tile rectangles from the frame before this one.
+        let pointer_pos = ctx.input(|input| {
+            input
+                .pointer
+                .interact_pos()
+                .or_else(|| input.pointer.hover_pos())
+        });
+        let over_tile = pointer_pos.is_some_and(|pos| {
+            self.stash
+                .layout
+                .tile_rects
+                .iter()
+                .any(|(_, tile_rect)| tile_rect.contains(pos))
+        });
+        if !over_tile && !self.stash.box_swallowed_click {
+            if let Some(pos) = pointer_pos.filter(|pos| marquee_rect.contains(*pos)) {
+                if ctx.input(|input| input.pointer.primary_released()) {
+                    self.stash.selection.clear();
+                    self.stash.selected = None;
+                }
+                if ctx.input(|input| input.pointer.secondary_clicked()) {
+                    self.stash.menu_pos = Some(pos);
+                }
+            }
+        }
+
         self.stash.layout = StashGalleryLayout {
             paths: paths.to_vec(),
             columns,
             rows_visible,
+            tile_rects: Vec::new(),
         };
 
         // Fresh decodes are capped per frame so a folder of large stills cannot stall the window.
@@ -242,6 +340,7 @@ impl ImageViewer {
                         for path in row {
                             let tile_rect =
                                 self.draw_stash_tile(ui, ctx, path, tile, &mut thumbnail_budget);
+                            self.stash.layout.tile_rects.push((path.clone(), tile_rect));
                             if self
                                 .stash
                                 .selected
@@ -262,6 +361,20 @@ impl ImageViewer {
                     self.stash.scroll_to_selection = false;
                 }
             });
+
+        if let Some(band) = self.stash.selection_box {
+            if band.is_drag() {
+                let rect = band.rect();
+                ui.painter().rect_filled(
+                    rect,
+                    0.0,
+                    egui::Color32::from_rgba_unmultiplied(214, 216, 220, 30),
+                );
+                ui.painter()
+                    .rect_stroke(rect, 0.0, egui::Stroke::new(1.0_f32, UI_ACCENT));
+                ctx.request_repaint();
+            }
+        }
     }
 
     /// One square tile: preview fitted inside it, file name on a strip at the bottom.
@@ -277,8 +390,19 @@ impl ImageViewer {
         if response.hovered() {
             self.stash.hovered = Some(path.clone());
         }
-        if response.clicked() {
-            self.stash.selected = Some(path.clone());
+        let band_active = self.stash.selection_box.is_some() || self.stash.box_swallowed_click;
+        if response.clicked() && !band_active {
+            let modifiers = ui.input(|input| input.modifiers);
+            self.stash_click_path(path, modifiers);
+            self.stash.menu_pos = None;
+        }
+        if response.secondary_clicked() {
+            if !self.stash.selection.contains(path) {
+                self.stash_click_path(path, egui::Modifiers::NONE);
+            }
+            if let Some(pos) = ui.input(|input| input.pointer.interact_pos()) {
+                self.stash.menu_pos = Some(pos);
+            }
         }
         let double_clicked = response.double_clicked();
         if !ui.is_rect_visible(rect) {
@@ -288,11 +412,7 @@ impl ImageViewer {
             return rect;
         }
 
-        let selected = self
-            .stash
-            .selected
-            .as_ref()
-            .is_some_and(|current| current == path);
+        let selected = self.stash.selection.contains(path);
         let border = if selected {
             UI_ACCENT
         } else if response.hovered() {

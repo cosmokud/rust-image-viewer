@@ -85,8 +85,9 @@ impl ImageViewer {
         }
 
         if remove_selected {
-            if let Some(path) = self.stash.selected.clone() {
-                self.remove_path_from_stash(&path);
+            let paths = self.stash_selected_paths();
+            if !paths.is_empty() {
+                self.remove_paths_from_stash(&paths);
             }
             return;
         }
@@ -98,7 +99,10 @@ impl ImageViewer {
         let index = target.clamp(0, last) as usize;
         let path = layout.paths[index].clone();
         if self.stash.selected.as_ref() != Some(&path) {
-            self.stash.selected = Some(path);
+            self.stash.selected = Some(path.clone());
+            self.stash.selection.clear();
+            self.stash.selection.insert(path.clone());
+            self.stash.selection_anchor = Some(path);
             self.stash.scroll_to_selection = true;
         }
     }

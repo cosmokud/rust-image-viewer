@@ -328,12 +328,70 @@ pub(crate) fn stash_window_size(screen: egui::Rect) -> egui::Vec2 {
     egui::vec2(width, height)
 }
 
-/// Grid metrics recorded while the stash gallery draws, so the keyboard can move around it.
+/// Grid metrics recorded while the stash gallery draws, so the keyboard can move around it
+/// and the marquee can map a screen rectangle back onto tiles.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct StashGalleryLayout {
     pub(crate) paths: Vec<PathBuf>,
     pub(crate) columns: usize,
     pub(crate) rows_visible: usize,
+    pub(crate) tile_rects: Vec<(PathBuf, egui::Rect)>,
+}
+
+/// Rubber-band selection drag in the stash gallery, in screen coordinates.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct StashSelectionBox {
+    pub(crate) start: egui::Pos2,
+    pub(crate) current: egui::Pos2,
+}
+
+impl StashSelectionBox {
+    pub(crate) fn rect(&self) -> egui::Rect {
+        egui::Rect::from_two_pos(self.start, self.current)
+    }
+
+    /// A press that never moved is a click, not a rubber band.
+    pub(crate) fn is_drag(&self) -> bool {
+        let rect = self.rect();
+        4.0 < rect.width().max(rect.height())
+    }
+}
+
+/// Every bulk action the stash chips and its right-click menu can run. Both surfaces call the
+/// same functions the file action menu uses, so nothing is reimplemented here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StashAction {
+    SelectAll,
+    DeselectAll,
+    DeleteFromStash,
+    Copy,
+    Cut,
+    Delete,
+    Rename,
+}
+
+impl StashAction {
+    pub(crate) const ALWAYS_AVAILABLE: [Self; 2] = [Self::SelectAll, Self::DeselectAll];
+
+    pub(crate) const SELECTION_ACTIONS: [Self; 5] = [
+        Self::DeleteFromStash,
+        Self::Copy,
+        Self::Cut,
+        Self::Delete,
+        Self::Rename,
+    ];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::SelectAll => "Select All",
+            Self::DeselectAll => "Deselect All",
+            Self::DeleteFromStash => "Delete from Stash",
+            Self::Copy => "Copy",
+            Self::Cut => "Cut",
+            Self::Delete => "Delete",
+            Self::Rename => "Rename",
+        }
+    }
 }
 
 /// The Stash dialog: a gallery over the marked files, plus one optional details column.
@@ -346,6 +404,16 @@ pub(crate) struct StashState {
     /// Everything in the stash, persisted in `<config dir>/stash.tsv`.
     pub(crate) entries: HashMap<PathBuf, StashEntry>,
     pub(crate) selected: Option<PathBuf>,
+    /// Multi-selection: the tiles outlined as chosen, independent of the marks.
+    pub(crate) selection: HashSet<PathBuf>,
+    /// Where a Shift+click range starts; moves with a plain or Ctrl click.
+    pub(crate) selection_anchor: Option<PathBuf>,
+    pub(crate) selection_box: Option<StashSelectionBox>,
+    /// True when the last release finished a rubber band, so the tile under the pointer must
+    /// not also treat it as a click.
+    pub(crate) box_swallowed_click: bool,
+    /// Right-click menu anchor, in screen coordinates.
+    pub(crate) menu_pos: Option<egui::Pos2>,
     /// Last drawn grid, read by the keyboard handler on the next frame.
     pub(crate) layout: StashGalleryLayout,
     /// Set by the keyboard handler: the next draw scrolls the selected tile into view.
@@ -365,6 +433,11 @@ impl Default for StashState {
             search: String::new(),
             entries: HashMap::new(),
             selected: None,
+            selection: HashSet::new(),
+            selection_anchor: None,
+            selection_box: None,
+            box_swallowed_click: false,
+            menu_pos: None,
             layout: StashGalleryLayout::default(),
             scroll_to_selection: false,
             details_open: false,
