@@ -373,8 +373,8 @@ pub(crate) enum StashAction {
 impl StashAction {
     pub(crate) const SELECTION_ACTIONS: [Self; 5] = [
         Self::DeleteFromStash,
-        Self::Copy,
         Self::Cut,
+        Self::Copy,
         Self::Delete,
         Self::Rename,
     ];
