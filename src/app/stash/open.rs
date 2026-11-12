@@ -20,6 +20,85 @@ impl ImageViewer {
         self.controls_show_time = Instant::now();
     }
 
+    /// Opens a stash file the way the current window already works: same folder means moving
+    /// the view (scroll the grid, jump the strip, swap the solo page) instead of reloading it,
+    /// and the current mode — solo, solo fullscreen, Long Strip, Masonry — is kept.
+    pub(crate) fn open_stash_path(&mut self, ctx: &egui::Context, path: &PathBuf) {
+        if !path.exists() {
+            self.remove_path_from_stash(path.as_path());
+            return;
+        }
+
+        // With single-instance off the user expects a separate window for this file.
+        if !self.config.single_instance {
+            if let Ok(executable) = std::env::current_exe() {
+                if let Err(err) = std::process::Command::new(executable).arg(path).spawn() {
+                    self.error_message = Some(format!("Failed to open a new window: {err}"));
+                }
+            }
+            return;
+        }
+
+        let same_folder = Self::same_media_folder(
+            self.current_media_path()
+                .as_ref()
+                .or(self.image_list.first()),
+            path,
+        );
+
+        if same_folder {
+            if let Some(index) = self
+                .image_list
+                .iter()
+                .position(|candidate| candidate == path)
+            {
+                self.reveal_media_index(index);
+                ctx.request_repaint();
+                return;
+            }
+        }
+
+        // Another folder: rebuild the list for that file, keeping the mode we are in. The strip
+        // and grid already own a "list changed" path; the solo view just opens the file.
+        if self.mode().is_strip() {
+            self.refresh_media_list_after_path_mutation(Some(path.clone()));
+            self.scroll_strip_to_current_index();
+            self.manga_update_preload_queue();
+        } else {
+            self.load_media(path);
+        }
+        ctx.request_repaint();
+    }
+
+    /// Moves the current view onto `index`, whatever the mode is showing right now.
+    fn reveal_media_index(&mut self, index: usize) {
+        if self.mode().is_strip() {
+            self.set_current_index_clamped(index);
+            self.scroll_strip_to_current_index();
+            self.manga_update_preload_queue();
+            return;
+        }
+
+        self.save_current_fullscreen_view_state();
+        self.set_current_index_clamped(index);
+        let Some(path) = self.image_list.get(self.current_index).cloned() else {
+            return;
+        };
+        self.load_image_retaining_visible_media(&path);
+    }
+
+    fn same_media_folder(anchor: Option<&PathBuf>, path: &Path) -> bool {
+        let anchor = anchor.and_then(|anchor| anchor.parent());
+        let candidate = path.parent();
+        match (anchor, candidate) {
+            (Some(anchor), Some(candidate)) => {
+                anchor.to_string_lossy().to_lowercase()
+                    == candidate.to_string_lossy().to_lowercase()
+            }
+            _ => false,
+        }
+    }
+
     pub(crate) fn close_stash(&mut self) {
         self.stash.open = false;
         self.stash.hovered = None;

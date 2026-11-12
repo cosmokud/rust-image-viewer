@@ -265,7 +265,11 @@ impl ImageViewer {
         if response.clicked() {
             self.stash.selected = Some(path.clone());
         }
+        let double_clicked = response.double_clicked();
         if !ui.is_rect_visible(rect) {
+            if double_clicked {
+                self.stash.selected = Some(path.clone());
+            }
             return rect;
         }
 
@@ -357,6 +361,9 @@ impl ImageViewer {
         // at the rest of the grid.
         if !self.stash.details_open && response.hovered() {
             self.draw_stash_tile_tooltip(response, path);
+        }
+        if double_clicked {
+            self.open_stash_path(ctx, path);
         }
 
         rect

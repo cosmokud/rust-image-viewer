@@ -79,9 +79,7 @@ impl ImageViewer {
 
         if open_selected {
             if let Some(path) = self.stash.selected.clone() {
-                self.prepare_single_instance_media_handoff(ctx);
-                self.load_media(&path);
-                ctx.request_repaint();
+                self.open_stash_path(ctx, &path);
             }
             return;
         }
