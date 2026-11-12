@@ -22,6 +22,17 @@ pub(crate) const STASH_DETAILS_MIN_WIDTH: f32 = 260.0;
 /// Space between the gallery and the details column.
 pub(crate) const STASH_DETAILS_GAP: f32 = 14.0;
 
+/// Gap between the groups of the command bar (chips, file count, details toggle).
+const STASH_CHROME_GAP: f32 = 8.0;
+
+/// Chip button side and the gap between two chips.
+const STASH_CHIP_WIDTH: f32 = 28.0;
+const STASH_CHIP_GAP: f32 = 3.0;
+
+/// A filter box narrower than this is unreadable, but the buttons still get their room: only
+/// below this does the box stop shrinking.
+const STASH_SEARCH_MIN_WIDTH: f32 = 60.0;
+
 /// Space kept for the gallery scrollbar. It is subtracted whether or not the bar is visible:
 /// letting the bar's presence change the column count made the grid flip back and forth while
 /// the window was being resized from the left/right edges.
@@ -123,16 +134,50 @@ impl ImageViewer {
         }
     }
 
-    /// Filter box on the left, file count and the details toggle on the right.
+    /// Filter box on the left, then the chips, file count and the details toggle on the right.
+    /// The buttons win the width fight: the filter box is measured against them and gives up its
+    /// pixels first, so the two groups never overlap at the minimum window width.
     fn draw_stash_command_bar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            // The chips take the room they need; the filter box gives it up first.
-            let reserved = if self.stash_selection_active() {
-                300.0
+        let chips = self.stash_chip_actions();
+        let (details_label, details_kind) = if self.stash.details_open {
+            ("Hide details", SettingsButtonKind::Primary)
+        } else {
+            ("Details", SettingsButtonKind::Secondary)
+        };
+        let details_width = settings_button_width(ui, details_label);
+        let count_text = format!(
+            "{} {}",
+            self.stash.entries.len(),
+            if self.stash.entries.len() == 1 {
+                "file"
             } else {
-                260.0
-            };
-            let search_width = (ui.available_width() - reserved).clamp(120.0, 400.0);
+                "files"
+            }
+        );
+        let count_width = ui.fonts(|fonts| {
+            fonts
+                .layout_no_wrap(
+                    count_text.clone(),
+                    egui::FontId::proportional(11.5),
+                    UI_TEXT_DIM,
+                )
+                .size()
+                .x
+                .ceil()
+        });
+
+        let mut right_width = details_width + STASH_CHROME_GAP + count_width;
+        if !chips.is_empty() {
+            right_width += STASH_CHROME_GAP
+                + chips.len() as f32 * STASH_CHIP_WIDTH
+                + (chips.len() - 1) as f32 * STASH_CHIP_GAP;
+        }
+        let search_width = (ui.available_width() - right_width - STASH_CHROME_GAP)
+            .clamp(STASH_SEARCH_MIN_WIDTH, 400.0);
+
+        ui.horizontal(|ui| {
+            // Every gap in this row is placed by hand, so the measurement above is exact.
+            ui.spacing_mut().item_spacing.x = 0.0;
             ui.add(
                 egui::TextEdit::singleline(&mut self.stash.search)
                     .hint_text("Filter stash")
@@ -141,12 +186,6 @@ impl ImageViewer {
             );
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let (details_label, details_kind) = if self.stash.details_open {
-                    ("Hide details", SettingsButtonKind::Primary)
-                } else {
-                    ("Details", SettingsButtonKind::Secondary)
-                };
-                let details_width = settings_button_width(ui, details_label);
                 if settings_button(
                     ui,
                     details_label,
@@ -159,26 +198,25 @@ impl ImageViewer {
                     self.stash.details_open = !self.stash.details_open;
                 }
 
-                ui.add_space(10.0);
-                let marked_count = self.stash.entries.len();
+                ui.add_space(STASH_CHROME_GAP);
                 ui.label(
-                    egui::RichText::new(format!(
-                        "{} {}",
-                        marked_count,
-                        if marked_count == 1 { "file" } else { "files" }
-                    ))
-                    .size(11.5)
-                    .color(UI_TEXT_DIM),
+                    egui::RichText::new(count_text)
+                        .size(11.5)
+                        .color(UI_TEXT_DIM),
                 );
 
                 // Chips read left to right in action order; added right to left because of the
                 // layout. Nothing shows until a file is selected.
-                ui.add_space(10.0);
-                for action in self.stash_chip_actions().into_iter().rev() {
+                if !chips.is_empty() {
+                    ui.add_space(STASH_CHROME_GAP);
+                }
+                for (index, action) in chips.into_iter().rev().enumerate() {
+                    if 0 < index {
+                        ui.add_space(STASH_CHIP_GAP);
+                    }
                     if stash_chip_button(ui, action).clicked() {
                         self.stash_run_action(ui.ctx(), action);
                     }
-                    ui.add_space(6.0);
                 }
             });
         });
@@ -640,7 +678,8 @@ impl ImageViewer {
 /// Square icon chip for the command bar: the icon carries the action, the hover text explains
 /// it.
 fn stash_chip_button(ui: &mut egui::Ui, action: StashAction) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(28.0, 24.0), egui::Sense::click());
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(STASH_CHIP_WIDTH, 24.0), egui::Sense::click());
     let fill = if response.is_pointer_button_down_on() {
         UI_SURFACE_ACTIVE
     } else if response.hovered() {
