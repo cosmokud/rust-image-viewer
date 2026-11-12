@@ -309,6 +309,51 @@ impl ImageViewer {
                 egui::FontId::proportional(11.0),
                 UI_TEXT,
             );
+
+        // The details column already covers the selected file; hovering is the only way to peek
+        // at the rest of the grid.
+        if !self.stash.details_open && response.hovered() {
+            self.draw_stash_tile_tooltip(response, path);
+        }
+    }
+
+    /// Hover card: name, size/dimension chips, then the whole path and the extension.
+    fn draw_stash_tile_tooltip(&self, response: egui::Response, path: &PathBuf) {
+        let info = self.delete_modal_item_info(path);
+        let extension = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_ascii_uppercase())
+            .unwrap_or_else(|| "NONE".to_string());
+
+        response.on_hover_ui(|ui| {
+            ui.set_max_width(360.0);
+            ui.vertical(|ui| {
+                ui.label(
+                    egui::RichText::new(&info.display_name)
+                        .size(13.0)
+                        .color(UI_TEXT_STRONG),
+                );
+                ui.add_space(6.0);
+                Self::draw_modal_metadata_chips(ui, &info.file_size_label, &info.dimensions_label);
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new(path.to_string_lossy().to_string())
+                        .size(11.0)
+                        .color(UI_TEXT_DIM),
+                );
+                ui.add_space(3.0);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} · .{}",
+                        stash_media_type_label(path),
+                        extension
+                    ))
+                    .size(11.0)
+                    .color(UI_TEXT),
+                );
+            });
+        });
     }
 
     /// Aspect-preserving fit: the preview is centred inside `rect`, never stretched.
