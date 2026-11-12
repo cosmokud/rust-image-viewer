@@ -216,7 +216,7 @@ impl ImageViewer {
                     .rounding(14.0)
                     .inner_margin(egui::Margin::same(10.0))
                     .show(ui, |ui| {
-                        ui.set_min_width(menu_content_width);
+                        ui.set_width(menu_content_width);
 
                         if self.render_single_file_action_buttons(
                             ui,
