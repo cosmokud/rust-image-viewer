@@ -244,13 +244,27 @@ impl ImageViewer {
                                                             ],
                                                             glyph,
                                                         );
+                                                        let mut layouter = text_field_layouter(
+                                                            egui::TextStyle::Body
+                                                                .resolve(ui.style()),
+                                                            SEARCH_FIELD_HEIGHT,
+                                                        );
                                                         let response = ui.add(
                                                             egui::TextEdit::singleline(
                                                                 &mut self.settings.search,
                                                             )
                                                             .hint_text("Search settings")
                                                             .frame(false)
-                                                            .desired_width(180.0),
+                                                            .margin(egui::Margin::symmetric(
+                                                                TEXT_FIELD_PADDING_X,
+                                                                0.0,
+                                                            ))
+                                                            .min_size(egui::vec2(
+                                                                0.0,
+                                                                SEARCH_FIELD_HEIGHT,
+                                                            ))
+                                                            .desired_width(180.0)
+                                                            .layouter(&mut layouter),
                                                         );
                                                         if std::mem::take(
                                                             &mut self.settings.focus_search,

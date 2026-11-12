@@ -112,6 +112,12 @@ pub(crate) const SETTINGS_CONTENT_MARGIN_X: f32 = 22.0;
 /// One height for every text field, so fields and chips line up.
 pub(crate) const SETTINGS_INPUT_HEIGHT: f32 = 30.0;
 
+/// Height of the compact search field in the dialog header.
+pub(crate) const SEARCH_FIELD_HEIGHT: f32 = 22.0;
+
+/// Height of the Stash command bar's filter field.
+pub(crate) const STASH_SEARCH_HEIGHT: f32 = 22.0;
+
 /// Height of one settings row. The row itself is the right-click target, so it has to be a full
 /// row tall; the label is sized to it and the controls centre in it.
 pub(crate) const SETTINGS_ROW_HEIGHT: f32 = 38.0;
@@ -333,6 +339,9 @@ fn dialog_list_height(item_count: usize) -> f32 {
     (item_count as f32 * DIALOG_CARD_ROW_HEIGHT)
         .clamp(DIALOG_CARD_ROW_HEIGHT, DIALOG_LIST_MAX_HEIGHT)
 }
+
+/// Height of the rename field inside a dialog card.
+pub(crate) const DIALOG_TEXT_FIELD_HEIGHT: f32 = 26.0;
 
 /// Fixed inner size of the delete confirmation window.
 pub(crate) fn delete_dialog_window_size(item_count: usize) -> egui::Vec2 {

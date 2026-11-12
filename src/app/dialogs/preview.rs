@@ -123,11 +123,20 @@ impl ImageViewer {
                                 ui.set_min_width(ui.available_width());
                                 match draft_name {
                                     Some(draft_name) => {
+                                        let mut layouter = text_field_layouter(
+                                            egui::TextStyle::Body.resolve(ui.style()),
+                                            DIALOG_TEXT_FIELD_HEIGHT,
+                                        );
                                         let response = ui.add(
                                             egui::TextEdit::singleline(draft_name)
-                                                .margin(egui::Margin::symmetric(8.0, 6.0))
+                                                .margin(egui::Margin::symmetric(
+                                                    TEXT_FIELD_PADDING_X,
+                                                    0.0,
+                                                ))
+                                                .min_size(egui::vec2(0.0, DIALOG_TEXT_FIELD_HEIGHT))
                                                 .desired_width(ui.available_width().max(180.0))
-                                                .clip_text(false),
+                                                .clip_text(false)
+                                                .layouter(&mut layouter),
                                         );
                                         if request_focus {
                                             response.request_focus();

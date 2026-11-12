@@ -71,6 +71,35 @@ pub(crate) fn ui_paint_surface(
     }
 }
 
+/// Horizontal padding inside a single-line text field. The vertical padding is zero on
+/// purpose; see [`text_field_layouter`].
+pub(crate) const TEXT_FIELD_PADDING_X: f32 = 8.0;
+
+/// Layouter for a single-line text field whose glyph row spans the field's whole height.
+///
+/// egui hit-tests a click against the galley's rows and clamps a position above or below them
+/// to the start or end of the line, so a click in a field's vertical padding selects the first
+/// word instead of the word under the pointer. A single row as tall as the field, with the
+/// glyphs centred inside it, makes every pixel of the box map to its own column.
+///
+/// Use it with `egui::Margin::symmetric(TEXT_FIELD_PADDING_X, 0.0)` and a `min_size` height
+/// equal to `height`, so the row covers the whole clickable box.
+pub(crate) fn text_field_layouter(
+    font_id: egui::FontId,
+    height: f32,
+) -> impl FnMut(&egui::Ui, &str, f32) -> std::sync::Arc<egui::Galley> {
+    move |ui: &egui::Ui, text: &str, _wrap_width: f32| {
+        let color = ui.visuals().text_color();
+        let mut job =
+            egui::text::LayoutJob::simple_singleline(text.to_owned(), font_id.clone(), color);
+        job.first_row_min_height = height;
+        if let Some(section) = job.sections.first_mut() {
+            section.format.valign = egui::Align::Center;
+        }
+        ui.fonts(|fonts| fonts.layout_job(job))
+    }
+}
+
 /// One device-pixel hairline that fills the available width, used as a section divider.
 pub(crate) fn ui_divider(ui: &mut egui::Ui) {
     let (rect, _) =

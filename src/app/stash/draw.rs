@@ -186,12 +186,18 @@ impl ImageViewer {
         ui.horizontal(|ui| {
             // Every gap in this row is placed by hand, so the measurement above is exact.
             ui.spacing_mut().item_spacing.x = 0.0;
+            let mut layouter = text_field_layouter(
+                egui::TextStyle::Body.resolve(ui.style()),
+                STASH_SEARCH_HEIGHT,
+            );
             ui.add(
                 egui::TextEdit::singleline(&mut self.stash.search)
                     .hint_text("Filter stash")
                     // The visible box (and so the gap after it) is exactly `search_width`.
                     .desired_width((search_width - 2.0 * STASH_SEARCH_MARGIN_X).max(24.0))
-                    .margin(egui::vec2(STASH_SEARCH_MARGIN_X, 4.0)),
+                    .margin(egui::Margin::symmetric(STASH_SEARCH_MARGIN_X, 0.0))
+                    .min_size(egui::vec2(0.0, STASH_SEARCH_HEIGHT))
+                    .layouter(&mut layouter),
             );
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

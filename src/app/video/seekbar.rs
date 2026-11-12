@@ -145,9 +145,13 @@ impl ImageViewer {
                 ui.separator();
                 ui.label(format!("Manual FPS (1-{})", max_custom_fps));
                 ui.horizontal(|ui| {
+                    let mut layouter =
+                        text_field_layouter(egui::TextStyle::Body.resolve(ui.style()), 22.0);
                     let text_response = ui.add_sized(
                         [64.0, 22.0],
-                        egui::TextEdit::singleline(&mut self.webp_custom_fps_input),
+                        egui::TextEdit::singleline(&mut self.webp_custom_fps_input)
+                            .margin(egui::Margin::symmetric(TEXT_FIELD_PADDING_X, 0.0))
+                            .layouter(&mut layouter),
                     );
                     let apply_clicked = ui.button("Set").clicked();
                     let apply_with_enter =

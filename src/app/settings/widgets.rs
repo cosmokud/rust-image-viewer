@@ -330,14 +330,19 @@ impl ImageViewer {
                             };
                             // Full control width: in the shortcuts tab the binding is the payload,
                             // so the field reaches the card edge instead of leaving a gap.
+                            let mut layouter = text_field_layouter(
+                                egui::FontId::monospace(11.5),
+                                SETTINGS_INPUT_HEIGHT,
+                            );
                             let response = ui.add(
                                 egui::TextEdit::singleline(&mut self.settings.texts[id])
                                     .hint_text(hint)
                                     .font(egui::FontId::monospace(11.5))
-                                    .margin(egui::Margin::symmetric(8.0, 6.0))
+                                    .margin(egui::Margin::symmetric(TEXT_FIELD_PADDING_X, 0.0))
                                     .min_size(egui::vec2(0.0, SETTINGS_INPUT_HEIGHT))
                                     .desired_width(controls)
-                                    .horizontal_align(egui::Align::LEFT),
+                                    .horizontal_align(egui::Align::LEFT)
+                                    .layouter(&mut layouter),
                             );
                             let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
                             // Commit only on Enter/focus loss: a half-typed binding must never be
