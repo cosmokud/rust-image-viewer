@@ -72,6 +72,8 @@ impl ImageViewer {
         self.release_video_resources_for_paths(&existing_paths);
 
         if self.config.confirm_delete_to_recycle_bin {
+            // A fresh window re-centers and takes the keyboard on its first frames.
+            self.delete_dialog_place_frames = DIALOG_WINDOW_PLACE_FRAMES;
             if existing_paths.len() == 1 {
                 self.pending_single_delete_target = existing_paths.into_iter().next();
             } else {

@@ -36,6 +36,8 @@ impl ImageViewer {
             error_message: None,
             just_opened: true,
         });
+        // A fresh window re-centers and takes the keyboard on its first frames.
+        self.rename_dialog_place_frames = DIALOG_WINDOW_PLACE_FRAMES;
         self.file_action_menu = None;
         self.show_controls = true;
         self.controls_show_time = Instant::now();

@@ -133,7 +133,7 @@ impl ImageViewer {
     /// One dispatch for the chips and the context menu, so both stay identical. Every arm calls
     /// the same routine the file action menu uses: rename opens the rename dialog, Delete opens
     /// the delete confirmation, Copy/Cut go through the shell clipboard path.
-    pub(crate) fn stash_run_action(&mut self, ctx: &egui::Context, action: StashAction) {
+    pub(crate) fn stash_run_action(&mut self, _ctx: &egui::Context, action: StashAction) {
         let paths = self.stash_selected_paths();
 
         match action {
@@ -162,16 +162,12 @@ impl ImageViewer {
                     return;
                 }
                 self.request_delete_for_paths(paths);
-                // The confirmation is drawn in the viewer window; raise it so it is not hidden
-                // behind the stash window.
-                ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Focus);
             }
             StashAction::Rename => {
                 if paths.is_empty() {
                     return;
                 }
                 self.start_rename_dialog_for_paths(paths);
-                ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Focus);
             }
         }
     }

@@ -187,6 +187,10 @@ pub(crate) struct ImageViewer {
     pub(crate) file_action_menu: Option<FileContextMenuState>,
     /// Rename dialog state for single-file or bulk rename operations.
     pub(crate) rename_overlay: Option<RenameOverlayState>,
+    /// Frames left to re-center the detached delete window while its native window appears.
+    pub(crate) delete_dialog_place_frames: u8,
+    /// Same, for the detached rename window.
+    pub(crate) rename_dialog_place_frames: u8,
     /// Active Ctrl+drag marquee selection used to mark multiple files in strip/masonry mode.
     pub(crate) mark_selection_box: Option<MarkSelectionBoxState>,
     /// Delete-confirmation target for a single-file action.
@@ -962,6 +966,8 @@ impl Default for ImageViewer {
             prepared_clipboard_paths: HashMap::new(),
             file_action_menu: None,
             rename_overlay: None,
+            delete_dialog_place_frames: 0,
+            rename_dialog_place_frames: 0,
             mark_selection_box: None,
             pending_single_delete_target: None,
             pending_marked_delete_targets: Vec::new(),

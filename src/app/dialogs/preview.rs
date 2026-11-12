@@ -31,27 +31,16 @@ impl ImageViewer {
     ) {
         let thumbnail_size = egui::vec2(84.0, 84.0);
         let (rect, _) = ui.allocate_exact_size(thumbnail_size, egui::Sense::hover());
-        ui.painter().rect_filled(
-            rect,
-            12.0,
-            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 14),
-        );
-        ui.painter().rect_stroke(
-            rect,
-            12.0,
-            egui::Stroke::new(
-                1.0_f32,
-                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 28),
-            ),
-        );
+        ui_paint_surface(ui.painter(), rect, 10.0, UI_CONTENT, Some(UI_BORDER));
 
+        let inner = rect.shrink(4.0);
         let unloadable = self.modal_thumbnail_is_unloadable(path.as_path());
         if unloadable {
-            paint_unloadable_cross(ui.painter(), rect, egui::Color32::from_rgb(214, 90, 82));
+            paint_unloadable_cross(ui.painter(), inner, UI_TEXT_DIM);
         } else if let Some((texture_id, image_size)) =
             self.ensure_modal_thumbnail_texture(ctx, path)
         {
-            let available = rect.shrink2(egui::vec2(6.0, 6.0));
+            let available = inner.shrink2(egui::vec2(2.0, 2.0));
             let scale = if image_size.x <= 0.0 || image_size.y <= 0.0 {
                 1.0
             } else {
@@ -78,7 +67,7 @@ impl ImageViewer {
                 egui::Align2::CENTER_CENTER,
                 placeholder,
                 egui::TextStyle::Button.resolve(ui.style()),
-                egui::Color32::from_rgb(188, 202, 220),
+                UI_TEXT_DIM,
             );
         }
     }
@@ -88,42 +77,19 @@ impl ImageViewer {
         file_size_label: &str,
         dimensions_label: &str,
     ) {
-        let render_chip = |ui: &mut egui::Ui,
-                           text: &str,
-                           fill: egui::Color32,
-                           stroke: egui::Stroke,
-                           color: egui::Color32| {
+        let render_chip = |ui: &mut egui::Ui, text: &str| {
             egui::Frame::none()
-                .fill(fill)
-                .stroke(stroke)
+                .fill(UI_SURFACE)
                 .rounding(6.0)
                 .inner_margin(egui::Margin::symmetric(8.0, 3.0))
                 .show(ui, |ui| {
-                    ui.label(egui::RichText::new(text).color(color).size(12.0));
+                    ui.label(egui::RichText::new(text).color(UI_TEXT).size(11.5));
                 });
         };
 
         ui.horizontal_wrapped(|ui| {
-            render_chip(
-                ui,
-                file_size_label,
-                egui::Color32::from_rgba_unmultiplied(58, 76, 98, 180),
-                egui::Stroke::new(
-                    1.0_f32,
-                    egui::Color32::from_rgba_unmultiplied(130, 168, 196, 180),
-                ),
-                egui::Color32::from_rgb(222, 233, 243),
-            );
-            render_chip(
-                ui,
-                dimensions_label,
-                egui::Color32::from_rgba_unmultiplied(72, 68, 38, 180),
-                egui::Stroke::new(
-                    1.0_f32,
-                    egui::Color32::from_rgba_unmultiplied(224, 192, 108, 180),
-                ),
-                egui::Color32::from_rgb(245, 225, 171),
-            );
+            render_chip(ui, file_size_label);
+            render_chip(ui, dimensions_label);
         });
     }
 
@@ -135,63 +101,69 @@ impl ImageViewer {
         draft_name: Option<&mut String>,
         request_focus: bool,
     ) {
+        // Two fills instead of a stroke: the same border trick the Settings cards use.
         egui::Frame::none()
-            .fill(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 10))
-            .stroke(egui::Stroke::new(
-                1.0_f32,
-                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 24),
-            ))
-            .rounding(14.0)
-            .inner_margin(egui::Margin::same(12.0))
+            .fill(UI_BORDER)
+            .rounding(12.0)
+            .inner_margin(egui::Margin::same(1.0))
             .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    self.draw_modal_thumbnail_preview(ui, ctx, &item.path);
-                    ui.add_space(12.0);
-                    ui.vertical(|ui| {
-                        ui.set_min_height(84.0);
-                        match draft_name {
-                            Some(draft_name) => {
-                                let response = ui.add(
-                                    egui::TextEdit::singleline(draft_name)
-                                        .desired_width(ui.available_width().max(180.0))
-                                        .clip_text(false),
-                                );
-                                if request_focus {
-                                    response.request_focus();
+                egui::Frame::none()
+                    .fill(UI_WINDOW)
+                    .rounding(11.0)
+                    .inner_margin(egui::Margin::same(11.0))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            self.draw_modal_thumbnail_preview(ui, ctx, &item.path);
+                            ui.add_space(12.0);
+                            ui.vertical(|ui| {
+                                ui.set_min_height(84.0);
+                                match draft_name {
+                                    Some(draft_name) => {
+                                        let response = ui.add(
+                                            egui::TextEdit::singleline(draft_name)
+                                                .margin(egui::Margin::symmetric(8.0, 6.0))
+                                                .desired_width(ui.available_width().max(180.0))
+                                                .clip_text(false),
+                                        );
+                                        if request_focus {
+                                            response.request_focus();
+                                        }
+                                    }
+                                    None => {
+                                        ui.label(
+                                            egui::RichText::new(&item.display_name)
+                                                .color(UI_TEXT_STRONG)
+                                                .size(13.5),
+                                        );
+                                    }
                                 }
-                            }
-                            None => {
-                                ui.label(
-                                    egui::RichText::new(&item.display_name)
-                                        .color(egui::Color32::WHITE)
-                                        .strong()
-                                        .size(15.0),
-                                );
-                            }
-                        }
 
-                        ui.add_space(8.0);
-                        Self::draw_modal_metadata_chips(
-                            ui,
-                            &item.file_size_label,
-                            &item.dimensions_label,
-                        );
-                        ui.add_space(8.0);
-                        let parent_label = item
-                            .path
-                            .parent()
-                            .map(|parent| parent.to_string_lossy().to_string())
-                            .unwrap_or_else(|| item.path.to_string_lossy().to_string());
-                        ui.label(
-                            egui::RichText::new(parent_label)
-                                .color(egui::Color32::from_rgb(146, 162, 178))
-                                .size(11.5),
-                        );
+                                ui.add_space(8.0);
+                                Self::draw_modal_metadata_chips(
+                                    ui,
+                                    &item.file_size_label,
+                                    &item.dimensions_label,
+                                );
+                                ui.add_space(8.0);
+                                let parent_label = item
+                                    .path
+                                    .parent()
+                                    .map(|parent| parent.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| item.path.to_string_lossy().to_string());
+                                ui.label(
+                                    egui::RichText::new(parent_label)
+                                        .monospace()
+                                        .color(UI_TEXT_FAINT)
+                                        .size(10.5),
+                                );
+                            });
+                        });
                     });
-                });
             });
     }
 
+    /// Delete confirmation in its own native window: the viewer stays visible and usable while
+    /// the user decides, and the window carries the Settings palette and buttons.
     pub(crate) fn draw_delete_confirmation_modal(&mut self, ctx: &egui::Context) {
         let (targets, title, summary) =
             if let Some(path) = self.pending_single_delete_target.clone() {
@@ -220,121 +192,77 @@ impl ImageViewer {
             .map(|path| self.delete_modal_item_info(path))
             .collect();
 
-        let mut cancel = ctx.input(|input| input.key_pressed(egui::Key::Escape));
-        let mut confirm = ctx.input(|input| {
-            input.key_pressed(egui::Key::Enter)
-                && !input.modifiers.ctrl
-                && !input.modifiers.shift
-                && !input.modifiers.alt
-        });
-        let screen_rect = ctx.screen_rect();
+        let mut place_frames = self.delete_dialog_place_frames;
+        let window_size = delete_dialog_window_size(preview_items.len());
+        let viewport_id = delete_dialog_viewport_id();
+        let mut choice = None;
 
-        egui::Area::new(egui::Id::new("delete_confirmation_backdrop"))
-            .fixed_pos(screen_rect.min)
-            .order(egui::Order::Foreground)
-            .show(ctx, |ui| {
-                let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, screen_rect.size());
-                ui.painter().rect_filled(
-                    rect,
-                    0.0,
-                    egui::Color32::from_rgba_unmultiplied(5, 7, 10, 190),
-                );
-            });
+        dialog_window_frame(
+            ctx,
+            viewport_id,
+            &title,
+            window_size,
+            &mut place_frames,
+            |ctx, ui| {
+                if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+                    choice = Some(DialogChoice::Cancel);
+                }
+                if ctx.input(|input| {
+                    input.key_pressed(egui::Key::Enter)
+                        && !input.modifiers.ctrl
+                        && !input.modifiers.shift
+                        && !input.modifiers.alt
+                }) {
+                    choice = Some(DialogChoice::Confirm);
+                }
 
-        let list_height = (preview_items.len() as f32 * 108.0)
-            .clamp(120.0, (screen_rect.height() - 260.0).max(120.0));
-        let modal_size = egui::vec2(
-            (screen_rect.width() - 48.0).clamp(420.0, 680.0),
-            (228.0 + list_height).clamp(280.0, screen_rect.height() - 36.0),
-        );
-        let modal_pos = screen_rect.center() - modal_size * 0.5;
-        egui::Area::new(egui::Id::new("delete_confirmation_modal"))
-            .fixed_pos(modal_pos)
-            .order(egui::Order::Foreground)
-            .show(ctx, |ui| {
-                ui.set_min_size(modal_size);
-                egui::Frame::none()
-                    .fill(egui::Color32::from_rgba_unmultiplied(18, 22, 28, 252))
-                    .stroke(egui::Stroke::new(
-                        1.0_f32,
-                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 40),
-                    ))
-                    .rounding(18.0)
-                    .inner_margin(egui::Margin::same(18.0))
+                dialog_heading(ui, &title, &summary);
+                ui.add_space(12.0);
+
+                let list_height = (ui.available_height() - DIALOG_FOOTER_HEIGHT).max(96.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("delete_dialog_list")
+                    .max_height(list_height)
+                    .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        ui.vertical(|ui| {
-                            ui.label(
-                                egui::RichText::new(title)
-                                    .color(egui::Color32::WHITE)
-                                    .strong()
-                                    .size(18.0),
-                            );
+                        for item in &preview_items {
+                            self.draw_modal_file_card(ui, ctx, item, None, false);
                             ui.add_space(8.0);
-                            ui.label(
-                                egui::RichText::new(summary)
-                                    .color(egui::Color32::from_rgb(210, 216, 224))
-                                    .size(14.0),
-                            );
-                            ui.add_space(12.0);
-
-                            egui::ScrollArea::vertical()
-                                .max_height((modal_size.y - 158.0).max(120.0))
-                                .auto_shrink([false, false])
-                                .show(ui, |ui| {
-                                    for item in &preview_items {
-                                        self.draw_modal_file_card(ui, ctx, item, None, false);
-                                        ui.add_space(8.0);
-                                    }
-                                });
-
-                            ui.add_space(12.0);
-                            ui.label(
-                                egui::RichText::new(
-                                    "Set confirm_delete_to_recycle_bin = false in your preset .ini to skip this confirmation.",
-                                )
-                                .color(egui::Color32::from_rgb(130, 168, 196))
-                                .size(12.0),
-                            );
-                            ui.add_space(16.0);
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                let delete_button = ui.add(
-                                    egui::Button::new(
-                                        egui::RichText::new("Delete to Recycle Bin")
-                                            .color(egui::Color32::WHITE),
-                                    )
-                                    .min_size(egui::vec2(170.0, 32.0))
-                                    .fill(egui::Color32::from_rgb(176, 52, 52))
-                                    .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(132, 36, 36)))
-                                    .rounding(4.0),
-                                );
-                                if delete_button.clicked() {
-                                    confirm = true;
-                                }
-
-                                let cancel_button = ui.add(
-                                    egui::Button::new("Cancel")
-                                        .min_size(egui::vec2(100.0, 32.0))
-                                        .fill(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 24))
-                                        .stroke(egui::Stroke::new(
-                                            1.0_f32,
-                                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 48),
-                                        ))
-                                        .rounding(4.0),
-                                );
-                                if cancel_button.clicked() {
-                                    cancel = true;
-                                }
-                            });
-                        });
+                        }
                     });
-            });
 
-        if cancel {
-            self.pending_single_delete_target = None;
-            self.pending_marked_delete_targets.clear();
-            self.modal_thumbnail_cache.clear();
-        } else if confirm {
-            self.perform_delete_targets(targets);
+                ui.add_space(10.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Set confirm_delete_to_recycle_bin = false in your preset .ini to skip \
+                         this confirmation.",
+                    )
+                    .size(10.5)
+                    .color(UI_TEXT_FAINT),
+                );
+                ui.add_space(12.0);
+                ui_divider(ui);
+                ui.add_space(10.0);
+                if let Some(chosen) = dialog_footer(ui, "Delete to Recycle Bin", "Cancel") {
+                    choice = Some(chosen);
+                }
+            },
+        );
+        self.delete_dialog_place_frames = place_frames;
+
+        let Some(choice) = choice else {
+            return;
+        };
+
+        // Closing in this frame drops the window instead of leaving it blank until the next pass.
+        ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Close);
+        match choice {
+            DialogChoice::Confirm => self.perform_delete_targets(targets),
+            DialogChoice::Cancel => {
+                self.pending_single_delete_target = None;
+                self.pending_marked_delete_targets.clear();
+                self.modal_thumbnail_cache.clear();
+            }
         }
     }
 }

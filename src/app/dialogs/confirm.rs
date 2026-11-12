@@ -6,6 +6,8 @@ use crate::app::*;
 use crate::prelude::*;
 
 impl ImageViewer {
+    /// Rename dialog in its own native window: the viewer and the Stash stay usable behind it,
+    /// and the window carries the Settings palette and buttons.
     pub(crate) fn draw_rename_modal(&mut self, ctx: &egui::Context) {
         let Some(rename_state) = self.rename_overlay.clone() else {
             return;
@@ -28,149 +30,91 @@ impl ImageViewer {
             "Edit each filename below. Every rename is validated before anything is moved."
                 .to_string()
         };
+        let confirm_label = if item_count == 1 {
+            "Rename File"
+        } else {
+            "Rename Files"
+        };
 
         let mut edited_state = rename_state;
-        let mut cancel = ctx.input(|input| input.key_pressed(egui::Key::Escape));
-        let mut confirm = ctx.input(|input| {
-            input.key_pressed(egui::Key::Enter)
-                && !input.modifiers.ctrl
-                && !input.modifiers.shift
-                && !input.modifiers.alt
-        });
-        let screen_rect = ctx.screen_rect();
+        let mut place_frames = self.rename_dialog_place_frames;
+        let window_size = rename_dialog_window_size(item_count);
+        let viewport_id = rename_dialog_viewport_id();
+        let mut choice = None;
 
-        egui::Area::new(egui::Id::new("rename_dialog_backdrop"))
-            .fixed_pos(screen_rect.min)
-            .order(egui::Order::Foreground)
-            .show(ctx, |ui| {
-                let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, screen_rect.size());
-                ui.painter().rect_filled(
-                    rect,
-                    0.0,
-                    egui::Color32::from_rgba_unmultiplied(5, 7, 10, 190),
-                );
-            });
+        dialog_window_frame(
+            ctx,
+            viewport_id,
+            &title,
+            window_size,
+            &mut place_frames,
+            |ctx, ui| {
+                if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+                    choice = Some(DialogChoice::Cancel);
+                }
+                if ctx.input(|input| {
+                    input.key_pressed(egui::Key::Enter)
+                        && !input.modifiers.ctrl
+                        && !input.modifiers.shift
+                        && !input.modifiers.alt
+                }) {
+                    choice = Some(DialogChoice::Confirm);
+                }
 
-        let list_height = (preview_items.len() as f32 * 108.0)
-            .clamp(120.0, (screen_rect.height() - 272.0).max(120.0));
-        let modal_size = egui::vec2(
-            (screen_rect.width() - 48.0).clamp(440.0, 720.0),
-            (244.0 + list_height).clamp(300.0, screen_rect.height() - 36.0),
-        );
-        let modal_pos = screen_rect.center() - modal_size * 0.5;
+                dialog_heading(ui, &title, &summary);
+                if let Some(error) = edited_state.error_message.as_ref() {
+                    ui.add_space(8.0);
+                    ui.label(egui::RichText::new(error).size(11.5).color(UI_TEXT_STRONG));
+                }
+                ui.add_space(12.0);
 
-        egui::Area::new(egui::Id::new("rename_dialog_modal"))
-            .fixed_pos(modal_pos)
-            .order(egui::Order::Foreground)
-            .show(ctx, |ui| {
-                ui.set_min_size(modal_size);
-                egui::Frame::none()
-                    .fill(egui::Color32::from_rgba_unmultiplied(18, 22, 28, 252))
-                    .stroke(egui::Stroke::new(
-                        1.0_f32,
-                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 40),
-                    ))
-                    .rounding(18.0)
-                    .inner_margin(egui::Margin::same(18.0))
+                let list_height = (ui.available_height() - DIALOG_FOOTER_HEIGHT).max(96.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("rename_dialog_list")
+                    .max_height(list_height)
+                    .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        ui.vertical(|ui| {
-                            ui.label(
-                                egui::RichText::new(title)
-                                    .color(egui::Color32::WHITE)
-                                    .strong()
-                                    .size(18.0),
+                        for (index, item) in preview_items.iter().enumerate() {
+                            self.draw_modal_file_card(
+                                ui,
+                                ctx,
+                                item,
+                                Some(&mut edited_state.items[index].draft_name),
+                                edited_state.just_opened && index == 0,
                             );
                             ui.add_space(8.0);
-                            ui.label(
-                                egui::RichText::new(summary)
-                                    .color(egui::Color32::from_rgb(210, 216, 224))
-                                    .size(14.0),
-                            );
-                            if let Some(error) = edited_state.error_message.as_ref() {
-                                ui.add_space(10.0);
-                                ui.label(
-                                    egui::RichText::new(error)
-                                        .color(egui::Color32::from_rgb(255, 148, 148))
-                                        .size(12.5),
-                                );
-                            }
-                            ui.add_space(12.0);
-
-                            egui::ScrollArea::vertical()
-                                .max_height((modal_size.y - 170.0).max(120.0))
-                                .auto_shrink([false, false])
-                                .show(ui, |ui| {
-                                    for (index, item) in preview_items.iter().enumerate() {
-                                        self.draw_modal_file_card(
-                                            ui,
-                                            ctx,
-                                            item,
-                                            Some(&mut edited_state.items[index].draft_name),
-                                            edited_state.just_opened && index == 0,
-                                        );
-                                        ui.add_space(8.0);
-                                    }
-                                });
-
-                            edited_state.just_opened = false;
-
-                            ui.add_space(16.0);
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    let confirm_label = if item_count == 1 {
-                                        "Rename File"
-                                    } else {
-                                        "Rename Files"
-                                    };
-                                    let rename_button = ui.add(
-                                        egui::Button::new(
-                                            egui::RichText::new(confirm_label)
-                                                .color(egui::Color32::WHITE),
-                                        )
-                                        .min_size(egui::vec2(132.0, 32.0))
-                                        .fill(egui::Color32::from_rgb(48, 122, 198))
-                                        .stroke(egui::Stroke::new(
-                                            1.0_f32,
-                                            egui::Color32::from_rgb(38, 92, 162),
-                                        ))
-                                        .rounding(6.0),
-                                    );
-                                    if rename_button.clicked() {
-                                        confirm = true;
-                                    }
-
-                                    let cancel_button = ui.add(
-                                        egui::Button::new("Cancel")
-                                            .min_size(egui::vec2(100.0, 32.0))
-                                            .fill(egui::Color32::from_rgba_unmultiplied(
-                                                255, 255, 255, 24,
-                                            ))
-                                            .stroke(egui::Stroke::new(
-                                                1.0_f32,
-                                                egui::Color32::from_rgba_unmultiplied(
-                                                    255, 255, 255, 48,
-                                                ),
-                                            ))
-                                            .rounding(6.0),
-                                    );
-                                    if cancel_button.clicked() {
-                                        cancel = true;
-                                    }
-                                },
-                            );
-                        });
+                        }
                     });
-            });
 
-        if cancel {
-            self.cancel_inline_rename();
+                edited_state.just_opened = false;
+
+                ui.add_space(12.0);
+                ui_divider(ui);
+                ui.add_space(10.0);
+                if let Some(chosen) = dialog_footer(ui, confirm_label, "Cancel") {
+                    choice = Some(chosen);
+                }
+            },
+        );
+        self.rename_dialog_place_frames = place_frames;
+
+        let Some(choice) = choice else {
             return;
-        }
+        };
 
-        self.rename_overlay = Some(edited_state);
-        if confirm {
-            self.commit_inline_rename();
+        match choice {
+            DialogChoice::Cancel => {
+                ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Close);
+                self.cancel_inline_rename();
+            }
+            DialogChoice::Confirm => {
+                // A rejected rename keeps the window open with its error message on screen.
+                self.rename_overlay = Some(edited_state);
+                self.commit_inline_rename();
+                if self.rename_overlay.is_none() {
+                    ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Close);
+                }
+            }
         }
     }
 }

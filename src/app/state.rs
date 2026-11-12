@@ -310,6 +310,40 @@ pub(crate) fn stash_window_min_size() -> egui::Vec2 {
 /// Frames the stash window re-asserts its centered geometry while the native window settles.
 pub(crate) const STASH_WINDOW_PLACE_FRAMES: u8 = 3;
 
+/// Native viewport that hosts the detached delete-confirmation dialog.
+pub(crate) fn delete_dialog_viewport_id() -> egui::ViewportId {
+    egui::ViewportId::from_hash_of("delete_confirmation_window")
+}
+
+/// Native viewport that hosts the detached rename dialog.
+pub(crate) fn rename_dialog_viewport_id() -> egui::ViewportId {
+    egui::ViewportId::from_hash_of("rename_window")
+}
+
+/// One dialog card (thumbnail, name, chips, path) plus the gap under it.
+pub(crate) const DIALOG_CARD_ROW_HEIGHT: f32 = 116.0;
+
+/// Tallest the scrolling card list grows before it scrolls instead.
+pub(crate) const DIALOG_LIST_MAX_HEIGHT: f32 = 420.0;
+
+/// Everything around the card list: heading, summary, hint, divider, buttons and margins.
+pub(crate) const DIALOG_CHROME_HEIGHT: f32 = 226.0;
+
+fn dialog_list_height(item_count: usize) -> f32 {
+    (item_count as f32 * DIALOG_CARD_ROW_HEIGHT)
+        .clamp(DIALOG_CARD_ROW_HEIGHT, DIALOG_LIST_MAX_HEIGHT)
+}
+
+/// Fixed inner size of the delete confirmation window.
+pub(crate) fn delete_dialog_window_size(item_count: usize) -> egui::Vec2 {
+    egui::vec2(600.0, DIALOG_CHROME_HEIGHT + dialog_list_height(item_count))
+}
+
+/// Fixed inner size of the rename window. Wider than delete: every row carries a text field.
+pub(crate) fn rename_dialog_window_size(item_count: usize) -> egui::Vec2 {
+    egui::vec2(680.0, DIALOG_CHROME_HEIGHT + dialog_list_height(item_count))
+}
+
 /// Native viewport that hosts the detached Stash dialog. A stable id lets a second click on the
 /// menu entry raise the existing window instead of opening a duplicate.
 pub(crate) fn stash_viewport_id() -> egui::ViewportId {
