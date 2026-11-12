@@ -455,6 +455,9 @@ pub(crate) struct StashState {
     pub(crate) box_swallowed_click: bool,
     /// Right-click menu anchor, in screen coordinates.
     pub(crate) menu_pos: Option<egui::Pos2>,
+    /// Painted rect of the open right-click menu, from the previous frame. Clicks inside it
+    /// belong to its rows, not to the empty gallery space behind it.
+    pub(crate) menu_rect: Option<egui::Rect>,
     /// Last drawn grid, read by the keyboard handler on the next frame.
     pub(crate) layout: StashGalleryLayout,
     /// Set by the keyboard handler: the next draw scrolls the selected tile into view.
@@ -479,6 +482,7 @@ impl Default for StashState {
             selection_box: None,
             box_swallowed_click: false,
             menu_pos: None,
+            menu_rect: None,
             layout: StashGalleryLayout::default(),
             scroll_to_selection: false,
             details_open: false,

@@ -127,19 +127,19 @@ impl ImageViewer {
                                             egui::TextStyle::Body.resolve(ui.style()),
                                             DIALOG_TEXT_FIELD_HEIGHT,
                                         );
-                                        let response = ui.add(
-                                            egui::TextEdit::singleline(draft_name)
-                                                .margin(egui::Margin::symmetric(
-                                                    TEXT_FIELD_PADDING_X,
-                                                    0.0,
-                                                ))
-                                                .min_size(egui::vec2(0.0, DIALOG_TEXT_FIELD_HEIGHT))
-                                                .desired_width(ui.available_width().max(180.0))
-                                                .clip_text(false)
-                                                .layouter(&mut layouter),
-                                        );
+                                        let mut output = egui::TextEdit::singleline(draft_name)
+                                            .margin(egui::Margin::symmetric(
+                                                TEXT_FIELD_PADDING_X,
+                                                0.0,
+                                            ))
+                                            .min_size(egui::vec2(0.0, DIALOG_TEXT_FIELD_HEIGHT))
+                                            .desired_width(ui.available_width().max(180.0))
+                                            .clip_text(false)
+                                            .layouter(&mut layouter)
+                                            .show(ui);
+                                        tame_triple_click(ui, &mut output);
                                         if request_focus {
-                                            response.request_focus();
+                                            output.response.request_focus();
                                         }
                                     }
                                     None => {

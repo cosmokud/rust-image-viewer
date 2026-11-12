@@ -147,14 +147,14 @@ impl ImageViewer {
                         egui::TextStyle::Body.resolve(ui.style()),
                         SETTINGS_INPUT_HEIGHT,
                     );
-                    ui.add(
-                        egui::TextEdit::singleline(&mut draft)
-                            .margin(egui::Margin::symmetric(TEXT_FIELD_PADDING_X, 0.0))
-                            .min_size(egui::vec2(0.0, SETTINGS_INPUT_HEIGHT))
-                            .desired_width(full)
-                            .hint_text("preset name")
-                            .layouter(&mut layouter),
-                    );
+                    let mut output = egui::TextEdit::singleline(&mut draft)
+                        .margin(egui::Margin::symmetric(TEXT_FIELD_PADDING_X, 0.0))
+                        .min_size(egui::vec2(0.0, SETTINGS_INPUT_HEIGHT))
+                        .desired_width(full)
+                        .hint_text("preset name")
+                        .layouter(&mut layouter)
+                        .show(ui);
+                    tame_triple_click(ui, &mut output);
                     self.settings.rename = Some((old_name.clone(), draft.clone()));
                     ui.add_space(6.0);
                     let gap = ui.spacing().item_spacing.x;
@@ -189,14 +189,14 @@ impl ImageViewer {
                     egui::TextStyle::Body.resolve(ui.style()),
                     SETTINGS_INPUT_HEIGHT,
                 );
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.settings.new_name)
-                        .margin(egui::Margin::symmetric(TEXT_FIELD_PADDING_X, 0.0))
-                        .min_size(egui::vec2(0.0, SETTINGS_INPUT_HEIGHT))
-                        .hint_text("new preset name")
-                        .desired_width(full)
-                        .layouter(&mut layouter),
-                );
+                let mut output = egui::TextEdit::singleline(&mut self.settings.new_name)
+                    .margin(egui::Margin::symmetric(TEXT_FIELD_PADDING_X, 0.0))
+                    .min_size(egui::vec2(0.0, SETTINGS_INPUT_HEIGHT))
+                    .hint_text("new preset name")
+                    .desired_width(full)
+                    .layouter(&mut layouter)
+                    .show(ui);
+                tame_triple_click(ui, &mut output);
                 ui.add_space(6.0);
                 if settings_button(
                     ui,

@@ -100,6 +100,65 @@ pub(crate) fn text_field_layouter(
     }
 }
 
+/// Character range of the word around `index`, using egui's own notion of a word character.
+pub(crate) fn word_range_at(text: &str, index: usize) -> (usize, usize) {
+    let chars: Vec<char> = text.chars().collect();
+    let len = chars.len();
+    let index = index.min(len);
+    let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let before = index.checked_sub(1).and_then(|i| chars.get(i).copied());
+    let after = chars.get(index).copied();
+    // The character before the caret decides the run, so a click inside a word selects that
+    // word rather than the separator beside it.
+    let word = match (before, after) {
+        (Some(b), _) if is_word(b) => true,
+        (Some(_), Some(a)) => is_word(a),
+        (Some(_), None) => false,
+        (None, Some(a)) => is_word(a),
+        (None, None) => return (0, 0),
+    };
+
+    let mut start = index;
+    while 0 < start && is_word(chars[start - 1]) == word {
+        start -= 1;
+    }
+    let mut end = index;
+    while end < len && is_word(chars[end]) == word {
+        end += 1;
+    }
+    (start, end)
+}
+
+/// egui counts clicks by time alone, not per widget: clicking a field to place the caret and
+/// then double-clicking a word in it counts as three clicks, and egui selects the whole line.
+/// A triple click is reduced back to the word under the pointer, which is what the double
+/// click asked for.
+pub(crate) fn tame_triple_click(
+    ui: &egui::Ui,
+    output: &mut egui::widgets::text_edit::TextEditOutput,
+) {
+    if !output.response.triple_clicked() {
+        return;
+    }
+    let Some(pos) = ui.ctx().pointer_interact_pos() else {
+        return;
+    };
+    let cursor = output
+        .galley
+        .cursor_from_pos(pos - output.response.rect.min);
+    let (start, end) = word_range_at(output.galley.text(), cursor.ccursor.index);
+    let range = egui::text_selection::CCursorRange::two(
+        egui::text::CCursor::new(start),
+        egui::text::CCursor::new(end),
+    );
+    let id = output.response.id;
+    if let Some(mut state) = egui::widgets::text_edit::TextEditState::load(ui.ctx(), id) {
+        state.cursor.set_char_range(Some(range));
+        state.store(ui.ctx(), id);
+    }
+    ui.ctx().request_repaint();
+}
+
 /// One device-pixel hairline that fills the available width, used as a section divider.
 pub(crate) fn ui_divider(ui: &mut egui::Ui) {
     let (rect, _) =

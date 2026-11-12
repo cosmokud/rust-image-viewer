@@ -334,7 +334,7 @@ impl ImageViewer {
                                 egui::FontId::monospace(11.5),
                                 SETTINGS_INPUT_HEIGHT,
                             );
-                            let response = ui.add(
+                            let mut output =
                                 egui::TextEdit::singleline(&mut self.settings.texts[id])
                                     .hint_text(hint)
                                     .font(egui::FontId::monospace(11.5))
@@ -342,8 +342,10 @@ impl ImageViewer {
                                     .min_size(egui::vec2(0.0, SETTINGS_INPUT_HEIGHT))
                                     .desired_width(controls)
                                     .horizontal_align(egui::Align::LEFT)
-                                    .layouter(&mut layouter),
-                            );
+                                    .layouter(&mut layouter)
+                                    .show(ui);
+                            tame_triple_click(ui, &mut output);
+                            let response = output.response;
                             let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
                             // Commit only on Enter/focus loss: a half-typed binding must never be
                             // written, so rejected text stays in the box for the user to fix.

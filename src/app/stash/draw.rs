@@ -190,15 +190,15 @@ impl ImageViewer {
                 egui::TextStyle::Body.resolve(ui.style()),
                 STASH_SEARCH_HEIGHT,
             );
-            ui.add(
-                egui::TextEdit::singleline(&mut self.stash.search)
-                    .hint_text("Filter stash")
-                    // The visible box (and so the gap after it) is exactly `search_width`.
-                    .desired_width((search_width - 2.0 * STASH_SEARCH_MARGIN_X).max(24.0))
-                    .margin(egui::Margin::symmetric(STASH_SEARCH_MARGIN_X, 0.0))
-                    .min_size(egui::vec2(0.0, STASH_SEARCH_HEIGHT))
-                    .layouter(&mut layouter),
-            );
+            let mut output = egui::TextEdit::singleline(&mut self.stash.search)
+                .hint_text("Filter stash")
+                // The visible box (and so the gap after it) is exactly `search_width`.
+                .desired_width((search_width - 2.0 * STASH_SEARCH_MARGIN_X).max(24.0))
+                .margin(egui::Margin::symmetric(STASH_SEARCH_MARGIN_X, 0.0))
+                .min_size(egui::vec2(0.0, STASH_SEARCH_HEIGHT))
+                .layouter(&mut layouter)
+                .show(ui);
+            tame_triple_click(ui, &mut output);
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if settings_button(
@@ -349,7 +349,15 @@ impl ImageViewer {
                 .iter()
                 .any(|(_, tile_rect)| tile_rect.contains(pos))
         });
-        if !over_tile && !self.stash.box_swallowed_click {
+        // A click on the open right-click menu must reach the menu, not be read here as a
+        // click on empty gallery space (which cleared the selection every action depends on).
+        let over_menu = self.stash.menu_pos.is_some()
+            && pointer_pos.is_some_and(|pos| {
+                self.stash
+                    .menu_rect
+                    .is_some_and(|menu_rect| menu_rect.contains(pos))
+            });
+        if !over_tile && !over_menu && !self.stash.box_swallowed_click {
             if let Some(pos) = pointer_pos.filter(|pos| marquee_rect.contains(*pos)) {
                 if ctx.input(|input| input.pointer.primary_released()) {
                     self.stash.selection.clear();

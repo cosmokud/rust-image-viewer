@@ -45,6 +45,9 @@ impl ImageViewer {
             });
 
         let menu_rect = area.response.rect;
+        // Published for the gallery, so a click on the menu is never read as a click on empty
+        // gallery space (that path clears the selection every action starts from).
+        self.stash.menu_rect = Some(menu_rect);
         let clicked_outside = ctx.input(|input| {
             input.pointer.any_click()
                 && input
@@ -55,11 +58,13 @@ impl ImageViewer {
 
         if let Some(action) = chosen {
             self.stash.menu_pos = None;
+            self.stash.menu_rect = None;
             self.stash_run_action(ctx, action);
             return;
         }
         if close || clicked_outside {
             self.stash.menu_pos = None;
+            self.stash.menu_rect = None;
         }
     }
 }

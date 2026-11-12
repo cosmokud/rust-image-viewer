@@ -249,7 +249,7 @@ impl ImageViewer {
                                                                 .resolve(ui.style()),
                                                             SEARCH_FIELD_HEIGHT,
                                                         );
-                                                        let response = ui.add(
+                                                        let mut output =
                                                             egui::TextEdit::singleline(
                                                                 &mut self.settings.search,
                                                             )
@@ -264,8 +264,10 @@ impl ImageViewer {
                                                                 SEARCH_FIELD_HEIGHT,
                                                             ))
                                                             .desired_width(180.0)
-                                                            .layouter(&mut layouter),
-                                                        );
+                                                            .layouter(&mut layouter)
+                                                            .show(ui);
+                                                        tame_triple_click(ui, &mut output);
+                                                        let response = output.response;
                                                         if std::mem::take(
                                                             &mut self.settings.focus_search,
                                                         ) {

@@ -147,12 +147,14 @@ impl ImageViewer {
                 ui.horizontal(|ui| {
                     let mut layouter =
                         text_field_layouter(egui::TextStyle::Body.resolve(ui.style()), 22.0);
-                    let text_response = ui.add_sized(
-                        [64.0, 22.0],
-                        egui::TextEdit::singleline(&mut self.webp_custom_fps_input)
-                            .margin(egui::Margin::symmetric(TEXT_FIELD_PADDING_X, 0.0))
-                            .layouter(&mut layouter),
-                    );
+                    let mut output = egui::TextEdit::singleline(&mut self.webp_custom_fps_input)
+                        .margin(egui::Margin::symmetric(TEXT_FIELD_PADDING_X, 0.0))
+                        .min_size(egui::vec2(64.0, 22.0))
+                        .desired_width(64.0)
+                        .layouter(&mut layouter)
+                        .show(ui);
+                    tame_triple_click(ui, &mut output);
+                    let text_response = output.response;
                     let apply_clicked = ui.button("Set").clicked();
                     let apply_with_enter =
                         text_response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
