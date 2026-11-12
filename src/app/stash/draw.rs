@@ -29,9 +29,17 @@ const STASH_CHROME_GAP: f32 = 8.0;
 const STASH_CHIP_WIDTH: f32 = 28.0;
 const STASH_CHIP_GAP: f32 = 3.0;
 
+/// Clear air between the filter box and the first button. Without it the two borders kiss at
+/// the minimum window width.
+const STASH_SEARCH_GAP: f32 = 16.0;
+
+/// Padding inside the filter box. egui measures `desired_width` for the text area and adds this
+/// on both sides, so it has to be subtracted to size the visible box.
+const STASH_SEARCH_MARGIN_X: f32 = 8.0;
+
 /// A filter box narrower than this is unreadable, but the buttons still get their room: only
 /// below this does the box stop shrinking.
-const STASH_SEARCH_MIN_WIDTH: f32 = 60.0;
+const STASH_SEARCH_MIN_WIDTH: f32 = 76.0;
 
 /// Space kept for the gallery scrollbar. It is subtracted whether or not the bar is visible:
 /// letting the bar's presence change the column count made the grid flip back and forth while
@@ -172,7 +180,7 @@ impl ImageViewer {
                 + chips.len() as f32 * STASH_CHIP_WIDTH
                 + (chips.len() - 1) as f32 * STASH_CHIP_GAP;
         }
-        let search_width = (ui.available_width() - right_width - STASH_CHROME_GAP)
+        let search_width = (ui.available_width() - right_width - STASH_SEARCH_GAP)
             .clamp(STASH_SEARCH_MIN_WIDTH, 400.0);
 
         ui.horizontal(|ui| {
@@ -181,8 +189,9 @@ impl ImageViewer {
             ui.add(
                 egui::TextEdit::singleline(&mut self.stash.search)
                     .hint_text("Filter stash")
-                    .desired_width(search_width)
-                    .margin(egui::vec2(8.0, 4.0)),
+                    // The visible box (and so the gap after it) is exactly `search_width`.
+                    .desired_width((search_width - 2.0 * STASH_SEARCH_MARGIN_X).max(24.0))
+                    .margin(egui::vec2(STASH_SEARCH_MARGIN_X, 4.0)),
             );
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
