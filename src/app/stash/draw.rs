@@ -14,8 +14,13 @@ pub(crate) const STASH_TILE_SIDE: f32 = 176.0;
 /// another column fitted.
 pub(crate) const STASH_TILE_GAP: f32 = 12.0;
 
-/// Width of the details column spawned by the command bar button.
-pub(crate) const STASH_DETAILS_WIDTH: f32 = 300.0;
+/// Narrowest the details column may get. With details open the gallery is pinned to two
+/// columns and this column absorbs every remaining pixel, so widening the window widens the
+/// panel instead of adding a third column.
+pub(crate) const STASH_DETAILS_MIN_WIDTH: f32 = 260.0;
+
+/// Space between the gallery and the details column.
+pub(crate) const STASH_DETAILS_GAP: f32 = 14.0;
 
 /// Space kept for the gallery scrollbar. It is subtracted whether or not the bar is visible:
 /// letting the bar's presence change the column count made the grid flip back and forth while
@@ -44,7 +49,7 @@ impl ImageViewer {
         let viewport_builder = egui::ViewportBuilder::default()
             .with_title("Stash")
             .with_inner_size(window_size)
-            .with_min_inner_size(STASH_WINDOW_MIN_SIZE)
+            .with_min_inner_size(stash_window_min_size())
             .with_position(initial_position)
             .with_resizable(true);
 
@@ -89,7 +94,7 @@ impl ImageViewer {
                         });
                     ui_divider(ui);
                     egui::Frame::none()
-                        .inner_margin(egui::Margin::same(16.0))
+                        .inner_margin(egui::Margin::symmetric(STASH_BODY_MARGIN_X, 16.0))
                         .show(ui, |ui| {
                             self.draw_stash_body(ui, ctx);
                         });
@@ -156,11 +161,15 @@ impl ImageViewer {
 
         ui.horizontal_top(|ui| {
             let details_open = self.stash.details_open;
+            let available = ui.available_width();
             let gallery_width = if details_open {
-                (ui.available_width() - STASH_DETAILS_WIDTH - 14.0).max(180.0)
+                let two_columns =
+                    2.0 * STASH_TILE_SIDE + STASH_TILE_GAP + STASH_SCROLLBAR_ALLOWANCE;
+                two_columns.min((available - STASH_DETAILS_GAP - STASH_DETAILS_MIN_WIDTH).max(64.0))
             } else {
-                ui.available_width()
+                available
             };
+            let details_width = (available - gallery_width - STASH_DETAILS_GAP).max(0.0);
             ui.allocate_ui_with_layout(
                 egui::vec2(gallery_width, row_height),
                 egui::Layout::top_down(egui::Align::Min),
@@ -170,9 +179,9 @@ impl ImageViewer {
             );
 
             if details_open {
-                ui.add_space(14.0);
+                ui.add_space(STASH_DETAILS_GAP);
                 ui.allocate_ui_with_layout(
-                    egui::vec2(STASH_DETAILS_WIDTH, row_height),
+                    egui::vec2(details_width, row_height),
                     egui::Layout::top_down(egui::Align::Min),
                     |ui| {
                         self.draw_stash_details(ui, ctx);

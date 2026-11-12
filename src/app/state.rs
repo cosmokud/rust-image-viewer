@@ -282,8 +282,23 @@ pub(crate) struct DeleteModalItemInfo {
     pub(crate) dimensions_label: String,
 }
 
-/// Smallest inner size the stash window takes on a small screen.
-pub(crate) const STASH_WINDOW_MIN_SIZE: egui::Vec2 = egui::vec2(560.0, 400.0);
+/// Tiles the minimum window width must fit with the details column closed.
+pub(crate) const STASH_MIN_TILE_COLUMNS: f32 = 4.0;
+
+/// The stash body frame's inner margin, on each side.
+pub(crate) const STASH_BODY_MARGIN_X: f32 = 16.0;
+
+/// Smallest inner size the stash window takes: exactly four tiles fit per row with the details
+/// column closed, so the grid never reflows below the density it was designed for.
+pub(crate) fn stash_window_min_size() -> egui::Vec2 {
+    let tiles = STASH_MIN_TILE_COLUMNS * STASH_TILE_SIDE;
+    let gaps = (STASH_MIN_TILE_COLUMNS - 1.0) * STASH_TILE_GAP;
+    // Body margins, the gallery scrollbar slot, and one pixel of window border per side.
+    egui::vec2(
+        tiles + gaps + STASH_BODY_MARGIN_X * 2.0 + STASH_SCROLLBAR_ALLOWANCE + 4.0,
+        400.0,
+    )
+}
 
 /// Frames the stash window re-asserts its centered geometry while the native window settles.
 pub(crate) const STASH_WINDOW_PLACE_FRAMES: u8 = 3;
@@ -294,14 +309,15 @@ pub(crate) fn stash_viewport_id() -> egui::ViewportId {
     egui::ViewportId::from_hash_of("stash_window")
 }
 
-/// Dialog size: most of the work area, so the gallery gets several columns.
+/// Dialog size: most of the work area, never below the four-tile minimum.
 pub(crate) fn stash_window_size(screen: egui::Rect) -> egui::Vec2 {
-    let width = (screen.width() * 0.7)
-        .max(STASH_WINDOW_MIN_SIZE.x.min(screen.width()))
-        .min(screen.width() * 0.9);
+    let min_size = stash_window_min_size();
+    let width = (screen.width() * 0.72)
+        .max(min_size.x.min(screen.width()))
+        .min((screen.width() - 24.0).max(min_size.x.min(screen.width())));
     let height = (screen.height() * 0.7)
-        .max(STASH_WINDOW_MIN_SIZE.y.min(screen.height()))
-        .min(screen.height() * 0.9);
+        .max(min_size.y.min(screen.height()))
+        .min((screen.height() - 24.0).max(min_size.y.min(screen.height())));
     egui::vec2(width, height)
 }
 
