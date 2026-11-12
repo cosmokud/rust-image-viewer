@@ -69,7 +69,9 @@ impl ImageViewer {
         self.file_action_menu = None;
         self.pending_single_delete_target = None;
         self.pending_marked_delete_targets.clear();
-        self.release_video_resources_for_paths(&existing_paths);
+        // Nothing is released here: the video player for the target is only torn down once
+        // `perform_delete_targets` actually moves the files. Cancelling the confirmation must
+        // leave the viewer exactly as it was.
 
         if self.config.confirm_delete_to_recycle_bin {
             // A fresh window re-centers and takes the keyboard on its first frames.

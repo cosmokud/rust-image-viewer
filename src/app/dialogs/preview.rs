@@ -272,9 +272,10 @@ impl ImageViewer {
         match choice {
             DialogChoice::Confirm => self.perform_delete_targets(targets),
             DialogChoice::Cancel => {
+                // Nothing was deleted, so nothing is dropped: clearing the thumbnail cache here
+                // would make the Stash and folder previews decode everything again.
                 self.pending_single_delete_target = None;
                 self.pending_marked_delete_targets.clear();
-                self.modal_thumbnail_cache.clear();
             }
         }
     }

@@ -73,8 +73,9 @@ impl ImageViewer {
     }
 
     pub(crate) fn cancel_inline_rename(&mut self) {
+        // Cancelling changes no file, so the thumbnails stay cached: dropping them here would
+        // make the dialogs' previews and the Stash re-decode every item.
         self.rename_overlay = None;
-        self.modal_thumbnail_cache.clear();
     }
 
     pub(crate) fn validate_rename_draft(draft_name: &str) -> Result<(), String> {
@@ -235,7 +236,6 @@ impl ImageViewer {
         }
 
         self.rename_overlay = None;
-        self.modal_thumbnail_cache.clear();
 
         let renamed_current = current_path_before.as_ref().and_then(|current_path| {
             changed_paths
@@ -244,13 +244,23 @@ impl ImageViewer {
                 .map(|(_, new_path)| new_path.clone())
         });
 
+        // A rename made from another window (the Stash, say) can touch a folder this viewer is
+        // not showing: there is nothing to refresh in that case.
+        let current_dir = current_path_before
+            .as_ref()
+            .and_then(|path| path.parent())
+            .map(Path::to_path_buf);
+        let current_folder_touched = changed_paths
+            .iter()
+            .any(|(original_path, _)| original_path.parent().map(Path::to_path_buf) == current_dir);
+
         if let Some(new_current_path) = renamed_current {
             if self.mode().is_solo() {
                 self.load_media(&new_current_path);
             } else {
                 self.refresh_media_list_after_path_mutation(Some(new_current_path));
             }
-        } else {
+        } else if current_folder_touched {
             self.refresh_media_list_after_path_mutation(current_path_before);
         }
     }
