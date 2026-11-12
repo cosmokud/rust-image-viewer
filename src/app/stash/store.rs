@@ -250,26 +250,33 @@ impl ImageViewer {
     /// Details for a stash tile: captured metadata first, and the same fallbacks the delete
     /// dialog uses when a dimension or size was never captured.
     pub(crate) fn stash_item_info(&self, path: &PathBuf) -> DeleteModalItemInfo {
-        let info = self.delete_modal_item_info(path);
         let Some(entry) = self.stash_entry(path.as_path()) else {
-            return info;
+            return self.delete_modal_item_info(path);
         };
 
+        // Everything the card shows is already in the entry: building it here avoids the
+        // metadata pass, and the dimension probe, that `delete_modal_item_info` would repeat on
+        // the first hover of every tile.
+        let display_name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.to_string_lossy().to_string());
         let file_size_label = if 0 < entry.size_bytes {
             Self::format_file_size(entry.size_bytes)
         } else {
-            info.file_size_label
+            Self::file_size_label_for_path(path).unwrap_or_else(|| "Unknown size".to_string())
         };
         let dimensions_label = if 0 < entry.width && 0 < entry.height {
             format!("{} x {} px", entry.width, entry.height)
         } else {
-            info.dimensions_label
+            self.delete_modal_item_info(path).dimensions_label
         };
 
         DeleteModalItemInfo {
+            path: path.clone(),
+            display_name,
             file_size_label,
             dimensions_label,
-            ..info
         }
     }
 }

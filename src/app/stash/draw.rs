@@ -57,7 +57,10 @@ impl ImageViewer {
         // The dialog is drawn in its own monochrome theme; egui keeps one style per context, so
         // it is installed for the duration of this window's frame and handed back afterwards.
         let viewer_style = ctx.style();
-        ctx.set_style(settings_style(viewer_style.as_ref()));
+        let mut stash_style = settings_style(viewer_style.as_ref());
+        // Hover cards answer a third sooner than egui's default half-second delay.
+        stash_style.interaction.tooltip_delay *= 2.0 / 3.0;
+        ctx.set_style(stash_style);
         ctx.show_viewport_immediate(viewport_id, viewport_builder, |ctx, _class| {
             // A decorated window brings its own close button, minimize and taskbar entry.
             if ctx.input(|input| input.viewport().close_requested()) {
