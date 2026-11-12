@@ -41,6 +41,25 @@ mod tests {
         );
     }
 
+    /// `default.ini` is rendered from `Config::default()`, so a per-row reset must land on the
+    /// value `get(&Config::default(), id)` reports for every key in the table.
+    #[test]
+    pub(crate) fn default_value_matches_config_default() {
+        let defaults = Config::default();
+        for setting in SETTINGS {
+            assert_eq!(
+                crate::settings_registry::default_value(setting.id),
+                Some(&get(&defaults, setting.id)),
+                "default drift for `{}`",
+                setting.key
+            );
+        }
+        assert_eq!(
+            crate::settings_registry::default_value(SETTINGS.len()),
+            None
+        );
+    }
+
     #[test]
     pub(crate) fn render_parse_roundtrip_keeps_every_value() {
         let original = capture(&Config::default());

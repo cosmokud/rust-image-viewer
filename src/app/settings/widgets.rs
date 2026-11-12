@@ -205,10 +205,10 @@ impl ImageViewer {
         let mut write_now = false;
 
         let row = ui.horizontal(|ui| {
-            ui.set_min_height(38.0);
             ui.spacing_mut().item_spacing.x = 10.0;
+            // The label takes the row height so the row itself is tall enough to right-click.
             let label_response = ui.add_sized(
-                [(label_slot - 6.0).max(40.0), 20.0],
+                [(label_slot - 6.0).max(40.0), SETTINGS_ROW_HEIGHT],
                 egui::Label::new(
                     egui::RichText::new(setting.label)
                         .size(13.0)
@@ -364,6 +364,10 @@ impl ImageViewer {
             });
             label_response
         });
+        // The row is registered by rect for the right-click menu (`open_settings_row_menu`):
+        // its controls allocate their own hit areas and sink the pointer, so widget hover only
+        // ever covers the label and the empty body, never the slider, box or toggle.
+        self.settings.row_rects.push((id, row.response.rect));
         // Paint the tooltip on the hover frame instead of `on_hover_text`: that delayed path needs a
         // frame after `interaction.tooltip_delay`, and an idle viewer only wakes the dialog's own
         // viewport on input, so the deadline frame usually never arrives and nothing is shown.

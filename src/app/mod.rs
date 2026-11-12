@@ -84,6 +84,9 @@ impl Default for SettingsModal {
             status_is_error: false,
             pending_confirm: None,
             save_due_at: None,
+            row_rects: Vec::new(),
+            row_menu: None,
+            row_menu_rect: None,
         }
     }
 }
