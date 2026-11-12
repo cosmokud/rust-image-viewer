@@ -621,81 +621,132 @@ impl ImageViewer {
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
 
-                // The preview grows to the column width, so a tall image makes the column
-                // scroll instead of being squeezed into a fixed box.
-                egui::ScrollArea::vertical()
-                    .id_salt("stash_details")
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        let Some(path) = self.stash.selected.clone() else {
-                            ui.label(
-                                egui::RichText::new("Select a file to see its details.")
-                                    .size(12.0)
-                                    .color(UI_TEXT_DIM),
-                            );
-                            return;
-                        };
-                        let info = self.stash_item_info(&path);
-                        let preview = self.ensure_modal_thumbnail_texture(ctx, &path);
+                let Some(path) = self.stash.selected.clone() else {
+                    ui.label(
+                        egui::RichText::new("Select a file to see its details.")
+                            .size(12.0)
+                            .color(UI_TEXT_DIM),
+                    );
+                    return;
+                };
+                let info = self.stash_item_info(&path);
+                let preview = self.ensure_modal_thumbnail_texture(ctx, &path);
 
-                        let preview_width = ui.available_width();
-                        let preview_height = preview
-                            .map(|(_, size)| {
-                                if 0.0 < size.x {
-                                    preview_width * size.y / size.x
-                                } else {
-                                    preview_width
-                                }
-                            })
-                            .unwrap_or(160.0)
-                            .max(80.0);
-                        let (preview_rect, _) = ui.allocate_exact_size(
-                            egui::vec2(preview_width, preview_height),
-                            egui::Sense::hover(),
-                        );
-                        ui_paint_surface(
-                            ui.painter(),
-                            preview_rect,
-                            8.0,
-                            UI_CONTENT,
-                            Some(UI_BORDER),
-                        );
-                        if let Some((texture_id, size)) = preview {
-                            Self::paint_stash_preview(
-                                ui,
-                                preview_rect.shrink(8.0),
-                                texture_id,
-                                size,
-                            );
+                // The image takes every pixel the column can give it and its height is capped
+                // at whatever is left of the window once the caption and the metadata are
+                // measured: growing the window grows the image, shrinking the window shrinks
+                // it, and the details never scroll out of reach.
+                let layout_path = path.to_string_lossy().to_string();
+                let reserve = modal_details_caption_height(ui, &info, &layout_path);
+                let available = ui.available_size();
+                let image_cap = (available.y - reserve).max(0.0);
+                let preview_width = available.x.max(0.0);
+                let natural_height = preview
+                    .map(|(_, size)| {
+                        if 0.0 < size.x && 0.0 < size.y {
+                            preview_width * size.y / size.x
+                        } else {
+                            preview_width
                         }
+                    })
+                    .unwrap_or(160.0);
+                let preview_height = natural_height.min(image_cap);
+                let (preview_rect, _) = ui.allocate_exact_size(
+                    egui::vec2(preview_width, preview_height),
+                    egui::Sense::hover(),
+                );
+                ui_paint_surface(ui.painter(), preview_rect, 8.0, UI_CONTENT, Some(UI_BORDER));
+                if let Some((texture_id, size)) = preview {
+                    Self::paint_stash_preview(ui, preview_rect.shrink(8.0), texture_id, size);
+                }
 
-                        ui.add_space(10.0);
-                        ui.label(
-                            egui::RichText::new(&info.display_name)
-                                .size(13.5)
-                                .color(UI_TEXT_STRONG),
-                        );
-                        ui.add_space(7.0);
-                        Self::draw_modal_metadata_chips(
-                            ui,
-                            &info.file_size_label,
-                            &info.dimensions_label,
-                        );
-                        ui.add_space(9.0);
-                        ui.label(
-                            egui::RichText::new(format!("Type  {}", stash_media_type_label(&path)))
-                                .size(11.5)
-                                .color(UI_TEXT),
-                        );
-                        ui.add_space(4.0);
-                        ui.label(
-                            egui::RichText::new(path.to_string_lossy().to_string())
-                                .size(11.0)
-                                .color(UI_TEXT_DIM),
-                        );
-                    });
+                ui.add_space(10.0);
+                ui.label(
+                    egui::RichText::new(&info.display_name)
+                        .size(13.5)
+                        .color(UI_TEXT_STRONG),
+                );
+                ui.add_space(7.0);
+                Self::draw_modal_metadata_chips(ui, &info.file_size_label, &info.dimensions_label);
+                ui.add_space(9.0);
+                ui.label(
+                    egui::RichText::new(format!("Type  {}", stash_media_type_label(&path)))
+                        .size(11.5)
+                        .color(UI_TEXT),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(layout_path)
+                        .size(11.0)
+                        .color(UI_TEXT_DIM),
+                );
             });
     }
+}
+
+/// Height the caption under the image needs: the name, the metadata chips, the type row and
+/// the path, plus the gaps between them. Sizes and spacings match what `draw_stash_details`
+/// paints, measured from the real text so the wrapped rows are reserved exactly once.
+fn modal_details_caption_height(
+    ui: &egui::Ui,
+    info: &DeleteModalItemInfo,
+    path_label: &str,
+) -> f32 {
+    let spacing = ui.spacing().item_spacing.y;
+    // Six gaps: the four explicit ones plus the item spacing every widget below adds.
+    let mut height = 10.0 + 7.0 + 9.0 + 4.0 + spacing * 5.0;
+    height += wrapped_label_height(ui, &info.display_name, 13.5);
+    height += metadata_chip_row_height(ui, &info.file_size_label, &info.dimensions_label);
+    height += wrapped_label_height(ui, "Type  Image", 11.5);
+    height += wrapped_label_height(ui, path_label, 11.0);
+    height
+}
+
+/// Height of the two metadata chips: one row when both fit side by side, two when they wrap.
+fn metadata_chip_row_height(ui: &egui::Ui, file_size_label: &str, dimensions_label: &str) -> f32 {
+    const CHIP_TEXT_SIZE: f32 = 11.5;
+    const CHIP_MARGIN_X: f32 = 8.0;
+    const CHIP_MARGIN_Y: f32 = 3.0;
+
+    let row = wrapped_label_height(ui, file_size_label, CHIP_TEXT_SIZE).max(wrapped_label_height(
+        ui,
+        dimensions_label,
+        CHIP_TEXT_SIZE,
+    )) + CHIP_MARGIN_Y * 2.0;
+    let chips_width = wrapped_label_width(ui, file_size_label, CHIP_TEXT_SIZE)
+        + wrapped_label_width(ui, dimensions_label, CHIP_TEXT_SIZE)
+        + CHIP_MARGIN_X * 4.0
+        + ui.spacing().item_spacing.x * 2.0;
+
+    if chips_width <= ui.available_width() {
+        row
+    } else {
+        row * 2.0 + ui.spacing().item_spacing.y
+    }
+}
+
+/// Layout job matching an ordinary wrapped label, so the measured rect is what gets painted.
+fn label_layout_job(ui: &egui::Ui, text: &str, size: f32) -> egui::text::LayoutJob {
+    let wrap_width = (ui.available_width() - ui.spacing().item_spacing.x).max(24.0);
+    egui::text::LayoutJob::simple(
+        text.to_owned(),
+        egui::FontId::proportional(size),
+        UI_TEXT,
+        wrap_width,
+    )
+}
+
+/// Height a label wraps to at `size`, measured against the column width without drawing it.
+fn wrapped_label_height(ui: &egui::Ui, text: &str, size: f32) -> f32 {
+    let job = label_layout_job(ui, text, size);
+    ui.fonts(|fonts| fonts.layout_job(job).rect.height())
+}
+
+/// Unwrapped width of a label at `size`.
+fn wrapped_label_width(ui: &egui::Ui, text: &str, size: f32) -> f32 {
+    let mut job = label_layout_job(ui, text, size);
+    job.wrap.max_width = f32::INFINITY;
+    ui.fonts(|fonts| fonts.layout_job(job).rect.width())
 }
 
 /// Square icon chip for the command bar: the icon carries the action, the hover text explains
