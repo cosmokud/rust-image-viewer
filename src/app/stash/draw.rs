@@ -94,7 +94,10 @@ impl ImageViewer {
                         });
                     ui_divider(ui);
                     egui::Frame::none()
-                        .inner_margin(egui::Margin::symmetric(STASH_BODY_MARGIN_X, 16.0))
+                        .inner_margin(egui::Margin::symmetric(
+                            STASH_BODY_MARGIN_X,
+                            STASH_BODY_MARGIN_Y,
+                        ))
                         .show(ui, |ui| {
                             self.draw_stash_body(ui, ctx);
                         });

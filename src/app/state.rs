@@ -282,21 +282,28 @@ pub(crate) struct DeleteModalItemInfo {
     pub(crate) dimensions_label: String,
 }
 
-/// Tiles the minimum window width must fit with the details column closed.
+/// Tiles the minimum window size must fit, per row and in height, with the details column
+/// closed, so the grid never reflows below the density it was designed for.
 pub(crate) const STASH_MIN_TILE_COLUMNS: f32 = 4.0;
+pub(crate) const STASH_MIN_TILE_ROWS: f32 = 2.0;
 
 /// The stash body frame's inner margin, on each side.
 pub(crate) const STASH_BODY_MARGIN_X: f32 = 16.0;
+pub(crate) const STASH_BODY_MARGIN_Y: f32 = 16.0;
 
-/// Smallest inner size the stash window takes: exactly four tiles fit per row with the details
-/// column closed, so the grid never reflows below the density it was designed for.
+/// Everything above and below the gallery: command bar with its margins, the divider and the
+/// item spacing around it. Kept slightly generous so the second row is never clipped.
+pub(crate) const STASH_CHROME_HEIGHT: f32 = 74.0;
+
+/// Smallest inner size the stash window takes.
 pub(crate) fn stash_window_min_size() -> egui::Vec2 {
-    let tiles = STASH_MIN_TILE_COLUMNS * STASH_TILE_SIDE;
-    let gaps = (STASH_MIN_TILE_COLUMNS - 1.0) * STASH_TILE_GAP;
+    let columns =
+        STASH_MIN_TILE_COLUMNS * STASH_TILE_SIDE + (STASH_MIN_TILE_COLUMNS - 1.0) * STASH_TILE_GAP;
+    let rows = STASH_MIN_TILE_ROWS * STASH_TILE_SIDE + (STASH_MIN_TILE_ROWS - 1.0) * STASH_TILE_GAP;
     // Body margins, the gallery scrollbar slot, and one pixel of window border per side.
     egui::vec2(
-        tiles + gaps + STASH_BODY_MARGIN_X * 2.0 + STASH_SCROLLBAR_ALLOWANCE + 4.0,
-        400.0,
+        columns + STASH_BODY_MARGIN_X * 2.0 + STASH_SCROLLBAR_ALLOWANCE + 4.0,
+        rows + STASH_BODY_MARGIN_Y * 2.0 + STASH_CHROME_HEIGHT + 2.0,
     )
 }
 
