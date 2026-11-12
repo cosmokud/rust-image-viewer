@@ -20,6 +20,13 @@ pub(crate) const DIALOG_WINDOW_MARGIN: f32 = 18.0;
 /// Height reserved below the card list: hint line, divider, buttons and their spacing.
 pub(crate) const DIALOG_FOOTER_HEIGHT: f32 = 108.0;
 
+/// Shortest the dialog may be dragged: heading, one card, hint line and the buttons.
+pub(crate) const DIALOG_WINDOW_MIN_HEIGHT: f32 = 300.0;
+
+/// Tallest the dialog may be dragged. A finite bound because some window managers reject an
+/// unbounded maximum height.
+pub(crate) const DIALOG_WINDOW_MAX_HEIGHT: f32 = 4096.0;
+
 /// What the user chose in a confirmation dialog this frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DialogChoice {
@@ -49,14 +56,19 @@ pub(crate) fn dialog_window_frame(
     // Only an approximation: the outer size also carries the native title bar, so the exact
     // centering is re-sent once the window reports its real outer rectangle.
     let initial_position = screen.center() - (size + egui::vec2(0.0, 34.0)) * 0.5;
+    // Vertical resize only: the card list grows with the window, while a pinned width keeps the
+    // two buttons and the filename fields from reflowing. There is no per-axis resizable flag,
+    // so the width is pinned by making the minimum and maximum width the same.
+    let min_size = egui::vec2(size.x, DIALOG_WINDOW_MIN_HEIGHT.min(size.y));
+    let max_size = egui::vec2(size.x, DIALOG_WINDOW_MAX_HEIGHT.max(size.y));
     let viewport_builder = egui::ViewportBuilder::default()
         .with_title(title)
         .with_inner_size(size)
-        .with_min_inner_size(size)
+        .with_min_inner_size(min_size)
+        .with_max_inner_size(max_size)
         .with_position(initial_position)
-        // A confirmation is a fixed panel, not a document: no maximize, no resize.
         .with_maximize_button(false)
-        .with_resizable(false);
+        .with_resizable(true);
 
     let mut choice = None;
     // The viewport callback is an `FnMut`; the body may run once, so it is taken out of its slot.
