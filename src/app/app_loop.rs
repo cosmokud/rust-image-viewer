@@ -544,6 +544,7 @@ impl eframe::App for ImageViewer {
             self.draw_rename_modal(ctx);
             self.draw_exit_confirmation_modal(ctx);
             self.draw_settings_modal(ctx);
+            self.draw_stash_modal(ctx);
         }
 
         let (hide_idle_cursor, cursor_idle_repaint_after) = if skip_drawing {

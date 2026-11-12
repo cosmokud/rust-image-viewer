@@ -26,6 +26,7 @@ pub(crate) mod platform;
 pub(crate) mod runtime_diag;
 pub(crate) mod settings;
 pub(crate) mod solo;
+pub(crate) mod stash;
 pub(crate) mod state;
 #[cfg(test)]
 pub(crate) mod tests;
@@ -55,6 +56,7 @@ pub(crate) use platform::*;
 pub(crate) use runtime_diag::*;
 pub(crate) use settings::*;
 pub(crate) use solo::*;
+pub(crate) use stash::*;
 pub(crate) use state::*;
 pub(crate) use theme::*;
 pub(crate) use ui::*;
@@ -192,6 +194,8 @@ pub(crate) struct ImageViewer {
     pub(crate) pending_exit_confirmation: bool,
     /// Settings dialog state: every preset setting, the preset list and the help page.
     pub(crate) settings: SettingsModal,
+    /// Stash dialog state: the gallery over marked files.
+    pub(crate) stash: StashState,
     /// Tracks Ctrl+V hold state so paste triggers once per key press even if key_pressed is swallowed.
     pub(crate) paste_shortcut_ctrl_v_was_down: bool,
     /// Cached thumbnail textures used by delete/rename dialogs.
@@ -962,6 +966,7 @@ impl Default for ImageViewer {
             pending_marked_delete_targets: Vec::new(),
             pending_exit_confirmation: false,
             settings: SettingsModal::default(),
+            stash: StashState::default(),
             paste_shortcut_ctrl_v_was_down: false,
             modal_thumbnail_cache: HashMap::new(),
             folder_placeholder_preview_scan_pending: HashSet::new(),

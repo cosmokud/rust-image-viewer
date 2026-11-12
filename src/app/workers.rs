@@ -485,3 +485,116 @@ pub(crate) fn process_manga_focused_video_load_request(
         seamless_lod_refresh: request.seamless_lod_refresh,
     }
 }
+
+pub(crate) struct StashPreviewLoadRequest {
+    pub(crate) request_id: u64,
+    pub(crate) path: PathBuf,
+    pub(crate) muted: bool,
+    pub(crate) initial_volume: f64,
+    pub(crate) prefer_hardware_decode: bool,
+    pub(crate) disable_hardware_decode: bool,
+    pub(crate) enable_cuda_decode: bool,
+    pub(crate) enable_d3d12_decode: bool,
+    pub(crate) output_bounds: Option<(u32, u32)>,
+}
+
+pub(crate) struct StashPreviewLoadResult {
+    pub(crate) request_id: u64,
+    pub(crate) path: PathBuf,
+    pub(crate) result: Result<VideoPlayer, String>,
+}
+
+/// Latest-only queue for the single stash hover-preview player.
+///
+/// Creating a GStreamer player takes seconds, so it never runs on the UI thread: the newest
+/// request wins, and a result whose tile is no longer hovered is discarded by the caller.
+pub(crate) struct StashPreviewPlayerCoordinator {
+    latest_request: Arc<Mutex<Option<StashPreviewLoadRequest>>>,
+    wake_tx: crossbeam_channel::Sender<()>,
+    result_rx: crossbeam_channel::Receiver<StashPreviewLoadResult>,
+}
+
+impl StashPreviewPlayerCoordinator {
+    pub(crate) fn new() -> Self {
+        let latest_request: Arc<Mutex<Option<StashPreviewLoadRequest>>> =
+            Arc::new(Mutex::new(None));
+        let (wake_tx, wake_rx) = crossbeam_channel::bounded::<()>(1);
+        let (result_tx, result_rx) = crossbeam_channel::bounded::<StashPreviewLoadResult>(4);
+
+        let latest_request_worker = Arc::clone(&latest_request);
+        crate::async_runtime::spawn_blocking_or_thread("stash-preview-player", move || {
+            run_stash_preview_player_coordinator(latest_request_worker, wake_rx, result_tx);
+        });
+
+        Self {
+            latest_request,
+            wake_tx,
+            result_rx,
+        }
+    }
+
+    pub(crate) fn submit(&self, request: StashPreviewLoadRequest) {
+        *self.latest_request.lock() = Some(request);
+        let _ = self.wake_tx.try_send(());
+    }
+
+    pub(crate) fn try_recv(
+        &self,
+    ) -> Result<StashPreviewLoadResult, crossbeam_channel::TryRecvError> {
+        self.result_rx.try_recv()
+    }
+}
+
+pub(crate) fn run_stash_preview_player_coordinator(
+    latest_request: Arc<Mutex<Option<StashPreviewLoadRequest>>>,
+    wake_rx: crossbeam_channel::Receiver<()>,
+    result_tx: crossbeam_channel::Sender<StashPreviewLoadResult>,
+) {
+    while wake_rx.recv().is_ok() {
+        loop {
+            while wake_rx.try_recv().is_ok() {}
+
+            let Some(request) = latest_request.lock().take() else {
+                break;
+            };
+
+            let result = process_stash_preview_load_request(request);
+            if result_tx.send(result).is_err() {
+                return;
+            }
+
+            if latest_request.lock().is_none() {
+                break;
+            }
+        }
+    }
+}
+
+pub(crate) fn process_stash_preview_load_request(
+    request: StashPreviewLoadRequest,
+) -> StashPreviewLoadResult {
+    let source_dimensions = cached_or_probe_video_dimensions(&request.path);
+    let output_dimensions =
+        video_output_dimensions_for_bounds(source_dimensions, request.output_bounds);
+    let result = create_video_player_with_fallback(
+        &request.path,
+        request.muted,
+        request.initial_volume,
+        request.prefer_hardware_decode,
+        request.disable_hardware_decode,
+        request.enable_cuda_decode,
+        request.enable_d3d12_decode,
+        source_dimensions,
+        output_dimensions,
+        |player| {
+            player.play()?;
+            Ok(())
+        },
+    );
+
+    StashPreviewLoadResult {
+        request_id: request.request_id,
+        path: request.path,
+        result,
+    }
+}

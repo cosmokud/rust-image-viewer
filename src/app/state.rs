@@ -263,6 +263,72 @@ pub(crate) struct DeleteModalItemInfo {
     pub(crate) dimensions_label: String,
 }
 
+/// The Stash dialog: a gallery over the marked files, plus one optional details column.
+pub(crate) struct StashState {
+    pub(crate) open: bool,
+    pub(crate) search: String,
+    pub(crate) selected: Option<PathBuf>,
+    pub(crate) details_open: bool,
+    /// Tile currently under the pointer. Drives the hover video preview.
+    pub(crate) hovered: Option<PathBuf>,
+    pub(crate) preview: StashVideoPreview,
+}
+
+impl Default for StashState {
+    fn default() -> Self {
+        Self {
+            open: false,
+            search: String::new(),
+            selected: None,
+            details_open: false,
+            hovered: None,
+            preview: StashVideoPreview::default(),
+        }
+    }
+}
+
+/// The single live player behind the hovered Stash tile. At most one video decodes at a time:
+/// moving the pointer to another tile drops the player before the next load is submitted.
+pub(crate) struct StashVideoPreview {
+    pub(crate) coordinator: StashPreviewPlayerCoordinator,
+    pub(crate) request_id: u64,
+    /// Path whose load was last submitted (or attempted), not necessarily the one playing.
+    pub(crate) requested_path: Option<PathBuf>,
+    pub(crate) player: Option<VideoPlayer>,
+    pub(crate) player_path: Option<PathBuf>,
+    pub(crate) texture: Option<egui::TextureHandle>,
+    pub(crate) texture_size: egui::Vec2,
+    /// Video that failed once, so hovering it again does not start another decode.
+    pub(crate) failed_path: Option<PathBuf>,
+}
+
+impl Default for StashVideoPreview {
+    fn default() -> Self {
+        Self {
+            coordinator: StashPreviewPlayerCoordinator::new(),
+            request_id: 0,
+            requested_path: None,
+            player: None,
+            player_path: None,
+            texture: None,
+            texture_size: egui::Vec2::ZERO,
+            failed_path: None,
+        }
+    }
+}
+
+impl StashVideoPreview {
+    /// Drops the player and every trace of the last hover, without stopping the coordinator.
+    pub(crate) fn clear(&mut self) {
+        self.requested_path = None;
+        self.player = None;
+        self.player_path = None;
+        self.texture = None;
+        self.texture_size = egui::Vec2::ZERO;
+        self.failed_path = None;
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct ModalThumbnailTexture {
     pub(crate) texture: egui::TextureHandle,
@@ -289,6 +355,7 @@ pub(crate) enum MenuActionIcon {
     Delete,
     Rename,
     OpenLocation,
+    Stash,
     Settings,
 }
 

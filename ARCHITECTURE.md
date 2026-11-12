@@ -143,6 +143,7 @@ src/app/
 | `masonry/` | 2 | authoritative dimension bookkeeping + folder metadata snapshots |
 | `window/` | 11 | layout application, display lookup, window rects, fullscreen transitions, dragging, autosize, title text, startup visibility, monitor queries |
 | `settings/` | 8 | settings window values/actions/widgets/rows/presets/tabs/modal |
+| `stash/` | 3 | the Stash dialog: marked-file gallery, hover video preview, details column |
 | `dialogs/` | 5 | delete/rename/exit modals, modal thumbnails and preview |
 | `help/` | 3 | shortcut help labels and the Help tab |
 | `diagnostics/` | 3 | FPS sampling, per-frame diag stats (the overlay itself is in `ui/`) |
@@ -166,6 +167,7 @@ Quick index of the hot entry points:
 | Where is what-to-load-next decided? | `src/manga_loader/demand.rs` + `src/app/manga/demand.rs` |
 | Where are keyboard shortcuts mapped? | `src/app/input/bindings.rs`, `src/app/input/actions.rs`, `src/app/input/shortcuts.rs` |
 | Where is the settings window drawn? | `src/app/settings/tabs.rs` (`draw_settings_modal`) |
+| Where is the Stash dialog drawn? | `src/app/stash/draw.rs` (`draw_stash_modal`) |
 | Where is a setting declared? | `src/settings_registry/table.rs` (one entry in `SETTINGS`) |
 | Where is the video pipeline built? | `src/video_player/player_init.rs` + `src/video_player/create.rs` |
 | Where is a video frame scaled? | `src/video_player/player_frames.rs` + `src/texture_upload.rs` |

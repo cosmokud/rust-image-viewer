@@ -562,6 +562,14 @@ impl ImageViewer {
                                     }
 
                                     if self
+                                        .menu_action_row(ui, "Stash", MenuActionIcon::Stash)
+                                        .clicked()
+                                    {
+                                        self.open_stash();
+                                        close_popup = true;
+                                    }
+
+                                    if self
                                         .menu_action_row(ui, "Settings", MenuActionIcon::Settings)
                                         .clicked()
                                     {
