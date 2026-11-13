@@ -375,7 +375,12 @@ pub(crate) enum HistoryDirection {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum HistoryAction {
     /// Files moved to the Recycle Bin; undo restores them from there, redo deletes them again.
-    DeleteToRecycle { paths: Vec<PathBuf> },
+    /// `stashed` lists the ones the stash held, so the entries come back with the files: the
+    /// list refresh that follows a deletion prunes them.
+    DeleteToRecycle {
+        paths: Vec<PathBuf>,
+        stashed: Vec<PathBuf>,
+    },
     /// Entries dropped from the stash. The files never moved, so undo only puts them back.
     DeleteFromStash { paths: Vec<PathBuf> },
     /// Renames as `(before, after)`; undo renames back, redo renames forward again.
@@ -430,7 +435,7 @@ impl HistoryAction {
     /// The files the dialog lists: the target of the action, not its source.
     pub(crate) fn paths(&self) -> Vec<PathBuf> {
         match self {
-            Self::DeleteToRecycle { paths } | Self::DeleteFromStash { paths } => paths.clone(),
+            Self::DeleteToRecycle { paths, .. } | Self::DeleteFromStash { paths } => paths.clone(),
             Self::Rename { pairs } => pairs.iter().map(|(_, after)| after.clone()).collect(),
         }
     }

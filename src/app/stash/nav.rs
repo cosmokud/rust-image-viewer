@@ -13,18 +13,19 @@ use crate::prelude::*;
 
 impl ImageViewer {
     pub(crate) fn handle_stash_keyboard(&mut self, ctx: &egui::Context) {
-        // The filter box owns the arrows while it has focus.
-        if ctx.memory(|memory| memory.focused().is_some()) {
-            return;
-        }
-
         // Its own confirmation window owns the keyboard while it is up.
         if self.history_confirm.is_some() {
             return;
         }
 
-        // Ctrl+Z / Ctrl+Y work here too: the stash is where most destructive actions start.
+        // Ctrl+Z / Ctrl+Y work here too, and before the focus guard: the stash is where most
+        // destructive actions start, and the filter box must not be able to hide them.
         if self.try_handle_history_shortcuts(ctx) {
+            return;
+        }
+
+        // The filter box owns the arrows while it has focus.
+        if ctx.memory(|memory| memory.focused().is_some()) {
             return;
         }
 

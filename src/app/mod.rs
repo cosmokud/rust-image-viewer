@@ -199,6 +199,9 @@ pub(crate) struct ImageViewer {
     pub(crate) redo_history: Vec<HistoryAction>,
     /// The undo/redo confirmation waiting for the user, if any.
     pub(crate) history_confirm: Option<HistoryConfirmState>,
+    /// True while a confirmed entry is being applied: the mutations it performs must not record
+    /// themselves as new history.
+    pub(crate) history_applying: bool,
     /// Active Ctrl+drag marquee selection used to mark multiple files in strip/masonry mode.
     pub(crate) mark_selection_box: Option<MarkSelectionBoxState>,
     /// Delete-confirmation target for a single-file action.
@@ -985,6 +988,7 @@ impl Default for ImageViewer {
             undo_history: Vec::new(),
             redo_history: Vec::new(),
             history_confirm: None,
+            history_applying: false,
             mark_selection_box: None,
             pending_single_delete_target: None,
             pending_marked_delete_targets: Vec::new(),

@@ -346,6 +346,23 @@ pub(crate) fn recording_a_mutation_clears_the_redo_branch() {
 }
 
 #[test]
+pub(crate) fn applying_a_history_entry_does_not_record_another_one() {
+    let mut viewer = ImageViewer::default();
+    viewer.history_applying = true;
+
+    viewer.history_record(HistoryAction::DeleteFromStash {
+        paths: vec![PathBuf::from("a.png")],
+    });
+    assert!(viewer.undo_history.is_empty());
+
+    viewer.history_applying = false;
+    viewer.history_record(HistoryAction::DeleteFromStash {
+        paths: vec![PathBuf::from("b.png")],
+    });
+    assert_eq!(viewer.undo_history.len(), 1);
+}
+
+#[test]
 pub(crate) fn the_history_keeps_only_its_most_recent_entries() {
     let mut viewer = ImageViewer::default();
     for index in 0..HISTORY_LIMIT + 5 {

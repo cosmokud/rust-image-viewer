@@ -205,9 +205,11 @@ impl ImageViewer {
         });
 
         let mut removed_any = false;
+        let mut removed: Vec<PathBuf> = Vec::new();
         for path in paths {
             if self.stash.entries.remove(path).is_some() {
                 removed_any = true;
+                removed.push(path.clone());
                 self.modal_thumbnail_cache.remove(path);
                 self.stash.selection.remove(path);
                 if self.stash.preview.requested_path.as_deref() == Some(path.as_path()) {
@@ -217,6 +219,15 @@ impl ImageViewer {
         }
         if !removed_any {
             return;
+        }
+
+        // Only the stash loses these files: Ctrl+Z puts the entries back without touching disk.
+        // Recorded here rather than at the call sites so the chip, the context menu and the
+        // Delete key all leave the same history. A path that was already gone from disk is not
+        // an action worth undoing.
+        removed.retain(|path| path.exists());
+        if !removed.is_empty() {
+            self.history_record(HistoryAction::DeleteFromStash { paths: removed });
         }
 
         let remaining: Vec<PathBuf> = self

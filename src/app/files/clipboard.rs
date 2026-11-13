@@ -287,11 +287,20 @@ impl ImageViewer {
 
         self.release_video_resources_for_paths(&existing_paths);
 
+        // Captured before the deletion: the refresh that follows prunes the stash entries of
+        // the files that are gone, so undo has to know which of them it owes the stash.
+        let stashed_paths: Vec<PathBuf> = existing_paths
+            .iter()
+            .filter(|path| self.stash.entries.contains_key(*path))
+            .cloned()
+            .collect();
+
         match move_paths_to_recycle_bin(&existing_paths) {
             Ok(()) => {
                 // Recorded before the view moves on: the entry is what Ctrl+Z restores.
                 self.history_record(HistoryAction::DeleteToRecycle {
                     paths: existing_paths.clone(),
+                    stashed: stashed_paths,
                 });
 
                 let mut prepared_clipboard_changed = false;

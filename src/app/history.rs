@@ -22,6 +22,11 @@ impl ImageViewer {
     /// Records one applied mutation and drops the redo branch: a new action makes the future that
     /// was branched off unreachable, exactly like an editor.
     pub(crate) fn history_record(&mut self, action: HistoryAction) {
+        // A confirmed entry is being applied: the mutations it performs are that entry, not new
+        // user actions, so they must not push anything onto the stacks.
+        if self.history_applying {
+            return;
+        }
         self.redo_history.clear();
         self.undo_history.push(action);
         if self.undo_history.len() > HISTORY_LIMIT {
@@ -76,7 +81,7 @@ impl ImageViewer {
 
         // The dialog can say in advance which deleted files will not come back.
         let unrestorable = match (&action, direction) {
-            (HistoryAction::DeleteToRecycle { paths }, HistoryDirection::Undo) => {
+            (HistoryAction::DeleteToRecycle { paths, .. }, HistoryDirection::Undo) => {
                 recycle_bin_missing_paths(paths)
             }
             _ => Vec::new(),
@@ -104,7 +109,9 @@ impl ImageViewer {
             return;
         };
 
+        self.history_applying = true;
         let errors = self.apply_history_action(direction, &action);
+        self.history_applying = false;
 
         if errors.is_empty() {
             match direction {
@@ -116,6 +123,76 @@ impl ImageViewer {
         }
     }
 
+    /// Brings every cached view of the restored files back in line, then refreshes the windows
+    /// that show them: the solo view, the strip/grid list, and the Stash gallery with its
+    /// details column.
+    fn restored_paths_changed_every_window(&mut self, restored: &[PathBuf], stashed: &[PathBuf]) {
+        for path in restored {
+            self.unloadable_files.remove(path);
+            self.modal_thumbnail_cache.remove(path);
+        }
+        if self
+            .stash
+            .details_preview
+            .as_ref()
+            .is_some_and(|preview| restored.contains(&preview.path))
+        {
+            self.stash.details_preview = None;
+        }
+        if self
+            .stash
+            .details_preview_pending
+            .as_ref()
+            .is_some_and(|(path, _, _)| restored.contains(path))
+        {
+            self.stash.details_preview_pending = None;
+        }
+
+        // The stash entry was pruned when its file disappeared; the file is back, so is the
+        // entry, with the same captured metadata the rest of the gallery shows.
+        let stashed_back: Vec<PathBuf> = stashed
+            .iter()
+            .filter(|path| path.exists())
+            .cloned()
+            .collect();
+        if !stashed_back.is_empty() {
+            self.stash_remember_paths(&stashed_back);
+            self.stash.selected = stashed_back.first().cloned();
+            self.stash.selection = stashed_back.iter().cloned().collect();
+            self.stash.selection_anchor = stashed_back.first().cloned();
+            self.stash.scroll_to_selection = true;
+        }
+
+        // The viewer had moved to another file (or to nothing) when these were deleted: it goes
+        // back to the restored one instead of showing a list that no longer matches the disk.
+        let current_missing = self.current_media_path().is_none_or(|path| !path.exists());
+        self.refresh_media_list_after_path_mutation(restored.first().cloned());
+
+        if current_missing {
+            let target = restored
+                .iter()
+                .find(|path| self.image_list.iter().any(|candidate| candidate == *path))
+                .cloned();
+            if let Some(path) = target {
+                if self.mode().is_strip() {
+                    if let Some(index) = self
+                        .image_list
+                        .iter()
+                        .position(|candidate| candidate == &path)
+                    {
+                        self.set_current_index_clamped(index);
+                        self.scroll_strip_to_current_index();
+                        self.manga_update_preload_queue();
+                    }
+                } else {
+                    self.load_media(&path);
+                }
+            }
+        }
+
+        self.needs_repaint = true;
+    }
+
     /// One mutation applied in one direction. Returns one message per file that could not be
     /// touched; the rest of the entry is applied regardless.
     fn apply_history_action(
@@ -124,22 +201,18 @@ impl ImageViewer {
         action: &HistoryAction,
     ) -> Vec<String> {
         match (action, direction) {
-            (HistoryAction::DeleteToRecycle { paths }, HistoryDirection::Undo) => {
+            (HistoryAction::DeleteToRecycle { paths, stashed }, HistoryDirection::Undo) => {
                 let (restored, errors) = restore_paths_from_recycle_bin(paths);
                 if !restored.is_empty() {
-                    self.refresh_media_list_after_path_mutation(restored.first().cloned());
+                    self.restored_paths_changed_every_window(&restored, stashed);
                 }
                 errors
             }
-            (HistoryAction::DeleteToRecycle { paths }, HistoryDirection::Redo) => {
-                // `perform_delete_targets` is the one place a deletion refreshes the view; its own
-                // history entry is dropped again because this redo owns the action.
+            (HistoryAction::DeleteToRecycle { paths, .. }, HistoryDirection::Redo) => {
+                // `perform_delete_targets` is the one place a deletion refreshes the view; the
+                // applying guard keeps it from recording itself as a new action.
                 let error_before = self.error_message.take();
-                let undo_depth = self.undo_history.len();
                 self.perform_delete_targets(paths.clone());
-                if self.undo_history.len() > undo_depth {
-                    self.undo_history.pop();
-                }
                 match self.error_message.take() {
                     Some(error) => vec![error],
                     None => {
