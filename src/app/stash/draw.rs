@@ -118,9 +118,12 @@ impl ImageViewer {
                 self.remember_stash_window_geometry(ctx);
             }
             if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
-                // Esc backs out of the right-click menu before it closes the window.
+                // Esc backs out one step at a time: the right-click menu, then the selection, and
+                // only a window with nothing left to back out of closes.
                 if self.stash.menu_pos.is_some() {
                     self.stash.menu_pos = None;
+                } else if !self.stash.selection.is_empty() {
+                    self.stash_clear_selection();
                 } else {
                     close_window = true;
                 }

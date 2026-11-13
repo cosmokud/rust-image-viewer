@@ -106,25 +106,23 @@ impl ImageViewer {
         self.stash.preview.clear();
     }
 
-    /// Stashed files in viewer order, narrowed by the stash filter box. Files stashed from
-    /// another folder follow, sorted, so the order is stable across sessions.
+    /// Stashed files in one stable, sorted order, narrowed by the stash filter box.
+    ///
+    /// The gallery must not rearrange itself while it is open. Ordering the tiles by the
+    /// viewer's folder list did exactly that: opening a stashed file from another folder
+    /// replaces that list, so the group that had been shown in viewer order was rebuilt around
+    /// the new folder and every tile moved. Paths are sorted instead, which is the same order in
+    /// every session, every folder and every filter.
     pub(crate) fn filtered_stash_paths(&self) -> Vec<PathBuf> {
         let query = self.stash.search.trim().to_lowercase();
         let mut ordered: Vec<PathBuf> = self
-            .image_list
-            .iter()
-            .filter(|path| self.stash.entries.contains_key(*path) && path.exists())
-            .cloned()
-            .collect();
-        let mut extras: Vec<PathBuf> = self
             .stash
             .entries
             .keys()
-            .filter(|path| !self.image_list.contains(*path) && path.exists())
+            .filter(|path| path.exists())
             .cloned()
             .collect();
-        extras.sort();
-        ordered.extend(extras);
+        ordered.sort_by_key(|path| path.to_string_lossy().to_lowercase());
 
         ordered
             .into_iter()
