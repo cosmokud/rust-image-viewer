@@ -14,9 +14,7 @@ pub(crate) const STASH_TILE_SIDE: f32 = 176.0;
 /// another column fitted.
 pub(crate) const STASH_TILE_GAP: f32 = 12.0;
 
-/// Narrowest the details column may get. With details open the gallery is pinned to two
-/// columns and this column absorbs every remaining pixel, so widening the window widens the
-/// panel instead of adding a third column.
+/// Narrowest the details column may get.
 pub(crate) const STASH_DETAILS_MIN_WIDTH: f32 = 260.0;
 
 /// Space between the gallery and the details column.
@@ -45,6 +43,15 @@ const STASH_SEARCH_MIN_WIDTH: f32 = 76.0;
 /// letting the bar's presence change the column count made the grid flip back and forth while
 /// the window was being resized from the left/right edges.
 pub(crate) const STASH_SCROLLBAR_ALLOWANCE: f32 = 10.0;
+
+/// Fixed width of the details column: the width it holds when the window is at its narrowest,
+/// where the gallery is exactly two tiles per row. The panel never grows past it, so widening
+/// the window buys gallery columns instead of stretching the panel around one image.
+pub(crate) fn stash_details_panel_width() -> f32 {
+    let two_columns = 2.0 * STASH_TILE_SIDE + STASH_TILE_GAP + STASH_SCROLLBAR_ALLOWANCE;
+    (stash_window_min_size().x - STASH_BODY_MARGIN_X * 2.0 - STASH_DETAILS_GAP - two_columns)
+        .max(STASH_DETAILS_MIN_WIDTH)
+}
 
 impl ImageViewer {
     pub(crate) fn draw_stash_modal(&mut self, ctx: &egui::Context) {
@@ -260,14 +267,19 @@ impl ImageViewer {
         ui.horizontal_top(|ui| {
             let details_open = self.stash.details_open;
             let available = ui.available_width();
+            // The details column is a fixed slice; the gallery takes everything else and answers
+            // a wider window with another column. Only a window narrower than the minimum (a
+            // small display) shrinks the panel.
+            let details_width = if details_open {
+                stash_details_panel_width().min((available - STASH_DETAILS_GAP).max(0.0))
+            } else {
+                0.0
+            };
             let gallery_width = if details_open {
-                let two_columns =
-                    2.0 * STASH_TILE_SIDE + STASH_TILE_GAP + STASH_SCROLLBAR_ALLOWANCE;
-                two_columns.min((available - STASH_DETAILS_GAP - STASH_DETAILS_MIN_WIDTH).max(64.0))
+                (available - details_width - STASH_DETAILS_GAP).max(64.0)
             } else {
                 available
             };
-            let details_width = (available - gallery_width - STASH_DETAILS_GAP).max(0.0);
             ui.allocate_ui_with_layout(
                 egui::vec2(gallery_width, row_height),
                 egui::Layout::top_down(egui::Align::Min),
