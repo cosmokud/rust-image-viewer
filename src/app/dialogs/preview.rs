@@ -210,7 +210,9 @@ impl ImageViewer {
         let viewport_id = delete_dialog_viewport_id();
         let mut choice = None;
 
-        dialog_window_frame(
+        // The frame reports the native title-bar close button; the body reports its buttons
+        // and Esc. Discarding the frame's answer left that close button doing nothing.
+        let frame_choice = dialog_window_frame(
             ctx,
             viewport_id,
             &title,
@@ -263,7 +265,7 @@ impl ImageViewer {
         );
         self.delete_dialog_place_frames = place_frames;
 
-        let Some(choice) = choice else {
+        let Some(choice) = choice.or(frame_choice) else {
             return;
         };
 

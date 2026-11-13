@@ -254,6 +254,7 @@ impl ImageViewer {
                                                                 &mut self.settings.search,
                                                             )
                                                             .hint_text("Search settings")
+                                                            .vertical_align(egui::Align::Center)
                                                             .frame(false)
                                                             .margin(egui::Margin::symmetric(
                                                                 TEXT_FIELD_PADDING_X,

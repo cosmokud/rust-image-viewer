@@ -218,6 +218,7 @@ impl ImageViewer {
             );
             let mut output = egui::TextEdit::singleline(&mut self.stash.search)
                 .hint_text("Filter stash")
+                .vertical_align(egui::Align::Center)
                 // The visible box (and so the gap after it) is exactly `search_width`.
                 .desired_width((search_width - 2.0 * STASH_SEARCH_MARGIN_X).max(24.0))
                 .margin(egui::Margin::symmetric(STASH_SEARCH_MARGIN_X, 0.0))

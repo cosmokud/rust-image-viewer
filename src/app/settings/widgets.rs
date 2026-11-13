@@ -337,6 +337,7 @@ impl ImageViewer {
                             let mut output =
                                 egui::TextEdit::singleline(&mut self.settings.texts[id])
                                     .hint_text(hint)
+                                    .vertical_align(egui::Align::Center)
                                     .font(egui::FontId::monospace(11.5))
                                     .margin(egui::Margin::symmetric(TEXT_FIELD_PADDING_X, 0.0))
                                     .min_size(egui::vec2(0.0, SETTINGS_INPUT_HEIGHT))

@@ -565,7 +565,7 @@ impl ImageViewer {
                                         .menu_action_row(ui, "Stash", MenuActionIcon::Stash)
                                         .clicked()
                                     {
-                                        self.open_stash();
+                                        self.open_stash(ui.ctx());
                                         close_popup = true;
                                     }
 
