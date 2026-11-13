@@ -294,7 +294,12 @@ impl ImageViewer {
     }
 
     pub(crate) fn save_current_fullscreen_view_state(&mut self) {
-        if !self.mode().is_fullscreen() || !self.config.fullscreen_remember_view_state_in_ram {
+        // The state is the solo camera: saving it from the strip or the grid stored a zoom and a
+        // pan that belonged to no image on screen, and restoring it later moved their camera.
+        if !self.mode().is_fullscreen()
+            || !self.mode().is_solo()
+            || !self.config.fullscreen_remember_view_state_in_ram
+        {
             return;
         }
 

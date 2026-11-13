@@ -43,6 +43,13 @@ impl ImageViewer {
     }
 
     pub(crate) fn apply_fullscreen_layout_for_current_image(&mut self, ctx: &egui::Context) {
+        // This fits one image to the screen, which is the solo view's layout. The strip and the
+        // grid have their own camera: running it there scaled their columns by a single image's
+        // fit factor and left a black band on the right.
+        if !self.mode().is_solo() {
+            return;
+        }
+
         let current_path = self.image_list.get(self.current_index).cloned();
         let force_fit = current_path
             .as_ref()

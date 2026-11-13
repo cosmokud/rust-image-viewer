@@ -91,7 +91,8 @@ impl ImageViewer {
             self.request_borderless_fullscreen_rect(ctx);
             // The opened file has to be laid out again, and if it is the file that was closed,
             // that layout puts the parked camera back.
-            self.restore_parked_fullscreen_view_pending = self.parked_fullscreen_view.is_some();
+            self.restore_parked_fullscreen_view_pending =
+                self.mode().is_solo() && self.parked_fullscreen_view.is_some();
             self.pending_media_layout = true;
             ctx.request_repaint();
             return;

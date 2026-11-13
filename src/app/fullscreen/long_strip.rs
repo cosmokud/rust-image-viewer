@@ -33,7 +33,10 @@ impl ImageViewer {
     /// Restore the saved view state for a given image path (fullscreen only).
     /// Returns true if state was restored, false if no saved state exists.
     pub(crate) fn restore_fullscreen_view_state(&mut self, path: &PathBuf) -> bool {
-        if !self.mode().is_fullscreen() || !self.config.fullscreen_remember_view_state_in_ram {
+        if !self.mode().is_fullscreen()
+            || !self.mode().is_solo()
+            || !self.config.fullscreen_remember_view_state_in_ram
+        {
             return false;
         }
 
