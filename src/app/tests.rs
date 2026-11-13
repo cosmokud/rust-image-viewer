@@ -1101,3 +1101,127 @@ pub(crate) fn manga_fully_loaded_visible_set_keeps_the_pump_idle() {
     assert!(!ImageViewer::manga_tile_needs_texture(true, false, true));
     assert!(!ImageViewer::manga_tile_needs_texture(false, false, false));
 }
+
+fn masonry_test_viewer(width: f32, count: usize) -> ImageViewer {
+    let mut viewer = ImageViewer::default();
+    viewer.screen_size = egui::vec2(width, 1080.0);
+    let files: Vec<std::path::PathBuf> = (0..count)
+        .map(|index| std::path::PathBuf::from(format!("page{index}.png")))
+        .collect();
+    viewer.set_image_list_raw(files);
+    viewer.set_current_index_clamped(3);
+    viewer.manga_loader = Some(MangaLoader::new());
+    if let Some(loader) = viewer.manga_loader.as_mut() {
+        for index in 0..count {
+            loader.dimension_cache.insert(
+                index,
+                (1000, 1200 + index as u32 * 300, MangaMediaType::StaticImage),
+            );
+        }
+    }
+    set_test_mode(&mut viewer, Mode::Strip(MangaLayoutMode::Masonry));
+    viewer.mark_manga_dimension_cache_current_if_complete();
+    viewer.masonry_ensure_layout_cache();
+    viewer
+}
+
+fn masonry_rects(viewer: &ImageViewer) -> Vec<(f32, f32, f32, f32)> {
+    viewer
+        .masonry_layout_items
+        .iter()
+        .map(|item| (item.x, item.y, item.width, item.height))
+        .collect()
+}
+
+#[test]
+pub(crate) fn leaving_the_strip_for_the_solo_view_captures_the_grid() {
+    let mut viewer = masonry_test_viewer(1920.0, 8);
+    let before = masonry_rects(&viewer);
+    viewer.zoom = 1.0;
+    viewer.manga_scroll_offset = 220.0;
+    viewer.manga_scroll_target = 220.0;
+
+    viewer.mode_transition(ModeEvent::ExitFullscreen);
+    viewer.capture_masonry_mode_session_snapshot();
+
+    let snapshot = viewer
+        .masonry_mode_session_snapshot
+        .as_ref()
+        .expect("leaving the strip must keep the grid session");
+    let snapshot_rects: Vec<(f32, f32, f32, f32)> = snapshot
+        .layout_items
+        .iter()
+        .map(|item| (item.x, item.y, item.width, item.height))
+        .collect();
+    assert_eq!(snapshot_rects, before);
+    assert_eq!(snapshot.scroll_offset, 220.0);
+}
+
+#[test]
+pub(crate) fn the_solo_view_keeps_the_grid_it_left_behind() {
+    let mut viewer = masonry_test_viewer(1920.0, 8);
+    let before = masonry_rects(&viewer);
+
+    viewer.mode_transition(ModeEvent::ExitFullscreen);
+    viewer.capture_masonry_mode_session_snapshot();
+    viewer.manga_suspend_runtime_for_solo_fullscreen();
+
+    assert_eq!(viewer.manga_total_height(), 0.0);
+    assert!(viewer.masonry_layout_valid);
+    assert_eq!(masonry_rects(&viewer), before);
+    assert!(viewer.can_reuse_preserved_masonry_layout());
+}
+
+#[test]
+pub(crate) fn returning_to_masonry_restores_the_grid_and_the_camera() {
+    let mut viewer = masonry_test_viewer(1920.0, 8);
+    viewer.zoom = 1.0;
+    viewer.manga_scroll_offset = 220.0;
+    viewer.manga_scroll_target = 220.0;
+    let before = masonry_rects(&viewer);
+    let path = viewer.current_media_path();
+
+    viewer.mode_transition(ModeEvent::ExitFullscreen);
+    viewer.capture_masonry_mode_session_snapshot();
+    viewer.manga_suspend_runtime_for_solo_fullscreen();
+    let _ = viewer.manga_total_height();
+
+    set_test_mode(&mut viewer, Mode::FullscreenSolo(MangaLayoutMode::Masonry));
+    viewer.mode_state.set_layout(MangaLayoutMode::Masonry);
+    viewer.mode_transition(ModeEvent::EnterStrip);
+
+    assert!(viewer.try_restore_masonry_mode_session_snapshot(path));
+    // Same follow-up the strip-entry caller makes after a successful restore.
+    viewer.hydrate_masonry_dimensions_from_session_snapshot();
+    assert_eq!(masonry_rects(&viewer), before);
+    assert_eq!(viewer.manga_scroll_offset, 220.0);
+    assert_eq!(viewer.zoom, 1.0);
+    assert!(viewer.masonry_authoritative_dimension_lock_active());
+}
+
+#[test]
+pub(crate) fn returning_to_a_narrower_window_relays_the_grid_without_re_probing() {
+    let mut viewer = masonry_test_viewer(1920.0, 8);
+    viewer.zoom = 1.0;
+    viewer.manga_scroll_offset = 220.0;
+    viewer.manga_scroll_target = 220.0;
+    let path = viewer.current_media_path();
+
+    viewer.mode_transition(ModeEvent::ExitFullscreen);
+    viewer.capture_masonry_mode_session_snapshot();
+    viewer.manga_suspend_runtime_for_solo_fullscreen();
+    let _ = viewer.manga_total_height();
+
+    set_test_mode(&mut viewer, Mode::FullscreenSolo(MangaLayoutMode::Masonry));
+    viewer.mode_state.set_layout(MangaLayoutMode::Masonry);
+    viewer.mode_transition(ModeEvent::EnterStrip);
+    viewer.screen_size = egui::vec2(960.0, 1080.0);
+
+    assert!(viewer.try_restore_masonry_mode_session_snapshot(path));
+    // Same follow-up the strip-entry caller makes after a successful restore.
+    viewer.hydrate_masonry_dimensions_from_session_snapshot();
+    assert!(viewer.masonry_layout_valid);
+    assert_eq!(viewer.masonry_layout_items.len(), 8);
+    assert!((viewer.masonry_layout_screen_x - 960.0).abs() <= 1.0);
+    assert!(viewer.masonry_authoritative_dimension_lock_active());
+}

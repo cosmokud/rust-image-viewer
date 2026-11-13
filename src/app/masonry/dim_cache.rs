@@ -140,7 +140,10 @@ impl ImageViewer {
     }
 
     pub(crate) fn capture_masonry_mode_session_snapshot(&mut self) {
-        if !self.mode().is_masonry() || self.image_list.is_empty() {
+        // Called both before and after the strip is left: the fullscreen-exit path captures
+        // once the mode has already become FloatingSolo, so the grid layout is what qualifies,
+        // not `is_masonry()`.
+        if !self.mode().is_grid() || self.image_list.is_empty() {
             return;
         }
 
@@ -166,7 +169,7 @@ impl ImageViewer {
             layout_len: self.masonry_layout_len,
             layout_list_signature: self.masonry_layout_list_signature,
             layout_valid: self.masonry_layout_valid,
-            layout_is_gallery: self.mode().is_gallery(),
+            layout_is_gallery: self.mode().layout() == MangaLayoutMode::Gallery,
         });
     }
 
@@ -232,26 +235,42 @@ impl ImageViewer {
         }
 
         let expected_gallery_layout = self.mode().layout() == MangaLayoutMode::Gallery;
+        // Everything but the window width describes the session itself: the same list, the same
+        // column count and the same layout kind make this snapshot the viewer's own.
         let compatible_layout = snapshot.layout_valid
             && snapshot.layout_is_gallery == expected_gallery_layout
             && snapshot.image_list_signature == self.image_list_signature
             && snapshot.layout_list_signature == self.image_list_signature
             && snapshot.layout_len == self.image_list.len()
             && snapshot.layout_items.len() == self.image_list.len()
-            && snapshot.layout_items_per_row == self.masonry_items_per_row
-            && (snapshot.layout_screen_x - self.screen_size.x.round()).abs() <= 1.0;
+            && snapshot.layout_items_per_row == self.masonry_items_per_row;
 
         if !compatible_layout {
             return false;
         }
 
-        self.masonry_layout_items = snapshot.layout_items;
-        self.masonry_layout_total_height = snapshot.layout_total_height;
-        self.masonry_layout_screen_x = snapshot.layout_screen_x;
-        self.masonry_layout_items_per_row = snapshot.layout_items_per_row;
-        self.masonry_layout_len = snapshot.layout_len;
-        self.masonry_layout_list_signature = self.image_list_signature;
-        self.masonry_layout_valid = true;
+        // The rects were measured at the width the session left at. Coming back to another
+        // width keeps the session's dimensions and camera and lays the grid out again for the
+        // width it has now, instead of discarding the snapshot and re-probing the folder.
+        let geometry_matches = (snapshot.layout_screen_x - self.screen_size.x.round()).abs() <= 1.0;
+
+        if geometry_matches {
+            self.masonry_layout_items = snapshot.layout_items;
+            self.masonry_layout_total_height = snapshot.layout_total_height;
+            self.masonry_layout_screen_x = snapshot.layout_screen_x;
+            self.masonry_layout_items_per_row = snapshot.layout_items_per_row;
+            self.masonry_layout_len = snapshot.layout_len;
+            self.masonry_layout_list_signature = self.image_list_signature;
+            self.masonry_layout_valid = true;
+        } else {
+            self.masonry_layout_items.clear();
+            self.masonry_layout_total_height = 0.0;
+            self.masonry_layout_screen_x = 0.0;
+            self.masonry_layout_items_per_row = 0;
+            self.masonry_layout_len = 0;
+            self.masonry_layout_list_signature = 0;
+            self.masonry_layout_valid = false;
+        }
         self.masonry_spatial_index = None;
 
         self.zoom = self.clamp_zoom(snapshot.zoom);
@@ -259,6 +278,11 @@ impl ImageViewer {
         self.zoom_velocity = 0.0;
         self.offset = snapshot.offset;
         self.manga_total_height_cache_valid = false;
+
+        if !geometry_matches {
+            // The dimensions the snapshot carries are what the new layout is built from.
+            self.hydrate_masonry_dimensions_from_session_snapshot();
+        }
 
         let max_scroll = (self.manga_total_height() - self.screen_size.y).max(0.0);
         self.manga_scroll_offset = snapshot.scroll_offset.clamp(0.0, max_scroll);
