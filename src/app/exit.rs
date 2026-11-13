@@ -35,6 +35,8 @@ impl ImageViewer {
             }
         }
         self.viewer_window_hidden = true;
+        // Refuse the close itself first: hiding the window is not a way of answering it.
+        ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         ctx.request_repaint();
     }

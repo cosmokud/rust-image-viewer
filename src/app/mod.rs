@@ -205,6 +205,9 @@ pub(crate) struct ImageViewer {
     /// True while the viewer window is hidden because Settings or Stash is still open; the app
     /// quits once the last of those windows is closed.
     pub(crate) viewer_window_hidden: bool,
+    /// A close requested from the app itself (title-bar button, Ctrl+W, Esc) waiting for the
+    /// frame driver to resolve it against the open Settings/Stash windows.
+    pub(crate) pending_viewer_close: bool,
     /// Active Ctrl+drag marquee selection used to mark multiple files in strip/masonry mode.
     pub(crate) mark_selection_box: Option<MarkSelectionBoxState>,
     /// Delete-confirmation target for a single-file action.
@@ -993,6 +996,7 @@ impl Default for ImageViewer {
             history_confirm: None,
             history_applying: false,
             viewer_window_hidden: false,
+            pending_viewer_close: false,
             mark_selection_box: None,
             pending_single_delete_target: None,
             pending_marked_delete_targets: Vec::new(),

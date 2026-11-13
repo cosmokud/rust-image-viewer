@@ -89,9 +89,12 @@ impl ImageViewer {
     }
 
     /// Marks and the stash survive an exit, so nothing here asks the user to confirm.
+    ///
+    /// The request is only queued: the frame driver decides between exiting and hiding the viewer
+    /// behind the Settings/Stash windows, which are windows of their own.
     pub(crate) fn request_app_exit(&mut self) {
         self.file_action_menu = None;
-        self.begin_fast_app_exit();
+        self.pending_viewer_close = true;
     }
 
     pub(crate) fn prepared_clipboard_operation_for_path(

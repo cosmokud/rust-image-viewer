@@ -20,22 +20,31 @@ impl eframe::App for ImageViewer {
         self.needs_repaint = false;
 
         let viewport_close_requested = ctx.input(|input| input.viewport().close_requested());
+        let viewer_close_requested = viewport_close_requested || self.pending_viewer_close;
+        self.pending_viewer_close = false;
+
         // Closing the viewer while Settings or Stash is open only hides it: those are windows of
-        // their own, and they stay alive until the user closes them.
-        let closing_to_independent_windows =
-            viewport_close_requested && self.viewer_has_independent_window();
-        if closing_to_independent_windows {
-            self.hide_viewer_window(ctx);
-        } else if viewport_close_requested {
-            self.request_app_exit();
+        // their own, and they stay alive until the user closes them. The frame keeps running
+        // afterwards — those windows are immediate viewports, and skipping one frame closes them.
+        if viewer_close_requested {
+            if self.viewer_has_independent_window() {
+                self.hide_viewer_window(ctx);
+            } else {
+                self.begin_fast_app_exit();
+            }
         }
+
         // A hidden viewer has nothing left to show once the last of those windows closes.
-        if self.viewer_window_hidden && !self.viewer_has_independent_window() {
-            self.begin_fast_app_exit();
+        if self.viewer_window_hidden {
+            if self.viewer_has_independent_window() {
+                // A hidden root window still carries the frames the children draw in: keep the
+                // event loop warm instead of relying on their input alone.
+                ctx.request_repaint_after(Duration::from_millis(250));
+            } else {
+                self.begin_fast_app_exit();
+            }
         }
-        if closing_to_independent_windows {
-            return;
-        }
+
         if self.should_short_circuit_frame_for_exit(self.should_exit) {
             Self::send_fast_close_viewport_commands(ctx);
             return;

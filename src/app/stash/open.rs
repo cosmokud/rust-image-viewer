@@ -52,8 +52,11 @@ impl ImageViewer {
         // frames without being activated: the keyboard focus stays on the stash.
         self.stash.raise_frames = STASH_RAISE_FRAMES;
         // Opening a file is a request to see it, even if the viewer window was closed behind
-        // this one while the stash stayed open.
-        self.show_viewer_window_if_hidden(ctx);
+        // this one while the stash stayed open. With multiple instances the file opens in a
+        // process of its own, so this window has nothing to show.
+        if self.config.single_instance {
+            self.show_viewer_window_if_hidden(ctx);
+        }
 
         // With single-instance off the user expects a separate window for this file.
         if !self.config.single_instance {
