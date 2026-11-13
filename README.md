@@ -60,9 +60,22 @@ A fast, borderless image and video viewer for Windows. Open media instantly, nav
 
 ### Download a release
 
-Grab the latest installer from the [Releases](https://github.com/cosmokud/rust-image-viewer/releases) page.
+Grab the latest installer or portable executable from the [Releases](https://github.com/cosmokud/rust-image-viewer/releases) page.
 
-Each release ships six files: installer with bundled GStreamer and without it, the same two for the `-legacy` (SSE4.2) build, and two portable executables. Use the bundled installer if you just want things to work; use the unbundled one if you already have GStreamer installed.
+Each release provides six files across two CPU architectures:
+
+| Release File | Architecture | Supported Processors / CPU Requirements | GStreamer | Notes |
+| ------------ | ------------ | --------------------------------------- | --------- | ----- |
+| `*-setup.exe` | **AVX2** (`x86-64-v3`) | Intel 4th Gen Core (Haswell, 2013+) / AMD Zen (2017+) or newer (all Windows 11 PCs) | Bundled | **Recommended for most users.** Full video and image playback out of the box. |
+| `*-setup-no-gstreamer.exe` | **AVX2** (`x86-64-v3`) | Intel 4th Gen Core (Haswell, 2013+) / AMD Zen (2017+) or newer | None | Lightweight installer. Uses system-installed GStreamer for video (image viewing works without GStreamer). |
+| `*-setup-legacy.exe` | **Legacy** (`x86-64-v2` / SSE4.2) | Older 64-bit CPUs lacking AVX2: Intel Core 1st–3rd Gen (Nehalem–Ivy Bridge, 2008+) / AMD Bulldozer (2011+) | Bundled | Full installer for older PCs. Video and image playback out of the box. |
+| `*-setup-no-gstreamer-legacy.exe` | **Legacy** (`x86-64-v2` / SSE4.2) | Older 64-bit CPUs lacking AVX2: Intel Core 1st–3rd Gen (2008+) / AMD Bulldozer (2011+) | None | Lightweight installer for older PCs without bundled GStreamer. |
+| `rust-image-viewer.exe` | **AVX2** (`x86-64-v3`) | Intel 4th Gen Core (Haswell, 2013+) / AMD Zen (2017+) or newer | None | Standalone portable executable. Requires system GStreamer for video playback. |
+| `rust-image-viewer-legacy.exe` | **Legacy** (`x86-64-v2` / SSE4.2) | Older 64-bit CPUs lacking AVX2: Intel Core 1st–3rd Gen (2008+) / AMD Bulldozer (2011+) | None | Standalone portable executable for older PCs. Requires system GStreamer for video playback. |
+
+> [!TIP]
+> - **Which build should I choose?** If your PC runs Windows 11 or was purchased after 2013, choose the standard **AVX2** version. If you have an older processor or experience crashes on startup due to illegal instructions, choose the **Legacy** version.
+> - **Bundled vs. No GStreamer:** If you want video playback without installing anything extra, choose a **bundled** installer. If you only view images or already have GStreamer installed on your system, choose **no-gstreamer** or the portable `.exe`.
 
 The app is portable — place the executable folder anywhere and use Windows **Open with** or file associations to launch media directly into it.
 
