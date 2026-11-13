@@ -38,6 +38,14 @@ impl ImageViewer {
                 player.pause_async();
             }
         }
+        // The window is about to leave the screen with whatever view it was showing: keep that
+        // exact camera (zoom, pan, rotation) for the file, so reopening it from the Stash comes
+        // back to the same place instead of a fresh fit.
+        if self.mode().is_fullscreen() && self.mode().is_solo() {
+            self.current_fullscreen_view_has_memory = true;
+            self.save_current_fullscreen_view_state();
+        }
+
         self.parked_viewer_inner_size =
             ctx.input(|input| input.raw.viewport().inner_rect.map(|rect| rect.size()));
         self.restore_viewer_size_pending = false;
