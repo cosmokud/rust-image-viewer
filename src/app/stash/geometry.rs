@@ -156,8 +156,10 @@ pub(crate) fn stash_viewport_builder(
     placing: bool,
 ) -> egui::ViewportBuilder {
     let builder = egui::ViewportBuilder::default()
-        .with_title("Stash")
+        .with_title(STASH_WINDOW_TITLE)
         .with_min_inner_size(stash_window_min_size())
+        // Files can be dropped straight onto the stash gallery.
+        .with_drag_and_drop(true)
         .with_resizable(true);
     if placing {
         builder

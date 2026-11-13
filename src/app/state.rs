@@ -463,6 +463,10 @@ pub(crate) struct StashState {
     /// Set by the keyboard handler: the next draw scrolls the selected tile into view.
     pub(crate) scroll_to_selection: bool,
     pub(crate) details_open: bool,
+    /// Peek: selecting a file — one click or an arrow key — opens it in the viewer.
+    pub(crate) peek: bool,
+    /// Frames still to re-raise the window after opening a file, so it stays above the viewer.
+    pub(crate) raise_frames: u8,
     /// Tile currently under the pointer. Drives the hover video preview.
     pub(crate) hovered: Option<PathBuf>,
     pub(crate) preview: StashVideoPreview,
@@ -496,6 +500,8 @@ impl Default for StashState {
             layout: StashGalleryLayout::default(),
             scroll_to_selection: false,
             details_open: false,
+            peek: false,
+            raise_frames: 0,
             hovered: None,
             preview: StashVideoPreview::default(),
             details_preview: None,

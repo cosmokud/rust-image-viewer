@@ -300,6 +300,72 @@ pub fn active_window_handle() -> HWND {
     active_or_foreground_window()
 }
 
+struct RaiseSearch<'a> {
+    title: &'a str,
+    process_id: u32,
+    found: HWND,
+}
+
+unsafe extern "system" fn find_titled_window(hwnd: HWND, lparam: LPARAM) -> i32 {
+    use winapi::um::winuser::{GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId};
+
+    let search = &mut *(lparam as *mut RaiseSearch);
+    let mut process_id: UINT = 0;
+    GetWindowThreadProcessId(hwnd, &mut process_id);
+    if process_id != search.process_id {
+        return 1;
+    }
+
+    let length = GetWindowTextLengthW(hwnd);
+    if length <= 0 {
+        return 1;
+    }
+    let mut buffer: Vec<u16> = vec![0; length as usize + 1];
+    let written = GetWindowTextW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32);
+    if written <= 0 {
+        return 1;
+    }
+    if String::from_utf16_lossy(&buffer[..written as usize]) == search.title {
+        search.found = hwnd;
+        return 0;
+    }
+    1
+}
+
+/// Raises one of this process's own windows to the top of the z-order without activating it.
+///
+/// Opening a file from the Stash updates the viewer behind it; the Stash must stay on top while
+/// the keyboard focus stays where the user left it, so the raise is `SWP_NOACTIVATE`.
+pub fn raise_process_window_without_focus(title: &str) -> bool {
+    use winapi::um::winuser::{
+        EnumWindows, SetWindowPos, HWND_TOP, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    };
+
+    let mut search = RaiseSearch {
+        title,
+        process_id: std::process::id(),
+        found: std::ptr::null_mut(),
+    };
+    unsafe {
+        EnumWindows(
+            Some(find_titled_window),
+            &mut search as *mut RaiseSearch as LPARAM,
+        );
+        if search.found.is_null() {
+            return false;
+        }
+        SetWindowPos(
+            search.found,
+            HWND_TOP,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        ) != 0
+    }
+}
+
 /// True while `scale_change_wndproc` is writing the restored size back: callers that would
 /// position the window themselves must wait for it to finish.
 pub fn is_scale_restore_in_flight() -> bool {
