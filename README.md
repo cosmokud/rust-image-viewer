@@ -148,13 +148,13 @@ Settings are stored in `%APPDATA%\rust-image-viewer\config.ini` on Windows. See 
 
 Toggle with `show_fps = true` in `config.ini` to monitor render FPS, queue depths, latencies, and cache hit rates. See [Diagnostics Overlay](docs/diagnostics.md) for metric definitions.
 
-## Architecture
-
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the full design overview.
-
 ## Troubleshooting
 
 Solutions for common issues regarding video playback (GStreamer), config resets, cache clearance, crash logs, and build errors. See [Troubleshooting](docs/troubleshooting.md).
+
+## Architecture
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the full design overview.
 
 ## License
 
