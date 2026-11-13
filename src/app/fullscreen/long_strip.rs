@@ -37,34 +37,39 @@ impl ImageViewer {
             return false;
         }
 
-        if let Some(state) = self.fullscreen_view_states.get(path).cloned() {
-            self.zoom = state.zoom;
-            self.zoom_target = state.zoom_target;
-            self.offset = state.offset;
-            self.zoom_velocity = 0.0;
-            self.current_rotation_steps = state.rotation_steps;
-            self.precise_rotation_degrees = state.precise_rotation_degrees;
-            self.precise_rotation_target_degrees = state.precise_rotation_target_degrees;
-            self.precise_rotation_velocity = 0.0;
-            self.flip_horizontal = state.flip_horizontal;
-            self.flip_vertical = state.flip_vertical;
-
-            // Apply saved rotations if image was reloaded
-            if let Some(ref mut img) = self.image {
-                for _ in 0..state.rotation_steps {
-                    img.rotate_clockwise();
-                }
-                if state.rotation_steps > 0 {
-                    self.texture = None; // Force texture rebuild
-                }
+        match self.fullscreen_view_states.get(path).cloned() {
+            Some(state) => {
+                self.apply_fullscreen_view_state(&state);
+                true
             }
-
-            self.current_fullscreen_view_has_memory = true;
-
-            true
-        } else {
-            false
+            None => false,
         }
+    }
+
+    /// Puts the camera, rotation and flips of a saved view state back on the current image.
+    pub(crate) fn apply_fullscreen_view_state(&mut self, state: &FullscreenViewState) {
+        self.zoom = state.zoom;
+        self.zoom_target = state.zoom_target;
+        self.offset = state.offset;
+        self.zoom_velocity = 0.0;
+        self.current_rotation_steps = state.rotation_steps;
+        self.precise_rotation_degrees = state.precise_rotation_degrees;
+        self.precise_rotation_target_degrees = state.precise_rotation_target_degrees;
+        self.precise_rotation_velocity = 0.0;
+        self.flip_horizontal = state.flip_horizontal;
+        self.flip_vertical = state.flip_vertical;
+
+        // Apply saved rotations if image was reloaded
+        if let Some(ref mut img) = self.image {
+            for _ in 0..state.rotation_steps {
+                img.rotate_clockwise();
+            }
+            if state.rotation_steps > 0 {
+                self.texture = None; // Force texture rebuild
+            }
+        }
+
+        self.current_fullscreen_view_has_memory = true;
     }
 
     /// Update the discrete 90° rotation count for the current image.

@@ -279,6 +279,20 @@ impl ImageViewer {
 
     /// Save the current view state for the current image (fullscreen only).
     /// This allows restoring zoom, pan, and rotation when returning to this image.
+    /// The camera the current solo-media view is showing right now.
+    pub(crate) fn current_fullscreen_view_state(&self) -> FullscreenViewState {
+        FullscreenViewState {
+            zoom: self.zoom,
+            zoom_target: self.zoom_target,
+            offset: self.offset,
+            precise_rotation_degrees: self.precise_rotation_degrees,
+            precise_rotation_target_degrees: self.precise_rotation_target_degrees,
+            rotation_steps: self.current_rotation_steps,
+            flip_horizontal: self.flip_horizontal,
+            flip_vertical: self.flip_vertical,
+        }
+    }
+
     pub(crate) fn save_current_fullscreen_view_state(&mut self) {
         if !self.mode().is_fullscreen() || !self.config.fullscreen_remember_view_state_in_ram {
             return;
@@ -288,17 +302,7 @@ impl ImageViewer {
             return;
         };
 
-        let state = FullscreenViewState {
-            zoom: self.zoom,
-            zoom_target: self.zoom_target,
-            offset: self.offset,
-            precise_rotation_degrees: self.precise_rotation_degrees,
-            precise_rotation_target_degrees: self.precise_rotation_target_degrees,
-            rotation_steps: self.current_rotation_steps,
-            flip_horizontal: self.flip_horizontal,
-            flip_vertical: self.flip_vertical,
-        };
-
+        let state = self.current_fullscreen_view_state();
         self.fullscreen_view_states.insert(path, state);
     }
 

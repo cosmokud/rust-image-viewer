@@ -213,6 +213,11 @@ pub(crate) struct ImageViewer {
     /// Set when the viewer comes back at that remembered size: the next floating layout fits the
     /// media into the window instead of resizing the window to the media.
     pub(crate) restore_viewer_size_pending: bool,
+    /// The exact fullscreen camera the viewer was closed at, together with the file it belonged
+    /// to: reopening that file from the Stash must come back to this view, not to a fresh fit.
+    pub(crate) parked_fullscreen_view: Option<(PathBuf, FullscreenViewState)>,
+    /// Set while that camera waits to be re-applied once the reopened file has loaded.
+    pub(crate) restore_parked_fullscreen_view_pending: bool,
     /// Active Ctrl+drag marquee selection used to mark multiple files in strip/masonry mode.
     pub(crate) mark_selection_box: Option<MarkSelectionBoxState>,
     /// Delete-confirmation target for a single-file action.
@@ -1004,6 +1009,8 @@ impl Default for ImageViewer {
             pending_viewer_close: false,
             parked_viewer_inner_size: None,
             restore_viewer_size_pending: false,
+            parked_fullscreen_view: None,
+            restore_parked_fullscreen_view_pending: false,
             mark_selection_box: None,
             pending_single_delete_target: None,
             pending_marked_delete_targets: Vec::new(),

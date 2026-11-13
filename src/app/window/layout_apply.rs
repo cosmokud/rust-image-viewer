@@ -48,6 +48,18 @@ impl ImageViewer {
             .as_ref()
             .is_some_and(|path| self.strip_open_force_fit_path.as_ref() == Some(path));
 
+        // A viewer closed on this very file comes back to the camera it was closed at, before the
+        // per-image memory or the default fit gets a say.
+        if self.restore_parked_fullscreen_view_pending {
+            self.restore_parked_fullscreen_view_pending = false;
+            if let Some((path, state)) = self.parked_fullscreen_view.clone() {
+                if current_path.as_ref() == Some(&path) {
+                    self.apply_fullscreen_view_state(&state);
+                    return;
+                }
+            }
+        }
+
         // Check if we have a saved view state for this image (fullscreen per-image memory).
         if let Some(path) = current_path.as_ref() {
             if self.restore_fullscreen_view_state(path) {

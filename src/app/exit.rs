@@ -39,11 +39,19 @@ impl ImageViewer {
             }
         }
         // The window is about to leave the screen with whatever view it was showing: keep that
-        // exact camera (zoom, pan, rotation) for the file, so reopening it from the Stash comes
-        // back to the same place instead of a fresh fit.
+        // exact camera (zoom, pan, rotation) next to the file it belongs to, so reopening that
+        // file from the Stash comes back to the same place instead of a fresh fit.
+        self.restore_parked_fullscreen_view_pending = false;
         if self.mode().is_fullscreen() && self.mode().is_solo() {
             self.current_fullscreen_view_has_memory = true;
             self.save_current_fullscreen_view_state();
+            self.parked_fullscreen_view = self
+                .image_list
+                .get(self.current_index)
+                .cloned()
+                .map(|path| (path, self.current_fullscreen_view_state()));
+        } else {
+            self.parked_fullscreen_view = None;
         }
 
         self.parked_viewer_inner_size =
@@ -81,7 +89,9 @@ impl ImageViewer {
             self.send_viewer_viewport_cmd(ctx, egui::ViewportCommand::Visible(true));
             self.send_viewer_viewport_cmd(ctx, egui::ViewportCommand::Minimized(false));
             self.request_borderless_fullscreen_rect(ctx);
-            // The opened file has to be fitted into the fullscreen viewport again.
+            // The opened file has to be laid out again, and if it is the file that was closed,
+            // that layout puts the parked camera back.
+            self.restore_parked_fullscreen_view_pending = self.parked_fullscreen_view.is_some();
             self.pending_media_layout = true;
             ctx.request_repaint();
             return;
