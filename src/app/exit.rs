@@ -63,6 +63,22 @@ impl ImageViewer {
         #[cfg(target_os = "windows")]
         crate::windows_env::unpark_window_offscreen(self.resolved_main_hwnd());
 
+        // A viewer closed in fullscreen comes back in fullscreen: the mode never changed while it
+        // was parked, so laying a floating rectangle over it produced a floating/fullscreen mix.
+        if self.mode().is_fullscreen() {
+            self.restore_viewer_size_pending = false;
+            if let Some(position) = self.floating_window_position {
+                self.send_viewer_viewport_cmd(ctx, egui::ViewportCommand::OuterPosition(position));
+            }
+            self.send_viewer_viewport_cmd(ctx, egui::ViewportCommand::Visible(true));
+            self.send_viewer_viewport_cmd(ctx, egui::ViewportCommand::Minimized(false));
+            self.request_borderless_fullscreen_rect(ctx);
+            // The opened file has to be fitted into the fullscreen viewport again.
+            self.pending_media_layout = true;
+            ctx.request_repaint();
+            return;
+        }
+
         let size = self.parked_viewer_inner_size;
         match self.floating_window_position {
             Some(position) => {

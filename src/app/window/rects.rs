@@ -21,22 +21,30 @@ impl ImageViewer {
             return;
         }
 
+        // Addressed to the root viewport: this is the viewer window's rectangle, and reopening
+        // the viewer from the Stash runs inside the Stash's own frame.
         let rect = crate::window_geometry::fullscreen_rect(display);
-        self.send_outer_position(
+        self.send_viewer_viewport_cmd(
             ctx,
-            egui::pos2(rect.left as f32 / ppp, rect.top as f32 / ppp),
+            egui::ViewportCommand::OuterPosition(egui::pos2(
+                rect.left as f32 / ppp,
+                rect.top as f32 / ppp,
+            )),
         );
-        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
-            rect.width() as f32 / ppp,
-            rect.height() as f32 / ppp,
-        )));
+        self.send_viewer_viewport_cmd(
+            ctx,
+            egui::ViewportCommand::InnerSize(egui::vec2(
+                rect.width() as f32 / ppp,
+                rect.height() as f32 / ppp,
+            )),
+        );
     }
 
     #[cfg(not(target_os = "windows"))]
     pub(crate) fn request_borderless_fullscreen_rect(&mut self, ctx: &egui::Context) {
         let monitor = self.monitor_size_points(ctx);
-        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::Pos2::ZERO));
-        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(monitor));
+        self.send_viewer_viewport_cmd(ctx, egui::ViewportCommand::OuterPosition(egui::Pos2::ZERO));
+        self.send_viewer_viewport_cmd(ctx, egui::ViewportCommand::InnerSize(monitor));
     }
 
     pub(crate) fn floating_layout_size_for_media_bounds(
