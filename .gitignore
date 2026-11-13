@@ -25,7 +25,7 @@ tmp
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
-docs/
+
 
 # Machine-local cargo config holding the shared absolute target dir (never commit)
 /.cargo/target-dir.local.toml
