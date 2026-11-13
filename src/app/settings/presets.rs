@@ -152,6 +152,7 @@ impl ImageViewer {
                         .min_size(egui::vec2(0.0, SETTINGS_INPUT_HEIGHT))
                         .desired_width(full)
                         .hint_text("preset name")
+                        .vertical_align(egui::Align::Center)
                         .layouter(&mut layouter)
                         .show(ui);
                     tame_triple_click(ui, &mut output);
@@ -194,6 +195,7 @@ impl ImageViewer {
                     .min_size(egui::vec2(0.0, SETTINGS_INPUT_HEIGHT))
                     .hint_text("new preset name")
                     .desired_width(full)
+                    .vertical_align(egui::Align::Center)
                     .layouter(&mut layouter)
                     .show(ui);
                 tame_triple_click(ui, &mut output);
