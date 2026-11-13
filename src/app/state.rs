@@ -466,6 +466,11 @@ pub(crate) struct StashState {
     /// Tile currently under the pointer. Drives the hover video preview.
     pub(crate) hovered: Option<PathBuf>,
     pub(crate) preview: StashVideoPreview,
+    /// Details-column texture, decoded at the size the column paints instead of stretching
+    /// the tile thumbnail.
+    pub(crate) details_preview: Option<StashDetailsPreview>,
+    /// Details decode waiting for its size to settle: path, side and when it may start.
+    pub(crate) details_preview_pending: Option<(PathBuf, u32, Instant)>,
     /// Rectangle and state the window comes back at, kept in
     /// `<config dir>/stash_window.tsv` across closes and restarts.
     pub(crate) window_geometry: Option<StashWindowGeometry>,
@@ -493,6 +498,8 @@ impl Default for StashState {
             details_open: false,
             hovered: None,
             preview: StashVideoPreview::default(),
+            details_preview: None,
+            details_preview_pending: None,
             window_geometry: None,
             geometry_save_due: None,
         }
@@ -539,6 +546,19 @@ impl StashVideoPreview {
         self.texture_size = egui::Vec2::ZERO;
         self.failed_path = None;
     }
+}
+
+/// One details-column image at the LOD bucket it was decoded for.
+#[derive(Clone)]
+pub(crate) struct StashDetailsPreview {
+    pub(crate) path: PathBuf,
+    /// Longest side the texture was decoded to: a larger painted column decodes again, a
+    /// smaller one reuses this.
+    pub(crate) side: u32,
+    pub(crate) texture: egui::TextureHandle,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) stamp: FileStamp,
 }
 
 #[derive(Clone)]

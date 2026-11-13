@@ -5,6 +5,7 @@
 use crate::app::*;
 use crate::prelude::*;
 
+pub(crate) mod details;
 pub(crate) mod draw;
 pub(crate) mod geometry;
 pub(crate) mod menu;
@@ -14,6 +15,7 @@ pub(crate) mod preview;
 pub(crate) mod selection;
 pub(crate) mod store;
 
+pub(crate) use details::*;
 pub(crate) use draw::*;
 pub(crate) use geometry::*;
 pub(crate) use menu::*;

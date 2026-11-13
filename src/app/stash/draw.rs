@@ -674,8 +674,13 @@ impl ImageViewer {
                     egui::Sense::hover(),
                 );
                 ui_paint_surface(ui.painter(), preview_rect, 8.0, UI_CONTENT, Some(UI_BORDER));
-                if let Some((texture_id, size)) = preview {
-                    Self::paint_stash_preview(ui, preview_rect.shrink(8.0), texture_id, size);
+                // The tile thumbnail stretched over this rectangle is the blurry fallback; the
+                // sharp texture is decoded for this exact painted size and takes over once it
+                // is ready.
+                let inner = preview_rect.shrink(8.0);
+                let sharp = self.ensure_stash_details_texture(ctx, &path, inner.size());
+                if let Some((texture_id, size)) = sharp.or(preview) {
+                    Self::paint_stash_preview(ui, inner, texture_id, size);
                 }
 
                 ui.add_space(10.0);
