@@ -143,6 +143,32 @@ pub(crate) fn stash_window_placement(
     }
 }
 
+/// The native window the stash is drawn in.
+///
+/// The rectangle is asserted only while the window is being placed. `eframe` diffs this
+/// builder every frame and turns any change into a native move or resize, and the remembered
+/// rectangle follows the live window on every settled frame, so putting it back into the
+/// builder re-sent `InnerSize`/`OuterPosition` during a drag or a resize: the window fought the
+/// user, snapped back to the previous frame's rectangle and left a doubled, slightly offset
+/// frame behind (worst on a second display, where the point/pixel conversion differs).
+pub(crate) fn stash_viewport_builder(
+    placement: StashWindowPlacement,
+    placing: bool,
+) -> egui::ViewportBuilder {
+    let builder = egui::ViewportBuilder::default()
+        .with_title("Stash")
+        .with_min_inner_size(stash_window_min_size())
+        .with_resizable(true);
+    if placing {
+        builder
+            .with_inner_size(placement.inner_size)
+            .with_position(placement.outer_position)
+            .with_maximized(placement.maximized)
+    } else {
+        builder
+    }
+}
+
 /// One axis of a remembered size: never under the window minimum, never past the work area.
 fn fit_side(value: f32, screen: f32, min: f32) -> f32 {
     let min = min.min(screen);
@@ -354,6 +380,26 @@ mod tests {
 
         assert!(placement.maximized);
         assert_eq!(placement.inner_size, egui::vec2(1000.0, 700.0));
+    }
+
+    #[test]
+    fn a_settled_window_keeps_its_rectangle_out_of_the_builder() {
+        let placement = stash_window_placement(
+            screen(),
+            Some(StashWindowGeometry::new(200.0, 100.0, 1000.0, 700.0, true)),
+        );
+
+        let placing = stash_viewport_builder(placement, true);
+        assert_eq!(placing.inner_size, Some(egui::vec2(1000.0, 700.0)));
+        assert_eq!(placing.position, Some(egui::pos2(200.0, 100.0)));
+        assert_eq!(placing.maximized, Some(true));
+
+        // Once placed, the builder must not re-assert the remembered rectangle: a diffed
+        // `InnerSize`/`OuterPosition` is a programmatic move that fights the user's drag.
+        let settled = stash_viewport_builder(placement, false);
+        assert_eq!(settled.inner_size, None);
+        assert_eq!(settled.position, None);
+        assert_eq!(settled.maximized, None);
     }
 
     #[test]

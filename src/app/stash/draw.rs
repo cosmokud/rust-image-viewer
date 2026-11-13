@@ -68,13 +68,11 @@ impl ImageViewer {
         let placement = stash_window_placement(screen, self.stash.window_geometry);
         let window_size = placement.inner_size;
         let viewport_id = stash_viewport_id();
-        let viewport_builder = egui::ViewportBuilder::default()
-            .with_title("Stash")
-            .with_inner_size(window_size)
-            .with_min_inner_size(stash_window_min_size())
-            .with_position(placement.outer_position)
-            .with_maximized(placement.maximized)
-            .with_resizable(true);
+        // Only a window still being placed gets its rectangle asserted; once settled, the
+        // builder carries no geometry, so the per-frame builder diff cannot turn the remembered
+        // rectangle into a native move/resize that fights the user's drag.
+        let placing = 0 < self.stash.place_frames;
+        let viewport_builder = stash_viewport_builder(placement, placing);
 
         let mut close_window = false;
         // The dialog is drawn in its own monochrome theme; egui keeps one style per context, so
