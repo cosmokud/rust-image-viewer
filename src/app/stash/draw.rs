@@ -328,8 +328,11 @@ impl ImageViewer {
         let rows_visible = ((viewport_height + gap) / (tile + gap)).floor().max(1.0) as usize;
 
         // Rubber band: press anywhere in the gallery, follow the pointer even outside it, and
-        // resolve against the tiles recorded by the previous frame.
-        let marquee_rect = ui.available_rect_before_wrap();
+        // resolve against the tiles recorded by the previous frame. The scroll bar's slot is
+        // left out: a drag that starts on the thumb scrolls the gallery, and reading it as a
+        // band also cleared the selection the moment the thumb was pressed.
+        let mut marquee_rect = ui.available_rect_before_wrap();
+        marquee_rect.max.x -= STASH_SCROLLBAR_ALLOWANCE;
         self.stash.box_swallowed_click = false;
         let modifiers = ctx.input(|input| input.modifiers);
         let mut band_released = None;
