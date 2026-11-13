@@ -1271,8 +1271,9 @@ impl Default for ImageViewer {
             #[cfg(target_os = "windows")]
             file_receiver: None,
         };
-        // The stash outlives the process: paths only, no pixels.
+        // The stash outlives the process: paths only, no pixels. Its window rectangle does too.
         viewer.load_stash_from_disk();
+        viewer.load_stash_window_geometry();
         viewer
     }
 }

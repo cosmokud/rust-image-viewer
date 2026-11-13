@@ -18,6 +18,12 @@ impl ImageViewer {
             return;
         }
 
+        // The stash window can still be open: write the rectangle it last settled on before
+        // the debounced save is dropped with the process.
+        if self.stash.geometry_save_due.take().is_some() {
+            self.save_stash_window_geometry();
+        }
+
         self.discard_runtime_work_for_exit();
         #[cfg(not(test))]
         crate::metadata_cache::request_metadata_cache_shutdown();

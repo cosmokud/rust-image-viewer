@@ -466,6 +466,11 @@ pub(crate) struct StashState {
     /// Tile currently under the pointer. Drives the hover video preview.
     pub(crate) hovered: Option<PathBuf>,
     pub(crate) preview: StashVideoPreview,
+    /// Rectangle and state the window comes back at, kept in
+    /// `<config dir>/stash_window.tsv` across closes and restarts.
+    pub(crate) window_geometry: Option<StashWindowGeometry>,
+    /// When the last change seen is written: one write per drag, not one per frame.
+    pub(crate) geometry_save_due: Option<Instant>,
 }
 
 impl Default for StashState {
@@ -488,6 +493,8 @@ impl Default for StashState {
             details_open: false,
             hovered: None,
             preview: StashVideoPreview::default(),
+            window_geometry: None,
+            geometry_save_due: None,
         }
     }
 }

@@ -55,21 +55,25 @@ impl ImageViewer {
         let screen = match self.stash.screen {
             Some(screen) => screen,
             None => {
-                let screen = settings_screen_rect(ctx);
+                // The remembered rectangle also decides which display the window comes back
+                // on, so the work area is resolved around it instead of around the viewer.
+                let screen = stash_screen_rect(ctx, self.stash.window_geometry);
                 self.stash.screen = Some(screen);
                 screen
             }
         };
-        let window_size = stash_window_size(screen);
-        // Only an approximation: the outer size also carries the native title bar, so the exact
-        // centering is re-sent once the window reports its real outer rectangle.
-        let initial_position = screen.center() - (window_size + egui::vec2(0.0, 34.0)) * 0.5;
+        // The last rectangle the user left, or the centred default on a first open. Its corner
+        // is only an approximation for a fresh window: the outer size also carries the native
+        // title bar, so the exact centering is re-sent once the real outer rect is reported.
+        let placement = stash_window_placement(screen, self.stash.window_geometry);
+        let window_size = placement.inner_size;
         let viewport_id = stash_viewport_id();
         let viewport_builder = egui::ViewportBuilder::default()
             .with_title("Stash")
             .with_inner_size(window_size)
             .with_min_inner_size(stash_window_min_size())
-            .with_position(initial_position)
+            .with_position(placement.outer_position)
+            .with_maximized(placement.maximized)
             .with_resizable(true);
 
         let mut close_window = false;
@@ -89,12 +93,24 @@ impl ImageViewer {
             // for a few frames until the native window settles on them.
             if 0 < self.stash.place_frames {
                 self.stash.place_frames -= 1;
-                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(window_size));
-                if let Some(outer_rect) = ctx.input(|input| input.viewport().outer_rect) {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(
-                        screen.center() - outer_rect.size() * 0.5,
-                    ));
+                if placement.maximized {
+                    // A maximized window owns its size and position; only the state is sent.
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+                } else {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(window_size));
+                    let position = if placement.restored {
+                        placement.outer_position
+                    } else {
+                        ctx.input(|input| input.viewport().outer_rect)
+                            .map(|outer_rect| screen.center() - outer_rect.size() * 0.5)
+                            .unwrap_or(placement.outer_position)
+                    };
+                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(position));
                 }
+            } else {
+                // Captured only after the placement frames above, which would otherwise record
+                // an intermediate rectangle instead of the one the user left.
+                self.remember_stash_window_geometry(ctx);
             }
             if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
                 // Esc backs out of the right-click menu before it closes the window.
@@ -138,6 +154,8 @@ impl ImageViewer {
             // Dropping the viewport closes the window in this frame instead of leaving an empty
             // dialog on screen until the next pass.
             ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Close);
+            // Written now, not on the debounce: the window is about to be gone.
+            self.save_stash_window_geometry();
             self.close_stash();
         }
     }

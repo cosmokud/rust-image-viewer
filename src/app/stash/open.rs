@@ -8,8 +8,9 @@ use crate::prelude::*;
 impl ImageViewer {
     pub(crate) fn open_stash(&mut self) {
         self.stash.open = true;
-        // Geometry is recomputed from the screen on every open, like the settings window: the
-        // stash always comes back centered instead of at the size of the last manual resize.
+        // The screen is resolved again on every open, so a remembered rectangle that belongs to
+        // another display is measured against that display: the stash comes back where it was
+        // left, and only a first open is centered.
         self.stash.screen = None;
         self.stash.place_frames = STASH_WINDOW_PLACE_FRAMES;
         self.stash.search.clear();
