@@ -1686,4 +1686,16 @@ pub const SETTINGS: &[Setting] = &[
         unused: false,
         action: None,
     },
+    Setting {
+        id: 139,
+        key: "floating_mode_remember_position",
+        tab: SettingsTab::Window,
+        label: "Remember floating window",
+        group: "Floating Mode",
+        help: "Keep the floating window where it is when moving to the next/previous file, and cap its size at the first opened file (or the last manual resize) true = remember position and size cap, false = re-center and size every file to its own dimensions",
+        kind: SettingKind::Bool,
+        applies: Applies::Live,
+        unused: false,
+        action: None,
+    },
 ];

@@ -5,6 +5,14 @@
 use crate::app::*;
 use crate::prelude::*;
 
+/// Title of the stash viewport's native window, which is also how that window is found when it
+/// has to be raised.
+pub(crate) const STASH_WINDOW_TITLE: &str = "Stash";
+
+/// Frames the stash window is re-raised after a file is opened: the raise is repeated for a few
+/// frames so it survives the viewer repainting itself behind it.
+pub(crate) const STASH_RAISE_FRAMES: u8 = 3;
+
 impl ImageViewer {
     pub(crate) fn open_stash(&mut self, ctx: &egui::Context) {
         // Already open: raise and focus the existing window instead of resetting its state,
@@ -39,6 +47,10 @@ impl ImageViewer {
             self.remove_path_from_stash(path.as_path());
             return;
         }
+
+        // The viewer is updated behind this window, so the stash is raised over it on the next
+        // frames without being activated: the keyboard focus stays on the stash.
+        self.stash.raise_frames = STASH_RAISE_FRAMES;
 
         // With single-instance off the user expects a separate window for this file.
         if !self.config.single_instance {
@@ -108,6 +120,54 @@ impl ImageViewer {
             }
             _ => false,
         }
+    }
+
+    /// Lifts the stash window to the top of the z-order without activating it, once per pending
+    /// frame. Called from inside its own viewport, which is the only place its native window is
+    /// known to exist.
+    pub(crate) fn stash_raise_window(&mut self, ctx: &egui::Context) {
+        if 0 == self.stash.raise_frames {
+            return;
+        }
+        self.stash.raise_frames -= 1;
+        #[cfg(target_os = "windows")]
+        crate::windows_env::raise_process_window_without_focus(STASH_WINDOW_TITLE);
+        ctx.request_repaint();
+    }
+
+    /// Files dropped on the stash window join the stash instead of being opened in the viewer.
+    /// Only the formats the viewer itself opens are taken, and the last one becomes the
+    /// selection so the drop is visible in the gallery.
+    pub(crate) fn stash_accept_dropped_files(&mut self, ctx: &egui::Context) {
+        let dropped: Vec<PathBuf> = ctx.input(|input| {
+            input
+                .raw
+                .dropped_files
+                .iter()
+                .filter_map(|file| file.path.clone())
+                .collect()
+        });
+        if dropped.is_empty() {
+            return;
+        }
+
+        let supported: Vec<PathBuf> = dropped
+            .into_iter()
+            .filter(|path| get_media_type(path.as_path()).is_some())
+            .collect();
+        if supported.is_empty() {
+            return;
+        }
+
+        self.stash_remember_paths(&supported);
+        if let Some(last) = supported.last().cloned() {
+            self.stash.selected = Some(last.clone());
+            self.stash.selection.clear();
+            self.stash.selection.insert(last.clone());
+            self.stash.selection_anchor = Some(last);
+            self.stash.scroll_to_selection = true;
+        }
+        self.stash.raise_frames = STASH_RAISE_FRAMES;
     }
 
     pub(crate) fn close_stash(&mut self) {

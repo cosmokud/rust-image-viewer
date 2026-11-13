@@ -29,6 +29,7 @@ impl Config {
             fullscreen_remember_view_state_in_ram: true,
             fullscreen_native_window_transition: true,
             maximize_to_borderless_fullscreen: true,
+            floating_mode_remember_position: true,
             confirm_delete_to_recycle_bin: true,
             auto_unmark_after_paste: true,
             mark_file: Some(egui::Key::Space),

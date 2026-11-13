@@ -189,6 +189,7 @@ pub(crate) fn value_of(config: &Config, id: usize) -> SettingValue {
         136 => SettingValue::Text(config.action_bindings_csv(Action::VideoMute)),
         137 => SettingValue::Bool(config.show_loading_spinners),
         138 => SettingValue::Bool(config.video_alpha_opaque_fallback),
+        139 => SettingValue::Bool(config.floating_mode_remember_position),
         _ => SettingValue::Num(0.0),
     }
 }
@@ -216,6 +217,7 @@ pub(crate) fn set_bool(config: &mut Config, id: usize, value: bool) {
         70 => config.manga_mipmap_video_thumbnails = value,
         137 => config.show_loading_spinners = value,
         138 => config.video_alpha_opaque_fallback = value,
+        139 => config.floating_mode_remember_position = value,
         _ => {}
     }
 }

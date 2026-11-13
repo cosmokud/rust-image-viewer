@@ -352,6 +352,12 @@ pub(crate) struct ImageViewer {
     pub(crate) image_rotated: bool,
     /// Pending window resize to apply after a frame delay (to prevent flash on fullscreen exit)
     pub(crate) pending_window_resize: Option<(egui::Vec2, egui::Pos2, u8)>,
+    /// Largest inner size a floating window may take when the next/previous file is laid out:
+    /// the first opened file's size, replaced by the size the user resizes the window to.
+    pub(crate) floating_size_cap: Option<egui::Vec2>,
+    /// Where the floating window last stood, so a next/previous layout can keep it there
+    /// instead of re-centring it (and so a fullscreen exit comes back to it).
+    pub(crate) floating_window_position: Option<egui::Pos2>,
     /// Floating zoom/pan captured for the next fullscreen entry layout.
     pub(crate) pending_floating_fullscreen_view_state: Option<FloatingFullscreenViewState>,
 
@@ -1039,6 +1045,8 @@ impl Default for ImageViewer {
             fullscreen_transition_target: 0.0,
             image_rotated: false,
             pending_window_resize: None,
+            floating_size_cap: None,
+            floating_window_position: None,
             pending_floating_fullscreen_view_state: None,
             fullscreen_view_states: HashMap::new(),
             current_fullscreen_view_has_memory: false,

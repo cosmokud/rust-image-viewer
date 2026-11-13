@@ -71,6 +71,9 @@ impl eframe::App for ImageViewer {
         // its title-bar buttons stay clickable.
         self.enforce_floating_window_buttons_on_display(ctx);
 
+        // Where the floating window stands, for the next file's layout to keep it there.
+        self.remember_floating_window_position(ctx);
+
         // PERFORMANCE: Check if window is minimized to reduce resource usage
         let is_minimized = ctx.input(|i| i.raw.viewport().minimized.unwrap_or(false));
 

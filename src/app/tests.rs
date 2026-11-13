@@ -328,6 +328,35 @@ pub(crate) fn floating_navigation_fit_uses_last_known_monitor_when_viewport_moni
 }
 
 #[test]
+pub(crate) fn floating_size_cap_stops_growth_without_forcing_small_files_to_grow() {
+    let monitor = egui::vec2(3840.0, 2160.0);
+    let cap = egui::vec2(2000.0, 3000.0);
+
+    let (_, small) =
+        ImageViewer::floating_layout_size_for_media_capped(1000.0, 1500.0, monitor, cap).unwrap();
+    assert_eq!(small, egui::vec2(1000.0, 1500.0));
+
+    let (_, large) =
+        ImageViewer::floating_layout_size_for_media_capped(4000.0, 2000.0, monitor, cap).unwrap();
+    assert_eq!(large, egui::vec2(2000.0, 1000.0));
+}
+
+#[test]
+pub(crate) fn floating_size_cap_keeps_a_media_larger_than_the_display_fitted() {
+    let monitor = egui::vec2(1920.0, 1080.0);
+    let (_, size) = ImageViewer::floating_layout_size_for_media_capped(
+        4000.0,
+        3000.0,
+        monitor,
+        egui::vec2(4000.0, 3000.0),
+    )
+    .unwrap();
+
+    assert!((size.x - 1440.0).abs() <= 0.01);
+    assert!((size.y - 1080.0).abs() <= 0.01);
+}
+
+#[test]
 pub(crate) fn image_navigation_does_not_retain_previous_texture_placeholder() {
     assert!(!ImageViewer::retain_visible_media_placeholder_for_swap(
         false,

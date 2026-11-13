@@ -411,6 +411,8 @@ impl ImageViewer {
                 // Safety: release events can occasionally be missed while dragging near/outside
                 // the window edge. Stop resizing as soon as the button is no longer held.
                 self.is_resizing = false;
+                // A manual resize is the new ceiling next/previous files may grow to.
+                self.adopt_floating_resize_cap(ctx);
                 self.resize_direction = ResizeDirection::None;
                 self.last_mouse_pos = None;
                 // Clear resize start state

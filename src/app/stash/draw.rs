@@ -129,6 +129,9 @@ impl ImageViewer {
                 }
             }
 
+            // Files dropped on this window join the stash rather than opening in the viewer.
+            self.stash_accept_dropped_files(ctx);
+
             // The preview player belongs to this window: its frames are uploaded for this
             // viewport's frame, so it is polled and drawn from inside the callback.
             self.stash.hovered = None;
@@ -155,6 +158,9 @@ impl ImageViewer {
                 });
 
             self.draw_stash_context_menu(ctx);
+            // Opening a file updates the viewer behind this window; keep the stash on top of
+            // it without taking the keyboard focus back.
+            self.stash_raise_window(ctx);
         });
         ctx.set_style(viewer_style);
 
@@ -179,6 +185,9 @@ impl ImageViewer {
             ("Details", SettingsButtonKind::Secondary)
         };
         let details_width = settings_button_width(ui, details_label);
+        // The Peek toggle sits right of Details, so its width is part of the button group too.
+        const STASH_PEEK_LABEL: &str = "Peek";
+        let peek_width = settings_button_width(ui, STASH_PEEK_LABEL);
         let count_text = format!(
             "{} {}",
             self.stash.entries.len(),
@@ -200,7 +209,8 @@ impl ImageViewer {
                 .ceil()
         });
 
-        let mut right_width = details_width + STASH_CHROME_GAP + count_width;
+        let mut right_width =
+            peek_width + STASH_CHROME_GAP + details_width + STASH_CHROME_GAP + count_width;
         if !chips.is_empty() {
             right_width += STASH_CHROME_GAP
                 + chips.len() as f32 * STASH_CHIP_WIDTH
@@ -228,6 +238,26 @@ impl ImageViewer {
             tame_triple_click(ui, &mut output);
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // Rightmost first in this layout: Peek, then Details, then the file count.
+                let peek_kind = if self.stash.peek {
+                    SettingsButtonKind::Primary
+                } else {
+                    SettingsButtonKind::Secondary
+                };
+                if settings_button(
+                    ui,
+                    STASH_PEEK_LABEL,
+                    egui::vec2(peek_width, 26.0),
+                    true,
+                    peek_kind,
+                )
+                .on_hover_text("Open the selected file as soon as it is selected")
+                .clicked()
+                {
+                    self.stash.peek = !self.stash.peek;
+                }
+
+                ui.add_space(STASH_CHROME_GAP);
                 if settings_button(
                     ui,
                     details_label,
@@ -480,6 +510,10 @@ impl ImageViewer {
             let modifiers = ui.input(|input| input.modifiers);
             self.stash_click_path(path, modifiers);
             self.stash.menu_pos = None;
+            // Peek: one click is enough to open the file, exactly like Enter or a double click.
+            if self.stash.peek {
+                self.open_stash_path(ctx, path);
+            }
         }
         if response.secondary_clicked() {
             if !self.stash.selection.contains(path) {

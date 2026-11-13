@@ -67,6 +67,32 @@ impl ImageViewer {
         Self::floating_layout_size_for_media_bounds(media_w, media_h, monitor)
     }
 
+    /// Floating layout with a size ceiling: a media item smaller than `cap` keeps its own size
+    /// (the window is never forced to grow), a larger one shrinks uniformly until it fits, and
+    /// the result is fitted into the display with the aspect ratio preserved.
+    pub(crate) fn floating_layout_size_for_media_capped(
+        media_w: f32,
+        media_h: f32,
+        monitor: egui::Vec2,
+        cap: egui::Vec2,
+    ) -> Option<(f32, egui::Vec2)> {
+        if media_w <= 0.0 || media_h <= 0.0 || monitor.x <= 0.0 || monitor.y <= 0.0 {
+            return None;
+        }
+
+        let cap_zoom = if cap.x > 0.0 && cap.y > 0.0 {
+            (cap.x / media_w).min(cap.y / media_h).min(1.0)
+        } else {
+            1.0
+        };
+        let (fit_zoom, size) = Self::floating_layout_size_for_media_bounds(
+            media_w * cap_zoom,
+            media_h * cap_zoom,
+            monitor,
+        )?;
+        Some((fit_zoom * cap_zoom, size))
+    }
+
     pub(crate) fn prepare_single_instance_media_handoff(&mut self, ctx: &egui::Context) {
         if self.mode().is_manga() {
             self.stop_manga_wheel_scroll();

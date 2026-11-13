@@ -734,7 +734,7 @@ payload before it can cost 2× in `color_image`.
 
 ### 11.3 Settings (`src/settings_registry/`)
 
-- `table.rs`: `SETTINGS` — 139 entries, each `Setting { key, tab, kind, control, default, help,
+- `table.rs`: `SETTINGS` — 140 entries, each `Setting { key, tab, kind, control, default, help,
   bounds }`. This is the single declaration of every editable value.
 - `types.rs`: `SettingsTab` (`General, Appearance, ZoomScroll, Motion, Autoscroll, Window, Files,
   Video, Performance, Shortcuts`), `SettingKind`, `RowControl`, `SettingValue`, `Applies`.

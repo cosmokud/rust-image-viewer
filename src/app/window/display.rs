@@ -164,6 +164,55 @@ impl ImageViewer {
         crate::windows_env::active_window_handle()
     }
 
+    /// Records where the floating window stands, so a next/previous layout can keep it there
+    /// and a fullscreen exit can come back to it. Skipped while fullscreen, maximized or in the
+    /// middle of a transition, when the rectangle on screen is not the floating one.
+    pub(crate) fn remember_floating_window_position(&mut self, ctx: &egui::Context) {
+        if self.mode().is_fullscreen()
+            || self.current_window_is_maximized(ctx)
+            || self.is_resizing
+            || self.pending_window_resize.is_some()
+            || self.floating_drag_start_outer_pos.is_some()
+        {
+            return;
+        }
+        if let Some(outer) = ctx.input(|input| input.raw.viewport().outer_rect) {
+            self.floating_window_position = Some(outer.min);
+        }
+    }
+
+    /// A remembered corner for a wanted inner size: pulled back inside the display's work area,
+    /// so a window that grew on a smaller file is still fully reachable on a larger one.
+    pub(crate) fn floating_position_for_inner(
+        &self,
+        ctx: &egui::Context,
+        position: egui::Pos2,
+        inner_size: egui::Vec2,
+    ) -> egui::Pos2 {
+        #[cfg(target_os = "windows")]
+        {
+            let ppp = ctx.pixels_per_point();
+            if ppp.is_finite() && ppp > 0.01 {
+                let outer = self.outer_size_for_inner(ctx, inner_size);
+                let width = (outer.x * ppp).round() as i32;
+                let height = (outer.y * ppp).round() as i32;
+                let left = (position.x * ppp).round() as i32;
+                let top = (position.y * ppp).round() as i32;
+                let display = crate::window_geometry::display_at((left, top))
+                    .or_else(|| self.current_display(ctx));
+                if let Some(display) = display {
+                    let (left, top) = crate::window_geometry::clamp_into(
+                        display.work,
+                        crate::window_geometry::Rect::new(left, top, left + width, top + height),
+                    );
+                    return egui::pos2(left as f32 / ppp, top as f32 / ppp);
+                }
+            }
+        }
+
+        position
+    }
+
     pub(crate) fn center_window_on_monitor(&mut self, ctx: &egui::Context, inner_size: egui::Vec2) {
         #[cfg(target_os = "windows")]
         if let Some(display) = self.current_display(ctx) {

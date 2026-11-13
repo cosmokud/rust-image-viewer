@@ -125,8 +125,12 @@ impl ImageViewer {
             self.stash.selected = Some(path.clone());
             self.stash.selection.clear();
             self.stash.selection.insert(path.clone());
-            self.stash.selection_anchor = Some(path);
+            self.stash.selection_anchor = Some(path.clone());
             self.stash.scroll_to_selection = true;
+            // Peek: moving the selection with the keyboard opens the file, like Enter does.
+            if self.stash.peek {
+                self.open_stash_path(ctx, &path);
+            }
         }
     }
 }

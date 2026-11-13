@@ -46,6 +46,9 @@ pub struct Config {
     /// maximized floating-window state. This also forces center right-click fullscreen toggles
     /// through the borderless path.
     pub maximize_to_borderless_fullscreen: bool,
+    /// In floating mode, keep the window's position across next/previous and stop the window
+    /// growing past the first opened file's size (or the last manual resize).
+    pub floating_mode_remember_position: bool,
     /// When true, deleting files asks for confirmation before sending them to the recycle bin.
     pub confirm_delete_to_recycle_bin: bool,
     /// When true, successful paste clears current marked-file selection by default.

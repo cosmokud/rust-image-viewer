@@ -199,7 +199,28 @@ impl ImageViewer {
         let media_w = media_w_u as f32;
         let media_h = media_h_u as f32;
         let monitor = self.monitor_size_points(ctx);
-        let Some((zoom, size)) = self.floating_layout_size_for_media(media_w, media_h, monitor)
+
+        if !self.config.floating_mode_remember_position {
+            // Every file is laid out on its own, centred: no remembered rectangle survives.
+            let Some((zoom, size)) = self.floating_layout_size_for_media(media_w, media_h, monitor)
+            else {
+                return;
+            };
+            self.zoom = zoom;
+            self.zoom_target = zoom;
+            self.floating_size_cap = Some(egui::vec2(media_w, media_h));
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+            self.center_window_on_monitor(ctx, size);
+            return;
+        }
+
+        // The first file of the session sets the ceiling the next/previous steps may grow to;
+        // a manual resize replaces it (`adopt_floating_resize_cap`).
+        let cap = self
+            .floating_size_cap
+            .get_or_insert(egui::vec2(media_w, media_h));
+        let Some((zoom, size)) =
+            Self::floating_layout_size_for_media_capped(media_w, media_h, monitor, *cap)
         else {
             return;
         };
@@ -207,6 +228,27 @@ impl ImageViewer {
         self.zoom = zoom;
         self.zoom_target = zoom;
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
-        self.center_window_on_monitor(ctx, size);
+        // Keep the window where it is: re-centring every file is what made it jump around while
+        // walking a folder. The remembered corner is only nudged back inside the display.
+        match self.floating_window_position {
+            Some(position) => {
+                let position = self.floating_position_for_inner(ctx, position, size);
+                self.send_outer_position(ctx, position);
+            }
+            None => self.center_window_on_monitor(ctx, size),
+        }
+    }
+
+    /// The user finished dragging a window edge: that size is the new ceiling for next/previous.
+    pub(crate) fn adopt_floating_resize_cap(&mut self, ctx: &egui::Context) {
+        if !self.config.floating_mode_remember_position || self.mode().is_fullscreen() {
+            return;
+        }
+        if let Some(inner) = ctx.input(|input| input.raw.viewport().inner_rect) {
+            let size = inner.size();
+            if size.x >= 1.0 && size.y >= 1.0 {
+                self.floating_size_cap = Some(size);
+            }
+        }
     }
 }
