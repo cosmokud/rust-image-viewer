@@ -328,6 +328,40 @@ pub(crate) fn floating_navigation_fit_uses_last_known_monitor_when_viewport_moni
 }
 
 #[test]
+pub(crate) fn recording_a_mutation_clears_the_redo_branch() {
+    let mut viewer = ImageViewer::default();
+    let action = |name: &str| HistoryAction::DeleteFromStash {
+        paths: vec![PathBuf::from(name)],
+    };
+
+    viewer.history_record(action("a.png"));
+    viewer.history_record(action("b.png"));
+    let undone = viewer.undo_history.pop().unwrap();
+    viewer.redo_history.push(undone);
+
+    viewer.history_record(action("c.png"));
+
+    assert!(viewer.redo_history.is_empty());
+    assert_eq!(viewer.undo_history.len(), 2);
+}
+
+#[test]
+pub(crate) fn the_history_keeps_only_its_most_recent_entries() {
+    let mut viewer = ImageViewer::default();
+    for index in 0..HISTORY_LIMIT + 5 {
+        viewer.history_record(HistoryAction::DeleteFromStash {
+            paths: vec![PathBuf::from(format!("file-{index}.png"))],
+        });
+    }
+
+    assert_eq!(viewer.undo_history.len(), HISTORY_LIMIT);
+    assert_eq!(
+        viewer.undo_history.first().map(HistoryAction::paths),
+        Some(vec![PathBuf::from("file-5.png")])
+    );
+}
+
+#[test]
 pub(crate) fn floating_size_cap_stops_growth_without_forcing_small_files_to_grow() {
     let monitor = egui::vec2(3840.0, 2160.0);
     let cap = egui::vec2(2000.0, 3000.0);

@@ -211,6 +211,12 @@ impl ImageViewer {
             completed_final_paths.push((original_path.clone(), new_path.clone()));
         }
 
+        // Recorded once every file has its new name: a half-applied rename never reaches the
+        // history, because the staged renames above already rolled themselves back.
+        self.history_record(HistoryAction::Rename {
+            pairs: changed_paths.clone(),
+        });
+
         let mut prepared_clipboard_changed = false;
         let mut stash_changed = false;
         for (original_path, new_path) in &changed_paths {

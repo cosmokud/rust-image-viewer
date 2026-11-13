@@ -537,6 +537,7 @@ impl eframe::App for ImageViewer {
             self.draw_fps_overlay(ctx);
             self.draw_file_action_context_menu(ctx);
             self.draw_delete_confirmation_modal(ctx);
+            self.draw_history_confirmation_modal(ctx);
             self.draw_rename_modal(ctx);
             self.draw_settings_modal(ctx);
             self.draw_stash_modal(ctx);

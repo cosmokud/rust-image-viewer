@@ -18,6 +18,16 @@ impl ImageViewer {
             return;
         }
 
+        // Its own confirmation window owns the keyboard while it is up.
+        if self.history_confirm.is_some() {
+            return;
+        }
+
+        // Ctrl+Z / Ctrl+Y work here too: the stash is where most destructive actions start.
+        if self.try_handle_history_shortcuts(ctx) {
+            return;
+        }
+
         let layout = self.stash.layout.clone();
         if layout.paths.is_empty() {
             return;

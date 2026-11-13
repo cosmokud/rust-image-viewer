@@ -143,7 +143,15 @@ impl ImageViewer {
                 if paths.is_empty() {
                     return;
                 }
-                self.remove_paths_from_stash(&paths);
+                let stashed: Vec<PathBuf> = paths
+                    .into_iter()
+                    .filter(|path| self.stash.entries.contains_key(path))
+                    .collect();
+                self.remove_paths_from_stash(&stashed);
+                if !stashed.is_empty() {
+                    // Only the stash loses them: Ctrl+Z puts the entries back.
+                    self.history_record(HistoryAction::DeleteFromStash { paths: stashed });
+                }
             }
             StashAction::Copy => {
                 if paths.is_empty() {

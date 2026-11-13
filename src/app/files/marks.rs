@@ -85,6 +85,7 @@ impl ImageViewer {
         self.rename_overlay.is_some()
             || self.pending_single_delete_target.is_some()
             || !self.pending_marked_delete_targets.is_empty()
+            || self.history_confirm.is_some()
     }
 
     /// Marks and the stash survive an exit, so nothing here asks the user to confirm.

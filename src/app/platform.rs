@@ -360,6 +360,100 @@ pub(crate) fn move_paths_to_recycle_bin(paths: &[PathBuf]) -> Result<(), String>
     trash::delete_all(paths).map_err(|err| format!("Failed to move file(s) to recycle bin: {err}"))
 }
 
+/// The paths among `paths` that are not in the Recycle Bin any more, so an undo can warn about
+/// them before the user confirms. An unreadable bin reports nothing rather than every file.
+pub(crate) fn recycle_bin_missing_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
+    let Ok(items) = trash::os_limited::list() else {
+        return Vec::new();
+    };
+
+    paths
+        .iter()
+        .filter(|path| {
+            let parent = path
+                .parent()
+                .map(|parent| parent.to_string_lossy().to_lowercase())
+                .unwrap_or_default();
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().to_lowercase())
+                .unwrap_or_default();
+            !items.iter().any(|item| {
+                item.original_parent.to_string_lossy().to_lowercase() == parent
+                    && item.name.to_string_lossy().to_lowercase() == name
+            })
+        })
+        .cloned()
+        .collect()
+}
+
+/// Puts deleted files back where they came from, out of the Recycle Bin.
+///
+/// Returns the paths that are back on disk and one message per path that could not be restored:
+/// it has left the Recycle Bin, or the restore itself failed. A missing item is never fatal — the
+/// caller reports it and drops the history entry, so the next undo reaches the action before it.
+pub(crate) fn restore_paths_from_recycle_bin(paths: &[PathBuf]) -> (Vec<PathBuf>, Vec<String>) {
+    if paths.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+
+    let items = match trash::os_limited::list() {
+        Ok(items) => items,
+        Err(err) => {
+            let message = format!("Cannot read the Recycle Bin: {err}");
+            return (
+                Vec::new(),
+                paths
+                    .iter()
+                    .map(|path| format!("{}: {message}", path.display()))
+                    .collect(),
+            );
+        }
+    };
+
+    let mut matched = Vec::new();
+    let mut restored = Vec::new();
+    let mut errors = Vec::new();
+
+    for path in paths {
+        let parent = path
+            .parent()
+            .map(|parent| parent.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+
+        let found = items.iter().find(|item| {
+            item.original_parent.to_string_lossy().to_lowercase() == parent
+                && item.name.to_string_lossy().to_lowercase() == name
+        });
+        match found {
+            Some(item) => {
+                matched.push(item.clone());
+                restored.push(path.clone());
+            }
+            // Deleted again, or the bin was emptied: this one cannot come back.
+            None => errors.push(format!(
+                "{} is no longer in the Recycle Bin",
+                path.display()
+            )),
+        }
+    }
+
+    if !matched.is_empty() {
+        if let Err(err) = trash::os_limited::restore_all(matched) {
+            let message = format!("Restore from the Recycle Bin failed: {err}");
+            for path in restored.drain(..) {
+                errors.push(format!("{}: {message}", path.display()));
+            }
+        }
+    }
+
+    (restored, errors)
+}
+
 impl ImageViewer {
     pub(crate) fn path_needs_cjk_fonts(path: &Path) -> bool {
         Self::text_needs_cjk_fonts(path.as_os_str().to_string_lossy().as_ref())

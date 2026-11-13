@@ -353,6 +353,100 @@ pub(crate) fn rename_dialog_window_size(item_count: usize) -> egui::Vec2 {
     egui::vec2(680.0, DIALOG_CHROME_HEIGHT + dialog_list_height(item_count))
 }
 
+/// Native viewport that hosts the detached undo/redo confirmation dialog.
+pub(crate) fn history_dialog_viewport_id() -> egui::ViewportId {
+    egui::ViewportId::from_hash_of("history_confirmation_window")
+}
+
+/// Undo/redo dialog size: the same shape as the delete confirmation, over the same files.
+pub(crate) fn history_dialog_window_size(item_count: usize) -> egui::Vec2 {
+    egui::vec2(600.0, DIALOG_CHROME_HEIGHT + dialog_list_height(item_count))
+}
+
+/// Which way one history confirmation moves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HistoryDirection {
+    Undo,
+    Redo,
+}
+
+/// One reversible file mutation. The history behind it lives in RAM only: it is gone with the
+/// process, exactly like the confirmation that guards it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum HistoryAction {
+    /// Files moved to the Recycle Bin; undo restores them from there, redo deletes them again.
+    DeleteToRecycle { paths: Vec<PathBuf> },
+    /// Entries dropped from the stash. The files never moved, so undo only puts them back.
+    DeleteFromStash { paths: Vec<PathBuf> },
+    /// Renames as `(before, after)`; undo renames back, redo renames forward again.
+    Rename { pairs: Vec<(PathBuf, PathBuf)> },
+}
+
+impl HistoryAction {
+    /// One file count phrase shared by every string the dialog shows.
+    fn file_count(&self) -> String {
+        let count = self.paths().len();
+        format!("{count} {}", if count == 1 { "file" } else { "files" })
+    }
+
+    pub(crate) fn title(&self, direction: HistoryDirection) -> String {
+        let verb = match direction {
+            HistoryDirection::Undo => "Undo",
+            HistoryDirection::Redo => "Redo",
+        };
+        let action = match self {
+            Self::DeleteToRecycle { .. } => "Delete to Recycle Bin",
+            Self::DeleteFromStash { .. } => "Remove from Stash",
+            Self::Rename { .. } => "Rename",
+        };
+        format!("{verb} {action} of {}", self.file_count())
+    }
+
+    pub(crate) fn summary(&self, direction: HistoryDirection) -> String {
+        match (self, direction) {
+            (Self::DeleteToRecycle { .. }, HistoryDirection::Undo) => {
+                "These files are put back from the Recycle Bin where they were deleted.".to_string()
+            }
+            (Self::DeleteToRecycle { .. }, HistoryDirection::Redo) => {
+                "These files are moved to the Recycle Bin again.".to_string()
+            }
+            (Self::DeleteFromStash { .. }, HistoryDirection::Undo) => {
+                "These files are put back in the stash. The files themselves never moved."
+                    .to_string()
+            }
+            (Self::DeleteFromStash { .. }, HistoryDirection::Redo) => {
+                "These files are removed from the stash again. The files themselves are kept."
+                    .to_string()
+            }
+            (Self::Rename { .. }, HistoryDirection::Undo) => {
+                "Every renamed file is given its previous name back.".to_string()
+            }
+            (Self::Rename { .. }, HistoryDirection::Redo) => {
+                "Every renamed file is given the name it was renamed to.".to_string()
+            }
+        }
+    }
+
+    /// The files the dialog lists: the target of the action, not its source.
+    pub(crate) fn paths(&self) -> Vec<PathBuf> {
+        match self {
+            Self::DeleteToRecycle { paths } | Self::DeleteFromStash { paths } => paths.clone(),
+            Self::Rename { pairs } => pairs.iter().map(|(_, after)| after.clone()).collect(),
+        }
+    }
+}
+
+/// The confirmation standing between Ctrl+Z / Ctrl+Y and the mutation behind it.
+#[derive(Clone, Debug)]
+pub(crate) struct HistoryConfirmState {
+    pub(crate) direction: HistoryDirection,
+    pub(crate) action: HistoryAction,
+    /// Frames left to centre the detached window and take its keyboard.
+    pub(crate) place_frames: u8,
+    /// Undone deletions that are no longer in the Recycle Bin: shown, then dropped with the entry.
+    pub(crate) unrestorable: Vec<PathBuf>,
+}
+
 /// Native viewport that hosts the detached Stash dialog. A stable id lets a second click on the
 /// menu entry raise the existing window instead of opening a duplicate.
 pub(crate) fn stash_viewport_id() -> egui::ViewportId {

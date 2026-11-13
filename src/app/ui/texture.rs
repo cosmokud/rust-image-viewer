@@ -21,6 +21,11 @@ impl ImageViewer {
             return;
         }
 
+        // Ctrl+Z / Ctrl+Y outrank every mode's own bindings.
+        if self.try_handle_history_shortcuts(ctx) {
+            return;
+        }
+
         if self.try_handle_ctrl_primary_mark_shortcut(ctx) {
             return;
         }

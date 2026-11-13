@@ -16,6 +16,7 @@ pub(crate) mod files;
 pub(crate) mod folder;
 pub(crate) mod fullscreen;
 pub(crate) mod help;
+pub(crate) mod history;
 pub(crate) mod input;
 pub(crate) mod manga;
 pub(crate) mod masonry;
@@ -46,6 +47,7 @@ pub(crate) use files::*;
 pub(crate) use folder::*;
 pub(crate) use fullscreen::*;
 pub(crate) use help::*;
+pub(crate) use history::*;
 pub(crate) use input::*;
 pub(crate) use manga::*;
 pub(crate) use masonry::*;
@@ -191,6 +193,12 @@ pub(crate) struct ImageViewer {
     pub(crate) delete_dialog_place_frames: u8,
     /// Same, for the detached rename window.
     pub(crate) rename_dialog_place_frames: u8,
+    /// File mutations that can still be undone, oldest first. RAM only.
+    pub(crate) undo_history: Vec<HistoryAction>,
+    /// Mutations undone and waiting to be redone, oldest first.
+    pub(crate) redo_history: Vec<HistoryAction>,
+    /// The undo/redo confirmation waiting for the user, if any.
+    pub(crate) history_confirm: Option<HistoryConfirmState>,
     /// Active Ctrl+drag marquee selection used to mark multiple files in strip/masonry mode.
     pub(crate) mark_selection_box: Option<MarkSelectionBoxState>,
     /// Delete-confirmation target for a single-file action.
@@ -974,6 +982,9 @@ impl Default for ImageViewer {
             rename_overlay: None,
             delete_dialog_place_frames: 0,
             rename_dialog_place_frames: 0,
+            undo_history: Vec::new(),
+            redo_history: Vec::new(),
+            history_confirm: None,
             mark_selection_box: None,
             pending_single_delete_target: None,
             pending_marked_delete_targets: Vec::new(),

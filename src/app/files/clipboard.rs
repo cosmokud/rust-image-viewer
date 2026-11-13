@@ -289,6 +289,11 @@ impl ImageViewer {
 
         match move_paths_to_recycle_bin(&existing_paths) {
             Ok(()) => {
+                // Recorded before the view moves on: the entry is what Ctrl+Z restores.
+                self.history_record(HistoryAction::DeleteToRecycle {
+                    paths: existing_paths.clone(),
+                });
+
                 let mut prepared_clipboard_changed = false;
                 for path in &existing_paths {
                     self.marked_files.remove(path);
