@@ -575,11 +575,6 @@ impl ImageViewer {
     /// Hover card: name, size/dimension chips, then the whole path and the extension.
     fn draw_stash_tile_tooltip(&self, response: egui::Response, path: &PathBuf) {
         let info = self.stash_item_info(path);
-        let extension = path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .map(|ext| ext.to_ascii_uppercase())
-            .unwrap_or_else(|| "NONE".to_string());
 
         response.on_hover_ui(|ui| {
             ui.set_max_width(360.0);
@@ -593,16 +588,6 @@ impl ImageViewer {
                 Self::draw_modal_metadata_chips(ui, &info.file_size_label, &info.dimensions_label);
                 ui.add_space(8.0);
                 stash_path_label(ui, &path.to_string_lossy(), 11.0);
-                ui.add_space(3.0);
-                ui.label(
-                    egui::RichText::new(format!(
-                        "{} · .{}",
-                        stash_media_type_label(path),
-                        extension
-                    ))
-                    .size(11.0)
-                    .color(UI_TEXT),
-                );
             });
         });
     }
@@ -687,12 +672,6 @@ impl ImageViewer {
                 );
                 ui.add_space(7.0);
                 Self::draw_modal_metadata_chips(ui, &info.file_size_label, &info.dimensions_label);
-                ui.add_space(9.0);
-                ui.label(
-                    egui::RichText::new(format!("Type  {}", stash_media_type_label(&path)))
-                        .size(11.5)
-                        .color(UI_TEXT),
-                );
                 ui.add_space(4.0);
                 stash_path_label(ui, &layout_path, 11.0);
             });
@@ -753,20 +732,19 @@ fn path_layout_job(
     job
 }
 
-/// Height the caption under the image needs: the name, the metadata chips, the type row and
-/// the path, plus the gaps between them. Sizes and spacings match what `draw_stash_details`
-/// paints, measured from the real text so the wrapped rows are reserved exactly once.
+/// Height the caption under the image needs: the name, the metadata chips and the path, plus
+/// the gaps between them. Sizes and spacings match what `draw_stash_details` paints, measured
+/// from the real text so the wrapped rows are reserved exactly once.
 fn modal_details_caption_height(
     ui: &egui::Ui,
     info: &DeleteModalItemInfo,
     path_label: &str,
 ) -> f32 {
     let spacing = ui.spacing().item_spacing.y;
-    // Six gaps: the four explicit ones plus the item spacing every widget below adds.
-    let mut height = 10.0 + 7.0 + 9.0 + 4.0 + spacing * 5.0;
+    // Five gaps: the three explicit ones plus the item spacing every widget below adds.
+    let mut height = 10.0 + 7.0 + 4.0 + spacing * 4.0;
     height += wrapped_label_height(ui, &info.display_name, 13.5);
     height += metadata_chip_row_height(ui, &info.file_size_label, &info.dimensions_label);
-    height += wrapped_label_height(ui, "Type  Image", 11.5);
     height += wrapped_label_height(ui, path_label, 11.0);
     height
 }
@@ -843,12 +821,4 @@ fn stash_chip_button(ui: &mut egui::Ui, action: StashAction) -> egui::Response {
     response
         .on_hover_text(stash_action_tooltip(action))
         .on_hover_cursor(egui::CursorIcon::PointingHand)
-}
-
-fn stash_media_type_label(path: &Path) -> &'static str {
-    match get_media_type(path) {
-        Some(MediaType::Image) => "Image",
-        Some(MediaType::Video) => "Video",
-        None => "File",
-    }
 }
