@@ -592,11 +592,7 @@ impl ImageViewer {
                 ui.add_space(6.0);
                 Self::draw_modal_metadata_chips(ui, &info.file_size_label, &info.dimensions_label);
                 ui.add_space(8.0);
-                ui.label(
-                    egui::RichText::new(path.to_string_lossy().to_string())
-                        .size(11.0)
-                        .color(UI_TEXT_DIM),
-                );
+                stash_path_label(ui, &path.to_string_lossy(), 11.0);
                 ui.add_space(3.0);
                 ui.label(
                     egui::RichText::new(format!(
@@ -698,13 +694,63 @@ impl ImageViewer {
                         .color(UI_TEXT),
                 );
                 ui.add_space(4.0);
-                ui.label(
-                    egui::RichText::new(layout_path)
-                        .size(11.0)
-                        .color(UI_TEXT_DIM),
-                );
+                stash_path_label(ui, &layout_path, 11.0);
             });
     }
+}
+
+/// A path label whose directory is emphasised and whose file name stays as it is: everything up
+/// to and including the last separator is bold, the name and extension are not.
+///
+/// epaint ships no bold face, so the emphasis is painted the way print did it: a second pass of
+/// the same layout, a fraction of a point away. Only the directory is inked in that pass (the
+/// file name is transparent), and the characters are the same, so both passes wrap identically.
+fn stash_path_label(ui: &mut egui::Ui, path: &str, size: f32) {
+    let primary = path_layout_job(ui, path, size, UI_TEXT_DIM);
+    let overlay = path_layout_job(ui, path, size, egui::Color32::TRANSPARENT);
+    // Both jobs are built before the label allocates: the wrap width is the same for both.
+    let response = ui.label(primary);
+    let galley = ui.fonts(|fonts| fonts.layout_job(overlay));
+    ui.painter().galley(
+        response.rect.min + egui::vec2(0.45, 0.35),
+        galley,
+        UI_TEXT_STRONG,
+    );
+}
+
+/// One text run per path part, bold for the directory and `file_color` for the name.
+fn path_layout_job(
+    ui: &egui::Ui,
+    path: &str,
+    size: f32,
+    file_color: egui::Color32,
+) -> egui::text::LayoutJob {
+    let wrap_width = (ui.available_width() - ui.spacing().item_spacing.x).max(24.0);
+    let font = egui::FontId::proportional(size);
+    // The separator belongs to the directory: `D:\Images\` rather than `D:\Images`.
+    let split = path.rfind(['\\', '/']).map(|index| index + 1).unwrap_or(0);
+
+    let mut job = egui::text::LayoutJob::default();
+    job.wrap.max_width = wrap_width;
+    job.append(
+        &path[..split],
+        0.0,
+        egui::TextFormat {
+            font_id: font.clone(),
+            color: UI_TEXT_STRONG,
+            ..Default::default()
+        },
+    );
+    job.append(
+        &path[split..],
+        0.0,
+        egui::TextFormat {
+            font_id: font,
+            color: file_color,
+            ..Default::default()
+        },
+    );
+    job
 }
 
 /// Height the caption under the image needs: the name, the metadata chips, the type row and
