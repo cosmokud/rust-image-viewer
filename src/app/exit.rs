@@ -13,6 +13,43 @@ impl ImageViewer {
         self.should_exit || viewport_close_requested
     }
 
+    /// True while a window that is not the viewer is open.
+    ///
+    /// Settings and Stash are windows of their own, not dialogs owned by the viewer window, so
+    /// closing the viewer leaves them on screen: the app keeps running until the last of them is
+    /// closed too.
+    pub(crate) fn viewer_has_independent_window(&self) -> bool {
+        self.settings.open || self.stash.open
+    }
+
+    /// Gives the screen to those windows: the viewer hides instead of closing, and keeps its
+    /// state (current file, mode, stash, history) for the next time it is shown.
+    pub(crate) fn hide_viewer_window(&mut self, ctx: &egui::Context) {
+        if self.viewer_window_hidden {
+            return;
+        }
+        // Nothing should keep playing behind a window the user just closed.
+        if let Some(player) = self.video_player.as_mut() {
+            if player.is_playing() {
+                player.pause_async();
+            }
+        }
+        self.viewer_window_hidden = true;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        ctx.request_repaint();
+    }
+
+    /// Brings the viewer back after it was hidden behind the Settings/Stash windows.
+    pub(crate) fn show_viewer_window_if_hidden(&mut self, ctx: &egui::Context) {
+        if !self.viewer_window_hidden {
+            return;
+        }
+        self.viewer_window_hidden = false;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        ctx.request_repaint();
+    }
+
     pub(crate) fn begin_fast_app_exit(&mut self) {
         if self.should_exit {
             return;

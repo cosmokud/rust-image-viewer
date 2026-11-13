@@ -51,6 +51,9 @@ impl ImageViewer {
         // The viewer is updated behind this window, so the stash is raised over it on the next
         // frames without being activated: the keyboard focus stays on the stash.
         self.stash.raise_frames = STASH_RAISE_FRAMES;
+        // Opening a file is a request to see it, even if the viewer window was closed behind
+        // this one while the stash stayed open.
+        self.show_viewer_window_if_hidden(ctx);
 
         // With single-instance off the user expects a separate window for this file.
         if !self.config.single_instance {

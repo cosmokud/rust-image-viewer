@@ -346,6 +346,22 @@ pub(crate) fn recording_a_mutation_clears_the_redo_branch() {
 }
 
 #[test]
+pub(crate) fn settings_and_stash_keep_the_app_alive_without_the_viewer() {
+    let mut viewer = ImageViewer::default();
+    assert!(!viewer.viewer_has_independent_window());
+
+    viewer.settings.open = true;
+    assert!(viewer.viewer_has_independent_window());
+
+    viewer.settings.open = false;
+    viewer.stash.open = true;
+    assert!(viewer.viewer_has_independent_window());
+
+    viewer.stash.open = false;
+    assert!(!viewer.viewer_has_independent_window());
+}
+
+#[test]
 pub(crate) fn applying_a_history_entry_does_not_record_another_one() {
     let mut viewer = ImageViewer::default();
     viewer.history_applying = true;

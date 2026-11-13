@@ -202,6 +202,9 @@ pub(crate) struct ImageViewer {
     /// True while a confirmed entry is being applied: the mutations it performs must not record
     /// themselves as new history.
     pub(crate) history_applying: bool,
+    /// True while the viewer window is hidden because Settings or Stash is still open; the app
+    /// quits once the last of those windows is closed.
+    pub(crate) viewer_window_hidden: bool,
     /// Active Ctrl+drag marquee selection used to mark multiple files in strip/masonry mode.
     pub(crate) mark_selection_box: Option<MarkSelectionBoxState>,
     /// Delete-confirmation target for a single-file action.
@@ -989,6 +992,7 @@ impl Default for ImageViewer {
             redo_history: Vec::new(),
             history_confirm: None,
             history_applying: false,
+            viewer_window_hidden: false,
             mark_selection_box: None,
             pending_single_delete_target: None,
             pending_marked_delete_targets: Vec::new(),

@@ -20,10 +20,23 @@ impl eframe::App for ImageViewer {
         self.needs_repaint = false;
 
         let viewport_close_requested = ctx.input(|input| input.viewport().close_requested());
-        if viewport_close_requested {
+        // Closing the viewer while Settings or Stash is open only hides it: those are windows of
+        // their own, and they stay alive until the user closes them.
+        let closing_to_independent_windows =
+            viewport_close_requested && self.viewer_has_independent_window();
+        if closing_to_independent_windows {
+            self.hide_viewer_window(ctx);
+        } else if viewport_close_requested {
             self.request_app_exit();
         }
-        if self.should_short_circuit_frame_for_exit(viewport_close_requested) {
+        // A hidden viewer has nothing left to show once the last of those windows closes.
+        if self.viewer_window_hidden && !self.viewer_has_independent_window() {
+            self.begin_fast_app_exit();
+        }
+        if closing_to_independent_windows {
+            return;
+        }
+        if self.should_short_circuit_frame_for_exit(self.should_exit) {
             Self::send_fast_close_viewport_commands(ctx);
             return;
         }
@@ -37,6 +50,10 @@ impl eframe::App for ImageViewer {
 
                 // Load the new file
                 self.load_media(&path);
+
+                // A second launch is a request to see the file: show the viewer again if it
+                // was hidden behind the Settings/Stash windows.
+                self.show_viewer_window_if_hidden(ctx);
 
                 // Bring window to foreground
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
