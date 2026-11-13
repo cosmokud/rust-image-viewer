@@ -193,6 +193,12 @@ impl ImageViewer {
     pub(crate) fn apply_floating_layout_for_current_image(&mut self, ctx: &egui::Context) {
         self.offset = egui::Vec2::ZERO;
 
+        // A closed viewer is parked outside the desktop: laying it out would move it back on
+        // screen. The next open re-applies the layout.
+        if self.viewer_window_hidden {
+            return;
+        }
+
         let Some((media_w_u, media_h_u)) = self.media_display_dimensions() else {
             return;
         };

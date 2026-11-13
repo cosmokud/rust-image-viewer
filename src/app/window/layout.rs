@@ -41,6 +41,9 @@ impl ImageViewer {
             || self.pending_media_layout
             || self.floating_drag_start_outer_pos.is_some()
             || !self.startup_window_shown
+            // A parked viewer stands outside the desktop on purpose; pulling it back would undo
+            // the close.
+            || self.viewer_window_hidden
             || self.current_window_is_maximized(ctx)
         {
             return;

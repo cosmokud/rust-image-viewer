@@ -366,6 +366,88 @@ pub fn raise_process_window_without_focus(title: &str) -> bool {
     }
 }
 
+/// Sets or clears `WS_EX_TOOLWINDOW`, which is what keeps a parked window out of the taskbar
+/// and out of Alt+Tab while it stands off the desktop.
+fn set_tool_window_style(hwnd: HWND, tool_window: bool) {
+    use winapi::um::winuser::{
+        GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
+    };
+
+    if hwnd.is_null() {
+        return;
+    }
+    unsafe {
+        let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        let style = if tool_window {
+            (style | WS_EX_TOOLWINDOW as isize) & !(WS_EX_APPWINDOW as isize)
+        } else {
+            style & !(WS_EX_TOOLWINDOW as isize)
+        };
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style);
+    }
+}
+
+/// Moves a window just outside the desktop without hiding it.
+///
+/// A hidden window stops receiving redraws on Windows, and with them the frames the Settings and
+/// Stash windows are drawn in: those are immediate viewports of this window's `update`. A parked
+/// window is still visible to the compositor — it paints, just where nothing can be seen — so the
+/// loop keeps running and those windows stay alive, and the tool-window style keeps the parked
+/// window out of the taskbar and Alt+Tab meanwhile.
+pub fn park_window_offscreen(hwnd: HWND) -> bool {
+    use winapi::um::winuser::{
+        SetWindowPos, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
+    };
+
+    let Some(rect) = window_rect(hwnd) else {
+        return false;
+    };
+    let centre = (
+        rect.left + (rect.right - rect.left) / 2,
+        rect.top + (rect.bottom - rect.top) / 2,
+    );
+    let Some(display) = monitor_info_at(centre.0, centre.1) else {
+        return false;
+    };
+
+    set_tool_window_style(hwnd, true);
+    unsafe {
+        SetWindowPos(
+            hwnd,
+            std::ptr::null_mut(),
+            display.monitor.right + 40,
+            display.monitor.top,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        ) != 0
+    }
+}
+
+/// Undoes `park_window_offscreen`: the window belongs on the taskbar again, and the caller puts
+/// it back where it was.
+pub fn unpark_window_offscreen(hwnd: HWND) -> bool {
+    use winapi::um::winuser::{
+        SetWindowPos, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+    };
+
+    if hwnd.is_null() {
+        return false;
+    }
+    set_tool_window_style(hwnd, false);
+    unsafe {
+        SetWindowPos(
+            hwnd,
+            std::ptr::null_mut(),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        ) != 0
+    }
+}
+
 /// True while `scale_change_wndproc` is writing the restored size back: callers that would
 /// position the window themselves must wait for it to finish.
 pub fn is_scale_restore_in_flight() -> bool {

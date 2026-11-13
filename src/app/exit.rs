@@ -22,8 +22,12 @@ impl ImageViewer {
         self.settings.open || self.stash.open
     }
 
-    /// Gives the screen to those windows: the viewer hides instead of closing, and keeps its
-    /// state (current file, mode, stash, history) for the next time it is shown.
+    /// Gives the screen to those windows: the viewer stops being visible without being hidden,
+    /// and keeps its state (current file, mode, stash, history) for the next time it is shown.
+    ///
+    /// It is parked just outside the desktop rather than hidden, because Windows stops sending
+    /// redraws to a hidden window — and the Settings and Stash viewports are drawn from this
+    /// window's frames, so hiding it froze them.
     pub(crate) fn hide_viewer_window(&mut self, ctx: &egui::Context) {
         if self.viewer_window_hidden {
             return;
@@ -35,18 +39,37 @@ impl ImageViewer {
             }
         }
         self.viewer_window_hidden = true;
-        // Refuse the close itself first: hiding the window is not a way of answering it.
+        // Refuse the close itself: the window keeps running, it just moves out of sight.
         ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        #[cfg(target_os = "windows")]
+        crate::windows_env::park_window_offscreen(self.resolved_main_hwnd());
         ctx.request_repaint();
     }
 
-    /// Brings the viewer back after it was hidden behind the Settings/Stash windows.
+    /// Brings the viewer back after it was closed behind the Settings/Stash windows.
     pub(crate) fn show_viewer_window_if_hidden(&mut self, ctx: &egui::Context) {
         if !self.viewer_window_hidden {
             return;
         }
         self.viewer_window_hidden = false;
+        #[cfg(target_os = "windows")]
+        crate::windows_env::unpark_window_offscreen(self.resolved_main_hwnd());
+
+        match self.floating_window_position {
+            Some(position) => self.send_outer_position(ctx, position),
+            None => {
+                let size = ctx.input(|input| {
+                    input
+                        .raw
+                        .viewport()
+                        .inner_rect
+                        .map(|rect| rect.size())
+                        .unwrap_or(egui::vec2(800.0, 600.0))
+                });
+                self.center_window_on_monitor(ctx, size);
+            }
+        }
+
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         ctx.request_repaint();

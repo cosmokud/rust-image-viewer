@@ -173,6 +173,8 @@ impl ImageViewer {
             || self.is_resizing
             || self.pending_window_resize.is_some()
             || self.floating_drag_start_outer_pos.is_some()
+            // The parked window is off the desktop: its rectangle is not the one to come back to.
+            || self.viewer_window_hidden
         {
             return;
         }
