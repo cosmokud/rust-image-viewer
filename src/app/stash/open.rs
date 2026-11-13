@@ -6,7 +6,17 @@ use crate::app::*;
 use crate::prelude::*;
 
 impl ImageViewer {
-    pub(crate) fn open_stash(&mut self) {
+    pub(crate) fn open_stash(&mut self, ctx: &egui::Context) {
+        // Already open: raise and focus the existing window instead of resetting its state,
+        // which would re-center it on the remembered placement. `Focus` alone is a no-op on a
+        // minimized window, so it is restored first.
+        if self.stash.open {
+            let viewport_id = stash_viewport_id();
+            ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Focus);
+            ctx.request_repaint();
+            return;
+        }
         self.stash.open = true;
         // The screen is resolved again on every open, so a remembered rectangle that belongs to
         // another display is measured against that display: the stash comes back where it was
