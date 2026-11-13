@@ -38,15 +38,23 @@ impl ImageViewer {
                 player.pause_async();
             }
         }
+        self.parked_viewer_inner_size =
+            ctx.input(|input| input.raw.viewport().inner_rect.map(|rect| rect.size()));
+        self.restore_viewer_size_pending = false;
         self.viewer_window_hidden = true;
         // Refuse the close itself: the window keeps running, it just moves out of sight.
-        ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        self.send_viewer_viewport_cmd(ctx, egui::ViewportCommand::CancelClose);
         #[cfg(target_os = "windows")]
         crate::windows_env::park_window_offscreen(self.resolved_main_hwnd());
         ctx.request_repaint();
     }
 
     /// Brings the viewer back after it was closed behind the Settings/Stash windows.
+    ///
+    /// It comes back exactly where and as large as it was left, and the file that reopened it is
+    /// fitted into that window instead of resizing it. Every command is addressed to the root
+    /// viewport: this runs inside the Stash's own frame, and a plain viewport command there would
+    /// move the Stash instead.
     pub(crate) fn show_viewer_window_if_hidden(&mut self, ctx: &egui::Context) {
         if !self.viewer_window_hidden {
             return;
@@ -55,23 +63,31 @@ impl ImageViewer {
         #[cfg(target_os = "windows")]
         crate::windows_env::unpark_window_offscreen(self.resolved_main_hwnd());
 
+        let size = self.parked_viewer_inner_size;
         match self.floating_window_position {
-            Some(position) => self.send_outer_position(ctx, position),
+            Some(position) => {
+                self.send_viewer_viewport_cmd(ctx, egui::ViewportCommand::OuterPosition(position))
+            }
             None => {
-                let size = ctx.input(|input| {
-                    input
-                        .raw
-                        .viewport()
-                        .inner_rect
-                        .map(|rect| rect.size())
-                        .unwrap_or(egui::vec2(800.0, 600.0))
-                });
-                self.center_window_on_monitor(ctx, size);
+                let fallback = size.unwrap_or(egui::vec2(800.0, 600.0));
+                let anchor = ctx
+                    .input(|input| input.raw.viewport().monitor_size)
+                    .unwrap_or(fallback);
+                let centred = egui::pos2(
+                    ((anchor.x - fallback.x) * 0.5).max(0.0),
+                    ((anchor.y - fallback.y) * 0.5).max(0.0),
+                );
+                self.send_viewer_viewport_cmd(ctx, egui::ViewportCommand::OuterPosition(centred));
             }
         }
+        if let Some(size) = size {
+            self.send_viewer_viewport_cmd(ctx, egui::ViewportCommand::InnerSize(size));
+            // The reopened window keeps its size; the media is fitted into it.
+            self.restore_viewer_size_pending = true;
+        }
 
-        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        self.send_viewer_viewport_cmd(ctx, egui::ViewportCommand::Visible(true));
+        self.send_viewer_viewport_cmd(ctx, egui::ViewportCommand::Minimized(false));
         ctx.request_repaint();
     }
 

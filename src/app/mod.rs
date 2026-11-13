@@ -208,6 +208,11 @@ pub(crate) struct ImageViewer {
     /// A close requested from the app itself (title-bar button, Ctrl+W, Esc) waiting for the
     /// frame driver to resolve it against the open Settings/Stash windows.
     pub(crate) pending_viewer_close: bool,
+    /// Inner size the viewer had when it was closed by a Stash/Settings window still being open.
+    pub(crate) parked_viewer_inner_size: Option<egui::Vec2>,
+    /// Set when the viewer comes back at that remembered size: the next floating layout fits the
+    /// media into the window instead of resizing the window to the media.
+    pub(crate) restore_viewer_size_pending: bool,
     /// Active Ctrl+drag marquee selection used to mark multiple files in strip/masonry mode.
     pub(crate) mark_selection_box: Option<MarkSelectionBoxState>,
     /// Delete-confirmation target for a single-file action.
@@ -997,6 +1002,8 @@ impl Default for ImageViewer {
             history_applying: false,
             viewer_window_hidden: false,
             pending_viewer_close: false,
+            parked_viewer_inner_size: None,
+            restore_viewer_size_pending: false,
             mark_selection_box: None,
             pending_single_delete_target: None,
             pending_marked_delete_targets: Vec::new(),

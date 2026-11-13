@@ -206,6 +206,20 @@ impl ImageViewer {
         let media_h = media_h_u as f32;
         let monitor = self.monitor_size_points(ctx);
 
+        // A viewer reopened from the Stash keeps the size it was closed at: the file is fitted
+        // into that window instead of the window being resized to the file.
+        if self.restore_viewer_size_pending {
+            self.restore_viewer_size_pending = false;
+            if let Some(size) =
+                ctx.input(|input| input.raw.viewport().inner_rect.map(|rect| rect.size()))
+            {
+                let zoom = self.fit_zoom_for_target_bounds(size, egui::vec2(media_w, media_h));
+                self.zoom = zoom;
+                self.zoom_target = zoom;
+                return;
+            }
+        }
+
         if !self.config.floating_mode_remember_position {
             // Every file is laid out on its own, centred: no remembered rectangle survives.
             let Some((zoom, size)) = self.floating_layout_size_for_media(media_w, media_h, monitor)
