@@ -103,20 +103,37 @@ impl ImageViewer {
                 open_selected = true;
             }
             let shortcut_mod = input.modifiers.command || input.modifiers.ctrl;
-            if shortcut_mod && input.key_pressed(egui::Key::C) {
+            // The clipboard chords arrive as `Copy`/`Cut` events with the key press dropped, so
+            // checking the keys alone never saw Ctrl+C or Ctrl+X: both forms are accepted.
+            let saw_copy_event = input
+                .raw
+                .events
+                .iter()
+                .any(|event| matches!(event, egui::Event::Copy));
+            let saw_cut_event = input
+                .raw
+                .events
+                .iter()
+                .any(|event| matches!(event, egui::Event::Cut));
+            if (shortcut_mod && input.key_pressed(egui::Key::C)) || saw_copy_event {
                 copy_selected = true;
             }
-            if shortcut_mod && input.key_pressed(egui::Key::X) {
+            // On Windows Shift+Delete is reported as a cut command too, so a cut event under
+            // Shift is the destructive delete rather than a cut.
+            let shift_delete = input.modifiers.shift
+                && (saw_cut_event
+                    || input.key_pressed(egui::Key::X)
+                    || input.key_pressed(egui::Key::Delete));
+            if !shift_delete && ((shortcut_mod && input.key_pressed(egui::Key::X)) || saw_cut_event)
+            {
                 cut_selected = true;
             }
             // Plain Delete empties the stash entry; Shift+Delete is the destructive one and goes
             // through the same confirmation dialog the viewer uses.
-            if input.key_pressed(egui::Key::Delete) {
-                if input.modifiers.shift {
-                    delete_to_recycle = true;
-                } else {
-                    remove_selected = true;
-                }
+            if shift_delete {
+                delete_to_recycle = true;
+            } else if input.key_pressed(egui::Key::Delete) {
+                remove_selected = true;
             }
         });
 

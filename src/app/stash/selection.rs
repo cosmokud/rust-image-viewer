@@ -33,6 +33,16 @@ impl ImageViewer {
         !self.stash.selection.is_empty()
     }
 
+    /// Copied/cut badge for a stash tile. Every stashed file is marked by definition, so the
+    /// plain marked visual is left out: only the clipboard state is worth a chip here.
+    pub(crate) fn stash_clipboard_mark_visual(&self, path: &PathBuf) -> Option<FileMarkVisual> {
+        match self.prepared_clipboard_operation_for_path(path.as_path()) {
+            Some(FileClipboardOperation::Copy) => Some(FileMarkVisual::Copied),
+            Some(FileClipboardOperation::Cut) => Some(FileMarkVisual::Cut),
+            _ => None,
+        }
+    }
+
     /// Explorer semantics: plain click replaces, Shift extends from the anchor, Ctrl toggles.
     pub(crate) fn stash_click_path(&mut self, path: &PathBuf, modifiers: egui::Modifiers) {
         let additive = modifiers.command || modifiers.ctrl;
