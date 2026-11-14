@@ -192,23 +192,16 @@ impl ImageViewer {
         // The Peek toggle sits right of Details, so its width is part of the button group too.
         const STASH_PEEK_LABEL: &str = "Peek";
         let peek_width = settings_button_width(ui, STASH_PEEK_LABEL);
-        // The caption doubles as a position readout: with a file selected it reads
-        // `3 of 392 files`, and the plain total otherwise.
-        let paths = self.filtered_stash_paths();
-        let total = paths.len();
-        let position = self
-            .stash
-            .selected
-            .as_ref()
-            .and_then(|selected| paths.iter().position(|path| path == selected));
-        let count_text = match position {
-            Some(index) => format!(
-                "{} of {} {}",
-                index + 1,
-                total,
+        // The caption doubles as a selection readout: with files selected it reads
+        // `5 of 392 files`, and the plain total otherwise.
+        let total = self.filtered_stash_paths().len();
+        let selected_count = self.stash.selection.len();
+        let count_text = match selected_count {
+            0 => format!("{total} {}", if total == 1 { "file" } else { "files" }),
+            selected => format!(
+                "{selected} of {total} {}",
                 if total == 1 { "file" } else { "files" }
             ),
-            None => format!("{} {}", total, if total == 1 { "file" } else { "files" }),
         };
         let count_width = ui.fonts(|fonts| {
             fonts
