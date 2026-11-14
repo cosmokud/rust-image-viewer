@@ -93,6 +93,10 @@ impl eframe::App for ImageViewer {
 
         self.track_display_scale_change(ctx);
 
+        // A viewer reopened from the Stash keeps the rectangle it was closed on, past the OS's
+        // answer to the move across displays.
+        self.assert_viewer_placement(ctx);
+
         // Safety net for scaled displays and monitor changes: keep the floating window where
         // its title-bar buttons stay clickable.
         self.enforce_floating_window_buttons_on_display(ctx);

@@ -5,6 +5,10 @@
 use crate::app::*;
 use crate::prelude::*;
 
+/// Frames a reopened viewer's rectangle is re-asserted for. Enough for the OS's DPI adjustment
+/// (and the scale guard's answer to it) to have run, short enough not to fight a real resize.
+pub(crate) const VIEWER_PLACE_FRAMES: u8 = 4;
+
 impl ImageViewer {
     pub(crate) fn should_short_circuit_frame_for_exit(
         &self,
@@ -168,6 +172,18 @@ impl ImageViewer {
     ) -> bool {
         let display = parked_display
             .or_else(|| parked_rect.and_then(crate::window_geometry::display_for_window_centre));
+        // A rectangle no display owns — the placeholder a minimized window carries — is not a
+        // place to come back to.
+        let parked_rect = parked_rect.filter(|rect| {
+            rect.width() > 0
+                && rect.height() > 0
+                && display.is_some_and(|display| {
+                    rect.left < display.monitor.right
+                        && rect.right > display.monitor.left
+                        && rect.top < display.monitor.bottom
+                        && rect.bottom > display.monitor.top
+                })
+        });
 
         let target = if self.mode().is_fullscreen() {
             let Some(display) = display else {
@@ -197,10 +213,59 @@ impl ImageViewer {
             target.width(),
             target.height(),
         );
+        // Asserted again for the next frames: moving off the parked position crosses displays,
+        // and the OS's DPI adjustment rewrites the rectangle the window was just given.
+        self.viewer_place_rect = Some(target);
+        self.viewer_place_frames = VIEWER_PLACE_FRAMES;
         self.send_viewer_viewport_cmd(ctx, egui::ViewportCommand::Visible(true));
         self.send_viewer_viewport_cmd(ctx, egui::ViewportCommand::Minimized(false));
         ctx.request_repaint();
         true
+    }
+
+    /// Keeps a reopened viewer on the rectangle it was just put back at.
+    ///
+    /// The move back from the parked position crosses displays, and the OS answers it with a DPI
+    /// adjustment that rewrites the window rectangle. Without this the window came back at the
+    /// size it had while parked, in the corner of the new display. Once the placement settles the
+    /// media is laid out again against the window it actually has.
+    pub(crate) fn assert_viewer_placement(&mut self, ctx: &egui::Context) {
+        if self.viewer_place_frames == 0 {
+            return;
+        }
+        // The window has been taken over: parked again, resized by the user, or put into a new
+        // mode by a resize this frame already queued.
+        if self.viewer_window_hidden
+            || self.is_resizing
+            || self.pending_window_resize.is_some()
+            || self.toggle_fullscreen
+        {
+            self.viewer_place_frames = 0;
+            self.viewer_place_rect = None;
+            return;
+        }
+
+        self.viewer_place_frames -= 1;
+        if let Some(rect) = self.viewer_place_rect {
+            #[cfg(target_os = "windows")]
+            crate::windows_env::set_window_rect(
+                self.resolved_main_hwnd(),
+                rect.left,
+                rect.top,
+                rect.width(),
+                rect.height(),
+            );
+            #[cfg(not(target_os = "windows"))]
+            let _ = rect;
+        }
+        if self.viewer_place_frames == 0 {
+            self.viewer_place_rect = None;
+            // Settled: lay the media out once against the window it now has, and keep the size
+            // the viewer was reopened at instead of resizing the window to the file.
+            self.restore_viewer_size_pending = !self.mode().is_fullscreen();
+            self.pending_media_layout = true;
+        }
+        ctx.request_repaint();
     }
 
     pub(crate) fn begin_fast_app_exit(&mut self) {

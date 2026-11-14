@@ -216,6 +216,13 @@ pub(crate) struct ImageViewer {
     /// fullscreen rectangle there and brought the window back on the second monitor.
     pub(crate) parked_display: Option<crate::window_geometry::Display>,
     pub(crate) parked_viewer_rect: Option<crate::window_geometry::Rect>,
+    /// Rectangle (physical pixels) a reopened viewer is being put back at, and the frames it is
+    /// still asserted for. Coming back from the parked position crosses displays, and the OS
+    /// answers that move with a DPI adjustment that rewrites the rectangle the window was just
+    /// given: a window reopened into a fullscreen rectangle came back at its old size in the
+    /// new display's corner.
+    pub(crate) viewer_place_rect: Option<crate::window_geometry::Rect>,
+    pub(crate) viewer_place_frames: u8,
     /// Set when the viewer comes back at that remembered size: the next floating layout fits the
     /// media into the window instead of resizing the window to the media.
     pub(crate) restore_viewer_size_pending: bool,
@@ -1022,6 +1029,8 @@ impl Default for ImageViewer {
             parked_viewer_inner_size: None,
             parked_display: None,
             parked_viewer_rect: None,
+            viewer_place_rect: None,
+            viewer_place_frames: 0,
             restore_viewer_size_pending: false,
             parked_fullscreen_view: None,
             restore_parked_fullscreen_view_pending: false,
