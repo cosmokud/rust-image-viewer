@@ -134,6 +134,9 @@ impl ImageViewer {
                 }
             }
         }
+        // The stash outlives the process but the mark set does not: every stashed file starts
+        // the session marked, so the viewer and the stash window agree from the first frame.
+        self.marked_files = entries.keys().cloned().collect();
         self.stash.entries = entries;
     }
 
@@ -170,7 +173,8 @@ impl ImageViewer {
         self.stash.entries.get(path)
     }
 
-    /// Adds paths that are not stashed yet, capturing their metadata once.
+    /// Adds paths that are not stashed yet, capturing their metadata once. Stashing is marking:
+    /// the mark set and the stash are the same set, so the paths are marked here too.
     pub(crate) fn stash_remember_paths(&mut self, paths: &[PathBuf]) {
         let mut added = false;
         for path in paths {
@@ -180,6 +184,7 @@ impl ImageViewer {
             self.stash
                 .entries
                 .insert(path.clone(), StashEntry::capture(path.clone()));
+            self.marked_files.insert(path.clone());
             added = true;
         }
         if added {
@@ -187,8 +192,41 @@ impl ImageViewer {
         }
     }
 
+    /// Silent counterpart of [`Self::remove_paths_from_stash`], for when the viewer unmarks a
+    /// file: an unmark empties the stash entry without becoming a stash action of its own.
+    pub(crate) fn stash_forget_paths(&mut self, paths: &[PathBuf]) -> bool {
+        let mut removed_any = false;
+        for path in paths {
+            if self.stash.entries.remove(path).is_none() {
+                continue;
+            }
+            removed_any = true;
+            self.modal_thumbnail_cache.remove(path);
+            self.stash.selection.remove(path);
+            if self.stash.preview.requested_path.as_deref() == Some(path.as_path()) {
+                self.stash.preview.clear();
+            }
+        }
+        if !removed_any {
+            return false;
+        }
+
+        let selected_gone = self
+            .stash
+            .selected
+            .as_ref()
+            .is_some_and(|selected| !self.stash.entries.contains_key(selected));
+        if selected_gone {
+            self.stash.selected = self.filtered_stash_paths().first().cloned();
+            self.stash.scroll_to_selection = self.stash.selected.is_some();
+        }
+
+        self.save_stash();
+        true
+    }
+
     /// Drops one entry, keeps the grid selection on the tile that took its place, and rewrites
-    /// the file. Unmarking is deliberately not involved: the mark is the session selection.
+    /// the file. The file is unmarked at the same time: the stash is exactly the marked set.
     pub(crate) fn remove_path_from_stash(&mut self, path: &Path) {
         self.remove_paths_from_stash(std::slice::from_ref(&path.to_path_buf()));
     }
@@ -220,6 +258,9 @@ impl ImageViewer {
         if !removed_any {
             return;
         }
+
+        // The mark set follows the stash: a file that left the stash is unmarked in the viewer.
+        self.forget_marks(&removed);
 
         // Only the stash loses these files: Ctrl+Z puts the entries back without touching disk.
         // Recorded here rather than at the call sites so the chip, the context menu and the

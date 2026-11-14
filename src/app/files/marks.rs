@@ -66,6 +66,29 @@ impl ImageViewer {
         self.prepared_clipboard_paths.remove(path).is_some()
     }
 
+    /// Drops marks for paths the stash removed, and the prepared clipboard set that followed them.
+    /// Used when the stash, not the viewer, is what dropped the file.
+    pub(crate) fn forget_marks(&mut self, paths: &[PathBuf]) {
+        let mut prepared_changed = false;
+        for path in paths {
+            if self.marked_files.remove(path) {
+                if self.prepared_clipboard_paths.remove(path).is_some() {
+                    prepared_changed = true;
+                }
+            }
+        }
+        if prepared_changed {
+            self.sync_prepared_clipboard_with_system();
+        }
+    }
+
+    /// "Unmark All": the stash holds exactly the marked files, so it empties with them.
+    pub(crate) fn unmark_all_files(&mut self) {
+        self.clear_all_marks();
+        let stashed: Vec<PathBuf> = self.stash.entries.keys().cloned().collect();
+        self.stash_forget_paths(&stashed);
+    }
+
     pub(crate) fn clear_all_marks(&mut self) {
         self.marked_files.clear();
         let had_prepared_clipboard_paths = !self.prepared_clipboard_paths.is_empty();
@@ -123,10 +146,11 @@ impl ImageViewer {
             if self.clear_prepared_clipboard_for_path(&path) {
                 self.sync_prepared_clipboard_with_system();
             }
+            // The stash is the persisted mark set: unmarking takes the file out of it too.
+            self.stash_forget_paths(std::slice::from_ref(&path));
             return false;
         }
 
-        // Marking is what feeds the stash; unmarking only clears the bulk-action selection.
         self.stash_remember_paths(std::slice::from_ref(&path));
         true
     }
@@ -136,6 +160,7 @@ impl ImageViewer {
         let mut prepared_clipboard_changed = false;
         let mut seen_paths = HashSet::new();
         let mut stashed_paths: Vec<PathBuf> = Vec::new();
+        let mut unstashed_paths: Vec<PathBuf> = Vec::new();
 
         for index in indices {
             if let Some(path) = self.image_list.get(*index).cloned() {
@@ -151,6 +176,7 @@ impl ImageViewer {
                     if self.clear_prepared_clipboard_for_path(&path) {
                         prepared_clipboard_changed = true;
                     }
+                    unstashed_paths.push(path.clone());
                 } else {
                     stashed_paths.push(path.clone());
                 }
@@ -161,6 +187,7 @@ impl ImageViewer {
         if prepared_clipboard_changed {
             self.sync_prepared_clipboard_with_system();
         }
+        self.stash_forget_paths(&unstashed_paths);
         self.stash_remember_paths(&stashed_paths);
 
         changed
@@ -388,7 +415,7 @@ impl ImageViewer {
 
         self.error_message = None;
         self.pending_window_title = Some(env!("CARGO_PKG_NAME").to_string());
-        self.clear_all_marks();
+        self.unmark_all_files();
         self.prepared_clipboard_paths.clear();
         self.file_action_menu = None;
         self.rename_overlay = None;

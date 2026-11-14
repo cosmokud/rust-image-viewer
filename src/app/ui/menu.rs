@@ -160,7 +160,7 @@ impl ImageViewer {
                 .menu_action_row(ui, "Unmark All", MenuActionIcon::Unmark)
                 .clicked()
         {
-            self.clear_all_marks();
+            self.unmark_all_files();
             activated = true;
         }
 

@@ -258,7 +258,7 @@ impl ImageViewer {
 
         if !new_paths.is_empty() {
             if self.config.auto_unmark_after_paste {
-                self.clear_all_marks();
+                self.unmark_all_files();
             } else {
                 self.clear_stale_marked_files();
                 self.clear_stale_prepared_clipboard_paths();
