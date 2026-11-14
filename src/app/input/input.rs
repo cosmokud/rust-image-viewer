@@ -827,7 +827,24 @@ impl ImageViewer {
 
                             let editing_path = self.breadcrumb_edit_active;
 
-                            // Edit sits left of Up: it turns the breadcrumb trail into a path field.
+                            let can_go_up = self
+                                .current_breadcrumb_directory()
+                                .and_then(|directory| directory.parent().map(Path::to_path_buf))
+                                .is_some();
+                            let up_response = breadcrumb_nav_icon_button(
+                                ui,
+                                BreadcrumbNavIcon::Up,
+                                can_go_up && !editing_path,
+                                "Up one folder",
+                            );
+                            if up_response.contains_pointer() {
+                                breadcrumb_ui_hovered = true;
+                            }
+                            if up_response.clicked() {
+                                breadcrumb_nav_up_requested = true;
+                            }
+
+                            // Edit sits right of Up: it turns the breadcrumb trail into a path field.
                             let edit_response = breadcrumb_nav_icon_button(
                                 ui,
                                 BreadcrumbNavIcon::Edit,
@@ -848,23 +865,6 @@ impl ImageViewer {
                                 } else {
                                     self.breadcrumb_edit_text.clear();
                                 }
-                            }
-
-                            let can_go_up = self
-                                .current_breadcrumb_directory()
-                                .and_then(|directory| directory.parent().map(Path::to_path_buf))
-                                .is_some();
-                            let up_response = breadcrumb_nav_icon_button(
-                                ui,
-                                BreadcrumbNavIcon::Up,
-                                can_go_up && !editing_path,
-                                "Up one folder",
-                            );
-                            if up_response.contains_pointer() {
-                                breadcrumb_ui_hovered = true;
-                            }
-                            if up_response.clicked() {
-                                breadcrumb_nav_up_requested = true;
                             }
 
                             ui.add_space(8.0);
