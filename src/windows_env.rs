@@ -1,8 +1,10 @@
 #![cfg(target_os = "windows")]
 
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use winapi::shared::minwindef::{LPARAM, LRESULT, UINT, WPARAM};
 use winapi::shared::windef::{HWND, RECT};
@@ -226,6 +228,36 @@ pub fn window_rect(hwnd: HWND) -> Option<RECT> {
         }
         Some(rect)
     }
+}
+
+/// Size of the window's client area, in physical pixels.
+pub fn window_client_size(hwnd: HWND) -> Option<(i32, i32)> {
+    use winapi::um::winuser::GetClientRect;
+
+    if hwnd.is_null() {
+        return None;
+    }
+    unsafe {
+        let mut rect: RECT = std::mem::zeroed();
+        if GetClientRect(hwnd, &mut rect) == 0 {
+            return None;
+        }
+        Some((rect.right - rect.left, rect.bottom - rect.top))
+    }
+}
+
+/// What the window frame adds around the client area, in physical pixels: borders, caption and
+/// padding. It is read from the live window, so it is the frame of the display the window is on.
+pub fn window_chrome(hwnd: HWND) -> Option<(i32, i32)> {
+    let outer = window_rect(hwnd)?;
+    let (client_width, client_height) = window_client_size(hwnd)?;
+    if client_width <= 0 || client_height <= 0 {
+        return None;
+    }
+    Some((
+        (outer.right - outer.left) - client_width,
+        (outer.bottom - outer.top) - client_height,
+    ))
 }
 
 pub fn set_window_rect(hwnd: HWND, x: i32, y: i32, w: i32, h: i32) -> bool {
@@ -515,7 +547,19 @@ pub fn set_fullscreen_guard(active: bool) {
     FULLSCREEN_TARGET.store(active, Ordering::SeqCst);
 }
 
-static PREVIOUS_WNDPROC: AtomicIsize = AtomicIsize::new(0);
+/// The window procedure each hooked window had before the guard, and whether a scale change on
+/// that window should be reported to the app's own zoom rescaling (only the viewer's does).
+fn guarded_windows() -> &'static Mutex<HashMap<isize, (isize, bool)>> {
+    static GUARDED: OnceLock<Mutex<HashMap<isize, (isize, bool)>>> = OnceLock::new();
+    GUARDED.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn guarded_window(hwnd: HWND) -> Option<(isize, bool)> {
+    guarded_windows()
+        .lock()
+        .ok()
+        .and_then(|windows| windows.get(&(hwnd as isize)).copied())
+}
 
 /// Re-asserts the window's physical outer size across a display scale change.
 ///
@@ -536,7 +580,9 @@ unsafe extern "system" fn scale_change_wndproc(
 ) -> LRESULT {
     use winapi::um::winuser::{CallWindowProcW, WM_DPICHANGED, WM_GETMINMAXINFO};
 
-    let previous = PREVIOUS_WNDPROC.load(Ordering::SeqCst);
+    let Some((previous, report_scale_change)) = guarded_window(hwnd) else {
+        return def_proc(hwnd, msg, wparam, lparam);
+    };
     if previous == 0 {
         return def_proc(hwnd, msg, wparam, lparam);
     }
@@ -588,7 +634,9 @@ unsafe extern "system" fn scale_change_wndproc(
         RESTORE_IN_FLIGHT.store(true, Ordering::SeqCst);
         let restored = set_window_rect(hwnd, left, top, width, height);
         RESTORE_IN_FLIGHT.store(false, Ordering::SeqCst);
-        if restored {
+        // Only the viewer scales its own content by the ratio; a side window's frame keeping its
+        // physical size says nothing about the image.
+        if restored && report_scale_change {
             SCALE_RESTORED.store(true, Ordering::SeqCst);
         }
     } else if left != after.left || top != after.top {
@@ -648,7 +696,11 @@ unsafe fn override_maximize_target(hwnd: HWND, lparam: LPARAM) {
 }
 
 /// Hooks the window procedure once, so a display scale change cannot resize the window.
-pub fn install_scale_change_guard(hwnd: HWND) {
+///
+/// `report_scale_change` is for the viewer, whose zoom follows the ratio; a side window passes
+/// false. Each hooked window keeps its own previous procedure, so the app's own dialogs get the
+/// same treatment as the main window instead of being rescaled by the OS.
+pub fn install_scale_change_guard(hwnd: HWND, report_scale_change: bool) {
     use winapi::um::winuser::{GetWindowLongPtrW, SetWindowLongPtrW, GWLP_WNDPROC};
 
     if hwnd.is_null() {
@@ -660,7 +712,9 @@ pub fn install_scale_change_guard(hwnd: HWND) {
         if previous == 0 || previous == hook {
             return;
         }
-        PREVIOUS_WNDPROC.store(previous, Ordering::SeqCst);
+        if let Ok(mut windows) = guarded_windows().lock() {
+            windows.insert(hwnd as isize, (previous, report_scale_change));
+        }
         SetWindowLongPtrW(hwnd, GWLP_WNDPROC, hook);
     }
 }
@@ -669,7 +723,11 @@ pub fn install_scale_change_guard(hwnd: HWND) {
 pub fn remove_scale_change_guard(hwnd: HWND) {
     use winapi::um::winuser::{SetWindowLongPtrW, GWLP_WNDPROC};
 
-    let previous = PREVIOUS_WNDPROC.swap(0, Ordering::SeqCst);
+    let previous = guarded_windows()
+        .lock()
+        .ok()
+        .and_then(|mut windows| windows.remove(&(hwnd as isize)))
+        .map_or(0, |(previous, _)| previous);
     if hwnd.is_null() || previous == 0 {
         return;
     }

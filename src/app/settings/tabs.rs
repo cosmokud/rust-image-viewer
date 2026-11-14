@@ -140,12 +140,18 @@ impl ImageViewer {
             SETTINGS_WINDOW_MIN_SIZE,
         );
         let viewport_id = settings_viewport_id();
-        let viewport_builder = egui::ViewportBuilder::default()
+        let mut viewport_builder = egui::ViewportBuilder::default()
             .with_title(SETTINGS_WINDOW_TITLE)
-            .with_inner_size(placement.inner_size)
             .with_min_inner_size(SETTINGS_WINDOW_MIN_SIZE)
-            .with_position(placement.outer_position)
             .with_resizable(true);
+        // Only while it is being placed: eframe diffs this builder every frame and turns a
+        // changed size or position into a native move, so a rectangle that follows the live
+        // window would fight the user's drag — and would add the frame's width on every frame.
+        if 0 < self.settings.place_frames {
+            viewport_builder = viewport_builder
+                .with_inner_size(placement.inner_size)
+                .with_position(placement.outer_position);
+        }
 
         // egui keeps one style per context and the child viewport shares the viewer's context,
         // so the monochrome dialog style is installed for the duration of the dialog's frame:
@@ -543,6 +549,7 @@ impl ImageViewer {
             ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Close);
             self.settings.open = false;
             // The native window is gone: its handle must not be read for the next one.
+            release_side_window(self.settings.native_hwnd);
             self.settings.native_hwnd = 0;
             self.settings.requested_rect = None;
             self.settings.rename = None;

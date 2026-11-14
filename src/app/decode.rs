@@ -243,6 +243,8 @@ impl ImageViewer {
                     viewer.main_hwnd = hwnd;
                     crate::windows_env::install_scale_change_guard(
                         hwnd as winapi::shared::windef::HWND,
+                        // The viewer rescales its zoom by the ratio a restored size implies.
+                        true,
                     );
                 }
             }

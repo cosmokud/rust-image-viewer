@@ -2,18 +2,20 @@
 //! across a restart.
 //!
 //! They live in `<config dir>/stash_window.tsv` and `settings_window.tsv`, in **physical pixels**:
-//! the outer top-left (where the OS puts the title bar), the outer size, and whether the window
-//! was maximized. A maximized window reports the work area rather than the rectangle the user
-//! chose, so the rectangle kept for restore is always the un-maximized one.
+//! the outer top-left (where the OS puts the title bar), the **client** size, and whether the
+//! window was maximized. A maximized window reports the work area rather than the size the user
+//! chose, so the size kept for restore is always the un-maximized one.
 //!
-//! Physical pixels are the invariant of a multi-monitor desktop. Points are not: each display has
-//! its own scale, and a rectangle converted through the wrong one was placed with the viewer's
-//! scale on the viewer's display, no matter which monitor the window was left on. The rectangle
-//! is therefore read from the window itself (`GetWindowRect`) and written back with the same
-//! `SetWindowPos`, the way the viewer window is placed.
+//! Two things are load-bearing here:
 //!
-//! The files are read once at startup and rewritten after the window has stopped moving, so a
-//! drag or a resize ends in a single write instead of one per frame.
+//! * The size is the client area, never the outer rectangle. The client size is what the viewport
+//!   builder takes; feeding the outer rectangle back in added the frame's width on every frame and
+//!   the Settings window grew by a border each frame until it filled the display.
+//! * The rectangle is physical, and it is placed with `SetWindowPos` on the window handle. A point
+//!   position is converted with the scale of whichever display the window was created on, which is
+//!   how a window left on the second monitor came back on the first one. Physical pixels are the
+//!   invariant of a multi-monitor desktop, and they are also what keeps a window's *apparent* size
+//!   when it moves between displays of different scales.
 
 #![allow(unused_imports)]
 
@@ -28,10 +30,10 @@ pub(crate) const SETTINGS_WINDOW_FILE_NAME: &str = "settings_window.tsv";
 pub(crate) const SETTINGS_WINDOW_TITLE: &str = "Settings";
 
 /// First line of each file. It is required: a record written in another unit (an earlier version
-/// stored points) must not be read as pixels. A version bump means "ignore the old record".
-pub(crate) const STASH_WINDOW_FILE_HEADER: &str = "# rust-image-viewer stash window v3";
+/// stored points, and another the outer size) must not be read as this one's.
+pub(crate) const STASH_WINDOW_FILE_HEADER: &str = "# rust-image-viewer stash window v4";
 
-pub(crate) const SETTINGS_WINDOW_FILE_HEADER: &str = "# rust-image-viewer settings window v3";
+pub(crate) const SETTINGS_WINDOW_FILE_HEADER: &str = "# rust-image-viewer settings window v4";
 
 /// A change is written this long after it was last seen: a drag reports a new rectangle every
 /// frame and must end in one write, not hundreds.
@@ -48,11 +50,30 @@ const MIN_WINDOW_HEIGHT: i32 = 120;
 /// Everything needed to put the window back where the user left it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct StashWindowGeometry {
+    /// Outer top-left, in physical pixels: where the OS puts the window's frame.
     pub(crate) left: f32,
     pub(crate) top: f32,
+    /// Client area size, in physical pixels: the viewport's own size, without the frame.
     pub(crate) width: f32,
     pub(crate) height: f32,
     pub(crate) maximized: bool,
+}
+
+/// A live window rectangle: the frame's position and the client area's size.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct NativeSideWindow {
+    pub(crate) outer: crate::window_geometry::Rect,
+    pub(crate) client_width: i32,
+    pub(crate) client_height: i32,
+}
+
+/// Where a restored window is put: the frame's corner, and the client size to keep.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct NativeSideWindowTarget {
+    pub(crate) left: i32,
+    pub(crate) top: i32,
+    pub(crate) width: i32,
+    pub(crate) height: i32,
 }
 
 impl StashWindowGeometry {
@@ -66,23 +87,35 @@ impl StashWindowGeometry {
         }
     }
 
-    pub(crate) fn from_rect(rect: crate::window_geometry::Rect, maximized: bool) -> Self {
+    pub(crate) fn from_native(native: NativeSideWindow, maximized: bool) -> Self {
         Self::new(
-            rect.left as f32,
-            rect.top as f32,
-            rect.width() as f32,
-            rect.height() as f32,
+            native.outer.left as f32,
+            native.outer.top as f32,
+            native.client_width as f32,
+            native.client_height as f32,
             maximized,
         )
     }
 
+    /// The frame's area, as well as the client size can tell it: used to ask which display the
+    /// window belongs to, where a border's worth of error does not matter.
     pub(crate) fn to_rect(self) -> crate::window_geometry::Rect {
+        let (left, top) = (self.left.round() as i32, self.top.round() as i32);
         crate::window_geometry::Rect::new(
-            self.left.round() as i32,
-            self.top.round() as i32,
-            self.left.round() as i32 + self.width.round() as i32,
-            self.top.round() as i32 + self.height.round() as i32,
+            left,
+            top,
+            left + self.width.round() as i32,
+            top + self.height.round() as i32,
         )
+    }
+
+    fn to_target(self) -> NativeSideWindowTarget {
+        NativeSideWindowTarget {
+            left: self.left.round() as i32,
+            top: self.top.round() as i32,
+            width: self.width.round() as i32,
+            height: self.height.round() as i32,
+        }
     }
 
     fn encode(&self) -> String {
@@ -120,7 +153,7 @@ impl StashWindowGeometry {
         Some(Self::new(left, top, width, height, maximized))
     }
 
-    /// Same window, up to the rounding of a pixel and the file's one decimal.
+    /// Same window, up to the rounding of a pixel.
     fn same_window(&self, other: &Self) -> bool {
         (self.left - other.left).abs() <= GEOMETRY_EPSILON
             && (self.top - other.top).abs() <= GEOMETRY_EPSILON
@@ -140,8 +173,8 @@ pub(crate) struct StashWindowPlacement {
     /// True when the rectangle came from disk: its corner is then exact, not the estimate a
     /// fresh window needs until the native title bar has been measured.
     pub(crate) restored: bool,
-    /// Physical rectangle to place the native window at, when the recreation used a record.
-    pub(crate) native_rect: Option<crate::window_geometry::Rect>,
+    /// Physical target to place the native window at, when the recreation used a record.
+    pub(crate) native_target: Option<NativeSideWindowTarget>,
 }
 
 /// A display's scale as a fraction of 96 dpi.
@@ -153,40 +186,52 @@ fn display_scale(dpi: u32) -> f32 {
     }
 }
 
-/// Physical rectangle and display scale a remembered window belongs to.
+/// Physical target and display scale a remembered window belongs to.
 ///
-/// The rectangle is kept whole when a display still covers it. A window left on a display that
-/// has since been unplugged resolves to the nearest one and is pulled inside its work area, so it
-/// is never placed off-screen.
+/// The target is kept whole when a display still covers it. A window left on a display that has
+/// since been unplugged resolves to the nearest one and is pulled inside its work area, so it is
+/// never placed off-screen.
 #[cfg(target_os = "windows")]
 pub(crate) fn side_window_target(
     remembered: StashWindowGeometry,
-) -> Option<(crate::window_geometry::Rect, f32)> {
+) -> Option<(NativeSideWindowTarget, f32)> {
     use crate::window_geometry::{display_at, display_for_window_centre, Rect};
 
-    let mut rect = remembered.to_rect();
-    let display = display_for_window_centre(rect).or_else(|| display_at(rect.centre()))?;
+    let mut target = remembered.to_target();
+    let outer = Rect::new(
+        target.left,
+        target.top,
+        target.left + target.width,
+        target.top + target.height,
+    );
+    let display = display_for_window_centre(outer).or_else(|| display_at(outer.centre()))?;
 
     // Never larger than the work area it is going onto, and never smaller than a usable window.
     let max_width = display.work.width().max(MIN_WINDOW_WIDTH);
     let max_height = display.work.height().max(MIN_WINDOW_HEIGHT);
-    if rect.width() > max_width || rect.height() > max_height {
-        let width = rect.width().min(max_width).max(MIN_WINDOW_WIDTH);
-        let height = rect.height().min(max_height).max(MIN_WINDOW_HEIGHT);
-        rect = Rect::new(rect.left, rect.top, rect.left + width, rect.top + height);
-    }
+    target.width = target.width.min(max_width).max(MIN_WINDOW_WIDTH);
+    target.height = target.height.min(max_height).max(MIN_WINDOW_HEIGHT);
 
     // Only the position is corrected: the window keeps the size it was closed at.
-    let (left, top) = crate::window_geometry::clamp_into(display.work, rect);
-    rect = Rect::new(left, top, left + rect.width(), top + rect.height());
+    let (left, top) = crate::window_geometry::clamp_into(
+        display.work,
+        Rect::new(
+            target.left,
+            target.top,
+            target.left + target.width,
+            target.top + target.height,
+        ),
+    );
+    target.left = left;
+    target.top = top;
 
-    Some((rect, display_scale(display.dpi)))
+    Some((target, display_scale(display.dpi)))
 }
 
 #[cfg(not(target_os = "windows"))]
 pub(crate) fn side_window_target(
     _remembered: StashWindowGeometry,
-) -> Option<(crate::window_geometry::Rect, f32)> {
+) -> Option<(NativeSideWindowTarget, f32)> {
     None
 }
 
@@ -199,27 +244,28 @@ pub(crate) fn side_window_placement(
     min_size: egui::Vec2,
 ) -> StashWindowPlacement {
     let target = remembered.and_then(side_window_target);
-    let Some((rect, scale)) = target else {
+    let Some((target, scale)) = target else {
         return StashWindowPlacement {
             inner_size: default_size,
             outer_position: screen.center() - (default_size + egui::vec2(0.0, 34.0)) * 0.5,
             maximized: false,
             restored: false,
-            native_rect: None,
+            native_target: None,
         };
     };
 
-    // Points for the viewport builder only: the native placement below is what decides where the
-    // window really stands. The minimum is enforced here so the first frame is already usable.
-    let width = (rect.width() as f32 / scale).max(min_size.x.min(screen.width()));
-    let height = (rect.height() as f32 / scale).max(min_size.y.min(screen.height()));
+    // Points for the viewport builder only, and they are the client size: the native placement
+    // below is what decides where the window really stands, and never grows it, because the
+    // number fed back here is the client area and not the frame's own.
+    let width = (target.width as f32 / scale).max(min_size.x.min(screen.width()));
+    let height = (target.height as f32 / scale).max(min_size.y.min(screen.height()));
 
     StashWindowPlacement {
         inner_size: egui::vec2(width, height),
-        outer_position: egui::pos2(rect.left as f32 / scale, rect.top as f32 / scale),
+        outer_position: egui::pos2(target.left as f32 / scale, target.top as f32 / scale),
         maximized: remembered.is_some_and(|geometry| geometry.maximized),
         restored: true,
-        native_rect: Some(rect),
+        native_target: Some(target),
     }
 }
 
@@ -361,26 +407,66 @@ fn rects_match(
         && (current.bottom - requested.bottom).abs() <= 2
 }
 
-/// The native outer rectangle of one of the app's own windows, in physical pixels.
-pub(crate) fn native_side_window_rect(hwnd: isize) -> Option<crate::window_geometry::Rect> {
+/// One of the app's own windows as the OS has it now, in physical pixels.
+pub(crate) fn native_side_window(hwnd: isize) -> Option<NativeSideWindow> {
     #[cfg(target_os = "windows")]
     {
         if hwnd == 0 {
             return None;
         }
-        let rect = crate::windows_env::window_rect(hwnd as winapi::shared::windef::HWND)?;
-        return Some(crate::window_geometry::Rect::new(
-            rect.left,
-            rect.top,
-            rect.right,
-            rect.bottom,
-        ));
+        let hwnd = hwnd as winapi::shared::windef::HWND;
+        let rect = crate::windows_env::window_rect(hwnd)?;
+        let (client_width, client_height) = crate::windows_env::window_client_size(hwnd)?;
+        return Some(NativeSideWindow {
+            outer: crate::window_geometry::Rect::new(rect.left, rect.top, rect.right, rect.bottom),
+            client_width,
+            client_height,
+        });
     }
 
     #[cfg(not(target_os = "windows"))]
     {
         let _ = hwnd;
         None
+    }
+}
+
+/// Keeps a side window's physical size when it is dragged to a display of another scale.
+///
+/// The OS answers `WM_DPICHANGED` with a rectangle that preserves the window's *logical* size, so
+/// a window moved from a 100% display to a 150% one came out 50% larger in pixels although
+/// nothing about its content changed. The guard writes the pre-change pixel size back, so the
+/// window keeps the size it had, which is also the size the record then keeps for next time.
+pub(crate) fn guard_side_window(hwnd: isize) {
+    #[cfg(target_os = "windows")]
+    {
+        if hwnd != 0 {
+            // A side window's frame does not scale the image's zoom the way the viewer's does.
+            crate::windows_env::install_scale_change_guard(
+                hwnd as winapi::shared::windef::HWND,
+                false,
+            );
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = hwnd;
+    }
+}
+
+/// Unhooks a side window that is going away.
+pub(crate) fn release_side_window(hwnd: isize) {
+    #[cfg(target_os = "windows")]
+    {
+        if hwnd != 0 {
+            crate::windows_env::remove_scale_change_guard(hwnd as winapi::shared::windef::HWND);
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = hwnd;
     }
 }
 
@@ -402,12 +488,11 @@ pub(crate) fn side_window_hwnd(title: &str) -> isize {
 ///
 /// Returns the rectangle to keep (unchanged when the frame is not restorable) and whether it
 /// changed. A minimized or fullscreen window reports a rectangle that is not the one to restore,
-/// so those frames leave the record alone.
+/// and a window whose handle is not known yet gives nothing to read, so those frames leave the
+/// record alone.
 pub(crate) fn settled_side_window_geometry(
     remembered: Option<StashWindowGeometry>,
-    native_rect: Option<crate::window_geometry::Rect>,
-    egui_outer: Option<egui::Rect>,
-    egui_scale: f32,
+    native: Option<NativeSideWindow>,
     maximized: bool,
     minimized: bool,
     fullscreen: bool,
@@ -415,26 +500,7 @@ pub(crate) fn settled_side_window_geometry(
     if minimized || fullscreen {
         return (remembered, false);
     }
-
-    // The OS is the authority on where the window stands: it knows the monitor it was dragged
-    // to, in the pixels that monitor uses.
-    let rect = native_rect.or_else(|| {
-        let outer = egui_outer?;
-        let scale = if egui_scale.is_finite() && egui_scale > 0.01 {
-            egui_scale
-        } else {
-            1.0
-        };
-        let left = (outer.min.x * scale).round() as i32;
-        let top = (outer.min.y * scale).round() as i32;
-        Some(crate::window_geometry::Rect::new(
-            left,
-            top,
-            left + (outer.width() * scale).round() as i32,
-            top + (outer.height() * scale).round() as i32,
-        ))
-    });
-    let Some(rect) = rect else {
+    let Some(native) = native else {
         return (remembered, false);
     };
 
@@ -443,22 +509,19 @@ pub(crate) fn settled_side_window_geometry(
         if maximized {
             return (None, false);
         }
-        return (Some(StashWindowGeometry::from_rect(rect, false)), true);
+        return (Some(StashWindowGeometry::from_native(native, false)), true);
     };
 
-    let mut changed = false;
     let mut next = geometry;
+    let mut changed = false;
     if next.maximized != maximized {
         next.maximized = maximized;
         changed = true;
     }
     if !maximized {
-        let current = StashWindowGeometry::from_rect(rect, false);
+        let current = StashWindowGeometry::from_native(native, next.maximized);
         if !next.same_window(&current) {
-            next = StashWindowGeometry {
-                maximized: next.maximized,
-                ..current
-            };
+            next = current;
             changed = true;
         }
     }
@@ -483,13 +546,9 @@ impl ImageViewer {
     /// write. A maximized window keeps the size and corner of the un-maximized window it will
     /// restore to.
     pub(crate) fn remember_stash_window_geometry(&mut self, ctx: &egui::Context) {
-        // Read before the input lock: `pixels_per_point` takes that same lock, so asking for it
-        // inside `ctx.input(...)` deadlocks the frame that draws the window.
-        let scale = ctx.pixels_per_point();
-        let (outer, maximized, minimized, fullscreen) = ctx.input(|input| {
+        let (maximized, minimized, fullscreen) = ctx.input(|input| {
             let viewport = input.viewport();
             (
-                viewport.outer_rect,
                 viewport.maximized.unwrap_or(false),
                 viewport.minimized.unwrap_or(false),
                 viewport.fullscreen.unwrap_or(false),
@@ -498,14 +557,16 @@ impl ImageViewer {
         if self.stash.native_hwnd == 0 {
             self.stash.native_hwnd = side_window_hwnd(STASH_WINDOW_TITLE);
         }
+        guard_side_window(self.stash.native_hwnd);
+        let native = native_side_window(self.stash.native_hwnd);
 
         // A window that has not reached the rectangle it was asked for is still on its way:
         // record nothing, and put it back. Recording that frame would overwrite the remembered
-        // monitor with the one the window merely happened to be created on.
+        // display with the one the window merely happened to be created on.
         #[cfg(target_os = "windows")]
         if let Some(requested) = self.stash.requested_rect {
-            match native_side_window_rect(self.stash.native_hwnd) {
-                Some(current) if rects_match(current, requested) => {
+            match native {
+                Some(window) if rects_match(window.outer, requested) => {
                     self.stash.requested_rect = None;
                 }
                 Some(_) => {
@@ -524,9 +585,7 @@ impl ImageViewer {
 
         let (geometry, changed) = settled_side_window_geometry(
             self.stash.window_geometry,
-            native_side_window_rect(self.stash.native_hwnd),
-            outer,
-            scale,
+            native,
             maximized,
             minimized,
             fullscreen,
@@ -548,12 +607,9 @@ impl ImageViewer {
 
     /// The Settings window's counterpart: same recording, its own file.
     pub(crate) fn remember_settings_window_geometry(&mut self, ctx: &egui::Context) {
-        // Same order as the Stash's: the scale first, then the locked input read.
-        let scale = ctx.pixels_per_point();
-        let (outer, maximized, minimized, fullscreen) = ctx.input(|input| {
+        let (maximized, minimized, fullscreen) = ctx.input(|input| {
             let viewport = input.viewport();
             (
-                viewport.outer_rect,
                 viewport.maximized.unwrap_or(false),
                 viewport.minimized.unwrap_or(false),
                 viewport.fullscreen.unwrap_or(false),
@@ -562,11 +618,13 @@ impl ImageViewer {
         if self.settings.native_hwnd == 0 {
             self.settings.native_hwnd = side_window_hwnd(SETTINGS_WINDOW_TITLE);
         }
+        guard_side_window(self.settings.native_hwnd);
+        let native = native_side_window(self.settings.native_hwnd);
 
         #[cfg(target_os = "windows")]
         if let Some(requested) = self.settings.requested_rect {
-            match native_side_window_rect(self.settings.native_hwnd) {
-                Some(current) if rects_match(current, requested) => {
+            match native {
+                Some(window) if rects_match(window.outer, requested) => {
                     self.settings.requested_rect = None;
                 }
                 Some(_) => {
@@ -585,9 +643,7 @@ impl ImageViewer {
 
         let (geometry, changed) = settled_side_window_geometry(
             self.settings.window_geometry,
-            native_side_window_rect(self.settings.native_hwnd),
-            outer,
-            scale,
+            native,
             maximized,
             minimized,
             fullscreen,
@@ -609,14 +665,12 @@ impl ImageViewer {
 
     /// Places the Stash's native window at the remembered rectangle.
     ///
-    /// Written in physical pixels and straight to the window, the way the viewer puts itself
-    /// back: a point-based position is converted with the scale of whichever monitor the window
-    /// happens to be created on, which is how a window left on the second monitor came back on
-    /// the first one. Returns false when the window or the record is not there yet, so the caller
+    /// The frame's corner and the client size go straight to the window, the way the viewer puts
+    /// itself back. Returns false when the window or the record is not there yet, so the caller
     /// can fall back to the viewport commands.
     #[cfg(target_os = "windows")]
     pub(crate) fn place_stash_window_natively(&mut self, placement: &StashWindowPlacement) -> bool {
-        let Some(rect) = placement.native_rect else {
+        let Some(target) = placement.native_target else {
             return false;
         };
         if self.stash.native_hwnd == 0 {
@@ -626,11 +680,11 @@ impl ImageViewer {
             return false;
         }
         let hwnd = self.stash.native_hwnd as winapi::shared::windef::HWND;
-        if placement.maximized {
-            let _ = crate::windows_env::set_window_maximized(hwnd, true);
-        }
-        self.stash.requested_rect = Some(rect);
-        crate::windows_env::set_window_rect(hwnd, rect.left, rect.top, rect.width(), rect.height())
+        let Some(outer) = place_side_window(hwnd, target, placement.maximized) else {
+            return false;
+        };
+        self.stash.requested_rect = Some(outer);
+        true
     }
 
     /// The Settings window's counterpart.
@@ -639,7 +693,7 @@ impl ImageViewer {
         &mut self,
         placement: &StashWindowPlacement,
     ) -> bool {
-        let Some(rect) = placement.native_rect else {
+        let Some(target) = placement.native_target else {
             return false;
         };
         if self.settings.native_hwnd == 0 {
@@ -649,11 +703,11 @@ impl ImageViewer {
             return false;
         }
         let hwnd = self.settings.native_hwnd as winapi::shared::windef::HWND;
-        if placement.maximized {
-            let _ = crate::windows_env::set_window_maximized(hwnd, true);
-        }
-        self.settings.requested_rect = Some(rect);
-        crate::windows_env::set_window_rect(hwnd, rect.left, rect.top, rect.width(), rect.height())
+        let Some(outer) = place_side_window(hwnd, target, placement.maximized) else {
+            return false;
+        };
+        self.settings.requested_rect = Some(outer);
+        true
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -689,12 +743,58 @@ impl ImageViewer {
     }
 }
 
+/// Puts the window's frame at `target.left`/`top` with the client area at the remembered size,
+/// and returns the frame rectangle it was given.
+///
+/// The frame is measured on the window itself, so the size restored is the client size on the
+/// display the window is on, whatever its borders and caption are there.
+#[cfg(target_os = "windows")]
+fn place_side_window(
+    hwnd: winapi::shared::windef::HWND,
+    target: NativeSideWindowTarget,
+    maximized: bool,
+) -> Option<crate::window_geometry::Rect> {
+    use crate::window_geometry::Rect;
+
+    // Keeps the client size across a display scale change instead of letting the OS rescale the
+    // whole window: the same rule the viewer follows.
+    guard_side_window(hwnd as isize);
+    // Measured before maximizing, where the frame is the window's own again.
+    let chrome = crate::windows_env::window_chrome(hwnd).unwrap_or((0, 0));
+    let width = target.width + chrome.0;
+    let height = target.height + chrome.1;
+    let outer = Rect::new(
+        target.left,
+        target.top,
+        target.left + width,
+        target.top + height,
+    );
+
+    if maximized {
+        let _ = crate::windows_env::set_window_maximized(hwnd, true);
+    }
+    crate::windows_env::set_window_rect(hwnd, outer.left, outer.top, width, height).then_some(outer)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn screen() -> egui::Rect {
         egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1920.0, 1040.0))
+    }
+
+    fn native(left: i32, top: i32, width: i32, height: i32) -> NativeSideWindow {
+        NativeSideWindow {
+            outer: crate::window_geometry::Rect::new(
+                left,
+                top,
+                left + width + 16,
+                top + height + 39,
+            ),
+            client_width: width,
+            client_height: height,
+        }
     }
 
     #[test]
@@ -720,25 +820,47 @@ mod tests {
 
         // The record is placed as it stands: no clamping onto this window's own display.
         assert_eq!(
-            placement.native_rect,
-            Some(crate::window_geometry::Rect::new(2200, 120, 3200, 820))
+            placement.native_target,
+            Some(NativeSideWindowTarget {
+                left: 2200,
+                top: 120,
+                width: 1000,
+                height: 700,
+            })
         );
         assert!(placement.restored);
     }
 
     #[test]
-    fn a_side_window_keeps_the_size_it_was_closed_at() {
+    fn the_builder_is_given_the_client_size_not_the_frame() {
+        let geometry = StashWindowGeometry::new(300.0, 200.0, 700.0, 500.0, false);
+
         let placement = side_window_placement(
             screen(),
-            Some(StashWindowGeometry::new(300.0, 200.0, 700.0, 500.0, false)),
+            Some(geometry),
             egui::vec2(900.0, 520.0),
             egui::vec2(560.0, 400.0),
         );
 
-        // The record's physical size is the outer size, so the fallback builder size is at least
-        // the remembered window and never the dialog's half-screen default.
-        assert!(placement.inner_size.x >= 560.0);
+        // Feeding the frame's width back in is what made the window grow every frame.
+        assert_eq!(placement.inner_size, egui::vec2(700.0, 500.0));
         assert_eq!(placement.outer_position, egui::pos2(300.0, 200.0));
+    }
+
+    #[test]
+    fn a_placed_window_keeps_the_size_it_is_given() {
+        // Recording the frame and restoring it as the client size added a frame per open.
+        let native = native(2100, 140, 1000, 700);
+        let (geometry, _) = settled_side_window_geometry(None, Some(native), false, false, false);
+        let placement = side_window_placement(
+            screen(),
+            geometry,
+            egui::vec2(900.0, 520.0),
+            egui::vec2(560.0, 400.0),
+        );
+
+        assert_eq!(placement.native_target.unwrap().width, 1000);
+        assert_eq!(placement.native_target.unwrap().height, 700);
     }
 
     #[test]
@@ -778,16 +900,16 @@ mod tests {
         let placement = stash_window_placement(screen(), None);
 
         assert!(!placement.restored);
-        assert_eq!(placement.native_rect, None);
+        assert_eq!(placement.native_target, None);
         assert_eq!(placement.inner_size, stash_window_size(screen()));
     }
 
     #[test]
-    fn a_native_frame_records_the_outer_rectangle_in_pixels() {
-        let rect = crate::window_geometry::Rect::new(2100, 140, 3100, 840);
+    fn a_native_frame_records_the_frame_corner_and_the_client_size() {
+        let native = native(2100, 140, 1000, 700);
 
         let (geometry, changed) =
-            settled_side_window_geometry(None, Some(rect), None, 1.5, false, false, false);
+            settled_side_window_geometry(None, Some(native), false, false, false);
         let geometry = geometry.expect("a settled frame records its rectangle");
 
         assert!(changed);
@@ -798,14 +920,23 @@ mod tests {
     }
 
     #[test]
+    fn a_frame_without_a_native_rectangle_records_nothing() {
+        let remembered = StashWindowGeometry::new(10.0, 20.0, 800.0, 600.0, false);
+
+        let (geometry, changed) =
+            settled_side_window_geometry(Some(remembered), None, false, false, false);
+
+        assert!(!changed);
+        assert_eq!(geometry, Some(remembered));
+    }
+
+    #[test]
     fn a_minimized_frame_leaves_the_record_alone() {
         let remembered = StashWindowGeometry::new(10.0, 20.0, 800.0, 600.0, false);
 
         let (geometry, changed) = settled_side_window_geometry(
             Some(remembered),
-            Some(crate::window_geometry::Rect::new(0, 0, 10, 10)),
-            None,
-            1.0,
+            Some(native(-32000, -32000, 160, 28)),
             false,
             true,
             false,
@@ -820,7 +951,7 @@ mod tests {
         let path = std::env::temp_dir().join("riv_geometry_header_probe.tsv");
         std::fs::write(
             &path,
-            "# rust-image-viewer stash window v2\n0.00\t0.00\t800.00\t600.00\t0\t1.500\n",
+            "# rust-image-viewer stash window v3\n0\t0\t800\t600\t0\n",
         )
         .unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
@@ -829,7 +960,7 @@ mod tests {
         let mut lines = text.lines().filter(|line| !line.trim().is_empty());
         let header = lines.next().unwrap();
         assert_ne!(header, STASH_WINDOW_FILE_HEADER);
-        // The parser refuses the file outright, so an old points record is never read as pixels.
+        // The parser refuses the file outright, so an older record is never read as this one's.
         assert_ne!(
             if header == STASH_WINDOW_FILE_HEADER {
                 lines.next().and_then(StashWindowGeometry::decode)
