@@ -412,18 +412,23 @@ fn set_tool_window_style(hwnd: HWND, tool_window: bool) {
 /// window out of the taskbar and Alt+Tab meanwhile.
 pub fn park_window_offscreen(hwnd: HWND) -> bool {
     use winapi::um::winuser::{
-        SetWindowPos, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
+        GetSystemMetrics, SetWindowPos, SM_CXVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+        SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
     };
 
-    let Some(rect) = window_rect(hwnd) else {
+    if hwnd.is_null() {
         return false;
-    };
-    let centre = (
-        rect.left + (rect.right - rect.left) / 2,
-        rect.top + (rect.bottom - rect.top) / 2,
-    );
-    let Some(display) = monitor_info_at(centre.0, centre.1) else {
-        return false;
+    }
+    // Right of the *whole* virtual desktop, not right of the display the window is on: a
+    // monitor standing to its right would otherwise catch the parked window, which is what made
+    // closing the viewer throw it onto the second monitor instead of out of sight.
+    let (x, y) = unsafe {
+        (
+            GetSystemMetrics(SM_XVIRTUALSCREEN)
+                .saturating_add(GetSystemMetrics(SM_CXVIRTUALSCREEN))
+                .saturating_add(40),
+            GetSystemMetrics(SM_YVIRTUALSCREEN),
+        )
     };
 
     set_tool_window_style(hwnd, true);
@@ -431,8 +436,8 @@ pub fn park_window_offscreen(hwnd: HWND) -> bool {
         SetWindowPos(
             hwnd,
             std::ptr::null_mut(),
-            display.monitor.right + 40,
-            display.monitor.top,
+            x,
+            y,
             0,
             0,
             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,

@@ -30,6 +30,10 @@ impl ImageViewer {
     /// window's frames, so hiding it froze them.
     pub(crate) fn hide_viewer_window(&mut self, ctx: &egui::Context) {
         if self.viewer_window_hidden {
+            // Already parked: the close it asked for is still refused, or the window would be
+            // destroyed under the Settings/Stash windows it is drawing.
+            self.send_viewer_viewport_cmd(ctx, egui::ViewportCommand::CancelClose);
+            ctx.request_repaint();
             return;
         }
         // Nothing should keep playing behind a window the user just closed.
