@@ -604,6 +604,96 @@ unsafe fn def_proc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) -> LRE
     DefWindowProcW(hwnd, msg, wparam, lparam)
 }
 
+static SNAP_HOTKEY_MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
+static SNAP_HOTKEY_HOOK: AtomicIsize = AtomicIsize::new(0);
+
+/// Keeps Windows from resizing the app's window with `Win`+`arrow`.
+///
+/// `Win`+`Left`/`Right`/`Up`/`Down` never reach the window: the shell snaps it to half the
+/// display, maximises or minimises it before the window procedure is asked anything, so the app
+/// cannot refuse from inside. A low-level keyboard hook sees the chord first and swallows exactly
+/// those four while one of the app's own windows has the keyboard, leaving the window's layout
+/// alone. `Win`+`Shift`+`Left`/`Right` only moves the window to the other display and is passed
+/// through untouched, and everywhere else on the desktop the chords keep their normal meaning.
+pub fn install_snap_hotkey_guard(hwnd: HWND) {
+    use winapi::um::winuser::{SetWindowsHookExW, WH_KEYBOARD_LL};
+
+    if hwnd.is_null() {
+        return;
+    }
+    SNAP_HOTKEY_MAIN_HWND.store(hwnd as isize, Ordering::SeqCst);
+    if SNAP_HOTKEY_HOOK.load(Ordering::SeqCst) != 0 {
+        return;
+    }
+
+    // The hook is delivered on the thread that installs it, which is the one running the window
+    // loop; `thread_id` 0 makes it see the keys of the whole desktop.
+    unsafe {
+        let hook = SetWindowsHookExW(
+            WH_KEYBOARD_LL,
+            Some(snap_hotkey_hook),
+            std::ptr::null_mut(),
+            0,
+        );
+        if !hook.is_null() {
+            SNAP_HOTKEY_HOOK.store(hook as isize, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Swallows `Win`+`arrow` while one of the app's windows is in front; returns 1 for those and
+/// passes everything else down the hook chain.
+unsafe extern "system" fn snap_hotkey_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    use winapi::um::winuser::{
+        CallNextHookEx, GetAsyncKeyState, GetForegroundWindow, GetWindowThreadProcessId,
+        KBDLLHOOKSTRUCT, VK_DOWN, VK_LEFT, VK_LWIN, VK_RIGHT, VK_RWIN, VK_SHIFT, VK_UP, WM_KEYDOWN,
+        WM_SYSKEYDOWN,
+    };
+
+    let pass_through = || CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam);
+    if code < 0 || lparam == 0 {
+        return pass_through();
+    }
+    let message = wparam as u32;
+    if message != WM_KEYDOWN && message != WM_SYSKEYDOWN {
+        return pass_through();
+    }
+
+    let key = (*(lparam as *const KBDLLHOOKSTRUCT)).vkCode;
+    if ![
+        VK_LEFT as u32,
+        VK_RIGHT as u32,
+        VK_UP as u32,
+        VK_DOWN as u32,
+    ]
+    .contains(&key)
+    {
+        return pass_through();
+    }
+
+    let down = |virtual_key: i32| (GetAsyncKeyState(virtual_key) as u16 & 0x8000) != 0;
+    // `Win`+`Shift`+arrow moves the window between displays: that one is wanted.
+    if !(down(VK_LWIN as i32) || down(VK_RWIN as i32)) || down(VK_SHIFT as i32) {
+        return pass_through();
+    }
+
+    // Only for the app's own windows: the chords keep working everywhere else.
+    let foreground = GetForegroundWindow();
+    let main = SNAP_HOTKEY_MAIN_HWND.load(Ordering::SeqCst) as HWND;
+    if foreground.is_null() || main.is_null() {
+        return pass_through();
+    }
+    let mut foreground_process = 0u32;
+    let mut main_process = 0u32;
+    GetWindowThreadProcessId(foreground, &mut foreground_process);
+    GetWindowThreadProcessId(main, &mut main_process);
+    if foreground_process == 0 || foreground_process != main_process {
+        return pass_through();
+    }
+
+    1
+}
+
 /// Rewrites only the maximize fields of a `WM_GETMINMAXINFO` answer.
 ///
 /// The default answer for an undecorated window inflates `rcWork` by `SM_CXSIZEFRAME +
