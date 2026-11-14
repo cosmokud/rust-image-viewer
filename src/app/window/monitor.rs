@@ -110,6 +110,37 @@ pub(crate) fn monitor_work_area_points_at(_anchor: egui::Pos2, _scale: f32) -> O
     None
 }
 
+/// Work area of the display nearest a *physical* point, in that display's own points, together
+/// with its scale.
+///
+/// A window rectangle recorded on another display is in that display's points: the scale has to
+/// come back with the work area, or the same rectangle becomes a window of another physical size
+/// when the display it was on is gone and the nearest one takes over.
+#[cfg(target_os = "windows")]
+pub(crate) fn monitor_work_area_and_scale_at(point: (i32, i32)) -> Option<(egui::Rect, f32)> {
+    let found = crate::windows_env::monitor_info_at(point.0, point.1)?;
+    let scale = if found.dpi_x > 0 {
+        (found.dpi_x as f32 / 96.0).clamp(0.5, 4.0)
+    } else {
+        1.0
+    };
+    let work = found.work;
+
+    Some((
+        egui::Rect::from_min_max(
+            egui::pos2(work.left as f32 / scale, work.top as f32 / scale),
+            egui::pos2(work.right as f32 / scale, work.bottom as f32 / scale),
+        ),
+        scale,
+    ))
+}
+
+#[cfg(not(target_os = "windows"))]
+#[allow(dead_code)]
+pub(crate) fn monitor_work_area_and_scale_at(_point: (i32, i32)) -> Option<(egui::Rect, f32)> {
+    None
+}
+
 #[cfg(target_os = "windows")]
 pub(crate) fn get_primary_monitor_refresh_hz() -> Option<f32> {
     use std::mem::{size_of, zeroed};

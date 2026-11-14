@@ -30,6 +30,15 @@ impl ImageViewer {
             return;
         }
         self.stash.open = true;
+        // The rectangle is rewritten into the point space of the display it belongs to, once per
+        // open: a stash left on a scaled second monitor comes back there at the size it was
+        // closed at, and a display that no longer exists resolves to the nearest one without
+        // changing the window's physical size.
+        if let Some(geometry) = self.stash.window_geometry {
+            if let Some((_, converted)) = resolved_side_window(geometry) {
+                self.stash.window_geometry = Some(converted);
+            }
+        }
         // The screen is resolved again on every open, so a remembered rectangle that belongs to
         // another display is measured against that display: the stash comes back where it was
         // left, and only a first open is centered.
@@ -182,6 +191,8 @@ impl ImageViewer {
 
     pub(crate) fn close_stash(&mut self) {
         self.stash.open = false;
+        // The native window is gone: its handle must not be read for the next one.
+        self.stash.native_hwnd = 0;
         self.stash.hovered = None;
         self.stash.preview.clear();
     }

@@ -141,7 +141,7 @@ impl ImageViewer {
         );
         let viewport_id = settings_viewport_id();
         let viewport_builder = egui::ViewportBuilder::default()
-            .with_title("Settings")
+            .with_title(SETTINGS_WINDOW_TITLE)
             .with_inner_size(placement.inner_size)
             .with_min_inner_size(SETTINGS_WINDOW_MIN_SIZE)
             .with_position(placement.outer_position)
@@ -536,6 +536,8 @@ impl ImageViewer {
             // dialog on screen until the next pass.
             ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Close);
             self.settings.open = false;
+            // The native window is gone: its handle must not be read for the next one.
+            self.settings.native_hwnd = 0;
             self.settings.rename = None;
             self.settings.pending_confirm = None;
             self.settings.pending_confirm = None;

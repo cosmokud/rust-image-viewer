@@ -24,6 +24,9 @@ pub(crate) const STASH_WINDOW_FILE_NAME: &str = "stash_window.tsv";
 
 pub(crate) const SETTINGS_WINDOW_FILE_NAME: &str = "settings_window.tsv";
 
+/// Title of the Settings window, which is also how that native window is found.
+pub(crate) const SETTINGS_WINDOW_TITLE: &str = "Settings";
+
 /// First line of each file; a version bump means "ignore the old record".
 pub(crate) const STASH_WINDOW_FILE_HEADER: &str = "# rust-image-viewer stash window v2";
 
@@ -246,11 +249,53 @@ pub(crate) fn side_window_screen(
         return settings_screen_rect(ctx);
     };
     let scale = sane_scale(remembered.scale);
+    // The anchor stays in the points the rectangle was recorded in: the query does the one
+    // conversion to physical pixels itself.
     let anchor = egui::pos2(
-        (remembered.left + remembered.width * 0.5) * scale,
-        (remembered.top + remembered.height * 0.5) * scale,
+        remembered.left + remembered.width * 0.5,
+        remembered.top + remembered.height * 0.5,
     );
     monitor_work_area_points_at(anchor, scale).unwrap_or_else(|| settings_screen_rect(ctx))
+}
+
+/// Rewrites a remembered rectangle into the point space of the display it belongs to.
+///
+/// The rectangle is read back on whatever desktop exists now: if the display it was recorded on
+/// is gone, the nearest one takes over, and a different scale there must not turn into a window
+/// of another physical size. The display is found from the rectangle's physical centre, and the
+/// rectangle is converted into that display's points before anything is placed with it.
+pub(crate) fn resolved_side_window(
+    remembered: StashWindowGeometry,
+) -> Option<(egui::Rect, StashWindowGeometry)> {
+    let recorded = sane_scale(remembered.scale);
+    let anchor = (
+        ((remembered.left + remembered.width * 0.5) * recorded).round() as i32,
+        ((remembered.top + remembered.height * 0.5) * recorded).round() as i32,
+    );
+    let (work, target_scale) = monitor_work_area_and_scale_at(anchor)?;
+    Some((work, rescale_side_window(remembered, target_scale)))
+}
+
+/// The same window rectangle expressed in the points of a display at `target_scale`.
+///
+/// Physical pixels are the invariant: a rectangle recorded at 150% keeps its physical size when
+/// it is read back on a 100% display, so its points grow by that ratio.
+pub(crate) fn rescale_side_window(
+    remembered: StashWindowGeometry,
+    target_scale: f32,
+) -> StashWindowGeometry {
+    let recorded = sane_scale(remembered.scale);
+    let target = sane_scale(target_scale);
+    let ratio = recorded / target;
+
+    StashWindowGeometry {
+        left: remembered.left * ratio,
+        top: remembered.top * ratio,
+        width: remembered.width * ratio,
+        height: remembered.height * ratio,
+        maximized: remembered.maximized,
+        scale: target,
+    }
 }
 
 /// The Stash's display.
@@ -304,6 +349,77 @@ pub(crate) fn write_stash_window_geometry(geometry: StashWindowGeometry) {
     write_window_geometry(STASH_WINDOW_FILE_NAME, STASH_WINDOW_FILE_HEADER, geometry);
 }
 
+/// Where a side window stands: the outer corner in the points of the display it is on, and that
+/// display's scale.
+///
+/// The OS is asked for the native rectangle first. egui reports a per-viewport rectangle too,
+/// but a window dragged to another monitor is the desktop's fact before it is egui's — reading
+/// the window itself is what keeps the record on the monitor the user actually moved it to.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct SideWindowAnchor {
+    pub(crate) left: f32,
+    pub(crate) top: f32,
+    pub(crate) scale: f32,
+}
+
+impl SideWindowAnchor {
+    pub(crate) fn from_egui(outer: egui::Rect, scale: f32) -> Self {
+        Self {
+            left: outer.min.x,
+            top: outer.min.y,
+            scale: sane_scale(scale),
+        }
+    }
+}
+
+/// A display's scale as a fraction of 96 dpi.
+fn display_scale(dpi: u32) -> f32 {
+    if dpi > 0 {
+        (dpi as f32 / 96.0).clamp(0.5, 4.0)
+    } else {
+        1.0
+    }
+}
+
+/// The corner and scale of a native window handle, straight from the OS.
+pub(crate) fn native_side_window_anchor(hwnd: isize) -> Option<SideWindowAnchor> {
+    #[cfg(target_os = "windows")]
+    {
+        if hwnd == 0 {
+            return None;
+        }
+        let rect = crate::windows_env::window_rect(hwnd as winapi::shared::windef::HWND)?;
+        let rect = crate::window_geometry::Rect::new(rect.left, rect.top, rect.right, rect.bottom);
+        let display = crate::window_geometry::display_for_window_centre(rect)?;
+        let scale = display_scale(display.dpi);
+        return Some(SideWindowAnchor {
+            left: rect.left as f32 / scale,
+            top: rect.top as f32 / scale,
+            scale,
+        });
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = hwnd;
+        None
+    }
+}
+
+/// Handle of the app's own side window with `title`, or 0 when it is not up (yet).
+pub(crate) fn side_window_hwnd(title: &str) -> isize {
+    #[cfg(target_os = "windows")]
+    {
+        crate::windows_env::find_process_window(title).map_or(0, |hwnd| hwnd as isize)
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = title;
+        0
+    }
+}
+
 /// Folds one frame of a settled side window into its remembered rectangle.
 ///
 /// Returns the rectangle to keep (unchanged when the frame is not restorable) and whether it
@@ -312,33 +428,32 @@ pub(crate) fn write_stash_window_geometry(geometry: StashWindowGeometry) {
 pub(crate) fn settled_side_window_geometry(
     remembered: Option<StashWindowGeometry>,
     inner: Option<egui::Rect>,
-    outer: Option<egui::Rect>,
+    anchor: Option<SideWindowAnchor>,
     maximized: bool,
     minimized: bool,
     fullscreen: bool,
-    scale: f32,
+    egui_scale: f32,
 ) -> (Option<StashWindowGeometry>, bool) {
     if minimized || fullscreen {
         return (remembered, false);
     }
-    let (Some(inner), Some(outer)) = (inner, outer) else {
+    let (Some(inner), Some(anchor)) = (inner, anchor) else {
         return (remembered, false);
     };
 
-    let scale = sane_scale(scale);
+    let scale = sane_scale(anchor.scale);
+    // egui measures the content in its own points; the record keeps them in the display's.
+    let inner_scale = sane_scale(egui_scale) / scale;
+    let width = inner.width() * inner_scale;
+    let height = inner.height() * inner_scale;
+
     let Some(mut geometry) = remembered else {
         // Nothing remembered yet: the first un-maximized rectangle becomes the record.
         if maximized {
             return (None, false);
         }
-        let geometry = StashWindowGeometry::new(
-            outer.min.x,
-            outer.min.y,
-            inner.width(),
-            inner.height(),
-            false,
-        )
-        .with_scale(scale);
+        let geometry = StashWindowGeometry::new(anchor.left, anchor.top, width, height, false)
+            .with_scale(scale);
         return (Some(geometry), true);
     };
 
@@ -352,14 +467,8 @@ pub(crate) fn settled_side_window_geometry(
         changed = true;
     }
     if !maximized {
-        let rect = StashWindowGeometry::new(
-            outer.min.x,
-            outer.min.y,
-            inner.width(),
-            inner.height(),
-            false,
-        )
-        .with_scale(scale);
+        let rect = StashWindowGeometry::new(anchor.left, anchor.top, width, height, false)
+            .with_scale(scale);
         if !geometry.same_window(&rect) {
             geometry = rect;
             changed = true;
@@ -398,11 +507,16 @@ impl ImageViewer {
                 viewport.fullscreen.unwrap_or(false),
             )
         });
+        if self.stash.native_hwnd == 0 {
+            self.stash.native_hwnd = side_window_hwnd(STASH_WINDOW_TITLE);
+        }
+        let anchor = native_side_window_anchor(self.stash.native_hwnd)
+            .or_else(|| outer.map(|outer| SideWindowAnchor::from_egui(outer, scale)));
 
         let (geometry, changed) = settled_side_window_geometry(
             self.stash.window_geometry,
             inner,
-            outer,
+            anchor,
             maximized,
             minimized,
             fullscreen,
@@ -437,11 +551,16 @@ impl ImageViewer {
                 viewport.fullscreen.unwrap_or(false),
             )
         });
+        if self.settings.native_hwnd == 0 {
+            self.settings.native_hwnd = side_window_hwnd(SETTINGS_WINDOW_TITLE);
+        }
+        let anchor = native_side_window_anchor(self.settings.native_hwnd)
+            .or_else(|| outer.map(|outer| SideWindowAnchor::from_egui(outer, scale)));
 
         let (geometry, changed) = settled_side_window_geometry(
             self.settings.window_geometry,
             inner,
-            outer,
+            anchor,
             maximized,
             minimized,
             fullscreen,
@@ -600,10 +719,15 @@ mod tests {
     #[test]
     fn a_settled_frame_records_the_scale_it_was_measured_at() {
         let inner = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
-        let outer = egui::Rect::from_min_size(egui::pos2(2000.0, 100.0), egui::vec2(800.0, 634.0));
+        // The OS puts the window's outer corner on the second monitor, which runs at 150%.
+        let anchor = Some(SideWindowAnchor {
+            left: 2000.0,
+            top: 100.0,
+            scale: 1.5,
+        });
 
         let (geometry, changed) =
-            settled_side_window_geometry(None, Some(inner), Some(outer), false, false, false, 1.5);
+            settled_side_window_geometry(None, Some(inner), anchor, false, false, false, 1.5);
         let geometry = geometry.expect("a settled frame records its rectangle");
 
         assert!(changed);
@@ -613,11 +737,26 @@ mod tests {
     }
 
     #[test]
+    fn a_rectangle_read_back_at_another_scale_keeps_its_physical_size() {
+        let recorded = StashWindowGeometry::new(100.0, 50.0, 800.0, 600.0, false).with_scale(1.5);
+
+        let rescaled = rescale_side_window(recorded, 1.0);
+
+        assert_eq!(rescaled.scale, 1.0);
+        assert_eq!(rescaled.left, 150.0);
+        assert_eq!(rescaled.top, 75.0);
+        assert_eq!(rescaled.width, 1200.0);
+        assert_eq!(rescaled.height, 900.0);
+    }
+
+    #[test]
     fn a_minimized_frame_leaves_the_record_alone() {
         let remembered = StashWindowGeometry::new(10.0, 20.0, 800.0, 600.0, false);
 
         let (geometry, changed) =
             settled_side_window_geometry(Some(remembered), None, None, false, true, false, 1.0);
+
+        // (Signature: remembered, inner, anchor, maximized, minimized, fullscreen, egui scale.)
 
         assert!(!changed);
         assert_eq!(geometry, Some(remembered));

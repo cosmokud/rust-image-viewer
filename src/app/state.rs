@@ -199,6 +199,8 @@ pub(crate) struct SettingsModal {
     pub(crate) window_geometry: Option<StashWindowGeometry>,
     /// When the last geometry change seen is written: one write per drag, not one per frame.
     pub(crate) geometry_save_due: Option<Instant>,
+    /// Native window handle, used to read the real rectangle from the OS; 0 until it is found.
+    pub(crate) native_hwnd: isize,
     /// Frames left to re-assert size and position right after the native window appears.
     pub(crate) place_frames: u8,
     pub(crate) tab: SettingsTabSlot,
@@ -600,6 +602,8 @@ pub(crate) struct StashState {
     /// Rectangle and state the window comes back at, kept in
     /// `<config dir>/stash_window.tsv` across closes and restarts.
     pub(crate) window_geometry: Option<StashWindowGeometry>,
+    /// Native window handle, used to read the real rectangle from the OS; 0 until it is found.
+    pub(crate) native_hwnd: isize,
     /// When the last change seen is written: one write per drag, not one per frame.
     pub(crate) geometry_save_due: Option<Instant>,
 }
@@ -630,6 +634,7 @@ impl Default for StashState {
             details_preview: None,
             details_preview_pending: None,
             window_geometry: None,
+            native_hwnd: 0,
             geometry_save_due: None,
         }
     }

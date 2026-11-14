@@ -348,6 +348,27 @@ unsafe extern "system" fn find_titled_window(hwnd: HWND, lparam: LPARAM) -> i32 
     1
 }
 
+/// Handle of this process's own top-level window with `title`, if it exists.
+///
+/// Used to read a side window's real rectangle: the OS knows where the window stands — including
+/// the monitor it was dragged to — before any cached geometry does.
+pub fn find_process_window(title: &str) -> Option<HWND> {
+    use winapi::um::winuser::EnumWindows;
+
+    let mut search = RaiseSearch {
+        title,
+        process_id: std::process::id(),
+        found: std::ptr::null_mut(),
+    };
+    unsafe {
+        EnumWindows(
+            Some(find_titled_window),
+            &mut search as *mut RaiseSearch as LPARAM,
+        );
+    }
+    (!search.found.is_null()).then_some(search.found)
+}
+
 /// Raises one of this process's own windows to the top of the z-order without activating it.
 ///
 /// Opening a file from the Stash updates the viewer behind it; the Stash must stay on top while
