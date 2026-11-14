@@ -43,15 +43,6 @@ impl ImageViewer {
             return;
         }
         self.settings.open = true;
-        // The remembered rectangle is rewritten into the point space of the display it belongs
-        // to, once per open: the dialog comes back on that display, at the size it was closed
-        // at, and a display that no longer exists resolves to the nearest one instead of
-        // changing the window's physical size.
-        if let Some(geometry) = self.settings.window_geometry {
-            if let Some((_, converted)) = resolved_side_window(geometry) {
-                self.settings.window_geometry = Some(converted);
-            }
-        }
         // Geometry is resolved from the remembered rectangle on every open; only a dialog that
         // has never been placed falls back to a centred half-screen box.
         self.settings.screen = None;

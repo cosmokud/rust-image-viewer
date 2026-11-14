@@ -74,6 +74,7 @@ impl Default for SettingsModal {
             window_geometry: None,
             geometry_save_due: None,
             native_hwnd: 0,
+            requested_rect: None,
             place_frames: 0,
             tab: SettingsTabSlot::Tab(crate::settings_registry::SettingsTab::General),
             search: String::new(),

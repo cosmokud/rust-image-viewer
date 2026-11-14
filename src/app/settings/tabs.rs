@@ -161,11 +161,17 @@ impl ImageViewer {
             // A reused viewport id ignores the builder size and position, so both are re-sent
             // for a few frames until the native window settles on them.
             if 0 < self.settings.place_frames {
-                self.settings.place_frames -= 1;
-                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(placement.inner_size));
-                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(
-                    placement.outer_position,
-                ));
+                // A remembered rectangle goes straight to the window in physical pixels; a point
+                // position would be converted with the wrong display's scale.
+                if self.place_settings_window_natively(&placement) {
+                    self.settings.place_frames = 0;
+                } else {
+                    self.settings.place_frames -= 1;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(placement.inner_size));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(
+                        placement.outer_position,
+                    ));
+                }
             } else {
                 // Follow the live window: the rectangle it settles on is the one to reopen at,
                 // including the display it was dragged to.
@@ -538,6 +544,7 @@ impl ImageViewer {
             self.settings.open = false;
             // The native window is gone: its handle must not be read for the next one.
             self.settings.native_hwnd = 0;
+            self.settings.requested_rect = None;
             self.settings.rename = None;
             self.settings.pending_confirm = None;
             self.settings.pending_confirm = None;

@@ -201,6 +201,9 @@ pub(crate) struct SettingsModal {
     pub(crate) geometry_save_due: Option<Instant>,
     /// Native window handle, used to read the real rectangle from the OS; 0 until it is found.
     pub(crate) native_hwnd: isize,
+    /// Rectangle the window was asked to stand on and has not reached yet. Frames that find it
+    /// elsewhere put it back instead of recording that position.
+    pub(crate) requested_rect: Option<crate::window_geometry::Rect>,
     /// Frames left to re-assert size and position right after the native window appears.
     pub(crate) place_frames: u8,
     pub(crate) tab: SettingsTabSlot,
@@ -604,6 +607,8 @@ pub(crate) struct StashState {
     pub(crate) window_geometry: Option<StashWindowGeometry>,
     /// Native window handle, used to read the real rectangle from the OS; 0 until it is found.
     pub(crate) native_hwnd: isize,
+    /// Rectangle the window was asked to stand on and has not reached yet.
+    pub(crate) requested_rect: Option<crate::window_geometry::Rect>,
     /// When the last change seen is written: one write per drag, not one per frame.
     pub(crate) geometry_save_due: Option<Instant>,
 }
@@ -635,6 +640,7 @@ impl Default for StashState {
             details_preview_pending: None,
             window_geometry: None,
             native_hwnd: 0,
+            requested_rect: None,
             geometry_save_due: None,
         }
     }

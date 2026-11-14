@@ -99,22 +99,31 @@ impl ImageViewer {
                 close_window = true;
             }
             // A reused viewport id ignores the builder size and position, so both are re-sent
-            // for a few frames until the native window settles on them.
+            // for a few frames until the native window settles on them. A remembered rectangle
+            // is written straight to the window in physical pixels instead: a point position
+            // would be converted with the scale of whichever monitor the window was created on,
+            // which is how a stash left on the second monitor came back on the first one.
             if 0 < self.stash.place_frames {
-                self.stash.place_frames -= 1;
-                if placement.maximized {
-                    // A maximized window owns its size and position; only the state is sent.
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+                if self.place_stash_window_natively(&placement) {
+                    // Written in physical pixels: nothing left to assert, and the next frame can
+                    // start recording the live rectangle again.
+                    self.stash.place_frames = 0;
                 } else {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(window_size));
-                    let position = if placement.restored {
-                        placement.outer_position
+                    self.stash.place_frames -= 1;
+                    if placement.maximized {
+                        // A maximized window owns its size and position; only the state is sent.
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
                     } else {
-                        ctx.input(|input| input.viewport().outer_rect)
-                            .map(|outer_rect| screen.center() - outer_rect.size() * 0.5)
-                            .unwrap_or(placement.outer_position)
-                    };
-                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(position));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(window_size));
+                        let position = if placement.restored {
+                            placement.outer_position
+                        } else {
+                            ctx.input(|input| input.viewport().outer_rect)
+                                .map(|outer_rect| screen.center() - outer_rect.size() * 0.5)
+                                .unwrap_or(placement.outer_position)
+                        };
+                        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(position));
+                    }
                 }
             } else {
                 // Captured only after the placement frames above, which would otherwise record
