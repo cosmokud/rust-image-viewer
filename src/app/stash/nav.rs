@@ -29,19 +29,21 @@ impl ImageViewer {
             return;
         }
 
-        let layout = self.stash.layout.clone();
-        if layout.paths.is_empty() {
+        // Only the order and the grid metrics are read here; the tile rectangles the layout also
+        // carries are not part of keyboard navigation.
+        let paths = std::sync::Arc::clone(&self.stash.layout.paths);
+        if paths.is_empty() {
             return;
         }
 
-        let columns = layout.columns.max(1) as isize;
-        let page = (columns as usize * layout.rows_visible.max(1)).max(1) as isize;
-        let last = (layout.paths.len() - 1) as isize;
+        let columns = self.stash.layout.columns.max(1) as isize;
+        let page = (columns as usize * self.stash.layout.rows_visible.max(1)).max(1) as isize;
+        let last = (paths.len() - 1) as isize;
         let current = self
             .stash
             .selected
             .as_ref()
-            .and_then(|selected| layout.paths.iter().position(|path| path == selected))
+            .and_then(|selected| paths.iter().position(|path| path == selected))
             .map(|index| index as isize)
             .unwrap_or(0);
 
@@ -131,7 +133,7 @@ impl ImageViewer {
         }
 
         let index = target.clamp(0, last) as usize;
-        let path = layout.paths[index].clone();
+        let path = paths[index].clone();
         if self.stash.selected.as_ref() != Some(&path) {
             self.stash.selected = Some(path.clone());
             self.stash.selection.clear();

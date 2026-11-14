@@ -138,6 +138,7 @@ impl ImageViewer {
         // the session marked, so the viewer and the stash window agree from the first frame.
         self.marked_files = entries.keys().cloned().collect();
         self.stash.entries = entries;
+        self.stash_invalidate_filtered_paths();
     }
 
     /// Rewrites the whole file. The stash is a few hundred paths at most, and it must not be
@@ -188,6 +189,7 @@ impl ImageViewer {
             added = true;
         }
         if added {
+            self.stash_invalidate_filtered_paths();
             self.save_stash();
         }
     }
@@ -211,13 +213,16 @@ impl ImageViewer {
             return false;
         }
 
+        // The gallery order no longer describes the stash: the next draw rebuilds it once.
+        self.stash_invalidate_filtered_paths();
         let selected_gone = self
             .stash
             .selected
             .as_ref()
             .is_some_and(|selected| !self.stash.entries.contains_key(selected));
         if selected_gone {
-            self.stash.selected = self.filtered_stash_paths().first().cloned();
+            let first = self.filtered_stash_paths().first().cloned();
+            self.stash.selected = first;
             self.stash.scroll_to_selection = self.stash.selected.is_some();
         }
 
@@ -258,6 +263,7 @@ impl ImageViewer {
         if !removed_any {
             return;
         }
+        self.stash_invalidate_filtered_paths();
 
         // The mark set follows the stash: a file that left the stash is unmarked in the viewer.
         self.forget_marks(&removed);
@@ -310,6 +316,7 @@ impl ImageViewer {
             entry.height = previous.height;
         }
         self.stash.entries.insert(new.to_path_buf(), entry);
+        self.stash_invalidate_filtered_paths();
         true
     }
 
@@ -319,6 +326,7 @@ impl ImageViewer {
         self.stash.entries.retain(|path, _| path.exists());
         let changed = self.stash.entries.len() != before;
         if changed {
+            self.stash_invalidate_filtered_paths();
             self.save_stash();
         }
         changed

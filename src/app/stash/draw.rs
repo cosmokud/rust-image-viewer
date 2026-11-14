@@ -9,6 +9,10 @@ use crate::prelude::*;
 /// tile squirm while dragging and then collapse the instant an extra column fitted.
 pub(crate) const STASH_TILE_SIDE: f32 = 176.0;
 
+/// Background thumbnail loads a single frame may start. They only queue a request; the decode
+/// happens on the thumbnail worker, so this just paces the queue while scrolling.
+pub(crate) const STASH_THUMBNAIL_LOADS_PER_FRAME: usize = 4;
+
 /// Constant gap between tiles. It must not absorb the leftover width: gaping it out slid every
 /// tile sideways as the window was dragged, and then collapsed back to the minimum the moment
 /// another column fitted.
@@ -335,7 +339,12 @@ impl ImageViewer {
         });
     }
 
-    fn draw_stash_gallery(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, paths: &[PathBuf]) {
+    fn draw_stash_gallery(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        paths: &std::sync::Arc<Vec<PathBuf>>,
+    ) {
         if paths.is_empty() {
             let message = if self.stash.search.trim().is_empty() {
                 "Nothing stashed yet. Mark files from the right-click menu to stash them."
@@ -434,48 +443,71 @@ impl ImageViewer {
             }
         }
 
-        self.stash.layout = StashGalleryLayout {
-            paths: paths.to_vec(),
-            columns,
-            rows_visible,
-            tile_rects: Vec::new(),
-        };
+        // The grid is virtualized: only the rows inside the scroll viewport are laid out, so a
+        // three-hundred-file stash costs the same per frame as a twenty-file one. The row stride
+        // is the tile plus the gap the vertical layout puts between rows.
+        let row_stride = tile + gap;
+        let total_rows = (paths.len() + columns - 1) / columns;
 
-        // Fresh decodes are capped per frame so a folder of large stills cannot stall the window.
-        let mut thumbnail_budget = 3usize;
-        let mut selected_rect = None;
-        egui::ScrollArea::vertical()
+        // Recorded in place: the layout vector keeps its capacity across frames, and its paths
+        // are the same shared list the gallery draws from.
+        self.stash.layout.paths = std::sync::Arc::clone(paths);
+        self.stash.layout.columns = columns;
+        self.stash.layout.rows_visible = rows_visible;
+        self.stash.layout.tile_rects.clear();
+
+        let selected_index = self
+            .stash
+            .selected
+            .as_ref()
+            .and_then(|selected| paths.iter().position(|path| path == selected));
+
+        let mut gallery = egui::ScrollArea::vertical()
             .id_salt("stash_gallery")
             .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                for row in paths.chunks(columns) {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = gap;
-                        for path in row {
-                            let tile_rect =
-                                self.draw_stash_tile(ui, ctx, path, tile, &mut thumbnail_budget);
-                            self.stash.layout.tile_rects.push((path.clone(), tile_rect));
-                            if self
-                                .stash
-                                .selected
-                                .as_ref()
-                                .is_some_and(|selected| selected == path)
-                            {
-                                selected_rect = Some(tile_rect);
-                            }
-                        }
-                    });
-                    ui.add_space(gap);
-                }
+            .auto_shrink([false, false]);
+        // Keyboard navigation can move the selection off screen. The offset comes from the row
+        // index because the tile itself is no longer built while it is out of view.
+        if self.stash.scroll_to_selection {
+            if let Some(index) = selected_index {
+                let row_top = (index / columns.max(1)) as f32 * row_stride;
+                let offset = (row_top - (viewport_height - tile) * 0.5).max(0.0);
+                gallery = gallery.vertical_scroll_offset(offset);
+            }
+            self.stash.scroll_to_selection = false;
+        }
 
-                if self.stash.scroll_to_selection {
-                    if let Some(rect) = selected_rect {
-                        ui.scroll_to_rect(rect, Some(egui::Align::Center));
+        // Background loads started this frame; decodes never run on the UI thread, this only keeps
+        // scrolling from flooding the thumbnail worker with requests.
+        let mut new_loads = STASH_THUMBNAIL_LOADS_PER_FRAME;
+        ui.spacing_mut().item_spacing.y = gap;
+        gallery.show_viewport(ui, |ui, viewport| {
+            // One row of overscan on each side keeps a fast scroll from painting empty rows.
+            let first_row = ((viewport.min.y / row_stride).floor().max(0.0) as usize)
+                .saturating_sub(1)
+                .min(total_rows);
+            let last_row =
+                ((viewport.max.y / row_stride).ceil().max(0.0) as usize + 1).min(total_rows);
+
+            // Rows above the viewport are skipped as blank space, and the rows below keep the
+            // full scroll extent so the scrollbar still maps to the whole stash.
+            ui.add_space(first_row as f32 * row_stride);
+            for row in first_row..last_row {
+                let start = row * columns;
+                let end = (start + columns).min(paths.len());
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = gap;
+                    for path in &paths[start..end] {
+                        let tile_rect = self.draw_stash_tile(ui, ctx, path, tile, &mut new_loads);
+                        self.stash.layout.tile_rects.push((path.clone(), tile_rect));
                     }
-                    self.stash.scroll_to_selection = false;
-                }
-            });
+                });
+            }
+            // The scroll extent is stated rather than grown row by row: it must not change with
+            // how many rows happen to be built this frame, or the scrollbar would jitter while
+            // scrolling.
+            ui.set_min_height(total_rows as f32 * row_stride - gap);
+        });
 
         if let Some(band) = self.stash.selection_box {
             if band.is_drag() {
@@ -499,7 +531,7 @@ impl ImageViewer {
         ctx: &egui::Context,
         path: &PathBuf,
         side: f32,
-        thumbnail_budget: &mut usize,
+        new_loads: &mut usize,
     ) -> egui::Rect {
         let (rect, response) = ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::click());
         if response.hovered() {
@@ -561,15 +593,7 @@ impl ImageViewer {
         if let Some((texture_id, size)) = live_preview {
             Self::paint_stash_preview(ui, inner, texture_id, size);
         } else {
-            let cached = self.modal_thumbnail_cache.contains_key(path);
-            let thumbnail = if cached || *thumbnail_budget > 0 {
-                if !cached {
-                    *thumbnail_budget = thumbnail_budget.saturating_sub(1);
-                }
-                self.ensure_modal_thumbnail_texture(ctx, path)
-            } else {
-                None
-            };
+            let thumbnail = self.stash_thumbnail_texture(path, new_loads);
 
             if let Some((texture_id, size)) = thumbnail {
                 Self::paint_stash_preview(ui, inner, texture_id, size);
@@ -680,7 +704,8 @@ impl ImageViewer {
                     return;
                 };
                 let info = self.stash_item_info(&path);
-                let preview = self.ensure_modal_thumbnail_texture(ctx, &path);
+                let mut details_loads = 1usize;
+                let preview = self.stash_thumbnail_texture(&path, &mut details_loads);
 
                 // The image takes every pixel the column can give it and its height is capped
                 // at whatever is left of the window once the caption and the metadata are

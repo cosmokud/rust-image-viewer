@@ -23,6 +23,33 @@ pub(crate) const STASH_DETAILS_MAX_SIDE: u32 = 2048;
 pub(crate) const STASH_DETAILS_DECODE_DELAY: Duration = Duration::from_millis(90);
 
 impl ImageViewer {
+    /// A gallery thumbnail that never decodes on the UI thread.
+    ///
+    /// A cached texture paints immediately; anything else is queued on the thumbnail worker and
+    /// the tile keeps its extension label until the result is uploaded. Decoding inline here was
+    /// what made the first frames of a large stash stall: each fresh tile held the window for the
+    /// whole decode.
+    pub(crate) fn stash_thumbnail_texture(
+        &mut self,
+        path: &PathBuf,
+        new_loads: &mut usize,
+    ) -> Option<(egui::TextureId, egui::Vec2)> {
+        if let Some(texture) = self.try_get_cached_modal_thumbnail_texture(path) {
+            return Some(texture);
+        }
+        if self.modal_thumbnail_is_unloadable(path.as_path()) {
+            return None;
+        }
+        if 0 < *new_loads
+            && !self.folder_placeholder_thumbnail_pending.contains(path)
+            && self.folder_placeholder_thumbnail_pending.len()
+                < self.folder_placeholder_thumbnail_pending_soft_limit()
+            && self.request_folder_placeholder_thumbnail_load(path)
+        {
+            *new_loads -= 1;
+        }
+        None
+    }
     /// Texture for the details column, or `None` while a fresh decode is still pending — the
     /// caller keeps painting the tile thumbnail until this returns something.
     pub(crate) fn ensure_stash_details_texture(

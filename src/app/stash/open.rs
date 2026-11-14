@@ -9,6 +9,10 @@ use crate::prelude::*;
 /// has to be raised.
 pub(crate) const STASH_WINDOW_TITLE: &str = "Stash";
 
+/// How long the filtered gallery order is trusted. Every rebuild stats every stashed file, so it
+/// cannot run every frame, but it must still notice a file deleted behind the window.
+pub(crate) const STASH_FILTERED_REFRESH: Duration = Duration::from_millis(1000);
+
 /// Frames the stash window is re-raised after a file is opened: the raise is repeated for a few
 /// frames so it survives the viewer repainting itself behind it.
 pub(crate) const STASH_RAISE_FRAMES: u8 = 3;
@@ -189,8 +193,20 @@ impl ImageViewer {
     /// replaces that list, so the group that had been shown in viewer order was rebuilt around
     /// the new folder and every tile moved. Paths are sorted instead, which is the same order in
     /// every session, every folder and every filter.
-    pub(crate) fn filtered_stash_paths(&self) -> Vec<PathBuf> {
+    /// The gallery order: every stashed file that still exists, sorted, then filtered.
+    ///
+    /// Rebuilt only when the stash or the filter changes, and refreshed on a slow tick so a file
+    /// deleted outside the app still leaves the grid. It used to rebuild every frame, which cost
+    /// one `exists()` per entry plus a sort: a few hundred files turned that into the dominant
+    /// cost of scrolling the gallery.
+    pub(crate) fn filtered_stash_paths(&mut self) -> std::sync::Arc<Vec<PathBuf>> {
         let query = self.stash.search.trim().to_lowercase();
+        if let Some(cached) = self.stash.filtered.as_ref() {
+            if cached.query == query && cached.built_at.elapsed() < STASH_FILTERED_REFRESH {
+                return std::sync::Arc::clone(&cached.paths);
+            }
+        }
+
         let mut ordered: Vec<PathBuf> = self
             .stash
             .entries
@@ -199,15 +215,24 @@ impl ImageViewer {
             .cloned()
             .collect();
         ordered.sort_by_key(|path| path.to_string_lossy().to_lowercase());
+        if !query.is_empty() {
+            ordered.retain(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().to_lowercase().contains(&query))
+            });
+        }
 
-        ordered
-            .into_iter()
-            .filter(|path| {
-                query.is_empty()
-                    || path
-                        .file_name()
-                        .is_some_and(|name| name.to_string_lossy().to_lowercase().contains(&query))
-            })
-            .collect()
+        let paths = std::sync::Arc::new(ordered);
+        self.stash.filtered = Some(StashFilteredPaths {
+            query,
+            built_at: Instant::now(),
+            paths: std::sync::Arc::clone(&paths),
+        });
+        paths
+    }
+
+    /// Forces the next draw to rebuild the gallery order, after the stash changed.
+    pub(crate) fn stash_invalidate_filtered_paths(&mut self) {
+        self.stash.filtered = None;
     }
 }

@@ -474,10 +474,22 @@ pub(crate) fn stash_window_size(screen: egui::Rect) -> egui::Vec2 {
 /// and the marquee can map a screen rectangle back onto tiles.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct StashGalleryLayout {
-    pub(crate) paths: Vec<PathBuf>,
+    /// The gallery order, shared with the cache it came from: cloning the layout for the
+    /// keyboard handler is then one refcount bump instead of one allocation per file.
+    pub(crate) paths: std::sync::Arc<Vec<PathBuf>>,
     pub(crate) columns: usize,
     pub(crate) rows_visible: usize,
     pub(crate) tile_rects: Vec<(PathBuf, egui::Rect)>,
+}
+
+/// The filtered gallery order, kept until the stash or the filter changes.
+///
+/// Building it costs one `exists()` per entry plus a sort, and the gallery asks for it every
+/// frame: on a stash of a few hundred files that stat storm was the bulk of the frame time.
+pub(crate) struct StashFilteredPaths {
+    pub(crate) query: String,
+    pub(crate) built_at: Instant,
+    pub(crate) paths: std::sync::Arc<Vec<PathBuf>>,
 }
 
 /// Rubber-band selection drag in the stash gallery, in screen coordinates.
@@ -559,6 +571,8 @@ pub(crate) struct StashState {
     pub(crate) menu_rect: Option<egui::Rect>,
     /// Last drawn grid, read by the keyboard handler on the next frame.
     pub(crate) layout: StashGalleryLayout,
+    /// Cached gallery order; `None` forces a rebuild on the next draw.
+    pub(crate) filtered: Option<StashFilteredPaths>,
     /// Set by the keyboard handler: the next draw scrolls the selected tile into view.
     pub(crate) scroll_to_selection: bool,
     pub(crate) details_open: bool,
@@ -597,6 +611,7 @@ impl Default for StashState {
             menu_pos: None,
             menu_rect: None,
             layout: StashGalleryLayout::default(),
+            filtered: None,
             scroll_to_selection: false,
             details_open: false,
             peek: false,
