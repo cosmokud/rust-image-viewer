@@ -6,6 +6,25 @@ use crate::app::*;
 use crate::prelude::*;
 
 impl ImageViewer {
+    /// The rectangle the fullscreen viewer takes on `display`.
+    ///
+    /// `windowed` fullscreen covers the work area instead of the display, so a taskbar that is
+    /// not set to auto-hide keeps its strip visible. An auto-hide taskbar reserves nothing, which
+    /// makes the work area the whole display: the same rect as borderless.
+    #[cfg(target_os = "windows")]
+    pub(crate) fn fullscreen_target_rect(
+        &self,
+        display: crate::window_geometry::Display,
+    ) -> crate::window_geometry::Rect {
+        if self.config.fullscreen_mode == crate::config::FullscreenMode::Windowed
+            && !crate::windows_env::taskbar_is_autohide()
+        {
+            crate::window_geometry::maximized_rect(display)
+        } else {
+            crate::window_geometry::fullscreen_rect(display)
+        }
+    }
+
     /// Borderless fullscreen: the whole display the window is on, written in physical pixels
     /// and converted once to points.
     #[cfg(target_os = "windows")]
@@ -23,17 +42,7 @@ impl ImageViewer {
 
         // Addressed to the root viewport: this is the viewer window's rectangle, and reopening
         // the viewer from the Stash runs inside the Stash's own frame.
-        //
-        // `windowed` fullscreen covers the work area instead of the display, so a taskbar that is
-        // not set to auto-hide keeps its strip visible. An auto-hide taskbar reserves nothing,
-        // which makes the work area the whole display: the same rect as borderless.
-        let rect = if self.config.fullscreen_mode == crate::config::FullscreenMode::Windowed
-            && !crate::windows_env::taskbar_is_autohide()
-        {
-            crate::window_geometry::maximized_rect(display)
-        } else {
-            crate::window_geometry::fullscreen_rect(display)
-        };
+        let rect = self.fullscreen_target_rect(display);
         self.send_viewer_viewport_cmd(
             ctx,
             egui::ViewportCommand::OuterPosition(egui::pos2(

@@ -56,6 +56,13 @@ impl ImageViewer {
 
         self.parked_viewer_inner_size =
             ctx.input(|input| input.raw.viewport().inner_rect.map(|rect| rect.size()));
+        // Captured before the park below: parking leaves the window just outside the desktop, so
+        // the display and rectangle the OS reports afterwards belong to the neighbour monitor.
+        #[cfg(target_os = "windows")]
+        {
+            self.parked_display = self.current_display(ctx);
+            self.parked_viewer_rect = self.main_window_rect_physical(ctx);
+        }
         self.restore_viewer_size_pending = false;
         self.viewer_window_hidden = true;
         // Refuse the close itself: the window keeps running, it just moves out of sight.
@@ -76,8 +83,23 @@ impl ImageViewer {
             return;
         }
         self.viewer_window_hidden = false;
+
+        // Taken from the close, not from the parked window: the parked window stands beside the
+        // desktop, so asking the OS which display owns it answers with the neighbour.
+        #[cfg(target_os = "windows")]
+        let parked_rect = self.parked_viewer_rect.take();
+        #[cfg(target_os = "windows")]
+        let parked_display = self.parked_display.take();
         #[cfg(target_os = "windows")]
         crate::windows_env::unpark_window_offscreen(self.resolved_main_hwnd());
+
+        // The physical restore runs before any point-based command: those are converted with the
+        // scale of whatever display the parked window stood on, which is what left the reopened
+        // viewer on the second monitor with a fullscreen rectangle that did not cover it.
+        #[cfg(target_os = "windows")]
+        if self.restore_parked_viewer_rect(ctx, parked_rect, parked_display) {
+            return;
+        }
 
         // A viewer closed in fullscreen comes back in fullscreen: the mode never changed while it
         // was parked, so laying a floating rectangle over it produced a floating/fullscreen mix.
@@ -124,6 +146,57 @@ impl ImageViewer {
         self.send_viewer_viewport_cmd(ctx, egui::ViewportCommand::Visible(true));
         self.send_viewer_viewport_cmd(ctx, egui::ViewportCommand::Minimized(false));
         ctx.request_repaint();
+    }
+
+    /// Puts the parked viewer back on the display and rectangle it was closed on, written in
+    /// physical pixels before any point-based command.
+    ///
+    /// Returns false when nothing was remembered, so the caller can fall back to those commands.
+    /// A fullscreen viewer is restored to the display's fullscreen rectangle rather than to the
+    /// floating one: measured around the parked window, that rectangle belongs to the neighbour
+    /// display.
+    #[cfg(target_os = "windows")]
+    fn restore_parked_viewer_rect(
+        &mut self,
+        ctx: &egui::Context,
+        parked_rect: Option<crate::window_geometry::Rect>,
+        parked_display: Option<crate::window_geometry::Display>,
+    ) -> bool {
+        let display = parked_display
+            .or_else(|| parked_rect.and_then(crate::window_geometry::display_for_window_centre));
+
+        let target = if self.mode().is_fullscreen() {
+            let Some(display) = display else {
+                return false;
+            };
+            crate::windows_env::set_fullscreen_guard(true);
+            self.restore_viewer_size_pending = false;
+            // The opened file has to be laid out again, and if it is the file that was closed,
+            // that layout puts the parked camera back.
+            self.restore_parked_fullscreen_view_pending =
+                self.mode().is_solo() && self.parked_fullscreen_view.is_some();
+            self.pending_media_layout = true;
+            self.fullscreen_target_rect(display)
+        } else {
+            let Some(rect) = parked_rect else {
+                return false;
+            };
+            // The reopened window keeps its size; the media is fitted into it.
+            self.restore_viewer_size_pending = self.parked_viewer_inner_size.is_some();
+            rect
+        };
+
+        crate::windows_env::set_window_rect(
+            self.resolved_main_hwnd(),
+            target.left,
+            target.top,
+            target.width(),
+            target.height(),
+        );
+        self.send_viewer_viewport_cmd(ctx, egui::ViewportCommand::Visible(true));
+        self.send_viewer_viewport_cmd(ctx, egui::ViewportCommand::Minimized(false));
+        ctx.request_repaint();
+        true
     }
 
     pub(crate) fn begin_fast_app_exit(&mut self) {

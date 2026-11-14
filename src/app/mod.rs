@@ -210,6 +210,12 @@ pub(crate) struct ImageViewer {
     pub(crate) pending_viewer_close: bool,
     /// Inner size the viewer had when it was closed by a Stash/Settings window still being open.
     pub(crate) parked_viewer_inner_size: Option<egui::Vec2>,
+    /// Display and outer rectangle (physical pixels) the viewer was closed on, captured while it
+    /// was still on screen. The parked window stands beside the desktop, so the display the OS
+    /// reports for it is the neighbour's: reopening the viewer from the Stash measured its
+    /// fullscreen rectangle there and brought the window back on the second monitor.
+    pub(crate) parked_display: Option<crate::window_geometry::Display>,
+    pub(crate) parked_viewer_rect: Option<crate::window_geometry::Rect>,
     /// Set when the viewer comes back at that remembered size: the next floating layout fits the
     /// media into the window instead of resizing the window to the media.
     pub(crate) restore_viewer_size_pending: bool,
@@ -1014,6 +1020,8 @@ impl Default for ImageViewer {
             viewer_window_hidden: false,
             pending_viewer_close: false,
             parked_viewer_inner_size: None,
+            parked_display: None,
+            parked_viewer_rect: None,
             restore_viewer_size_pending: false,
             parked_fullscreen_view: None,
             restore_parked_fullscreen_view_pending: false,
