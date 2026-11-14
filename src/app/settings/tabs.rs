@@ -121,24 +121,30 @@ impl ImageViewer {
 
         // The dialog lives in its own top-level native window: it is not clipped by a tiny
         // viewer window, owns its own taskbar entry, and never takes input away from the viewer.
+        // The dialog comes back where and as large as it was left, on the display it was left
+        // on. Only one that has never been placed — or whose display is gone, which resolves to
+        // the nearest one — is centred, and then on the viewer's own display.
+        let remembered = self.settings.window_geometry;
         let screen = match self.settings.screen {
             Some(screen) => screen,
             None => {
-                let screen = settings_screen_rect(ctx);
+                let screen = side_window_screen(ctx, remembered);
                 self.settings.screen = Some(screen);
                 screen
             }
         };
-        let window_size = settings_window_size(ctx, screen);
-        // Only an approximation: the outer size also carries the native title bar, so the exact
-        // centering is re-sent once the window reports its real outer rectangle.
-        let initial_position = screen.center() - (window_size + egui::vec2(0.0, 34.0)) * 0.5;
+        let placement = side_window_placement(
+            screen,
+            remembered,
+            settings_window_size(ctx, screen),
+            SETTINGS_WINDOW_MIN_SIZE,
+        );
         let viewport_id = settings_viewport_id();
         let viewport_builder = egui::ViewportBuilder::default()
             .with_title("Settings")
-            .with_inner_size(window_size)
+            .with_inner_size(placement.inner_size)
             .with_min_inner_size(SETTINGS_WINDOW_MIN_SIZE)
-            .with_position(initial_position)
+            .with_position(placement.outer_position)
             .with_resizable(true);
 
         // egui keeps one style per context and the child viewport shares the viewer's context,
@@ -156,12 +162,14 @@ impl ImageViewer {
             // for a few frames until the native window settles on them.
             if 0 < self.settings.place_frames {
                 self.settings.place_frames -= 1;
-                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(window_size));
-                if let Some(outer_rect) = ctx.input(|input| input.viewport().outer_rect) {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(
-                        screen.center() - outer_rect.size() * 0.5,
-                    ));
-                }
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(placement.inner_size));
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(
+                    placement.outer_position,
+                ));
+            } else {
+                // Follow the live window: the rectangle it settles on is the one to reopen at,
+                // including the display it was dragged to.
+                self.remember_settings_window_geometry(ctx);
             }
 
             if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
@@ -514,10 +522,16 @@ impl ImageViewer {
         if let Some(due_at) = self.settings.save_due_at {
             ctx.request_repaint_after(due_at.saturating_duration_since(Instant::now()));
         }
+        if let Some(due_at) = self.settings.geometry_save_due {
+            ctx.request_repaint_after(due_at.saturating_duration_since(Instant::now()));
+        }
 
         if close_modal {
             self.close_settings_row_menu();
             self.flush_pending_settings_save(ctx);
+            // Written now, not on the debounce: the window is about to be gone.
+            self.settings.geometry_save_due = None;
+            self.save_settings_window_geometry();
             // Dropping the viewport closes the window in this frame instead of leaving an empty
             // dialog on screen until the next pass.
             ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Close);

@@ -71,6 +71,8 @@ impl Default for SettingsModal {
         Self {
             open: false,
             screen: None,
+            window_geometry: None,
+            geometry_save_due: None,
             place_frames: 0,
             tab: SettingsTabSlot::Tab(crate::settings_registry::SettingsTab::General),
             search: String::new(),
@@ -1345,6 +1347,7 @@ impl Default for ImageViewer {
         // The stash outlives the process: paths only, no pixels. Its window rectangle does too.
         viewer.load_stash_from_disk();
         viewer.load_stash_window_geometry();
+        viewer.load_settings_window_geometry();
         viewer
     }
 }

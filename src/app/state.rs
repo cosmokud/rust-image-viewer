@@ -123,9 +123,12 @@ pub(crate) const STASH_SEARCH_HEIGHT: f32 = 22.0;
 pub(crate) const SETTINGS_ROW_HEIGHT: f32 = 38.0;
 
 /// Every settings row keeps at least this much width for its control.
+///
+/// (`StashWindowGeometry` is the app's one side-window rectangle record: the Settings and Stash
+/// windows both store it, with the display scale its points belong to.)
 pub(crate) const SETTINGS_CONTROLS_MIN_WIDTH: f32 = 220.0;
 
-/// Frames the dialog re-asserts its centered geometry while the native window settles.
+/// Frames the dialog re-asserts its placed geometry while the native window settles.
 pub(crate) const SETTINGS_WINDOW_PLACE_FRAMES: u8 = 3;
 
 /// Monitor work area (egui points) hosting the viewer. The dialog centers on it and takes
@@ -190,6 +193,12 @@ pub(crate) struct SettingsModal {
     /// Monitor work area (egui points) captured when the dialog opened. The 50%-of-screen
     /// size and the centering both derive from it, so the live window cannot jump.
     pub(crate) screen: Option<egui::Rect>,
+    /// Rectangle and display scale the dialog was last settled at, kept in
+    /// `<config dir>/settings_window.tsv` across closes and restarts. Opening the dialog puts it
+    /// back there — including on the second monitor — instead of centring it on the viewer.
+    pub(crate) window_geometry: Option<StashWindowGeometry>,
+    /// When the last geometry change seen is written: one write per drag, not one per frame.
+    pub(crate) geometry_save_due: Option<Instant>,
     /// Frames left to re-assert size and position right after the native window appears.
     pub(crate) place_frames: u8,
     pub(crate) tab: SettingsTabSlot,

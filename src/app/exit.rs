@@ -273,10 +273,13 @@ impl ImageViewer {
             return;
         }
 
-        // The stash window can still be open: write the rectangle it last settled on before
+        // The side windows can still be open: write the rectangles they last settled on before
         // the debounced save is dropped with the process.
         if self.stash.geometry_save_due.take().is_some() {
             self.save_stash_window_geometry();
+        }
+        if self.settings.geometry_save_due.take().is_some() {
+            self.save_settings_window_geometry();
         }
 
         self.discard_runtime_work_for_exit();
