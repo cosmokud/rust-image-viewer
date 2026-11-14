@@ -144,9 +144,10 @@ impl ImageViewer {
             .with_title(SETTINGS_WINDOW_TITLE)
             .with_min_inner_size(SETTINGS_WINDOW_MIN_SIZE)
             .with_resizable(true);
-        // Only while it is being placed: eframe diffs this builder every frame and turns a
-        // changed size or position into a native move, so a rectangle that follows the live
-        // window would fight the user's drag — and would add the frame's width on every frame.
+        // Only while it is being placed. eframe diffs this builder every frame and turns a changed
+        // size into a native resize, and the rectangle follows the live window, so a size that
+        // includes the frame came back as the next frame's client size and the dialog grew by a
+        // border every frame until it filled the display.
         if 0 < self.settings.place_frames {
             viewport_builder = viewport_builder
                 .with_inner_size(placement.inner_size)
@@ -551,8 +552,6 @@ impl ImageViewer {
             // The native window is gone: its handle must not be read for the next one.
             self.settings.native_hwnd = 0;
             self.settings.requested_rect = None;
-            self.settings.requested_frames = 0;
-            self.settings.scale = None;
             self.settings.rename = None;
             self.settings.pending_confirm = None;
             self.settings.pending_confirm = None;
