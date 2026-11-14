@@ -385,7 +385,10 @@ impl ImageViewer {
     /// write. A maximized window keeps the size and corner of the un-maximized window it will
     /// restore to.
     pub(crate) fn remember_stash_window_geometry(&mut self, ctx: &egui::Context) {
-        let (inner, outer, maximized, minimized, fullscreen, scale) = ctx.input(|input| {
+        // Read before the input lock: `pixels_per_point` takes that same lock, so asking for it
+        // inside `ctx.input(...)` deadlocks the frame that draws the window.
+        let scale = ctx.pixels_per_point();
+        let (inner, outer, maximized, minimized, fullscreen) = ctx.input(|input| {
             let viewport = input.viewport();
             (
                 viewport.inner_rect,
@@ -393,7 +396,6 @@ impl ImageViewer {
                 viewport.maximized.unwrap_or(false),
                 viewport.minimized.unwrap_or(false),
                 viewport.fullscreen.unwrap_or(false),
-                ctx.pixels_per_point(),
             )
         });
 
@@ -423,7 +425,9 @@ impl ImageViewer {
 
     /// The Settings window's counterpart: same recording, its own file.
     pub(crate) fn remember_settings_window_geometry(&mut self, ctx: &egui::Context) {
-        let (inner, outer, maximized, minimized, fullscreen, scale) = ctx.input(|input| {
+        // Same order as the Stash's: the scale first, then the locked input read.
+        let scale = ctx.pixels_per_point();
+        let (inner, outer, maximized, minimized, fullscreen) = ctx.input(|input| {
             let viewport = input.viewport();
             (
                 viewport.inner_rect,
@@ -431,7 +435,6 @@ impl ImageViewer {
                 viewport.maximized.unwrap_or(false),
                 viewport.minimized.unwrap_or(false),
                 viewport.fullscreen.unwrap_or(false),
-                ctx.pixels_per_point(),
             )
         });
 
