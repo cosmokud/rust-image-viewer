@@ -154,6 +154,15 @@ impl StartupWindowMode {
     }
 }
 
+impl FullscreenMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Borderless => "borderless",
+            Self::Windowed => "windowed",
+        }
+    }
+}
+
 impl WindowTitlePathMode {
     pub fn as_str(&self) -> &'static str {
         match self {

@@ -97,6 +97,16 @@ pub enum StartupWindowMode {
     Fullscreen,
 }
 
+/// How the app's fullscreen window covers the display.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FullscreenMode {
+    /// Whole display, taskbar included.
+    Borderless,
+    /// Whole display above the taskbar: the work area, so a non-auto-hide taskbar stays visible.
+    /// An auto-hide taskbar reserves nothing, so this behaves like `Borderless` there.
+    Windowed,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WindowTitlePathMode {
     /// Show filename in floating mode and full path in other modes.

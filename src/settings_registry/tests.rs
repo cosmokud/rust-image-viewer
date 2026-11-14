@@ -79,14 +79,14 @@ mod tests {
 
     #[test]
     pub(crate) fn registry_covers_every_tab() {
-        assert_eq!(SETTINGS.len(), 140);
+        assert_eq!(SETTINGS.len(), 141);
         for (tab, expected) in [
             (SettingsTab::General, 5),
             (SettingsTab::Appearance, 2),
             (SettingsTab::ZoomScroll, 8),
             (SettingsTab::Motion, 7),
             (SettingsTab::Autoscroll, 12),
-            (SettingsTab::Window, 10),
+            (SettingsTab::Window, 11),
             (SettingsTab::Files, 6),
             (SettingsTab::Video, 11),
             (SettingsTab::Performance, 14),

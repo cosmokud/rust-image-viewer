@@ -109,8 +109,8 @@ pub fn apply_values(config: &mut Config, values: &[(usize, SettingValue)]) -> Ve
 /// knowing which keys have app-side setters.
 pub fn app_consequence(id: usize) -> Option<AppConsequence> {
     match id {
-        47 => Some(AppConsequence::MasonryItemsPerRow),
-        138 => Some(AppConsequence::AlphaOpaqueFallback),
+        48 => Some(AppConsequence::MasonryItemsPerRow),
+        139 => Some(AppConsequence::AlphaOpaqueFallback),
         _ => None,
     }
 }

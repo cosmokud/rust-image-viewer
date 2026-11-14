@@ -17,6 +17,7 @@ The config file is at `%APPDATA%\rust-image-viewer\config.ini` on Windows. Delet
 | `vsync`                                         | `true`     | Enable vsync to reduce tearing.                                                                    |
 | `metadata_cache_max_size_mb`                    | `1024`     | Max on-disk size of the metadata cache in MiB. `0` disables the cap.                              |
 | `background_rgb`                                | `0, 0, 0`  | Background color as an RGB triplet.                                                                |
+| `fullscreen_mode`                               | `borderless` | `borderless` = whole display, taskbar covered. `windowed` = whole display above the taskbar, so a non-auto-hide taskbar stays visible. |
 | `fullscreen_reset_fit_on_mode_switch`           | `true`     | Fit media when switching between floating and fullscreen.                                          |
 | `manga_long_strip_reset_fit_on_fullscreen_exit` | `true`     | Fit long-strip view when returning from solo fullscreen.                                           |
 | `fullscreen_remember_view_state_in_ram`         | `true`     | Remember zoom/pan/rotation per image for the current fullscreen session.                           |

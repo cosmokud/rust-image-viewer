@@ -286,6 +286,22 @@ pub fn monitor_info_at(x: i32, y: i32) -> Option<MonitorBox> {
     }
 }
 
+/// Is the shell's taskbar set to auto-hide?
+///
+/// An auto-hide taskbar reserves no work area, so a fullscreen window that asks for the work
+/// area would already cover the whole display: callers can treat the two as the same case.
+/// A taskbar that is not auto-hide answers `false` and keeps its strip of the display.
+pub fn taskbar_is_autohide() -> bool {
+    use winapi::um::shellapi::{SHAppBarMessage, ABM_GETSTATE, ABS_AUTOHIDE, APPBARDATA};
+
+    unsafe {
+        let mut data: APPBARDATA = std::mem::zeroed();
+        data.cbSize = std::mem::size_of::<APPBARDATA>() as u32;
+        let state = SHAppBarMessage(ABM_GETSTATE, &mut data);
+        (state as u32 & ABS_AUTOHIDE) != 0
+    }
+}
+
 pub fn is_window_maximized(hwnd: HWND) -> bool {
     use winapi::um::winuser::IsZoomed;
 

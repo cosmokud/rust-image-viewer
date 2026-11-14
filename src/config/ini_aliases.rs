@@ -17,7 +17,7 @@ use std::path::PathBuf;
 /// The table is per section, and a spelling may appear in more than one section only when it
 /// must route to a different key there: `[Settings] controls_hide_delay` is the controls
 /// delay, `[Video] controls_hide_delay` is the legacy name for the bottom overlay delay.
-pub(crate) const INI_ALIASES: [(IniSection, &[&str], &str); 69] = [
+pub(crate) const INI_ALIASES: [(IniSection, &[&str], &str); 70] = [
     (
         IniSection::Settings,
         &["controls_hide_delay"],
@@ -112,6 +112,11 @@ pub(crate) const INI_ALIASES: [(IniSection, &[&str], &str); 69] = [
             "animate_fullscreen_with_maximize_restore",
         ],
         "fullscreen_native_window_transition",
+    ),
+    (
+        IniSection::Settings,
+        &["fullscreen_mode", "fullscreen_type", "fullscreen_style"],
+        "fullscreen_mode",
     ),
     (
         IniSection::Settings,

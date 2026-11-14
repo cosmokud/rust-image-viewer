@@ -195,6 +195,18 @@ impl StartupWindowMode {
     }
 }
 
+impl FullscreenMode {
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "borderless" | "borderless_fullscreen" | "full" => Some(Self::Borderless),
+            "windowed" | "windowed_fullscreen" | "work_area" | "above_taskbar" => {
+                Some(Self::Windowed)
+            }
+            _ => None,
+        }
+    }
+}
+
 impl WindowTitlePathMode {
     pub fn from_str(s: &str) -> Option<Self> {
         match s.trim().to_lowercase().as_str() {

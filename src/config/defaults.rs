@@ -24,6 +24,7 @@ impl Config {
             resize_border_size: 6.0,
             background_rgb: [0, 0, 0],
             marked_file_border_rgb: [94, 214, 255],
+            fullscreen_mode: FullscreenMode::Borderless,
             fullscreen_reset_fit_on_mode_switch: true,
             manga_long_strip_reset_fit_on_fullscreen_exit: true,
             fullscreen_remember_view_state_in_ram: true,

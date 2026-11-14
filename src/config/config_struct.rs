@@ -34,6 +34,9 @@ pub struct Config {
     pub background_rgb: [u8; 3],
     /// Border color for marked items as RGB (0-255)
     pub marked_file_border_rgb: [u8; 3],
+    /// How fullscreen covers the display: whole screen (borderless) or the work area above a
+    /// non-auto-hide taskbar (windowed).
+    pub fullscreen_mode: FullscreenMode,
     /// Reset image to center and fit-to-screen when switching between floating and fullscreen.
     pub fullscreen_reset_fit_on_mode_switch: bool,
     /// Reset long-strip zoom/scroll when returning from solo fullscreen.

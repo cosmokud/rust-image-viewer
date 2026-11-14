@@ -54,14 +54,20 @@ impl ImageViewer {
                                 if offset > 0 {
                                     ui.add_space(2.0);
                                 }
-                                if let Some(row_write_now) = self.draw_setting_row(
-                                    ui,
-                                    &crate::settings_registry::SETTINGS[*id],
-                                    label_column,
-                                    read_only,
-                                ) {
+                                let setting = &crate::settings_registry::SETTINGS[*id];
+                                if let Some(row_write_now) =
+                                    self.draw_setting_row(ui, setting, label_column, read_only)
+                                {
                                     changed = true;
                                     write_now |= row_write_now;
+                                    // The fullscreen rect is written when fullscreen is entered,
+                                    // so a mode change while already fullscreen re-applies it.
+                                    if setting.key == "fullscreen_mode"
+                                        && self.mode().is_fullscreen()
+                                    {
+                                        #[cfg(target_os = "windows")]
+                                        self.request_borderless_fullscreen_rect(ui.ctx());
+                                    }
                                 }
                             }
                         });
