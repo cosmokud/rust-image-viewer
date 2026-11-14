@@ -311,6 +311,15 @@ pub fn is_window_maximized(hwnd: HWND) -> bool {
     unsafe { IsZoomed(hwnd) != 0 }
 }
 
+fn is_window_minimized(hwnd: HWND) -> bool {
+    use winapi::um::winuser::IsIconic;
+
+    if hwnd.is_null() {
+        return false;
+    }
+    unsafe { IsIconic(hwnd) != 0 }
+}
+
 /// The active window, or the foreground one when nothing is active.
 pub fn active_window_handle() -> HWND {
     active_or_foreground_window()
@@ -535,7 +544,7 @@ unsafe extern "system" fn scale_change_wndproc(
     lparam: LPARAM,
 ) -> LRESULT {
     use winapi::um::winuser::{
-        CallWindowProcW, SC_MAXIMIZE, SC_MINIMIZE, SC_RESTORE, WM_DPICHANGED, WM_GETMINMAXINFO,
+        CallWindowProcW, SC_MAXIMIZE, WM_DPICHANGED, WM_GETMINMAXINFO, WM_MOVE, WM_SIZE,
         WM_SYSCOMMAND, WM_WINDOWPOSCHANGING,
     };
 
@@ -559,22 +568,25 @@ unsafe extern "system" fn scale_change_wndproc(
     // the second layer: the keyboard guard normally stops the chord before the shell acts, and
     // this catches whatever still gets through.
     if msg == WM_WINDOWPOSCHANGING {
-        if win_held_position_change(lparam) {
+        if win_held_position_change(hwnd, lparam) {
             return 0;
         }
         return CallWindowProcW(previous, hwnd, msg, wparam, lparam);
     }
 
+    // `Win`+`Down` minimises the window, and that one is wanted: only maximise is refused here.
     if msg == WM_SYSCOMMAND {
         let command = wparam & 0xFFF0;
-        if (command == SC_MAXIMIZE as WPARAM
-            || command == SC_MINIMIZE as WPARAM
-            || command == SC_RESTORE as WPARAM)
-            && win_key_down()
-        {
+        if command == SC_MAXIMIZE as WPARAM && win_key_down() {
             return 0;
         }
         return CallWindowProcW(previous, hwnd, msg, wparam, lparam);
+    }
+
+    if msg == WM_SIZE || msg == WM_MOVE {
+        let result = CallWindowProcW(previous, hwnd, msg, wparam, lparam);
+        settle_window_rect(hwnd);
+        return result;
     }
 
     if msg != WM_DPICHANGED {
@@ -635,6 +647,54 @@ unsafe extern "system" fn scale_change_wndproc(
     result
 }
 
+static SETTLED_RECT: std::sync::Mutex<Option<(i32, i32, i32, i32)>> = std::sync::Mutex::new(None);
+static REVERT_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+/// Keeps the window on the rectangle the app chose while a `Win` key is down.
+///
+/// The keyboard guard normally stops `Win`+`Left`/`Right`/`Up` before the shell acts, but a snap
+/// hands the window a new rectangle before the window procedure can refuse it, and a hook can be
+/// missed. The last rectangle seen with no `Win` key held is therefore written back as soon as the
+/// shell changes it, so the window's layout survives even when the chord itself gets through.
+/// `Win`+`Down` is untouched: a minimised window is left minimised.
+fn settle_window_rect(hwnd: HWND) {
+    if REVERT_IN_FLIGHT.load(Ordering::SeqCst)
+        || FULLSCREEN_TARGET.load(Ordering::SeqCst)
+        || is_scale_restore_in_flight()
+    {
+        return;
+    }
+    let Some(rect) = window_rect(hwnd) else {
+        return;
+    };
+    let current = (
+        rect.left,
+        rect.top,
+        rect.right - rect.left,
+        rect.bottom - rect.top,
+    );
+    let Ok(mut settled) = SETTLED_RECT.lock() else {
+        return;
+    };
+    if !win_key_down() {
+        *settled = Some(current);
+        return;
+    }
+    if is_window_minimized(hwnd) || is_window_maximized(hwnd) {
+        return;
+    }
+    let Some((left, top, width, height)) = *settled else {
+        return;
+    };
+    if (left, top, width, height) == current {
+        return;
+    }
+    drop(settled);
+    REVERT_IN_FLIGHT.store(true, Ordering::SeqCst);
+    set_window_rect(hwnd, left, top, width, height);
+    REVERT_IN_FLIGHT.store(false, Ordering::SeqCst);
+}
+
 /// True while one of the `Win` keys is physically down.
 fn win_key_down() -> bool {
     use winapi::um::winuser::{GetAsyncKeyState, VK_LWIN, VK_RWIN};
@@ -649,13 +709,21 @@ fn win_key_down() -> bool {
 ///
 /// The rectangle the change targets is not looked at: a snap stays on the display, a move to the
 /// other display leaves it, and both replace the layout the app chose, so both are refused.
-fn win_held_position_change(lparam: LPARAM) -> bool {
+fn win_held_position_change(hwnd: HWND, lparam: LPARAM) -> bool {
     use winapi::um::winuser::{SWP_NOMOVE, SWP_NOSIZE, WINDOWPOS};
 
-    if lparam == 0 || !win_key_down() {
+    if lparam == 0 || !win_key_down() || is_window_minimized(hwnd) {
+        return false;
+    }
+    // The guard's own write-back must not be refused by the guard.
+    if REVERT_IN_FLIGHT.load(Ordering::SeqCst) {
         return false;
     }
     let proposed = unsafe { &*(lparam as *const WINDOWPOS) };
+    // The iconic position `Win`+`Down` moves the window to: minimising stays allowed.
+    if proposed.x <= -32000 || proposed.y <= -32000 {
+        return false;
+    }
     proposed.flags & SWP_NOSIZE == 0 || proposed.flags & SWP_NOMOVE == 0
 }
 
@@ -679,7 +747,6 @@ unsafe fn def_proc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) -> LRE
     DefWindowProcW(hwnd, msg, wparam, lparam)
 }
 
-static SNAP_HOTKEY_MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
 static SNAP_HOTKEY_INSTALLED: AtomicBool = AtomicBool::new(false);
 
 /// Modifier state the keyboard hook has seen for itself. Reading it from the hook's own event
@@ -690,44 +757,68 @@ static WIN_KEY_DOWN: AtomicBool = AtomicBool::new(false);
 
 /// Keeps Windows from moving or resizing the app's window with `Win`+`arrow`.
 ///
-/// `Win`+`Left`/`Right`/`Up`/`Down` is handled by the shell before the window procedure is asked
+/// `Win`+`Left`/`Right`/`Up` is handled by the shell before the window procedure is asked
 /// anything, so the app cannot refuse it from the window: a low-level keyboard hook sees the chord
-/// first and stops all four while one of the app's own windows has the keyboard, with or without
+/// first and stops all three while one of the app's own windows has the keyboard, with or without
 /// `Shift`, since `Win`+`Shift`+`Left`/`Right` also carries the window to another display and so
-/// also throws the layout away. Everywhere else the chords keep their normal meaning.
+/// also throws the layout away. `Win`+`Down` is left alone: it only minimises. Everywhere else the
+/// chords keep their normal meaning.
 ///
 /// The hook is installed on a thread of its own that does nothing but pump messages. A hook is
-/// called on the thread that installed it, which in the first attempt was the drawing thread: an
-/// image being decoded there held the callback past the system's hook timeout, after which
-/// Windows silently drops the hook, and `Win`+`arrow` went through again. This thread never
-/// decodes or draws, so its hook lasts as long as the process.
-pub fn install_snap_hotkey_guard(hwnd: HWND) {
-    if hwnd.is_null() {
-        return;
-    }
-    SNAP_HOTKEY_MAIN_HWND.store(hwnd as isize, Ordering::SeqCst);
+/// called on the thread that installed it, and the drawing thread can be busy decoding for longer
+/// than the system's hook timeout, after which Windows drops the hook without telling anyone. The
+/// thread reports whether the install took, and a failure falls back to the caller's thread.
+pub fn install_snap_hotkey_guard() {
     if SNAP_HOTKEY_INSTALLED.swap(true, Ordering::SeqCst) {
         return;
     }
 
+    let (sender, receiver) = std::sync::mpsc::channel();
     let spawned = std::thread::Builder::new()
         .name("win-arrow-guard".to_string())
-        .spawn(|| unsafe { snap_hotkey_hook_thread() });
-    if spawned.is_err() {
-        SNAP_HOTKEY_INSTALLED.store(false, Ordering::SeqCst);
+        .spawn(move || unsafe { snap_hotkey_hook_thread(sender) })
+        .is_ok();
+    let hooked = spawned
+        && receiver
+            .recv_timeout(std::time::Duration::from_millis(500))
+            .unwrap_or(false);
+    if !hooked {
+        // The window loop's own thread already pumps messages, so it can hold the hook instead.
+        unsafe {
+            install_snap_hotkey_hook();
+        }
     }
 }
 
-unsafe fn snap_hotkey_hook_thread() {
+unsafe fn install_snap_hotkey_hook() -> bool {
     use winapi::um::libloaderapi::GetModuleHandleW;
-    use winapi::um::winuser::{GetMessageW, SetWindowsHookExW, MSG, WH_KEYBOARD_LL};
+    use winapi::um::winuser::{
+        PeekMessageW, SetWindowsHookExW, MSG, PM_NOREMOVE, WH_KEYBOARD_LL, WM_USER,
+    };
+
+    // Hook callbacks land in the installing thread's message queue, and a fresh thread has none
+    // until it first asks for messages, so the queue is made before the hook exists.
+    let mut message: MSG = std::mem::zeroed();
+    PeekMessageW(
+        &mut message,
+        std::ptr::null_mut(),
+        WM_USER,
+        WM_USER,
+        PM_NOREMOVE,
+    );
 
     // A global hook also needs the module its procedure lives in: with a null one the call fails
-    // and nothing is hooked, which is why the first attempt appeared to change nothing at all.
-    // `thread_id` 0 makes it see the keys of the whole desktop.
+    // and nothing is hooked. `thread_id` 0 makes it see the keys of the whole desktop.
     let module = GetModuleHandleW(std::ptr::null());
-    if SetWindowsHookExW(WH_KEYBOARD_LL, Some(snap_hotkey_hook), module, 0).is_null() {
-        SNAP_HOTKEY_INSTALLED.store(false, Ordering::SeqCst);
+    !SetWindowsHookExW(WH_KEYBOARD_LL, Some(snap_hotkey_hook), module, 0).is_null()
+}
+
+unsafe fn snap_hotkey_hook_thread(installed: std::sync::mpsc::Sender<bool>) {
+    use winapi::um::winuser::{GetMessageW, MSG};
+
+    let hooked = install_snap_hotkey_hook();
+    let _ = installed.send(hooked);
+    if !hooked {
         return;
     }
 
@@ -741,32 +832,31 @@ fn key_is_down(virtual_key: i32) -> bool {
     unsafe { (GetAsyncKeyState(virtual_key) as u16 & 0x8000) != 0 }
 }
 
-/// True when the window holding the keyboard belongs to this process.
+/// True when the window with the keyboard belongs to this process.
+///
+/// The process id is taken from the running process, never from a remembered window handle: the
+/// handle kept at startup goes stale as soon as the window is recreated, `GetWindowThreadProcessId`
+/// then answers 0 for both, and the chord sailed through as if the app were not in front.
 fn keyboard_belongs_to_app() -> bool {
+    use winapi::um::processthreadsapi::GetCurrentProcessId;
     use winapi::um::winuser::{GetForegroundWindow, GetWindowThreadProcessId};
 
-    let main = SNAP_HOTKEY_MAIN_HWND.load(Ordering::SeqCst) as HWND;
-    if main.is_null() {
-        return false;
-    }
     unsafe {
         let foreground = GetForegroundWindow();
         if foreground.is_null() {
             return false;
         }
         let mut foreground_process = 0u32;
-        let mut main_process = 0u32;
         GetWindowThreadProcessId(foreground, &mut foreground_process);
-        GetWindowThreadProcessId(main, &mut main_process);
-        foreground_process != 0 && foreground_process == main_process
+        foreground_process != 0 && foreground_process == GetCurrentProcessId()
     }
 }
 
-/// Stops every `Win`+`arrow`, `Shift` or not; everything else goes down the chain.
+/// Stops every `Win`+`Left`/`Right`/`Up`, `Shift` or not; `Win`+`Down` and the rest go through.
 unsafe extern "system" fn snap_hotkey_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     use winapi::um::winuser::{
-        CallNextHookEx, KBDLLHOOKSTRUCT, VK_DOWN, VK_LEFT, VK_LWIN, VK_RIGHT, VK_RWIN, VK_UP,
-        WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
+        CallNextHookEx, KBDLLHOOKSTRUCT, VK_LEFT, VK_LWIN, VK_RIGHT, VK_RWIN, VK_UP, WM_KEYDOWN,
+        WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
     };
 
     let pass_through = || CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam);
@@ -787,14 +877,7 @@ unsafe extern "system" fn snap_hotkey_hook(code: i32, wparam: WPARAM, lparam: LP
     if !pressed {
         return pass_through();
     }
-    if ![
-        VK_LEFT as u32,
-        VK_RIGHT as u32,
-        VK_UP as u32,
-        VK_DOWN as u32,
-    ]
-    .contains(&key)
-    {
+    if ![VK_LEFT as u32, VK_RIGHT as u32, VK_UP as u32].contains(&key) {
         return pass_through();
     }
 
