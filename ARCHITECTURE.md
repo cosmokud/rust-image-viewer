@@ -121,6 +121,7 @@ src/app/
   core_state.rs           small cross-cutting queries (list signature, exit locks)
   exit.rs                 fast-exit path
   decode.rs               decoder preferences, upload policy inputs, init_viewer
+  history.rs              undo/redo of file mutations (recycle bin, rename, stash)
   paths.rs                file stamps and the Windows Ctrl+V probe
   platform.rs             Windows-only: CJK fonts, reveal-in-explorer, shell clipboard
   workers.rs              background coordinators (media load, solo probe, thumbnails)
@@ -139,12 +140,12 @@ src/app/
 | `media/` | 8 | `load_media_internal`, async solo image/video loads, media swap placeholders, displayed-size maths, animated (GIF/WebP) controls |
 | `solo/` | 4 | solo texture cache, LOD target sides, neighbour probing, neighbour preloading |
 | `video/` | 10 | playback availability state, track popups, video navigation, vector icons, resume positions, seek gesture, seekbar, first-frame extraction |
-| `manga/` | 39 | everything Long Strip and Masonry: layouts, uploads, demand accounting, preload, drawing, video tiles |
+| `manga/` | 40 | everything Long Strip and Masonry: layouts, uploads, demand accounting, preload, drawing, video tiles |
 | `masonry/` | 2 | authoritative dimension bookkeeping + folder metadata snapshots |
 | `window/` | 11 | layout application, display lookup, window rects, fullscreen transitions, dragging, autosize, title text, startup visibility, monitor queries |
-| `settings/` | 8 | settings window values/actions/widgets/rows/presets/tabs/modal |
-| `stash/` | 8 | the Stash window: gallery, selection/rubber band, chips + context menu, keyboard navigation, hover video preview, details column, on-disk stash (`stash.tsv`) |
-| `dialogs/` | 5 | delete/rename modals, modal thumbnails and preview |
+| `settings/` | 9 | settings window values/actions/widgets/rows/presets/tabs/modal |
+| `stash/` | 10 | the Stash window: gallery, selection/rubber band, chips + context menu, keyboard navigation, hover video preview, details column, on-disk stash (`stash.tsv`) |
+| `dialogs/` | 7 | delete/rename modals, undo/redo confirmation, modal thumbnails and preview |
 | `help/` | 3 | shortcut help labels and the Help tab |
 | `diagnostics/` | 3 | FPS sampling, per-frame diag stats (the overlay itself is in `ui/`) |
 | `fullscreen/` | 4 | per-image view memory, rotation/flip state, Long Strip reset |
@@ -763,6 +764,14 @@ warm cache survives a solo detour, and a titlebar-specific restore path separate
 fullscreen toggles. On Windows, native maximize/restore is used inside the transition so it feels
 native rather than an instant borderless snap.
 
+The app supports independent secondary viewports (Settings, Stash, and detached confirmation
+dialogs). Closing the viewer while secondary windows remain open parks the viewer off-screen
+(`windows_env::park_window_offscreen`) instead of terminating the process. Reopening a file or
+activating an item from Stash instantly restores the viewer (`unpark_window_offscreen`), re-applies
+any parked fullscreen camera, or re-enters fullscreen directly if it was closed in fullscreen
+(`reopen_into_fullscreen`). Between folder files, floating mode preserves its window position
+and size ceiling (`floating_mode_remember_position`).
+
 ### 11.5 Input
 
 - `src/app/input/input.rs`: `handle_input` and `draw_controls` (the whole chrome).
@@ -788,6 +797,28 @@ bindings.
   a slider drag from being stolen by a zoom action.
 - Audio/subtitle popups are in `src/app/video/tracks.rs`; external subtitle discovery matches the
   video stem (`external_subtitle_options_for_video`).
+
+### 11.7 Stash and marked files (`src/app/stash/`, `src/app/files/marks.rs`)
+
+- Dedicated secondary native viewport (`STASH_WINDOW_TITLE = "Stash"`).
+- Pinned tile gaps and fixed tile sizing ensure stable geometry without grid jumping during resize.
+- Multi-select (rubber-band drag, click selection, Ctrl+A), context menu actions, and chips.
+- Full keyboard navigation: arrow keys navigate the grid, `Enter` opens the selection in the viewer
+  in-place (preserving current view mode), `Delete` removes items from the stash, and `Esc` deselects
+  or dismisses dialogs.
+- Early hover preview cards and a collapsible details column with dimension-capped decode
+  (`src/app/stash/details.rs`).
+- Accepts external drag-and-dropped files.
+- Persisted to `%APPDATA%\rust-image-viewer\` across sessions (`src/app/stash/store.rs`).
+
+### 11.8 File mutations, confirmation dialogs, and undo/redo (`src/app/history.rs`, `src/app/dialogs/`)
+
+- Detached, vertically resizable modal viewports for destructive file operations: delete confirmation,
+  rename confirmation, and undo/redo confirmation (`src/app/dialogs/confirm.rs`, `history.rs`, `window.rs`).
+- Handles native titlebar close buttons, `Esc` to cancel, and `Enter` to confirm.
+- In-memory undo/redo stacks (`undo_history`, `redo_history`) bound to `Ctrl+Z` and `Ctrl+Y`.
+- Actions supported: `DeleteToRecycle` (verifies items remain in the Recycle Bin before undoing restore),
+  `DeleteFromStash`, and `Rename`.
 
 ---
 

@@ -22,6 +22,8 @@ A fast, borderless image and video viewer for Windows. Open media instantly, nav
 - Fast folder navigation with natural sort, single-instance reuse, and drag-and-drop support.
 - Animated GIF, animated WebP, and video playback in the same window — no switching apps.
 - Hardware-accelerated video decoding on Windows (D3D12 / D3D11 / CUDA) with automatic fallback to software if a hardware decoder wedges.
+- Dedicated **Stash** window to collect, filter, preview, and organize marked files across folders.
+- Full **Undo / Redo** (`Ctrl+Z`, `Ctrl+Y`) for file deletions, renames, and stash operations with confirmation dialogs.
 - Tabbed, searchable Settings window with live preset management and reset-to-defaults.
 - Dual release builds: AVX2 (default, every Windows 11 machine) and SSE4.2 (`-legacy`, for older CPUs).
 - Persistent metadata cache so the second time you open a folder is noticeably faster than the first.
@@ -125,6 +127,7 @@ Opening one file builds the media list for its entire folder and enables previou
 - **Solo fullscreen** — one item, full screen.
 - **Long Strip** — continuous vertical scroll through the whole folder, great for reading manga or image sequences.
 - **Masonry** — multi-column grid for browsing dense folders.
+- **Stash** — standalone gallery window for reviewing, filtering, and organizing marked files across folders.
 
 Switch between Long Strip and Masonry with the mode buttons in the bottom-right corner while fullscreen.
 
@@ -135,6 +138,7 @@ Switch between Long Strip and Masonry with the mode buttons in the bottom-right 
 - Middle-click starts freehand autoscroll.
 - Space marks the hovered item; Ctrl+Left-click toggles the mark.
 - In Long Strip or Masonry, right-click on an item opens it in solo fullscreen.
+- Ctrl+Z / Ctrl+Y confirms undo and redo for deletes, renames, and stash changes.
 
 ## Shortcuts
 

@@ -22,6 +22,8 @@ The config file is at `%APPDATA%\rust-image-viewer\config.ini` on Windows. Delet
 | `fullscreen_remember_view_state_in_ram`         | `true`     | Remember zoom/pan/rotation per image for the current fullscreen session.                           |
 | `fullscreen_native_window_transition`           | `true`     | Use Windows maximize/restore animations during fullscreen transitions.                             |
 | `maximize_to_borderless_fullscreen`             | `true`     | Make the maximize button enter borderless fullscreen instead of a maximized floating window.       |
+| `floating_mode_remember_position`               | `true`     | Keep floating window position and size cap between files.                                          |
+| `confirm_delete_to_recycle_bin`                 | `true`     | Show confirmation modal before deleting to Recycle Bin.                                            |
 | `auto_unmark_after_paste`                       | `true`     | Clear the marked selection after a successful paste.                                               |
 | `zoom_animation_speed`                          | `20`       | Floating zoom animation speed. `0` disables animation.                                            |
 | `precise_rotation_step_degrees`                 | `2.0`      | Degrees per `Ctrl+Up` / `Ctrl+Down`.                                                               |

@@ -8,6 +8,8 @@ Bindings are context-aware — the same key can do different things in different
 | ----------------- | -------------------------- |
 | Toggle fullscreen | `f`, `f11`, `f12`, `enter` |
 | Exit              | `ctrl+w`, `escape`         |
+| Undo file action  | `ctrl+z`                   |
+| Redo file action  | `ctrl+y`                   |
 
 ## Floating and solo fullscreen
 
@@ -65,6 +67,16 @@ Bindings are context-aware — the same key can do different things in different
 | ------------ | ------- |
 | Play / pause | `space` |
 | Mute         | `m`     |
+
+## Stash
+
+| Action             | Default                       |
+| ------------------ | ----------------------------- |
+| Navigate items     | `left`, `right`, `up`, `down` |
+| Open selected item | `enter`                       |
+| Remove from stash  | `delete`                      |
+| Select all         | `ctrl+a`                      |
+| Deselect / Close   | `escape`                      |
 
 ## Custom shortcuts
 

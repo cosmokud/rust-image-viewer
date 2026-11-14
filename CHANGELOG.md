@@ -1,7 +1,44 @@
 # Changelog
 
-## [Unreleased]
+## [0.4.4] - 2026-11-14
 
+### Highlights
+
+- Dedicated Stash native window to manage, filter, preview, and organize marked files across folders with drag-and-drop and persistent storage.
+- Multi-step Undo/Redo (`Ctrl+Z`, `Ctrl+Y`) for destructive file operations (recycle bin deletions, renames, stash removals) backed by detached confirmation dialogs.
+- Multi-window lifecycle preserves open Settings and Stash windows when the viewer is closed, parking the viewer off-screen for seamless reopening.
+- Floating mode remembers window position and size ceiling across files (`floating_mode_remember_position`).
+- Viewport and camera memory keeps fullscreen zoom/pan across reopens and preserves Long Strip and Masonry scroll positions during solo view excursions.
+- Major codebase refactoring: decomposed the monolithic `main.rs` into structured `src/app/` submodules and modularized loader, player, cache, and settings crates.
+
+### Added
+
+- Detached native Stash window with rubber-band multi-selection, keyboard navigation, hover preview cards, details inspector, and context menu actions.
+- File action Undo and Redo stacks (`Ctrl+Z` / `Ctrl+Y`) with detached confirmation dialogs verifying Recycle Bin restorable status.
+- Detached, vertically resizable dialog windows for delete and rename confirmations with native close button support.
+- `floating_mode_remember_position` option to maintain floating window placement and size ceiling across folder navigation.
+- Right-click "Reset to Default" per-row context menu in the Settings dialog.
+- Drag-and-drop file support directly into the Stash window.
+
+### Changed
+
+- Closing the viewer leaves active Settings and Stash windows open; reopening restores the viewer to its prior position, size, or fullscreen state.
+- Excursions to solo view from Long Strip or Masonry preserve layout cameras and scroll offsets without contaminating solo view state.
+- Decoupled crate root into modular packages: `src/app/`, `src/manga_loader/`, `src/video_player/`, `src/settings_registry/`, `src/metadata_cache/`, `src/image_loader/`, and `src/config/`.
+- Extracted standalone documentation for shortcuts, configuration, diagnostics, and troubleshooting.
+
+### Fixed
+
+- Reopening a viewer closed in fullscreen restores directly back into fullscreen mode with its previous camera.
+- Pinned stash tile sizes and gaps so window resizing maintains grid stability without sliding or snapping.
+- Centered hint text vertically in single-line text fields and fixed padding hit-testing to prevent spurious line-start selection.
+- Native title-bar close buttons in confirmation dialogs now correctly cancel the dialog instead of being ignored.
+- Details column preview images in Stash are decoded at the column paint size and capped at window height.
+
+### Maintenance
+
+- Replaced monolithic modules with domain-scoped directory packages and modular wiring.
+- Added test coverage for undo/redo history stacks, recycle bin restoration tracking, and stash geometry.
 
 ## [0.4.3] - 2026-11-11
 
