@@ -690,6 +690,130 @@ unsafe fn def_proc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) -> LRE
     DefWindowProcW(hwnd, msg, wparam, lparam)
 }
 
+static SNAP_HOTKEY_MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
+static SNAP_HOTKEY_HOOK: AtomicIsize = AtomicIsize::new(0);
+
+/// Modifier state the keyboard hook has seen for itself. Reading it from the hook's own event
+/// stream is the only reliable answer inside the hook: asking the OS for a key's state there can
+/// lag the event being handled by a keystroke, which swallowed the arrow of `Win`+`Shift`+arrow
+/// once already and left the shell without a move while the app acted on `Shift`+arrow alone.
+static WIN_KEY_DOWN: AtomicBool = AtomicBool::new(false);
+static SHIFT_KEY_DOWN: AtomicBool = AtomicBool::new(false);
+
+/// Keeps Windows from resizing the app's window with `Win`+`arrow`.
+///
+/// `Win`+`Left`/`Right`/`Up`/`Down` is handled by the shell before the window procedure is asked
+/// anything, so the app cannot refuse it from the window: a low-level keyboard hook sees the chord
+/// first and stops exactly those four while one of the app's own windows has the keyboard.
+/// `Win`+`Shift`+`Left`/`Right` carries the window to the other display and is passed through, and
+/// in every other application the chords keep their normal meaning.
+pub fn install_snap_hotkey_guard(hwnd: HWND) {
+    use winapi::um::libloaderapi::GetModuleHandleW;
+    use winapi::um::winuser::{SetWindowsHookExW, WH_KEYBOARD_LL};
+
+    if hwnd.is_null() {
+        return;
+    }
+    SNAP_HOTKEY_MAIN_HWND.store(hwnd as isize, Ordering::SeqCst);
+    if SNAP_HOTKEY_HOOK.load(Ordering::SeqCst) != 0 {
+        return;
+    }
+
+    // The hook runs on the thread that installs it, which is the one pumping the window's
+    // messages; `thread_id` 0 makes it see the keys of the whole desktop. A global hook also needs
+    // the module its procedure lives in: with a null one the call fails and nothing is hooked,
+    // which is why the first attempt appeared to change nothing at all.
+    unsafe {
+        let module = GetModuleHandleW(std::ptr::null());
+        let hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(snap_hotkey_hook), module, 0);
+        if !hook.is_null() {
+            SNAP_HOTKEY_HOOK.store(hook as isize, Ordering::SeqCst);
+        }
+    }
+}
+
+fn key_is_down(virtual_key: i32) -> bool {
+    use winapi::um::winuser::GetAsyncKeyState;
+
+    unsafe { (GetAsyncKeyState(virtual_key) as u16 & 0x8000) != 0 }
+}
+
+/// True when the window holding the keyboard belongs to this process.
+fn keyboard_belongs_to_app() -> bool {
+    use winapi::um::winuser::{GetForegroundWindow, GetWindowThreadProcessId};
+
+    let main = SNAP_HOTKEY_MAIN_HWND.load(Ordering::SeqCst) as HWND;
+    if main.is_null() {
+        return false;
+    }
+    unsafe {
+        let foreground = GetForegroundWindow();
+        if foreground.is_null() {
+            return false;
+        }
+        let mut foreground_process = 0u32;
+        let mut main_process = 0u32;
+        GetWindowThreadProcessId(foreground, &mut foreground_process);
+        GetWindowThreadProcessId(main, &mut main_process);
+        foreground_process != 0 && foreground_process == main_process
+    }
+}
+
+/// Stops `Win`+`arrow` (but never `Win`+`Shift`+`arrow`); everything else goes down the chain.
+unsafe extern "system" fn snap_hotkey_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    use winapi::um::winuser::{
+        CallNextHookEx, KBDLLHOOKSTRUCT, VK_DOWN, VK_LEFT, VK_LSHIFT, VK_LWIN, VK_RIGHT, VK_RSHIFT,
+        VK_RWIN, VK_SHIFT, VK_UP, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    };
+
+    let pass_through = || CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam);
+    if code < 0 || lparam == 0 {
+        return pass_through();
+    }
+    let message = wparam as u32;
+    let pressed = message == WM_KEYDOWN || message == WM_SYSKEYDOWN;
+    if !pressed && message != WM_KEYUP && message != WM_SYSKEYUP {
+        return pass_through();
+    }
+
+    let key = (*(lparam as *const KBDLLHOOKSTRUCT)).vkCode;
+    if key == VK_LWIN as u32 || key == VK_RWIN as u32 {
+        WIN_KEY_DOWN.store(pressed, Ordering::SeqCst);
+    } else if key == VK_SHIFT as u32 || key == VK_LSHIFT as u32 || key == VK_RSHIFT as u32 {
+        SHIFT_KEY_DOWN.store(pressed, Ordering::SeqCst);
+    }
+
+    if !pressed {
+        return pass_through();
+    }
+    if ![
+        VK_LEFT as u32,
+        VK_RIGHT as u32,
+        VK_UP as u32,
+        VK_DOWN as u32,
+    ]
+    .contains(&key)
+    {
+        return pass_through();
+    }
+
+    // Both the hook's own tracking and the OS state are consulted: either saying "down" is
+    // enough, so a missed modifier event can only ever err towards letting the chord through.
+    let win_held = WIN_KEY_DOWN.load(Ordering::SeqCst)
+        || key_is_down(VK_LWIN as i32)
+        || key_is_down(VK_RWIN as i32);
+    let shift_held = SHIFT_KEY_DOWN.load(Ordering::SeqCst)
+        || key_is_down(VK_SHIFT as i32)
+        || key_is_down(VK_LSHIFT as i32)
+        || key_is_down(VK_RSHIFT as i32);
+    if !win_held || shift_held || !keyboard_belongs_to_app() {
+        return pass_through();
+    }
+
+    // Non-zero stops the chord here: the shell never sees it.
+    1
+}
+
 /// Rewrites only the maximize fields of a `WM_GETMINMAXINFO` answer.
 ///
 /// The default answer for an undecorated window inflates `rcWork` by `SM_CXSIZEFRAME +
