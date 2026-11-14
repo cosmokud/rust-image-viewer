@@ -549,9 +549,10 @@ impl ImageViewer {
             ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Close);
             self.settings.open = false;
             // The native window is gone: its handle must not be read for the next one.
-            release_side_window(self.settings.native_hwnd);
             self.settings.native_hwnd = 0;
             self.settings.requested_rect = None;
+            self.settings.requested_frames = 0;
+            self.settings.scale = None;
             self.settings.rename = None;
             self.settings.pending_confirm = None;
             self.settings.pending_confirm = None;

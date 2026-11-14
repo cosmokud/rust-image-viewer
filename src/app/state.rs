@@ -204,6 +204,11 @@ pub(crate) struct SettingsModal {
     /// Rectangle the window was asked to stand on and has not reached yet. Frames that find it
     /// elsewhere put it back instead of recording that position.
     pub(crate) requested_rect: Option<crate::window_geometry::Rect>,
+    /// How many frames may still put it back: the OS can rewrite the rectangle (a display scale
+    /// change does), and putting it back forever would fight the user's drag.
+    pub(crate) requested_frames: u8,
+    /// Display scale last seen for this window, to notice a move to another display.
+    pub(crate) scale: Option<f32>,
     /// Frames left to re-assert size and position right after the native window appears.
     pub(crate) place_frames: u8,
     pub(crate) tab: SettingsTabSlot,
@@ -609,6 +614,10 @@ pub(crate) struct StashState {
     pub(crate) native_hwnd: isize,
     /// Rectangle the window was asked to stand on and has not reached yet.
     pub(crate) requested_rect: Option<crate::window_geometry::Rect>,
+    /// How many frames may still put it back.
+    pub(crate) requested_frames: u8,
+    /// Display scale last seen for this window.
+    pub(crate) scale: Option<f32>,
     /// When the last change seen is written: one write per drag, not one per frame.
     pub(crate) geometry_save_due: Option<Instant>,
 }
@@ -641,6 +650,8 @@ impl Default for StashState {
             window_geometry: None,
             native_hwnd: 0,
             requested_rect: None,
+            requested_frames: 0,
+            scale: None,
             geometry_save_due: None,
         }
     }

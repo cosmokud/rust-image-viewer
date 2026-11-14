@@ -42,6 +42,11 @@ pub(crate) const STASH_GEOMETRY_SAVE_DELAY: Duration = Duration::from_millis(400
 /// Sub-pixel differences are noise: the native rectangle is re-read every frame.
 const GEOMETRY_EPSILON: f32 = 0.5;
 
+/// Frames a window that has not reached its requested rectangle may be put back. The OS does not
+/// always grant a rectangle exactly (a display scale change rewrites it), and a window that kept
+/// being pushed back could not be dragged at all.
+const REQUESTED_RECT_FRAMES: u8 = 4;
+
 /// Smallest window the record may restore, in physical pixels: a truncated or nonsense record
 /// must not produce a sliver of a window.
 const MIN_WINDOW_WIDTH: i32 = 160;
@@ -431,45 +436,6 @@ pub(crate) fn native_side_window(hwnd: isize) -> Option<NativeSideWindow> {
     }
 }
 
-/// Keeps a side window's physical size when it is dragged to a display of another scale.
-///
-/// The OS answers `WM_DPICHANGED` with a rectangle that preserves the window's *logical* size, so
-/// a window moved from a 100% display to a 150% one came out 50% larger in pixels although
-/// nothing about its content changed. The guard writes the pre-change pixel size back, so the
-/// window keeps the size it had, which is also the size the record then keeps for next time.
-pub(crate) fn guard_side_window(hwnd: isize) {
-    #[cfg(target_os = "windows")]
-    {
-        if hwnd != 0 {
-            // A side window's frame does not scale the image's zoom the way the viewer's does.
-            crate::windows_env::install_scale_change_guard(
-                hwnd as winapi::shared::windef::HWND,
-                false,
-            );
-        }
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = hwnd;
-    }
-}
-
-/// Unhooks a side window that is going away.
-pub(crate) fn release_side_window(hwnd: isize) {
-    #[cfg(target_os = "windows")]
-    {
-        if hwnd != 0 {
-            crate::windows_env::remove_scale_change_guard(hwnd as winapi::shared::windef::HWND);
-        }
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = hwnd;
-    }
-}
-
 /// Handle of the app's own side window with `title`, or 0 when it is not up (yet).
 pub(crate) fn side_window_hwnd(title: &str) -> isize {
     #[cfg(target_os = "windows")]
@@ -546,6 +512,8 @@ impl ImageViewer {
     /// write. A maximized window keeps the size and corner of the un-maximized window it will
     /// restore to.
     pub(crate) fn remember_stash_window_geometry(&mut self, ctx: &egui::Context) {
+        // The context lock is taken by both: read the scale outside `input`.
+        let scale = ctx.pixels_per_point();
         let (maximized, minimized, fullscreen) = ctx.input(|input| {
             let viewport = input.viewport();
             (
@@ -557,8 +525,32 @@ impl ImageViewer {
         if self.stash.native_hwnd == 0 {
             self.stash.native_hwnd = side_window_hwnd(STASH_WINDOW_TITLE);
         }
-        guard_side_window(self.stash.native_hwnd);
         let native = native_side_window(self.stash.native_hwnd);
+
+        // The OS keeps a window's *logical* size across a display scale change and rescales it in
+        // pixels, so a window moved to another display came out larger. Put the client size it
+        // was left at back, once, where the user has it now; the rescaled frame is not recorded.
+        let previous_scale = self.stash.scale.replace(scale);
+        #[cfg(target_os = "windows")]
+        if previous_scale.is_some_and(|previous| (previous - scale).abs() > 0.01) {
+            if let (Some(window), Some(geometry)) = (native, self.stash.window_geometry) {
+                let target = NativeSideWindowTarget {
+                    left: window.outer.left,
+                    top: window.outer.top,
+                    width: geometry.width.round() as i32,
+                    height: geometry.height.round() as i32,
+                };
+                if let Some(outer) = place_side_window(
+                    self.stash.native_hwnd as winapi::shared::windef::HWND,
+                    target,
+                    maximized,
+                ) {
+                    self.stash.requested_rect = Some(outer);
+                    self.stash.requested_frames = REQUESTED_RECT_FRAMES;
+                }
+            }
+            return;
+        }
 
         // A window that has not reached the rectangle it was asked for is still on its way:
         // record nothing, and put it back. Recording that frame would overwrite the remembered
@@ -569,7 +561,8 @@ impl ImageViewer {
                 Some(window) if rects_match(window.outer, requested) => {
                     self.stash.requested_rect = None;
                 }
-                Some(_) => {
+                Some(_) if 0 < self.stash.requested_frames => {
+                    self.stash.requested_frames -= 1;
                     crate::windows_env::set_window_rect(
                         self.stash.native_hwnd as winapi::shared::windef::HWND,
                         requested.left,
@@ -579,7 +572,8 @@ impl ImageViewer {
                     );
                     return;
                 }
-                None => return,
+                // Not granted, or the window is being dragged: accept where it stands.
+                _ => self.stash.requested_rect = None,
             }
         }
 
@@ -607,6 +601,8 @@ impl ImageViewer {
 
     /// The Settings window's counterpart: same recording, its own file.
     pub(crate) fn remember_settings_window_geometry(&mut self, ctx: &egui::Context) {
+        // The context lock is taken by both: read the scale outside `input`.
+        let scale = ctx.pixels_per_point();
         let (maximized, minimized, fullscreen) = ctx.input(|input| {
             let viewport = input.viewport();
             (
@@ -618,8 +614,30 @@ impl ImageViewer {
         if self.settings.native_hwnd == 0 {
             self.settings.native_hwnd = side_window_hwnd(SETTINGS_WINDOW_TITLE);
         }
-        guard_side_window(self.settings.native_hwnd);
         let native = native_side_window(self.settings.native_hwnd);
+
+        // Same rule as the Stash: a scale change must not resize the window.
+        let previous_scale = self.settings.scale.replace(scale);
+        #[cfg(target_os = "windows")]
+        if previous_scale.is_some_and(|previous| (previous - scale).abs() > 0.01) {
+            if let (Some(window), Some(geometry)) = (native, self.settings.window_geometry) {
+                let target = NativeSideWindowTarget {
+                    left: window.outer.left,
+                    top: window.outer.top,
+                    width: geometry.width.round() as i32,
+                    height: geometry.height.round() as i32,
+                };
+                if let Some(outer) = place_side_window(
+                    self.settings.native_hwnd as winapi::shared::windef::HWND,
+                    target,
+                    maximized,
+                ) {
+                    self.settings.requested_rect = Some(outer);
+                    self.settings.requested_frames = REQUESTED_RECT_FRAMES;
+                }
+            }
+            return;
+        }
 
         #[cfg(target_os = "windows")]
         if let Some(requested) = self.settings.requested_rect {
@@ -627,7 +645,8 @@ impl ImageViewer {
                 Some(window) if rects_match(window.outer, requested) => {
                     self.settings.requested_rect = None;
                 }
-                Some(_) => {
+                Some(_) if 0 < self.settings.requested_frames => {
+                    self.settings.requested_frames -= 1;
                     crate::windows_env::set_window_rect(
                         self.settings.native_hwnd as winapi::shared::windef::HWND,
                         requested.left,
@@ -637,7 +656,7 @@ impl ImageViewer {
                     );
                     return;
                 }
-                None => return,
+                _ => self.settings.requested_rect = None,
             }
         }
 
@@ -684,6 +703,7 @@ impl ImageViewer {
             return false;
         };
         self.stash.requested_rect = Some(outer);
+        self.stash.requested_frames = REQUESTED_RECT_FRAMES;
         true
     }
 
@@ -707,6 +727,7 @@ impl ImageViewer {
             return false;
         };
         self.settings.requested_rect = Some(outer);
+        self.settings.requested_frames = REQUESTED_RECT_FRAMES;
         true
     }
 
@@ -756,9 +777,6 @@ fn place_side_window(
 ) -> Option<crate::window_geometry::Rect> {
     use crate::window_geometry::Rect;
 
-    // Keeps the client size across a display scale change instead of letting the OS rescale the
-    // whole window: the same rule the viewer follows.
-    guard_side_window(hwnd as isize);
     // Measured before maximizing, where the frame is the window's own again.
     let chrome = crate::windows_env::window_chrome(hwnd).unwrap_or((0, 0));
     let width = target.width + chrome.0;

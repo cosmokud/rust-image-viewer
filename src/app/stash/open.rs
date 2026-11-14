@@ -183,9 +183,10 @@ impl ImageViewer {
     pub(crate) fn close_stash(&mut self) {
         self.stash.open = false;
         // The native window is gone: its handle must not be read for the next one.
-        release_side_window(self.stash.native_hwnd);
         self.stash.native_hwnd = 0;
         self.stash.requested_rect = None;
+        self.stash.requested_frames = 0;
+        self.stash.scale = None;
         self.stash.hovered = None;
         self.stash.preview.clear();
     }
