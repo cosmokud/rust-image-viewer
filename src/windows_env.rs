@@ -535,8 +535,8 @@ unsafe extern "system" fn scale_change_wndproc(
     lparam: LPARAM,
 ) -> LRESULT {
     use winapi::um::winuser::{
-        CallWindowProcW, SC_MAXIMIZE, SC_MINIMIZE, WM_DPICHANGED, WM_GETMINMAXINFO, WM_SYSCOMMAND,
-        WM_WINDOWPOSCHANGING,
+        CallWindowProcW, SC_MAXIMIZE, SC_MINIMIZE, SC_RESTORE, WM_DPICHANGED, WM_GETMINMAXINFO,
+        WM_SYSCOMMAND, WM_WINDOWPOSCHANGING,
     };
 
     let previous = PREVIOUS_WNDPROC.load(Ordering::SeqCst);
@@ -552,13 +552,14 @@ unsafe extern "system" fn scale_change_wndproc(
     }
 
     // `Win`+arrow is not a command the window sees as a key: the shell has already decided to
-    // snap, maximise or minimise it, and those replace the rectangle the app laid its media out
-    // for. A window position change while one of the `Win` keys is physically down is that chord
-    // (a drag or a resize by hand has no `Win` held), so it is refused here. `Win`+`Shift`+arrow
-    // carries the window to the other display instead: the target lies on another display, which
-    // is let through, since that crossing's size is the OS's to choose.
+    // snap, maximise, minimise or carry it to another display, and every one of those replaces
+    // the rectangle the app laid its media out for. A window position change while one of the
+    // `Win` keys is physically down is that chord (a drag or a resize by hand has no `Win` held),
+    // so it is refused here whatever display it targets — `Win`+`Shift`+arrow included. This is
+    // the second layer: the keyboard guard normally stops the chord before the shell acts, and
+    // this catches whatever still gets through.
     if msg == WM_WINDOWPOSCHANGING {
-        if win_arrow_resize(hwnd, lparam) {
+        if win_held_position_change(lparam) {
             return 0;
         }
         return CallWindowProcW(previous, hwnd, msg, wparam, lparam);
@@ -566,7 +567,10 @@ unsafe extern "system" fn scale_change_wndproc(
 
     if msg == WM_SYSCOMMAND {
         let command = wparam & 0xFFF0;
-        if (command == SC_MAXIMIZE as WPARAM || command == SC_MINIMIZE as WPARAM) && win_key_down()
+        if (command == SC_MAXIMIZE as WPARAM
+            || command == SC_MINIMIZE as WPARAM
+            || command == SC_RESTORE as WPARAM)
+            && win_key_down()
         {
             return 0;
         }
@@ -641,33 +645,18 @@ fn win_key_down() -> bool {
     }
 }
 
-/// True when the pending position change is the shell resizing the window in place on `Win`+arrow.
-fn win_arrow_resize(hwnd: HWND, lparam: LPARAM) -> bool {
-    use winapi::um::winuser::{SWP_NOSIZE, WINDOWPOS};
+/// True when the pending position change is the shell moving or resizing the window on `Win`+arrow.
+///
+/// The rectangle the change targets is not looked at: a snap stays on the display, a move to the
+/// other display leaves it, and both replace the layout the app chose, so both are refused.
+fn win_held_position_change(lparam: LPARAM) -> bool {
+    use winapi::um::winuser::{SWP_NOMOVE, SWP_NOSIZE, WINDOWPOS};
 
     if lparam == 0 || !win_key_down() {
         return false;
     }
     let proposed = unsafe { &*(lparam as *const WINDOWPOS) };
-    if proposed.flags & SWP_NOSIZE != 0 {
-        return false;
-    }
-    let Some(current) = window_rect(hwnd) else {
-        return false;
-    };
-    let target = RECT {
-        left: proposed.x,
-        top: proposed.y,
-        right: proposed.x + proposed.cx,
-        bottom: proposed.y + proposed.cy,
-    };
-
-    // A window being carried onto another display is the one resize the chords may still do.
-    match (display_bounds(current), display_bounds(target)) {
-        (Some(current), Some(target)) => current == target,
-        // No display to compare: leave the change alone rather than freeze the window.
-        _ => false,
-    }
+    proposed.flags & SWP_NOSIZE == 0 || proposed.flags & SWP_NOMOVE == 0
 }
 
 /// The display rectangle a window belongs to, by the display under its centre.
@@ -691,45 +680,59 @@ unsafe fn def_proc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) -> LRE
 }
 
 static SNAP_HOTKEY_MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
-static SNAP_HOTKEY_HOOK: AtomicIsize = AtomicIsize::new(0);
+static SNAP_HOTKEY_INSTALLED: AtomicBool = AtomicBool::new(false);
 
 /// Modifier state the keyboard hook has seen for itself. Reading it from the hook's own event
 /// stream is the only reliable answer inside the hook: asking the OS for a key's state there can
 /// lag the event being handled by a keystroke, which swallowed the arrow of `Win`+`Shift`+arrow
 /// once already and left the shell without a move while the app acted on `Shift`+arrow alone.
 static WIN_KEY_DOWN: AtomicBool = AtomicBool::new(false);
-static SHIFT_KEY_DOWN: AtomicBool = AtomicBool::new(false);
 
-/// Keeps Windows from resizing the app's window with `Win`+`arrow`.
+/// Keeps Windows from moving or resizing the app's window with `Win`+`arrow`.
 ///
 /// `Win`+`Left`/`Right`/`Up`/`Down` is handled by the shell before the window procedure is asked
 /// anything, so the app cannot refuse it from the window: a low-level keyboard hook sees the chord
-/// first and stops exactly those four while one of the app's own windows has the keyboard.
-/// `Win`+`Shift`+`Left`/`Right` carries the window to the other display and is passed through, and
-/// in every other application the chords keep their normal meaning.
+/// first and stops all four while one of the app's own windows has the keyboard, with or without
+/// `Shift`, since `Win`+`Shift`+`Left`/`Right` also carries the window to another display and so
+/// also throws the layout away. Everywhere else the chords keep their normal meaning.
+///
+/// The hook is installed on a thread of its own that does nothing but pump messages. A hook is
+/// called on the thread that installed it, which in the first attempt was the drawing thread: an
+/// image being decoded there held the callback past the system's hook timeout, after which
+/// Windows silently drops the hook, and `Win`+`arrow` went through again. This thread never
+/// decodes or draws, so its hook lasts as long as the process.
 pub fn install_snap_hotkey_guard(hwnd: HWND) {
-    use winapi::um::libloaderapi::GetModuleHandleW;
-    use winapi::um::winuser::{SetWindowsHookExW, WH_KEYBOARD_LL};
-
     if hwnd.is_null() {
         return;
     }
     SNAP_HOTKEY_MAIN_HWND.store(hwnd as isize, Ordering::SeqCst);
-    if SNAP_HOTKEY_HOOK.load(Ordering::SeqCst) != 0 {
+    if SNAP_HOTKEY_INSTALLED.swap(true, Ordering::SeqCst) {
         return;
     }
 
-    // The hook runs on the thread that installs it, which is the one pumping the window's
-    // messages; `thread_id` 0 makes it see the keys of the whole desktop. A global hook also needs
-    // the module its procedure lives in: with a null one the call fails and nothing is hooked,
-    // which is why the first attempt appeared to change nothing at all.
-    unsafe {
-        let module = GetModuleHandleW(std::ptr::null());
-        let hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(snap_hotkey_hook), module, 0);
-        if !hook.is_null() {
-            SNAP_HOTKEY_HOOK.store(hook as isize, Ordering::SeqCst);
-        }
+    let spawned = std::thread::Builder::new()
+        .name("win-arrow-guard".to_string())
+        .spawn(|| unsafe { snap_hotkey_hook_thread() });
+    if spawned.is_err() {
+        SNAP_HOTKEY_INSTALLED.store(false, Ordering::SeqCst);
     }
+}
+
+unsafe fn snap_hotkey_hook_thread() {
+    use winapi::um::libloaderapi::GetModuleHandleW;
+    use winapi::um::winuser::{GetMessageW, SetWindowsHookExW, MSG, WH_KEYBOARD_LL};
+
+    // A global hook also needs the module its procedure lives in: with a null one the call fails
+    // and nothing is hooked, which is why the first attempt appeared to change nothing at all.
+    // `thread_id` 0 makes it see the keys of the whole desktop.
+    let module = GetModuleHandleW(std::ptr::null());
+    if SetWindowsHookExW(WH_KEYBOARD_LL, Some(snap_hotkey_hook), module, 0).is_null() {
+        SNAP_HOTKEY_INSTALLED.store(false, Ordering::SeqCst);
+        return;
+    }
+
+    let mut message: MSG = std::mem::zeroed();
+    while GetMessageW(&mut message, std::ptr::null_mut(), 0, 0) > 0 {}
 }
 
 fn key_is_down(virtual_key: i32) -> bool {
@@ -759,11 +762,11 @@ fn keyboard_belongs_to_app() -> bool {
     }
 }
 
-/// Stops `Win`+`arrow` (but never `Win`+`Shift`+`arrow`); everything else goes down the chain.
+/// Stops every `Win`+`arrow`, `Shift` or not; everything else goes down the chain.
 unsafe extern "system" fn snap_hotkey_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     use winapi::um::winuser::{
-        CallNextHookEx, KBDLLHOOKSTRUCT, VK_DOWN, VK_LEFT, VK_LSHIFT, VK_LWIN, VK_RIGHT, VK_RSHIFT,
-        VK_RWIN, VK_SHIFT, VK_UP, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
+        CallNextHookEx, KBDLLHOOKSTRUCT, VK_DOWN, VK_LEFT, VK_LWIN, VK_RIGHT, VK_RWIN, VK_UP,
+        WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
     };
 
     let pass_through = || CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam);
@@ -779,8 +782,6 @@ unsafe extern "system" fn snap_hotkey_hook(code: i32, wparam: WPARAM, lparam: LP
     let key = (*(lparam as *const KBDLLHOOKSTRUCT)).vkCode;
     if key == VK_LWIN as u32 || key == VK_RWIN as u32 {
         WIN_KEY_DOWN.store(pressed, Ordering::SeqCst);
-    } else if key == VK_SHIFT as u32 || key == VK_LSHIFT as u32 || key == VK_RSHIFT as u32 {
-        SHIFT_KEY_DOWN.store(pressed, Ordering::SeqCst);
     }
 
     if !pressed {
@@ -802,11 +803,7 @@ unsafe extern "system" fn snap_hotkey_hook(code: i32, wparam: WPARAM, lparam: LP
     let win_held = WIN_KEY_DOWN.load(Ordering::SeqCst)
         || key_is_down(VK_LWIN as i32)
         || key_is_down(VK_RWIN as i32);
-    let shift_held = SHIFT_KEY_DOWN.load(Ordering::SeqCst)
-        || key_is_down(VK_SHIFT as i32)
-        || key_is_down(VK_LSHIFT as i32)
-        || key_is_down(VK_RSHIFT as i32);
-    if !win_held || shift_held || !keyboard_belongs_to_app() {
+    if !win_held || !keyboard_belongs_to_app() {
         return pass_through();
     }
 
