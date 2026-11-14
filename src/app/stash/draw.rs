@@ -503,10 +503,13 @@ impl ImageViewer {
                     }
                 });
             }
-            // The scroll extent is stated rather than grown row by row: it must not change with
-            // how many rows happen to be built this frame, or the scrollbar would jitter while
-            // scrolling.
-            ui.set_min_height(total_rows as f32 * row_stride - gap);
+            // The rows that were skipped below are reserved as one block of empty space, so the
+            // scroll extent is the whole grid no matter which rows are built this frame. The
+            // trailing gap is included because the last built row does not add one. Setting the
+            // height instead would do: egui measures a min rect from the content origin, so it
+            // added the skipped rows a second time and the scrollbar thumb stopped halfway down
+            // while the grid had already reached its end.
+            ui.add_space((total_rows - last_row) as f32 * row_stride + gap);
         });
 
         if let Some(band) = self.stash.selection_box {

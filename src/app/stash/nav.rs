@@ -2,9 +2,10 @@
 //!
 //! Left/Right walk the flat order, Up/Down jump one row at a time, Page Up/Page Down jump one
 //! visible screen, Home/End go to the first and last file, Enter opens the selection in the
-//! viewer and Delete drops it from the stash. Ctrl+A selects every visible file; Ctrl+Shift+A
-//! clears the selection (Esc belongs to the menu and the window, and Ctrl+D is a text-field
-//! shortcut elsewhere in the app).
+//! viewer, Delete drops it from the stash, and Shift+Delete deletes the files themselves through
+//! the usual confirmation (they go to the Recycle Bin). Ctrl+C / Ctrl+X put the selection on the
+//! clipboard. Ctrl+A selects every visible file; Ctrl+Shift+A clears the selection (Esc belongs to
+//! the menu and the window, and Ctrl+D is a text-field shortcut elsewhere in the app).
 
 #![allow(unused_imports)]
 
@@ -53,6 +54,9 @@ impl ImageViewer {
         let mut remove_selected = false;
         let mut select_all = false;
         let mut deselect_all = false;
+        let mut copy_selected = false;
+        let mut cut_selected = false;
+        let mut delete_to_recycle = false;
         ctx.input(|input| {
             // Shift wins: Ctrl+Shift+A clears, Ctrl+A selects.
             if input.key_pressed(egui::Key::A) && (input.modifiers.command || input.modifiers.ctrl)
@@ -98,8 +102,21 @@ impl ImageViewer {
             if input.key_pressed(egui::Key::Enter) {
                 open_selected = true;
             }
+            let shortcut_mod = input.modifiers.command || input.modifiers.ctrl;
+            if shortcut_mod && input.key_pressed(egui::Key::C) {
+                copy_selected = true;
+            }
+            if shortcut_mod && input.key_pressed(egui::Key::X) {
+                cut_selected = true;
+            }
+            // Plain Delete empties the stash entry; Shift+Delete is the destructive one and goes
+            // through the same confirmation dialog the viewer uses.
             if input.key_pressed(egui::Key::Delete) {
-                remove_selected = true;
+                if input.modifiers.shift {
+                    delete_to_recycle = true;
+                } else {
+                    remove_selected = true;
+                }
             }
         });
 
@@ -110,6 +127,28 @@ impl ImageViewer {
 
         if deselect_all {
             self.stash_clear_selection();
+            return;
+        }
+
+        if copy_selected || cut_selected {
+            let paths = self.stash_selected_paths();
+            if paths.is_empty() {
+                return;
+            }
+            let operation = if copy_selected {
+                FileClipboardOperation::Copy
+            } else {
+                FileClipboardOperation::Cut
+            };
+            self.apply_clipboard_operation_to_paths(paths, operation);
+            return;
+        }
+
+        if delete_to_recycle {
+            let paths = self.stash_selected_paths();
+            if !paths.is_empty() {
+                self.request_delete_for_paths(paths);
+            }
             return;
         }
 
