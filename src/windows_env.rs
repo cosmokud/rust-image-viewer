@@ -534,7 +534,10 @@ unsafe extern "system" fn scale_change_wndproc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    use winapi::um::winuser::{CallWindowProcW, WM_DPICHANGED, WM_GETMINMAXINFO};
+    use winapi::um::winuser::{
+        CallWindowProcW, SC_MAXIMIZE, SC_MINIMIZE, WM_DPICHANGED, WM_GETMINMAXINFO, WM_SYSCOMMAND,
+        WM_WINDOWPOSCHANGING,
+    };
 
     let previous = PREVIOUS_WNDPROC.load(Ordering::SeqCst);
     if previous == 0 {
@@ -546,6 +549,28 @@ unsafe extern "system" fn scale_change_wndproc(
         let result = CallWindowProcW(previous, hwnd, msg, wparam, lparam);
         override_maximize_target(hwnd, lparam);
         return result;
+    }
+
+    // `Win`+arrow is not a command the window sees as a key: the shell has already decided to
+    // snap, maximise or minimise it, and those replace the rectangle the app laid its media out
+    // for. A window position change while one of the `Win` keys is physically down is that chord
+    // (a drag or a resize by hand has no `Win` held), so it is refused here. `Win`+`Shift`+arrow
+    // carries the window to the other display instead: the target lies on another display, which
+    // is let through, since that crossing's size is the OS's to choose.
+    if msg == WM_WINDOWPOSCHANGING {
+        if win_arrow_resize(hwnd, lparam) {
+            return 0;
+        }
+        return CallWindowProcW(previous, hwnd, msg, wparam, lparam);
+    }
+
+    if msg == WM_SYSCOMMAND {
+        let command = wparam & 0xFFF0;
+        if (command == SC_MAXIMIZE as WPARAM || command == SC_MINIMIZE as WPARAM) && win_key_down()
+        {
+            return 0;
+        }
+        return CallWindowProcW(previous, hwnd, msg, wparam, lparam);
     }
 
     if msg != WM_DPICHANGED {
@@ -563,6 +588,14 @@ unsafe extern "system" fn scale_change_wndproc(
     let (Some(before), Some(after)) = (before, window_rect(hwnd)) else {
         return result;
     };
+
+    // A window that the OS has just carried to another display is not being rescaled in place:
+    // keeping its pixels there leaves it half the size on a 200% display, and the position clamp
+    // below then pulls it inside the display it was leaving, so it never arrives. Those crossings
+    // are the OS's to size; only a scale change on the same display is restored here.
+    if display_bounds(before) != display_bounds(after) {
+        return result;
+    }
 
     let (width, height) = (before.right - before.left, before.bottom - before.top);
     if width <= 0 || height <= 0 {
@@ -598,100 +631,63 @@ unsafe extern "system" fn scale_change_wndproc(
     result
 }
 
+/// True while one of the `Win` keys is physically down.
+fn win_key_down() -> bool {
+    use winapi::um::winuser::{GetAsyncKeyState, VK_LWIN, VK_RWIN};
+
+    unsafe {
+        (GetAsyncKeyState(VK_LWIN as i32) as u16 & 0x8000) != 0
+            || (GetAsyncKeyState(VK_RWIN as i32) as u16 & 0x8000) != 0
+    }
+}
+
+/// True when the pending position change is the shell resizing the window in place on `Win`+arrow.
+fn win_arrow_resize(hwnd: HWND, lparam: LPARAM) -> bool {
+    use winapi::um::winuser::{SWP_NOSIZE, WINDOWPOS};
+
+    if lparam == 0 || !win_key_down() {
+        return false;
+    }
+    let proposed = unsafe { &*(lparam as *const WINDOWPOS) };
+    if proposed.flags & SWP_NOSIZE != 0 {
+        return false;
+    }
+    let Some(current) = window_rect(hwnd) else {
+        return false;
+    };
+    let target = RECT {
+        left: proposed.x,
+        top: proposed.y,
+        right: proposed.x + proposed.cx,
+        bottom: proposed.y + proposed.cy,
+    };
+
+    // A window being carried onto another display is the one resize the chords may still do.
+    match (display_bounds(current), display_bounds(target)) {
+        (Some(current), Some(target)) => current == target,
+        // No display to compare: leave the change alone rather than freeze the window.
+        _ => false,
+    }
+}
+
+/// The display rectangle a window belongs to, by the display under its centre.
+fn display_bounds(rect: RECT) -> Option<(i32, i32, i32, i32)> {
+    let display = monitor_info_at(
+        rect.left + (rect.right - rect.left) / 2,
+        rect.top + (rect.bottom - rect.top) / 2,
+    )?;
+    Some((
+        display.monitor.left,
+        display.monitor.top,
+        display.monitor.right,
+        display.monitor.bottom,
+    ))
+}
+
 unsafe fn def_proc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     use winapi::um::winuser::DefWindowProcW;
 
     DefWindowProcW(hwnd, msg, wparam, lparam)
-}
-
-static SNAP_HOTKEY_MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
-static SNAP_HOTKEY_HOOK: AtomicIsize = AtomicIsize::new(0);
-
-/// Keeps Windows from resizing the app's window with `Win`+`arrow`.
-///
-/// `Win`+`Left`/`Right`/`Up`/`Down` never reach the window: the shell snaps it to half the
-/// display, maximises or minimises it before the window procedure is asked anything, so the app
-/// cannot refuse from inside. A low-level keyboard hook sees the chord first and swallows exactly
-/// those four while one of the app's own windows has the keyboard, leaving the window's layout
-/// alone. `Win`+`Shift`+`Left`/`Right` only moves the window to the other display and is passed
-/// through untouched, and everywhere else on the desktop the chords keep their normal meaning.
-pub fn install_snap_hotkey_guard(hwnd: HWND) {
-    use winapi::um::winuser::{SetWindowsHookExW, WH_KEYBOARD_LL};
-
-    if hwnd.is_null() {
-        return;
-    }
-    SNAP_HOTKEY_MAIN_HWND.store(hwnd as isize, Ordering::SeqCst);
-    if SNAP_HOTKEY_HOOK.load(Ordering::SeqCst) != 0 {
-        return;
-    }
-
-    // The hook is delivered on the thread that installs it, which is the one running the window
-    // loop; `thread_id` 0 makes it see the keys of the whole desktop.
-    unsafe {
-        let hook = SetWindowsHookExW(
-            WH_KEYBOARD_LL,
-            Some(snap_hotkey_hook),
-            std::ptr::null_mut(),
-            0,
-        );
-        if !hook.is_null() {
-            SNAP_HOTKEY_HOOK.store(hook as isize, Ordering::SeqCst);
-        }
-    }
-}
-
-/// Swallows `Win`+`arrow` while one of the app's windows is in front; returns 1 for those and
-/// passes everything else down the hook chain.
-unsafe extern "system" fn snap_hotkey_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    use winapi::um::winuser::{
-        CallNextHookEx, GetAsyncKeyState, GetForegroundWindow, GetWindowThreadProcessId,
-        KBDLLHOOKSTRUCT, VK_DOWN, VK_LEFT, VK_LWIN, VK_RIGHT, VK_RWIN, VK_SHIFT, VK_UP, WM_KEYDOWN,
-        WM_SYSKEYDOWN,
-    };
-
-    let pass_through = || CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam);
-    if code < 0 || lparam == 0 {
-        return pass_through();
-    }
-    let message = wparam as u32;
-    if message != WM_KEYDOWN && message != WM_SYSKEYDOWN {
-        return pass_through();
-    }
-
-    let key = (*(lparam as *const KBDLLHOOKSTRUCT)).vkCode;
-    if ![
-        VK_LEFT as u32,
-        VK_RIGHT as u32,
-        VK_UP as u32,
-        VK_DOWN as u32,
-    ]
-    .contains(&key)
-    {
-        return pass_through();
-    }
-
-    let down = |virtual_key: i32| (GetAsyncKeyState(virtual_key) as u16 & 0x8000) != 0;
-    // `Win`+`Shift`+arrow moves the window between displays: that one is wanted.
-    if !(down(VK_LWIN as i32) || down(VK_RWIN as i32)) || down(VK_SHIFT as i32) {
-        return pass_through();
-    }
-
-    // Only for the app's own windows: the chords keep working everywhere else.
-    let foreground = GetForegroundWindow();
-    let main = SNAP_HOTKEY_MAIN_HWND.load(Ordering::SeqCst) as HWND;
-    if foreground.is_null() || main.is_null() {
-        return pass_through();
-    }
-    let mut foreground_process = 0u32;
-    let mut main_process = 0u32;
-    GetWindowThreadProcessId(foreground, &mut foreground_process);
-    GetWindowThreadProcessId(main, &mut main_process);
-    if foreground_process == 0 || foreground_process != main_process {
-        return pass_through();
-    }
-
-    1
 }
 
 /// Rewrites only the maximize fields of a `WM_GETMINMAXINFO` answer.

@@ -244,11 +244,6 @@ impl ImageViewer {
                     crate::windows_env::install_scale_change_guard(
                         hwnd as winapi::shared::windef::HWND,
                     );
-                    // `Win`+arrow resizes the window outside the app's control; the viewer's own
-                    // layout is laid out for the rectangle it chose.
-                    crate::windows_env::install_snap_hotkey_guard(
-                        hwnd as winapi::shared::windef::HWND,
-                    );
                 }
             }
         }
