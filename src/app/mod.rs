@@ -319,6 +319,12 @@ pub(crate) struct ImageViewer {
     pub(crate) breadcrumb_back_history_popup_hover_deadline: Option<Instant>,
     /// Path whose breadcrumb separator currently owns the child-folder popup.
     pub(crate) breadcrumb_child_popup_path: Option<PathBuf>,
+    /// Whether the breadcrumb bar is currently an editable path field.
+    pub(crate) breadcrumb_edit_active: bool,
+    /// Text held by the editable path field.
+    pub(crate) breadcrumb_edit_text: String,
+    /// One-shot focus (with everything selected) for the path field, set when editing starts.
+    pub(crate) breadcrumb_edit_focus_requested: bool,
     /// Time when controls were last shown
     pub(crate) controls_show_time: Instant,
     /// Error message to display
@@ -1056,6 +1062,9 @@ impl Default for ImageViewer {
             folder_navigation_history_index: None,
             breadcrumb_back_history_popup_hover_deadline: None,
             breadcrumb_child_popup_path: None,
+            breadcrumb_edit_active: false,
+            breadcrumb_edit_text: String::new(),
+            breadcrumb_edit_focus_requested: false,
             controls_show_time: Instant::now(),
             error_message: None,
             image_changed: false,

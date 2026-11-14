@@ -56,6 +56,50 @@ impl ImageViewer {
         true
     }
 
+    /// Open whatever the address field was given. A directory loads in the current mode;
+    /// a file opens alone in solo fullscreen with its folder loaded for the strip modes.
+    pub(crate) fn open_breadcrumb_address_path(&mut self, raw: &str) {
+        let mut text = raw.trim().to_string();
+        if text.len() >= 2 && text.starts_with('"') && text.ends_with('"') {
+            text = text[1..text.len() - 1].to_string();
+        }
+        if text.is_empty() {
+            return;
+        }
+
+        let path = PathBuf::from(&text);
+        if path.is_dir() {
+            self.navigate_to_breadcrumb_directory(path.as_path());
+            return;
+        }
+        if !path.exists() {
+            self.error_message = Some(format!("Path does not exist: {}", path.display()));
+            return;
+        }
+
+        if let Some(directory) = path.parent().map(Path::to_path_buf) {
+            self.navigate_to_breadcrumb_directory(directory.as_path());
+        }
+
+        let index = self
+            .image_list
+            .iter()
+            .position(|candidate| candidate == &path);
+        if self.mode().is_strip() {
+            if let Some(index) = index {
+                self.open_strip_item_in_solo_fullscreen(index, false);
+                return;
+            }
+        } else if let Some(index) = index {
+            self.set_current_index_clamped(index);
+        }
+
+        self.load_media(&path);
+        if !self.mode().is_fullscreen() {
+            self.toggle_fullscreen = true;
+        }
+    }
+
     pub(crate) fn build_folder_placeholder_image(path: PathBuf, is_up_entry: bool) -> LoadedImage {
         const SIZE: usize = 512;
 

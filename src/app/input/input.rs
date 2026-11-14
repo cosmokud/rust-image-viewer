@@ -41,13 +41,19 @@ impl ImageViewer {
         if self.controls_show_time.elapsed().as_secs_f32() > self.config.controls_hide_delay {
             if let Some(pos) = mouse_pos {
                 if pos.y >= self.top_controls_hotzone_height() {
-                    // Don't hide while selecting title text.
-                    if !self.title_text_dragging && !title_bar_menu_was_active {
+                    // Don't hide while selecting title text or editing the path.
+                    if !self.title_text_dragging
+                        && !title_bar_menu_was_active
+                        && !self.breadcrumb_edit_active
+                    {
                         self.show_controls = false;
                     }
                 }
             } else {
-                if !self.title_text_dragging && !title_bar_menu_was_active {
+                if !self.title_text_dragging
+                    && !title_bar_menu_was_active
+                    && !self.breadcrumb_edit_active
+                {
                     self.show_controls = false;
                 }
             }
@@ -64,6 +70,8 @@ impl ImageViewer {
         let mut breadcrumb_nav_up_requested = false;
         let mut breadcrumb_ui_hovered = false;
         let mut breadcrumb_popup_active = false;
+        let mut breadcrumb_edit_commit: Option<String> = None;
+        let mut breadcrumb_edit_cancel_requested = false;
 
         // Draw control bar
         let bar_height = Self::TITLE_BAR_HEIGHT;
@@ -637,6 +645,7 @@ impl ImageViewer {
                                 Back,
                                 Forward,
                                 Up,
+                                Edit,
                             }
 
                             let draw_breadcrumb_nav_icon =
@@ -644,68 +653,28 @@ impl ImageViewer {
                                  rect: egui::Rect,
                                  icon: BreadcrumbNavIcon,
                                  stroke_color: egui::Color32| {
-                                    let icon_rect = rect.shrink2(egui::vec2(5.0, 4.0));
-                                    let stroke = egui::Stroke::new(1.7_f32, stroke_color);
-                                    match icon {
-                                        BreadcrumbNavIcon::Back => {
-                                            let left = icon_rect.left() + 1.0;
-                                            let right = icon_rect.right() - 1.0;
-                                            let top = icon_rect.top() + 0.5;
-                                            let mid = icon_rect.center().y;
-                                            let bottom = icon_rect.bottom() - 0.5;
-                                            ui.painter().line_segment(
-                                                [egui::pos2(right, top), egui::pos2(left, mid)],
-                                                stroke,
-                                            );
-                                            ui.painter().line_segment(
-                                                [egui::pos2(right, bottom), egui::pos2(left, mid)],
-                                                stroke,
-                                            );
-                                        }
-                                        BreadcrumbNavIcon::Forward => {
-                                            let left = icon_rect.left() + 1.0;
-                                            let right = icon_rect.right() - 1.0;
-                                            let top = icon_rect.top() + 0.5;
-                                            let mid = icon_rect.center().y;
-                                            let bottom = icon_rect.bottom() - 0.5;
-                                            ui.painter().line_segment(
-                                                [egui::pos2(left, top), egui::pos2(right, mid)],
-                                                stroke,
-                                            );
-                                            ui.painter().line_segment(
-                                                [egui::pos2(left, bottom), egui::pos2(right, mid)],
-                                                stroke,
-                                            );
-                                        }
+                                    let source = match icon {
+                                        BreadcrumbNavIcon::Back => egui::include_image!(
+                                            "../../../assets/lucide/arrow-left.svg"
+                                        ),
+                                        BreadcrumbNavIcon::Forward => egui::include_image!(
+                                            "../../../assets/lucide/arrow-right.svg"
+                                        ),
                                         BreadcrumbNavIcon::Up => {
-                                            let center_x = icon_rect.center().x;
-                                            let top = icon_rect.top() + 0.5;
-                                            let mid = icon_rect.center().y;
-                                            let bottom = icon_rect.bottom() - 0.5;
-                                            ui.painter().line_segment(
-                                                [
-                                                    egui::pos2(center_x, bottom),
-                                                    egui::pos2(center_x, top),
-                                                ],
-                                                stroke,
-                                            );
-                                            let wing = (icon_rect.width() * 0.22).clamp(2.5, 4.5);
-                                            ui.painter().line_segment(
-                                                [
-                                                    egui::pos2(center_x, top),
-                                                    egui::pos2(center_x - wing, mid),
-                                                ],
-                                                stroke,
-                                            );
-                                            ui.painter().line_segment(
-                                                [
-                                                    egui::pos2(center_x, top),
-                                                    egui::pos2(center_x + wing, mid),
-                                                ],
-                                                stroke,
-                                            );
+                                            egui::include_image!(
+                                                "../../../assets/lucide/arrow-up.svg"
+                                            )
                                         }
-                                    }
+                                        BreadcrumbNavIcon::Edit => egui::include_image!(
+                                            "../../../assets/lucide/square-pen.svg"
+                                        ),
+                                    };
+                                    Self::paint_lucide_icon(
+                                        ui,
+                                        rect.shrink2(egui::vec2(5.0, 4.0)),
+                                        source,
+                                        stroke_color,
+                                    );
                                 };
 
                             let breadcrumb_nav_icon_button =
@@ -734,7 +703,8 @@ impl ImageViewer {
                                     response
                                 };
 
-                            let can_go_back = self.folder_navigation_can_go_back();
+                            let can_go_back = self.folder_navigation_can_go_back()
+                                && !self.breadcrumb_edit_active;
                             let back_response = breadcrumb_nav_icon_button(
                                 ui,
                                 BreadcrumbNavIcon::Back,
@@ -840,7 +810,8 @@ impl ImageViewer {
                                 self.breadcrumb_back_history_popup_hover_deadline = None;
                             }
 
-                            let can_go_forward = self.folder_navigation_can_go_forward();
+                            let can_go_forward = self.folder_navigation_can_go_forward()
+                                && !self.breadcrumb_edit_active;
                             let forward_response = breadcrumb_nav_icon_button(
                                 ui,
                                 BreadcrumbNavIcon::Forward,
@@ -854,6 +825,31 @@ impl ImageViewer {
                                 breadcrumb_nav_forward_requested = true;
                             }
 
+                            let editing_path = self.breadcrumb_edit_active;
+
+                            // Edit sits left of Up: it turns the breadcrumb trail into a path field.
+                            let edit_response = breadcrumb_nav_icon_button(
+                                ui,
+                                BreadcrumbNavIcon::Edit,
+                                true,
+                                "Enter a folder or file path",
+                            );
+                            if edit_response.contains_pointer() {
+                                breadcrumb_ui_hovered = true;
+                            }
+                            if edit_response.clicked() {
+                                self.breadcrumb_edit_active = !editing_path;
+                                if self.breadcrumb_edit_active {
+                                    self.breadcrumb_edit_text = self
+                                        .current_breadcrumb_directory()
+                                        .map(|directory| directory.display().to_string())
+                                        .unwrap_or_default();
+                                    self.breadcrumb_edit_focus_requested = true;
+                                } else {
+                                    self.breadcrumb_edit_text.clear();
+                                }
+                            }
+
                             let can_go_up = self
                                 .current_breadcrumb_directory()
                                 .and_then(|directory| directory.parent().map(Path::to_path_buf))
@@ -861,7 +857,7 @@ impl ImageViewer {
                             let up_response = breadcrumb_nav_icon_button(
                                 ui,
                                 BreadcrumbNavIcon::Up,
-                                can_go_up,
+                                can_go_up && !editing_path,
                                 "Up one folder",
                             );
                             if up_response.contains_pointer() {
@@ -872,6 +868,52 @@ impl ImageViewer {
                             }
 
                             ui.add_space(8.0);
+
+                            if self.breadcrumb_edit_active {
+                                breadcrumb_ui_hovered = true;
+                                let field_response = ui.add_sized(
+                                    egui::vec2(ui.available_width().max(120.0), 22.0),
+                                    egui::TextEdit::singleline(&mut self.breadcrumb_edit_text)
+                                        .hint_text("Paste a folder or file path"),
+                                );
+
+                                if self.breadcrumb_edit_focus_requested {
+                                    self.breadcrumb_edit_focus_requested = false;
+                                    field_response.request_focus();
+                                    // Select the whole path so a paste replaces it.
+                                    let id = field_response.id;
+                                    let end = self.breadcrumb_edit_text.chars().count();
+                                    if let Some(mut state) =
+                                        egui::widgets::text_edit::TextEditState::load(ui.ctx(), id)
+                                    {
+                                        state.cursor.set_char_range(Some(
+                                            egui::text_selection::CCursorRange::two(
+                                                egui::text::CCursor::new(0),
+                                                egui::text::CCursor::new(end),
+                                            ),
+                                        ));
+                                        state.store(ui.ctx(), id);
+                                    }
+                                }
+
+                                let enter_pressed =
+                                    ui.input(|input| input.key_pressed(egui::Key::Enter));
+                                let escape_pressed =
+                                    ui.input(|input| input.key_pressed(egui::Key::Escape));
+
+                                if escape_pressed && field_response.has_focus() {
+                                    breadcrumb_edit_cancel_requested = true;
+                                } else if enter_pressed
+                                    && (field_response.has_focus() || field_response.lost_focus())
+                                {
+                                    breadcrumb_edit_commit =
+                                        Some(self.breadcrumb_edit_text.clone());
+                                } else if field_response.lost_focus() {
+                                    breadcrumb_edit_cancel_requested = true;
+                                }
+
+                                return;
+                            }
 
                             let Some(current_path) = self.current_media_path() else {
                                 ui.label(
@@ -920,14 +962,27 @@ impl ImageViewer {
                                     egui::Frame::popup(ui.style()).total_margin().sum().x;
                                 let arrow_anchor_min_width = (popup_frame_margin_x + 1.0).max(18.0);
                                 let arrow_response = ui.add(
-                                    egui::Button::new(
-                                        egui::RichText::new(">")
-                                            .color(egui::Color32::from_gray(150)),
-                                    )
-                                    // popup_below_widget derives popup width from the anchor width.
-                                    // Keep this wider than popup frame margins to avoid negative widths.
-                                    .min_size(egui::vec2(arrow_anchor_min_width, 18.0))
-                                    .frame(false),
+                                    egui::Button::new("")
+                                        // popup_below_widget derives popup width from the anchor width.
+                                        // Keep this wider than popup frame margins to avoid negative widths.
+                                        .min_size(egui::vec2(arrow_anchor_min_width, 18.0))
+                                        .frame(false),
+                                );
+                                let chevron_color = if arrow_response.hovered() {
+                                    egui::Color32::WHITE
+                                } else {
+                                    egui::Color32::from_gray(150)
+                                };
+                                Self::paint_lucide_icon(
+                                    ui,
+                                    egui::Rect::from_center_size(
+                                        arrow_response.rect.center(),
+                                        egui::vec2(12.0, 12.0),
+                                    ),
+                                    egui::include_image!(
+                                        "../../../assets/lucide/chevron-right.svg"
+                                    ),
+                                    chevron_color,
                                 );
 
                                 if arrow_response.contains_pointer() {
@@ -1048,6 +1103,17 @@ impl ImageViewer {
             self.title_bar_menu_active = true;
             self.show_controls = true;
             self.controls_show_time = Instant::now();
+        }
+
+        if breadcrumb_edit_cancel_requested {
+            self.breadcrumb_edit_active = false;
+            self.breadcrumb_edit_text.clear();
+        }
+
+        if let Some(text) = breadcrumb_edit_commit {
+            self.breadcrumb_edit_active = false;
+            self.breadcrumb_edit_text.clear();
+            self.open_breadcrumb_address_path(text.as_str());
         }
 
         if let Some(target_index) = breadcrumb_nav_back_target_index {

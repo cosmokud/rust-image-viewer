@@ -13,6 +13,12 @@ impl ImageViewer {
             return;
         }
 
+        // The address field owns the keyboard while it is being edited.
+        if self.breadcrumb_edit_active {
+            self.paste_shortcut_ctrl_v_was_down = windows_ctrl_v_shortcut_down();
+            return;
+        }
+
         if self.try_handle_global_marked_file_shortcuts(ctx) {
             return;
         }
