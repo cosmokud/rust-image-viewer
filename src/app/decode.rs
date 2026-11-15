@@ -256,6 +256,12 @@ impl ImageViewer {
                     crate::windows_env::install_minimize_hotkey(
                         hwnd as winapi::shared::windef::HWND,
                     );
+                    // The chords are reserved for the app as well: the OS sends them here instead
+                    // of to the shell, so no snap and no animation can start in the first place.
+                    crate::windows_env::reserve_snap_hotkeys(
+                        hwnd as winapi::shared::windef::HWND,
+                        true,
+                    );
                 }
             }
         }

@@ -544,8 +544,8 @@ unsafe extern "system" fn scale_change_wndproc(
     lparam: LPARAM,
 ) -> LRESULT {
     use winapi::um::winuser::{
-        CallWindowProcW, SC_MAXIMIZE, WM_DPICHANGED, WM_GETMINMAXINFO, WM_HOTKEY, WM_MOVE, WM_SIZE,
-        WM_SYSCOMMAND, WM_WINDOWPOSCHANGING,
+        CallWindowProcW, SC_MAXIMIZE, WA_INACTIVE, WM_ACTIVATE, WM_DPICHANGED, WM_GETMINMAXINFO,
+        WM_HOTKEY, WM_MOVE, WM_SIZE, WM_SYSCOMMAND, WM_WINDOWPOSCHANGING,
     };
 
     let previous = PREVIOUS_WNDPROC.load(Ordering::SeqCst);
@@ -583,13 +583,22 @@ unsafe extern "system" fn scale_change_wndproc(
         return CallWindowProcW(previous, hwnd, msg, wparam, lparam);
     }
 
-    // `Win`+`Down` arrives here instead of at the shell, because the shell only minimises windows
-    // that carry a sizing border and this one does not.
+    // The reserved chords arrive here instead of at the shell, and the point is that nothing
+    // happens: a snap that never starts cannot animate. `Win`+`Down` is carried out by hand.
     if msg == WM_HOTKEY {
-        if wparam as i32 == MINIMIZE_HOTKEY_ID {
+        let id = wparam as i32;
+        if id == MINIMIZE_HOTKEY_ID {
             minimize_foreground(hwnd);
             return 0;
         }
+        if id == SNAP_HOTKEY_LEFT || id == SNAP_HOTKEY_RIGHT || id == SNAP_HOTKEY_UP {
+            return 0;
+        }
+        return CallWindowProcW(previous, hwnd, msg, wparam, lparam);
+    }
+
+    if msg == WM_ACTIVATE {
+        reserve_snap_hotkeys(hwnd, wparam & 0xFFFF != WA_INACTIVE as WPARAM);
         return CallWindowProcW(previous, hwnd, msg, wparam, lparam);
     }
 
@@ -758,6 +767,39 @@ unsafe fn def_proc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) -> LRE
 }
 
 const MINIMIZE_HOTKEY_ID: i32 = 0x5249;
+const SNAP_HOTKEY_LEFT: i32 = 0x524A;
+const SNAP_HOTKEY_RIGHT: i32 = 0x524B;
+const SNAP_HOTKEY_UP: i32 = 0x524C;
+
+/// Takes `Win`+`Left`/`Right`/`Up` away from the shell while the viewer has the keyboard.
+///
+/// A registered hot key is dispatched to its own window instead of to the shell, so the chord never
+/// reaches the code that starts a snap, and with no snap there is no animation to sit through. It
+/// is reserved only while one of the app's windows is active: everywhere else the chords keep their
+/// normal meaning. Registration is refused when another process already owns a combination, so the
+/// keyboard hook and the window-procedure refusals stay in place as the other layers.
+pub fn reserve_snap_hotkeys(hwnd: HWND, reserved: bool) {
+    use winapi::um::winuser::{
+        RegisterHotKey, UnregisterHotKey, MOD_NOREPEAT, MOD_WIN, VK_LEFT, VK_RIGHT, VK_UP,
+    };
+
+    if hwnd.is_null() {
+        return;
+    }
+    for (id, key) in [
+        (SNAP_HOTKEY_LEFT, VK_LEFT),
+        (SNAP_HOTKEY_RIGHT, VK_RIGHT),
+        (SNAP_HOTKEY_UP, VK_UP),
+    ] {
+        unsafe {
+            if reserved {
+                RegisterHotKey(hwnd, id, (MOD_WIN | MOD_NOREPEAT) as u32, key as u32);
+            } else {
+                UnregisterHotKey(hwnd, id);
+            }
+        }
+    }
+}
 
 /// Takes the sizing border off the main window, which is what lets the shell rearrange it.
 ///
