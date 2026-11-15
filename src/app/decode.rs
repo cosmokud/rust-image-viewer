@@ -245,23 +245,13 @@ impl ImageViewer {
                         hwnd as winapi::shared::windef::HWND,
                     );
                     // `Win`+arrow moves or resizes the window outside the app's control, and the
-                    // viewer's layout is laid out for the rectangle the app chose. The sizing
-                    // border goes first: it is what the shell needs in order to snap, so without it
-                    // the chord cannot even start. Then the keyboard guard, and the `Win`+`Down`
-                    // minimise the border takes away.
-                    crate::windows_env::make_main_window_unsnappable(
+                    // viewer's layout is laid out for the rectangle the app chose. The compositor's
+                    // transitions go first: the shell can start a snap before any message or hook
+                    // sees the chord, and the animation it plays is what would be left to watch.
+                    crate::windows_env::disable_window_transitions(
                         hwnd as winapi::shared::windef::HWND,
                     );
                     crate::windows_env::install_snap_hotkey_guard();
-                    crate::windows_env::install_minimize_hotkey(
-                        hwnd as winapi::shared::windef::HWND,
-                    );
-                    // The chords are reserved for the app as well: the OS sends them here instead
-                    // of to the shell, so no snap and no animation can start in the first place.
-                    crate::windows_env::reserve_snap_hotkeys(
-                        hwnd as winapi::shared::windef::HWND,
-                        true,
-                    );
                 }
             }
         }

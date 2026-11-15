@@ -544,8 +544,8 @@ unsafe extern "system" fn scale_change_wndproc(
     lparam: LPARAM,
 ) -> LRESULT {
     use winapi::um::winuser::{
-        CallWindowProcW, SC_MAXIMIZE, WA_INACTIVE, WM_ACTIVATE, WM_DPICHANGED, WM_GETMINMAXINFO,
-        WM_HOTKEY, WM_MOVE, WM_SIZE, WM_SYSCOMMAND, WM_WINDOWPOSCHANGING,
+        CallWindowProcW, SC_MAXIMIZE, WM_DPICHANGED, WM_GETMINMAXINFO, WM_MOVE, WM_SIZE,
+        WM_SYSCOMMAND, WM_WINDOWPOSCHANGING,
     };
 
     let previous = PREVIOUS_WNDPROC.load(Ordering::SeqCst);
@@ -577,28 +577,13 @@ unsafe extern "system" fn scale_change_wndproc(
     // `Win`+`Down` minimises the window, and that one is wanted: only maximise is refused here.
     if msg == WM_SYSCOMMAND {
         let command = wparam & 0xFFF0;
+        guard_log(&format!(
+            "syscommand cmd=0x{command:x} win={}",
+            win_key_down()
+        ));
         if command == SC_MAXIMIZE as WPARAM && win_key_down() {
             return 0;
         }
-        return CallWindowProcW(previous, hwnd, msg, wparam, lparam);
-    }
-
-    // The reserved chords arrive here instead of at the shell, and the point is that nothing
-    // happens: a snap that never starts cannot animate. `Win`+`Down` is carried out by hand.
-    if msg == WM_HOTKEY {
-        let id = wparam as i32;
-        if id == MINIMIZE_HOTKEY_ID {
-            minimize_foreground(hwnd);
-            return 0;
-        }
-        if id == SNAP_HOTKEY_LEFT || id == SNAP_HOTKEY_RIGHT || id == SNAP_HOTKEY_UP {
-            return 0;
-        }
-        return CallWindowProcW(previous, hwnd, msg, wparam, lparam);
-    }
-
-    if msg == WM_ACTIVATE {
-        reserve_snap_hotkeys(hwnd, wparam & 0xFFFF != WA_INACTIVE as WPARAM);
         return CallWindowProcW(previous, hwnd, msg, wparam, lparam);
     }
 
@@ -709,6 +694,9 @@ fn settle_window_rect(hwnd: HWND) {
         return;
     }
     drop(settled);
+    guard_log(&format!(
+        "revert from={current:?} to=({left}, {top}, {width}, {height})"
+    ));
     REVERT_IN_FLIGHT.store(true, Ordering::SeqCst);
     set_window_rect(hwnd, left, top, width, height);
     REVERT_IN_FLIGHT.store(false, Ordering::SeqCst);
@@ -731,19 +719,26 @@ fn win_key_down() -> bool {
 fn win_held_position_change(hwnd: HWND, lparam: LPARAM) -> bool {
     use winapi::um::winuser::{SWP_NOMOVE, SWP_NOSIZE, WINDOWPOS};
 
-    if lparam == 0 || !win_key_down() || is_window_minimized(hwnd) {
-        return false;
-    }
-    // The guard's own write-back must not be refused by the guard.
-    if REVERT_IN_FLIGHT.load(Ordering::SeqCst) {
+    if lparam == 0 {
         return false;
     }
     let proposed = unsafe { &*(lparam as *const WINDOWPOS) };
+    let win = win_key_down();
+    let minimized = is_window_minimized(hwnd);
+    let moves = proposed.flags & SWP_NOSIZE == 0 || proposed.flags & SWP_NOMOVE == 0;
+    guard_log(&format!(
+        "wpc win={win} min={minimized} moves={moves} x={} y={} cx={} cy={} flags=0x{:x}",
+        proposed.x, proposed.y, proposed.cx, proposed.cy, proposed.flags
+    ));
+    // The guard's own write-back must not be refused by the guard.
+    if !win || minimized || REVERT_IN_FLIGHT.load(Ordering::SeqCst) || !moves {
+        return false;
+    }
     // The iconic position `Win`+`Down` moves the window to: minimising stays allowed.
     if proposed.x <= -32000 || proposed.y <= -32000 {
         return false;
     }
-    proposed.flags & SWP_NOSIZE == 0 || proposed.flags & SWP_NOMOVE == 0
+    true
 }
 
 /// The display rectangle a window belongs to, by the display under its centre.
@@ -766,112 +761,47 @@ unsafe fn def_proc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) -> LRE
     DefWindowProcW(hwnd, msg, wparam, lparam)
 }
 
-const MINIMIZE_HOTKEY_ID: i32 = 0x5249;
-const SNAP_HOTKEY_LEFT: i32 = 0x524A;
-const SNAP_HOTKEY_RIGHT: i32 = 0x524B;
-const SNAP_HOTKEY_UP: i32 = 0x524C;
+/// Temporary: appends one line per event next to the executable, in `win-guard.log`.
+fn guard_log(line: &str) {
+    use std::io::Write;
 
-/// Takes `Win`+`Left`/`Right`/`Up` away from the shell while the viewer has the keyboard.
-///
-/// A registered hot key is dispatched to its own window instead of to the shell, so the chord never
-/// reaches the code that starts a snap, and with no snap there is no animation to sit through. It
-/// is reserved only while one of the app's windows is active: everywhere else the chords keep their
-/// normal meaning. Registration is refused when another process already owns a combination, so the
-/// keyboard hook and the window-procedure refusals stay in place as the other layers.
-pub fn reserve_snap_hotkeys(hwnd: HWND, reserved: bool) {
-    use winapi::um::winuser::{
-        RegisterHotKey, UnregisterHotKey, MOD_NOREPEAT, MOD_WIN, VK_LEFT, VK_RIGHT, VK_UP,
+    let Ok(exe) = std::env::current_exe() else {
+        return;
     };
-
-    if hwnd.is_null() {
+    let Some(dir) = exe.parent() else {
         return;
-    }
-    for (id, key) in [
-        (SNAP_HOTKEY_LEFT, VK_LEFT),
-        (SNAP_HOTKEY_RIGHT, VK_RIGHT),
-        (SNAP_HOTKEY_UP, VK_UP),
-    ] {
-        unsafe {
-            if reserved {
-                RegisterHotKey(hwnd, id, (MOD_WIN | MOD_NOREPEAT) as u32, key as u32);
-            } else {
-                UnregisterHotKey(hwnd, id);
-            }
-        }
-    }
-}
-
-/// Takes the sizing border off the main window, which is what lets the shell rearrange it.
-///
-/// `Win`+`Left`/`Right` snapping, the animation that goes with it, `Win`+`Down` and de-maximising
-/// all need `WS_THICKFRAME` on the window. The shell starts that snap on its own, before the window
-/// procedure is asked anything and before a keyboard hook sees the arrow, so nothing the app does
-/// inside the window can stop it: a window with no sizing border simply has nothing to snap, and
-/// the chord cannot start the animation at all. The border is invisible here — the window is
-/// undecorated and the app writes its own rectangles — and `WS_MAXIMIZEBOX` is kept, so the app's
-/// own maximise still works.
-pub fn make_main_window_unsnappable(hwnd: HWND) {
-    use winapi::um::winuser::{
-        GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWL_STYLE, SWP_FRAMECHANGED,
-        SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WS_THICKFRAME,
     };
-
-    if hwnd.is_null() {
-        return;
-    }
-    unsafe {
-        let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
-        if style & WS_THICKFRAME as isize == 0 {
-            return;
-        }
-        SetWindowLongPtrW(hwnd, GWL_STYLE, style & !(WS_THICKFRAME as isize));
-        SetWindowPos(
-            hwnd,
-            std::ptr::null_mut(),
-            0,
-            0,
-            0,
-            0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
-        );
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("win-guard.log"))
+    {
+        let _ = writeln!(file, "{line}");
     }
 }
 
-/// Gives `Win`+`Down` back the minimise it lost with the sizing border.
+/// Turns off the compositor's transitions for the window.
 ///
-/// The shell will not minimise a window that has no sizing border, so the chord is taken as this
-/// process's hot key and the window procedure minimises whatever is in front: the viewer when it
-/// has the keyboard, and the window that has it otherwise, which keeps the chord meaning the same
-/// thing everywhere.
-pub fn install_minimize_hotkey(hwnd: HWND) {
-    use winapi::um::winuser::{RegisterHotKey, MOD_NOREPEAT, MOD_WIN, VK_DOWN};
+/// Windows animates the move it makes for a snap, and that animation is played by DWM even when the
+/// window's rectangle is put back a moment later: it is what is left to see once the window itself
+/// refuses the change. A window with transitions disabled is moved without the animation, so a
+/// change that is undone draws nothing.
+pub fn disable_window_transitions(hwnd: HWND) {
+    use winapi::um::dwmapi::{DwmSetWindowAttribute, DWMWA_TRANSITIONS_FORCEDISABLED};
 
     if hwnd.is_null() {
         return;
     }
-    unsafe {
-        RegisterHotKey(
+    let disabled: i32 = 1;
+    let result = unsafe {
+        DwmSetWindowAttribute(
             hwnd,
-            MINIMIZE_HOTKEY_ID,
-            (MOD_WIN | MOD_NOREPEAT) as u32,
-            VK_DOWN as u32,
-        );
-    }
-}
-
-fn minimize_foreground(own: HWND) {
-    use winapi::um::winuser::{GetForegroundWindow, ShowWindow, SW_MINIMIZE};
-
-    unsafe {
-        let target = if keyboard_belongs_to_app() {
-            own
-        } else {
-            GetForegroundWindow()
-        };
-        if !target.is_null() {
-            ShowWindow(target, SW_MINIMIZE);
-        }
-    }
+            DWMWA_TRANSITIONS_FORCEDISABLED as u32,
+            &disabled as *const i32 as *const _,
+            std::mem::size_of::<i32>() as u32,
+        )
+    };
+    guard_log(&format!("transitions hr=0x{result:x}"));
 }
 
 static SNAP_HOTKEY_INSTALLED: AtomicBool = AtomicBool::new(false);
@@ -937,7 +867,13 @@ unsafe fn install_snap_hotkey_hook() -> bool {
     // A global hook also needs the module its procedure lives in: with a null one the call fails
     // and nothing is hooked. `thread_id` 0 makes it see the keys of the whole desktop.
     let module = GetModuleHandleW(std::ptr::null());
-    !SetWindowsHookExW(WH_KEYBOARD_LL, Some(snap_hotkey_hook), module, 0).is_null()
+    let hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(snap_hotkey_hook), module, 0);
+    guard_log(&format!(
+        "hook install ok={} err={}",
+        !hook.is_null(),
+        winapi::um::errhandlingapi::GetLastError()
+    ));
+    !hook.is_null()
 }
 
 unsafe fn snap_hotkey_hook_thread(installed: std::sync::mpsc::Sender<bool>) {
@@ -982,8 +918,8 @@ fn keyboard_belongs_to_app() -> bool {
 /// Stops every `Win`+`Left`/`Right`/`Up`, `Shift` or not; `Win`+`Down` and the rest go through.
 unsafe extern "system" fn snap_hotkey_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     use winapi::um::winuser::{
-        CallNextHookEx, GetForegroundWindow, KBDLLHOOKSTRUCT, VK_DOWN, VK_LEFT, VK_LWIN, VK_RIGHT,
-        VK_RWIN, VK_UP, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
+        CallNextHookEx, KBDLLHOOKSTRUCT, VK_LEFT, VK_LWIN, VK_RIGHT, VK_RWIN, VK_UP, WM_KEYDOWN,
+        WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
     };
 
     let pass_through = || CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam);
@@ -1013,16 +949,12 @@ unsafe extern "system" fn snap_hotkey_hook(code: i32, wparam: WPARAM, lparam: LP
     let win_held = WIN_KEY_DOWN.load(Ordering::SeqCst)
         || key_is_down(VK_LWIN as i32)
         || key_is_down(VK_RWIN as i32);
-    if !win_held || !keyboard_belongs_to_app() {
+    let app = keyboard_belongs_to_app();
+    guard_log(&format!(
+        "key vk={key} msg={message} win={win_held} app={app}"
+    ));
+    if !win_held || !app {
         return pass_through();
-    }
-
-    // `Win`+`Down` only minimises, which is wanted: it is done here so the chord still works if
-    // the hot key registration for it was refused, and the hot key covers the case where the hook
-    // is the thing that was refused.
-    if key == VK_DOWN as u32 {
-        minimize_foreground(GetForegroundWindow());
-        return 1;
     }
 
     // Non-zero stops the chord here: the shell never sees it.
