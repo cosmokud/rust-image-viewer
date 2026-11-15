@@ -591,6 +591,99 @@ pub fn chord_carried_recently(within_ms: u64) -> bool {
 /// True once this proc has carried the chord of the key press still in flight.
 static CHORD_MOVED_ON_PRESS: AtomicBool = AtomicBool::new(false);
 
+/// The rectangle the chord in flight began on, read by the window procedure.
+///
+/// The shell writes its own placement mid-press, and that placement is redirected before it is
+/// applied; the display to redirect to is the one next to where the chord began, so the placement
+/// has to be measured against that rectangle and not against the live one — which the redirect
+/// itself is changing.
+static CHORD_ANCHOR: std::sync::Mutex<Option<crate::window_geometry::Rect>> =
+    std::sync::Mutex::new(None);
+
+fn set_chord_anchor(anchor: Option<crate::window_geometry::Rect>) {
+    let mut slot = CHORD_ANCHOR
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *slot = anchor;
+}
+
+fn chord_anchor() -> Option<crate::window_geometry::Rect> {
+    *CHORD_ANCHOR
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The position the window belongs at after a chord from `from` towards `direction`.
+fn neighbour_position(from: crate::window_geometry::Rect, direction: i32) -> Option<(i32, i32)> {
+    let monitors = monitor_rects();
+    let current = crate::window_geometry::display_for_window_centre(from)?.monitor;
+    crate::window_geometry::adjacent_display_position(&monitors, current, from, direction)
+}
+
+/// Rewrites the placement the shell writes for a Win+Shift+arrow before it is applied.
+///
+/// The shell's own placement leaves the window straddling the seam, and this app then carries it
+/// a frame or two later: two placements, and the first one is visible as the window jumping into a
+/// corner and back. A placement arrives as `WM_WINDOWPOSCHANGING`, before it reaches the screen,
+/// so the position is rewritten to the one the carry would write and the bad rectangle is never
+/// shown.
+///
+/// Only chords are touched, and only placements that keep the window's size: a resize is somebody
+/// else's rectangle (the fullscreen fit, most often) and is left exactly as sent.
+unsafe fn redirect_chord_placement(hwnd: HWND, lparam: LPARAM) -> bool {
+    use winapi::um::winuser::{GetAsyncKeyState, VK_LEFT, VK_RIGHT, WINDOWPOS};
+
+    if lparam == 0
+        || FULLSCREEN_TARGET.load(Ordering::SeqCst)
+        || !shift_key_down()
+        || !win_key_down()
+    {
+        return false;
+    }
+    let direction = if (GetAsyncKeyState(VK_LEFT as i32) as u16 & 0x8000) != 0 {
+        -1
+    } else if (GetAsyncKeyState(VK_RIGHT as i32) as u16 & 0x8000) != 0 {
+        1
+    } else {
+        return false;
+    };
+
+    let position = chord_anchor()
+        .or_else(|| {
+            window_rect(hwnd).map(|rect| {
+                crate::window_geometry::Rect::new(rect.left, rect.top, rect.right, rect.bottom)
+            })
+        })
+        .and_then(|from| neighbour_position(from, direction));
+    let Some((x, y)) = position else {
+        return false;
+    };
+
+    let pos = lparam as *mut WINDOWPOS;
+    if (*pos).x == x && (*pos).y == y {
+        return false;
+    }
+    if (*pos).cx != 0
+        && window_rect(hwnd).is_some_and(|now| {
+            (*pos).cx != now.right - now.left || (*pos).cy != now.bottom - now.top
+        })
+    {
+        return false;
+    }
+
+    crate::diag::trace(
+        "chord",
+        &format!(
+            "shell placement ({},{}) redirected to ({x},{y})",
+            (*pos).x,
+            (*pos).y
+        ),
+    );
+    (*pos).x = x;
+    (*pos).y = y;
+    true
+}
+
 /// Win+Shift+Left/Right when the shell has left the chord to the window.
 ///
 /// The shell performs the chord for windows it arranges and such a window never sees the arrow;
@@ -810,10 +903,12 @@ fn win_chord_watch(hwnd: HWND) {
         let win_down = win_key_down();
         if win_down && !win_was_down {
             anchor = rect();
+            set_chord_anchor(anchor);
             pending = None;
             crate::diag::trace("chord", &format!("windows key down anchor={anchor:?}"));
         } else if !win_down && win_was_down && pending.is_none() {
             anchor = None;
+            set_chord_anchor(None);
         }
         win_was_down = win_down;
 
@@ -836,6 +931,7 @@ fn win_chord_watch(hwnd: HWND) {
             if let (Some(before), Some(now)) = (anchor, rect()) {
                 if (now.left - before.left).abs() > 2 || (now.top - before.top).abs() > 2 {
                     anchor = Some(now);
+                    set_chord_anchor(anchor);
                 }
             }
         }
@@ -920,6 +1016,7 @@ fn win_chord_watch(hwnd: HWND) {
             if let Some(before) = anchor {
                 let (next, carried) = settle_chord(hwnd, direction, before, rect);
                 anchor = next;
+                set_chord_anchor(anchor);
                 after_chord = anchor.map(|rect| (rect, Instant::now()));
                 verify = carried.map(|position| (position, Instant::now()));
             }
@@ -960,10 +1057,18 @@ fn settle_chord<F: Fn() -> Option<crate::window_geometry::Rect>>(
     // The shell's own move is not accepted as the answer: it can leave the window straddling
     // the seam, and a window whose centre is still on the display it came from is one the app's
     // clamps and its fullscreen refit read as "not moved".
+    let target = neighbour_position(before, direction);
     let carried = carry_to_neighbour(hwnd, direction, before);
     if carried.is_some() {
         note_win_chord();
         crate::diag::trace("chord", "carried the window to the neighbour display");
+    } else if let (Some(target), Some(now)) = (target, rect()) {
+        // A placement redirected before it reached the screen leaves the window already where the
+        // carry would put it: nothing to write, but the chord is settled all the same — the app
+        // may size the window for its new display instead of waiting for the keys to come up.
+        if (now.left - target.0).abs() <= 2 && (now.top - target.1).abs() <= 2 {
+            LAST_CARRY_MS.store(chord_clock_ms().max(1), Ordering::SeqCst);
+        }
     }
     (rect(), carried)
 }
@@ -1001,6 +1106,9 @@ unsafe extern "system" fn scale_change_wndproc(
     if msg == WM_WINDOWPOSCHANGING || msg == WM_WINDOWPOSCHANGED {
         if win_key_down() {
             note_win_chord();
+        }
+        if msg == WM_WINDOWPOSCHANGING {
+            redirect_chord_placement(hwnd, lparam);
         }
         return CallWindowProcW(previous, hwnd, msg, wparam, lparam);
     }

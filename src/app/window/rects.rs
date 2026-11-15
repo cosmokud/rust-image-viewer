@@ -110,7 +110,7 @@ impl ImageViewer {
             // that the viewport really is that display's size.
             if self.pending_display_refit {
                 self.pending_display_refit = false;
-                self.refit_view_after_display_move();
+                self.refit_view_after_display_move(ctx);
                 ctx.request_repaint();
             }
             return;

@@ -81,7 +81,18 @@ impl ImageViewer {
             }
         }
 
-        // No saved state - apply default fullscreen layout
+        self.fit_solo_fullscreen_view(ctx);
+        if force_fit {
+            self.strip_open_force_fit_path = None;
+        }
+    }
+
+    /// Fits the solo image to the display the window is on, ignoring every remembered camera.
+    ///
+    /// The fullscreen entry paths restore the camera an image was last looked at, which is a
+    /// camera for the display it was looked at on: a window carried to a display of another size
+    /// needs the fit that display allows, not that memory.
+    pub(crate) fn fit_solo_fullscreen_view(&mut self, ctx: &egui::Context) {
         self.current_fullscreen_view_has_memory = false;
         self.offset = egui::Vec2::ZERO;
         self.reset_precise_rotation();
@@ -105,22 +116,26 @@ impl ImageViewer {
                 );
                 self.zoom = z;
                 self.zoom_target = z;
-                if force_fit {
-                    self.strip_open_force_fit_path = None;
-                }
             }
         }
     }
 
     /// Fits the media to the display a Win+Shift+arrow carried the fullscreen window to.
     ///
-    /// A solo image is fitted by `apply_fullscreen_layout_for_current_image`, which the pending
-    /// layout already runs. The strip and the grid carry their own camera — row heights and
-    /// column widths come from the viewport size — so after the window arrives at another size
-    /// the camera is still framing the display it came from. Each layout is fitted again from the
-    /// same entry point that fits it on the way in, keeping the item being viewed.
-    pub(crate) fn refit_view_after_display_move(&mut self) {
-        if self.image_list.is_empty() || self.mode().is_solo() {
+    /// A solo image is fitted without its remembered camera, which belongs to the display it came
+    /// from. The strip and the grid carry their own camera — row heights and column widths come
+    /// from the viewport size — so after the window arrives at another size the camera is still
+    /// framing the old display. Each layout is fitted again from the same entry point that fits it
+    /// on the way in, keeping the item being viewed.
+    pub(crate) fn refit_view_after_display_move(&mut self, ctx: &egui::Context) {
+        if self.image_list.is_empty() {
+            return;
+        }
+
+        if self.mode().is_solo() {
+            // The queued layout would restore the old display's camera over this fit.
+            self.pending_media_layout = false;
+            self.fit_solo_fullscreen_view(ctx);
             return;
         }
 
