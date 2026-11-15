@@ -882,7 +882,7 @@ pub fn spawn_win_chord_watch(hwnd: HWND) {
 }
 
 fn win_chord_watch(hwnd: HWND) {
-    use winapi::um::winuser::{GetAsyncKeyState, VK_LEFT, VK_RIGHT};
+    use winapi::um::winuser::{GetAsyncKeyState, VK_LEFT, VK_RIGHT, VK_UP};
 
     /// Fast enough to see a press land, cheap enough to run for the life of the process.
     const POLL: std::time::Duration = std::time::Duration::from_millis(12);
@@ -909,6 +909,16 @@ fn win_chord_watch(hwnd: HWND) {
 
     let mut win_was_down = win_key_down();
     let mut arrow_was_down = arrow().is_some();
+    // Any arrow the session sees, Up included: the chord's direction is not what matters here.
+    let mut plain_was_down: Option<i32> = None;
+    // A Win+arrow chord the keyboard hook cannot see: the shell takes the arrow before any
+    // low-level hook is called, so the window is put back where it was instead of the key
+    // being swallowed. `target` is the rectangle to return to, `zoomed` whether it was
+    // maximized, and the instant is when the chord was pressed.
+    let mut restore: Option<(HWND, crate::window_geometry::Rect, bool, Instant)> = None;
+    let mut anchor_zoomed = false;
+    // The app window the chord is on: the viewer, the stash or settings, whichever has focus.
+    let mut chord_window = hwnd;
     // The rectangle the chord began on, and the move waiting for the shell to give up on it.
     let mut anchor: Option<crate::window_geometry::Rect> = None;
     let mut pending: Option<(i32, Instant)> = None;
@@ -924,7 +934,14 @@ fn win_chord_watch(hwnd: HWND) {
 
         let win_down = win_key_down();
         if win_down && !win_was_down {
-            anchor = rect();
+            chord_window = focused_app_window().unwrap_or(hwnd);
+            let rect_of_chord = window_rect(chord_window).map(|rect| {
+                crate::window_geometry::Rect::new(rect.left, rect.top, rect.right, rect.bottom)
+            });
+            anchor = rect_of_chord;
+            anchor_zoomed = is_window_maximized(chord_window);
+            ANCHOR_ZOOMED.store(anchor_zoomed, Ordering::SeqCst);
+            restore = None;
             set_chord_anchor(anchor);
             pending = None;
             crate::diag::trace("chord", &format!("windows key down anchor={anchor:?}"));
@@ -933,11 +950,56 @@ fn win_chord_watch(hwnd: HWND) {
             set_chord_anchor(None);
         }
         win_was_down = win_down;
+        let plain_arrow = [VK_LEFT, VK_RIGHT, VK_UP]
+            .into_iter()
+            .find(|vk| unsafe { (GetAsyncKeyState(*vk as i32) as u16 & 0x8000) != 0 });
+
+        let plain_pressed = plain_arrow.is_some() && plain_was_down.is_none();
+        plain_was_down = plain_arrow;
 
         let direction = arrow();
         let is_down = direction.is_some();
-        let pressed = is_down && !arrow_was_down;
+        let pressed = (is_down && !arrow_was_down) || plain_pressed;
         arrow_was_down = is_down;
+
+        // Win+Left/Right/Up leave no trace in the keyboard hook, so the press is only visible
+        // here. The window goes back to the rectangle the chord started on, every poll it is
+        // somewhere else, so a snap the shell applies late is still undone.
+        if pressed && plain_arrow.is_some() && win_down && !shift_key_down() && app_window_focused()
+        {
+            if let Some(target) = anchor {
+                crate::diag::trace("chord", "snap chord pressed: holding the old rectangle");
+                disable_window_transitions(chord_window);
+                restore = Some((chord_window, target, anchor_zoomed, Instant::now()));
+            }
+        }
+        if let Some((window, target, zoomed, since)) = restore {
+            RESTORE_WRITE.store(true, Ordering::SeqCst);
+            let zoomed_now = is_window_maximized(window);
+            if zoomed && !zoomed_now {
+                set_window_maximized(window, true);
+            } else if !zoomed && zoomed_now {
+                set_window_maximized(window, false);
+            }
+            if !zoomed {
+                let width = target.right - target.left;
+                let height = target.bottom - target.top;
+                let elsewhere = window_rect(window).is_none_or(|now| {
+                    (now.left - target.left).abs() > 2
+                        || (now.top - target.top).abs() > 2
+                        || (now.right - now.left - width).abs() > 2
+                        || (now.bottom - now.top - height).abs() > 2
+                });
+                if elsewhere {
+                    set_window_rect(window, target.left, target.top, width, height);
+                }
+            }
+            RESTORE_WRITE.store(false, Ordering::SeqCst);
+            if since.elapsed() >= std::time::Duration::from_millis(700) {
+                restore = None;
+            }
+        }
+
         if pressed && shift_key_down() && win_down {
             if let (Some(direction), Some(from)) = (direction, anchor) {
                 pending = Some((direction, Instant::now()));
@@ -1115,8 +1177,8 @@ unsafe extern "system" fn scale_change_wndproc(
     lparam: LPARAM,
 ) -> LRESULT {
     use winapi::um::winuser::{
-        CallWindowProcW, WM_DPICHANGED, WM_GETMINMAXINFO, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN,
-        WM_SYSKEYUP, WM_WINDOWPOSCHANGED, WM_WINDOWPOSCHANGING,
+        CallWindowProcW, SC_MAXIMIZE, WM_DPICHANGED, WM_GETMINMAXINFO, WM_KEYDOWN, WM_KEYUP,
+        WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_WINDOWPOSCHANGED, WM_WINDOWPOSCHANGING,
     };
 
     let previous = PREVIOUS_WNDPROC.load(Ordering::SeqCst);
@@ -1132,9 +1194,17 @@ unsafe extern "system" fn scale_change_wndproc(
             note_win_chord();
         }
         if msg == WM_WINDOWPOSCHANGING {
+            if refuse_snap_placement(hwnd, lparam) {
+                return 0;
+            }
             redirect_chord_placement(hwnd, lparam);
+            return CallWindowProcW(previous, hwnd, msg, wparam, lparam);
         }
-        return CallWindowProcW(previous, hwnd, msg, wparam, lparam);
+        // The last moment before the window is painted: a placement that got past the refusal is
+        // written back here, in the same message pass, so its new rectangle is never drawn.
+        let result = CallWindowProcW(previous, hwnd, msg, wparam, lparam);
+        hold_chord_rect(hwnd);
+        return result;
     }
 
     // The shell carries Win+Shift+arrow itself and then the window never sees the arrow. When it
@@ -1145,6 +1215,16 @@ unsafe extern "system" fn scale_change_wndproc(
         // Bit 30 of the key message is set when the key was already down: auto-repeat.
         let repeat = !key_up && (lparam & (1 << 30)) != 0;
         if handle_win_chord_key(hwnd, wparam, key_up, repeat) {
+            return 0;
+        }
+        return CallWindowProcW(previous, hwnd, msg, wparam, lparam);
+    }
+
+    // The shell maximises the window for Win+Up: a maximise while a Windows key is held is the
+    // chord and nothing the user asked of the app, so it is refused where it is decided.
+    if msg == WM_SYSCOMMAND {
+        if wparam & 0xFFF0 == SC_MAXIMIZE as WPARAM && win_key_down() {
+            crate::diag::trace("chord", "refused the chord's maximise");
             return 0;
         }
         return CallWindowProcW(previous, hwnd, msg, wparam, lparam);
@@ -1295,6 +1375,12 @@ unsafe fn override_maximize_target(hwnd: HWND, lparam: LPARAM) {
 /// The low-level keyboard hook, kept alive by the thread that pumps its messages.
 static SWALLOW_HOOK: AtomicIsize = AtomicIsize::new(0);
 
+/// Set while the chord guard is writing the rectangle itself, so its own writes are not refused.
+static RESTORE_WRITE: AtomicBool = AtomicBool::new(false);
+
+/// Whether the window was maximised when the current chord began.
+static ANCHOR_ZOOMED: AtomicBool = AtomicBool::new(false);
+
 /// Index in `SWALLOWED_DOWN` for the arrows whose Win chord is suppressed.
 static SWALLOWED_DOWN: [AtomicBool; 3] = [
     AtomicBool::new(false),
@@ -1364,18 +1450,46 @@ fn swallow_slot(vk: u32) -> Option<usize> {
 /// Settings, the stash and the dialogs are viewports of the same process, so this covers every
 /// window the app owns — and nothing else: chords stay the shell's while another app is focused.
 fn app_window_focused() -> bool {
+    focused_app_window().is_some()
+}
+
+/// The app's own window that has the foreground, if one does: the viewer, the stash or settings.
+fn focused_app_window() -> Option<HWND> {
     use winapi::um::processthreadsapi::GetCurrentProcessId;
     use winapi::um::winuser::{GetForegroundWindow, GetWindowThreadProcessId};
 
     unsafe {
         let foreground = GetForegroundWindow();
         if foreground.is_null() {
-            return false;
+            return None;
         }
         let mut pid = 0u32;
         GetWindowThreadProcessId(foreground, &mut pid);
-        pid != 0 && pid == GetCurrentProcessId()
+        (pid != 0 && pid == GetCurrentProcessId()).then_some(foreground)
     }
+}
+
+/// Takes the snap transition away from a window: the shell keeps animating a chord the app is
+/// about to undo, and an animation of a move that is being reverted is the whole artefact.
+pub fn disable_window_transitions(hwnd: HWND) {
+    use winapi::shared::minwindef::BOOL;
+    use winapi::um::dwmapi::DwmSetWindowAttribute;
+
+    if hwnd.is_null() {
+        return;
+    }
+    // DWMWA_TRANSITIONS_FORCEDISABLED, which the winapi crate does not name.
+    const DWMWA_TRANSITIONS_FORCEDISABLED: u32 = 3;
+    let disabled: BOOL = 1;
+    let result = unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_TRANSITIONS_FORCEDISABLED,
+            &disabled as *const BOOL as *const _,
+            std::mem::size_of::<BOOL>() as u32,
+        )
+    };
+    crate::diag::trace("chord", &format!("transitions hr=0x{result:x}"));
 }
 
 /// Swallows Win+Left, Win+Right and Win+Up for the app's windows in every mode.
@@ -1407,32 +1521,21 @@ unsafe extern "system" fn win_arrow_swallow_hook(
             } else if key_up {
                 MODIFIERS.fetch_and(!bit, Ordering::SeqCst);
             }
-            crate::diag::trace(
-                "chord",
-                &format!(
-                    "modifier vk={vk} down={} bits={:#x}",
-                    key_down,
-                    MODIFIERS.load(Ordering::SeqCst)
-                ),
-            );
             return CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam);
         }
 
         if let Some(slot) = swallow_slot(vk) {
             let modifiers = MODIFIERS.load(Ordering::SeqCst);
-            let win_held = modifiers & (MOD_WIN_LEFT | MOD_WIN_RIGHT) != 0;
-            let shift_held = modifiers & (MOD_SHIFT_LEFT | MOD_SHIFT_RIGHT) != 0;
+            // The machine is consulted as well: Win chords are handled deep enough in the shell
+            // that the Windows key press itself need not reach a low-level hook, and a chord's
+            // modifier must not depend on that press having been delivered here.
+            let win_held = modifiers & (MOD_WIN_LEFT | MOD_WIN_RIGHT) != 0 || win_key_down();
+            let shift_held =
+                modifiers & (MOD_SHIFT_LEFT | MOD_SHIFT_RIGHT) != 0 || shift_key_down();
             let focused = app_window_focused();
             let chord = win_held && !shift_held && focused;
-            if key_down {
-                crate::diag::trace(
-                    "chord",
-                    &format!(
-                        "arrow vk={vk} win={win_held} shift={shift_held} focused={focused} swallow={chord}"
-                    ),
-                );
-            }
             if key_down && chord {
+                crate::diag::trace("chord", &format!("swallowed arrow vk={vk}"));
                 SWALLOWED_DOWN[slot].store(true, Ordering::SeqCst);
                 return 1;
             }
@@ -1447,38 +1550,101 @@ unsafe extern "system" fn win_arrow_swallow_hook(
     CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam)
 }
 
-/// Installs the keyboard hook once, on a thread of its own: a low-level hook only fires while the
-/// thread that set it pumps messages, and the UI thread's pump belongs to winit.
+/// Installs the keyboard hook once, on the thread that owns the window and its message pump.
+///
+/// A low-level hook is only called while the thread that set it pumps messages, and that pump is
+/// the UI thread's (winit's loop). A thread of this process's own was tried first and Windows
+/// delivered nothing to it although it pumped as well; the UI thread is the one the hook is
+/// specified for and the one that works.
 pub fn install_win_arrow_swallow() {
+    use winapi::um::winuser::{SetWindowsHookExW, WH_KEYBOARD_LL};
+
     static STARTED: OnceLock<()> = OnceLock::new();
 
     if STARTED.set(()).is_err() {
         return;
     }
-    let spawned = std::thread::Builder::new()
-        .name("win-arrow-swallow".to_string())
-        .spawn(|| unsafe {
-            use winapi::um::winuser::{GetMessageW, SetWindowsHookExW, MSG, WH_KEYBOARD_LL};
-
-            let hook = SetWindowsHookExW(
-                WH_KEYBOARD_LL,
-                Some(win_arrow_swallow_hook),
-                std::ptr::null_mut(),
-                0,
+    unsafe {
+        let hook = SetWindowsHookExW(
+            WH_KEYBOARD_LL,
+            Some(win_arrow_swallow_hook),
+            std::ptr::null_mut(),
+            0,
+        );
+        if hook.is_null() {
+            crate::diag::trace(
+                "chord",
+                &format!(
+                    "keyboard swallow hook failed to install err={}",
+                    std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+                ),
             );
-            if hook.is_null() {
-                crate::diag::trace("chord", "keyboard swallow hook failed to install");
-                return;
-            }
-            SWALLOW_HOOK.store(hook as isize, Ordering::SeqCst);
-            seed_modifiers();
-            crate::diag::trace("chord", "keyboard swallow hook installed");
-            let mut msg: MSG = std::mem::zeroed();
-            while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {}
-        });
-    if spawned.is_err() {
-        crate::diag::trace("chord", "keyboard swallow thread failed to start");
+            return;
+        }
+        SWALLOW_HOOK.store(hook as isize, Ordering::SeqCst);
+        seed_modifiers();
+        crate::diag::trace("chord", "keyboard swallow hook installed");
     }
+}
+
+/// Whether the move the shell is about to make is a Win+Left/Right/Up snap, which is refused in
+/// place so the window never leaves its rectangle and nothing is left to animate.
+///
+/// The chord's own carry (Win+Shift) is not a snap, minimising for Win+Down is left alone, and
+/// the restore this app writes is exempt so it can undo whatever did get through.
+unsafe fn refuse_snap_placement(hwnd: HWND, lparam: LPARAM) -> bool {
+    use winapi::um::winuser::{IsIconic, SWP_NOMOVE, SWP_NOSIZE, WINDOWPOS};
+
+    if lparam == 0 || RESTORE_WRITE.load(Ordering::SeqCst) {
+        return false;
+    }
+    if !win_key_down() || shift_key_down() || IsIconic(hwnd) != 0 {
+        return false;
+    }
+    let proposed = &*(lparam as *const WINDOWPOS);
+    // The iconic place Win+Down moves the window to, and anything that leaves it where it is.
+    if proposed.x <= -32000 || proposed.y <= -32000 {
+        return false;
+    }
+    if proposed.flags & SWP_NOSIZE != 0 && proposed.flags & SWP_NOMOVE != 0 {
+        return false;
+    }
+    crate::diag::trace("chord", "refused the chord's placement");
+    true
+}
+
+/// Puts a window back on the rectangle its chord started from, in the same message pass as the
+/// move that took it away, so the moved rectangle is never painted.
+unsafe fn hold_chord_rect(hwnd: HWND) {
+    if RESTORE_WRITE.load(Ordering::SeqCst) || !win_key_down() || shift_key_down() {
+        return;
+    }
+    let Some(anchor) = chord_anchor() else {
+        return;
+    };
+    // A maximise is undone by its state, and its rectangle is the maximised one.
+    if is_window_maximized(hwnd) != anchor_is_zoomed() {
+        return;
+    }
+    let width = anchor.right - anchor.left;
+    let height = anchor.bottom - anchor.top;
+    let moved = window_rect(hwnd).is_none_or(|now| {
+        (now.left - anchor.left).abs() > 2
+            || (now.top - anchor.top).abs() > 2
+            || (now.right - now.left - width).abs() > 2
+            || (now.bottom - now.top - height).abs() > 2
+    });
+    if moved {
+        crate::diag::trace("chord", "wrote the chord's rectangle back before the paint");
+        RESTORE_WRITE.store(true, Ordering::SeqCst);
+        set_window_rect(hwnd, anchor.left, anchor.top, width, height);
+        RESTORE_WRITE.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Whether the window was maximised when its chord began, as the watcher last recorded it.
+fn anchor_is_zoomed() -> bool {
+    ANCHOR_ZOOMED.load(Ordering::SeqCst)
 }
 
 /// Hooks the window procedure once, so a display scale change cannot resize the window.
@@ -1497,6 +1663,7 @@ pub fn install_scale_change_guard(hwnd: HWND) {
         PREVIOUS_WNDPROC.store(previous, Ordering::SeqCst);
         SetWindowLongPtrW(hwnd, GWLP_WNDPROC, hook);
     }
+    disable_window_transitions(hwnd);
     spawn_win_chord_watch(hwnd);
     install_win_arrow_swallow();
 }
