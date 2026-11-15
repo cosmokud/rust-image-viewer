@@ -245,13 +245,16 @@ impl ImageViewer {
                         hwnd as winapi::shared::windef::HWND,
                     );
                     // `Win`+arrow moves or resizes the window outside the app's control, and the
-                    // viewer's layout is laid out for the rectangle the app chose. The compositor's
-                    // transitions go first: the shell can start a snap before any message or hook
-                    // sees the chord, and the animation it plays is what would be left to watch.
+                    // viewer's layout is laid out for the rectangle the app chose. The sizing
+                    // border is what the shell needs to snap the window at all, so it comes off
+                    // and is watched, because winit writes the styles back on fullscreen and
+                    // resize changes. The compositor's transitions go too, so a change that is
+                    // refused or undone draws no animation.
+                    crate::windows_env::strip_thick_frame(hwnd as winapi::shared::windef::HWND);
+                    crate::windows_env::watch_window_style(hwnd as winapi::shared::windef::HWND);
                     crate::windows_env::disable_window_transitions(
                         hwnd as winapi::shared::windef::HWND,
                     );
-                    crate::windows_env::install_snap_hotkey_guard();
                 }
             }
         }

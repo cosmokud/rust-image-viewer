@@ -544,8 +544,8 @@ unsafe extern "system" fn scale_change_wndproc(
     lparam: LPARAM,
 ) -> LRESULT {
     use winapi::um::winuser::{
-        CallWindowProcW, SC_MAXIMIZE, WM_DPICHANGED, WM_GETMINMAXINFO, WM_MOVE, WM_SIZE,
-        WM_SYSCOMMAND, WM_WINDOWPOSCHANGING,
+        CallWindowProcW, SC_MAXIMIZE, WM_ACTIVATE, WM_DPICHANGED, WM_GETMINMAXINFO, WM_MOVE,
+        WM_SIZE, WM_SYSCOMMAND, WM_TIMER, WM_WINDOWPOSCHANGING,
     };
 
     let previous = PREVIOUS_WNDPROC.load(Ordering::SeqCst);
@@ -577,19 +577,31 @@ unsafe extern "system" fn scale_change_wndproc(
     // `Win`+`Down` minimises the window, and that one is wanted: only maximise is refused here.
     if msg == WM_SYSCOMMAND {
         let command = wparam & 0xFFF0;
-        guard_log(&format!(
-            "syscommand cmd=0x{command:x} win={}",
-            win_key_down()
-        ));
         if command == SC_MAXIMIZE as WPARAM && win_key_down() {
             return 0;
         }
         return CallWindowProcW(previous, hwnd, msg, wparam, lparam);
     }
 
+    if msg == WM_TIMER {
+        strip_thick_frame(hwnd);
+        return CallWindowProcW(previous, hwnd, msg, wparam, lparam);
+    }
+
+    if msg == WM_ACTIVATE {
+        strip_thick_frame(hwnd);
+        return CallWindowProcW(previous, hwnd, msg, wparam, lparam);
+    }
+
     if msg == WM_SIZE || msg == WM_MOVE {
         let result = CallWindowProcW(previous, hwnd, msg, wparam, lparam);
         settle_window_rect(hwnd);
+        // A geometry change is where winit rewrites the window styles, so the sizing border is
+        // taken off again here rather than only once at startup: the first `Win`+arrow after a
+        // fullscreen switch would otherwise still start a snap.
+        if !win_key_down() {
+            strip_thick_frame(hwnd);
+        }
         return result;
     }
 
@@ -662,10 +674,7 @@ static REVERT_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 /// shell changes it, so the window's layout survives even when the chord itself gets through.
 /// `Win`+`Down` is untouched: a minimised window is left minimised.
 fn settle_window_rect(hwnd: HWND) {
-    if REVERT_IN_FLIGHT.load(Ordering::SeqCst)
-        || FULLSCREEN_TARGET.load(Ordering::SeqCst)
-        || is_scale_restore_in_flight()
-    {
+    if REVERT_IN_FLIGHT.load(Ordering::SeqCst) || is_scale_restore_in_flight() {
         return;
     }
     let Some(rect) = window_rect(hwnd) else {
@@ -681,10 +690,16 @@ fn settle_window_rect(hwnd: HWND) {
         return;
     };
     if !win_key_down() {
-        *settled = Some(current);
+        // A minimised window sits at the iconic position and must not become the rectangle the
+        // next chord is written back to.
+        if !is_window_minimized(hwnd) {
+            *settled = Some(current);
+        }
         return;
     }
-    if is_window_minimized(hwnd) || is_window_maximized(hwnd) {
+    // Not skipped for a maximised window: fullscreen is a maximised borderless window here, and
+    // skipping it is exactly how `Win`+arrow used to leave the fullscreen viewer off-centre.
+    if is_window_minimized(hwnd) {
         return;
     }
     let Some((left, top, width, height)) = *settled else {
@@ -694,9 +709,6 @@ fn settle_window_rect(hwnd: HWND) {
         return;
     }
     drop(settled);
-    guard_log(&format!(
-        "revert from={current:?} to=({left}, {top}, {width}, {height})"
-    ));
     REVERT_IN_FLIGHT.store(true, Ordering::SeqCst);
     set_window_rect(hwnd, left, top, width, height);
     REVERT_IN_FLIGHT.store(false, Ordering::SeqCst);
@@ -726,10 +738,10 @@ fn win_held_position_change(hwnd: HWND, lparam: LPARAM) -> bool {
     let win = win_key_down();
     let minimized = is_window_minimized(hwnd);
     let moves = proposed.flags & SWP_NOSIZE == 0 || proposed.flags & SWP_NOMOVE == 0;
-    guard_log(&format!(
-        "wpc win={win} min={minimized} moves={moves} x={} y={} cx={} cy={} flags=0x{:x}",
-        proposed.x, proposed.y, proposed.cx, proposed.cy, proposed.flags
-    ));
+    if win {
+        // winit can have written the sizing border back since the watchdog last looked.
+        strip_thick_frame(hwnd);
+    }
     // The guard's own write-back must not be refused by the guard.
     if !win || minimized || REVERT_IN_FLIGHT.load(Ordering::SeqCst) || !moves {
         return false;
@@ -761,24 +773,59 @@ unsafe fn def_proc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) -> LRE
     DefWindowProcW(hwnd, msg, wparam, lparam)
 }
 
-/// Temporary: appends one line per event next to the executable, in `win-guard.log`.
-fn guard_log(line: &str) {
-    use std::io::Write;
+/// Takes the sizing border off the window, which is the style the shell needs in order to snap it.
+///
+/// A borderless window has nothing for Aero Snap to resize, so `Win`+`Left`/`Right` start no snap,
+/// draw no animation and cannot expose the desktop for a frame. It is taken off at startup, again
+/// by [`watch_window_style`] whenever winit writes the styles back, and once more when a `Win` chord
+/// arrives. The same bit is the one that gives a borderless window an edge-resize grip, and the
+/// app's own maximise is `WS_MAXIMIZEBOX`, which this does not touch.
+pub fn strip_thick_frame(hwnd: HWND) {
+    use winapi::um::winuser::{
+        GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWL_STYLE, SWP_FRAMECHANGED,
+        SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WS_THICKFRAME,
+    };
 
-    let Ok(exe) = std::env::current_exe() else {
+    if hwnd.is_null() {
         return;
-    };
-    let Some(dir) = exe.parent() else {
-        return;
-    };
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(dir.join("win-guard.log"))
-    {
-        let _ = writeln!(file, "{line}");
+    }
+    unsafe {
+        let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+        if style & WS_THICKFRAME as isize == 0 {
+            return;
+        }
+        SetWindowLongPtrW(hwnd, GWL_STYLE, style & !(WS_THICKFRAME as isize));
+        SetWindowPos(
+            hwnd,
+            std::ptr::null_mut(),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        );
     }
 }
+
+/// Keeps the sizing border off while the app runs.
+///
+/// winit writes the window styles itself, after the startup strip and again on every fullscreen or
+/// resize change, so a strip that only reacts to those events can always be beaten by a later
+/// write: the first `Win`+arrow after a mode change then still starts a snap. A quarter-second
+/// timer re-checks the style instead, so the border is gone again long before the next chord, and
+/// the check itself is one `GetWindowLongPtrW`.
+pub fn watch_window_style(hwnd: HWND) {
+    use winapi::um::winuser::SetTimer;
+
+    if hwnd.is_null() {
+        return;
+    }
+    unsafe {
+        SetTimer(hwnd, STYLE_TIMER_ID, 250, None);
+    }
+}
+
+const STYLE_TIMER_ID: usize = 0x5244;
 
 /// Turns off the compositor's transitions for the window.
 ///
@@ -793,177 +840,14 @@ pub fn disable_window_transitions(hwnd: HWND) {
         return;
     }
     let disabled: i32 = 1;
-    let result = unsafe {
+    unsafe {
         DwmSetWindowAttribute(
             hwnd,
             DWMWA_TRANSITIONS_FORCEDISABLED as u32,
             &disabled as *const i32 as *const _,
             std::mem::size_of::<i32>() as u32,
-        )
-    };
-    guard_log(&format!("transitions hr=0x{result:x}"));
-}
-
-static SNAP_HOTKEY_INSTALLED: AtomicBool = AtomicBool::new(false);
-
-/// Modifier state the keyboard hook has seen for itself. Reading it from the hook's own event
-/// stream is the only reliable answer inside the hook: asking the OS for a key's state there can
-/// lag the event being handled by a keystroke, which swallowed the arrow of `Win`+`Shift`+arrow
-/// once already and left the shell without a move while the app acted on `Shift`+arrow alone.
-static WIN_KEY_DOWN: AtomicBool = AtomicBool::new(false);
-
-/// Keeps Windows from moving or resizing the app's window with `Win`+`arrow`.
-///
-/// `Win`+`Left`/`Right`/`Up` is handled by the shell before the window procedure is asked
-/// anything, so the app cannot refuse it from the window: a low-level keyboard hook sees the chord
-/// first and stops all three while one of the app's own windows has the keyboard, with or without
-/// `Shift`, since `Win`+`Shift`+`Left`/`Right` also carries the window to another display and so
-/// also throws the layout away. `Win`+`Down` is left alone: it only minimises. Everywhere else the
-/// chords keep their normal meaning.
-///
-/// The hook is installed on a thread of its own that does nothing but pump messages. A hook is
-/// called on the thread that installed it, and the drawing thread can be busy decoding for longer
-/// than the system's hook timeout, after which Windows drops the hook without telling anyone. The
-/// thread reports whether the install took, and a failure falls back to the caller's thread.
-pub fn install_snap_hotkey_guard() {
-    if SNAP_HOTKEY_INSTALLED.swap(true, Ordering::SeqCst) {
-        return;
+        );
     }
-    guard_log(&format!(
-        "build={} exe={:?}",
-        option_env!("RIV_COMMIT").unwrap_or("unknown"),
-        std::env::current_exe().ok()
-    ));
-
-    let (sender, receiver) = std::sync::mpsc::channel();
-    let spawned = std::thread::Builder::new()
-        .name("win-arrow-guard".to_string())
-        .spawn(move || unsafe { snap_hotkey_hook_thread(sender) })
-        .is_ok();
-    let hooked = spawned
-        && receiver
-            .recv_timeout(std::time::Duration::from_millis(500))
-            .unwrap_or(false);
-    if !hooked {
-        // The window loop's own thread already pumps messages, so it can hold the hook instead.
-        unsafe {
-            install_snap_hotkey_hook();
-        }
-    }
-}
-
-unsafe fn install_snap_hotkey_hook() -> bool {
-    use winapi::um::libloaderapi::GetModuleHandleW;
-    use winapi::um::winuser::{
-        PeekMessageW, SetWindowsHookExW, MSG, PM_NOREMOVE, WH_KEYBOARD_LL, WM_USER,
-    };
-
-    // Hook callbacks land in the installing thread's message queue, and a fresh thread has none
-    // until it first asks for messages, so the queue is made before the hook exists.
-    let mut message: MSG = std::mem::zeroed();
-    PeekMessageW(
-        &mut message,
-        std::ptr::null_mut(),
-        WM_USER,
-        WM_USER,
-        PM_NOREMOVE,
-    );
-
-    // A global hook also needs the module its procedure lives in: with a null one the call fails
-    // and nothing is hooked. `thread_id` 0 makes it see the keys of the whole desktop.
-    let module = GetModuleHandleW(std::ptr::null());
-    let hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(snap_hotkey_hook), module, 0);
-    guard_log(&format!(
-        "hook install ok={} err={}",
-        !hook.is_null(),
-        winapi::um::errhandlingapi::GetLastError()
-    ));
-    !hook.is_null()
-}
-
-unsafe fn snap_hotkey_hook_thread(installed: std::sync::mpsc::Sender<bool>) {
-    use winapi::um::winuser::{GetMessageW, MSG};
-
-    let hooked = install_snap_hotkey_hook();
-    let _ = installed.send(hooked);
-    if !hooked {
-        return;
-    }
-
-    let mut message: MSG = std::mem::zeroed();
-    while GetMessageW(&mut message, std::ptr::null_mut(), 0, 0) > 0 {}
-}
-
-fn key_is_down(virtual_key: i32) -> bool {
-    use winapi::um::winuser::GetAsyncKeyState;
-
-    unsafe { (GetAsyncKeyState(virtual_key) as u16 & 0x8000) != 0 }
-}
-
-/// True when the window with the keyboard belongs to this process.
-///
-/// The process id is taken from the running process, never from a remembered window handle: the
-/// handle kept at startup goes stale as soon as the window is recreated, `GetWindowThreadProcessId`
-/// then answers 0 for both, and the chord sailed through as if the app were not in front.
-fn keyboard_belongs_to_app() -> bool {
-    use winapi::um::processthreadsapi::GetCurrentProcessId;
-    use winapi::um::winuser::{GetForegroundWindow, GetWindowThreadProcessId};
-
-    unsafe {
-        let foreground = GetForegroundWindow();
-        if foreground.is_null() {
-            return false;
-        }
-        let mut foreground_process = 0u32;
-        GetWindowThreadProcessId(foreground, &mut foreground_process);
-        foreground_process != 0 && foreground_process == GetCurrentProcessId()
-    }
-}
-
-/// Stops every `Win`+`Left`/`Right`/`Up`, `Shift` or not; `Win`+`Down` and the rest go through.
-unsafe extern "system" fn snap_hotkey_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    use winapi::um::winuser::{
-        CallNextHookEx, KBDLLHOOKSTRUCT, VK_LEFT, VK_LWIN, VK_RIGHT, VK_RWIN, VK_UP, WM_KEYDOWN,
-        WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
-    };
-
-    let pass_through = || CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam);
-    if code < 0 || lparam == 0 {
-        return pass_through();
-    }
-    let message = wparam as u32;
-    let pressed = message == WM_KEYDOWN || message == WM_SYSKEYDOWN;
-    if !pressed && message != WM_KEYUP && message != WM_SYSKEYUP {
-        return pass_through();
-    }
-
-    let key = (*(lparam as *const KBDLLHOOKSTRUCT)).vkCode;
-    if key == VK_LWIN as u32 || key == VK_RWIN as u32 {
-        WIN_KEY_DOWN.store(pressed, Ordering::SeqCst);
-    }
-
-    if !pressed {
-        return pass_through();
-    }
-    if ![VK_LEFT as u32, VK_RIGHT as u32, VK_UP as u32].contains(&key) {
-        return pass_through();
-    }
-
-    // Both the hook's own tracking and the OS state are consulted: either saying "down" is
-    // enough, so a missed modifier event can only ever err towards letting the chord through.
-    let win_held = WIN_KEY_DOWN.load(Ordering::SeqCst)
-        || key_is_down(VK_LWIN as i32)
-        || key_is_down(VK_RWIN as i32);
-    let app = keyboard_belongs_to_app();
-    guard_log(&format!(
-        "key vk={key} msg={message} win={win_held} app={app}"
-    ));
-    if !win_held || !app {
-        return pass_through();
-    }
-
-    // Non-zero stops the chord here: the shell never sees it.
-    1
 }
 
 /// Rewrites only the maximize fields of a `WM_GETMINMAXINFO` answer.
