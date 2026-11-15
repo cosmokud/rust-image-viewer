@@ -241,20 +241,10 @@ impl ImageViewer {
                 if let RawWindowHandle::Win32(win32) = handle.as_raw() {
                     let hwnd = win32.hwnd.get() as isize;
                     viewer.main_hwnd = hwnd;
-                    crate::windows_env::install_scale_change_guard(
-                        hwnd as winapi::shared::windef::HWND,
-                    );
-                    // `Win`+arrow moves or resizes the window outside the app's control, and the
-                    // viewer's layout is laid out for the rectangle the app chose. The sizing
-                    // border is what the shell needs to snap the window at all, so it comes off
-                    // and is watched, because winit writes the styles back on fullscreen and
-                    // resize changes. The compositor's transitions go too, so a change that is
-                    // refused or undone draws no animation.
-                    crate::windows_env::strip_thick_frame(hwnd as winapi::shared::windef::HWND);
-                    crate::windows_env::watch_window_style(hwnd as winapi::shared::windef::HWND);
-                    crate::windows_env::disable_window_transitions(
-                        hwnd as winapi::shared::windef::HWND,
-                    );
+                    // Nothing is installed on the window's procedure: the shell moves and sizes
+                    // the window exactly as it does for any other, and the app keeps no opinion
+                    // about a rectangle the OS chose.
+                    let _: isize = hwnd;
                 }
             }
         }
