@@ -137,38 +137,35 @@ impl ImageViewer {
                 false
             }
         };
-        if !restored {
-            // Scale changed without the guard restoring the size (maximized, fullscreen, or a
-            // size the app asked for): nothing of the media geometry is re-based.
-            self.scale_restore_in_flight = false;
-            crate::diag::trace(
-                "rect",
-                &format!(
-                    "scale change previous={previous} now={ppp} restored=false zoom={zoom_before}"
-                ),
-            );
-            return;
-        }
-        self.scale_restore_in_flight = true;
-
-        // The window kept its physical size, so the rendered image must keep its physical size
-        // too: `zoom` is media px per egui point, and a point is now `ppp/previous` times larger,
-        // so `zoom` shrinks by the same ratio — the media's physical size is unchanged and the
-        // autosize below computes a no-op instead of a resize.
+        // A point changed size, so the media measured in points must change its measurement by the
+        // same ratio or the image lands at another physical size. Rescaled on every reported
+        // change, not only the ones the guard recorded: the OS reports the scale several times
+        // while a window crosses the seam, and rescaling a subset of those multiplies part of the
+        // move in and leaves the rest out, so a move there and back does not return the zoom it
+        // started with. A plain ratio telescopes, so any path between two scales ends the same.
         let inverse_scale = previous / ppp;
         self.zoom *= inverse_scale;
         self.zoom_target *= inverse_scale;
         self.offset *= inverse_scale;
-        // The locked in-window zoom was measured against the old point size.
-        self.floating_zoom_inside_window_locked = false;
-        self.pending_media_layout = false;
         crate::diag::trace(
             "rect",
             &format!(
-                "scale change previous={previous} now={ppp} restored=true zoom {zoom_before} -> {} offset_scaled={}",
-                self.zoom, inverse_scale,
+                "scale change previous={previous} now={ppp} restored={restored} zoom {zoom_before} -> {} ratio={inverse_scale}",
+                self.zoom,
             ),
         );
+
+        if !restored {
+            // The window's own size was not restored by the guard (maximized, fullscreen, or a
+            // size the app asked for), so nothing of the window geometry is re-based.
+            self.scale_restore_in_flight = false;
+            return;
+        }
+        self.scale_restore_in_flight = true;
+
+        // The locked in-window zoom was measured against the old point size.
+        self.floating_zoom_inside_window_locked = false;
+        self.pending_media_layout = false;
 
         // A scale change while borderless fullscreen re-targets the display that now holds the
         // window centre: the old rect is in the old display's pixels and would leave a gap or
