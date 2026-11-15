@@ -123,6 +123,7 @@ impl ImageViewer {
         }
 
         self.last_ppp = ppp;
+        let zoom_before = self.zoom;
 
         // The flag is read only on a scale change: the guard may have fired a frame before the
         // scale factor reached egui, and a pending flag must survive until the two meet.
@@ -140,6 +141,12 @@ impl ImageViewer {
             // Scale changed without the guard restoring the size (maximized, fullscreen, or a
             // size the app asked for): nothing of the media geometry is re-based.
             self.scale_restore_in_flight = false;
+            crate::diag::trace(
+                "rect",
+                &format!(
+                    "scale change previous={previous} now={ppp} restored=false zoom={zoom_before}"
+                ),
+            );
             return;
         }
         self.scale_restore_in_flight = true;
@@ -155,6 +162,13 @@ impl ImageViewer {
         // The locked in-window zoom was measured against the old point size.
         self.floating_zoom_inside_window_locked = false;
         self.pending_media_layout = false;
+        crate::diag::trace(
+            "rect",
+            &format!(
+                "scale change previous={previous} now={ppp} restored=true zoom {zoom_before} -> {} offset_scaled={}",
+                self.zoom, inverse_scale,
+            ),
+        );
 
         // A scale change while borderless fullscreen re-targets the display that now holds the
         // window centre: the old rect is in the old display's pixels and would leave a gap or

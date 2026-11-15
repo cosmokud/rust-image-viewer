@@ -667,29 +667,23 @@ fn carry_to_neighbour(
     hwnd: HWND,
     direction: i32,
     from: crate::window_geometry::Rect,
-) -> Option<(crate::window_geometry::Rect, (i32, i32))> {
+) -> Option<(i32, i32)> {
     use winapi::um::winuser::{SetWindowPos, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER};
 
     let monitors = monitor_rects();
     let current = crate::window_geometry::display_for_window_centre(from)?.monitor;
-    let target = crate::window_geometry::adjacent_display(&monitors, current, direction)?;
-
-    if let Some(now) = window_rect(hwnd) {
-        let centre = (
-            now.left + (now.right - now.left) / 2,
-            now.top + (now.bottom - now.top) / 2,
-        );
-        let arrived = centre.0 > target.left
-            && centre.0 < target.right
-            && centre.1 > target.top
-            && centre.1 < target.bottom;
-        if arrived {
-            return None;
-        }
-    }
 
     let (x, y) =
         crate::window_geometry::adjacent_display_position(&monitors, current, from, direction)?;
+
+    // Judged by where the window is, not by the display under its centre: the shell's placement
+    // can straddle the seam, and a fullscreen window the scale change resized can have its centre
+    // on the display it is leaving. Either way the answer is the same position this would write.
+    if let Some(now) = window_rect(hwnd) {
+        if (now.left - x).abs() <= 2 && (now.top - y).abs() <= 2 {
+            return None;
+        }
+    }
     let moved = unsafe {
         SetWindowPos(
             hwnd,
@@ -701,7 +695,7 @@ fn carry_to_neighbour(
             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
         ) != 0
     };
-    moved.then_some((target, (x, y)))
+    moved.then_some((x, y))
 }
 
 unsafe extern "system" fn collect_monitor_rect(
@@ -789,7 +783,7 @@ fn win_chord_watch(hwnd: HWND) {
     // Where the window came to rest after a chord, to tell whether anything moved it back.
     let mut after_chord: Option<(crate::window_geometry::Rect, Instant)> = None;
     // A move this thread made, to be re-asserted if a geometry pass puts the window back.
-    let mut verify: Option<(crate::window_geometry::Rect, (i32, i32), Instant)> = None;
+    let mut verify: Option<((i32, i32), Instant)> = None;
 
     loop {
         std::thread::sleep(POLL);
@@ -829,18 +823,11 @@ fn win_chord_watch(hwnd: HWND) {
         // A pass that listens to the rectangle egui still holds, or the OS's own answer to the
         // display scale change, can put the window back after it was carried. One look a moment
         // later, and one repeat of the move, is what makes the carry survive that.
-        if let Some((display, position, since)) = verify {
+        if let Some((position, since)) = verify {
             if since.elapsed() >= std::time::Duration::from_millis(400) {
                 verify = None;
                 let arrived = rect().is_some_and(|now| {
-                    let centre = (
-                        now.left + (now.right - now.left) / 2,
-                        now.top + (now.bottom - now.top) / 2,
-                    );
-                    centre.0 > display.left
-                        && centre.0 < display.right
-                        && centre.1 > display.top
-                        && centre.1 < display.bottom
+                    (now.left - position.0).abs() <= 2 && (now.top - position.1).abs() <= 2
                 });
                 if !arrived {
                     crate::diag::trace(
@@ -897,7 +884,7 @@ fn win_chord_watch(hwnd: HWND) {
                 let (next, carried) = settle_chord(hwnd, direction, before, rect);
                 anchor = next;
                 after_chord = anchor.map(|rect| (rect, Instant::now()));
-                verify = carried.map(|(display, position)| (display, position, Instant::now()));
+                verify = carried.map(|position| (position, Instant::now()));
             }
         }
     }
@@ -906,17 +893,14 @@ fn win_chord_watch(hwnd: HWND) {
 /// Carries the window for one press of the chord, wherever the shell left it.
 ///
 /// Returns the rectangle the next press is measured against, and — when the window had to be
-/// carried — the display it was carried to together with the position written, so the move can
-/// be re-asserted if a geometry pass puts the window back.
+/// carried — the position written, so the move can be re-asserted if a geometry pass puts the
+/// window back.
 fn settle_chord<F: Fn() -> Option<crate::window_geometry::Rect>>(
     hwnd: HWND,
     direction: i32,
     before: crate::window_geometry::Rect,
     rect: F,
-) -> (
-    Option<crate::window_geometry::Rect>,
-    Option<(crate::window_geometry::Rect, (i32, i32))>,
-) {
+) -> (Option<crate::window_geometry::Rect>, Option<(i32, i32)>) {
     let now = rect();
     let shell_moved = now
         .is_some_and(|now| (now.left - before.left).abs() > 2 || (now.top - before.top).abs() > 2);
