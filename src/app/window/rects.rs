@@ -101,6 +101,20 @@ impl ImageViewer {
             return;
         }
 
+        crate::diag::trace(
+            "rect",
+            &format!(
+                "fullscreen refit outer=({},{},{},{}) target=({},{},{},{})",
+                outer.left,
+                outer.top,
+                outer.right,
+                outer.bottom,
+                target.left,
+                target.top,
+                target.right,
+                target.bottom,
+            ),
+        );
         self.request_borderless_fullscreen_rect(ctx);
         self.pending_media_layout = true;
         ctx.request_repaint();

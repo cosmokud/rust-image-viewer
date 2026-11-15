@@ -398,6 +398,15 @@ impl ImageViewer {
                 let target_outer_min = target_inner_min - inner_to_outer_offset;
                 self.send_outer_position(ctx, target_outer_min);
             }
+            #[cfg(target_os = "windows")]
+            crate::diag::trace(
+                "rect",
+                &format!(
+                    "autosize inner={desired:?} hwnd={:?} cached_inner={current_inner_rect:?}",
+                    crate::windows_env::window_rect(self.resolved_main_hwnd())
+                        .map(|rect| (rect.left, rect.top)),
+                ),
+            );
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(desired));
         }
     }

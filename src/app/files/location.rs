@@ -7,6 +7,15 @@ use crate::prelude::*;
 
 impl ImageViewer {
     pub(crate) fn send_outer_position(&mut self, ctx: &egui::Context, pos: egui::Pos2) {
+        #[cfg(target_os = "windows")]
+        crate::diag::trace(
+            "rect",
+            &format!(
+                "outer position asked={pos:?} hwnd={:?}",
+                crate::windows_env::window_rect(self.resolved_main_hwnd())
+                    .map(|rect| (rect.left, rect.top)),
+            ),
+        );
         ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
     }
 

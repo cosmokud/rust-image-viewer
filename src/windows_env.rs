@@ -776,6 +776,8 @@ fn win_chord_watch(hwnd: HWND) {
     // The rectangle the chord began on, and the move waiting for the shell to give up on it.
     let mut anchor: Option<crate::window_geometry::Rect> = None;
     let mut pending: Option<(i32, Instant)> = None;
+    // Where the window came to rest after a chord, to tell whether anything moved it back.
+    let mut after_chord: Option<(crate::window_geometry::Rect, Instant)> = None;
 
     loop {
         std::thread::sleep(POLL);
@@ -815,27 +817,72 @@ fn win_chord_watch(hwnd: HWND) {
         let Some((direction, since)) = pending else {
             continue;
         };
-        if since.elapsed() < SHELL_GRACE {
-            continue;
+        // A press that lands before the grace ran out on the last one settles that one first:
+        // taps of the chord come faster than the grace.
+        if since.elapsed() >= SHELL_GRACE || pressed {
+            pending = None;
+            if let Some(before) = anchor {
+                anchor = settle_chord(hwnd, direction, before, rect);
+                after_chord = anchor.map(|rect| (rect, Instant::now()));
+            }
         }
-        pending = None;
-        let Some(before) = anchor else {
-            continue;
-        };
 
-        let now = rect();
-        let shell_moved = now.is_some_and(|now| {
-            (now.left - before.left).abs() > 2 || (now.top - before.top).abs() > 2
-        });
-        if shell_moved {
-            crate::diag::trace("chord", "the shell carried the window itself");
-        } else if move_window_to_adjacent_display(hwnd, direction) {
-            note_win_chord();
-            crate::diag::trace("chord", "carried the window to the neighbour display");
+        // A move that the geometry passes put back is invisible otherwise: the rectangle the
+        // chord left behind is not where the window is a moment later.
+        if let Some((rested, since)) = after_chord {
+            if since.elapsed() >= std::time::Duration::from_millis(500) {
+                after_chord = None;
+                let now = rect();
+                let moved = now.is_some_and(|now| {
+                    (now.left - rested.left).abs() > 2 || (now.top - rested.top).abs() > 2
+                });
+                crate::diag::trace(
+                    "chord",
+                    &format!(
+                        "half a second after the chord: now={:?} rested=({},{}) moved_back={moved}",
+                        now.map(|rect| (rect.left, rect.top)),
+                        rested.left,
+                        rested.top,
+                    ),
+                );
+            }
         }
-        // Either way the next press of the chord starts from where the window is now.
-        anchor = rect();
     }
+}
+
+/// Carries the window for one press of the chord, unless the shell already did.
+///
+/// Returns the rectangle the next press is measured against.
+fn settle_chord<F: Fn() -> Option<crate::window_geometry::Rect>>(
+    hwnd: HWND,
+    direction: i32,
+    before: crate::window_geometry::Rect,
+    rect: F,
+) -> Option<crate::window_geometry::Rect> {
+    let now = rect();
+    let shell_moved = now
+        .is_some_and(|now| (now.left - before.left).abs() > 2 || (now.top - before.top).abs() > 2);
+    let display = |rect: Option<crate::window_geometry::Rect>| {
+        rect.and_then(crate::window_geometry::display_for_window_centre)
+            .map(|display| (display.monitor.left, display.monitor.top))
+    };
+    crate::diag::trace(
+        "chord",
+        &format!(
+            "settle direction={direction} before=({},{}) now={:?} shell_moved={shell_moved} display={:?} was={:?}",
+            before.left,
+            before.top,
+            now.map(|rect| (rect.left, rect.top)),
+            display(now),
+            display(Some(before)),
+        ),
+    );
+
+    if !shell_moved && move_window_to_adjacent_display(hwnd, direction) {
+        note_win_chord();
+        crate::diag::trace("chord", "carried the window to the neighbour display");
+    }
+    rect()
 }
 
 /// Re-asserts the window's physical outer size across a display scale change.
@@ -938,6 +985,26 @@ unsafe extern "system" fn scale_change_wndproc(
             }
         }
     }
+
+    crate::diag::trace(
+        "rect",
+        &format!(
+            "dpi change before=({},{},{},{}) after=({},{},{},{}) write=({},{},{},{}) win_held={}",
+            before.left,
+            before.top,
+            before.right,
+            before.bottom,
+            after.left,
+            after.top,
+            after.right,
+            after.bottom,
+            left,
+            top,
+            width,
+            height,
+            win_key_down(),
+        ),
+    );
 
     if after.right - after.left != width || after.bottom - after.top != height {
         RESTORE_IN_FLIGHT.store(true, Ordering::SeqCst);
