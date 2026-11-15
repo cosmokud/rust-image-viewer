@@ -69,6 +69,7 @@ impl ImageViewer {
     pub(crate) fn enforce_fullscreen_display(&mut self, ctx: &egui::Context) {
         if !self.mode().is_fullscreen() {
             self.pending_display_refit = false;
+            self.fullscreen_display_origin = None;
             return;
         }
         if self.is_resizing
@@ -97,6 +98,19 @@ impl ImageViewer {
         let Some(display) = self.current_display(ctx) else {
             return;
         };
+        // Carried to another display, and the camera belongs to the one it came from. The window
+        // can arrive already the right size there — a window too big for the display it left is
+        // resized on the way — so the resize being needed says nothing about whether the fit is.
+        let origin = (display.monitor.left, display.monitor.top);
+        match self.fullscreen_display_origin {
+            None => self.fullscreen_display_origin = Some(origin),
+            Some(previous) if previous != origin => {
+                self.fullscreen_display_origin = Some(origin);
+                self.pending_display_refit = true;
+            }
+            _ => {}
+        }
+
         let Some(outer) = self.main_window_rect_physical(ctx) else {
             return;
         };
@@ -109,6 +123,11 @@ impl ImageViewer {
             // The window is where it belongs: fit the camera to the display it arrived on, now
             // that the viewport really is that display's size.
             if self.pending_display_refit {
+                // A frame that still has the old display's size would be fitted to that one.
+                if !self.fullscreen_layout_ready(ctx) {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(40));
+                    return;
+                }
                 self.pending_display_refit = false;
                 self.refit_view_after_display_move(ctx);
                 ctx.request_repaint();

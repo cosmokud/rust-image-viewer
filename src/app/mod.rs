@@ -354,6 +354,8 @@ pub(crate) struct ImageViewer {
     /// The fullscreen window was carried to another display and its camera still belongs to the
     /// one it came from: fit it once the new rectangle has landed.
     pub(crate) pending_display_refit: bool,
+    /// The display the fullscreen viewer is on, to tell when it has been carried to another one.
+    pub(crate) fullscreen_display_origin: Option<(i32, i32)>,
     /// Screen size
     pub(crate) screen_size: egui::Vec2,
     /// Last `pixels_per_point` a frame ran at; a change means a display scale change.
@@ -1094,6 +1096,7 @@ impl Default for ImageViewer {
             image_changed: false,
             pending_media_layout: false,
             pending_display_refit: false,
+            fullscreen_display_origin: None,
             screen_size: egui::Vec2::new(1920.0, 1080.0),
             last_ppp: 0.0,
             main_hwnd: 0,
