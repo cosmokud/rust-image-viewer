@@ -574,6 +574,20 @@ pub fn shell_owns_window_rect() -> bool {
     win_key_down() || win_chord_just_seen(400)
 }
 
+/// Stamped when this proc carries a window to the neighbour display for a chord.
+static LAST_CARRY_MS: AtomicU64 = AtomicU64::new(0);
+
+/// True for `within_ms` after this proc carried the window for a chord.
+///
+/// Mid-chord the app leaves the window's rectangle to the shell, but a chord this proc carried is
+/// settled as far as the app is concerned: the shell is not going to write a rectangle for it any
+/// more, so the geometry passes may size the window for its new display immediately instead of
+/// waiting for the keys to come up.
+pub fn chord_carried_recently(within_ms: u64) -> bool {
+    let stamped = LAST_CARRY_MS.load(Ordering::SeqCst);
+    stamped != 0 && chord_clock_ms().saturating_sub(stamped) < within_ms
+}
+
 /// True once this proc has carried the chord of the key press still in flight.
 static CHORD_MOVED_ON_PRESS: AtomicBool = AtomicBool::new(false);
 
@@ -695,6 +709,9 @@ fn carry_to_neighbour(
             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
         ) != 0
     };
+    if moved {
+        LAST_CARRY_MS.store(chord_clock_ms().max(1), Ordering::SeqCst);
+    }
     moved.then_some((x, y))
 }
 
@@ -784,6 +801,8 @@ fn win_chord_watch(hwnd: HWND) {
     let mut after_chord: Option<(crate::window_geometry::Rect, Instant)> = None;
     // A move this thread made, to be re-asserted if a geometry pass puts the window back.
     let mut verify: Option<((i32, i32), Instant)> = None;
+    // The rectangle last seen after the shell's own move, to tell when that move has landed.
+    let mut settle_seen: Option<crate::window_geometry::Rect> = None;
 
     loop {
         std::thread::sleep(POLL);
@@ -805,6 +824,7 @@ fn win_chord_watch(hwnd: HWND) {
         if pressed && shift_key_down() && win_down {
             if let (Some(direction), Some(_)) = (direction, anchor) {
                 pending = Some((direction, Instant::now()));
+                settle_seen = None;
                 crate::diag::trace("chord", &format!("arrow pressed direction={direction}"));
             }
         }
@@ -874,11 +894,28 @@ fn win_chord_watch(hwnd: HWND) {
         }
 
         let Some((direction, since)) = pending else {
+            settle_seen = None;
             continue;
+        };
+        // The shell's own placement lands within a frame or two of the press, and the window sits
+        // where the shell dropped it until the grace runs out — visible as a jump into a corner
+        // before the carry. A rectangle that stopped changing is the shell's answer already, so
+        // settle on that instead of waiting out the whole grace; the verify pass still corrects
+        // anything written after it.
+        let shell_settled = match (anchor, rect()) {
+            (Some(before), Some(now))
+                if (now.left - before.left).abs() > 2 || (now.top - before.top).abs() > 2 =>
+            {
+                let stable = settle_seen == Some(now);
+                settle_seen = Some(now);
+                stable
+            }
+            _ => false,
         };
         // A press that lands before the grace ran out on the last one settles that one first:
         // taps of the chord come faster than the grace.
-        if since.elapsed() >= SHELL_GRACE || pressed {
+        if since.elapsed() >= SHELL_GRACE || pressed || shell_settled {
+            settle_seen = None;
             pending = None;
             if let Some(before) = anchor {
                 let (next, carried) = settle_chord(hwnd, direction, before, rect);

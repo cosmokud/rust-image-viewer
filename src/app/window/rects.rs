@@ -67,8 +67,11 @@ impl ImageViewer {
     /// fitting the media again is what keeps the image the same relative size on the new screen.
     #[cfg(target_os = "windows")]
     pub(crate) fn enforce_fullscreen_display(&mut self, ctx: &egui::Context) {
-        if !self.mode().is_fullscreen()
-            || self.is_resizing
+        if !self.mode().is_fullscreen() {
+            self.pending_display_refit = false;
+            return;
+        }
+        if self.is_resizing
             || self.pending_window_resize.is_some()
             || self.toggle_fullscreen
             || self.viewer_window_hidden
@@ -80,8 +83,13 @@ impl ImageViewer {
         }
         // Mid-chord the rectangle belongs to the shell, and the frame that comes with the keys
         // held is too early to fit anything. A completed move owns no repaint of its own, so the
-        // pass has to come back by itself once the chord is over.
-        if crate::windows_env::shell_owns_window_rect() {
+        // pass has to come back by itself once the chord is over. A chord this app carried itself
+        // is already over — the shell writes nothing more for it — and holding the keys down
+        // there leaves the window at the old display's size for as long as they are held, so
+        // that one is fitted straight away.
+        if crate::windows_env::shell_owns_window_rect()
+            && !crate::windows_env::chord_carried_recently(700)
+        {
             ctx.request_repaint_after(std::time::Duration::from_millis(80));
             return;
         }
@@ -98,6 +106,13 @@ impl ImageViewer {
             && (outer.width() - target.width()).abs() <= 2
             && (outer.height() - target.height()).abs() <= 2;
         if on_display {
+            // The window is where it belongs: fit the camera to the display it arrived on, now
+            // that the viewport really is that display's size.
+            if self.pending_display_refit {
+                self.pending_display_refit = false;
+                self.refit_view_after_display_move();
+                ctx.request_repaint();
+            }
             return;
         }
 
@@ -117,6 +132,7 @@ impl ImageViewer {
         );
         self.request_borderless_fullscreen_rect(ctx);
         self.pending_media_layout = true;
+        self.pending_display_refit = true;
         ctx.request_repaint();
     }
 

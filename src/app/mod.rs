@@ -351,6 +351,9 @@ pub(crate) struct ImageViewer {
     /// For videos, dimensions may be unknown until the first decoded frame.
     /// When true, we retry applying the appropriate layout once dimensions become available.
     pub(crate) pending_media_layout: bool,
+    /// The fullscreen window was carried to another display and its camera still belongs to the
+    /// one it came from: fit it once the new rectangle has landed.
+    pub(crate) pending_display_refit: bool,
     /// Screen size
     pub(crate) screen_size: egui::Vec2,
     /// Last `pixels_per_point` a frame ran at; a change means a display scale change.
@@ -1090,6 +1093,7 @@ impl Default for ImageViewer {
             error_message: None,
             image_changed: false,
             pending_media_layout: false,
+            pending_display_refit: false,
             screen_size: egui::Vec2::new(1920.0, 1080.0),
             last_ppp: 0.0,
             main_hwnd: 0,

@@ -112,6 +112,35 @@ impl ImageViewer {
         }
     }
 
+    /// Fits the media to the display a Win+Shift+arrow carried the fullscreen window to.
+    ///
+    /// A solo image is fitted by `apply_fullscreen_layout_for_current_image`, which the pending
+    /// layout already runs. The strip and the grid carry their own camera — row heights and
+    /// column widths come from the viewport size — so after the window arrives at another size
+    /// the camera is still framing the display it came from. Each layout is fitted again from the
+    /// same entry point that fits it on the way in, keeping the item being viewed.
+    pub(crate) fn refit_view_after_display_move(&mut self) {
+        if self.image_list.is_empty() || self.mode().is_solo() {
+            return;
+        }
+
+        self.offset = egui::Vec2::ZERO;
+        self.zoom_velocity = 0.0;
+        self.manga_shift_wheel_pan_velocity_x = 0.0;
+
+        if self.mode().is_grid() {
+            // The grid at 100% is its fit: the columns divide the viewport.
+            self.zoom = 1.0;
+            self.zoom_target = 1.0;
+            self.invalidate_manga_layout_cache_for_zoom();
+            self.scroll_strip_to_current_index();
+            return;
+        }
+
+        self.reset_long_strip_view_to_current_media();
+        self.manga_update_current_index();
+    }
+
     pub(crate) fn tick_floating_zoom_animation(&mut self, ctx: &egui::Context) -> bool {
         if self.mode().is_fullscreen() {
             self.zoom_target = self.zoom;
