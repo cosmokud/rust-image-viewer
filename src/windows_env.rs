@@ -720,6 +720,124 @@ unsafe extern "system" fn collect_monitor_rect(
     1
 }
 
+/// Watches the chord's key states from outside the message queue.
+///
+/// The shell keeps Win+Shift+arrow to itself: a window it arranges never sees the arrow, and a
+/// window it declines (a frameless one covering a display, for instance) may deliver nothing but
+/// the release, so no message handler can tell the two cases apart. The key states can be read
+/// without a message, and the window's own rectangle settles which case this was: a rectangle
+/// that moved since the chord began means the shell carried the window itself.
+///
+/// The rectangle is sampled when the Windows key goes down — always before the shell acts — and
+/// is brought up to date after each move, so repeated presses within one hold of the key work.
+pub fn spawn_win_chord_watch(hwnd: HWND) {
+    static STARTED: OnceLock<()> = OnceLock::new();
+
+    if hwnd.is_null() || STARTED.set(()).is_err() {
+        return;
+    }
+    let hwnd = hwnd as isize;
+    let spawned = std::thread::Builder::new()
+        .name("win-chord-watch".to_string())
+        .spawn(move || win_chord_watch(hwnd as HWND));
+    if spawned.is_err() {
+        crate::diag::trace("chord", "watch thread failed to start");
+    }
+}
+
+fn win_chord_watch(hwnd: HWND) {
+    use winapi::um::winuser::{GetAsyncKeyState, VK_LEFT, VK_RIGHT};
+
+    /// Fast enough to see a press land, cheap enough to run for the life of the process.
+    const POLL: std::time::Duration = std::time::Duration::from_millis(12);
+    /// How long the shell is given to make the move before this thread makes it.
+    const SHELL_GRACE: std::time::Duration = std::time::Duration::from_millis(180);
+
+    let arrow = || {
+        // A chord with both arrows down has no direction: answer `None` for it.
+        let left = unsafe { (GetAsyncKeyState(VK_LEFT as i32) as u16 & 0x8000) != 0 };
+        let right = unsafe { (GetAsyncKeyState(VK_RIGHT as i32) as u16 & 0x8000) != 0 };
+        match (left, right) {
+            (true, false) => Some(-1),
+            (false, true) => Some(1),
+            _ => None,
+        }
+    };
+    let rect = || {
+        window_rect(hwnd).map(|rect| {
+            crate::window_geometry::Rect::new(rect.left, rect.top, rect.right, rect.bottom)
+        })
+    };
+
+    crate::diag::trace("chord", "watch started");
+
+    let mut win_was_down = win_key_down();
+    let mut arrow_was_down = arrow().is_some();
+    // The rectangle the chord began on, and the move waiting for the shell to give up on it.
+    let mut anchor: Option<crate::window_geometry::Rect> = None;
+    let mut pending: Option<(i32, Instant)> = None;
+
+    loop {
+        std::thread::sleep(POLL);
+
+        let win_down = win_key_down();
+        if win_down && !win_was_down {
+            anchor = rect();
+            pending = None;
+            crate::diag::trace("chord", &format!("windows key down anchor={anchor:?}"));
+        } else if !win_down && win_was_down && pending.is_none() {
+            anchor = None;
+        }
+        win_was_down = win_down;
+
+        let direction = arrow();
+        let is_down = direction.is_some();
+        let pressed = is_down && !arrow_was_down;
+        arrow_was_down = is_down;
+        if pressed && shift_key_down() && win_down {
+            if let (Some(direction), Some(_)) = (direction, anchor) {
+                pending = Some((direction, Instant::now()));
+                crate::diag::trace("chord", &format!("arrow pressed direction={direction}"));
+            }
+        }
+
+        // A move the shell made for another chord (Win+Left snapping, say) happened on its own:
+        // the next press has to start from where the window is now. Only between presses, so a
+        // move the shell is making for *this* press still shows up as one.
+        if pending.is_none() && !is_down {
+            if let (Some(before), Some(now)) = (anchor, rect()) {
+                if (now.left - before.left).abs() > 2 || (now.top - before.top).abs() > 2 {
+                    anchor = Some(now);
+                }
+            }
+        }
+
+        let Some((direction, since)) = pending else {
+            continue;
+        };
+        if since.elapsed() < SHELL_GRACE {
+            continue;
+        }
+        pending = None;
+        let Some(before) = anchor else {
+            continue;
+        };
+
+        let now = rect();
+        let shell_moved = now.is_some_and(|now| {
+            (now.left - before.left).abs() > 2 || (now.top - before.top).abs() > 2
+        });
+        if shell_moved {
+            crate::diag::trace("chord", "the shell carried the window itself");
+        } else if move_window_to_adjacent_display(hwnd, direction) {
+            note_win_chord();
+            crate::diag::trace("chord", "carried the window to the neighbour display");
+        }
+        // Either way the next press of the chord starts from where the window is now.
+        anchor = rect();
+    }
+}
+
 /// Re-asserts the window's physical outer size across a display scale change.
 ///
 /// Windows answers `WM_DPICHANGED` with a rectangle that keeps the window's *logical* size, so a
@@ -900,6 +1018,7 @@ pub fn install_scale_change_guard(hwnd: HWND) {
         PREVIOUS_WNDPROC.store(previous, Ordering::SeqCst);
         SetWindowLongPtrW(hwnd, GWLP_WNDPROC, hook);
     }
+    spawn_win_chord_watch(hwnd);
 }
 
 /// Unhooks the window procedure; a no-op when no guard was installed.

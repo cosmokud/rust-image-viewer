@@ -75,9 +75,14 @@ impl ImageViewer {
             || self.viewer_place_frames != 0
             // A natively maximized window carries its own frame outside `rcWork`: nothing to fit.
             || self.current_window_is_maximized(ctx)
-            // Mid-chord the rectangle belongs to the shell; this pass must not argue with it.
-            || crate::windows_env::shell_owns_window_rect()
         {
+            return;
+        }
+        // Mid-chord the rectangle belongs to the shell, and the frame that comes with the keys
+        // held is too early to fit anything. A completed move owns no repaint of its own, so the
+        // pass has to come back by itself once the chord is over.
+        if crate::windows_env::shell_owns_window_rect() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(80));
             return;
         }
 
