@@ -620,7 +620,37 @@ fn neighbour_position(from: crate::window_geometry::Rect, direction: i32) -> Opt
     crate::window_geometry::adjacent_display_position(&monitors, current, from, direction)
 }
 
-/// Rewrites the placement the shell writes for a Win+Shift+arrow before it is applied.
+/// The arrow the chord in flight is holding, if any.
+fn chord_direction() -> Option<i32> {
+    use winapi::um::winuser::{GetAsyncKeyState, VK_LEFT, VK_RIGHT};
+
+    unsafe {
+        if (GetAsyncKeyState(VK_LEFT as i32) as u16 & 0x8000) != 0 {
+            Some(-1)
+        } else if (GetAsyncKeyState(VK_RIGHT as i32) as u16 & 0x8000) != 0 {
+            Some(1)
+        } else {
+            None
+        }
+    }
+}
+
+/// Where the window in the chord in flight belongs: the neighbour of the display the chord began
+/// on, using that rectangle rather than the live one so every placement in one press agrees.
+fn chord_target_position(hwnd: HWND) -> Option<(i32, i32)> {
+    if FULLSCREEN_TARGET.load(Ordering::SeqCst) || !shift_key_down() || !win_key_down() {
+        return None;
+    }
+    let direction = chord_direction()?;
+    let from = chord_anchor().or_else(|| {
+        window_rect(hwnd).map(|rect| {
+            crate::window_geometry::Rect::new(rect.left, rect.top, rect.right, rect.bottom)
+        })
+    })?;
+    neighbour_position(from, direction)
+}
+
+/// Rewrites the placement written for a Win+Shift+arrow before it is applied.
 ///
 /// The shell's own placement leaves the window straddling the seam, and this app then carries it
 /// a frame or two later: two placements, and the first one is visible as the window jumping into a
@@ -628,34 +658,15 @@ fn neighbour_position(from: crate::window_geometry::Rect, direction: i32) -> Opt
 /// so the position is rewritten to the one the carry would write and the bad rectangle is never
 /// shown.
 ///
-/// Only chords are touched, and only placements that keep the window's size: a resize is somebody
-/// else's rectangle (the fullscreen fit, most often) and is left exactly as sent.
+/// The size is left exactly as sent: during a chord it is the scale change's answer, and the guard
+/// for that puts the outer size back itself.
 unsafe fn redirect_chord_placement(hwnd: HWND, lparam: LPARAM) -> bool {
-    use winapi::um::winuser::{GetAsyncKeyState, VK_LEFT, VK_RIGHT, WINDOWPOS};
+    use winapi::um::winuser::WINDOWPOS;
 
-    if lparam == 0
-        || FULLSCREEN_TARGET.load(Ordering::SeqCst)
-        || !shift_key_down()
-        || !win_key_down()
-    {
+    if lparam == 0 {
         return false;
     }
-    let direction = if (GetAsyncKeyState(VK_LEFT as i32) as u16 & 0x8000) != 0 {
-        -1
-    } else if (GetAsyncKeyState(VK_RIGHT as i32) as u16 & 0x8000) != 0 {
-        1
-    } else {
-        return false;
-    };
-
-    let position = chord_anchor()
-        .or_else(|| {
-            window_rect(hwnd).map(|rect| {
-                crate::window_geometry::Rect::new(rect.left, rect.top, rect.right, rect.bottom)
-            })
-        })
-        .and_then(|from| neighbour_position(from, direction));
-    let Some((x, y)) = position else {
+    let Some((x, y)) = chord_target_position(hwnd) else {
         return false;
     };
 
@@ -663,20 +674,16 @@ unsafe fn redirect_chord_placement(hwnd: HWND, lparam: LPARAM) -> bool {
     if (*pos).x == x && (*pos).y == y {
         return false;
     }
-    if (*pos).cx != 0
-        && window_rect(hwnd).is_some_and(|now| {
-            (*pos).cx != now.right - now.left || (*pos).cy != now.bottom - now.top
-        })
-    {
-        return false;
-    }
 
     crate::diag::trace(
         "chord",
         &format!(
-            "shell placement ({},{}) redirected to ({x},{y})",
+            "placement ({},{}) {}x{} flags={:#x} redirected to ({x},{y})",
             (*pos).x,
-            (*pos).y
+            (*pos).y,
+            (*pos).cx,
+            (*pos).cy,
+            (*pos).flags
         ),
     );
     (*pos).x = x;
@@ -1160,9 +1167,15 @@ unsafe extern "system" fn scale_change_wndproc(
 
     let mut left = after.left;
     let mut top = after.top;
-    // Mid-chord the display under the centre is still the one the window is leaving: pulling the
-    // rectangle inside that one is what cancelled the move.
-    if !win_key_down() {
+    if let Some((x, y)) = chord_target_position(hwnd) {
+        // A window rescaled while the chord is in flight keeps the position the OS suggested,
+        // which is the shell's straddled one: writing it back shows the window where it is not
+        // going to stay. The neighbour's position is written instead, the carry's own.
+        left = x;
+        top = y;
+    } else if !win_key_down() {
+        // Mid-chord the display under the centre is still the one the window is leaving: pulling
+        // the rectangle inside that one is what cancelled the move.
         if let Some(display) = monitor_info_at(
             after.left + (after.right - after.left) / 2,
             after.top + (after.bottom - after.top) / 2,
