@@ -295,6 +295,14 @@ impl ImageViewer {
             return;
         }
 
+        // A Win chord moves the window from outside the app. The rectangle egui still holds is
+        // the one from before that move, so sizing the window from it here would undo the chord
+        // one frame after the shell performed it.
+        #[cfg(target_os = "windows")]
+        if crate::windows_env::shell_owns_window_rect() {
+            return;
+        }
+
         let Some(mut desired) = self.image_display_size_at_zoom() else {
             return;
         };

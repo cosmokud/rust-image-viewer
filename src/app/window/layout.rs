@@ -58,6 +58,13 @@ impl ImageViewer {
                 return;
             }
 
+            // A Win chord moves the window from outside the app. Mid-move the display holding
+            // its centre is still the one it is leaving, so this clamp would drag it straight
+            // back: Win+Shift+Left/Right would never arrive anywhere.
+            if crate::windows_env::shell_owns_window_rect() {
+                return;
+            }
+
             let Some(display) = self.current_display(ctx) else {
                 return;
             };

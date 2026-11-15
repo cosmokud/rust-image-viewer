@@ -93,6 +93,10 @@ impl eframe::App for ImageViewer {
 
         self.track_display_scale_change(ctx);
 
+        // A fullscreen viewer follows the window when the shell carries it to another display.
+        #[cfg(target_os = "windows")]
+        self.enforce_fullscreen_display(ctx);
+
         // A viewer reopened from the Stash keeps the rectangle it was closed on, past the OS's
         // answer to the move across displays.
         self.assert_viewer_placement(ctx);

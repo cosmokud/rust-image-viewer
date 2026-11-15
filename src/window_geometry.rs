@@ -121,6 +121,45 @@ pub fn clamp_into(work: Rect, rect: Rect) -> (i32, i32) {
     (left, top)
 }
 
+/// Where a window lands when it is carried one display to the left (`direction < 0`) or right:
+/// its size is kept, its offset on the display is kept, and it wraps around to the far side of
+/// the desktop when no display stands further that way.
+///
+/// Only displays sharing the current one's row take part: a display above or below belongs to a
+/// vertical chain a horizontal chord does not cross into. A single-display desktop answers
+/// `None` — there is nowhere to go.
+pub fn adjacent_display_position(
+    monitors: &[Rect],
+    current: Rect,
+    window: Rect,
+    direction: i32,
+) -> Option<(i32, i32)> {
+    if monitors.len() < 2 || direction == 0 {
+        return None;
+    }
+
+    let mut row: Vec<Rect> = monitors
+        .iter()
+        .copied()
+        .filter(|monitor| monitor.top < current.bottom && monitor.bottom > current.top)
+        .collect();
+    // A desktop whose displays share no row (stacked vertically) still has to answer: the chord
+    // then walks the whole desktop instead of one row of it.
+    if row.len() < 2 {
+        row = monitors.to_vec();
+    }
+    row.sort_by_key(|monitor| (monitor.left, monitor.top));
+
+    let index = row.iter().position(|monitor| *monitor == current)?;
+    let step = if direction < 0 { row.len() - 1 } else { 1 };
+    let target = row[(index + step) % row.len()];
+
+    // Same offset on the new display, pulled back inside it when the displays differ in size.
+    let offset_x = (window.left - current.left).clamp(0, (target.width() - window.width()).max(0));
+    let offset_y = (window.top - current.top).clamp(0, (target.height() - window.height()).max(0));
+    Some((target.left + offset_x, target.top + offset_y))
+}
+
 /// The display that owns `window`: the one nearest its centre, never its corner or the primary.
 pub fn display_for_window_centre(window: Rect) -> Option<Display> {
     display_at(window.centre())
@@ -226,6 +265,67 @@ mod tests {
         let work = Rect::new(-1920 + 120, 0, 0, 1080);
 
         assert_eq!(maximize_target(monitor, work), (120, 0, 1800, 1080));
+    }
+
+    #[test]
+    fn a_window_keeps_its_offset_when_it_is_carried_to_the_next_display() {
+        let primary = Rect::new(0, 0, 1920, 1080);
+        let secondary = Rect::new(1920, 0, 1920 + 2560, 1440);
+        let window = Rect::new(100, 80, 900, 680);
+
+        let (x, y) = adjacent_display_position(&[primary, secondary], primary, window, 1).unwrap();
+        assert_eq!((x, y), (1920 + 100, 80));
+    }
+
+    #[test]
+    fn the_last_display_wraps_around_to_the_first() {
+        let primary = Rect::new(0, 0, 1920, 1080);
+        let secondary = Rect::new(1920, 0, 4480, 1440);
+        let window = Rect::new(1920, 100, 2720, 700);
+
+        let (x, y) =
+            adjacent_display_position(&[primary, secondary], secondary, window, 1).unwrap();
+        assert_eq!((x, y), (primary.left, 100));
+    }
+
+    #[test]
+    fn a_display_above_is_not_the_next_display_sideways() {
+        let primary = Rect::new(0, 0, 1920, 1080);
+        let above = Rect::new(0, -1200, 1920, -120);
+        let right = Rect::new(1920, 0, 3840, 1080);
+
+        let found = adjacent_display_position(
+            &[primary, above, right],
+            primary,
+            Rect::new(10, 10, 810, 610),
+            1,
+        );
+        assert_eq!(found, Some((1930, 10)));
+    }
+
+    #[test]
+    fn an_oversized_window_stays_at_the_target_corner() {
+        let primary = Rect::new(0, 0, 3440, 1440);
+        let small = Rect::new(3440, 0, 3440 + 1280, 720);
+
+        let found = adjacent_display_position(
+            &[primary, small],
+            primary,
+            Rect::new(2000, 400, 3600, 1600),
+            1,
+        );
+        assert_eq!(found, Some((small.left, small.top)));
+    }
+
+    #[test]
+    fn a_single_display_has_no_neighbour() {
+        let primary = Rect::new(0, 0, 1920, 1080);
+        let window = Rect::new(10, 10, 810, 610);
+
+        assert_eq!(
+            adjacent_display_position(&[primary], primary, window, -1),
+            None
+        );
     }
 
     #[test]

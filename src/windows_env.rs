@@ -2,7 +2,9 @@
 
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
+use std::sync::OnceLock;
+use std::time::Instant;
 
 use winapi::shared::minwindef::{LPARAM, LRESULT, UINT, WPARAM};
 use winapi::shared::windef::{HWND, RECT};
@@ -517,6 +519,207 @@ pub fn set_fullscreen_guard(active: bool) {
 
 static PREVIOUS_WNDPROC: AtomicIsize = AtomicIsize::new(0);
 
+// ── Win+arrow chords ───────────────────────────────────────────────────────────────────
+
+/// The clock every chord stamp shares: milliseconds since the first query.
+///
+/// The window procedure and the frame code both read the stamps, so they need one monotonic
+/// origin rather than a per-call `Instant::now()`.
+fn chord_clock_ms() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
+/// When a Win-held window change was last seen or made by this app; 0 before the first chord.
+static LAST_WIN_CHORD_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Is a Windows key physically down right now?
+///
+/// The state is read from the machine, not from this thread's message queue: the chords are
+/// handled between messages, and the queue copy only reflects what was already dispatched.
+pub fn win_key_down() -> bool {
+    use winapi::um::winuser::{GetAsyncKeyState, VK_LWIN, VK_RWIN};
+
+    unsafe {
+        (GetAsyncKeyState(VK_LWIN as i32) as u16 & 0x8000) != 0
+            || (GetAsyncKeyState(VK_RWIN as i32) as u16 & 0x8000) != 0
+    }
+}
+
+fn shift_key_down() -> bool {
+    use winapi::um::winuser::{GetAsyncKeyState, VK_SHIFT};
+
+    unsafe { (GetAsyncKeyState(VK_SHIFT as i32) as u16 & 0x8000) != 0 }
+}
+
+fn note_win_chord() {
+    LAST_WIN_CHORD_MS.store(chord_clock_ms().max(1), Ordering::SeqCst);
+}
+
+fn win_chord_just_seen(within_ms: u64) -> bool {
+    let stamped = LAST_WIN_CHORD_MS.load(Ordering::SeqCst);
+    stamped != 0 && chord_clock_ms().saturating_sub(stamped) < within_ms
+}
+
+/// True while Windows, not this app, owns the viewer's rectangle.
+///
+/// Win+arrow chords are the shell's: it moves the window itself and sends the app nothing.
+/// Win+Shift+Left/Right carries the window to the neighbouring display, Win+Left/Right snaps it
+/// to half of the current one. Every geometry pass the app runs (the floating clamp, the
+/// autosize, the scale guard, the maximize answer) has to stand aside while that is in flight,
+/// or it puts the window back where it came from a frame later — which is exactly why a
+/// Win+Shift+arrow move never arrived. The stamp also covers the frames just after the keys are
+/// released, when the rectangle the shell wrote has not reached egui yet.
+pub fn shell_owns_window_rect() -> bool {
+    win_key_down() || win_chord_just_seen(400)
+}
+
+/// True once this proc has carried the chord of the key press still in flight.
+static CHORD_MOVED_ON_PRESS: AtomicBool = AtomicBool::new(false);
+
+/// Win+Shift+Left/Right when the shell has left the chord to the window.
+///
+/// The shell performs the chord for windows it arranges and such a window never sees the arrow;
+/// a window the shell declines (a frameless one covering a whole display, for instance) does, and
+/// is then carried to the neighbour by hand. Returns true when the chord was consumed.
+///
+/// `key_up` is the release of the same press: it only acts when the press itself never arrived,
+/// which is what a chord the shell half-consumed looks like. `repeat` is an auto-repeat and is
+/// the same press, so it never moves the window a second time.
+fn handle_win_chord_key(hwnd: HWND, vk: WPARAM, key_up: bool, repeat: bool) -> bool {
+    use winapi::um::winuser::{VK_LEFT, VK_RIGHT};
+
+    let key = vk as i32;
+    let direction = if key == VK_LEFT as i32 {
+        -1
+    } else if key == VK_RIGHT as i32 {
+        1
+    } else {
+        return false;
+    };
+    if !shift_key_down() || !win_key_down() {
+        return false;
+    }
+
+    if key_up {
+        // The end of a press this proc already honoured: nothing left to do.
+        if CHORD_MOVED_ON_PRESS.swap(false, Ordering::SeqCst) {
+            return true;
+        }
+        // The shell's own move lands while the keys are held, so a change stamped since the
+        // press means the window has already gone where it should.
+        if win_chord_just_seen(1500) {
+            return false;
+        }
+    } else {
+        if repeat {
+            return CHORD_MOVED_ON_PRESS.load(Ordering::SeqCst);
+        }
+        // A window change stamped a moment ago is the shell's own move arriving first: doing it
+        // again here would carry the window two displays over.
+        if win_chord_just_seen(150) {
+            return false;
+        }
+    }
+
+    if !move_window_to_adjacent_display(hwnd, direction) {
+        return false;
+    }
+    note_win_chord();
+    if !key_up {
+        CHORD_MOVED_ON_PRESS.store(true, Ordering::SeqCst);
+    }
+    true
+}
+
+/// Carries the window one display to the left (`direction < 0`) or right, the way Win+Shift+arrow
+/// does: same size, same offset on the display. False when the desktop has no neighbour there.
+fn move_window_to_adjacent_display(hwnd: HWND, direction: i32) -> bool {
+    use winapi::um::winuser::{
+        GetMonitorInfoW, MonitorFromWindow, SetWindowPos, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+        SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
+    };
+
+    let Some(window) = window_rect(hwnd) else {
+        return false;
+    };
+
+    let current = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+    if current.is_null() {
+        return false;
+    }
+    let mut info: MONITORINFO = unsafe { std::mem::zeroed() };
+    info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+    if unsafe { GetMonitorInfoW(current, &mut info) } == 0 {
+        return false;
+    }
+    let current_rect = crate::window_geometry::Rect::new(
+        info.rcMonitor.left,
+        info.rcMonitor.top,
+        info.rcMonitor.right,
+        info.rcMonitor.bottom,
+    );
+
+    let mut monitors: Vec<crate::window_geometry::Rect> = Vec::new();
+    unsafe {
+        winapi::um::winuser::EnumDisplayMonitors(
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            Some(collect_monitor_rect),
+            &mut monitors as *mut Vec<crate::window_geometry::Rect> as LPARAM,
+        );
+    }
+
+    let window_rect =
+        crate::window_geometry::Rect::new(window.left, window.top, window.right, window.bottom);
+    let Some((x, y)) = crate::window_geometry::adjacent_display_position(
+        &monitors,
+        current_rect,
+        window_rect,
+        direction,
+    ) else {
+        return false;
+    };
+
+    unsafe {
+        SetWindowPos(
+            hwnd,
+            std::ptr::null_mut(),
+            x,
+            y,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        ) != 0
+    }
+}
+
+unsafe extern "system" fn collect_monitor_rect(
+    monitor: winapi::shared::windef::HMONITOR,
+    _hdc: winapi::shared::windef::HDC,
+    _clip: *mut RECT,
+    lparam: LPARAM,
+) -> i32 {
+    use winapi::um::winuser::{GetMonitorInfoW, MONITORINFO};
+
+    let monitors = &mut *(lparam as *mut Vec<crate::window_geometry::Rect>);
+    let mut info: MONITORINFO = std::mem::zeroed();
+    info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+    if GetMonitorInfoW(monitor, &mut info) == 0 {
+        return 1;
+    }
+    let rect = crate::window_geometry::Rect::new(
+        info.rcMonitor.left,
+        info.rcMonitor.top,
+        info.rcMonitor.right,
+        info.rcMonitor.bottom,
+    );
+    if !monitors.contains(&rect) {
+        monitors.push(rect);
+    }
+    1
+}
+
 /// Re-asserts the window's physical outer size across a display scale change.
 ///
 /// Windows answers `WM_DPICHANGED` with a rectangle that keeps the window's *logical* size, so a
@@ -534,7 +737,10 @@ unsafe extern "system" fn scale_change_wndproc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    use winapi::um::winuser::{CallWindowProcW, WM_DPICHANGED, WM_GETMINMAXINFO};
+    use winapi::um::winuser::{
+        CallWindowProcW, WM_DPICHANGED, WM_GETMINMAXINFO, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN,
+        WM_SYSKEYUP, WM_WINDOWPOSCHANGED, WM_WINDOWPOSCHANGING,
+    };
 
     let previous = PREVIOUS_WNDPROC.load(Ordering::SeqCst);
     if previous == 0 {
@@ -542,9 +748,36 @@ unsafe extern "system" fn scale_change_wndproc(
     }
     let previous: WNDPROC = std::mem::transmute(previous);
 
+    // A rectangle written while a Windows key is held is the shell's, from a chord the app never
+    // asked for: stamping it is what tells the geometry passes to leave it alone.
+    if msg == WM_WINDOWPOSCHANGING || msg == WM_WINDOWPOSCHANGED {
+        if win_key_down() {
+            note_win_chord();
+        }
+        return CallWindowProcW(previous, hwnd, msg, wparam, lparam);
+    }
+
+    // The shell carries Win+Shift+arrow itself and then the window never sees the arrow. When it
+    // leaves the chord to the window, this is the only place that can honour it. The key-up is
+    // covered too: a chord the shell half-consumed is seen as a release and nothing else.
+    if matches!(msg, WM_SYSKEYDOWN | WM_KEYDOWN | WM_SYSKEYUP | WM_KEYUP) {
+        let key_up = msg == WM_SYSKEYUP || msg == WM_KEYUP;
+        // Bit 30 of the key message is set when the key was already down: auto-repeat.
+        let repeat = !key_up && (lparam & (1 << 30)) != 0;
+        if handle_win_chord_key(hwnd, wparam, key_up, repeat) {
+            return 0;
+        }
+        return CallWindowProcW(previous, hwnd, msg, wparam, lparam);
+    }
+
     if msg == WM_GETMINMAXINFO {
         let result = CallWindowProcW(previous, hwnd, msg, wparam, lparam);
-        override_maximize_target(hwnd, lparam);
+        // A maximized window the shell is carrying to another display must be allowed to
+        // maximize on that display. Pinning the answer to the display holding the window's old
+        // centre is what refused the move.
+        if !win_key_down() {
+            override_maximize_target(hwnd, lparam);
+        }
         return result;
     }
 
@@ -571,16 +804,20 @@ unsafe extern "system" fn scale_change_wndproc(
 
     let mut left = after.left;
     let mut top = after.top;
-    if let Some(display) = monitor_info_at(
-        after.left + (after.right - after.left) / 2,
-        after.top + (after.bottom - after.top) / 2,
-    ) {
-        let work = display.work;
-        if top < work.top {
-            top = work.top;
-        }
-        if left + width > work.right {
-            left = work.right - width;
+    // Mid-chord the display under the centre is still the one the window is leaving: pulling the
+    // rectangle inside that one is what cancelled the move.
+    if !win_key_down() {
+        if let Some(display) = monitor_info_at(
+            after.left + (after.right - after.left) / 2,
+            after.top + (after.bottom - after.top) / 2,
+        ) {
+            let work = display.work;
+            if top < work.top {
+                top = work.top;
+            }
+            if left + width > work.right {
+                left = work.right - width;
+            }
         }
     }
 

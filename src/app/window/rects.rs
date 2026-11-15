@@ -59,6 +59,48 @@ impl ImageViewer {
         );
     }
 
+    /// Keeps the fullscreen viewer on the display it is on.
+    ///
+    /// Win+Shift+arrow carries the window to the neighbouring display, and the rectangle it was
+    /// given covers the one it left. Writing the target rect of the display that owns the window
+    /// now makes the fullscreen viewer follow the move instead of leaving it at the old size, and
+    /// fitting the media again is what keeps the image the same relative size on the new screen.
+    #[cfg(target_os = "windows")]
+    pub(crate) fn enforce_fullscreen_display(&mut self, ctx: &egui::Context) {
+        if !self.mode().is_fullscreen()
+            || self.is_resizing
+            || self.pending_window_resize.is_some()
+            || self.toggle_fullscreen
+            || self.viewer_window_hidden
+            || self.viewer_place_frames != 0
+            // A natively maximized window carries its own frame outside `rcWork`: nothing to fit.
+            || self.current_window_is_maximized(ctx)
+            // Mid-chord the rectangle belongs to the shell; this pass must not argue with it.
+            || crate::windows_env::shell_owns_window_rect()
+        {
+            return;
+        }
+
+        let Some(display) = self.current_display(ctx) else {
+            return;
+        };
+        let Some(outer) = self.main_window_rect_physical(ctx) else {
+            return;
+        };
+        let target = self.fullscreen_target_rect(display);
+        let on_display = (outer.left - target.left).abs() <= 2
+            && (outer.top - target.top).abs() <= 2
+            && (outer.width() - target.width()).abs() <= 2
+            && (outer.height() - target.height()).abs() <= 2;
+        if on_display {
+            return;
+        }
+
+        self.request_borderless_fullscreen_rect(ctx);
+        self.pending_media_layout = true;
+        ctx.request_repaint();
+    }
+
     #[cfg(not(target_os = "windows"))]
     pub(crate) fn request_borderless_fullscreen_rect(&mut self, ctx: &egui::Context) {
         let monitor = self.monitor_size_points(ctx);

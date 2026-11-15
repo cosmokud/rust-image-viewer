@@ -178,6 +178,14 @@ impl ImageViewer {
         {
             return;
         }
+        // A Win chord moves the window from outside the app, and egui's cached rectangle is the
+        // one from before that move: remembering it would send the next file layout back to the
+        // display the window just left.
+        #[cfg(target_os = "windows")]
+        if crate::windows_env::shell_owns_window_rect() {
+            return;
+        }
+
         if let Some(outer) = ctx.input(|input| input.raw.viewport().outer_rect) {
             self.floating_window_position = Some(outer.min);
         }
