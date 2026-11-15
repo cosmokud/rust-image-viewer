@@ -933,6 +933,11 @@ fn win_chord_watch(hwnd: HWND) {
         std::thread::sleep(POLL);
 
         let win_down = win_key_down();
+        // The rectangle the window rests on outside a chord, kept fresh here too: a window that
+        // never receives a message (idle viewer) would otherwise hold a stale one.
+        if !win_down && restore.is_none() {
+            record_settled_rect(focused_app_window().unwrap_or(hwnd));
+        }
         if win_down && !win_was_down {
             chord_window = focused_app_window().unwrap_or(hwnd);
             let rect_of_chord = window_rect(chord_window).map(|rect| {
@@ -941,6 +946,8 @@ fn win_chord_watch(hwnd: HWND) {
             anchor = rect_of_chord;
             anchor_zoomed = is_window_maximized(chord_window);
             ANCHOR_ZOOMED.store(anchor_zoomed, Ordering::SeqCst);
+            // The chord begins on this rectangle: it is what the window must come back to.
+            record_settled_rect(chord_window);
             restore = None;
             set_chord_anchor(anchor);
             pending = None;
@@ -1178,7 +1185,8 @@ unsafe extern "system" fn scale_change_wndproc(
 ) -> LRESULT {
     use winapi::um::winuser::{
         CallWindowProcW, SC_MAXIMIZE, WM_DPICHANGED, WM_GETMINMAXINFO, WM_KEYDOWN, WM_KEYUP,
-        WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_WINDOWPOSCHANGED, WM_WINDOWPOSCHANGING,
+        WM_MOVE, WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_WINDOWPOSCHANGED,
+        WM_WINDOWPOSCHANGING,
     };
 
     let previous = PREVIOUS_WNDPROC.load(Ordering::SeqCst);
@@ -1203,6 +1211,7 @@ unsafe extern "system" fn scale_change_wndproc(
         // The last moment before the window is painted: a placement that got past the refusal is
         // written back here, in the same message pass, so its new rectangle is never drawn.
         let result = CallWindowProcW(previous, hwnd, msg, wparam, lparam);
+        settle_window_rect(hwnd);
         hold_chord_rect(hwnd);
         return result;
     }
@@ -1218,6 +1227,18 @@ unsafe extern "system" fn scale_change_wndproc(
             return 0;
         }
         return CallWindowProcW(previous, hwnd, msg, wparam, lparam);
+    }
+
+    // Any other move or resize is the shell's chord or the app's own: while no Windows key is
+    // held, the rectangle it lands on is the one the next chord is undone to.
+    if msg == WM_MOVE || msg == WM_SIZE {
+        let result = CallWindowProcW(previous, hwnd, msg, wparam, lparam);
+        if win_key_down() {
+            settle_window_rect(hwnd);
+        } else {
+            record_settled_rect(hwnd);
+        }
+        return result;
     }
 
     // The shell maximises the window for Win+Up: a maximise while a Windows key is held is the
@@ -1611,6 +1632,96 @@ unsafe fn refuse_snap_placement(hwnd: HWND, lparam: LPARAM) -> bool {
     }
     crate::diag::trace("chord", "refused the chord's placement");
     true
+}
+
+/// Per window, the rectangle it last had with no Windows key held: the one a chord is undone to.
+static SETTLED_RECTS: std::sync::Mutex<
+    Option<std::collections::HashMap<isize, (i32, i32, i32, i32)>>,
+> = std::sync::Mutex::new(None);
+
+/// Records the rectangle a window rests on while no chord is being pressed.
+pub fn record_settled_rect(hwnd: HWND) {
+    let Some(rect) = window_rect(hwnd) else {
+        return;
+    };
+    if unsafe { winapi::um::winuser::IsIconic(hwnd) } != 0 {
+        return;
+    }
+    let mut settled = SETTLED_RECTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    settled
+        .get_or_insert_with(std::collections::HashMap::new)
+        .insert(
+            hwnd as isize,
+            (
+                rect.left,
+                rect.top,
+                rect.right - rect.left,
+                rect.bottom - rect.top,
+            ),
+        );
+}
+
+/// The display a rectangle belongs to, by the display under its centre.
+fn rect_display(rect: RECT) -> Option<crate::window_geometry::Rect> {
+    let center_x = (rect.left + rect.right) / 2;
+    let center_y = (rect.top + rect.bottom) / 2;
+    monitor_rects().into_iter().find(|display| {
+        center_x >= display.left
+            && center_x < display.right
+            && center_y >= display.top
+            && center_y < display.bottom
+    })
+}
+
+/// Keeps the window on the rectangle it rested on while a Windows key is held.
+///
+/// A snap hands the window a new rectangle before the window procedure can always refuse it, so
+/// the settled rectangle is written back as soon as the shell changes it — in the same message
+/// pass, before the window can be painted there. `Win`+`Down` is left minimised, and
+/// `Win`+`Shift`+`Left`/`Right` adopts the rectangle it lands on: that move is the chord's point.
+unsafe fn settle_window_rect(hwnd: HWND) {
+    use winapi::um::winuser::IsIconic;
+
+    if RESTORE_WRITE.load(Ordering::SeqCst) || !win_key_down() || IsIconic(hwnd) != 0 {
+        return;
+    }
+    let Some(rect) = window_rect(hwnd) else {
+        return;
+    };
+    let current = (
+        rect.left,
+        rect.top,
+        rect.right - rect.left,
+        rect.bottom - rect.top,
+    );
+    let mut all = SETTLED_RECTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let settled = all.get_or_insert_with(std::collections::HashMap::new);
+    let Some((left, top, width, height)) = settled.get(&(hwnd as isize)).copied() else {
+        return;
+    };
+    if (left, top, width, height) == current {
+        return;
+    }
+    let held = RECT {
+        left,
+        top,
+        right: left + width,
+        bottom: top + height,
+    };
+    // A move that lands on another display is the chord's carry, not a snap: keep that rectangle.
+    if rect_display(rect) != rect_display(held) {
+        settled.insert(hwnd as isize, current);
+        return;
+    }
+    drop(all);
+    crate::diag::trace("chord", "wrote the settled rectangle back before the paint");
+    RESTORE_WRITE.store(true, Ordering::SeqCst);
+    set_window_rect(hwnd, left, top, width, height);
+    RESTORE_WRITE.store(false, Ordering::SeqCst);
 }
 
 /// Puts a window back on the rectangle its chord started from, in the same message pass as the
