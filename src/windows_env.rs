@@ -829,6 +829,11 @@ pub fn install_snap_hotkey_guard() {
     if SNAP_HOTKEY_INSTALLED.swap(true, Ordering::SeqCst) {
         return;
     }
+    guard_log(&format!(
+        "build={} exe={:?}",
+        option_env!("RIV_COMMIT").unwrap_or("unknown"),
+        std::env::current_exe().ok()
+    ));
 
     let (sender, receiver) = std::sync::mpsc::channel();
     let spawned = std::thread::Builder::new()
