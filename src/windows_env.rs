@@ -613,6 +613,21 @@ fn chord_anchor() -> Option<crate::window_geometry::Rect> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Moves a window without touching its size, its place in the z-order or the focus.
+unsafe fn set_window_position(hwnd: HWND, x: i32, y: i32) {
+    use winapi::um::winuser::{SetWindowPos, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER};
+
+    SetWindowPos(
+        hwnd,
+        std::ptr::null_mut(),
+        x,
+        y,
+        0,
+        0,
+        SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+    );
+}
+
 /// The position the window belongs at after a chord from `from` towards `direction`.
 fn neighbour_position(from: crate::window_geometry::Rect, direction: i32) -> Option<(i32, i32)> {
     let monitors = monitor_rects();
@@ -924,10 +939,21 @@ fn win_chord_watch(hwnd: HWND) {
         let pressed = is_down && !arrow_was_down;
         arrow_was_down = is_down;
         if pressed && shift_key_down() && win_down {
-            if let (Some(direction), Some(_)) = (direction, anchor) {
+            if let (Some(direction), Some(from)) = (direction, anchor) {
                 pending = Some((direction, Instant::now()));
                 settle_seen = None;
                 crate::diag::trace("chord", &format!("arrow pressed direction={direction}"));
+                // The window belongs on the neighbour display from the press, not from the
+                // moment the shell gives up on its own placement: carrying it here means the
+                // shell's rectangle arrives at a window that is already where it is going, and
+                // nothing shows the window anywhere else on the way.
+                if let Some((x, y)) = neighbour_position(from, direction) {
+                    unsafe { set_window_position(hwnd, x, y) };
+                    LAST_CARRY_MS.store(chord_clock_ms().max(1), Ordering::SeqCst);
+                    note_win_chord();
+                    verify = Some(((x, y), Instant::now()));
+                    crate::diag::trace("chord", &format!("carried on the press to ({x},{y})"));
+                }
             }
         }
 
@@ -947,31 +973,22 @@ fn win_chord_watch(hwnd: HWND) {
         // display scale change, can put the window back after it was carried. One look a moment
         // later, and one repeat of the move, is what makes the carry survive that.
         if let Some((position, since)) = verify {
+            // Corrected on every poll, not only at the deadline: whatever writes the window
+            // somewhere else — the shell's own placement, or a frame the app sent from a
+            // rectangle it still holds — is undone before the next frame can show it.
+            let arrived = rect().is_some_and(|now| {
+                (now.left - position.0).abs() <= 2 && (now.top - position.1).abs() <= 2
+            });
+            if !arrived {
+                crate::diag::trace(
+                    "chord",
+                    &format!("re-asserting the move to ({},{})", position.0, position.1),
+                );
+                unsafe { set_window_position(hwnd, position.0, position.1) };
+                note_win_chord();
+            }
             if since.elapsed() >= std::time::Duration::from_millis(400) {
                 verify = None;
-                let arrived = rect().is_some_and(|now| {
-                    (now.left - position.0).abs() <= 2 && (now.top - position.1).abs() <= 2
-                });
-                if !arrived {
-                    crate::diag::trace(
-                        "chord",
-                        &format!("re-asserting the move to ({},{})", position.0, position.1),
-                    );
-                    unsafe {
-                        winapi::um::winuser::SetWindowPos(
-                            hwnd,
-                            std::ptr::null_mut(),
-                            position.0,
-                            position.1,
-                            0,
-                            0,
-                            winapi::um::winuser::SWP_NOSIZE
-                                | winapi::um::winuser::SWP_NOZORDER
-                                | winapi::um::winuser::SWP_NOACTIVATE,
-                        );
-                    }
-                    note_win_chord();
-                }
             }
         }
 
