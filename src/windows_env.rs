@@ -1290,6 +1290,119 @@ unsafe fn override_maximize_target(hwnd: HWND, lparam: LPARAM) {
     (*info).ptMaxSize.y = height;
 }
 
+// ── Win+arrow suppression ──────────────────────────────────────────────────────
+
+/// The low-level keyboard hook, kept alive by the thread that pumps its messages.
+static SWALLOW_HOOK: AtomicIsize = AtomicIsize::new(0);
+
+/// Index in `SWALLOWED_DOWN` for the arrows whose Win chord is suppressed.
+static SWALLOWED_DOWN: [AtomicBool; 3] = [
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+];
+
+fn swallow_slot(vk: u32) -> Option<usize> {
+    use winapi::um::winuser::{VK_LEFT, VK_RIGHT, VK_UP};
+
+    match vk as i32 {
+        v if v == VK_LEFT as i32 => Some(0),
+        v if v == VK_RIGHT as i32 => Some(1),
+        v if v == VK_UP as i32 => Some(2),
+        _ => None,
+    }
+}
+
+/// Is the foreground window one of this process's windows?
+///
+/// Settings, the stash and the dialogs are viewports of the same process, so this covers every
+/// window the app owns — and nothing else: chords stay the shell's while another app is focused.
+fn app_window_focused() -> bool {
+    use winapi::um::processthreadsapi::GetCurrentProcessId;
+    use winapi::um::winuser::{GetForegroundWindow, GetWindowThreadProcessId};
+
+    unsafe {
+        let foreground = GetForegroundWindow();
+        if foreground.is_null() {
+            return false;
+        }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(foreground, &mut pid);
+        pid != 0 && pid == GetCurrentProcessId()
+    }
+}
+
+/// Swallows Win+Left, Win+Right and Win+Up for the app's windows in every mode.
+///
+/// Win+Down (minimize) and Win+Shift+Left/Right (carry to the neighbour display) are left alone:
+/// the chord is passed to the next hook and the shell handles it as before. The press is consumed
+/// before the shell sees it, so the window is no longer snapped, maximized or moved by these
+/// chords. The release is consumed too, but only when the press was: a lone release belongs to a
+/// chord the app never took.
+unsafe extern "system" fn win_arrow_swallow_hook(
+    code: i32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    use winapi::um::winuser::{
+        CallNextHookEx, KBDLLHOOKSTRUCT, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    };
+
+    if code >= 0 && lparam != 0 {
+        let event = lparam as *const KBDLLHOOKSTRUCT;
+        if let Some(slot) = swallow_slot((*event).vkCode) {
+            let message = wparam as u32;
+            let key_up = message == WM_KEYUP || message == WM_SYSKEYUP;
+            let key_down = message == WM_KEYDOWN || message == WM_SYSKEYDOWN;
+            let chord = app_window_focused() && win_key_down() && !shift_key_down();
+            if key_down && chord {
+                SWALLOWED_DOWN[slot].store(true, Ordering::SeqCst);
+                return 1;
+            }
+            if key_up {
+                let taken = SWALLOWED_DOWN[slot].swap(false, Ordering::SeqCst);
+                if taken || chord {
+                    return 1;
+                }
+            }
+        }
+    }
+    CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam)
+}
+
+/// Installs the keyboard hook once, on a thread of its own: a low-level hook only fires while the
+/// thread that set it pumps messages, and the UI thread's pump belongs to winit.
+pub fn install_win_arrow_swallow() {
+    static STARTED: OnceLock<()> = OnceLock::new();
+
+    if STARTED.set(()).is_err() {
+        return;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("win-arrow-swallow".to_string())
+        .spawn(|| unsafe {
+            use winapi::um::winuser::{GetMessageW, SetWindowsHookExW, MSG, WH_KEYBOARD_LL};
+
+            let hook = SetWindowsHookExW(
+                WH_KEYBOARD_LL,
+                Some(win_arrow_swallow_hook),
+                std::ptr::null_mut(),
+                0,
+            );
+            if hook.is_null() {
+                crate::diag::trace("chord", "keyboard swallow hook failed to install");
+                return;
+            }
+            SWALLOW_HOOK.store(hook as isize, Ordering::SeqCst);
+            crate::diag::trace("chord", "keyboard swallow hook installed");
+            let mut msg: MSG = std::mem::zeroed();
+            while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {}
+        });
+    if spawned.is_err() {
+        crate::diag::trace("chord", "keyboard swallow thread failed to start");
+    }
+}
+
 /// Hooks the window procedure once, so a display scale change cannot resize the window.
 pub fn install_scale_change_guard(hwnd: HWND) {
     use winapi::um::winuser::{GetWindowLongPtrW, SetWindowLongPtrW, GWLP_WNDPROC};
@@ -1307,6 +1420,7 @@ pub fn install_scale_change_guard(hwnd: HWND) {
         SetWindowLongPtrW(hwnd, GWLP_WNDPROC, hook);
     }
     spawn_win_chord_watch(hwnd);
+    install_win_arrow_swallow();
 }
 
 /// Unhooks the window procedure; a no-op when no guard was installed.
