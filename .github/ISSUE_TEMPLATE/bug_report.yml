@@ -1,0 +1,170 @@
+name: Bug report
+description: Report a crash, hang, wrong behaviour, or broken file/format support.
+title: "[Bug] "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. This app is Windows-only and ships as two CPU builds (AVX2 and
+        legacy SSE4.2), plus bundled and no-GStreamer installers — the build and install type
+        matter for almost every bug, so please fill them in.
+
+        Security issues: do **not** open a public issue. Use the
+        [security policy](https://github.com/cosmokud/rust-image-viewer/blob/main/SECURITY.md).
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Preflight
+      options:
+        - label: I searched existing issues and this is not a duplicate.
+          required: true
+        - label: I am on the latest release (pre-1.0.0, older releases are unsupported).
+          required: true
+        - label: This is not a security issue (if it is, I read SECURITY.md and will report privately).
+          required: true
+
+  - type: dropdown
+    id: build
+    attributes:
+      label: Build variant
+      description: Taken from the file name (`*-legacy-*` / `rust-image-viewer-legacy.exe` is the SSE4.2 build).
+      options:
+        - AVX2 (default)
+        - Legacy SSE4.2
+        - Built from source (cargo build --release)
+  - type: dropdown
+    id: install
+    attributes:
+      label: Install type
+      options:
+        - Setup exe, GStreamer bundled
+        - Setup exe, no GStreamer
+        - Portable exe
+        - Built/run from source
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Pick the closest one. See the feature map in ARCHITECTURE.md if unsure.
+      options:
+        - Window / fullscreen / DPI / multi-monitor
+        - Navigation (prev/next, sort order, folder scan)
+        - Layout: Long Strip
+        - Layout: Masonry
+        - Video playback
+        - Animated GIF / WebP
+        - Stash window
+        - Settings window
+        - File operations (delete / rename / undo / redo)
+        - Cache / metadata / performance
+        - Drag-and-drop / single-instance handoff
+        - Startup / installer
+        - Other
+  - type: dropdown
+    id: format
+    attributes:
+      label: File type involved
+      description: Skip for bugs that do not involve a file format.
+      options:
+        - Not format-specific
+        - JPEG
+        - PNG
+        - WebP (static)
+        - WebP (animated)
+        - GIF (animated)
+        - BMP
+        - PSD
+        - ICO
+        - TIFF
+        - MP4
+        - MKV
+        - WebM
+        - AVI
+        - MOV
+        - WMV
+        - FLV
+        - M4V
+        - 3GP
+        - OGV
+  - type: input
+    id: version
+    attributes:
+      label: App version
+      placeholder: e.g. 0.4.4
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Windows version and build
+      placeholder: e.g. Windows 11 24H2 (22631.4169)
+    validations:
+      required: true
+  - type: input
+    id: hardware
+    attributes:
+      label: CPU and GPU (+ driver version if video is involved)
+      placeholder: e.g. i7-9700K, RTX 3070 driver 560.94
+  - type: input
+    id: display
+    attributes:
+      label: Display setup
+      placeholder: e.g. 2 monitors, 2560x1440 @ 150% scale + 1920x1080 @ 100%
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open folder X with N files
+        2. Press / use ...
+        3. Observe
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behaviour
+      description: Include any error text, dialog message, or the exact point where it hangs.
+    validations:
+      required: true
+  - type: input
+    id: frequency
+    attributes:
+      label: How often does it happen?
+      placeholder: e.g. every time / 1 in 20 navigations / once
+  - type: dropdown
+    id: crash
+    attributes:
+      label: Did the process crash or hang?
+      options:
+        - No crash, no hang
+        - Hang (unresponsive window)
+        - Crash / close / process disappeared
+        - Silent failure to display the file
+  - type: textarea
+    id: diag_log
+    attributes:
+      label: Diagnostics log
+      description: |
+        Enable the log sink, reproduce, then attach the newest file:
+
+        - PowerShell: `$env:RIV_DIAG='1'`, run the app, reproduce, `Remove-Item Env:RIV_DIAG`
+        - cmd: `set RIV_DIAG=1`, run, reproduce
+        - Logs land in `%TEMP%\rust-image-viewer\` as `diag-<pid>-<unix_ts>.log`
+          (or set `RIV_DIAG_DIR` to pick the folder). Circle frame times default to 16 ms via
+          `RIV_DIAG_FRAME_MS`, hang threshold via `RIV_DIAG_HANG_MS` (default 2000 ms).
+        - If the app crashed, also attach `panic.log` from the same folder.
+    placeholder: Paste the last ~50 lines, or drag the file in.
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Config changes, sample files (licence/mirror-safe only), screenshots, recordings.
