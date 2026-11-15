@@ -8,12 +8,13 @@ use crate::prelude::*;
 impl ImageViewer {
     #[track_caller]
     pub(crate) fn send_outer_position(&mut self, ctx: &egui::Context, pos: egui::Pos2) {
-        if crate::windows_env::win_chord_in_progress() {
+        {
             let caller = std::panic::Location::caller();
             crate::windows_env::guard_log(&format!(
-                "outer_position {:.0},{:.0} from {}:{}",
+                "outer_position {:.0},{:.0} chord={} from {}:{}",
                 pos.x,
                 pos.y,
+                crate::windows_env::win_chord_in_progress(),
                 caller.file(),
                 caller.line()
             ));

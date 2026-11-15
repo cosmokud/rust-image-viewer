@@ -235,10 +235,16 @@ pub fn set_window_rect(hwnd: HWND, x: i32, y: i32, w: i32, h: i32) -> bool {
     if hwnd.is_null() || w <= 0 || h <= 0 {
         return false;
     }
-    if win_chord_in_progress() {
+    {
         let caller = std::panic::Location::caller();
+        let win = win_key_down();
+        let rect = window_rect(hwnd);
         guard_log(&format!(
-            "set_window_rect {x},{y} {w}x{h} from {}:{}",
+            "set_window_rect {x},{y} {w}x{h} win={win} at={} from {}:{}",
+            match rect {
+                Some(rect) => format!("{},{},{},{}", rect.left, rect.top, rect.right, rect.bottom),
+                None => "none".to_string(),
+            },
             caller.file(),
             caller.line()
         ));
@@ -713,6 +719,10 @@ fn settle_window_rect(hwnd: HWND) {
 /// Temporary: appends one line per event next to the executable, in `win-guard.log`.
 pub fn guard_log(line: &str) {
     use std::io::Write;
+
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let start = *START.get_or_init(std::time::Instant::now);
+    let line = &format!("{:>6}ms {line}", start.elapsed().as_millis());
 
     let Ok(exe) = std::env::current_exe() else {
         return;
