@@ -228,26 +228,11 @@ pub fn window_rect(hwnd: HWND) -> Option<RECT> {
     }
 }
 
-#[track_caller]
 pub fn set_window_rect(hwnd: HWND, x: i32, y: i32, w: i32, h: i32) -> bool {
     use winapi::um::winuser::{SetWindowPos, SWP_NOACTIVATE, SWP_NOZORDER};
 
     if hwnd.is_null() || w <= 0 || h <= 0 {
         return false;
-    }
-    {
-        let caller = std::panic::Location::caller();
-        let win = win_key_down();
-        let rect = window_rect(hwnd);
-        guard_log(&format!(
-            "set_window_rect {x},{y} {w}x{h} win={win} at={} from {}:{}",
-            match rect {
-                Some(rect) => format!("{},{},{},{}", rect.left, rect.top, rect.right, rect.bottom),
-                None => "none".to_string(),
-            },
-            caller.file(),
-            caller.line()
-        ));
     }
     unsafe {
         SetWindowPos(
@@ -324,15 +309,6 @@ pub fn is_window_maximized(hwnd: HWND) -> bool {
         return false;
     }
     unsafe { IsZoomed(hwnd) != 0 }
-}
-
-fn is_window_minimized(hwnd: HWND) -> bool {
-    use winapi::um::winuser::IsIconic;
-
-    if hwnd.is_null() {
-        return false;
-    }
-    unsafe { IsIconic(hwnd) != 0 }
 }
 
 /// The active window, or the foreground one when nothing is active.
@@ -558,10 +534,7 @@ unsafe extern "system" fn scale_change_wndproc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    use winapi::um::winuser::{
-        CallWindowProcW, SC_MAXIMIZE, WM_ACTIVATE, WM_DPICHANGED, WM_GETMINMAXINFO, WM_MOVE,
-        WM_SIZE, WM_SYSCOMMAND, WM_TIMER, WM_WINDOWPOSCHANGED, WM_WINDOWPOSCHANGING,
-    };
+    use winapi::um::winuser::{CallWindowProcW, WM_DPICHANGED, WM_GETMINMAXINFO};
 
     let previous = PREVIOUS_WNDPROC.load(Ordering::SeqCst);
     if previous == 0 {
@@ -572,57 +545,6 @@ unsafe extern "system" fn scale_change_wndproc(
     if msg == WM_GETMINMAXINFO {
         let result = CallWindowProcW(previous, hwnd, msg, wparam, lparam);
         override_maximize_target(hwnd, lparam);
-        return result;
-    }
-
-    // `Win`+arrow is the shell's to perform: `Win`+`Shift`+arrow carries the window to another
-    // display exactly as it does for Notepad, and the app must not stand in the way of that by
-    // rewriting the rectangle afterwards. The sizing border is what keeps the snap variants from
-    // having anything to resize, and it is dropped on every `Win`-held change in case winit has
-    // written it back.
-    if msg == WM_WINDOWPOSCHANGING {
-        if win_key_down() {
-            strip_thick_frame(hwnd);
-        }
-        return CallWindowProcW(previous, hwnd, msg, wparam, lparam);
-    }
-
-    // `Win`+`Down` minimises the window, and that one is wanted: only maximise is refused here.
-    if msg == WM_SYSCOMMAND {
-        let command = wparam & 0xFFF0;
-        if command == SC_MAXIMIZE as WPARAM && win_key_down() {
-            return 0;
-        }
-        return CallWindowProcW(previous, hwnd, msg, wparam, lparam);
-    }
-
-    if msg == WM_TIMER {
-        strip_thick_frame(hwnd);
-        return CallWindowProcW(previous, hwnd, msg, wparam, lparam);
-    }
-
-    if msg == WM_ACTIVATE {
-        strip_thick_frame(hwnd);
-        return CallWindowProcW(previous, hwnd, msg, wparam, lparam);
-    }
-
-    // `WM_WINDOWPOSCHANGED` is the last chance before the window is painted at the new rectangle:
-    // a change that ignored the refusal is written back here, in the same message pass.
-    if msg == WM_WINDOWPOSCHANGED {
-        let result = CallWindowProcW(previous, hwnd, msg, wparam, lparam);
-        settle_window_rect(hwnd);
-        return result;
-    }
-
-    if msg == WM_SIZE || msg == WM_MOVE {
-        let result = CallWindowProcW(previous, hwnd, msg, wparam, lparam);
-        settle_window_rect(hwnd);
-        // A geometry change is where winit rewrites the window styles, so the sizing border is
-        // taken off again here rather than only once at startup: the first `Win`+arrow after a
-        // fullscreen switch would otherwise still start a snap.
-        if !win_key_down() {
-            strip_thick_frame(hwnd);
-        }
         return result;
     }
 
@@ -641,14 +563,6 @@ unsafe extern "system" fn scale_change_wndproc(
     let (Some(before), Some(after)) = (before, window_rect(hwnd)) else {
         return result;
     };
-
-    // A window that the OS has just carried to another display is not being rescaled in place:
-    // keeping its pixels there leaves it half the size on a 200% display, and the position clamp
-    // below then pulls it inside the display it was leaving, so it never arrives. Those crossings
-    // are the OS's to size; only a scale change on the same display is restored here.
-    if display_bounds(before) != display_bounds(after) {
-        return result;
-    }
 
     let (width, height) = (before.right - before.left, before.bottom - before.top);
     if width <= 0 || height <= 0 {
@@ -684,191 +598,10 @@ unsafe extern "system" fn scale_change_wndproc(
     result
 }
 
-static SETTLED_RECT: std::sync::Mutex<Option<(i32, i32, i32, i32)>> = std::sync::Mutex::new(None);
-
-/// Keeps the window on the rectangle the app chose while a `Win` key is down.
-///
-/// A snap hands the window a new rectangle before the window procedure can always refuse it, so the
-/// last rectangle seen with no `Win` key held is written back as soon as the shell changes it. Two
-/// chords are genuinely wanted and are adopted instead: `Win`+`Down` minimises, and
-/// `Win`+`Shift`+`Left`/`Right` carries the window to another display, whose rectangle becomes the
-/// one the viewer is held on from then on.
-fn settle_window_rect(hwnd: HWND) {
-    if is_scale_restore_in_flight() {
-        return;
-    }
-    let Some(rect) = window_rect(hwnd) else {
-        return;
-    };
-    // A minimised window sits at the iconic position and must not become the rectangle the next
-    // chord is measured against.
-    if is_window_minimized(hwnd) {
-        return;
-    }
-    let Ok(mut settled) = SETTLED_RECT.lock() else {
-        return;
-    };
-    *settled = Some((
-        rect.left,
-        rect.top,
-        rect.right - rect.left,
-        rect.bottom - rect.top,
-    ));
-}
-
-/// Temporary: appends one line per event next to the executable, in `win-guard.log`.
-pub fn guard_log(line: &str) {
-    use std::io::Write;
-
-    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    let start = *START.get_or_init(std::time::Instant::now);
-    let line = &format!("{:>6}ms {line}", start.elapsed().as_millis());
-
-    let Ok(exe) = std::env::current_exe() else {
-        return;
-    };
-    let Some(dir) = exe.parent() else {
-        return;
-    };
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(dir.join("win-guard.log"))
-    {
-        let _ = writeln!(file, "{line}");
-    }
-}
-
-/// True while a `Win` chord owns the window.
-///
-/// A `Win`+arrow chord is performed by the shell over several frames, and any position the app
-/// writes during it cancels the move: the window hangs over the seam, the app's own clamp sees a
-/// centre still on the display it is leaving and pulls it back, so the chord never gets anywhere.
-/// While a `Win` key is down the window's rectangle belongs to the shell alone.
-pub fn win_chord_in_progress() -> bool {
-    let now = std::time::Instant::now();
-    if win_key_down() {
-        if let Ok(mut seen) = WIN_CHORD_SEEN.lock() {
-            *seen = Some(now);
-        }
-        return true;
-    }
-    // The frames that render during the chord still carry the rectangle from before the move, and
-    // a layout that positions the window from that stale centre pulls it straight back home. The
-    // chord is therefore considered in flight for a moment after the keys are released too.
-    let seen = WIN_CHORD_SEEN.lock().ok().and_then(|seen| *seen);
-    matches!(seen, Some(at) if now.saturating_duration_since(at) < CHORD_SETTLE)
-}
-
-const CHORD_SETTLE: std::time::Duration = std::time::Duration::from_millis(400);
-
-static WIN_CHORD_SEEN: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
-
-/// True while one of the `Win` keys is physically down.
-fn win_key_down() -> bool {
-    use winapi::um::winuser::{GetAsyncKeyState, VK_LWIN, VK_RWIN};
-
-    unsafe {
-        (GetAsyncKeyState(VK_LWIN as i32) as u16 & 0x8000) != 0
-            || (GetAsyncKeyState(VK_RWIN as i32) as u16 & 0x8000) != 0
-    }
-}
-
-/// The display rectangle a window belongs to, by the display under its centre.
-fn display_bounds(rect: RECT) -> Option<(i32, i32, i32, i32)> {
-    let display = monitor_info_at(
-        rect.left + (rect.right - rect.left) / 2,
-        rect.top + (rect.bottom - rect.top) / 2,
-    )?;
-    Some((
-        display.monitor.left,
-        display.monitor.top,
-        display.monitor.right,
-        display.monitor.bottom,
-    ))
-}
-
 unsafe fn def_proc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     use winapi::um::winuser::DefWindowProcW;
 
     DefWindowProcW(hwnd, msg, wparam, lparam)
-}
-
-/// Takes the sizing border off the window, which is the style the shell needs in order to snap it.
-///
-/// A borderless window has nothing for Aero Snap to resize, so `Win`+`Left`/`Right` start no snap,
-/// draw no animation and cannot expose the desktop for a frame. It is taken off at startup, again
-/// by [`watch_window_style`] whenever winit writes the styles back, and once more when a `Win` chord
-/// arrives. The same bit is the one that gives a borderless window an edge-resize grip, and the
-/// app's own maximise is `WS_MAXIMIZEBOX`, which this does not touch.
-pub fn strip_thick_frame(hwnd: HWND) {
-    use winapi::um::winuser::{
-        GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWL_STYLE, SWP_FRAMECHANGED,
-        SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WS_THICKFRAME,
-    };
-
-    if hwnd.is_null() {
-        return;
-    }
-    unsafe {
-        let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
-        if style & WS_THICKFRAME as isize == 0 {
-            return;
-        }
-        SetWindowLongPtrW(hwnd, GWL_STYLE, style & !(WS_THICKFRAME as isize));
-        SetWindowPos(
-            hwnd,
-            std::ptr::null_mut(),
-            0,
-            0,
-            0,
-            0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
-        );
-    }
-}
-
-/// Keeps the sizing border off while the app runs.
-///
-/// winit writes the window styles itself, after the startup strip and again on every fullscreen or
-/// resize change, so a strip that only reacts to those events can always be beaten by a later
-/// write: the first `Win`+arrow after a mode change then still starts a snap. A quarter-second
-/// timer re-checks the style instead, so the border is gone again long before the next chord, and
-/// the check itself is one `GetWindowLongPtrW`.
-pub fn watch_window_style(hwnd: HWND) {
-    use winapi::um::winuser::SetTimer;
-
-    if hwnd.is_null() {
-        return;
-    }
-    unsafe {
-        SetTimer(hwnd, STYLE_TIMER_ID, 250, None);
-    }
-}
-
-const STYLE_TIMER_ID: usize = 0x5244;
-
-/// Turns off the compositor's transitions for the window.
-///
-/// Windows animates the move it makes for a snap, and that animation is played by DWM even when the
-/// window's rectangle is put back a moment later: it is what is left to see once the window itself
-/// refuses the change. A window with transitions disabled is moved without the animation, so a
-/// change that is undone draws nothing.
-pub fn disable_window_transitions(hwnd: HWND) {
-    use winapi::um::dwmapi::{DwmSetWindowAttribute, DWMWA_TRANSITIONS_FORCEDISABLED};
-
-    if hwnd.is_null() {
-        return;
-    }
-    let disabled: i32 = 1;
-    unsafe {
-        DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_TRANSITIONS_FORCEDISABLED as u32,
-            &disabled as *const i32 as *const _,
-            std::mem::size_of::<i32>() as u32,
-        );
-    }
 }
 
 /// Rewrites only the maximize fields of a `WM_GETMINMAXINFO` answer.

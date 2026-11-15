@@ -241,26 +241,9 @@ impl ImageViewer {
                 if let RawWindowHandle::Win32(win32) = handle.as_raw() {
                     let hwnd = win32.hwnd.get() as isize;
                     viewer.main_hwnd = hwnd;
-                    // Nothing is installed on the window's procedure: the shell moves and sizes
-                    // the window exactly as it does for any other, and the app keeps no opinion
-                    // about a rectangle the OS chose.
-                    let style = unsafe {
-                        winapi::um::winuser::GetWindowLongPtrW(
-                            hwnd as winapi::shared::windef::HWND,
-                            winapi::um::winuser::GWL_STYLE,
-                        )
-                    };
-                    let rect =
-                        crate::windows_env::window_rect(hwnd as winapi::shared::windef::HWND);
-                    match rect {
-                        Some(rect) => crate::windows_env::guard_log(&format!(
-                            "startup style=0x{style:x} rect={},{},{},{}",
-                            rect.left, rect.top, rect.right, rect.bottom
-                        )),
-                        None => crate::windows_env::guard_log(&format!(
-                            "startup style=0x{style:x} rect=none"
-                        )),
-                    }
+                    crate::windows_env::install_scale_change_guard(
+                        hwnd as winapi::shared::windef::HWND,
+                    );
                 }
             }
         }

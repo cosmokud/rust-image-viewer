@@ -101,18 +101,6 @@ impl eframe::App for ImageViewer {
         // its title-bar buttons stay clickable.
         self.enforce_floating_window_buttons_on_display(ctx);
 
-        // Temporary: the rectangle the window really has on each frame of a `Win` chord, so the
-        // log shows whether the shell moved it at all.
-        #[cfg(target_os = "windows")]
-        if crate::windows_env::win_chord_in_progress() {
-            if let Some(rect) = crate::windows_env::window_rect(self.resolved_main_hwnd()) {
-                crate::windows_env::guard_log(&format!(
-                    "frame rect {},{},{},{}",
-                    rect.left, rect.top, rect.right, rect.bottom
-                ));
-            }
-        }
-
         // Where the floating window stands, for the next file's layout to keep it there.
         self.remember_floating_window_position(ctx);
 

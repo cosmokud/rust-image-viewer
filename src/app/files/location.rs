@@ -6,19 +6,7 @@ use crate::app::*;
 use crate::prelude::*;
 
 impl ImageViewer {
-    #[track_caller]
     pub(crate) fn send_outer_position(&mut self, ctx: &egui::Context, pos: egui::Pos2) {
-        {
-            let caller = std::panic::Location::caller();
-            crate::windows_env::guard_log(&format!(
-                "outer_position {:.0},{:.0} chord={} from {}:{}",
-                pos.x,
-                pos.y,
-                crate::windows_env::win_chord_in_progress(),
-                caller.file(),
-                caller.line()
-            ));
-        }
         ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
     }
 
