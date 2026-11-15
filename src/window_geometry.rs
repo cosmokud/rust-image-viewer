@@ -134,6 +134,20 @@ pub fn adjacent_display_position(
     window: Rect,
     direction: i32,
 ) -> Option<(i32, i32)> {
+    let target = adjacent_display(monitors, current, direction)?;
+
+    // Same offset on the new display, pulled back inside it when the displays differ in size.
+    let offset_x = (window.left - current.left).clamp(0, (target.width() - window.width()).max(0));
+    let offset_y = (window.top - current.top).clamp(0, (target.height() - window.height()).max(0));
+    Some((target.left + offset_x, target.top + offset_y))
+}
+
+/// The display one step to the left (`direction < 0`) or right of `current`, wrapping around.
+///
+/// This is the display the chord is *for*, which is not always the one the shell carrying it
+/// ends up choosing: a window too large for the neighbour is left straddling the seam with its
+/// centre still on the display it came from.
+pub fn adjacent_display(monitors: &[Rect], current: Rect, direction: i32) -> Option<Rect> {
     if monitors.len() < 2 || direction == 0 {
         return None;
     }
@@ -152,12 +166,7 @@ pub fn adjacent_display_position(
 
     let index = row.iter().position(|monitor| *monitor == current)?;
     let step = if direction < 0 { row.len() - 1 } else { 1 };
-    let target = row[(index + step) % row.len()];
-
-    // Same offset on the new display, pulled back inside it when the displays differ in size.
-    let offset_x = (window.left - current.left).clamp(0, (target.width() - window.width()).max(0));
-    let offset_y = (window.top - current.top).clamp(0, (target.height() - window.height()).max(0));
-    Some((target.left + offset_x, target.top + offset_y))
+    Some(row[(index + step) % row.len()])
 }
 
 /// The display that owns `window`: the one nearest its centre, never its corner or the primary.

@@ -622,7 +622,12 @@ fn handle_win_chord_key(hwnd: HWND, vk: WPARAM, key_up: bool, repeat: bool) -> b
         }
     }
 
-    if !move_window_to_adjacent_display(hwnd, direction) {
+    let Some(from) = window_rect(hwnd) else {
+        return false;
+    };
+    let from = crate::window_geometry::Rect::new(from.left, from.top, from.right, from.bottom);
+    let carried = carry_to_neighbour(hwnd, direction, from).is_some();
+    if !carried {
         return false;
     }
     note_win_chord();
@@ -632,34 +637,8 @@ fn handle_win_chord_key(hwnd: HWND, vk: WPARAM, key_up: bool, repeat: bool) -> b
     true
 }
 
-/// Carries the window one display to the left (`direction < 0`) or right, the way Win+Shift+arrow
-/// does: same size, same offset on the display. False when the desktop has no neighbour there.
-fn move_window_to_adjacent_display(hwnd: HWND, direction: i32) -> bool {
-    use winapi::um::winuser::{
-        GetMonitorInfoW, MonitorFromWindow, SetWindowPos, MONITORINFO, MONITOR_DEFAULTTONEAREST,
-        SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
-    };
-
-    let Some(window) = window_rect(hwnd) else {
-        return false;
-    };
-
-    let current = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
-    if current.is_null() {
-        return false;
-    }
-    let mut info: MONITORINFO = unsafe { std::mem::zeroed() };
-    info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
-    if unsafe { GetMonitorInfoW(current, &mut info) } == 0 {
-        return false;
-    }
-    let current_rect = crate::window_geometry::Rect::new(
-        info.rcMonitor.left,
-        info.rcMonitor.top,
-        info.rcMonitor.right,
-        info.rcMonitor.bottom,
-    );
-
+/// The displays this desktop is made of, in physical pixels.
+fn monitor_rects() -> Vec<crate::window_geometry::Rect> {
     let mut monitors: Vec<crate::window_geometry::Rect> = Vec::new();
     unsafe {
         winapi::um::winuser::EnumDisplayMonitors(
@@ -669,19 +648,49 @@ fn move_window_to_adjacent_display(hwnd: HWND, direction: i32) -> bool {
             &mut monitors as *mut Vec<crate::window_geometry::Rect> as LPARAM,
         );
     }
+    monitors
+}
 
-    let window_rect =
-        crate::window_geometry::Rect::new(window.left, window.top, window.right, window.bottom);
-    let Some((x, y)) = crate::window_geometry::adjacent_display_position(
-        &monitors,
-        current_rect,
-        window_rect,
-        direction,
-    ) else {
-        return false;
-    };
+/// Carries the window to the display the chord is for — one display left (`direction < 0`) or
+/// right of `from` — keeping its size and its offset on that display.
+///
+/// `from` is the rectangle the chord began on, not the live one: the shell has usually moved the
+/// window already, and where it put the window says nothing about which display the chord is for.
+/// A window too large for the neighbour is left by the shell straddling the seam with its centre
+/// still on the display it came from, and every geometry pass in the app then reads that centre
+/// as "still on the old display" and drags it straight back. Placing it here, with its centre
+/// inside the display the chord is for, is what makes the move stick.
+///
+/// A window already resting on that display is left exactly where the shell put it. Returns the
+/// display and position written when the window had to be carried.
+fn carry_to_neighbour(
+    hwnd: HWND,
+    direction: i32,
+    from: crate::window_geometry::Rect,
+) -> Option<(crate::window_geometry::Rect, (i32, i32))> {
+    use winapi::um::winuser::{SetWindowPos, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER};
 
-    unsafe {
+    let monitors = monitor_rects();
+    let current = crate::window_geometry::display_for_window_centre(from)?.monitor;
+    let target = crate::window_geometry::adjacent_display(&monitors, current, direction)?;
+
+    if let Some(now) = window_rect(hwnd) {
+        let centre = (
+            now.left + (now.right - now.left) / 2,
+            now.top + (now.bottom - now.top) / 2,
+        );
+        let arrived = centre.0 > target.left
+            && centre.0 < target.right
+            && centre.1 > target.top
+            && centre.1 < target.bottom;
+        if arrived {
+            return None;
+        }
+    }
+
+    let (x, y) =
+        crate::window_geometry::adjacent_display_position(&monitors, current, from, direction)?;
+    let moved = unsafe {
         SetWindowPos(
             hwnd,
             std::ptr::null_mut(),
@@ -691,7 +700,8 @@ fn move_window_to_adjacent_display(hwnd: HWND, direction: i32) -> bool {
             0,
             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
         ) != 0
-    }
+    };
+    moved.then_some((target, (x, y)))
 }
 
 unsafe extern "system" fn collect_monitor_rect(
@@ -778,6 +788,8 @@ fn win_chord_watch(hwnd: HWND) {
     let mut pending: Option<(i32, Instant)> = None;
     // Where the window came to rest after a chord, to tell whether anything moved it back.
     let mut after_chord: Option<(crate::window_geometry::Rect, Instant)> = None;
+    // A move this thread made, to be re-asserted if a geometry pass puts the window back.
+    let mut verify: Option<(crate::window_geometry::Rect, (i32, i32), Instant)> = None;
 
     loop {
         std::thread::sleep(POLL);
@@ -814,16 +826,42 @@ fn win_chord_watch(hwnd: HWND) {
             }
         }
 
-        let Some((direction, since)) = pending else {
-            continue;
-        };
-        // A press that lands before the grace ran out on the last one settles that one first:
-        // taps of the chord come faster than the grace.
-        if since.elapsed() >= SHELL_GRACE || pressed {
-            pending = None;
-            if let Some(before) = anchor {
-                anchor = settle_chord(hwnd, direction, before, rect);
-                after_chord = anchor.map(|rect| (rect, Instant::now()));
+        // A pass that listens to the rectangle egui still holds, or the OS's own answer to the
+        // display scale change, can put the window back after it was carried. One look a moment
+        // later, and one repeat of the move, is what makes the carry survive that.
+        if let Some((display, position, since)) = verify {
+            if since.elapsed() >= std::time::Duration::from_millis(400) {
+                verify = None;
+                let arrived = rect().is_some_and(|now| {
+                    let centre = (
+                        now.left + (now.right - now.left) / 2,
+                        now.top + (now.bottom - now.top) / 2,
+                    );
+                    centre.0 > display.left
+                        && centre.0 < display.right
+                        && centre.1 > display.top
+                        && centre.1 < display.bottom
+                });
+                if !arrived {
+                    crate::diag::trace(
+                        "chord",
+                        &format!("re-asserting the move to ({},{})", position.0, position.1),
+                    );
+                    unsafe {
+                        winapi::um::winuser::SetWindowPos(
+                            hwnd,
+                            std::ptr::null_mut(),
+                            position.0,
+                            position.1,
+                            0,
+                            0,
+                            winapi::um::winuser::SWP_NOSIZE
+                                | winapi::um::winuser::SWP_NOZORDER
+                                | winapi::um::winuser::SWP_NOACTIVATE,
+                        );
+                    }
+                    note_win_chord();
+                }
             }
         }
 
@@ -847,18 +885,38 @@ fn win_chord_watch(hwnd: HWND) {
                 );
             }
         }
+
+        let Some((direction, since)) = pending else {
+            continue;
+        };
+        // A press that lands before the grace ran out on the last one settles that one first:
+        // taps of the chord come faster than the grace.
+        if since.elapsed() >= SHELL_GRACE || pressed {
+            pending = None;
+            if let Some(before) = anchor {
+                let (next, carried) = settle_chord(hwnd, direction, before, rect);
+                anchor = next;
+                after_chord = anchor.map(|rect| (rect, Instant::now()));
+                verify = carried.map(|(display, position)| (display, position, Instant::now()));
+            }
+        }
     }
 }
 
-/// Carries the window for one press of the chord, unless the shell already did.
+/// Carries the window for one press of the chord, wherever the shell left it.
 ///
-/// Returns the rectangle the next press is measured against.
+/// Returns the rectangle the next press is measured against, and — when the window had to be
+/// carried — the display it was carried to together with the position written, so the move can
+/// be re-asserted if a geometry pass puts the window back.
 fn settle_chord<F: Fn() -> Option<crate::window_geometry::Rect>>(
     hwnd: HWND,
     direction: i32,
     before: crate::window_geometry::Rect,
     rect: F,
-) -> Option<crate::window_geometry::Rect> {
+) -> (
+    Option<crate::window_geometry::Rect>,
+    Option<(crate::window_geometry::Rect, (i32, i32))>,
+) {
     let now = rect();
     let shell_moved = now
         .is_some_and(|now| (now.left - before.left).abs() > 2 || (now.top - before.top).abs() > 2);
@@ -878,11 +936,15 @@ fn settle_chord<F: Fn() -> Option<crate::window_geometry::Rect>>(
         ),
     );
 
-    if !shell_moved && move_window_to_adjacent_display(hwnd, direction) {
+    // The shell's own move is not accepted as the answer: it can leave the window straddling
+    // the seam, and a window whose centre is still on the display it came from is one the app's
+    // clamps and its fullscreen refit read as "not moved".
+    let carried = carry_to_neighbour(hwnd, direction, before);
+    if carried.is_some() {
         note_win_chord();
         crate::diag::trace("chord", "carried the window to the neighbour display");
     }
-    rect()
+    (rect(), carried)
 }
 
 /// Re-asserts the window's physical outer size across a display scale change.
