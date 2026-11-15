@@ -45,6 +45,9 @@ impl ImageViewer {
             // the close.
             || self.viewer_window_hidden
             || self.current_window_is_maximized(ctx)
+            // A `Win` chord is sliding the window somewhere, and this clamp would drag it back to
+            // the display it is leaving on every frame of the slide.
+            || crate::windows_env::win_chord_in_progress()
         {
             return;
         }

@@ -701,6 +701,16 @@ fn settle_window_rect(hwnd: HWND) {
     ));
 }
 
+/// True while a `Win` chord owns the window.
+///
+/// A `Win`+arrow chord is performed by the shell over several frames, and any position the app
+/// writes during it cancels the move: the window hangs over the seam, the app's own clamp sees a
+/// centre still on the display it is leaving and pulls it back, so the chord never gets anywhere.
+/// While a `Win` key is down the window's rectangle belongs to the shell alone.
+pub fn win_chord_in_progress() -> bool {
+    win_key_down()
+}
+
 /// True while one of the `Win` keys is physically down.
 fn win_key_down() -> bool {
     use winapi::um::winuser::{GetAsyncKeyState, VK_LWIN, VK_RWIN};
