@@ -228,11 +228,20 @@ pub fn window_rect(hwnd: HWND) -> Option<RECT> {
     }
 }
 
+#[track_caller]
 pub fn set_window_rect(hwnd: HWND, x: i32, y: i32, w: i32, h: i32) -> bool {
     use winapi::um::winuser::{SetWindowPos, SWP_NOACTIVATE, SWP_NOZORDER};
 
     if hwnd.is_null() || w <= 0 || h <= 0 {
         return false;
+    }
+    if win_chord_in_progress() {
+        let caller = std::panic::Location::caller();
+        guard_log(&format!(
+            "set_window_rect {x},{y} {w}x{h} from {}:{}",
+            caller.file(),
+            caller.line()
+        ));
     }
     unsafe {
         SetWindowPos(
@@ -699,6 +708,25 @@ fn settle_window_rect(hwnd: HWND) {
         rect.right - rect.left,
         rect.bottom - rect.top,
     ));
+}
+
+/// Temporary: appends one line per event next to the executable, in `win-guard.log`.
+pub fn guard_log(line: &str) {
+    use std::io::Write;
+
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let Some(dir) = exe.parent() else {
+        return;
+    };
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("win-guard.log"))
+    {
+        let _ = writeln!(file, "{line}");
+    }
 }
 
 /// True while a `Win` chord owns the window.
