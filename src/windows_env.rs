@@ -668,11 +668,11 @@ static REVERT_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
 /// Keeps the window on the rectangle the app chose while a `Win` key is down.
 ///
-/// The keyboard guard normally stops `Win`+`Left`/`Right`/`Up` before the shell acts, but a snap
-/// hands the window a new rectangle before the window procedure can refuse it, and a hook can be
-/// missed. The last rectangle seen with no `Win` key held is therefore written back as soon as the
-/// shell changes it, so the window's layout survives even when the chord itself gets through.
-/// `Win`+`Down` is untouched: a minimised window is left minimised.
+/// A snap hands the window a new rectangle before the window procedure can always refuse it, so the
+/// last rectangle seen with no `Win` key held is written back as soon as the shell changes it. Two
+/// chords are genuinely wanted and are adopted instead: `Win`+`Down` minimises, and
+/// `Win`+`Shift`+`Left`/`Right` carries the window to another display, whose rectangle becomes the
+/// one the viewer is held on from then on.
 fn settle_window_rect(hwnd: HWND) {
     if REVERT_IN_FLIGHT.load(Ordering::SeqCst) || is_scale_restore_in_flight() {
         return;
@@ -708,6 +708,12 @@ fn settle_window_rect(hwnd: HWND) {
     if (left, top, width, height) == current {
         return;
     }
+    // `Win`+`Shift`+arrow on another display is a move the viewer should keep, not undo: the new
+    // rectangle becomes the one held from now on, so the window stays where it was carried.
+    if display_bounds(rect) != display_bounds(rect_of((left, top, width, height))) {
+        *settled = Some(current);
+        return;
+    }
     drop(settled);
     REVERT_IN_FLIGHT.store(true, Ordering::SeqCst);
     set_window_rect(hwnd, left, top, width, height);
@@ -726,8 +732,9 @@ fn win_key_down() -> bool {
 
 /// True when the pending position change is the shell moving or resizing the window on `Win`+arrow.
 ///
-/// The rectangle the change targets is not looked at: a snap stays on the display, a move to the
-/// other display leaves it, and both replace the layout the app chose, so both are refused.
+/// A snap keeps the window on the display it is already on and replaces the layout the app chose,
+/// so it is refused. `Win`+`Shift`+`Left`/`Right` instead lands on another display, which is the
+/// chord's whole purpose, and is let through.
 fn win_held_position_change(hwnd: HWND, lparam: LPARAM) -> bool {
     use winapi::um::winuser::{SWP_NOMOVE, SWP_NOSIZE, WINDOWPOS};
 
@@ -750,7 +757,35 @@ fn win_held_position_change(hwnd: HWND, lparam: LPARAM) -> bool {
     if proposed.x <= -32000 || proposed.y <= -32000 {
         return false;
     }
-    true
+    // A change that puts the window on another display is `Win`+`Shift`+arrow, not a snap.
+    !moved_to_another_display(hwnd, proposed)
+}
+
+/// True when the pending change lands on a different display than the window's current one.
+fn moved_to_another_display(hwnd: HWND, proposed: &winapi::um::winuser::WINDOWPOS) -> bool {
+    let Some(current) = window_rect(hwnd) else {
+        return false;
+    };
+    let target = RECT {
+        left: proposed.x,
+        top: proposed.y,
+        right: proposed.x + proposed.cx,
+        bottom: proposed.y + proposed.cy,
+    };
+    match (display_bounds(current), display_bounds(target)) {
+        (Some(current), Some(target)) => current != target,
+        // No display to compare: leave the change alone rather than freeze the window.
+        _ => false,
+    }
+}
+
+fn rect_of((left, top, width, height): (i32, i32, i32, i32)) -> RECT {
+    RECT {
+        left,
+        top,
+        right: left + width,
+        bottom: top + height,
+    }
 }
 
 /// The display rectangle a window belongs to, by the display under its centre.
