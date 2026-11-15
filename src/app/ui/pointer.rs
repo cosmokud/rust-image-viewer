@@ -305,8 +305,25 @@ impl ImageViewer {
         desired.x = desired.x.max(200.0);
         desired.y = desired.y.max(150.0);
 
-        let (current_inner_rect, current_outer_rect) =
+        let (current_inner_rect, mut current_outer_rect) =
             ctx.input(|i| (i.raw.viewport().inner_rect, i.raw.viewport().outer_rect));
+
+        // egui's viewport rectangle lags the window by a frame or more after the shell moves it,
+        // and the reposition below keeps the centre of whatever rectangle it is given: a stale one
+        // on the display the window just left puts the window straight back there. The OS rect is
+        // the only truthful answer, so it wins whenever it can be read.
+        #[cfg(target_os = "windows")]
+        {
+            let ppp = ctx.pixels_per_point();
+            if let Some(rect) = crate::windows_env::window_rect(self.resolved_main_hwnd()) {
+                if ppp.is_finite() && ppp > 0.01 {
+                    current_outer_rect = Some(egui::Rect::from_min_max(
+                        egui::pos2(rect.left as f32 / ppp, rect.top as f32 / ppp),
+                        egui::pos2(rect.right as f32 / ppp, rect.bottom as f32 / ppp),
+                    ));
+                }
+            }
+        }
 
         // While the zoomed media already exceeds the current floating viewport, keep this
         // "zoom inside window" mode stable and do not autosize the native window.
