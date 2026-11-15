@@ -560,16 +560,14 @@ unsafe extern "system" fn scale_change_wndproc(
         return result;
     }
 
-    // `Win`+arrow is not a command the window sees as a key: the shell has already decided to
-    // snap, maximise, minimise or carry it to another display, and every one of those replaces
-    // the rectangle the app laid its media out for. A window position change while one of the
-    // `Win` keys is physically down is that chord (a drag or a resize by hand has no `Win` held),
-    // so it is refused here whatever display it targets — `Win`+`Shift`+arrow included. This is
-    // the second layer: the keyboard guard normally stops the chord before the shell acts, and
-    // this catches whatever still gets through.
+    // `Win`+arrow is the shell's to perform: `Win`+`Shift`+arrow carries the window to another
+    // display exactly as it does for Notepad, and the app must not stand in the way of that by
+    // rewriting the rectangle afterwards. The sizing border is what keeps the snap variants from
+    // having anything to resize, and it is dropped on every `Win`-held change in case winit has
+    // written it back.
     if msg == WM_WINDOWPOSCHANGING {
-        if win_held_position_change(hwnd, lparam) {
-            return 0;
+        if win_key_down() {
+            strip_thick_frame(hwnd);
         }
         return CallWindowProcW(previous, hwnd, msg, wparam, lparam);
     }
@@ -672,7 +670,6 @@ unsafe extern "system" fn scale_change_wndproc(
 }
 
 static SETTLED_RECT: std::sync::Mutex<Option<(i32, i32, i32, i32)>> = std::sync::Mutex::new(None);
-static REVERT_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
 /// Keeps the window on the rectangle the app chose while a `Win` key is down.
 ///
@@ -682,45 +679,26 @@ static REVERT_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 /// `Win`+`Shift`+`Left`/`Right` carries the window to another display, whose rectangle becomes the
 /// one the viewer is held on from then on.
 fn settle_window_rect(hwnd: HWND) {
-    if REVERT_IN_FLIGHT.load(Ordering::SeqCst) || is_scale_restore_in_flight() {
+    if is_scale_restore_in_flight() {
         return;
     }
     let Some(rect) = window_rect(hwnd) else {
         return;
     };
-    let current = (
+    // A minimised window sits at the iconic position and must not become the rectangle the next
+    // chord is measured against.
+    if is_window_minimized(hwnd) {
+        return;
+    }
+    let Ok(mut settled) = SETTLED_RECT.lock() else {
+        return;
+    };
+    *settled = Some((
         rect.left,
         rect.top,
         rect.right - rect.left,
         rect.bottom - rect.top,
-    );
-    let Ok(mut settled) = SETTLED_RECT.lock() else {
-        return;
-    };
-    if !win_key_down() {
-        // A minimised window sits at the iconic position and must not become the rectangle the
-        // next chord is written back to.
-        if !is_window_minimized(hwnd) {
-            *settled = Some(current);
-        }
-        return;
-    }
-    // Not skipped for a maximised window: fullscreen is a maximised borderless window here, and
-    // skipping it is exactly how `Win`+arrow used to leave the fullscreen viewer off-centre.
-    if is_window_minimized(hwnd) {
-        return;
-    }
-    let Some((left, top, width, height)) = *settled else {
-        return;
-    };
-    if (left, top, width, height) == current {
-        return;
-    }
-
-    drop(settled);
-    REVERT_IN_FLIGHT.store(true, Ordering::SeqCst);
-    set_window_rect(hwnd, left, top, width, height);
-    REVERT_IN_FLIGHT.store(false, Ordering::SeqCst);
+    ));
 }
 
 /// True while one of the `Win` keys is physically down.
@@ -731,40 +709,6 @@ fn win_key_down() -> bool {
         (GetAsyncKeyState(VK_LWIN as i32) as u16 & 0x8000) != 0
             || (GetAsyncKeyState(VK_RWIN as i32) as u16 & 0x8000) != 0
     }
-}
-
-/// True when the pending position change is the shell moving or resizing the window on `Win`+arrow.
-///
-/// Every `Win`+arrow change is refused, `Win`+`Shift` included. Telling the two chords apart was
-/// tried twice and cannot be done from here: the measurements showed `Win`+`Shift` sliding the
-/// window in steps that look exactly like a snap's (same display, same size, position only), and a
-/// grace window covering the steps after the keys are released let real snaps through as well,
-/// which is why the window started moving and flickering again. Refusing everything is the only
-/// rule that holds the window where the app put it.
-fn win_held_position_change(hwnd: HWND, lparam: LPARAM) -> bool {
-    use winapi::um::winuser::{SWP_NOMOVE, SWP_NOSIZE, WINDOWPOS};
-
-    if lparam == 0 {
-        return false;
-    }
-    let proposed = unsafe { &*(lparam as *const WINDOWPOS) };
-    let win = win_key_down();
-    if win {
-        // winit can have written the sizing border back since the watchdog last looked.
-        strip_thick_frame(hwnd);
-    }
-    // The guard's own write-back must not be refused by the guard.
-    if !win || is_window_minimized(hwnd) || REVERT_IN_FLIGHT.load(Ordering::SeqCst) {
-        return false;
-    }
-    if proposed.flags & SWP_NOSIZE != 0 && proposed.flags & SWP_NOMOVE != 0 {
-        return false;
-    }
-    // The iconic position `Win`+`Down` moves the window to: minimising stays allowed.
-    if proposed.x <= -32000 || proposed.y <= -32000 {
-        return false;
-    }
-    true
 }
 
 /// The display rectangle a window belongs to, by the display under its centre.
