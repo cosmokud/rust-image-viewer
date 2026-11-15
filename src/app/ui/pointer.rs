@@ -286,6 +286,9 @@ impl ImageViewer {
 
     pub(crate) fn request_floating_autosize(&mut self, ctx: &egui::Context) {
         if self.mode().is_fullscreen()
+            // A `Win` chord is moving the window: sizing it to the image here would position it
+            // from the rectangle it had before the move and undo the chord.
+            || crate::windows_env::win_chord_in_progress()
             || self.current_window_is_maximized(ctx)
             || self.is_resizing
             || self.pending_window_resize.is_some()

@@ -736,8 +736,23 @@ pub fn guard_log(line: &str) {
 /// centre still on the display it is leaving and pulls it back, so the chord never gets anywhere.
 /// While a `Win` key is down the window's rectangle belongs to the shell alone.
 pub fn win_chord_in_progress() -> bool {
-    win_key_down()
+    let now = std::time::Instant::now();
+    if win_key_down() {
+        if let Ok(mut seen) = WIN_CHORD_SEEN.lock() {
+            *seen = Some(now);
+        }
+        return true;
+    }
+    // The frames that render during the chord still carry the rectangle from before the move, and
+    // a layout that positions the window from that stale centre pulls it straight back home. The
+    // chord is therefore considered in flight for a moment after the keys are released too.
+    let seen = WIN_CHORD_SEEN.lock().ok().and_then(|seen| *seen);
+    matches!(seen, Some(at) if now.saturating_duration_since(at) < CHORD_SETTLE)
 }
+
+const CHORD_SETTLE: std::time::Duration = std::time::Duration::from_millis(400);
+
+static WIN_CHORD_SEEN: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
 
 /// True while one of the `Win` keys is physically down.
 fn win_key_down() -> bool {
