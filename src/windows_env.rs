@@ -2,7 +2,7 @@
 
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::Instant;
 
@@ -1302,6 +1302,52 @@ static SWALLOWED_DOWN: [AtomicBool; 3] = [
     AtomicBool::new(false),
 ];
 
+const MOD_WIN_LEFT: u32 = 1 << 0;
+const MOD_WIN_RIGHT: u32 = 1 << 1;
+const MOD_SHIFT_LEFT: u32 = 1 << 2;
+const MOD_SHIFT_RIGHT: u32 = 1 << 3;
+
+/// The modifiers as the hook itself sees them.
+///
+/// `GetAsyncKeyState` is not dependable inside a low-level hook: it is read while the event is
+/// still being routed, so a chord's modifier can read as up although its press came through a
+/// moment before. Tracking the modifier presses in the hook keeps the answer to what actually
+/// arrived, and the state is seeded from the machine once so a key already held at install works.
+static MODIFIERS: AtomicU32 = AtomicU32::new(0);
+
+fn modifier_bit(vk: u32) -> Option<u32> {
+    use winapi::um::winuser::{VK_LSHIFT, VK_LWIN, VK_RSHIFT, VK_RWIN, VK_SHIFT};
+
+    match vk as i32 {
+        v if v == VK_LWIN as i32 => Some(MOD_WIN_LEFT),
+        v if v == VK_RWIN as i32 => Some(MOD_WIN_RIGHT),
+        v if v == VK_LSHIFT as i32 => Some(MOD_SHIFT_LEFT),
+        v if v == VK_RSHIFT as i32 => Some(MOD_SHIFT_RIGHT),
+        // Input that names only the generic key is taken as either side.
+        v if v == VK_SHIFT as i32 => Some(MOD_SHIFT_LEFT | MOD_SHIFT_RIGHT),
+        _ => None,
+    }
+}
+
+/// Reads the modifiers once, for a chord that was already being held when the hook went in.
+fn seed_modifiers() {
+    use winapi::um::winuser::{GetAsyncKeyState, VK_LWIN, VK_RWIN, VK_SHIFT};
+
+    let mut bits = 0;
+    unsafe {
+        if (GetAsyncKeyState(VK_LWIN as i32) as u16 & 0x8000) != 0 {
+            bits |= MOD_WIN_LEFT;
+        }
+        if (GetAsyncKeyState(VK_RWIN as i32) as u16 & 0x8000) != 0 {
+            bits |= MOD_WIN_RIGHT;
+        }
+        if (GetAsyncKeyState(VK_SHIFT as i32) as u16 & 0x8000) != 0 {
+            bits |= MOD_SHIFT_LEFT | MOD_SHIFT_RIGHT;
+        }
+    }
+    MODIFIERS.store(bits, Ordering::SeqCst);
+}
+
 fn swallow_slot(vk: u32) -> Option<usize> {
     use winapi::um::winuser::{VK_LEFT, VK_RIGHT, VK_UP};
 
@@ -1350,11 +1396,42 @@ unsafe extern "system" fn win_arrow_swallow_hook(
 
     if code >= 0 && lparam != 0 {
         let event = lparam as *const KBDLLHOOKSTRUCT;
-        if let Some(slot) = swallow_slot((*event).vkCode) {
-            let message = wparam as u32;
-            let key_up = message == WM_KEYUP || message == WM_SYSKEYUP;
-            let key_down = message == WM_KEYDOWN || message == WM_SYSKEYDOWN;
-            let chord = app_window_focused() && win_key_down() && !shift_key_down();
+        let vk = (*event).vkCode;
+        let message = wparam as u32;
+        let key_up = message == WM_KEYUP || message == WM_SYSKEYUP;
+        let key_down = message == WM_KEYDOWN || message == WM_SYSKEYDOWN;
+
+        if let Some(bit) = modifier_bit(vk) {
+            if key_down {
+                MODIFIERS.fetch_or(bit, Ordering::SeqCst);
+            } else if key_up {
+                MODIFIERS.fetch_and(!bit, Ordering::SeqCst);
+            }
+            crate::diag::trace(
+                "chord",
+                &format!(
+                    "modifier vk={vk} down={} bits={:#x}",
+                    key_down,
+                    MODIFIERS.load(Ordering::SeqCst)
+                ),
+            );
+            return CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam);
+        }
+
+        if let Some(slot) = swallow_slot(vk) {
+            let modifiers = MODIFIERS.load(Ordering::SeqCst);
+            let win_held = modifiers & (MOD_WIN_LEFT | MOD_WIN_RIGHT) != 0;
+            let shift_held = modifiers & (MOD_SHIFT_LEFT | MOD_SHIFT_RIGHT) != 0;
+            let focused = app_window_focused();
+            let chord = win_held && !shift_held && focused;
+            if key_down {
+                crate::diag::trace(
+                    "chord",
+                    &format!(
+                        "arrow vk={vk} win={win_held} shift={shift_held} focused={focused} swallow={chord}"
+                    ),
+                );
+            }
             if key_down && chord {
                 SWALLOWED_DOWN[slot].store(true, Ordering::SeqCst);
                 return 1;
@@ -1394,6 +1471,7 @@ pub fn install_win_arrow_swallow() {
                 return;
             }
             SWALLOW_HOOK.store(hook as isize, Ordering::SeqCst);
+            seed_modifiers();
             crate::diag::trace("chord", "keyboard swallow hook installed");
             let mut msg: MSG = std::mem::zeroed();
             while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {}
