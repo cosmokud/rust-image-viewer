@@ -545,7 +545,7 @@ unsafe extern "system" fn scale_change_wndproc(
 ) -> LRESULT {
     use winapi::um::winuser::{
         CallWindowProcW, SC_MAXIMIZE, WM_ACTIVATE, WM_DPICHANGED, WM_GETMINMAXINFO, WM_MOVE,
-        WM_SIZE, WM_SYSCOMMAND, WM_TIMER, WM_WINDOWPOSCHANGING,
+        WM_SIZE, WM_SYSCOMMAND, WM_TIMER, WM_WINDOWPOSCHANGED, WM_WINDOWPOSCHANGING,
     };
 
     let previous = PREVIOUS_WNDPROC.load(Ordering::SeqCst);
@@ -591,6 +591,14 @@ unsafe extern "system" fn scale_change_wndproc(
     if msg == WM_ACTIVATE {
         strip_thick_frame(hwnd);
         return CallWindowProcW(previous, hwnd, msg, wparam, lparam);
+    }
+
+    // `WM_WINDOWPOSCHANGED` is the last chance before the window is painted at the new rectangle:
+    // a change that ignored the refusal is written back here, in the same message pass.
+    if msg == WM_WINDOWPOSCHANGED {
+        let result = CallWindowProcW(previous, hwnd, msg, wparam, lparam);
+        settle_window_rect(hwnd);
+        return result;
     }
 
     if msg == WM_SIZE || msg == WM_MOVE {
@@ -708,12 +716,7 @@ fn settle_window_rect(hwnd: HWND) {
     if (left, top, width, height) == current {
         return;
     }
-    // `Win`+`Shift`+arrow on another display is a move the viewer should keep, not undo: the new
-    // rectangle becomes the one held from now on, so the window stays where it was carried.
-    if display_bounds(rect) != display_bounds(rect_of((left, top, width, height))) {
-        *settled = Some(current);
-        return;
-    }
+
     drop(settled);
     REVERT_IN_FLIGHT.store(true, Ordering::SeqCst);
     set_window_rect(hwnd, left, top, width, height);
@@ -732,9 +735,12 @@ fn win_key_down() -> bool {
 
 /// True when the pending position change is the shell moving or resizing the window on `Win`+arrow.
 ///
-/// A snap keeps the window on the display it is already on and replaces the layout the app chose,
-/// so it is refused. `Win`+`Shift`+`Left`/`Right` instead lands on another display, which is the
-/// chord's whole purpose, and is let through.
+/// Every `Win`+arrow change is refused, `Win`+`Shift` included. Telling the two chords apart was
+/// tried twice and cannot be done from here: the measurements showed `Win`+`Shift` sliding the
+/// window in steps that look exactly like a snap's (same display, same size, position only), and a
+/// grace window covering the steps after the keys are released let real snaps through as well,
+/// which is why the window started moving and flickering again. Refusing everything is the only
+/// rule that holds the window where the app put it.
 fn win_held_position_change(hwnd: HWND, lparam: LPARAM) -> bool {
     use winapi::um::winuser::{SWP_NOMOVE, SWP_NOSIZE, WINDOWPOS};
 
@@ -743,49 +749,22 @@ fn win_held_position_change(hwnd: HWND, lparam: LPARAM) -> bool {
     }
     let proposed = unsafe { &*(lparam as *const WINDOWPOS) };
     let win = win_key_down();
-    let minimized = is_window_minimized(hwnd);
-    let moves = proposed.flags & SWP_NOSIZE == 0 || proposed.flags & SWP_NOMOVE == 0;
     if win {
         // winit can have written the sizing border back since the watchdog last looked.
         strip_thick_frame(hwnd);
     }
     // The guard's own write-back must not be refused by the guard.
-    if !win || minimized || REVERT_IN_FLIGHT.load(Ordering::SeqCst) || !moves {
+    if !win || is_window_minimized(hwnd) || REVERT_IN_FLIGHT.load(Ordering::SeqCst) {
+        return false;
+    }
+    if proposed.flags & SWP_NOSIZE != 0 && proposed.flags & SWP_NOMOVE != 0 {
         return false;
     }
     // The iconic position `Win`+`Down` moves the window to: minimising stays allowed.
     if proposed.x <= -32000 || proposed.y <= -32000 {
         return false;
     }
-    // A change that puts the window on another display is `Win`+`Shift`+arrow, not a snap.
-    !moved_to_another_display(hwnd, proposed)
-}
-
-/// True when the pending change lands on a different display than the window's current one.
-fn moved_to_another_display(hwnd: HWND, proposed: &winapi::um::winuser::WINDOWPOS) -> bool {
-    let Some(current) = window_rect(hwnd) else {
-        return false;
-    };
-    let target = RECT {
-        left: proposed.x,
-        top: proposed.y,
-        right: proposed.x + proposed.cx,
-        bottom: proposed.y + proposed.cy,
-    };
-    match (display_bounds(current), display_bounds(target)) {
-        (Some(current), Some(target)) => current != target,
-        // No display to compare: leave the change alone rather than freeze the window.
-        _ => false,
-    }
-}
-
-fn rect_of((left, top, width, height): (i32, i32, i32, i32)) -> RECT {
-    RECT {
-        left,
-        top,
-        right: left + width,
-        bottom: top + height,
-    }
+    true
 }
 
 /// The display rectangle a window belongs to, by the display under its centre.
