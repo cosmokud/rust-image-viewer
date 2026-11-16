@@ -278,6 +278,8 @@ impl eframe::App for ImageViewer {
             return;
         }
 
+        self.drive_fullscreen_trace(ctx);
+
         if self.toggle_fullscreen {
             self.stop_manga_autoscroll();
             let entering_fullscreen = !self.mode().is_fullscreen();
@@ -285,6 +287,18 @@ impl eframe::App for ImageViewer {
             let window_was_maximized = self.current_window_is_maximized(ctx);
             let use_native_transition = self.use_native_fullscreen_window_transition()
                 && !self.toggle_fullscreen_force_borderless;
+
+            #[cfg(target_os = "windows")]
+            {
+                crate::windows_env::arm_fs_watch(1500);
+                crate::windows_env::fs_trace("toggle", || {
+                    format!(
+                        "entering={entering_fullscreen} native={use_native_transition} from_titlebar={toggled_from_titlebar} was_maximized={window_was_maximized} masonry={} solo={}",
+                        self.mode().is_masonry(),
+                        self.mode().is_solo(),
+                    )
+                });
+            }
             let entering_titlebar_strip = toggled_from_titlebar
                 && self.mode_state.titlebar_pending_restore_layout().is_some();
             let preserve_strip_return_context = !entering_fullscreen
@@ -849,6 +863,35 @@ impl eframe::App for ImageViewer {
                 repaint_reason = "idle-parked";
                 ctx.request_repaint_after(Duration::from_secs(60 * 60 * 24));
             }
+        }
+
+        // Frame log for the transition trace (`RIV_FS_TRACE=1`): the rects this frame was laid
+        // out with against the rects the window has.
+        #[cfg(target_os = "windows")]
+        if crate::windows_env::fs_watch_active() {
+            let (inner, outer) = ctx.input(|input| {
+                let viewport = input.raw.viewport();
+                (
+                    viewport.inner_rect.map(|rect| rect.size()),
+                    viewport.outer_rect.map(|rect| rect.size()),
+                )
+            });
+            crate::windows_env::fs_trace("frame", || {
+                format!(
+                    "fullscreen={} masonry={} screen={:?} inner={:?} outer={:?} os={:?}",
+                    self.mode().is_fullscreen(),
+                    self.mode().is_masonry(),
+                    ctx.screen_rect().size(),
+                    inner,
+                    outer,
+                    crate::windows_env::window_rect(self.resolved_main_hwnd()).map(|rect| (
+                        rect.left,
+                        rect.top,
+                        rect.right - rect.left,
+                        rect.bottom - rect.top
+                    )),
+                )
+            });
         }
 
         // Last thing in the frame: the rectangle this frame asked for. Everything above it had to

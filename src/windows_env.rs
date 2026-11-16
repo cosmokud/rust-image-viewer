@@ -201,10 +201,191 @@ pub fn set_window_maximized(hwnd: HWND, maximize: bool) -> bool {
     // The display the window is on decides the maximize rectangle: the `WM_GETMINMAXINFO` guard
     // rewrites it to that display's `rcWork`, so a move staged beforehand is all this needs.
     let cmd = if maximize { SW_MAXIMIZE } else { SW_RESTORE };
+    arm_fs_watch(1500);
+    fs_trace("maximize", || {
+        format!(
+            "ShowWindow({}) zoomed={} rect={:?}",
+            if maximize {
+                "SW_MAXIMIZE"
+            } else {
+                "SW_RESTORE"
+            },
+            is_window_maximized(hwnd),
+            window_rect(hwnd).map(|r| (r.left, r.top, r.right - r.left, r.bottom - r.top)),
+        )
+    });
     unsafe {
         ShowWindow(hwnd, cmd);
     }
     true
+}
+
+// ── Fullscreen transition trace (`RIV_FS_TRACE=1`) ────────────────────────────
+//
+// A fullscreen toggle that shows the desktop for a moment has to be read back as what the window
+// actually did: how many rectangles it was given, in what order, whether it was visible and in
+// front the whole time, and what the frames around it were laid out for. The log lands in
+// `<exe dir>/.tmp/fs-trace/state.log`, and nothing is written unless the switch is set.
+
+/// Is the transition trace switched on? (`RIV_FS_TRACE=1`)
+pub fn fs_trace_enabled() -> bool {
+    fs_trace_enabled_inner()
+}
+
+/// Is the diagnostic driver switched on? (`RIV_FS_AUTOTOGGLE=1`)
+pub fn fs_autotoggle_requested() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("RIV_FS_AUTOTOGGLE")
+            .map(|value| {
+                let value = value.trim();
+                !value.is_empty() && value != "0"
+            })
+            .unwrap_or(false)
+    })
+}
+
+fn fs_trace_enabled_inner() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("RIV_FS_TRACE")
+            .map(|value| {
+                let value = value.trim();
+                !value.is_empty() && value != "0"
+            })
+            .unwrap_or(false)
+    })
+}
+
+/// Milliseconds since the first trace line: the transition is read in order and against the clock.
+fn fs_trace_clock_ms() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
+pub fn fs_trace(tag: &str, message: impl FnOnce() -> String) {
+    use std::io::Write;
+
+    if !fs_trace_enabled() {
+        return;
+    }
+    let Some(dir) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join(".tmp").join("fs-trace")))
+    else {
+        return;
+    };
+    let _ = std::fs::create_dir_all(&dir);
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("state.log"))
+    {
+        let _ = writeln!(file, "[{:>6} ms] {tag}: {}", fs_trace_clock_ms(), message());
+    }
+}
+
+/// When the sampler below stops watching; 0 while it is not watching at all.
+static FS_WATCH_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Watches the window for `millis` from now: every change it makes is a line in the trace.
+pub fn arm_fs_watch(millis: u64) {
+    if !fs_trace_enabled() {
+        return;
+    }
+    FS_WATCH_UNTIL_MS.store(
+        fs_trace_clock_ms().saturating_add(millis).max(1),
+        Ordering::SeqCst,
+    );
+}
+
+/// Is the transition sampler watching right now?
+///
+/// The frame log asks it every frame: a session without `RIV_FS_TRACE` pays one atomic load.
+pub fn fs_watch_active() -> bool {
+    let until = FS_WATCH_UNTIL_MS.load(Ordering::SeqCst);
+    until != 0 && fs_trace_clock_ms() < until
+}
+
+fn window_above(hwnd: HWND) -> String {
+    use winapi::um::winuser::{GetClassNameW, GetWindow, GW_HWNDPREV};
+
+    unsafe {
+        let above = GetWindow(hwnd, GW_HWNDPREV);
+        if above.is_null() {
+            return "none".to_string();
+        }
+        let mut buffer: [u16; 64] = [0; 64];
+        let written = GetClassNameW(above, buffer.as_mut_ptr(), buffer.len() as i32);
+        if written <= 0 {
+            return "?".to_string();
+        }
+        String::from_utf16_lossy(&buffer[..written as usize])
+    }
+}
+
+/// Everything the compositor is being asked to show for this window, on one line.
+fn window_state_line(hwnd: HWND) -> String {
+    use winapi::um::winuser::{
+        GetForegroundWindow, GetWindowLongPtrW, IsIconic, IsWindowVisible, IsZoomed, GWL_EXSTYLE,
+        GWL_STYLE, WS_EX_TOPMOST, WS_THICKFRAME, WS_VISIBLE,
+    };
+
+    let Some(rect) = window_rect(hwnd) else {
+        return "gone".to_string();
+    };
+    unsafe {
+        let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+        let exstyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        format!(
+            "rect=({},{}) {}x{} visible={} style_visible={} zoomed={} iconic={} topmost={} thick={} foreground={} above={}",
+            rect.left,
+            rect.top,
+            rect.right - rect.left,
+            rect.bottom - rect.top,
+            IsWindowVisible(hwnd) != 0,
+            style & WS_VISIBLE as isize != 0,
+            IsZoomed(hwnd) != 0,
+            IsIconic(hwnd) != 0,
+            exstyle & WS_EX_TOPMOST as isize != 0,
+            style & WS_THICKFRAME as isize != 0,
+            GetForegroundWindow() == hwnd,
+            window_above(hwnd),
+        )
+    }
+}
+
+/// Samples the window while a transition is being watched, and logs only what changed.
+fn fs_watch(hwnd: HWND) {
+    let mut last = String::new();
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        if !fs_watch_active() {
+            last.clear();
+            continue;
+        }
+        let state = window_state_line(hwnd);
+        if state != last {
+            fs_trace("state", || state.clone());
+            last = state;
+        }
+    }
+}
+
+/// Starts the transition sampler once, for the life of the process.
+pub fn spawn_fs_watch(hwnd: HWND) {
+    static STARTED: OnceLock<()> = OnceLock::new();
+
+    if hwnd.is_null() || !fs_trace_enabled() || STARTED.set(()).is_err() {
+        return;
+    }
+    let hwnd = hwnd as isize;
+    let spawned = std::thread::Builder::new()
+        .name("fs-watch".to_string())
+        .spawn(move || fs_watch(hwnd as HWND));
+    if spawned.is_err() {
+        fs_trace("watch", || "sampler failed to start".to_string());
+    }
 }
 
 /// Message that carries a whole-rectangle placement to the window, between frames.
@@ -231,6 +412,17 @@ pub fn post_window_rect(hwnd: HWND, rect: crate::window_geometry::Rect) -> bool 
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *posted = Some((rect.left, rect.top, rect.width(), rect.height()));
     }
+    arm_fs_watch(1500);
+    fs_trace("place", || {
+        format!(
+            "posted ({},{}) {}x{} current={:?}",
+            rect.left,
+            rect.top,
+            rect.width(),
+            rect.height(),
+            window_rect(hwnd).map(|r| (r.left, r.top, r.right - r.left, r.bottom - r.top)),
+        )
+    });
     unsafe { PostMessageW(hwnd, WM_PLACE_RECT, 0, 0) != 0 }
 }
 
@@ -245,6 +437,12 @@ fn place_posted_rect(hwnd: HWND) {
             "rect",
             &format!("placing the posted rect ({left},{top}) {width}x{height}"),
         );
+        fs_trace("place", || {
+            format!("applying ({left},{top}) {width}x{height}")
+        });
+        // With the placement, not on its own: the frame recalculation discards the composited
+        // content, which is invisible only when the very next thing is the new rectangle.
+        strip_thick_frame(hwnd);
         RESTORE_WRITE.store(true, Ordering::SeqCst);
         set_window_rect(hwnd, left, top, width, height);
         RESTORE_WRITE.store(false, Ordering::SeqCst);
@@ -1228,9 +1426,9 @@ unsafe extern "system" fn scale_change_wndproc(
     lparam: LPARAM,
 ) -> LRESULT {
     use winapi::um::winuser::{
-        CallWindowProcW, SC_MAXIMIZE, WM_ACTIVATE, WM_DPICHANGED, WM_GETMINMAXINFO, WM_KEYDOWN,
-        WM_KEYUP, WM_MOVE, WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER,
-        WM_WINDOWPOSCHANGED, WM_WINDOWPOSCHANGING,
+        CallWindowProcW, SC_MAXIMIZE, WM_DPICHANGED, WM_GETMINMAXINFO, WM_KEYDOWN, WM_KEYUP,
+        WM_MOVE, WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_WINDOWPOSCHANGED,
+        WM_WINDOWPOSCHANGING,
     };
 
     let previous = PREVIOUS_WNDPROC.load(Ordering::SeqCst);
@@ -1278,25 +1476,20 @@ unsafe extern "system" fn scale_change_wndproc(
         return CallWindowProcW(previous, hwnd, msg, wparam, lparam);
     }
 
-    if msg == WM_TIMER {
-        strip_thick_frame(hwnd);
-        return CallWindowProcW(previous, hwnd, msg, wparam, lparam);
-    }
-
-    if msg == WM_ACTIVATE {
-        strip_thick_frame(hwnd);
-        return CallWindowProcW(previous, hwnd, msg, wparam, lparam);
-    }
-
     // Any other move or resize is the shell's chord or the app's own: while no Windows key is
     // held, the rectangle it lands on is the one the next chord is undone to.
+    //
+    // The sizing border is not taken off here. A style change forces a frame recalculation, and
+    // that discards what the compositor holds for the window: done on the frame that just resized
+    // it, the viewer showed the desktop until the next frame was painted. It rides along with a
+    // placement instead (`place_posted_rect`), where the rectangle and the recalculation are one
+    // step.
     if msg == WM_MOVE || msg == WM_SIZE {
         let result = CallWindowProcW(previous, hwnd, msg, wparam, lparam);
         if win_key_down() {
             settle_window_rect(hwnd);
         } else {
             record_settled_rect(hwnd);
-            strip_thick_frame(hwnd);
         }
         return result;
     }
@@ -1698,10 +1891,12 @@ unsafe fn refuse_snap_placement(hwnd: HWND, lparam: LPARAM) -> bool {
     true
 }
 
-const STYLE_TIMER_ID: usize = 0x5244;
-
 /// Takes the sizing border off: Aero Snap divides the screen with it, and the snap's resize is what
 /// the window is seen doing before it is put back.
+///
+/// The frame recalculation this forces throws away the window's composited content, so it is only
+/// ever done as part of a placement — never on its own, and never after a resize that the window
+/// is already showing.
 pub fn strip_thick_frame(hwnd: HWND) {
     use winapi::um::winuser::{
         GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWL_STYLE, SWP_FRAMECHANGED,
@@ -1716,6 +1911,12 @@ pub fn strip_thick_frame(hwnd: HWND) {
         if style & WS_THICKFRAME as isize == 0 {
             return;
         }
+        fs_trace("style", || {
+            format!(
+                "stripping WS_THICKFRAME rect={:?}",
+                window_rect(hwnd).map(|r| (r.left, r.top, r.right - r.left, r.bottom - r.top)),
+            )
+        });
         SetWindowLongPtrW(hwnd, GWL_STYLE, style & !(WS_THICKFRAME as isize));
         SetWindowPos(
             hwnd,
@@ -1726,19 +1927,6 @@ pub fn strip_thick_frame(hwnd: HWND) {
             0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
         );
-    }
-}
-
-/// Keeps the sizing border off while the app runs: winit rewrites the styles on every fullscreen or
-/// resize change, so a quarter-second timer puts it back off long before the next chord.
-pub fn watch_window_style(hwnd: HWND) {
-    use winapi::um::winuser::SetTimer;
-
-    if hwnd.is_null() {
-        return;
-    }
-    unsafe {
-        SetTimer(hwnd, STYLE_TIMER_ID, 250, None);
     }
 }
 
@@ -1883,9 +2071,9 @@ pub fn install_scale_change_guard(hwnd: HWND) {
         SetWindowLongPtrW(hwnd, GWLP_WNDPROC, hook);
     }
     strip_thick_frame(hwnd);
-    watch_window_style(hwnd);
     disable_window_transitions(hwnd);
     spawn_win_chord_watch(hwnd);
+    spawn_fs_watch(hwnd);
     install_win_arrow_swallow();
 }
 

@@ -96,6 +96,35 @@ impl ImageViewer {
         self.toggle_fullscreen = true;
     }
 
+    /// Diagnostic driver: toggles fullscreen by itself so one transition can be traced.
+    ///
+    /// Off unless `RIV_FS_AUTOTOGGLE` is set. Enters fullscreen a second in, leaves it two seconds
+    /// later, and exits the process two seconds after that, so the trace in
+    /// `<exe dir>/.tmp/fs-trace/state.log` covers both directions of one toggle.
+    #[cfg(target_os = "windows")]
+    pub(crate) fn drive_fullscreen_trace(&mut self, ctx: &egui::Context) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        if !crate::windows_env::fs_autotoggle_requested() {
+            return;
+        }
+
+        static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        static ENTERED: AtomicBool = AtomicBool::new(false);
+        static LEFT: AtomicBool = AtomicBool::new(false);
+
+        let elapsed = START.get_or_init(std::time::Instant::now).elapsed();
+        if elapsed >= std::time::Duration::from_secs(1) && !ENTERED.swap(true, Ordering::SeqCst) {
+            self.request_shortcut_fullscreen_toggle();
+        } else if elapsed >= std::time::Duration::from_secs(3) && !LEFT.swap(true, Ordering::SeqCst)
+        {
+            self.request_shortcut_fullscreen_toggle();
+        } else if elapsed >= std::time::Duration::from_secs(6) {
+            std::process::exit(0);
+        }
+        ctx.request_repaint_after(std::time::Duration::from_millis(16));
+    }
+
     pub(crate) fn request_shortcut_fullscreen_toggle(&mut self) {
         self.stop_manga_autoscroll();
 
