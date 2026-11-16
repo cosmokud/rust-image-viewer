@@ -10,7 +10,7 @@ code for a given behaviour actually lives, in the order a question is normally a
 where is it, why is it built that way). Read §2 for the map, §3–§5 for the request lifetime, and
 jump to the chapter whose subject matches the change you were asked to make.
 
-Documented against **0.4.4** (after the `src/app/` split; the previous revision of this file
+Documented against **0.4.5** (after the `src/app/` split; the previous revision of this file
 covered 0.4.1-rc.5, so everything from `src/cache_key.rs` onward is new).
 
 ---
@@ -771,6 +771,8 @@ activating an item from Stash instantly restores the viewer (`unpark_window_offs
 any parked fullscreen camera, or re-enters fullscreen directly if it was closed in fullscreen
 (`reopen_into_fullscreen`). Between folder files, floating mode preserves its window position
 and size ceiling (`floating_mode_remember_position`).
+
+To eliminate desktop flashing and resize tearing during fullscreen toggles and layout switches, a native snapshot cover overlay (`src/windows_env.rs`, `src/app/window/display.rs`) holds a frozen frame over the window until atomic placement and the replacement layout paint. Secondary windows (Stash, Settings) persist positions in physical pixels to prevent DPI scale drift across mixed-DPI displays.
 
 ### 11.5 Input
 

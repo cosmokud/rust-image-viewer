@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.4.5] - 2026-11-17
+
+### Highlights
+
+- Tear-free fullscreen and layout transitions using a native snapshot cover overlay during window resizing and mode changes.
+- Enhanced Stash window with clipboard shortcuts (`Ctrl+C`, `Ctrl+X`), `Delete` key support, badges, selected file counts, and improved virtualization responsiveness.
+- Multi-monitor window stability persisting side windows (Stash, Settings) in physical pixels to prevent DPI scale drift.
+
+### Added
+
+- Native snapshot cover overlay suppressing background tearing and desktop flashes during fullscreen toggles and mode switches.
+- Stash clipboard operations (`Ctrl+C` copy, `Ctrl+X` cut) with visual badge feedback and `Delete` key support.
+- Selected file counter and active cursor position indicators in the Stash window caption.
+- GitHub issue templates for bug reports, feature requests, and performance tracking.
+
+### Changed
+
+- Stash and Settings windows persist position and dimensions in physical pixels across multi-monitor setups.
+- Breadcrumb bar supports direct path editing for folders and files with Lucide icon styling.
+
+### Fixed
+
+- Prevented Stash gallery scrollbar from terminating before reaching the end of large file collections.
+- Corrected fullscreen and snap window placement across multi-display DPI transitions.
+
 ## [0.4.4] - 2026-11-14
 
 ### Highlights
