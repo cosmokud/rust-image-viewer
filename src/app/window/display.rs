@@ -306,6 +306,25 @@ impl ImageViewer {
     pub(crate) fn apply_pending_viewer_rect(&mut self, ctx: &egui::Context) {
         #[cfg(target_os = "windows")]
         if let Some(rect) = self.pending_viewer_rect.take() {
+            // A resize over a display is covered with the frame the app painted last, which egui
+            // hands over the frame after it is asked for. A resize that cannot be covered — one
+            // that stays inside the window's own area, or one whose frame never arrives — goes
+            // ahead regardless.
+            if crate::windows_env::rect_covers_display(rect)
+                && self.transition_cover.is_none()
+                && self.transition_cover_waits < 3
+            {
+                self.transition_cover_waits += 1;
+                self.pending_viewer_rect = Some(rect);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot);
+                ctx.request_repaint();
+                return;
+            }
+            self.transition_cover_waits = 0;
+            if let Some((width, height, rgba)) = self.transition_cover.as_ref() {
+                crate::windows_env::set_pending_cover(rect, *width, *height, rgba);
+                self.transition_cover = None;
+            }
             if crate::windows_env::post_window_rect(self.resolved_main_hwnd(), rect) {
                 ctx.request_repaint();
             }

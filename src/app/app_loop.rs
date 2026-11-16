@@ -72,6 +72,26 @@ impl eframe::App for ImageViewer {
             }
         }
 
+        // The frame the app painted last, kept to stand over a resize that covers a display.
+        #[cfg(target_os = "windows")]
+        if self.transition_cover.is_none() {
+            let painted = ctx.input(|input| {
+                input.events.iter().find_map(|event| match event {
+                    egui::Event::Screenshot { image, .. } => Some(image.clone()),
+                    _ => None,
+                })
+            });
+            if let Some(image) = painted {
+                let [width, height] = image.size;
+                let mut rgba = Vec::with_capacity(width * height * 4);
+                for pixel in &image.pixels {
+                    rgba.extend_from_slice(&[pixel.r(), pixel.g(), pixel.b(), pixel.a()]);
+                }
+                self.transition_cover = Some((width, height, rgba));
+                ctx.request_repaint();
+            }
+        }
+
         self.poll_pending_media_directory_scan(ctx);
         self.poll_pending_solo_probe(ctx);
         self.preload_cached_solo_image_textures_for_current_neighbors(ctx);
@@ -277,9 +297,13 @@ impl eframe::App for ImageViewer {
             Self::send_fast_close_viewport_commands(ctx);
             return;
         }
-        // The window is erased with the background it is about to be painted with.
+        // The window is erased with the background it is about to be painted with, and the
+        // picture standing over a resize is taken down once this frame has been painted.
         #[cfg(target_os = "windows")]
-        crate::windows_env::set_window_background(self.config.background_rgb);
+        {
+            crate::windows_env::set_window_background(self.config.background_rgb);
+            crate::windows_env::step_resize_ghost();
+        }
 
         self.drive_fullscreen_trace(ctx);
 

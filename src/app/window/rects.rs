@@ -39,7 +39,14 @@ impl ImageViewer {
         // One placement for the whole rectangle, written as the frame ends. Two commands would
         // be two rectangles at the compositor, and the display stands in the area the window
         // gained until the frame it was placed in has been painted.
-        self.pending_viewer_rect = Some(self.fullscreen_target_rect(display));
+        // Asked for every frame until the window is there, so only a changed target is a new
+        // transition: repeating the same one must not restart the frame it is covered with.
+        let target = self.fullscreen_target_rect(display);
+        if self.pending_viewer_rect != Some(target) {
+            self.transition_cover = None;
+            self.transition_cover_waits = 0;
+        }
+        self.pending_viewer_rect = Some(target);
         ctx.request_repaint();
     }
 
