@@ -295,27 +295,20 @@ impl ImageViewer {
         self.send_outer_position(ctx, outer_pos);
     }
 
-    /// Writes the placement the frame asked for, as the frame ends.
+    /// Hands the placement this frame asked for to the window, to be applied once the frame is
+    /// painted.
     ///
-    /// An area a window has just gained holds whatever stands behind it until the window has a
-    /// frame of that size to show, and that frame is painted at the end of this update. Placing
-    /// the window here rather than where the layout asked for it leaves nothing of the frame
-    /// between the placement and the paint that fills it — which is what the desktop was showing
-    /// through while floating became fullscreen.
+    /// Placing it here, inside the frame, is what showed the desktop through the window while it
+    /// grew: the frame still being painted holds the old surface size, so only the part of it the
+    /// old rectangle covers was written and the rest was the desktop. The placement is posted
+    /// instead and lands after that frame is presented; the redraw that follows paints the whole
+    /// new rectangle.
     pub(crate) fn apply_pending_viewer_rect(&mut self, ctx: &egui::Context) {
         #[cfg(target_os = "windows")]
         if let Some(rect) = self.pending_viewer_rect.take() {
-            if !crate::windows_env::set_window_rect(
-                self.resolved_main_hwnd(),
-                rect.left,
-                rect.top,
-                rect.width(),
-                rect.height(),
-            ) {
-                // The window is gone: nothing to place, and nothing to wait for either.
-                return;
+            if crate::windows_env::post_window_rect(self.resolved_main_hwnd(), rect) {
+                ctx.request_repaint();
             }
-            ctx.request_repaint();
             return;
         }
 

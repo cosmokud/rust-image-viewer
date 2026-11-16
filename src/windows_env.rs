@@ -207,6 +207,50 @@ pub fn set_window_maximized(hwnd: HWND, maximize: bool) -> bool {
     true
 }
 
+/// Message that carries a whole-rectangle placement to the window, between frames.
+///
+/// A window resized from inside a frame shows the desktop while it grows: the frame being painted
+/// still holds the old surface size, so only the part of the buffer the old rectangle covers is
+/// written and the compositor has nothing for the rest. The message is dispatched after that frame
+/// has been presented, and the redraw that follows paints the whole new rectangle.
+pub const WM_PLACE_RECT: UINT = 0x8000 + 0x4D52;
+
+/// The rectangle a posted `WM_PLACE_RECT` carries.
+static POSTED_RECT: std::sync::Mutex<Option<(i32, i32, i32, i32)>> = std::sync::Mutex::new(None);
+
+/// Hands a window its new rectangle for after the frame being drawn.
+pub fn post_window_rect(hwnd: HWND, rect: crate::window_geometry::Rect) -> bool {
+    use winapi::um::winuser::PostMessageW;
+
+    if hwnd.is_null() {
+        return false;
+    }
+    {
+        let mut posted = POSTED_RECT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *posted = Some((rect.left, rect.top, rect.width(), rect.height()));
+    }
+    unsafe { PostMessageW(hwnd, WM_PLACE_RECT, 0, 0) != 0 }
+}
+
+/// Applies the rectangle a `WM_PLACE_RECT` carries.
+fn place_posted_rect(hwnd: HWND) {
+    let posted = POSTED_RECT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    if let Some((left, top, width, height)) = posted {
+        crate::diag::trace(
+            "rect",
+            &format!("placing the posted rect ({left},{top}) {width}x{height}"),
+        );
+        RESTORE_WRITE.store(true, Ordering::SeqCst);
+        set_window_rect(hwnd, left, top, width, height);
+        RESTORE_WRITE.store(false, Ordering::SeqCst);
+    }
+}
+
 /// A display's rectangles and effective scale, all in physical pixels.
 #[derive(Clone, Copy)]
 pub struct MonitorBox {
@@ -1194,6 +1238,11 @@ unsafe extern "system" fn scale_change_wndproc(
         return def_proc(hwnd, msg, wparam, lparam);
     }
     let previous: WNDPROC = std::mem::transmute(previous);
+
+    if msg == WM_PLACE_RECT {
+        place_posted_rect(hwnd);
+        return 0;
+    }
 
     // A rectangle written while a Windows key is held is the shell's, from a chord the app never
     // asked for: stamping it is what tells the geometry passes to leave it alone.
