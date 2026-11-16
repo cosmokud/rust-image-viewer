@@ -388,6 +388,69 @@ pub fn spawn_fs_watch(hwnd: HWND) {
     }
 }
 
+/// The colour the window is filled with before the app's own frame arrives.
+///
+/// A window has nothing drawn in an area it just gained until the next frame is swapped, and this
+/// class has no background brush: for that moment the compositor shows the desktop through the
+/// window. The erase is answered with the viewer's own background instead, so the gained area is
+/// already the colour the frame is about to paint.
+static WINDOW_BACKGROUND: AtomicU32 = AtomicU32::new(0);
+
+/// Sets the colour the window is erased with, as `0x00BBGGRR` in a `COLORREF`.
+pub fn set_window_background(rgb: [u8; 3]) {
+    WINDOW_BACKGROUND.store(
+        u32::from(rgb[0]) | u32::from(rgb[1]) << 8 | u32::from(rgb[2]) << 16,
+        Ordering::Relaxed,
+    );
+}
+
+/// Paints the whole client area in the viewer's background colour.
+fn erase_window_background(hwnd: HWND, hdc: winapi::shared::windef::HDC) -> bool {
+    use winapi::um::wingdi::{CreateSolidBrush, DeleteObject};
+    use winapi::um::winuser::{FillRect, GetClientRect};
+
+    if hdc.is_null() {
+        return false;
+    }
+    unsafe {
+        // `RIV_FS_FILL_TEST` paints the fill a colour nothing else uses, so a transition can be
+        // watched to tell a filled moment from the desktop still showing through it.
+        static FILL_TEST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let colour = if *FILL_TEST.get_or_init(|| std::env::var_os("RIV_FS_FILL_TEST").is_some()) {
+            0x00FF_00FF
+        } else {
+            WINDOW_BACKGROUND.load(Ordering::Relaxed)
+        };
+        let brush = CreateSolidBrush(colour);
+        if brush.is_null() {
+            return false;
+        }
+        let mut client: RECT = std::mem::zeroed();
+        let have_client = GetClientRect(hwnd, &mut client) != 0;
+        if have_client {
+            FillRect(hdc, &client, brush);
+            // A drawing-context fill is only worth doing if it reaches the surface an OpenGL
+            // window is composited from: the pixel is read back to say that it did.
+            let readback = if fs_trace_enabled() {
+                use winapi::um::wingdi::GetPixel;
+                let pixel = GetPixel(hdc, 4, 4);
+                format!(" readback={pixel:#010x}")
+            } else {
+                String::new()
+            };
+            fs_trace("erase", || {
+                format!(
+                    "filled client {}x{}{readback}",
+                    client.right - client.left,
+                    client.bottom - client.top
+                )
+            });
+        }
+        DeleteObject(brush as *mut _);
+        have_client
+    }
+}
+
 /// Message that carries a whole-rectangle placement to the window, between frames.
 ///
 /// A window resized from inside a frame shows the desktop while it grows: the frame being painted
@@ -443,9 +506,69 @@ fn place_posted_rect(hwnd: HWND) {
         // With the placement, not on its own: the frame recalculation discards the composited
         // content, which is invisible only when the very next thing is the new rectangle.
         strip_thick_frame(hwnd);
+        let covers = covers_display(left, top, width, height);
         RESTORE_WRITE.store(true, Ordering::SeqCst);
         set_window_rect(hwnd, left, top, width, height);
         RESTORE_WRITE.store(false, Ordering::SeqCst);
+        if covers {
+            paint_window_background_now(hwnd);
+        }
+    }
+}
+
+/// The size the window last reported to its procedure.
+static LAST_SIZE: std::sync::Mutex<Option<(i32, i32)>> = std::sync::Mutex::new(None);
+
+/// Did this resize take the window to a whole display, or off one?
+///
+/// Both directions are the fullscreen transition. Growing leaves an area with nothing drawn in
+/// it, and shrinking hands back the area the display had: the window is filled either way.
+fn size_change_crosses_a_display(hwnd: HWND) -> bool {
+    let Some(rect) = window_rect(hwnd) else {
+        return false;
+    };
+    let size = (rect.right - rect.left, rect.bottom - rect.top);
+    let previous = LAST_SIZE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .replace(size);
+    let covers = |(width, height): (i32, i32)| {
+        covers_display(rect.left, rect.top, width, height)
+            || covers_display(
+                rect.left + (rect.right - rect.left - width) / 2,
+                rect.top + (rect.bottom - rect.top - height) / 2,
+                width,
+                height,
+            )
+    };
+    covers(size) || previous.map(covers).unwrap_or(false)
+}
+
+/// Is this rectangle a display's own, or the work area it leaves for windows?
+fn covers_display(left: i32, top: i32, width: i32, height: i32) -> bool {
+    let Some(display) = monitor_info_at(left + width / 2, top + height / 2) else {
+        return false;
+    };
+    let fits = |rect: RECT| {
+        (rect.left - left).abs() <= 2
+            && (rect.top - top).abs() <= 2
+            && (rect.right - rect.left - width).abs() <= 2
+            && (rect.bottom - rect.top - height).abs() <= 2
+    };
+    fits(display.monitor) || fits(display.work)
+}
+
+/// Fills the window now, rather than when the erase message arrives.
+fn paint_window_background_now(hwnd: HWND) {
+    use winapi::um::winuser::{GetDC, ReleaseDC};
+
+    unsafe {
+        let hdc = GetDC(hwnd);
+        if hdc.is_null() {
+            return;
+        }
+        erase_window_background(hwnd, hdc);
+        ReleaseDC(hwnd, hdc);
     }
 }
 
@@ -1426,8 +1549,8 @@ unsafe extern "system" fn scale_change_wndproc(
     lparam: LPARAM,
 ) -> LRESULT {
     use winapi::um::winuser::{
-        CallWindowProcW, SC_MAXIMIZE, WM_DPICHANGED, WM_GETMINMAXINFO, WM_KEYDOWN, WM_KEYUP,
-        WM_MOVE, WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_WINDOWPOSCHANGED,
+        CallWindowProcW, SC_MAXIMIZE, WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN,
+        WM_KEYUP, WM_MOVE, WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_WINDOWPOSCHANGED,
         WM_WINDOWPOSCHANGING,
     };
 
@@ -1440,6 +1563,14 @@ unsafe extern "system" fn scale_change_wndproc(
     if msg == WM_PLACE_RECT {
         place_posted_rect(hwnd);
         return 0;
+    }
+
+    // Filled with the viewer's background rather than left to the desktop.
+    if msg == WM_ERASEBKGND {
+        if erase_window_background(hwnd, wparam as winapi::shared::windef::HDC) {
+            return 1;
+        }
+        return CallWindowProcW(previous, hwnd, msg, wparam, lparam);
     }
 
     // A rectangle written while a Windows key is held is the shell's, from a chord the app never
@@ -1486,6 +1617,14 @@ unsafe extern "system" fn scale_change_wndproc(
     // step.
     if msg == WM_MOVE || msg == WM_SIZE {
         let result = CallWindowProcW(previous, hwnd, msg, wparam, lparam);
+        if msg == WM_SIZE && size_change_crosses_a_display(hwnd) {
+            // The window has nothing drawn yet for the size it just took: with no background brush
+            // the compositor shows the desktop there until the next frame is swapped. Filled here,
+            // inside the placement that resized it, so that moment never reaches the screen. A
+            // resize that stays inside the window's own area keeps its content, and painting it
+            // would only blink.
+            paint_window_background_now(hwnd);
+        }
         if win_key_down() {
             settle_window_rect(hwnd);
         } else {

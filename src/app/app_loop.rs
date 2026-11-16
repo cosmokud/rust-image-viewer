@@ -277,6 +277,9 @@ impl eframe::App for ImageViewer {
             Self::send_fast_close_viewport_commands(ctx);
             return;
         }
+        // The window is erased with the background it is about to be painted with.
+        #[cfg(target_os = "windows")]
+        crate::windows_env::set_window_background(self.config.background_rgb);
 
         self.drive_fullscreen_trace(ctx);
 
