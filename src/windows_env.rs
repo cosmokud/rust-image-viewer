@@ -459,6 +459,18 @@ fn erase_window_background(hwnd: HWND, hdc: winapi::shared::windef::HDC) -> bool
 /// has been presented, and the redraw that follows paints the whole new rectangle.
 pub const WM_PLACE_RECT: UINT = 0x8000 + 0x4D52;
 
+/// The timer that takes the picture over a resize down.
+///
+/// It has to be the window's own: the app paints only when it has something new to draw, and an
+/// idle viewer would leave the picture standing until the next mouse move took it down.
+const GHOST_TIMER: usize = 0x5256;
+
+/// How long the picture stands, counted from when it is shown.
+///
+/// The placement lands a composition or two after it, and the frame for the new rectangle one or
+/// two after that: this is a shade past both.
+const GHOST_TIMER_MS: u32 = 50;
+
 /// The rectangle a posted `WM_PLACE_RECT` carries.
 static POSTED_RECT: std::sync::Mutex<Option<(i32, i32, i32, i32)>> = std::sync::Mutex::new(None);
 
@@ -533,6 +545,7 @@ fn place_posted_rect(hwnd: HWND) {
         fs_trace("place", || "applied".to_string());
         if covered {
             note_cover_placed();
+            unsafe { winapi::um::winuser::SetTimer(hwnd, GHOST_TIMER, GHOST_TIMER_MS, None) };
         }
         RESTORE_WRITE.store(false, Ordering::SeqCst);
         if covers {
@@ -1070,6 +1083,11 @@ pub fn step_resize_ghost() {
     if wait_for_composition {
         unsafe { winapi::um::dwmapi::DwmFlush() };
     }
+    hide_resize_ghost();
+}
+
+/// Takes the picture down, whatever the plan says.
+fn hide_resize_ghost() {
     *GHOST_PLAN
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
@@ -2058,9 +2076,9 @@ unsafe extern "system" fn scale_change_wndproc(
     lparam: LPARAM,
 ) -> LRESULT {
     use winapi::um::winuser::{
-        CallWindowProcW, SC_MAXIMIZE, WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN,
-        WM_KEYUP, WM_MOVE, WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_WINDOWPOSCHANGED,
-        WM_WINDOWPOSCHANGING,
+        CallWindowProcW, KillTimer, SC_MAXIMIZE, WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO,
+        WM_KEYDOWN, WM_KEYUP, WM_MOVE, WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP,
+        WM_TIMER, WM_WINDOWPOSCHANGED, WM_WINDOWPOSCHANGING,
     };
 
     let previous = PREVIOUS_WNDPROC.load(Ordering::SeqCst);
@@ -2071,6 +2089,14 @@ unsafe extern "system" fn scale_change_wndproc(
 
     if msg == WM_PLACE_RECT {
         place_posted_rect(hwnd);
+        return 0;
+    }
+
+    // The picture over a resize comes down on the window's own timer, not on a frame: the app
+    // stops painting once it has nothing new to draw.
+    if msg == WM_TIMER && wparam == GHOST_TIMER {
+        unsafe { KillTimer(hwnd, GHOST_TIMER) };
+        hide_resize_ghost();
         return 0;
     }
 
