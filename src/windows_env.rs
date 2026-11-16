@@ -511,19 +511,20 @@ fn place_posted_rect(hwnd: HWND) {
         // composited from empty until the next frame is painted: the frame the app just painted
         // stands over it while that happens.
         if covers || window_covers_display(hwnd) {
-            let cover = PENDING_COVER
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .take();
-            if let Some((rect, source_w, source_h, rgba)) = cover {
-                // The picture has to be on screen before the rectangle changes. The hole is the
-                // composition the resize lands in, so a picture queued alongside the resize is
-                // not there yet: it is presented first, and the resize follows it.
-                if cover_resize_with_frame(rect, source_w, source_h, &rgba) {
-                    unsafe { winapi::um::dwmapi::DwmFlush() };
-                    fs_trace("ghost", || "synced".to_string());
-                }
+            // The picture has to be on screen before the rectangle changes. The hole is the
+            // composition the resize lands in, so a picture queued alongside the resize is not
+            // there yet: it is presented first, and the resize follows it.
+            if show_prepared_cover(left, top, width, height) {
+                unsafe { winapi::um::dwmapi::DwmFlush() };
+                fs_trace("ghost", || "synced".to_string());
             }
+        } else {
+            drop_prepared_cover(
+                PREPARED_COVER
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take(),
+            );
         }
         RESTORE_WRITE.store(true, Ordering::SeqCst);
         set_window_rect(hwnd, left, top, width, height);
@@ -714,7 +715,7 @@ fn window_covers_display(hwnd: HWND) -> bool {
     )
 }
 
-/// Covers `rect` with the frame the viewer has just painted, for the next frames.
+/// Draws the frame the viewer has just painted over `rect`, ready for the placement that takes it.
 ///
 /// A resize takes the window's composited surface with it: until the frame for the new size is
 /// painted, the area the window covers has nothing in it and the desktop is what shows through.
@@ -724,21 +725,17 @@ fn window_covers_display(hwnd: HWND) -> bool {
 ///
 /// `words` is that frame, and nothing is shown without it: an uncovered resize is what happens
 /// today, and a ghost over the wrong picture would be worse than the hole.
-pub fn cover_resize_with_frame(
+fn prepare_cover(
     rect: crate::window_geometry::Rect,
     source_w: usize,
     source_h: usize,
     words: &[u32],
 ) -> bool {
-    use winapi::shared::windef::{POINT, SIZE};
     use winapi::um::wingdi::{
         CreateSolidBrush, DeleteDC, DeleteObject, SelectObject, SetStretchBltMode, StretchBlt,
-        AC_SRC_OVER, BLENDFUNCTION, HALFTONE, SRCCOPY,
+        HALFTONE, SRCCOPY,
     };
-    use winapi::um::winuser::{
-        FillRect, GetDC, ReleaseDC, SetWindowPos, UpdateLayeredWindow, HWND_TOPMOST,
-        SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, ULW_OPAQUE,
-    };
+    use winapi::um::winuser::{FillRect, GetDC, ReleaseDC};
 
     let (width, height) = (rect.width(), rect.height());
     if width <= 0 || height <= 0 || source_w == 0 || source_h == 0 {
@@ -747,9 +744,9 @@ pub fn cover_resize_with_frame(
     if words.len() < source_w * source_h {
         return false;
     }
-    let Some(ghost) = ghost_window() else {
+    if ghost_window().is_none() {
         return false;
-    };
+    }
 
     unsafe {
         let screen = GetDC(std::ptr::null_mut());
@@ -763,7 +760,7 @@ pub fn cover_resize_with_frame(
             ReleaseDC(std::ptr::null_mut(), screen);
             return false;
         };
-        let Some((cover_dc, cover_bitmap, _)) = create_dib(screen, width, height) else {
+        let Some((cover_dc, cover_bitmap, cover_bits)) = create_dib(screen, width, height) else {
             DeleteObject(source_bitmap as *mut _);
             DeleteDC(source_dc);
             ReleaseDC(std::ptr::null_mut(), screen);
@@ -774,6 +771,9 @@ pub fn cover_resize_with_frame(
         std::slice::from_raw_parts_mut(source_bits, source_w * source_h)
             .copy_from_slice(&words[..source_w * source_h]);
 
+        // Both surfaces have to be selected into their contexts: a device context created for a
+        // bitmap does not draw with it until it is, and one that is not holds a blank surface.
+        SelectObject(source_dc, source_bitmap as *mut _);
         SelectObject(cover_dc, cover_bitmap as *mut _);
         // The background stands where the picture does not reach: the cover is never a hole.
         let cover = RECT {
@@ -788,7 +788,7 @@ pub fn cover_resize_with_frame(
             DeleteObject(brush as *mut _);
         }
         SetStretchBltMode(cover_dc, HALFTONE);
-        StretchBlt(
+        let stretched = StretchBlt(
             cover_dc,
             0,
             0,
@@ -802,10 +802,121 @@ pub fn cover_resize_with_frame(
             SRCCOPY,
         );
 
-        let mut destination = POINT {
-            x: rect.left,
-            y: rect.top,
-        };
+        let sample = words[(source_h / 2) * source_w + source_w / 2];
+        let middle = (height / 2) as usize * width as usize + (width / 2) as usize;
+        let drawn_pixel = *cover_bits.add(middle);
+        let corner = *cover_bits.add((height / 8) as usize * width as usize + (width / 8) as usize);
+        fs_trace("ghost", || {
+            format!(
+                "prepared ({},{}) {width}x{height} stretched={} sample={:06x} \
+                 drawn={:06x},{:06x}",
+                rect.left,
+                rect.top,
+                stretched != 0,
+                sample,
+                drawn_pixel,
+                corner
+            )
+        });
+
+        let mut prepared = PREPARED_COVER
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        drop_prepared_cover(prepared.take());
+        *prepared = Some(PreparedCover {
+            dc: cover_dc as isize,
+            bitmap: cover_bitmap as isize,
+            left: rect.left,
+            top: rect.top,
+            width,
+            height,
+        });
+
+        DeleteObject(source_bitmap as *mut _);
+        DeleteDC(source_dc);
+        ReleaseDC(std::ptr::null_mut(), screen);
+
+        true
+    }
+}
+
+/// The cover built for a placement, standing ready until the placement arrives.
+///
+/// The handles are held as plain integers, as the window handles are: they are only ever used on
+/// the thread that drew them.
+struct PreparedCover {
+    dc: isize,
+    bitmap: isize,
+    left: i32,
+    top: i32,
+    width: i32,
+    height: i32,
+}
+
+static PREPARED_COVER: std::sync::Mutex<Option<PreparedCover>> = std::sync::Mutex::new(None);
+
+/// Gives back the surface a cover was drawn on.
+fn drop_prepared_cover(cover: Option<PreparedCover>) {
+    use winapi::um::wingdi::{DeleteDC, DeleteObject};
+
+    if let Some(cover) = cover {
+        unsafe {
+            DeleteObject(cover.bitmap as *mut _);
+            DeleteDC(cover.dc as winapi::shared::windef::HDC);
+        }
+    }
+}
+
+/// Hands the frame that covers the next placement to the window procedure.
+///
+/// The picture is drawn here, while the viewer is still showing its own frame, and not between
+/// that frame and the new rectangle: drawn there, it would be part of the transition itself.
+pub fn set_pending_cover(
+    rect: crate::window_geometry::Rect,
+    width: usize,
+    height: usize,
+    cover: &[u32],
+) {
+    // The window is stood up before it is needed, so that creating it is not part of the
+    // placement it is there to cover.
+    let _ = ghost_window();
+    prepare_cover(rect, width, height, cover);
+}
+
+/// Shows the cover built for this rectangle, and gives its surface back.
+///
+/// A cover built for another rectangle is dropped instead: it would stand in the wrong place.
+fn show_prepared_cover(left: i32, top: i32, width: i32, height: i32) -> bool {
+    use winapi::shared::windef::{POINT, SIZE};
+    use winapi::um::wingdi::{AC_SRC_OVER, BLENDFUNCTION};
+    use winapi::um::winuser::{
+        GetDC, ReleaseDC, SetWindowPos, UpdateLayeredWindow, HWND_TOPMOST, SWP_NOACTIVATE,
+        SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, ULW_OPAQUE,
+    };
+
+    let mut prepared = PREPARED_COVER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(cover) = prepared.as_ref() else {
+        return false;
+    };
+    if cover.left != left || cover.top != top || cover.width != width || cover.height != height {
+        drop_prepared_cover(prepared.take());
+        fs_trace("ghost", || "dropped, the rectangle moved".to_string());
+        return false;
+    }
+    let Some(ghost) = ghost_window() else {
+        drop_prepared_cover(prepared.take());
+        return false;
+    };
+
+    unsafe {
+        let screen = GetDC(std::ptr::null_mut());
+        if screen.is_null() {
+            drop_prepared_cover(prepared.take());
+            return false;
+        }
+        let mut destination = POINT { x: left, y: top };
         let mut size = SIZE {
             cx: width,
             cy: height,
@@ -822,12 +933,17 @@ pub fn cover_resize_with_frame(
             screen,
             &mut destination,
             &mut size,
-            cover_dc,
+            cover.dc as winapi::shared::windef::HDC,
             &mut origin,
             0,
             &mut blend as *mut BLENDFUNCTION,
             ULW_OPAQUE,
         );
+        ReleaseDC(std::ptr::null_mut(), screen);
+        drop_prepared_cover(prepared.take());
+        if drawn == 0 {
+            return false;
+        }
         SetWindowPos(
             ghost,
             HWND_TOPMOST,
@@ -837,48 +953,15 @@ pub fn cover_resize_with_frame(
             0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
         );
-        fs_trace("ghost", || {
-            format!(
-                "covering ({},{}) {width}x{height} drawn={}",
-                rect.left,
-                rect.top,
-                drawn != 0
-            )
-        });
         *GHOST_HIDE_AT
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) =
             Some(std::time::Instant::now() + GHOST_HOLD);
-
-        DeleteObject(cover_bitmap as *mut _);
-        DeleteDC(cover_dc);
-        DeleteObject(source_bitmap as *mut _);
-        DeleteDC(source_dc);
-        ReleaseDC(std::ptr::null_mut(), screen);
-
-        drawn != 0
+        fs_trace("ghost", || {
+            format!("covering ({left},{top}) {width}x{height}")
+        });
+        true
     }
-}
-
-/// The frame a placement should be covered with, handed over by the app.
-static PENDING_COVER: std::sync::Mutex<
-    Option<(crate::window_geometry::Rect, usize, usize, Vec<u32>)>,
-> = std::sync::Mutex::new(None);
-
-/// Hands the frame that covers the next placement to the window procedure.
-pub fn set_pending_cover(
-    rect: crate::window_geometry::Rect,
-    width: usize,
-    height: usize,
-    cover: &[u32],
-) {
-    // The window is stood up before it is needed, so that creating it is not part of the
-    // placement it is there to cover.
-    let _ = ghost_window();
-    let mut pending = PENDING_COVER
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    *pending = Some((rect, width, height, cover.to_vec()));
 }
 
 /// Is this rectangle a display's own, or the work area it leaves for windows?
