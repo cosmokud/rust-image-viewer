@@ -407,6 +407,12 @@ pub(crate) struct ImageViewer {
     pub(crate) image_rotated: bool,
     /// Pending window resize to apply after a frame delay (to prevent flash on fullscreen exit)
     pub(crate) pending_window_resize: Option<(egui::Vec2, egui::Pos2, u8)>,
+    /// A whole-rectangle placement waiting for the end of the frame.
+    ///
+    /// The window is placed last thing in the frame: an area the window gains before it has a
+    /// frame of its own to show is the desktop until the frame is painted.
+    #[cfg(target_os = "windows")]
+    pub(crate) pending_viewer_rect: Option<crate::window_geometry::Rect>,
     /// Largest inner size a floating window may take when the next/previous file is laid out:
     /// the first opened file's size, replaced by the size the user resizes the window to.
     pub(crate) floating_size_cap: Option<egui::Vec2>,
@@ -1119,6 +1125,8 @@ impl Default for ImageViewer {
             fullscreen_transition_target: 0.0,
             image_rotated: false,
             pending_window_resize: None,
+            #[cfg(target_os = "windows")]
+            pending_viewer_rect: None,
             floating_size_cap: None,
             floating_window_position: None,
             pending_floating_fullscreen_view_state: None,

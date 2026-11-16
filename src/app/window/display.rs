@@ -280,18 +280,46 @@ impl ImageViewer {
                 let height = (outer.y * ppp).round() as i32;
                 let left = (outer_pos.x * ppp).round() as i32;
                 let top = (outer_pos.y * ppp).round() as i32;
-                let hwnd = self.resolved_main_hwnd();
-                if crate::windows_env::set_window_rect(hwnd, left, top, width, height) {
-                    // The area the placement uncovered holds whatever was behind it until the
-                    // next frame is painted, so ask for that frame now.
-                    ctx.request_repaint();
-                    return;
-                }
+                self.pending_viewer_rect = Some(crate::window_geometry::Rect::new(
+                    left,
+                    top,
+                    left + width,
+                    top + height,
+                ));
+                ctx.request_repaint();
+                return;
             }
         }
 
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(inner_size));
         self.send_outer_position(ctx, outer_pos);
+    }
+
+    /// Writes the placement the frame asked for, as the frame ends.
+    ///
+    /// An area a window has just gained holds whatever stands behind it until the window has a
+    /// frame of that size to show, and that frame is painted at the end of this update. Placing
+    /// the window here rather than where the layout asked for it leaves nothing of the frame
+    /// between the placement and the paint that fills it — which is what the desktop was showing
+    /// through while floating became fullscreen.
+    pub(crate) fn apply_pending_viewer_rect(&mut self, ctx: &egui::Context) {
+        #[cfg(target_os = "windows")]
+        if let Some(rect) = self.pending_viewer_rect.take() {
+            if !crate::windows_env::set_window_rect(
+                self.resolved_main_hwnd(),
+                rect.left,
+                rect.top,
+                rect.width(),
+                rect.height(),
+            ) {
+                // The window is gone: nothing to place, and nothing to wait for either.
+                return;
+            }
+            ctx.request_repaint();
+            return;
+        }
+
+        let _ = ctx;
     }
 
     /// Outer size (inner plus decorations) for a wanted inner size, in points.

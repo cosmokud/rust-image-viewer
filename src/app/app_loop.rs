@@ -851,6 +851,10 @@ impl eframe::App for ImageViewer {
             }
         }
 
+        // Last thing in the frame: the rectangle this frame asked for. Everything above it had to
+        // be drawn first, so the window's new area is covered by the very frame it is placed in.
+        self.apply_pending_viewer_rect(ctx);
+
         // Guarded: a disabled session pays one cached bool load, no locks and no clock reads.
         if let Some(frame_started) = frame_started {
             // Present handoff: everything above had to finish before egui/wgpu could present.
