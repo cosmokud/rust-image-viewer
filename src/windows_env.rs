@@ -612,11 +612,15 @@ struct GhostPlan {
     earliest: std::time::Instant,
     /// Hidden by this whatever happens, so a stalled app cannot leave a picture on the screen.
     latest: std::time::Instant,
+    /// No hiding before this either: counted from the placement, the composition it lands in has
+    /// to pass before the picture can go, or it goes out in that composition and uncovers the
+    /// hole itself.
+    after_place: Option<std::time::Instant>,
 }
 
 static GHOST_PLAN: std::sync::Mutex<Option<GhostPlan>> = std::sync::Mutex::new(None);
 
-/// The frame the ghost waits for: the one painted for the rectangle it stands over.
+/// The frame the ghost waits for: one painted for the rectangle it stands over.
 const GHOST_FRAMES_HELD: u32 = 1;
 
 /// The shortest and longest the picture stands.
@@ -625,6 +629,13 @@ const GHOST_FRAMES_HELD: u32 = 1;
 /// app, which would otherwise leave a still picture standing over its window.
 const GHOST_EARLIEST: std::time::Duration = std::time::Duration::from_millis(12);
 const GHOST_LATEST: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// How long after the placement the picture is held.
+///
+/// Under three refreshes of a 144 Hz display it was still coming down in the composition the
+/// resize landed in, and the desktop showed through it: this is the shortest hold that was not
+/// seen as a hole, with a refresh to spare.
+const GHOST_AFTER_PLACE: std::time::Duration = std::time::Duration::from_millis(25);
 
 fn ghost_class() -> Vec<u16> {
     wide(OsStr::new("RustImageViewerResizeGhost"))
@@ -991,6 +1002,7 @@ fn show_prepared_cover(left: i32, top: i32, width: i32, height: i32) -> bool {
             painted: 0,
             earliest: now + GHOST_EARLIEST,
             latest: now + GHOST_LATEST,
+            after_place: None,
         });
         fs_trace("ghost", || {
             format!("covering ({left},{top}) {width}x{height}")
@@ -1011,6 +1023,7 @@ fn note_cover_placed() {
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(plan) = plan.as_mut() {
         plan.placed = true;
+        plan.after_place = Some(std::time::Instant::now() + GHOST_AFTER_PLACE);
     }
 }
 
@@ -1032,21 +1045,35 @@ pub fn note_viewer_frame_painted() {
 /// and it is presented before the frame after that comes round: the picture goes down with it,
 /// standing only for the compositions the hole was in.
 pub fn step_resize_ghost() {
-    let down = {
+    let (down, wait_for_composition) = {
         let plan = GHOST_PLAN
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         match plan.as_ref() {
-            None => false,
+            None => (false, false),
             Some(plan) => {
                 let now = std::time::Instant::now();
-                now >= plan.latest
-                    || (plan.placed && plan.painted >= GHOST_FRAMES_HELD && now >= plan.earliest)
+                let painted = plan.placed && plan.painted >= GHOST_FRAMES_HELD;
+                let held = plan.after_place.is_some_and(|at| now >= at);
+                if now >= plan.latest {
+                    (true, false)
+                } else if painted && held && now >= plan.earliest {
+                    // The frame for the new rectangle has been presented. Frames painted are
+                    // not frames presented: the app paints them faster than the display shows
+                    // them, so this waits for the composition that carries it to be done, and
+                    // the picture comes down onto that frame instead of onto a guess.
+                    (true, true)
+                } else {
+                    (false, false)
+                }
             }
         }
     };
     if !down {
         return;
+    }
+    if wait_for_composition {
+        unsafe { winapi::um::dwmapi::DwmFlush() };
     }
     *GHOST_PLAN
         .lock()
