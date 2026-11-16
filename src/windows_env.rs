@@ -1184,9 +1184,9 @@ unsafe extern "system" fn scale_change_wndproc(
     lparam: LPARAM,
 ) -> LRESULT {
     use winapi::um::winuser::{
-        CallWindowProcW, SC_MAXIMIZE, WM_DPICHANGED, WM_GETMINMAXINFO, WM_KEYDOWN, WM_KEYUP,
-        WM_MOVE, WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_WINDOWPOSCHANGED,
-        WM_WINDOWPOSCHANGING,
+        CallWindowProcW, SC_MAXIMIZE, WM_ACTIVATE, WM_DPICHANGED, WM_GETMINMAXINFO, WM_KEYDOWN,
+        WM_KEYUP, WM_MOVE, WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER,
+        WM_WINDOWPOSCHANGED, WM_WINDOWPOSCHANGING,
     };
 
     let previous = PREVIOUS_WNDPROC.load(Ordering::SeqCst);
@@ -1229,6 +1229,16 @@ unsafe extern "system" fn scale_change_wndproc(
         return CallWindowProcW(previous, hwnd, msg, wparam, lparam);
     }
 
+    if msg == WM_TIMER {
+        strip_thick_frame(hwnd);
+        return CallWindowProcW(previous, hwnd, msg, wparam, lparam);
+    }
+
+    if msg == WM_ACTIVATE {
+        strip_thick_frame(hwnd);
+        return CallWindowProcW(previous, hwnd, msg, wparam, lparam);
+    }
+
     // Any other move or resize is the shell's chord or the app's own: while no Windows key is
     // held, the rectangle it lands on is the one the next chord is undone to.
     if msg == WM_MOVE || msg == WM_SIZE {
@@ -1237,6 +1247,7 @@ unsafe extern "system" fn scale_change_wndproc(
             settle_window_rect(hwnd);
         } else {
             record_settled_rect(hwnd);
+            strip_thick_frame(hwnd);
         }
         return result;
     }
@@ -1616,6 +1627,10 @@ pub fn install_win_arrow_swallow() {
 unsafe fn refuse_snap_placement(hwnd: HWND, lparam: LPARAM) -> bool {
     use winapi::um::winuser::{IsIconic, SWP_NOMOVE, SWP_NOSIZE, WINDOWPOS};
 
+    if win_key_down() {
+        // winit can have written the sizing border back since the timer last looked.
+        strip_thick_frame(hwnd);
+    }
     if lparam == 0 || RESTORE_WRITE.load(Ordering::SeqCst) {
         return false;
     }
@@ -1632,6 +1647,50 @@ unsafe fn refuse_snap_placement(hwnd: HWND, lparam: LPARAM) -> bool {
     }
     crate::diag::trace("chord", "refused the chord's placement");
     true
+}
+
+const STYLE_TIMER_ID: usize = 0x5244;
+
+/// Takes the sizing border off: Aero Snap divides the screen with it, and the snap's resize is what
+/// the window is seen doing before it is put back.
+pub fn strip_thick_frame(hwnd: HWND) {
+    use winapi::um::winuser::{
+        GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWL_STYLE, SWP_FRAMECHANGED,
+        SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WS_THICKFRAME,
+    };
+
+    if hwnd.is_null() {
+        return;
+    }
+    unsafe {
+        let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+        if style & WS_THICKFRAME as isize == 0 {
+            return;
+        }
+        SetWindowLongPtrW(hwnd, GWL_STYLE, style & !(WS_THICKFRAME as isize));
+        SetWindowPos(
+            hwnd,
+            std::ptr::null_mut(),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        );
+    }
+}
+
+/// Keeps the sizing border off while the app runs: winit rewrites the styles on every fullscreen or
+/// resize change, so a quarter-second timer puts it back off long before the next chord.
+pub fn watch_window_style(hwnd: HWND) {
+    use winapi::um::winuser::SetTimer;
+
+    if hwnd.is_null() {
+        return;
+    }
+    unsafe {
+        SetTimer(hwnd, STYLE_TIMER_ID, 250, None);
+    }
 }
 
 /// Per window, the rectangle it last had with no Windows key held: the one a chord is undone to.
@@ -1774,6 +1833,8 @@ pub fn install_scale_change_guard(hwnd: HWND) {
         PREVIOUS_WNDPROC.store(previous, Ordering::SeqCst);
         SetWindowLongPtrW(hwnd, GWLP_WNDPROC, hook);
     }
+    strip_thick_frame(hwnd);
+    watch_window_style(hwnd);
     disable_window_transitions(hwnd);
     spawn_win_chord_watch(hwnd);
     install_win_arrow_swallow();
