@@ -459,17 +459,18 @@ fn erase_window_background(hwnd: HWND, hdc: winapi::shared::windef::HDC) -> bool
 /// has been presented, and the redraw that follows paints the whole new rectangle.
 pub const WM_PLACE_RECT: UINT = 0x8000 + 0x4D52;
 
-/// The timer that takes the picture over a resize down.
-///
-/// It has to be the window's own: the app paints only when it has something new to draw, and an
-/// idle viewer would leave the picture standing until the next mouse move took it down.
-const GHOST_TIMER: usize = 0x5256;
+/// Posted to the window when the picture over a resize has stood long enough.
+const WM_GHOST_DOWN: UINT = 0x8000 + 0x4D53;
 
-/// How long the picture stands, counted from when it is shown.
+/// Which cover the message that comes back belongs to, so a late one cannot take down a newer.
+static GHOST_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// How long the picture stands over the rectangle it was placed for.
 ///
-/// The placement lands a composition or two after it, and the frame for the new rectangle one or
-/// two after that: this is a shade past both.
-const GHOST_TIMER_MS: u32 = 50;
+/// The frame for the new rectangle is painted within a composition or two and presented with the
+/// one after it: this is those two, and no more, so the picture is not still standing at its old
+/// scale while the new one is on the screen.
+const GHOST_DOWN_DELAY: std::time::Duration = std::time::Duration::from_millis(16);
 
 /// The rectangle a posted `WM_PLACE_RECT` carries.
 static POSTED_RECT: std::sync::Mutex<Option<(i32, i32, i32, i32)>> = std::sync::Mutex::new(None);
@@ -545,7 +546,37 @@ fn place_posted_rect(hwnd: HWND) {
         fs_trace("place", || "applied".to_string());
         if covered {
             note_cover_placed();
-            unsafe { winapi::um::winuser::SetTimer(hwnd, GHOST_TIMER, GHOST_TIMER_MS, None) };
+            // On a thread of its own rather than on a window timer: a timer is given in
+            // milliseconds but fires on the system tick, which is over 15 ms wide, and the
+            // picture has to come down within a composition of the frame it stands over.
+            let generation = GHOST_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+            let window = hwnd as usize;
+            std::thread::spawn(move || {
+                // The system tick is over 15 ms wide and a sleep is rounded up to it, which is
+                // enough to leave the picture standing when the frame it stands for is already
+                // on the screen: the last of the wait is spent watching the clock instead.
+                let deadline = std::time::Instant::now() + GHOST_DOWN_DELAY;
+                loop {
+                    let now = std::time::Instant::now();
+                    if now >= deadline {
+                        break;
+                    }
+                    let left = deadline - now;
+                    if left > std::time::Duration::from_millis(3) {
+                        std::thread::sleep(left - std::time::Duration::from_millis(3));
+                    } else {
+                        std::thread::yield_now();
+                    }
+                }
+                unsafe {
+                    winapi::um::winuser::PostMessageW(
+                        window as HWND,
+                        WM_GHOST_DOWN,
+                        generation as WPARAM,
+                        0,
+                    );
+                }
+            });
         }
         RESTORE_WRITE.store(false, Ordering::SeqCst);
         if covers {
@@ -830,12 +861,13 @@ fn prepare_cover(
             FillRect(cover_dc, &cover, brush);
             DeleteObject(brush as *mut _);
         }
-        // Whole, and no bigger than it already is: the rectangle it goes in is what the window is
-        // about to look like, and a picture enlarged or cropped into it is a visible change in
-        // what is on the screen and not one the resize makes. The background stands around it.
-        let scale = (width as f64 / source_w as f64).min(height as f64 / source_h as f64);
-        let picture_w = ((source_w as f64) * scale).round() as i32;
-        let picture_h = ((source_h as f64) * scale).round() as i32;
+        // At its own size, and never scaled: the picture is what is on the screen now, and
+        // scaling it is a change the eye reads as a zoom — in on the way to fullscreen, out on
+        // the way back — before the frame for the new rectangle arrives. What the rectangle has
+        // that the frame does not is filled with the background, and what the frame has that the
+        // rectangle does not is cropped from the middle.
+        let picture_w = (source_w as i32).min(width);
+        let picture_h = (source_h as i32).min(height);
         SetStretchBltMode(cover_dc, HALFTONE);
         let stretched = StretchBlt(
             cover_dc,
@@ -844,10 +876,10 @@ fn prepare_cover(
             picture_w,
             picture_h,
             source_dc,
-            0,
-            0,
-            source_w as i32,
-            source_h as i32,
+            (source_w as i32 - picture_w) / 2,
+            (source_h as i32 - picture_h) / 2,
+            picture_w,
+            picture_h,
             SRCCOPY,
         );
 
@@ -2076,9 +2108,9 @@ unsafe extern "system" fn scale_change_wndproc(
     lparam: LPARAM,
 ) -> LRESULT {
     use winapi::um::winuser::{
-        CallWindowProcW, KillTimer, SC_MAXIMIZE, WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO,
-        WM_KEYDOWN, WM_KEYUP, WM_MOVE, WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP,
-        WM_TIMER, WM_WINDOWPOSCHANGED, WM_WINDOWPOSCHANGING,
+        CallWindowProcW, SC_MAXIMIZE, WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN,
+        WM_KEYUP, WM_MOVE, WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_WINDOWPOSCHANGED,
+        WM_WINDOWPOSCHANGING,
     };
 
     let previous = PREVIOUS_WNDPROC.load(Ordering::SeqCst);
@@ -2092,11 +2124,13 @@ unsafe extern "system" fn scale_change_wndproc(
         return 0;
     }
 
-    // The picture over a resize comes down on the window's own timer, not on a frame: the app
-    // stops painting once it has nothing new to draw.
-    if msg == WM_TIMER && wparam == GHOST_TIMER {
-        unsafe { KillTimer(hwnd, GHOST_TIMER) };
-        hide_resize_ghost();
+    // The picture over a resize comes down on a message of its own, not on a frame: the app stops
+    // painting once it has nothing new to draw, and an idle viewer would leave it standing until
+    // the next mouse move took it down.
+    if msg == WM_GHOST_DOWN {
+        if GHOST_GENERATION.load(Ordering::SeqCst) == wparam as u64 {
+            hide_resize_ghost();
+        }
         return 0;
     }
 
