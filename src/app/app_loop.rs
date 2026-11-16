@@ -83,11 +83,15 @@ impl eframe::App for ImageViewer {
             });
             if let Some(image) = painted {
                 let [width, height] = image.size;
-                let mut rgba = Vec::with_capacity(width * height * 4);
+                // In the layout the copying needs, and off the placement's path: the frame is
+                // stretched over the resize between two messages, with a refresh to spare.
+                let mut cover = Vec::with_capacity(width * height);
                 for pixel in &image.pixels {
-                    rgba.extend_from_slice(&[pixel.r(), pixel.g(), pixel.b(), pixel.a()]);
+                    cover.push(
+                        (pixel.r() as u32) << 16 | (pixel.g() as u32) << 8 | pixel.b() as u32,
+                    );
                 }
-                self.transition_cover = Some((width, height, rgba));
+                self.transition_cover = Some((width, height, cover));
                 ctx.request_repaint();
             }
         }

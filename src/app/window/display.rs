@@ -321,8 +321,8 @@ impl ImageViewer {
                 return;
             }
             self.transition_cover_waits = 0;
-            if let Some((width, height, rgba)) = self.transition_cover.as_ref() {
-                crate::windows_env::set_pending_cover(rect, *width, *height, rgba);
+            if let Some((width, height, cover)) = self.transition_cover.as_ref() {
+                crate::windows_env::set_pending_cover(rect, *width, *height, cover);
                 self.transition_cover = None;
             }
             if crate::windows_env::post_window_rect(self.resolved_main_hwnd(), rect) {

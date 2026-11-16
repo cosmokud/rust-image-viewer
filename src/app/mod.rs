@@ -414,7 +414,7 @@ pub(crate) struct ImageViewer {
     #[cfg(target_os = "windows")]
     pub(crate) pending_viewer_rect: Option<crate::window_geometry::Rect>,
     /// The frame the app painted last, kept to stand over a resize that covers a display.
-    pub(crate) transition_cover: Option<(usize, usize, Vec<u8>)>,
+    pub(crate) transition_cover: Option<(usize, usize, Vec<u32>)>,
     /// Frames spent waiting for that frame to arrive before the resize goes ahead without it.
     pub(crate) transition_cover_waits: u8,
     /// Largest inner size a floating window may take when the next/previous file is laid out:
