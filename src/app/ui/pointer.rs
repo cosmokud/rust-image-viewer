@@ -390,14 +390,18 @@ impl ImageViewer {
             .unwrap_or(true);
 
         if should_send {
-            if let (Some(inner_rect), Some(outer_rect)) = (current_inner_rect, current_outer_rect) {
-                // Keep the window center stable while changing inner size so zoom-resize
-                // expands/contracts from center instead of top-left.
-                let inner_to_outer_offset = inner_rect.min - outer_rect.min;
-                let target_inner_min = inner_rect.center() - desired * 0.5;
-                let target_outer_min = target_inner_min - inner_to_outer_offset;
-                self.send_outer_position(ctx, target_outer_min);
-            }
+            // The size and the re-centred corner go in one placement: as two commands the
+            // window is briefly at one of them with the old content clipped into it.
+            let outer_pos = match (current_inner_rect, current_outer_rect) {
+                (Some(inner_rect), Some(outer_rect)) => {
+                    // Keep the window center stable while changing inner size so zoom-resize
+                    // expands/contracts from center instead of top-left.
+                    let inner_to_outer_offset = inner_rect.min - outer_rect.min;
+                    let target_inner_min = inner_rect.center() - desired * 0.5;
+                    Some(target_inner_min - inner_to_outer_offset)
+                }
+                _ => None,
+            };
             #[cfg(target_os = "windows")]
             crate::diag::trace(
                 "rect",
@@ -407,7 +411,12 @@ impl ImageViewer {
                         .map(|rect| (rect.left, rect.top)),
                 ),
             );
-            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(desired));
+            match outer_pos {
+                Some(position) => self.place_viewer_window(ctx, desired, position),
+                None => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(desired));
+                }
+            }
         }
     }
 }

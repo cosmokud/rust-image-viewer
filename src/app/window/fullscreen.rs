@@ -229,8 +229,10 @@ impl ImageViewer {
             self.zoom = zoom;
             self.zoom_target = zoom;
             self.floating_size_cap = Some(egui::vec2(media_w, media_h));
-            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
-            self.center_window_on_monitor(ctx, size);
+            // Size and corner together: the reference point of this layout is the centred
+            // floating window, and writing it in two placements shows the desktop in between.
+            let position = self.floating_centred_position(ctx, size);
+            self.place_viewer_window(ctx, size, position);
             return;
         }
 
@@ -247,16 +249,13 @@ impl ImageViewer {
 
         self.zoom = zoom;
         self.zoom_target = zoom;
-        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
         // Keep the window where it is: re-centring every file is what made it jump around while
         // walking a folder. The remembered corner is only nudged back inside the display.
-        match self.floating_window_position {
-            Some(position) => {
-                let position = self.floating_position_for_inner(ctx, position, size);
-                self.send_outer_position(ctx, position);
-            }
-            None => self.center_window_on_monitor(ctx, size),
-        }
+        let position = match self.floating_window_position {
+            Some(position) => self.floating_position_for_inner(ctx, position, size),
+            None => self.floating_centred_position(ctx, size),
+        };
+        self.place_viewer_window(ctx, size, position);
     }
 
     /// The user finished dragging a window edge: that size is the new ceiling for next/previous.

@@ -224,6 +224,16 @@ impl ImageViewer {
     }
 
     pub(crate) fn center_window_on_monitor(&mut self, ctx: &egui::Context, inner_size: egui::Vec2) {
+        let position = self.floating_centred_position(ctx, inner_size);
+        self.send_outer_position(ctx, position);
+    }
+
+    /// Where a floating window of `inner_size` stands when it is centred on its display.
+    pub(crate) fn floating_centred_position(
+        &self,
+        ctx: &egui::Context,
+        inner_size: egui::Vec2,
+    ) -> egui::Pos2 {
         #[cfg(target_os = "windows")]
         if let Some(display) = self.current_display(ctx) {
             let ppp = ctx.pixels_per_point();
@@ -234,15 +244,54 @@ impl ImageViewer {
                 let outer_w = (outer.x * ppp).round() as i32;
                 let outer_h = (outer.y * ppp).round() as i32;
                 let (left, top) = crate::window_geometry::centre_in(display.work, outer_w, outer_h);
-                self.send_outer_position(ctx, egui::pos2(left as f32 / ppp, top as f32 / ppp));
-                return;
+                return egui::pos2(left as f32 / ppp, top as f32 / ppp);
             }
         }
 
         let monitor = self.monitor_size_points(ctx);
         let x = (monitor.x - inner_size.x) * 0.5;
         let y = (monitor.y - inner_size.y) * 0.5;
-        self.send_outer_position(ctx, egui::pos2(x.max(0.0), y));
+        egui::pos2(x.max(0.0), y)
+    }
+
+    /// Moves and sizes the viewer in one window placement.
+    ///
+    /// A move and a resize asked for separately reach the compositor as two rectangles, and the
+    /// first one is on screen for a frame with the old content clipped into it: floating leaves
+    /// its corner for the display's origin before it grows, and fullscreen shrinks in that origin
+    /// before it moves back. Either way the desktop shows through for a frame. Writing the whole
+    /// rectangle in one `SetWindowPos` leaves no intermediate rectangle to see.
+    pub(crate) fn place_viewer_window(
+        &mut self,
+        ctx: &egui::Context,
+        inner_size: egui::Vec2,
+        outer_pos: egui::Pos2,
+    ) {
+        if inner_size.x < 1.0 || inner_size.y < 1.0 {
+            return;
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            let ppp = ctx.pixels_per_point();
+            if ppp.is_finite() && ppp > 0.01 {
+                let outer = self.outer_size_for_inner(ctx, inner_size);
+                let width = (outer.x * ppp).round() as i32;
+                let height = (outer.y * ppp).round() as i32;
+                let left = (outer_pos.x * ppp).round() as i32;
+                let top = (outer_pos.y * ppp).round() as i32;
+                let hwnd = self.resolved_main_hwnd();
+                if crate::windows_env::set_window_rect(hwnd, left, top, width, height) {
+                    // The area the placement uncovered holds whatever was behind it until the
+                    // next frame is painted, so ask for that frame now.
+                    ctx.request_repaint();
+                    return;
+                }
+            }
+        }
+
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(inner_size));
+        self.send_outer_position(ctx, outer_pos);
     }
 
     /// Outer size (inner plus decorations) for a wanted inner size, in points.

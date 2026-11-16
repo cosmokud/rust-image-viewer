@@ -43,6 +43,21 @@ impl ImageViewer {
         // Addressed to the root viewport: this is the viewer window's rectangle, and reopening
         // the viewer from the Stash runs inside the Stash's own frame.
         let rect = self.fullscreen_target_rect(display);
+
+        // One placement for the whole rectangle: a move and a resize sent as two commands are
+        // two rectangles at the compositor, and the first one shows the desktop behind the
+        // window for a frame on the way into fullscreen.
+        if crate::windows_env::set_window_rect(
+            self.resolved_main_hwnd(),
+            rect.left,
+            rect.top,
+            rect.width(),
+            rect.height(),
+        ) {
+            ctx.request_repaint();
+            return;
+        }
+
         self.send_viewer_viewport_cmd(
             ctx,
             egui::ViewportCommand::OuterPosition(egui::pos2(
