@@ -25,38 +25,29 @@ impl ImageViewer {
         }
     }
 
-    /// Borderless fullscreen: the whole display the window is on, written in physical pixels
-    /// and converted once to points.
+    /// Borderless fullscreen: the whole display the window is on, in physical pixels, as one
+    /// placement written when the frame ends.
     #[cfg(target_os = "windows")]
     pub(crate) fn request_borderless_fullscreen_rect(&mut self, ctx: &egui::Context) {
         // Armed first: a scale change on the way must not fight the rect written below.
         crate::windows_env::set_fullscreen_guard(true);
 
-        let ppp = ctx.pixels_per_point();
         let Some(display) = self.current_display(ctx) else {
             return;
         };
-        if !ppp.is_finite() || ppp <= 0.01 {
-            return;
-        }
 
-        // Addressed to the root viewport: this is the viewer window's rectangle, and reopening
-        // the viewer from the Stash runs inside the Stash's own frame.
-        let rect = self.fullscreen_target_rect(display);
-        self.send_viewer_viewport_cmd(
-            ctx,
-            egui::ViewportCommand::OuterPosition(egui::pos2(
-                rect.left as f32 / ppp,
-                rect.top as f32 / ppp,
-            )),
-        );
-        self.send_viewer_viewport_cmd(
-            ctx,
-            egui::ViewportCommand::InnerSize(egui::vec2(
-                rect.width() as f32 / ppp,
-                rect.height() as f32 / ppp,
-            )),
-        );
+        // One placement for the whole rectangle, written as the frame ends. Two commands would
+        // be two rectangles at the compositor, and the display stands in the area the window
+        // gained until the frame it was placed in has been painted.
+        // Asked for every frame until the window is there, so only a changed target is a new
+        // transition: repeating the same one must not restart the frame it is covered with.
+        let target = self.fullscreen_target_rect(display);
+        if self.pending_viewer_rect != Some(target) {
+            self.transition_cover = None;
+            self.transition_cover_waits = 0;
+        }
+        self.pending_viewer_rect = Some(target);
+        ctx.request_repaint();
     }
 
     /// Keeps the fullscreen viewer on the display it is on.

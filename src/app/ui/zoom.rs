@@ -97,7 +97,14 @@ impl ImageViewer {
     }
 
     pub(crate) fn mode_transition(&mut self, event: ModeEvent) -> Mode {
-        self.mode_state.transition(event)
+        let before = self.mode();
+        let after = self.mode_state.transition(event);
+        if after != before {
+            // Each mode lays the window out for itself, and the resize that does it is a
+            // transition like any other: the frame being left stands over it.
+            self.cover_next_placement = true;
+        }
+        after
     }
 
     pub(crate) fn clear_strip_return_context(&mut self) {

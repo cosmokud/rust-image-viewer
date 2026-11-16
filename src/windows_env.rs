@@ -201,10 +201,928 @@ pub fn set_window_maximized(hwnd: HWND, maximize: bool) -> bool {
     // The display the window is on decides the maximize rectangle: the `WM_GETMINMAXINFO` guard
     // rewrites it to that display's `rcWork`, so a move staged beforehand is all this needs.
     let cmd = if maximize { SW_MAXIMIZE } else { SW_RESTORE };
+    arm_fs_watch(1500);
+    fs_trace("maximize", || {
+        format!(
+            "ShowWindow({}) zoomed={} rect={:?}",
+            if maximize {
+                "SW_MAXIMIZE"
+            } else {
+                "SW_RESTORE"
+            },
+            is_window_maximized(hwnd),
+            window_rect(hwnd).map(|r| (r.left, r.top, r.right - r.left, r.bottom - r.top)),
+        )
+    });
     unsafe {
         ShowWindow(hwnd, cmd);
     }
     true
+}
+
+// ── Fullscreen transition trace (`RIV_FS_TRACE=1`) ────────────────────────────
+//
+// A fullscreen toggle that shows the desktop for a moment has to be read back as what the window
+// actually did: how many rectangles it was given, in what order, whether it was visible and in
+// front the whole time, and what the frames around it were laid out for. The log lands in
+// `<exe dir>/.tmp/fs-trace/state.log`, and nothing is written unless the switch is set.
+
+/// Is the transition trace switched on? (`RIV_FS_TRACE=1`)
+pub fn fs_trace_enabled() -> bool {
+    fs_trace_enabled_inner()
+}
+
+/// Is the diagnostic driver switched on? (`RIV_FS_AUTOTOGGLE=1`)
+pub fn fs_autotoggle_requested() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("RIV_FS_AUTOTOGGLE")
+            .map(|value| {
+                let value = value.trim();
+                !value.is_empty() && value != "0"
+            })
+            .unwrap_or(false)
+    })
+}
+
+fn fs_trace_enabled_inner() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("RIV_FS_TRACE")
+            .map(|value| {
+                let value = value.trim();
+                !value.is_empty() && value != "0"
+            })
+            .unwrap_or(false)
+    })
+}
+
+/// Milliseconds since the first trace line: the transition is read in order and against the clock.
+fn fs_trace_clock_ms() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
+pub fn fs_trace(tag: &str, message: impl FnOnce() -> String) {
+    use std::io::Write;
+
+    if !fs_trace_enabled() {
+        return;
+    }
+    let Some(dir) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join(".tmp").join("fs-trace")))
+    else {
+        return;
+    };
+    let _ = std::fs::create_dir_all(&dir);
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("state.log"))
+    {
+        let _ = writeln!(file, "[{:>6} ms] {tag}: {}", fs_trace_clock_ms(), message());
+    }
+}
+
+/// When the sampler below stops watching; 0 while it is not watching at all.
+static FS_WATCH_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Watches the window for `millis` from now: every change it makes is a line in the trace.
+pub fn arm_fs_watch(millis: u64) {
+    if !fs_trace_enabled() {
+        return;
+    }
+    FS_WATCH_UNTIL_MS.store(
+        fs_trace_clock_ms().saturating_add(millis).max(1),
+        Ordering::SeqCst,
+    );
+}
+
+/// Is the transition sampler watching right now?
+///
+/// The frame log asks it every frame: a session without `RIV_FS_TRACE` pays one atomic load.
+pub fn fs_watch_active() -> bool {
+    let until = FS_WATCH_UNTIL_MS.load(Ordering::SeqCst);
+    until != 0 && fs_trace_clock_ms() < until
+}
+
+fn window_above(hwnd: HWND) -> String {
+    use winapi::um::winuser::{GetClassNameW, GetWindow, GW_HWNDPREV};
+
+    unsafe {
+        let above = GetWindow(hwnd, GW_HWNDPREV);
+        if above.is_null() {
+            return "none".to_string();
+        }
+        let mut buffer: [u16; 64] = [0; 64];
+        let written = GetClassNameW(above, buffer.as_mut_ptr(), buffer.len() as i32);
+        if written <= 0 {
+            return "?".to_string();
+        }
+        String::from_utf16_lossy(&buffer[..written as usize])
+    }
+}
+
+/// Everything the compositor is being asked to show for this window, on one line.
+fn window_state_line(hwnd: HWND) -> String {
+    use winapi::um::winuser::{
+        GetForegroundWindow, GetWindowLongPtrW, IsIconic, IsWindowVisible, IsZoomed, GWL_EXSTYLE,
+        GWL_STYLE, WS_EX_TOPMOST, WS_THICKFRAME, WS_VISIBLE,
+    };
+
+    let Some(rect) = window_rect(hwnd) else {
+        return "gone".to_string();
+    };
+    unsafe {
+        let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+        let exstyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        format!(
+            "rect=({},{}) {}x{} visible={} style_visible={} zoomed={} iconic={} topmost={} thick={} foreground={} above={}",
+            rect.left,
+            rect.top,
+            rect.right - rect.left,
+            rect.bottom - rect.top,
+            IsWindowVisible(hwnd) != 0,
+            style & WS_VISIBLE as isize != 0,
+            IsZoomed(hwnd) != 0,
+            IsIconic(hwnd) != 0,
+            exstyle & WS_EX_TOPMOST as isize != 0,
+            style & WS_THICKFRAME as isize != 0,
+            GetForegroundWindow() == hwnd,
+            window_above(hwnd),
+        )
+    }
+}
+
+/// Samples the window while a transition is being watched, and logs only what changed.
+fn fs_watch(hwnd: HWND) {
+    let mut last = String::new();
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        if !fs_watch_active() {
+            last.clear();
+            continue;
+        }
+        let state = window_state_line(hwnd);
+        if state != last {
+            fs_trace("state", || state.clone());
+            last = state;
+        }
+    }
+}
+
+/// Starts the transition sampler once, for the life of the process.
+pub fn spawn_fs_watch(hwnd: HWND) {
+    static STARTED: OnceLock<()> = OnceLock::new();
+
+    if hwnd.is_null() || !fs_trace_enabled() || STARTED.set(()).is_err() {
+        return;
+    }
+    let hwnd = hwnd as isize;
+    let spawned = std::thread::Builder::new()
+        .name("fs-watch".to_string())
+        .spawn(move || fs_watch(hwnd as HWND));
+    if spawned.is_err() {
+        fs_trace("watch", || "sampler failed to start".to_string());
+    }
+}
+
+/// The colour the window is filled with before the app's own frame arrives.
+///
+/// A window has nothing drawn in an area it just gained until the next frame is swapped, and this
+/// class has no background brush: for that moment the compositor shows the desktop through the
+/// window. The erase is answered with the viewer's own background instead, so the gained area is
+/// already the colour the frame is about to paint.
+static WINDOW_BACKGROUND: AtomicU32 = AtomicU32::new(0);
+
+/// Sets the colour the window is erased with, as `0x00BBGGRR` in a `COLORREF`.
+pub fn set_window_background(rgb: [u8; 3]) {
+    WINDOW_BACKGROUND.store(
+        u32::from(rgb[0]) | u32::from(rgb[1]) << 8 | u32::from(rgb[2]) << 16,
+        Ordering::Relaxed,
+    );
+}
+
+/// Paints the whole client area in the viewer's background colour.
+fn erase_window_background(hwnd: HWND, hdc: winapi::shared::windef::HDC) -> bool {
+    use winapi::um::wingdi::{CreateSolidBrush, DeleteObject};
+    use winapi::um::winuser::{FillRect, GetClientRect};
+
+    if hdc.is_null() {
+        return false;
+    }
+    unsafe {
+        // `RIV_FS_FILL_TEST` paints the fill a colour nothing else uses, so a transition can be
+        // watched to tell a filled moment from the desktop still showing through it.
+        static FILL_TEST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let colour = if *FILL_TEST.get_or_init(|| std::env::var_os("RIV_FS_FILL_TEST").is_some()) {
+            0x00FF_00FF
+        } else {
+            WINDOW_BACKGROUND.load(Ordering::Relaxed)
+        };
+        let brush = CreateSolidBrush(colour);
+        if brush.is_null() {
+            return false;
+        }
+        let mut client: RECT = std::mem::zeroed();
+        let have_client = GetClientRect(hwnd, &mut client) != 0;
+        if have_client {
+            FillRect(hdc, &client, brush);
+            // A drawing-context fill is only worth doing if it reaches the surface an OpenGL
+            // window is composited from: the pixel is read back to say that it did.
+            let readback = if fs_trace_enabled() {
+                use winapi::um::wingdi::GetPixel;
+                let pixel = GetPixel(hdc, 4, 4);
+                format!(" readback={pixel:#010x}")
+            } else {
+                String::new()
+            };
+            fs_trace("erase", || {
+                format!(
+                    "filled client {}x{}{readback}",
+                    client.right - client.left,
+                    client.bottom - client.top
+                )
+            });
+        }
+        DeleteObject(brush as *mut _);
+        have_client
+    }
+}
+
+/// Message that carries a whole-rectangle placement to the window, between frames.
+///
+/// A window resized from inside a frame shows the desktop while it grows: the frame being painted
+/// still holds the old surface size, so only the part of the buffer the old rectangle covers is
+/// written and the compositor has nothing for the rest. The message is dispatched after that frame
+/// has been presented, and the redraw that follows paints the whole new rectangle.
+pub const WM_PLACE_RECT: UINT = 0x8000 + 0x4D52;
+
+/// Posted to the window when the picture over a resize has stood long enough.
+const WM_GHOST_DOWN: UINT = 0x8000 + 0x4D53;
+
+/// Which cover the message that comes back belongs to, so a late one cannot take down a newer.
+static GHOST_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// How long the picture stands over the rectangle it was placed for.
+///
+/// The frame for the new rectangle is painted within a composition or two and presented with the
+/// one after it: this is those two, and no more, so the picture is not still standing at its old
+/// scale while the new one is on the screen.
+const GHOST_DOWN_DELAY: std::time::Duration = std::time::Duration::from_millis(16);
+
+/// The rectangle a posted `WM_PLACE_RECT` carries.
+static POSTED_RECT: std::sync::Mutex<Option<(i32, i32, i32, i32)>> = std::sync::Mutex::new(None);
+
+/// Hands a window its new rectangle for after the frame being drawn.
+pub fn post_window_rect(hwnd: HWND, rect: crate::window_geometry::Rect) -> bool {
+    use winapi::um::winuser::PostMessageW;
+
+    if hwnd.is_null() {
+        return false;
+    }
+    {
+        let mut posted = POSTED_RECT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *posted = Some((rect.left, rect.top, rect.width(), rect.height()));
+    }
+    arm_fs_watch(1500);
+    fs_trace("place", || {
+        format!(
+            "posted ({},{}) {}x{} current={:?}",
+            rect.left,
+            rect.top,
+            rect.width(),
+            rect.height(),
+            window_rect(hwnd).map(|r| (r.left, r.top, r.right - r.left, r.bottom - r.top)),
+        )
+    });
+    unsafe { PostMessageW(hwnd, WM_PLACE_RECT, 0, 0) != 0 }
+}
+
+/// Applies the rectangle a `WM_PLACE_RECT` carries.
+fn place_posted_rect(hwnd: HWND) {
+    let posted = POSTED_RECT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    if let Some((left, top, width, height)) = posted {
+        crate::diag::trace(
+            "rect",
+            &format!("placing the posted rect ({left},{top}) {width}x{height}"),
+        );
+        fs_trace("place", || {
+            format!("applying ({left},{top}) {width}x{height}")
+        });
+        // With the placement, not on its own: the frame recalculation discards the composited
+        // content, which is invisible only when the very next thing is the new rectangle.
+        strip_thick_frame(hwnd);
+        let covers = covers_display(left, top, width, height);
+        // A resize that takes the window to a display, or off one, leaves the surface it is
+        // composited from empty until the next frame is painted: the frame the app just painted
+        // stands over it while that happens.
+        // Any placement the app gave a frame is covered with it: a resize empties the window
+        // whatever it grows into, over a display or not. Which placements those are is the app's
+        // call — one of another rectangle drops its frame unshown.
+        //
+        // The picture has to be on screen before the rectangle changes. The hole is the
+        // composition the resize lands in, so a picture queued alongside the resize is not there
+        // yet: it is presented first, and the resize follows it.
+        let covered = show_prepared_cover(left, top, width, height);
+        if covered {
+            unsafe { winapi::um::dwmapi::DwmFlush() };
+            fs_trace("ghost", || "synced".to_string());
+        }
+        RESTORE_WRITE.store(true, Ordering::SeqCst);
+        set_window_rect(hwnd, left, top, width, height);
+        fs_trace("place", || "applied".to_string());
+        if covered {
+            note_cover_placed();
+            // On a thread of its own rather than on a window timer: a timer is given in
+            // milliseconds but fires on the system tick, which is over 15 ms wide, and the
+            // picture has to come down within a composition of the frame it stands over.
+            let generation = GHOST_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+            let window = hwnd as usize;
+            std::thread::spawn(move || {
+                // The system tick is over 15 ms wide and a sleep is rounded up to it, which is
+                // enough to leave the picture standing when the frame it stands for is already
+                // on the screen: the last of the wait is spent watching the clock instead.
+                let deadline = std::time::Instant::now() + GHOST_DOWN_DELAY;
+                loop {
+                    let now = std::time::Instant::now();
+                    if now >= deadline {
+                        break;
+                    }
+                    let left = deadline - now;
+                    if left > std::time::Duration::from_millis(3) {
+                        std::thread::sleep(left - std::time::Duration::from_millis(3));
+                    } else {
+                        std::thread::yield_now();
+                    }
+                }
+                unsafe {
+                    winapi::um::winuser::PostMessageW(
+                        window as HWND,
+                        WM_GHOST_DOWN,
+                        generation as WPARAM,
+                        0,
+                    );
+                }
+            });
+        }
+        RESTORE_WRITE.store(false, Ordering::SeqCst);
+        if covers {
+            paint_window_background_now(hwnd);
+        }
+    }
+}
+
+/// The size the window last reported to its procedure.
+static LAST_SIZE: std::sync::Mutex<Option<(i32, i32)>> = std::sync::Mutex::new(None);
+
+/// Did this resize take the window to a whole display, or off one?
+///
+/// Both directions are the fullscreen transition. Growing leaves an area with nothing drawn in
+/// it, and shrinking hands back the area the display had: the window is filled either way.
+fn size_change_crosses_a_display(hwnd: HWND) -> bool {
+    let Some(rect) = window_rect(hwnd) else {
+        return false;
+    };
+    let size = (rect.right - rect.left, rect.bottom - rect.top);
+    let previous = LAST_SIZE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .replace(size);
+    let covers = |(width, height): (i32, i32)| {
+        covers_display(rect.left, rect.top, width, height)
+            || covers_display(
+                rect.left + (rect.right - rect.left - width) / 2,
+                rect.top + (rect.bottom - rect.top - height) / 2,
+                width,
+                height,
+            )
+    };
+    covers(size) || previous.map(covers).unwrap_or(false)
+}
+
+/// Is this rectangle a display's own, or the work area it leaves for windows?
+fn covers_display(left: i32, top: i32, width: i32, height: i32) -> bool {
+    let Some(display) = monitor_info_at(left + width / 2, top + height / 2) else {
+        return false;
+    };
+    let fits = |rect: RECT| {
+        (rect.left - left).abs() <= 2
+            && (rect.top - top).abs() <= 2
+            && (rect.right - rect.left - width).abs() <= 2
+            && (rect.bottom - rect.top - height).abs() <= 2
+    };
+    fits(display.monitor) || fits(display.work)
+}
+
+/// Fills the window now, rather than when the erase message arrives.
+fn paint_window_background_now(hwnd: HWND) {
+    use winapi::um::winuser::{GetDC, ReleaseDC};
+
+    unsafe {
+        let hdc = GetDC(hwnd);
+        if hdc.is_null() {
+            return;
+        }
+        erase_window_background(hwnd, hdc);
+        ReleaseDC(hwnd, hdc);
+    }
+}
+
+// ── The picture a resize happens behind ───────────────────────────────────────────────
+
+/// The window that stands in for the viewer while it is resized.
+static GHOST_WINDOW: AtomicIsize = AtomicIsize::new(0);
+
+/// What the ghost is waiting for before it can come down.
+struct GhostPlan {
+    /// The rectangle it stands over has been applied.
+    placed: bool,
+    /// Frames the app has painted since then; the first is the one for the new rectangle.
+    painted: u32,
+    /// No hiding before this: the picture needs a composition of its own to be picked up.
+    earliest: std::time::Instant,
+    /// Hidden by this whatever happens, so a stalled app cannot leave a picture on the screen.
+    latest: std::time::Instant,
+    /// No hiding before this either: counted from the placement, the composition it lands in has
+    /// to pass before the picture can go, or it goes out in that composition and uncovers the
+    /// hole itself.
+    after_place: Option<std::time::Instant>,
+}
+
+static GHOST_PLAN: std::sync::Mutex<Option<GhostPlan>> = std::sync::Mutex::new(None);
+
+/// The frame the ghost waits for: one painted for the rectangle it stands over.
+const GHOST_FRAMES_HELD: u32 = 1;
+
+/// The shortest and longest the picture stands.
+///
+/// The short end is a composition, which is what carries the resize; the long one is a stalled
+/// app, which would otherwise leave a still picture standing over its window.
+const GHOST_EARLIEST: std::time::Duration = std::time::Duration::from_millis(12);
+const GHOST_LATEST: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// How long after the placement the picture is held.
+///
+/// Under three refreshes of a 144 Hz display it was still coming down in the composition the
+/// resize landed in, and the desktop showed through it: this is the shortest hold that was not
+/// seen as a hole, with a refresh to spare.
+const GHOST_AFTER_PLACE: std::time::Duration = std::time::Duration::from_millis(25);
+
+fn ghost_class() -> Vec<u16> {
+    wide(OsStr::new("RustImageViewerResizeGhost"))
+}
+
+/// The ghost window, created the first time one is needed.
+fn ghost_window() -> Option<HWND> {
+    use winapi::um::winuser::{
+        CreateWindowExW, DefWindowProcW, RegisterClassW, WNDCLASSW, WS_EX_LAYERED,
+        WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    };
+
+    let existing = GHOST_WINDOW.load(Ordering::SeqCst);
+    if existing != 0 {
+        return Some(existing as HWND);
+    }
+
+    unsafe {
+        use winapi::um::libloaderapi::GetModuleHandleW;
+
+        let instance = GetModuleHandleW(std::ptr::null());
+        let class = ghost_class();
+        let mut window_class: WNDCLASSW = std::mem::zeroed();
+        window_class.lpfnWndProc = Some(DefWindowProcW);
+        window_class.hInstance = instance;
+        window_class.lpszClassName = class.as_ptr();
+        // A second registration of the same class fails, and the class is already there.
+        RegisterClassW(&window_class);
+
+        let hwnd = CreateWindowExW(
+            // Click-through: a stray press while it stands belongs to the viewer underneath.
+            WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST | WS_EX_TRANSPARENT,
+            class.as_ptr(),
+            std::ptr::null(),
+            WS_POPUP,
+            0,
+            0,
+            1,
+            1,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            instance,
+            std::ptr::null_mut(),
+        );
+        if hwnd.is_null() {
+            return None;
+        }
+        GHOST_WINDOW.store(hwnd as isize, Ordering::SeqCst);
+        Some(hwnd)
+    }
+}
+
+/// A 32-bit drawing surface holding one frame's worth of pixels, top-down.
+fn create_dib(
+    screen: winapi::shared::windef::HDC,
+    width: i32,
+    height: i32,
+) -> Option<(
+    winapi::shared::windef::HDC,
+    winapi::shared::windef::HBITMAP,
+    *mut u32,
+)> {
+    use winapi::um::wingdi::{
+        CreateCompatibleDC, CreateDIBSection, DeleteDC, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
+        DIB_RGB_COLORS,
+    };
+
+    unsafe {
+        let memory = CreateCompatibleDC(screen);
+        if memory.is_null() {
+            return None;
+        }
+        let mut header: BITMAPINFO = std::mem::zeroed();
+        header.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+        header.bmiHeader.biWidth = width;
+        header.bmiHeader.biHeight = -height;
+        header.bmiHeader.biPlanes = 1;
+        header.bmiHeader.biBitCount = 32;
+        header.bmiHeader.biCompression = BI_RGB as u32;
+        let mut bits: *mut winapi::ctypes::c_void = std::ptr::null_mut();
+        let bitmap = CreateDIBSection(
+            memory,
+            &header,
+            DIB_RGB_COLORS,
+            &mut bits as *mut *mut winapi::ctypes::c_void,
+            std::ptr::null_mut(),
+            0,
+        );
+        if bitmap.is_null() {
+            DeleteDC(memory);
+            return None;
+        }
+        Some((memory, bitmap, bits as *mut u32))
+    }
+}
+
+/// Does the window, as it stands, cover a whole display?
+pub fn window_covers_display(hwnd: HWND) -> bool {
+    let Some(rect) = window_rect(hwnd) else {
+        return false;
+    };
+    covers_display(
+        rect.left,
+        rect.top,
+        rect.right - rect.left,
+        rect.bottom - rect.top,
+    )
+}
+
+/// Draws the frame the viewer has just painted over `rect`, ready for the placement that takes it.
+///
+/// A resize takes the window's composited surface with it: until the frame for the new size is
+/// painted, the area the window covers has nothing in it and the desktop is what shows through.
+/// That hole is one refresh wide — 7 ms on a 144 Hz display — so it cannot be repainted in time;
+/// it is covered instead. The frame the app already rendered is stretched over the rectangle the
+/// window is about to take, which is what the resize is supposed to look like anyway.
+///
+/// `words` is that frame, and nothing is shown without it: an uncovered resize is what happens
+/// today, and a ghost over the wrong picture would be worse than the hole.
+fn prepare_cover(
+    rect: crate::window_geometry::Rect,
+    source_w: usize,
+    source_h: usize,
+    words: &[u32],
+) -> bool {
+    use winapi::um::wingdi::{
+        CreateSolidBrush, DeleteDC, DeleteObject, SelectObject, SetStretchBltMode, StretchBlt,
+        HALFTONE, SRCCOPY,
+    };
+    use winapi::um::winuser::{FillRect, GetDC, ReleaseDC};
+
+    let (width, height) = (rect.width(), rect.height());
+    if width <= 0 || height <= 0 || source_w == 0 || source_h == 0 {
+        return false;
+    }
+    if words.len() < source_w * source_h {
+        return false;
+    }
+    if ghost_window().is_none() {
+        return false;
+    }
+
+    unsafe {
+        let screen = GetDC(std::ptr::null_mut());
+        if screen.is_null() {
+            return false;
+        }
+
+        let Some((source_dc, source_bitmap, source_bits)) =
+            create_dib(screen, source_w as i32, source_h as i32)
+        else {
+            ReleaseDC(std::ptr::null_mut(), screen);
+            return false;
+        };
+        let Some((cover_dc, cover_bitmap, cover_bits)) = create_dib(screen, width, height) else {
+            DeleteObject(source_bitmap as *mut _);
+            DeleteDC(source_dc);
+            ReleaseDC(std::ptr::null_mut(), screen);
+            return false;
+        };
+
+        // The frame is already in the compositor's layout: one word per pixel, blue first.
+        std::slice::from_raw_parts_mut(source_bits, source_w * source_h)
+            .copy_from_slice(&words[..source_w * source_h]);
+
+        // Both surfaces have to be selected into their contexts: a device context created for a
+        // bitmap does not draw with it until it is, and one that is not holds a blank surface.
+        SelectObject(source_dc, source_bitmap as *mut _);
+        SelectObject(cover_dc, cover_bitmap as *mut _);
+        // The background stands where the picture does not reach: the cover is never a hole.
+        let cover = RECT {
+            left: 0,
+            top: 0,
+            right: width,
+            bottom: height,
+        };
+        let brush = CreateSolidBrush(WINDOW_BACKGROUND.load(Ordering::Relaxed));
+        if !brush.is_null() {
+            FillRect(cover_dc, &cover, brush);
+            DeleteObject(brush as *mut _);
+        }
+        // At its own size, and never scaled: the picture is what is on the screen now, and
+        // scaling it is a change the eye reads as a zoom — in on the way to fullscreen, out on
+        // the way back — before the frame for the new rectangle arrives. What the rectangle has
+        // that the frame does not is filled with the background, and what the frame has that the
+        // rectangle does not is cropped from the middle.
+        let picture_w = (source_w as i32).min(width);
+        let picture_h = (source_h as i32).min(height);
+        SetStretchBltMode(cover_dc, HALFTONE);
+        let stretched = StretchBlt(
+            cover_dc,
+            (width - picture_w) / 2,
+            (height - picture_h) / 2,
+            picture_w,
+            picture_h,
+            source_dc,
+            (source_w as i32 - picture_w) / 2,
+            (source_h as i32 - picture_h) / 2,
+            picture_w,
+            picture_h,
+            SRCCOPY,
+        );
+
+        let sample = words[(source_h / 2) * source_w + source_w / 2];
+        let middle = (height / 2) as usize * width as usize + (width / 2) as usize;
+        let drawn_pixel = *cover_bits.add(middle);
+        let corner = *cover_bits.add((height / 8) as usize * width as usize + (width / 8) as usize);
+        fs_trace("ghost", || {
+            format!(
+                "prepared ({},{}) {width}x{height} from {source_w}x{source_h} \
+                 stretched={} sample={:06x} drawn={:06x},{:06x}",
+                rect.left,
+                rect.top,
+                stretched != 0,
+                sample,
+                drawn_pixel,
+                corner
+            )
+        });
+
+        let mut prepared = PREPARED_COVER
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        drop_prepared_cover(prepared.take());
+        *prepared = Some(PreparedCover {
+            dc: cover_dc as isize,
+            bitmap: cover_bitmap as isize,
+            left: rect.left,
+            top: rect.top,
+            width,
+            height,
+        });
+
+        DeleteObject(source_bitmap as *mut _);
+        DeleteDC(source_dc);
+        ReleaseDC(std::ptr::null_mut(), screen);
+
+        true
+    }
+}
+
+/// The cover built for a placement, standing ready until the placement arrives.
+///
+/// The handles are held as plain integers, as the window handles are: they are only ever used on
+/// the thread that drew them.
+struct PreparedCover {
+    dc: isize,
+    bitmap: isize,
+    left: i32,
+    top: i32,
+    width: i32,
+    height: i32,
+}
+
+static PREPARED_COVER: std::sync::Mutex<Option<PreparedCover>> = std::sync::Mutex::new(None);
+
+/// Gives back the surface a cover was drawn on.
+fn drop_prepared_cover(cover: Option<PreparedCover>) {
+    use winapi::um::wingdi::{DeleteDC, DeleteObject};
+
+    if let Some(cover) = cover {
+        unsafe {
+            DeleteObject(cover.bitmap as *mut _);
+            DeleteDC(cover.dc as winapi::shared::windef::HDC);
+        }
+    }
+}
+
+/// Hands the frame that covers the next placement to the window procedure.
+///
+/// The picture is drawn here, while the viewer is still showing its own frame, and not between
+/// that frame and the new rectangle: drawn there, it would be part of the transition itself.
+pub fn set_pending_cover(
+    rect: crate::window_geometry::Rect,
+    width: usize,
+    height: usize,
+    cover: &[u32],
+) {
+    // The window is stood up before it is needed, so that creating it is not part of the
+    // placement it is there to cover.
+    let _ = ghost_window();
+    prepare_cover(rect, width, height, cover);
+}
+
+/// Shows the cover built for this rectangle, and gives its surface back.
+///
+/// A cover built for another rectangle is dropped instead: it would stand in the wrong place.
+fn show_prepared_cover(left: i32, top: i32, width: i32, height: i32) -> bool {
+    use winapi::shared::windef::{POINT, SIZE};
+    use winapi::um::wingdi::{AC_SRC_OVER, BLENDFUNCTION};
+    use winapi::um::winuser::{
+        GetDC, ReleaseDC, SetWindowPos, UpdateLayeredWindow, HWND_TOPMOST, SWP_NOACTIVATE,
+        SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, ULW_OPAQUE,
+    };
+
+    let mut prepared = PREPARED_COVER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(cover) = prepared.as_ref() else {
+        return false;
+    };
+    if cover.left != left || cover.top != top || cover.width != width || cover.height != height {
+        drop_prepared_cover(prepared.take());
+        fs_trace("ghost", || "dropped, the rectangle moved".to_string());
+        return false;
+    }
+    let Some(ghost) = ghost_window() else {
+        drop_prepared_cover(prepared.take());
+        return false;
+    };
+
+    unsafe {
+        let screen = GetDC(std::ptr::null_mut());
+        if screen.is_null() {
+            drop_prepared_cover(prepared.take());
+            return false;
+        }
+        let mut destination = POINT { x: left, y: top };
+        let mut size = SIZE {
+            cx: width,
+            cy: height,
+        };
+        let mut origin = POINT { x: 0, y: 0 };
+        let mut blend = BLENDFUNCTION {
+            BlendOp: AC_SRC_OVER as u8,
+            BlendFlags: 0,
+            SourceConstantAlpha: 255,
+            AlphaFormat: 0,
+        };
+        let drawn = UpdateLayeredWindow(
+            ghost,
+            screen,
+            &mut destination,
+            &mut size,
+            cover.dc as winapi::shared::windef::HDC,
+            &mut origin,
+            0,
+            &mut blend as *mut BLENDFUNCTION,
+            ULW_OPAQUE,
+        );
+        ReleaseDC(std::ptr::null_mut(), screen);
+        drop_prepared_cover(prepared.take());
+        if drawn == 0 {
+            return false;
+        }
+        SetWindowPos(
+            ghost,
+            HWND_TOPMOST,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        );
+        let now = std::time::Instant::now();
+        *GHOST_PLAN
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(GhostPlan {
+            placed: false,
+            painted: 0,
+            earliest: now + GHOST_EARLIEST,
+            latest: now + GHOST_LATEST,
+            after_place: None,
+        });
+        fs_trace("ghost", || {
+            format!("covering ({left},{top}) {width}x{height}")
+        });
+        true
+    }
+}
+
+/// Is this rectangle a display's own, or the work area it leaves for windows?
+pub fn rect_covers_display(rect: crate::window_geometry::Rect) -> bool {
+    covers_display(rect.left, rect.top, rect.width(), rect.height())
+}
+
+/// Notes that the rectangle the cover stands over has been applied.
+fn note_cover_placed() {
+    let mut plan = GHOST_PLAN
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(plan) = plan.as_mut() {
+        plan.placed = true;
+        plan.after_place = Some(std::time::Instant::now() + GHOST_AFTER_PLACE);
+    }
+}
+
+/// Notes a frame the app has painted, so the picture comes down with the frame that replaces it.
+pub fn note_viewer_frame_painted() {
+    let mut plan = GHOST_PLAN
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(plan) = plan.as_mut() {
+        if plan.placed {
+            plan.painted = plan.painted.saturating_add(1);
+        }
+    }
+}
+
+/// Takes the ghost down once the frame painted for its rectangle is up.
+///
+/// Called once per frame. The frame after the placement is the one painted for the new rectangle,
+/// and it is presented before the frame after that comes round: the picture goes down with it,
+/// standing only for the compositions the hole was in.
+pub fn step_resize_ghost() {
+    let (down, wait_for_composition) = {
+        let plan = GHOST_PLAN
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match plan.as_ref() {
+            None => (false, false),
+            Some(plan) => {
+                let now = std::time::Instant::now();
+                let painted = plan.placed && plan.painted >= GHOST_FRAMES_HELD;
+                let held = plan.after_place.is_some_and(|at| now >= at);
+                if now >= plan.latest {
+                    (true, false)
+                } else if painted && held && now >= plan.earliest {
+                    // The frame for the new rectangle has been presented. Frames painted are
+                    // not frames presented: the app paints them faster than the display shows
+                    // them, so this waits for the composition that carries it to be done, and
+                    // the picture comes down onto that frame instead of onto a guess.
+                    (true, true)
+                } else {
+                    (false, false)
+                }
+            }
+        }
+    };
+    if !down {
+        return;
+    }
+    if wait_for_composition {
+        unsafe { winapi::um::dwmapi::DwmFlush() };
+    }
+    hide_resize_ghost();
+}
+
+/// Takes the picture down, whatever the plan says.
+fn hide_resize_ghost() {
+    *GHOST_PLAN
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    let ghost = GHOST_WINDOW.load(Ordering::SeqCst);
+    if ghost != 0 {
+        use winapi::um::winuser::{ShowWindow, SW_HIDE};
+        unsafe { ShowWindow(ghost as HWND, SW_HIDE) };
+        fs_trace("ghost", || "hidden".to_string());
+    }
 }
 
 /// A display's rectangles and effective scale, all in physical pixels.
@@ -1184,9 +2102,9 @@ unsafe extern "system" fn scale_change_wndproc(
     lparam: LPARAM,
 ) -> LRESULT {
     use winapi::um::winuser::{
-        CallWindowProcW, SC_MAXIMIZE, WM_ACTIVATE, WM_DPICHANGED, WM_GETMINMAXINFO, WM_KEYDOWN,
-        WM_KEYUP, WM_MOVE, WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER,
-        WM_WINDOWPOSCHANGED, WM_WINDOWPOSCHANGING,
+        CallWindowProcW, SC_MAXIMIZE, WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN,
+        WM_KEYUP, WM_MOVE, WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_WINDOWPOSCHANGED,
+        WM_WINDOWPOSCHANGING,
     };
 
     let previous = PREVIOUS_WNDPROC.load(Ordering::SeqCst);
@@ -1194,6 +2112,29 @@ unsafe extern "system" fn scale_change_wndproc(
         return def_proc(hwnd, msg, wparam, lparam);
     }
     let previous: WNDPROC = std::mem::transmute(previous);
+
+    if msg == WM_PLACE_RECT {
+        place_posted_rect(hwnd);
+        return 0;
+    }
+
+    // The picture over a resize comes down on a message of its own, not on a frame: the app stops
+    // painting once it has nothing new to draw, and an idle viewer would leave it standing until
+    // the next mouse move took it down.
+    if msg == WM_GHOST_DOWN {
+        if GHOST_GENERATION.load(Ordering::SeqCst) == wparam as u64 {
+            hide_resize_ghost();
+        }
+        return 0;
+    }
+
+    // Filled with the viewer's background rather than left to the desktop.
+    if msg == WM_ERASEBKGND {
+        if erase_window_background(hwnd, wparam as winapi::shared::windef::HDC) {
+            return 1;
+        }
+        return CallWindowProcW(previous, hwnd, msg, wparam, lparam);
+    }
 
     // A rectangle written while a Windows key is held is the shell's, from a chord the app never
     // asked for: stamping it is what tells the geometry passes to leave it alone.
@@ -1229,25 +2170,28 @@ unsafe extern "system" fn scale_change_wndproc(
         return CallWindowProcW(previous, hwnd, msg, wparam, lparam);
     }
 
-    if msg == WM_TIMER {
-        strip_thick_frame(hwnd);
-        return CallWindowProcW(previous, hwnd, msg, wparam, lparam);
-    }
-
-    if msg == WM_ACTIVATE {
-        strip_thick_frame(hwnd);
-        return CallWindowProcW(previous, hwnd, msg, wparam, lparam);
-    }
-
     // Any other move or resize is the shell's chord or the app's own: while no Windows key is
     // held, the rectangle it lands on is the one the next chord is undone to.
+    //
+    // The sizing border is not taken off here. A style change forces a frame recalculation, and
+    // that discards what the compositor holds for the window: done on the frame that just resized
+    // it, the viewer showed the desktop until the next frame was painted. It rides along with a
+    // placement instead (`place_posted_rect`), where the rectangle and the recalculation are one
+    // step.
     if msg == WM_MOVE || msg == WM_SIZE {
         let result = CallWindowProcW(previous, hwnd, msg, wparam, lparam);
+        if msg == WM_SIZE && size_change_crosses_a_display(hwnd) {
+            // The window has nothing drawn yet for the size it just took: with no background brush
+            // the compositor shows the desktop there until the next frame is swapped. Filled here,
+            // inside the placement that resized it, so that moment never reaches the screen. A
+            // resize that stays inside the window's own area keeps its content, and painting it
+            // would only blink.
+            paint_window_background_now(hwnd);
+        }
         if win_key_down() {
             settle_window_rect(hwnd);
         } else {
             record_settled_rect(hwnd);
-            strip_thick_frame(hwnd);
         }
         return result;
     }
@@ -1649,10 +2593,12 @@ unsafe fn refuse_snap_placement(hwnd: HWND, lparam: LPARAM) -> bool {
     true
 }
 
-const STYLE_TIMER_ID: usize = 0x5244;
-
 /// Takes the sizing border off: Aero Snap divides the screen with it, and the snap's resize is what
 /// the window is seen doing before it is put back.
+///
+/// The frame recalculation this forces throws away the window's composited content, so it is only
+/// ever done as part of a placement — never on its own, and never after a resize that the window
+/// is already showing.
 pub fn strip_thick_frame(hwnd: HWND) {
     use winapi::um::winuser::{
         GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWL_STYLE, SWP_FRAMECHANGED,
@@ -1667,6 +2613,12 @@ pub fn strip_thick_frame(hwnd: HWND) {
         if style & WS_THICKFRAME as isize == 0 {
             return;
         }
+        fs_trace("style", || {
+            format!(
+                "stripping WS_THICKFRAME rect={:?}",
+                window_rect(hwnd).map(|r| (r.left, r.top, r.right - r.left, r.bottom - r.top)),
+            )
+        });
         SetWindowLongPtrW(hwnd, GWL_STYLE, style & !(WS_THICKFRAME as isize));
         SetWindowPos(
             hwnd,
@@ -1677,19 +2629,6 @@ pub fn strip_thick_frame(hwnd: HWND) {
             0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
         );
-    }
-}
-
-/// Keeps the sizing border off while the app runs: winit rewrites the styles on every fullscreen or
-/// resize change, so a quarter-second timer puts it back off long before the next chord.
-pub fn watch_window_style(hwnd: HWND) {
-    use winapi::um::winuser::SetTimer;
-
-    if hwnd.is_null() {
-        return;
-    }
-    unsafe {
-        SetTimer(hwnd, STYLE_TIMER_ID, 250, None);
     }
 }
 
@@ -1834,9 +2773,9 @@ pub fn install_scale_change_guard(hwnd: HWND) {
         SetWindowLongPtrW(hwnd, GWLP_WNDPROC, hook);
     }
     strip_thick_frame(hwnd);
-    watch_window_style(hwnd);
     disable_window_transitions(hwnd);
     spawn_win_chord_watch(hwnd);
+    spawn_fs_watch(hwnd);
     install_win_arrow_swallow();
 }
 
