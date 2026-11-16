@@ -310,10 +310,19 @@ impl ImageViewer {
             // hands over the frame after it is asked for. A resize that cannot be covered — one
             // that stays inside the window's own area, or one whose frame never arrives — goes
             // ahead regardless.
-            if crate::windows_env::rect_covers_display(rect)
-                && self.transition_cover.is_none()
-                && self.transition_cover_waits < 3
-            {
+            // The picture has to be of the frame the window is showing now. One taken before the
+            // window last changed size is of the wrong rectangle — it was the size the window had
+            // before it went fullscreen — and standing it over the resize looks worse than the
+            // hole it stands in for.
+            let (frame_w, frame_h) = self.frame_size_in_pixels(ctx);
+            let cover_is_current = self
+                .transition_cover
+                .as_ref()
+                .is_some_and(|(width, height, _)| *width == frame_w && *height == frame_h);
+            let touches_a_display = crate::windows_env::rect_covers_display(rect)
+                || crate::windows_env::window_covers_display(self.resolved_main_hwnd());
+            if touches_a_display && !cover_is_current && self.transition_cover_waits < 3 {
+                self.transition_cover = None;
                 self.transition_cover_waits += 1;
                 self.pending_viewer_rect = Some(rect);
                 ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot);
@@ -332,6 +341,20 @@ impl ImageViewer {
         }
 
         let _ = ctx;
+    }
+
+    /// The size of the frame the window is showing, in physical pixels.
+    #[cfg(target_os = "windows")]
+    fn frame_size_in_pixels(&self, ctx: &egui::Context) -> (usize, usize) {
+        let ppp = ctx.pixels_per_point();
+        let inner = ctx.input(|input| input.raw.viewport().inner_rect.map(|rect| rect.size()));
+        match inner {
+            Some(inner) => (
+                (inner.x * ppp).round().max(0.0) as usize,
+                (inner.y * ppp).round().max(0.0) as usize,
+            ),
+            None => (0, 0),
+        }
     }
 
     /// Outer size (inner plus decorations) for a wanted inner size, in points.

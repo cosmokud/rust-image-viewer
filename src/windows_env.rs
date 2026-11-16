@@ -733,7 +733,7 @@ fn create_dib(
 }
 
 /// Does the window, as it stands, cover a whole display?
-fn window_covers_display(hwnd: HWND) -> bool {
+pub fn window_covers_display(hwnd: HWND) -> bool {
     let Some(rect) = window_rect(hwnd) else {
         return false;
     };
@@ -817,30 +817,25 @@ fn prepare_cover(
             FillRect(cover_dc, &cover, brush);
             DeleteObject(brush as *mut _);
         }
-        // Kept in proportion: the picture is cropped to the rectangle's shape rather than
-        // squeezed into it. A distorted picture is a visible change in what is under the window,
-        // and it is not what the rectangle is about to look like.
-        let (crop_x, crop_y, crop_w, crop_h) =
-            if source_w * height as usize > source_h * width as usize {
-                let cropped = ((source_h as f64) * width as f64 / height as f64).round() as i32;
-                (
-                    (source_w as i32 - cropped) / 2,
-                    0,
-                    cropped.min(source_h as i32),
-                    source_h as i32,
-                )
-            } else {
-                let cropped = ((source_w as f64) * height as f64 / width as f64).round() as i32;
-                (
-                    0,
-                    (source_h as i32 - cropped) / 2,
-                    source_w as i32,
-                    cropped.min(source_w as i32),
-                )
-            };
+        // Whole, and no bigger than it already is: the rectangle it goes in is what the window is
+        // about to look like, and a picture enlarged or cropped into it is a visible change in
+        // what is on the screen and not one the resize makes. The background stands around it.
+        let scale = (width as f64 / source_w as f64).min(height as f64 / source_h as f64);
+        let picture_w = ((source_w as f64) * scale).round() as i32;
+        let picture_h = ((source_h as f64) * scale).round() as i32;
         SetStretchBltMode(cover_dc, HALFTONE);
         let stretched = StretchBlt(
-            cover_dc, 0, 0, width, height, source_dc, crop_x, crop_y, crop_w, crop_h, SRCCOPY,
+            cover_dc,
+            (width - picture_w) / 2,
+            (height - picture_h) / 2,
+            picture_w,
+            picture_h,
+            source_dc,
+            0,
+            0,
+            source_w as i32,
+            source_h as i32,
+            SRCCOPY,
         );
 
         let sample = words[(source_h / 2) * source_w + source_w / 2];
@@ -849,8 +844,8 @@ fn prepare_cover(
         let corner = *cover_bits.add((height / 8) as usize * width as usize + (width / 8) as usize);
         fs_trace("ghost", || {
             format!(
-                "prepared ({},{}) {width}x{height} stretched={} sample={:06x} \
-                 drawn={:06x},{:06x}",
+                "prepared ({},{}) {width}x{height} from {source_w}x{source_h} \
+                 stretched={} sample={:06x} drawn={:06x},{:06x}",
                 rect.left,
                 rect.top,
                 stretched != 0,
