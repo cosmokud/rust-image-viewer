@@ -520,26 +520,20 @@ fn place_posted_rect(hwnd: HWND) {
         // content, which is invisible only when the very next thing is the new rectangle.
         strip_thick_frame(hwnd);
         let covers = covers_display(left, top, width, height);
-        let mut covered = false;
         // A resize that takes the window to a display, or off one, leaves the surface it is
         // composited from empty until the next frame is painted: the frame the app just painted
         // stands over it while that happens.
-        if covers || window_covers_display(hwnd) {
-            // The picture has to be on screen before the rectangle changes. The hole is the
-            // composition the resize lands in, so a picture queued alongside the resize is not
-            // there yet: it is presented first, and the resize follows it.
-            covered = show_prepared_cover(left, top, width, height);
-            if covered {
-                unsafe { winapi::um::dwmapi::DwmFlush() };
-                fs_trace("ghost", || "synced".to_string());
-            }
-        } else {
-            drop_prepared_cover(
-                PREPARED_COVER
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .take(),
-            );
+        // Any placement the app gave a frame is covered with it: a resize empties the window
+        // whatever it grows into, over a display or not. Which placements those are is the app's
+        // call — one of another rectangle drops its frame unshown.
+        //
+        // The picture has to be on screen before the rectangle changes. The hole is the
+        // composition the resize lands in, so a picture queued alongside the resize is not there
+        // yet: it is presented first, and the resize follows it.
+        let covered = show_prepared_cover(left, top, width, height);
+        if covered {
+            unsafe { winapi::um::dwmapi::DwmFlush() };
+            fs_trace("ghost", || "synced".to_string());
         }
         RESTORE_WRITE.store(true, Ordering::SeqCst);
         set_window_rect(hwnd, left, top, width, height);

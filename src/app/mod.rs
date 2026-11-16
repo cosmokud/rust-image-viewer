@@ -417,6 +417,9 @@ pub(crate) struct ImageViewer {
     pub(crate) transition_cover: Option<(usize, usize, Vec<u32>)>,
     /// Frames spent waiting for that frame to arrive before the resize goes ahead without it.
     pub(crate) transition_cover_waits: u8,
+    /// The next placement shows another mode, and is covered even if it stays inside the window's
+    /// own display area: switching modes resizes the window, and a resize empties it either way.
+    pub(crate) cover_next_placement: bool,
     /// Largest inner size a floating window may take when the next/previous file is laid out:
     /// the first opened file's size, replaced by the size the user resizes the window to.
     pub(crate) floating_size_cap: Option<egui::Vec2>,
@@ -1133,6 +1136,7 @@ impl Default for ImageViewer {
             pending_viewer_rect: None,
             transition_cover: None,
             transition_cover_waits: 0,
+            cover_next_placement: false,
             floating_size_cap: None,
             floating_window_position: None,
             pending_floating_fullscreen_view_state: None,

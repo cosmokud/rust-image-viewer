@@ -321,7 +321,8 @@ impl ImageViewer {
                 .is_some_and(|(width, height, _)| *width == frame_w && *height == frame_h);
             let touches_a_display = crate::windows_env::rect_covers_display(rect)
                 || crate::windows_env::window_covers_display(self.resolved_main_hwnd());
-            if touches_a_display && !cover_is_current && self.transition_cover_waits < 3 {
+            let cover_wanted = touches_a_display || self.cover_next_placement;
+            if cover_wanted && !cover_is_current && self.transition_cover_waits < 3 {
                 self.transition_cover = None;
                 self.transition_cover_waits += 1;
                 self.pending_viewer_rect = Some(rect);
@@ -330,6 +331,7 @@ impl ImageViewer {
                 return;
             }
             self.transition_cover_waits = 0;
+            self.cover_next_placement = false;
             if let Some((width, height, cover)) = self.transition_cover.as_ref() {
                 crate::windows_env::set_pending_cover(rect, *width, *height, cover);
                 self.transition_cover = None;
