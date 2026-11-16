@@ -507,6 +507,7 @@ fn place_posted_rect(hwnd: HWND) {
         // content, which is invisible only when the very next thing is the new rectangle.
         strip_thick_frame(hwnd);
         let covers = covers_display(left, top, width, height);
+        let mut covered = false;
         // A resize that takes the window to a display, or off one, leaves the surface it is
         // composited from empty until the next frame is painted: the frame the app just painted
         // stands over it while that happens.
@@ -514,7 +515,8 @@ fn place_posted_rect(hwnd: HWND) {
             // The picture has to be on screen before the rectangle changes. The hole is the
             // composition the resize lands in, so a picture queued alongside the resize is not
             // there yet: it is presented first, and the resize follows it.
-            if show_prepared_cover(left, top, width, height) {
+            covered = show_prepared_cover(left, top, width, height);
+            if covered {
                 unsafe { winapi::um::dwmapi::DwmFlush() };
                 fs_trace("ghost", || "synced".to_string());
             }
@@ -529,6 +531,9 @@ fn place_posted_rect(hwnd: HWND) {
         RESTORE_WRITE.store(true, Ordering::SeqCst);
         set_window_rect(hwnd, left, top, width, height);
         fs_trace("place", || "applied".to_string());
+        if covered {
+            note_cover_placed();
+        }
         RESTORE_WRITE.store(false, Ordering::SeqCst);
         if covers {
             paint_window_background_now(hwnd);
@@ -597,15 +602,29 @@ fn paint_window_background_now(hwnd: HWND) {
 /// The window that stands in for the viewer while it is resized.
 static GHOST_WINDOW: AtomicIsize = AtomicIsize::new(0);
 
-/// When the ghost may come down: long enough for the frame painted for the new size to be up.
-static GHOST_HIDE_AT: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+/// What the ghost is waiting for before it can come down.
+struct GhostPlan {
+    /// The rectangle it stands over has been applied.
+    placed: bool,
+    /// Frames the app has painted since then; the first is the one for the new rectangle.
+    painted: u32,
+    /// No hiding before this: the picture needs a composition of its own to be picked up.
+    earliest: std::time::Instant,
+    /// Hidden by this whatever happens, so a stalled app cannot leave a picture on the screen.
+    latest: std::time::Instant,
+}
 
-/// How long the picture stands over a covered resize.
+static GHOST_PLAN: std::sync::Mutex<Option<GhostPlan>> = std::sync::Mutex::new(None);
+
+/// The frame the ghost waits for: the one painted for the rectangle it stands over.
+const GHOST_FRAMES_HELD: u32 = 1;
+
+/// The shortest and longest the picture stands.
 ///
-/// The resize itself takes a composition to reach the screen, and the frame for the new size
-/// follows it by one more. Counting the app's frames is no use: they are painted faster than
-/// they are presented, and the picture came down before the hole it covers was filled.
-const GHOST_HOLD: std::time::Duration = std::time::Duration::from_millis(40);
+/// The short end is a composition, which is what carries the resize; the long one is a stalled
+/// app, which would otherwise leave a still picture standing over its window.
+const GHOST_EARLIEST: std::time::Duration = std::time::Duration::from_millis(12);
+const GHOST_LATEST: std::time::Duration = std::time::Duration::from_millis(150);
 
 fn ghost_class() -> Vec<u16> {
     wide(OsStr::new("RustImageViewerResizeGhost"))
@@ -787,19 +806,30 @@ fn prepare_cover(
             FillRect(cover_dc, &cover, brush);
             DeleteObject(brush as *mut _);
         }
+        // Kept in proportion: the picture is cropped to the rectangle's shape rather than
+        // squeezed into it. A distorted picture is a visible change in what is under the window,
+        // and it is not what the rectangle is about to look like.
+        let (crop_x, crop_y, crop_w, crop_h) =
+            if source_w * height as usize > source_h * width as usize {
+                let cropped = ((source_h as f64) * width as f64 / height as f64).round() as i32;
+                (
+                    (source_w as i32 - cropped) / 2,
+                    0,
+                    cropped.min(source_h as i32),
+                    source_h as i32,
+                )
+            } else {
+                let cropped = ((source_w as f64) * height as f64 / width as f64).round() as i32;
+                (
+                    0,
+                    (source_h as i32 - cropped) / 2,
+                    source_w as i32,
+                    cropped.min(source_w as i32),
+                )
+            };
         SetStretchBltMode(cover_dc, HALFTONE);
         let stretched = StretchBlt(
-            cover_dc,
-            0,
-            0,
-            width,
-            height,
-            source_dc,
-            0,
-            0,
-            source_w as i32,
-            source_h as i32,
-            SRCCOPY,
+            cover_dc, 0, 0, width, height, source_dc, crop_x, crop_y, crop_w, crop_h, SRCCOPY,
         );
 
         let sample = words[(source_h / 2) * source_w + source_w / 2];
@@ -953,10 +983,15 @@ fn show_prepared_cover(left: i32, top: i32, width: i32, height: i32) -> bool {
             0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
         );
-        *GHOST_HIDE_AT
+        let now = std::time::Instant::now();
+        *GHOST_PLAN
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-            Some(std::time::Instant::now() + GHOST_HOLD);
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(GhostPlan {
+            placed: false,
+            painted: 0,
+            earliest: now + GHOST_EARLIEST,
+            latest: now + GHOST_LATEST,
+        });
         fs_trace("ghost", || {
             format!("covering ({left},{top}) {width}x{height}")
         });
@@ -969,21 +1004,51 @@ pub fn rect_covers_display(rect: crate::window_geometry::Rect) -> bool {
     covers_display(rect.left, rect.top, rect.width(), rect.height())
 }
 
-/// Takes the ghost down once the covered resize has had its time.
-///
-/// Called once per frame, so it comes down with a frame that finds its time passed: the viewer is
-/// then showing the frame painted for its new rectangle, and the picture is not needed.
-pub fn step_resize_ghost() {
-    let hide_at = *GHOST_HIDE_AT
+/// Notes that the rectangle the cover stands over has been applied.
+fn note_cover_placed() {
+    let mut plan = GHOST_PLAN
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let Some(hide_at) = hide_at else {
-        return;
+    if let Some(plan) = plan.as_mut() {
+        plan.placed = true;
+    }
+}
+
+/// Notes a frame the app has painted, so the picture comes down with the frame that replaces it.
+pub fn note_viewer_frame_painted() {
+    let mut plan = GHOST_PLAN
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(plan) = plan.as_mut() {
+        if plan.placed {
+            plan.painted = plan.painted.saturating_add(1);
+        }
+    }
+}
+
+/// Takes the ghost down once the frame painted for its rectangle is up.
+///
+/// Called once per frame. The frame after the placement is the one painted for the new rectangle,
+/// and it is presented before the frame after that comes round: the picture goes down with it,
+/// standing only for the compositions the hole was in.
+pub fn step_resize_ghost() {
+    let down = {
+        let plan = GHOST_PLAN
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match plan.as_ref() {
+            None => false,
+            Some(plan) => {
+                let now = std::time::Instant::now();
+                now >= plan.latest
+                    || (plan.placed && plan.painted >= GHOST_FRAMES_HELD && now >= plan.earliest)
+            }
+        }
     };
-    if std::time::Instant::now() < hide_at {
+    if !down {
         return;
     }
-    *GHOST_HIDE_AT
+    *GHOST_PLAN
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     let ghost = GHOST_WINDOW.load(Ordering::SeqCst);

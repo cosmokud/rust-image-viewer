@@ -929,6 +929,11 @@ impl eframe::App for ImageViewer {
         // be drawn first, so the window's new area is covered by the very frame it is placed in.
         self.apply_pending_viewer_rect(ctx);
 
+        // The frame laid out here is the one painted next, so the picture standing over a resize
+        // can come down with it.
+        #[cfg(target_os = "windows")]
+        crate::windows_env::note_viewer_frame_painted();
+
         // Guarded: a disabled session pays one cached bool load, no locks and no clock reads.
         if let Some(frame_started) = frame_started {
             // Present handoff: everything above had to finish before egui/wgpu could present.
