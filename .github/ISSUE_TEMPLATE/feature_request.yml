@@ -45,8 +45,8 @@ body:
       options:
         - Window / fullscreen / controls
         - Navigation / sorting
-        - Layout: Long Strip
-        - Layout: Masonry
+        - "Layout: Long Strip"
+        - "Layout: Masonry"
         - Video playback
         - Animated images
         - Stash window

@@ -51,8 +51,8 @@ body:
       options:
         - Window / fullscreen / DPI / multi-monitor
         - Navigation (prev/next, sort order, folder scan)
-        - Layout: Long Strip
-        - Layout: Masonry
+        - "Layout: Long Strip"
+        - "Layout: Masonry"
         - Video playback
         - Animated GIF / WebP
         - Stash window
@@ -162,7 +162,7 @@ body:
           (or set `RIV_DIAG_DIR` to pick the folder). Circle frame times default to 16 ms via
           `RIV_DIAG_FRAME_MS`, hang threshold via `RIV_DIAG_HANG_MS` (default 2000 ms).
         - If the app crashed, also attach `panic.log` from the same folder.
-    placeholder: Paste the last ~50 lines, or drag the file in.
+      placeholder: Paste the last ~50 lines, or drag the file in.
   - type: textarea
     id: extra
     attributes:
