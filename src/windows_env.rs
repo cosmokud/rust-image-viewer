@@ -2225,6 +2225,10 @@ unsafe extern "system" fn scale_change_wndproc(
     let before = window_rect(hwnd);
     let result = CallWindowProcW(previous, hwnd, msg, wparam, lparam);
 
+    // The shell asks for larger icons on the display the window moved to; the handles loaded at
+    // the previous scale would be rescaled from there.
+    install_app_icons(hwnd);
+
     if FULLSCREEN_TARGET.load(Ordering::SeqCst) || is_window_maximized(hwnd) {
         return result;
     }
@@ -2756,6 +2760,103 @@ fn anchor_is_zoomed() -> bool {
     ANCHOR_ZOOMED.load(Ordering::SeqCst)
 }
 
+/// The identity the shell files this process's taskbar buttons under.
+///
+/// `packaging/nsis/installer.nsi` stamps the same id onto the shortcuts it creates
+/// (`ApplicationID::Set`), so a viewer started from the Start Menu and one started by opening a
+/// file land on one taskbar button instead of two.
+pub const APP_USER_MODEL_ID: &str = "dev.rust-image-viewer.app";
+
+/// Tells the shell which taskbar identity this process belongs to.
+pub fn claim_taskbar_identity() {
+    use windows::core::HSTRING;
+    use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
+
+    let id = HSTRING::from(APP_USER_MODEL_ID);
+    match unsafe { SetCurrentProcessExplicitAppUserModelID(&id) } {
+        Ok(()) => {
+            crate::diag::trace("icon", "claimed the taskbar identity");
+        }
+        Err(error) => {
+            crate::diag::trace("icon", &format!("taskbar identity refused: {error}"));
+        }
+    }
+}
+
+/// Puts the executable's own icon resource on the window, at the sizes the shell asks for, and
+/// on its window class.
+///
+/// `eframe` hands winit a single RGBA bitmap, and winit turns that one image into the small and
+/// the large handle alike: Windows then rescales it for the titlebar, Alt+Tab and the taskbar
+/// thumbnail. Loading the 16/20/24/32… frames `build.rs` embedded instead gives every surface a
+/// frame drawn at its own size. The class icons cover the app's other windows (Settings, Stash,
+/// the dialogs), which never send a `WM_SETICON` of their own. Re-applied on a display scale
+/// change, where the shell asks for larger icons.
+pub fn install_app_icons(hwnd: HWND) {
+    use winapi::um::libloaderapi::GetModuleHandleW;
+    use winapi::um::winnt::LPCWSTR;
+    use winapi::um::winuser::{
+        GetDpiForWindow, GetSystemMetricsForDpi, LoadImageW, SendMessageW, SetClassLongPtrW,
+        GCLP_HICON, GCLP_HICONSM, ICON_BIG, ICON_SMALL, IMAGE_ICON, LR_DEFAULTCOLOR, LR_SHARED,
+        MAKEINTRESOURCEW, SM_CXICON, SM_CXSMICON, SM_CYICON, SM_CYSMICON, WM_SETICON,
+    };
+
+    // The resource id `build.rs` embeds the application icon as.
+    const APP_ICON_RESOURCE: u16 = 1;
+
+    if hwnd.is_null() {
+        return;
+    }
+
+    unsafe {
+        let module = GetModuleHandleW(std::ptr::null());
+        if module.is_null() {
+            return;
+        }
+        let dpi = match GetDpiForWindow(hwnd) {
+            0 => 96,
+            dpi => dpi,
+        };
+        let name = MAKEINTRESOURCEW(APP_ICON_RESOURCE) as LPCWSTR;
+        // `LR_SHARED` keeps the handles with the module, so re-loading them for every scale a
+        // window is dragged across neither leaks nor takes ownership of what the class holds.
+        let load = |metric: i32, metric_y: i32| {
+            let (cx, cy) = (
+                GetSystemMetricsForDpi(metric, dpi),
+                GetSystemMetricsForDpi(metric_y, dpi),
+            );
+            LoadImageW(
+                module,
+                name,
+                IMAGE_ICON,
+                cx,
+                cy,
+                LR_DEFAULTCOLOR | LR_SHARED,
+            )
+        };
+
+        for (kind, metric, metric_y) in [
+            (ICON_SMALL, SM_CXSMICON, SM_CYSMICON),
+            (ICON_BIG, SM_CXICON, SM_CYICON),
+        ] {
+            let icon = load(metric, metric_y);
+            if !icon.is_null() {
+                SendMessageW(hwnd, WM_SETICON, kind as usize, icon as isize);
+            }
+        }
+
+        // The class icons every other window of this process is created with.
+        let small = load(SM_CXSMICON, SM_CYSMICON);
+        if !small.is_null() {
+            SetClassLongPtrW(hwnd, GCLP_HICONSM, small as isize);
+        }
+        let big = load(SM_CXICON, SM_CYICON);
+        if !big.is_null() {
+            SetClassLongPtrW(hwnd, GCLP_HICON, big as isize);
+        }
+    }
+}
+
 /// Hooks the window procedure once, so a display scale change cannot resize the window.
 pub fn install_scale_change_guard(hwnd: HWND) {
     use winapi::um::winuser::{GetWindowLongPtrW, SetWindowLongPtrW, GWLP_WNDPROC};
@@ -2772,6 +2873,7 @@ pub fn install_scale_change_guard(hwnd: HWND) {
         PREVIOUS_WNDPROC.store(previous, Ordering::SeqCst);
         SetWindowLongPtrW(hwnd, GWLP_WNDPROC, hook);
     }
+    install_app_icons(hwnd);
     strip_thick_frame(hwnd);
     disable_window_transitions(hwnd);
     spawn_win_chord_watch(hwnd);

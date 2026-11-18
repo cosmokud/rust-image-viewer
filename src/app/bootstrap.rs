@@ -33,6 +33,11 @@ pub(crate) fn main() -> eframe::Result<()> {
     crate::video_player::mark_ui_thread();
     let _ = crate::async_runtime::init_runtime();
 
+    // Before any window exists, so the taskbar groups this process under the identity the
+    // installer stamps on its shortcuts. The taskbar caches a button's icon by that identity.
+    #[cfg(target_os = "windows")]
+    crate::windows_env::claim_taskbar_identity();
+
     // Parse command line arguments
     let image_path = if args.len() > 1 {
         Some(PathBuf::from(&args[1]))

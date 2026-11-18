@@ -93,6 +93,9 @@ VIAddVersionKey "ProductVersion" "${VERSION}"
 ; installer icon
 !if "${INSTALLERICON}" != ""
   !define MUI_ICON "${INSTALLERICON}"
+  ; The uninstaller is a separate executable with its own icon resource; without this it kept
+  ; MUI's stock one, which is what appeared in its own title bar and window.
+  !define MUI_UNICON "${INSTALLERICON}"
 !endif
 
 ; installer sidebar image
