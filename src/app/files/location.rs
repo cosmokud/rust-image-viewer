@@ -1,4 +1,4 @@
-//! Open-in-explorer actions.
+//! Open-in-explorer, open-with and default-app actions.
 
 #![allow(unused_imports)]
 
@@ -30,6 +30,61 @@ impl ImageViewer {
         command: egui::ViewportCommand,
     ) {
         ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, command);
+    }
+
+    /// Reveals `path` in the OS file manager, reporting a failure in the viewer's error banner.
+    pub(crate) fn open_file_location_for_path(&mut self, path: &Path) {
+        if let Err(e) = reveal_path_in_file_explorer(path) {
+            self.error_message = Some(format!(
+                "Failed to open file location ({}): {}",
+                path.display(),
+                e
+            ));
+        }
+    }
+
+    /// Hands `path` to whatever application the OS associates with its extension.
+    pub(crate) fn open_in_default_app_for_path(&mut self, path: &Path) {
+        if let Err(e) = open_path_in_default_app(path) {
+            self.error_message = Some(format!(
+                "Failed to open in the default app ({}): {}",
+                path.display(),
+                e
+            ));
+        }
+    }
+
+    /// Shows the OS "Open with" picker, to open this one file with another application.
+    pub(crate) fn open_with_dialog_for_path(&mut self, path: &Path) {
+        if let Err(e) = open_path_with_shell_dialog(path) {
+            self.error_message = Some(format!(
+                "Failed to open the Open With dialog ({}): {}",
+                path.display(),
+                e
+            ));
+        }
+    }
+
+    /// Viewer menus target a list index; the Stash passes the path it has selected.
+    pub(crate) fn open_file_location_for_index(&mut self, target_index: usize) {
+        let Some(path) = self.image_list.get(target_index).cloned() else {
+            return;
+        };
+        self.open_file_location_for_path(path.as_path());
+    }
+
+    pub(crate) fn open_in_default_app_for_index(&mut self, target_index: usize) {
+        let Some(path) = self.image_list.get(target_index).cloned() else {
+            return;
+        };
+        self.open_in_default_app_for_path(path.as_path());
+    }
+
+    pub(crate) fn open_with_dialog_for_index(&mut self, target_index: usize) {
+        let Some(path) = self.image_list.get(target_index).cloned() else {
+            return;
+        };
+        self.open_with_dialog_for_path(path.as_path());
     }
 
     pub(crate) fn reset_floating_window_drag_anchor(&mut self) {

@@ -26,7 +26,15 @@ impl ImageViewer {
         } else {
             "Mark"
         });
-        labels.extend(["Cut", "Copy", "Delete", "Rename", "Open file location"]);
+        labels.extend([
+            "Cut",
+            "Copy",
+            "Delete",
+            "Rename",
+            "Open File Location",
+            "Open in Default App",
+            "Open With...",
+        ]);
 
         let has_marked_paths = !self.collect_marked_paths_in_current_order().is_empty();
         if has_marked_paths {

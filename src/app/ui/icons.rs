@@ -73,6 +73,12 @@ impl ImageViewer {
             MenuActionIcon::OpenLocation => {
                 egui::include_image!("../../../assets/lucide/folder-open.svg")
             }
+            MenuActionIcon::OpenDefaultApp => {
+                egui::include_image!("../../../assets/lucide/external-link.svg")
+            }
+            MenuActionIcon::OpenWith => {
+                egui::include_image!("../../../assets/lucide/app-window.svg")
+            }
             MenuActionIcon::Stash => {
                 egui::include_image!("../../../assets/lucide/briefcase-plus.svg")
             }

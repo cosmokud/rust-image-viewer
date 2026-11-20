@@ -196,18 +196,4 @@ impl ImageViewer {
             format!("{} B", bytes)
         }
     }
-
-    pub(crate) fn open_file_location_for_index(&mut self, target_index: usize) {
-        let Some(path) = self.image_list.get(target_index).cloned() else {
-            return;
-        };
-
-        if let Err(e) = reveal_path_in_file_explorer(path.as_path()) {
-            self.error_message = Some(format!(
-                "Failed to open file location ({}): {}",
-                path.display(),
-                e
-            ));
-        }
-    }
 }

@@ -6,6 +6,13 @@
 use crate::app::*;
 use crate::prelude::*;
 
+/// One row of the stash right-click menu: an action, or a rule between two groups of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StashMenuEntry {
+    Action(StashAction),
+    Separator,
+}
+
 impl ImageViewer {
     /// Selected paths in gallery order, so bulk actions follow what the user sees.
     pub(crate) fn stash_selected_paths(&self) -> Vec<PathBuf> {
@@ -130,14 +137,28 @@ impl ImageViewer {
         actions
     }
 
-    /// Menu: Select All stays reachable with an empty selection; the rest needs one.
-    pub(crate) fn stash_menu_actions(&self) -> Vec<StashAction> {
-        let mut actions = vec![StashAction::SelectAll];
-        if self.stash_selection_active() {
-            actions.push(StashAction::DeselectAll);
-            actions.extend(StashAction::SELECTION_ACTIONS);
+    /// Menu: Select All stays reachable with an empty selection; the rest needs one. The open
+    /// actions sit in their own group between Delete from Stash and the clipboard actions.
+    pub(crate) fn stash_menu_entries(&self) -> Vec<StashMenuEntry> {
+        let mut entries = vec![StashMenuEntry::Action(StashAction::SelectAll)];
+        if !self.stash_selection_active() {
+            return entries;
         }
-        actions
+
+        entries.extend([
+            StashMenuEntry::Action(StashAction::DeselectAll),
+            StashMenuEntry::Action(StashAction::DeleteFromStash),
+            StashMenuEntry::Separator,
+            StashMenuEntry::Action(StashAction::OpenFileLocation),
+            StashMenuEntry::Action(StashAction::OpenInDefaultApp),
+            StashMenuEntry::Action(StashAction::OpenWith),
+            StashMenuEntry::Separator,
+            StashMenuEntry::Action(StashAction::Cut),
+            StashMenuEntry::Action(StashAction::Copy),
+            StashMenuEntry::Action(StashAction::Delete),
+            StashMenuEntry::Action(StashAction::Rename),
+        ]);
+        entries
     }
 
     /// One dispatch for the chips and the context menu, so both stay identical. Every arm calls
@@ -154,6 +175,26 @@ impl ImageViewer {
                     return;
                 }
                 self.remove_paths_from_stash(&paths);
+            }
+            // The open actions act on one file: the first selected, in gallery order, which is
+            // the tile the user right-clicked.
+            StashAction::OpenFileLocation => {
+                let Some(path) = paths.first() else {
+                    return;
+                };
+                self.open_file_location_for_path(path.as_path());
+            }
+            StashAction::OpenInDefaultApp => {
+                let Some(path) = paths.first() else {
+                    return;
+                };
+                self.open_in_default_app_for_path(path.as_path());
+            }
+            StashAction::OpenWith => {
+                let Some(path) = paths.first() else {
+                    return;
+                };
+                self.open_with_dialog_for_path(path.as_path());
             }
             StashAction::Copy => {
                 if paths.is_empty() {
@@ -188,6 +229,9 @@ pub(crate) fn stash_action_tooltip(action: StashAction) -> &'static str {
         StashAction::SelectAll => "Select every file in the stash",
         StashAction::DeselectAll => "Clear the selection",
         StashAction::DeleteFromStash => "Remove from the stash (the file itself is kept)",
+        StashAction::OpenFileLocation => "Reveal the file in its folder",
+        StashAction::OpenInDefaultApp => "Open the file in the app its extension is bound to",
+        StashAction::OpenWith => "Choose an app to open the file with",
         StashAction::Copy => "Copy the selected files to the clipboard",
         StashAction::Cut => "Cut the selected files to the clipboard",
         StashAction::Delete => "Delete the selected files to the Recycle Bin",
@@ -200,6 +244,9 @@ pub(crate) fn stash_action_icon(action: StashAction) -> MenuActionIcon {
         StashAction::SelectAll => MenuActionIcon::MarkAll,
         StashAction::DeselectAll => MenuActionIcon::Deselect,
         StashAction::DeleteFromStash => MenuActionIcon::StashRemove,
+        StashAction::OpenFileLocation => MenuActionIcon::OpenLocation,
+        StashAction::OpenInDefaultApp => MenuActionIcon::OpenDefaultApp,
+        StashAction::OpenWith => MenuActionIcon::OpenWith,
         StashAction::Copy => MenuActionIcon::Copy,
         StashAction::Cut => MenuActionIcon::Cut,
         StashAction::Delete => MenuActionIcon::Delete,

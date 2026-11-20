@@ -13,7 +13,7 @@ impl ImageViewer {
             return;
         };
 
-        let actions = self.stash_menu_actions();
+        let entries = self.stash_menu_entries();
         let mut chosen: Option<StashAction> = None;
         let close = ctx.input(|input| input.key_pressed(egui::Key::Escape));
 
@@ -33,12 +33,25 @@ impl ImageViewer {
                         // The rows paint from `available_width`; without this the Area hands
                         // them the whole screen.
                         ui.set_width(STASH_MENU_WIDTH);
-                        for action in actions {
-                            if self
-                                .menu_action_row(ui, action.label(), stash_action_icon(action))
-                                .clicked()
-                            {
-                                chosen = Some(action);
+                        for entry in entries {
+                            match entry {
+                                StashMenuEntry::Separator => {
+                                    ui.add_space(4.0);
+                                    ui.separator();
+                                    ui.add_space(4.0);
+                                }
+                                StashMenuEntry::Action(action) => {
+                                    if self
+                                        .menu_action_row(
+                                            ui,
+                                            action.label(),
+                                            stash_action_icon(action),
+                                        )
+                                        .clicked()
+                                    {
+                                        chosen = Some(action);
+                                    }
+                                }
                             }
                         }
                     });

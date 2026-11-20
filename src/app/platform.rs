@@ -112,6 +112,26 @@ pub(crate) fn open_path_in_default_app(path: &std::path::Path) -> std::io::Resul
     }
 }
 
+/// Shows the shell's own "Open with" picker for `path`, the same dialog Explorer uses.
+#[cfg(target_os = "windows")]
+pub(crate) fn open_path_with_shell_dialog(path: &Path) -> std::io::Result<()> {
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    // shell32's OpenAs_RunDLL is the association picker itself, so it lists the apps the file
+    // type can open with and offers "Always use this app" — unlike a hand-built app list.
+    std::process::Command::new("rundll32.exe")
+        .creation_flags(CREATE_NO_WINDOW)
+        .arg("shell32.dll,OpenAs_RunDLL")
+        .arg(path)
+        .spawn()
+        .map(|_| ())
+}
+
+/// Only Windows has a separate "Open with" picker; elsewhere the default app is the best offer.
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn open_path_with_shell_dialog(path: &Path) -> std::io::Result<()> {
+    open_path_in_default_app(path)
+}
+
 #[cfg(target_os = "windows")]
 pub(crate) fn sh_open_folder_and_select_item(path: &Path) -> std::io::Result<()> {
     let mut should_uninitialize = false;

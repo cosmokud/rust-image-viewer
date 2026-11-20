@@ -97,13 +97,39 @@ impl ImageViewer {
         let open_location_label = if current_labels {
             "Open Current File Location"
         } else {
-            "Open file location"
+            "Open File Location"
         };
         if self
             .menu_action_row(ui, open_location_label, MenuActionIcon::OpenLocation)
             .clicked()
         {
             self.open_file_location_for_index(target_index);
+            activated = true;
+        }
+
+        let open_default_app_label = if current_labels {
+            "Open Current File in Default App"
+        } else {
+            "Open in Default App"
+        };
+        if self
+            .menu_action_row(ui, open_default_app_label, MenuActionIcon::OpenDefaultApp)
+            .clicked()
+        {
+            self.open_in_default_app_for_index(target_index);
+            activated = true;
+        }
+
+        let open_with_label = if current_labels {
+            "Open Current File With..."
+        } else {
+            "Open With..."
+        };
+        if self
+            .menu_action_row(ui, open_with_label, MenuActionIcon::OpenWith)
+            .clicked()
+        {
+            self.open_with_dialog_for_index(target_index);
             activated = true;
         }
 
