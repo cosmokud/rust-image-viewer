@@ -94,6 +94,12 @@ impl ImageViewer {
             activated = true;
         }
 
+        // The open-with-shell rows are their own group in the pointer menu; the title-bar
+        // pop-up keeps its single block of file actions.
+        if !current_labels {
+            ui.separator();
+        }
+
         let open_location_label = if current_labels {
             "Open Current File Location"
         } else {

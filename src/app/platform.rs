@@ -113,23 +113,63 @@ pub(crate) fn open_path_in_default_app(path: &std::path::Path) -> std::io::Resul
 }
 
 /// Shows the shell's own "Open with" picker for `path`, the same dialog Explorer uses.
+///
+/// `SHOpenWithDialog` is the shell's association picker: it lists the apps the file type can open
+/// with and offers "Always use this app", unlike a hand-built list. It is modal to `parent`, so
+/// the dialog stays above the viewer window.
 #[cfg(target_os = "windows")]
-pub(crate) fn open_path_with_shell_dialog(path: &Path) -> std::io::Result<()> {
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    // shell32's OpenAs_RunDLL is the association picker itself, so it lists the apps the file
-    // type can open with and offers "Always use this app" — unlike a hand-built app list.
-    std::process::Command::new("rundll32.exe")
-        .creation_flags(CREATE_NO_WINDOW)
-        .arg("shell32.dll,OpenAs_RunDLL")
-        .arg(path)
-        .spawn()
-        .map(|_| ())
-}
+pub(crate) fn open_path_with_shell_dialog(
+    parent: winapi::shared::windef::HWND,
+    path: &Path,
+) -> std::io::Result<()> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{HWND as WindowsHwnd, RPC_E_CHANGED_MODE};
+    use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
+    use windows::Win32::UI::Shell::{
+        SHOpenWithDialog, OAIF_ALLOW_REGISTRATION, OAIF_EXEC, OPENASINFO,
+    };
 
-/// Only Windows has a separate "Open with" picker; elsewhere the default app is the best offer.
-#[cfg(not(target_os = "windows"))]
-pub(crate) fn open_path_with_shell_dialog(path: &Path) -> std::io::Result<()> {
-    open_path_in_default_app(path)
+    // The shell wants an initialized apartment on the thread the dialog runs on. Already
+    // initialized another way (RPC_E_CHANGED_MODE) is fine: the dialog still runs.
+    let mut should_uninitialize = false;
+    unsafe {
+        let hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        if hr.is_ok() {
+            should_uninitialize = true;
+        } else if hr != RPC_E_CHANGED_MODE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("CoInitializeEx failed before the Open With dialog: {hr:?}"),
+            ));
+        }
+    }
+
+    let wide_path: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let info = OPENASINFO {
+        pcszFile: PCWSTR(wide_path.as_ptr()),
+        pcszClass: PCWSTR::null(),
+        oaifInFlags: OAIF_ALLOW_REGISTRATION | OAIF_EXEC,
+    };
+
+    // Modal: this returns once the user picked an app or cancelled.
+    let result = unsafe { SHOpenWithDialog(WindowsHwnd(parent as *mut _), &info) };
+
+    if should_uninitialize {
+        unsafe {
+            CoUninitialize();
+        }
+    }
+
+    result.map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("SHOpenWithDialog failed: {e}"),
+        )
+    })
 }
 
 #[cfg(target_os = "windows")]

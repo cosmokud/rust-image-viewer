@@ -191,6 +191,9 @@ pub(crate) struct ImageViewer {
     pub(crate) prepared_clipboard_paths: HashMap<PathBuf, FileClipboardOperation>,
     /// Pointer-anchored file actions context menu state.
     pub(crate) file_action_menu: Option<FileContextMenuState>,
+    /// File whose "Open with" picker waits for the fullscreen exit that precedes it, and the
+    /// frames it may still wait before being shown anyway.
+    pub(crate) pending_open_with_path: Option<(PathBuf, u8)>,
     /// Rename dialog state for single-file or bulk rename operations.
     pub(crate) rename_overlay: Option<RenameOverlayState>,
     /// Frames left to re-center the detached delete window while its native window appears.
@@ -1039,6 +1042,7 @@ impl Default for ImageViewer {
             marked_files: HashSet::new(),
             prepared_clipboard_paths: HashMap::new(),
             file_action_menu: None,
+            pending_open_with_path: None,
             rename_overlay: None,
             delete_dialog_place_frames: 0,
             rename_dialog_place_frames: 0,

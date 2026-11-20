@@ -500,6 +500,9 @@ impl eframe::App for ImageViewer {
             }
         }
 
+        // A picker asked for while fullscreen waits here until the window is back.
+        self.drive_pending_open_with(ctx);
+
         let fullscreen_animation_active = false;
 
         // Process pending window resize (delayed to prevent flash on fullscreen exit)

@@ -36,9 +36,9 @@ impl ImageViewer {
                         for entry in entries {
                             match entry {
                                 StashMenuEntry::Separator => {
-                                    ui.add_space(4.0);
+                                    // Same rule as the viewer's file menu: egui's own separator
+                                    // spacing, no added gaps around it.
                                     ui.separator();
-                                    ui.add_space(4.0);
                                 }
                                 StashMenuEntry::Action(action) => {
                                     if self
