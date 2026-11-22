@@ -241,9 +241,13 @@ impl ImageViewer {
                 if let RawWindowHandle::Win32(win32) = handle.as_raw() {
                     let hwnd = win32.hwnd.get() as isize;
                     viewer.main_hwnd = hwnd;
-                    crate::windows_env::install_scale_change_guard(
-                        hwnd as winapi::shared::windef::HWND,
-                    );
+                    let native_hwnd = hwnd as winapi::shared::windef::HWND;
+                    crate::windows_env::install_scale_change_guard(native_hwnd);
+                    // Cloak before frame 1: eframe 0.29 unconditionally calls set_visible(true) on first frame.
+                    if !start_visible {
+                        viewer.startup_window_cloaked =
+                            crate::windows_env::set_window_cloaked(native_hwnd, true);
+                    }
                 }
             }
         }

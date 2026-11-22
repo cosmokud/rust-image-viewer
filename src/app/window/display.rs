@@ -174,6 +174,7 @@ impl ImageViewer {
             || self.pending_window_resize.is_some()
             || self.floating_drag_start_outer_pos.is_some()
             || !self.startup_window_shown
+            || self.startup_window_cloaked
             // The parked window is off the desktop: its rectangle is not the one to come back to.
             || self.viewer_window_hidden
         {
@@ -316,8 +317,10 @@ impl ImageViewer {
             // before it went fullscreen — and standing it over the resize looks worse than the
             // hole it stands in for.
             let hwnd = self.resolved_main_hwnd();
-            let window_visible =
-                self.startup_window_shown && crate::windows_env::is_window_visible(hwnd);
+            let window_visible = self.startup_window_shown
+                && !self.startup_window_cloaked
+                && crate::windows_env::is_window_visible(hwnd)
+                && !crate::windows_env::is_window_cloaked(hwnd);
             if !window_visible {
                 self.transition_cover = None;
                 self.transition_cover_waits = 0;

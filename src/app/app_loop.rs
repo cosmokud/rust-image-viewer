@@ -50,6 +50,9 @@ impl eframe::App for ImageViewer {
             return;
         }
 
+        // Uncloak only after the previous post-resize frame has finished swap_buffers().
+        self.maybe_uncloak_startup_window();
+
         // ============ SINGLE INSTANCE: CHECK FOR INCOMING FILES ============
         // Check if another instance sent us a file path to open
         #[cfg(target_os = "windows")]
@@ -306,7 +309,7 @@ impl eframe::App for ImageViewer {
         #[cfg(target_os = "windows")]
         {
             crate::windows_env::set_window_background(self.config.background_rgb);
-            if self.startup_window_shown {
+            if self.startup_window_shown && !self.startup_window_cloaked {
                 crate::windows_env::step_resize_ghost();
             }
         }
@@ -640,7 +643,14 @@ impl eframe::App for ImageViewer {
 
         // Startup UX: keep the window hidden until initial layout is applied.
         // This avoids the brief flash of the default empty window on Explorer-open.
-        self.show_window_if_ready(ctx);
+        let armed_startup_reveal = self.show_window_if_ready(ctx);
+        if !armed_startup_reveal
+            && self.startup_window_cloaked
+            && self.startup_window_shown
+            && !skip_drawing
+        {
+            self.note_startup_reveal_frame_painted(ctx.screen_rect().size());
+        }
 
         // Determine if we need continuous repainting.
         // Keep visual animations separate from background loader work so idle
@@ -776,7 +786,11 @@ impl eframe::App for ImageViewer {
         // - Fully idle: push repaint far into the future (event loop will still wake on input)
         crate::diag::note_stage("schedule");
         let mut repaint_reason = "none";
-        if any_animation_active {
+        if self.startup_window_cloaked && self.startup_window_shown {
+            // Never park while DWM-cloaked post-show: next frame must run to uncloak after swap.
+            repaint_reason = "startup-uncloak";
+            ctx.request_repaint();
+        } else if any_animation_active {
             if self.masonry_navigation_active_for_heavy_work() {
                 // Pace active masonry redraws near high-refresh cadence instead of spinning
                 // the UI thread as fast as possible under load.
@@ -786,6 +800,10 @@ impl eframe::App for ImageViewer {
                 repaint_reason = "animation-immediate";
                 ctx.request_repaint();
             }
+        } else if !self.startup_window_shown {
+            // Keep polling until startup_ready_to_show() or its 2s safety fallback triggers.
+            repaint_reason = "startup-preroll";
+            ctx.request_repaint_after(Duration::from_millis(16));
         } else if media_load_pending || manga_video_load_pending {
             repaint_reason = "media-load-pending";
             ctx.request_repaint_after(Duration::from_millis(16));

@@ -146,6 +146,49 @@ pub(crate) fn startup_window_for_video_stays_centered_on_screen() {
 }
 
 #[test]
+pub(crate) fn startup_reveal_waits_for_target_size_frame_then_uncloaks() {
+    let t0 = Instant::now();
+    let target = egui::Vec2::new(1280.0, 720.0);
+    let mut reveal = super::StartupRevealState::new(Some(target), t0);
+
+    // Before any post-show frame is painted, stay cloaked.
+    assert!(!reveal.ready_to_uncloak(t0));
+
+    // Old-size frame (800x600) does not satisfy the target size yet.
+    reveal.note_painted_frame(egui::Vec2::new(800.0, 600.0));
+    assert!(!reveal.ready_to_uncloak(t0 + Duration::from_millis(16)));
+
+    // First frame painted at final video size (within 2pt tolerance) unlocks uncloak for next frame.
+    reveal.note_painted_frame(egui::Vec2::new(1281.0, 719.0));
+    assert!(reveal.ready_to_uncloak(t0 + Duration::from_millis(32)));
+}
+
+#[test]
+pub(crate) fn startup_reveal_uncloaks_on_mismatched_frame_cap_and_deadline() {
+    let t0 = Instant::now();
+    let target = egui::Vec2::new(1280.0, 720.0);
+
+    // OS-clamped size fallback: 3 painted frames uncloak even if size never matches target.
+    let mut by_frames = super::StartupRevealState::new(Some(target), t0);
+    by_frames.note_painted_frame(egui::Vec2::new(1000.0, 600.0));
+    by_frames.note_painted_frame(egui::Vec2::new(1000.0, 600.0));
+    assert!(!by_frames.ready_to_uncloak(t0 + Duration::from_millis(32)));
+    by_frames.note_painted_frame(egui::Vec2::new(1000.0, 600.0));
+    assert!(by_frames.ready_to_uncloak(t0 + Duration::from_millis(48)));
+
+    // Hard deadline fallback: uncloaks even with 0 painted frames.
+    let by_deadline = super::StartupRevealState::new(Some(target), t0);
+    assert!(!by_deadline.ready_to_uncloak(t0 + Duration::from_millis(149)));
+    assert!(by_deadline.ready_to_uncloak(t0 + super::STARTUP_REVEAL_TIMEOUT));
+
+    // No target size (e.g. fullscreen/error): single painted frame uncloaks on next frame.
+    let mut no_target = super::StartupRevealState::new(None, t0);
+    assert!(!no_target.ready_to_uncloak(t0));
+    no_target.note_painted_frame(egui::Vec2::new(1920.0, 1080.0));
+    assert!(no_target.ready_to_uncloak(t0 + Duration::from_millis(16)));
+}
+
+#[test]
 pub(crate) fn solo_probe_offsets_interleave_without_momentum() {
     let offsets = ImageViewer::build_solo_probe_offsets(SoloPreloadMomentum::Neutral, 3, 2);
 

@@ -480,6 +480,46 @@ pub fn is_window_visible(hwnd: HWND) -> bool {
     !hwnd.is_null() && unsafe { winapi::um::winuser::IsWindowVisible(hwnd) != 0 }
 }
 
+/// Cloaks/uncloaks a window via DWM (`DWMWA_CLOAK = 13`): hides pixels even when `WS_VISIBLE` is true.
+pub fn set_window_cloaked(hwnd: HWND, cloaked: bool) -> bool {
+    use winapi::shared::minwindef::BOOL;
+    use winapi::um::dwmapi::DwmSetWindowAttribute;
+
+    if hwnd.is_null() {
+        return false;
+    }
+    const DWMWA_CLOAK: u32 = 13;
+    let value: BOOL = if cloaked { 1 } else { 0 };
+    unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_CLOAK,
+            &value as *const BOOL as *const _,
+            std::mem::size_of::<BOOL>() as u32,
+        ) >= 0
+    }
+}
+
+/// True when DWM reports the window as cloaked (`DWMWA_CLOAKED = 14`).
+pub fn is_window_cloaked(hwnd: HWND) -> bool {
+    use winapi::um::dwmapi::DwmGetWindowAttribute;
+
+    if hwnd.is_null() {
+        return false;
+    }
+    const DWMWA_CLOAKED: u32 = 14;
+    let mut cloaked: u32 = 0;
+    let hr = unsafe {
+        DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_CLOAKED,
+            &mut cloaked as *mut u32 as *mut _,
+            std::mem::size_of::<u32>() as u32,
+        )
+    };
+    hr >= 0 && cloaked != 0
+}
+
 /// Drops any queued `WM_PLACE_RECT` rectangle so an in-flight post becomes a no-op.
 pub fn clear_posted_window_rect() {
     *POSTED_RECT
@@ -542,7 +582,7 @@ fn place_posted_rect(hwnd: HWND) {
         // The picture has to be on screen before the rectangle changes. The hole is the
         // composition the resize lands in, so a picture queued alongside the resize is not there
         // yet: it is presented first, and the resize follows it.
-        let visible = is_window_visible(hwnd);
+        let visible = is_window_visible(hwnd) && !is_window_cloaked(hwnd);
         let covered = if visible {
             show_prepared_cover(left, top, width, height)
         } else {

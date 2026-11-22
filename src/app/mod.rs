@@ -603,6 +603,10 @@ pub(crate) struct ImageViewer {
     /// Keep the window hidden until we've applied initial layout.
     /// This prevents the default empty window flashing for a few milliseconds on startup.
     pub(crate) startup_window_shown: bool,
+    /// True while DWMWA_CLOAK hides the window across eframe's frame-1 `set_visible(true)` and initial resize swap.
+    pub(crate) startup_window_cloaked: bool,
+    /// Post-show reveal tracker: uncloaks once a frame at target size has swapped (or deadline hits).
+    pub(crate) startup_reveal: Option<StartupRevealState>,
     /// Used as a safety fallback to avoid staying hidden forever (e.g., if a video never yields dimensions).
     pub(crate) startup_hide_started_at: Instant,
 
@@ -1215,6 +1219,8 @@ impl Default for ImageViewer {
             gstreamer_initialized: false,
 
             startup_window_shown: false,
+            startup_window_cloaked: false,
+            startup_reveal: None,
             startup_hide_started_at: Instant::now(),
 
             // Manga reading mode fields

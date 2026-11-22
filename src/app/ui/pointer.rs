@@ -292,6 +292,7 @@ impl ImageViewer {
             || self.floating_drag_start_outer_pos.is_some()
             || self.defer_media_view_reset
             || !self.startup_window_shown
+            || self.startup_window_cloaked
         {
             return;
         }

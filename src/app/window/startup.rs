@@ -5,16 +5,62 @@
 use crate::app::*;
 use crate::prelude::*;
 
+pub(crate) const STARTUP_REVEAL_TIMEOUT: Duration = Duration::from_millis(150);
+const STARTUP_REVEAL_SIZE_TOLERANCE_PT: f32 = 2.0;
+const STARTUP_REVEAL_MAX_MISMATCHED_FRAMES: u8 = 3;
+
+/// Tracks post-show frames while DWM-cloaked so uncloaking happens after a frame at the target size swaps.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct StartupRevealState {
+    armed_at: Instant,
+    target_inner_size: Option<egui::Vec2>,
+    matched_frames: u8,
+    painted_frames: u8,
+}
+
+impl StartupRevealState {
+    pub(crate) fn new(target_inner_size: Option<egui::Vec2>, now: Instant) -> Self {
+        Self {
+            armed_at: now,
+            target_inner_size,
+            matched_frames: 0,
+            painted_frames: 0,
+        }
+    }
+
+    pub(crate) fn note_painted_frame(&mut self, frame_size: egui::Vec2) {
+        self.painted_frames = self.painted_frames.saturating_add(1);
+        let size_matches = match self.target_inner_size {
+            None => true,
+            Some(target) => {
+                (frame_size.x - target.x).abs() <= STARTUP_REVEAL_SIZE_TOLERANCE_PT
+                    && (frame_size.y - target.y).abs() <= STARTUP_REVEAL_SIZE_TOLERANCE_PT
+            }
+        };
+        if size_matches {
+            self.matched_frames = self.matched_frames.saturating_add(1);
+        }
+    }
+
+    pub(crate) fn ready_to_uncloak(&self, now: Instant) -> bool {
+        self.matched_frames >= 1
+            || self.painted_frames >= STARTUP_REVEAL_MAX_MISMATCHED_FRAMES
+            || now.saturating_duration_since(self.armed_at) >= STARTUP_REVEAL_TIMEOUT
+    }
+}
+
 impl ImageViewer {
-    pub(crate) fn show_window_if_ready(&mut self, ctx: &egui::Context) {
+    /// Returns true on the exact frame that transitions `startup_window_shown` to true.
+    pub(crate) fn show_window_if_ready(&mut self, ctx: &egui::Context) -> bool {
         if self.startup_window_shown {
-            return;
+            return false;
         }
 
         if !self.startup_ready_to_show() {
-            return;
+            return false;
         }
 
+        let mut target_inner_size = None;
         if !self.mode().is_fullscreen() && matches!(self.current_media_type, Some(MediaType::Video))
         {
             let size = if let Some((vid_w, vid_h)) = self.media_display_dimensions() {
@@ -28,6 +74,7 @@ impl ImageViewer {
             } else {
                 egui::Vec2::new(800.0, 600.0)
             };
+            target_inner_size = Some(size);
 
             let position = self.floating_centred_position(ctx, size);
             // Clear stale pre-show placement so async WM_PLACE_RECT cannot overwrite startup rect.
@@ -61,7 +108,41 @@ impl ImageViewer {
 
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         self.startup_window_shown = true;
+        if self.startup_window_cloaked {
+            self.startup_reveal = Some(StartupRevealState::new(target_inner_size, Instant::now()));
+            ctx.request_repaint();
+        }
         self.needs_repaint = true;
+        true
+    }
+
+    /// Uncloaks the startup window at the top of the frame *after* a target-sized frame has swapped.
+    pub(crate) fn maybe_uncloak_startup_window(&mut self) {
+        if !self.startup_window_cloaked || !self.startup_window_shown {
+            return;
+        }
+        let should_uncloak = self
+            .startup_reveal
+            .as_ref()
+            .map_or(true, |reveal| reveal.ready_to_uncloak(Instant::now()));
+        if !should_uncloak {
+            return;
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let hwnd = self.resolved_main_hwnd();
+            if !hwnd.is_null() {
+                crate::windows_env::set_window_cloaked(hwnd, false);
+            }
+        }
+        self.startup_window_cloaked = false;
+        self.startup_reveal = None;
+    }
+
+    pub(crate) fn note_startup_reveal_frame_painted(&mut self, frame_size: egui::Vec2) {
+        if let Some(reveal) = self.startup_reveal.as_mut() {
+            reveal.note_painted_frame(frame_size);
+        }
     }
 
     pub(crate) fn text_needs_cjk_fonts(text: &str) -> bool {
