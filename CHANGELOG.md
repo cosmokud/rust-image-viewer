@@ -1,5 +1,32 @@
 # Changelog
 
+## [0.4.6] - 2026-11-23
+
+### Highlights
+
+- Every Windows surface (title bar, Alt+Tab, taskbar, thumbnails, installer and uninstaller) now uses the new per-size `RIV` app icon instead of one rescaled bitmap.
+- `Open in Default App` and `Open With...` added to the file and Stash context menus, backed by the shell's own association picker.
+- Video startup no longer races its own window placement, and windows can no longer start completely off-screen.
+
+### Added
+
+- `Open in Default App` and `Open With...` menu entries in the viewer file menu (pointer and title-bar variants) and the Stash context menu.
+- Shell `SHOpenWithDialog` picker, made modal to the viewer; requested while fullscreen, it exits fullscreen first and opens once the window is back.
+- `APP_USER_MODEL_ID` (`dev.rust-image-viewer.app`) claimed at startup so taskbar buttons group under the identity the installer stamps on its shortcuts.
+
+### Changed
+
+- `assets/icon.ico` rebuilt from the `RIV` artwork as frames drawn at 16, 20, 24, 32, 40, 48, 64, 72, 96, 128 and 256; icons are installed on `WM_SETICON`/window class and re-installed on display scale changes.
+- The NSIS uninstaller uses the installer icon instead of MUI's stock one.
+- Stash menu is built from entries (actions and separators) rather than a flat action list.
+
+### Fixed
+
+- Video startup pinned the window off-screen at `(-10000, -10000)` before its first frame; it now stays visible-but-hidden on-screen and places itself with a synchronous `SetWindowPos`, clearing stale queued placements so `WM_PLACE_RECT` cannot overwrite it.
+- `window_geometry::clamp_into` left a window completely off the left edge of a display; it is now pulled back onto the work area.
+- Transition cover and resize ghost are no longer armed before the startup window is actually visible.
+- GitHub issue forms validate again (`placeholder` moved under `attributes`, `Layout:` options quoted), so the bug template is listed in the new-issue chooser.
+
 ## [0.4.5] - 2026-11-17
 
 ### Highlights

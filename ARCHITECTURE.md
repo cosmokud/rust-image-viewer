@@ -10,7 +10,7 @@ code for a given behaviour actually lives, in the order a question is normally a
 where is it, why is it built that way). Read §2 for the map, §3–§5 for the request lifetime, and
 jump to the chapter whose subject matches the change you were asked to make.
 
-Documented against **0.4.5** (after the `src/app/` split; the previous revision of this file
+Documented against **0.4.6** (after the `src/app/` split; the previous revision of this file
 covered 0.4.1-rc.5, so everything from `src/cache_key.rs` onward is new).
 
 ---
@@ -91,8 +91,8 @@ than one file.
 | `src/texture_upload.rs` | `UploadKind`, `UploadPolicy`, `upload`, mipmap gate, size ceiling | The only place textures are created/updated |
 | `src/video_thumbnail.rs` | First-frame extraction without a live player; dimension probes | Preview and layout data for video tiles |
 | `src/viewer_mode.rs` | `Mode`, `ModeState`, `ModeEvent`, `MangaLayoutMode`, titlebar latches | Decisions only — effects stay in `app/` |
-| `src/window_geometry.rs` | Physical-pixel display/work-area geometry, clamping, DPI transitions | Windows never become unreachable |
-| `src/windows_env.rs` | Win32 glue: registry PATH refresh, maximize/restore, scale-change subclass | Native window behaviour |
+| `src/window_geometry.rs` | Physical-pixel display/work-area geometry, clamping, DPI transitions | Windows never become unreachable (including fully off the left/top edge) |
+| `src/windows_env.rs` | Win32 glue: registry PATH refresh, maximize/restore, scale-change subclass, icon install, taskbar identity | Native window behaviour |
 | `src/diag.rs` | Opt-in `env.local` forensics: stage timings, counters, hang watchdog, panic hook | The only way to see a real freeze after the fact |
 | `assets/config.ini` | Canonical config template | Ship-time source of truth for defaults |
 | `build.rs` | Config-template sync, icon embedding, delay-loaded GStreamer DLLs | Smaller image-only startup |
@@ -123,7 +123,7 @@ src/app/
   decode.rs               decoder preferences, upload policy inputs, init_viewer
   history.rs              undo/redo of file mutations (recycle bin, rename, stash)
   paths.rs                file stamps and the Windows Ctrl+V probe
-  platform.rs             Windows-only: CJK fonts, reveal-in-explorer, shell clipboard
+  platform.rs             Windows-only: CJK fonts, reveal-in-explorer, default app, shell "Open with"
   workers.rs              background coordinators (media load, solo probe, thumbnails)
   navigation.rs           solo next/prev/first/last
   runtime_diag.rs         tracing subscriber init + panic report hook
@@ -216,8 +216,14 @@ Sizing happens *before* `run_native` to avoid a flash of a default-sized window.
   drop can still start a session.
 - **Image**: probe header dimensions synchronously (bypassing `metadata_cache`), size to 100%
   display or fit-to-screen, center.
-- **Video**: start hidden at `(-10000, -10000)` with a placeholder size; real placement waits for
-  dimensions or first-frame readiness (`ImageViewer::show_window_if_ready`).
+- **Video**: start hidden but **on-screen** at a centered 800×600 (`startup_window_for_video`,
+  `start_visible = !gstreamer_available`); real placement waits for dimensions or first-frame
+  readiness (`ImageViewer::show_window_if_ready`). The window is kept visible-but-hidden with
+  `WS_VISIBLE = false` rather than parked at `(-10000, -10000)`, so the OS and egui rect
+  bookkeeping stay valid; startup places it with a synchronous `windows_env::set_window_rect`
+  after `windows_env::clear_posted_window_rect`, so an async `WM_PLACE_RECT` queued earlier
+  cannot overwrite the startup rectangle. Frame-time effects (transition cover, resize ghost)
+  only arm once `startup_window_shown` is set.
 - **Unknown**: small centered error window.
 
 All values are **logical points**, matching `ViewportBuilder`; physical pixels here oversize the
@@ -232,6 +238,11 @@ window on a scaled display and push the title-bar buttons off screen.
 
 The app draws its own title bar, so there are no native decorations. MSAA/depth/stencil are
 dropped because the frame is 2D UI plus one media texture.
+
+`windows_env::claim_taskbar_identity()` runs in `bootstrap::main` *before* any window exists and
+sets `SetCurrentProcessExplicitAppUserModelID(APP_USER_MODEL_ID)`, the same id
+`packaging/nsis/installer.nsi` stamps on its shortcuts (`ApplicationID::Set`), so the taskbar
+groups a Start-Menu launch and a file-association launch under one button.
 
 ### 3.4 `ImageViewer::new` / `init_viewer` (`src/app/mod.rs`, `src/app/decode.rs`)
 
@@ -772,7 +783,15 @@ any parked fullscreen camera, or re-enters fullscreen directly if it was closed 
 (`reopen_into_fullscreen`). Between folder files, floating mode preserves its window position
 and size ceiling (`floating_mode_remember_position`).
 
-To eliminate desktop flashing and resize tearing during fullscreen toggles and layout switches, a native snapshot cover overlay (`src/windows_env.rs`, `src/app/window/display.rs`) holds a frozen frame over the window until atomic placement and the replacement layout paint. Secondary windows (Stash, Settings) persist positions in physical pixels to prevent DPI scale drift across mixed-DPI displays.
+To eliminate desktop flashing and resize tearing during fullscreen toggles and layout switches, a native snapshot cover overlay (`src/windows_env.rs`, `src/app/window/display.rs`) holds a frozen frame over the window until atomic placement and the replacement layout paint. Secondary windows (Stash, Settings) persist positions in physical pixels to prevent DPI scale drift across mixed-DPI displays. Both cover and resize ghost are gated on `startup_window_shown` and `IsWindowVisible`, so neither runs against a window that has not appeared yet.
+
+File actions that leave the process (`src/app/files/location.rs`) share one path each:
+`reveal_path_in_file_explorer`, `open_path_in_default_app`, and
+`open_path_with_shell_dialog` (`SHOpenWithDialog`, `OAIF_ALLOW_REGISTRATION | OAIF_EXEC`,
+modal to the viewer HWND). The picker is a shell dialog owned by the viewer, so
+`open_with_dialog_for_path` leaves fullscreen first and parks the path in
+`pending_open_with_path`; `drive_pending_open_with` retries it each frame until the window is back
+(`OPEN_WITH_FULLSCREEN_EXIT_FRAMES = 3` maximum).
 
 ### 11.5 Input
 
@@ -805,6 +824,8 @@ bindings.
 - Dedicated secondary native viewport (`STASH_WINDOW_TITLE = "Stash"`).
 - Pinned tile gaps and fixed tile sizing ensure stable geometry without grid jumping during resize.
 - Multi-select (rubber-band drag, click selection, Ctrl+A), context menu actions, and chips.
+  The menu is a list of `StashMenuEntry` values (actions plus separators), so `Open File Location`,
+  `Open in Default App` and `Open With...` form their own group.
 - Full keyboard navigation: arrow keys navigate the grid, `Enter` opens the selection in the viewer
   in-place (preserving current view mode), `Delete` removes items from the stash, and `Esc` deselects
   or dismisses dialogs.
@@ -894,7 +915,7 @@ active Criterion harness; `benches/` is present but empty.
 | GIF sliding window | `src/image_loader/gif_decode.rs` | Bounded RAM on huge GIFs |
 | Animated WebP streaming | `src/image_loader/webp_stream.rs` | First frame now, rest later |
 | Off-thread cache writes | `src/metadata_cache/writer.rs` | File I/O off the frame path |
-| Hidden off-screen video start | `src/app/bootstrap.rs`, `src/app/window/startup.rs` | No startup flash |
+| Hidden on-screen video start | `src/app/bootstrap.rs`, `src/app/window/startup.rs` | No startup flash, valid window rects |
 | Lazy CJK font load | `src/app/window/startup.rs` | Large fonts only when needed |
 | Reactive idle rendering | `src/app/app_loop.rs` | No idle repaint |
 | Centralized texture reuse | `src/texture_upload.rs` | One filter/mipmap/handle policy |

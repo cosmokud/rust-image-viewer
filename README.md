@@ -138,6 +138,7 @@ Switch between Long Strip and Masonry with the mode buttons in the bottom-right 
 - Middle-click starts freehand autoscroll.
 - Space marks the hovered item; Ctrl+Left-click toggles the mark.
 - In Long Strip or Masonry, right-click on an item opens it in solo fullscreen.
+- The file and Stash menus can reveal a file's location, open it in the default app, or open it with another app via the Windows picker.
 - Ctrl+Z / Ctrl+Y confirms undo and redo for deletes, renames, and stash changes.
 
 ## Shortcuts
