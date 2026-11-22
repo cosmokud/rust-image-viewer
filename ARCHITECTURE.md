@@ -92,7 +92,7 @@ than one file.
 | `src/video_thumbnail.rs` | First-frame extraction without a live player; dimension probes | Preview and layout data for video tiles |
 | `src/viewer_mode.rs` | `Mode`, `ModeState`, `ModeEvent`, `MangaLayoutMode`, titlebar latches | Decisions only — effects stay in `app/` |
 | `src/window_geometry.rs` | Physical-pixel display/work-area geometry, clamping, DPI transitions | Windows never become unreachable (including fully off the left/top edge) |
-| `src/windows_env.rs` | Win32 glue: registry PATH refresh, maximize/restore, scale-change subclass, icon install, taskbar identity | Native window behaviour |
+| `src/windows_env.rs` | Win32 glue: registry PATH refresh, maximize/restore, scale-change subclass, icon install, taskbar identity, DWM cloak | Native window behaviour |
 | `src/diag.rs` | Opt-in `env.local` forensics: stage timings, counters, hang watchdog, panic hook | The only way to see a real freeze after the fact |
 | `assets/config.ini` | Canonical config template | Ship-time source of truth for defaults |
 | `build.rs` | Config-template sync, icon embedding, delay-loaded GStreamer DLLs | Smaller image-only startup |
@@ -216,14 +216,24 @@ Sizing happens *before* `run_native` to avoid a flash of a default-sized window.
   drop can still start a session.
 - **Image**: probe header dimensions synchronously (bypassing `metadata_cache`), size to 100%
   display or fit-to-screen, center.
-- **Video**: start hidden but **on-screen** at a centered 800×600 (`startup_window_for_video`,
+- **Video**: start **DWM-cloaked** but on-screen at a centered 800×600 (`startup_window_for_video`,
   `start_visible = !gstreamer_available`); real placement waits for dimensions or first-frame
-  readiness (`ImageViewer::show_window_if_ready`). The window is kept visible-but-hidden with
-  `WS_VISIBLE = false` rather than parked at `(-10000, -10000)`, so the OS and egui rect
-  bookkeeping stay valid; startup places it with a synchronous `windows_env::set_window_rect`
-  after `windows_env::clear_posted_window_rect`, so an async `WM_PLACE_RECT` queued earlier
-  cannot overwrite the startup rectangle. Frame-time effects (transition cover, resize ghost)
-  only arm once `startup_window_shown` is set.
+  readiness (`ImageViewer::show_window_if_ready`). The window is not parked at
+  `(-10000, -10000)`, so OS and egui rect bookkeeping stay valid. `init_viewer` cloaks the HWND
+  (`windows_env::set_window_cloaked`, `DWMWA_CLOAK`) before frame 1, because eframe 0.29 calls
+  `set_visible(true)` unconditionally on its first frame. Startup then places the window with a
+  synchronous `windows_env::set_window_rect` after `windows_env::clear_posted_window_rect`, so an
+  async `WM_PLACE_RECT` queued earlier cannot overwrite the startup rectangle.
+- **Reveal**: `show_window_if_ready` returns true on the exact frame it sets
+  `startup_window_shown`, and arms `StartupRevealState`. Every later frame records
+  `note_startup_reveal_frame_painted(screen_rect().size())`; `maybe_uncloak_startup_window` runs at
+  the top of the frame *after* one at the target size has swapped
+  (`STARTUP_REVEAL_SIZE_TOLERANCE_PT = 2.0`), falling back to
+  `STARTUP_REVEAL_MAX_MISMATCHED_FRAMES = 3` painted frames or the
+  `STARTUP_REVEAL_TIMEOUT = 150 ms` deadline so an OS-clamped size cannot leave it cloaked.
+  While cloaked, the cover, resize ghost, layout clamping, autohide and pointer logic all skip the
+  window, and the repaint scheduler never parks: it forces `startup-uncloak` while cloaked and
+  `startup-preroll` (16 ms) until `startup_window_shown`.
 - **Unknown**: small centered error window.
 
 All values are **logical points**, matching `ViewportBuilder`; physical pixels here oversize the
@@ -783,7 +793,7 @@ any parked fullscreen camera, or re-enters fullscreen directly if it was closed 
 (`reopen_into_fullscreen`). Between folder files, floating mode preserves its window position
 and size ceiling (`floating_mode_remember_position`).
 
-To eliminate desktop flashing and resize tearing during fullscreen toggles and layout switches, a native snapshot cover overlay (`src/windows_env.rs`, `src/app/window/display.rs`) holds a frozen frame over the window until atomic placement and the replacement layout paint. Secondary windows (Stash, Settings) persist positions in physical pixels to prevent DPI scale drift across mixed-DPI displays. Both cover and resize ghost are gated on `startup_window_shown` and `IsWindowVisible`, so neither runs against a window that has not appeared yet.
+To eliminate desktop flashing and resize tearing during fullscreen toggles and layout switches, a native snapshot cover overlay (`src/windows_env.rs`, `src/app/window/display.rs`) holds a frozen frame over the window until atomic placement and the replacement layout paint. Secondary windows (Stash, Settings) persist positions in physical pixels to prevent DPI scale drift across mixed-DPI displays. Both cover and resize ghost are gated on `startup_window_shown`, `startup_window_cloaked`, `IsWindowVisible` and `DWMWA_CLOAKED`, so neither runs against a window that has not appeared yet.
 
 File actions that leave the process (`src/app/files/location.rs`) share one path each:
 `reveal_path_in_file_explorer`, `open_path_in_default_app`, and
@@ -915,7 +925,7 @@ active Criterion harness; `benches/` is present but empty.
 | GIF sliding window | `src/image_loader/gif_decode.rs` | Bounded RAM on huge GIFs |
 | Animated WebP streaming | `src/image_loader/webp_stream.rs` | First frame now, rest later |
 | Off-thread cache writes | `src/metadata_cache/writer.rs` | File I/O off the frame path |
-| Hidden on-screen video start | `src/app/bootstrap.rs`, `src/app/window/startup.rs` | No startup flash, valid window rects |
+| Hidden cloaked video start | `src/app/bootstrap.rs`, `src/app/window/startup.rs` | No startup flash, valid window rects |
 | Lazy CJK font load | `src/app/window/startup.rs` | Large fonts only when needed |
 | Reactive idle rendering | `src/app/app_loop.rs` | No idle repaint |
 | Centralized texture reuse | `src/texture_upload.rs` | One filter/mipmap/handle policy |
