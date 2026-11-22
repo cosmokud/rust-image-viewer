@@ -475,6 +475,18 @@ const GHOST_DOWN_DELAY: std::time::Duration = std::time::Duration::from_millis(1
 /// The rectangle a posted `WM_PLACE_RECT` carries.
 static POSTED_RECT: std::sync::Mutex<Option<(i32, i32, i32, i32)>> = std::sync::Mutex::new(None);
 
+/// True when the native window is currently visible (`WS_VISIBLE`).
+pub fn is_window_visible(hwnd: HWND) -> bool {
+    !hwnd.is_null() && unsafe { winapi::um::winuser::IsWindowVisible(hwnd) != 0 }
+}
+
+/// Drops any queued `WM_PLACE_RECT` rectangle so an in-flight post becomes a no-op.
+pub fn clear_posted_window_rect() {
+    *POSTED_RECT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+}
+
 /// Hands a window its new rectangle for after the frame being drawn.
 pub fn post_window_rect(hwnd: HWND, rect: crate::window_geometry::Rect) -> bool {
     use winapi::um::winuser::PostMessageW;
@@ -530,7 +542,16 @@ fn place_posted_rect(hwnd: HWND) {
         // The picture has to be on screen before the rectangle changes. The hole is the
         // composition the resize lands in, so a picture queued alongside the resize is not there
         // yet: it is presented first, and the resize follows it.
-        let covered = show_prepared_cover(left, top, width, height);
+        let visible = is_window_visible(hwnd);
+        let covered = if visible {
+            show_prepared_cover(left, top, width, height)
+        } else {
+            let mut prepared = PREPARED_COVER
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            drop_prepared_cover(prepared.take());
+            false
+        };
         if covered {
             unsafe { winapi::um::dwmapi::DwmFlush() };
             fs_trace("ghost", || "synced".to_string());
@@ -573,7 +594,7 @@ fn place_posted_rect(hwnd: HWND) {
             });
         }
         RESTORE_WRITE.store(false, Ordering::SeqCst);
-        if covers {
+        if visible && covers {
             paint_window_background_now(hwnd);
         }
     }
@@ -1107,7 +1128,10 @@ pub fn step_resize_ghost() {
         return;
     }
     if wait_for_composition {
-        unsafe { winapi::um::dwmapi::DwmFlush() };
+        let ghost = GHOST_WINDOW.load(Ordering::SeqCst) as HWND;
+        if is_window_visible(ghost) {
+            unsafe { winapi::um::dwmapi::DwmFlush() };
+        }
     }
     hide_resize_ghost();
 }

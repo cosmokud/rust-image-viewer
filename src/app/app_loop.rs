@@ -306,7 +306,9 @@ impl eframe::App for ImageViewer {
         #[cfg(target_os = "windows")]
         {
             crate::windows_env::set_window_background(self.config.background_rgb);
-            crate::windows_env::step_resize_ghost();
+            if self.startup_window_shown {
+                crate::windows_env::step_resize_ghost();
+            }
         }
 
         self.drive_fullscreen_trace(ctx);
@@ -577,8 +579,9 @@ impl eframe::App for ImageViewer {
         // For videos during startup: skip ALL drawing until we have dimensions and layout is applied.
         // This prevents the flash of an empty window with controls before the video frame appears.
         // Like MPV, we want the window to appear only when it has the first frame ready.
-        let skip_drawing =
-            !self.startup_window_shown && matches!(self.current_media_type, Some(MediaType::Video));
+        let skip_drawing = !self.startup_window_shown
+            && matches!(self.current_media_type, Some(MediaType::Video))
+            && !self.startup_ready_to_show();
 
         // Draw controls overlay (top bar for title/buttons) BEFORE the main view.
         // This ensures title-bar hover/selection state is available to suppress gestures

@@ -132,22 +132,7 @@ pub(crate) fn main() -> eframe::Result<()> {
                 (size, pos, true) // Images: show window immediately with correct size
             }
             Some(MediaType::Video) => {
-                if !gstreamer_runtime_available() {
-                    // Missing runtime: show immediately with placeholder text in floating mode.
-                    let size = egui::Vec2::new(800.0, 600.0);
-                    let pos = egui::Pos2::new(
-                        ((screen_size.x - size.x) * 0.5).max(0.0),
-                        ((screen_size.y - size.y) * 0.5).max(0.0),
-                    );
-                    (size, pos, true)
-                } else {
-                    // Videos: position window OFF-SCREEN initially
-                    // This completely hides the window until the first frame is ready.
-                    // The window will be moved on-screen once video dimensions and first frame are available.
-                    let size = egui::Vec2::new(800.0, 600.0);
-                    let off_screen_pos = egui::Pos2::new(-10000.0, -10000.0);
-                    (size, off_screen_pos, false)
-                }
+                startup_window_for_video(screen_size, gstreamer_runtime_available())
             }
             None => {
                 // Unknown file type, show error window

@@ -291,6 +291,7 @@ impl ImageViewer {
             || self.pending_window_resize.is_some()
             || self.floating_drag_start_outer_pos.is_some()
             || self.defer_media_view_reset
+            || !self.startup_window_shown
         {
             return;
         }

@@ -173,6 +173,7 @@ impl ImageViewer {
             || self.is_resizing
             || self.pending_window_resize.is_some()
             || self.floating_drag_start_outer_pos.is_some()
+            || !self.startup_window_shown
             // The parked window is off the desktop: its rectangle is not the one to come back to.
             || self.viewer_window_hidden
         {
@@ -314,13 +315,25 @@ impl ImageViewer {
             // window last changed size is of the wrong rectangle — it was the size the window had
             // before it went fullscreen — and standing it over the resize looks worse than the
             // hole it stands in for.
+            let hwnd = self.resolved_main_hwnd();
+            let window_visible =
+                self.startup_window_shown && crate::windows_env::is_window_visible(hwnd);
+            if !window_visible {
+                self.transition_cover = None;
+                self.transition_cover_waits = 0;
+                self.cover_next_placement = false;
+                if crate::windows_env::post_window_rect(hwnd, rect) {
+                    ctx.request_repaint();
+                }
+                return;
+            }
             let (frame_w, frame_h) = self.frame_size_in_pixels(ctx);
             let cover_is_current = self
                 .transition_cover
                 .as_ref()
                 .is_some_and(|(width, height, _)| *width == frame_w && *height == frame_h);
             let touches_a_display = crate::windows_env::rect_covers_display(rect)
-                || crate::windows_env::window_covers_display(self.resolved_main_hwnd());
+                || crate::windows_env::window_covers_display(hwnd);
             let cover_wanted = touches_a_display || self.cover_next_placement;
             if cover_wanted && !cover_is_current && self.transition_cover_waits < 3 {
                 self.transition_cover = None;

@@ -15,7 +15,8 @@ impl ImageViewer {
             return;
         }
 
-        if matches!(self.current_media_type, Some(MediaType::Video)) {
+        if !self.mode().is_fullscreen() && matches!(self.current_media_type, Some(MediaType::Video))
+        {
             let size = if let Some((vid_w, vid_h)) = self.media_display_dimensions() {
                 self.floating_layout_size_for_media(
                     vid_w as f32,
@@ -28,8 +29,34 @@ impl ImageViewer {
                 egui::Vec2::new(800.0, 600.0)
             };
 
-            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
-            self.center_window_on_monitor(ctx, size);
+            let position = self.floating_centred_position(ctx, size);
+            // Clear stale pre-show placement so async WM_PLACE_RECT cannot overwrite startup rect.
+            self.pending_viewer_rect = None;
+            self.transition_cover = None;
+            self.transition_cover_waits = 0;
+            self.cover_next_placement = false;
+            self.floating_window_position = None;
+
+            let mut placed_synchronously = false;
+            #[cfg(target_os = "windows")]
+            {
+                crate::windows_env::clear_posted_window_rect();
+                let ppp = ctx.pixels_per_point();
+                let hwnd = self.resolved_main_hwnd();
+                if ppp.is_finite() && ppp > 0.01 && !hwnd.is_null() {
+                    let outer = self.outer_size_for_inner(ctx, size);
+                    let width = (outer.x * ppp).round() as i32;
+                    let height = (outer.y * ppp).round() as i32;
+                    let left = (position.x * ppp).round() as i32;
+                    let top = (position.y * ppp).round() as i32;
+                    placed_synchronously =
+                        crate::windows_env::set_window_rect(hwnd, left, top, width, height);
+                }
+            }
+            if !placed_synchronously {
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+                self.send_outer_position(ctx, position);
+            }
         }
 
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
@@ -62,4 +89,17 @@ pub(crate) fn startup_window_for_no_file(
         ((screen_size.y - size.y) * 0.5).max(0.0),
     );
     (size, pos, true)
+}
+
+pub(crate) fn startup_window_for_video(
+    screen_size: egui::Vec2,
+    gstreamer_available: bool,
+) -> (egui::Vec2, egui::Pos2, bool) {
+    let size = egui::Vec2::new(800.0, 600.0);
+    let pos = egui::Pos2::new(
+        ((screen_size.x - size.x) * 0.5).max(0.0),
+        ((screen_size.y - size.y) * 0.5).max(0.0),
+    );
+    // Keep window hidden via WS_VISIBLE=false until first frame; stay on-screen so OS/egui rects stay valid.
+    (size, pos, !gstreamer_available)
 }

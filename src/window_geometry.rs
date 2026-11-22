@@ -114,6 +114,9 @@ pub fn clamp_into(work: Rect, rect: Rect) -> (i32, i32) {
     if top < work.top {
         top = work.top;
     }
+    if left + rect.width() <= work.left {
+        left = work.left;
+    }
     if left + rect.width() > work.right {
         left = work.right - rect.width();
     }
@@ -350,5 +353,10 @@ mod tests {
         let (x, _) = clamp_into(display.work, off_right);
         assert_eq!(x, display.work.right - 800);
         assert_eq!(off_right.width(), 800);
+        // Completely off the left edge is pulled back onto the work area.
+        let off_left = Rect::new(-10000, -10000, -10000 + 960, -10000 + 540);
+        let (x, y) = clamp_into(display.work, off_left);
+        assert_eq!(x, display.work.left);
+        assert_eq!(y, display.work.top);
     }
 }

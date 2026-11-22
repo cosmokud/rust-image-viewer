@@ -130,6 +130,22 @@ pub(crate) fn startup_window_without_file_is_500x500_and_visible() {
 }
 
 #[test]
+pub(crate) fn startup_window_for_video_stays_centered_on_screen() {
+    let screen_size = egui::Vec2::new(1920.0, 1080.0);
+
+    let (size, pos, start_visible) = super::startup_window_for_video(screen_size, true);
+    assert_eq!(size, egui::Vec2::new(800.0, 600.0));
+    assert_eq!(pos, egui::Pos2::new(560.0, 240.0));
+    assert!(!start_visible);
+
+    let (size_no_gst, pos_no_gst, visible_no_gst) =
+        super::startup_window_for_video(screen_size, false);
+    assert_eq!(size_no_gst, egui::Vec2::new(800.0, 600.0));
+    assert_eq!(pos_no_gst, egui::Pos2::new(560.0, 240.0));
+    assert!(visible_no_gst);
+}
+
+#[test]
 pub(crate) fn solo_probe_offsets_interleave_without_momentum() {
     let offsets = ImageViewer::build_solo_probe_offsets(SoloPreloadMomentum::Neutral, 3, 2);
 
