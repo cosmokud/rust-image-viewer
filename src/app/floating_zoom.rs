@@ -12,6 +12,11 @@ pub(crate) const MAX_FLOATING_ZOOM_PER_NOTCH: f32 = 2.5;
 pub(crate) const FLOATING_ZOOM_SETTLED_PX: f32 = 0.5;
 /// Velocity settle threshold in physical pixels per second so the spring never snaps while gliding.
 pub(crate) const FLOATING_ZOOM_SETTLED_VEL_PX_PER_SEC: f32 = 2.0;
+/// Brief quiet grace after the spring reaches rest before cloaked-to-live settle/reveal,
+/// keeping rapid scroll bursts continuously inside `Travelling` without cloak/uncloak stalls.
+/// Any click, drag, key press, or genuine focus loss bypasses this grace immediately (0ms).
+pub(crate) const FLOATING_ZOOM_SETTLE_GRACE: std::time::Duration =
+    std::time::Duration::from_millis(60);
 /// Natural angular frequency (rad/s) for the critically damped (`zeta = 1.0`) log-space spring:
 /// smooth velocity ramp on frame 1 (< 10% at 60Hz), ~180-250ms glide matching fullscreen smooth
 /// scroll responsiveness, zero overshoot, zero bounce.
@@ -1012,10 +1017,52 @@ pub(crate) fn quantize_and_clamp_window(
     PhysicalRect::new(left, top, right, bottom)
 }
 
+/// True when a floating zoom session genuinely lost window focus mid-gesture.
+/// Hover-scrolling an unfocused floating window (`started_focused == false`) must NOT abort.
+pub(crate) fn should_abort_for_focus_loss(started_focused: bool, currently_focused: bool) -> bool {
+    started_focused && !currently_focused
+}
+
+/// True when `Travelling` should transition to `Settling`.
+/// Any click, drag, key press, or genuine focus loss bypasses the quiet settle grace immediately (0ms).
+pub(crate) fn should_enter_settling_from_travelling(
+    settled_since: Option<std::time::Instant>,
+    now: std::time::Instant,
+    soft_interrupt: bool,
+    has_pending_wheel: bool,
+) -> bool {
+    if soft_interrupt {
+        return true;
+    }
+    if has_pending_wheel {
+        return false;
+    }
+    settled_since
+        .is_some_and(|since| now.saturating_duration_since(since) >= FLOATING_ZOOM_SETTLE_GRACE)
+}
+
+/// Exact 1x DWM VSync pacing decision before committing a `Travelling` layered frame.
+/// Uses `DwmGetCompositionTimingInfo().cRefresh` when available; falls back safely to measuring
+/// external `SwapBuffers` elapsed time since `last_update_exit` when DWM timing is unavailable.
+pub(crate) fn needs_dwm_flush_before_commit(
+    current_c_refresh: Option<u64>,
+    last_committed_c_refresh: Option<u64>,
+    last_update_exit: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> bool {
+    if let (Some(curr), Some(last)) = (current_c_refresh, last_committed_c_refresh) {
+        return curr == last;
+    }
+    last_update_exit
+        .is_some_and(|t| now.saturating_duration_since(t) < std::time::Duration::from_millis(2))
+}
+
 /// Multithreaded 32.32 fixed-point bilinear resampler: straight RGBA8 -> opaque premultiplied BGRA8.
 ///
 /// Output alpha is always 255 (composited over `bg_rgb`) so layered hit-testing covers every pixel
 /// and transparent images match `eframe`'s opaque background identically.
+/// Writes `(0..dst_w, 0..dst_h)` into a buffer whose row stride is `dst_stride_pixels >= dst_w`,
+/// allowing capacity-reused DIB sections without per-frame kernel reallocation.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn resample_rgba_to_bgra(
     src_rgba: &[u8],
@@ -1024,12 +1071,15 @@ pub(crate) fn resample_rgba_to_bgra(
     dst_bgra: &mut [u8],
     dst_w: u32,
     dst_h: u32,
+    dst_stride_pixels: usize,
     exact: (f32, f32, f32, f32),
     bg_rgb: [u8; 3],
     flip_h: bool,
     flip_v: bool,
 ) {
-    if src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
+    use rayon::prelude::*;
+
+    if src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 || dst_stride_pixels < dst_w as usize {
         return;
     }
     if !exact.0.is_finite()
@@ -1043,118 +1093,169 @@ pub(crate) fn resample_rgba_to_bgra(
     }
 
     let src_row_bytes = src_w as usize * 4;
-    let dst_row_bytes = dst_w as usize * 4;
+    let dst_stride_bytes = dst_stride_pixels * 4;
     if src_rgba.len() < src_row_bytes * src_h as usize
-        || dst_bgra.len() < dst_row_bytes * dst_h as usize
+        || dst_bgra.len() < dst_stride_bytes * dst_h as usize
     {
         return;
     }
 
-    let step_x = ((src_w as f64 / exact.2 as f64) * SAMPLE_ONE) as u64;
-    let step_y = ((src_h as f64 / exact.3 as f64) * SAMPLE_ONE) as u64;
-    let base_x = ((0.5 - exact.0 as f64) * step_x as f64 - SAMPLE_ONE * 0.5) as i64;
-    let base_y = ((0.5 - exact.1 as f64) * step_y as f64 - SAMPLE_ONE * 0.5) as i64;
-    let max_sx = ((src_w as u64).saturating_sub(1)) << 32;
-    let max_sy = ((src_h as u64).saturating_sub(1)) << 32;
-    let max_col = (src_w as usize).saturating_sub(1);
-    let max_row = (src_h as usize).saturating_sub(1);
-    let bg_r = bg_rgb[0] as u32;
-    let bg_g = bg_rgb[1] as u32;
-    let bg_b = bg_rgb[2] as u32;
-    let bg_pixel = [bg_rgb[2], bg_rgb[1], bg_rgb[0], 255];
-
-    // Destination pixel index ranges whose pixel center `(dst + 0.5)` lies inside
-    // `[exact.0, exact.0 + exact.2) x [exact.1, exact.1 + exact.3)`.
-    // Pixels outside this rect are filled with opaque `bg_rgb` (no edge smearing on free Stage 2 pan),
-    // while Stage 1 cover-fit rects always cover `[0, dst_w) x [0, dst_h)` with 0px background bars.
-    let x_min = (exact.0 as f64 - 0.5).ceil().clamp(0.0, dst_w as f64) as usize;
-    let x_max = ((exact.0 as f64 + exact.2 as f64 - 0.5)
-        .ceil()
-        .clamp(0.0, dst_w as f64) as usize)
-        .max(x_min);
-    let y_min = (exact.1 as f64 - 0.5).ceil().clamp(0.0, dst_h as f64) as usize;
-    let y_max = ((exact.1 as f64 + exact.3 as f64 - 0.5)
-        .ceil()
-        .clamp(0.0, dst_h as f64) as usize)
-        .max(y_min);
+    let params = ResampleBandParams {
+        src_rgba,
+        src_row_bytes,
+        dst_w: dst_w as usize,
+        dst_stride_bytes,
+        step_x: ((src_w as f64 / exact.2 as f64) * SAMPLE_ONE) as u64,
+        step_y: ((src_h as f64 / exact.3 as f64) * SAMPLE_ONE) as u64,
+        base_x: ((0.5 - exact.0 as f64)
+            * (((src_w as f64 / exact.2 as f64) * SAMPLE_ONE) as u64 as f64)
+            - SAMPLE_ONE * 0.5) as i64,
+        base_y: ((0.5 - exact.1 as f64)
+            * (((src_h as f64 / exact.3 as f64) * SAMPLE_ONE) as u64 as f64)
+            - SAMPLE_ONE * 0.5) as i64,
+        max_sx: ((src_w as u64).saturating_sub(1)) << 32,
+        max_sy: ((src_h as u64).saturating_sub(1)) << 32,
+        max_col: (src_w as usize).saturating_sub(1),
+        max_row: (src_h as usize).saturating_sub(1),
+        bg_r: bg_rgb[0] as u32,
+        bg_g: bg_rgb[1] as u32,
+        bg_b: bg_rgb[2] as u32,
+        bg_pixel: [bg_rgb[2], bg_rgb[1], bg_rgb[0], 255],
+        // Destination pixel index ranges whose pixel center `(dst + 0.5)` lies inside
+        // `[exact.0, exact.0 + exact.2) x [exact.1, exact.1 + exact.3)`.
+        // Pixels outside this rect are filled with opaque `bg_rgb` (no edge smearing on free Stage 2 pan),
+        // while Stage 1 cover-fit rects always cover `[0, dst_w) x [0, dst_h)` with 0px background bars.
+        x_min: (exact.0 as f64 - 0.5).ceil().clamp(0.0, dst_w as f64) as usize,
+        x_max: ((exact.0 as f64 + exact.2 as f64 - 0.5)
+            .ceil()
+            .clamp(0.0, dst_w as f64) as usize)
+            .max((exact.0 as f64 - 0.5).ceil().clamp(0.0, dst_w as f64) as usize),
+        y_min: (exact.1 as f64 - 0.5).ceil().clamp(0.0, dst_h as f64) as usize,
+        y_max: ((exact.1 as f64 + exact.3 as f64 - 0.5)
+            .ceil()
+            .clamp(0.0, dst_h as f64) as usize)
+            .max((exact.1 as f64 - 0.5).ceil().clamp(0.0, dst_h as f64) as usize),
+        flip_h,
+        flip_v,
+    };
 
     let total_rows = dst_h as usize;
     let threads = resample_thread_count(total_rows);
-    let rows_per_thread = total_rows.div_ceil(threads);
-    let dst_slice = &mut dst_bgra[..total_rows * dst_row_bytes];
+    let dst_slice = &mut dst_bgra[..total_rows * dst_stride_bytes];
 
-    std::thread::scope(|scope| {
-        for (band_idx, band_buf) in dst_slice
-            .chunks_mut(rows_per_thread * dst_row_bytes)
+    if threads <= 1 {
+        resample_rgba_to_bgra_band(&params, 0, dst_slice);
+        return;
+    }
+
+    let rows_per_band = total_rows.div_ceil(threads);
+    dst_slice
+        .par_chunks_mut(rows_per_band * dst_stride_bytes)
+        .enumerate()
+        .for_each(|(band_idx, band_buf)| {
+            let start_y = band_idx * rows_per_band;
+            resample_rgba_to_bgra_band(&params, start_y, band_buf);
+        });
+}
+
+#[derive(Clone, Copy)]
+struct ResampleBandParams<'a> {
+    src_rgba: &'a [u8],
+    src_row_bytes: usize,
+    dst_w: usize,
+    dst_stride_bytes: usize,
+    step_x: u64,
+    step_y: u64,
+    base_x: i64,
+    base_y: i64,
+    max_sx: u64,
+    max_sy: u64,
+    max_col: usize,
+    max_row: usize,
+    bg_r: u32,
+    bg_g: u32,
+    bg_b: u32,
+    bg_pixel: [u8; 4],
+    x_min: usize,
+    x_max: usize,
+    y_min: usize,
+    y_max: usize,
+    flip_h: bool,
+    flip_v: bool,
+}
+
+fn resample_rgba_to_bgra_band(
+    params: &ResampleBandParams<'_>,
+    start_y: usize,
+    band_buf: &mut [u8],
+) {
+    let dst_visible_bytes = params.dst_w * 4;
+    for (local_y, dst_row) in band_buf.chunks_mut(params.dst_stride_bytes).enumerate() {
+        let y = start_y + local_y;
+        let row_pixels = dst_row[..dst_visible_bytes].as_chunks_mut::<4>().0;
+        if y < params.y_min || y >= params.y_max || params.x_min >= params.x_max {
+            row_pixels.fill(params.bg_pixel);
+            continue;
+        }
+
+        row_pixels[..params.x_min].fill(params.bg_pixel);
+        row_pixels[params.x_max..].fill(params.bg_pixel);
+
+        let raw_sy = (y as i64)
+            .saturating_mul(params.step_y as i64)
+            .saturating_add(params.base_y)
+            .max(0) as u64;
+        let clamped_sy = raw_sy.min(params.max_sy);
+        let sy = if params.flip_v {
+            params.max_sy - clamped_sy
+        } else {
+            clamped_sy
+        };
+        let top_row = ((sy >> 32) as usize).min(params.max_row);
+        let bottom_row = (top_row + 1).min(params.max_row);
+        let wy = ((sy >> 24) & 0xFF) as u32;
+        let top =
+            &params.src_rgba[top_row * params.src_row_bytes..(top_row + 1) * params.src_row_bytes];
+        let bottom = &params.src_rgba
+            [bottom_row * params.src_row_bytes..(bottom_row + 1) * params.src_row_bytes];
+
+        for (offset_x, pixel) in row_pixels[params.x_min..params.x_max]
+            .iter_mut()
             .enumerate()
         {
-            let start_y = band_idx * rows_per_thread;
-            scope.spawn(move || {
-                for (local_y, dst_row) in band_buf.chunks_mut(dst_row_bytes).enumerate() {
-                    let y = start_y + local_y;
-                    let row_pixels = dst_row.as_chunks_mut::<4>().0;
-                    if y < y_min || y >= y_max || x_min >= x_max {
-                        row_pixels.fill(bg_pixel);
-                        continue;
-                    }
+            let x = params.x_min + offset_x;
+            let raw_sx = (x as i64)
+                .saturating_mul(params.step_x as i64)
+                .saturating_add(params.base_x)
+                .max(0) as u64;
+            let clamped_sx = raw_sx.min(params.max_sx);
+            let sx = if params.flip_h {
+                params.max_sx - clamped_sx
+            } else {
+                clamped_sx
+            };
+            let left_col = ((sx >> 32) as usize).min(params.max_col);
+            let right_col = (left_col + 1).min(params.max_col);
+            let wx = ((sx >> 24) & 0xFF) as u32;
 
-                    row_pixels[..x_min].fill(bg_pixel);
-                    row_pixels[x_max..].fill(bg_pixel);
+            let [r, g, b, a] =
+                sample_bilinear_rgba(top, bottom, left_col * 4, right_col * 4, wx, wy);
 
-                    let raw_sy = (y as i64)
-                        .saturating_mul(step_y as i64)
-                        .saturating_add(base_y)
-                        .max(0) as u64;
-                    let clamped_sy = raw_sy.min(max_sy);
-                    let sy = if flip_v {
-                        max_sy - clamped_sy
-                    } else {
-                        clamped_sy
-                    };
-                    let top_row = ((sy >> 32) as usize).min(max_row);
-                    let bottom_row = (top_row + 1).min(max_row);
-                    let wy = ((sy >> 24) & 0xFF) as u32;
-                    let top = &src_rgba[top_row * src_row_bytes..(top_row + 1) * src_row_bytes];
-                    let bottom =
-                        &src_rgba[bottom_row * src_row_bytes..(bottom_row + 1) * src_row_bytes];
-
-                    for (offset_x, pixel) in row_pixels[x_min..x_max].iter_mut().enumerate() {
-                        let x = x_min + offset_x;
-                        let raw_sx = (x as i64)
-                            .saturating_mul(step_x as i64)
-                            .saturating_add(base_x)
-                            .max(0) as u64;
-                        let clamped_sx = raw_sx.min(max_sx);
-                        let sx = if flip_h {
-                            max_sx - clamped_sx
-                        } else {
-                            clamped_sx
-                        };
-                        let left_col = ((sx >> 32) as usize).min(max_col);
-                        let right_col = (left_col + 1).min(max_col);
-                        let wx = ((sx >> 24) & 0xFF) as u32;
-
-                        let [r, g, b, a] =
-                            sample_bilinear_rgba(top, bottom, left_col * 4, right_col * 4, wx, wy);
-
-                        if a == 255 {
-                            pixel[0] = b;
-                            pixel[1] = g;
-                            pixel[2] = r;
-                            pixel[3] = 255;
-                        } else {
-                            let alpha = a as u32;
-                            let inv = 255 - alpha;
-                            pixel[0] = ((b as u32 * alpha + bg_b * inv + 127) / 255) as u8;
-                            pixel[1] = ((g as u32 * alpha + bg_g * inv + 127) / 255) as u8;
-                            pixel[2] = ((r as u32 * alpha + bg_r * inv + 127) / 255) as u8;
-                            pixel[3] = 255;
-                        }
-                    }
-                }
-            });
+            if a == 255 {
+                pixel[0] = b;
+                pixel[1] = g;
+                pixel[2] = r;
+                pixel[3] = 255;
+            } else {
+                let alpha = a as u32;
+                let inv = 255 - alpha;
+                pixel[0] = ((b as u32 * alpha + params.bg_b * inv + 127) / 255) as u8;
+                pixel[1] = ((g as u32 * alpha + params.bg_g * inv + 127) / 255) as u8;
+                pixel[2] = ((r as u32 * alpha + params.bg_r * inv + 127) / 255) as u8;
+                pixel[3] = 255;
+            }
         }
-    });
+    }
 }
 
 fn resample_thread_count(rows: usize) -> usize {
@@ -1393,6 +1494,7 @@ mod tests {
             &mut dst,
             2,
             2,
+            2,
             (0.0, 0.0, 2.0, 2.0),
             bg,
             false,
@@ -1417,6 +1519,7 @@ mod tests {
             &mut flipped,
             2,
             2,
+            2,
             (0.0, 0.0, 2.0, 2.0),
             bg,
             true,
@@ -1435,6 +1538,7 @@ mod tests {
             &mut wide,
             200,
             40,
+            200,
             (0.0, 0.0, 200.0, 40.0),
             [0, 0, 0],
             false,
@@ -1976,6 +2080,7 @@ mod tests {
             &mut dst,
             16,
             12,
+            16,
             (4.0, 3.0, 8.0, 6.0),
             bg,
             false,
@@ -1997,7 +2102,7 @@ mod tests {
         // Case 2: Stage 2 panned completely off-screen -> 100% bg_rgb.
         for &exact in &[(20.0f32, 20.0, 8.0, 6.0), (-20.0, -20.0, 8.0, 6.0)] {
             let mut off = vec![0u8; 16 * 12 * 4];
-            resample_rgba_to_bgra(&src, 4, 4, &mut off, 16, 12, exact, bg, false, false);
+            resample_rgba_to_bgra(&src, 4, 4, &mut off, 16, 12, 16, exact, bg, false, false);
             assert!(
                 off.as_chunks::<4>().0.iter().all(|&p| p == bg_bgra),
                 "off-screen exact={exact:?} must fill 100% with bg_rgb"
@@ -2013,6 +2118,7 @@ mod tests {
             &mut stage1,
             16,
             12,
+            16,
             (0.0, -0.25, 16.0, 12.5),
             bg,
             false,
@@ -2895,5 +3001,348 @@ mod tests {
         assert!(!tracker.accept_egui_double_click(t0 + std::time::Duration::from_millis(40)));
         // A later independent egui double-click is accepted normally.
         assert!(tracker.accept_egui_double_click(t0 + std::time::Duration::from_millis(300)));
+    }
+
+    #[test]
+    fn resample_rgba_to_bgra_respects_padded_dib_stride_without_row_skew() {
+        // 4x4 RGBA source with distinct colors and semi-transparent pixels.
+        let mut src = Vec::with_capacity(4 * 4 * 4);
+        for y in 0..4u8 {
+            for x in 0..4u8 {
+                let a = if (x + y) % 2 == 0 { 255 } else { 128 };
+                src.extend_from_slice(&[x * 60 + 20, y * 50 + 30, (x + y) * 30, a]);
+            }
+        }
+        let bg = [18u8, 22u8, 26u8];
+        let dst_w = 73u32;
+        let dst_h = 57u32;
+        let padded_stride = 256usize; // capacity-bucketed DIB stride > dst_w
+        let sentinel = [0xAAu8, 0xBB, 0xCC, 0xDD];
+
+        // 1) Stage 2 partial rect with background fill.
+        let exact = (10.25f32, 7.5, 51.5, 39.75);
+        let mut tight = vec![0u8; dst_w as usize * dst_h as usize * 4];
+        resample_rgba_to_bgra(
+            &src,
+            4,
+            4,
+            &mut tight,
+            dst_w,
+            dst_h,
+            dst_w as usize,
+            exact,
+            bg,
+            false,
+            false,
+        );
+
+        let mut padded = vec![0u8; padded_stride * dst_h as usize * 4];
+        for px in padded.chunks_exact_mut(4) {
+            px.copy_from_slice(&sentinel);
+        }
+        resample_rgba_to_bgra(
+            &src,
+            4,
+            4,
+            &mut padded,
+            dst_w,
+            dst_h,
+            padded_stride,
+            exact,
+            bg,
+            false,
+            false,
+        );
+
+        for y in 0..dst_h as usize {
+            let tight_row = &tight[y * dst_w as usize * 4..(y + 1) * dst_w as usize * 4];
+            let padded_visible =
+                &padded[y * padded_stride * 4..y * padded_stride * 4 + dst_w as usize * 4];
+            assert_eq!(
+                padded_visible, tight_row,
+                "row {y} mismatch with padded stride {padded_stride}"
+            );
+            // Padding tail past `dst_w` must remain untouched.
+            let padded_tail =
+                &padded[y * padded_stride * 4 + dst_w as usize * 4..(y + 1) * padded_stride * 4];
+            assert!(
+                padded_tail.chunks_exact(4).all(|px| px == sentinel),
+                "padding bytes past dst_w were overwritten on row {y}"
+            );
+        }
+
+        // 2) Stage 1 full coverage with padded stride: zero background pixels in visible area.
+        let opaque_white = vec![255u8; 4 * 4 * 4];
+        let mut stage1 = vec![0u8; padded_stride * dst_h as usize * 4];
+        resample_rgba_to_bgra(
+            &opaque_white,
+            4,
+            4,
+            &mut stage1,
+            dst_w,
+            dst_h,
+            padded_stride,
+            (0.0, -0.3, dst_w as f32, dst_h as f32 + 0.6),
+            [0, 0, 0],
+            false,
+            false,
+        );
+        for y in 0..dst_h as usize {
+            let row = &stage1[y * padded_stride * 4..y * padded_stride * 4 + dst_w as usize * 4];
+            assert!(
+                row.chunks_exact(4).all(|px| px == [255, 255, 255, 255]),
+                "Stage 1 row {y} must have 100% opaque coverage"
+            );
+        }
+    }
+
+    #[test]
+    fn rayon_parallel_resampler_is_bit_identical_to_single_threaded_across_repeated_calls() {
+        let src_w = 64u32;
+        let src_h = 48u32;
+        let mut src = Vec::with_capacity(src_w as usize * src_h as usize * 4);
+        for y in 0..src_h {
+            for x in 0..src_w {
+                src.push(((x * 7 + y * 3) & 0xFF) as u8);
+                src.push(((x * 5 + y * 11) & 0xFF) as u8);
+                src.push(((x * 13 + y * 17) & 0xFF) as u8);
+                src.push(if (x + y) % 5 == 0 { 180 } else { 255 });
+            }
+        }
+        // Large enough dst_h to guarantee multi-band rayon execution (`>= 32 * threads`).
+        let dst_w = 320u32;
+        let dst_h = 384u32;
+        let dst_stride = 512usize;
+        let exact = (-12.4f32, -8.7, 345.2, 401.9);
+        let bg = [15u8, 25u8, 35u8];
+
+        // Compute single-threaded reference via `resample_rgba_to_bgra_band`.
+        let step_x = ((src_w as f64 / exact.2 as f64) * SAMPLE_ONE) as u64;
+        let step_y = ((src_h as f64 / exact.3 as f64) * SAMPLE_ONE) as u64;
+        let base_x = ((0.5 - exact.0 as f64) * step_x as f64 - SAMPLE_ONE * 0.5) as i64;
+        let base_y = ((0.5 - exact.1 as f64) * step_y as f64 - SAMPLE_ONE * 0.5) as i64;
+        let x_min = (exact.0 as f64 - 0.5).ceil().clamp(0.0, dst_w as f64) as usize;
+        let x_max = ((exact.0 as f64 + exact.2 as f64 - 0.5)
+            .ceil()
+            .clamp(0.0, dst_w as f64) as usize)
+            .max(x_min);
+        let y_min = (exact.1 as f64 - 0.5).ceil().clamp(0.0, dst_h as f64) as usize;
+        let y_max = ((exact.1 as f64 + exact.3 as f64 - 0.5)
+            .ceil()
+            .clamp(0.0, dst_h as f64) as usize)
+            .max(y_min);
+        let params = ResampleBandParams {
+            src_rgba: &src,
+            src_row_bytes: src_w as usize * 4,
+            dst_w: dst_w as usize,
+            dst_stride_bytes: dst_stride * 4,
+            step_x,
+            step_y,
+            base_x,
+            base_y,
+            max_sx: ((src_w as u64).saturating_sub(1)) << 32,
+            max_sy: ((src_h as u64).saturating_sub(1)) << 32,
+            max_col: (src_w as usize).saturating_sub(1),
+            max_row: (src_h as usize).saturating_sub(1),
+            bg_r: bg[0] as u32,
+            bg_g: bg[1] as u32,
+            bg_b: bg[2] as u32,
+            bg_pixel: [bg[2], bg[1], bg[0], 255],
+            x_min,
+            x_max,
+            y_min,
+            y_max,
+            flip_h: true,
+            flip_v: false,
+        };
+        let mut expected = vec![0u8; dst_stride * dst_h as usize * 4];
+        resample_rgba_to_bgra_band(&params, 0, &mut expected);
+
+        let mut actual = vec![0u8; dst_stride * dst_h as usize * 4];
+        for _ in 0..5 {
+            actual.fill(0);
+            resample_rgba_to_bgra(
+                &src,
+                src_w,
+                src_h,
+                &mut actual,
+                dst_w,
+                dst_h,
+                dst_stride,
+                exact,
+                bg,
+                true,
+                false,
+            );
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn unfocused_hover_scroll_does_not_trigger_focus_loss_handbrake() {
+        // Unfocused hover-scroll (`started_focused == false`) must NOT abort while unfocused.
+        assert!(!should_abort_for_focus_loss(false, false));
+        assert!(!should_abort_for_focus_loss(false, true));
+        // Focused session staying focused must NOT abort.
+        assert!(!should_abort_for_focus_loss(true, true));
+        // Focused session that genuinely loses focus mid-gesture MUST abort cleanly.
+        assert!(should_abort_for_focus_loss(true, false));
+    }
+
+    #[test]
+    fn settle_grace_holds_for_60ms_and_bypasses_immediately_on_interrupt() {
+        let t0 = std::time::Instant::now();
+        // Before 60ms quiet grace expires -> stay in Travelling.
+        assert!(!should_enter_settling_from_travelling(
+            Some(t0),
+            t0 + std::time::Duration::from_millis(59),
+            false,
+            false
+        ));
+        // At/after 60ms quiet grace -> enter Settling.
+        assert!(should_enter_settling_from_travelling(
+            Some(t0),
+            t0 + FLOATING_ZOOM_SETTLE_GRACE,
+            false,
+            false
+        ));
+        // New wheel delta keeps us in Travelling even past 60ms.
+        assert!(!should_enter_settling_from_travelling(
+            Some(t0),
+            t0 + std::time::Duration::from_millis(120),
+            false,
+            true
+        ));
+        // Click/key/focus-loss interrupt bypasses grace immediately (0ms delay).
+        assert!(should_enter_settling_from_travelling(
+            Some(t0),
+            t0,
+            true,
+            true
+        ));
+        assert!(should_enter_settling_from_travelling(None, t0, true, false));
+    }
+
+    #[test]
+    fn dwm_vsync_pacing_locks_to_crefresh_and_falls_back_to_update_exit() {
+        let now = std::time::Instant::now();
+        // Same DWM refresh count -> must wait via DwmFlush.
+        assert!(needs_dwm_flush_before_commit(
+            Some(100),
+            Some(100),
+            Some(now - std::time::Duration::from_millis(20)),
+            now
+        ));
+        // Advanced DWM refresh count -> already on new VBlank, do NOT double-wait.
+        assert!(!needs_dwm_flush_before_commit(
+            Some(101),
+            Some(100),
+            Some(now),
+            now
+        ));
+        // DWM timing unavailable -> fall back to `last_update_exit` (< 2ms means non-VSynced SwapBuffers).
+        assert!(needs_dwm_flush_before_commit(
+            None,
+            None,
+            Some(now - std::time::Duration::from_millis(1)),
+            now
+        ));
+        assert!(!needs_dwm_flush_before_commit(
+            None,
+            None,
+            Some(now - std::time::Duration::from_millis(5)),
+            now
+        ));
+    }
+
+    #[test]
+    fn fast_multi_notch_wheel_spam_and_reversal_stays_smooth_and_monotonic() {
+        let mut state = FloatingZoomState::new(FloatingZoomInit {
+            window_rect: PhysicalRect::new(560, 240, 1360, 840), // 800x600
+            monitor_rect: monitor_1080p(),
+            media_w: 800.0,
+            media_h: 600.0,
+            current_zoom: 1.0,
+            current_offset_pt: (0.0, 0.0),
+            pixels_per_point: 1.0,
+            max_zoom_factor: 10.0,
+            config_zoom_step: 1.02,
+            inside_window_locked: false,
+        })
+        .unwrap();
+
+        // Spam 20 rapid notches in (1 notch per 120Hz frame) crossing Phase 1 -> Phase 2.
+        let mut prev_w = state.drawn_w;
+        let mut crossed_stage2 = false;
+        for _ in 0..20 {
+            state.add_notches_at(1.0, Some((1020, 510)));
+            let frame = state.step(1.0 / 120.0);
+            assert!(
+                state.drawn_w >= prev_w - 1e-4,
+                "zoom-in spam must be strictly monotonic: prev={prev_w} curr={}",
+                state.drawn_w
+            );
+            if frame.is_stage2 {
+                crossed_stage2 = true;
+            }
+            prev_w = state.drawn_w;
+        }
+        // Glide to target (max_zoom_factor 10.0 -> 8000px).
+        for _ in 0..240 {
+            let frame = state.step(1.0 / 120.0);
+            assert!(state.drawn_w >= prev_w - 1e-4);
+            if frame.is_stage2 {
+                crossed_stage2 = true;
+            }
+            prev_w = state.drawn_w;
+            if frame.settled {
+                break;
+            }
+        }
+        assert!(crossed_stage2, "20 notches in must cross into Phase 2");
+        assert!(
+            (state.drawn_w - state.ceiling_w).abs() < 1.0,
+            "20 notches in should reach ceiling_w ({}) cleanly, got {}",
+            state.ceiling_w,
+            state.drawn_w
+        );
+
+        // Immediately reverse 25 notches out crossing Phase 2 -> Phase 1 back to floor.
+        let mut prev_out_w = state.drawn_w;
+        let mut returned_stage1 = false;
+        for _ in 0..25 {
+            state.add_notches_at(-1.0, Some((1020, 510)));
+            let frame = state.step(1.0 / 120.0);
+            assert!(
+                state.drawn_w <= prev_out_w + 1e-4,
+                "zoom-out spam must be strictly monotonic: prev={prev_out_w} curr={}",
+                state.drawn_w
+            );
+            if !frame.is_stage2 {
+                returned_stage1 = true;
+            }
+            prev_out_w = state.drawn_w;
+        }
+        for _ in 0..240 {
+            let frame = state.step(1.0 / 120.0);
+            assert!(state.drawn_w <= prev_out_w + 1e-4);
+            if !frame.is_stage2 {
+                returned_stage1 = true;
+            }
+            prev_out_w = state.drawn_w;
+            if frame.settled {
+                break;
+            }
+        }
+        assert!(
+            returned_stage1,
+            "reversal must cross smoothly back into Phase 1"
+        );
+        assert!(
+            (state.drawn_w - state.floor_w).abs() < 1.0,
+            "25 notches out should reach floor_w ({}) cleanly, got {}",
+            state.floor_w,
+            state.drawn_w
+        );
     }
 }

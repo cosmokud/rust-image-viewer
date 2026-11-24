@@ -342,8 +342,12 @@ impl ImageViewer {
                                             raw_unmodified_notches,
                                             regular_ctrl_scroll_zoom_bound,
                                         );
-                                    } else if self.floating_zoom_stage_active() {
-                                        // Suppress residual egui smooth_scroll_delta tail while layered stage owns wheel.
+                                    } else if self.floating_zoom_stage_active()
+                                        || self.is_floating_zoom_stage_eligible(ctx)
+                                    {
+                                        // Suppress residual egui smooth_scroll_delta tail whenever
+                                        // the Windows layered stage is active or eligible for this
+                                        // floating solo media view.
                                         handled_by_stage = true;
                                     }
                                 }

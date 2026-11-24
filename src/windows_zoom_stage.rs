@@ -33,8 +33,10 @@ use crate::app::{ZoomStageModifiers, ZoomStageMouseEvent};
 const ZOOM_STAGE_CLASS: &str = "RustImageViewerZoomStage";
 static REGISTER_CLASS: Once = Once::new();
 
-/// Armed while floating zoom stage owns wheel input (Travelling or Settling).
+/// Armed while floating zoom stage owns wheel input (Travelling, Settling, or eligible idle floating mode).
 static ZOOM_CAPTURE_ARMED: AtomicBool = AtomicBool::new(false);
+/// True only while a `FloatingZoomSession` is actively running (`Travelling` or `Settling`).
+static ZOOM_SESSION_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// Whether Ctrl+wheel should also be captured as zoom notches.
 static ZOOM_CAPTURE_CTRL_WHEEL: AtomicBool = AtomicBool::new(false);
 /// Signed raw Win32 wheel delta (120 = 1 notch) accumulated from both `zoom_hwnd` and `main_hwnd`.
@@ -80,8 +82,17 @@ fn request_egui_repaint() {
     }
 }
 
+#[cfg(test)]
 pub fn is_zoom_capture_armed() -> bool {
     ZOOM_CAPTURE_ARMED.load(Ordering::SeqCst)
+}
+
+pub fn set_zoom_session_active(active: bool) {
+    ZOOM_SESSION_ACTIVE.store(active, Ordering::SeqCst);
+}
+
+pub fn is_zoom_session_active() -> bool {
+    ZOOM_SESSION_ACTIVE.load(Ordering::SeqCst)
 }
 
 pub fn signal_interrupt() {
@@ -155,6 +166,7 @@ pub fn set_zoom_capture_armed(armed: bool, allow_ctrl_wheel: bool) {
     ZOOM_CAPTURE_CTRL_WHEEL.store(allow_ctrl_wheel, Ordering::SeqCst);
     ZOOM_CAPTURE_ARMED.store(armed, Ordering::SeqCst);
     if !armed {
+        ZOOM_SESSION_ACTIVE.store(false, Ordering::SeqCst);
         ZOOM_WHEEL_DELTA.store(0, Ordering::SeqCst);
         ZOOM_WHEEL_CURSOR_VALID.store(false, Ordering::SeqCst);
         ZOOM_INTERRUPT.store(false, Ordering::SeqCst);
@@ -162,13 +174,20 @@ pub fn set_zoom_capture_armed(armed: bool, allow_ctrl_wheel: bool) {
     }
 }
 
-/// Disarms wheel capture and clears wheel/interrupt flags WITHOUT clearing queued mouse events,
-/// so the reveal path can drain all clicks that arrived before and during `dwm_flush()` + `hide()`.
+/// Arms or disarms wheel capture WITHOUT discarding any queued wheel deltas or mouse events.
+/// Used on reveal and idle floating-mode sync so zero wheel ticks are dropped or leaked into egui.
+pub fn set_zoom_capture_armed_preserving_queues(armed: bool, allow_ctrl_wheel: bool) {
+    ZOOM_CAPTURE_CTRL_WHEEL.store(allow_ctrl_wheel, Ordering::SeqCst);
+    ZOOM_CAPTURE_ARMED.store(armed, Ordering::SeqCst);
+}
+
+/// Disarms wheel capture and clears interrupt flags WITHOUT clearing queued mouse events or
+/// wheel deltas, so the reveal path can drain all clicks and wheel ticks that arrived during
+/// `dwm_flush()` + `hide()`.
+#[cfg(test)]
 pub fn disarm_zoom_capture_preserving_mouse_events() {
     ZOOM_CAPTURE_CTRL_WHEEL.store(false, Ordering::SeqCst);
     ZOOM_CAPTURE_ARMED.store(false, Ordering::SeqCst);
-    ZOOM_WHEEL_DELTA.store(0, Ordering::SeqCst);
-    ZOOM_WHEEL_CURSOR_VALID.store(false, Ordering::SeqCst);
     ZOOM_INTERRUPT.store(false, Ordering::SeqCst);
 }
 
@@ -215,7 +234,9 @@ fn record_wheel_wparam(wparam: WPARAM, lparam: LPARAM) -> bool {
     let shift = (keys & MK_SHIFT) != 0;
     let alt = unsafe { GetKeyState(VK_MENU) < 0 };
     if shift || alt || (ctrl && !ZOOM_CAPTURE_CTRL_WHEEL.load(Ordering::SeqCst)) {
-        signal_interrupt();
+        if ZOOM_SESSION_ACTIVE.load(Ordering::SeqCst) {
+            signal_interrupt();
+        }
         return false;
     }
     let delta = ((wparam >> 16) as i16) as i32;
@@ -369,25 +390,31 @@ unsafe extern "system" fn zoom_stage_wndproc(
     }
 }
 
+/// Rounds a requested DIB dimension up to a 256px capacity bucket (minimum 256px) so
+/// Phase 1 window resizing reuses the existing kernel `CreateDIBSection` without reallocating.
+pub(crate) fn dib_capacity_bucket(dim: u32) -> u32 {
+    (dim.saturating_add(255) & !255).max(256)
+}
+
 struct DibSurface {
     mem_dc: HDC,
     bitmap: HBITMAP,
     old_bitmap: HGDIOBJ,
     bits: *mut u8,
-    width: u32,
-    height: u32,
+    cap_w: u32,
+    cap_h: u32,
 }
 
 impl DibSurface {
-    fn create(width: u32, height: u32) -> Option<Self> {
-        if width == 0 || height == 0 {
+    fn create(cap_w: u32, cap_h: u32) -> Option<Self> {
+        if cap_w == 0 || cap_h == 0 {
             return None;
         }
         let mut bmi: BITMAPINFO = unsafe { std::mem::zeroed() };
         bmi.bmiHeader = BITMAPINFOHEADER {
             biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: width as i32,
-            biHeight: -(height as i32), // top-down DIB
+            biWidth: cap_w as i32,
+            biHeight: -(cap_h as i32), // top-down DIB
             biPlanes: 1,
             biBitCount: 32,
             biCompression: BI_RGB,
@@ -424,14 +451,14 @@ impl DibSurface {
                 bitmap,
                 old_bitmap,
                 bits: bits as *mut u8,
-                width,
-                height,
+                cap_w,
+                cap_h,
             })
         }
     }
 
     fn as_slice_mut(&mut self) -> &mut [u8] {
-        let len = self.width as usize * self.height as usize * 4;
+        let len = self.cap_w as usize * self.cap_h as usize * 4;
         unsafe { std::slice::from_raw_parts_mut(self.bits, len) }
     }
 }
@@ -448,10 +475,12 @@ impl Drop for DibSurface {
     }
 }
 
-/// Reusable `WS_EX_LAYERED` window + DIB section for atomic floating-zoom commits.
+/// Reusable `WS_EX_LAYERED` window + capacity-bucketed DIB section for atomic floating-zoom commits.
 pub(crate) struct ZoomStageWindow {
     hwnd: HWND,
     surface: Option<DibSurface>,
+    last_w: u32,
+    last_h: u32,
     visible: bool,
 }
 
@@ -492,6 +521,8 @@ impl ZoomStageWindow {
             Some(Self {
                 hwnd,
                 surface: None,
+                last_w: 0,
+                last_h: 0,
                 visible: false,
             })
         }
@@ -545,15 +576,16 @@ impl ZoomStageWindow {
         }
     }
 
-    /// Ensures DIB matches `(width, height)`, calls `paint` to fill premultiplied BGRA,
-    /// then commits position, size, and pixels atomically via `UpdateLayeredWindow`.
+    /// Ensures DIB capacity covers `(width, height)`, calls `paint(dst_bgra, dst_stride_pixels)`
+    /// to fill premultiplied BGRA in `(0..width, 0..height)`, then commits position, size, and
+    /// pixels atomically via `UpdateLayeredWindow`.
     pub(crate) fn commit(
         &mut self,
         left: i32,
         top: i32,
         width: u32,
         height: u32,
-        paint: impl FnOnce(&mut [u8]),
+        paint: impl FnOnce(&mut [u8], usize),
     ) -> bool {
         if self.hwnd.is_null() || width == 0 || height == 0 {
             return false;
@@ -561,15 +593,21 @@ impl ZoomStageWindow {
         let needs_alloc = self
             .surface
             .as_ref()
-            .is_none_or(|s| s.width != width || s.height != height);
+            .is_none_or(|s| s.cap_w < width || s.cap_h < height);
         if needs_alloc {
-            self.surface = DibSurface::create(width, height);
+            let (cur_w, cur_h) = self.surface.as_ref().map_or((0, 0), |s| (s.cap_w, s.cap_h));
+            let new_cap_w = cur_w.max(dib_capacity_bucket(width));
+            let new_cap_h = cur_h.max(dib_capacity_bucket(height));
+            self.surface = DibSurface::create(new_cap_w, new_cap_h);
         }
         let Some(surface) = self.surface.as_mut() else {
             return false;
         };
+        self.last_w = width;
+        self.last_h = height;
 
-        paint(surface.as_slice_mut());
+        let stride_pixels = surface.cap_w as usize;
+        paint(surface.as_slice_mut(), stride_pixels);
 
         let mut dst_pt = POINT { x: left, y: top };
         let mut size = SIZE {
@@ -610,6 +648,14 @@ impl ZoomStageWindow {
                 ShowWindow(self.hwnd, SW_HIDE);
             }
             self.visible = false;
+        }
+        // Reclaim oversized DIB capacity when idle if allocated area is >4x last used area.
+        if let Some(surface) = self.surface.as_ref() {
+            let cap_area = u64::from(surface.cap_w).saturating_mul(u64::from(surface.cap_h));
+            let used_area = u64::from(self.last_w).saturating_mul(u64::from(self.last_h));
+            if cap_area > used_area.saturating_mul(4).max(512 * 512) {
+                self.surface = None;
+            }
         }
     }
 }
@@ -671,6 +717,20 @@ pub(crate) fn dwm_flush() {
     }
 }
 
+/// Returns DWM's monotonically increasing desktop composition refresh counter (`cRefresh`),
+/// or `None` if DWM composition timing is unavailable.
+pub(crate) fn dwm_composition_refresh_count() -> Option<u64> {
+    unsafe {
+        let mut info: winapi::um::dwmapi::DWM_TIMING_INFO = std::mem::zeroed();
+        info.cbSize = std::mem::size_of::<winapi::um::dwmapi::DWM_TIMING_INFO>() as u32;
+        if winapi::um::dwmapi::DwmGetCompositionTimingInfo(std::ptr::null_mut(), &mut info) >= 0 {
+            Some(info.cRefresh)
+        } else {
+            None
+        }
+    }
+}
+
 pub(crate) fn ensure_foreground(hwnd: HWND) {
     if hwnd.is_null() {
         return;
@@ -724,5 +784,14 @@ mod tests {
             }
         ));
         assert!(drain_mouse_events().is_empty());
+    }
+
+    #[test]
+    fn dib_capacity_bucket_rounds_to_256px_multiples() {
+        assert_eq!(dib_capacity_bucket(1), 256);
+        assert_eq!(dib_capacity_bucket(256), 256);
+        assert_eq!(dib_capacity_bucket(257), 512);
+        assert_eq!(dib_capacity_bucket(1440), 1536);
+        assert_eq!(dib_capacity_bucket(1920), 2048);
     }
 }

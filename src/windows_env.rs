@@ -2376,7 +2376,7 @@ unsafe extern "system" fn scale_change_wndproc(
         return 0;
     }
 
-    if crate::windows_zoom_stage::is_zoom_capture_armed()
+    if crate::windows_zoom_stage::is_zoom_session_active()
         && (msg == WM_KILLFOCUS
             || (msg == WM_ACTIVATE && (wparam & 0xFFFF) == WA_INACTIVE as WPARAM))
     {

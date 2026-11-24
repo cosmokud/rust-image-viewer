@@ -606,16 +606,21 @@ impl eframe::App for ImageViewer {
         // For videos during startup: skip ALL drawing until we have dimensions and layout is applied.
         // This prevents the flash of an empty window with controls before the video frame appears.
         // Like MPV, we want the window to appear only when it has the first frame ready.
-        let skip_drawing = !self.startup_window_shown
+        let skip_startup_video_draw = !self.startup_window_shown
             && matches!(self.current_media_type, Some(MediaType::Video))
             && !self.startup_ready_to_show();
+        // While the Win32 layered floating zoom stage is `Travelling`, `main_hwnd` is DWM-cloaked
+        // and invisible: skip expensive egui controls/image layout work so cloaked `SwapBuffers`
+        // finishes in <0.2ms with zero GPU contention (detached Settings/Stash viewports stay alive).
+        let skip_cloaked_zoom_travelling = self.floating_zoom_stage_is_travelling();
+        let skip_drawing = skip_startup_video_draw || skip_cloaked_zoom_travelling;
 
         // Draw controls overlay (top bar for title/buttons) BEFORE the main view.
         // This ensures title-bar hover/selection state is available to suppress gestures
         // (drag/pan/double-click) in the same frame.
         if !skip_drawing {
             self.draw_controls(ctx);
-        } else {
+        } else if skip_startup_video_draw {
             self.mouse_over_window_buttons = false;
             self.mouse_over_title_text = false;
             self.mouse_over_title_bar_drag_handle = false;
@@ -651,6 +656,10 @@ impl eframe::App for ImageViewer {
             self.draw_delete_confirmation_modal(ctx);
             self.draw_history_confirmation_modal(ctx);
             self.draw_rename_modal(ctx);
+        }
+        // Keep detached immediate viewports (Settings / Stash) alive even while `main_hwnd` is
+        // cloaked during `Travelling` (skipping a frame would close an open immediate viewport).
+        if !skip_startup_video_draw {
             self.draw_settings_modal(ctx);
             self.draw_stash_modal(ctx);
         }
@@ -758,11 +767,12 @@ impl eframe::App for ImageViewer {
                 }
             });
 
+        let floating_zoom_settle_grace = self.floating_zoom_stage_settle_grace_remaining();
         let any_animation_active = fullscreen_animation_active
             || pending_resize_active
             || texture_animation_active
             || draw_animation_active
-            || self.floating_zoom_stage_active()
+            || (self.floating_zoom_stage_active() && floating_zoom_settle_grace.is_none())
             || self.is_panning
             || self.is_resizing
             || self.is_seeking
@@ -825,6 +835,11 @@ impl eframe::App for ImageViewer {
                 repaint_reason = "animation-immediate";
                 ctx.request_repaint();
             }
+        } else if let Some(grace_remaining) = floating_zoom_settle_grace {
+            // Quiet settle grace after spring rest: sleep cheaply without spinning CPU/DWM;
+            // any wheel tick, click, or key wakes immediately via `request_repaint()`.
+            repaint_reason = "floating-zoom-settle-grace";
+            ctx.request_repaint_after(grace_remaining.min(Duration::from_millis(8)));
         } else if !self.startup_window_shown {
             // Keep polling until startup_ready_to_show() or its 2s safety fallback triggers.
             repaint_reason = "startup-preroll";
@@ -982,6 +997,8 @@ impl eframe::App for ImageViewer {
         // can come down with it.
         #[cfg(target_os = "windows")]
         crate::windows_env::note_viewer_frame_painted();
+        #[cfg(target_os = "windows")]
+        self.note_floating_zoom_update_exit();
 
         // Guarded: a disabled session pays one cached bool load, no locks and no clock reads.
         if let Some(frame_started) = frame_started {
