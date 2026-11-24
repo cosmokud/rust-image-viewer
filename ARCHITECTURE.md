@@ -10,8 +10,9 @@ code for a given behaviour actually lives, in the order a question is normally a
 where is it, why is it built that way). Read §2 for the map, §3–§5 for the request lifetime, and
 jump to the chapter whose subject matches the change you were asked to make.
 
-Documented against **0.4.6** (after the `src/app/` split; the previous revision of this file
-covered 0.4.1-rc.5, so everything from `src/cache_key.rs` onward is new).
+Documented against **0.4.7** (after the `src/app/` split and the layered floating-zoom stage; the
+previous revision of this file covered 0.4.1-rc.5, so everything from `src/cache_key.rs` onward is
+new).
 
 ---
 
@@ -59,10 +60,10 @@ src/
   app_dirs.rs  async_runtime.rs  cache_key.rs  diag.rs  first_frame.rs
   folder_travel_cache.rs  image_resize.rs  manga_spatial.rs  media_index.rs  perf_metrics.rs
   probe_video.rs  single_instance.rs  texture_upload.rs  video_thumbnail.rs
-  viewer_mode.rs  window_geometry.rs  windows_env.rs
+  viewer_mode.rs  window_geometry.rs  windows_env.rs  windows_zoom_stage.rs
 ```
 
-`main.rs` is 65 lines: `mod app; mod prelude;` plus the module list and `#[global_allocator]`.
+`main.rs` is 68 lines: `mod app; mod prelude;` plus the module list and `#[global_allocator]`.
 `main()` itself lives in [`src/app/bootstrap.rs`](src/app/bootstrap.rs).
 
 Rule of thumb when adding code: **new behaviour goes into the innermost module whose name
@@ -92,7 +93,8 @@ than one file.
 | `src/video_thumbnail.rs` | First-frame extraction without a live player; dimension probes | Preview and layout data for video tiles |
 | `src/viewer_mode.rs` | `Mode`, `ModeState`, `ModeEvent`, `MangaLayoutMode`, titlebar latches | Decisions only — effects stay in `app/` |
 | `src/window_geometry.rs` | Physical-pixel display/work-area geometry, clamping, DPI transitions | Windows never become unreachable (including fully off the left/top edge) |
-| `src/windows_env.rs` | Win32 glue: registry PATH refresh, maximize/restore, scale-change subclass, icon install, taskbar identity, DWM cloak | Native window behaviour |
+| `src/windows_env.rs` | Win32 glue: registry PATH refresh, maximize/restore, scale-change subclass, icon install, taskbar identity, DWM cloak, `main_hwnd` primary-mouse capture, synchronous cursor resync | Native window behaviour |
+| `src/windows_zoom_stage.rs` | `ZoomStageWindow`: reusable `WS_EX_LAYERED` window + capacity-bucketed DIB, `UpdateLayeredWindow` commits, wheel/interrupt/mouse queues, `dwm_flush` and composition-refresh pacing | The zero-flicker floating zoom stage |
 | `src/diag.rs` | Opt-in `env.local` forensics: stage timings, counters, hang watchdog, panic hook | The only way to see a real freeze after the fact |
 | `assets/config.ini` | Canonical config template | Ship-time source of truth for defaults |
 | `build.rs` | Config-template sync, icon embedding, delay-loaded GStreamer DLLs | Smaller image-only startup |
@@ -102,7 +104,7 @@ than one file.
 
 ### 2.3 `src/app/` — the application module
 
-`app/mod.rs` holds the `ImageViewer` struct (306 fields), the `impl ImageViewer` header, all of
+`app/mod.rs` holds the `ImageViewer` struct (344 fields), the `impl ImageViewer` header, all of
 its associated constants (79 of them), and `Default`/`Drop`. Every method of `ImageViewer` lives
 in a child module as its own `impl ImageViewer` block, and `app/mod.rs` re-exports each child, so
 a method is callable from anywhere in `app/` regardless of which file defines it.
@@ -121,6 +123,7 @@ src/app/
   core_state.rs           small cross-cutting queries (list signature, exit locks)
   exit.rs                 fast-exit path
   decode.rs               decoder preferences, upload policy inputs, init_viewer
+  floating_zoom.rs        floating scroll-zoom maths, drag/click handoff types, 32.32 bilinear resampler
   history.rs              undo/redo of file mutations (recycle bin, rename, stash)
   paths.rs                file stamps and the Windows Ctrl+V probe
   platform.rs             Windows-only: CJK fonts, reveal-in-explorer, default app, shell "Open with"
@@ -142,7 +145,7 @@ src/app/
 | `video/` | 10 | playback availability state, track popups, video navigation, vector icons, resume positions, seek gesture, seekbar, first-frame extraction |
 | `manga/` | 40 | everything Long Strip and Masonry: layouts, uploads, demand accounting, preload, drawing, video tiles |
 | `masonry/` | 2 | authoritative dimension bookkeeping + folder metadata snapshots |
-| `window/` | 11 | layout application, display lookup, window rects, fullscreen transitions, dragging, autosize, title text, startup visibility, monitor queries |
+| `window/` | 12 | layout application, display lookup, window rects, fullscreen transitions, dragging, autosize, title text, startup visibility, monitor queries, the floating zoom stage driver |
 | `settings/` | 9 | settings window values/actions/widgets/rows/presets/tabs/modal |
 | `stash/` | 10 | the Stash window: gallery, selection/rubber band, chips + context menu, keyboard navigation, hover video preview, details column, on-disk stash (`stash.tsv`) |
 | `dialogs/` | 7 | delete/rename modals, undo/redo confirmation, modal thumbnails and preview |
@@ -163,6 +166,7 @@ Quick index of the hot entry points:
 | Where is next/prev decided? | `src/app/navigation.rs` |
 | Where is the solo texture uploaded? | `src/app/ui/texture.rs` (`update_texture`) |
 | Where is the solo image painted? | `src/app/ui/draw_image.rs` |
+| Where does floating scroll zoom live? | `src/app/floating_zoom.rs` (maths), `src/app/window/floating_zoom_driver.rs` (per-frame driver), `src/windows_zoom_stage.rs` (layered Win32 window) |
 | Where is the whole strip/masonry frame painted? | `src/app/manga/draw_item.rs` — `draw_manga_mode` and the per-tile `draw_manga_item` |
 | Where does a manga tile get decoded? | `src/manga_loader/decode.rs` + `.../coordinator.rs` |
 | Where is what-to-load-next decided? | `src/manga_loader/demand.rs` + `src/app/manga/demand.rs` |
@@ -290,21 +294,28 @@ double-click timing, and issues the first `load_image` / `load_media_internal`.
 5. **Minimized guard**: pause a playing video, return without requesting a repaint.
 6. FPS sampling, lazy Windows CJK font install (only if the filename needs it), one-shot startup
    fullscreen, floating-window position tracking, drag-and-drop.
-7. **Input** (`note_stage("input")`): `handle_input(ctx)` — the whole key/mouse/gesture layer; it
-   can switch media, so it exits early when a modal or the file menu is open.
+7. **Input** (`note_stage("input")`): `prepare_floating_zoom_stage_for_input` first (freeze and
+   sync the layered zoom state, fire any split right-click), then `handle_input(ctx)` — the whole
+   key/mouse/gesture layer; it can switch media, so it exits early when a modal or the file menu
+   is open.
 8. Exit re-check, `apply_pending_window_title`, `update_bottom_overlays_visibility`.
 9. **Texture update** (`note_stage("texture")`): `update_texture(ctx)` — decode/upload the current
    media. This runs *before* layout because a video's first frame reveals its real dimensions.
-10. **Layout**: when `image_changed`, apply floating / maximized / fullscreen once, except when a
+10. **Floating zoom stage** (Windows): `drive_floating_zoom_stage` advances `Travelling` /
+    `Settling` and commits layered frames (§11.9). While it owns the window it is DWM-cloaked, so
+    egui skips the solo image and control layout for that frame.
+11. **Layout**: when `image_changed`, apply floating / maximized / fullscreen once, except when a
     fullscreen entry is already pending.
-11. **Draw** (`note_stage("draw")`): `draw_image`, then overlays in fixed order — video controls,
+12. **Draw** (`note_stage("draw")`): `draw_image`, then overlays in fixed order — video controls,
     manga video controls, manga zoom bar and toggle, FPS overlay, file action context menu,
     delete/rename modals, settings window, help.
-12. **Repaint schedule** (`note_stage("schedule")`): 0 ms while animating, 7 ms under masonry
+13. **Repaint schedule** (`note_stage("schedule")`): 0 ms while animating, 7 ms under masonry
     navigation, 16 ms while placeholders/queues are live, slower for background decode, a
-    deadline for a timed UI auto-hide, and a long idle wait otherwise. The event loop still wakes
-    on input, so "idle" costs nothing.
-13. **Diag** (`note_stage("present")`): when `diag::enabled()`, build `diag_frame_stats` (backlog,
+    deadline for a timed UI auto-hide, and a long idle wait otherwise. An active floating-zoom
+    stage keeps repainting through `Travelling` and `Settling`, but idles in ~8 ms slices during the
+    60 ms settle grace so a scroll burst never pays a cloak/uncloak round trip. The event loop still
+    wakes on input, so "idle" costs nothing.
+14. **Diag** (`note_stage("present")`): when `diag::enabled()`, build `diag_frame_stats` (backlog,
     visible count, uploads, TTV samples) and emit one frame record.
 
 ### 4.1 Folder browsing chrome
@@ -853,6 +864,72 @@ bindings.
 - Actions supported: `DeleteToRecycle` (verifies items remain in the Recycle Bin before undoing restore),
   `DeleteFromStash`, and `Rename`.
 
+### 11.9 Floating scroll zoom (`src/app/floating_zoom.rs`, `src/app/window/floating_zoom_driver.rs`, `src/windows_zoom_stage.rs`)
+
+Wheel zoom in the floating window cannot go through egui: resizing the real window per frame both
+flashes and races the compositor, so the gesture runs on a **native layered overlay** and only the
+final state is handed back. Three files, one pipeline:
+
+1. **Math** — `FloatingZoomState` (`src/app/floating_zoom.rs`) is the whole geometry of a gesture.
+   - `centre` is captured once at gesture start and never re-read from a rounded window rect, so
+     repeated notches cannot drift the window.
+   - `toward_w` accumulates notches; `drawn_w` chases it through an exact analytical critically
+     damped (`zeta = 1.0`) spring in *log* width space (`FLOATING_ZOOM_SPRING_OMEGA = 30`), so
+     motion is `C^1`, framerate-independent, and never overshoots.
+   - `per_notch = config.zoom_step ^ 13` (`FULLSCREEN_EQUIV_FRAMES_PER_NOTCH`): one Windows 3-line
+     notch feeds egui's `smooth_scroll_delta` for 13 frames at 60 Hz, so floating and fullscreen
+     zoom feel identical.
+   - **Stage 1** grows the window from its fitted size up to `cap_w` (fit-to-monitor, or the locked
+     window size when `floating_zoom_inside_window_locked`); the picture rect is a cover-fit, so
+     there are never black bars.
+   - **Stage 2** starts past `cap_w`: window and picture grow together and zoom is cursor-anchored
+     (`anchor`, clamped into the window) with free pan. Zooming back below the `cap_w + 25%`
+     home-return zone telescopes `pan` back through `home_share`, arriving at `(0, 0)` exactly at
+     `cap_w` — the reverse gesture retraces the forward one instead of jumping home.
+   - Window rects quantize *outward* around the captured centre, which is what makes fractional DPI
+     scales and odd sizes free of 1 px wobble.
+2. **Stage window** — `ZoomStageWindow` (`src/windows_zoom_stage.rs`) is one reusable
+   `WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE` popup kept above `main_hwnd`. Pixels are
+   produced by a rayon-parallel 32.32 fixed-point bilinear resampler (`resample_rgba_to_bgra`) into
+   a premultiplied-BGRA DIB, then committed **atomically** with `UpdateLayeredWindow`. The DIB is
+   bucketed to 256 px capacity steps (`dib_capacity_bucket`), so a resize burst reuses one kernel
+   allocation; pixels outside the picture rect are filled with the background colour, so free pan
+   never smears edge columns. Commits are paced to the compositor through
+   `dwm_composition_refresh_count` (`DwmGetCompositionTimingInfo().cRefresh`) with `dwm_flush` as
+   fallback, so the stage never outruns VSync and never halves the refresh rate.
+3. **Driver** — `FloatingZoomSession` (`src/app/window/floating_zoom_driver.rs`) runs each frame from
+   `app_loop` between texture update and layout. Entry (`handle_floating_wheel_zoom_stage`) requires
+   `is_floating_zoom_stage_eligible` (solo, not fullscreen/maximized, no modal/menu/resize/pan/seek,
+   no rotation, source pixels available); it places the stage, commits frame 0 **before** cloaking
+   `main_hwnd` (a zoom-out otherwise shows a 1-frame hole) and cloaks it only after one composition.
+   From then on the real window is invisible and egui skips its layout (`skip_cloaked_zoom_travelling`).
+   - `Travelling`: step the spring, resample, commit. Wheel deltas are consumed from Win32 directly,
+     not from egui, so a burst can never be replayed twice. When the spring rests, a 60 ms
+     `FLOATING_ZOOM_SETTLE_GRACE` keeps the session open and the repaint scheduler idles through it,
+     so rapid scroll bursts pay no cloak/uncloak cost while a settled static image costs no resamples.
+   - `Settling`: convert to exact `(zoom, offset)` (`to_eframe_state`, cover-fit aware, so the
+     handoff is 0 px), resize and reposition `main_hwnd` under the stage, wait for 2 matching
+     client sizes (or 150 ms), then uncloak → `dwm_flush` → hide stage → hand off input. Ordering
+     matters: the stage must leave the screen before any message can land on it.
+   - **Input handoff** is the part that makes the feature feel finished. `zoom_hwnd` queues
+     primary/secondary/middle/X-button events; on reveal they are replayed exactly once in one of
+     seven resolved shapes (`handoff_zoom_stage_inputs`): direct or split double-click
+     (`FloatingPrimaryDoubleClickState` unifies stage and window clicks, `double_click_grace_period`
+     plus a 12 px radius), direct or split right-click, Mouse4/Mouse5, middle-click autoscroll, and
+     a still-held primary press handed to resize/move/pan. A pending key press freezes the spring
+     first (`prepare_floating_zoom_stage_for_input`) so keyboard actions run on the zoomed state
+     instead of being overwritten by the driver later in the frame. `sync_main_window_cursor_pos`
+     sends a 1 px-nudged then exact `WM_MOUSEMOVE` *synchronously* because winit deduplicates a
+     repeated cursor position and would otherwise leave egui's pointer at `None` after the stage
+     disappears.
+
+Guards worth remembering: `floating_zoom_settled_zoom` stops autosize from snapping the window back
+over a just-settled zoom, `floating_drag_threshold_crossed` applies a 4 px deadzone before a floating
+drag moves the window, `pan_last_cursor_phys` keeps panning smooth when the pointer leaves the window,
+and the stage is cancelled (`cancel_floating_zoom_stage_immediately`) on exit paths and media changes.
+30 unit tests in `src/app/floating_zoom.rs` cover the spring, quantization, home-return telescope and
+double-click resolution; 2 in `src/windows_zoom_stage.rs` cover the DIB capacity bucket.
+
 ---
 
 ## 12. Observability
@@ -926,6 +1003,11 @@ active Criterion harness; `benches/` is present but empty.
 | Animated WebP streaming | `src/image_loader/webp_stream.rs` | First frame now, rest later |
 | Off-thread cache writes | `src/metadata_cache/writer.rs` | File I/O off the frame path |
 | Hidden cloaked video start | `src/app/bootstrap.rs`, `src/app/window/startup.rs` | No startup flash, valid window rects |
+| Layered floating zoom stage | `src/windows_zoom_stage.rs`, `src/app/floating_zoom.rs` | Zero-flicker zoom: no window under compositor racing the picture |
+| Capacity-bucketed DIB reuse | `src/windows_zoom_stage.rs` | One kernel bitmap allocation per scroll burst, not per frame |
+| VSync-paced layered commits | `src/windows_zoom_stage.rs` | Stage never outruns or halves the monitor refresh |
+| Cloaked-while-travelling frame skip | `src/app/app_loop.rs` | Invisible window costs no egui layout during a zoom |
+| Settle-grace repaint slices | `src/app/app_loop.rs` | Scroll bursts avoid cloak/uncloak stalls; static images idle |
 | Lazy CJK font load | `src/app/window/startup.rs` | Large fonts only when needed |
 | Reactive idle rendering | `src/app/app_loop.rs` | No idle repaint |
 | Centralized texture reuse | `src/texture_upload.rs` | One filter/mipmap/handle policy |

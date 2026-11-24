@@ -17,6 +17,7 @@ A fast, borderless image and video viewer for Windows. Open media instantly, nav
 ## Highlights
 
 - Borderless floating window with a custom title bar, auto-hiding controls, and smooth fullscreen transitions.
+- Zero-flicker scroll zoom in the floating window: a native layered overlay resizes and repaints over a cloaked window, then hands every queued click, drag, and shortcut back untouched.
 - Multi-monitor aware: maximization, DPI scaling, and window dragging all do the right thing across displays.
 - Two fullscreen multi-item layouts: **Long Strip** (continuous vertical scroll) and **Masonry** (dense grid).
 - Fast folder navigation with natural sort, single-instance reuse, and drag-and-drop support.

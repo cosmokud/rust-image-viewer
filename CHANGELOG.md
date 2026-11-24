@@ -1,5 +1,32 @@
 # Changelog
 
+## [0.4.7] - 2026-11-25
+
+### Highlights
+
+- Floating-mode scroll zoom no longer flickers: a native layered overlay resizes and repaints above the viewer while the real window stays cloaked, so zooming never flashes, tears, or shows the desktop.
+- Zoom speed matches fullscreen exactly, and every click, drag, right-click, middle-click and shortcut made during a zoom is delivered afterwards exactly once.
+
+### Added
+
+- Zero-flicker floating zoom stage: a reusable layered window with a capacity-reused bitmap surface, a multithreaded fixed-point bilinear resampler, and refresh-paced atomic commits.
+- Center-anchored two-stage zoom: the window grows from fit to monitor fit, then zooms and pans around the cursor, with a smooth return to centered when zooming back out.
+- Lossless input handoff after a zoom: single and split double-clicks, right-clicks, middle-click autoscroll, side buttons, and held-button drag all continue where the user left off.
+
+### Changed
+
+- `double_click_grace_period` default raised from `0.35` to `0.50`, paired with a Windows-sized 12 px click radius.
+- Floating autosize keeps the image aspect ratio down to a 48 pt minimum side and stands down after a settled zoom, so it never adds black bars or fights the zoom.
+- Floating window dragging ignores the first 4 px of movement, so click tremor no longer nudges the window.
+- While a zoom is in flight the viewer skips its own image layout (open Settings and Stash windows keep drawing) and the repaint scheduler idles through a short settle grace instead of spinning.
+
+### Fixed
+
+- Floating zoom flicker, tearing, and desktop flashes, including a one-frame hole when zooming out.
+- Dropped and duplicated input after zooming, including double-clicks with a stationary cursor and right-clicks split across the zoom and the real window.
+- Scroll-spam stalls from per-frame bitmap reallocation and unpaced layered-window updates.
+- Autosize snapping the window back over a zoom that had just settled, and leftover smooth-scroll momentum still zooming the old path.
+
 ## [0.4.6] - 2026-11-23
 
 ### Highlights

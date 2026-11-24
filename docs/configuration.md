@@ -8,7 +8,7 @@ The config file is at `%APPDATA%\rust-image-viewer\config.ini` on Windows. Delet
 | ----------------------------------------------- | ---------- | -------------------------------------------------------------------------------------------------- |
 | `controls_hide_delay`                           | `0.5`      | Seconds before the title bar / controls hide.                                                      |
 | `bottom_overlay_hide_delay`                     | `0.5`      | Seconds before bottom overlays (video controls, mode buttons, zoom HUD) hide.                     |
-| `double_click_grace_period`                     | `0.50`     | Double-click timing window in seconds.                                                             |
+| `double_click_grace_period`                     | `0.50`     | Double-click timing window in seconds, with a 12 px click radius.                                  |
 | `show_fps`                                      | `false`    | Show the diagnostics overlay in the top-right corner.                                              |
 | `resize_border_size`                            | `6`        | Floating-window resize hit area in pixels.                                                         |
 | `startup_window_mode`                           | `floating` | `floating` or `fullscreen`.                                                                        |
@@ -26,9 +26,9 @@ The config file is at `%APPDATA%\rust-image-viewer\config.ini` on Windows. Delet
 | `floating_mode_remember_position`               | `true`     | Keep floating window position and size cap between files.                                          |
 | `confirm_delete_to_recycle_bin`                 | `true`     | Show confirmation modal before deleting to Recycle Bin.                                            |
 | `auto_unmark_after_paste`                       | `true`     | Clear the marked selection after a successful paste.                                               |
-| `zoom_animation_speed`                          | `20`       | Floating zoom animation speed. `0` disables animation.                                            |
+| `zoom_animation_speed`                          | `20`       | Floating autosize zoom spring speed. `0` snaps instantly. Scroll zoom uses its own fixed spring.   |
 | `precise_rotation_step_degrees`                 | `2.0`      | Degrees per `Ctrl+Up` / `Ctrl+Down`.                                                               |
-| `zoom_step`                                     | `1.02`     | Scroll-wheel zoom multiplier.                                                                      |
+| `zoom_step`                                     | `1.02`     | Scroll-wheel zoom multiplier. Floating applies `zoom_step ^ 13` per notch to match fullscreen.     |
 | `max_zoom_percent`                              | `1000`     | Maximum zoom level as a percentage.                                                                |
 
 ## Long Strip and Masonry
