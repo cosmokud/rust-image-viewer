@@ -33,6 +33,7 @@ impl ImageViewer {
     /// redraws to a hidden window — and the Settings and Stash viewports are drawn from this
     /// window's frames, so hiding it froze them.
     pub(crate) fn hide_viewer_window(&mut self, ctx: &egui::Context) {
+        self.cancel_floating_zoom_stage_immediately();
         if self.viewer_window_hidden {
             // Already parked: the close it asked for is still refused, or the window would be
             // destroyed under the Settings/Stash windows it is drawing.
@@ -269,6 +270,7 @@ impl ImageViewer {
     }
 
     pub(crate) fn begin_fast_app_exit(&mut self) {
+        self.cancel_floating_zoom_stage_immediately();
         if self.should_exit {
             return;
         }
@@ -309,6 +311,7 @@ impl ImageViewer {
         self.image = None;
         self.texture = None;
         self.video_texture = None;
+        self.last_video_frame = None;
         self.pending_video_thumbnail_placeholder = None;
         self.retained_media_placeholder_visible = false;
     }

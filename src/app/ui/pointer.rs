@@ -288,6 +288,7 @@ impl ImageViewer {
         if self.mode().is_fullscreen()
             || self.current_window_is_maximized(ctx)
             || self.is_resizing
+            || self.floating_zoom_stage_active()
             || self.pending_window_resize.is_some()
             || self.floating_drag_start_outer_pos.is_some()
             || self.defer_media_view_reset
@@ -309,8 +310,16 @@ impl ImageViewer {
             return;
         };
 
-        desired.x = desired.x.max(200.0);
-        desired.y = desired.y.max(150.0);
+        // Preserve aspect ratio at the minimum side floor so autosize never introduces black bars
+        // or fights a settled floating scroll-zoom below 200x150.
+        if desired.x > 0.0
+            && desired.y > 0.0
+            && (desired.x < MIN_FLOATING_ZOOM_SIDE_PT || desired.y < MIN_FLOATING_ZOOM_SIDE_PT)
+        {
+            let scale =
+                (MIN_FLOATING_ZOOM_SIDE_PT / desired.x).max(MIN_FLOATING_ZOOM_SIDE_PT / desired.y);
+            desired *= scale;
+        }
 
         let (current_inner_rect, current_outer_rect) =
             ctx.input(|i| (i.raw.viewport().inner_rect, i.raw.viewport().outer_rect));

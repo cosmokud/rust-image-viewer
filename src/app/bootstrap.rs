@@ -191,7 +191,7 @@ pub(crate) fn main() -> eframe::Result<()> {
             .with_transparent(false) // Avoid compositing issues
             .with_icon(build_app_icon())
             .with_visible(start_visible) // Images: visible immediately; Videos: hidden until first frame
-            .with_min_inner_size([200.0, 150.0])
+            .with_min_inner_size([48.0, 48.0])
             .with_inner_size(initial_size) // Pre-calculated size based on media dimensions
             .with_position(initial_pos) // Pre-calculated centered position
             .with_drag_and_drop(true),

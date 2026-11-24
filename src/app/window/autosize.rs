@@ -260,6 +260,7 @@ impl ImageViewer {
 
             // Get new frame if available
             if let Some(frame) = player.get_frame() {
+                self.last_video_frame = Some(frame.clone());
                 activate_deferred_video_swap = self.defer_media_view_reset;
                 solo_displayed_video_position = frame.pts;
 
@@ -314,6 +315,8 @@ impl ImageViewer {
             } else if self.is_seeking {
                 needs_repaint = true;
             }
+        } else {
+            self.last_video_frame = None;
         }
 
         if let Some(position) = solo_displayed_video_position {

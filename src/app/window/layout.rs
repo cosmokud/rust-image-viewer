@@ -37,6 +37,7 @@ impl ImageViewer {
         if self.mode().is_fullscreen()
             || self.is_resizing
             || self.is_panning
+            || self.floating_zoom_stage_active()
             || self.pending_window_resize.is_some()
             || self.pending_media_layout
             || self.floating_drag_start_outer_pos.is_some()

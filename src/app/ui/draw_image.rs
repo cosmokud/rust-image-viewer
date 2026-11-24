@@ -46,6 +46,7 @@ impl ImageViewer {
             && !self.is_resizing
             && !self.is_seeking
             && !self.manga_autoscroll_active
+            && !self.floating_zoom_stage_active()
             && !floating_image_exceeds_window
             && self.offset.length() > 0.1
         {
@@ -177,21 +178,34 @@ impl ImageViewer {
                             self.zoom_target = self.zoom;
                             self.zoom_velocity = 0.0;
                         } else {
-                            // In floating mode, follow cursor when zoomed past 100%
-                            let old_zoom = self.zoom;
-                            self.zoom_target = self.clamp_zoom(self.zoom_target * factor);
-                            self.zoom = self.clamp_zoom(self.zoom * factor);
+                            #[cfg(target_os = "windows")]
+                            let handled_by_stage = {
+                                let notches = if wheel_steps_ctrl != 0.0 {
+                                    (wheel_steps_ctrl / 3.0).clamp(-6.0, 6.0)
+                                } else {
+                                    wheel_steps_ctrl_effective.signum()
+                                };
+                                self.handle_floating_wheel_zoom_stage(ctx, notches, true)
+                            };
+                            #[cfg(not(target_os = "windows"))]
+                            let handled_by_stage = false;
+                            if !handled_by_stage {
+                                // Fallback when layered stage is unavailable (maximized, rotated, non-Windows).
+                                let old_zoom = self.zoom;
+                                self.zoom_target = self.clamp_zoom(self.zoom_target * factor);
+                                self.zoom = self.clamp_zoom(self.zoom * factor);
 
-                            let has_offset = self.offset.length() > 0.1;
-                            if old_zoom > 1.0 || self.zoom > 1.0 || has_offset {
-                                let rect_center = screen_rect.center();
-                                let cursor_offset = pos - rect_center;
-                                let zoom_ratio = self.zoom / old_zoom;
-                                self.offset =
-                                    self.offset * zoom_ratio - cursor_offset * (zoom_ratio - 1.0);
+                                let has_offset = self.offset.length() > 0.1;
+                                if old_zoom > 1.0 || self.zoom > 1.0 || has_offset {
+                                    let rect_center = screen_rect.center();
+                                    let cursor_offset = pos - rect_center;
+                                    let zoom_ratio = self.zoom / old_zoom;
+                                    self.offset = self.offset * zoom_ratio
+                                        - cursor_offset * (zoom_ratio - 1.0);
+                                }
+                                self.zoom_velocity = 0.0;
+                                self.maybe_refresh_current_solo_image_lod();
                             }
-                            self.zoom_velocity = 0.0;
-                            self.maybe_refresh_current_solo_image_lod();
                         }
 
                         handled_modifier_wheel = true;
@@ -208,8 +222,34 @@ impl ImageViewer {
                 && !pointer_over_shortcut_ui_for_wheel
                 && !slider_wheel_guard_active
             {
+                let raw_unmodified_notches: f32 = ctx.input(|i| {
+                    let mut total = 0.0f32;
+                    for e in &i.raw.events {
+                        if let egui::Event::MouseWheel {
+                            unit,
+                            delta,
+                            modifiers,
+                        } = e
+                        {
+                            if modifiers.ctrl || modifiers.shift || modifiers.alt {
+                                continue;
+                            }
+                            let dy = delta.y;
+                            if !dy.is_finite() || dy == 0.0 {
+                                continue;
+                            }
+                            let n = match unit {
+                                egui::MouseWheelUnit::Line => dy / 3.0,
+                                egui::MouseWheelUnit::Page => dy,
+                                egui::MouseWheelUnit::Point => dy / WHEEL_POINTS_PER_LINE,
+                            };
+                            total += n.clamp(-WHEEL_MAX_STEPS_PER_EVENT, WHEEL_MAX_STEPS_PER_EVENT);
+                        }
+                    }
+                    total
+                });
                 let scroll_delta = ctx.input(|i| i.smooth_scroll_delta.y);
-                if scroll_delta != 0.0 {
+                if raw_unmodified_notches != 0.0 || scroll_delta != 0.0 {
                     if let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) {
                         // Only suppress zoom when the pointer is on the title *text* (or window buttons),
                         // not on the empty title bar area.
@@ -217,26 +257,49 @@ impl ImageViewer {
                             // Intentionally ignore scroll for zoom while selecting/copying title text.
                         } else {
                             let step = self.config.zoom_step;
-                            let factor = if scroll_delta > 0.0 { step } else { 1.0 / step };
-                            if self.mode().is_fullscreen() {
-                                self.zoom_at(pos, factor, screen_rect);
-                                self.zoom_target = self.zoom;
-                                self.zoom_velocity = 0.0;
+                            let dir = if raw_unmodified_notches != 0.0 {
+                                raw_unmodified_notches
                             } else {
-                                let old_zoom = self.zoom;
-                                self.zoom_target = self.clamp_zoom(self.zoom_target * factor);
-                                self.zoom = self.clamp_zoom(self.zoom * factor);
-
-                                let has_offset = self.offset.length() > 0.1;
-                                if old_zoom > 1.0 || self.zoom > 1.0 || has_offset {
-                                    let rect_center = screen_rect.center();
-                                    let cursor_offset = pos - rect_center;
-                                    let zoom_ratio = self.zoom / old_zoom;
-                                    self.offset = self.offset * zoom_ratio
-                                        - cursor_offset * (zoom_ratio - 1.0);
+                                scroll_delta
+                            };
+                            let factor = if dir > 0.0 { step } else { 1.0 / step };
+                            if self.mode().is_fullscreen() {
+                                if scroll_delta != 0.0 {
+                                    self.zoom_at(pos, factor, screen_rect);
+                                    self.zoom_target = self.zoom;
+                                    self.zoom_velocity = 0.0;
                                 }
-                                self.zoom_velocity = 0.0;
-                                self.maybe_refresh_current_solo_image_lod();
+                            } else {
+                                let mut handled_by_stage = false;
+                                #[cfg(target_os = "windows")]
+                                {
+                                    if raw_unmodified_notches != 0.0 {
+                                        handled_by_stage = self.handle_floating_wheel_zoom_stage(
+                                            ctx,
+                                            raw_unmodified_notches,
+                                            regular_ctrl_scroll_zoom_bound,
+                                        );
+                                    } else if self.floating_zoom_stage_active() {
+                                        // Suppress residual egui smooth_scroll_delta tail while layered stage owns wheel.
+                                        handled_by_stage = true;
+                                    }
+                                }
+                                if !handled_by_stage && scroll_delta != 0.0 {
+                                    let old_zoom = self.zoom;
+                                    self.zoom_target = self.clamp_zoom(self.zoom_target * factor);
+                                    self.zoom = self.clamp_zoom(self.zoom * factor);
+
+                                    let has_offset = self.offset.length() > 0.1;
+                                    if old_zoom > 1.0 || self.zoom > 1.0 || has_offset {
+                                        let rect_center = screen_rect.center();
+                                        let cursor_offset = pos - rect_center;
+                                        let zoom_ratio = self.zoom / old_zoom;
+                                        self.offset = self.offset * zoom_ratio
+                                            - cursor_offset * (zoom_ratio - 1.0);
+                                    }
+                                    self.zoom_velocity = 0.0;
+                                    self.maybe_refresh_current_solo_image_lod();
+                                }
                             }
                         }
                     }

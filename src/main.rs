@@ -60,6 +60,9 @@ mod window_geometry;
 #[cfg(target_os = "windows")]
 mod windows_env;
 
+#[cfg(target_os = "windows")]
+mod windows_zoom_stage;
+
 #[cfg(all(target_os = "windows", feature = "mimalloc-allocator"))]
 #[global_allocator]
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;

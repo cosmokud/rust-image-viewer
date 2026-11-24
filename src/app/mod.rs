@@ -13,6 +13,7 @@ pub(crate) mod diagnostics;
 pub(crate) mod dialogs;
 pub(crate) mod exit;
 pub(crate) mod files;
+pub(crate) mod floating_zoom;
 pub(crate) mod folder;
 pub(crate) mod fullscreen;
 pub(crate) mod help;
@@ -44,6 +45,7 @@ pub(crate) use diagnostics::*;
 pub(crate) use dialogs::*;
 pub(crate) use exit::*;
 pub(crate) use files::*;
+pub(crate) use floating_zoom::*;
 pub(crate) use folder::*;
 pub(crate) use fullscreen::*;
 pub(crate) use help::*;
@@ -547,6 +549,14 @@ pub(crate) struct ImageViewer {
     /// When true, floating autosize is suppressed while zoomed media exceeds the viewport.
     /// Set by explicit user window drag/resize while in zoom-inside-window mode.
     pub(crate) floating_zoom_inside_window_locked: bool,
+    /// Last decoded solo video frame (O(1) refcounted `Bytes`) for CPU resampling during floating zoom.
+    pub(crate) last_video_frame: Option<crate::video_player::VideoFrame>,
+    /// Reusable Win32 layered window for zero-flicker floating scroll zoom.
+    #[cfg(target_os = "windows")]
+    pub(crate) zoom_stage_window: Option<crate::windows_zoom_stage::ZoomStageWindow>,
+    /// Active floating scroll-zoom session driving `zoom_stage_window`.
+    #[cfg(target_os = "windows")]
+    pub(crate) floating_zoom_session: Option<FloatingZoomSession>,
 
     // ============ PERFORMANCE OPTIMIZATION FIELDS ============
     /// Whether any animation or state change requires a repaint
@@ -1192,6 +1202,11 @@ impl Default for ImageViewer {
             floating_drag_start_outer_pos: None,
             floating_drag_start_cursor_screen: None,
             floating_zoom_inside_window_locked: false,
+            last_video_frame: None,
+            #[cfg(target_os = "windows")]
+            zoom_stage_window: None,
+            #[cfg(target_os = "windows")]
+            floating_zoom_session: None,
 
             // Performance optimization fields
             needs_repaint: false,
@@ -1616,6 +1631,11 @@ impl ImageViewer {
 
 impl Drop for ImageViewer {
     fn drop(&mut self) {
+        self.cancel_floating_zoom_stage_immediately();
+        #[cfg(target_os = "windows")]
+        {
+            self.zoom_stage_window = None;
+        }
         if self.pending_idle_config_sync {
             self.pending_idle_config_sync = false;
             self.config.sync_disk_file_with_template();

@@ -2167,8 +2167,8 @@ unsafe extern "system" fn scale_change_wndproc(
 ) -> LRESULT {
     use winapi::um::winuser::{
         CallWindowProcW, SC_MAXIMIZE, WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN,
-        WM_KEYUP, WM_MOVE, WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_WINDOWPOSCHANGED,
-        WM_WINDOWPOSCHANGING,
+        WM_KEYUP, WM_MOUSEWHEEL, WM_MOVE, WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP,
+        WM_WINDOWPOSCHANGED, WM_WINDOWPOSCHANGING,
     };
 
     let previous = PREVIOUS_WNDPROC.load(Ordering::SeqCst);
@@ -2176,6 +2176,10 @@ unsafe extern "system" fn scale_change_wndproc(
         return def_proc(hwnd, msg, wparam, lparam);
     }
     let previous: WNDPROC = std::mem::transmute(previous);
+
+    if msg == WM_MOUSEWHEEL && crate::windows_zoom_stage::try_consume_main_wheel(wparam) {
+        return 0;
+    }
 
     if msg == WM_PLACE_RECT {
         place_posted_rect(hwnd);

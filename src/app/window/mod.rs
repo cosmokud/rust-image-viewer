@@ -5,6 +5,7 @@
 pub(crate) mod autosize;
 pub(crate) mod display;
 pub(crate) mod drag;
+pub(crate) mod floating_zoom_driver;
 pub(crate) mod fullscreen;
 pub(crate) mod layout;
 pub(crate) mod layout_apply;
@@ -16,6 +17,7 @@ pub(crate) mod title;
 pub(crate) use autosize::*;
 pub(crate) use display::*;
 pub(crate) use drag::*;
+pub(crate) use floating_zoom_driver::*;
 pub(crate) use fullscreen::*;
 pub(crate) use layout::*;
 pub(crate) use layout_apply::*;

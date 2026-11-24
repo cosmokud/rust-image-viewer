@@ -140,6 +140,7 @@ impl eframe::App for ImageViewer {
 
         // When minimized, skip most processing to save CPU/GPU
         if is_minimized {
+            self.cancel_floating_zoom_stage_immediately();
             // Pause video playback when minimized to save CPU
             if let Some(ref mut player) = self.video_player {
                 if player.is_playing() {
@@ -215,6 +216,8 @@ impl eframe::App for ImageViewer {
         // can see the correct dimensions and apply layout before showing the window.
         let texture_animation_active = self.update_texture(ctx);
         crate::diag::note_stage("texture");
+        #[cfg(target_os = "windows")]
+        self.drive_floating_zoom_stage(ctx);
         let window_is_maximized = self.current_window_is_maximized(ctx);
 
         // Apply layout changes after image changes.
@@ -317,6 +320,7 @@ impl eframe::App for ImageViewer {
         self.drive_fullscreen_trace(ctx);
 
         if self.toggle_fullscreen {
+            self.cancel_floating_zoom_stage_immediately();
             self.stop_manga_autoscroll();
             let entering_fullscreen = !self.mode().is_fullscreen();
             let toggled_from_titlebar = self.toggle_fullscreen_from_titlebar;
@@ -738,6 +742,7 @@ impl eframe::App for ImageViewer {
             || pending_resize_active
             || texture_animation_active
             || draw_animation_active
+            || self.floating_zoom_stage_active()
             || self.is_panning
             || self.is_resizing
             || self.is_seeking

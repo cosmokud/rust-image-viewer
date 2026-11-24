@@ -171,6 +171,7 @@ impl ImageViewer {
         if self.mode().is_fullscreen()
             || self.current_window_is_maximized(ctx)
             || self.is_resizing
+            || self.floating_zoom_stage_active()
             || self.pending_window_resize.is_some()
             || self.floating_drag_start_outer_pos.is_some()
             || !self.startup_window_shown
