@@ -280,6 +280,7 @@ impl ImageViewer {
                             }
 
                             self.video_player = Some(player);
+                            self.last_video_frame = None;
                             self.current_video_path = Some(path.clone());
                             self.error_message = None;
                             self.clear_video_playback_unavailable_state();

@@ -163,8 +163,8 @@ impl ImageViewer {
             return false;
         }
 
-        // While resizing, treat window size as the source of truth.
-        if self.is_resizing {
+        // While resizing or driving the layered zoom stage, do not mutate zoom via spring.
+        if self.is_resizing || self.floating_zoom_stage_active() {
             self.zoom_target = self.zoom;
             self.zoom_velocity = 0.0;
             return false;

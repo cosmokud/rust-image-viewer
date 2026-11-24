@@ -54,6 +54,7 @@ impl ImageViewer {
             }
         }
         self.video_player = None;
+        self.last_video_frame = None;
         self.current_video_path = Some(path.clone());
         self.pending_media_layout = false;
         let normalized_reason = if !gstreamer_runtime_available() {
@@ -102,6 +103,7 @@ impl ImageViewer {
                 }
             }
             self.video_player = None;
+            self.last_video_frame = None;
             self.pending_media_layout = false;
             self.video_playback_unavailable_reason = Some(reason);
         }

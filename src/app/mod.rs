@@ -549,6 +549,8 @@ pub(crate) struct ImageViewer {
     /// When true, floating autosize is suppressed while zoomed media exceeds the viewport.
     /// Set by explicit user window drag/resize while in zoom-inside-window mode.
     pub(crate) floating_zoom_inside_window_locked: bool,
+    /// Zoom value handed off from the layered floating zoom stage; suppresses redundant autosize while unchanged.
+    pub(crate) floating_zoom_settled_zoom: Option<f32>,
     /// Last decoded solo video frame (O(1) refcounted `Bytes`) for CPU resampling during floating zoom.
     pub(crate) last_video_frame: Option<crate::video_player::VideoFrame>,
     /// Reusable Win32 layered window for zero-flicker floating scroll zoom.
@@ -1202,6 +1204,7 @@ impl Default for ImageViewer {
             floating_drag_start_outer_pos: None,
             floating_drag_start_cursor_screen: None,
             floating_zoom_inside_window_locked: false,
+            floating_zoom_settled_zoom: None,
             last_video_frame: None,
             #[cfg(target_os = "windows")]
             zoom_stage_window: None,
@@ -1635,6 +1638,7 @@ impl Drop for ImageViewer {
         #[cfg(target_os = "windows")]
         {
             self.zoom_stage_window = None;
+            crate::windows_zoom_stage::clear_egui_ctx();
         }
         if self.pending_idle_config_sync {
             self.pending_idle_config_sync = false;

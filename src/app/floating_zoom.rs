@@ -1,7 +1,5 @@
 //! Floating-mode center-anchored two-stage scroll zoom math and 32.32 fixed-point bilinear CPU resampler.
 
-use std::sync::atomic::AtomicBool;
-
 /// Default per-notch multiplier matching `rust-hover-preview` and prior ~5-frame `smooth_scroll_delta` feel.
 pub(crate) const DEFAULT_FLOATING_ZOOM_PER_NOTCH: f32 = 1.10;
 /// Settle threshold in physical pixels: prevents infinite sub-pixel chasing.
@@ -119,6 +117,7 @@ pub(crate) struct FloatingZoomState {
     pub(crate) cap_w: f32,
     pub(crate) floor_w: f32,
     pub(crate) ceiling_w: f32,
+    pub(crate) min_side_px: f32,
     pub(crate) per_notch: f32,
     pub(crate) inside_window_locked: bool,
     pub(crate) last_window_rect: PhysicalRect,
@@ -136,16 +135,18 @@ impl FloatingZoomState {
             return None;
         }
         let win_w = init.window_rect.width().max(1) as f32;
+        let win_h = init.window_rect.height().max(1) as f32;
         let mon_w = init.monitor_rect.width().max(1) as f32;
         let mon_h = init.monitor_rect.height().max(1) as f32;
         let aspect = init.media_h / init.media_w;
         let ppp = init.pixels_per_point;
 
         let fit_monitor_w = mon_w.min(mon_h / aspect).max(1.0);
+        let fit_window_w = win_w.min(win_h / aspect).max(1.0);
         let cap_w = if init.inside_window_locked {
-            win_w
+            fit_window_w
         } else {
-            fit_monitor_w.max(win_w)
+            fit_monitor_w.max(fit_window_w)
         };
 
         let drawn_w = (init.media_w * init.current_zoom * ppp).max(1.0);
@@ -184,6 +185,7 @@ impl FloatingZoomState {
             cap_w,
             floor_w,
             ceiling_w,
+            min_side_px,
             per_notch: effective_per_notch_factor(init.config_zoom_step),
             inside_window_locked: init.inside_window_locked,
             last_window_rect: init.window_rect,
@@ -241,8 +243,10 @@ impl FloatingZoomState {
     }
 
     fn evaluate_frame(&mut self, prev_drawn_w: f32) -> FloatingZoomFrame {
-        let win_w_f = self.drawn_w.min(self.cap_w).max(1.0);
-        let win_h_f = (win_w_f * self.aspect).max(1.0);
+        let raw_w_f = self.drawn_w.min(self.cap_w).max(1.0);
+        let raw_h_f = (raw_w_f * self.aspect).max(1.0);
+        let win_w_f = raw_w_f.max(self.min_side_px);
+        let win_h_f = raw_h_f.max(self.min_side_px);
         let placed = quantize_and_clamp_window(self.centre, win_w_f, win_h_f, self.monitor_rect);
         self.last_window_rect = placed;
 
@@ -252,7 +256,15 @@ impl FloatingZoomState {
 
         let picture_rect = if !is_stage2 {
             self.pan = (0.0, 0.0);
-            (0.0, 0.0, win_w, win_h)
+            // Aspect-preserving cover rect matches `to_eframe_state`'s `zoom_w.max(zoom_h)` identically (0px handoff pop).
+            let cover_w = win_w.max(win_h / self.aspect);
+            let cover_h = cover_w * self.aspect;
+            (
+                (win_w - cover_w) * 0.5,
+                (win_h - cover_h) * 0.5,
+                cover_w,
+                cover_h,
+            )
         } else {
             let scale_ratio = if prev_drawn_w > 0.0 {
                 self.drawn_w / prev_drawn_w
@@ -281,7 +293,7 @@ impl FloatingZoomState {
     }
 
     /// Converts settled state back to exact `(eframe_zoom, eframe_offset_pt)` for 0px handoff pop.
-    pub(crate) fn to_eframe_state(&self, pixels_per_point: f32) -> (f32, (f32, f32)) {
+    pub(crate) fn to_eframe_state(self, pixels_per_point: f32) -> (f32, (f32, f32)) {
         let ppp = pixels_per_point.max(0.01);
         let is_stage2 = self.drawn_w > self.cap_w + 0.01;
         if !is_stage2 {
@@ -352,6 +364,7 @@ pub(crate) fn quantize_and_clamp_window(
 ///
 /// Output alpha is always 255 (composited over `bg_rgb`) so layered hit-testing covers every pixel
 /// and transparent images match `eframe`'s opaque background identically.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn resample_rgba_to_bgra(
     src_rgba: &[u8],
     src_w: u32,
@@ -411,7 +424,10 @@ pub(crate) fn resample_rgba_to_bgra(
             scope.spawn(move || {
                 for (local_y, dst_row) in band_buf.chunks_mut(dst_row_bytes).enumerate() {
                     let y = start_y + local_y;
-                    let raw_sy = (y as i64 * step_y as i64 + base_y).max(0) as u64;
+                    let raw_sy = (y as i64)
+                        .saturating_mul(step_y as i64)
+                        .saturating_add(base_y)
+                        .max(0) as u64;
                     let clamped_sy = raw_sy.min(max_sy);
                     let sy = if flip_v {
                         max_sy - clamped_sy
@@ -425,8 +441,11 @@ pub(crate) fn resample_rgba_to_bgra(
                     let bottom =
                         &src_rgba[bottom_row * src_row_bytes..(bottom_row + 1) * src_row_bytes];
 
-                    for (x, pixel) in dst_row.chunks_exact_mut(4).enumerate() {
-                        let raw_sx = (x as i64 * step_x as i64 + base_x).max(0) as u64;
+                    for (x, pixel) in dst_row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                        let raw_sx = (x as i64)
+                            .saturating_mul(step_x as i64)
+                            .saturating_add(base_x)
+                            .max(0) as u64;
                         let clamped_sx = raw_sx.min(max_sx);
                         let sx = if flip_h {
                             max_sx - clamped_sx
@@ -502,10 +521,6 @@ fn sample_bilinear_rgba(
     out
 }
 
-/// Helper flag used by tests/diagnostics; unused in production.
-#[allow(dead_code)]
-static _SYNC_MARKER: AtomicBool = AtomicBool::new(false);
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -569,15 +584,11 @@ mod tests {
         }
         assert!(frame.settled);
         assert!(!frame.is_stage2);
-        assert_eq!(
-            frame.picture_rect,
-            (
-                0.0,
-                0.0,
-                frame.window_rect.width() as f32,
-                frame.window_rect.height() as f32
-            )
-        );
+        let (px, py, pw, ph) = frame.picture_rect;
+        assert!(px <= 0.01 && py <= 0.01);
+        assert!(px + pw >= frame.window_rect.width() as f32 - 0.01);
+        assert!(py + ph >= frame.window_rect.height() as f32 - 0.01);
+        assert!(((pw / ph) - (800.0 / 600.0)).abs() < 1e-4);
         assert!((frame.window_rect.centre_f32().0 - 960.0).abs() <= 0.5);
 
         // Stage 2: zoom past cap -> window stays capped at 1440x1080, image grows inside.
@@ -753,6 +764,109 @@ mod tests {
             false,
             false,
         );
-        assert!(wide.chunks_exact(4).all(|p| p == [255, 255, 255, 255]));
+        assert!(wide
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|&p| p == [255, 255, 255, 255]));
+    }
+
+    #[test]
+    fn handoff_alignment_zero_pop_across_dpi_scales_and_stages() {
+        for &ppp in &[1.0f32, 1.25, 1.5, 1.75, 2.0] {
+            let mut state = FloatingZoomState::new(FloatingZoomInit {
+                window_rect: PhysicalRect::new(300, 200, 1101, 651), // 801x451
+                monitor_rect: PhysicalRect::new(0, 0, 2560, 1440),
+                media_w: 1600.0,
+                media_h: 900.0,
+                current_zoom: 801.0 / (1600.0 * ppp),
+                current_offset_pt: (0.0, 0.0),
+                pixels_per_point: ppp,
+                max_zoom_factor: 10.0,
+                config_zoom_step: 1.02,
+                inside_window_locked: false,
+            })
+            .unwrap();
+
+            // Stage 1 settle: layered picture_rect must match eframe's draw_image rect to < 0.01px.
+            state.add_notches(2.0);
+            let mut frame = state.step(0.016);
+            for _ in 0..100 {
+                frame = state.step(0.016);
+            }
+            assert!(frame.settled && !frame.is_stage2);
+            let (zoom, (ox, oy)) = state.to_eframe_state(ppp);
+            let ef_w = state.media_w * zoom * ppp;
+            let ef_h = state.media_h * zoom * ppp;
+            let ef_x = (frame.window_rect.width() as f32 - ef_w) * 0.5 + ox * ppp;
+            let ef_y = (frame.window_rect.height() as f32 - ef_h) * 0.5 + oy * ppp;
+            assert!((frame.picture_rect.0 - ef_x).abs() < 1e-2, "ppp={ppp}");
+            assert!((frame.picture_rect.1 - ef_y).abs() < 1e-2, "ppp={ppp}");
+            assert!((frame.picture_rect.2 - ef_w).abs() < 1e-2, "ppp={ppp}");
+            assert!((frame.picture_rect.3 - ef_h).abs() < 1e-2, "ppp={ppp}");
+
+            // Stage 2 settle with pan: also 0px pop.
+            state.add_notches(15.0);
+            for _ in 0..120 {
+                frame = state.step(0.016);
+            }
+            assert!(frame.settled && frame.is_stage2);
+            state.pan = (45.5, -30.25);
+            frame = state.step(0.016);
+            let (zoom, (ox, oy)) = state.to_eframe_state(ppp);
+            let ef_w = state.media_w * zoom * ppp;
+            let ef_h = state.media_h * zoom * ppp;
+            let ef_x = (frame.window_rect.width() as f32 - ef_w) * 0.5 + ox * ppp;
+            let ef_y = (frame.window_rect.height() as f32 - ef_h) * 0.5 + oy * ppp;
+            assert!(
+                (frame.picture_rect.0 - ef_x).abs() < 1e-2,
+                "stage2 ppp={ppp}"
+            );
+            assert!(
+                (frame.picture_rect.1 - ef_y).abs() < 1e-2,
+                "stage2 ppp={ppp}"
+            );
+            assert!(
+                (frame.picture_rect.2 - ef_w).abs() < 1e-2,
+                "stage2 ppp={ppp}"
+            );
+            assert!(
+                (frame.picture_rect.3 - ef_h).abs() < 1e-2,
+                "stage2 ppp={ppp}"
+            );
+        }
+    }
+
+    #[test]
+    fn extreme_aspect_ratios_and_negative_monitor_coords() {
+        let neg_mon = PhysicalRect::new(-1920, -1080, 0, 0);
+        for &(mw, mh) in &[(10000.0f32, 10.0f32), (10.0f32, 10000.0f32)] {
+            let mut state = FloatingZoomState::new(FloatingZoomInit {
+                window_rect: PhysicalRect::new(-1200, -600, -700, -500),
+                monitor_rect: neg_mon,
+                media_w: mw,
+                media_h: mh,
+                current_zoom: 0.1,
+                current_offset_pt: (0.0, 0.0),
+                pixels_per_point: 1.5,
+                max_zoom_factor: 10.0,
+                config_zoom_step: 1.1,
+                inside_window_locked: false,
+            })
+            .unwrap();
+            let min_px = (MIN_FLOATING_ZOOM_SIDE_PT * 1.5).ceil() as i32;
+            state.add_notches(-50.0);
+            let mut frame = state.step(0.016);
+            for _ in 0..100 {
+                frame = state.step(0.016);
+            }
+            assert!(frame.window_rect.width() >= min_px);
+            assert!(frame.window_rect.height() >= min_px);
+            assert!(frame.window_rect.left >= neg_mon.left);
+            assert!(frame.window_rect.right <= neg_mon.right);
+            assert!(frame.window_rect.top >= neg_mon.top);
+            assert!(frame.window_rect.bottom <= neg_mon.bottom);
+            assert!(frame.picture_rect.2.is_finite() && frame.picture_rect.3.is_finite());
+        }
     }
 }

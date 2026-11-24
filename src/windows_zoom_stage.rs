@@ -5,22 +5,22 @@
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::sync::Once;
+use std::sync::{Mutex, Once};
 
 use winapi::shared::minwindef::{LPARAM, LRESULT, UINT, WPARAM};
-use winapi::shared::windef::{HBITMAP, HDC, HGDIOBJ, HWND, POINT, SIZE};
+use winapi::shared::windef::{HBITMAP, HDC, HGDIOBJ, HWND, POINT, RECT, SIZE};
 use winapi::um::wingdi::{
     CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, SelectObject, AC_SRC_ALPHA,
     AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, DIB_RGB_COLORS,
 };
 use winapi::um::winuser::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetKeyState, GetWindow, GetWindowLongPtrW,
-    LoadCursorW, RegisterClassExW, SetCursor, SetWindowPos, ShowWindow, UpdateLayeredWindow,
-    GWL_EXSTYLE, GW_HWNDPREV, HWND_TOP, HWND_TOPMOST, IDC_ARROW, MA_NOACTIVATE, MK_CONTROL,
-    MK_SHIFT, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOWNOACTIVATE, ULW_ALPHA,
-    VK_MENU, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_MOUSEACTIVATE, WM_MOUSEWHEEL,
-    WM_RBUTTONDOWN, WM_SETCURSOR, WM_XBUTTONDOWN, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetKeyState, GetWindow,
+    GetWindowLongPtrW, LoadCursorW, RegisterClassExW, SetCursor, SetWindowPos, ShowWindow,
+    UpdateLayeredWindow, GWL_EXSTYLE, GW_HWNDPREV, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST,
+    IDC_ARROW, MA_NOACTIVATE, MK_CONTROL, MK_SHIFT, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SW_HIDE, SW_SHOWNOACTIVATE, ULW_ALPHA, VK_MENU, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
+    WM_MBUTTONDOWN, WM_MOUSEACTIVATE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_SETCURSOR, WM_XBUTTONDOWN,
+    WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 const ZOOM_STAGE_CLASS: &str = "RustImageViewerZoomStage";
@@ -32,14 +32,49 @@ static ZOOM_CAPTURE_ARMED: AtomicBool = AtomicBool::new(false);
 static ZOOM_CAPTURE_CTRL_WHEEL: AtomicBool = AtomicBool::new(false);
 /// Signed raw Win32 wheel delta (120 = 1 notch) accumulated from both `zoom_hwnd` and `main_hwnd`.
 static ZOOM_WHEEL_DELTA: AtomicI32 = AtomicI32::new(0);
-/// Set on pointer button press over `zoom_hwnd` to trigger immediate settle/handoff.
+/// Set on pointer button press over `zoom_hwnd` or focus loss to trigger immediate settle/handoff.
 static ZOOM_INTERRUPT: AtomicBool = AtomicBool::new(false);
+/// Cloned `egui::Context` so WndProc hooks can wake an idle winit/eframe loop immediately.
+static EGUI_CTX: Mutex<Option<egui::Context>> = Mutex::new(None);
 
 fn wide(s: &str) -> Vec<u16> {
     OsStr::new(s)
         .encode_wide()
         .chain(std::iter::once(0))
         .collect()
+}
+
+pub fn register_egui_ctx(ctx: &egui::Context) {
+    let mut guard = EGUI_CTX
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if guard.is_none() {
+        *guard = Some(ctx.clone());
+    }
+}
+
+pub fn clear_egui_ctx() {
+    let mut guard = EGUI_CTX
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *guard = None;
+}
+
+fn request_egui_repaint() {
+    if let Ok(guard) = EGUI_CTX.try_lock() {
+        if let Some(ctx) = guard.as_ref() {
+            ctx.request_repaint();
+        }
+    }
+}
+
+pub fn is_zoom_capture_armed() -> bool {
+    ZOOM_CAPTURE_ARMED.load(Ordering::SeqCst)
+}
+
+pub fn signal_interrupt() {
+    ZOOM_INTERRUPT.store(true, Ordering::SeqCst);
+    request_egui_repaint();
 }
 
 pub fn set_zoom_capture_armed(armed: bool, allow_ctrl_wheel: bool) {
@@ -73,17 +108,18 @@ pub fn take_interrupt() -> bool {
 }
 
 fn record_wheel_wparam(wparam: WPARAM) -> bool {
-    let keys = (wparam & 0xFFFF) as usize;
+    let keys = wparam & 0xFFFF;
     let ctrl = (keys & MK_CONTROL) != 0;
     let shift = (keys & MK_SHIFT) != 0;
     let alt = unsafe { GetKeyState(VK_MENU) < 0 };
     if shift || alt || (ctrl && !ZOOM_CAPTURE_CTRL_WHEEL.load(Ordering::SeqCst)) {
-        ZOOM_INTERRUPT.store(true, Ordering::SeqCst);
+        signal_interrupt();
         return false;
     }
     let delta = ((wparam >> 16) as i16) as i32;
     if delta != 0 {
         ZOOM_WHEEL_DELTA.fetch_add(delta, Ordering::SeqCst);
+        request_egui_repaint();
     }
     true
 }
@@ -103,11 +139,13 @@ unsafe extern "system" fn zoom_stage_wndproc(
         WM_MOUSEWHEEL => {
             if ZOOM_CAPTURE_ARMED.load(Ordering::SeqCst) {
                 record_wheel_wparam(wparam);
+            } else {
+                request_egui_repaint();
             }
             0
         }
         WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_LBUTTONDBLCLK | WM_XBUTTONDOWN => {
-            ZOOM_INTERRUPT.store(true, Ordering::SeqCst);
+            signal_interrupt();
             0
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
@@ -251,8 +289,23 @@ impl ZoomStageWindow {
             return;
         }
         unsafe {
-            let exstyle = GetWindowLongPtrW(main_hwnd, GWL_EXSTYLE);
-            let insert_after = if (exstyle & WS_EX_TOPMOST as isize) != 0 {
+            let main_topmost =
+                (GetWindowLongPtrW(main_hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST as isize) != 0;
+            let self_topmost =
+                (GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST as isize) != 0;
+            if !main_topmost && self_topmost {
+                // Demote out of topmost band first; HWND_TOP alone does not clear WS_EX_TOPMOST.
+                SetWindowPos(
+                    self.hwnd,
+                    HWND_NOTOPMOST,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                );
+            }
+            let insert_after = if main_topmost {
                 HWND_TOPMOST
             } else {
                 let prev = GetWindow(main_hwnd, GW_HWNDPREV);
@@ -290,7 +343,7 @@ impl ZoomStageWindow {
         let needs_alloc = self
             .surface
             .as_ref()
-            .map_or(true, |s| s.width != width || s.height != height);
+            .is_none_or(|s| s.width != width || s.height != height);
         if needs_alloc {
             self.surface = DibSurface::create(width, height);
         }
@@ -378,6 +431,19 @@ pub(crate) fn place_main_under_stage(
             height,
             SWP_NOACTIVATE,
         ) != 0
+    }
+}
+
+pub(crate) fn client_size(hwnd: HWND) -> Option<(i32, i32)> {
+    if hwnd.is_null() {
+        return None;
+    }
+    unsafe {
+        let mut rect: RECT = std::mem::zeroed();
+        if GetClientRect(hwnd, &mut rect) == 0 {
+            return None;
+        }
+        Some((rect.right - rect.left, rect.bottom - rect.top))
     }
 }
 

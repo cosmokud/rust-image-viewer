@@ -42,6 +42,7 @@ impl ImageViewer {
         #[cfg(target_os = "windows")]
         {
             crate::windows_zoom_stage::set_zoom_capture_armed(false, false);
+            self.floating_zoom_settled_zoom = None;
             if let Some(session) = self.floating_zoom_session.take() {
                 if session.main_cloaked {
                     let main_hwnd = self.resolved_main_hwnd();
@@ -81,6 +82,8 @@ impl ImageViewer {
             return true;
         }
 
+        crate::windows_zoom_stage::register_egui_ctx(ctx);
+
         if self.mode().is_fullscreen()
             || !self.mode().is_solo()
             || self.current_window_is_maximized(ctx)
@@ -88,6 +91,10 @@ impl ImageViewer {
             || self.is_panning
             || self.is_seeking
             || self.manga_autoscroll_active
+            || self.title_bar_menu_active
+            || self.file_action_menu.is_some()
+            || self.any_modal_dialog_open()
+            || self.retained_media_placeholder_visible
             || !self.startup_window_shown
             || self.startup_window_cloaked
             || self.viewer_window_hidden
@@ -161,9 +168,8 @@ impl ImageViewer {
         if !self.commit_floating_zoom_frame(entry_frame) {
             return false;
         }
-        if notches < 0.0 {
-            crate::windows_zoom_stage::dwm_flush();
-        }
+        // Wait one DWM composition before cloaking main_hwnd so zoom_hwnd is on screen (0px vanish flash on both zoom-in and zoom-out).
+        crate::windows_zoom_stage::dwm_flush();
         let cloaked = crate::windows_env::set_window_cloaked(main_hwnd, true);
         if !cloaked {
             if let Some(stage) = self.zoom_stage_window.as_mut() {
@@ -175,7 +181,9 @@ impl ImageViewer {
         self.pending_viewer_rect = None;
         self.transition_cover = None;
         self.transition_cover_waits = 0;
+        self.zoom_target = self.zoom;
         self.zoom_velocity = 0.0;
+        self.floating_zoom_settled_zoom = None;
         crate::windows_env::clear_posted_window_rect();
         crate::windows_zoom_stage::set_zoom_capture_armed(true, allow_ctrl_wheel);
 
@@ -264,14 +272,15 @@ impl ImageViewer {
                     session.state.toward_w = session.state.drawn_w;
                 }
 
-                let now = Instant::now();
-                let dt = now.saturating_duration_since(last_tick).as_secs_f32();
-                last_tick = now;
-
-                // Adaptive VSync guard: if cloaked SwapBuffers returned immediately (< 2ms), pace via DwmFlush.
+                // Adaptive VSync guard: if cloaked SwapBuffers returned immediately (< 2ms), pace via DwmFlush
+                // BEFORE sampling dt so dt measures the real elapsed time up to commit.
                 if last_commit.elapsed() < Duration::from_millis(2) {
                     crate::windows_zoom_stage::dwm_flush();
                 }
+
+                let now = Instant::now();
+                let dt = now.saturating_duration_since(last_tick).as_secs_f32();
+                last_tick = now;
 
                 let frame = session.state.step(dt);
                 if !self.commit_floating_zoom_frame(frame) {
@@ -340,13 +349,19 @@ impl ImageViewer {
                     ctx.request_repaint();
                 } else {
                     let screen_px = ctx.screen_rect().size() * ppp;
-                    if (screen_px.x - target_rect.width() as f32).abs() <= 2.5
-                        && (screen_px.y - target_rect.height() as f32).abs() <= 2.5
-                    {
+                    let client_matches = crate::windows_zoom_stage::client_size(main_hwnd)
+                        .is_some_and(|(cw, ch)| {
+                            (cw - target_rect.width()).abs() <= 1
+                                && (ch - target_rect.height()).abs() <= 1
+                                && (screen_px.x - cw as f32).abs() <= 1.0
+                                && (screen_px.y - ch as f32).abs() <= 1.0
+                        });
+                    if client_matches {
                         matched_frames = matched_frames.saturating_add(1);
                     }
 
                     if matched_frames >= 2 || started_at.elapsed() >= Duration::from_millis(150) {
+                        self.floating_zoom_settled_zoom = Some(self.zoom);
                         crate::windows_env::set_window_cloaked(main_hwnd, false);
                         crate::windows_zoom_stage::dwm_flush();
                         if let Some(stage) = self.zoom_stage_window.as_mut() {
@@ -371,16 +386,21 @@ impl ImageViewer {
 
     #[cfg(target_os = "windows")]
     fn has_floating_zoom_source_pixels(&self) -> bool {
+        if self.retained_media_placeholder_visible {
+            return false;
+        }
         if let Some(img) = self.image.as_ref() {
             let f = img.current_frame_data();
             return f.width > 0
                 && f.height > 0
                 && f.pixels.len() >= f.width as usize * f.height as usize * 4;
         }
-        if let Some(vf) = self.last_video_frame.as_ref() {
-            return vf.width > 0
-                && vf.height > 0
-                && vf.pixels.len() >= vf.width as usize * vf.height as usize * 4;
+        if self.video_player.is_some() {
+            if let Some(vf) = self.last_video_frame.as_ref() {
+                return vf.width > 0
+                    && vf.height > 0
+                    && vf.pixels.len() >= vf.width as usize * vf.height as usize * 4;
+            }
         }
         false
     }
@@ -421,27 +441,29 @@ impl ImageViewer {
             );
         }
 
-        if let Some(vf) = self.last_video_frame.as_ref() {
-            return stage.commit(
-                frame.window_rect.left,
-                frame.window_rect.top,
-                win_w,
-                win_h,
-                |dst| {
-                    resample_rgba_to_bgra(
-                        &vf.pixels,
-                        vf.width,
-                        vf.height,
-                        dst,
-                        win_w,
-                        win_h,
-                        frame.picture_rect,
-                        bg_rgb,
-                        flip_h,
-                        flip_v,
-                    );
-                },
-            );
+        if self.video_player.is_some() {
+            if let Some(vf) = self.last_video_frame.as_ref() {
+                return stage.commit(
+                    frame.window_rect.left,
+                    frame.window_rect.top,
+                    win_w,
+                    win_h,
+                    |dst| {
+                        resample_rgba_to_bgra(
+                            &vf.pixels,
+                            vf.width,
+                            vf.height,
+                            dst,
+                            win_w,
+                            win_h,
+                            frame.picture_rect,
+                            bg_rgb,
+                            flip_h,
+                            flip_v,
+                        );
+                    },
+                );
+            }
         }
 
         false

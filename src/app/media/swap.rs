@@ -88,6 +88,7 @@ impl ImageViewer {
             if let Some(texture) = self.video_texture.take() {
                 drop(texture);
             }
+            self.last_video_frame = None;
             self.video_texture_source_path = None;
             self.video_texture_dims = None;
         }
@@ -106,6 +107,7 @@ impl ImageViewer {
         self.zoom_velocity = 0.0;
         self.zoom = 1.0;
         self.zoom_target = 1.0;
+        self.floating_zoom_settled_zoom = None;
         self.current_rotation_steps = 0;
         self.reset_precise_rotation();
         self.flip_horizontal = false;

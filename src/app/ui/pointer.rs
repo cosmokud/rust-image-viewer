@@ -297,6 +297,13 @@ impl ImageViewer {
         {
             return;
         }
+        // Prevent autosize from fighting/shifting a rect just settled by the layered floating zoom stage.
+        if let Some(settled_zoom) = self.floating_zoom_settled_zoom {
+            if (settled_zoom - self.zoom).abs() < 1e-5 {
+                return;
+            }
+            self.floating_zoom_settled_zoom = None;
+        }
 
         // A Win chord moves the window from outside the app. The rectangle egui still holds is
         // the one from before that move, so sizing the window from it here would undo the chord

@@ -2166,9 +2166,9 @@ unsafe extern "system" fn scale_change_wndproc(
     lparam: LPARAM,
 ) -> LRESULT {
     use winapi::um::winuser::{
-        CallWindowProcW, SC_MAXIMIZE, WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN,
-        WM_KEYUP, WM_MOUSEWHEEL, WM_MOVE, WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP,
-        WM_WINDOWPOSCHANGED, WM_WINDOWPOSCHANGING,
+        CallWindowProcW, SC_MAXIMIZE, WA_INACTIVE, WM_ACTIVATE, WM_DPICHANGED, WM_ERASEBKGND,
+        WM_GETMINMAXINFO, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_MOUSEWHEEL, WM_MOVE, WM_SIZE,
+        WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_WINDOWPOSCHANGED, WM_WINDOWPOSCHANGING,
     };
 
     let previous = PREVIOUS_WNDPROC.load(Ordering::SeqCst);
@@ -2179,6 +2179,13 @@ unsafe extern "system" fn scale_change_wndproc(
 
     if msg == WM_MOUSEWHEEL && crate::windows_zoom_stage::try_consume_main_wheel(wparam) {
         return 0;
+    }
+
+    if crate::windows_zoom_stage::is_zoom_capture_armed()
+        && (msg == WM_KILLFOCUS
+            || (msg == WM_ACTIVATE && (wparam & 0xFFFF) == WA_INACTIVE as WPARAM))
+    {
+        crate::windows_zoom_stage::signal_interrupt();
     }
 
     if msg == WM_PLACE_RECT {
