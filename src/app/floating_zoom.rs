@@ -163,12 +163,9 @@ impl FloatingZoomState {
             .min(FLOATING_ZOOM_CEILING_PX);
 
         let pan = if drawn_w > cap_w + 0.01 {
-            let max_pan_x = ((drawn_w - win_w) * 0.5).max(0.0);
-            let max_pan_y =
-                ((drawn_w * aspect - init.window_rect.height().max(1) as f32) * 0.5).max(0.0);
             (
-                (init.current_offset_pt.0 * ppp).clamp(-max_pan_x, max_pan_x),
-                (init.current_offset_pt.1 * ppp).clamp(-max_pan_y, max_pan_y),
+                init.current_offset_pt.0 * ppp,
+                init.current_offset_pt.1 * ppp,
             )
         } else {
             (0.0, 0.0)
@@ -321,12 +318,7 @@ impl FloatingZoomState {
                 (self.pan.0 * scale, self.pan.1 * scale)
             };
             let drawn_h = self.drawn_w * self.aspect;
-            let max_pan_x = ((self.drawn_w - win_w) * 0.5).max(0.0);
-            let max_pan_y = ((drawn_h - win_h) * 0.5).max(0.0);
-            self.pan = (
-                new_pan_x.clamp(-max_pan_x, max_pan_x),
-                new_pan_y.clamp(-max_pan_y, max_pan_y),
-            );
+            self.pan = (new_pan_x, new_pan_y);
             (
                 (win_w - self.drawn_w) * 0.5 + self.pan.0,
                 (win_h - drawn_h) * 0.5 + self.pan.1,
@@ -406,24 +398,17 @@ pub(crate) fn resolve_floating_zoom_drag_takeover(
 }
 
 /// Applies one physical-pixel cursor delta to floating-mode image pan offset (in logical points),
-/// clamping so the image always covers the window (0px black bars) across any DPI scale.
+/// allowing free panning across any DPI scale.
 pub(crate) fn apply_floating_pan_step_phys(
     current_offset_pt: (f32, f32),
     prev_cursor_phys: (f32, f32),
     current_cursor_phys: (f32, f32),
     pixels_per_point: f32,
-    display_size_pt: (f32, f32),
-    window_size_pt: (f32, f32),
 ) -> (f32, f32) {
     let ppp = pixels_per_point.max(0.01);
     let dx = (current_cursor_phys.0 - prev_cursor_phys.0) / ppp;
     let dy = (current_cursor_phys.1 - prev_cursor_phys.1) / ppp;
-    let max_x = ((display_size_pt.0 - window_size_pt.0) * 0.5).max(0.0);
-    let max_y = ((display_size_pt.1 - window_size_pt.1) * 0.5).max(0.0);
-    (
-        (current_offset_pt.0 + dx).clamp(-max_x, max_x),
-        (current_offset_pt.1 + dy).clamp(-max_y, max_y),
-    )
+    (current_offset_pt.0 + dx, current_offset_pt.1 + dy)
 }
 
 /// Smoothstep factor in `[0, 1]` that eases Stage 2 pan back to `(0, 0)` over the last notch
@@ -575,6 +560,22 @@ pub(crate) fn resample_rgba_to_bgra(
     let bg_r = bg_rgb[0] as u32;
     let bg_g = bg_rgb[1] as u32;
     let bg_b = bg_rgb[2] as u32;
+    let bg_pixel = [bg_rgb[2], bg_rgb[1], bg_rgb[0], 255];
+
+    // Destination pixel index ranges whose pixel center `(dst + 0.5)` lies inside
+    // `[exact.0, exact.0 + exact.2) x [exact.1, exact.1 + exact.3)`.
+    // Pixels outside this rect are filled with opaque `bg_rgb` (no edge smearing on free Stage 2 pan),
+    // while Stage 1 cover-fit rects always cover `[0, dst_w) x [0, dst_h)` with 0px background bars.
+    let x_min = (exact.0 as f64 - 0.5).ceil().clamp(0.0, dst_w as f64) as usize;
+    let x_max = ((exact.0 as f64 + exact.2 as f64 - 0.5)
+        .ceil()
+        .clamp(0.0, dst_w as f64) as usize)
+        .max(x_min);
+    let y_min = (exact.1 as f64 - 0.5).ceil().clamp(0.0, dst_h as f64) as usize;
+    let y_max = ((exact.1 as f64 + exact.3 as f64 - 0.5)
+        .ceil()
+        .clamp(0.0, dst_h as f64) as usize)
+        .max(y_min);
 
     let total_rows = dst_h as usize;
     let threads = resample_thread_count(total_rows);
@@ -590,6 +591,15 @@ pub(crate) fn resample_rgba_to_bgra(
             scope.spawn(move || {
                 for (local_y, dst_row) in band_buf.chunks_mut(dst_row_bytes).enumerate() {
                     let y = start_y + local_y;
+                    let row_pixels = dst_row.as_chunks_mut::<4>().0;
+                    if y < y_min || y >= y_max || x_min >= x_max {
+                        row_pixels.fill(bg_pixel);
+                        continue;
+                    }
+
+                    row_pixels[..x_min].fill(bg_pixel);
+                    row_pixels[x_max..].fill(bg_pixel);
+
                     let raw_sy = (y as i64)
                         .saturating_mul(step_y as i64)
                         .saturating_add(base_y)
@@ -607,7 +617,8 @@ pub(crate) fn resample_rgba_to_bgra(
                     let bottom =
                         &src_rgba[bottom_row * src_row_bytes..(bottom_row + 1) * src_row_bytes];
 
-                    for (x, pixel) in dst_row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                    for (offset_x, pixel) in row_pixels[x_min..x_max].iter_mut().enumerate() {
+                        let x = x_min + offset_x;
                         let raw_sx = (x as i64)
                             .saturating_mul(step_x as i64)
                             .saturating_add(base_x)
@@ -724,7 +735,7 @@ mod tests {
     }
 
     #[test]
-    fn two_stage_zoom_grows_caps_clamps_pan_and_shrinks_with_zero_black_bars() {
+    fn two_stage_zoom_grows_caps_preserves_free_pan_and_shrinks_with_zero_black_bars() {
         let mut state = FloatingZoomState::new(FloatingZoomInit {
             window_rect: PhysicalRect::new(560, 240, 1360, 840), // 800x600 centered at (960, 540)
             monitor_rect: monitor_1080p(),
@@ -768,19 +779,15 @@ mod tests {
         assert_eq!(frame.window_rect.height(), 1080);
         assert!(frame.picture_rect.2 > 1440.0);
 
-        // Inject extreme pan and step -> pan must clamp so image never exposes black bars.
-        state.pan = (9999.0, -9999.0);
+        // Inject free pan well beyond image edges -> pan stays unclamped in Stage 2.
+        state.pan = (2500.0, -1800.0);
         frame = state.step(0.016);
-        let (px, py, pw, ph) = frame.picture_rect;
-        assert!(px <= 0.01, "left edge exposed: {px}");
-        assert!(py <= 0.01, "top edge exposed: {py}");
+        assert!((state.pan.0 - 2500.0).abs() < 1e-3);
+        assert!((state.pan.1 - (-1800.0)).abs() < 1e-3);
+        assert!(frame.picture_rect.0 > 0.0, "expected uncovered left region");
         assert!(
-            px + pw >= frame.window_rect.width() as f32 - 0.01,
-            "right edge exposed"
-        );
-        assert!(
-            py + ph >= frame.window_rect.height() as f32 - 0.01,
-            "bottom edge exposed"
+            frame.picture_rect.1 + frame.picture_rect.3 < frame.window_rect.height() as f32,
+            "expected uncovered bottom region"
         );
 
         // Zoom back out: first crossing detents at cap (1440x1080), then shrinks to aspect-locked floor (64x48).
@@ -1342,59 +1349,175 @@ mod tests {
     }
 
     #[test]
-    fn phase2_global_cursor_pan_delta_and_clamping_across_dpi_scales() {
+    fn phase2_global_cursor_pan_moves_freely_across_dpi_scales() {
         for &ppp in &[1.0f32, 1.25, 1.5, 2.0] {
-            let win_pt = (1000.0 / ppp, 800.0 / ppp);
-            let display_pt = (1400.0 / ppp, 1200.0 / ppp);
-            let max_x = (display_pt.0 - win_pt.0) * 0.5;
-            let max_y = (display_pt.1 - win_pt.1) * 0.5;
-
             // Zero movement -> zero jump.
-            let o0 = apply_floating_pan_step_phys(
-                (10.0, -5.0),
-                (500.0, 400.0),
-                (500.0, 400.0),
-                ppp,
-                display_pt,
-                win_pt,
-            );
+            let o0 =
+                apply_floating_pan_step_phys((10.0, -5.0), (500.0, 400.0), (500.0, 400.0), ppp);
             assert!((o0.0 - 10.0).abs() < 1e-4 && (o0.1 - (-5.0)).abs() < 1e-4);
 
             // Physical delta scales cleanly by 1 / ppp.
-            let o1 = apply_floating_pan_step_phys(
-                (0.0, 0.0),
-                (500.0, 400.0),
-                (550.0, 360.0),
-                ppp,
-                display_pt,
-                win_pt,
-            );
+            let o1 = apply_floating_pan_step_phys((0.0, 0.0), (500.0, 400.0), (550.0, 360.0), ppp);
             assert!((o1.0 - 50.0 / ppp).abs() < 1e-4);
             assert!((o1.1 - (-40.0 / ppp)).abs() < 1e-4);
 
-            // Extreme drag clamps strictly to image overhang -> 0px black bars.
-            let clamped = apply_floating_pan_step_phys(
-                o1,
-                (550.0, 360.0),
-                (5550.0, -4640.0),
-                ppp,
-                display_pt,
-                win_pt,
-            );
-            assert!((clamped.0 - max_x).abs() < 1e-4);
-            assert!((clamped.1 - (-max_y)).abs() < 1e-4);
+            // Large drag moves freely well beyond any image overhang without clamping.
+            let far = apply_floating_pan_step_phys(o1, (550.0, 360.0), (5550.0, -4640.0), ppp);
+            assert!((far.0 - 5050.0 / ppp).abs() < 1e-3);
+            assert!((far.1 - (-5040.0 / ppp)).abs() < 1e-3);
 
-            // Reversing direction from clamped edge moves immediately (no dead zone).
-            let backed = apply_floating_pan_step_phys(
-                clamped,
-                (5550.0, -4640.0),
-                (5530.0, -4620.0),
-                ppp,
-                display_pt,
-                win_pt,
-            );
-            assert!((backed.0 - (max_x - 20.0 / ppp)).abs() < 1e-4);
-            assert!((backed.1 - (-max_y + 20.0 / ppp)).abs() < 1e-4);
+            // Reversing direction moves immediately.
+            let backed =
+                apply_floating_pan_step_phys(far, (5550.0, -4640.0), (5530.0, -4620.0), ppp);
+            assert!((backed.0 - 5030.0 / ppp).abs() < 1e-3);
+            assert!((backed.1 - (-5020.0 / ppp)).abs() < 1e-3);
         }
+    }
+
+    #[test]
+    fn stage2_cursor_anchored_zoom_preserves_free_pan_and_returns_home_on_zoom_out() {
+        let monitor = monitor_1080p();
+        let cap_rect = PhysicalRect::new(240, 0, 1680, 1080); // 1440x1080
+                                                              // Start in Stage 2 (2x cap = 2880x2160) with a large free pan well past image edges
+                                                              // (max edge-clamped pan would be 720x540; use (1200, -900) so background is exposed).
+        let initial_offset = (1200.0f32, -900.0f32);
+        let mut state = FloatingZoomState::new(FloatingZoomInit {
+            window_rect: cap_rect,
+            monitor_rect: monitor,
+            media_w: 1440.0,
+            media_h: 1080.0,
+            current_zoom: 2.0,
+            current_offset_pt: initial_offset,
+            pixels_per_point: 1.0,
+            max_zoom_factor: 10.0,
+            config_zoom_step: 1.10,
+            inside_window_locked: false,
+        })
+        .unwrap();
+
+        // Frame 0 preserves the full unclamped offset with 0px snap.
+        assert!((state.pan.0 - initial_offset.0).abs() < 1e-3);
+        assert!((state.pan.1 - initial_offset.1).abs() < 1e-3);
+        let f0 = state.current_frame();
+        assert!(f0.is_stage2);
+        assert!(f0.picture_rect.0 > 0.0, "left background should be exposed");
+
+        let cursor = (900i32, 600i32);
+        let local_cx = (cursor.0 - cap_rect.left) as f32;
+        let local_cy = (cursor.1 - cap_rect.top) as f32;
+        let expected_u = (local_cx - f0.picture_rect.0) / f0.picture_rect.2;
+        let expected_v = (local_cy - f0.picture_rect.1) / f0.picture_rect.3;
+
+        // Zoom in 3 notches around cursor: image point under cursor stays invariant and pan does not snap back.
+        state.add_notches_at(3.0, Some(cursor));
+        let mut frame = f0;
+        for _ in 0..120 {
+            frame = state.step(0.016);
+            let (px, py, pw, ph) = frame.picture_rect;
+            let u = (local_cx - px) / pw;
+            let v = (local_cy - py) / ph;
+            assert!(
+                (u - expected_u).abs() < 1e-3,
+                "u drifted: {u} vs {expected_u}"
+            );
+            assert!(
+                (v - expected_v).abs() < 1e-3,
+                "v drifted: {v} vs {expected_v}"
+            );
+        }
+        assert!(frame.settled && frame.is_stage2);
+        assert!(
+            frame.picture_rect.0 > 0.0,
+            "free pan must not snap back to left edge during Stage 2 zoom"
+        );
+
+        // Zoom all the way out back to Stage 1 -> home_share smoothly eases pan back to (0.0, 0.0).
+        state.add_notches_at(-30.0, Some(cursor));
+        let mut prev_pan_len = f32::INFINITY;
+        for _ in 0..180 {
+            frame = state.step(0.016);
+            if frame.is_stage2 && state.drawn_w < frame.window_rect.width() as f32 * 1.10 {
+                let pan_len = state.pan.0.hypot(state.pan.1);
+                assert!(
+                    pan_len <= prev_pan_len + 1e-2,
+                    "pan did not ease monotonically home: {pan_len} > {prev_pan_len}"
+                );
+                prev_pan_len = pan_len;
+            }
+        }
+        assert!(frame.settled && !frame.is_stage2);
+        assert_eq!(state.pan, (0.0, 0.0));
+        let (px, py, pw, ph) = frame.picture_rect;
+        assert!(px <= 0.01 && py <= 0.01);
+        assert!(px + pw >= frame.window_rect.width() as f32 - 0.01);
+        assert!(py + ph >= frame.window_rect.height() as f32 - 0.01);
+    }
+
+    #[test]
+    fn resample_rgba_to_bgra_fills_uncovered_stage2_regions_with_bg_without_smearing() {
+        // 4x4 opaque red source image.
+        let mut src = Vec::with_capacity(4 * 4 * 4);
+        for _ in 0..16 {
+            src.extend_from_slice(&[255, 0, 0, 255]);
+        }
+        let bg = [12u8, 34u8, 56u8];
+        let bg_bgra = [56u8, 34u8, 12u8, 255u8];
+        let red_bgra = [0u8, 0u8, 255u8, 255u8];
+
+        // Case 1: Stage 2 freely panned so image covers [4..12) x [3..9) inside a 16x12 destination.
+        let mut dst = vec![0u8; 16 * 12 * 4];
+        resample_rgba_to_bgra(
+            &src,
+            4,
+            4,
+            &mut dst,
+            16,
+            12,
+            (4.0, 3.0, 8.0, 6.0),
+            bg,
+            false,
+            false,
+        );
+        for y in 0..12usize {
+            for x in 0..16usize {
+                let idx = (y * 16 + x) * 4;
+                let px = &dst[idx..idx + 4];
+                let inside = (4..12).contains(&x) && (3..9).contains(&y);
+                if inside {
+                    assert_eq!(px, &red_bgra, "expected image pixel at ({x},{y})");
+                } else {
+                    assert_eq!(px, &bg_bgra, "expected bg_rgb (no edge smear) at ({x},{y})");
+                }
+            }
+        }
+
+        // Case 2: Stage 2 panned completely off-screen -> 100% bg_rgb.
+        for &exact in &[(20.0f32, 20.0, 8.0, 6.0), (-20.0, -20.0, 8.0, 6.0)] {
+            let mut off = vec![0u8; 16 * 12 * 4];
+            resample_rgba_to_bgra(&src, 4, 4, &mut off, 16, 12, exact, bg, false, false);
+            assert!(
+                off.as_chunks::<4>().0.iter().all(|&p| p == bg_bgra),
+                "off-screen exact={exact:?} must fill 100% with bg_rgb"
+            );
+        }
+
+        // Case 3: Stage 1 cover-fit rect -> 100% image pixels, zero background pixels.
+        let mut stage1 = vec![0u8; 16 * 12 * 4];
+        resample_rgba_to_bgra(
+            &src,
+            4,
+            4,
+            &mut stage1,
+            16,
+            12,
+            (0.0, -0.25, 16.0, 12.5),
+            bg,
+            false,
+            false,
+        );
+        assert!(
+            stage1.as_chunks::<4>().0.iter().all(|&p| p == red_bgra),
+            "Stage 1 must have 100% coverage with zero background pixels"
+        );
     }
 }
