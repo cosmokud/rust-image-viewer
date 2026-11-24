@@ -15,10 +15,14 @@ impl ImageViewer {
             return false;
         };
 
+        let ppp = ctx.pixels_per_point();
         ctx.input(|i| i.raw.viewport().inner_rect)
             .map(|inner_rect| {
-                display_size.x > inner_rect.width() + 1.0
-                    || display_size.y > inner_rect.height() + 1.0
+                floating_image_exceeds_window_size(
+                    (display_size.x, display_size.y),
+                    (inner_rect.width(), inner_rect.height()),
+                    ppp,
+                )
             })
             .unwrap_or(false)
     }

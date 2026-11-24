@@ -2177,7 +2177,7 @@ unsafe extern "system" fn scale_change_wndproc(
     }
     let previous: WNDPROC = std::mem::transmute(previous);
 
-    if msg == WM_MOUSEWHEEL && crate::windows_zoom_stage::try_consume_main_wheel(wparam) {
+    if msg == WM_MOUSEWHEEL && crate::windows_zoom_stage::try_consume_main_wheel(wparam, lparam) {
         return 0;
     }
 

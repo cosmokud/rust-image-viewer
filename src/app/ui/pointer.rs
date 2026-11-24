@@ -333,8 +333,15 @@ impl ImageViewer {
 
         // While the zoomed media already exceeds the current floating viewport, keep this
         // "zoom inside window" mode stable and do not autosize the native window.
+        let ppp = ctx.pixels_per_point();
         let zoom_inside_current_viewport = current_inner_rect
-            .map(|rect| desired.x > rect.width() + 1.0 || desired.y > rect.height() + 1.0)
+            .map(|rect| {
+                floating_image_exceeds_window_size(
+                    (desired.x, desired.y),
+                    (rect.width(), rect.height()),
+                    ppp,
+                )
+            })
             .unwrap_or(false);
         if zoom_inside_current_viewport && self.floating_zoom_inside_window_locked {
             return;

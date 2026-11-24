@@ -4,7 +4,7 @@
 
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Mutex, Once};
 
 use winapi::shared::minwindef::{LPARAM, LRESULT, UINT, WPARAM};
@@ -14,11 +14,11 @@ use winapi::um::wingdi::{
     AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, DIB_RGB_COLORS,
 };
 use winapi::um::winuser::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetKeyState, GetWindow,
-    GetWindowLongPtrW, LoadCursorW, RegisterClassExW, SetCursor, SetWindowPos, ShowWindow,
-    UpdateLayeredWindow, GWL_EXSTYLE, GW_HWNDPREV, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST,
-    IDC_ARROW, MA_NOACTIVATE, MK_CONTROL, MK_SHIFT, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SW_HIDE, SW_SHOWNOACTIVATE, ULW_ALPHA, VK_MENU, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetCursorPos, GetKeyState,
+    GetWindow, GetWindowLongPtrW, LoadCursorW, RegisterClassExW, SetCursor, SetWindowPos,
+    ShowWindow, UpdateLayeredWindow, GWL_EXSTYLE, GW_HWNDPREV, HWND_NOTOPMOST, HWND_TOP,
+    HWND_TOPMOST, IDC_ARROW, MA_NOACTIVATE, MK_CONTROL, MK_SHIFT, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOSIZE, SW_HIDE, SW_SHOWNOACTIVATE, ULW_ALPHA, VK_MENU, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
     WM_MBUTTONDOWN, WM_MOUSEACTIVATE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_SETCURSOR, WM_XBUTTONDOWN,
     WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
@@ -32,6 +32,9 @@ static ZOOM_CAPTURE_ARMED: AtomicBool = AtomicBool::new(false);
 static ZOOM_CAPTURE_CTRL_WHEEL: AtomicBool = AtomicBool::new(false);
 /// Signed raw Win32 wheel delta (120 = 1 notch) accumulated from both `zoom_hwnd` and `main_hwnd`.
 static ZOOM_WHEEL_DELTA: AtomicI32 = AtomicI32::new(0);
+/// Packed physical screen `(x, y)` cursor position from the latest `WM_MOUSEWHEEL` (`x` low 32, `y` high 32).
+static ZOOM_WHEEL_CURSOR: AtomicU64 = AtomicU64::new(0);
+static ZOOM_WHEEL_CURSOR_VALID: AtomicBool = AtomicBool::new(false);
 /// Set on pointer button press over `zoom_hwnd` or focus loss to trigger immediate settle/handoff.
 static ZOOM_INTERRUPT: AtomicBool = AtomicBool::new(false);
 /// Cloned `egui::Context` so WndProc hooks can wake an idle winit/eframe loop immediately.
@@ -82,21 +85,38 @@ pub fn set_zoom_capture_armed(armed: bool, allow_ctrl_wheel: bool) {
     ZOOM_CAPTURE_ARMED.store(armed, Ordering::SeqCst);
     if !armed {
         ZOOM_WHEEL_DELTA.store(0, Ordering::SeqCst);
+        ZOOM_WHEEL_CURSOR_VALID.store(false, Ordering::SeqCst);
         ZOOM_INTERRUPT.store(false, Ordering::SeqCst);
     }
 }
 
 /// Called from `main_hwnd`'s WndProc hook on `WM_MOUSEWHEEL`.
 /// Returns `true` if the wheel message was consumed by the active floating zoom stage.
-pub fn try_consume_main_wheel(wparam: WPARAM) -> bool {
+pub fn try_consume_main_wheel(wparam: WPARAM, lparam: LPARAM) -> bool {
     if !ZOOM_CAPTURE_ARMED.load(Ordering::SeqCst) {
         return false;
     }
-    record_wheel_wparam(wparam)
+    record_wheel_wparam(wparam, lparam)
 }
 
-pub fn take_wheel_delta() -> i32 {
-    ZOOM_WHEEL_DELTA.swap(0, Ordering::SeqCst)
+pub fn take_wheel_delta_and_cursor() -> (i32, Option<(i32, i32)>) {
+    let delta = ZOOM_WHEEL_DELTA.swap(0, Ordering::SeqCst);
+    let cursor = if ZOOM_WHEEL_CURSOR_VALID.load(Ordering::SeqCst) {
+        let packed = ZOOM_WHEEL_CURSOR.load(Ordering::SeqCst);
+        Some((packed as u32 as i32, (packed >> 32) as u32 as i32))
+    } else {
+        None
+    };
+    (delta, cursor)
+}
+
+pub fn cursor_screen_point() -> Option<(i32, i32)> {
+    let mut pt = POINT { x: 0, y: 0 };
+    if unsafe { GetCursorPos(&mut pt) } != 0 {
+        Some((pt.x, pt.y))
+    } else {
+        None
+    }
 }
 
 pub fn peek_wheel_delta() -> i32 {
@@ -107,7 +127,7 @@ pub fn take_interrupt() -> bool {
     ZOOM_INTERRUPT.swap(false, Ordering::SeqCst)
 }
 
-fn record_wheel_wparam(wparam: WPARAM) -> bool {
+fn record_wheel_wparam(wparam: WPARAM, lparam: LPARAM) -> bool {
     let keys = wparam & 0xFFFF;
     let ctrl = (keys & MK_CONTROL) != 0;
     let shift = (keys & MK_SHIFT) != 0;
@@ -118,6 +138,12 @@ fn record_wheel_wparam(wparam: WPARAM) -> bool {
     }
     let delta = ((wparam >> 16) as i16) as i32;
     if delta != 0 {
+        // WM_MOUSEWHEEL lparam carries physical screen coordinates (signed 16-bit x, y).
+        let x = (lparam & 0xFFFF) as i16 as i32;
+        let y = ((lparam >> 16) & 0xFFFF) as i16 as i32;
+        let packed = (x as u32 as u64) | ((y as u32 as u64) << 32);
+        ZOOM_WHEEL_CURSOR.store(packed, Ordering::SeqCst);
+        ZOOM_WHEEL_CURSOR_VALID.store(true, Ordering::SeqCst);
         ZOOM_WHEEL_DELTA.fetch_add(delta, Ordering::SeqCst);
         request_egui_repaint();
     }
@@ -138,7 +164,7 @@ unsafe extern "system" fn zoom_stage_wndproc(
         }
         WM_MOUSEWHEEL => {
             if ZOOM_CAPTURE_ARMED.load(Ordering::SeqCst) {
-                record_wheel_wparam(wparam);
+                record_wheel_wparam(wparam, lparam);
             } else {
                 request_egui_repaint();
             }

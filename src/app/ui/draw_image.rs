@@ -32,9 +32,14 @@ impl ImageViewer {
         let floating_image_exceeds_window = if self.mode().is_fullscreen() {
             false
         } else {
+            let ppp = ctx.pixels_per_point();
             self.image_display_size_at_zoom()
                 .map(|size| {
-                    size.x > screen_rect.width() + 0.5 || size.y > screen_rect.height() + 0.5
+                    floating_image_exceeds_window_size(
+                        (size.x, size.y),
+                        (screen_rect.width(), screen_rect.height()),
+                        ppp,
+                    )
                 })
                 .unwrap_or(false)
         };
@@ -563,8 +568,15 @@ impl ImageViewer {
                             self.drag_floating_window_without_native_snap(ctx);
                         } else {
                             self.reset_floating_window_drag_anchor();
-                            // In floating mode when zoomed past 100%, pan image inside window
+                            // In floating mode when zoomed past window, pan image inside window (clamped: 0px black bars).
                             self.offset += drag_delta;
+                            if let Some(display_size) = self.image_display_size_at_zoom() {
+                                let max_x = ((display_size.x - screen_rect.width()) * 0.5).max(0.0);
+                                let max_y =
+                                    ((display_size.y - screen_rect.height()) * 0.5).max(0.0);
+                                self.offset.x = self.offset.x.clamp(-max_x, max_x);
+                                self.offset.y = self.offset.y.clamp(-max_y, max_y);
+                            }
                         }
                         self.last_mouse_pos = Some(cursor);
                     } else if self.pan_drag_moves_window && !self.mode().is_fullscreen() {

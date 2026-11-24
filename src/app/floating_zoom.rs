@@ -113,6 +113,8 @@ pub(crate) struct FloatingZoomState {
     pub(crate) drawn_w: f32,
     pub(crate) toward_w: f32,
     pub(crate) pan: (f32, f32),
+    /// Latched physical screen cursor `(x, y)` for Stage 2 cursor-anchored zoom; ignored in Stage 1.
+    pub(crate) anchor: Option<(i32, i32)>,
     pub(crate) fit_monitor_w: f32,
     pub(crate) cap_w: f32,
     pub(crate) floor_w: f32,
@@ -181,6 +183,7 @@ impl FloatingZoomState {
             drawn_w,
             toward_w: drawn_w.clamp(floor_w, ceiling_w),
             pan,
+            anchor: None,
             fit_monitor_w,
             cap_w,
             floor_w,
@@ -192,10 +195,14 @@ impl FloatingZoomState {
         })
     }
 
-    /// Accumulates signed fractional wheel notches onto `toward_w` (never onto `drawn_w`).
-    pub(crate) fn add_notches(&mut self, notches: f32) {
+    /// Accumulates signed fractional wheel notches onto `toward_w` (never onto `drawn_w`)
+    /// and latches the physical screen cursor `anchor` for Stage 2 cursor-anchored zoom.
+    pub(crate) fn add_notches_at(&mut self, notches: f32, anchor: Option<(i32, i32)>) {
         if !notches.is_finite() || notches == 0.0 {
             return;
+        }
+        if anchor.is_some() {
+            self.anchor = anchor;
         }
         let prev_toward = self.toward_w;
         let factor = notch_step_factor(self.per_notch, notches);
@@ -213,6 +220,11 @@ impl FloatingZoomState {
         }
 
         self.toward_w = next;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn add_notches(&mut self, notches: f32) {
+        self.add_notches_at(notches, None);
     }
 
     pub(crate) fn is_settled(&self) -> bool {
@@ -266,16 +278,48 @@ impl FloatingZoomState {
                 cover_h,
             )
         } else {
-            let scale_ratio = if prev_drawn_w > 0.0 {
-                self.drawn_w / prev_drawn_w
+            // Smooth Stage 1 -> Stage 2 crossing: scale only the overhang past `cap_w` around the cursor.
+            let base_w = if prev_drawn_w <= self.cap_w + 0.01 {
+                self.cap_w
+            } else {
+                prev_drawn_w
+            };
+            let scale = if base_w > 0.0 {
+                self.drawn_w / base_w
             } else {
                 1.0
+            };
+            let home_return_share = if self.drawn_w < prev_drawn_w {
+                home_share(self.drawn_w - win_w, win_w)
+            } else {
+                1.0
+            };
+            let (new_pan_x, new_pan_y) = if home_return_share < 1.0 {
+                // Within the last notch of overhang on zoom-out, smoothly ease pan home to (0, 0) without overshooting.
+                (
+                    self.pan.0 * home_return_share,
+                    self.pan.1 * home_return_share,
+                )
+            } else if let Some((ax, ay)) = self.anchor {
+                let (box_cx, box_cy) = placed.centre_f32();
+                let px = (ax as f32).clamp(placed.left as f32, placed.right as f32);
+                let py = (ay as f32).clamp(placed.top as f32, placed.bottom as f32);
+                let exact_img_cx = box_cx + self.pan.0;
+                let exact_img_cy = box_cy + self.pan.1;
+                (
+                    (px - box_cx) + (exact_img_cx - px) * scale,
+                    (py - box_cy) + (exact_img_cy - py) * scale,
+                )
+            } else {
+                (self.pan.0 * scale, self.pan.1 * scale)
             };
             let drawn_h = self.drawn_w * self.aspect;
             let max_pan_x = ((self.drawn_w - win_w) * 0.5).max(0.0);
             let max_pan_y = ((drawn_h - win_h) * 0.5).max(0.0);
-            self.pan.0 = (self.pan.0 * scale_ratio).clamp(-max_pan_x, max_pan_x);
-            self.pan.1 = (self.pan.1 * scale_ratio).clamp(-max_pan_y, max_pan_y);
+            self.pan = (
+                new_pan_x.clamp(-max_pan_x, max_pan_x),
+                new_pan_y.clamp(-max_pan_y, max_pan_y),
+            );
             (
                 (win_w - self.drawn_w) * 0.5 + self.pan.0,
                 (win_h - drawn_h) * 0.5 + self.pan.1,
@@ -307,6 +351,56 @@ impl FloatingZoomState {
             let zoom = self.drawn_w / (self.media_w * ppp);
             (zoom, (self.pan.0 / ppp, self.pan.1 / ppp))
         }
+    }
+}
+
+/// Smoothstep factor in `[0, 1]` that eases Stage 2 pan back to `(0, 0)` over the last notch
+/// (`10%` of window width) of overhang when zooming out toward the cap.
+pub(crate) fn home_share(overhang: f32, window: f32) -> f32 {
+    let last = window * (DEFAULT_FLOATING_ZOOM_PER_NOTCH - 1.0);
+    if last <= 0.0 || overhang >= last {
+        return 1.0;
+    }
+    let t = (overhang / last).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// True when the displayed image genuinely exceeds the floating window (Stage 2 / zoomed-inside-window),
+/// excluding the cover-fit overhang produced by integer physical-pixel window quantization in Stage 1.
+pub(crate) fn floating_image_exceeds_window_size(
+    display_size_pt: (f32, f32),
+    window_size_pt: (f32, f32),
+    pixels_per_point: f32,
+) -> bool {
+    let ppp = pixels_per_point.max(0.01);
+    const TOL_PT: f32 = 0.5;
+    let exceeds_x = display_size_pt.0 > window_size_pt.0 + TOL_PT;
+    let exceeds_y = display_size_pt.1 > window_size_pt.1 + TOL_PT;
+    if !exceeds_x && !exceeds_y {
+        return false;
+    }
+    if exceeds_x && exceeds_y {
+        return true;
+    }
+    // Single-axis overhang: Stage 1 cover-fit matches the other axis to the window edge and
+    // leaves <= 2 physical px of aspect-quantization slack when shrunk to fit the overhanging axis.
+    let dw = display_size_pt.0 * ppp;
+    let dh = display_size_pt.1 * ppp;
+    let ww = window_size_pt.0 * ppp;
+    let wh = window_size_pt.1 * ppp;
+    if dw <= 0.0 || dh <= 0.0 || ww <= 0.0 || wh <= 0.0 {
+        return false;
+    }
+    if exceeds_x {
+        let y_at_edge = (dh - wh).abs() <= 1.5;
+        let contain_gap_y = wh - ww * (dh / dw);
+        let min_slack_px = (dw - ww).min(contain_gap_y);
+        !(y_at_edge && min_slack_px <= 2.0)
+    } else {
+        let x_at_edge = (dw - ww).abs() <= 1.5;
+        let contain_gap_x = ww - wh * (dw / dh);
+        let min_slack_px = (dh - wh).min(contain_gap_x);
+        !(x_at_edge && min_slack_px <= 2.0)
     }
 }
 
@@ -868,5 +962,200 @@ mod tests {
             assert!(frame.window_rect.bottom <= neg_mon.bottom);
             assert!(frame.picture_rect.2.is_finite() && frame.picture_rect.3.is_finite());
         }
+    }
+
+    #[test]
+    fn stage1_settle_never_trips_exceeds_window_and_stage2_always_does() {
+        let aspects: &[(f32, f32)] = &[
+            (800.0, 600.0),   // 4:3
+            (1600.0, 900.0),  // 16:9
+            (2560.0, 1080.0), // 21:9
+            (3000.0, 1000.0), // 3:1 panorama
+            (1000.0, 3000.0), // 1:3 tall
+            (1000.0, 1000.0), // 1:1 square
+            (900.0, 1600.0),  // 9:16 portrait
+        ];
+        let monitor = PhysicalRect::new(0, 0, 2560, 1440);
+        for &ppp in &[1.0f32, 1.25, 1.5, 1.75, 2.0] {
+            for &(mw, mh) in aspects {
+                let aspect = mh / mw;
+                let start_w = (600.0f32).min(600.0 / aspect).max(120.0);
+                let start_h = (start_w * aspect).round().max(60.0) as i32;
+                let start_w_i = start_w.round() as i32;
+                let win_rect = PhysicalRect::new(400, 200, 400 + start_w_i, 200 + start_h);
+                let mut state = FloatingZoomState::new(FloatingZoomInit {
+                    window_rect: win_rect,
+                    monitor_rect: monitor,
+                    media_w: mw,
+                    media_h: mh,
+                    current_zoom: start_w_i as f32 / (mw * ppp),
+                    current_offset_pt: (0.0, 0.0),
+                    pixels_per_point: ppp,
+                    max_zoom_factor: 10.0,
+                    config_zoom_step: 1.10,
+                    inside_window_locked: false,
+                })
+                .unwrap();
+
+                // Stage 1: zoom in +2 notches and zoom out -3 notches -> must NEVER exceed window.
+                for &notches in &[1.0f32, 1.0, -3.0] {
+                    state.add_notches(notches);
+                    let mut frame = state.step(0.016);
+                    for _ in 0..120 {
+                        frame = state.step(0.016);
+                    }
+                    assert!(frame.settled && !frame.is_stage2);
+                    let (zoom, offset) = state.to_eframe_state(ppp);
+                    assert_eq!(offset, (0.0, 0.0));
+                    let disp = (mw * zoom, mh * zoom);
+                    let win_pt = (
+                        frame.window_rect.width() as f32 / ppp,
+                        frame.window_rect.height() as f32 / ppp,
+                    );
+                    assert!(
+                        !floating_image_exceeds_window_size(disp, win_pt, ppp),
+                        "Stage 1 falsely exceeded window: ppp={ppp} media=({mw},{mh}) disp={disp:?} win_pt={win_pt:?}"
+                    );
+                }
+
+                // Stage 2: zoom well past cap -> MUST exceed window so click+drag pans image.
+                state.add_notches(25.0);
+                let mut frame = state.step(0.016);
+                for _ in 0..160 {
+                    frame = state.step(0.016);
+                }
+                assert!(frame.settled && frame.is_stage2);
+                let (zoom, _offset) = state.to_eframe_state(ppp);
+                let disp = (mw * zoom, mh * zoom);
+                let win_pt = (
+                    frame.window_rect.width() as f32 / ppp,
+                    frame.window_rect.height() as f32 / ppp,
+                );
+                assert!(
+                    floating_image_exceeds_window_size(disp, win_pt, ppp),
+                    "Stage 2 failed to exceed window: ppp={ppp} media=({mw},{mh}) disp={disp:?} win_pt={win_pt:?}"
+                );
+            }
+        }
+
+        // Maximized letterboxed 4:3 image zoomed vertically in 16:9 window must still report exceeds=true.
+        assert!(floating_image_exceeds_window_size(
+            (1512.0, 1134.0),
+            (1920.0, 1080.0),
+            1.0
+        ));
+    }
+
+    #[test]
+    fn stage2_cursor_anchored_zoom_invariance_clamp_and_smooth_home_return() {
+        let monitor = monitor_1080p();
+        // Window already at cap (1440x1080 centered on 1920x1080 -> [240..1680, 0..1080]).
+        let cap_rect = PhysicalRect::new(240, 0, 1680, 1080);
+        let mut state = FloatingZoomState::new(FloatingZoomInit {
+            window_rect: cap_rect,
+            monitor_rect: monitor,
+            media_w: 1440.0,
+            media_h: 1080.0,
+            current_zoom: 1.0,
+            current_offset_pt: (0.0, 0.0),
+            pixels_per_point: 1.0,
+            max_zoom_factor: 10.0,
+            config_zoom_step: 1.10,
+            inside_window_locked: false,
+        })
+        .unwrap();
+
+        // Off-center cursor at (1300, 300) in screen coords (inside [240..1680, 0..1080]).
+        let cursor = (1300i32, 300i32);
+        let local_cx = (cursor.0 - cap_rect.left) as f32;
+        let local_cy = (cursor.1 - cap_rect.top) as f32;
+        let expected_u = local_cx / 1440.0;
+        let expected_v = local_cy / 1080.0;
+
+        // Multi-step exponential chase zoom-in into Stage 2: image point under cursor stays invariant.
+        state.add_notches_at(6.0, Some(cursor));
+        let mut frame = state.current_frame();
+        for _ in 0..120 {
+            frame = state.step(0.016);
+            if frame.is_stage2 {
+                let (px, py, pw, ph) = frame.picture_rect;
+                // Zero black bars on every frame.
+                assert!(px <= 0.01 && py <= 0.01);
+                assert!(px + pw >= frame.window_rect.width() as f32 - 0.01);
+                assert!(py + ph >= frame.window_rect.height() as f32 - 0.01);
+                // Normalized image coordinate under cursor remains invariant.
+                let u = (local_cx - px) / pw;
+                let v = (local_cy - py) / ph;
+                assert!(
+                    (u - expected_u).abs() < 1e-3,
+                    "zoom-in u drifted: {u} vs {expected_u}"
+                );
+                assert!(
+                    (v - expected_v).abs() < 1e-3,
+                    "zoom-in v drifted: {v} vs {expected_v}"
+                );
+            }
+        }
+        assert!(frame.settled && frame.is_stage2);
+        assert!(state.pan.0.abs() > 10.0 && state.pan.1.abs() > 10.0);
+
+        // Zoom out partway while still well above cap (> 10% overhang): cursor point stays invariant.
+        state.add_notches_at(-2.0, Some(cursor));
+        for _ in 0..120 {
+            frame = state.step(0.016);
+            let (px, py, pw, ph) = frame.picture_rect;
+            assert!(px <= 0.01 && py <= 0.01);
+            assert!(px + pw >= frame.window_rect.width() as f32 - 0.01);
+            assert!(py + ph >= frame.window_rect.height() as f32 - 0.01);
+            let u = (local_cx - px) / pw;
+            let v = (local_cy - py) / ph;
+            assert!(
+                (u - expected_u).abs() < 1e-3,
+                "zoom-out u drifted: {u} vs {expected_u}"
+            );
+            assert!(
+                (v - expected_v).abs() < 1e-3,
+                "zoom-out v drifted: {v} vs {expected_v}"
+            );
+        }
+        assert!(frame.settled && frame.is_stage2);
+
+        // Start a brand-new session while ALREADY in Stage 2 with existing zoom & pan: 0px jump on frame 0.
+        let (settled_zoom, settled_offset) = state.to_eframe_state(1.0);
+        let mut resumed = FloatingZoomState::new(FloatingZoomInit {
+            window_rect: frame.window_rect,
+            monitor_rect: monitor,
+            media_w: 1440.0,
+            media_h: 1080.0,
+            current_zoom: settled_zoom,
+            current_offset_pt: settled_offset,
+            pixels_per_point: 1.0,
+            max_zoom_factor: 10.0,
+            config_zoom_step: 1.10,
+            inside_window_locked: false,
+        })
+        .unwrap();
+        let f0 = resumed.current_frame();
+        assert!((f0.picture_rect.0 - frame.picture_rect.0).abs() < 1e-2);
+        assert!((f0.picture_rect.1 - frame.picture_rect.1).abs() < 1e-2);
+        assert!((f0.picture_rect.2 - frame.picture_rect.2).abs() < 1e-2);
+
+        // Zoom all the way back to cap -> pan eases smoothly to (0.0, 0.0) with zero black bars.
+        resumed.add_notches_at(-20.0, Some(cursor));
+        let mut prev_pan_len = (resumed.pan.0.hypot(resumed.pan.1)) + 1.0;
+        for _ in 0..160 {
+            frame = resumed.step(0.016);
+            let (px, py, pw, ph) = frame.picture_rect;
+            assert!(px <= 0.01 && py <= 0.01);
+            assert!(px + pw >= frame.window_rect.width() as f32 - 0.01);
+            assert!(py + ph >= frame.window_rect.height() as f32 - 0.01);
+            if resumed.drawn_w <= frame.window_rect.width() as f32 * 1.10 {
+                let pan_len = resumed.pan.0.hypot(resumed.pan.1);
+                assert!(pan_len <= prev_pan_len + 1e-2);
+                prev_pan_len = pan_len;
+            }
+        }
+        assert!(frame.settled && !frame.is_stage2);
+        assert_eq!(resumed.pan, (0.0, 0.0));
     }
 }

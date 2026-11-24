@@ -70,7 +70,8 @@ impl ImageViewer {
             return false;
         }
         if let Some(session) = self.floating_zoom_session.as_mut() {
-            session.state.add_notches(notches);
+            let cursor = crate::windows_zoom_stage::cursor_screen_point();
+            session.state.add_notches_at(notches, cursor);
             if matches!(session.phase, FloatingZoomPhase::Settling { .. }) {
                 let now = Instant::now();
                 session.phase = FloatingZoomPhase::Travelling {
@@ -153,7 +154,8 @@ impl ImageViewer {
             return false;
         }
 
-        state.add_notches(notches);
+        let cursor = crate::windows_zoom_stage::cursor_screen_point();
+        state.add_notches_at(notches, cursor);
         let entry_frame = if notches < 0.0 {
             // Zoom-out entry: commit frame 0 covering main_hwnd before cloaking so main_hwnd never peeks behind shrinking stage.
             state.current_frame()
@@ -264,9 +266,14 @@ impl ImageViewer {
                 mut last_tick,
                 mut last_commit,
             } => {
-                let raw_delta = crate::windows_zoom_stage::take_wheel_delta();
+                let (raw_delta, wheel_cursor) =
+                    crate::windows_zoom_stage::take_wheel_delta_and_cursor();
                 if raw_delta != 0 && !soft_interrupt {
-                    session.state.add_notches(raw_delta as f32 / 120.0);
+                    let cursor =
+                        wheel_cursor.or_else(crate::windows_zoom_stage::cursor_screen_point);
+                    session
+                        .state
+                        .add_notches_at(raw_delta as f32 / 120.0, cursor);
                 }
                 if soft_interrupt {
                     session.state.toward_w = session.state.drawn_w;
