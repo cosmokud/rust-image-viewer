@@ -225,9 +225,10 @@ impl ImageViewer {
         visuals.panel_fill = bg;
         cc.egui_ctx.set_visuals(visuals);
 
-        // Give users a more forgiving double-click detection window.
+        // Give users a Windows-grade forgiving double-click detection window and click radius.
         cc.egui_ctx.options_mut(|opt| {
             opt.input_options.max_double_click_delay = viewer.config.double_click_grace_period;
+            opt.input_options.max_click_dist = 12.0;
         });
 
         // The native handle is what lets geometry ask the *display under the window* instead of

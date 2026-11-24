@@ -2166,6 +2166,11 @@ static MAIN_POINTER_GONE: AtomicBool = AtomicBool::new(false);
 
 /// Resynchronizes winit/egui's cursor position on `main_hwnd` after an overlay hides
 /// (such as `zoom_hwnd`), preventing `PointerGone` from dropping stationary-cursor clicks.
+///
+/// `winit` does not clear its `last_position` cache on `WM_MOUSELEAVE`, so a single `WM_MOUSEMOVE`
+/// at the unchanged client coordinate would be deduplicated and leave `egui-winit`'s
+/// `pointer_pos_in_points` as `None`. Posting a 1px nudged move immediately followed by the exact
+/// cursor coordinate forces `winit` to emit `CursorMoved` at the exact real position.
 pub fn sync_main_window_cursor_pos(hwnd: HWND) {
     use winapi::shared::windef::POINT;
     use winapi::um::winuser::{
@@ -2188,8 +2193,20 @@ pub fn sync_main_window_cursor_pos(hwnd: HWND) {
             return;
         }
         if pt.x >= rc.left && pt.x < rc.right && pt.y >= rc.top && pt.y < rc.bottom {
-            let lparam = ((pt.x as u16 as usize) | ((pt.y as u16 as usize) << 16)) as LPARAM;
-            let _ = PostMessageW(hwnd, WM_MOUSEMOVE, 0, lparam);
+            let nudge_x = if pt.x > rc.left {
+                pt.x - 1
+            } else if pt.x + 1 < rc.right {
+                pt.x + 1
+            } else {
+                pt.x
+            };
+            let nudge_lparam =
+                ((nudge_x as u16 as usize) | ((pt.y as u16 as usize) << 16)) as LPARAM;
+            let exact_lparam = ((pt.x as u16 as usize) | ((pt.y as u16 as usize) << 16)) as LPARAM;
+            if nudge_lparam != exact_lparam {
+                let _ = PostMessageW(hwnd, WM_MOUSEMOVE, 0, nudge_lparam);
+            }
+            let _ = PostMessageW(hwnd, WM_MOUSEMOVE, 0, exact_lparam);
         }
     }
 }
@@ -2224,7 +2241,13 @@ unsafe extern "system" fn scale_change_wndproc(
     ) && MAIN_POINTER_GONE.swap(false, Ordering::SeqCst)
     {
         // Belt-and-suspenders guard: if a click arrives before a posted `WM_MOUSEMOVE` is pumped,
-        // synchronously feed `WM_MOUSEMOVE` first so winit/egui always has exact cursor coords.
+        // synchronously feed a 1px-nudged + exact `WM_MOUSEMOVE` pair first so winit never
+        // deduplicates against its stale `last_position` and egui always has exact cursor coords.
+        let x = (lparam & 0xFFFF) as i16 as i32;
+        let y = ((lparam >> 16) & 0xFFFF) as i16 as i32;
+        let nudge_x = if x > 0 { x - 1 } else { x + 1 };
+        let nudge_lparam = ((nudge_x as u16 as usize) | ((y as u16 as usize) << 16)) as LPARAM;
+        CallWindowProcW(previous, hwnd, WM_MOUSEMOVE, 0, nudge_lparam);
         CallWindowProcW(previous, hwnd, WM_MOUSEMOVE, 0, lparam);
     }
 

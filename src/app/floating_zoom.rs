@@ -1,14 +1,21 @@
 //! Floating-mode center-anchored two-stage scroll zoom math and 32.32 fixed-point bilinear CPU resampler.
 
-/// Default per-notch multiplier matching `rust-hover-preview` and prior ~5-frame `smooth_scroll_delta` feel.
-pub(crate) const DEFAULT_FLOATING_ZOOM_PER_NOTCH: f32 = 1.10;
+/// Number of 60Hz frames `egui`'s `smooth_scroll_delta` remains non-zero for one Windows 3-line
+/// mouse wheel notch (`3 * 40.0 = 120.0pt` decaying via `exponential_smooth_factor(0.90, 0.1, dt)`
+/// until `< 1.0pt` -> 13 frames).
+pub(crate) const FULLSCREEN_EQUIV_FRAMES_PER_NOTCH: f32 = 13.0;
+/// Default per-notch multiplier matching fullscreen mode at `config.zoom_step = 1.02` (`1.02^13 ≈ 1.2936`).
+pub(crate) const DEFAULT_FLOATING_ZOOM_PER_NOTCH: f32 = 1.293_606_6;
+/// Safety upper bound for per-notch zoom multiplier when `config.zoom_step` is set high.
+pub(crate) const MAX_FLOATING_ZOOM_PER_NOTCH: f32 = 2.5;
 /// Settle threshold in physical pixels: snaps sub-pixel spring tail cleanly.
 pub(crate) const FLOATING_ZOOM_SETTLED_PX: f32 = 0.5;
 /// Velocity settle threshold in physical pixels per second so the spring never snaps while gliding.
 pub(crate) const FLOATING_ZOOM_SETTLED_VEL_PX_PER_SEC: f32 = 2.0;
 /// Natural angular frequency (rad/s) for the critically damped (`zeta = 1.0`) log-space spring:
-/// smooth velocity ramp on frame 1 (< 4% at 60Hz), ~180-220ms glide, zero overshoot, zero bounce.
-pub(crate) const FLOATING_ZOOM_SPRING_OMEGA: f32 = 18.0;
+/// smooth velocity ramp on frame 1 (< 10% at 60Hz), ~180-250ms glide matching fullscreen smooth
+/// scroll responsiveness, zero overshoot, zero bounce.
+pub(crate) const FLOATING_ZOOM_SPRING_OMEGA: f32 = 30.0;
 /// Stage 2 pan-return zone width as a fraction of window width (`25%` overhang above `cap_w`).
 pub(crate) const FLOATING_ZOOM_HOME_RETURN_ZONE_FRAC: f32 = 0.25;
 /// Max frame dt (seconds) so a stall/wake never teleports the zoom.
@@ -21,18 +28,16 @@ pub(crate) const FLOATING_ZOOM_CEILING_PX: f32 = 1.0e9;
 /// 32.32 fixed-point unit (`2^32`).
 const SAMPLE_ONE: f64 = 4_294_967_296.0;
 
-/// Derives per-notch zoom multiplier from `config.zoom_step`.
-/// Default `zoom_step = 1.02` was tuned for multi-frame `smooth_scroll_delta`, so map ~1.02 -> 1.10x;
-/// explicit user values are respected directly.
+/// Derives per-notch zoom multiplier from `config.zoom_step`, synced with fullscreen mode's
+/// `smooth_scroll_delta` accumulation (`config.zoom_step ^ 13` per Windows 3-line notch at 60Hz).
 pub(crate) fn effective_per_notch_factor(config_zoom_step: f32) -> f32 {
-    if !config_zoom_step.is_finite() {
+    if !config_zoom_step.is_finite() || config_zoom_step <= 1.0 {
         return DEFAULT_FLOATING_ZOOM_PER_NOTCH;
     }
-    if (config_zoom_step - 1.02).abs() < 0.005 {
-        DEFAULT_FLOATING_ZOOM_PER_NOTCH
-    } else {
-        config_zoom_step.clamp(1.01, 2.0)
-    }
+    config_zoom_step
+        .clamp(1.005, 2.0)
+        .powf(FULLSCREEN_EQUIV_FRAMES_PER_NOTCH)
+        .clamp(1.05, MAX_FLOATING_ZOOM_PER_NOTCH)
 }
 
 /// Exact fractional notch factor: whole notches use `powi`, fractional remainder uses `powf`.
@@ -521,16 +526,38 @@ impl PendingZoomStageInputs {
         event: ZoomStageMouseEvent,
         now: std::time::Instant,
         click_tol: (i32, i32),
+        double_click_interval: std::time::Duration,
+        double_click_tol: (i32, i32),
     ) {
         match event {
             ZoomStageMouseEvent::PrimaryDown {
                 screen_pt,
                 modifiers,
             } => {
-                self.primary_down = Some(PendingZoomStageClick {
-                    screen_pt,
-                    modifiers,
-                });
+                // Promote a second unmodified primary click on `zoom_hwnd` within double-click
+                // time and tolerance directly to `primary_double_click`, even when slight hand
+                // tremor exceeded Windows' tiny 4px `SM_CXDOUBLECLK` box and prevented `WM_LBUTTONDBLCLK`.
+                if !modifiers.any()
+                    && is_split_double_click(
+                        self.primary_click_completed,
+                        now,
+                        screen_pt,
+                        double_click_interval,
+                        double_click_tol,
+                    )
+                {
+                    self.primary_down = None;
+                    self.primary_click_completed = None;
+                    self.primary_double_click = Some(PendingZoomStageClick {
+                        screen_pt,
+                        modifiers,
+                    });
+                } else {
+                    self.primary_down = Some(PendingZoomStageClick {
+                        screen_pt,
+                        modifiers,
+                    });
+                }
                 self.secondary_down = None;
             }
             ZoomStageMouseEvent::PrimaryUp {
@@ -1086,8 +1113,8 @@ mod tests {
         // Cap for 4:3 on 1920x1080 is 1440x1080.
         assert!((state.cap_w - 1440.0).abs() < 1e-2);
 
-        // Stage 1: zoom in 3 notches -> grows window around (960, 540), fills 100%.
-        state.add_notches(3.0);
+        // Stage 1: zoom in 2 notches -> grows window around (960, 540), fills 100%.
+        state.add_notches(2.0);
         let mut frame = state.step(0.016);
         for _ in 0..80 {
             frame = state.step(0.016);
@@ -1102,7 +1129,7 @@ mod tests {
         assert!((frame.window_rect.centre_f32().0 - 960.0).abs() <= 0.5);
 
         // Stage 2: zoom past cap -> window stays capped at 1440x1080, image grows inside.
-        state.add_notches(10.0);
+        state.add_notches(4.0);
         for _ in 0..120 {
             frame = state.step(0.016);
         }
@@ -1406,7 +1433,7 @@ mod tests {
                     current_offset_pt: (0.0, 0.0),
                     pixels_per_point: ppp,
                     max_zoom_factor: 10.0,
-                    config_zoom_step: 1.10,
+                    config_zoom_step: 1.02,
                     inside_window_locked: false,
                 })
                 .unwrap();
@@ -1725,7 +1752,7 @@ mod tests {
             current_offset_pt: initial_offset,
             pixels_per_point: 1.0,
             max_zoom_factor: 10.0,
-            config_zoom_step: 1.10,
+            config_zoom_step: 1.02,
             inside_window_locked: false,
         })
         .unwrap();
@@ -1859,6 +1886,8 @@ mod tests {
     #[test]
     fn zoom_stage_direct_double_click_triggers_handoff() {
         let now = std::time::Instant::now();
+        let dbl_interval = std::time::Duration::from_millis(500);
+        let dbl_tol = (12, 12);
         let mut inputs = PendingZoomStageInputs::default();
         inputs.record_event(
             ZoomStageMouseEvent::PrimaryDown {
@@ -1866,7 +1895,9 @@ mod tests {
                 modifiers: ZoomStageModifiers::none(),
             },
             now,
-            (8, 8),
+            (12, 12),
+            dbl_interval,
+            dbl_tol,
         );
         inputs.record_event(
             ZoomStageMouseEvent::PrimaryUp {
@@ -1874,7 +1905,9 @@ mod tests {
                 modifiers: ZoomStageModifiers::none(),
             },
             now,
-            (8, 8),
+            (12, 12),
+            dbl_interval,
+            dbl_tol,
         );
         inputs.record_event(
             ZoomStageMouseEvent::PrimaryDoubleClick {
@@ -1882,7 +1915,9 @@ mod tests {
                 modifiers: ZoomStageModifiers::none(),
             },
             now,
-            (8, 8),
+            (12, 12),
+            dbl_interval,
+            dbl_tol,
         );
         assert_eq!(
             inputs.primary_double_click,
@@ -1893,11 +1928,56 @@ mod tests {
         );
         assert!(inputs.primary_down.is_none());
         assert!(inputs.primary_click_completed.is_none());
+
+        // Second unmodified PrimaryDown within human tremor radius (8px, beyond Windows' 4px SM_CXDOUBLECLK)
+        // and human cadence (420ms) also promotes directly to `primary_double_click`.
+        let mut tremor_inputs = PendingZoomStageInputs::default();
+        tremor_inputs.record_event(
+            ZoomStageMouseEvent::PrimaryDown {
+                screen_pt: (500, 400),
+                modifiers: ZoomStageModifiers::none(),
+            },
+            now,
+            (12, 12),
+            dbl_interval,
+            dbl_tol,
+        );
+        tremor_inputs.record_event(
+            ZoomStageMouseEvent::PrimaryUp {
+                screen_pt: (503, 402),
+                modifiers: ZoomStageModifiers::none(),
+            },
+            now + std::time::Duration::from_millis(40),
+            (12, 12),
+            dbl_interval,
+            dbl_tol,
+        );
+        tremor_inputs.record_event(
+            ZoomStageMouseEvent::PrimaryDown {
+                screen_pt: (508, 406),
+                modifiers: ZoomStageModifiers::none(),
+            },
+            now + std::time::Duration::from_millis(420),
+            (12, 12),
+            dbl_interval,
+            dbl_tol,
+        );
+        assert_eq!(
+            tremor_inputs.primary_double_click,
+            Some(PendingZoomStageClick {
+                screen_pt: (508, 406),
+                modifiers: ZoomStageModifiers::none(),
+            })
+        );
+        assert!(tremor_inputs.primary_down.is_none());
+        assert!(tremor_inputs.primary_click_completed.is_none());
     }
 
     #[test]
     fn split_double_click_respects_time_radius_and_modifiers() {
         let t0 = std::time::Instant::now();
+        let dbl_interval = std::time::Duration::from_millis(500);
+        let dbl_tol = (12, 12);
         let mut inputs = PendingZoomStageInputs::default();
         inputs.record_event(
             ZoomStageMouseEvent::PrimaryDown {
@@ -1905,7 +1985,9 @@ mod tests {
                 modifiers: ZoomStageModifiers::none(),
             },
             t0,
-            (8, 8),
+            (12, 12),
+            dbl_interval,
+            dbl_tol,
         );
         inputs.record_event(
             ZoomStageMouseEvent::PrimaryUp {
@@ -1913,30 +1995,29 @@ mod tests {
                 modifiers: ZoomStageModifiers::none(),
             },
             t0,
-            (8, 8),
+            (12, 12),
+            dbl_interval,
+            dbl_tol,
         );
         let first_click = inputs.primary_click_completed;
         assert!(first_click.is_some());
 
-        let max_interval = std::time::Duration::from_millis(500);
-        let tol = (6, 6);
-
-        // Within time and radius -> triggers split double-click.
+        // Normal human cadence (440ms) and 8px tremor -> triggers split double-click.
         assert!(is_split_double_click(
             first_click,
-            t0 + std::time::Duration::from_millis(180),
-            (605, 354),
-            max_interval,
-            tol
+            t0 + std::time::Duration::from_millis(440),
+            (610, 357),
+            dbl_interval,
+            dbl_tol
         ));
 
         // Outside radius -> does NOT trigger.
         assert!(!is_split_double_click(
             first_click,
             t0 + std::time::Duration::from_millis(180),
-            (620, 351),
-            max_interval,
-            tol
+            (630, 351),
+            dbl_interval,
+            dbl_tol
         ));
 
         // Outside time -> does NOT trigger.
@@ -1944,8 +2025,24 @@ mod tests {
             first_click,
             t0 + std::time::Duration::from_millis(650),
             (602, 351),
-            max_interval,
-            tol
+            dbl_interval,
+            dbl_tol
+        ));
+
+        // Click 1 held across reveal (drag takeover armed) then released within click radius -> Click 2 triggers.
+        let held_press = (600, 350);
+        let held_release = (608, 356);
+        assert!(points_within_tolerance(held_press, held_release, 12, 12));
+        let recorded = Some(LastZoomStagePrimaryClick {
+            at: t0 + std::time::Duration::from_millis(50),
+            screen_pt: held_press,
+        });
+        assert!(is_split_double_click(
+            recorded,
+            t0 + std::time::Duration::from_millis(450),
+            (609, 358),
+            dbl_interval,
+            dbl_tol
         ));
 
         // Modified click (Ctrl+Click) must NOT arm split double-click.
@@ -1961,7 +2058,9 @@ mod tests {
                 modifiers: ctrl_mod,
             },
             t0,
-            (8, 8),
+            (12, 12),
+            dbl_interval,
+            dbl_tol,
         );
         mod_inputs.record_event(
             ZoomStageMouseEvent::PrimaryUp {
@@ -1969,7 +2068,9 @@ mod tests {
                 modifiers: ctrl_mod,
             },
             t0,
-            (8, 8),
+            (12, 12),
+            dbl_interval,
+            dbl_tol,
         );
         assert!(mod_inputs.primary_click_completed.is_none());
     }
@@ -1977,6 +2078,8 @@ mod tests {
     #[test]
     fn direct_and_split_right_click_preserve_exact_logical_coords_and_reject_drags() {
         let t0 = std::time::Instant::now();
+        let dbl_interval = std::time::Duration::from_millis(500);
+        let dbl_tol = (12, 12);
         let win_rect = PhysicalRect::new(200, 100, 1000, 700);
         let ppp = 1.25;
         let ctrl_mod = ZoomStageModifiers {
@@ -1993,7 +2096,9 @@ mod tests {
                 modifiers: ctrl_mod,
             },
             t0,
-            (8, 8),
+            (12, 12),
+            dbl_interval,
+            dbl_tol,
         );
         direct.record_event(
             ZoomStageMouseEvent::SecondaryUp {
@@ -2001,7 +2106,9 @@ mod tests {
                 modifiers: ZoomStageModifiers::none(),
             },
             t0,
-            (8, 8),
+            (12, 12),
+            dbl_interval,
+            dbl_tol,
         );
         let click = direct.secondary_click.expect("direct right-click captured");
         assert!(click.modifiers.ctrl);
@@ -2017,7 +2124,9 @@ mod tests {
                 modifiers: ctrl_mod,
             },
             t0,
-            (8, 8),
+            (12, 12),
+            dbl_interval,
+            dbl_tol,
         );
         dragged.record_event(
             ZoomStageMouseEvent::SecondaryUp {
@@ -2025,7 +2134,9 @@ mod tests {
                 modifiers: ctrl_mod,
             },
             t0,
-            (8, 8),
+            (12, 12),
+            dbl_interval,
+            dbl_tol,
         );
         assert!(dragged.secondary_click.is_none());
 
@@ -2037,10 +2148,12 @@ mod tests {
                 modifiers: ctrl_mod,
             },
             t0,
-            (8, 8),
+            (12, 12),
+            dbl_interval,
+            dbl_tol,
         );
         assert!(split.secondary_down.is_some());
-        let resolved = resolve_split_secondary_click(split.secondary_down, (703, 402), (8, 8))
+        let resolved = resolve_split_secondary_click(split.secondary_down, (703, 402), (12, 12))
             .expect("split right-click within tolerance");
         assert!(resolved.modifiers.ctrl);
         let (slx, sly) = screen_point_to_logical_local(resolved.screen_pt, win_rect, ppp);
@@ -2048,12 +2161,16 @@ mod tests {
         assert!((sly - (302.0 / ppp)).abs() < 1e-4);
 
         // Split RMB dragged far away -> rejected.
-        assert!(resolve_split_secondary_click(split.secondary_down, (740, 400), (8, 8)).is_none());
+        assert!(
+            resolve_split_secondary_click(split.secondary_down, (740, 400), (12, 12)).is_none()
+        );
     }
 
     #[test]
     fn middle_and_extra_mouse_buttons_capture_cleanly_on_zoom_stage() {
         let t0 = std::time::Instant::now();
+        let dbl_interval = std::time::Duration::from_millis(500);
+        let dbl_tol = (12, 12);
         let mut inputs = PendingZoomStageInputs::default();
         inputs.record_event(
             ZoomStageMouseEvent::MiddleDown {
@@ -2061,10 +2178,18 @@ mod tests {
                 modifiers: ZoomStageModifiers::none(),
             },
             t0,
-            (8, 8),
+            (12, 12),
+            dbl_interval,
+            dbl_tol,
         );
         assert_eq!(inputs.middle_down.map(|(_, held)| held), Some(true));
-        inputs.record_event(ZoomStageMouseEvent::MiddleUp, t0, (8, 8));
+        inputs.record_event(
+            ZoomStageMouseEvent::MiddleUp,
+            t0,
+            (12, 12),
+            dbl_interval,
+            dbl_tol,
+        );
         assert_eq!(inputs.middle_down.map(|(_, held)| held), Some(false));
 
         inputs.record_event(
@@ -2073,7 +2198,9 @@ mod tests {
                 modifiers: ZoomStageModifiers::none(),
             },
             t0,
-            (8, 8),
+            (12, 12),
+            dbl_interval,
+            dbl_tol,
         );
         inputs.record_event(
             ZoomStageMouseEvent::Extra2Down {
@@ -2081,10 +2208,35 @@ mod tests {
                 modifiers: ZoomStageModifiers::none(),
             },
             t0,
-            (8, 8),
+            (12, 12),
+            dbl_interval,
+            dbl_tol,
         );
         assert!(inputs.extra1_down.is_some());
         assert!(inputs.extra2_down.is_some());
+    }
+
+    #[test]
+    fn floating_per_notch_factor_matches_fullscreen_smooth_scroll_and_scales_with_zoom_step() {
+        // Default config.zoom_step = 1.02 -> 1.02^13 ≈ 1.2936 (matches 60Hz fullscreen smooth_scroll_delta).
+        let default_f = effective_per_notch_factor(1.02);
+        assert!(
+            (default_f - 1.02f32.powf(FULLSCREEN_EQUIV_FRAMES_PER_NOTCH)).abs() < 1e-4,
+            "default per-notch factor {default_f} did not match 1.02^13"
+        );
+        // Strictly monotonic scaling with config.zoom_step (no discontinuity around 1.02).
+        let f_low = effective_per_notch_factor(1.01);
+        let f_mid = effective_per_notch_factor(1.03);
+        let f_high = effective_per_notch_factor(1.05);
+        assert!(f_low < default_f && default_f < f_mid && f_mid < f_high);
+        assert!((f_mid - 1.03f32.powf(FULLSCREEN_EQUIV_FRAMES_PER_NOTCH)).abs() < 1e-4);
+        assert!((f_high - 1.05f32.powf(FULLSCREEN_EQUIV_FRAMES_PER_NOTCH)).abs() < 1e-4);
+        // Clamps safely for extreme or invalid inputs.
+        assert_eq!(effective_per_notch_factor(2.0), MAX_FLOATING_ZOOM_PER_NOTCH);
+        assert_eq!(
+            effective_per_notch_factor(f32::NAN),
+            DEFAULT_FLOATING_ZOOM_PER_NOTCH
+        );
     }
 
     #[test]
@@ -2241,7 +2393,7 @@ mod tests {
                 current_offset_pt: (160.0, -120.0),
                 pixels_per_point: 1.0,
                 max_zoom_factor: 10.0,
-                config_zoom_step: 1.10,
+                config_zoom_step: 1.02,
                 inside_window_locked: false,
             })
             .unwrap()
@@ -2251,16 +2403,17 @@ mod tests {
         let mut s144 = make_stage2_state();
 
         // Zoom out enough to cross Stage 2 -> Stage 1 in one gesture (no detent stuck at cap_w).
-        s60.add_notches(-4.0);
-        s144.add_notches(-4.0);
+        s60.add_notches(-2.0);
+        s144.add_notches(-2.0);
         assert!(s60.toward_w < s60.cap_w);
         assert!(s144.toward_w < s144.cap_w);
 
-        // Compare mid-return at t = 1/12s = 83.33ms (5 steps @ 60Hz vs 12 steps @ 144Hz).
+        // Compare mid-return at t = 1/30s = 33.33ms (2 steps @ 60Hz vs 5 steps @ 144Hz -> use 5/120s = 41.67ms:
+        // 5 steps @ 120Hz vs 6 steps @ 144Hz, or 1/24s = 41.67ms).
         for _ in 0..5 {
-            let _ = s60.step(1.0 / 60.0);
+            let _ = s60.step(1.0 / 120.0);
         }
-        for _ in 0..12 {
+        for _ in 0..6 {
             let _ = s144.step(1.0 / 144.0);
         }
         assert!(s60.drawn_w > s60.cap_w && s144.drawn_w > s144.cap_w);

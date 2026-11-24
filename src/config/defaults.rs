@@ -18,7 +18,7 @@ impl Config {
             controls_hide_delay: 0.5,
             bottom_overlay_hide_delay: 0.5,
             cursor_idle_hide_delay: 3.0,
-            double_click_grace_period: 0.35,
+            double_click_grace_period: 0.50,
             show_fps: false,
             show_fps_update_interval_ms: 500,
             resize_border_size: 6.0,

@@ -550,6 +550,9 @@ pub(crate) struct ImageViewer {
     /// screen pixels (`GetCursorPos` units), to match `OuterPosition` after the conversion
     /// applied in `drag_floating_window_without_native_snap`.
     pub(crate) floating_drag_start_cursor_screen: Option<egui::Pos2>,
+    /// True once the active floating-window drag has moved past the click deadzone so normal
+    /// click/double-click tremor never jiggles the window.
+    pub(crate) floating_drag_threshold_crossed: bool,
     /// When true, floating autosize is suppressed while zoomed media exceeds the viewport.
     /// Set by explicit user window drag/resize while in zoom-inside-window mode.
     pub(crate) floating_zoom_inside_window_locked: bool,
@@ -1214,6 +1217,7 @@ impl Default for ImageViewer {
             resize_last_size: None,
             floating_drag_start_outer_pos: None,
             floating_drag_start_cursor_screen: None,
+            floating_drag_threshold_crossed: false,
             floating_zoom_inside_window_locked: false,
             floating_zoom_settled_zoom: None,
             last_video_frame: None,

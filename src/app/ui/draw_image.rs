@@ -532,13 +532,14 @@ impl ImageViewer {
             if !self.mode().is_fullscreen() {
                 #[cfg(target_os = "windows")]
                 {
+                    let ppp = ctx.pixels_per_point().max(0.5);
+                    let click_tol = crate::windows_zoom_stage::click_drag_tolerance(ppp);
                     if !primary_down || primary_pressed {
                         if let Some(press_pt) =
                             self.pending_zoom_stage_primary_click_candidate.take()
                         {
                             let release_pt = crate::windows_zoom_stage::cursor_screen_point()
                                 .unwrap_or(press_pt);
-                            let click_tol = crate::windows_zoom_stage::click_drag_tolerance();
                             if points_within_tolerance(
                                 press_pt,
                                 release_pt,
@@ -555,8 +556,11 @@ impl ImageViewer {
                     }
 
                     if self.last_zoom_stage_primary_click.is_some() {
-                        let (max_interval, dbl_tol) =
-                            crate::windows_zoom_stage::double_click_time_and_tolerance();
+                        let (sys_interval, dbl_tol) =
+                            crate::windows_zoom_stage::double_click_time_and_tolerance(ppp);
+                        let max_interval = sys_interval.max(Duration::from_secs_f64(
+                            self.config.double_click_grace_period.clamp(0.1, 1.5),
+                        ));
                         let now = Instant::now();
                         let other_button_pressed = secondary_clicked
                             || middle_pressed

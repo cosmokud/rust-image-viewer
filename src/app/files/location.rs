@@ -126,5 +126,6 @@ impl ImageViewer {
     pub(crate) fn reset_floating_window_drag_anchor(&mut self) {
         self.floating_drag_start_outer_pos = None;
         self.floating_drag_start_cursor_screen = None;
+        self.floating_drag_threshold_crossed = false;
     }
 }

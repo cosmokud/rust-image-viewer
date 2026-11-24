@@ -8,7 +8,7 @@ The config file is at `%APPDATA%\rust-image-viewer\config.ini` on Windows. Delet
 | ----------------------------------------------- | ---------- | -------------------------------------------------------------------------------------------------- |
 | `controls_hide_delay`                           | `0.5`      | Seconds before the title bar / controls hide.                                                      |
 | `bottom_overlay_hide_delay`                     | `0.5`      | Seconds before bottom overlays (video controls, mode buttons, zoom HUD) hide.                     |
-| `double_click_grace_period`                     | `0.35`     | Double-click timing window in seconds.                                                             |
+| `double_click_grace_period`                     | `0.50`     | Double-click timing window in seconds.                                                             |
 | `show_fps`                                      | `false`    | Show the diagnostics overlay in the top-right corner.                                              |
 | `resize_border_size`                            | `6`        | Floating-window resize hit area in pixels.                                                         |
 | `startup_window_mode`                           | `floating` | `floating` or `fullscreen`.                                                                        |

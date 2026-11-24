@@ -103,22 +103,25 @@ pub fn drain_mouse_events() -> Vec<ZoomStageMouseEvent> {
     guard.drain(..).collect()
 }
 
-pub fn double_click_time_and_tolerance() -> (Duration, (i32, i32)) {
+pub fn double_click_time_and_tolerance(pixels_per_point: f32) -> (Duration, (i32, i32)) {
+    let ppp = pixels_per_point.max(0.5);
+    let min_tol = (12.0 * ppp).round() as i32;
     unsafe {
         let ms = GetDoubleClickTime();
         let interval = if ms == 0 {
             Duration::from_millis(500)
         } else {
-            Duration::from_millis(u64::from(ms).clamp(100, 1500))
+            Duration::from_millis(u64::from(ms).clamp(500, 1500))
         };
-        let half_x = (GetSystemMetrics(SM_CXDOUBLECLK) / 2).max(6);
-        let half_y = (GetSystemMetrics(SM_CYDOUBLECLK) / 2).max(6);
+        let half_x = (GetSystemMetrics(SM_CXDOUBLECLK) / 2).max(min_tol).max(12);
+        let half_y = (GetSystemMetrics(SM_CYDOUBLECLK) / 2).max(min_tol).max(12);
         (interval, (half_x, half_y))
     }
 }
 
-pub fn click_drag_tolerance() -> (i32, i32) {
-    (8, 8)
+pub fn click_drag_tolerance(pixels_per_point: f32) -> (i32, i32) {
+    let tol = ((12.0 * pixels_per_point.max(0.5)).round() as i32).max(12);
+    (tol, tol)
 }
 
 fn current_modifiers() -> ZoomStageModifiers {

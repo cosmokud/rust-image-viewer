@@ -158,7 +158,8 @@ impl ImageViewer {
         self.pending_zoom_stage_secondary_press = None;
         let release_pt =
             crate::windows_zoom_stage::cursor_screen_point().unwrap_or(press.screen_pt);
-        let click_tol = crate::windows_zoom_stage::click_drag_tolerance();
+        let ppp = ctx.pixels_per_point().max(0.5);
+        let click_tol = crate::windows_zoom_stage::click_drag_tolerance(ppp);
         let Some(click) = resolve_split_secondary_click(Some(press), release_pt, click_tol) else {
             return;
         };
@@ -403,10 +404,18 @@ impl ImageViewer {
             }
         }
 
-        let click_tol = crate::windows_zoom_stage::click_drag_tolerance();
+        let ppp = ctx.pixels_per_point().max(0.5);
+        let click_tol = crate::windows_zoom_stage::click_drag_tolerance(ppp);
+        let (sys_dbl_interval, dbl_tol) =
+            crate::windows_zoom_stage::double_click_time_and_tolerance(ppp);
+        let dbl_interval = sys_dbl_interval.max(Duration::from_secs_f64(
+            self.config.double_click_grace_period.clamp(0.1, 1.5),
+        ));
         let now = Instant::now();
         for event in drained_events {
-            session.pending_inputs.record_event(event, now, click_tol);
+            session
+                .pending_inputs
+                .record_event(event, now, click_tol, dbl_interval, dbl_tol);
         }
         if focus_lost && !session.pending_inputs.has_any() {
             session.pending_inputs.clear();
@@ -537,9 +546,13 @@ impl ImageViewer {
                         // 5) Drain all pre-flush and during-flush mouse events
                         let reveal_now = Instant::now();
                         for event in crate::windows_zoom_stage::drain_mouse_events() {
-                            session
-                                .pending_inputs
-                                .record_event(event, reveal_now, click_tol);
+                            session.pending_inputs.record_event(
+                                event,
+                                reveal_now,
+                                click_tol,
+                                dbl_interval,
+                                dbl_tol,
+                            );
                         }
                         // 6) Resync main_hwnd cursor pos so stationary clicks never see PointerGone
                         crate::windows_env::sync_main_window_cursor_pos(main_hwnd);
@@ -673,7 +686,8 @@ impl ImageViewer {
             } else {
                 let release_pt =
                     crate::windows_zoom_stage::cursor_screen_point().unwrap_or(down.screen_pt);
-                let click_tol = crate::windows_zoom_stage::click_drag_tolerance();
+                let ppp = ctx.pixels_per_point().max(0.5);
+                let click_tol = crate::windows_zoom_stage::click_drag_tolerance(ppp);
                 if let Some(click) =
                     resolve_split_secondary_click(Some(down), release_pt, click_tol)
                 {
@@ -742,7 +756,8 @@ impl ImageViewer {
                 if !down.modifiers.any() {
                     let release_pt =
                         crate::windows_zoom_stage::cursor_screen_point().unwrap_or(down.screen_pt);
-                    let click_tol = crate::windows_zoom_stage::click_drag_tolerance();
+                    let ppp = ctx.pixels_per_point().max(0.5);
+                    let click_tol = crate::windows_zoom_stage::click_drag_tolerance(ppp);
                     if points_within_tolerance(down.screen_pt, release_pt, click_tol.0, click_tol.1)
                     {
                         self.last_zoom_stage_primary_click = Some(LastZoomStagePrimaryClick {
@@ -833,6 +848,7 @@ impl ImageViewer {
                     Some(egui::pos2(start_outer_phys.0, start_outer_phys.1));
                 self.floating_drag_start_cursor_screen =
                     Some(egui::pos2(start_cursor_phys.0, start_cursor_phys.1));
+                self.floating_drag_threshold_crossed = false;
                 self.pan_last_cursor_phys = None;
                 self.last_mouse_pos = None;
             }

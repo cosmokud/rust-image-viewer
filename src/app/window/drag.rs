@@ -80,11 +80,21 @@ impl ImageViewer {
             }
         };
 
+        let ppp = ctx.pixels_per_point().max(0.01);
+        if !self.floating_drag_threshold_crossed {
+            let deadzone_px = (4.0 * ppp).max(4.0);
+            if (current_cursor_physical - start_cursor_physical).length() < deadzone_px {
+                ctx.request_repaint();
+                return;
+            }
+            self.floating_drag_threshold_crossed = true;
+        }
+
         let new_pos = Self::floating_drag_target_outer_pos(
             start_outer_physical,
             start_cursor_physical,
             current_cursor_physical,
-            ctx.pixels_per_point(),
+            ppp,
         );
         self.send_outer_position(ctx, new_pos);
         // A drag that outruns the window can lose pointer events (capture changes, and

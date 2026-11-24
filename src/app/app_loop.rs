@@ -195,6 +195,19 @@ impl eframe::App for ImageViewer {
         // Debounced preset-file write for settings slider drags.
         self.flush_pending_settings_save(ctx);
 
+        // Keep egui double-click timing & click radius live-synced with config.
+        let desired_dbl_delay = self.config.double_click_grace_period.clamp(0.1, 1.5);
+        let needs_input_opt_sync = ctx.options(|opt| {
+            (opt.input_options.max_double_click_delay - desired_dbl_delay).abs() > 1e-6
+                || (opt.input_options.max_click_dist - 12.0).abs() > 1e-4
+        });
+        if needs_input_opt_sync {
+            ctx.options_mut(|opt| {
+                opt.input_options.max_double_click_delay = desired_dbl_delay;
+                opt.input_options.max_click_dist = 12.0;
+            });
+        }
+
         // Sync/interrupt any active floating zoom stage before input runs so keyboard shortcuts
         // never get overwritten by `drive_floating_zoom_stage` and split right-clicks fire immediately.
         #[cfg(target_os = "windows")]
