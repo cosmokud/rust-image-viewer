@@ -104,7 +104,7 @@ than one file.
 
 ### 2.3 `src/app/` — the application module
 
-`app/mod.rs` holds the `ImageViewer` struct (344 fields), the `impl ImageViewer` header, all of
+`app/mod.rs` holds the `ImageViewer` struct (314 fields), the `impl ImageViewer` header, all of
 its associated constants (79 of them), and `Default`/`Drop`. Every method of `ImageViewer` lives
 in a child module as its own `impl ImageViewer` block, and `app/mod.rs` re-exports each child, so
 a method is callable from anywhere in `app/` regardless of which file defines it.
