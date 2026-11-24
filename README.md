@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/cosmokud/rust-image-viewer/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/cosmokud/rust-image-viewer?style=for-the-badge&color=024bd1" /></a>
+  <a href="https://github.com/cosmokud/rust-image-viewer/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/cosmokud/rust-image-viewer?style=for-the-badge&color=c2362b" /></a>
   <img alt="Rust" src="https://img.shields.io/badge/Rust-1.99%2B-orange?style=for-the-badge&logo=rust" />
   <img alt="Windows 10 and 11" src="https://img.shields.io/badge/Platform-Windows%2010%2F11-blue?style=for-the-badge&logo=windows" />
   <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-111111?style=for-the-badge" /></a>
