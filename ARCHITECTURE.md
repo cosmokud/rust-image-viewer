@@ -10,7 +10,7 @@ code for a given behaviour actually lives, in the order a question is normally a
 where is it, why is it built that way). Read §2 for the map, §3–§5 for the request lifetime, and
 jump to the chapter whose subject matches the change you were asked to make.
 
-Documented against **0.4.7** (after the `src/app/` split and the layered floating-zoom stage; the
+Documented against **0.4.8** (after the `src/app/` split and the layered floating-zoom stage; the
 previous revision of this file covered 0.4.1-rc.5, so everything from `src/cache_key.rs` onward is
 new).
 

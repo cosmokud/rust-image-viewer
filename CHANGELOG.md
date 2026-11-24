@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.8] - 2026-11-25
+
+### Changed
+
+- `README.md` rewritten in the house style the other Rust Windows Series repositories use: centered icon, title, tagline, badges, and a navigation line, followed by overview, features, formats, install, usage, shortcuts, configuration, diagnostics, troubleshooting, build, architecture, and license sections.
+- The repository now carries the shared series artwork under `assets/series/`, and the README closes with the Rust Windows Series table linking Background Muter, Image Viewer, Hover Preview, and Win Cleaner.
+
 ## [0.4.7] - 2026-11-25
 
 ### Highlights
