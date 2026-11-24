@@ -164,6 +164,8 @@ pub(crate) fn get_global_cursor_pos() -> Option<egui::Pos2> {
 
 pub(crate) const GLOBAL_MOUSE_LEFT: u32 = 0x01;
 
+pub(crate) const GLOBAL_MOUSE_RIGHT: u32 = 0x02;
+
 pub(crate) const GLOBAL_MOUSE_MIDDLE: u32 = 0x04;
 
 pub(crate) const GLOBAL_MOUSE_EXTRA1: u32 = 0x05;

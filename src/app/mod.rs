@@ -563,6 +563,12 @@ pub(crate) struct ImageViewer {
     /// Active floating scroll-zoom session driving `zoom_stage_window`.
     #[cfg(target_os = "windows")]
     pub(crate) floating_zoom_session: Option<FloatingZoomSession>,
+    /// Last unmodified primary click that completed on `zoom_stage_window`, for split double-click detection.
+    pub(crate) last_zoom_stage_primary_click: Option<LastZoomStagePrimaryClick>,
+    /// Physical screen point of an unmodified primary press handed off from `zoom_stage_window` while still held.
+    pub(crate) pending_zoom_stage_primary_click_candidate: Option<(i32, i32)>,
+    /// Secondary press captured on `zoom_stage_window` while RMB was still held on reveal (for split right-click).
+    pub(crate) pending_zoom_stage_secondary_press: Option<PendingZoomStageClick>,
 
     // ============ PERFORMANCE OPTIMIZATION FIELDS ============
     /// Whether any animation or state change requires a repaint
@@ -1215,6 +1221,9 @@ impl Default for ImageViewer {
             zoom_stage_window: None,
             #[cfg(target_os = "windows")]
             floating_zoom_session: None,
+            last_zoom_stage_primary_click: None,
+            pending_zoom_stage_primary_click_candidate: None,
+            pending_zoom_stage_secondary_press: None,
 
             // Performance optimization fields
             needs_repaint: false,

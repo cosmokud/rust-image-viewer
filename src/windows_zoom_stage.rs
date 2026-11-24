@@ -2,10 +2,12 @@
 
 #![cfg(target_os = "windows")]
 
+use std::collections::VecDeque;
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Mutex, Once};
+use std::time::Duration;
 
 use winapi::shared::minwindef::{LPARAM, LRESULT, UINT, WPARAM};
 use winapi::shared::windef::{HBITMAP, HDC, HGDIOBJ, HWND, POINT, RECT, SIZE};
@@ -15,14 +17,18 @@ use winapi::um::wingdi::{
 };
 use winapi::um::winuser::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetCursorPos,
-    GetForegroundWindow, GetKeyState, GetWindow, GetWindowLongPtrW, LoadCursorW, RegisterClassExW,
-    SetCursor, SetForegroundWindow, SetWindowPos, ShowWindow, UpdateLayeredWindow, GWL_EXSTYLE,
-    GW_HWNDPREV, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, IDC_ARROW, MA_NOACTIVATE, MK_CONTROL,
-    MK_SHIFT, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOWNOACTIVATE, ULW_ALPHA,
-    VK_MENU, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEACTIVATE,
-    WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_SETCURSOR, WM_XBUTTONDOWN, WNDCLASSEXW, WS_EX_LAYERED,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    GetDoubleClickTime, GetForegroundWindow, GetKeyState, GetSystemMetrics, GetWindow,
+    GetWindowLongPtrW, LoadCursorW, RegisterClassExW, SetCursor, SetForegroundWindow, SetWindowPos,
+    ShowWindow, UpdateLayeredWindow, CS_DBLCLKS, GWL_EXSTYLE, GW_HWNDPREV, HWND_NOTOPMOST,
+    HWND_TOP, HWND_TOPMOST, IDC_ARROW, MA_NOACTIVATE, MK_CONTROL, MK_SHIFT, SM_CXDOUBLECLK,
+    SM_CYDOUBLECLK, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOWNOACTIVATE, ULW_ALPHA,
+    VK_CONTROL, VK_MENU, VK_SHIFT, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
+    WM_MBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR,
+    WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_POPUP, XBUTTON1, XBUTTON2,
 };
+
+use crate::app::{ZoomStageModifiers, ZoomStageMouseEvent};
 
 const ZOOM_STAGE_CLASS: &str = "RustImageViewerZoomStage";
 static REGISTER_CLASS: Once = Once::new();
@@ -38,9 +44,8 @@ static ZOOM_WHEEL_CURSOR: AtomicU64 = AtomicU64::new(0);
 static ZOOM_WHEEL_CURSOR_VALID: AtomicBool = AtomicBool::new(false);
 /// Set on pointer button press over `zoom_hwnd` or focus loss to trigger immediate settle/handoff.
 static ZOOM_INTERRUPT: AtomicBool = AtomicBool::new(false);
-/// Packed physical screen `(x, y)` of a `WM_LBUTTONDOWN` captured on `zoom_hwnd` for seamless drag/pan handoff.
-static PENDING_PRIMARY_DRAG_PT: AtomicU64 = AtomicU64::new(0);
-static PENDING_PRIMARY_DRAG_VALID: AtomicBool = AtomicBool::new(false);
+/// Ordered queue of mouse events captured by `zoom_stage_wndproc` for lossless reveal handoff.
+static PENDING_MOUSE_EVENTS: Mutex<VecDeque<ZoomStageMouseEvent>> = Mutex::new(VecDeque::new());
 /// Cloned `egui::Context` so WndProc hooks can wake an idle winit/eframe loop immediately.
 static EGUI_CTX: Mutex<Option<egui::Context>> = Mutex::new(None);
 
@@ -84,26 +89,63 @@ pub fn signal_interrupt() {
     request_egui_repaint();
 }
 
-pub fn clear_pending_primary_drag() {
-    PENDING_PRIMARY_DRAG_VALID.store(false, Ordering::SeqCst);
+pub fn clear_mouse_events() {
+    let mut guard = PENDING_MOUSE_EVENTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.clear();
 }
 
-pub fn take_pending_primary_drag() -> Option<(i32, i32)> {
-    if PENDING_PRIMARY_DRAG_VALID.swap(false, Ordering::SeqCst) {
-        let packed = PENDING_PRIMARY_DRAG_PT.load(Ordering::SeqCst);
-        Some((packed as u32 as i32, (packed >> 32) as u32 as i32))
+pub fn drain_mouse_events() -> Vec<ZoomStageMouseEvent> {
+    let mut guard = PENDING_MOUSE_EVENTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.drain(..).collect()
+}
+
+pub fn double_click_time_and_tolerance() -> (Duration, (i32, i32)) {
+    unsafe {
+        let ms = GetDoubleClickTime();
+        let interval = if ms == 0 {
+            Duration::from_millis(500)
+        } else {
+            Duration::from_millis(u64::from(ms).clamp(100, 1500))
+        };
+        let half_x = (GetSystemMetrics(SM_CXDOUBLECLK) / 2).max(6);
+        let half_y = (GetSystemMetrics(SM_CYDOUBLECLK) / 2).max(6);
+        (interval, (half_x, half_y))
+    }
+}
+
+pub fn click_drag_tolerance() -> (i32, i32) {
+    (8, 8)
+}
+
+fn current_modifiers() -> ZoomStageModifiers {
+    unsafe {
+        ZoomStageModifiers {
+            ctrl: GetKeyState(VK_CONTROL) < 0,
+            shift: GetKeyState(VK_SHIFT) < 0,
+            alt: GetKeyState(VK_MENU) < 0,
+        }
+    }
+}
+
+fn push_mouse_event(event: ZoomStageMouseEvent, interrupt: bool) {
+    {
+        let mut guard = PENDING_MOUSE_EVENTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if guard.len() >= 64 {
+            guard.pop_front();
+        }
+        guard.push_back(event);
+    }
+    if interrupt {
+        signal_interrupt();
     } else {
-        None
+        request_egui_repaint();
     }
-}
-
-fn record_primary_drag_press() {
-    if let Some((x, y)) = cursor_screen_point() {
-        let packed = (x as u32 as u64) | ((y as u32 as u64) << 32);
-        PENDING_PRIMARY_DRAG_PT.store(packed, Ordering::SeqCst);
-        PENDING_PRIMARY_DRAG_VALID.store(true, Ordering::SeqCst);
-    }
-    signal_interrupt();
 }
 
 pub fn set_zoom_capture_armed(armed: bool, allow_ctrl_wheel: bool) {
@@ -113,7 +155,7 @@ pub fn set_zoom_capture_armed(armed: bool, allow_ctrl_wheel: bool) {
         ZOOM_WHEEL_DELTA.store(0, Ordering::SeqCst);
         ZOOM_WHEEL_CURSOR_VALID.store(false, Ordering::SeqCst);
         ZOOM_INTERRUPT.store(false, Ordering::SeqCst);
-        PENDING_PRIMARY_DRAG_VALID.store(false, Ordering::SeqCst);
+        clear_mouse_events();
     }
 }
 
@@ -198,18 +240,118 @@ unsafe extern "system" fn zoom_stage_wndproc(
             0
         }
         WM_LBUTTONDOWN => {
-            record_primary_drag_press();
+            if let Some(screen_pt) = cursor_screen_point() {
+                push_mouse_event(
+                    ZoomStageMouseEvent::PrimaryDown {
+                        screen_pt,
+                        modifiers: current_modifiers(),
+                    },
+                    true,
+                );
+            } else {
+                signal_interrupt();
+            }
             0
         }
         WM_LBUTTONUP => {
-            clear_pending_primary_drag();
+            if let Some(screen_pt) = cursor_screen_point() {
+                push_mouse_event(
+                    ZoomStageMouseEvent::PrimaryUp {
+                        screen_pt,
+                        modifiers: current_modifiers(),
+                    },
+                    false,
+                );
+            }
             0
         }
-        WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_LBUTTONDBLCLK | WM_XBUTTONDOWN => {
-            clear_pending_primary_drag();
-            signal_interrupt();
+        WM_LBUTTONDBLCLK => {
+            if let Some(screen_pt) = cursor_screen_point() {
+                push_mouse_event(
+                    ZoomStageMouseEvent::PrimaryDoubleClick {
+                        screen_pt,
+                        modifiers: current_modifiers(),
+                    },
+                    true,
+                );
+            } else {
+                signal_interrupt();
+            }
             0
         }
+        WM_RBUTTONDOWN => {
+            if let Some(screen_pt) = cursor_screen_point() {
+                push_mouse_event(
+                    ZoomStageMouseEvent::SecondaryDown {
+                        screen_pt,
+                        modifiers: current_modifiers(),
+                    },
+                    true,
+                );
+            } else {
+                signal_interrupt();
+            }
+            0
+        }
+        WM_RBUTTONUP => {
+            if let Some(screen_pt) = cursor_screen_point() {
+                push_mouse_event(
+                    ZoomStageMouseEvent::SecondaryUp {
+                        screen_pt,
+                        modifiers: current_modifiers(),
+                    },
+                    false,
+                );
+            }
+            0
+        }
+        WM_MBUTTONDOWN => {
+            if let Some(screen_pt) = cursor_screen_point() {
+                push_mouse_event(
+                    ZoomStageMouseEvent::MiddleDown {
+                        screen_pt,
+                        modifiers: current_modifiers(),
+                    },
+                    true,
+                );
+            } else {
+                signal_interrupt();
+            }
+            0
+        }
+        WM_MBUTTONUP => {
+            push_mouse_event(ZoomStageMouseEvent::MiddleUp, false);
+            0
+        }
+        WM_XBUTTONDOWN => {
+            let xbutton = ((wparam >> 16) & 0xFFFF) as u16;
+            if let Some(screen_pt) = cursor_screen_point() {
+                let modifiers = current_modifiers();
+                if xbutton == XBUTTON1 {
+                    push_mouse_event(
+                        ZoomStageMouseEvent::Extra1Down {
+                            screen_pt,
+                            modifiers,
+                        },
+                        true,
+                    );
+                } else if xbutton == XBUTTON2 {
+                    push_mouse_event(
+                        ZoomStageMouseEvent::Extra2Down {
+                            screen_pt,
+                            modifiers,
+                        },
+                        true,
+                    );
+                } else {
+                    signal_interrupt();
+                }
+            } else {
+                signal_interrupt();
+            }
+            1
+        }
+        WM_XBUTTONUP => 1,
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
 }
@@ -308,6 +450,7 @@ impl ZoomStageWindow {
             REGISTER_CLASS.call_once(|| {
                 let mut wc: WNDCLASSEXW = std::mem::zeroed();
                 wc.cbSize = std::mem::size_of::<WNDCLASSEXW>() as u32;
+                wc.style = CS_DBLCLKS;
                 wc.lpfnWndProc = Some(zoom_stage_wndproc);
                 wc.hInstance = hinstance;
                 wc.lpszClassName = class_w.as_ptr();

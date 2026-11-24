@@ -6,6 +6,56 @@ use crate::app::*;
 use crate::prelude::*;
 
 impl ImageViewer {
+    /// Resets view zoom/rotation/offset on double-click (fullscreen fit or floating reset+center).
+    /// Shared by normal egui double-click and lossless zoom-stage direct/split double-click handoff.
+    pub(crate) fn reset_view_on_double_click(
+        &mut self,
+        ctx: &egui::Context,
+        screen_rect: egui::Rect,
+    ) {
+        self.reset_current_view_rotation(ctx);
+        self.offset = egui::Vec2::ZERO;
+        self.manga_shift_wheel_pan_velocity_x = 0.0;
+        self.zoom_velocity = 0.0;
+        self.floating_zoom_settled_zoom = None;
+        self.floating_zoom_inside_window_locked = false;
+        self.is_panning = false;
+        self.is_resizing = false;
+        self.pan_drag_button = None;
+        self.pan_drag_moves_window = false;
+        self.last_mouse_pos = None;
+        self.pan_last_cursor_phys = None;
+        self.reset_floating_window_drag_anchor();
+
+        // Get dimensions from current media (image or video)
+        if let Some((img_w_u, img_h_u)) = self.media_display_dimensions() {
+            let img_w = img_w_u as f32;
+            let img_h = img_h_u as f32;
+
+            if self.mode().is_fullscreen() {
+                // Fit to whichever fullscreen axis is exhausted first.
+                if img_w > 0.0 && img_h > 0.0 {
+                    let fit_zoom = self
+                        .fit_zoom_for_target_bounds(screen_rect.size(), egui::vec2(img_w, img_h));
+                    self.zoom = fit_zoom;
+                    self.zoom_target = self.zoom;
+                }
+                self.clear_current_fullscreen_view_memory();
+            } else {
+                // Floating mode: reset to 100% size, or fit to screen if needed.
+                let monitor = self.monitor_size_points(ctx);
+                if let Some((fit_zoom, desired)) =
+                    self.floating_layout_size_for_media(img_w, img_h, monitor)
+                {
+                    self.zoom = fit_zoom;
+                    self.zoom_target = fit_zoom;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(desired));
+                    self.center_window_on_monitor(ctx, desired);
+                }
+            }
+        }
+    }
+
     /// Draw the main image
     /// Returns true if animation is in progress and requires repaint
     pub(crate) fn draw_image(&mut self, ctx: &egui::Context) -> bool {
@@ -453,10 +503,91 @@ impl ImageViewer {
                 animation_active = true;
             }
 
+            // Split double-click detection: if click 1 landed on `zoom_hwnd` just before reveal
+            // and click 2 lands on `main_hwnd` within the system double-click time and radius,
+            // fire the exact double-click handler and suppress starting a drag/resize on click 2.
+            let mut split_double_click_triggered = false;
+            if !self.mode().is_fullscreen() {
+                #[cfg(target_os = "windows")]
+                {
+                    if !primary_down {
+                        if let Some(press_pt) =
+                            self.pending_zoom_stage_primary_click_candidate.take()
+                        {
+                            let release_pt = crate::windows_zoom_stage::cursor_screen_point()
+                                .unwrap_or(press_pt);
+                            let click_tol = crate::windows_zoom_stage::click_drag_tolerance();
+                            if points_within_tolerance(
+                                press_pt,
+                                release_pt,
+                                click_tol.0,
+                                click_tol.1,
+                            ) {
+                                self.last_zoom_stage_primary_click =
+                                    Some(LastZoomStagePrimaryClick {
+                                        at: Instant::now(),
+                                        screen_pt: press_pt,
+                                    });
+                            }
+                        }
+                    }
+
+                    if self.last_zoom_stage_primary_click.is_some() {
+                        let (max_interval, dbl_tol) =
+                            crate::windows_zoom_stage::double_click_time_and_tolerance();
+                        let now = Instant::now();
+                        let other_button_pressed = secondary_clicked
+                            || middle_pressed
+                            || ctx.input(|i| {
+                                i.pointer.button_pressed(egui::PointerButton::Secondary)
+                                    || i.pointer.button_pressed(egui::PointerButton::Extra1)
+                                    || i.pointer.button_pressed(egui::PointerButton::Extra2)
+                            });
+                        let expired = self
+                            .last_zoom_stage_primary_click
+                            .is_some_and(|c| now.saturating_duration_since(c.at) > max_interval);
+                        if other_button_pressed || expired {
+                            self.last_zoom_stage_primary_click = None;
+                        } else if primary_pressed
+                            && !ctrl_held
+                            && !shift_held
+                            && !alt_held
+                            && !title_ui_blocking
+                            && !pointer_over_shortcut_ui
+                            && !over_video_controls
+                            && !over_title_bar_buttons
+                        {
+                            if let Some(press_pt) = crate::windows_zoom_stage::cursor_screen_point()
+                            {
+                                if is_split_double_click(
+                                    self.last_zoom_stage_primary_click,
+                                    now,
+                                    press_pt,
+                                    max_interval,
+                                    dbl_tol,
+                                ) {
+                                    self.last_zoom_stage_primary_click = None;
+                                    self.pending_zoom_stage_primary_click_candidate = None;
+                                    split_double_click_triggered = true;
+                                } else {
+                                    self.last_zoom_stage_primary_click = None;
+                                }
+                            } else {
+                                self.last_zoom_stage_primary_click = None;
+                            }
+                        }
+                    }
+                }
+            } else {
+                self.last_zoom_stage_primary_click = None;
+                self.pending_zoom_stage_primary_click_candidate = None;
+            }
+
             // Handle resize start (but not if over video controls, and never from the
             // title-bar button cluster: a resize moves/resizes the window under the cursor and
             // swallows the button click, which made Close unreachable in floating mode).
             if primary_pressed
+                && !split_double_click_triggered
                 && hover_resize_direction != ResizeDirection::None
                 && !self.mouse_over_window_buttons
                 && !self.is_resizing
@@ -503,6 +634,7 @@ impl ImageViewer {
                 // A new drag still needs the cursor inside the window: pressing something and
                 // then yanking the cursor out of it must not start moving the window.
                 let drag_can_start = pan_down_action
+                    && !split_double_click_triggered
                     && pointer_pos.is_some()
                     && hover_resize_direction == ResizeDirection::None
                     && !over_video_controls
@@ -688,46 +820,14 @@ impl ImageViewer {
             self.request_floating_autosize(ctx);
 
             // Handle double-click to fit media to screen (fullscreen) or reset zoom (floating)
-            if ctx.input(|i| {
-                i.pointer
-                    .button_double_clicked(egui::PointerButton::Primary)
-            }) && !title_ui_blocking
-                && !pointer_over_shortcut_ui
-            {
-                self.reset_current_view_rotation(ctx);
-                self.offset = egui::Vec2::ZERO;
-                self.manga_shift_wheel_pan_velocity_x = 0.0;
-                self.zoom_velocity = 0.0;
-
-                // Get dimensions from current media (image or video)
-                if let Some((img_w_u, img_h_u)) = self.media_display_dimensions() {
-                    let img_w = img_w_u as f32;
-                    let img_h = img_h_u as f32;
-
-                    if self.mode().is_fullscreen() {
-                        // Fit to whichever fullscreen axis is exhausted first.
-                        if img_w > 0.0 && img_h > 0.0 {
-                            let fit_zoom = self.fit_zoom_for_target_bounds(
-                                screen_rect.size(),
-                                egui::vec2(img_w, img_h),
-                            );
-                            self.zoom = fit_zoom;
-                            self.zoom_target = self.zoom;
-                        }
-                        self.clear_current_fullscreen_view_memory();
-                    } else {
-                        // Floating mode: reset to 100% size, or fit to screen if needed.
-                        let monitor = self.monitor_size_points(ctx);
-                        if let Some((fit_zoom, desired)) =
-                            self.floating_layout_size_for_media(img_w, img_h, monitor)
-                        {
-                            self.zoom = fit_zoom;
-                            self.zoom_target = fit_zoom;
-                            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(desired));
-                            self.center_window_on_monitor(ctx, desired);
-                        }
-                    }
-                }
+            let double_clicked = split_double_click_triggered
+                || (ctx.input(|i| {
+                    i.pointer
+                        .button_double_clicked(egui::PointerButton::Primary)
+                }) && !title_ui_blocking
+                    && !pointer_over_shortcut_ui);
+            if double_clicked {
+                self.reset_view_on_double_click(ctx, screen_rect);
             }
         }
 

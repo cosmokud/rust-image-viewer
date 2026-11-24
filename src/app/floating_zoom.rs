@@ -360,6 +360,309 @@ pub(crate) struct PendingPrimaryDrag {
     pub(crate) press_screen_pt: (i32, i32),
 }
 
+/// Modifier key snapshot captured alongside a Win32 mouse message on `zoom_hwnd`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ZoomStageModifiers {
+    pub(crate) ctrl: bool,
+    pub(crate) shift: bool,
+    pub(crate) alt: bool,
+}
+
+impl ZoomStageModifiers {
+    #[cfg(test)]
+    pub(crate) const fn none() -> Self {
+        Self {
+            ctrl: false,
+            shift: false,
+            alt: false,
+        }
+    }
+
+    pub(crate) const fn any(self) -> bool {
+        self.ctrl || self.shift || self.alt
+    }
+}
+
+/// Structured mouse event captured by `zoom_stage_wndproc` while the layered stage is visible.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ZoomStageMouseEvent {
+    PrimaryDown {
+        screen_pt: (i32, i32),
+        modifiers: ZoomStageModifiers,
+    },
+    PrimaryUp {
+        screen_pt: (i32, i32),
+        modifiers: ZoomStageModifiers,
+    },
+    PrimaryDoubleClick {
+        screen_pt: (i32, i32),
+        modifiers: ZoomStageModifiers,
+    },
+    SecondaryDown {
+        screen_pt: (i32, i32),
+        modifiers: ZoomStageModifiers,
+    },
+    SecondaryUp {
+        screen_pt: (i32, i32),
+        modifiers: ZoomStageModifiers,
+    },
+    MiddleDown {
+        screen_pt: (i32, i32),
+        modifiers: ZoomStageModifiers,
+    },
+    MiddleUp,
+    Extra1Down {
+        screen_pt: (i32, i32),
+        modifiers: ZoomStageModifiers,
+    },
+    Extra2Down {
+        screen_pt: (i32, i32),
+        modifiers: ZoomStageModifiers,
+    },
+}
+
+/// Physical screen coordinates and modifiers for a captured click/press on `zoom_hwnd`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PendingZoomStageClick {
+    pub(crate) screen_pt: (i32, i32),
+    pub(crate) modifiers: ZoomStageModifiers,
+}
+
+/// Recorded unmodified primary click that completed on `zoom_hwnd`, used to detect
+/// split double-clicks where click 1 hits `zoom_hwnd` and click 2 hits `main_hwnd`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LastZoomStagePrimaryClick {
+    pub(crate) at: std::time::Instant,
+    pub(crate) screen_pt: (i32, i32),
+}
+
+/// Accumulated mouse interactions captured on `zoom_hwnd` while a floating zoom session
+/// is settling/revealing `main_hwnd`, so zero clicks/drags/double-clicks/right-clicks are lost.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PendingZoomStageInputs {
+    pub(crate) primary_down: Option<PendingZoomStageClick>,
+    pub(crate) primary_click_completed: Option<LastZoomStagePrimaryClick>,
+    pub(crate) primary_double_click: Option<PendingZoomStageClick>,
+    pub(crate) secondary_down: Option<PendingZoomStageClick>,
+    pub(crate) secondary_click: Option<PendingZoomStageClick>,
+    pub(crate) middle_down: Option<(PendingZoomStageClick, bool)>,
+    pub(crate) extra1_down: Option<PendingZoomStageClick>,
+    pub(crate) extra2_down: Option<PendingZoomStageClick>,
+}
+
+/// True when two physical screen points are within `(tol_x, tol_y)` pixels of each other.
+pub(crate) fn points_within_tolerance(
+    a: (i32, i32),
+    b: (i32, i32),
+    tol_x: i32,
+    tol_y: i32,
+) -> bool {
+    (a.0 - b.0).abs() <= tol_x.max(0) && (a.1 - b.1).abs() <= tol_y.max(0)
+}
+
+/// Converts a physical screen point `(x, y)` to window-local logical coordinates `(x_pt, y_pt)`.
+pub(crate) fn screen_point_to_logical_local(
+    screen_pt: (i32, i32),
+    window_rect: PhysicalRect,
+    pixels_per_point: f32,
+) -> (f32, f32) {
+    let ppp = pixels_per_point.max(0.01);
+    (
+        (screen_pt.0 - window_rect.left) as f32 / ppp,
+        (screen_pt.1 - window_rect.top) as f32 / ppp,
+    )
+}
+
+impl PendingZoomStageInputs {
+    pub(crate) fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    pub(crate) fn has_any(&self) -> bool {
+        self.primary_down.is_some()
+            || self.primary_click_completed.is_some()
+            || self.primary_double_click.is_some()
+            || self.secondary_down.is_some()
+            || self.secondary_click.is_some()
+            || self.middle_down.is_some()
+            || self.extra1_down.is_some()
+            || self.extra2_down.is_some()
+    }
+
+    pub(crate) fn record_event(
+        &mut self,
+        event: ZoomStageMouseEvent,
+        now: std::time::Instant,
+        click_tol: (i32, i32),
+    ) {
+        match event {
+            ZoomStageMouseEvent::PrimaryDown {
+                screen_pt,
+                modifiers,
+            } => {
+                self.primary_down = Some(PendingZoomStageClick {
+                    screen_pt,
+                    modifiers,
+                });
+                self.secondary_down = None;
+            }
+            ZoomStageMouseEvent::PrimaryUp {
+                screen_pt,
+                modifiers: _,
+            } => {
+                if let Some(down) = self.primary_down.take() {
+                    if !down.modifiers.any()
+                        && points_within_tolerance(
+                            down.screen_pt,
+                            screen_pt,
+                            click_tol.0,
+                            click_tol.1,
+                        )
+                    {
+                        self.primary_click_completed =
+                            Some(LastZoomStagePrimaryClick { at: now, screen_pt });
+                    }
+                }
+            }
+            ZoomStageMouseEvent::PrimaryDoubleClick {
+                screen_pt,
+                modifiers,
+            } => {
+                self.primary_down = None;
+                self.primary_click_completed = None;
+                if !modifiers.any() {
+                    self.primary_double_click = Some(PendingZoomStageClick {
+                        screen_pt,
+                        modifiers,
+                    });
+                }
+            }
+            ZoomStageMouseEvent::SecondaryDown {
+                screen_pt,
+                modifiers,
+            } => {
+                self.primary_down = None;
+                self.primary_click_completed = None;
+                self.secondary_down = Some(PendingZoomStageClick {
+                    screen_pt,
+                    modifiers,
+                });
+            }
+            ZoomStageMouseEvent::SecondaryUp {
+                screen_pt,
+                modifiers,
+            } => {
+                if let Some(down) = self.secondary_down.take() {
+                    if points_within_tolerance(down.screen_pt, screen_pt, click_tol.0, click_tol.1)
+                    {
+                        self.secondary_click = Some(PendingZoomStageClick {
+                            screen_pt,
+                            modifiers: ZoomStageModifiers {
+                                ctrl: down.modifiers.ctrl || modifiers.ctrl,
+                                shift: down.modifiers.shift || modifiers.shift,
+                                alt: down.modifiers.alt || modifiers.alt,
+                            },
+                        });
+                    }
+                }
+            }
+            ZoomStageMouseEvent::MiddleDown {
+                screen_pt,
+                modifiers,
+            } => {
+                self.primary_down = None;
+                self.primary_click_completed = None;
+                self.middle_down = Some((
+                    PendingZoomStageClick {
+                        screen_pt,
+                        modifiers,
+                    },
+                    true,
+                ));
+            }
+            ZoomStageMouseEvent::MiddleUp => {
+                if let Some((_, still_down)) = self.middle_down.as_mut() {
+                    *still_down = false;
+                }
+            }
+            ZoomStageMouseEvent::Extra1Down {
+                screen_pt,
+                modifiers,
+            } => {
+                self.primary_down = None;
+                self.primary_click_completed = None;
+                self.extra1_down = Some(PendingZoomStageClick {
+                    screen_pt,
+                    modifiers,
+                });
+            }
+            ZoomStageMouseEvent::Extra2Down {
+                screen_pt,
+                modifiers,
+            } => {
+                self.primary_down = None;
+                self.primary_click_completed = None;
+                self.extra2_down = Some(PendingZoomStageClick {
+                    screen_pt,
+                    modifiers,
+                });
+            }
+        }
+    }
+}
+
+/// True when a primary press on `main_hwnd` completes a split double-click whose first
+/// click landed on `zoom_hwnd` within `max_interval` and `double_click_tol`.
+pub(crate) fn is_split_double_click(
+    last_click: Option<LastZoomStagePrimaryClick>,
+    now: std::time::Instant,
+    press_pt: (i32, i32),
+    max_interval: std::time::Duration,
+    double_click_tol: (i32, i32),
+) -> bool {
+    let Some(last) = last_click else {
+        return false;
+    };
+    now.saturating_duration_since(last.at) <= max_interval
+        && points_within_tolerance(
+            last.screen_pt,
+            press_pt,
+            double_click_tol.0,
+            double_click_tol.1,
+        )
+}
+
+/// Resolves a split secondary click (`WM_RBUTTONDOWN` on `zoom_hwnd`, release on `main_hwnd`):
+/// returns `Some` with the release coordinates if the pointer stayed within `click_tol`.
+pub(crate) fn resolve_split_secondary_click(
+    pending: Option<PendingZoomStageClick>,
+    release_pt: (i32, i32),
+    click_tol: (i32, i32),
+) -> Option<PendingZoomStageClick> {
+    let down = pending?;
+    if points_within_tolerance(down.screen_pt, release_pt, click_tol.0, click_tol.1) {
+        Some(PendingZoomStageClick {
+            screen_pt: release_pt,
+            modifiers: down.modifiers,
+        })
+    } else {
+        None
+    }
+}
+
+/// True when `handle_input` mutated `(zoom_target, offset)` after a keyboard interrupt synced
+/// the floating zoom stage, meaning the stage must immediately reveal without overwriting them.
+pub(crate) fn key_interrupt_mutated_view(
+    synced_zoom_target: f32,
+    synced_offset: (f32, f32),
+    current_zoom_target: f32,
+    current_offset: (f32, f32),
+) -> bool {
+    (current_zoom_target - synced_zoom_target).abs() > 1e-5
+        || (current_offset.0 - synced_offset.0).abs() > 1e-3
+        || (current_offset.1 - synced_offset.1).abs() > 1e-3
+}
+
 /// Action to engage immediately on reveal when a primary mouse press was captured on `zoom_hwnd`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum FloatingZoomDragTakeover {
@@ -1519,5 +1822,272 @@ mod tests {
             stage1.as_chunks::<4>().0.iter().all(|&p| p == red_bgra),
             "Stage 1 must have 100% coverage with zero background pixels"
         );
+    }
+
+    #[test]
+    fn zoom_stage_direct_double_click_triggers_handoff() {
+        let now = std::time::Instant::now();
+        let mut inputs = PendingZoomStageInputs::default();
+        inputs.record_event(
+            ZoomStageMouseEvent::PrimaryDown {
+                screen_pt: (500, 400),
+                modifiers: ZoomStageModifiers::none(),
+            },
+            now,
+            (8, 8),
+        );
+        inputs.record_event(
+            ZoomStageMouseEvent::PrimaryUp {
+                screen_pt: (501, 400),
+                modifiers: ZoomStageModifiers::none(),
+            },
+            now,
+            (8, 8),
+        );
+        inputs.record_event(
+            ZoomStageMouseEvent::PrimaryDoubleClick {
+                screen_pt: (502, 401),
+                modifiers: ZoomStageModifiers::none(),
+            },
+            now,
+            (8, 8),
+        );
+        assert_eq!(
+            inputs.primary_double_click,
+            Some(PendingZoomStageClick {
+                screen_pt: (502, 401),
+                modifiers: ZoomStageModifiers::none(),
+            })
+        );
+        assert!(inputs.primary_down.is_none());
+        assert!(inputs.primary_click_completed.is_none());
+    }
+
+    #[test]
+    fn split_double_click_respects_time_radius_and_modifiers() {
+        let t0 = std::time::Instant::now();
+        let mut inputs = PendingZoomStageInputs::default();
+        inputs.record_event(
+            ZoomStageMouseEvent::PrimaryDown {
+                screen_pt: (600, 350),
+                modifiers: ZoomStageModifiers::none(),
+            },
+            t0,
+            (8, 8),
+        );
+        inputs.record_event(
+            ZoomStageMouseEvent::PrimaryUp {
+                screen_pt: (602, 351),
+                modifiers: ZoomStageModifiers::none(),
+            },
+            t0,
+            (8, 8),
+        );
+        let first_click = inputs.primary_click_completed;
+        assert!(first_click.is_some());
+
+        let max_interval = std::time::Duration::from_millis(500);
+        let tol = (6, 6);
+
+        // Within time and radius -> triggers split double-click.
+        assert!(is_split_double_click(
+            first_click,
+            t0 + std::time::Duration::from_millis(180),
+            (605, 354),
+            max_interval,
+            tol
+        ));
+
+        // Outside radius -> does NOT trigger.
+        assert!(!is_split_double_click(
+            first_click,
+            t0 + std::time::Duration::from_millis(180),
+            (620, 351),
+            max_interval,
+            tol
+        ));
+
+        // Outside time -> does NOT trigger.
+        assert!(!is_split_double_click(
+            first_click,
+            t0 + std::time::Duration::from_millis(650),
+            (602, 351),
+            max_interval,
+            tol
+        ));
+
+        // Modified click (Ctrl+Click) must NOT arm split double-click.
+        let mut mod_inputs = PendingZoomStageInputs::default();
+        let ctrl_mod = ZoomStageModifiers {
+            ctrl: true,
+            shift: false,
+            alt: false,
+        };
+        mod_inputs.record_event(
+            ZoomStageMouseEvent::PrimaryDown {
+                screen_pt: (600, 350),
+                modifiers: ctrl_mod,
+            },
+            t0,
+            (8, 8),
+        );
+        mod_inputs.record_event(
+            ZoomStageMouseEvent::PrimaryUp {
+                screen_pt: (600, 350),
+                modifiers: ctrl_mod,
+            },
+            t0,
+            (8, 8),
+        );
+        assert!(mod_inputs.primary_click_completed.is_none());
+    }
+
+    #[test]
+    fn direct_and_split_right_click_preserve_exact_logical_coords_and_reject_drags() {
+        let t0 = std::time::Instant::now();
+        let win_rect = PhysicalRect::new(200, 100, 1000, 700);
+        let ppp = 1.25;
+        let ctrl_mod = ZoomStageModifiers {
+            ctrl: true,
+            shift: false,
+            alt: false,
+        };
+
+        // Direct Ctrl+RMB (down + up on zoom stage) -> exact logical coordinates for context menu.
+        let mut direct = PendingZoomStageInputs::default();
+        direct.record_event(
+            ZoomStageMouseEvent::SecondaryDown {
+                screen_pt: (450, 350),
+                modifiers: ctrl_mod,
+            },
+            t0,
+            (8, 8),
+        );
+        direct.record_event(
+            ZoomStageMouseEvent::SecondaryUp {
+                screen_pt: (450, 350),
+                modifiers: ZoomStageModifiers::none(),
+            },
+            t0,
+            (8, 8),
+        );
+        let click = direct.secondary_click.expect("direct right-click captured");
+        assert!(click.modifiers.ctrl);
+        let (lx, ly) = screen_point_to_logical_local(click.screen_pt, win_rect, ppp);
+        assert!((lx - 200.0).abs() < 1e-4);
+        assert!((ly - 200.0).abs() < 1e-4);
+
+        // Direct RMB dragged far away -> rejected.
+        let mut dragged = PendingZoomStageInputs::default();
+        dragged.record_event(
+            ZoomStageMouseEvent::SecondaryDown {
+                screen_pt: (450, 350),
+                modifiers: ctrl_mod,
+            },
+            t0,
+            (8, 8),
+        );
+        dragged.record_event(
+            ZoomStageMouseEvent::SecondaryUp {
+                screen_pt: (520, 420),
+                modifiers: ctrl_mod,
+            },
+            t0,
+            (8, 8),
+        );
+        assert!(dragged.secondary_click.is_none());
+
+        // Split RMB (down on zoom stage, up on main window).
+        let mut split = PendingZoomStageInputs::default();
+        split.record_event(
+            ZoomStageMouseEvent::SecondaryDown {
+                screen_pt: (700, 400),
+                modifiers: ctrl_mod,
+            },
+            t0,
+            (8, 8),
+        );
+        assert!(split.secondary_down.is_some());
+        let resolved = resolve_split_secondary_click(split.secondary_down, (703, 402), (8, 8))
+            .expect("split right-click within tolerance");
+        assert!(resolved.modifiers.ctrl);
+        let (slx, sly) = screen_point_to_logical_local(resolved.screen_pt, win_rect, ppp);
+        assert!((slx - (503.0 / ppp)).abs() < 1e-4);
+        assert!((sly - (302.0 / ppp)).abs() < 1e-4);
+
+        // Split RMB dragged far away -> rejected.
+        assert!(resolve_split_secondary_click(split.secondary_down, (740, 400), (8, 8)).is_none());
+    }
+
+    #[test]
+    fn middle_and_extra_mouse_buttons_capture_cleanly_on_zoom_stage() {
+        let t0 = std::time::Instant::now();
+        let mut inputs = PendingZoomStageInputs::default();
+        inputs.record_event(
+            ZoomStageMouseEvent::MiddleDown {
+                screen_pt: (300, 250),
+                modifiers: ZoomStageModifiers::none(),
+            },
+            t0,
+            (8, 8),
+        );
+        assert_eq!(inputs.middle_down.map(|(_, held)| held), Some(true));
+        inputs.record_event(ZoomStageMouseEvent::MiddleUp, t0, (8, 8));
+        assert_eq!(inputs.middle_down.map(|(_, held)| held), Some(false));
+
+        inputs.record_event(
+            ZoomStageMouseEvent::Extra1Down {
+                screen_pt: (300, 250),
+                modifiers: ZoomStageModifiers::none(),
+            },
+            t0,
+            (8, 8),
+        );
+        inputs.record_event(
+            ZoomStageMouseEvent::Extra2Down {
+                screen_pt: (300, 250),
+                modifiers: ZoomStageModifiers::none(),
+            },
+            t0,
+            (8, 8),
+        );
+        assert!(inputs.extra1_down.is_some());
+        assert!(inputs.extra2_down.is_some());
+    }
+
+    #[test]
+    fn key_interrupt_view_mutation_detection_preserves_keyboard_actions() {
+        let mut state = FloatingZoomState::new(FloatingZoomInit {
+            window_rect: PhysicalRect::new(560, 240, 1360, 840),
+            monitor_rect: monitor_1080p(),
+            media_w: 800.0,
+            media_h: 600.0,
+            current_zoom: 1.0,
+            current_offset_pt: (0.0, 0.0),
+            pixels_per_point: 1.0,
+            max_zoom_factor: 10.0,
+            config_zoom_step: 1.02,
+            inside_window_locked: false,
+        })
+        .unwrap();
+        state.add_notches(4.0);
+        let _ = state.step(0.016);
+        let frozen = state.freeze_for_interrupt();
+        assert!(frozen.settled);
+
+        let (synced_zoom, synced_offset) = state.to_eframe_state(1.0);
+        assert!(!key_interrupt_mutated_view(
+            synced_zoom,
+            synced_offset,
+            synced_zoom,
+            synced_offset
+        ));
+        // Simulating `ResetZoom` / `ZoomIn` / `ZoomOut` mutating `zoom_target`.
+        assert!(key_interrupt_mutated_view(
+            synced_zoom,
+            synced_offset,
+            1.0,
+            (0.0, 0.0)
+        ));
     }
 }

@@ -6,6 +6,175 @@ use crate::app::*;
 use crate::prelude::*;
 
 impl ImageViewer {
+    /// Handles a solo-mode secondary (right) click at window-local logical `pos` inside `screen_rect`.
+    /// Shared by normal egui `secondary_clicked` and lossless zoom-stage right-click handoff.
+    pub(crate) fn handle_solo_secondary_click(
+        &mut self,
+        pos: egui::Pos2,
+        screen_rect: egui::Rect,
+        ctrl: bool,
+    ) -> bool {
+        if !self.mode().is_solo() {
+            return false;
+        }
+        if self.pointer_over_shortcut_blocking_ui(Some(pos), screen_rect) {
+            return false;
+        }
+
+        if self.manga_autoscroll_active {
+            self.stop_manga_autoscroll();
+            return true;
+        }
+
+        if ctrl {
+            if !self.image_list.is_empty() {
+                self.open_file_action_menu(
+                    pos,
+                    self.current_index
+                        .min(self.image_list.len().saturating_sub(1)),
+                );
+                return true;
+            }
+            return false;
+        }
+
+        let goto_file_uses_right_click =
+            self.action_uses_binding(Action::GotoFile, InputBinding::MouseRight);
+        if goto_file_uses_right_click
+            && self
+                .current_media_path()
+                .as_ref()
+                .is_some_and(|path| self.is_folder_navigation_entry_path(path.as_path()))
+            && self.point_over_current_media(pos, screen_rect)
+        {
+            if let Some(path) = self.current_media_path() {
+                if self.traverse_folder_entry_path(path.as_path()) {
+                    return true;
+                }
+            }
+        }
+
+        let select_area_uses_right_click =
+            self.action_uses_binding(Action::SelectArea, InputBinding::MouseRight);
+        if select_area_uses_right_click {
+            if let Some(action) = self.right_click_black_bar_action(pos, screen_rect) {
+                self.run_action(action);
+                return true;
+            }
+        }
+
+        let screen_width = screen_rect.width().max(1.0);
+        let side_zone = screen_width / 9.0;
+        if select_area_uses_right_click && pos.x < side_zone {
+            self.run_action(Action::PreviousImage);
+            return true;
+        }
+        if select_area_uses_right_click && pos.x > screen_width - side_zone {
+            self.run_action(Action::NextImage);
+            return true;
+        }
+        if goto_file_uses_right_click && self.point_over_current_media(pos, screen_rect) {
+            self.request_goto_file_fullscreen_toggle();
+            return true;
+        }
+
+        if pos.x >= side_zone && pos.x <= screen_width - side_zone {
+            let has_animated_gif = self.image.as_ref().is_some_and(|img| img.is_animated());
+            if matches!(self.current_media_type, Some(MediaType::Video)) {
+                self.try_toggle_solo_video_play_pause();
+                return true;
+            } else if has_animated_gif {
+                self.gif_paused = !self.gif_paused;
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Dispatches any solo-mode discrete action bound to `binding` (`MouseMiddle`, `Mouse4`, `Mouse5`)
+    /// captured while the floating zoom stage covered `main_hwnd`.
+    pub(crate) fn dispatch_zoom_stage_mouse_button_action(
+        &mut self,
+        binding: InputBinding,
+    ) -> bool {
+        if !self.mode().is_solo() || self.any_modal_dialog_open() || self.file_action_menu.is_some()
+        {
+            return false;
+        }
+
+        if self.video_navigation_mode_active() {
+            let media_playing = if self.solo_video_playback_mode_active() {
+                self.solo_video_playing_active()
+            } else {
+                self.image.as_ref().is_some_and(|img| img.is_animated()) && !self.gif_paused
+            };
+            if media_playing
+                && self.config.video_priority_previous_file_binding.as_ref() == Some(&binding)
+            {
+                if self.config.videos_only_navigation {
+                    self.suppress_video_controls_for_next_video_load = true;
+                }
+                self.navigate_prev_for_video_mode();
+                return true;
+            }
+            if media_playing
+                && self.config.video_priority_next_file_binding.as_ref() == Some(&binding)
+            {
+                if self.config.videos_only_navigation {
+                    self.suppress_video_controls_for_next_video_load = true;
+                }
+                self.navigate_next_for_video_mode();
+                return true;
+            }
+            if self.solo_video_playback_mode_active()
+                && self.config.video_priority_play_pause_binding.as_ref() == Some(&binding)
+            {
+                self.try_toggle_solo_video_play_pause();
+                return true;
+            }
+        }
+
+        let actions_to_run: Vec<Action> = self
+            .config
+            .action_bindings
+            .iter()
+            .filter_map(|(action, bindings)| {
+                let action = *action;
+                let solo_discrete = matches!(
+                    action,
+                    Action::ToggleFullscreen
+                        | Action::GotoFile
+                        | Action::Exit
+                        | Action::ResetZoom
+                        | Action::Minimize
+                        | Action::Close
+                        | Action::NextImage
+                        | Action::PreviousImage
+                        | Action::RotateClockwise
+                        | Action::RotateCounterClockwise
+                        | Action::FlipVertically
+                        | Action::FlipHorizontally
+                        | Action::ZoomIn
+                        | Action::ZoomOut
+                        | Action::VideoPlayPause
+                        | Action::VideoMute
+                        | Action::PreciseRotationClockwise
+                        | Action::PreciseRotationCounterClockwise
+                );
+                (solo_discrete && bindings.contains(&binding)).then_some(action)
+            })
+            .collect();
+
+        if actions_to_run.is_empty() {
+            return false;
+        }
+        for action in actions_to_run {
+            self.run_action(action);
+        }
+        true
+    }
+
     /// Handle keyboard and mouse input
     pub(crate) fn handle_input(&mut self, ctx: &egui::Context) {
         if !self.window_allows_keyboard_shortcuts(ctx) {

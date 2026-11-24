@@ -24,7 +24,11 @@ pub(crate) struct FloatingZoomSession {
     pub(crate) state: FloatingZoomState,
     pub(crate) phase: FloatingZoomPhase,
     pub(crate) main_cloaked: bool,
-    pub(crate) pending_primary_drag: Option<PendingPrimaryDrag>,
+    pub(crate) pending_inputs: PendingZoomStageInputs,
+    /// Snapshot of `(zoom_target, offset)` synced before `handle_input` when a key interrupt
+    /// arrived, so `drive_floating_zoom_stage` never overwrites keyboard actions (`ResetZoom`,
+    /// `ZoomIn`, `ZoomOut`, etc.).
+    pub(crate) key_interrupt_synced_view: Option<(f32, egui::Vec2)>,
 }
 
 impl ImageViewer {
@@ -39,11 +43,18 @@ impl ImageViewer {
         }
     }
 
+    pub(crate) fn clear_zoom_stage_click_handoff_state(&mut self) {
+        self.last_zoom_stage_primary_click = None;
+        self.pending_zoom_stage_primary_click_candidate = None;
+        self.pending_zoom_stage_secondary_press = None;
+    }
+
     pub(crate) fn cancel_floating_zoom_stage_immediately(&mut self) {
         #[cfg(target_os = "windows")]
         {
             crate::windows_zoom_stage::set_zoom_capture_armed(false, false);
             self.floating_zoom_settled_zoom = None;
+            self.clear_zoom_stage_click_handoff_state();
             if let Some(session) = self.floating_zoom_session.take() {
                 if session.main_cloaked {
                     let main_hwnd = self.resolved_main_hwnd();
@@ -56,6 +67,112 @@ impl ImageViewer {
                 stage.hide();
             }
         }
+    }
+
+    /// Runs right BEFORE `handle_input(ctx)`:
+    /// 1. Polls any split secondary press (`WM_RBUTTONDOWN` on `zoom_hwnd`, release on `main_hwnd`)
+    ///    and dispatches the exact solo right-click handler at the exact cursor position.
+    /// 2. If a keyboard shortcut/key press arrives while the layered zoom stage is active,
+    ///    freezes and syncs `(zoom, offset)` into `self` BEFORE `handle_input(ctx)` runs so
+    ///    keyboard actions (`ResetZoom`, `ZoomIn`, `ZoomOut`, `Delete`, `NextImage`, `F11`, etc.)
+    ///    execute on top of the exact zoomed state and are never overwritten or dropped.
+    #[cfg(target_os = "windows")]
+    pub(crate) fn prepare_floating_zoom_stage_for_input(&mut self, ctx: &egui::Context) {
+        self.poll_pending_zoom_stage_secondary_press(ctx);
+
+        if self.floating_zoom_session.is_none() {
+            return;
+        }
+
+        let key_event_present = ctx.input(|i| {
+            i.raw.events.iter().any(|e| {
+                matches!(
+                    e,
+                    egui::Event::Key { pressed: true, .. }
+                        | egui::Event::Copy
+                        | egui::Event::Cut
+                        | egui::Event::Paste(_)
+                )
+            })
+        });
+        if !key_event_present {
+            return;
+        }
+
+        let main_hwnd = self.resolved_main_hwnd();
+        if main_hwnd.is_null() {
+            self.cancel_floating_zoom_stage_immediately();
+            return;
+        }
+
+        let Some(mut session) = self.floating_zoom_session.take() else {
+            return;
+        };
+
+        if session.key_interrupt_synced_view.is_none() {
+            let frame = session.state.freeze_for_interrupt();
+            if matches!(session.phase, FloatingZoomPhase::Travelling { .. }) {
+                session.phase = self.begin_settling_main_window(
+                    ctx,
+                    main_hwnd,
+                    &session.state,
+                    frame.window_rect,
+                );
+            } else {
+                let ppp = ctx.pixels_per_point().max(0.01);
+                let (zoom, (ox, oy)) = session.state.to_eframe_state(ppp);
+                self.zoom = zoom;
+                self.zoom_target = zoom;
+                self.zoom_velocity = 0.0;
+                self.offset = egui::vec2(ox, oy);
+                self.floating_zoom_inside_window_locked = session.state.inside_window_locked;
+            }
+            session.key_interrupt_synced_view = Some((self.zoom_target, self.offset));
+        }
+
+        self.floating_zoom_session = Some(session);
+        ctx.request_repaint();
+    }
+
+    #[cfg(target_os = "windows")]
+    fn poll_pending_zoom_stage_secondary_press(&mut self, ctx: &egui::Context) {
+        let Some(press) = self.pending_zoom_stage_secondary_press else {
+            return;
+        };
+        if self.mode().is_fullscreen()
+            || !self.mode().is_solo()
+            || self.any_modal_dialog_open()
+            || self.file_action_menu.is_some()
+        {
+            self.pending_zoom_stage_secondary_press = None;
+            return;
+        }
+        if global_mouse_button_down(GLOBAL_MOUSE_RIGHT) {
+            ctx.request_repaint();
+            return;
+        }
+
+        self.pending_zoom_stage_secondary_press = None;
+        let release_pt =
+            crate::windows_zoom_stage::cursor_screen_point().unwrap_or(press.screen_pt);
+        let click_tol = crate::windows_zoom_stage::click_drag_tolerance();
+        let Some(click) = resolve_split_secondary_click(Some(press), release_pt, click_tol) else {
+            return;
+        };
+
+        let main_hwnd = self.resolved_main_hwnd();
+        let ppp = ctx.pixels_per_point().max(0.01);
+        let screen_rect = ctx.screen_rect();
+        let logical_pos = if let Some(r) = crate::windows_env::window_rect(main_hwnd) {
+            let win_rect = PhysicalRect::new(r.left, r.top, r.right, r.bottom);
+            let (lx, ly) = screen_point_to_logical_local(click.screen_pt, win_rect, ppp);
+            egui::pos2(lx, ly)
+        } else {
+            ctx.input(|i| i.pointer.hover_pos())
+                .unwrap_or_else(|| screen_rect.center())
+        };
+        self.handle_solo_secondary_click(logical_pos, screen_rect, click.modifiers.ctrl);
+        ctx.request_repaint();
     }
 
     /// Starts (or feeds) the zero-flicker Win32 layered floating-zoom stage on wheel input.
@@ -187,6 +304,7 @@ impl ImageViewer {
         self.zoom_target = self.zoom;
         self.zoom_velocity = 0.0;
         self.floating_zoom_settled_zoom = None;
+        self.clear_zoom_stage_click_handoff_state();
         crate::windows_env::clear_posted_window_rect();
         crate::windows_zoom_stage::set_zoom_capture_armed(true, allow_ctrl_wheel);
 
@@ -198,7 +316,8 @@ impl ImageViewer {
                 last_commit: now,
             },
             main_cloaked: true,
-            pending_primary_drag: None,
+            pending_inputs: PendingZoomStageInputs::default(),
+            key_interrupt_synced_view: None,
         });
         ctx.request_repaint();
         true
@@ -222,6 +341,8 @@ impl ImageViewer {
             || self.image_rotated
             || self.is_resizing
             || self.is_panning
+            || self.any_modal_dialog_open()
+            || self.file_action_menu.is_some()
             || crate::windows_env::shell_owns_window_rect()
             || !self.has_floating_zoom_source_pixels();
         if hard_abort {
@@ -229,18 +350,20 @@ impl ImageViewer {
             return;
         }
 
-        let captured_drag = crate::windows_zoom_stage::take_pending_primary_drag()
-            .map(|press_screen_pt| PendingPrimaryDrag { press_screen_pt });
+        let drained_events = crate::windows_zoom_stage::drain_mouse_events();
         let stage_interrupt = crate::windows_zoom_stage::take_interrupt();
         let focus_lost = !ctx.input(|i| i.focused);
         let key_pressed = ctx.input(|i| {
-            i.raw
-                .events
-                .iter()
-                .any(|e| matches!(e, egui::Event::Key { pressed: true, .. }))
+            i.raw.events.iter().any(|e| {
+                matches!(
+                    e,
+                    egui::Event::Key { pressed: true, .. }
+                        | egui::Event::Copy
+                        | egui::Event::Cut
+                        | egui::Event::Paste(_)
+                )
+            })
         });
-        let soft_interrupt =
-            stage_interrupt || captured_drag.is_some() || focus_lost || key_pressed;
 
         let main_hwnd = self.resolved_main_hwnd();
         if main_hwnd.is_null() {
@@ -254,18 +377,44 @@ impl ImageViewer {
             None => return,
         };
 
-        if let Some(drag) = captured_drag {
-            session.pending_primary_drag = Some(drag);
-        } else if focus_lost {
-            session.pending_primary_drag = None;
+        // If a keyboard action (`ResetZoom`, `ZoomIn`, `ZoomOut`, etc.) mutated `(zoom_target, offset)`
+        // after `prepare_floating_zoom_stage_for_input` synced the frozen zoom state, immediately
+        // reveal `main_hwnd` without overwriting the keyboard action's new view state!
+        if let Some((synced_zoom_target, synced_offset)) = session.key_interrupt_synced_view {
+            if key_interrupt_mutated_view(
+                synced_zoom_target,
+                (synced_offset.x, synced_offset.y),
+                self.zoom_target,
+                (self.offset.x, self.offset.y),
+            ) {
+                self.floating_zoom_settled_zoom = None;
+                crate::windows_env::set_window_cloaked(main_hwnd, false);
+                crate::windows_zoom_stage::dwm_flush();
+                if let Some(stage) = self.zoom_stage_window.as_mut() {
+                    stage.hide();
+                }
+                crate::windows_zoom_stage::set_zoom_capture_armed(false, false);
+                ctx.request_repaint();
+                return;
+            }
         }
-        if session.pending_primary_drag.is_some() && !global_mouse_button_down(GLOBAL_MOUSE_LEFT) {
-            session.pending_primary_drag = None;
+
+        let click_tol = crate::windows_zoom_stage::click_drag_tolerance();
+        let now = Instant::now();
+        for event in drained_events {
+            session.pending_inputs.record_event(event, now, click_tol);
         }
+        if focus_lost && !session.pending_inputs.has_any() {
+            session.pending_inputs.clear();
+        }
+        let soft_interrupt = stage_interrupt
+            || session.pending_inputs.has_any()
+            || focus_lost
+            || key_pressed
+            || session.key_interrupt_synced_view.is_some();
 
         // If new wheel input arrives during Settling (and not interrupted), immediately resume Travelling.
         if !soft_interrupt
-            && session.pending_primary_drag.is_none()
             && matches!(session.phase, FloatingZoomPhase::Settling { .. })
             && crate::windows_zoom_stage::peek_wheel_delta() != 0
         {
@@ -370,9 +519,12 @@ impl ImageViewer {
                     }
 
                     if matched_frames >= 2 || started_at.elapsed() >= Duration::from_millis(150) {
-                        let pending_drag = crate::windows_zoom_stage::take_pending_primary_drag()
-                            .map(|press_screen_pt| PendingPrimaryDrag { press_screen_pt })
-                            .or(session.pending_primary_drag);
+                        let reveal_now = Instant::now();
+                        for event in crate::windows_zoom_stage::drain_mouse_events() {
+                            session
+                                .pending_inputs
+                                .record_event(event, reveal_now, click_tol);
+                        }
                         self.floating_zoom_settled_zoom = Some(self.zoom);
                         crate::windows_env::set_window_cloaked(main_hwnd, false);
                         crate::windows_zoom_stage::dwm_flush();
@@ -380,11 +532,11 @@ impl ImageViewer {
                             stage.hide();
                         }
                         crate::windows_zoom_stage::set_zoom_capture_armed(false, false);
-                        self.handoff_pending_primary_drag(
+                        self.handoff_zoom_stage_inputs(
                             ctx,
                             main_hwnd,
                             target_rect,
-                            pending_drag,
+                            session.pending_inputs,
                         );
                         ctx.request_repaint();
                     } else {
@@ -462,6 +614,144 @@ impl ImageViewer {
             resized_main: true,
             matched_frames,
             started_at: Instant::now(),
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn handoff_zoom_stage_inputs(
+        &mut self,
+        ctx: &egui::Context,
+        main_hwnd: winapi::shared::windef::HWND,
+        target_rect: PhysicalRect,
+        pending: PendingZoomStageInputs,
+    ) {
+        if !pending.has_any() || self.mode().is_fullscreen() || !self.mode().is_solo() {
+            return;
+        }
+
+        crate::windows_zoom_stage::ensure_foreground(main_hwnd);
+
+        let ppp = ctx.pixels_per_point().max(0.01);
+        let win_w_pt = target_rect.width().max(1) as f32 / ppp;
+        let win_h_pt = target_rect.height().max(1) as f32 / ppp;
+        let local_rect =
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(win_w_pt, win_h_pt));
+
+        // 1. Direct double-click on zoom stage (`WM_LBUTTONDBLCLK`).
+        if pending.primary_double_click.is_some() {
+            self.clear_zoom_stage_click_handoff_state();
+            self.reset_view_on_double_click(ctx, local_rect);
+            return;
+        }
+
+        // 2. Direct right-click (down + up on zoom stage within click radius).
+        if let Some(click) = pending.secondary_click {
+            self.clear_zoom_stage_click_handoff_state();
+            let (lx, ly) = screen_point_to_logical_local(click.screen_pt, target_rect, ppp);
+            self.handle_solo_secondary_click(egui::pos2(lx, ly), local_rect, click.modifiers.ctrl);
+            return;
+        }
+
+        // 3. Split right-click (down on zoom stage; release on main window or right during reveal).
+        if let Some(down) = pending.secondary_down {
+            self.clear_zoom_stage_click_handoff_state();
+            if global_mouse_button_down(GLOBAL_MOUSE_RIGHT) {
+                self.pending_zoom_stage_secondary_press = Some(down);
+                ctx.request_repaint();
+            } else {
+                let release_pt =
+                    crate::windows_zoom_stage::cursor_screen_point().unwrap_or(down.screen_pt);
+                let click_tol = crate::windows_zoom_stage::click_drag_tolerance();
+                if let Some(click) =
+                    resolve_split_secondary_click(Some(down), release_pt, click_tol)
+                {
+                    let (lx, ly) = screen_point_to_logical_local(click.screen_pt, target_rect, ppp);
+                    self.handle_solo_secondary_click(
+                        egui::pos2(lx, ly),
+                        local_rect,
+                        click.modifiers.ctrl,
+                    );
+                }
+            }
+            return;
+        }
+
+        // 4. Side buttons (Mouse4 / XBUTTON1 and Mouse5 / XBUTTON2).
+        if pending.extra1_down.is_some() {
+            self.clear_zoom_stage_click_handoff_state();
+            self.dispatch_zoom_stage_mouse_button_action(InputBinding::Mouse4);
+            return;
+        }
+        if pending.extra2_down.is_some() {
+            self.clear_zoom_stage_click_handoff_state();
+            self.dispatch_zoom_stage_mouse_button_action(InputBinding::Mouse5);
+            return;
+        }
+
+        // 5. Middle button (freehand autoscroll or any bound solo discrete action).
+        if let Some((click, still_down)) = pending.middle_down {
+            self.clear_zoom_stage_click_handoff_state();
+            if self.action_uses_binding(Action::FreehandAutoscroll, InputBinding::MouseMiddle) {
+                if self.manga_autoscroll_active {
+                    self.stop_manga_autoscroll();
+                } else {
+                    let (lx, ly) = screen_point_to_logical_local(click.screen_pt, target_rect, ppp);
+                    let anchor = egui::pos2(lx, ly);
+                    if self.get_resize_direction(anchor, local_rect) == ResizeDirection::None {
+                        let middle_held =
+                            still_down && global_mouse_button_down(GLOBAL_MOUSE_MIDDLE);
+                        self.manga_autoscroll_active = true;
+                        self.manga_autoscroll_anchor = Some(anchor);
+                        self.manga_autoscroll_middle_hold_tracking = middle_held;
+                        self.manga_autoscroll_cancel_on_middle_release = false;
+                        self.manga_autoscroll_middle_hold_started_at =
+                            middle_held.then(Instant::now);
+                        self.is_panning = false;
+                        self.last_mouse_pos = None;
+                        self.pan_last_cursor_phys = None;
+                    }
+                }
+            } else {
+                self.dispatch_zoom_stage_mouse_button_action(InputBinding::MouseMiddle);
+            }
+            return;
+        }
+
+        // 6. Unmodified primary click completed on zoom stage -> arm split double-click detector.
+        if let Some(completed) = pending.primary_click_completed {
+            self.last_zoom_stage_primary_click = Some(completed);
+        }
+
+        // 7. Primary press still held on reveal -> handoff to resize / move / pan, and also track
+        //    click candidate in case user releases shortly without dragging (split double-click).
+        if let Some(down) = pending.primary_down {
+            let primary_still_down = global_mouse_button_down(GLOBAL_MOUSE_LEFT);
+            if !primary_still_down {
+                if !down.modifiers.any() {
+                    let release_pt =
+                        crate::windows_zoom_stage::cursor_screen_point().unwrap_or(down.screen_pt);
+                    let click_tol = crate::windows_zoom_stage::click_drag_tolerance();
+                    if points_within_tolerance(down.screen_pt, release_pt, click_tol.0, click_tol.1)
+                    {
+                        self.last_zoom_stage_primary_click = Some(LastZoomStagePrimaryClick {
+                            at: Instant::now(),
+                            screen_pt: down.screen_pt,
+                        });
+                    }
+                }
+                return;
+            }
+            if !down.modifiers.any() {
+                self.pending_zoom_stage_primary_click_candidate = Some(down.screen_pt);
+            }
+            self.handoff_pending_primary_drag(
+                ctx,
+                main_hwnd,
+                target_rect,
+                Some(PendingPrimaryDrag {
+                    press_screen_pt: down.screen_pt,
+                }),
+            );
         }
     }
 

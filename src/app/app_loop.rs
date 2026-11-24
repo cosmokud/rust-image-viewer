@@ -195,11 +195,17 @@ impl eframe::App for ImageViewer {
         // Debounced preset-file write for settings slider drags.
         self.flush_pending_settings_save(ctx);
 
+        // Sync/interrupt any active floating zoom stage before input runs so keyboard shortcuts
+        // never get overwritten by `drive_floating_zoom_stage` and split right-clicks fire immediately.
+        #[cfg(target_os = "windows")]
+        self.prepare_floating_zoom_stage_for_input(ctx);
+
         // The settings window is its own window: the viewer keeps handling its own input.
         self.handle_input(ctx);
         crate::diag::note_stage("input");
 
         if self.should_short_circuit_frame_for_exit(false) {
+            self.cancel_floating_zoom_stage_immediately();
             Self::send_fast_close_viewport_commands(ctx);
             return;
         }
@@ -222,6 +228,7 @@ impl eframe::App for ImageViewer {
 
         // Apply layout changes after image changes.
         if self.image_changed {
+            self.clear_zoom_stage_click_handoff_state();
             // If we're about to enter fullscreen (startup or user toggle), skip applying
             // a floating layout first to avoid a one-frame flash.
             if !self.mode().is_fullscreen() && self.toggle_fullscreen {
